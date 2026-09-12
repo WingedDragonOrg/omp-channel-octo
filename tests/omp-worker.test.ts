@@ -1,0 +1,835 @@
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { afterEach, describe, expect, test } from "bun:test";
+import { createWorkerFactory } from "../src/omp/index.ts";
+import type { HostTool, OmpWorker, PromptContext, WorkerEvent, WorkerOptions, WorkerProcess } from "../src/contracts.ts";
+
+const fixturePath = resolve(import.meta.dir, "fixtures/omp-rpc-worker.ts");
+const watchdogParentFixturePath = resolve(import.meta.dir, "fixtures/omp-watchdog-parent.ts");
+
+type LogEntry = Record<string, unknown>;
+
+type Harness = {
+	tempDir: string;
+	logPath: string;
+	markerPath: string;
+	worker: OmpWorker;
+	spawned: WorkerProcess | undefined;
+	cleanup: () => Promise<void>;
+};
+
+const harnesses = new Set<Harness>();
+
+afterEach(async () => {
+	for (const harness of [...harnesses]) {
+		await harness.cleanup();
+		harnesses.delete(harness);
+	}
+});
+
+async function readLog(path: string): Promise<LogEntry[]> {
+	try {
+		const contents = await readFile(path, "utf8");
+		return contents
+			.split("\n")
+			.filter(line => line.length > 0)
+			.map(line => JSON.parse(line) as LogEntry);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
+	}
+}
+
+async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs = 1500): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (await predicate()) return;
+		await Bun.sleep(10);
+	}
+	throw new Error(`condition was not met within ${timeoutMs}ms`);
+}
+
+function processIsAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+		if ((error as NodeJS.ErrnoException).code === "EPERM") return true;
+		throw error;
+	}
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 1500): Promise<void> {
+	await waitUntil(() => !processIsAlive(pid), timeoutMs);
+}
+
+async function withHarness<T>(
+	scenario: string,
+	run: (harness: Harness) => Promise<T>,
+	options: { descendantDelayMs?: number; sessionFile?: string } = {},
+): Promise<T> {
+	const tempDir = await realpath(await mkdtemp(join(tmpdir(), "omp-rpc-worker-")));
+	const logPath = join(tempDir, "fixture.log");
+	const markerPath = join(tempDir, "descendant.alive");
+	const conflictingCwd = join(tempDir, "wrong-cwd");
+	const conflictingSessionDir = join(tempDir, "wrong-session-dir");
+	const extraArgs = [
+		fixturePath,
+		"--mode",
+		"interactive",
+		"--approval-mode",
+		"always-ask",
+		"--cwd",
+		conflictingCwd,
+		"--session-dir",
+		conflictingSessionDir,
+		"--fixture-scenario",
+		scenario,
+		"--fixture-log",
+		logPath,
+		"--fixture-marker",
+		markerPath,
+		"--fixture-descendant-delay",
+		String(options.descendantDelayMs ?? 0),
+	];
+	const requestedSessionFile =
+		options.sessionFile && !options.sessionFile.startsWith("/") ? join(tempDir, options.sessionFile) : options.sessionFile;
+	const factory = createWorkerFactory({
+		ompCommand: process.execPath,
+		extraArgs,
+		startupTimeoutMs: 2_000,
+		cancelTimeoutMs: 800,
+	});
+	let spawned: WorkerProcess | undefined;
+	const workerOptions: WorkerOptions = {
+		cwd: tempDir,
+		sessionDir: tempDir,
+		...(requestedSessionFile === undefined ? {} : { sessionFile: requestedSessionFile }),
+		onSpawn: processInfo => {
+			spawned = processInfo;
+		},
+	};
+	const worker = await factory.create(workerOptions);
+	const harness: Harness = {
+		tempDir,
+		logPath,
+		markerPath,
+		worker,
+		get spawned() {
+			return spawned;
+		},
+		cleanup: async () => {
+			try {
+				await worker.stop();
+			} catch {
+				// Individual tests assert the stop result they care about.  Cleanup
+				// must still remove the fixture after a crash-path assertion.
+			}
+			if (spawned) {
+				await waitUntil(() => !processIsAlive(spawned!.pid), 1_500).catch(() => {});
+			}
+			try {
+				await rm(tempDir, { recursive: true, force: true });
+			} catch {
+				// Best effort only; process assertions happen before cleanup.
+			}
+		},
+	};
+	harnesses.add(harness);
+	try {
+		return await run(harness);
+	} finally {
+		await harness.cleanup();
+		harnesses.delete(harness);
+	}
+}
+
+function commandTypes(entries: LogEntry[]): string[] {
+	return entries
+		.filter(entry => entry.kind === "command")
+		.map(entry => {
+			const command = entry.command;
+			return command && typeof command === "object" && "type" in command && typeof command.type === "string"
+				? command.type
+				: "<invalid>";
+		});
+}
+
+function startupEntry(entries: LogEntry[]): LogEntry {
+	const startup = entries.find(entry => entry.kind === "startup");
+	if (!startup) throw new Error("fixture startup record was not written");
+	return startup;
+}
+
+function argumentValue(argv: unknown, name: string): string | undefined {
+	if (!Array.isArray(argv)) return undefined;
+	for (let index = argv.length - 1; index >= 0; index--) {
+		const value = argv[index];
+		if (value === name && typeof argv[index + 1] === "string") return argv[index + 1] as string;
+		if (typeof value === "string" && value.startsWith(`${name}=`)) return value.slice(name.length + 1);
+	}
+	return undefined;
+}
+
+function resultTextFromCommand(command: unknown): string {
+	if (!command || typeof command !== "object" || Array.isArray(command)) return String(command ?? "");
+	const result = (command as LogEntry).result;
+	if (!result || typeof result !== "object" || Array.isArray(result)) return String(result ?? "");
+	const content = (result as LogEntry).content;
+	if (!Array.isArray(content)) return String(result);
+	const text = content.find(
+		value => value && typeof value === "object" && !Array.isArray(value) && (value as LogEntry).type === "text",
+	);
+	return text && typeof text === "object" && !Array.isArray(text) && typeof (text as LogEntry).text === "string"
+		? (text as LogEntry).text as string
+		: String(result);
+}
+
+describe("OMP RPC worker", () => {
+	test("starts a real child with enforced RPC/yolo/cwd flags and reads state after ready", async () => {
+		await withHarness("normal", async harness => {
+			expect(harness.spawned?.pid).toBeGreaterThan(0);
+			expect(harness.spawned?.pgid).toBeGreaterThan(0);
+			expect(harness.spawned?.cwd).toBe(harness.tempDir);
+			expect(harness.spawned?.identity).toBeTruthy();
+			expect(harness.worker.sessionId).toBe("fixture-session-normal");
+			expect(harness.worker.sessionFile).toBe(join(harness.tempDir, "fixture-normal.jsonl"));
+
+			await waitUntil(async () => (await readLog(harness.logPath)).some(entry => entry.kind === "command"));
+			const entries = await readLog(harness.logPath);
+			const startup = startupEntry(entries);
+			expect(startup.cwd).toBe(harness.tempDir);
+			expect(startup.cwdArg).toBe(harness.tempDir);
+			expect(argumentValue(startup.argv, "--mode")).toBe("rpc");
+			expect(argumentValue(startup.argv, "--approval-mode")).toBe("yolo");
+			expect(argumentValue(startup.argv, "--cwd")).toBe(harness.tempDir);
+			expect(argumentValue(startup.argv, "--session-dir")).toBe(harness.tempDir);
+		});
+	});
+	test("materializes a valid fresh session before returning the worker", async () => {
+		await withHarness("normal", async harness => {
+			expect(existsSync(harness.worker.sessionFile)).toBe(true);
+			const firstLine = (await readFile(harness.worker.sessionFile, "utf8")).trim().split("\n")[0];
+			if (firstLine === undefined) throw new Error("fixture session file is empty");
+			const header = JSON.parse(firstLine) as LogEntry;
+			expect(header).toMatchObject({
+				type: "session",
+				version: 3,
+				id: "fixture-session-normal",
+				cwd: harness.tempDir,
+			});
+		});
+	});
+
+	test("passes an explicit session file for recovery instead of selecting a recent session", async () => {
+		await withHarness("normal", async harness => {
+			expect(harness.worker.sessionFile).toBe(join(harness.tempDir, "resume.jsonl"));
+			expect(existsSync(harness.worker.sessionFile)).toBe(true);
+			const entries = await readLog(harness.logPath);
+			const startup = startupEntry(entries);
+			expect(argumentValue(startup.argv, "--resume")).toBe(join(harness.tempDir, "resume.jsonl"));
+			expect(commandTypes(entries)).not.toContain("new_session");
+		}, { sessionFile: "resume.jsonl" });
+	});
+
+	test("does not treat the prompt acknowledgement as completion", async () => {
+		await withHarness("normal", async harness => {
+			const events: WorkerEvent[] = [];
+			let settled = false;
+			const prompt = harness.worker.prompt("run", event => events.push(event)).then(
+				() => {
+					settled = true;
+				},
+				(error: unknown) => {
+					settled = true;
+					throw error;
+				},
+			);
+			await waitUntil(async () =>
+				(await readLog(harness.logPath)).some(entry => {
+					if (entry.kind !== "out" || !entry.frame || typeof entry.frame !== "object") return false;
+					const frame = entry.frame as Record<string, unknown>;
+					return frame.type === "response" && frame.command === "prompt" && frame.success === true;
+				}),
+			);
+			// The fixture records the immediate acknowledgement before scheduling
+			// its terminal events; no wall-clock sleep is needed to expose the
+			// distinction between acceptance and completion.
+			expect(settled).toBe(false);
+			await prompt;
+			const textEvents = events.filter(event => event.type === "text");
+			expect(textEvents).toHaveLength(2);
+			expect(textEvents[0]).toMatchObject({ type: "text", text: "fixture completed", final: false });
+			expect(textEvents[1]).toMatchObject({ type: "text", text: "fixture completed", final: true });
+			expect(textEvents[0]?.messageId).toEqual(expect.any(String));
+			expect(textEvents[0]?.messageId).toBe(textEvents[1]?.messageId);
+		});
+	});
+
+	test("completes a local-only prompt from agentInvoked false without agent events", async () => {
+		await withHarness("local", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("/help", event => events.push(event));
+			expect(events).toEqual([]);
+		});
+	});
+
+	test("rejects a delayed asynchronous prompt error after the initial ack", async () => {
+		await withHarness("error", async harness => {
+			await expect(harness.worker.prompt("run", () => {})).rejects.toThrow("fixture delayed prompt failure");
+		});
+	});
+	test("rejects a prompt failure sharing the acknowledgement stdout chunk", async () => {
+		await withHarness("same-chunk-error", async harness => {
+			await expect(harness.worker.prompt("same chunk", () => {})).rejects.toThrow("fixture same-chunk prompt failure");
+		});
+	});
+
+	test("emits cumulative text snapshots and one authoritative final while filtering non-assistant events", async () => {
+		await withHarness("message-end", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("message boundaries", event => events.push(event));
+			const textEvents = events.filter(event => event.type === "text");
+			expect(textEvents.map(event => ({ type: event.type, text: event.text, final: event.final }))).toEqual([
+				{ type: "text", text: "prefix `in", final: false },
+				{ type: "text", text: "prefix `inline\nco", final: false },
+				{ type: "text", text: "prefix `inline\ncode` suffix\n\n", final: false },
+				{ type: "text", text: "prefix `inline\ncode` suffix\n\nlast", final: false },
+				{ type: "text", text: "prefix `inline\ncode` suffix\n\nlast (authoritative)", final: true },
+			]);
+			expect(textEvents[0]?.messageId).toEqual(expect.any(String));
+			expect(textEvents.every(event => event.messageId === textEvents[0]?.messageId)).toBe(true);
+			expect(textEvents.some(event => event.text.includes("secret user message"))).toBe(false);
+			expect(textEvents.some(event => event.text.includes("SECRET_THINKING"))).toBe(false);
+			expect(textEvents.some(event => event.text.includes("SECRET_TOOL_RESULT"))).toBe(false);
+			expect(textEvents.some(event => event.text.includes("turn_start"))).toBe(false);
+			expect(textEvents.some(event => event.text.includes("turn_end"))).toBe(false);
+		});
+	});
+	test("emits an assistant message_end body even when no text delta arrived", async () => {
+		await withHarness("message-end-no-delta", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("message without deltas", event => events.push(event));
+			const textEvents = events.filter(event => event.type === "text");
+			expect(textEvents).toHaveLength(1);
+			expect(textEvents[0]).toMatchObject({ type: "text", text: "message without deltas", final: true });
+			expect(textEvents[0]?.messageId).toEqual(expect.any(String));
+		});
+	});
+	test("emits an empty final text event so an assistant message can close", async () => {
+		await withHarness("message-end-empty", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("empty assistant message", event => events.push(event));
+			const textEvents = events.filter(event => event.type === "text");
+			expect(textEvents).toHaveLength(1);
+			expect(textEvents[0]).toMatchObject({ type: "text", text: "", final: true });
+			expect(textEvents[0]?.messageId).toEqual(expect.any(String));
+		});
+	});
+
+	test("waits for a terminal agent end across a continuation round", async () => {
+		await withHarness("continuation", async harness => {
+			const events: WorkerEvent[] = [];
+			let settled = false;
+			const prompt = harness.worker.prompt("continue this turn", event => events.push(event)).then(() => {
+				settled = true;
+			});
+			await waitUntil(async () => (await readLog(harness.logPath)).some(entry => entry.kind === "continue_pending"));
+			expect(settled).toBe(false);
+			expect(events).toEqual([]);
+			await prompt;
+			const textEvents = events.filter(event => event.type === "text");
+			expect(textEvents.map(event => ({ text: event.text, final: event.final }))).toEqual([
+				{ text: "continued body", final: false },
+				{ text: "continued body", final: true },
+			]);
+			expect(textEvents[0]?.messageId).toEqual(expect.any(String));
+			expect(textEvents[0]?.messageId).toBe(textEvents[1]?.messageId);
+		});
+	});
+	test("emits each assistant message body without artificial separators", async () => {
+		await withHarness("multi-message", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("multiple assistant messages", event => events.push(event));
+			const textEvents = events.filter(event => event.type === "text");
+			expect(textEvents.map(event => ({ text: event.text, final: event.final }))).toEqual([
+				{ text: "first body", final: false },
+				{ text: "first body", final: true },
+				{ text: "second body", final: false },
+				{ text: "second body", final: true },
+			]);
+			expect(textEvents[0]?.messageId).toBe(textEvents[1]?.messageId);
+			expect(textEvents[2]?.messageId).toBe(textEvents[3]?.messageId);
+			expect(textEvents[0]?.messageId).not.toBe(textEvents[2]?.messageId);
+			expect(events.every(event => event.type === "text")).toBe(true);
+		});
+	});
+
+	test("does not suppress identical text from distinct assistant messages", async () => {
+		await withHarness("same-message-text", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("same assistant messages", event => events.push(event));
+			const textEvents = events.filter(event => event.type === "text");
+			expect(textEvents.map(event => ({ text: event.text, final: event.final }))).toEqual([
+				{ text: "same body", final: false },
+				{ text: "same body", final: true },
+				{ text: "same body", final: false },
+				{ text: "same body", final: true },
+			]);
+			expect(textEvents[0]?.messageId).toBe(textEvents[1]?.messageId);
+			expect(textEvents[2]?.messageId).toBe(textEvents[3]?.messageId);
+			expect(textEvents[0]?.messageId).not.toBe(textEvents[2]?.messageId);
+			expect(events.every(event => event.type === "text")).toBe(true);
+		});
+	});
+
+	test("allocates a stable unique message ID when assistant messages have no upstream ID", async () => {
+		await withHarness("generated-message-id", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("generate message IDs", event => events.push(event));
+			const textEvents = events.filter(event => event.type === "text");
+			expect(textEvents.map(event => ({ text: event.text, final: event.final }))).toEqual([
+				{ text: "generated first", final: false },
+				{ text: "generated first", final: true },
+				{ text: "generated second", final: false },
+				{ text: "generated second", final: true },
+			]);
+			const firstMessageId = textEvents[0]?.messageId;
+			const secondMessageId = textEvents[2]?.messageId;
+			expect(firstMessageId).toEqual(expect.any(String));
+			expect(secondMessageId).toEqual(expect.any(String));
+			expect(firstMessageId).toBe(textEvents[1]?.messageId);
+			expect(secondMessageId).toBe(textEvents[3]?.messageId);
+			expect(firstMessageId).not.toBe(secondMessageId);
+		});
+	});
+
+	test("maps real turn and tool lifecycle events without leaking tool payloads", async () => {
+		const startedAt = Date.now();
+		await withHarness("tool-progress", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("show tool progress", event => events.push(event));
+			const executionEvents = events.filter(event => event.type !== "text");
+			expect(executionEvents.map(event => event.type)).toEqual(["turn_start", "tool_start", "tool_end", "turn_end"]);
+			expect(executionEvents[0]).toMatchObject({ type: "turn_start", turnId: 0, atMs: 2_000 });
+			expect(executionEvents[1]).toMatchObject({
+				type: "tool_start",
+				toolCallId: "fixture-progress-call-1",
+				toolName: "fixture_echo",
+			});
+			expect(executionEvents[2]).toMatchObject({
+				type: "tool_end",
+				toolCallId: "fixture-progress-call-1",
+				status: "succeeded",
+			});
+			expect(executionEvents[3]).toMatchObject({ type: "turn_end", turnId: 0 });
+			for (const event of executionEvents.slice(1)) {
+				if ("atMs" in event) {
+					expect(event.atMs).toBeGreaterThanOrEqual(startedAt - 1_000);
+					expect(event.atMs).toBeLessThanOrEqual(Date.now() + 1_000);
+				}
+			}
+			const serializedExecution = JSON.stringify(executionEvents);
+			expect(serializedExecution).not.toContain("SECRET_TOOL_ARGUMENTS");
+			expect(serializedExecution).not.toContain("SECRET_TOOL_RESULT");
+			expect(serializedExecution).not.toContain("SECRET_THINKING");
+			expect(executionEvents[1]).not.toHaveProperty("args");
+			expect(executionEvents[2]).not.toHaveProperty("result");
+
+			const textEvents = events.filter(event => event.type === "text");
+			expect(textEvents.some(event => event.text.includes("SECRET_TOOL_ARGUMENTS"))).toBe(false);
+			expect(textEvents.some(event => event.text.includes("SECRET_TOOL_RESULT"))).toBe(false);
+			expect(textEvents.some(event => event.text.includes("SECRET_THINKING"))).toBe(false);
+		});
+	});
+
+	test("publishes only a safe skill name as a read tool summary", async () => {
+		await withHarness("tool-summary", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("show a skill file", event => events.push(event));
+			const toolStart = events.find(event => event.type === "tool_start");
+			expect(toolStart).toMatchObject({
+				type: "tool_start",
+				toolCallId: "fixture-summary-read-1",
+				toolName: "read",
+				summary: "spec-design",
+			});
+			expect(toolStart).not.toHaveProperty("args");
+			const toolEnd = events.find(event => event.type === "tool_end");
+			expect(toolEnd).toMatchObject({
+				type: "tool_end",
+				toolCallId: "fixture-summary-read-1",
+				status: "succeeded",
+				summary: "spec-design",
+			});
+			expect(toolEnd).not.toHaveProperty("result");
+			const serialized = JSON.stringify(events);
+			expect(serialized).not.toContain("Authorization");
+			expect(serialized).not.toContain("SECRET_AUTHORIZATION");
+			expect(serialized).not.toContain("SECRET_SUMMARY_SECRET");
+			expect(serialized).not.toContain("SECRET_SUMMARY_RESULT");
+		});
+	});
+
+	test("maps only successful todo tool details to a typed update", async () => {
+		await withHarness("todo-progress", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("show todo progress", event => events.push(event));
+			const todoEvents = events.filter(event => event.type === "todo_update");
+			const turnStart = events.find(event => event.type === "turn_start");
+			const turnEnd = events.find(event => event.type === "turn_end");
+			expect(turnStart).toMatchObject({ type: "turn_start", atMs: 3_000 });
+			expect(turnEnd).toMatchObject({ type: "turn_end", atMs: expect.any(Number) });
+			if (turnStart?.type === "turn_start" && turnEnd?.type === "turn_end") {
+				expect(turnStart.turnId).toEqual(expect.anything());
+				expect(turnEnd.turnId).toBe(turnStart.turnId);
+			}
+			expect(todoEvents).toHaveLength(1);
+			expect(todoEvents[0]).toEqual({
+				type: "todo_update",
+				atMs: expect.any(Number),
+				op: "init",
+				phases: [
+					{
+						name: "Planning",
+						tasks: [
+							{ content: "draft plan", status: "completed" },
+							{ content: "ship plan", status: "blocked", blocker: "waiting on review" },
+						],
+					},
+				],
+			});
+			const toolEnd = events.find(event => event.type === "tool_end");
+			expect(toolEnd).toMatchObject({
+				type: "tool_end",
+				toolCallId: "fixture-todo-call-1",
+				status: "succeeded",
+			});
+			const serialized = JSON.stringify(events);
+			expect(serialized).not.toContain("SECRET_TODO_ARGUMENTS");
+			expect(serialized).not.toContain("SECRET_TODO_TEXT");
+			expect(serialized).not.toContain("result");
+			expect(serialized).not.toContain("thinking");
+			expect(events.some(event => event.type === "run_end")).toBe(false);
+		});
+	});
+
+	test("does not publish todo phases from a failed todo tool result", async () => {
+		await withHarness("todo-failed", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("failed todo progress", event => events.push(event));
+			expect(events.filter(event => event.type === "todo_update")).toEqual([]);
+			const toolEnd = events.find(event => event.type === "tool_end");
+			expect(toolEnd).toMatchObject({
+				type: "tool_end",
+				toolCallId: "fixture-todo-call-1",
+				status: "failed",
+				errorCategory: "unknown",
+			});
+			const serialized = JSON.stringify(events);
+			expect(serialized).not.toContain("SECRET_TODO_ARGUMENTS");
+			expect(serialized).not.toContain("SECRET_TODO_TEXT");
+		});
+	});
+
+	test("rejects a terminal agent turn with model stopReason error", async () => {
+		await withHarness("model-error", async harness => {
+			await expect(harness.worker.prompt("model failure", () => {})).rejects.toThrow(/model.*error|model failure/i);
+		});
+	});
+
+	test("reassembles a lossless v2 frame larger than the v1 physical limit", async () => {
+		await withHarness("v2", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("large output", event => events.push(event));
+			const textEvents = events.filter(event => event.type === "text");
+			expect(textEvents).toHaveLength(2);
+			expect(textEvents[0]?.text.startsWith("fixture-v2-")).toBe(true);
+			expect(textEvents[0]?.text.length).toBeGreaterThan(1_000_000);
+			expect(textEvents[0]?.final).toBe(false);
+			expect(textEvents[1]?.final).toBe(true);
+			expect(textEvents[1]?.text).toBe(textEvents[0]?.text);
+			expect(textEvents[0]?.messageId).toEqual(expect.any(String));
+			expect(textEvents[0]?.messageId).toBe(textEvents[1]?.messageId);
+		});
+	});
+
+	test("registers host tools as essential before prompting and returns textual results", async () => {
+		await withHarness("host-tool", async harness => {
+			let receivedArgs: Record<string, unknown> | undefined;
+			const tool: HostTool = {
+				name: "fixture_echo",
+				description: "Echo a fixture value",
+				parameters: { type: "object", properties: { message: { type: "string" } } },
+				execute: async args => {
+					receivedArgs = args;
+					return `host result: ${String(args.message)}`;
+				},
+			};
+			const context: PromptContext = { tools: [tool] };
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("use host tool", event => events.push(event), context);
+			expect(events.some(event => event.type === "text" && event.text.includes("host result:"))).toBe(true);
+			const entries = await readLog(harness.logPath);
+			const setToolsEntry = entries.find(entry => entry.kind === "command" && (entry.command as LogEntry)?.type === "set_host_tools");
+			expect(setToolsEntry).toBeDefined();
+			const setTools = setToolsEntry!.command as LogEntry;
+			expect(Array.isArray(setTools.tools)).toBe(true);
+			expect((setTools.tools as LogEntry[])[0]?.loadMode).toBe("essential");
+			expect(commandTypes(entries).indexOf("set_host_tools")).toBeLessThan(commandTypes(entries).indexOf("prompt"));
+			const hostResult = entries.find(
+				entry => entry.kind === "command" && (entry.command as LogEntry)?.type === "host_tool_result",
+			);
+			expect(hostResult).toBeDefined();
+			expect((hostResult!.command as LogEntry).isError).toBe(false);
+			expect(resultTextFromCommand(hostResult!.command)).toContain("host result: hello from fixture");
+		});
+	});
+
+	test("fails an unknown host tool through an error result instead of hanging", async () => {
+		await withHarness("host-unknown", async harness => {
+			const prompt = harness.worker.prompt(
+				"use missing host tool",
+				() => {},
+				{ tools: [] },
+			);
+			await prompt;
+			const entries = await readLog(harness.logPath);
+			const hostResult = entries.find(
+				entry => entry.kind === "command" && (entry.command as LogEntry)?.type === "host_tool_result",
+			);
+			expect(hostResult).toBeDefined();
+			expect((hostResult!.command as LogEntry).isError).toBe(true);
+			expect(resultTextFromCommand(hostResult!.command)).toMatch(/unknown|missing|not found/i);
+		});
+	});
+
+	test("aborts an in-flight host tool when the RPC side cancels it", async () => {
+		await withHarness("host-cancel", async harness => {
+			let aborted = false;
+			const tool: HostTool = {
+				name: "fixture_echo",
+				description: "Wait until cancelled",
+				parameters: { type: "object" },
+				execute: async (_args, signal) =>
+					await new Promise<string>((_resolve, reject) => {
+						if (signal.aborted) {
+							aborted = true;
+							reject(new Error("host tool cancelled"));
+							return;
+						}
+						signal.addEventListener(
+							"abort",
+							() => {
+								aborted = true;
+								reject(new Error("host tool cancelled"));
+							},
+							{ once: true },
+						);
+					}),
+			};
+			const promptResult = harness.worker.prompt("cancel host tool", () => {}, { tools: [tool] }).catch(() => undefined);
+			await waitUntil(async () =>
+				(await readLog(harness.logPath)).some(entry => {
+					if (entry.kind !== "out" || !entry.frame || typeof entry.frame !== "object") return false;
+					return (entry.frame as LogEntry).type === "host_tool_cancel";
+				}),
+			);
+			await promptResult;
+			expect(aborted).toBe(true);
+			const entries = await readLog(harness.logPath);
+			const hostResult = entries.find(
+				entry => entry.kind === "command" && (entry.command as LogEntry)?.type === "host_tool_result",
+			);
+			expect(hostResult).toBeDefined();
+			expect((hostResult!.command as LogEntry).isError).toBe(true);
+		});
+	});
+
+	test("aborts a host tool signal during worker stop and does not leave the prompt pending", async () => {
+		await withHarness("host-stop", async harness => {
+			let aborted = false;
+			const tool: HostTool = {
+				name: "fixture_echo",
+				description: "Wait for worker stop",
+				parameters: { type: "object" },
+				execute: async (_args, signal) =>
+					await new Promise<string>((_resolve, reject) => {
+						signal.addEventListener(
+							"abort",
+							() => {
+								aborted = true;
+								reject(new Error("worker stopped"));
+							},
+							{ once: true },
+						);
+					}),
+			};
+			const prompt = harness.worker.prompt("stop host tool", () => {}, { tools: [tool] }).catch(() => undefined);
+			await waitUntil(async () =>
+				(await readLog(harness.logPath)).some(entry => {
+					if (entry.kind !== "out" || !entry.frame || typeof entry.frame !== "object") return false;
+					return (entry.frame as LogEntry).type === "host_tool_call";
+				}),
+			);
+			const stopped = await harness.worker.stop();
+			await prompt;
+			expect(stopped).toBe(true);
+			expect(aborted).toBe(true);
+		});
+	});
+
+	test("fails closed when a prompt asks for unsupported extension UI", async () => {
+		await withHarness("ui", async harness => {
+			const result = await Promise.race([
+				harness.worker.prompt("interactive operation", () => {}).then(
+					() => ({ kind: "resolved" as const }),
+					error => ({ kind: "rejected" as const, error }),
+				),
+				Bun.sleep(500).then(() => ({ kind: "timeout" as const })),
+			]);
+			expect(result.kind).toBe("rejected");
+			if (result.kind === "rejected") expect(result.error).toBeInstanceOf(Error);
+		});
+	});
+
+	test("stops the whole process group after abort instead of releasing on parent exit", async () => {
+		await withHarness("cancel", async harness => {
+			const prompt = harness.worker.prompt("long running operation", () => {}).catch(() => undefined);
+			await waitUntil(() => existsSync(harness.markerPath));
+			const descendantPid = Number(readFileSync(harness.markerPath, "utf8").trim());
+			expect(descendantPid).toBeGreaterThan(0);
+			expect(processIsAlive(descendantPid)).toBe(true);
+
+			const stopped = await harness.worker.stop();
+			expect(stopped).toBe(true);
+			await prompt;
+			await waitForProcessExit(descendantPid);
+			expect(processIsAlive(descendantPid)).toBe(false);
+		});
+	}, 5_000);
+
+	test("reaps managed descendants when the RPC parent crashes", async () => {
+		await withHarness("crash", async harness => {
+			const promptResult = harness.worker.prompt("crash now", () => {}).then(
+				() => ({ ok: true as const }),
+				error => ({ ok: false as const, error }),
+			);
+			await waitUntil(() => existsSync(harness.markerPath));
+			const descendantPid = Number(readFileSync(harness.markerPath, "utf8").trim());
+			const result = await promptResult;
+			expect(result.ok).toBe(false);
+			await waitForProcessExit(descendantPid);
+			expect(processIsAlive(descendantPid)).toBe(false);
+		});
+	}, 5_000);
+	test("watchdog reaps the worker group after the actual channel parent dies", async () => {
+		const tempDir = await realpath(await mkdtemp(join(tmpdir(), "omp-watchdog-parent-")));
+		const markerPath = join(tempDir, "descendant.alive");
+		const readyPath = join(tempDir, "parent.ready");
+		const processInfoPath = join(tempDir, "worker-process.json");
+		const parent = Bun.spawn(
+			[
+				process.execPath,
+				watchdogParentFixturePath,
+				"--temp-dir",
+				tempDir,
+				"--marker",
+				markerPath,
+				"--ready",
+				readyPath,
+				"--process-info",
+				processInfoPath,
+			],
+			{ stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+		);
+		try {
+			await waitUntil(() => existsSync(readyPath), 5_000);
+			const workerProcess = JSON.parse(readFileSync(processInfoPath, "utf8")) as WorkerProcess;
+			const descendantPid = Number(readFileSync(markerPath, "utf8").trim());
+			expect(workerProcess.pid).toBeGreaterThan(0);
+			expect(workerProcess.pgid).toBeGreaterThan(0);
+			expect(descendantPid).toBeGreaterThan(0);
+			expect(processIsAlive(workerProcess.pid)).toBe(true);
+			expect(processIsAlive(descendantPid)).toBe(true);
+
+			parent.kill("SIGKILL");
+			await parent.exited;
+			await waitForProcessExit(workerProcess.pid, 5_000);
+			await waitForProcessExit(descendantPid, 5_000);
+			expect(processIsAlive(workerProcess.pid)).toBe(false);
+			expect(processIsAlive(descendantPid)).toBe(false);
+			// A failed watchdog argument mapping must not signal this host test
+			// process or release an unverified/unknown PID.
+			expect(processIsAlive(process.pid)).toBe(true);
+		} finally {
+			try {
+				parent.kill("SIGKILL");
+			} catch {
+				// The parent may already have been reaped after the assertion.
+			}
+			await parent.exited.catch(() => {});
+			await rm(tempDir, { recursive: true, force: true });
+		}
+	}, 10_000);
+
+	test("kills a child when durable onSpawn persistence fails and never prompts it", async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "omp-rpc-spawn-failure-"));
+		const logPath = join(tempDir, "fixture.log");
+		let spawned: WorkerProcess | undefined;
+		try {
+			const factory = createWorkerFactory({
+				ompCommand: process.execPath,
+				extraArgs: [fixturePath, "--fixture-scenario", "normal", "--fixture-log", logPath],
+				startupTimeoutMs: 2_000,
+				cancelTimeoutMs: 500,
+			});
+			await expect(
+				factory.create({
+					cwd: tempDir,
+					sessionDir: tempDir,
+					onSpawn: processInfo => {
+						spawned = processInfo;
+						throw new Error("fixture persistence failed");
+					},
+				}),
+			).rejects.toThrow("fixture persistence failed");
+			expect(spawned?.pid).toBeGreaterThan(0);
+			await waitForProcessExit(spawned!.pid);
+			const entries = await readLog(logPath);
+			expect(entries.some(entry => entry.kind === "prompt")).toBe(false);
+		} finally {
+			await rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	test("refuses recovery with an unverified identity and leaves the PID untouched", async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "omp-rpc-recover-"));
+		try {
+			const factory = createWorkerFactory({ ompCommand: process.execPath });
+			const recovered = await factory.recover({
+				pid: process.pid,
+				pgid: process.pid,
+				identity: "not-the-current-process-start-identity",
+				cwd: tempDir,
+			});
+			expect(recovered).toBe(false);
+			expect(processIsAlive(process.pid)).toBe(true);
+		} finally {
+			await rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	test("accepts recovery only for an actively owned process identity", async () => {
+		await withHarness("normal", async harness => {
+			expect(harness.spawned).toBeDefined();
+			const factory = createWorkerFactory({ ompCommand: process.execPath });
+			await expect(factory.recover(harness.spawned!)).resolves.toBe(true);
+			await waitForProcessExit(harness.spawned!.pid);
+			expect(processIsAlive(harness.spawned!.pid)).toBe(false);
+		});
+	});
+});

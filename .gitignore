@@ -1,0 +1,14 @@
+node_modules/
+.bun/
+.env
+.env.*
+.envrc
+.envrc.*
+config.json
+*.local.json
+.DS_Store
+state/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log

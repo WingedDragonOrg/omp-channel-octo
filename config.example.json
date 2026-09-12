@@ -1,0 +1,7 @@
+{
+  "apiUrl": "https://im.deepminer.com.cn/",
+  "botTokenEnv": "OCTO_BOT_TOKEN",
+  "allowedGroupIds": [],
+  "ompCommand": "omp",
+  "stateDir": "~/.local/state/omp-channel-octo"
+}
