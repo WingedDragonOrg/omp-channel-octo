@@ -76,6 +76,7 @@ export interface WorkerLedgerRecord extends WorkerProcess {
   botUid: string;
   sessionId: string;
   sessionFile: string;
+  moveTargetCwd: string | null;
   state: "running" | "stopping" | "stopped" | "unknown";
 }
 
@@ -238,6 +239,7 @@ export class ChannelStore {
         pgid INTEGER NOT NULL,
         identity TEXT NOT NULL,
         cwd TEXT NOT NULL,
+        move_target_cwd TEXT,
         state TEXT NOT NULL CHECK(state IN ('running', 'stopping', 'stopped', 'unknown')),
         updated_at INTEGER NOT NULL
       );
@@ -248,6 +250,7 @@ export class ChannelStore {
       "ALTER TABLE outbox ADD COLUMN segment_index INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE outbox ADD COLUMN desired_version INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE outbox ADD COLUMN acked_version INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE worker_ledger ADD COLUMN move_target_cwd TEXT",
     ]) {
       try {
         this.db.exec(statement);
@@ -599,10 +602,13 @@ export class ChannelStore {
 
   recordWorker(worker: WorkerLedgerRecord): void {
     this.run(
-      `INSERT INTO worker_ledger(id, bot_uid, session_id, session_file, pid, pgid, identity, cwd, state, updated_at)
-       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO worker_ledger(
+         id, bot_uid, session_id, session_file, pid, pgid, identity, cwd, move_target_cwd, state, updated_at
+       )
+       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at,
-         pid = excluded.pid, pgid = excluded.pgid, identity = excluded.identity, cwd = excluded.cwd`,
+         pid = excluded.pid, pgid = excluded.pgid, identity = excluded.identity, cwd = excluded.cwd,
+         move_target_cwd = excluded.move_target_cwd`,
       [
         worker.id,
         worker.botUid,
@@ -612,9 +618,17 @@ export class ChannelStore {
         worker.pgid,
         worker.identity,
         worker.cwd,
+        worker.moveTargetCwd,
         worker.state,
         Date.now(),
       ],
+    );
+  }
+
+  markWorkerMoveTarget(id: string, cwd: string): void {
+    this.run(
+      "UPDATE worker_ledger SET move_target_cwd = ?, updated_at = ? WHERE id = ?",
+      [cwd, Date.now(), id],
     );
   }
 
@@ -629,6 +643,7 @@ export class ChannelStore {
         pgid: asNumber(row.pgid),
         identity: asString(row.identity),
         cwd: asString(row.cwd),
+        moveTargetCwd: asNullableString(row.move_target_cwd),
         state: row.state === "running" || row.state === "stopping" || row.state === "unknown" ? row.state : "stopped",
       }),
     );
@@ -677,6 +692,22 @@ export class ChannelStore {
     return row ? this.outboxFromRow(row) : null;
   }
 
+  beginTextCreate(id: string): boolean {
+    return this.transaction(() => {
+      const row = this.query(
+        "SELECT kind, remote_message_id, state FROM outbox WHERE id = ?",
+        [id],
+      )[0];
+      if (!row || row.kind !== "text" || asNullableString(row.remote_message_id)) return false;
+      if (row.state === "unknown") return true;
+      if (row.state !== "pending") return false;
+      return this.run(
+        "UPDATE outbox SET state = 'unknown', last_error = NULL WHERE id = ? AND state = 'pending' AND remote_message_id IS NULL",
+        [id],
+      ).changes === 1;
+    });
+  }
+
   listTextStream(botUid: string, taskId: string, streamMessageId: string): OutboxRecord[] {
     return this.query(
       `SELECT * FROM outbox
@@ -689,7 +720,7 @@ export class ChannelStore {
   updateTextOutbox(id: string, text: string, desiredVersion: number): boolean {
     return this.transaction(() => {
       const row = this.query(
-        "SELECT kind, remote_message_id, desired_version, acked_version FROM outbox WHERE id = ?",
+        "SELECT kind, remote_message_id, state, desired_version, acked_version FROM outbox WHERE id = ?",
         [id],
       )[0];
       if (!row || row.kind !== "text") return false;
@@ -697,7 +728,12 @@ export class ChannelStore {
       if (desiredVersion <= currentDesired) return false;
       const remoteMessageId = asNullableString(row.remote_message_id);
       const currentAcked = asNumber(row.acked_version);
-      const nextState = remoteMessageId && currentAcked >= desiredVersion ? "sent" : "pending";
+      const preservesUnknownCreate = row.state === "unknown" && !remoteMessageId;
+      const nextState = preservesUnknownCreate
+        ? "unknown"
+        : remoteMessageId && currentAcked >= desiredVersion
+          ? "sent"
+          : "pending";
       this.run(
         `UPDATE outbox
          SET text = ?, desired_version = ?, acked_version = ?, state = ?, last_error = NULL

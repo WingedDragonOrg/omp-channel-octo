@@ -65,6 +65,10 @@ type LockHandle = {
   path: string;
   release(): Promise<void>;
 };
+type DirectoryLease = {
+  ready: Promise<void>;
+  complete(): void;
+};
 
 type AppError = Error & { code?: string };
 
@@ -271,6 +275,7 @@ function genericTaskFailure(contextFailure: boolean): string {
 class CoreService implements ChannelService {
   private readonly taskOperations = new Set<Promise<void>>();
   private readonly chatTails = new Map<string, Promise<void>>();
+  private readonly scheduledTasks = new Map<string, Promise<void>>();
   private readonly directoryTails = new Map<string, Promise<void>>();
   private readonly runtimes = new Map<string, RuntimeTask>();
   private readonly questionWaiters = new Map<string, QuestionWaiter>();
@@ -319,6 +324,7 @@ class CoreService implements ChannelService {
           this.store.markWorkerStopped(ledger.id);
         } else {
           this.blockedDirectories.add(ledger.cwd);
+          if (ledger.moveTargetCwd) this.blockedDirectories.add(ledger.moveTargetCwd);
         }
       }
       if (this.stopping) throw new Error("channel 正在停止");
@@ -528,9 +534,14 @@ class CoreService implements ChannelService {
     );
   }
 
-  private sessionRoots(): readonly string[] {
+  private async sessionRootsFor(cwd: string): Promise<readonly string[]> {
     const stateSessions = join(this.options.config.stateDir, "sessions");
-    return [stateSessions, ...(this.options.workerFactory.sessionRoots ?? [])];
+    if (!this.options.workerFactory.sessionRootsFor) return [stateSessions];
+    try {
+      return [stateSessions, ...(await this.options.workerFactory.sessionRootsFor(cwd))];
+    } catch {
+      return [stateSessions];
+    }
   }
 
   private async reconcileExternalBinding(
@@ -538,7 +549,8 @@ class CoreService implements ChannelService {
     binding: BindingRecord | null = this.bot ? this.store.getBinding(this.bot.uid, target) : null,
   ): Promise<BindingRecord | null> {
     if (!binding || !binding.sessionFile) return binding;
-    const moved = await findMovedSession(binding, { roots: this.sessionRoots() });
+    if (this.blockedDirectories.has(binding.cwd)) return binding;
+    const moved = await findMovedSession(binding, { roots: await this.sessionRootsFor(binding.cwd) });
     if (
       !moved ||
       (moved.sessionId === binding.sessionId &&
@@ -559,6 +571,24 @@ class CoreService implements ChannelService {
       return binding;
     }
     return rebound;
+  }
+  private hasRuntime(target: ChatTarget): boolean {
+    const key = targetKey(target);
+    for (const runtime of this.runtimes.values()) {
+      if (targetKey(runtime.target) === key) return true;
+    }
+    return false;
+  }
+
+  private directoryUnavailable(cwd: string): boolean {
+    if (this.blockedDirectories.has(cwd) || this.directoryTails.has(cwd)) return true;
+    for (const runtime of this.runtimes.values()) {
+      if (runtime.cwd === cwd) return true;
+    }
+    for (const task of this.store.listQueuedTasks()) {
+      if (task.cwd === cwd) return true;
+    }
+    return false;
   }
 
 
@@ -590,7 +620,7 @@ class CoreService implements ChannelService {
   }
 
   private async handleNew(target: ChatTarget, argument: string): Promise<void> {
-    if (this.bot && this.store.getActiveTask(this.bot.uid, target)) {
+    if (this.bot && (this.store.getActiveTask(this.bot.uid, target) || this.hasRuntime(target))) {
       await this.enqueueText(target, "当前聊天有运行中或排队任务，请先 /cancel。", null);
       return;
     }
@@ -613,7 +643,14 @@ class CoreService implements ChannelService {
       await this.enqueueText(target, `目录无效：${safeErrorMessage(error, "无法访问该目录")}`, null);
       return;
     }
-    const sessionId = createSessionId();
+    const commandLease = this.tryAcquireCommandDirectories([cwd]);
+    if (!commandLease) {
+      await this.enqueueText(target, "目标目录当前被任务或未确认会话占用，请稍后重试。", null);
+      return;
+    }
+    try {
+      await commandLease.ready;
+      const sessionId = createSessionId();
     const sessionDir = join(this.options.config.stateDir, "sessions");
     await mkdir(sessionDir, { recursive: true });
     const ledgerId = `new-${sessionId}`;
@@ -637,6 +674,7 @@ class CoreService implements ChannelService {
             pgid: processInfo.pgid,
             identity: processInfo.identity,
             cwd: processInfo.cwd,
+            moveTargetCwd: null,
             state: "running",
           });
         },
@@ -688,10 +726,13 @@ class CoreService implements ChannelService {
       if (persistenceFailed) throw new Error("本地状态盘写入失败，会话未切换。");
       await this.enqueueText(target, "无法创建可恢复的 OMP 会话，当前绑定未改变。", null);
     }
+    } finally {
+      commandLease.complete();
+  }
   }
 
   private async handleMove(target: ChatTarget, argument: string): Promise<void> {
-    if (this.bot && this.store.getActiveTask(this.bot.uid, target)) {
+    if (this.bot && (this.store.getActiveTask(this.bot.uid, target) || this.hasRuntime(target))) {
       await this.enqueueText(target, "当前聊天有运行中或排队任务，请先 /cancel。", null);
       return;
     }
@@ -724,6 +765,13 @@ class CoreService implements ChannelService {
       await this.enqueueText(target, "绑定的 OMP 会话文件不存在，未迁移。", null);
       return;
     }
+    const commandLease = this.tryAcquireCommandDirectories([previous.cwd, cwd]);
+    if (!commandLease) {
+      await this.enqueueText(target, "源目录或目标目录当前被任务或未确认会话占用，请稍后重试。", null);
+      return;
+    }
+    try {
+      await commandLease.ready;
     const sessionDir = join(this.options.config.stateDir, "sessions");
     await mkdir(sessionDir, { recursive: true });
     const ledgerId = `move-${randomUUID()}`;
@@ -747,16 +795,19 @@ class CoreService implements ChannelService {
             pgid: processInfo.pgid,
             identity: processInfo.identity,
             cwd: processInfo.cwd,
+            moveTargetCwd: null,
             state: "running",
           });
         },
       });
+      this.store.markWorkerMoveTarget(ledgerId, cwd);
       await candidate.prompt(`/move ${cwd}`, () => {});
       const movedState: ProjectSessionState = await candidate.refreshState();
       const moved = await verifyMovedSession(previous, movedState, cwd);
       stopped = await candidate.stop();
       if (!stopped) {
         this.blockedDirectories.add(previous.cwd);
+        this.blockedDirectories.add(cwd);
         throw new Error("worker did not stop");
       }
       this.store.markWorkerStopped(ledgerId);
@@ -780,6 +831,7 @@ class CoreService implements ChannelService {
           this.store.markWorkerStopped(ledgerId);
         } else {
           this.blockedDirectories.add(previous.cwd);
+          this.blockedDirectories.add(cwd);
         }
       } else if (spawned && !stopped) {
         const verified = await this.options.workerFactory.recover(spawned).catch(() => false);
@@ -787,10 +839,14 @@ class CoreService implements ChannelService {
           this.store.markWorkerStopped(ledgerId);
         } else {
           this.blockedDirectories.add(previous.cwd);
+          this.blockedDirectories.add(cwd);
         }
       }
       if (persistenceFailed) throw new Error("本地状态盘写入失败，会话未迁移。");
       await this.enqueueText(target, "无法验证 OMP 原生 /move，当前绑定未改变。", null);
+    }
+    } finally {
+      commandLease.complete();
     }
   }
 
@@ -930,65 +986,127 @@ class CoreService implements ChannelService {
     this.scheduleTask(task.id);
     this.flushTarget(message);
   }
-
   private scheduleTask(taskId: string): void {
     const task = this.store.getTask(taskId);
     if (!task) return;
     const target = taskTarget(task);
     const chatKey = targetKey(target);
-    const scheduledCwd = task.cwd;
     const previousChat = this.chatTails.get(chatKey) ?? Promise.resolve();
-    const previousDirectory = this.directoryTails.get(scheduledCwd) ?? Promise.resolve();
-    const next = Promise.all([previousChat.catch(() => {}), previousDirectory.catch(() => {})]).then(async () => {
-      if (this.stopping) return;
-      const current = this.store.getTask(taskId);
-      if (!current || current.state !== "queued") return;
-      const binding = await this.reconcileExternalBinding(
-        target,
-        this.store.getBinding(this.bot!.uid, target),
-      );
-      if (binding && binding.cwd !== current.cwd) {
-        await this.scheduleRedirectedTask(taskId, binding.cwd);
-        return;
-      }
-      await this.runTask(taskId, binding?.cwd ?? current.cwd);
-    });
+    const next = previousChat.catch(() => {}).then(() => this.runScheduledTask(taskId));
     this.chatTails.set(chatKey, next);
-    this.directoryTails.set(scheduledCwd, next);
+    this.scheduledTasks.set(taskId, next);
     this.taskOperations.add(next);
     const cleanup = () => {
       if (this.chatTails.get(chatKey) === next) this.chatTails.delete(chatKey);
-      if (this.directoryTails.get(scheduledCwd) === next) this.directoryTails.delete(scheduledCwd);
+      if (this.scheduledTasks.get(taskId) === next) this.scheduledTasks.delete(taskId);
       this.taskOperations.delete(next);
     };
     void next.then(cleanup, cleanup);
   }
 
-  private async scheduleRedirectedTask(taskId: string, cwd: string): Promise<void> {
-    const previous = this.directoryTails.get(cwd) ?? Promise.resolve();
-    const redirected = previous.catch(() => {}).then(async () => {
-      if (this.stopping) return;
-      const task = this.store.getTask(taskId);
-      if (!task || task.state !== "queued") return;
+  private createDirectoryLease(cwd: string): DirectoryLease {
+    const previous = this.directoryTails.get(cwd);
+    const completion = Promise.withResolvers<void>();
+    const lease = completion.promise;
+    this.directoryTails.set(cwd, lease);
+    let complete = false;
+    return {
+      ready: previous?.catch(() => {}) ?? Promise.resolve(),
+      complete: () => {
+        if (complete) return;
+        complete = true;
+        if (this.directoryTails.get(cwd) === lease) this.directoryTails.delete(cwd);
+        completion.resolve();
+      },
+    };
+  }
+
+  private tryAcquireCommandDirectories(cwds: readonly string[]): DirectoryLease | undefined {
+    const unique = [...new Set(cwds)];
+    if (unique.some(cwd => this.directoryUnavailable(cwd))) return undefined;
+    const leases = unique.map(cwd => this.createDirectoryLease(cwd));
+    return {
+      ready: Promise.all(leases.map(lease => lease.ready)).then(() => {}),
+      complete: () => {
+        for (const lease of leases) lease.complete();
+      },
+    };
+  }
+
+  private async acquireDirectoryLease(cwd: string): Promise<DirectoryLease> {
+    const lease = this.createDirectoryLease(cwd);
+    await lease.ready;
+    return lease;
+  }
+
+  private async earlierDirectoryOperations(task: TaskRecord, cwd: string): Promise<Promise<void>[]> {
+    const queued = this.store.listQueuedTasks();
+    const currentIndex = queued.findIndex(candidate => candidate.id === task.id);
+    if (currentIndex < 0) return [];
+    const operations: Promise<void>[] = [];
+    for (let index = 0; index < currentIndex; index += 1) {
+      const earlier = queued[index];
+      if (!earlier) continue;
       const binding = await this.reconcileExternalBinding(
-        taskTarget(task),
-        this.store.getBinding(this.bot!.uid, taskTarget(task)),
+        taskTarget(earlier),
+        this.store.getBinding(this.bot!.uid, taskTarget(earlier)),
       );
-      if (binding && binding.cwd !== cwd) {
-        this.store.markFailed(taskId, "绑定目录在启动前再次变更，任务未启动。");
-        await this.enqueueText(taskTarget(task), genericTaskFailure(false), taskId);
+      if ((binding?.cwd ?? earlier.cwd) !== cwd) continue;
+      const operation = this.scheduledTasks.get(earlier.id);
+      if (operation) operations.push(operation);
+    }
+    return operations;
+  }
+
+  private async runScheduledTask(taskId: string): Promise<void> {
+    let lease: DirectoryLease | undefined;
+    try {
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const current = this.store.getTask(taskId);
+        if (this.stopping || !current || current.state !== "queued") return;
+        const binding = await this.reconcileExternalBinding(
+          taskTarget(current),
+          this.store.getBinding(this.bot!.uid, taskTarget(current)),
+        );
+        const reconciledCurrent = this.store.getTask(taskId);
+        if (this.stopping || !reconciledCurrent || reconciledCurrent.state !== "queued") return;
+        const cwd = binding?.cwd ?? reconciledCurrent.cwd;
+        const earlier = await this.earlierDirectoryOperations(reconciledCurrent, cwd);
+        await Promise.all(earlier.map(operation => operation.catch(() => {})));
+
+        const beforeLease = this.store.getTask(taskId);
+        if (this.stopping || !beforeLease || beforeLease.state !== "queued") return;
+        lease = await this.acquireDirectoryLease(cwd);
+
+        const refreshed = await this.reconcileExternalBinding(
+          taskTarget(beforeLease),
+          this.store.getBinding(this.bot!.uid, taskTarget(beforeLease)),
+        );
+        const latest = this.store.getTask(taskId);
+        if (this.stopping || !latest || latest.state !== "queued") return;
+        const currentCwd = refreshed?.cwd ?? latest.cwd;
+        if (currentCwd !== cwd) {
+          lease.complete();
+          lease = undefined;
+          continue;
+        }
+        const newlyEarlier = await this.earlierDirectoryOperations(latest, currentCwd);
+        if (newlyEarlier.length > 0) {
+          lease.complete();
+          lease = undefined;
+          await Promise.all(newlyEarlier.map(operation => operation.catch(() => {})));
+          continue;
+        }
+        await this.runTask(taskId, cwd);
         return;
       }
-      await this.runTask(taskId, cwd);
-    });
-    this.directoryTails.set(cwd, redirected);
-    this.taskOperations.add(redirected);
-    const cleanup = () => {
-      if (this.directoryTails.get(cwd) === redirected) this.directoryTails.delete(cwd);
-      this.taskOperations.delete(redirected);
-    };
-    void redirected.then(cleanup, cleanup);
-    await redirected;
+      const task = this.store.getTask(taskId);
+      if (!task || task.state !== "queued") return;
+      this.store.markFailed(taskId, "绑定目录在启动前持续变更，任务未启动。");
+      await this.enqueueText(taskTarget(task), genericTaskFailure(false), taskId);
+    } finally {
+      lease?.complete();
+    }
   }
 
   private async runTask(taskId: string, lockedCwd?: string): Promise<void> {
@@ -1075,7 +1193,7 @@ class CoreService implements ChannelService {
       trackActivity(progressTail);
     };
     const scheduleProgressEdit = (): void => {
-      if (!progressCardStarted || progressCardDisabled || progressTimer) return;
+      if (this.stopping || !progressCardStarted || progressCardDisabled || progressTimer) return;
       const editDue = progressVersion > progressSentVersion
         ? progressNextEditAt
         : Number.POSITIVE_INFINITY;
@@ -1123,7 +1241,12 @@ class CoreService implements ChannelService {
         );
         if (progressVersion === version) progressSentVersion = version;
       } catch {
-        // Keep the version dirty so a terminal frame can be retried after an aborted edit.
+        if (!running) {
+          progressCardDisabled = true;
+          clearTimeout(progressTimer);
+          progressTimer = undefined;
+          progressTickerDueAt = undefined;
+        }
       } finally {
         scheduleProgressEdit();
       }
@@ -1199,6 +1322,7 @@ class CoreService implements ChannelService {
             pgid: processInfo.pgid,
             identity: processInfo.identity,
             cwd: processInfo.cwd,
+            moveTargetCwd: null,
             state: "running",
           });
         },
@@ -1879,6 +2003,7 @@ class CoreService implements ChannelService {
         };
       }
       const reconcile = item.state === "unknown";
+      if (!reconcile) this.store.beginTextCreate(item.id);
       this.markStreamEditStarted(item, target);
       const receipt = await this.withTextAttempt(item.taskId, (signal) =>
         this.options.transport.sendText(target, item.text ?? "", item.clientMsgNo, signal),

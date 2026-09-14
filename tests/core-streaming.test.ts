@@ -1,4 +1,8 @@
 import { expect, test, vi } from "bun:test";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { openChannelStore } from "../src/store";
 import type { RemoteTextMessage, TextRequest } from "./fixtures/core-fakes";
 import {
   assistantText,
@@ -336,6 +340,129 @@ test("an accepted create with a lost receipt recovers by stable client message n
     await closeCoreHarness(harness);
   }
 });
+test("a final arriving after an unknown create preserves reconciliation and edits the latest body", async () => {
+  vi.useFakeTimers();
+  const transport = new ReceiptLostTransport();
+  const allowFinal = Promise.withResolvers<void>();
+  const task = inbound({
+    messageId: "stream-lost-receipt-final-later",
+    channelId: "dm-stream-lost-receipt-final-later",
+    text: "recover a final after receipt loss",
+  });
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ emit }) => {
+      emit(assistantText("assistant-lost-later", "stale accepted body", false));
+      await transport.firstSendAccepted.promise;
+      await allowFinal.promise;
+      emit(assistantText("assistant-lost-later", "latest final body", true));
+    },
+  });
+  try {
+    await harness.service.handleInbound(task);
+    await harness.workers.waitForPromptCount(1);
+    await transport.firstSendAccepted.promise;
+    const probe = await openChannelStore(harness.stateDir);
+    try {
+      const pending = probe.listPendingOutbox(harness.bot.uid, task).find(
+        (item) => item.streamMessageId?.endsWith(":assistant-lost-later"),
+      );
+      expect(pending?.state).toBe("unknown");
+      expect(pending?.attempts).toBe(0);
+    } finally {
+      probe.close();
+    }
+    transport.releaseFirstReceipt();
+    await waitForStatus(
+      harness.service,
+      task,
+      (status) => status.state === "running" && status.unknownOutbox === 1,
+    );
+    allowFinal.resolve();
+    await flushPromises();
+    await transport.reconnect();
+    vi.advanceTimersByTime(2_000);
+    await flushPromises();
+    await waitForStatus(
+      harness.service,
+      task,
+      (status) => status.state === "completed" && status.outbox === 0,
+    );
+
+    const sends = textSends(transport);
+    expect(sends).toHaveLength(2);
+    expect(sends[0]?.clientMsgNo).toBe(sends[1]?.clientMsgNo);
+    expect(transport.listRemoteText(task)).toHaveLength(1);
+    expect(transport.visibleText(task)).toBe("latest final body");
+    expect(textEdits(transport).at(-1)?.text).toBe("latest final body");
+  } finally {
+    allowFinal.resolve();
+    transport.releaseFirstReceipt();
+    vi.useRealTimers();
+    await closeCoreHarness(harness);
+  }
+});
+test("an in-flight create recovery keeps the accepted remote ID and latest persisted body", async () => {
+  const bot = { uid: "bot-stream-create-crash", name: "Fixture Bot" };
+  const target = { channelId: "dm-stream-create-crash", channelType: 1 as const };
+  const taskId = "stream-create-crash-task";
+  const streamMessageId = `${taskId}:assistant-crash`;
+  const clientMsgNo = "stream-create-crash-client";
+  const rowId = "stream-create-crash-row";
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-stream-crash-")));
+  const transport = new FakeTransport({ bot });
+  const accepted = await transport.sendText(target, "stale accepted body", clientMsgNo);
+  if (typeof accepted.messageId !== "string") throw new Error("fixture create did not return a message ID");
+  const store = await openChannelStore(join(root, "state"));
+  let storeClosed = false;
+  let restarted: Awaited<ReturnType<typeof createCoreHarness>> | undefined;
+  try {
+    store.setBotUid(bot.uid);
+    store.enqueueOutbox({
+      id: rowId,
+      botUid: bot.uid,
+      channelId: target.channelId,
+      channelType: target.channelType,
+      taskId,
+      kind: "text",
+      text: "stale accepted body",
+      path: null,
+      fileKind: null,
+      clientMsgNo,
+      streamMessageId,
+      segmentIndex: 0,
+      desiredVersion: 1,
+      ackedVersion: 0,
+    });
+    expect(store.beginTextCreate(rowId)).toBe(true);
+    expect(store.updateTextOutbox(rowId, "latest persisted body", 2)).toBe(true);
+    const beforeRestart = store.getOutbox(rowId);
+    expect(beforeRestart?.state).toBe("unknown");
+    expect(beforeRestart?.attempts).toBe(0);
+    expect(beforeRestart?.text).toBe("latest persisted body");
+    store.close();
+    storeClosed = true;
+
+    const workers = new FakeWorkerFactory();
+    restarted = await createCoreHarness({ root, bot, transport, workers });
+    await waitForStatus(restarted.service, target, (status) => status.outbox === 0);
+
+    expect(workers.prompts).toHaveLength(0);
+    const recoverySends = textSends(transport).filter(({ clientMsgNo: value }) => value === clientMsgNo);
+    expect(recoverySends).toHaveLength(2);
+    expect(recoverySends[0]?.clientMsgNo).toBe(recoverySends[1]?.clientMsgNo);
+    expect(transport.listRemoteText(target)).toHaveLength(1);
+    expect(transport.visibleText(target)).toBe("latest persisted body");
+    expect(textEdits(transport).at(-1)?.messageId).toBe(accepted.messageId);
+    expect(textEdits(transport).at(-1)?.text).toBe("latest persisted body");
+  } finally {
+    if (restarted) await closeCoreHarness(restarted);
+    if (!storeClosed) store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+
 
 
 test("an empty final snapshot closes an existing assistant message without sending a blank message", async () => {

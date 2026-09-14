@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { loadValidatedSessionState, type ProjectSessionState } from "../project-session.ts";
@@ -102,7 +102,153 @@ function normalizeProfileName(profile: string | undefined): string | undefined {
 	return normalized;
 }
 
-function profileFromArgs(args: readonly string[]): string | undefined {
+type RootEnvironment = Record<string, string | undefined>;
+
+type ProfileSelection = {
+	profile: string | undefined;
+	inheritedProfile: string | undefined;
+};
+
+const ROOT_ENV_KEYS = new Set([
+	"HOME",
+	"NODE_ENV",
+	"OMP_PROFILE",
+	"PI_PROFILE",
+	"OMP_CONFIG_DIR",
+	"PI_CONFIG_DIR",
+	"OMP_CODING_AGENT_DIR",
+	"PI_CODING_AGENT_DIR",
+	"XDG_DATA_HOME",
+]);
+const ROOT_ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/u;
+const PROFILE_STRING_VALUE_FLAGS = new Set([
+	"--cwd",
+	"--config",
+	"--add-dir",
+	"--mode",
+	"--fork",
+	"--provider",
+	"--model",
+	"--smol",
+	"--slow",
+	"--plan",
+	"--prewalk-into",
+	"--plan-yolo-into",
+	"--max-time",
+	"--service-tier",
+	"--api-key",
+	"--system-prompt",
+	"--append-system-prompt",
+	"--provider-session-id",
+	"--prompt-cache-key",
+	"--session-dir",
+	"--models",
+	"--tools",
+	"--thinking",
+	"--export",
+	"--hook",
+	"--extension",
+	"-e",
+	"--trusted-extension",
+	"--plugin-dir",
+	"--skills",
+	"--approval-mode",
+]);
+const PROFILE_OPTIONAL_VALUE_FLAGS = new Set(["--resume", "-r", "--session"]);
+
+function parseRootEnvLine(line: string): { key: string; value: string } | undefined {
+	const trimmed = line.trim();
+	if (!trimmed || trimmed.startsWith("#")) return undefined;
+	const equals = trimmed.indexOf("=");
+	if (equals < 0) return undefined;
+	let key = trimmed.slice(0, equals).trim();
+	const exported = key.match(/^export[ \t]+(.*)$/u);
+	if (exported) key = exported[1]!.trim();
+	if (!ROOT_ENV_NAME_RE.test(key)) return undefined;
+	const raw = trimmed.slice(equals + 1).replace(/^[ \t]+/u, "");
+	const quote = raw[0];
+	if (quote === '"' || quote === "'" || quote === "`") {
+		let close = raw.indexOf(quote, 1);
+		while (close !== -1 && raw[close - 1] === "\\") close = raw.indexOf(quote, close + 1);
+		const value = close === -1 ? raw.slice(1) : raw.slice(1, close);
+		return value.includes("\0") ? undefined : { key, value };
+	}
+	const comment = raw.search(/[ \t]#/u);
+	const value = (comment < 0 ? raw : raw.slice(0, comment)).trimEnd();
+	return value.includes("\0") ? undefined : { key, value };
+}
+
+function readRootEnvFile(filePath: string, mapOmpToPi = true): Record<string, string> {
+	let contents: string;
+	try {
+		contents = readFileSync(filePath, "utf8");
+	} catch {
+		return {};
+	}
+	const values: Record<string, string> = {};
+	for (const line of contents.split("\n")) {
+		const parsed = parseRootEnvLine(line);
+		if (parsed) values[parsed.key] = parsed.value;
+	}
+	if (mapOmpToPi) {
+		for (const key of Object.keys(values)) {
+			if (key.startsWith("OMP_")) values[`PI_${key.slice(4)}`] = values[key]!;
+		}
+	}
+	return values;
+}
+
+function rootEnvironment(): RootEnvironment {
+	const environment: RootEnvironment = {};
+	for (const [key, value] of Object.entries(process.env)) environment[key] = value;
+	return environment;
+}
+
+function applyRootEnvFile(environment: RootEnvironment, filePath: string): void {
+	for (const [key, value] of Object.entries(readRootEnvFile(filePath))) {
+		if (ROOT_ENV_KEYS.has(key) && !environment[key]) environment[key] = value;
+	}
+}
+
+function expandRootEnvValues(values: Record<string, string>, environment: RootEnvironment): Record<string, string> {
+	const expanded: Record<string, string> = {};
+	for (const [key, value] of Object.entries(values)) {
+		expanded[key] = value.replace(
+			/(\\)?\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/gu,
+			(match, escaped: string | undefined, braced: string | undefined, bare: string | undefined) => {
+				if (escaped) return match.slice(1);
+				const name = braced ?? bare;
+				if (!name) return match;
+				return environment[name] ?? expanded[name] ?? "";
+			},
+		);
+	}
+	return expanded;
+}
+
+function applyProjectDotenv(environment: RootEnvironment, cwd: string): void {
+	const nodeEnv = environment.NODE_ENV || "development";
+	const files = [".env", `.env.${nodeEnv}`, ".env.local", `.env.${nodeEnv}.local`];
+	const loaded: Record<string, string> = {};
+	for (const file of files) {
+		const values = readRootEnvFile(join(cwd, file), false);
+		const expanded = expandRootEnvValues(values, { ...loaded, ...environment });
+		for (const [key, value] of Object.entries(expanded)) loaded[key] = value;
+	}
+	for (const [key, value] of Object.entries(loaded)) {
+		if (!environment[key]) environment[key] = value;
+	}
+}
+
+function inheritedProfileName(environment: RootEnvironment): string | undefined {
+	try {
+		return normalizeProfileName(environment.OMP_PROFILE !== undefined ? environment.OMP_PROFILE : environment.PI_PROFILE);
+	} catch {
+		return undefined;
+	}
+}
+
+function profileSelection(args: readonly string[], environment: RootEnvironment): ProfileSelection {
 	let selected: string | undefined;
 	let explicit = false;
 	for (let index = 0; index < args.length; index += 1) {
@@ -122,29 +268,70 @@ function profileFromArgs(args: readonly string[]): string | undefined {
 			if (!value) throw new Error("--profile requires a profile name");
 			selected = value;
 			explicit = true;
+			continue;
+		}
+		if (PROFILE_STRING_VALUE_FLAGS.has(arg)) {
+			const next = args[index + 1];
+			if (arg !== "--plan" || (next !== undefined && !next.startsWith("-"))) index += 1;
+			continue;
+		}
+		if (PROFILE_OPTIONAL_VALUE_FLAGS.has(arg)) {
+			const next = args[index + 1];
+			if (next !== undefined && !next.startsWith("-")) index += 1;
 		}
 	}
-	if (explicit) return normalizeProfileName(selected);
-	const environmentProfile = process.env.OMP_PROFILE !== undefined ? process.env.OMP_PROFILE : process.env.PI_PROFILE;
-	return normalizeProfileName(environmentProfile);
+	const inherited = inheritedProfileName(environment);
+	return { profile: explicit ? normalizeProfileName(selected) : inherited, inheritedProfile: inherited };
 }
 
-function resolveOmpSessionRoot(extraArgs: readonly string[]): string {
-	const profile = profileFromArgs(extraArgs);
+function profileDerivedAgentDir(
+	cwd: string,
+	configRoot: string,
+	environment: RootEnvironment,
+	selection: ProfileSelection,
+): boolean {
+	if (selection.profile !== undefined || !environment.PI_CODING_AGENT_DIR) return false;
+	const source = environment.PI_PROFILE !== undefined ? normalizeProfileName(environment.PI_PROFILE) : selection.inheritedProfile;
+	if (!source) return false;
+	return (
+		resolve(cwd, environment.PI_CODING_AGENT_DIR) ===
+		resolve(join(configRoot, "profiles", source, "agent"))
+	);
+}
+
+function resolveOmpSessionRootForCwd(cwd: string, extraArgs: readonly string[]): string {
+	const environment = rootEnvironment();
+	applyProjectDotenv(environment, cwd);
+	const selection = profileSelection(extraArgs, environment);
 	const home = homedir();
-	const configDirName = process.env.PI_CONFIG_DIR || ".omp";
-	const configRoot = join(home, configDirName);
-	const profileConfigRoot = profile ? join(configRoot, "profiles", profile) : configRoot;
-	const defaultAgentDir = join(profileConfigRoot, "agent");
-	const configuredAgentDir = !profile ? process.env.PI_CODING_AGENT_DIR : undefined;
-	const agentDir = configuredAgentDir ? resolve(configuredAgentDir) : defaultAgentDir;
+	const baseConfigRoot = join(home, environment.PI_CONFIG_DIR || ".omp");
+	const initialConfigRoot = join(baseConfigRoot, ...(selection.profile ? ["profiles", selection.profile] : []));
+	const initialDefaultAgent = join(initialConfigRoot, "agent");
+	const configuredAgentDir =
+		selection.profile || profileDerivedAgentDir(cwd, baseConfigRoot, environment, selection)
+			? undefined
+			: environment.PI_CODING_AGENT_DIR;
+	const initialAgentDir = configuredAgentDir ? resolve(cwd, configuredAgentDir) : initialDefaultAgent;
+
+	applyRootEnvFile(environment, join(cwd, ".env"));
+	applyRootEnvFile(environment, join(initialAgentDir, ".env"));
+	applyRootEnvFile(environment, join(initialConfigRoot, ".env"));
+	applyRootEnvFile(environment, join(home, ".env"));
+
+	const baseConfigRootAfterEnv = join(home, environment.PI_CONFIG_DIR || ".omp");
+	const configRoot = join(baseConfigRootAfterEnv, ...(selection.profile ? ["profiles", selection.profile] : []));
+	const defaultAgentDir = join(configRoot, "agent");
+	const configuredAgent = profileDerivedAgentDir(cwd, baseConfigRootAfterEnv, environment, selection)
+		? undefined
+		: environment.PI_CODING_AGENT_DIR;
+	const agentDir = selection.profile || !configuredAgent ? defaultAgentDir : resolve(cwd, configuredAgent);
 	let sessionsRoot = agentDir;
 	if ((process.platform === "darwin" || process.platform === "linux") && resolve(agentDir) === resolve(defaultAgentDir)) {
-		const xdgDataHome = process.env.XDG_DATA_HOME;
+		const xdgDataHome = environment.XDG_DATA_HOME;
 		if (xdgDataHome) {
-			const xdgAppRoot = join(xdgDataHome, "omp");
-			if (profile) {
-				const xdgProfileRoot = join(xdgAppRoot, "profiles", profile);
+			const xdgAppRoot = join(resolve(cwd, xdgDataHome), "omp");
+			if (selection.profile) {
+				const xdgProfileRoot = join(xdgAppRoot, "profiles", selection.profile);
 				if (existsSync(xdgProfileRoot)) sessionsRoot = xdgProfileRoot;
 			} else if (existsSync(xdgAppRoot)) {
 				sessionsRoot = xdgAppRoot;
@@ -1309,20 +1496,19 @@ class OmpWorkerFactory implements WorkerFactory {
 	#options: WorkerFactoryOptions;
 	#startupTimeoutMs: number;
 	#cancelTimeoutMs: number;
-	#sessionRoots: readonly string[];
 
 	constructor(options: WorkerFactoryOptions) {
 		if (!options || typeof options.ompCommand !== "string" || options.ompCommand.length === 0)
 			throw new Error("ompCommand is required");
 		this.#options = { ...options, extraArgs: [...(options.extraArgs ?? [])] };
-		this.#sessionRoots = [resolveOmpSessionRoot(this.#options.extraArgs ?? [])];
 		this.#startupTimeoutMs = options.startupTimeoutMs && options.startupTimeoutMs > 0 ? options.startupTimeoutMs : DEFAULT_STARTUP_TIMEOUT_MS;
 		this.#cancelTimeoutMs = options.cancelTimeoutMs && options.cancelTimeoutMs > 0 ? options.cancelTimeoutMs : DEFAULT_CANCEL_TIMEOUT_MS;
 	}
-
-	get sessionRoots(): readonly string[] {
-		return this.#sessionRoots;
+	async sessionRootsFor(cwd: string): Promise<readonly string[]> {
+		if (!isAbsolute(cwd)) return [];
+		return [resolveOmpSessionRootForCwd(resolve(cwd), this.#options.extraArgs ?? [])];
 	}
+
 	async create(options: WorkerOptions): Promise<OmpWorker> {
 
 		if (!options || !isAbsolute(options.cwd) || !isAbsolute(options.sessionDir))

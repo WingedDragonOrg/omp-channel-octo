@@ -126,7 +126,7 @@ export interface OmpWorker {
 }
 
 export interface WorkerFactory {
-  readonly sessionRoots?: readonly string[];
+  sessionRootsFor?(cwd: string): Promise<readonly string[]>;
   create(options: WorkerOptions): Promise<OmpWorker>;
   recover(process: WorkerProcess): Promise<boolean>;
 }

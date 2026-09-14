@@ -85,6 +85,35 @@ class PresentationTransport extends FakeTransport {
     return deferred.promise;
   }
 }
+class FailingTerminalProgressTransport extends PresentationTransport {
+  readonly cardCreated = Promise.withResolvers<void>();
+  terminalEditAttempts = 0;
+
+  override async sendProgressCard(
+    target: ChatTarget,
+    progress: ProgressCard,
+    clientMsgNo: string,
+    signal?: AbortSignal,
+  ): Promise<SendReceipt | null> {
+    const receipt = await super.sendProgressCard(target, progress, clientMsgNo, signal);
+    this.cardCreated.resolve();
+    return receipt;
+  }
+  override async editProgressCard(
+    target: ChatTarget,
+    messageId: string,
+    progress: ProgressCard,
+    cardSeq: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (progress.state !== "running") {
+      this.terminalEditAttempts += 1;
+      throw new Error("fixture terminal progress edit unavailable");
+    }
+    return super.editProgressCard(target, messageId, progress, cardSeq, signal);
+  }
+}
+
 class DelayedStartupTransport extends PresentationTransport {
   readonly contextStarted = Promise.withResolvers<void>();
   private readonly contextGate = Promise.withResolvers<void>();
@@ -543,6 +572,54 @@ test("a running tool card ticker advances elapsed time without new events and st
     await closeCoreHarness(harness);
   }
 }, 10_000);
+
+test("a terminal progress edit failure is bounded and disposed on service stop", async () => {
+  const transport = new FailingTerminalProgressTransport();
+  const task = inbound({
+    messageId: "presentation-terminal-edit-failure",
+    channelId: "dm-presentation-terminal-edit-failure",
+    text: "dispose a failed terminal card",
+  });
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ emit }) => {
+      const now = Date.now();
+      emit({
+        type: "tool_start",
+        toolCallId: "tool-terminal-failure",
+        toolName: "shell",
+        atMs: now,
+        summary: "terminal failure",
+      });
+      await transport.cardCreated.promise;
+      await Promise.resolve();
+      emit({ type: "run_end", atMs: Date.now(), state: "completed" });
+    },
+  });
+  let stopped = false;
+  try {
+    await harness.service.handleInbound(task);
+    await waitForStatus(
+      harness.service,
+      task,
+      (status) => status.state === "completed" && status.outbox === 0,
+    );
+    for (let attempt = 0; attempt < 100 && transport.terminalEditAttempts === 0; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    expect(transport.progressCardSends).toHaveLength(1);
+    expect(transport.terminalEditAttempts).toBe(1);
+
+    await harness.service.stop();
+    stopped = true;
+    const attemptsAfterStop = transport.terminalEditAttempts;
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    expect(transport.terminalEditAttempts).toBe(attemptsAfterStop);
+  } finally {
+    if (!stopped) await harness.service.stop().catch(() => {});
+    await closeCoreHarness(harness);
+  }
+}, 5_000);
 
 test("typing and the progress card are cancelled when an active task is cancelled", async () => {
   vi.useFakeTimers();
