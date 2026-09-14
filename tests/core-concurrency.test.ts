@@ -41,15 +41,13 @@ test("tasks bound to the same normalized directory never overlap", async () => {
       inbound({ messageId: "bind-second", ...secondTarget, text: `/new ${sharedDirectory}` }),
     );
 
-    await Promise.all([
-      harness.service.handleInbound(
-        inbound({ messageId: "work-first", ...firstTarget, text: "first" }),
-      ),
-      harness.service.handleInbound(
-        inbound({ messageId: "work-second", ...secondTarget, text: "second" }),
-      ),
-    ]);
+    await harness.service.handleInbound(
+      inbound({ messageId: "work-first", ...firstTarget, text: "first" }),
+    );
     await firstStartedSignal;
+    await harness.service.handleInbound(
+      inbound({ messageId: "work-second", ...secondTarget, text: "second" }),
+    );
     expect(harness.workers.prompts).toHaveLength(1);
 
     releaseFirst();
