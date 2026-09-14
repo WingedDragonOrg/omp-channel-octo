@@ -389,6 +389,34 @@ describe("execution card rendering", () => {
     expect(rendered!.plain).toContain("处理进度");
   });
 
+  test("uses a compact hierarchy with aligned status metadata for tool rows", () => {
+    const tracker = createExecutionTracker({ runId: "tool-row" });
+    startTurn(tracker, "turn-1", 0);
+    startTool(tracker, "tool-1", "generate_image", 1_000, "写入文件");
+    const rendered = buildExecutionCard(tracker.snapshot(36_200), fullCapabilities);
+    expect(rendered).not.toBeNull();
+
+    const timeline = nodeById(rendered!.card as JsonRecord, "timeline_detail");
+    const row = (timeline.items as JsonRecord[]).find(item => item.type === "ColumnSet");
+    expect(row).toMatchObject({ spacing: "Small" });
+    const columns = row?.columns as JsonRecord[];
+    expect(columns).toHaveLength(3);
+    expect(columns[0]).toMatchObject({ width: "auto", verticalContentAlignment: "Center" });
+    expect(columns[1]?.items).toEqual([
+      expect.objectContaining({ text: "写入文件", weight: "Bolder", spacing: "None" }),
+      expect.objectContaining({ text: "generate_image", isSubtle: true, size: "Small", spacing: "None" }),
+    ]);
+    expect(columns[2]?.items).toEqual([
+      expect.objectContaining({
+        text: "进行中 · 35.2s",
+        horizontalAlignment: "Right",
+        isSubtle: true,
+        size: "Small",
+        spacing: "None",
+      }),
+    ]);
+  });
+
   test("keeps todos visible while terminal execution details are collapsed", () => {
     const tracker = createExecutionTracker({ runId: "fold" });
     startTurn(tracker, "turn-1", 0);

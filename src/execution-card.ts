@@ -623,19 +623,43 @@ function makeTextBlock(text: string, options: JsonNode = {}): JsonNode {
 }
 
 function makeToolRow(tool: ExecutionToolSnapshot): JsonNode {
+  const displayName = displayToolName(tool.toolName);
+  const mainItems = tool.summary === undefined
+    ? [makeTextBlock(displayName, { weight: "Bolder", spacing: "None" })]
+    : [
+        makeTextBlock(tool.summary, { weight: "Bolder", spacing: "None" }),
+        makeTextBlock(displayName, { isSubtle: true, size: "Small", spacing: "None" }),
+      ];
+  const statusParts = [toolStateLabel(tool.state)];
+  if (tool.state === "failed" && tool.errorCategory) statusParts.push(errorCategoryLabel(tool.errorCategory));
+  if (tool.durationMs !== null) statusParts.push(formatDuration(tool.durationMs));
   return {
     type: "ColumnSet",
-    spacing: "None",
+    spacing: "Small",
     columns: [
       {
         type: "Column",
         width: "auto",
+        verticalContentAlignment: "Center",
         items: [makeTextBlock(toolStateGlyph(tool.state), { spacing: "None", color: executionTone(tool.state) })],
       },
       {
         type: "Column",
         width: "stretch",
-        items: [makeTextBlock(toolLine(tool), { spacing: "None" })],
+        items: mainItems,
+      },
+      {
+        type: "Column",
+        width: "auto",
+        verticalContentAlignment: "Center",
+        items: [
+          makeTextBlock(statusParts.join(" · "), {
+            horizontalAlignment: "Right",
+            isSubtle: true,
+            size: "Small",
+            spacing: "None",
+          }),
+        ],
       },
     ],
   };
