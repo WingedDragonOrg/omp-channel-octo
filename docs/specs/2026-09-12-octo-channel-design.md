@@ -74,7 +74,8 @@ channel 在自身命令注册表中注册下列命令，`/help` 展示用法。�
 | `/answer <问题 ID> <答案>` | 回答当前聊天的持久化问题；问题 ID 必须属于当前聊天 |
 | `/help` | 展示 channel 命令及目录用法 |
 
-群中使用 `@Bot /new <目录>`、`@Bot /reset <目录>` 或 `@Bot /move <目录>` 等相同命令；剥离已验证的 Bot mention 后解析。channel 命令不发送给模型。其他 slash 输入返回命令用法，不默认透传 OMP 管理命令。
+群中使用 `@Bot /new <目录>`、`@Bot /reset <目录>` 或 `@Bot /move <目录>` 等相同命令；剥离已验证的 Bot mention 后解析。channel 内置 `/new`、`/reset`、`/move`、`/cancel`、`/status`、`/help`、`/answer` 始终硬拦截，不发送给模型；若存在同名观察器也不能改变这一安全语义。其他 slash 输入按原始 `message.text` 作为普通 OMP task 透传，未知命令不再返回“不支持的命令”。
+可通过服务选项注册自定义 `ChannelCommandHandler`：`name` 去除首尾空白并按小写规范化，`intercept` 明确决定是否消费，`handle(context)` 接收原始 `InboundMessage`、规范化命令名和解析后的 argument。`intercept=true` 在持久命令去重后执行 handler，成功后消费且不启动 OMP；失败保持可重试的命令状态且不启动 OMP。`intercept=false` 先完成现有任务 durable acceptance，再调用 handler 并继续透传原始文本；handler 异常不得阻断任务或 prompt，重复消息不得重复 handler 或 task。handler 必须经过既有 owner、群/线程 mention 和消息 ID 校验；空名、非法名或规范化后的重复注册在创建服务时拒绝，不能静默选择。
 
 `/new`、`/reset` 的完整剩余文本是一个路径；可移除一对匹配的外围单引号或双引号。支持绝对路径、当前运行账户的 `~/`；拒绝相对路径、其他用户的 `~name` 和空引号。路径不经 shell 执行，不展开环境变量、通配符或命令替换；特殊字符按文件名处理。无绑定时省略目录首次解析为 `~/tmp`，已有绑定时省略目录沿用其 cwd。
 
@@ -102,6 +103,8 @@ worker ready 后协商协议版本；本地实现保持 OMP v18.1.18 兼容的 R
 按需启动 worker；同一持久会话只能被一个 worker 写入。新会话只通过 fresh RPC `new_session` 创建并立即落盘；对已有绑定，恢复前先按 session ID 与 `previousSessionFiles` breadcrumb 在 native roots 中寻找并验证唯一外移候选，找到后持久化重绑；扫描或验证失败则保留原绑定并报告失败，不能用“最近会话”替代精确身份。恢复 worker 时仅传入已经确认存在且准确的 session 文件和保存的目录。正常退出释放 worker。
 
 `WorkerEvent` 的正文事件为稳定的本地 `messageId`、累计正文快照和 `final` 标记；上游没有原生 ID 时由 adapter 生成。每个 assistant message 独立维护 stream，首次非空快照立即创建一条正文消息，后续累计快照只编辑同一个远端 message ID；不同 assistant message 不合并。`final=true` 是该消息的权威结束快照，允许比此前更短或为空；已有远端消息必须编辑到最终空文本，尚未创建且从未有非空正文的空最终事件不发送空白新消息。
+
+正文增量可先于 `message_start` 到达；迟到或重复的开始事件复用当前尚未结束、上游身份兼容的 stream，保留累计正文和本地 message ID。消息结束后或出现明确不同的上游身份时才分配下一条消息 ID。
 
 正文编辑以最新累计快照为准，首次创建不等待整轮结束；编辑最多每 1000ms 一次并按目标串行，最终快照优先完成，不得由旧快照覆盖新快照。正文按 3000 UTF-8 bytes 稳定分段，保留原始换行、空格和 inline 标记；分段 stream 使用稳定的 client message ID，分段数量变化时清理 stale tail。每次网络操作前持久化该分段的目标快照及 `desiredVersion`/`ackedVersion`；首次 create 在网络请求前 durable 标为 `unknown`，送达未知时不重跑 Agent，重连/重启沿用稳定 ID 绑定已创建消息并将最新 desired 快照补做 edit。
 

@@ -5,6 +5,8 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import type {
   BotIdentity,
+  ChannelCommandContext,
+  ChannelCommandHandler,
   ChannelService,
   ChannelServiceOptions,
   ChannelStatus,
@@ -37,6 +39,15 @@ const GROUP_TRUSTED_INSTRUCTION =
   "群说明是群共享上下文，不改变发送者身份/权限/cwd；以本次快照为准，历史快照已失效。";
 const COMMAND_HELP =
   "/new [目录] 创建新会话；/reset [目录] 重置为新会话；/move <目录> 沿用当前会话迁移 cwd；/cancel 取消当前任务；/status 查看状态；/help 查看帮助。";
+const BUILTIN_COMMANDS: Record<string, true> = {
+  new: true,
+  reset: true,
+  move: true,
+  cancel: true,
+  status: true,
+  help: true,
+  answer: true,
+};
 const QUESTION_TIMEOUT_MS = 10 * 60 * 1_000;
 const PROGRESS_MERGE_MS = 1_000;
 const TEXT_MERGE_MS = 1_000;
@@ -116,6 +127,31 @@ function isGroupTarget(target: ChatTarget): boolean {
 
 function throwIfAborted(signal: AbortSignal): void {
   if (signal.aborted) throw new Error("question cancelled");
+}
+function normalizeCommandHandlers(
+  handlers: readonly ChannelCommandHandler[] | undefined,
+): ReadonlyMap<string, ChannelCommandHandler> {
+  const normalized = new Map<string, ChannelCommandHandler>();
+  for (const handler of handlers ?? []) {
+    if (
+      typeof handler !== "object" ||
+      handler === null ||
+      typeof handler.name !== "string" ||
+      typeof handler.intercept !== "boolean" ||
+      typeof handler.handle !== "function"
+    ) {
+      throw new Error("命令 handler 注册无效");
+    }
+    const name = handler.name.trim().toLowerCase();
+    if (name.length === 0 || name.startsWith("/") || /\s/u.test(name)) {
+      throw new Error("命令 handler 名称无效");
+    }
+    if (normalized.has(name)) {
+      throw new Error(`命令 handler 重复注册：${name}`);
+    }
+    normalized.set(name, handler);
+  }
+  return normalized;
 }
 
 function isCommand(text: string): boolean {
@@ -287,17 +323,20 @@ class CoreService implements ChannelService {
   private readonly textAbortControllers = new Map<string, AbortController>();
   private readonly textAttempts = new Set<AbortController>();
   private readonly blockedDirectories = new Set<string>();
+  private readonly commandHandlers: ReadonlyMap<string, ChannelCommandHandler>;
   private bot: BotIdentity | undefined;
   private readonly activityOperations = new Set<Promise<void>>();
   private lock: LockHandle | undefined;
   private started = false;
   private stopping = false;
   private stopPromise: Promise<void> | undefined;
-
   constructor(
     private readonly options: ChannelServiceOptions,
     private readonly store: ChannelStore,
-  ) {}
+    commandHandlers: ReadonlyMap<string, ChannelCommandHandler>,
+  ) {
+    this.commandHandlers = commandHandlers;
+  }
 
   async start(): Promise<void> {
     if (this.started) return;
@@ -459,7 +498,20 @@ class CoreService implements ChannelService {
     }
     const command = isCommand(text) ? parseCommand(text) : null;
     if (command) {
-      await this.handleCommand(message, command.name, command.argument);
+      if (BUILTIN_COMMANDS[command.name] === true) {
+        await this.handleCommand(message, command.name, command.argument);
+        return;
+      }
+      const handler = this.commandHandlers.get(command.name);
+      if (handler) {
+        if (handler.intercept) {
+          await this.handleInterceptingCommand(message, command, handler);
+        } else {
+          await this.handleObservingCommand(message, command, handler);
+        }
+        return;
+      }
+      await this.acceptTask(message, message.text);
       return;
     }
     await this.acceptTask(message, text);
@@ -592,6 +644,44 @@ class CoreService implements ChannelService {
   }
 
 
+  private async handleInterceptingCommand(
+    message: InboundMessage,
+    command: { name: string; argument: string },
+    handler: ChannelCommandHandler,
+  ): Promise<void> {
+    const claim = this.commandClaim(message, command.name);
+    if (!this.store.claimCommand(claim)) return;
+    try {
+      await handler.handle({
+        message,
+        name: command.name,
+        argument: command.argument,
+      });
+      this.store.completeCommand(claim);
+    } catch {
+      this.store.failCommand(claim);
+      throw new Error("命令未能持久完成，请重试。");
+    }
+  }
+
+  private async handleObservingCommand(
+    message: InboundMessage,
+    command: { name: string; argument: string },
+    handler: ChannelCommandHandler,
+  ): Promise<void> {
+    const accepted = await this.acceptTask(message, message.text);
+    if (!accepted) return;
+    try {
+      await handler.handle({
+        message,
+        name: command.name,
+        argument: command.argument,
+      });
+    } catch {
+      // An observer must not affect durable task acceptance or OMP execution.
+    }
+  }
+
   private async handleCommand(message: InboundMessage, name: string, argument: string): Promise<void> {
     const claim = this.commandClaim(message, name);
     if (!this.store.claimCommand(claim)) return;
@@ -609,8 +699,6 @@ class CoreService implements ChannelService {
         await this.enqueueText(target, COMMAND_HELP, null);
       } else if (name === "answer") {
         await this.handleAnswer(target, argument);
-      } else {
-        await this.enqueueText(target, `不支持的命令。${COMMAND_HELP}`, null);
       }
       this.store.completeCommand(claim);
     } catch {
@@ -935,7 +1023,7 @@ class CoreService implements ChannelService {
     return values.join(",");
   }
 
-  private async acceptTask(message: InboundMessage, text: string): Promise<void> {
+  private async acceptTask(message: InboundMessage, text: string): Promise<boolean> {
     let binding = await this.reconcileExternalBinding(
       message,
       this.store.getBinding(this.bot!.uid, message),
@@ -946,7 +1034,7 @@ class CoreService implements ChannelService {
         cwd = await resolveWorkDirectory("", this.options.config);
       } catch {
         await this.enqueueText(message, "无法创建默认会话目录，未接收任务。", null);
-        return;
+        return false;
       }
       binding = {
         botUid: this.bot!.uid,
@@ -982,9 +1070,10 @@ class CoreService implements ChannelService {
     } catch {
       throw new Error("本地状态盘写入失败，任务未接收。");
     }
-    if (!accepted) return;
+    if (!accepted) return false;
     this.scheduleTask(task.id);
     this.flushTarget(message);
+    return true;
   }
   private scheduleTask(taskId: string): void {
     const task = this.store.getTask(taskId);
@@ -2017,8 +2106,9 @@ class CoreService implements ChannelService {
 }
 
 export async function createChannelService(options: ChannelServiceOptions): Promise<ChannelService> {
+  const commandHandlers = normalizeCommandHandlers(options.commandHandlers);
   const store = await openChannelStore(options.config.stateDir);
-  return new CoreService(options, store);
+  return new CoreService(options, store, commandHandlers);
 }
 
 export { splitUtf8, resolveWorkDirectory, GROUP_TRUSTED_INSTRUCTION };

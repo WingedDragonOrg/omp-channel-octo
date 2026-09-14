@@ -159,10 +159,23 @@ export interface ChannelStatus {
   pendingQuestionIds: string[];
 }
 
+export interface ChannelCommandContext {
+  message: InboundMessage;
+  name: string;
+  argument: string;
+}
+
+export interface ChannelCommandHandler {
+  name: string;
+  intercept: boolean;
+  handle(context: ChannelCommandContext): Promise<void> | void;
+}
+
 export interface ChannelServiceOptions {
   config: CoreServiceConfig;
   transport: ChannelTransport;
   workerFactory: WorkerFactory;
+  commandHandlers?: readonly ChannelCommandHandler[];
 }
 
 export interface ChannelService {
