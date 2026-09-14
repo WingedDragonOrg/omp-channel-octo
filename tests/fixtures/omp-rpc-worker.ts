@@ -20,6 +20,7 @@ type Scenario =
 	| "message-end-no-delta"
 	| "message-end-empty"
 	| "generated-message-id"
+	| "late-message-start"
 	| "multi-message"
 	| "same-message-text"
 	| "tool-progress"
@@ -581,6 +582,18 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		return;
 	}
 	response(id, "prompt", { agentInvoked: true });
+	if (scenario === "late-message-start") {
+		const message = { role: "assistant", content: [] };
+		emit({ type: "agent_start" });
+		emit({ type: "message_update", message, assistantMessageEvent: { type: "text_delta", delta: "已" } });
+		emit({ type: "message_start", message });
+		emit({ type: "message_update", message, assistantMessageEvent: { type: "text_delta", delta: "发送" } });
+		emit({ type: "message_start", message });
+		emit({ type: "message_end", message: { ...message, content: [{ type: "text", text: "已发送" }] } });
+		emitAssistantMessage("下一条", 2, false);
+		emit({ type: "agent_end", messages: [], willContinue: false });
+		return;
+	}
 	if (scenario === "continuation") {
 		setTimeout(() => void emitContinuationScenario(id), 35);
 		return;

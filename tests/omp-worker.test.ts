@@ -407,6 +407,17 @@ describe("OMP RPC worker", () => {
 		});
 	});
 
+	test("keeps a streamed prefix on the same message across late and repeated starts", async () => {
+		await withHarness("late-message-start", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("message identity", event => events.push(event));
+			const text = events.filter(event => event.type === "text");
+			expect(text.map(event => event.text)).toEqual(["已", "已发送", "已发送", "下一条", "下一条"]);
+			expect(new Set(text.slice(0, 3).map(event => event.messageId)).size).toBe(1);
+			expect(text[3]?.messageId).not.toBe(text[0]?.messageId);
+		});
+	});
+
 	test("maps real turn and tool lifecycle events without leaking tool payloads", async () => {
 		const startedAt = Date.now();
 		await withHarness("tool-progress", async harness => {

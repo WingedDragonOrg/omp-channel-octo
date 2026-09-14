@@ -1344,7 +1344,7 @@ class RpcWorker implements OmpWorker {
 				const message = frame.message;
 				if (isRecord(message) && message.role === "assistant") {
 					const key = asAssistantMessageKey(message);
-					if (!(key && active.completedAssistantMessageKeys.has(key))) allocateAssistantMessage(active, key);
+					if (!(key && active.completedAssistantMessageKeys.has(key))) ensureAssistantMessage(active, message);
 				}
 				return;
 			}
