@@ -550,6 +550,9 @@ class CoreService implements ChannelService {
       const interrupted = this.store.markInterruptedOnStart(identity.uid);
       for (const task of interrupted) {
         await this.enqueueText(taskTarget(task), `服务已重启完成；任务 ${task.id} 因重启中断，请重新发送。`, null);
+        // The card's message id and sequence live in the interrupted process's memory, so the new
+        // process cannot edit it and the client keeps showing the last state the old process sent.
+        console.error(`[progress-card] 任务 ${task.id} 因重启中断：进度卡停留在最后一次成功编辑的状态`);
       }
       const restartedAt = Date.now();
       const notifiedTargets = new Set<string>();
@@ -2010,6 +2013,8 @@ class CoreService implements ChannelService {
     let progressCardStarted = false;
     let progressCardDisabled = false;
     let progressCardFinished = false;
+    /** Set after the first running-card failure so a repeating error logs once per task. */
+    let progressFailureLogged = false;
     let progressCardId: string | undefined;
     let progressCardSeq = 0;
     let latestProgress: ProgressCard | undefined;
@@ -2087,11 +2092,19 @@ class CoreService implements ChannelService {
           parentSignal,
         );
         if (progressVersion === version) progressSentVersion = version;
-      } catch {
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "unknown error";
         if (!running) {
           progressCardDisabled = true;
           clearTimeout(progressTimer);
           progressTimer = undefined;
+          console.error(
+            `[progress-card] 终态编辑失败 target=${targetKey(target)} state=${progress.state}`
+            + ` seq=${cardSeq}：${reason}`,
+          );
+        } else if (!progressFailureLogged) {
+          progressFailureLogged = true;
+          console.error(`[progress-card] 运行中编辑失败 target=${targetKey(target)} seq=${cardSeq}：${reason}`);
         }
       } finally {
         scheduleProgressEdit();
@@ -2307,6 +2320,9 @@ class CoreService implements ChannelService {
               );
               if (!receipt?.messageId) {
                 progressCardDisabled = true;
+                console.error(
+                  `[progress-card] 未创建进度卡 target=${targetKey(target)}：卡片能力不可用或内容超出限制`,
+                );
                 return;
               }
               progressCardId = receipt.messageId;
@@ -2318,8 +2334,12 @@ class CoreService implements ChannelService {
               } else if (!progressCardFinished) {
                 scheduleProgressEdit();
               }
-            } catch {
+            } catch (error) {
               progressCardStarted = false;
+              console.error(
+                `[progress-card] 创建失败 target=${targetKey(target)}：`
+                + `${error instanceof Error ? error.message : "unknown error"}`,
+              );
             }
           });
           return;
