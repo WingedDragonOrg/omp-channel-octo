@@ -301,9 +301,12 @@ describe("execution tracker", () => {
     expect(firstTaskColumns).toHaveLength(2);
     const taskPrefix = (firstTaskColumns[0]?.items as JsonRecord[])[0]!;
     expect(taskPrefix.fontType).toBe("Monospace");
-    expect((firstTaskColumns[0]?.items as JsonRecord[])[0]?.text).toBe("│\u00a0├─");
-    expect(cardText(firstTaskColumns[1]!)).toContain("● Wire storage");
-    expect(cardText(foundationRows[1]!)).toContain("- Wait for access · 等待授权");
+    expect((firstTaskColumns[0]?.items as JsonRecord[])[0]?.text).toBe("│\u00a0├─\u00a0●");
+    expect(cardText(firstTaskColumns[1]!)).toBe("Wire storage");
+    const blockedTaskColumns = foundationRows[1]?.columns as JsonRecord[];
+    expect(blockedTaskColumns).toHaveLength(2);
+    expect((blockedTaskColumns[0]?.items as JsonRecord[])[0]?.text).toBe("│\u00a0└─\u00a0-");
+    expect(cardText(blockedTaskColumns[1]!)).toBe("Wait for access · 等待授权");
     expect(cardText(blockedCard)).not.toContain("│  ├─");
     expect(blockedRendered!.plain).toContain("├─ Foundation");
     expect(blockedRendered!.plain).toContain("│  ├─ ● Wire storage");

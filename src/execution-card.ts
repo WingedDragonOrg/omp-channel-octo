@@ -693,9 +693,13 @@ function todoPhaseText(phase: ExecutionTodoPhase, phaseIndex: number, phaseCount
   return `${branch} ${phase.name}`;
 }
 
-function todoTaskContent(task: ExecutionTodoTask): string {
+function todoTaskLabel(task: ExecutionTodoTask): string {
   const blocker = task.blocker === undefined ? "" : ` · ${task.blocker}`;
-  return `${todoStatusGlyph(task.status)} ${task.content}${blocker}`;
+  return `${task.content}${blocker}`;
+}
+
+function todoTaskContent(task: ExecutionTodoTask): string {
+  return `${todoStatusGlyph(task.status)} ${todoTaskLabel(task)}`;
 }
 
 function todoTaskText(
@@ -720,7 +724,7 @@ function makeTodoTaskRow(
   const continuation = phaseIndex === phaseCount - 1 ? "\u00a0" : "│";
   const branch = taskIndex === taskCount - 1 ? "└─" : "├─";
   const tone = todoTone(task.status);
-  // Keep the tree prefix in its own auto-width column; body text cannot shift its alignment.
+  // Keep the tree prefix and status token in their own auto-width column; body text cannot shift their alignment.
   return {
     type: "ColumnSet",
     spacing: "None",
@@ -729,13 +733,13 @@ function makeTodoTaskRow(
         type: "Column",
         width: "auto",
         verticalContentAlignment: "Center",
-        items: [makeTextBlock(`${continuation}\u00a0${branch}`, { color: tone, fontType: "Monospace", spacing: "None" })],
+        items: [makeTextBlock(`${continuation}\u00a0${branch}\u00a0${todoStatusGlyph(task.status)}`, { color: tone, fontType: "Monospace", spacing: "None" })],
       },
       {
         type: "Column",
         width: "stretch",
         verticalContentAlignment: "Center",
-        items: [makeTextBlock(todoTaskContent(task), { color: tone, spacing: "None" })],
+        items: [makeTextBlock(todoTaskLabel(task), { color: tone, spacing: "None" })],
       },
     ],
   };
