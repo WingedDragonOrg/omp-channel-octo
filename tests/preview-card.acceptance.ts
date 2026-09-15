@@ -312,15 +312,27 @@ test("preview snapshot shows every subagent state by default", () => {
   expect(cardText(hiddenSummary)).toContain("已隐藏 3 个子代理");
   const todoDetail = nodeById(card, "todo_detail");
   const todoSummary = nodeById(card, "todo_hidden_summary");
-  const todoOmitted = nodeById(card, "todo_omitted_tasks");
+  const todoOmitted = cardNodes(card).find(node => (
+    typeof node.id === "string"
+    && node.id.startsWith("todo_omitted_task_")
+    && node.isVisible === false
+  ));
+  expect(todoOmitted).toBeDefined();
+  if (!todoOmitted) throw new Error("hidden Todo row was not rendered");
+  const preparationPhase = (todoDetail.items as JsonRecord[]).find(item => (
+    item.type === "Container" && cardText(item).includes("准备阶段")
+  ));
+  expect(preparationPhase).toBeDefined();
+  if (!preparationPhase) throw new Error("preparation phase was not rendered");
+  expect(cardNodes(preparationPhase).some(node => node.id === todoOmitted.id)).toBe(true);
   expect(todoSummary.isVisible).not.toBe(false);
-  expect(todoOmitted).toMatchObject({ isVisible: false });
   expect(cardText(todoDetail)).toContain("已隐藏");
   expect(cardNodes(card).some(node => node.id === "btn_expand_todo")).toBe(true);
   expect(cardNodes(card).some(node => node.id === "btn_collapse_todo")).toBe(true);
-  expect(cardNodes(card).some(node => node.id === "btn_expand_subagents")).toBe(false);
-});
+  expect(cardNodes(card).some(node => node.id === "btn_expand_subagents")).toBe(true);
+  expect(cardNodes(card).some(node => node.id === "btn_expand_trace")).toBe(true);
 
+});
 test("preview rich fallback expands older trace rows without ToggleVisibility", () => {
   const built = buildExecutionCard(previewSnapshot(), {
     ...previewCapabilities,

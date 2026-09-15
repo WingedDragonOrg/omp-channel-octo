@@ -1235,10 +1235,12 @@ describe("execution card rendering", () => {
     const subagentDetail = nodeById(card, "subagent_detail");
     expect(cardText(subagentDetail)).toContain("已隐藏 2 个子代理，共 3 个子代理");
     expect(cardText(subagentDetail)).toContain("等待子代理 · verifier");
-    expect(cardText(subagentDetail)).not.toContain("子代理 · scout");
+    const hiddenSubagentSteps = nodeById(subagentDetail, "subagent_omitted_steps");
+    expect(hiddenSubagentSteps).toMatchObject({ isVisible: false });
+    expect(cardText(hiddenSubagentSteps)).toContain("子代理 · scout");
     const timelineSection = nodeById(card, "timeline_section");
     const timelineHeader = (timelineSection.items as JsonRecord[])[0]!;
-    expect(nodes(timelineHeader).some(node => node.id === "btn_expand_trace")).toBe(false);
+    expect(nodes(timelineHeader).some(node => node.id === "btn_expand_trace")).toBe(true);
     const fullyBudgeted = buildExecutionCard(
       tracker.snapshot(1_800),
       {
@@ -1255,13 +1257,12 @@ describe("execution card rendering", () => {
     );
     expect(fullyBudgetedRows).toHaveLength(1);
     expect(fullyBudgetedRows.every(row => row.isVisible !== false)).toBe(true);
-    expect(nodes(fullyBudgetedCard).some(node => node.id === "btn_expand_subagents")).toBe(false);
-    const budgetedTimeline = nodeById(card, "timeline_detail");
+    expect(nodes(fullyBudgetedCard).some(node => node.id === "btn_expand_subagents")).toBe(true);
+    const budgetedTimeline = nodeById(fullyBudgetedCard, "timeline_detail");
     const budgetedTraceRows = (budgetedTimeline.items as JsonRecord[]).filter(item => item.type === "ColumnSet");
-    expect(budgetedTraceRows).toHaveLength(2);
-    expect(budgetedTraceRows.every(row => row.isVisible !== false)).toBe(true);
-    expect(nodes(card).some(node => node.id === "timeline_omitted_steps")).toBe(false);
-    expect(nodes(card).some(node => node.id === "btn_expand_trace")).toBe(false);
+    expect(budgetedTraceRows).toHaveLength(0);
+    expect(nodes(fullyBudgetedCard).some(node => node.id === "timeline_omitted_steps")).toBe(true);
+    expect(nodes(fullyBudgetedCard).some(node => node.id === "btn_expand_trace")).toBe(true);
   });
   test("prioritizes current and blocked todo tasks while preserving order and reporting omissions", () => {
     const tracker = createExecutionTracker({ runId: "todo-budget" });
@@ -1325,14 +1326,10 @@ describe("execution card rendering", () => {
     expect(rendered).not.toBeNull();
     const card = rendered!.card as JsonRecord;
     const summary = nodeById(card, "todo_hidden_summary");
-    const omitted = nodeById(card, "todo_omitted_tasks");
-    expect(summary.isVisible).not.toBe(false);
-    expect(omitted).toMatchObject({ isVisible: false });
+    const omitted = nodeById(card, "todo_omitted_task_0_1");
+    expect(omitted).toMatchObject({ type: "ColumnSet", isVisible: false });
     expect(cardText(omitted)).toContain("task-1");
-    const omittedTaskRow = nodes(omitted).find(node => node.type === "ColumnSet" && cardText(node).includes("task-1"));
-    expect(omittedTaskRow).toBeDefined();
-    if (!omittedTaskRow) throw new Error("omitted todo task row was not rendered");
-    const omittedTaskColumns = omittedTaskRow.columns as JsonRecord[];
+    const omittedTaskColumns = omitted.columns as JsonRecord[];
     expect(omittedTaskColumns).toHaveLength(2);
     expect(omittedTaskColumns[0]).toMatchObject({ width: "80px" });
     expect((omittedTaskColumns[0]?.items as JsonRecord[])[0]).toMatchObject({
@@ -1340,22 +1337,27 @@ describe("execution card rendering", () => {
       size: "Small",
       wrap: false,
     });
+    const todoDetail = nodeById(card, "todo_detail");
+    const phaseContainers = (todoDetail.items as JsonRecord[]).filter(item => (
+      item.type === "Container" && item.id === undefined
+    ));
+    expect(phaseContainers.some(phase => nodes(phase).some(node => node.id === "todo_omitted_task_0_1"))).toBe(true);
+    expect((todoDetail.items as JsonRecord[]).some(item => item.id === "todo_omitted_task_0_1")).toBe(false);
 
     const expand = toggleActionById(card, "todo_expand");
     expect(expand.title).toBe("展开");
-    expect(targetElements(expand)).toEqual([
-      { elementId: "todo_hidden_summary", isVisible: false },
-      { elementId: "todo_omitted_tasks", isVisible: true },
-      { elementId: "btn_collapse_todo", isVisible: true },
-      { elementId: "btn_expand_todo", isVisible: false },
-    ]);
+    const expandedTodoTargets = targetElements(expand).filter(target => (
+      typeof target.elementId === "string" && target.elementId.startsWith("todo_omitted_task_")
+    ));
+    expect(expandedTodoTargets.length).toBeGreaterThan(0);
+    expect(expandedTodoTargets.every(target => target.isVisible === true)).toBe(true);
+    expect(expandedTodoTargets.some(target => target.elementId === "todo_omitted_task_0_1")).toBe(true);
     const collapse = toggleActionById(card, "todo_collapse");
     expect(collapse.title).toBe("收起");
-    expect(targetElements(collapse)).toEqual([
-      { elementId: "todo_hidden_summary", isVisible: true },
-      { elementId: "todo_omitted_tasks", isVisible: false },
-      { elementId: "btn_collapse_todo", isVisible: false },
-      { elementId: "btn_expand_todo", isVisible: true },
-    ]);
+    const collapsedTodoTargets = targetElements(collapse).filter(target => (
+      typeof target.elementId === "string" && target.elementId.startsWith("todo_omitted_task_")
+    ));
+    expect(collapsedTodoTargets).toHaveLength(expandedTodoTargets.length);
+    expect(collapsedTodoTargets.every(target => target.isVisible === false)).toBe(true);
   });
 });

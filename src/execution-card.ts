@@ -215,7 +215,7 @@ const MAX_VISIBLE_TOOLS = 3;
 const MAX_RENDERED_TOOLS = 32;
 const MAX_COMPACT_TOOL_ROWS = 8;
 const MAX_VISIBLE_TODO_TASKS = 96;
-const MAX_EXPANDED_TODO_TASKS = 12;
+const MAX_EXPANDED_TODO_TASKS = 4;
 const DEFAULT_MAX_NODES = 200;
 const DEFAULT_MAX_DEPTH = 16;
 const DEFAULT_MAX_PAYLOAD_BYTES = 512 * 1024;
@@ -791,12 +791,15 @@ function makeTodoTaskRow(
   taskIndex: number,
   taskCount: number,
   richTextSupported: boolean,
+  options: { readonly id?: string; readonly isVisible?: boolean } = {},
 ): JsonNode {
   const continuation = phaseIndex === phaseCount - 1 ? "\u00a0" : "│";
   const branch = taskIndex === taskCount - 1 ? "└─" : "├─";
   const tone = todoTone(task.status);
   return {
     type: "ColumnSet",
+    ...(options.id === undefined ? {} : { id: options.id }),
+    ...(options.isVisible === undefined ? {} : { isVisible: options.isVisible }),
     spacing: "None",
     columns: [
       {
@@ -854,9 +857,10 @@ function todoLines(
 ): string[] {
   const lines: string[] = [];
   if (hiddenCount > 0) lines.push(`已隐藏 ${hiddenCount} 个任务，共 ${totalCount} 个任务`);
-  const phaseCount = todos.length;
+  const visiblePhases = todos.filter(phase => phase.tasks.length > 0);
+  const phaseCount = visiblePhases.length;
   for (let phaseIndex = 0; phaseIndex < phaseCount; phaseIndex += 1) {
-    const phase = todos[phaseIndex]!;
+    const phase = visiblePhases[phaseIndex]!;
     lines.push(todoPhaseText(phase, phaseIndex, phaseCount));
     for (let taskIndex = 0; taskIndex < phase.tasks.length; taskIndex += 1) {
       lines.push(todoTaskText(phase.tasks[taskIndex]!, phaseIndex, phaseCount, taskIndex, phase.tasks.length));
@@ -865,45 +869,14 @@ function todoLines(
   return lines;
 }
 
-function makeExpandedTodoItems(
-  todos: readonly ExecutionTodoPhase[],
-  richTextSupported: boolean,
-): JsonNode[] {
-  const items: JsonNode[] = [];
-  const totalCount = todos.reduce((count, phase) => count + phase.tasks.length, 0);
-  let renderedCount = 0;
-  for (let phaseIndex = 0; phaseIndex < todos.length && renderedCount < MAX_EXPANDED_TODO_TASKS; phaseIndex += 1) {
-    const phase = todos[phaseIndex]!;
-    const taskCount = Math.min(phase.tasks.length, MAX_EXPANDED_TODO_TASKS - renderedCount);
-    if (taskCount === 0) continue;
-    items.push(makeTextBlock(phase.name, { weight: "Bolder", spacing: "None" }));
-    for (let taskIndex = 0; taskIndex < taskCount; taskIndex += 1) {
-      items.push(makeTodoTaskRow(
-        phase.tasks[taskIndex]!,
-        phaseIndex,
-        todos.length,
-        taskIndex,
-        taskCount,
-        richTextSupported,
-      ));
-    }
-    renderedCount += taskCount;
-  }
-  if (renderedCount < totalCount) {
-    items.push(makeTextBlock(`还有 ${totalCount - renderedCount} 个任务受卡片大小限制`, {
-      isSubtle: true,
-      spacing: "Small",
-    }));
-  }
-  return items;
-}
 function makeTodoItems(
+  allTodos: readonly ExecutionTodoPhase[],
   todos: readonly ExecutionTodoPhase[],
+  omittedTodos: readonly ExecutionTodoPhase[],
   hiddenCount: number,
   totalCount: number,
   structuredLayout: boolean,
   richTextSupported: boolean,
-  omittedTodos: readonly ExecutionTodoPhase[] = [],
 ): JsonNode[] {
   const items: JsonNode[] = [];
   if (hiddenCount > 0) {
@@ -913,45 +886,95 @@ function makeTodoItems(
       spacing: "Small",
     }));
   }
-  const phaseCount = todos.length;
-  for (let phaseIndex = 0; phaseIndex < phaseCount; phaseIndex += 1) {
-    const phase = todos[phaseIndex]!;
-    const taskItems: JsonNode[] = [];
-    for (let taskIndex = 0; taskIndex < phase.tasks.length; taskIndex += 1) {
-      const task = phase.tasks[taskIndex]!;
-      taskItems.push(structuredLayout
-        ? makeTodoTaskRow(task, phaseIndex, phaseCount, taskIndex, phase.tasks.length, richTextSupported)
-        : makeTextBlock(
-          todoTaskText(task, phaseIndex, phaseCount, taskIndex, phase.tasks.length),
-          { color: todoTone(task.status), spacing: "None" },
-        ));
-    }
+
+  const phaseEntries: Array<{
+    readonly sourceIndex: number;
+    readonly phase: ExecutionTodoPhase;
+    readonly visibleTasks: ReadonlySet<ExecutionTodoTask>;
+    readonly omittedTasks: ReadonlySet<ExecutionTodoTask>;
+  }> = [];
+  for (let sourceIndex = 0; sourceIndex < allTodos.length; sourceIndex += 1) {
+    const phase = allTodos[sourceIndex]!;
+    const visibleTasks = new Set(todos[sourceIndex]?.tasks ?? []);
+    const omittedTasks = new Set(omittedTodos[sourceIndex]?.tasks ?? []);
+    if (!phase.tasks.some(task => visibleTasks.has(task) || (structuredLayout && omittedTasks.has(task)))) continue;
+    phaseEntries.push({ sourceIndex, phase, visibleTasks, omittedTasks });
+  }
+
+  let renderedOmittedCount = 0;
+  for (let phaseIndex = 0; phaseIndex < phaseEntries.length; phaseIndex += 1) {
+    const entry = phaseEntries[phaseIndex]!;
     const phaseItems: JsonNode[] = [
       structuredLayout
-        ? makeTodoPhaseRow(phase, phaseIndex, phaseCount)
-        : makeTextBlock(todoPhaseText(phase, phaseIndex, phaseCount), {
+        ? makeTodoPhaseRow(entry.phase, phaseIndex, phaseEntries.length)
+        : makeTextBlock(todoPhaseText(entry.phase, phaseIndex, phaseEntries.length), {
           weight: "Bolder",
           spacing: "None",
         }),
-      ...taskItems,
     ];
+    for (let taskIndex = 0; taskIndex < entry.phase.tasks.length; taskIndex += 1) {
+      const task = entry.phase.tasks[taskIndex]!;
+      if (entry.visibleTasks.has(task)) {
+        phaseItems.push(structuredLayout
+          ? makeTodoTaskRow(task, phaseIndex, phaseEntries.length, taskIndex, entry.phase.tasks.length, richTextSupported)
+          : makeTextBlock(
+            todoTaskText(task, phaseIndex, phaseEntries.length, taskIndex, entry.phase.tasks.length),
+            { color: todoTone(task.status), spacing: "None" },
+          ));
+      } else if (
+        structuredLayout
+        && entry.omittedTasks.has(task)
+        && renderedOmittedCount < MAX_EXPANDED_TODO_TASKS
+      ) {
+        phaseItems.push(makeTodoTaskRow(
+          task,
+          phaseIndex,
+          phaseEntries.length,
+          taskIndex,
+          entry.phase.tasks.length,
+          richTextSupported,
+          {
+            id: `todo_omitted_task_${entry.sourceIndex}_${taskIndex}`,
+            isVisible: false,
+          },
+        ));
+        renderedOmittedCount += 1;
+      }
+    }
     items.push({
       type: "Container",
       spacing: "Small",
       items: phaseItems,
     });
   }
-  if (omittedTodos.length > 0) {
-    items.push({
-      type: "Container",
-      id: "todo_omitted_tasks",
-      isVisible: false,
-      style: "emphasis",
+
+  const omittedCount = omittedTodos.reduce((count, phase) => count + phase.tasks.length, 0);
+  if (renderedOmittedCount < omittedCount) {
+    items.push(makeTextBlock(`还有 ${omittedCount - renderedOmittedCount} 个任务受卡片大小限制`, {
+      isSubtle: true,
       spacing: "Small",
-      items: makeExpandedTodoItems(omittedTodos, richTextSupported),
-    });
+    }));
   }
   return items;
+}
+
+function todoOmittedTaskIds(
+  allTodos: readonly ExecutionTodoPhase[],
+  omittedTodos: readonly ExecutionTodoPhase[],
+): string[] {
+  const ids: string[] = [];
+  let renderedCount = 0;
+  for (let sourceIndex = 0; sourceIndex < allTodos.length; sourceIndex += 1) {
+    const phase = allTodos[sourceIndex]!;
+    const omittedTasks = new Set(omittedTodos[sourceIndex]?.tasks ?? []);
+    for (let taskIndex = 0; taskIndex < phase.tasks.length; taskIndex += 1) {
+      if (!omittedTasks.has(phase.tasks[taskIndex]!)) continue;
+      if (renderedCount >= MAX_EXPANDED_TODO_TASKS) return ids;
+      ids.push(`todo_omitted_task_${sourceIndex}_${taskIndex}`);
+      renderedCount += 1;
+    }
+  }
+  return ids;
 }
 
 function makeTextBlock(text: string, options: JsonNode = {}): JsonNode {
@@ -1078,6 +1101,7 @@ function makeTimelineItems(
 }
 
 function makeTodoContainer(
+  allTodos: readonly ExecutionTodoPhase[],
   todos: readonly ExecutionTodoPhase[],
   hiddenCount: number,
   totalCount: number,
@@ -1086,10 +1110,7 @@ function makeTodoContainer(
   omittedTodos: readonly ExecutionTodoPhase[] = [],
   actionSets: readonly JsonNode[] = [],
 ): JsonNode | null {
-  if (
-    (todos.length === 0 || todos.every(phase => phase.tasks.length === 0))
-    && omittedTodos.length === 0
-  ) return null;
+  if (!allTodos.some(phase => phase.tasks.length > 0)) return null;
   const heading = structuredLayout && actionSets.length > 0
     ? makeSectionHeader("任务清单", actionSets)
     : makeTextBlock("任务清单", { weight: "Bolder", size: "Medium", spacing: "None" });
@@ -1100,7 +1121,7 @@ function makeTodoContainer(
     spacing: "Medium",
     items: [
       heading,
-      ...makeTodoItems(todos, hiddenCount, totalCount, structuredLayout, richTextSupported, omittedTodos),
+      ...makeTodoItems(allTodos, todos, omittedTodos, hiddenCount, totalCount, structuredLayout, richTextSupported),
     ],
   };
 }
@@ -1646,15 +1667,6 @@ function buildCandidate(
   const hiddenSubagents = Math.max(0, totalSubagents - visibleSubagents.length);
   const visibleTodoTasks = visibleTodos.reduce((count, phase) => count + phase.tasks.length, 0);
   const hiddenTodoTasks = Math.max(0, totalTodoTasks - visibleTodoTasks);
-  const showTraceHistory = hiddenTodoTasks === 0;
-  const renderedOlderTraceTools = showTraceHistory ? olderTraceTools : [];
-  const renderedOmittedTraceTools = showTraceHistory && canToggle
-    ? expandableOmittedTraceTools
-    : [];
-  const showSubagentHistory = hiddenTodoTasks === 0;
-  const renderedOmittedSubagentTools = showSubagentHistory && canToggle
-    ? expandableOmittedSubagentTools
-    : [];
   const elapsed = formatDuration(snapshot.elapsedMs);
   const metrics = `${snapshot.phaseCount} 个阶段 · ${snapshot.toolCount} 次工具调用 · ${elapsed}`;
   const notice = executionNotice(snapshot, visibleTodos);
@@ -1663,13 +1675,13 @@ function buildCandidate(
     hiddenTraceTools,
     richLayout,
     visibleSubagents.length > 0 ? "暂无其他工具活动" : "正在准备",
-    renderedOlderTraceTools,
-    renderedOmittedTraceTools,
-    showTraceHistory && canToggle,
+    olderTraceTools,
+    canToggle ? expandableOmittedTraceTools : [],
+    canToggle,
   );
   const hasRenderedSubagentActivity = visibleSubagents.length > 0
     || olderSubagents.length > 0
-    || renderedOmittedSubagentTools.length > 0;
+    || expandableOmittedSubagentTools.length > 0;
   const subagentContainer = richLayout && hasRenderedSubagentActivity
     ? makeSubagentContainer(
       visibleSubagents,
@@ -1677,28 +1689,30 @@ function buildCandidate(
       totalSubagents,
       true,
       olderSubagents,
-      renderedOmittedSubagentTools,
+      canToggle ? expandableOmittedSubagentTools : [],
       canToggle,
     )
     : null;
   const traceHiddenIds = [
-    ...renderedOlderTraceTools.map((_tool, index) => `timeline_older_step_${index}`),
-    ...(renderedOmittedTraceTools.length > 0 ? ["timeline_omitted_steps"] : []),
+    ...olderTraceTools.map((_tool, index) => `timeline_older_step_${index}`),
+    ...(expandableOmittedTraceTools.length > 0 ? ["timeline_omitted_steps"] : []),
   ];
   const subagentHiddenIds = [
     ...olderSubagents.map((_tool, index) => `subagent_older_step_${index}`),
-    ...(renderedOmittedSubagentTools.length > 0 ? ["subagent_omitted_steps"] : []),
+    ...(expandableOmittedSubagentTools.length > 0 ? ["subagent_omitted_steps"] : []),
   ];
   const traceToggleSets = canToggle ? makeToggleSets(traceHiddenIds) : [];
   const subagentToggleSets = canToggle && subagentContainer
     ? makeSubagentToggleSets(subagentHiddenIds)
     : [];
   const expandableOmittedTodos = canToggle ? omittedTodos : [];
-  const todoToggleSets = expandableOmittedTodos.length > 0
-    ? makeTodoToggleSets(["todo_omitted_tasks"])
+  const todoHiddenIds = canToggle ? todoOmittedTaskIds(snapshot.todos, expandableOmittedTodos) : [];
+  const todoToggleSets = todoHiddenIds.length > 0
+    ? makeTodoToggleSets(todoHiddenIds)
     : [];
   const todoContainer = hasContainer
     ? makeTodoContainer(
+      snapshot.todos,
       visibleTodos,
       hiddenTodoTasks,
       totalTodoTasks,
@@ -1828,12 +1842,12 @@ function trimTodos(
   if (target === taskRefs.length) {
     return {
       visible: todos.map(phase => ({ name: phase.name, tasks: phase.tasks.slice() })),
-      omitted: [],
+      omitted: todos.map(phase => ({ name: phase.name, tasks: [] })),
     };
   }
   if (target === 0) {
     return {
-      visible: [],
+      visible: todos.map(phase => ({ name: phase.name, tasks: [] })),
       omitted: todos.map(phase => ({ name: phase.name, tasks: phase.tasks.slice() })),
     };
   }
@@ -1873,8 +1887,8 @@ function trimTodos(
       else omittedTasks.push(task);
       refIndex += 1;
     }
-    if (visibleTasks.length > 0) visible.push({ name: phase.name, tasks: visibleTasks });
-    if (omittedTasks.length > 0) omitted.push({ name: phase.name, tasks: omittedTasks });
+    visible.push({ name: phase.name, tasks: visibleTasks });
+    omitted.push({ name: phase.name, tasks: omittedTasks });
   }
   return { visible, omitted };
 }
