@@ -20,6 +20,7 @@ import type {
   InboundAttachment,
   InboundAttachmentKind,
   InboundMessage,
+  InboundQuote,
   SendReceipt,
   ThreadSummary,
 } from "../contracts.ts";
@@ -144,6 +145,8 @@ const MERGE_FORWARD_HEADER = "[合并转发]";
 const MAX_MERGE_FORWARD_MESSAGES = 30;
 const MAX_MERGE_FORWARD_CODE_POINTS = 4_000;
 const MAX_RICH_TEXT_CODE_POINTS = 2_000;
+/** 引用块只承载文本，超出部分截断：引用是上下文，不是第二份正文。 */
+const MAX_QUOTED_CODE_POINTS = 2_000;
 /** Random bytes appended to the temp file a download writes before renaming it into place. */
 const ATTACHMENT_PART_BYTES = 6;
 /** Audio MIME types the transcription endpoint understands; anything else goes as opaque bytes. */
@@ -1033,17 +1036,53 @@ function messageContent(payload: JsonRecord): ExtractedContent | undefined {
   }
 }
 
+/**
+ * A reply carries the quoted message inline: `payload.reply.payload` is a full payload of
+ * its own (the real client sends the original type, blocks, and `plain`), so the same type
+ * table reads it. Only depth 1 is read — a quoted message that itself quotes something
+ * contributes just its own content — and the quoted text is bounded like rich text.
+ */
+function quotedMessage(
+  payload: JsonRecord,
+): { quote: InboundQuote; attachments: InboundAttachment[] } | null {
+  const reply = payload.reply;
+  if (!isJsonRecord(reply)) return null;
+  const quotedPayload = reply.payload;
+  if (!isJsonRecord(quotedPayload)) return null;
+  const content = messageContent(quotedPayload);
+  if (content === undefined) return null;
+  // 引用里的相对 URL 与正文一样不可用：它们不参与「这条引用有没有内容」的判定。
+  const attachments = content.attachments.filter(
+    (attachment) => absoluteHttpUrl(attachment.url) !== undefined,
+  );
+  const text = truncateCodePoints(content.text, MAX_QUOTED_CODE_POINTS).trim();
+  if (text.length === 0 && attachments.length === 0) return null;
+  const senderName = reply.from_name;
+  return {
+    quote: { senderName: typeof senderName === "string" ? senderName : "", text },
+    attachments,
+  };
+}
+
 function normalizedMessage(data: DecodedInbound, botUid: string, botName: string): InboundMessage {
   if (!(data.channelType === 1 || data.channelType === 2 || data.channelType === 5)) {
     throw new OctoError(`Octo message channel type ${data.channelType} is unsupported`);
   }
   if (!isJsonRecord(data.payload)) throw new OctoError("Octo message payload has invalid schema");
   const content = messageContent(data.payload);
+  const quoted = quotedMessage(data.payload);
   // Unusable references never become attachments, so a message left with neither text nor
   // attachments stays unsupported — the same answer as before attachments existed. Text-shaped
   // payloads are the exception: `@bot` alone still runs a normal (empty) turn.
-  const attachments = (content?.attachments ?? [])
-    .filter((attachment) => absoluteHttpUrl(attachment.url) !== undefined);
+  const attachments: InboundAttachment[] = [];
+  const seenUrls = new Set<string>();
+  for (const attachment of [...content?.attachments ?? [], ...quoted?.attachments ?? []]) {
+    const url = absoluteHttpUrl(attachment.url);
+    // 引用消息里的同一张图不重复落盘；回复自己的附件时以本消息的条目为准。
+    if (url === undefined || seenUrls.has(url)) continue;
+    seenUrls.add(url);
+    attachments.push(attachment);
+  }
   const entities = mentionEntities(data.payload);
   const mentionedUserIds = mentionUids(data.payload);
   const text = stripBotMention(content?.text ?? "", botUid, botName, entities, mentionedUserIds);
@@ -1061,6 +1100,7 @@ function normalizedMessage(data: DecodedInbound, botUid: string, botName: string
     text,
     mentionedUserIds,
     attachments,
+    quoted: quoted?.quote ?? null,
     supported,
     messageSeq: knownIntOrZero(data.messageSeq),
     messageTimestamp: knownIntOrZero(data.timestamp) * 1000,

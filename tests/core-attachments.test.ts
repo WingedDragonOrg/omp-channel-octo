@@ -225,6 +225,67 @@ test("图片无文本：恰好一条任务，提示词含附件块与绝对路�
   }
 });
 
+test("回复带图的消息：引用正文与引用附件一起进入同一条任务", async () => {
+  const harness = await createAttachmentHarness();
+  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+  const url = "https://cdn.example.test/quoted.png";
+  harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
+  try {
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "attach-quoted-reply",
+        ...target,
+        text: "现在能看到这个图片了吗",
+        quoted: { senderName: "董振兴", text: "@O-小爱 [图片]这个开关要打开" },
+        attachments: [attachment(url, "image", "image.png", { size: IMAGE_BYTES.byteLength })],
+      }),
+    );
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+
+    expect(harness.workers.prompts).toHaveLength(1);
+    expect(taskCount(harness, target)).toBe(1);
+    const prompt = harness.workers.prompts[0]!.text;
+    expect(prompt).toContain("现在能看到这个图片了吗");
+    expect(prompt).toContain("[引用 董振兴]\n@O-小爱 [图片]这个开关要打开");
+    expect(prompt).toContain(ATTACHMENT_HEADER);
+
+    const paths = attachmentPathsFromPrompt(prompt);
+    expect(paths).toHaveLength(1);
+    await expectSameBytes(paths[0]!, IMAGE_BYTES);
+    expect(harness.transport.downloadRequests).toHaveLength(1);
+  } finally {
+    await closeAttachmentHarness(harness);
+  }
+});
+
+test("只引用文本时引用块进入正文，不带引用的文本任务逐字不变", async () => {
+  const harness = await createAttachmentHarness();
+  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+  try {
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "attach-quote-only",
+        ...target,
+        text: "接着说",
+        quoted: { senderName: "董振兴", text: "上一句" },
+      }),
+    );
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+    await harness.service.handleInbound(
+      inbound({ messageId: "attach-plain-no-quote", ...target, text: "  普通文本 " }),
+    );
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+
+    expect(harness.transport.downloadRequests).toHaveLength(0);
+    expect(harness.workers.prompts.map((prompt) => prompt.text)).toEqual([
+      "接着说\n\n[引用 董振兴]\n上一句",
+      "  普通文本 ",
+    ]);
+  } finally {
+    await closeAttachmentHarness(harness);
+  }
+});
+
 test("文字 + 图片：仍是一条任务，提示词同时含用户文本与附件块", async () => {
   const harness = await createAttachmentHarness();
   const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };

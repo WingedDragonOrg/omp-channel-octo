@@ -13,6 +13,7 @@
 ### 包含
 
 - 入站类型表（1 文本、2 图片、3 GIF、4 语音、5 视频、6 位置、7 名片、8 文件、9 文件别名、11 合并转发、14 富文本、17 交互卡片）的文本与附件提取。
+- 回复（引用）消息：客户端内联在 `payload.reply.payload` 里的被引用 payload 同样过一遍类型表——文本成为引用块，媒体成为本条消息的附件。
 - `InboundMessage` 携带 `attachments`；`supported` 语义从「是文本消息」扩展为「能形成可用输入」。
 - 媒体附件（图片/GIF/语音/视频/文件/富文本内嵌图片）下载到状态目录，绝对路径写进任务正文。
 - 语音消息的服务端转写（best-effort）。
@@ -24,6 +25,8 @@
 
 - 贴纸（12/13）、加入组织（16）、截屏（20）、错误/CMD（97/98/99）、系统类（1000+/2000+）、RTC（99xx）的记录：仍回复「不支持的消息类型，不会启动任务。」
 - 解析 type-17 卡片树：只取服务端权威 `plain`。
+- 引用链：只读一层，被引用消息自身再引用别的消息时不再展开。
+- 按 ID 回查被引用消息：客户端已经把整条 payload 内联在 `reply` 里，不额外请求服务端。
 - 下载合并转发内嵌消息的附件：只摊平文本，内层媒体渲染为占位符。
 - 图片缩放/转码、OCR、音视频理解；转写只调用部署已有的 ASR 服务，不在本机跑模型。
 - 出站能力变化：host tool 的图片/文件发送保持现状。
@@ -31,6 +34,7 @@
 
 ## 已知约束
 
+- 回复消息的真实形状（线上实测：`现在能看到这个图片了吗` 回复 seq 12）：`payload.reply = { root_mid, message_id, message_seq, from_uid, from_name, payload }`，其中 `reply.payload` 是被引用消息的**完整** payload（同一套 `type` / `content` / `plain` / `mention` 字段，实测为 `type 14` 富文本），因此类型表可直接复用，不需要第二个解析器。回复方的 `type` 与引用无关（实测为 `type 1`），`reply` 由服务端在 WS 与 `messages/sync` 两条来源上一并投递。
 - Octo 类型枚举见 octo-lib `common/msg.go`：1 Text、2 Image、3 GIF、4 Voice、5 Video、6 Location、7 Card、8 File、11 MultipleForward、12 VectorSticker、13 EmojiSticker、14 RichText、16、17 InteractiveCard、97/98/99、1000+、2000、9989+。
 - 各类型字段（跨仓取证：octo-web `packages/dmworkbase/src/Messages/*` 的 `decodeJSON`、octo-server `modules/bot_api/obo_fanout_content_type_test.go` 的样本 payload、octo-lib `common/richtext.go`、参考适配器 `openclaw-channel-octo/src/inbound.ts` 的 `resolveContent`）：
   - 2 图片：`url`、`caption`、`name`、`size`、`width`、`height`（`size` 由线上真实图片消息的 payload 实测确认，用于下载前的超限预检）。
@@ -68,12 +72,14 @@
 | 大小上限 | 单一配置 `attachments.maxBytes`，默认 25 MiB，超限即拒绝任务 | 一次大文件转发不应打满磁盘或长时间占用连接 |
 | 保留 | 启动时清理 14 天前的附件目录，best-effort | 无上限增长不可接受；清理失败不影响启动 |
 | 群历史 | 只把可提取文本写进历史正文，附件本身不注入 | 历史只承载文本，避免历史注入触发成批下载 |
+| 引用消息 | 用同一张类型表读 `reply.payload`，媒体并入本条消息的附件（按绝对 URL 去重），文本渲染成 `[引用 <发送者>]` 块 | 客户端已内联整条 payload，回查服务端既慢又要多一条权限面；一条回复仍是一次任务，引用只是上下文 |
 
 ## 设计
 
 ### 数据契约
 
 - `InboundMessage` 增加 `attachments: InboundAttachment[]`；`InboundAttachment = { url, kind: "image" | "file" | "audio" | "video", name, size, durationSeconds }`。`size` / `durationSeconds` 未知时为 `0`；`url` 一律是绝对 http/https，相对路径与其他不可用 URL 不产生附件项。`size` 是客户端声明值，只用于下载前的超限判定；提示词里展示的大小取实际落盘字节数。
+- `InboundMessage` 增加 `quoted: InboundQuote | null`；`InboundQuote = { senderName, text }`，`text` 是被引用消息的可提取文本，按 code point 截断到 2000。被引用媒体不放进 `quoted`，而是并入 `attachments`（本条消息自己的在前、按绝对 URL 去重），因此下载、大小上限、失败清理、重投复用与提示词附件块都只有一套逻辑。
 - `supported`：文本类（1 文本、14 富文本、17 卡片）恒为 `true`——它们的内容就是文本，空文本（例如只 @Bot 没有别的话）仍是一次合法的普通回合，交给 Agent 自然回应；其余类型为 `text.trim().length > 0 || attachments.length > 0`，即必须是媒体真的可用（提取到文本或附件）才算支持；类型表之外的类型恒为 `false`。`text` 是该类型的可提取文本（mention 仍在传输层按既有规则剥离）。
 - `ChannelTransport` 增加：
   - `downloadAttachment({ url, path, maxBytes, signal }): Promise<number>`：落盘并返回字节数。
@@ -106,6 +112,8 @@
 
 「其他」保持既有行为：回复「不支持的消息类型，不会启动任务。」，不写 inbound / task 记录，不产生任何外网请求。
 
+回复（引用）：`payload.reply.payload` 走同一张表，取到的文本成为引用块的正文、取到的媒体并入本条消息的附件。`supported` 仍只由本条消息自己的 payload 决定——引用内容随之一起进入任务，但不会把贴纸之类的本条类型变成支持。被引用消息自身还有 `reply` 时不再展开。
+
 ### 附件管道
 
 - 目录：`<stateDir>/attachments/<channelType>-<channelId>/<messageId>/`，目录权限 `0700`，文件名 `<index>-<safeName>`，文件权限 `0600`。
@@ -119,19 +127,23 @@
 
 ### 提示词形态
 
-任务正文 = 用户文本 +（可选）转写块 +（可选）附件块，块之间空行分隔：
+任务正文 = 用户文本 +（可选）引用块 +（可选）转写块 +（可选）附件块，块之间空行分隔：
 
 ```
 <用户文本>
 
+[引用 董振兴]
+@O-小爱 [图片]这个开关要打开
+
 [语音转写] 帮我看下这个页面的报错
 
 附件（已保存到本机；需要时用 read 打开）：
-1. image 截图.png 1.2 MB → /Users/you/.local/state/omp-channel-octo/attachments/2-<channelId>/<messageId>/0-截图.png
-2. audio 语音.amr 8.0 KB (3s) → /Users/you/.local/state/omp-channel-octo/attachments/2-<channelId>/<messageId>/0-语音.amr
+1. image image.png 1.2 MB → /Users/you/.local/state/omp-channel-octo/attachments/2-<channelId>/<messageId>/0-image.png
+2. audio 语音.amr 8.0 KB (3s) → /Users/you/.local/state/omp-channel-octo/attachments/2-<channelId>/<messageId>/1-语音.amr
 ```
 
-- 只有用户文本时提示词与今天完全一致。
+- 只有用户文本、且本条消息不是回复时，提示词与今天完全一致（逐字返回，不 trim）。
+- 引用块只在被引用消息有可提取文本时出现，标题为 `[引用 <发送者>]`，发送者名缺失时退回 `[引用]`；被引用文本原样保留（其中的历史 mention 不剥离，那是被引用者说过的话）。被引用媒体以普通附件行出现，路径落在**回复消息**自己的附件目录里。
 - 附件块只在有附件时出现；转写块只在拿到非空转写时出现。
 - 附件块里的大小取实际落盘字节数，时长取 payload 声明的秒数（未知则不打印时长）。
 - 被接受的正文落在既有 `tasks.text`，因此排队任务与群历史拼接天然一致；steering 不建任务，直接注入同一份组装正文（含附件块），因此运行中的回合同样拿得到附件。
@@ -145,6 +157,8 @@
 | 任一附件超过 `maxBytes` | 同样通道回复「附件超过 <N> MB 上限，未接收任务。」；不写 task 行 |
 | 附件数量超过 8 或总预算超过 120 秒 | 同样通道回复「附件过多或下载超时，未接收任务。」；不写 task 行 |
 | URL 不可用（相对路径、非 http/https、为空） | 该附件不计入；若因此没有文本也没有其他附件，按「其他类型」处理（回复不支持） |
+| 被引用消息的文本与媒体都不可用（相对 URL、类型不支持、`reply` 缺 payload） | 该引用不成立：不加引用块、不产生附件，本条消息按自身内容照常处理 |
+| 被引用媒体超过 `maxBytes` 或下载失败 | 与自身附件同一条路径：按对应文案拒绝整条任务，引用块也随之不投递 |
 | 只有 mention、没有内容（`@Bot` 单独出现） | 文本类消息照常是一次普通回合：正文为空，Agent 正常回应（例如询问要做什么）；不回复「不支持的消息类型」 |
 | 语音转写失败或返回空文本 | 任务照常接受，提示词只含音频路径 |
 | `attachments.enabled=false` | 附件一律不计入：有文本则按纯文本任务；没有文本时回复「附件接收已关闭，未接收任务。」 |
@@ -170,6 +184,8 @@
 - 有待回答问题时的带附件消息：文本仍按既有规则作为答案处理，附件不参与回答、不落盘；只有不构成答案的消息才走任务路径。
 - 附件路径可能包含非 ASCII 文件名；写入与提示词使用同一字符串，不做额外转码。
 - 图片 `url` 指向 404 或非图片内容时不额外校验内容类型：下载成功即交付路径，由 Agent 自行判断内容。
+- 引用只读一层：`reply.payload.reply` 不展开，避免自引用或深链放大；引用文本按 code point 截断到 2000。
+- 引用媒体与本条消息自己的附件 URL 相同时只保留一条，落盘一次；被引用媒体落在回复消息的目录里，与原始消息的副本互不影响（同 URL 再被回复会被复用规则挡住重复下载）。
 
 ## 验收标准
 
@@ -197,6 +213,10 @@
 22. 单条消息附件数量超过 8 或下载总预算超过 120 秒：回复「附件过多或下载超时，未接收任务。」，不建任务。
 23. 半失败清理：一条有两个附件的消息在第二个附件失败时，只删除本次新建的文件；此前已被接受的同 messageId 任务引用到的文件仍然存在。
 24. 只 @Bot、不带任何内容：不回复「不支持的消息类型，不会启动任务。」，而是照常启动一个正文为空的回合，Agent 正常回应（例如询问要做什么）；贴纸等其他类型仍回复「不支持」。
+25. 回复一条带图的消息、自己只写字：产生**一条**任务，提示词含用户文本、`[引用 <发送者>]` 块与被引用图片的附件行；图片落盘在本条消息的目录下，字节数与远端一致。
+26. 直接回复一条带图的消息、自己不写字：同样产生一条任务，正文以引用块与附件块开头。
+27. 被引用消息只有相对 URL、或类型不在类型表内时：不产生附件、不加引用块，本条消息按自身内容处理；`supported` 仍只由本条 payload 决定。
+28. 被引用媒体与自己的附件是同一个 URL 时只落盘一次、提示词里只出现一行；被引用媒体下载失败或超限时按既定文案拒绝整条任务。
 
 ## 未决事项
 

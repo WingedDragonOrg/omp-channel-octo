@@ -744,10 +744,16 @@ class CoreService implements ChannelService {
    * `null` 也表示该消息已被更早的处理路径（含重投去重）消费。
    */
   private async materializeInbound(message: InboundMessage): Promise<string | null> {
-    if (message.attachments.length === 0) return message.text;
+    const quotedText = message.quoted?.text.trim() ?? "";
+    // 只带引用、不带附件时也要把引用块交给 Agent；普通文本任务的正文保持逐字不变。
+    if (message.attachments.length === 0) {
+      return quotedText.length === 0 ? message.text : composePromptText(message.text, [], message.quoted);
+    }
     const attachmentConfig = this.options.config.attachments;
     if (attachmentConfig?.enabled !== true) {
-      if (message.text.trim().length > 0) return message.text;
+      if (message.text.trim().length > 0 || quotedText.length > 0) {
+        return composePromptText(message.text, [], message.quoted);
+      }
       const claim = this.commandClaim(message, "attachment");
       if (!this.store.claimCommand(claim)) return null;
       await this.refuseAttachments(message, claim, ATTACHMENTS_DISABLED_TEXT);
@@ -806,7 +812,7 @@ class CoreService implements ChannelService {
             attachment.kind === "audio" ? await this.transcribeInboundAudio(path, budget.signal) : null,
         });
       }
-      const promptText = composePromptText(message.text, files);
+      const promptText = composePromptText(message.text, files, message.quoted);
       this.store.releaseClaim(claim);
       return promptText;
     } catch (error) {
@@ -2713,6 +2719,7 @@ class CoreService implements ChannelService {
       text,
       mentionedUserIds: [bot.uid],
       attachments: [],
+      quoted: null,
       supported: true,
       messageSeq: 0,
       messageTimestamp: Date.now(),

@@ -23,6 +23,17 @@ export interface InboundAttachment {
   durationSeconds: number;
 }
 
+/**
+ * Text of the message a reply quotes, taken from the payload the client embedded in
+ * `reply`. Quoted media never lives here: it is merged into `InboundMessage.attachments`
+ * so the normal download and prompt blocks apply to it.
+ */
+export interface InboundQuote {
+  /** Display name of the quoted message's sender, as the quoting client rendered it. */
+  senderName: string;
+  text: string;
+}
+
 /** One attachment download performed by the transport. */
 export interface AttachmentDownload {
   url: string;
@@ -39,6 +50,11 @@ export interface InboundMessage extends ChatTarget {
   mentionedUserIds: string[];
   /** Attachments carried by this message, already filtered to absolute http/https URLs. */
   attachments: InboundAttachment[];
+  /**
+   * Message this one replies to, as the client quoted it; `null` when it is not a reply.
+   * The quoted media is merged into `attachments`, so only its text needs a separate field.
+   */
+  quoted: InboundQuote | null;
   /** True when the message yields usable input: non-empty text or at least one attachment. */
   supported: boolean;
   /**

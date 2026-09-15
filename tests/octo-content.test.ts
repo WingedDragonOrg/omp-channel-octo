@@ -361,6 +361,91 @@ describe("Octo inbound message content", () => {
     ]);
   });
 
+  test("reads the quoted message of a reply as text plus its own media", async () => {
+    const inbox: InboundMessage[] = [];
+    const { current, connection } = await startFixtureTransport(async (message) => {
+      inbox.push(message);
+    });
+    const quotedImage = `${current.apiUrl}/fixture-download/quoted.png`;
+
+    const messages = await deliverInbound(current, connection, inbox, [
+      // 线上真实回复：自己的 type 1 文本 + 内联的整条被引用 payload（这里是被引用消息
+      // 的 type 14 富文本，图片块带绝对 CDN 直链）。
+      {
+        type: 1,
+        content: "现在能看到这个图片了吗",
+        reply: {
+          root_mid: "original-message",
+          message_id: "original-message",
+          message_seq: 12,
+          from_uid: current.ownerUid,
+          from_name: "董振兴",
+          payload: {
+            type: 14,
+            plain: "@O-小爱 [图片]这个开关要打开",
+            content: [
+              { type: "text", text: "@O-小爱 " },
+              { type: "image", url: quotedImage, width: 980, height: 1258 },
+              { type: "text", text: "这个开关要打开" },
+            ],
+            mention: { uids: [current.botUid], entities: [{ uid: current.botUid, offset: 0, length: 5 }] },
+          },
+        },
+      },
+      // 只回复不写字：正文为空，内容全部来自被引用的消息。
+      {
+        type: 1,
+        content: "",
+        reply: {
+          message_id: "original-message",
+          from_name: "董振兴",
+          payload: { type: 2, url: quotedImage, caption: "被引用的图片说明" },
+        },
+      },
+      // 被引用消息只有不可下载的相对 URL，也没有文本：整条引用不成立。
+      {
+        type: 1,
+        content: "这条引用不可用",
+        reply: { from_name: "董振兴", payload: { type: 2, url: "file/preview/relative.png" } },
+      },
+      // 自己的图片与引用的图片是同一个 URL：只保留一条附件。
+      {
+        type: 2,
+        url: quotedImage,
+        reply: { from_name: "董振兴", payload: { type: 2, url: quotedImage, caption: "同一个文件" } },
+      },
+    ]);
+
+    expect(
+      messages.map((message) => ({
+        text: message.text,
+        supported: message.supported,
+        quoted: message.quoted,
+        attachments: message.attachments,
+      })),
+    ).toEqual([
+      {
+        text: "现在能看到这个图片了吗",
+        supported: true,
+        quoted: { senderName: "董振兴", text: "@O-小爱 [图片]这个开关要打开" },
+        attachments: [attachment(quotedImage, "image")],
+      },
+      {
+        text: "",
+        supported: true,
+        quoted: { senderName: "董振兴", text: "被引用的图片说明" },
+        attachments: [attachment(quotedImage, "image")],
+      },
+      { text: "这条引用不可用", supported: true, quoted: null, attachments: [] },
+      {
+        text: "",
+        supported: true,
+        quoted: { senderName: "董振兴", text: "同一个文件" },
+        attachments: [attachment(quotedImage, "image")],
+      },
+    ]);
+  });
+
   test("strips the bot mention from extracted text", async () => {
     const inbox: InboundMessage[] = [];
     const { current, connection } = await startFixtureTransport(async (message) => {

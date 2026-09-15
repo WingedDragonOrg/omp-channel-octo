@@ -1054,6 +1054,7 @@ export function inbound(
     text: "perform fixture work",
     mentionedUserIds: [],
     attachments: [],
+    quoted: null,
     supported: true,
     messageSeq: 0,
     messageTimestamp: 0,

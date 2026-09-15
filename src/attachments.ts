@@ -1,6 +1,6 @@
 import { readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
-import type { ChatTarget, InboundAttachmentKind } from "./contracts.ts";
+import type { ChatTarget, InboundAttachmentKind, InboundQuote } from "./contracts.ts";
 
 /** Attachment directories untouched for this long are removed at service start. */
 export const ATTACHMENT_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
@@ -85,19 +85,32 @@ export function safeAttachmentName(
   return `${index}-${base.toLowerCase().endsWith(extension.toLowerCase()) || extension.length === 0 ? base : `${base}${extension}`}`;
 }
 
-/** Renders the transcription and attachment blocks appended to the user text. */
-export function composePromptText(text: string, files: readonly SavedAttachment[]): string {
-  if (files.length === 0) return text;
+/** Renders the transcription, quoted-message, and attachment blocks appended to the user text. */
+export function composePromptText(
+  text: string,
+  files: readonly SavedAttachment[],
+  quote: InboundQuote | null = null,
+): string {
+  const quoteText = quote?.text.trim() ?? "";
+  // 没有附件也没有引用时保持逐字返回：普通文本任务的正文与今天完全一致。
+  if (files.length === 0 && quoteText.length === 0) return text;
   const sections = [text.trim()];
+  if (quoteText.length > 0) {
+    const senderName = quote?.senderName.trim() ?? "";
+    const heading = senderName.length > 0 ? `[引用 ${senderName}]` : "[引用]";
+    sections.push(`${heading}\n${quoteText}`);
+  }
   for (const file of files) {
     const transcription = file.transcription?.trim() ?? "";
     if (transcription.length > 0) sections.push(`[语音转写] ${transcription}`);
   }
-  const lines = files.map((file, index) => {
-    const duration = file.durationSeconds > 0 ? ` (${file.durationSeconds}s)` : "";
-    return `${index + 1}. ${file.kind} ${file.name} ${formatBytes(file.bytes)}${duration} → ${file.path}`;
-  });
-  sections.push(["附件（已保存到本机；需要时用 read 打开）：", ...lines].join("\n"));
+  if (files.length > 0) {
+    const lines = files.map((file, index) => {
+      const duration = file.durationSeconds > 0 ? ` (${file.durationSeconds}s)` : "";
+      return `${index + 1}. ${file.kind} ${file.name} ${formatBytes(file.bytes)}${duration} → ${file.path}`;
+    });
+    sections.push(["附件（已保存到本机；需要时用 read 打开）：", ...lines].join("\n"));
+  }
   return sections.filter(section => section.length > 0).join("\n\n");
 }
 

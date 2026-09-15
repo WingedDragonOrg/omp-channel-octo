@@ -179,6 +179,25 @@ test("omits the transcription block when there is no usable transcription", () =
   ].join("\n\n"));
 });
 
+test("renders the quoted message ahead of the attachment block", () => {
+  const files = [
+    saved({ path: "/state/attachments/2-group-1/msg-2/0-quoted.png", name: "0-quoted.png", kind: "image", bytes: 2048 }),
+  ];
+  expect(composePromptText("看下这个", files, { senderName: " 董振兴 ", text: " 原消息 " })).toBe([
+    "看下这个",
+    "[引用 董振兴]\n原消息",
+    [
+      ATTACHMENT_HEADER,
+      "1. image 0-quoted.png 2.0 KB → /state/attachments/2-group-1/msg-2/0-quoted.png",
+    ].join("\n"),
+  ].join("\n\n"));
+});
+
+test("keeps an attachment-only reply's quote without an empty text section", () => {
+  expect(composePromptText("   ", [], { senderName: "", text: "被引用的正文" }))
+    .toBe("[引用]\n被引用的正文");
+});
+
 test("renders byte counts across the B, KB and MB boundaries", () => {
   expect(formatBytes(0)).toBe("0 B");
   expect(formatBytes(1023)).toBe("1023 B");
