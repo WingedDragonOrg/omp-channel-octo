@@ -632,7 +632,7 @@ describe("execution card rendering", () => {
     expect(nodes(card).some(node => node.type === "Action.ToggleVisibility")).toBe(false);
   });
 
-  test("renders step panels with aligned status metadata", () => {
+  test("renders step panels with an aligned marker, body, and status stack", () => {
     const tracker = createExecutionTracker({ runId: "tool-row" });
     startTurn(tracker, "turn-1", 0);
     startTool(tracker, "tool-1", "generate_image", 1_000, "写入文件");
@@ -653,8 +653,8 @@ describe("execution card rendering", () => {
     const row = nodes(panel!).find(item => item.type === "ColumnSet");
     expect(row).toMatchObject({ spacing: "None" });
     const rowColumns = row?.columns as JsonRecord[];
-    expect(rowColumns).toHaveLength(3);
-    expect(rowColumns[0]).toMatchObject({ width: "auto", verticalContentAlignment: "Center" });
+    expect(rowColumns).toHaveLength(2);
+    expect(rowColumns[0]).toMatchObject({ width: "24px", verticalContentAlignment: "Center" });
     expect(rowColumns[0]?.items).toEqual([
       expect.objectContaining({ text: "•", color: "Accent", size: "Small", spacing: "None" }),
     ]);
@@ -662,16 +662,43 @@ describe("execution card rendering", () => {
     expect(rowColumns[1]?.items).toEqual([
       expect.objectContaining({ text: "写入文件", weight: "Bolder", spacing: "None" }),
       expect.objectContaining({ text: "generate_image", isSubtle: true, size: "Small", spacing: "None" }),
-    ]);
-    expect(rowColumns[2]).toMatchObject({ width: "auto", verticalContentAlignment: "Center" });
-    expect(rowColumns[2]?.items).toEqual([
       expect.objectContaining({
         text: "进行中 · 35.2s",
-        horizontalAlignment: "Right",
         isSubtle: true,
         size: "Small",
         spacing: "None",
+        color: "Accent",
       }),
+    ]);
+  });
+  test("keeps long timeline summaries in the stretch body column", () => {
+    const tracker = createExecutionTracker({ runId: "tool-row-long-summary" });
+    startTurn(tracker, "turn-1", 0);
+    startTool(tracker, "hub-1", "hub", 1_000, "IRC → preview-agent · 未收到回复");
+    tracker.apply({
+      type: "tool_end",
+      toolCallId: "hub-1",
+      atMs: 1_140,
+      status: "failed",
+      errorCategory: "worker",
+    });
+    const rendered = buildExecutionCard(tracker.snapshot(1_140), fullCapabilities);
+    expect(rendered).not.toBeNull();
+
+    const timeline = nodeById(rendered!.card as JsonRecord, "timeline_detail");
+    const step = (timeline.items as JsonRecord[]).find(item => item.type === "ColumnSet");
+    expect(step).toBeDefined();
+    if (!step) throw new Error("long-summary tool step was not rendered");
+    const outerColumn = (step.columns as JsonRecord[])[0]!;
+    const panel = (outerColumn.items as JsonRecord[])[0]!;
+    const row = nodes(panel).find(item => item.type === "ColumnSet")!;
+    const rowColumns = row.columns as JsonRecord[];
+    expect(rowColumns).toHaveLength(2);
+    expect(rowColumns[0]).toMatchObject({ width: "24px" });
+    expect((rowColumns[1]?.items as JsonRecord[]).map(item => item.text)).toEqual([
+      "IRC → preview-agent · 未收到回复",
+      "IRC 协作",
+      "失败 · 执行器错误 · 140ms",
     ]);
   });
 

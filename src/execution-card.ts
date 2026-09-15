@@ -947,26 +947,22 @@ function makeToolRow(
                 columns: [
                   {
                     type: "Column",
-                    width: "auto",
+                    width: "24px",
                     verticalContentAlignment: "Center",
                     items: [makeTextBlock(glyph, {
                       spacing: "None",
                       color: tone,
+                      fontType: "Monospace",
                       size: "Small",
+                      wrap: false,
                     })],
                   },
                   {
                     type: "Column",
                     width: "stretch",
-                    items: mainItems,
-                  },
-                  {
-                    type: "Column",
-                    width: "auto",
-                    verticalContentAlignment: "Center",
                     items: [
+                      ...mainItems,
                       makeTextBlock(statusParts.join(" · "), {
-                        horizontalAlignment: "Right",
                         isSubtle: true,
                         size: "Small",
                         spacing: "None",
