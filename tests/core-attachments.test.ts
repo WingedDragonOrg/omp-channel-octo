@@ -43,6 +43,7 @@ const REFUSAL_DISABLED = "附件接收已关闭，未接收任务。";
 const REFUSAL_OVERSIZE = "附件超过 1 MB 上限，未接收任务。";
 const REFUSAL_OVER_BUDGET = "附件过多或下载超时，未接收任务。";
 const REFUSAL_DOWNLOAD_FAILED = "附件下载失败，未接收任务。";
+const REFUSAL_UNSUPPORTED = "不支持的消息类型，不会启动任务。";
 
 interface AttachmentHarness {
   readonly root: string;
@@ -431,6 +432,59 @@ test("下载失败：回复失败文案、清理空目录、不建任务、重�
     await settleReplies(harness, target);
     expect(replyCount(harness, REFUSAL_DOWNLOAD_FAILED)).toBe(1);
     expect(harness.transport.downloadRequests).toHaveLength(1);
+  } finally {
+    await closeAttachmentHarness(harness);
+  }
+});
+
+test("不支持的消息类型：回复固定文案、无任务与下载，重投不重复回复", async () => {
+  const harness = await createAttachmentHarness();
+  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+  // 贴纸（类型表之外）在传输层就是 supported=false、无附件。
+  const sticker = inbound({
+    messageId: "unsupported-sticker",
+    ...target,
+    text: "",
+    supported: false,
+    attachments: [],
+  });
+  try {
+    await harness.service.handleInbound(sticker);
+    await settleReplies(harness, target);
+    await harness.service.handleInbound(sticker);
+    await settleReplies(harness, target);
+
+    // 第二次投递命中同一 messageId 的 command claim，所以拒绝只出现一次。
+    expect(replyCount(harness, REFUSAL_UNSUPPORTED)).toBe(1);
+    expect(taskCount(harness, target)).toBe(0);
+    expect(harness.workers.prompts).toHaveLength(0);
+    expect(harness.transport.downloadRequests).toHaveLength(0);
+  } finally {
+    await closeAttachmentHarness(harness);
+  }
+});
+
+test("文件附件在提示词里渲染为 file 行并原样落盘", async () => {
+  const harness = await createAttachmentHarness();
+  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+  const url = "https://cdn.example.test/quarterly.pdf";
+  const bytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37]);
+  harness.transport.attachmentBodies.set(url, bytes);
+  const message = inbound({
+    messageId: "attach-pdf",
+    ...target,
+    text: "看下文档",
+    attachments: [attachment(url, "file", "quarterly.pdf", { size: bytes.byteLength })],
+  });
+  try {
+    await harness.service.handleInbound(message);
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+
+    const path = savedPath(harness, target, message.messageId, 0, "quarterly.pdf", "file", url);
+    const prompt = harness.workers.prompts[0]!.text;
+    expect(attachmentPathsFromPrompt(prompt)).toEqual([path]);
+    expect(prompt).toContain(`1. file quarterly.pdf ${bytes.byteLength} B → ${path}`);
+    await expectSameBytes(path, bytes);
   } finally {
     await closeAttachmentHarness(harness);
   }
