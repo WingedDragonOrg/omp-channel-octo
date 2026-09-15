@@ -304,25 +304,27 @@ describe("execution tracker", () => {
       color: "Accent",
       fontType: "Monospace",
       size: "Small",
-      text: "│\u00a0├─\u00a0●",
+      text: "│\u00a0├─\u2009[•]",
+      wrap: false,
     });
-    expect(firstTaskColumns[0]).toMatchObject({ width: 12, verticalContentAlignment: "Center" });
-    expect(firstTaskColumns[1]).toMatchObject({ width: 80, verticalContentAlignment: "Center" });
+    expect(firstTaskColumns[0]).toMatchObject({ width: "80px", verticalContentAlignment: "Center" });
+    expect(firstTaskColumns[1]).toMatchObject({ width: "stretch", verticalContentAlignment: "Center" });
     expect(cardText(firstTaskColumns[1]!)).toBe("Wire storage");
     const blockedTaskColumns = foundationRows[1]?.columns as JsonRecord[];
     expect(blockedTaskColumns).toHaveLength(2);
     expect((blockedTaskColumns[0]?.items as JsonRecord[])[0]).toMatchObject({
-      text: "│\u00a0└─\u00a0-",
+      text: "│\u00a0└─\u2009[-]",
       color: "Default",
       fontType: "Monospace",
       size: "Small",
+      wrap: false,
     });
-    expect(blockedTaskColumns[0]).toMatchObject({ width: 12, verticalContentAlignment: "Center" });
-    expect(blockedTaskColumns[1]).toMatchObject({ width: 80, verticalContentAlignment: "Center" });
+    expect(blockedTaskColumns[0]).toMatchObject({ width: "80px", verticalContentAlignment: "Center" });
+    expect(blockedTaskColumns[1]).toMatchObject({ width: "stretch", verticalContentAlignment: "Center" });
     expect(cardText(blockedTaskColumns[1]!)).toBe("Wait for access · 等待授权");
     expect(cardText(blockedCard)).not.toContain("│  ├─");
     expect(blockedRendered!.plain).toContain("├─ Foundation");
-    expect(blockedRendered!.plain).toContain("│  ├─ ● Wire storage");
+    expect(blockedRendered!.plain).toContain("│  ├─ • Wire storage");
     expect(blockedRendered!.plain).toContain("│  └─ - Wait for access · 等待授权");
     expect(blockedRendered!.plain).toContain("   └─ - Run checks");
 
@@ -359,7 +361,7 @@ describe("execution tracker", () => {
     expect(rendered!.plain).toContain("├─ Foundation");
     expect(rendered!.plain).toContain("│  ├─ ✓ Wire storage");
     expect(rendered!.plain).toContain("│  └─ × Wait for access");
-    expect(rendered!.plain).toContain("   └─ ● Run checks");
+    expect(rendered!.plain).toContain("   └─ • Run checks");
   });
 
   test("run_end is authoritative for completed, failed, and cancelled terminal states", () => {
@@ -608,7 +610,7 @@ describe("execution card rendering", () => {
     expect(rowColumns).toHaveLength(3);
     expect(rowColumns[0]).toMatchObject({ width: "auto", verticalContentAlignment: "Center" });
     expect(rowColumns[0]?.items).toEqual([
-      expect.objectContaining({ text: "●", color: "Accent", size: "Small", spacing: "None" }),
+      expect.objectContaining({ text: "•", color: "Accent", size: "Small", spacing: "None" }),
     ]);
     expect(rowColumns[1]).toMatchObject({ width: "stretch" });
     expect(rowColumns[1]?.items).toEqual([
@@ -834,7 +836,7 @@ describe("execution card rendering", () => {
     const running = buildExecutionCard(runningTracker.snapshot(2), fullCapabilities);
     expect(running).not.toBeNull();
     const runningNodes = nodes(running!.card as JsonRecord);
-    const runningGlyphs = runningNodes.filter(node => node.text === "●");
+    const runningGlyphs = runningNodes.filter(node => node.text === "•");
     expect(runningGlyphs).toHaveLength(2);
     expect(runningGlyphs.every(node => node.color === "Accent")).toBe(true);
     const runningRow = runningNodes.find(node => (

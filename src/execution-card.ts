@@ -200,7 +200,9 @@ const TOGGLE_ACTION = "Action.ToggleVisibility";
 const SUCCESS_GLYPH = "✓";
 const WAITING_GLYPH = "-";
 const FAILURE_GLYPH = "×";
-const RUNNING_GLYPH = "●";
+const RUNNING_GLYPH = "•";
+// A fixed pixel slot prevents mobile glyph metrics from moving task content.
+const TODO_MARKER_COLUMN_WIDTH = "80px";
 const WAITING_TOOL_NAMES: Record<string, true> = {
   subagent_await: true,
   wait: true,
@@ -212,8 +214,6 @@ const MAX_LOCAL_TASKS = 128;
 const MAX_VISIBLE_TOOLS = 3;
 const MAX_RENDERED_TOOLS = 32;
 const MAX_COMPACT_TRACE_TOOLS = 8;
-const TODO_MARKER_COLUMN_WEIGHT = 12;
-const TODO_CONTENT_COLUMN_WEIGHT = 80;
 const MAX_VISIBLE_TODO_TASKS = 96;
 const DEFAULT_MAX_NODES = 200;
 const DEFAULT_MAX_DEPTH = 16;
@@ -636,7 +636,6 @@ function toolVisualTone(tool: ExecutionToolSnapshot): "Accent" | "Good" | "Atten
   return executionTone(tool.state);
 }
 
-
 function todoStatusGlyph(status: TodoStatus): string {
   switch (status) {
     case "in_progress":
@@ -770,18 +769,19 @@ function makeTodoTaskRow(
     columns: [
       {
         type: "Column",
-        width: TODO_MARKER_COLUMN_WEIGHT,
+        width: TODO_MARKER_COLUMN_WIDTH,
         verticalContentAlignment: "Center",
-        items: [makeTextBlock(`${continuation}\u00a0${branch}\u00a0${todoStatusGlyph(task.status)}`, {
+        items: [makeTextBlock(`${continuation}\u00a0${branch}\u2009[${todoStatusGlyph(task.status)}]`, {
           color: tone,
           fontType: "Monospace",
           size: "Small",
           spacing: "None",
+          wrap: false,
         })],
       },
       {
         type: "Column",
-        width: TODO_CONTENT_COLUMN_WEIGHT,
+        width: "stretch",
         verticalContentAlignment: "Center",
         items: [makeTextBlock(todoTaskLabel(task), { color: tone, spacing: "None" })],
       },
