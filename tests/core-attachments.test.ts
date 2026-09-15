@@ -1,10 +1,15 @@
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { AttachmentError, attachmentDirectory, safeAttachmentName } from "../src/attachments.ts";
+import {
+  ATTACHMENT_DOWNLOAD_BUDGET_MS,
+  AttachmentError,
+  attachmentDirectory,
+  safeAttachmentName,
+} from "../src/attachments.ts";
 import type {
   AttachmentConfig,
   BotIdentity,
@@ -431,11 +436,11 @@ test("下载失败：回复失败文案、清理空目录、不建任务、重�
   }
 });
 
-test("下载超时：按「过多或超时」文案拒绝，不建任务也不落盘", async () => {
+test("单条附件超时：按「下载失败」文案拒绝，不建任务也不落盘", async () => {
   const harness = await createAttachmentHarness();
   const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
-  // 传输层把单条超时与总预算中止都归类为 timeout；服务层据此选文案而不是笼统的下载失败。
-  harness.transport.attachmentFailure = new AttachmentError("timeout", "download aborted");
+  // 单条 60 秒超时由传输层归类为 timeout；只有整条消息的 120 秒预算耗尽才算「超限」。
+  harness.transport.attachmentFailure = new AttachmentError("timeout", "download timed out");
   const message = inbound({
     messageId: "attach-timeout",
     ...target,
@@ -446,12 +451,83 @@ test("下载超时：按「过多或超时」文案拒绝，不建任务也不�
     await harness.service.handleInbound(message);
     await settleReplies(harness, target);
 
+    expect(replyCount(harness, REFUSAL_DOWNLOAD_FAILED)).toBe(1);
+    expect(replyCount(harness, REFUSAL_OVER_BUDGET)).toBe(0);
+    expect(harness.workers.prompts).toHaveLength(0);
+    expect(taskCount(harness, target)).toBe(0);
+    expect(existsSync(messageDirectory(harness, message, message.messageId))).toBe(false);
+  } finally {
+    await closeAttachmentHarness(harness);
+  }
+});
+
+test("整条消息的下载预算耗尽：按「过多或超时」文案拒绝，不建任务也不落盘", async () => {
+  const harness = await createAttachmentHarness();
+  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+  const url = "https://cdn.example.test/stalled.bin";
+  harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
+  harness.transport.downloadHangs = true;
+  const message = inbound({
+    messageId: "attach-budget",
+    ...target,
+    text: "看下这个大文件",
+    attachments: [attachment(url, "file", "stalled.bin", { size: IMAGE_BYTES.byteLength })],
+  });
+  vi.useFakeTimers();
+  try {
+    const pending = harness.service.handleInbound(message);
+    // 假定时器只接管计时：真实的 fs 步骤照常完成，用真实 I/O 让出事件循环直到下载开始。
+    for (let tick = 0; tick < 200 && harness.transport.downloadRequests.length === 0; tick += 1) {
+      await stat(harness.stateDir);
+    }
+    expect(harness.transport.downloadRequests).toHaveLength(1);
+
+    vi.advanceTimersByTime(ATTACHMENT_DOWNLOAD_BUDGET_MS);
+    vi.useRealTimers();
+    await pending;
+    await settleReplies(harness, target);
+
     expect(replyCount(harness, REFUSAL_OVER_BUDGET)).toBe(1);
     expect(replyCount(harness, REFUSAL_DOWNLOAD_FAILED)).toBe(0);
     expect(harness.workers.prompts).toHaveLength(0);
     expect(taskCount(harness, target)).toBe(0);
     expect(existsSync(messageDirectory(harness, message, message.messageId))).toBe(false);
   } finally {
+    vi.useRealTimers();
+    await closeAttachmentHarness(harness);
+  }
+});
+
+test("语音转写耗尽下载预算：整条任务按「过多或超时」拒绝", async () => {
+  const harness = await createAttachmentHarness();
+  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+  const url = "https://cdn.example.test/voice.amr";
+  harness.transport.attachmentBodies.set(url, AUDIO_BYTES);
+  harness.transport.transcriptionHangs = true;
+  const message = inbound({
+    messageId: "attach-budget-audio",
+    ...target,
+    text: "听下这段语音",
+    attachments: [attachment(url, "audio", "voice.amr", { size: AUDIO_BYTES.byteLength })],
+  });
+  vi.useFakeTimers();
+  try {
+    const pending = harness.service.handleInbound(message);
+    for (let tick = 0; tick < 200 && harness.transport.transcriptionRequests.length === 0; tick += 1) {
+      await stat(harness.stateDir);
+    }
+    expect(harness.transport.transcriptionRequests).toHaveLength(1);
+
+    vi.advanceTimersByTime(ATTACHMENT_DOWNLOAD_BUDGET_MS);
+    vi.useRealTimers();
+    await pending;
+    await settleReplies(harness, target);
+
+    expect(replyCount(harness, REFUSAL_OVER_BUDGET)).toBe(1);
+    expect(harness.workers.prompts).toHaveLength(0);
+    expect(taskCount(harness, target)).toBe(0);
+  } finally {
+    vi.useRealTimers();
     await closeAttachmentHarness(harness);
   }
 });
@@ -679,6 +755,38 @@ test("命令消息带附件不下载：/status 与 /queue <文本>", async () =>
     expect(harness.transport.downloadRequests).toHaveLength(0);
     // /queue 的正文仍是命令参数本身，不带附件块。
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["看下这个报错"]);
+  } finally {
+    await closeAttachmentHarness(harness);
+  }
+});
+
+test("未注册的 /xxx 带附件：按普通任务处理，附件照常落盘并进正文", async () => {
+  const harness = await createAttachmentHarness();
+  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+  const url = "https://cdn.example.test/unregistered.png";
+  harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
+  const text = "/notregistered 看下这张图";
+  try {
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "command-unregistered",
+        ...target,
+        text,
+        attachments: [attachment(url, "image", "unregistered.png", { size: IMAGE_BYTES.byteLength })],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+
+    // 未注册的 /xxx 不是命令，仍是一次普通任务：附件同样被取回并写进正文。
+    expect(harness.transport.downloadRequests).toHaveLength(1);
+    expect(taskCount(harness, target)).toBe(1);
+    const prompt = harness.workers.prompts[0]!.text;
+    expect(prompt).toContain(text);
+    expect(prompt).toContain(ATTACHMENT_HEADER);
+    const path = savedPath(harness, target, "command-unregistered", 0, "unregistered.png", "image", url);
+    expect(attachmentPathsFromPrompt(prompt)).toEqual([path]);
+    await expectSameBytes(path, IMAGE_BYTES);
   } finally {
     await closeAttachmentHarness(harness);
   }

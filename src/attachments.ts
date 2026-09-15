@@ -23,7 +23,12 @@ export interface SavedAttachment {
   transcription: string | null;
 }
 
-export type AttachmentFailureReason = "oversize" | "timeout" | "failed";
+/**
+ * 附件被拒的原因：`oversize` 单条超过配置上限，`failed` / `timeout` 单条附件没能取回
+ * （网络错误、非 2xx、单条 60 秒超时），`budget` 整条消息 120 秒的下载预算耗尽（含转写）。
+ * `budget` 只由服务层的预算计时器判定，其余由传输层抛出；拒绝文案按此区分。
+ */
+export type AttachmentFailureReason = "oversize" | "budget" | "timeout" | "failed";
 
 /**
  * Thrown by `ChannelTransport.downloadAttachment` so the service can pick the matching
@@ -74,13 +79,14 @@ export function safeAttachmentName(
   const extension = /^\.[A-Za-z0-9]{1,12}$/u.test(hinted)
     ? hinted
     : extensionOf(name) || extensionOf(url);
-  const base = (name.split(/[\\/]/u).pop() ?? "")
+  const cleaned = (name.split(/[\\/]/u).pop() ?? "")
     // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u001f\u007f]/gu, "")
     .replace(/[:*?"<>|]/gu, "_")
     .trim()
-    .replace(/^\.+/u, "")
-    .slice(0, MAX_ATTACHMENT_NAME_LENGTH);
+    .replace(/^\.+/u, "");
+  // 按 code point 截断：按 UTF-16 单元切会留下孤立代理位，落盘名与提示词里会出现 U+FFFD。
+  const base = Array.from(cleaned).slice(0, MAX_ATTACHMENT_NAME_LENGTH).join("");
   if (base.length === 0) return `${index}-${kind}${extension}`;
   return `${index}-${base.toLowerCase().endsWith(extension.toLowerCase()) || extension.length === 0 ? base : `${base}${extension}`}`;
 }
@@ -124,14 +130,17 @@ export function formatBytes(bytes: number): string {
 
 /**
  * Removes attachment directories whose last modification is older than `maxAgeMs`.
- * Best-effort: individual failures are ignored so a stale entry cannot block startup.
+ * Best-effort: a failing entry is logged and skipped so it can neither block startup nor
+ * keep the remaining directories from being scanned.
  */
 export async function sweepAttachments(stateDir: string, maxAgeMs: number, now = Date.now()): Promise<number> {
   const root = attachmentRoot(stateDir);
   let channels: string[];
   try {
     channels = await readdir(root);
-  } catch {
+  } catch (error) {
+    // 首次启动还没有附件目录是正常情形；其余读取失败必须留痕，否则清理长期失效无从发现。
+    if (errnoCode(error) !== "ENOENT") console.error(`[attachments] 无法读取附件目录 ${root}`, error);
     return 0;
   }
   let removed = 0;
@@ -140,7 +149,8 @@ export async function sweepAttachments(stateDir: string, maxAgeMs: number, now =
     let messages: string[];
     try {
       messages = await readdir(channelPath);
-    } catch {
+    } catch (error) {
+      if (errnoCode(error) !== "ENOENT") console.error(`[attachments] 无法读取附件目录 ${channelPath}`, error);
       continue;
     }
     for (const message of messages) {
@@ -150,15 +160,25 @@ export async function sweepAttachments(stateDir: string, maxAgeMs: number, now =
         if (!info.isDirectory() || now - info.mtimeMs <= maxAgeMs) continue;
         await rm(messagePath, { recursive: true, force: true });
         removed += 1;
-      } catch {
+      } catch (error) {
+        if (errnoCode(error) !== "ENOENT") console.error(`[attachments] 清理 ${messagePath} 失败`, error);
         continue;
       }
     }
     try {
       if ((await readdir(channelPath)).length === 0) await rm(channelPath, { recursive: true, force: true });
-    } catch {
+    } catch (error) {
+      if (errnoCode(error) !== "ENOENT") console.error(`[attachments] 移除空目录 ${channelPath} 失败`, error);
       continue;
     }
   }
   return removed;
+}
+
+/** 目录操作的 errno：日志要区分「目录本来就不在」与「真的失败」。 */
+function errnoCode(error: unknown): string | undefined {
+  if (error !== null && typeof error === "object" && "code" in error && typeof error.code === "string") {
+    return error.code;
+  }
+  return undefined;
 }

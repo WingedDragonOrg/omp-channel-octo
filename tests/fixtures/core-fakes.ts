@@ -116,6 +116,10 @@ export class FakeTransport implements ChannelTransport {
   attachmentFailure: AttachmentError | undefined;
   /** When set, `transcribeAudio` throws this instead of consulting `transcriptionByPath`. */
   transcriptionError: Error | undefined;
+  /** When true, `downloadAttachment` waits for its signal to abort instead of finishing. */
+  downloadHangs = false;
+  /** When true, `transcribeAudio` waits for its signal to abort instead of answering. */
+  transcriptionHangs = false;
   readonly bot: BotIdentity;
   online: boolean;
   maxConcurrentTextRequests = 0;
@@ -527,6 +531,15 @@ export class FakeTransport implements ChannelTransport {
     if (request.signal?.aborted) {
       throw new AttachmentError("failed", "fixture attachment download aborted");
     }
+    if (this.downloadHangs) {
+      await new Promise<never>((_resolve, reject) => {
+        request.signal?.addEventListener(
+          "abort",
+          () => reject(new AttachmentError("timeout", "fixture attachment download timed out")),
+          { once: true },
+        );
+      });
+    }
     if (this.attachmentFailure) throw this.attachmentFailure;
     const body = this.attachmentBodies.get(request.url);
     if (!body) throw new AttachmentError("failed", `fixture has no body for ${request.url}`);
@@ -541,6 +554,11 @@ export class FakeTransport implements ChannelTransport {
   async transcribeAudio(path: string, signal?: AbortSignal): Promise<string | null> {
     this.transcriptionRequests.push(path);
     if (signal?.aborted) throw new Error("fixture transcription aborted");
+    if (this.transcriptionHangs) {
+      await new Promise<never>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("fixture transcription aborted")), { once: true });
+      });
+    }
     if (this.transcriptionError) throw this.transcriptionError;
     return this.transcriptionByPath.get(path) ?? null;
   }

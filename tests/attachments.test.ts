@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import { mkdir, mkdtemp, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
@@ -72,6 +72,19 @@ test("falls back to the index and kind when nothing usable is left of the name",
 test("truncates an overlong name to 80 characters before appending the extension", () => {
   const name = safeAttachmentName(`${"x".repeat(100)}.png`, 5, "image", "https://host/y.png");
   expect(name).toBe(`5-${"x".repeat(80)}.png`);
+});
+
+test("counts the 80-character limit in code points, so a surrogate pair is never cut in half", () => {
+  const emoji = "😀".repeat(41); // 41 code points, 82 UTF-16 units: nothing to cut
+  expect(safeAttachmentName(emoji, 5, "image", "https://host/y.png")).toBe(`5-${emoji}.png`);
+
+  const boundary = `${"x".repeat(79)}😀`; // 80 code points, 81 units: the cut must not land inside the pair
+  const kept = safeAttachmentName(boundary, 6, "image", "https://host/y.png");
+  expect(kept).toBe(`6-${boundary}.png`);
+  // 落盘名按 UTF-8 编码：孤立代理位会被写成 U+FFFD，往返编码一次就能看出来。
+  expect(Buffer.from(kept, "utf8").toString("utf8")).toBe(kept);
+
+  expect(safeAttachmentName(`${"y".repeat(85)}😀`, 7, "image", "https://host/y.png")).toBe(`7-${"y".repeat(80)}.png`);
 });
 
 test("keeps same-named attachments of one message apart by index", () => {
@@ -241,11 +254,39 @@ test("sweeps stale message directories and removes emptied channel directories",
   }
 });
 
-test("returns zero when the attachment root does not exist", async () => {
+test("returns zero without logging when the attachment root does not exist", async () => {
   const root = await mkdtemp(join(tmpdir(), "omp-channel-octo-attachments-"));
+  const logged = vi.spyOn(console, "error").mockImplementation(() => {});
   try {
     expect(await sweepAttachments(join(root, "state"), ATTACHMENT_MAX_AGE_MS, Date.now())).toBe(0);
+    expect(logged).not.toHaveBeenCalled();
   } finally {
+    logged.mockRestore();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("logs a directory it cannot read and still sweeps the remaining ones", async () => {
+  const root = await mkdtemp(join(tmpdir(), "omp-channel-octo-attachments-"));
+  const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const stateDir = join(root, "state");
+    const staleMessage = join(attachmentRoot(stateDir), "1-dm", "msg-old");
+    await mkdir(staleMessage, { recursive: true });
+    await writeFile(join(staleMessage, "1-chart.png"), "stale");
+    const now = Date.now();
+    const stale = new Date(now - ATTACHMENT_MAX_AGE_MS - 24 * 60 * 60 * 1000);
+    await utimes(staleMessage, stale, stale);
+    // 通道位被一个普通文件占住：readdir 以 ENOTDIR 失败，清理要留痕并且继续处理后续通道。
+    const blocked = join(attachmentRoot(stateDir), "not-a-directory");
+    await writeFile(blocked, "blocker");
+
+    expect(await sweepAttachments(stateDir, ATTACHMENT_MAX_AGE_MS, now)).toBe(1);
+    expect(await exists(staleMessage)).toBe(false);
+    expect(await exists(blocked)).toBe(true);
+    expect(logged).toHaveBeenCalledWith(expect.stringContaining(blocked), expect.anything());
+  } finally {
+    logged.mockRestore();
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -258,6 +299,6 @@ test("exposes the failure reason and a stable name on AttachmentError", () => {
   expect(error.reason).toBe("oversize");
   expect(error.message).toBe("attachment exceeds the 25 MB limit");
 
-  const reasons: AttachmentFailureReason[] = ["oversize", "timeout", "failed"];
+  const reasons: AttachmentFailureReason[] = ["oversize", "budget", "timeout", "failed"];
   expect(reasons.map(reason => new AttachmentError(reason, reason).reason)).toEqual(reasons);
 });

@@ -463,14 +463,17 @@ async function existingFileSize(path: string): Promise<number | null> {
   }
 }
 
-/** 失败原因到拒绝文案：超限给出配置的 MB 上限（整数不带小数，非整数保留一位），其余固定文案。 */
+/**
+ * 失败原因到拒绝文案：单条超限给出配置的 MB 上限（整数不带小数，非整数保留一位），
+ * 整条消息的预算耗尽给出超限文案，单条附件取不回来给出下载失败文案。
+ */
 function attachmentRefusalText(reason: AttachmentFailureReason, maxBytes: number): string {
   if (reason === "oversize") {
     const megabytes = maxBytes / (1024 * 1024);
     const limit = Number.isInteger(megabytes) ? `${megabytes}` : megabytes.toFixed(1);
     return `附件超过 ${limit} MB 上限，未接收任务。`;
   }
-  if (reason === "timeout") return ATTACHMENTS_OVER_BUDGET_TEXT;
+  if (reason === "budget") return ATTACHMENTS_OVER_BUDGET_TEXT;
   return ATTACHMENT_DOWNLOAD_FAILED_TEXT;
 }
 
@@ -727,7 +730,10 @@ class CoreService implements ChannelService {
         }
         return;
       }
-      await this.acceptTask(message, message.text);
+      // 未注册的 /xxx 不是命令，仍按普通任务走唯一组装点，附件照常取回。
+      const slashPrompt = await this.materializeInbound(message);
+      if (slashPrompt === null) return;
+      await this.acceptTask(message, slashPrompt);
       return;
     }
     if (await this.answerPendingQuestion(message, text)) return;
@@ -795,8 +801,9 @@ class CoreService implements ChannelService {
             });
           } catch (error) {
             if (error instanceof AttachmentError && error.reason === "oversize") throw error;
-            // 唯一的两种中止来源（单条超时、整条预算）都按超时失败归类。
-            if (signal.aborted) throw new AttachmentError("timeout", "attachment download aborted");
+            // 单条 60 秒超时与整条 120 秒预算都会中止同一条 signal；只有预算耗尽按「超限」回复。
+            if (budget.signal.aborted) throw new AttachmentError("budget", "attachment budget exhausted");
+            if (signal.aborted) throw new AttachmentError("timeout", "attachment download timed out");
             if (error instanceof AttachmentError) throw error;
             throw new AttachmentError("failed", "attachment download failed");
           }
@@ -846,7 +853,7 @@ class CoreService implements ChannelService {
       return transcription !== null && transcription.trim().length > 0 ? transcription : null;
     } catch {
       if (budgetSignal.aborted) {
-        throw new AttachmentError("timeout", "attachment budget exhausted during transcription");
+        throw new AttachmentError("budget", "attachment budget exhausted during transcription");
       }
       return null;
     }
