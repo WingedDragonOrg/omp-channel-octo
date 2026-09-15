@@ -4,11 +4,16 @@ import {
   assistantText,
   closeCoreHarness,
   createCoreHarness,
+  type FakePromptContext,
   FakeTransport,
   FakeWorkerFactory,
   inbound,
   waitForStatus,
 } from "./fixtures/core-fakes";
+
+const flushMicrotasks = async (): Promise<void> => {
+  for (let step = 0; step < 8; step += 1) await Promise.resolve();
+};
 
 type TypingCall = {
   target: ChatTarget;
@@ -508,23 +513,25 @@ test("failed terminal execution events preserve todo phases and error category",
     await closeCoreHarness(harness);
   }
 });
-test("a running tool card ticker advances elapsed time without new events and stops at terminal", async () => {
+test("a running tool card only re-renders on real events and stops at terminal", async () => {
   const transport = new PresentationTransport();
   const promptStarted = Promise.withResolvers<void>();
   const workerGate = Promise.withResolvers<void>();
+  let emitLater: FakePromptContext["emit"] | undefined;
   const task = inbound({
-    messageId: "presentation-card-ticker",
-    channelId: "dm-presentation-card-ticker",
+    messageId: "presentation-card-idle",
+    channelId: "dm-presentation-card-idle",
     text: "hold a tool",
   });
   const harness = await createCoreHarness({
     transport,
     prompt: async ({ emit }) => {
+      emitLater = emit;
       const startedAt = Date.now();
-      emit({ type: "turn_start", turnId: "turn-ticker", atMs: startedAt });
+      emit({ type: "turn_start", turnId: "turn-idle", atMs: startedAt });
       emit({
         type: "tool_start",
-        toolCallId: "tool-ticker",
+        toolCallId: "tool-idle",
         toolName: "shell",
         atMs: Date.now(),
         summary: "long running",
@@ -533,42 +540,44 @@ test("a running tool card ticker advances elapsed time without new events and st
       await workerGate.promise;
     },
   });
-  const firstEditPromise = transport.waitForProgressCard(
-    (edit) => edit.progress.state === "running",
-  );
-  const terminalCardPromise = transport.waitForProgressCard(
-    (edit) => edit.progress.state === "completed",
-  );
   try {
+    vi.useFakeTimers();
     await harness.service.handleInbound(task);
     await promptStarted.promise;
-
-
-    const firstEdit = (await firstEditPromise).progress;
-    expect(firstEdit.state).toBe("running");
+    await flushMicrotasks();
     expect(transport.progressCardSends).toHaveLength(1);
-    const initialElapsed = transport.progressCardSends[0]?.progress.elapsedMs ?? -1;
-    expect(firstEdit.elapsedMs).toBeGreaterThan(initialElapsed);
+    expect(transport.progressCardEdits).toHaveLength(0);
 
-    const secondEditPromise = transport.waitForProgressCard(
-      (edit) => edit.progress.state === "running" && edit.progress.elapsedMs > firstEdit.elapsedMs,
-    );
-    const secondEdit = (await secondEditPromise).progress;
-    expect(secondEdit.elapsedMs).toBeGreaterThan(firstEdit.elapsedMs);
+    vi.advanceTimersByTime(60_000);
+    await flushMicrotasks();
+    expect(transport.progressCardEdits).toHaveLength(0);
+
+    emitLater?.({
+      type: "tool_end",
+      toolCallId: "tool-idle",
+      atMs: Date.now(),
+      status: "succeeded",
+      summary: "long running",
+    });
+    vi.advanceTimersByTime(1_000);
+    await flushMicrotasks();
+    expect(transport.progressCardEdits).toHaveLength(1);
+    expect(transport.progressCardEdits[0]?.progress.tools[0]?.state).toBe("succeeded");
 
     workerGate.resolve();
-    await waitForStatus(
-      harness.service,
-      task,
-      (status) => status.state === "completed" && status.outbox === 0,
-    );
-    const terminal = await terminalCardPromise;
-    expect(terminal.progress.state).toBe("completed");
+    for (let step = 0; step < 10 && transport.progressCardEdits.at(-1)?.progress.state !== "completed"; step += 1) {
+      vi.advanceTimersByTime(1_000);
+      await flushMicrotasks();
+    }
+    const terminal = transport.progressCardEdits.at(-1);
+    expect(terminal?.progress.state).toBe("completed");
     const editCount = transport.progressCardEdits.length;
-    await new Promise<void>((resolve) => setTimeout(resolve, 1_100));
+    vi.advanceTimersByTime(120_000);
+    await flushMicrotasks();
     expect(transport.progressCardEdits).toHaveLength(editCount);
   } finally {
     workerGate.resolve();
+    vi.useRealTimers();
     await closeCoreHarness(harness);
   }
 }, 10_000);

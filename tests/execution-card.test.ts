@@ -740,7 +740,10 @@ describe("execution card rendering", () => {
     const timelineHeader = timelineItems[0]!;
     expect(nodes(timelineHeader).some(node => node.id === "btn_collapse_trace")).toBe(false);
     expect(nodes(timelineHeader).some(node => node.id === "btn_expand_trace")).toBe(false);
-    expect(nodes(card).some(node => node.type === "Action.ToggleVisibility")).toBe(false);
+    const toggleActionIds = nodes(card)
+      .filter(node => node.type === "Action.ToggleVisibility")
+      .map(node => node.id);
+    expect(toggleActionIds.sort()).toEqual(["progress_collapse", "progress_expand"]);
   });
 
   test("renders step panels with an aligned marker, body, and status stack", () => {
@@ -863,6 +866,52 @@ describe("execution card rendering", () => {
       expect(collapsedTarget.isVisible).toBe(!expandedTarget.isVisible);
     }
   });
+  test("offers the whole-card collapse control while the run is still active", () => {
+    const tracker = createExecutionTracker({ runId: "running-collapse" });
+    startTurn(tracker, "turn-1", 0);
+    startTool(tracker, "tool-1", "read", 1, "读取文件");
+    tracker.apply({ type: "tool_end", toolCallId: "tool-1", atMs: 2, status: "succeeded" });
+    startTool(tracker, "subagent-1", "task", 3, "运行子代理");
+    tracker.apply({
+      type: "todo_update",
+      atMs: 4,
+      op: "init",
+      phases: [{ name: "执行阶段", tasks: [{ content: "进行中任务", status: "in_progress" }] }],
+    });
+    const snapshot = tracker.snapshot(5);
+    expect(snapshot.state).toBe("running");
+    const rendered = buildExecutionCard(snapshot, fullCapabilities);
+
+    expect(rendered).not.toBeNull();
+    const card = rendered!.card as JsonRecord;
+    expect(nodeById(card, "todo_detail").isVisible).not.toBe(false);
+    expect(nodeById(card, "subagent_section").isVisible).not.toBe(false);
+    expect(nodeById(card, "timeline_section").isVisible).not.toBe(false);
+
+    const header = nodeById(card, "octo-execution-trace-header");
+    expect(nodes(header).some(node => node.id === "btn_collapse_progress")).toBe(true);
+    expect(nodeById(card, "btn_collapse_progress")).toMatchObject({ isVisible: true });
+    expect(nodeById(card, "btn_expand_progress")).toMatchObject({ isVisible: false });
+
+    const collapseAction = toggleActionById(card, "progress_collapse");
+    expect(collapseAction.title).toBe("收起");
+    expect(targetElements(collapseAction)).toEqual([
+      { elementId: "todo_detail", isVisible: false },
+      { elementId: "subagent_section", isVisible: false },
+      { elementId: "timeline_section", isVisible: false },
+      { elementId: "btn_collapse_progress", isVisible: false },
+      { elementId: "btn_expand_progress", isVisible: true },
+    ]);
+    const expandAction = toggleActionById(card, "progress_expand");
+    expect(targetElements(expandAction)).toEqual([
+      { elementId: "todo_detail", isVisible: true },
+      { elementId: "subagent_section", isVisible: true },
+      { elementId: "timeline_section", isVisible: true },
+      { elementId: "btn_collapse_progress", isVisible: true },
+      { elementId: "btn_expand_progress", isVisible: false },
+    ]);
+  });
+
   test("collapses completed progress details behind a header expand control", () => {
     const tracker = createExecutionTracker({ runId: "terminal-collapse" });
     startTurn(tracker, "turn-1", 0);
@@ -1288,11 +1337,13 @@ describe("execution card rendering", () => {
     const timelineSection = nodeById(card, "timeline_section");
     const timelineHeader = (timelineSection.items as JsonRecord[])[0]!;
     expect(nodes(timelineHeader).some(node => node.id === "btn_expand_trace")).toBe(true);
+    // Budget just above the smallest viable running card: the subagent section
+    // survives while trace rows are dropped first.
     const fullyBudgeted = buildExecutionCard(
       tracker.snapshot(1_800),
       {
         ...fullCapabilities,
-        limits: { ...fullCapabilities.limits, maxNodes: 180 },
+        limits: { ...fullCapabilities.limits, maxNodes: 195 },
       },
     );
     expect(fullyBudgeted).not.toBeNull();
@@ -1307,8 +1358,11 @@ describe("execution card rendering", () => {
     expect(nodes(fullyBudgetedCard).some(node => node.id === "btn_expand_subagents")).toBe(true);
     const budgetedTimeline = nodeById(fullyBudgetedCard, "timeline_detail");
     const budgetedTraceRows = (budgetedTimeline.items as JsonRecord[]).filter(item => item.type === "ColumnSet");
-    expect(budgetedTraceRows).toHaveLength(0);
-    expect(nodes(fullyBudgetedCard).some(node => node.id === "timeline_omitted_steps")).toBe(true);
+    // A tight budget keeps recent trace steps visible and hides older ones
+    // behind the expand control instead of dropping trace detail entirely.
+    expect(budgetedTraceRows.length).toBeGreaterThan(0);
+    expect(budgetedTraceRows.filter(row => row.isVisible !== false).length).toBeLessThanOrEqual(3);
+    expect(budgetedTraceRows.some(row => row.isVisible === false)).toBe(true);
     expect(nodes(fullyBudgetedCard).some(node => node.id === "btn_expand_trace")).toBe(true);
   });
   test("prioritizes current and blocked todo tasks while preserving order and reporting omissions", () => {

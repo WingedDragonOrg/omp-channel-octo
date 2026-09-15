@@ -350,6 +350,78 @@ describe("Octo registration and WuKongIM transport", () => {
     });
   });
 
+  test("strips a verified bot mention wherever the client placed it", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const started = await startFixtureTransport({}, async (message) => {
+      received.push(message as unknown as Record<string, unknown>);
+    });
+    const { connection } = started;
+    const botPrefix = `@${fixture!.botName}`;
+    const mentionLength = botPrefix.length;
+
+    fixture!.sendInboundBatch(connection, [
+      {
+        fromUid: fixture!.ownerUid,
+        channelId: "group-trailing-entity",
+        channelType: 2,
+        text: `/status ${botPrefix}`,
+        mention: {
+          entities: [{ uid: fixture!.botUid, offset: "/status ".length, length: mentionLength }],
+        },
+        messageId: "9007199254741021",
+        messageSeq: 71,
+      },
+      {
+        fromUid: fixture!.ownerUid,
+        channelId: "group-trailing-uid",
+        channelType: 2,
+        text: `/new /tmp ${botPrefix}`,
+        mention: { uids: [fixture!.botUid] },
+        messageId: "9007199254741022",
+        messageSeq: 72,
+      },
+      {
+        fromUid: fixture!.ownerUid,
+        channelId: "group-inline-uid",
+        channelType: 2,
+        text: `清理 ${botPrefix} 这个目录`,
+        mention: { uids: [fixture!.botUid] },
+        messageId: "9007199254741023",
+        messageSeq: 73,
+      },
+      {
+        fromUid: fixture!.ownerUid,
+        channelId: "group-trailing-uid-token",
+        channelType: 2,
+        text: `/status @${fixture!.botUid}`,
+        mention: { uids: [fixture!.botUid] },
+        messageId: "9007199254741025",
+        messageSeq: 74,
+      },
+      {
+        fromUid: fixture!.ownerUid,
+        channelId: "group-unverified-uid",
+        channelType: 2,
+        text: `${botPrefix} /status`,
+        mention: { uids: ["other-member"] },
+        messageId: "9007199254741024",
+        messageSeq: 75,
+      },
+    ]);
+
+    await waitForFixture(
+      () => received.length === 5 ? received : undefined,
+      2_000,
+      "fixture mention placements were not delivered",
+    );
+
+    expect(received[0]).toMatchObject({ channelId: "group-trailing-entity", text: "/status" });
+    expect(received[1]).toMatchObject({ channelId: "group-trailing-uid", text: "/new /tmp" });
+    expect(received[2]).toMatchObject({ channelId: "group-inline-uid", text: "清理  这个目录" });
+    expect(received[3]).toMatchObject({ channelId: "group-trailing-uid-token", text: "/status" });
+    expect(received[4]).toMatchObject({ channelId: "group-unverified-uid", text: `${botPrefix} /status` });
+  });
+
   test("re-registers and authenticates with fresh credentials after reconnect", async () => {
     fixture = await createOctoProtocolFixture({
       registrationTokens: ["im-token-first", "im-token-second"],

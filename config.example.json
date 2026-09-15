@@ -3,5 +3,8 @@
   "botTokenEnv": "OCTO_BOT_TOKEN",
   "allowedGroupIds": [],
   "ompCommand": "omp",
-  "stateDir": "~/.local/state/omp-channel-octo"
+  "stateDir": "~/.local/state/omp-channel-octo",
+  "restart": {
+    "command": ["super", "-y", "restart", "omp-channel-octo"]
+  }
 }

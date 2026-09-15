@@ -1,0 +1,12 @@
+# Worktrunk project configuration — https://worktrunk.dev/config/
+# Hooks run inside each new worktree. `bun install` is blocking so a worktree is
+# never handed over with dependencies half-installed.
+
+[pre-start]
+deps = "bun install"
+
+# Merge gate. Both commands run concurrently and every one must pass.
+
+[pre-merge]
+typecheck = "bun run typecheck"
+test = "bun test"

@@ -27,6 +27,7 @@ type Scenario =
 	| "tool-summary"
 	| "todo-progress"
 	| "hub-summary"
+	| "command-summary"
 	| "todo-failed"
 	| "continuation"
 	| "model-error"
@@ -458,6 +459,40 @@ function emitSpecialToolSummaryScenario(id: string | undefined): void {
 	appendLog({ kind: "turn_complete", id, specialToolSummary: true });
 }
 
+function emitCommandSummaryScenario(id: string | undefined): void {
+	const calls = [
+		{
+			toolCallId: "fixture-command-serve-1",
+			toolName: "bash",
+			args: {
+				command: "set -a && . ./.envrc && set +a &&\nbun run src/cli.ts serve --config \"$HOME/Library/Application Support/omp-channel-octo/config.json\"",
+				cwd: "SECRET_COMMAND_CWD",
+				env: { OCTO_BOT_TOKEN: "SECRET_COMMAND_ENV" },
+			},
+		},
+		{
+			toolCallId: "fixture-command-grep-2",
+			toolName: "bash",
+			args: { command: 'grep -rn "tool_execution_start" tests/ | head -20' },
+		},
+	] as const;
+	emit({ type: "agent_start" });
+	emit({ type: "turn_start", turnIndex: 0, timestamp: 6_000 });
+	for (const call of calls) {
+		emit({ type: "tool_execution_start", ...call });
+		emit({
+			type: "tool_execution_end",
+			toolCallId: call.toolCallId,
+			toolName: call.toolName,
+			result: { content: [{ type: "text", text: "SECRET_COMMAND_RESULT" }], details: {} },
+			isError: false,
+		});
+	}
+	emit({ type: "turn_end", turnIndex: 0 });
+	emit({ type: "agent_end", messages: [], willContinue: false });
+	appendLog({ kind: "turn_complete", id, commandSummary: true });
+}
+
 function emitTodoScenario(id: string | undefined, failed = false): void {
 	const phases = [
 		{
@@ -700,6 +735,10 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 	}
 	if (scenario === "hub-summary") {
 		setTimeout(() => emitSpecialToolSummaryScenario(id), 35);
+		return;
+	}
+	if (scenario === "command-summary") {
+		setTimeout(() => emitCommandSummaryScenario(id), 35);
 		return;
 	}
 	if (scenario === "message-end") {

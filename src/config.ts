@@ -20,6 +20,7 @@ const CONFIG_KEYS = new Set([
   "stateDir",
   "startupTimeoutMs",
   "cancelTimeoutMs",
+  "restart",
 ]);
 const TOKEN_ENV_PATTERN = /^(?:OCTO_|OMP_CHANNEL_OCTO_)[A-Za-z_][A-Za-z0-9_]*$/u;
 const MIN_TIMEOUT_MS = 100;
@@ -35,6 +36,8 @@ export interface AppConfig extends CoreServiceConfig {
   ompExtraArgs: string[];
   startupTimeoutMs?: number;
   cancelTimeoutMs?: number;
+  /** Deployment restart command, e.g. ["super", "-y", "restart", "omp-channel-octo"]. */
+  restartCommand?: string[];
 }
 
 export interface ConfigParseOptions {
@@ -118,6 +121,22 @@ function parseBotTokenEnv(value: unknown): string {
   return name;
 }
 
+function parseRestartCommand(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw configError("restart 必须是 JSON 对象");
+  }
+  const document = value as Record<string, unknown>;
+  for (const key of Object.keys(document)) {
+    if (key !== "command") throw configError(`不支持字段 restart.${key}`);
+  }
+  if (document.command === undefined) return undefined;
+  if (!Array.isArray(document.command) || document.command.length === 0) {
+    throw configError("restart.command 必须是非空字符串数组");
+  }
+  return document.command.map((entry, index) => requireString(entry, `restart.command[${index}]`));
+}
+
 export function parseConfig(input: unknown, options: ConfigParseOptions = {}): AppConfig {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw configError("根值必须是 JSON 对象");
@@ -168,6 +187,7 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
 
   const startupTimeoutMs = parseTimeout(document.startupTimeoutMs, "startupTimeoutMs");
   const cancelTimeoutMs = parseTimeout(document.cancelTimeoutMs, "cancelTimeoutMs");
+  const restartCommand = parseRestartCommand(document.restart);
 
   return {
     apiUrl,
@@ -182,6 +202,7 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
     stateDir: resolveLocalPath(document.stateDir, "stateDir", home),
     ...(startupTimeoutMs === undefined ? {} : { startupTimeoutMs }),
     ...(cancelTimeoutMs === undefined ? {} : { cancelTimeoutMs }),
+    ...(restartCommand === undefined ? {} : { restartCommand }),
   };
 }
 

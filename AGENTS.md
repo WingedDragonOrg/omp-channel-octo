@@ -1,0 +1,123 @@
+# Repository Guidelines
+
+## Project Overview
+
+`omp-channel-octo` is a private, resident TypeScript/Bun service that connects one Octo User Bot to a local OMP assistant. It accepts authenticated private messages and explicitly authorized group or CommunityTopic messages, keeps per-chat OMP sessions and durable task state, and returns assistant text, files, and optional execution progress cards. OMP runs as a child process over stdio RPC; it is not exposed through a network listener.
+
+The design and behavioral contract are recorded in `docs/specs/2026-09-12-octo-channel-design.md`. Read it before changing permissions, commands, session movement, output delivery, persistence, or lifecycle behavior.
+
+## Architecture & Data Flow
+
+The main runtime path is:
+
+```text
+Octo HTTP/WebSocket
+  -> OctoTransport (`src/octo/index.ts`)
+  -> CoreService (`src/service.ts`)
+  -> ChannelStore (`src/store.ts`): authorization, deduplication, bindings, tasks, outbox
+  -> OMP worker (`src/omp/index.ts`): child process and stdio RPC
+  -> WorkerEvent / ExecutionEvent
+  -> durable outbox + ExecutionTracker
+  -> Octo text, file, typing, and progress-card operations
+```
+
+- `src/cli.ts` owns command dispatch and process lifecycle. `main` handles `check`, `serve`/`start`, and `launchd`; `runServe` constructs the transport, worker factory, and service, then owns SIGINT/SIGTERM shutdown. Signal handlers must be removed only by the code that installed them; preserve unrelated host-process listeners.
+- `OctoTransport` performs Bot registration, encrypted WebSocket communication, HTTP operations, inbound normalization, reconnection, message/file delivery, and AdaptiveCard capability checks. `ChatTarget` is keyed by the real `channelType` and `channelId`, not a display name.
+- `CoreService` validates owner, group allowlist, thread identity, and structured bot mentions before handling commands or starting OMP. Built-ins are `/new`, `/reset`, `/move`, `/cancel`, `/status`, `/help`, and `/restart`; while a chat has a pending `ask` question, the owner's next non-command text in that chat is its answer rather than a new task. With no persisted owner, the first valid private message claims ownership, is durably deduplicated, and only receives confirmation; it does not execute that message.
+- `ChannelStore` opens `channel.sqlite` under `stateDir` with SQLite WAL/foreign keys. It persists owners, bindings, inbound claims, tasks, outbox records, questions, and the worker ledger. Durable acceptance precedes side effects; after a task crosses the `started` boundary, restart or reconnect must not automatically rerun it.
+- `src/omp/index.ts` launches the installed OMP executable with an explicit RPC mode, yolo approval mode, cwd, and session directory. Keep the RPC decoder and OMP process lifecycle isolated from the host service. Worker cancellation uses bounded process/group shutdown and watchdog bookkeeping.
+- `src/project-session.ts` validates session headers, canonical cwd, session IDs, and `previousSessionFiles` breadcrumbs. Native `/move` preserves session identity; external recovery accepts only an exact, uniquely verified session rather than a recent or fuzzy file match.
+- Assistant output is cumulative per assistant message: stable local/remote IDs, immediate first nonempty create, serialized edits throttled to one second, authoritative final snapshots, and stable 3,000-UTF-8-byte segments. Do not merge separate assistant messages or let an older snapshot overwrite a newer one.
+- `src/execution-card.ts` provides `ExecutionTracker`, safe execution snapshots, and AdaptiveCard construction. Real tool/turn/todo/run events feed one editable progress card; capability and payload limits are checked before sending it, and card failures must not block text delivery.
+
+## Key Directories
+
+| Path | Purpose |
+| --- | --- |
+| `src/` | Production CLI, service orchestration, contracts, configuration, persistence, session handling, and presentation. |
+| `src/octo/` | Octo HTTP/WebSocket transport, encrypted wire framing, inbound normalization, uploads, typing, text, and card delivery. |
+| `src/omp/` | OMP child-process RPC worker, v1/v2 frame decoding, session-root resolution, host-tool calls, and process cleanup. |
+| `tests/` | Behavioral, integration, lifecycle, transport, persistence, streaming, recovery, and boundary tests. |
+| `tests/fixtures/` | Deterministic fakes plus HTTP/WebSocket and real-child-process protocol fixtures. |
+| `docs/specs/` | Confirmed product and architecture specification. |
+
+## Development Commands
+
+Install and run the standard checks:
+
+```sh
+bun install
+bun run typecheck
+bun test
+```
+
+Create a local configuration and exercise the service:
+
+```sh
+mkdir -p ~/.config/omp-channel-octo
+cp config.example.json ~/.config/omp-channel-octo/config.json
+chmod 600 ~/.config/omp-channel-octo/config.json
+bun run check -- --config ~/.config/omp-channel-octo/config.json
+bun run serve -- --config ~/.config/omp-channel-octo/config.json
+```
+
+`check` validates configuration, Bot registration, and an OMP fresh-worker start/stop path; it deliberately does not call a model. `start` is an alias for `serve`. The default config path is `~/.config/omp-channel-octo/config.json`.
+
+For macOS launchd:
+
+```sh
+bun run launchd -- install --config ~/.config/omp-channel-octo/config.json
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.omp.channel-octo.plist"
+launchctl bootout "gui/$(id -u)/com.omp.channel-octo"
+bun run launchd -- uninstall --plist "$HOME/Library/LaunchAgents/com.omp.channel-octo.plist"
+```
+
+`launchd install` writes a private plist and does not call `launchctl`; loading and unloading are explicit operational steps. The generated plist uses the resolved OMP executable path and restrictive permissions.
+
+## Code Conventions & Common Patterns
+
+- Use strict TypeScript contracts from `src/contracts.ts` and explicit dependency injection through `createChannelService`, `createOctoTransport`, `createWorkerFactory`, and option interfaces. Keep transport, persistence, worker, and presentation seams independently testable.
+- Keep explicit `.ts` import extensions and follow the ESM/Bundler configuration in `tsconfig.json`.
+- Validate untrusted config, protocol frames, message metadata, paths, and tool results at their boundaries. Use type guards and bounded body/frame sizes instead of assuming external shapes.
+- Use `AbortSignal` and bounded deadlines for network activity, typing/card operations, worker cancellation, and shutdown. Pair resource ownership with `try`/`finally`; preserve the original error when rolling back a store transaction.
+- Route state changes through `ChannelStore` transactions and persist durable acceptance, desired outbox versions, and stable client IDs before network operations. Reconnect recovery resumes delivery; it does not rerun an already-started task.
+- Serialize by normalized realpath and chat target. A move holds both source and target directory leases, and a directory remains blocked until worker termination is confirmed.
+- Treat command paths as data, not shell input. Apply the existing absolute/`~/` path rules and realpath normalization; do not add shell expansion or a second path parser.
+- Keep user-visible errors and progress summaries safe and bounded. Never expose tokens, raw tool arguments/results, model thinking, or protocol payloads in logs, cards, or group output.
+- Keep the OMP RPC compatibility decoder in `src/omp/index.ts` separate from host lifecycle/signal handling and retain its complete upstream MIT license. Do not clear global signal listeners to solve worker conflicts.
+
+## Important Files
+
+- `src/cli.ts` — executable entry point, `main`, `check`, `serve`, and launchd command handling.
+- `src/config.ts` — config parsing, path resolution, credential source validation, state-directory checks, and `toCoreConfig`.
+- `src/service.ts` — `CoreService`, command routing, authorization, scheduling, worker coordination, outbox delivery, questions, and progress activity.
+- `src/contracts.ts` — transport, inbound message, worker, service, command-handler, and status interfaces.
+- `src/store.ts` — `ChannelStore`, SQLite schema/migrations, transactions, and durable records.
+- `src/omp/index.ts` — `createWorkerFactory`, RPC framing, OMP event translation, host tools, and process-group cleanup.
+- `src/octo/index.ts` — `OctoTransport`, encrypted protocol, HTTP/WebSocket connection, and outbound operations.
+- `src/project-session.ts` — session-header validation, native move checks, and precise moved-session discovery.
+- `src/execution-card.ts` — `createExecutionTracker` and `buildExecutionCard`.
+- `src/launchd.ts` — plist generation, atomic installation, permission enforcement, and uninstall.
+- `config.example.json` — safe configuration template; defaults to the Octo API, `OCTO_BOT_TOKEN`, no allowed groups, `omp`, and `~/.local/state/omp-channel-octo`.
+- `tests/fixtures/core-fakes.ts`, `octo-protocol-server.ts`, and `omp-rpc-worker.ts` — the primary deterministic, encrypted-protocol, and real-child test harnesses.
+
+## Runtime/Tooling Preferences
+
+- Use Bun as the runtime, package manager, and test runner. The package is ESM; `bun.lock`, `bun-types`, and the `#!/usr/bin/env bun` CLI establish this convention. Node-compatible APIs are imported from `node:*` while executing under Bun.
+- TypeScript targets ES2022/ESNext with Bundler resolution, strict checking, `noUncheckedIndexedAccess`, and `exactOptionalPropertyTypes`. `tsconfig.json` includes both `src/**/*.ts` and `tests/**/*.ts` and emits no JavaScript.
+- Use the installed `omp` executable, or pass `--omp-command` for a validated executable path. OMP stays in a child process over stdio RPC; do not load the full OMP runtime into the service host.
+- Credentials come from a private config `botToken` or a `botTokenEnv`, never both. Environment credential names must use `OCTO_` or `OMP_CHANNEL_OCTO_` prefixes; keep `.envrc`, local config, state, SQLite, and logs out of version control and never echo token values.
+- `stateDir` is created with private permissions and contains SQLite/outbox/runtime data. The sample defaults are in `config.example.json`; `src/config.ts` normalizes the API URL and local paths.
+- `package.json` has no build or lint script. The supported compiler check is `bun run typecheck`; use the repository's existing scripts rather than introducing an unrecorded toolchain.
+
+## Testing & QA
+
+- Run `bun run typecheck` and `bun test` for a normal change. There is no coverage command in `package.json`.
+- The suite intentionally separates layers: `tests/cli-lifecycle.test.ts` spawns the real CLI and Octo fixture; `tests/omp-worker.test.ts` spawns the real Bun RPC fixture; core streaming, bindings, recovery, and boundary tests use deterministic fakes and temporary directories.
+- For lifecycle changes, preserve real-process coverage for `/status`, clean SIGTERM exit, WebSocket closure, and absence of the bot token from captured output. `tests/cli-lifecycle.test.ts` is the reference test.
+- For RPC changes, use `tests/omp-worker.test.ts` and `tests/fixtures/omp-rpc-worker.ts`; cover ready negotiation, v1/v2 chunk reassembly, prompt acknowledgement versus completion, cumulative text events, late/repeated starts, cancellation, crashes, and process-group cleanup.
+- For output/outbox changes, consult `core-streaming.test.ts`, `core-outbox.test.ts`, `core-recovery.test.ts`, and `core-presentation.test.ts`. Preserve fake-timer coverage for one-second serialized edits, final corrections/empty finals, stable IDs, and lost-receipt recovery.
+- For session, directory, and concurrency changes, use `project-bindings.test.ts`, `omp-session-roots.test.ts`, `core-concurrency.test.ts`, `core-new.test.ts`, and `core-cancel.test.ts`. For protocol/config/card changes, use `octo-transport.test.ts`, `config-launchd.test.ts`, `execution-card.test.ts`, `core-gate.test.ts`, and `core-group-context.test.ts` as appropriate.
+- Test fixtures enforce important boundaries: `core-fakes.ts` records transport attempts and the 3,000-byte text limit; `octo-protocol-server.ts` exercises real HTTP/WebSocket crypto and configurable server failures; `omp-rpc-worker.ts` emits deterministic JSONL without calling a model.
+- Card layout can only be judged on the real client, so every change to `src/execution-card.ts` ends by sending the live preview card: `set -a && . ./.envrc && set +a && bun run test:preview-card`. `.envrc` (gitignored) supplies `OCTO_BOT_TOKEN`, the target chat, and the API URL. Send it as part of the change; never wait for a reminder.
+- `check` and the RPC fixture prove startup and protocol behavior, not model quality. Live launchd loading, detached-terminal operation, full logged-in Octo end-to-end behavior, screenshot-pixel validation, and typing visibility beyond the server's long-TTL window require separate environment-specific verification.

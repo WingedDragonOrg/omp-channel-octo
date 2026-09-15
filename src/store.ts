@@ -33,6 +33,12 @@ export interface TaskRecord extends ChatTarget {
   resultText: string | null;
   errorText: string | null;
 }
+export interface RestartNoticeRecord extends ChatTarget {
+  id: string;
+  botUid: string;
+  requestedAt: number;
+}
+
 export interface OutboxRecord extends ChatTarget {
   id: string;
   botUid: string;
@@ -267,6 +273,13 @@ export class ChannelStore {
       );
       CREATE INDEX IF NOT EXISTS session_context_target
         ON session_context_ledger(bot_uid, channel_type, channel_id);
+      CREATE TABLE IF NOT EXISTS restart_notices (
+        id TEXT PRIMARY KEY NOT NULL,
+        bot_uid TEXT NOT NULL,
+        channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
+        channel_id TEXT NOT NULL,
+        requested_at INTEGER NOT NULL
+      );
     `);
     for (const statement of [
       "ALTER TABLE outbox ADD COLUMN remote_message_id TEXT",
@@ -607,6 +620,31 @@ export class ChannelStore {
       );
       return rows.map((row) => this.taskFromRow(row));
     });
+  }
+
+  addRestartNotice(record: RestartNoticeRecord): void {
+    this.run(
+      `INSERT INTO restart_notices(id, bot_uid, channel_type, channel_id, requested_at)
+       VALUES(?, ?, ?, ?, ?)`,
+      [record.id, record.botUid, record.channelType, record.channelId, record.requestedAt],
+    );
+  }
+
+  listRestartNotices(botUid: string): RestartNoticeRecord[] {
+    return this.query(
+      "SELECT * FROM restart_notices WHERE bot_uid = ? ORDER BY requested_at ASC, rowid ASC",
+      [botUid],
+    ).map((row) => ({
+      id: asString(row.id),
+      botUid: asString(row.bot_uid),
+      channelType: asNumber(row.channel_type) as 1 | 2 | 5,
+      channelId: asString(row.channel_id),
+      requestedAt: asNumber(row.requested_at),
+    }));
+  }
+
+  clearRestartNotice(id: string): void {
+    this.run("DELETE FROM restart_notices WHERE id = ?", [id]);
   }
 
   cancelQueued(botUid: string, target: ChatTarget): string[] {

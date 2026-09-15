@@ -993,8 +993,25 @@ function safeAskSummary(args: unknown): string {
 	return count > 0 ? `等待用户回答 · ${count} 个问题` : "等待用户回答";
 }
 
+// One bounded line: the progress row prints the command itself, so the summary has to stay short
+// enough to read at a glance on a phone-width card.  Credential-shaped text is redacted by the
+// card layer, which sanitizes every summary before it reaches a client.
+const COMMAND_SUMMARY_CHARS = 72;
+
+function safeCommandSummary(args: unknown): string | undefined {
+	if (!isRecord(args) || typeof args.command !== "string") return undefined;
+	const command = args.command.replace(/\s+/gu, " ").trim();
+	if (command.length === 0) return undefined;
+	if (command.length <= COMMAND_SUMMARY_CHARS) return command;
+	const clipped = command.slice(0, COMMAND_SUMMARY_CHARS - 1);
+	const boundary = clipped.lastIndexOf(" ");
+	return `${boundary > 0 ? clipped.slice(0, boundary) : clipped}…`;
+}
+
 function safeSpecialToolSummary(toolName: string, args: unknown): string | undefined {
 	switch (toolName) {
+		case "bash":
+			return safeCommandSummary(args);
 		case "hub":
 			return safeHubSummary(args);
 		case "task":

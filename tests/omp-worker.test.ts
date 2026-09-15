@@ -527,6 +527,43 @@ describe("OMP RPC worker", () => {
 		});
 	});
 
+	test("publishes a bounded command summary for command tools without leaking payloads", async () => {
+		await withHarness("command-summary", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("run two commands", event => events.push(event));
+			const toolEvents = events.filter(event => event.type === "tool_start" || event.type === "tool_end");
+			expect(toolEvents.map(event => {
+				if (event.type === "tool_start") {
+					return { type: event.type, toolName: event.toolName, summary: event.summary };
+				}
+				return { type: event.type, summary: event.summary };
+			})).toEqual([
+				{
+					type: "tool_start",
+					toolName: "bash",
+					summary: "set -a && . ./.envrc && set +a && bun run src/cli.ts serve --config…",
+				},
+				{ type: "tool_end", summary: "set -a && . ./.envrc && set +a && bun run src/cli.ts serve --config…" },
+				{
+					type: "tool_start",
+					toolName: "bash",
+					summary: 'grep -rn "tool_execution_start" tests/ | head -20',
+				},
+				{ type: "tool_end", summary: 'grep -rn "tool_execution_start" tests/ | head -20' },
+			]);
+			for (const event of toolEvents) {
+				expect(event).not.toHaveProperty("args");
+				expect(event).not.toHaveProperty("result");
+				if (event.summary === undefined) throw new Error("command tool summary was not published");
+				expect(event.summary).not.toContain("\n");
+			}
+			const serialized = JSON.stringify(events);
+			expect(serialized).not.toContain("SECRET_COMMAND_CWD");
+			expect(serialized).not.toContain("SECRET_COMMAND_ENV");
+			expect(serialized).not.toContain("SECRET_COMMAND_RESULT");
+		});
+	});
+
 	test("maps only successful todo tool details to a typed update", async () => {
 		await withHarness("todo-progress", async harness => {
 			const events: WorkerEvent[] = [];

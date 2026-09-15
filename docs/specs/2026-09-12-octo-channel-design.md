@@ -73,10 +73,14 @@ channel 在自身命令注册表中注册下列命令，`/help` 展示用法。�
 | `/move <目录>` | 调用当前会话的 OMP 原生 `/move`，校验刷新后的 session state，沿用同一 session ID、历史和附件 |
 | `/cancel` | 取消当前聊天正在执行的任务，并清除该聊天待执行消息 |
 | `/status` | 返回当前会话、目录和运行/排队/中断状态 |
-| `/answer <问题 ID> <答案>` | 回答当前聊天的持久化问题；问题 ID 必须属于当前聊天 |
+| `/restart [now]` | 通过部署方配置的重启命令安全重启 channel；省略参数时在有任何运行/排队任务时拒绝；`now` 强制重启并中断在途任务 |
 | `/help` | 展示 channel 命令及目录用法 |
 
-群中使用 `@Bot /new <目录>`、`@Bot /reset <目录>` 或 `@Bot /move <目录>` 等相同命令；剥离已验证的 Bot mention 后解析。channel 内置 `/new`、`/reset`、`/move`、`/cancel`、`/status`、`/help`、`/answer` 始终硬拦截，不发送给模型；若存在同名观察器也不能改变这一安全语义。其他 slash 输入按原始 `message.text` 作为普通 OMP task 透传，未知命令不再返回“不支持的命令”。
+当前聊天有待回答问题时，owner 在该聊天的非命令回复就是答案本身：合法选项编号按选项校验，其他文本原样作为自填答案；没有待回答问题时同一文本按普通任务输入处理。
+
+`/restart` 只在配置了 `restart.command`（非空字符串数组，例如 `["super","-y","restart","omp-channel-octo"]`）时可用；未配置时明确回复未配置且不猜测重启机制。命令由 channel 以独立会话派生，进程停止由该命令对应的进程管理器负责（Super 的 `restart` 会先给 channel 发 SIGTERM），channel 自己不会在命令未停止它时擅自退出，只记录一条告警。发起的聊天先收到“正在重启 channel”，请求被持久化；进程恢复后在原聊天投递“channel 已重启完成：PID …，启动于 …”。重启时被中断的在途任务发送“channel 正在重启，本会话任务已中断；重启完成后会在本会话确认。”，未开始的排队任务在下次启动按 interrupted 报告。重启完成通报超过 10 分钟未投递则丢弃，不对未发生的重启做确认。
+
+群中使用 `@Bot /new <目录>`、`@Bot /reset <目录>` 或 `@Bot /move <目录>` 等相同命令；剥离已验证的 Bot mention 后解析。命令与 mention 的先后顺序不固定：客户端可能发送 `@Bot /command <参数>` 或 `/command <参数> @Bot`，解析前剥离全部已验证的 Bot mention，无论它位于命令前、命令后还是参数中间，并清理剥离处残留的空白。结构化 span 与文本对不上或缺失时，退回按 mention uid 列表匹配独立出现的 `@BotName` 或 `@BotUid` 词元（两侧为空白或文本边界，允许尾随冒号）；未指向当前 Bot 的文本型 `@` 不剥离，用户正文中的其他 `@` 保持原样。命令只允许 owner 发起：群、线程和私聊中其他成员的命令一律拒绝，既不执行也不回复。channel 内置 `/new`、`/reset`、`/move`、`/cancel`、`/status`、`/help`、`/restart` 始终硬拦截，不发送给模型；若存在同名观察器也不能改变这一安全语义。其他 slash 输入按原始 `message.text` 作为普通 OMP task 透传，未知命令不再返回“不支持的命令”。
 可通过服务选项注册自定义 `ChannelCommandHandler`：`name` 去除首尾空白并按小写规范化，`intercept` 明确决定是否消费，`handle(context)` 接收原始 `InboundMessage`、规范化命令名和解析后的 argument。`intercept=true` 在持久命令去重后执行 handler，成功后消费且不启动 OMP；失败保持可重试的命令状态且不启动 OMP。`intercept=false` 先完成现有任务 durable acceptance，再调用 handler 并继续透传原始文本；handler 异常不得阻断任务或 prompt，重复消息不得重复 handler 或 task。handler 必须经过既有 owner、群/线程 mention 和消息 ID 校验；空名、非法名或规范化后的重复注册在创建服务时拒绝，不能静默选择。
 
 `/new`、`/reset` 的完整剩余文本是一个路径；可移除一对匹配的外围单引号或双引号。支持绝对路径、当前运行账户的 `~/`；拒绝相对路径、其他用户的 `~name` 和空引号。路径不经 shell 执行，不展开环境变量、通配符或命令替换；特殊字符按文件名处理。无绑定时省略目录首次解析为 `~/tmp`，已有绑定时省略目录沿用其 cwd。
@@ -105,7 +109,7 @@ OMP `session.compacting` 生命周期在压缩时把当前 turn sidecar 中的�
 
 所有任务都获得固定目标与 cwd 的 `ask`、`octo_send_file` 工具；群和线程额外获得 `octo_group_read`、`octo_group_write`。文件工具的相对路径按任务 cwd 解析，绝对路径可指向本地其他文件，系统不提供目录沙箱保证；发送前复制到 stateDir spool；outbox 保存稳定 client message ID，断线重试不重跑任务。文件永久失败标记 dead 并报告，但不得阻塞后续文字 outbox。
 
-`ask` 创建带持久化 ID 的问题后暂停当前任务。`/answer <问题 ID> <答案>` 必须来自同一聊天，单选/多选选项必须满足数量和范围校验；不提供默认答案，重复、跨聊天或过期答案不会再次触发 prompt。问题十分钟无答案即过期；取消、服务重启会使等待失效。
+`ask` 创建带持久化 ID 的问题后暂停当前任务，并给出一段包含问题正文、编号选项（如有）和回复规则的文本。只要该聊天存在待回答的问题，owner 在该聊天的下一条非命令文本即为该聊天最早待回答问题的答案：合法选项编号按单选/多选的数量和范围校验，其他文本原样作为自填答案返回给模型；命令仍然优先。不提供默认答案，无待回答问题、不同聊天、重复或过期后的回复都不作为答案，其中无待回答问题和过期后的文本按普通任务输入处理。问题十分钟无答案即过期；取消、服务重启会使等待失效。
 
 
 ### RPC 与输出
@@ -121,9 +125,9 @@ OMP extension 在 worker 启动时由固定路径自动加载；sidecar 根路�
 
 正文编辑以最新累计快照为准，首次创建不等待整轮结束；编辑最多每 1000ms 一次并按目标串行，最终快照优先完成，不得由旧快照覆盖新快照。正文按 3000 UTF-8 bytes 稳定分段，保留原始换行、空格和 inline 标记；分段 stream 使用稳定的 client message ID，分段数量变化时清理 stale tail。每次网络操作前持久化该分段的目标快照及 `desiredVersion`/`ackedVersion`；首次 create 在网络请求前 durable 标为 `unknown`，送达未知时不重跑 Agent，重连/重启沿用稳定 ID 绑定已创建消息并将最新 desired 快照补做 edit。
 
-真实 `tool_start`/`tool_end`、`turn_start`/`turn_end`、`todo_update` 和 `run_end` 事件由单一 `ExecutionTracker` 累计阶段、工具、todo、终态和 elapsed；真实工具或 todo 进度首次出现时懒建一张可编辑卡，之后只编辑该卡。运行中 elapsed 每秒刷新；卡片 edit 使用严格递增的单卡 sequence，终态为 `completed`、`cancelled` 或 `failed`。卡片采用“摘要头部—当前状态—任务清单—子代理—执行轨迹”的进度通知布局；任务清单按阶段→任务的树形层级渲染，使用分支连接线和嵌套区块表达父子关系；任务节点只显示状态图标、任务内容和 blocker，不重复渲染状态文字；富布局下阶段标题与任务分支使用结构化 ColumnSet 分列，避免依赖比例字体空格对齐；富布局能力下使用强调色 Container、状态/耗时摘要和带状态元数据的步骤面板，轨迹步骤使用 Web 端兼容的 ColumnSet，轨迹行使用固定 24px 等宽标记列和 stretch 正文列，状态摘要置于正文列并允许自然换行，避免窄屏下正文被状态列挤压；状态图标与步骤内容、状态摘要同处彩色背景 Container 内；子代理列表位于执行轨迹之前；当对应区块超过三个步骤且能力支持 `Action.ToggleVisibility` 时，在标题行右侧提供“展开”/“收起”控件，默认展示最近三个步骤，其余步骤通过“展开”查看；终态卡片在支持 `Action.ToggleVisibility` 时默认收起任务、子代理和执行轨迹详情，保留状态摘要，并可通过标题行的“展开”恢复；状态标记按语义统一：成功/已完成使用绿色 `✓`，等待、取消和阻塞使用中性灰色 `-`，失败和放弃使用红色 `×`，进行中使用蓝色/Accent `•`；取消任务内容在支持 `RichTextBlock` 时使用删除线；能力不足时保持信息完整的降级文本。内置 `hub`/IRC、`task`、`todo` 和 `ask` 工具使用操作级安全摘要，IRC 轨迹显示方向、目标或协作状态，不显示消息正文。卡片只展示安全摘要，不转发工具参数/结果、原始 payload、模型思考或秘密。超出渲染预算且仍可展开时，轨迹与子代理都使用同一组紧凑 ColumnSet 行，状态标记列与 stretch 摘要列保持一致；不支持展开时只保留安全的隐藏计数。紧凑行的等待字形后使用不换行空格，避免客户端将 `- ` 解析成 Markdown 列表。
-富布局下子代理区块只将仍在运行或等待的子代理作为默认丰富行；已完成、失败、取消或停止的子代理默认隐藏，能力支持 `Action.ToggleVisibility` 时随“展开”以紧凑行查看。执行轨迹默认展示最近三个工具步骤的丰富行，其余步骤即使展开也只使用紧凑文字行。当前 OMP worker 以通用 RPC `tool_execution_start`/`tool_execution_end` 形成安全工具事件；OMP 另有可选的 `set_subagent_subscription` 生命周期/进度事件桥，但它不属于 `pi.on` 专用 hook，且尚未纳入本服务的 `WorkerEvent` 卡片契约。
-任务清单发生预算裁剪时保留隐藏任务摘要；支持 `Action.ToggleVisibility` 时，标题行显示“展开”/“收起”按钮，展开后按原阶段和原任务顺序将被裁剪任务插回树形位置，并复用富布局任务行的状态标记、颜色、blocker 与层级连接；若卡片节点预算不足，仅渲染有界数量的隐藏任务行并保留剩余数量提示；能力不支持该动作时只保留安全的隐藏计数。
+真实 `tool_start`/`tool_end`、`turn_start`/`turn_end`、`todo_update` 和 `run_end` 事件由单一 `ExecutionTracker` 累计阶段、工具、todo、终态和 elapsed；真实工具或 todo 进度首次出现时懒建一张可编辑卡，之后只编辑该卡。运行中 elapsed 只在真实事件到达时随卡片刷新，事件编辑遵守 1000ms 合并窗口，无事件时不做周期重绘；卡片 edit 使用严格递增的单卡 sequence，终态为 `completed`、`cancelled` 或 `failed`。卡片采用“摘要头部—当前状态—任务清单—子代理—执行轨迹”的进度通知布局；任务清单按阶段→任务的树形层级渲染，使用分支连接线和嵌套区块表达父子关系；任务节点只显示状态图标、任务内容和 blocker，不重复渲染状态文字；富布局下阶段标题与任务分支使用结构化 ColumnSet 分列，避免依赖比例字体空格对齐；富布局能力下使用强调色 Container、状态/耗时摘要和带状态元数据的步骤面板，轨迹步骤使用 Web 端兼容的 ColumnSet，轨迹行使用固定 24px 等宽标记列和 stretch 正文列，状态摘要置于正文列并允许自然换行，避免窄屏下正文被状态列挤压；状态图标与步骤内容、状态摘要同处彩色背景 Container 内；子代理列表位于执行轨迹之前；当对应区块超过三个步骤且能力支持 `Action.ToggleVisibility` 时，在标题行右侧提供“展开”/“收起”控件，默认展示最近三个步骤，其余步骤通过“展开”查看；能力支持 `Action.ToggleVisibility` 时，卡片头部始终提供“收起”/“展开”整卡详情控件：运行中默认展开任务、子代理和执行轨迹详情，收起后只保留摘要头部、当前状态与告警；终态卡片默认收起这三类详情，保留状态摘要，并可通过头部的“展开”恢复；状态标记按语义统一：成功/已完成使用绿色 `✓`，等待、取消和阻塞使用中性灰色 `-`，失败和放弃使用红色 `×`，进行中使用蓝色/Accent `•`；取消任务内容在支持 `RichTextBlock` 时使用删除线；能力不足时保持信息完整的降级文本。内置 `hub`/IRC、`task`、`todo` 和 `ask` 工具使用操作级安全摘要，IRC 轨迹显示方向、目标或协作状态，不显示消息正文；命令类工具显示压成单行的有界命令文本摘要，便于在轨迹里直接看到所运行的命令。卡片只展示安全摘要，不转发工具参数/结果、原始 payload、模型思考或秘密。超出渲染预算且仍可展开时，轨迹与子代理都使用同一组紧凑 ColumnSet 行，状态标记列与 stretch 摘要列保持一致；不支持展开时只保留安全的隐藏计数。紧凑行的等待字形后使用不换行空格，避免客户端将 `- ` 解析成 Markdown 列表。
+富布局下子代理区块只将仍在运行或等待的子代理作为默认丰富行；已完成、失败、取消或停止的子代理默认隐藏，能力支持 `Action.ToggleVisibility` 时随“展开”以紧凑行查看。执行轨迹默认展示最近三个工具步骤的丰富行，其余步骤即使展开也只使用紧凑文字行。当前 OMP worker 以通用 RPC `tool_execution_start`/`tool_execution_end` 形成安全工具事件：`bash` 的摘要是压成单行、截断到 72 字符的命令文本，路径类工具只取安全文件名组件，其余工具按操作语义派生；命令文本中的凭据形态字符串由卡片层统一脱敏，宿主始终不转发原始 args/result。OMP 另有可选的 `set_subagent_subscription` 生命周期/进度事件桥，但它不属于 `pi.on` 专用 hook，且尚未纳入本服务的 `WorkerEvent` 卡片契约。
+任务清单发生预算裁剪时保留隐藏任务摘要；支持 `Action.ToggleVisibility` 时，标题行显示“展开”/“收起”按钮，展开后按原阶段和原任务顺序将被裁剪任务插回树形位置，并复用富布局任务行的状态标记、颜色、blocker 与层级连接；若卡片节点预算不足，先按 8/4/2 收缩可展开隐藏行的渲染行数（任务隐藏行上限不超过 4），保留隐藏数量提示，仍不足时再按既有顺序裁剪可见工具行与任务行；能力不支持该动作时只保留安全的隐藏计数。
 
 发卡前必须通过能力 profile 门禁：profile 启用，包含 `octo/v1` 与 card version 1.5，且 card/display/reasoning 开关均启用；`TextBlock` 是唯一硬依赖，`Container` 等布局元素缺失时使用扁平 fallback；`Action.ToggleVisibility` 仅在能力声明支持时渲染。遵守服务端声明的 payload、node、depth 等 limits，无法满足时不发卡且不阻断正文；同一执行最多一张卡。
 
@@ -156,9 +160,9 @@ Octo 断线不取消已经开始的 Agent；正文 outbox 与任务状态持久�
 8. 长正文保留原始换行、空格和 inline 标记；每个 assistant message 独立 stream，首次非空累计快照立即 create，后续累计快照以同一 message ID 每 1000ms 最多一次串行 edit，最终更短或空快照权威生效；正文按 3000 UTF-8 bytes 稳定分段并清理 stale tail，异步 prompt 失败、本地完成和 worker 异常退出均正确结束任务状态，不生成通用完成文字。
 9. 正文 outbox 在 create 前 durable 记录 `unknown`，保存 desired/acked 版本；断线、重启或送达未知恢复时沿用稳定 client ID、编辑最新快照且不重跑 Agent，不因失败重复创建。
 10. 执行过程中取消能越过待执行队列；后续队列被清除，取消不被宣称为回滚。未确认停止时不启动同目录新任务。
-11. `ask` 问题可跨消息持久等待，单选/多选校验、十分钟过期、跨聊天或重复回答均安全拒绝，取消不使用默认答案。
+11. `ask` 问题可跨消息持久等待；owner 在同一聊天的下一条非命令文本被当作答案（编号选项按单选/多选校验，其他文本原样返回），不同聊天、无待回答问题、重复或过期后的文本都不作为答案并按普通任务处理，取消不使用默认答案。
 12. 在接收、started 落盘、执行、回复阶段分别终止服务再启动：绑定可恢复，历史可读，遗留任务报告中断，同消息重投不再执行副作用；外部移动只按精确 session ID 与 breadcrumb 唯一重绑，roots 依 native profile/`.env` 有效 cwd 解析，不选最近文件。
-13. Octo 断开再连接不重跑任务；已持久化正文从 outbox 继续投递，送达未知明确呈现；真实 `ExecutionEvent` tracker 用一张卡累计工具/turn/todo/run 终态与每秒 elapsed，遵守 TextBlock/Container fallback、ToggleVisibility 能力和 payload/node/depth limits，卡片 edit sequence 单调递增，安全摘要不含原始 payload；typing 每 3 秒续期、活动请求 2 秒有界，终态卡片失败只做一次 best-effort，均不阻断正文。
+13. Octo 断开再连接不重跑任务；已持久化正文从 outbox 继续投递，送达未知明确呈现；真实 `ExecutionEvent` tracker 用一张卡累计工具/turn/todo/run 终态与 elapsed，只在真实事件到达时随卡片刷新（编辑按 1000ms 合并窗口推进，无周期重绘），遵守 TextBlock/Container fallback、ToggleVisibility 能力和 payload/node/depth limits，卡片 edit sequence 单调递增，安全摘要不含原始 payload 与参数对象（命令类工具显示单行、截断到 72 字符并经凭据脱敏的命令文本）；typing 每 3 秒续期、活动请求 2 秒有界，终态卡片失败只做一次 best-effort，均不阻断正文。
 14. 状态盘写入失败不启动新任务；同 Bot 第二实例不能启动；App Bot 配置不能被验收为支持群聊。
 15. `launchd install` 仅写入权限为 `0600` 的 plist，不调用 `launchctl`；实际启动、停止分别由 `launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.omp.channel-octo.plist"` 与 `launchctl bootout "gui/$(id -u)/com.omp.channel-octo"` 完成，`launchd uninstall` 只删除 plist。环境凭证会进入该私有 plist，runtime 复用 plist 中安装时解析出的 OMP 路径；退出交互终端后仍能从实际 Octo 收发，日志不包含 token。
 16. 新建 session 的第一次 agent start 会注入目标的完整共享说明；恢复 session 只在没有可靠的同 session/目标/version committed marker，或 marker 仍处于 pending 时补注入；已 committed 的恢复不会因重新启动 worker 自动重复注入。
@@ -166,6 +170,7 @@ Octo 断线不取消已经开始的 Agent；正文 outbox 与任务状态持久�
 18. OMP compaction 后，压缩上下文保留当前 turn immutable snapshot 的完整共享说明和 version 边界；即使 version 不变也只在该 compaction 生命周期中恢复性注入，下一次普通 turn 不重复注入；当前 turn 的 `octo_group_write` 不改写这份 snapshot。
 19. 共享说明 sidecar、持久 marker 和 extension 输入按 Bot、真实聊天目标与真实 OMP session 隔离，不包含 Bot token；extension 或 sidecar 目标不匹配、输入不完整或 session ID 未确认时在进入模型前拒绝共享上下文；marker CAS 失败时保留 pending、不得标为 committed，并在下一任务重放。
 20. OMP prompt acceptance 与 context marker 提交之间发生崩溃时，pending 状态可恢复并在下一任务重放，不能静默跳过；正常成功路径不重复注入同一 version，重放使用明确的 injection attempt ID。
+21. `/restart` 只使用部署配置的 `restart.command`，未配置时明确拒绝且不猜测重启机制；存在运行或排队任务时默认拒绝并提示 `/cancel` 或 `/restart now`；`now` 先持久化重启请求再执行命令，发起聊天收到“正在重启 channel”，进程恢复后在发起聊天与被打断会话投递重启完成通报，超过 10 分钟的旧通报不投递；重启命令未停止进程时 channel 继续运行并记录告警。真实 CLI 端到端覆盖命令执行、进程自行以 0 退出以及重启后的确认投递。
 
 ## 实施前提与未决事项
 

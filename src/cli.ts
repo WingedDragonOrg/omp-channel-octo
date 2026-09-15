@@ -145,6 +145,8 @@ async function runCheck(configPath: string | undefined): Promise<void> {
   }
 }
 
+const RESTART_WATCHDOG_MS = 15_000;
+
 async function runServe(configPath: string | undefined, ompCommandOverride: string | undefined): Promise<void> {
   const config = await loadConfig(configPath);
   await ensureStateDirectory(config);
@@ -165,6 +167,7 @@ async function runServe(configPath: string | undefined, ompCommandOverride: stri
   let startPromise: Promise<void> | undefined;
   const shutdown = Promise.withResolvers<void>();
   let shutdownRequested = false;
+  const restartCommand = config.restartCommand;
   const onSignal = () => {
     if (shutdownRequested) return;
     shutdownRequested = true;
@@ -177,6 +180,38 @@ async function runServe(configPath: string | undefined, ompCommandOverride: stri
       config: toCoreConfig(config),
       transport,
       workerFactory,
+      ...(restartCommand === undefined
+        ? {}
+        : {
+            restart: {
+              request: async (): Promise<void> => {
+                try {
+                  const child = Bun.spawn([...restartCommand], {
+                    cwd: process.cwd(),
+                    env: process.env,
+                    detached: true,
+                    stdio: ["ignore", "ignore", "inherit"],
+                  });
+                  child.unref();
+                  console.error(`[restart] 已执行 ${restartCommand.join(" ")}（pid ${child.pid}）`);
+                  // The command stops this process (a supervisor sends SIGTERM); warn when it
+                  // returns without doing so instead of tearing the service down unmanaged.
+                  const watchdog = setTimeout(() => {
+                    if (!shutdownRequested) {
+                      console.error(
+                        `[restart] ${restartCommand.join(" ")} 未停止本进程，channel 继续运行；如需强制退出请发送 SIGTERM。`,
+                      );
+                    }
+                  }, RESTART_WATCHDOG_MS);
+                  watchdog.unref();
+                } catch (error) {
+                  console.error(
+                    `[restart] 重启命令启动失败：${error instanceof Error ? error.message : String(error)}`,
+                  );
+                }
+              },
+            },
+          }),
     });
     startPromise = service.start();
     const first = await Promise.race([

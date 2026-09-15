@@ -194,6 +194,15 @@ export interface ChannelServiceOptions {
   transport: ChannelTransport;
   workerFactory: WorkerFactory;
   commandHandlers?: readonly ChannelCommandHandler[];
+  /**
+   * Deployment restart port, present only when a restart command is configured.
+   * `request` runs that command and the host then stops this process.
+   */
+  restart?: RestartPort;
+}
+
+export interface RestartPort {
+  request(): Promise<void>;
 }
 
 export interface ChannelService {

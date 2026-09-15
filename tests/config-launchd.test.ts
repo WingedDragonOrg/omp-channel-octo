@@ -69,6 +69,18 @@ test("explicit API URL and owner remain configured", () => {
   expect(config.ownerId).toBe("explicit-owner");
 });
 
+test("restart command is optional and validated when present", () => {
+  expect(parseConfig(configDocument())).not.toHaveProperty("restartCommand");
+  expect(parseConfig(configDocument({ restart: {} }))).not.toHaveProperty("restartCommand");
+  expect(parseConfig(configDocument({
+    restart: { command: ["super", "-y", "restart", "omp-channel-octo"] },
+  })).restartCommand).toEqual(["super", "-y", "restart", "omp-channel-octo"]);
+
+  for (const restart of [[], "super restart", { command: [] }, { command: [""] }, { command: "super" }, { unknown: true }]) {
+    expect(() => parseConfig(configDocument({ restart }))).toThrow(/restart/);
+  }
+});
+
 test("config still requires credentials and all other required fields", () => {
   for (const field of ["allowedGroupIds", "ompCommand", "stateDir"] as const) {
     const document = configDocument({ ownerId: "owner" });

@@ -150,7 +150,7 @@ function previewSnapshot() {
     endAtMs: 700,
     status: "cancelled",
     errorCategory: "cancelled",
-    summary: "运行回归检查",
+    summary: "bun run typecheck && bun test tests/core-presentation.test.ts",
   });
   addPreviewTool(tracker, {
     toolCallId: "preview-old-task",
@@ -331,6 +331,8 @@ test("preview snapshot shows every subagent state by default", () => {
   expect(cardNodes(card).some(node => node.id === "btn_collapse_todo")).toBe(true);
   expect(cardNodes(card).some(node => node.id === "btn_expand_subagents")).toBe(true);
   expect(cardNodes(card).some(node => node.id === "btn_expand_trace")).toBe(true);
+  expect(nodeById(card, "btn_collapse_progress")).toMatchObject({ isVisible: true });
+  expect(nodeById(card, "timeline_section").isVisible).not.toBe(false);
 
 });
 test("preview rich fallback expands older trace rows without ToggleVisibility", () => {

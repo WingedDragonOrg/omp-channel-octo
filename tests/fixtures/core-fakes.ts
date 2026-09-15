@@ -14,6 +14,7 @@ import type {
   OmpWorker,
   ProgressCard,
   PromptContext,
+  RestartPort,
   SendReceipt,
   WorkerEvent,
   WorkerFactory,
@@ -673,6 +674,7 @@ export interface CoreHarnessOptions {
    * `null` omits ownerId from the test config so enrollment starts unconfigured.
    */
   ownerId?: string | null;
+  restart?: RestartPort;
 }
 
 export async function createCoreHarness(options: CoreHarnessOptions = {}): Promise<CoreHarness> {
@@ -695,7 +697,12 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
     stateDir,
     homeDir: root,
   } as CoreServiceConfig;
-  const service = await createChannelService({ config, transport, workerFactory: workers });
+  const service = await createChannelService({
+    config,
+    transport,
+    workerFactory: workers,
+    ...(options.restart === undefined ? {} : { restart: options.restart }),
+  });
   await service.start();
   return { root, stateDir, config, bot: transport.bot, transport, workers, service };
 }

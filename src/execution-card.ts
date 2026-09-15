@@ -216,6 +216,8 @@ const MAX_LOCAL_TASKS = 128;
 const MAX_VISIBLE_TOOLS = 3;
 const MAX_RENDERED_TOOLS = 32;
 const MAX_COMPACT_TOOL_ROWS = 8;
+/** Hidden-row budgets tried in order by the card fit search. */
+const HIDDEN_ROW_LIMITS = [MAX_COMPACT_TOOL_ROWS, 4, 2];
 const MAX_VISIBLE_TODO_TASKS = 96;
 const MAX_EXPANDED_TODO_TASKS = 4;
 const DEFAULT_MAX_NODES = 200;
@@ -880,6 +882,7 @@ function makeTodoItems(
   totalCount: number,
   structuredLayout: boolean,
   richTextSupported: boolean,
+  omittedRowLimit: number,
 ): JsonNode[] {
   const items: JsonNode[] = [];
   if (hiddenCount > 0) {
@@ -927,7 +930,7 @@ function makeTodoItems(
       } else if (
         structuredLayout
         && entry.omittedTasks.has(task)
-        && renderedOmittedCount < MAX_EXPANDED_TODO_TASKS
+        && renderedOmittedCount < omittedRowLimit
       ) {
         phaseItems.push(makeTodoTaskRow(
           task,
@@ -964,6 +967,7 @@ function makeTodoItems(
 function todoOmittedTaskIds(
   allTodos: readonly ExecutionTodoPhase[],
   omittedTodos: readonly ExecutionTodoPhase[],
+  limit: number = MAX_EXPANDED_TODO_TASKS,
 ): string[] {
   const ids: string[] = [];
   let renderedCount = 0;
@@ -972,7 +976,7 @@ function todoOmittedTaskIds(
     const omittedTasks = new Set(omittedTodos[sourceIndex]?.tasks ?? []);
     for (let taskIndex = 0; taskIndex < phase.tasks.length; taskIndex += 1) {
       if (!omittedTasks.has(phase.tasks[taskIndex]!)) continue;
-      if (renderedCount >= MAX_EXPANDED_TODO_TASKS) return ids;
+      if (renderedCount >= limit) return ids;
       ids.push(`todo_omitted_task_${sourceIndex}_${taskIndex}`);
       renderedCount += 1;
     }
@@ -1120,6 +1124,7 @@ function makeTodoContainer(
   richTextSupported: boolean,
   omittedTodos: readonly ExecutionTodoPhase[] = [],
   actionSets: readonly JsonNode[] = [],
+  omittedRowLimit: number = MAX_EXPANDED_TODO_TASKS,
 ): JsonNode | null {
   if (!allTodos.some(phase => phase.tasks.length > 0)) return null;
   const heading = structuredLayout && actionSets.length > 0
@@ -1132,7 +1137,16 @@ function makeTodoContainer(
     spacing: "Medium",
     items: [
       heading,
-      ...makeTodoItems(allTodos, todos, omittedTodos, hiddenCount, totalCount, structuredLayout, richTextSupported),
+      ...makeTodoItems(
+        allTodos,
+        todos,
+        omittedTodos,
+        hiddenCount,
+        totalCount,
+        structuredLayout,
+        richTextSupported,
+        omittedRowLimit,
+      ),
     ],
   };
 }
@@ -1364,7 +1378,10 @@ function makeTodoToggleSets(hiddenElementIds: readonly string[]): JsonNode[] {
     },
   ];
 }
-function makeProgressToggleSets(detailElementIds: readonly string[]): JsonNode[] {
+function makeProgressToggleSets(
+  detailElementIds: readonly string[],
+  initiallyExpanded: boolean,
+): JsonNode[] {
   if (detailElementIds.length === 0) return [];
   const collapsedTargets = [
     ...detailElementIds.map(elementId => ({ elementId, isVisible: false })),
@@ -1380,7 +1397,7 @@ function makeProgressToggleSets(detailElementIds: readonly string[]): JsonNode[]
     {
       type: "ActionSet",
       id: "btn_collapse_progress",
-      isVisible: false,
+      isVisible: initiallyExpanded,
       horizontalAlignment: "Right",
       spacing: "None",
       actions: [
@@ -1395,7 +1412,7 @@ function makeProgressToggleSets(detailElementIds: readonly string[]): JsonNode[]
     {
       type: "ActionSet",
       id: "btn_expand_progress",
-      isVisible: true,
+      isVisible: !initiallyExpanded,
       horizontalAlignment: "Right",
       spacing: "None",
       actions: [
@@ -1633,7 +1650,9 @@ function buildCandidate(
   visibleTodos: readonly ExecutionTodoPhase[],
   omittedTodos: readonly ExecutionTodoPhase[],
   totalTodoTasks: number,
+  hiddenRowLimit: number,
 ): ExecutionCardResult {
+  const todoRowLimit = Math.min(hiddenRowLimit, MAX_EXPANDED_TODO_TASKS);
   const hasContainer = supportsElement(capabilities, "Container");
   const hasColumnSet = supportsElement(capabilities, "ColumnSet");
   const richTextSupported = supportsElement(capabilities, "RichTextBlock");
@@ -1661,18 +1680,22 @@ function buildCandidate(
   const omittedTraceTools = richLayout
     ? omittedTools.filter(tool => !isSubagentTool(tool.toolName))
     : [];
-  const expandableOmittedTraceTools = omittedTraceTools.length <= MAX_COMPACT_TOOL_ROWS
-    ? omittedTraceTools
-    : [];
+  const cappedOmittedTraceTools = omittedTraceTools.length <= MAX_COMPACT_TOOL_ROWS ? omittedTraceTools : [];
+  const expandableOmittedTraceTools = cappedOmittedTraceTools.slice(
+    Math.max(0, cappedOmittedTraceTools.length - hiddenRowLimit),
+  );
   const omittedSubagentTools = richLayout
     ? [
         ...omittedTools.filter(tool => isSubagentTool(tool.toolName) && !isActiveSubagent(tool)),
         ...visibleTools.filter(tool => isSubagentTool(tool.toolName) && !isActiveSubagent(tool)),
       ]
     : [];
-  const expandableOmittedSubagentTools = omittedSubagentTools.length <= MAX_COMPACT_TOOL_ROWS
+  const cappedOmittedSubagentTools = omittedSubagentTools.length <= MAX_COMPACT_TOOL_ROWS
     ? omittedSubagentTools
     : [];
+  const expandableOmittedSubagentTools = cappedOmittedSubagentTools.slice(
+    Math.max(0, cappedOmittedSubagentTools.length - hiddenRowLimit),
+  );
   const totalTraceTools = richLayout ? snapshot.tools.length - totalSubagents : snapshot.tools.length;
   const hiddenTraceTools = Math.max(0, totalTraceTools - visibleTraceTools.length);
   const hiddenSubagents = Math.max(0, totalSubagents - visibleSubagents.length);
@@ -1720,8 +1743,10 @@ function buildCandidate(
   const subagentToggleSets = canToggle && subagentContainer
     ? makeSubagentToggleSets(subagentHiddenIds)
     : [];
-  const expandableOmittedTodos = canToggle ? omittedTodos : [];
-  const todoHiddenIds = canToggle ? todoOmittedTaskIds(snapshot.todos, expandableOmittedTodos) : [];
+  const expandableOmittedTodos = canToggle && hiddenRowLimit > 0 ? omittedTodos : [];
+  const todoHiddenIds = canToggle
+    ? todoOmittedTaskIds(snapshot.todos, expandableOmittedTodos, todoRowLimit)
+    : [];
   const todoToggleSets = todoHiddenIds.length > 0
     ? makeTodoToggleSets(todoHiddenIds)
     : [];
@@ -1735,6 +1760,7 @@ function buildCandidate(
       richTextSupported,
       expandableOmittedTodos,
       todoToggleSets,
+      todoRowLimit,
     )
     : null;
   const terminal = snapshot.state !== "running";
@@ -1743,10 +1769,12 @@ function buildCandidate(
     ...(subagentContainer === null ? [] : ["subagent_section"]),
     "timeline_section",
   ];
-  const overallToggleSets = terminal && canToggle
-    ? makeProgressToggleSets(detailElementIds)
+  // Terminal cards open collapsed behind the header expand control; a running
+  // card keeps its live detail open and offers the matching collapse control.
+  const overallToggleSets = canToggle
+    ? makeProgressToggleSets(detailElementIds, !terminal)
     : [];
-  const overallDetailsVisible = overallToggleSets.length === 0;
+  const overallDetailsVisible = !terminal || overallToggleSets.length === 0;
   const body: JsonNode[] = [];
 
   if (stackedLayout) {
@@ -1922,15 +1950,20 @@ export function buildExecutionCard(
   while (visibleToolCount >= 0 && visibleTodoCount >= 0) {
     const visibleTools = snapshot.tools.slice(Math.max(0, totalTools - visibleToolCount));
     const trimmedTodos = trimTodos(snapshot.todos, visibleTodoCount);
-    const candidate = buildCandidate(
-      snapshot,
-      capabilities,
-      visibleTools,
-      trimmedTodos.visible,
-      trimmedTodos.omitted,
-      totalTodoTasks,
-    );
-    if (cardWithinLimits(candidate.card, candidate.plain, limits)) return candidate;
+    // Visible content wins over expandable hidden rows: keep this much detail and
+    // shrink the hidden-row budget until the card fits.
+    for (const hiddenRowLimit of HIDDEN_ROW_LIMITS) {
+      const candidate = buildCandidate(
+        snapshot,
+        capabilities,
+        visibleTools,
+        trimmedTodos.visible,
+        trimmedTodos.omitted,
+        totalTodoTasks,
+        hiddenRowLimit,
+      );
+      if (cardWithinLimits(candidate.card, candidate.plain, limits)) return candidate;
+    }
     // Keep execution activity visible; reduce the less volatile todo detail first.
     if (visibleTodoCount > 0) {
       visibleTodoCount -= 1;

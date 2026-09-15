@@ -557,10 +557,12 @@ async function readFileHeader(path: string, maxBytes = 64 * 1024): Promise<Uint8
   }
 }
 
-function mentionEntities(payload: JsonRecord): Array<{ uid: string; offset: number; length: number }> {
+type MentionEntity = { uid: string; offset: number; length: number };
+
+function mentionEntities(payload: JsonRecord): MentionEntity[] {
   const mention = payload.mention;
   if (!isJsonRecord(mention) || !Array.isArray(mention.entities)) return [];
-  const entities: Array<{ uid: string; offset: number; length: number }> = [];
+  const entities: MentionEntity[] = [];
   for (const raw of mention.entities) {
     if (!isJsonRecord(raw) || typeof raw.uid !== "string" || raw.uid.length === 0) continue;
     if (!Number.isSafeInteger(raw.offset) || !Number.isSafeInteger(raw.length)) continue;
@@ -593,6 +595,59 @@ function mentionUids(payload: JsonRecord): string[] {
   return uids;
 }
 
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+/**
+ * Removes the bot mention wherever the client placed it. Group clients render
+ * `@bot /command args` and `/command args @bot` alike, and a mention may also
+ * arrive as a bare uid list without spans.
+ */
+function stripBotMention(
+  text: string,
+  botUid: string,
+  botName: string,
+  entities: readonly MentionEntity[],
+  mentionedUserIds: readonly string[],
+): string {
+  const spans = entities
+    .filter((entity) => entity.uid === botUid
+      && entity.offset + entity.length <= text.length
+      && text.slice(entity.offset, entity.offset + entity.length).startsWith("@"))
+    .sort((left, right) => right.offset - left.offset);
+  if (spans.length > 0) {
+    let stripped = text;
+    for (const span of spans) {
+      stripped = stripped.slice(0, span.offset) + stripped.slice(span.offset + span.length);
+    }
+    return trimMentionSeam(
+      stripped,
+      spans.some((span) => span.offset === 0),
+      spans.some((span) => span.offset + span.length === text.length),
+    );
+  }
+  if (!mentionedUserIds.includes(botUid)) return text;
+  const tokens = [botName, botUid].filter((value) => value.length > 0).map(escapeRegExp);
+  if (tokens.length === 0) return text;
+  const pattern = new RegExp(`(^|\\s)@(?:${tokens.join("|")})(?=$|[\\s:：])`, "gu");
+  let touchesStart = false;
+  let touchesEnd = false;
+  const stripped = text.replace(pattern, (match: string, lead: string, offset: number) => {
+    if (offset === 0) touchesStart = true;
+    if (offset + match.length === text.length) touchesEnd = true;
+    return lead;
+  });
+  return stripped === text ? text : trimMentionSeam(stripped, touchesStart, touchesEnd);
+}
+
+function trimMentionSeam(text: string, touchesStart: boolean, touchesEnd: boolean): string {
+  let trimmed = text;
+  if (touchesStart) trimmed = trimmed.replace(/^[\s:：]+/u, "");
+  if (touchesEnd) trimmed = trimmed.replace(/\s+$/u, "");
+  return trimmed;
+}
+
 function normalizedMessage(data: DecodedInbound, botUid: string, botName: string): InboundMessage {
   if (!(data.channelType === 1 || data.channelType === 2 || data.channelType === 5)) {
     throw new OctoError(`Octo message channel type ${data.channelType} is unsupported`);
@@ -602,20 +657,7 @@ function normalizedMessage(data: DecodedInbound, botUid: string, botName: string
   const supported = data.payload.type === TEXT_MESSAGE_TYPE;
   const entities = mentionEntities(data.payload);
   const mentionedUserIds = mentionUids(data.payload);
-  let normalizedText = text;
-  const botEntity = entities.find((entity) => entity.uid === botUid
-    && entity.offset + entity.length <= text.length
-    && text.slice(entity.offset, entity.offset + entity.length).startsWith("@"));
-  if (botEntity) {
-    normalizedText = text.slice(0, botEntity.offset) + text.slice(botEntity.offset + botEntity.length);
-    if (botEntity.offset === 0) normalizedText = normalizedText.replace(/^[\s:：]+/u, "");
-  } else if (mentionedUserIds.includes(botUid)) {
-    const prefix = `@${botName}`;
-    const next = text[prefix.length];
-    if (text.startsWith(prefix) && (next === undefined || /[\s:：]/u.test(next))) {
-      normalizedText = text.slice(prefix.length).replace(/^[\s:：]+/u, "");
-    }
-  }
+  const normalizedText = stripBotMention(text, botUid, botName, entities, mentionedUserIds);
   const channelId = data.channelType === 1 ? data.senderId : data.rawChannelId;
   if (channelId.length === 0) throw new OctoError("Octo group message has no channel id");
   return {
@@ -1393,16 +1435,18 @@ export class OctoTransport implements ChannelTransport {
 
   private handleRecv(state: SocketState, frameBody: Uint8Array): void {
     const reader = new ByteReader(frameBody);
+    let header = "";
     try {
       const setting = reader.byte();
       void reader.string();
       const senderId = reader.string();
       const rawChannelId = reader.string();
       const channelType = reader.byte();
+      header = `channelType=${channelType} sender=${senderId} channel=${rawChannelId}`;
       if (channelType === 1
         && rawChannelId.includes("@")
         && !rawChannelId.includes(this.registration?.uid ?? "")) {
-        this.logger("Octo DM channel id failed the bot identity check");
+        this.logger(`Octo DM channel id failed the bot identity check (${header})`);
         return;
       }
       if (state.serverVersion >= 3) void reader.int32();
@@ -1430,7 +1474,8 @@ export class OctoTransport implements ChannelTransport {
         }
       });
     } catch (error) {
-      this.logger(error instanceof OctoError ? error.message : "Octo inbound message is invalid");
+      const detail = error instanceof OctoError ? error.message : "Octo inbound message is invalid";
+      this.logger(header.length > 0 ? `${detail} (${header})` : detail);
     }
   }
 
