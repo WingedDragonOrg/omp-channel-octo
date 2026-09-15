@@ -43,6 +43,22 @@ export interface RestartNoticeRecord extends ChatTarget {
   requestedAt: number;
 }
 
+/**
+ * The last progress-card frame the server accepted for a task. Card identity only exists in the
+ * process that observed the run, so this row lets the next process submit one terminal edit
+ * instead of leaving the client on the last running state.
+ */
+export interface ProgressCardRecord extends ChatTarget {
+  botUid: string;
+  taskId: string;
+  messageId: string;
+  lastSeq: number;
+  /** Encoded `ExecutionSnapshot` of the last accepted frame. */
+  snapshot: string;
+  /** Recovery attempts already spent on this row. */
+  attempts: number;
+}
+
 export interface OutboxRecord extends ChatTarget {
   id: string;
   botUid: string;
@@ -331,6 +347,18 @@ export class ChannelStore {
         mode TEXT NOT NULL CHECK(mode IN ('steer', 'queue')),
         updated_at INTEGER NOT NULL,
         PRIMARY KEY(bot_uid, channel_type, channel_id)
+      );
+      CREATE TABLE IF NOT EXISTS progress_cards (
+        bot_uid TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
+        channel_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        last_seq INTEGER NOT NULL CHECK(last_seq >= 1),
+        snapshot TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(bot_uid, task_id)
       );
     `);
     for (const statement of [
@@ -719,6 +747,76 @@ export class ChannelStore {
       );
       return rows.map((row) => this.taskFromRow(row));
     });
+  }
+
+  /**
+   * Records the card frame the server accepted. Reads back through {@link listProgressCards} when
+   * a later process has to finalize a card this one cannot.
+   */
+  saveProgressCard(record: Omit<ProgressCardRecord, "attempts">): void {
+    this.run(
+      `INSERT INTO progress_cards(
+         bot_uid, task_id, channel_type, channel_id, message_id, last_seq, snapshot, attempts, updated_at
+       )
+       VALUES(?, ?, ?, ?, ?, ?, ?, 0, ?)
+       ON CONFLICT(bot_uid, task_id) DO UPDATE SET
+         channel_type = excluded.channel_type,
+         channel_id = excluded.channel_id,
+         message_id = excluded.message_id,
+         last_seq = excluded.last_seq,
+         snapshot = excluded.snapshot,
+         attempts = 0,
+         updated_at = excluded.updated_at`,
+      [
+        record.botUid,
+        record.taskId,
+        record.channelType,
+        record.channelId,
+        record.messageId,
+        record.lastSeq,
+        record.snapshot,
+        Date.now(),
+      ],
+    );
+  }
+
+  listProgressCards(botUid: string): ProgressCardRecord[] {
+    return this.query(
+      "SELECT * FROM progress_cards WHERE bot_uid = ? ORDER BY updated_at ASC, task_id ASC",
+      [botUid],
+    ).map((row) => ({
+      botUid: asString(row.bot_uid),
+      taskId: asString(row.task_id),
+      channelType: asNumber(row.channel_type) as 1 | 2 | 5,
+      channelId: asString(row.channel_id),
+      messageId: asString(row.message_id),
+      lastSeq: asNumber(row.last_seq),
+      snapshot: asString(row.snapshot),
+      attempts: asNumber(row.attempts),
+    }));
+  }
+
+  /**
+   * Counts a spent recovery attempt and returns the new total. The sequence advances too: an
+   * attempt whose response was lost may already have been accepted, so the next one must stay
+   * strictly above every sequence the server has seen.
+   */
+  recordProgressCardAttempt(botUid: string, taskId: string): number {
+    this.run(
+      `UPDATE progress_cards
+       SET attempts = attempts + 1, last_seq = last_seq + 1, updated_at = ?
+       WHERE bot_uid = ? AND task_id = ?`,
+      [Date.now(), botUid, taskId],
+    );
+    const row = this.query(
+      "SELECT attempts FROM progress_cards WHERE bot_uid = ? AND task_id = ?",
+      [botUid, taskId],
+    )[0];
+    return asNumber(row?.attempts);
+  }
+
+  clearProgressCard(botUid: string, taskId: string): void {
+    this.run("DELETE FROM progress_cards WHERE bot_uid = ? AND task_id = ?", [botUid, taskId]);
   }
 
   addRestartNotice(record: RestartNoticeRecord): void {

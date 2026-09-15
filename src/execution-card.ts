@@ -502,6 +502,83 @@ export function createExecutionTracker(options: ExecutionTrackerOptions = {}): E
   return new ExecutionTrackerState(options);
 }
 
+/**
+ * Serializes a snapshot for durable storage. A process that did not observe the run (for example
+ * the one that starts after a restart interrupted it) can then replay the same trajectory and
+ * submit one terminal card edit instead of leaving the client on the last running state.
+ */
+export function encodeExecutionSnapshot(snapshot: ExecutionSnapshot): string {
+  return JSON.stringify(snapshot);
+}
+
+/**
+ * Rebuilds a terminal snapshot from a stored payload by replaying it through a fresh tracker, so
+ * the same sanitizing, capping, and terminal-state rules apply as in the live run. Returns null
+ * when the payload is not a usable snapshot; callers drop such rows rather than guess.
+ */
+export function restoreExecutionSnapshot(
+  encoded: string,
+  options: { readonly state: Exclude<ExecutionState, "running">; readonly atMs: number },
+): ExecutionSnapshot | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(encoded);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object") return null;
+  const record = parsed as { runId?: unknown; startedAtMs?: unknown; tools?: unknown; todos?: unknown };
+  if (!Array.isArray(record.tools) || !Array.isArray(record.todos)) return null;
+  const startedAtMs = typeof record.startedAtMs === "number" ? finiteTime(record.startedAtMs) : null;
+  const tracker = createExecutionTracker({
+    runId: typeof record.runId === "string" ? record.runId : "octo-progress",
+    ...(startedAtMs === null ? {} : { initialAtMs: startedAtMs }),
+  });
+  const entries = record.tools;
+  for (let index = 0; index < entries.length; index += 1) {
+    const value = entries[index];
+    if (value === null || typeof value !== "object") continue;
+    const tool = value as Record<string, unknown>;
+    const toolCallId = typeof tool.toolCallId === "string" && tool.toolCallId.length > 0
+      ? tool.toolCallId
+      : `stored-${index}`;
+    const summary = typeof tool.summary === "string" ? tool.summary : undefined;
+    const startedToolAtMs = typeof tool.startedAtMs === "number" ? eventTime(tool.startedAtMs) : 0;
+    tracker.apply({
+      type: "tool_start",
+      toolCallId,
+      toolName: typeof tool.toolName === "string" ? tool.toolName : "",
+      atMs: startedToolAtMs,
+      ...(summary === undefined ? {} : { summary }),
+    });
+    const state = savedToolState(tool.state);
+    const endedAtMs = typeof tool.endedAtMs === "number" ? finiteTime(tool.endedAtMs) : null;
+    if (state === null || endedAtMs === null) continue;
+    tracker.apply({
+      type: "tool_end",
+      toolCallId,
+      atMs: endedAtMs,
+      status: state,
+      ...(summary === undefined ? {} : { summary }),
+      ...(state === "failed" || state === "cancelled"
+        ? { errorCategory: safeErrorCategory(tool.errorCategory, state === "cancelled" ? "cancelled" : "unknown") }
+        : {}),
+    });
+  }
+  if (record.todos.length > 0) {
+    tracker.apply({
+      type: "todo_update",
+      atMs: options.atMs,
+      phases: record.todos as readonly ExecutionTodoPhase[],
+    });
+  }
+  return tracker.apply({ type: "run_end", atMs: options.atMs, state: options.state });
+}
+
+function savedToolState(value: unknown): Exclude<ExecutionToolState, "running"> | null {
+  return value === "succeeded" || value === "failed" || value === "cancelled" ? value : null;
+}
+
 interface JsonNode {
   [key: string]: unknown;
 }

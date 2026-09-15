@@ -42,7 +42,14 @@ import type {
   WorkerOptions,
   WorkerProcess,
 } from "./contracts.ts";
-import { createExecutionTracker, type ExecutionEvent } from "./execution-card.ts";
+import {
+  createExecutionTracker,
+  encodeExecutionSnapshot,
+  restoreExecutionSnapshot,
+  type ExecutionEvent,
+  type ExecutionSnapshot,
+  type ExecutionState,
+} from "./execution-card.ts";
 import {
   GROUP_HISTORY_DEFAULT_MAX_MESSAGES,
   createHistoryBuffer,
@@ -67,7 +74,15 @@ import {
   type ProjectSessionBinding,
   type ProjectSessionState,
 } from "./project-session.ts";
-import { ChannelStore, type BindingRecord, type InboundClaim, type OutboxRecord, type TaskRecord, openChannelStore } from "./store.ts";
+import {
+  ChannelStore,
+  type BindingRecord,
+  type InboundClaim,
+  type OutboxRecord,
+  type ProgressCardRecord,
+  type TaskRecord,
+  openChannelStore,
+} from "./store.ts";
 import { threadParentGroupId } from "./thread-target.ts";
 
 const MAX_TEXT_BYTES = 3_000;
@@ -106,6 +121,8 @@ const PROGRESS_MERGE_MS = 1_000;
 const TEXT_MERGE_MS = 1_000;
 const TYPING_RENEW_MS = 3_000;
 const ACTIVITY_REQUEST_TIMEOUT_MS = 2_000;
+/** Recovery attempts for a card left by a previous process before the row is dropped. */
+const PROGRESS_CARD_RECOVERY_ATTEMPTS = 3;
 const GROUP_HISTORY_FETCH_TIMEOUT_MS = 10_000;
 /** How long one 免@ decision is reused before the group switch is consulted again. */
 const MENTION_PREF_TTL_MS = 60_000;
@@ -550,9 +567,6 @@ class CoreService implements ChannelService {
       const interrupted = this.store.markInterruptedOnStart(identity.uid);
       for (const task of interrupted) {
         await this.enqueueText(taskTarget(task), `服务已重启完成；任务 ${task.id} 因重启中断，请重新发送。`, null);
-        // The card's message id and sequence live in the interrupted process's memory, so the new
-        // process cannot edit it and the client keeps showing the last state the old process sent.
-        console.error(`[progress-card] 任务 ${task.id} 因重启中断：进度卡停留在最后一次成功编辑的状态`);
       }
       const restartedAt = Date.now();
       const notifiedTargets = new Set<string>();
@@ -588,6 +602,7 @@ class CoreService implements ChannelService {
       );
       if (this.stopping) throw new Error("channel 正在停止");
       this.flushAllOutbox();
+      await this.recoverProgressCards();
     } catch (error) {
       this.started = false;
       await this.options.transport.stop().catch(() => {});
@@ -1185,6 +1200,132 @@ class CoreService implements ChannelService {
         `[group-history] commit failed target=${targetKey(target)}:`
         + ` ${error instanceof Error ? error.message : "unknown error"}`,
       );
+    }
+  }
+
+  /**
+   * Persists the card frame the server accepted. A process that did not observe the run cannot
+   * address the card, so this row is what lets a later process close it. Storage failures are
+   * logged instead of being treated as card failures.
+   */
+  private rememberProgressCard(
+    taskId: string,
+    target: ChatTarget,
+    messageId: string,
+    lastSeq: number,
+    snapshot: ExecutionSnapshot,
+  ): void {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) return;
+    try {
+      this.store.saveProgressCard({
+        botUid,
+        taskId,
+        channelType: target.channelType,
+        channelId: target.channelId,
+        messageId,
+        lastSeq,
+        snapshot: encodeExecutionSnapshot(snapshot),
+      });
+    } catch (error) {
+      console.error(
+        `[progress-card] 无法记录卡片状态 task=${taskId}：`
+        + `${error instanceof Error ? error.message : "unknown error"}`,
+      );
+    }
+  }
+
+  /** Drops the persisted card row. Bookkeeping failures are logged, never fatal. */
+  private forgetProgressCard(taskId: string): void {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) return;
+    try {
+      this.store.clearProgressCard(botUid, taskId);
+    } catch (error) {
+      console.error(
+        `[progress-card] 无法清除卡片记录 task=${taskId}：`
+        + `${error instanceof Error ? error.message : "unknown error"}`,
+      );
+    }
+  }
+
+  /**
+   * Counts a recovery attempt, whose row also advances the stored sequence: an attempt whose
+   * response was lost may already be accepted, so the next one has to stay strictly above it. A
+   * failing state disk must not keep the channel from starting, so that failure is logged and
+   * reported as the last attempt.
+   */
+  private recordProgressCardAttempt(taskId: string): number {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) return PROGRESS_CARD_RECOVERY_ATTEMPTS;
+    try {
+      return this.store.recordProgressCardAttempt(botUid, taskId);
+    } catch (error) {
+      console.error(
+        `[progress-card] 无法记录补发尝试 task=${taskId}：`
+        + `${error instanceof Error ? error.message : "unknown error"}`,
+      );
+      return PROGRESS_CARD_RECOVERY_ATTEMPTS;
+    }
+  }
+
+  /**
+   * Closes cards left open by an earlier process — a restart that interrupted the turn, or a
+   * terminal edit that never landed. Without this the client keeps showing the last running state
+   * forever, because the card's message id and sequence only existed in that process.
+   */
+  private async recoverProgressCards(): Promise<void> {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) return;
+    for (const card of this.store.listProgressCards(botUid)) {
+      const target: ChatTarget = { channelType: card.channelType, channelId: card.channelId };
+      const task = this.store.getTask(card.taskId);
+      const state: Exclude<ExecutionState, "running"> = task?.state === "completed"
+        ? "completed"
+        : task?.state === "failed"
+          ? "failed"
+          : "cancelled";
+      const snapshot = restoreExecutionSnapshot(card.snapshot, { state, atMs: Date.now() });
+      if (snapshot === null) {
+        this.forgetProgressCard(card.taskId);
+        console.error(`[progress-card] 丢弃无法解析的卡片记录 task=${card.taskId}`);
+        continue;
+      }
+      try {
+        await this.submitRecoveredCard(target, card, snapshot);
+        this.forgetProgressCard(card.taskId);
+        console.error(
+          `[progress-card] 已补发终态卡片 task=${card.taskId} target=${targetKey(target)} state=${state}`,
+        );
+      } catch (error) {
+        const attempts = this.recordProgressCardAttempt(card.taskId);
+        console.error(
+          `[progress-card] 补发终态失败 task=${card.taskId} attempt=${attempts}：`
+          + `${error instanceof Error ? error.message : "unknown error"}`,
+        );
+        if (attempts >= PROGRESS_CARD_RECOVERY_ATTEMPTS) this.forgetProgressCard(card.taskId);
+      }
+    }
+  }
+
+  /** One recovery edit, under the same bounded deadline as a live card edit. */
+  private async submitRecoveredCard(
+    target: ChatTarget,
+    card: ProgressCardRecord,
+    snapshot: ExecutionSnapshot,
+  ): Promise<void> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ACTIVITY_REQUEST_TIMEOUT_MS);
+    try {
+      await this.options.transport.editProgressCard(
+        target,
+        card.messageId,
+        snapshot,
+        card.lastSeq + 1,
+        controller.signal,
+      );
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -2092,6 +2233,11 @@ class CoreService implements ChannelService {
           parentSignal,
         );
         if (progressVersion === version) progressSentVersion = version;
+        if (running) {
+          this.rememberProgressCard(taskId, target, messageId, cardSeq, progress);
+        } else {
+          this.forgetProgressCard(taskId);
+        }
       } catch (error) {
         const reason = error instanceof Error ? error.message : "unknown error";
         if (!running) {
@@ -2328,6 +2474,7 @@ class CoreService implements ChannelService {
               progressCardId = receipt.messageId;
               progressCardSeq = 1;
               progressSentVersion = initialVersion;
+              this.rememberProgressCard(taskId, target, progressCardId, 1, initial);
               if (progressVersion > progressSentVersion) {
                 if (progressCardFinished) queueProgress(() => editLatestProgress());
                 else scheduleProgressEdit();
