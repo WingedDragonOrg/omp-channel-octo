@@ -2,7 +2,7 @@ import { constants as fsConstants } from "node:fs";
 import { access, chmod, mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, normalize, resolve } from "node:path";
-import type { CoreServiceConfig } from "./contracts.ts";
+import type { CoreServiceConfig, GroupHistoryConfig } from "./contracts.ts";
 
 export const DEFAULT_CONFIG_PATH = "~/.config/omp-channel-octo/config.json";
 export const DEFAULT_BOT_TOKEN_ENV = "OCTO_BOT_TOKEN";
@@ -21,10 +21,14 @@ const CONFIG_KEYS = new Set([
   "startupTimeoutMs",
   "cancelTimeoutMs",
   "restart",
+  "groupHistory",
 ]);
 const TOKEN_ENV_PATTERN = /^(?:OCTO_|OMP_CHANNEL_OCTO_)[A-Za-z_][A-Za-z0-9_]*$/u;
 const MIN_TIMEOUT_MS = 100;
 const MAX_TIMEOUT_MS = 300_000;
+const DEFAULT_GROUP_HISTORY_MAX_MESSAGES = 50;
+const MIN_GROUP_HISTORY_MESSAGES = 1;
+const MAX_GROUP_HISTORY_MESSAGES = 200;
 
 export interface AppConfig extends CoreServiceConfig {
   apiUrl: string;
@@ -38,6 +42,8 @@ export interface AppConfig extends CoreServiceConfig {
   cancelTimeoutMs?: number;
   /** Deployment restart command, e.g. ["super", "-y", "restart", "omp-channel-octo"]. */
   restartCommand?: string[];
+  /** Group/thread history injection; defaults to enabled with 50 messages. */
+  groupHistory: GroupHistoryConfig;
 }
 
 export interface ConfigParseOptions {
@@ -121,6 +127,34 @@ function parseBotTokenEnv(value: unknown): string {
   return name;
 }
 
+function parseGroupHistory(value: unknown): GroupHistoryConfig {
+  if (value === undefined) {
+    return { enabled: true, maxMessages: DEFAULT_GROUP_HISTORY_MAX_MESSAGES };
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw configError("groupHistory 必须是 JSON 对象");
+  }
+  const document = value as Record<string, unknown>;
+  for (const key of Object.keys(document)) {
+    if (key !== "enabled" && key !== "maxMessages") throw configError(`不支持字段 groupHistory.${key}`);
+  }
+  const enabled = document.enabled === undefined ? true : document.enabled;
+  if (typeof enabled !== "boolean") throw configError("groupHistory.enabled 必须是布尔值");
+  if (document.maxMessages === undefined) return { enabled, maxMessages: DEFAULT_GROUP_HISTORY_MAX_MESSAGES };
+  const maxMessages = document.maxMessages;
+  if (
+    typeof maxMessages !== "number"
+    || !Number.isInteger(maxMessages)
+    || maxMessages < MIN_GROUP_HISTORY_MESSAGES
+    || maxMessages > MAX_GROUP_HISTORY_MESSAGES
+  ) {
+    throw configError(
+      `groupHistory.maxMessages 必须是 ${MIN_GROUP_HISTORY_MESSAGES} 到 ${MAX_GROUP_HISTORY_MESSAGES} 的整数`,
+    );
+  }
+  return { enabled, maxMessages };
+}
+
 function parseRestartCommand(value: unknown): string[] | undefined {
   if (value === undefined) return undefined;
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -188,6 +222,7 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
   const startupTimeoutMs = parseTimeout(document.startupTimeoutMs, "startupTimeoutMs");
   const cancelTimeoutMs = parseTimeout(document.cancelTimeoutMs, "cancelTimeoutMs");
   const restartCommand = parseRestartCommand(document.restart);
+  const groupHistory = parseGroupHistory(document.groupHistory);
 
   return {
     apiUrl,
@@ -203,6 +238,7 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
     ...(startupTimeoutMs === undefined ? {} : { startupTimeoutMs }),
     ...(cancelTimeoutMs === undefined ? {} : { cancelTimeoutMs }),
     ...(restartCommand === undefined ? {} : { restartCommand }),
+    groupHistory,
   };
 }
 
@@ -264,5 +300,6 @@ export function toCoreConfig(config: AppConfig): CoreServiceConfig {
     ...(config.ownerId === undefined ? {} : { ownerId: config.ownerId }),
     allowedGroupIds: [...config.allowedGroupIds],
     stateDir: config.stateDir,
+    groupHistory: { ...config.groupHistory },
   };
 }

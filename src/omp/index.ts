@@ -1110,6 +1110,8 @@ class RpcWorker implements OmpWorker {
 	#requestCounter = 0;
 	#pending = new Map<string, PendingResponse>();
 	#activePrompt: PromptRun | undefined;
+	/** True from prompt acknowledgement until the terminal `agent_end` settles the run. */
+	#streaming = false;
 	#activeTools = new Map<string, HostTool>();
 	#hostCalls = new Map<string, HostCall>();
 	#sessionFile = "";
@@ -1223,6 +1225,7 @@ class RpcWorker implements OmpWorker {
 			);
 			this.#assertSuccess(response, "prompt");
 			if (response.id !== run.requestId) throw new Error("OMP prompt acknowledgement did not contain the expected request ID");
+			this.#streaming = true;
 			const data = response.data;
 			if (isRecord(data) && data.agentInvoked === false) this.#settlePrompt(run);
 			await run.completion;
@@ -1233,7 +1236,30 @@ class RpcWorker implements OmpWorker {
 			this.#abortHostCalls(new Error("prompt finished"));
 			await this.#clearHostTools();
 			if (this.#activePrompt === run) this.#activePrompt = undefined;
+			this.#streaming = false;
 		}
+	}
+
+	/**
+	 * Steering is only meaningful while a turn streams: once the terminal `agent_end` arrived OMP
+	 * would park the message in a queue no later turn drains, so the host must fall back to a task.
+	 */
+	async steer(text: string): Promise<void> {
+		if (this.#closed) throw new Error("OMP worker is not running");
+		if (!this.#activePrompt || !this.#streaming) {
+			throw new Error("OMP worker is not streaming a turn");
+		}
+		if (typeof text !== "string" || text.trim().length === 0) {
+			throw new Error("OMP steering text must be a non-empty string");
+		}
+		const response = await this.#request({ type: "steer", message: text }, DEFAULT_REQUEST_TIMEOUT_MS);
+		this.#assertSuccess(response, "steer");
+	}
+
+	async abortTurn(): Promise<void> {
+		if (this.#closed) throw new Error("OMP worker is not running");
+		const response = await this.#request({ type: "abort" }, Math.min(1_000, this.#cancelTimeoutMs));
+		this.#assertSuccess(response, "abort");
 	}
 
 	async stop(): Promise<boolean> {
@@ -1615,12 +1641,14 @@ class RpcWorker implements OmpWorker {
 	#settlePrompt(run: PromptRun): void {
 		if (run.settled) return;
 		run.settled = true;
+		this.#streaming = false;
 		run.resolve();
 	}
 
 	#rejectPrompt(run: PromptRun, error: Error): void {
 		if (run.settled) return;
 		run.settled = true;
+		this.#streaming = false;
 		run.reject(error);
 	}
 

@@ -91,6 +91,14 @@ class DelayedStopWorker implements OmpWorker {
       : this.inner.prompt(text, onEvent, context);
   }
 
+  steer(text: string): Promise<void> {
+    return this.inner.steer(text);
+  }
+
+  abortTurn(): Promise<void> {
+    return this.inner.abortTurn();
+  }
+
   refreshState(): Promise<ProjectSessionState> {
     return this.inner.refreshState();
   }
@@ -144,6 +152,14 @@ class StopFalseWorker implements OmpWorker {
       : this.inner.prompt(text, onEvent, context);
   }
 
+  steer(text: string): Promise<void> {
+    return this.inner.steer(text);
+  }
+
+  abortTurn(): Promise<void> {
+    return this.inner.abortTurn();
+  }
+
   refreshState(): Promise<ProjectSessionState> {
     return this.inner.refreshState();
   }
@@ -195,6 +211,14 @@ class CommandLeaseWorker implements OmpWorker {
     } else {
       await this.inner.prompt(text, onEvent, context);
     }
+  }
+
+  async steer(text: string): Promise<void> {
+    await this.inner.steer(text);
+  }
+
+  async abortTurn(): Promise<void> {
+    await this.inner.abortTurn();
   }
 
   async refreshState(): Promise<ProjectSessionState> {
@@ -450,7 +474,7 @@ test("directory execution preserves durable acceptance order across chats", asyn
     );
     await holdStarted.promise;
     firstQueuedTask = harness.service.handleInbound(
-      inbound({ messageId: "order-first-queued", ...firstTarget, text: "order-first-queued" }),
+      inbound({ messageId: "order-first-queued", ...firstTarget, text: "/queue order-first-queued" }),
     );
     await firstQueuedTask;
     secondQueuedTask = harness.service.handleInbound(
@@ -518,7 +542,7 @@ for (const commandKind of ["new", "move"] as const) {
         inbound({
           messageId: `command-lease-queued-${commandKind}`,
           ...firstTarget,
-          text: "command-lease-queued",
+          text: "/queue command-lease-queued",
         }),
       );
       await queuedTask;
@@ -674,7 +698,7 @@ test("a queued task reacquires the moved cwd lock after its chat predecessor wit
     );
     await holdStarted.promise;
     await harness.service.handleInbound(
-      inbound({ messageId: "queued-move-a", ...target, text: "queued-a" }),
+      inbound({ messageId: "queued-move-a", ...target, text: "/queue queued-a" }),
     );
     await writeFile(
       sessionFile,
@@ -688,7 +712,7 @@ test("a queued task reacquires the moved cwd lock after its chat predecessor wit
       "utf8",
     );
     await harness.service.handleInbound(
-      inbound({ messageId: "queued-move-b", ...target, text: "queued-b" }),
+      inbound({ messageId: "queued-move-b", ...target, text: "/queue queued-b" }),
     );
     releaseHold.release();
     await harness.workers.waitForPromptCount(3);

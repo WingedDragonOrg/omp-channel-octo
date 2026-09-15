@@ -12,7 +12,21 @@ export interface InboundMessage extends ChatTarget {
   text: string;
   mentionedUserIds: string[];
   supported: boolean;
+  /**
+   * Per-channel monotonic WuKongIM sequence of this message. `0` means the
+   * transport could not decode one, and such messages never participate in
+   * group history accounting.
+   */
+  messageSeq: number;
+  /** Server send time in epoch milliseconds; `0` means unknown. */
+  messageTimestamp: number;
 }
+
+/**
+ * Delivery choice for a message that arrives while its chat already runs a task:
+ * `steer` injects it into the running OMP turn, `queue` runs it after that turn yields.
+ */
+export type ChatAppendMode = "steer" | "queue";
 
 export interface BotIdentity {
   uid: string;
@@ -25,18 +39,54 @@ export interface SendReceipt {
   messageId?: string;
 }
 
+/** One text message of a group/thread channel history window. */
+export interface HistoryMessage {
+  seq: number;
+  senderId: string;
+  text: string;
+  timestamp: number;
+}
+
+/**
+ * Server-side channel history page request. `untilSeq === 0` means "the newest
+ * `limit` messages"; otherwise the page covers `[sinceSeq, untilSeq)` starting
+ * at `sinceSeq` and is truncated by `limit` (WuKongIM `pull_mode=1`).
+ */
+export interface HistoryFetch {
+  sinceSeq: number;
+  untilSeq: number;
+  limit: number;
+  signal?: AbortSignal;
+}
+
 export interface ChannelTransport {
   initialize(): Promise<BotIdentity>;
   start(
     onMessage: (message: InboundMessage) => Promise<void>,
     onOnline: () => void,
   ): Promise<void>;
+  /** Group/thread history page; rejects when the server call fails. */
+  fetchGroupMessages(target: ChatTarget, fetch: HistoryFetch): Promise<HistoryMessage[]>;
   getGroupContext(target: ChatTarget): Promise<GroupContext | null>;
   updateGroupContext(
     target: ChatTarget,
     content: string,
     signal?: AbortSignal,
   ): Promise<{ version: number }>;
+  getGroupInfo(groupId: string, signal?: AbortSignal): Promise<GroupInfo>;
+  getGroupMembers(groupId: string, signal?: AbortSignal): Promise<GroupMember[]>;
+  updateGroupInfo(
+    groupId: string,
+    patch: GroupInfoPatch,
+    signal?: AbortSignal,
+  ): Promise<void>;
+  listThreads(groupId: string, signal?: AbortSignal): Promise<ThreadSummary[]>;
+  createThread(groupId: string, name: string, signal?: AbortSignal): Promise<ThreadSummary>;
+  getThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<ThreadSummary>;
+  getThreadMembers(groupId: string, shortId: string, signal?: AbortSignal): Promise<GroupMember[]>;
+  joinThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void>;
+  leaveThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void>;
+  deleteThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void>;
   sendFile(
     target: ChatTarget,
     path: string,
@@ -78,6 +128,41 @@ export interface GroupContext {
   version: number;
   updatedAt: string | null;
   updatedBy: string;
+}
+
+export interface GroupInfo {
+  groupId: string;
+  name: string;
+  notice: string;
+  creator: string;
+  status: number;
+  createdAt: string;
+}
+
+export interface GroupInfoPatch {
+  name?: string;
+  notice?: string;
+}
+
+export interface GroupMember {
+  uid: string;
+  name: string;
+  role: number;
+  robot: boolean;
+  joinedAt: string;
+}
+
+export interface ThreadSummary {
+  shortId: string;
+  groupId: string;
+  channelId: string;
+  name: string;
+  creatorUid: string;
+  status: number;
+  memberCount: number;
+  messageCount: number;
+  createdAt: string;
+  updatedAt: string;
 }
  
 export type ProgressCard = ExecutionSnapshot;
@@ -139,6 +224,10 @@ export interface OmpWorker {
     onEvent: (event: WorkerEvent) => void,
     context?: PromptContext,
   ): Promise<void>;
+  /** Injects a message into the running OMP turn; fails once no turn is streaming. */
+  steer(text: string): Promise<void>;
+  /** Aborts the current OMP turn without clearing its queued messages or killing the worker. */
+  abortTurn(): Promise<void>;
   refreshState(): Promise<ProjectSessionState>;
   stop(): Promise<boolean>;
 }
@@ -149,12 +238,20 @@ export interface WorkerFactory {
   recover(process: WorkerProcess): Promise<boolean>;
 }
 
+export interface GroupHistoryConfig {
+  enabled: boolean;
+  /** Upper bound of history entries injected per task turn (1..200). */
+  maxMessages: number;
+}
+
 export interface CoreServiceConfig {
   ownerId?: string;
   allowedGroupIds: string[];
   stateDir: string;
   /** Injectable home for deterministic tests; production defaults to os.homedir(). */
   homeDir?: string;
+  /** `parseConfig` always supplies this (defaults to enabled with `maxMessages = 50`); omitting it disables history. */
+  groupHistory?: GroupHistoryConfig;
 }
 
 export type ChatExecutionState =
@@ -171,6 +268,7 @@ export interface ChannelStatus {
   sessionId: string | null;
   cwd: string | null;
   state: ChatExecutionState;
+  mode: ChatAppendMode;
   queued: number;
   outbox: number;
   unknownOutbox: number;

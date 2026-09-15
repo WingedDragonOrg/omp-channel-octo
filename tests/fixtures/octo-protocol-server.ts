@@ -91,6 +91,43 @@ export interface FixtureGroupContextUpdate {
   body: Record<string, unknown>;
 }
 
+export interface FixtureManagementRequest {
+  method: string;
+  path: string;
+  authorization: string | undefined;
+  body: Record<string, unknown>;
+}
+
+/** Thread record returned by the fixture's group/thread management routes. */
+export interface FixtureManagementThread {
+  short_id: string;
+  group_no: string;
+  channel_id: string;
+  channel_type: number;
+  name: string;
+  creator_uid: string;
+  status: number;
+  member_count: number;
+  message_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+type ManagementRoute =
+  | { kind: "group-info"; groupId: string }
+  | { kind: "group-members"; groupId: string }
+  | { kind: "group-info-update"; groupId: string }
+  | { kind: "thread-list"; groupId: string }
+  | { kind: "thread-create"; groupId: string }
+  | { kind: "thread-info"; groupId: string; shortId: string }
+  | { kind: "thread-delete"; groupId: string; shortId: string }
+  | { kind: "thread-members"; groupId: string; shortId: string }
+  | { kind: "thread-join"; groupId: string; shortId: string }
+  | { kind: "thread-leave"; groupId: string; shortId: string };
+
+const FIXTURE_MANAGEMENT_CREATED_AT = "2026-09-12T00:00:00.000Z";
+const FIXTURE_GROUP_NAME = "Fixture Group";
+
 export interface FixtureSentMessage {
   authorization: string | undefined;
   body: Record<string, unknown>;
@@ -106,6 +143,12 @@ export interface FixtureCardProfileRequest {
   authorization: string | undefined;
 }
 export interface FixtureMessageEdit {
+  path: string;
+  authorization: string | undefined;
+  body: Record<string, unknown>;
+}
+
+export interface FixtureMessageSyncRequest {
   path: string;
   authorization: string | undefined;
   body: Record<string, unknown>;
@@ -155,6 +198,10 @@ export interface OctoProtocolFixtureOptions {
   groupContextPutStatuses?: Record<string, number>;
   /** Versions returned from successful context updates. */
   groupContextPutVersions?: Record<string, number>;
+  /** Status override for bot group/thread management routes, keyed by `${METHOD} ${pathname}`. */
+  managementStatuses?: Record<string, number>;
+  /** Raw response body for bot group/thread management routes, keyed by `${METHOD} ${pathname}`. */
+  managementBodies?: Record<string, unknown>;
   /** Status for presigned URL discovery. */
   presignStatus?: number;
   /** Offset applied only to the upload server's expected byte count. */
@@ -179,6 +226,8 @@ export interface OctoProtocolFixtureOptions {
   sendMessageDelayMs?: number;
   /** Delay before responding to POST /v1/bot/message/edit. */
   messageEditDelayMs?: number;
+  /** Delay before responding to POST /v1/bot/messages/sync. */
+  messageSyncDelayMs?: number;
 }
 
 
@@ -462,11 +511,13 @@ export class OctoProtocolFixture {
   readonly typingRequests: FixtureTypingRequest[] = [];
   readonly cardProfileRequests: FixtureCardProfileRequest[] = [];
   readonly messageEdits: FixtureMessageEdit[] = [];
+  readonly messagesSyncRequests: FixtureMessageSyncRequest[] = [];
   /** Latest type-1 text body accepted by message_id. */
   readonly latestEditedTextByMessageId = new Map<string, string>();
 
   readonly groupContextRequests: FixtureGroupContextRequest[] = [];
   readonly groupContextUpdates: FixtureGroupContextUpdate[] = [];
+  readonly managementRequests: FixtureManagementRequest[] = [];
   readonly presignRequests: FixturePresignRequest[] = [];
   readonly uploadRequests: FixtureUploadRequest[] = [];
   readonly connections: FixtureConnection[] = [];
@@ -489,6 +540,11 @@ export class OctoProtocolFixture {
   private registerCount = 0;
   private uploadCount = 0;
   private nextMessageId = FIRST_MESSAGE_ID;
+  private readonly managedGroupInfo = new Map<string, { name: string; notice: string }>();
+  private readonly managedThreads = new Map<string, FixtureManagementThread[]>();
+  private nextThreadSequence = 0;
+  private messageSyncStatus = 200;
+  private messageSyncBody: unknown = { messages: [] };
   private started = false;
 
   private constructor(options: OctoProtocolFixtureOptions, httpServer: Server, wsServer: WebSocketServer, port: number) {
@@ -582,6 +638,155 @@ export class OctoProtocolFixture {
   }
   getLatestEditedText(messageId: string): string | undefined {
     return this.latestEditedTextByMessageId.get(messageId);
+  }
+
+  /**
+   * Response returned by POST /v1/bot/messages/sync. Objects are JSON-serialized; a string
+   * is written verbatim so tests can exercise malformed-JSON handling.
+   */
+  setMessagesSync(body: unknown, status = 200): void {
+    this.messageSyncBody = body;
+    this.messageSyncStatus = status;
+  }
+
+  private managementRouteFor(method: string, pathname: string): ManagementRoute | null {
+    const group = /^\/v1\/bot\/groups\/([^/]+)$/.exec(pathname);
+    if (group?.[1] !== undefined && method === "GET") {
+      return { kind: "group-info", groupId: decodeURIComponent(group[1]) };
+    }
+    const members = /^\/v1\/bot\/groups\/([^/]+)\/members$/.exec(pathname);
+    if (members?.[1] !== undefined && method === "GET") {
+      return { kind: "group-members", groupId: decodeURIComponent(members[1]) };
+    }
+    const info = /^\/v1\/bot\/groups\/([^/]+)\/info$/.exec(pathname);
+    if (info?.[1] !== undefined && method === "PUT") {
+      return { kind: "group-info-update", groupId: decodeURIComponent(info[1]) };
+    }
+    const threads = /^\/v1\/bot\/groups\/([^/]+)\/threads$/.exec(pathname);
+    if (threads?.[1] !== undefined) {
+      if (method === "GET") return { kind: "thread-list", groupId: decodeURIComponent(threads[1]) };
+      if (method === "POST") return { kind: "thread-create", groupId: decodeURIComponent(threads[1]) };
+      return null;
+    }
+    const thread = /^\/v1\/bot\/groups\/([^/]+)\/threads\/([^/]+)$/.exec(pathname);
+    if (thread?.[1] !== undefined && thread[2] !== undefined) {
+      const groupId = decodeURIComponent(thread[1]);
+      const shortId = decodeURIComponent(thread[2]);
+      if (method === "GET") return { kind: "thread-info", groupId, shortId };
+      if (method === "DELETE") return { kind: "thread-delete", groupId, shortId };
+      return null;
+    }
+    const action = /^\/v1\/bot\/groups\/([^/]+)\/threads\/([^/]+)\/(members|join|leave)$/.exec(pathname);
+    if (action?.[1] !== undefined && action[2] !== undefined) {
+      const groupId = decodeURIComponent(action[1]);
+      const shortId = decodeURIComponent(action[2]);
+      if (method === "GET" && action[3] === "members") return { kind: "thread-members", groupId, shortId };
+      if (method === "POST" && action[3] === "join") return { kind: "thread-join", groupId, shortId };
+      if (method === "POST" && action[3] === "leave") return { kind: "thread-leave", groupId, shortId };
+    }
+    return null;
+  }
+
+  private threadOf(groupId: string, shortId: string): FixtureManagementThread | undefined {
+    return (this.managedThreads.get(groupId) ?? []).find((thread) => thread.short_id === shortId);
+  }
+
+  private respondManagement(
+    route: ManagementRoute,
+    body: Record<string, unknown>,
+    response: ServerResponse,
+  ): void {
+    const groupId = route.groupId;
+    const stored = this.managedGroupInfo.get(groupId);
+    switch (route.kind) {
+      case "group-info": {
+        writeJson(response, 200, {
+          group_no: groupId,
+          name: stored?.name ?? FIXTURE_GROUP_NAME,
+          notice: stored?.notice ?? "",
+          creator: OWNER_UID,
+          status: 1,
+          created_at: FIXTURE_MANAGEMENT_CREATED_AT,
+        });
+        return;
+      }
+      case "group-members": {
+        writeJson(response, 200, [
+          { uid: OWNER_UID, name: "Fixture Owner", role: 1, robot: 0, created_at: FIXTURE_MANAGEMENT_CREATED_AT },
+          { uid: BOT_UID, name: BOT_NAME, role: 0, robot: 1, created_at: FIXTURE_MANAGEMENT_CREATED_AT },
+        ]);
+        return;
+      }
+      case "group-info-update": {
+        const name = typeof body.name === "string" ? body.name : undefined;
+        const notice = typeof body.notice === "string" ? body.notice : undefined;
+        if (name === undefined && notice === undefined) {
+          writeJson(response, 400, { error: { message: "请求参数有误。" }, msg: "请求参数有误。" });
+          return;
+        }
+        this.managedGroupInfo.set(groupId, {
+          name: name ?? stored?.name ?? FIXTURE_GROUP_NAME,
+          notice: notice ?? stored?.notice ?? "",
+        });
+        writeJson(response, 200, { ok: true });
+        return;
+      }
+      case "thread-list": {
+        writeJson(response, 200, this.managedThreads.get(groupId) ?? []);
+        return;
+      }
+      case "thread-create": {
+        const shortId = `thread-${this.nextThreadSequence}`;
+        this.nextThreadSequence += 1;
+        const thread: FixtureManagementThread = {
+          short_id: shortId,
+          group_no: groupId,
+          channel_id: `${groupId}____${shortId}`,
+          channel_type: 5,
+          name: typeof body.name === "string" ? body.name : "",
+          creator_uid: BOT_UID,
+          status: 1,
+          member_count: 1,
+          message_count: 0,
+          created_at: FIXTURE_MANAGEMENT_CREATED_AT,
+          updated_at: FIXTURE_MANAGEMENT_CREATED_AT,
+        };
+        this.managedThreads.set(groupId, [...(this.managedThreads.get(groupId) ?? []), thread]);
+        writeJson(response, 200, thread);
+        return;
+      }
+      case "thread-info": {
+        const thread = this.threadOf(groupId, route.shortId);
+        if (!thread) {
+          writeJson(response, 400, {
+            error: { code: "err.server.bot_api.request_invalid", message: "请求参数有误。" },
+            msg: "请求参数有误。",
+            status: 400,
+          });
+          return;
+        }
+        writeJson(response, 200, thread);
+        return;
+      }
+      case "thread-delete": {
+        this.managedThreads.set(
+          groupId,
+          (this.managedThreads.get(groupId) ?? []).filter((thread) => thread.short_id !== route.shortId),
+        );
+        writeJson(response, 200, { status: 200 });
+        return;
+      }
+      case "thread-members": {
+        writeJson(response, 200, [
+          { uid: BOT_UID, name: BOT_NAME, role: 1, created_at: FIXTURE_MANAGEMENT_CREATED_AT },
+        ]);
+        return;
+      }
+      default: {
+        writeJson(response, 200, { status: 200 });
+        return;
+      }
+    }
   }
 
 
@@ -734,6 +939,36 @@ export class OctoProtocolFixture {
       return;
     }
 
+    const managementRoute = this.managementRouteFor(request.method ?? "GET", url.pathname);
+    if (managementRoute !== null) {
+      this.managementRequests.push({
+        method: request.method ?? "",
+        path: url.pathname,
+        authorization,
+        body: parsedBody,
+      });
+      if (authorization !== `Bearer ${BOT_TOKEN}`) {
+        writeJson(response, 401, { error: { message: "invalid bot token" } });
+        return;
+      }
+      const key = `${request.method} ${url.pathname}`;
+      const overrideStatus = this.options.managementStatuses?.[key];
+      if (overrideStatus !== undefined && (overrideStatus < 200 || overrideStatus >= 300)) {
+        writeJson(response, overrideStatus, {
+          error: { message: "management route failed" },
+          msg: "management route failed",
+        });
+        return;
+      }
+      const overrideBody = this.options.managementBodies?.[key];
+      if (overrideBody !== undefined) {
+        writeJson(response, 200, overrideBody);
+        return;
+      }
+      this.respondManagement(managementRoute, parsedBody, response);
+      return;
+    }
+
     const threadPath = /^\/v1\/bot\/groups\/([^/]+)\/threads\/([^/]+)\/md$/.exec(url.pathname);
     const groupPath = /^\/v1\/bot\/groups\/([^/]+)\/md$/.exec(url.pathname);
     let target: string | undefined;
@@ -862,6 +1097,27 @@ export class OctoProtocolFixture {
         }
       }
       writeJson(response, 200, { ok: true });
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/bot/messages/sync") {
+      this.messagesSyncRequests.push({
+        path: `${url.pathname}${url.search}`,
+        authorization,
+        body: parsedBody,
+      });
+      if (authorization !== `Bearer ${BOT_TOKEN}`) {
+        writeJson(response, 401, { error: "invalid bot token" });
+        return;
+      }
+      const responseDelay = this.options.messageSyncDelayMs ?? 0;
+      if (responseDelay > 0) await sleep(responseDelay);
+      response.writeHead(this.messageSyncStatus, { "content-type": "application/json" });
+      response.end(
+        typeof this.messageSyncBody === "string"
+          ? this.messageSyncBody
+          : JSON.stringify(this.messageSyncBody),
+      );
       return;
     }
 

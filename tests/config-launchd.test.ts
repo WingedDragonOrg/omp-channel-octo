@@ -1,6 +1,7 @@
+import { readFileSync } from "node:fs";
 import { expect, test } from "bun:test";
 import { generateLaunchdPlist } from "../src/launchd.ts";
-import { parseConfig } from "../src/config.ts";
+import { parseConfig, toCoreConfig } from "../src/config.ts";
 
 function configDocument(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -79,6 +80,55 @@ test("restart command is optional and validated when present", () => {
   for (const restart of [[], "super restart", { command: [] }, { command: [""] }, { command: "super" }, { unknown: true }]) {
     expect(() => parseConfig(configDocument({ restart }))).toThrow(/restart/);
   }
+});
+
+test("group history defaults to enabled with 50 messages", () => {
+  expect(toCoreConfig(parseConfig(configDocument())).groupHistory).toEqual({ enabled: true, maxMessages: 50 });
+  expect(toCoreConfig(parseConfig(configDocument({ groupHistory: {} }))).groupHistory)
+    .toEqual({ enabled: true, maxMessages: 50 });
+  expect(toCoreConfig(parseConfig(configDocument({ groupHistory: { maxMessages: 12 } }))).groupHistory)
+    .toEqual({ enabled: true, maxMessages: 12 });
+  expect(toCoreConfig(parseConfig(configDocument({ groupHistory: { enabled: false } }))).groupHistory)
+    .toEqual({ enabled: false, maxMessages: 50 });
+});
+
+test("group history passes an explicit window through to the core config", () => {
+  expect(toCoreConfig(parseConfig(configDocument({
+    groupHistory: { enabled: true, maxMessages: 200 },
+  }))).groupHistory).toEqual({ enabled: true, maxMessages: 200 });
+  expect(toCoreConfig(parseConfig(configDocument({
+    groupHistory: { enabled: true, maxMessages: 1 },
+  }))).groupHistory).toEqual({ enabled: true, maxMessages: 1 });
+});
+
+test("group history rejects an out-of-range or non-integer message window", () => {
+  for (const maxMessages of [0, 201, 1.5, "20", null]) {
+    expect(() => parseConfig(configDocument({ groupHistory: { enabled: true, maxMessages } })))
+      .toThrow(/maxMessages/);
+  }
+});
+
+test("group history rejects a non-boolean enabled flag", () => {
+  for (const enabled of ["true", 1, null]) {
+    expect(() => parseConfig(configDocument({ groupHistory: { enabled } }))).toThrow(/enabled/);
+  }
+});
+
+test("group history rejects unknown fields and non-object values", () => {
+  expect(() => parseConfig(configDocument({ groupHistory: { enabled: true, limit: 5 } })))
+    .toThrow(/groupHistory\.limit/);
+  for (const groupHistory of [[], "on", null, 3]) {
+    expect(() => parseConfig(configDocument({ groupHistory }))).toThrow(/groupHistory/);
+  }
+});
+
+test("config.example.json stays parseable and documents the group history defaults", () => {
+  const example = JSON.parse(
+    readFileSync(new URL("../config.example.json", import.meta.url), "utf8"),
+  ) as Record<string, unknown>;
+  expect(example.groupHistory).toEqual({ enabled: true, maxMessages: 50 });
+  expect(toCoreConfig(parseConfig(example, { env: { OCTO_BOT_TOKEN: "example-token" } })).groupHistory)
+    .toEqual({ enabled: true, maxMessages: 50 });
 });
 
 test("config still requires credentials and all other required fields", () => {

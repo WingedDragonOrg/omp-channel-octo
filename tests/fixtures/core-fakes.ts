@@ -4,18 +4,26 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import type {
   BotIdentity,
+  ChannelCommandHandler,
   ChannelService,
   ChannelStatus,
   ChannelTransport,
   ChatTarget,
   CoreServiceConfig,
   GroupContext,
+  GroupHistoryConfig,
+  GroupInfo,
+  GroupInfoPatch,
+  GroupMember,
+  HistoryFetch,
+  HistoryMessage,
   InboundMessage,
   OmpWorker,
   ProgressCard,
   PromptContext,
   RestartPort,
   SendReceipt,
+  ThreadSummary,
   WorkerEvent,
   WorkerFactory,
   WorkerOptions,
@@ -93,12 +101,16 @@ export class FakeTransport implements ChannelTransport {
   readonly textRequests: TextRequest[] = [];
   readonly remoteTextMessages = new Map<string, RemoteTextMessage>();
   readonly groupContextCalls: ChatTarget[] = [];
+  readonly managementCalls: Array<{ action: string; groupId: string; shortId: string | null }> = [];
+  readonly historyCalls: Array<{ target: ChatTarget } & HistoryFetch> = [];
   readonly bot: BotIdentity;
   online: boolean;
   maxConcurrentTextRequests = 0;
 
   private readonly startOnline: boolean;
   private readonly contexts = new Map<string, GroupContext | null>();
+  private readonly histories = new Map<string, HistoryMessage[]>();
+  private historyFailure: Error | undefined;
   private readonly attemptWaiters: Array<{
     predicate: (attempt: TransportAttempt) => boolean;
     resolve: (attempt: TransportAttempt) => void;
@@ -114,6 +126,12 @@ export class FakeTransport implements ChannelTransport {
   private failOncePredicate: ((message: SentMessage) => boolean) | undefined;
   private failEditOncePredicate: ((request: TextRequest) => boolean) | undefined;
   private groupContextFailure: Error | undefined;
+  private readonly groupInfo = new Map<string, GroupInfo>();
+  private readonly groupMembers = new Map<string, GroupMember[]>();
+  private readonly threads = new Map<string, ThreadSummary[]>();
+  private readonly threadMembers = new Map<string, GroupMember[]>();
+  private managementFailure: Error | undefined;
+  private nextThreadId = 1;
   constructor(options: FakeTransportOptions = {}) {
     this.bot = options.bot ?? { uid: "bot-fixture", name: "Fixture Bot" };
     this.online = options.online ?? true;
@@ -133,6 +151,33 @@ export class FakeTransport implements ChannelTransport {
     if (this.startOnline && this.online) {
       onOnline();
     }
+  }
+
+  async fetchGroupMessages(target: ChatTarget, fetch: HistoryFetch): Promise<HistoryMessage[]> {
+    this.historyCalls.push({ target: { ...target }, ...fetch });
+    if (fetch.signal?.aborted) throw new Error("fixture history aborted");
+    if (this.historyFailure) throw this.historyFailure;
+    const stored = this.histories.get(`${target.channelType}:${target.channelId}`) ?? [];
+    const ascending = [...stored].sort((left, right) => left.seq - right.seq);
+    if (fetch.sinceSeq === 0 && fetch.untilSeq === 0) {
+      return ascending.slice(Math.max(0, ascending.length - fetch.limit));
+    }
+    return ascending
+      .filter((message) => message.seq >= fetch.sinceSeq
+        && (fetch.untilSeq === 0 || message.seq < fetch.untilSeq))
+      .slice(0, fetch.limit);
+  }
+
+  setGroupHistory(target: ChatTarget, messages: readonly HistoryMessage[]): void {
+    this.histories.set(
+      `${target.channelType}:${target.channelId}`,
+      messages.map((message) => ({ ...message })),
+    );
+  }
+
+  /** Passing `undefined` clears the failure so later reads succeed again. */
+  failGroupHistoryWith(error?: Error): void {
+    this.historyFailure = error;
   }
 
   async getGroupContext(target: ChatTarget): Promise<GroupContext | null> {
@@ -172,8 +217,144 @@ export class FakeTransport implements ChannelTransport {
     );
   }
 
-  failGroupContextWith(error: Error): void {
+  /** Passing `undefined` clears the failure so later reads succeed again. */
+  failGroupContextWith(error?: Error): void {
     this.groupContextFailure = error;
+  }
+
+  private recordManagement(
+    action: string,
+    groupId: string,
+    shortId: string | null,
+    signal?: AbortSignal,
+  ): void {
+    if (signal?.aborted) throw new Error("fixture management aborted");
+    if (this.managementFailure) throw this.managementFailure;
+    this.managementCalls.push({ action, groupId, shortId });
+  }
+
+  private groupInfoFor(groupId: string): GroupInfo {
+    return (
+      this.groupInfo.get(groupId) ?? {
+        groupId,
+        name: "Fixture Group",
+        notice: "",
+        creator: "owner-1",
+        status: 1,
+        createdAt: "2026-09-12T00:00:00.000Z",
+      }
+    );
+  }
+
+  async getGroupInfo(groupId: string, signal?: AbortSignal): Promise<GroupInfo> {
+    this.recordManagement("group-info", groupId, null, signal);
+    return this.groupInfoFor(groupId);
+  }
+
+  async getGroupMembers(groupId: string, signal?: AbortSignal): Promise<GroupMember[]> {
+    this.recordManagement("group-members", groupId, null, signal);
+    return this.groupMembers.get(groupId) ?? [];
+  }
+
+  async updateGroupInfo(
+    groupId: string,
+    patch: GroupInfoPatch,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    this.recordManagement("group-update", groupId, null, signal);
+    const previous = this.groupInfoFor(groupId);
+    this.groupInfo.set(groupId, {
+      ...previous,
+      ...(patch.name === undefined ? {} : { name: patch.name }),
+      ...(patch.notice === undefined ? {} : { notice: patch.notice }),
+    });
+  }
+
+  async listThreads(groupId: string, signal?: AbortSignal): Promise<ThreadSummary[]> {
+    this.recordManagement("list-threads", groupId, null, signal);
+    return (this.threads.get(groupId) ?? []).map((thread) => ({ ...thread }));
+  }
+
+  async createThread(groupId: string, name: string, signal?: AbortSignal): Promise<ThreadSummary> {
+    this.recordManagement("create-thread", groupId, null, signal);
+    const shortId = `thread-${this.nextThreadId}`;
+    this.nextThreadId += 1;
+    const thread: ThreadSummary = {
+      shortId,
+      groupId,
+      channelId: `${groupId}____${shortId}`,
+      name,
+      creatorUid: this.bot.uid,
+      status: 1,
+      memberCount: 1,
+      messageCount: 0,
+      createdAt: "2026-09-12T00:00:00.000Z",
+      updatedAt: "2026-09-12T00:00:00.000Z",
+    };
+    this.threads.set(groupId, [...(this.threads.get(groupId) ?? []), thread]);
+    return { ...thread };
+  }
+
+  async getThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<ThreadSummary> {
+    this.recordManagement("thread-info", groupId, shortId, signal);
+    const thread = (this.threads.get(groupId) ?? []).find((entry) => entry.shortId === shortId);
+    if (!thread) throw new Error(`fixture thread ${shortId} is not known`);
+    return { ...thread };
+  }
+
+  async getThreadMembers(
+    groupId: string,
+    shortId: string,
+    signal?: AbortSignal,
+  ): Promise<GroupMember[]> {
+    this.recordManagement("thread-members", groupId, shortId, signal);
+    return this.threadMembers.get(`${groupId}:${shortId}`) ?? [];
+  }
+
+  async joinThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void> {
+    this.recordManagement("thread-join", groupId, shortId, signal);
+  }
+
+  async leaveThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void> {
+    this.recordManagement("thread-leave", groupId, shortId, signal);
+  }
+
+  async deleteThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void> {
+    this.recordManagement("thread-delete", groupId, shortId, signal);
+    this.threads.set(
+      groupId,
+      (this.threads.get(groupId) ?? []).filter((entry) => entry.shortId !== shortId),
+    );
+  }
+
+  setGroupInfo(groupId: string, info: GroupInfo): void {
+    this.groupInfo.set(groupId, { ...info });
+  }
+
+  setGroupMembers(groupId: string, members: readonly GroupMember[]): void {
+    this.groupMembers.set(
+      groupId,
+      members.map((member) => ({ ...member })),
+    );
+  }
+
+  setThreadMembers(groupId: string, shortId: string, members: readonly GroupMember[]): void {
+    this.threadMembers.set(
+      `${groupId}:${shortId}`,
+      members.map((member) => ({ ...member })),
+    );
+  }
+
+  setThreads(groupId: string, threads: readonly ThreadSummary[]): void {
+    this.threads.set(
+      groupId,
+      threads.map((thread) => ({ ...thread })),
+    );
+  }
+
+  /** Passing `undefined` clears the failure so later calls succeed again. */
+  failManagementWith(error?: Error): void {
+    this.managementFailure = error;
   }
 
   async sendText(
@@ -437,12 +618,24 @@ export class FakeTransport implements ChannelTransport {
   }
 }
 
+export interface FakeAppendRecord {
+  text: string;
+  sessionId: string;
+  cwd: string;
+}
+
 export interface FakePromptContext {
   readonly text: string;
   readonly cwd: string;
   readonly sessionId: string;
   readonly promptContext: PromptContext | undefined;
   readonly emit: (event: WorkerEvent) => void;
+  /** Appended messages this prompt already received, oldest first. */
+  appended(): readonly FakeAppendRecord[];
+  /** Resolves with the next appended message delivered while this prompt runs. */
+  waitForAppend(): Promise<FakeAppendRecord>;
+  /** Resolves when `/interrupt` aborts this prompt's turn. */
+  waitForAbort(): Promise<void>;
   append(relativeOrAbsolutePath: string, text: string): Promise<void>;
   isStopped(): boolean;
   onStop(callback: () => void): void;
@@ -464,6 +657,12 @@ class FixtureWorker implements OmpWorker {
 
   private currentCwd: string;
   private readonly stopCallbacks = new Set<() => void>();
+  private promptInFlight = false;
+  private abortSignaled = false;
+  private appendCursor = 0;
+  private readonly appendedMessages: FakeAppendRecord[] = [];
+  private readonly appendWaiters: Array<(record: FakeAppendRecord) => void> = [];
+  private readonly abortWaiters: Array<() => void> = [];
 
   constructor(
     private readonly options: WorkerOptions,
@@ -576,23 +775,69 @@ class FixtureWorker implements OmpWorker {
       await this.writeSessionHeader(previousSessionFiles);
       return;
     }
-    await this.promptHandler({
+    this.promptInFlight = true;
+    try {
+      await this.promptHandler({
+        text,
+        cwd,
+        sessionId: this.sessionId,
+        promptContext,
+        emit: onEvent,
+        appended: () => [...this.appendedMessages],
+        waitForAppend: () => this.takeAppend(),
+        waitForAbort: () => this.takeAbort(),
+        append: async (relativeOrAbsolutePath, content) => {
+          const path = isAbsolute(relativeOrAbsolutePath)
+            ? relativeOrAbsolutePath
+            : join(cwd, relativeOrAbsolutePath);
+          await mkdir(dirname(path), { recursive: true });
+          await appendFile(path, content, "utf8");
+        },
+        isStopped: () => this.stopped,
+        onStop: (callback) => {
+          this.stopCallbacks.add(callback);
+        },
+      });
+    } finally {
+      this.promptInFlight = false;
+    }
+  }
+
+  async steer(text: string): Promise<void> {
+    if (!this.promptInFlight) throw new Error("fixture worker is not streaming a turn");
+    this.appendedMessages.push({
       text,
-      cwd,
       sessionId: this.sessionId,
-      promptContext,
-      emit: onEvent,
-      append: async (relativeOrAbsolutePath, content) => {
-        const path = isAbsolute(relativeOrAbsolutePath)
-          ? relativeOrAbsolutePath
-          : join(cwd, relativeOrAbsolutePath);
-        await mkdir(dirname(path), { recursive: true });
-        await appendFile(path, content, "utf8");
-      },
-      isStopped: () => this.stopped,
-      onStop: (callback) => {
-        this.stopCallbacks.add(callback);
-      },
+      cwd: this.currentCwd,
+    });
+    while (this.appendWaiters.length > 0 && this.appendCursor < this.appendedMessages.length) {
+      const waiter = this.appendWaiters.shift()!;
+      const record = this.appendedMessages[this.appendCursor++]!;
+      waiter(record);
+    }
+  }
+
+  async abortTurn(): Promise<void> {
+    if (!this.promptInFlight) throw new Error("fixture worker has no prompt in progress");
+    this.abortSignaled = true;
+    for (const callback of this.abortWaiters.splice(0)) callback();
+  }
+
+  private takeAppend(): Promise<FakeAppendRecord> {
+    const next = this.appendedMessages[this.appendCursor];
+    if (next) {
+      this.appendCursor += 1;
+      return Promise.resolve(next);
+    }
+    return new Promise<FakeAppendRecord>((resolve) => {
+      this.appendWaiters.push(resolve);
+    });
+  }
+
+  private takeAbort(): Promise<void> {
+    if (this.abortSignaled) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      this.abortWaiters.push(resolve);
     });
   }
 
@@ -601,6 +846,10 @@ class FixtureWorker implements OmpWorker {
     for (const callback of this.stopCallbacks) {
       callback();
     }
+    // A stopped worker can never continue the turn, so prompts awaiting an abort
+    // must not keep the fixture (and any awaiting test) alive.
+    this.abortSignaled = true;
+    for (const callback of this.abortWaiters.splice(0)) callback();
     return true;
   }
 }
@@ -674,6 +923,12 @@ export interface CoreHarnessOptions {
    * `null` omits ownerId from the test config so enrollment starts unconfigured.
    */
   ownerId?: string | null;
+  /** Overrides the allowlist when a test drives chat targets outside the defaults. */
+  allowedGroupIds?: string[];
+  /** Group history configuration; absent means the service default (disabled). */
+  groupHistory?: GroupHistoryConfig;
+  /** Extra command handlers, e.g. an observing handler that still runs a prompt. */
+  commandHandlers?: readonly ChannelCommandHandler[];
   restart?: RestartPort;
 }
 
@@ -693,14 +948,23 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
   const workers = options.workers ?? new FakeWorkerFactory(options.prompt);
   const config = {
     ...(options.ownerId === null ? {} : { ownerId: options.ownerId ?? "owner-1" }),
-    allowedGroupIds: ["group-allowed", "group-a", "group-b", "group-fresh", "group-unavailable", "group-tools"],
+    allowedGroupIds: options.allowedGroupIds ?? [
+      "group-allowed",
+      "group-a",
+      "group-b",
+      "group-fresh",
+      "group-unavailable",
+      "group-tools",
+    ],
     stateDir,
     homeDir: root,
+    ...(options.groupHistory === undefined ? {} : { groupHistory: options.groupHistory }),
   } as CoreServiceConfig;
   const service = await createChannelService({
     config,
     transport,
     workerFactory: workers,
+    ...(options.commandHandlers === undefined ? {} : { commandHandlers: options.commandHandlers }),
     ...(options.restart === undefined ? {} : { restart: options.restart }),
   });
   await service.start();
@@ -728,6 +992,8 @@ export function inbound(
     text: "perform fixture work",
     mentionedUserIds: [],
     supported: true,
+    messageSeq: 0,
+    messageTimestamp: 0,
     ...overrides,
   };
 }

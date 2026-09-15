@@ -171,6 +171,8 @@ test("a task that never started reports the restart on the next start", async ()
         state: "queued",
         resultText: null,
         errorText: null,
+        messageSeq: 0,
+        historyEligible: true,
       },
     );
   } finally {

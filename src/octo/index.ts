@@ -10,8 +10,14 @@ import type {
   ChannelTransport,
   ChatTarget,
   GroupContext,
+  GroupInfo,
+  GroupInfoPatch,
+  GroupMember,
+  HistoryFetch,
+  HistoryMessage,
   InboundMessage,
   SendReceipt,
+  ThreadSummary,
 } from "../contracts.ts";
 import { isJsonRecord, type JsonRecord } from "./type-guards.ts";
 import {
@@ -19,6 +25,7 @@ import {
   type ExecutionCardCapabilities,
   type ExecutionSnapshot,
 } from "../execution-card.ts";
+import { threadParentGroupId } from "../thread-target.ts";
 
 type Logger = (message: string) => void;
 
@@ -50,6 +57,7 @@ type DecodedInbound = {
   channelType: number;
   messageId: bigint;
   messageSeq: number;
+  timestamp: number;
   payload: unknown;
 };
 
@@ -648,6 +656,14 @@ function trimMentionSeam(text: string, touchesStart: boolean, touchesEnd: boolea
   return trimmed;
 }
 
+/**
+ * Sequences and second timestamps arrive as unsigned 32-bit integers. Values that cannot
+ * take part in history accounting (missing/zero) collapse to the `0` unknown sentinel.
+ */
+function knownIntOrZero(value: number): number {
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
 function normalizedMessage(data: DecodedInbound, botUid: string, botName: string): InboundMessage {
   if (!(data.channelType === 1 || data.channelType === 2 || data.channelType === 5)) {
     throw new OctoError(`Octo message channel type ${data.channelType} is unsupported`);
@@ -668,6 +684,8 @@ function normalizedMessage(data: DecodedInbound, botUid: string, botName: string
     text: normalizedText,
     mentionedUserIds,
     supported,
+    messageSeq: knownIntOrZero(data.messageSeq),
+    messageTimestamp: knownIntOrZero(data.timestamp) * 1000,
   };
 }
 
@@ -691,12 +709,11 @@ function encodeRecvAck(messageId: bigint, messageSeq: number): Buffer {
 
 function contextPath(channelId: string, channelType: ChatTarget["channelType"]): string {
   if ((channelType as number) === 5) {
-    const separator = channelId.indexOf("____");
-    if (separator <= 0 || separator + 4 >= channelId.length) {
+    const groupId = threadParentGroupId(channelId);
+    if (groupId === null) {
       throw new OctoError("Octo thread target must contain a parent and topic id");
     }
-    const groupId = channelId.slice(0, separator);
-    const threadId = channelId.slice(separator + 4);
+    const threadId = channelId.slice(groupId.length + 4);
     return `/v1/bot/groups/${encodeURIComponent(groupId)}/threads/${encodeURIComponent(threadId)}/md`;
   }
   return `/v1/bot/groups/${encodeURIComponent(channelId)}/md`;
@@ -725,6 +742,210 @@ function parseVersion(value: unknown): { version: number } {
     throw new OctoError("Octo group context update response has invalid schema");
   }
   return { version: value.version as number };
+}
+
+function managementId(value: string, label: string): string {
+  const id = value.trim();
+  if (id.length === 0 || id.length > 128 || id.includes("/")) {
+    throw new OctoError(`Octo ${label} is invalid`, { permanent: true });
+  }
+  return id;
+}
+
+function groupPath(groupId: string): string {
+  return `/v1/bot/groups/${encodeURIComponent(managementId(groupId, "group id"))}`;
+}
+
+function threadPath(groupId: string, shortId: string): string {
+  return `${groupPath(groupId)}/threads/${encodeURIComponent(managementId(shortId, "thread id"))}`;
+}
+
+/**
+ * Body of a failed bot API call, reduced to a single bounded line. The server message is
+ * operator-facing text about the request itself; it never carries bot credentials.
+ */
+function serverErrorMessage(body: Uint8Array): string | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(decodeUtf8(body, "error"));
+  } catch {
+    return null;
+  }
+  if (!isJsonRecord(value)) return null;
+  const nested = isJsonRecord(value["error"]) ? value["error"]["message"] : undefined;
+  const message = typeof nested === "string" && nested.length > 0 ? nested : value["msg"];
+  if (typeof message !== "string" || message.length === 0) return null;
+  const single = message.replace(/\s+/gu, " ").trim();
+  return single.length > 200 ? `${single.slice(0, 200)}…` : single;
+}
+
+function managementError(label: string, status: number, body: Uint8Array): OctoError {
+  const detail = serverErrorMessage(body);
+  return new OctoError(
+    detail === null
+      ? `Octo ${label} request failed with HTTP ${status}`
+      : `Octo ${label} failed with HTTP ${status}: ${detail}`,
+    { status, permanent: status === 400 || status === 401 || status === 403 || status === 404 },
+  );
+}
+
+async function botApiRequest(
+  apiBase: string,
+  botToken: string,
+  label: string,
+  path: string,
+  method: "GET" | "POST" | "PUT" | "DELETE",
+  body: JsonRecord | undefined,
+  signal: AbortSignal | undefined,
+): Promise<unknown> {
+  const response = await requestWithTimeout(
+    apiUrl(apiBase, path),
+    {
+      method,
+      headers:
+        body === undefined
+          ? authHeaders(botToken)
+          : { ...authHeaders(botToken), "Content-Type": "application/json" },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    },
+    label,
+    signal,
+    MAX_HTTP_BODY_BYTES,
+  );
+  if (response.status < 200 || response.status >= 300) {
+    throw managementError(label, response.status, response.body);
+  }
+  if (response.body.byteLength === 0) return null;
+  return parseJson(response.body, label);
+}
+
+function groupInfoFromResponse(value: unknown): GroupInfo {
+  if (!isJsonRecord(value)) {
+    throw new OctoError("Octo group info response has invalid schema");
+  }
+  const creator = value["creator"];
+  const notice = value["notice"];
+  const name = value["name"];
+  const status = value["status"];
+  const createdAt = value["created_at"];
+  return {
+    groupId: requiredString(value["group_no"], "group info group_no"),
+    name: typeof name === "string" ? name : "",
+    notice: typeof notice === "string" ? notice : "",
+    creator: typeof creator === "string" ? creator : "",
+    status: typeof status === "number" && Number.isFinite(status) ? status : 0,
+    createdAt: typeof createdAt === "string" ? createdAt : "",
+  };
+}
+
+function memberFromResponse(value: unknown, label: string): GroupMember {
+  if (!isJsonRecord(value)) {
+    throw new OctoError(`Octo ${label} response has invalid schema`);
+  }
+  const name = value["name"];
+  const role = value["role"];
+  const joinedAt = value["created_at"];
+  return {
+    uid: requiredString(value["uid"], `${label} uid`),
+    name: typeof name === "string" ? name : "",
+    role: typeof role === "number" && Number.isFinite(role) ? role : 0,
+    robot: value["robot"] === 1 || value["robot"] === true,
+    joinedAt: typeof joinedAt === "string" ? joinedAt : "",
+  };
+}
+
+function membersFromResponse(value: unknown, label: string): GroupMember[] {
+  if (!Array.isArray(value)) {
+    throw new OctoError(`Octo ${label} response has invalid schema`);
+  }
+  return value.map((entry) => memberFromResponse(entry, label));
+}
+
+function threadFromResponse(value: unknown): ThreadSummary {
+  if (!isJsonRecord(value)) {
+    throw new OctoError("Octo thread response has invalid schema");
+  }
+  const shortId = requiredString(value["short_id"], "thread short_id");
+  const groupId = value["group_no"];
+  const channelId = value["channel_id"];
+  const name = value["name"];
+  const creatorUid = value["creator_uid"];
+  const status = value["status"];
+  const memberCount = value["member_count"];
+  const messageCount = value["message_count"];
+  const createdAt = value["created_at"];
+  const updatedAt = value["updated_at"];
+  const resolvedGroupId = typeof groupId === "string" ? groupId : "";
+  return {
+    shortId,
+    groupId: resolvedGroupId,
+    channelId:
+      typeof channelId === "string" && channelId.length > 0
+        ? channelId
+        : `${resolvedGroupId}____${shortId}`,
+    name: typeof name === "string" ? name : "",
+    creatorUid: typeof creatorUid === "string" ? creatorUid : "",
+    status: typeof status === "number" && Number.isFinite(status) ? status : 0,
+    memberCount: typeof memberCount === "number" && Number.isFinite(memberCount) ? memberCount : 0,
+    messageCount:
+      typeof messageCount === "number" && Number.isFinite(messageCount) ? messageCount : 0,
+    createdAt: typeof createdAt === "string" ? createdAt : "",
+    updatedAt: typeof updatedAt === "string" ? updatedAt : "",
+  };
+}
+
+function threadsFromResponse(value: unknown): ThreadSummary[] {
+  if (!Array.isArray(value)) {
+    throw new OctoError("Octo thread list response has invalid schema");
+  }
+  return value.map(threadFromResponse);
+}
+
+/**
+ * `POST /v1/bot/messages/sync` answers with base64-encoded JSON payloads that follow the
+ * same `{type, content}` shape as WS frames. Rows that are not group text from another
+ * sender are skipped individually, so one malformed row cannot fail the whole page.
+ */
+function historyFromResponse(value: unknown, botUid: string): HistoryMessage[] {
+  if (!isJsonRecord(value) || !Array.isArray(value.messages)) {
+    throw new OctoError("Octo message sync response has invalid schema");
+  }
+  const messages: HistoryMessage[] = [];
+  for (const entry of value.messages) {
+    const message = historyMessage(entry, botUid);
+    if (message) messages.push(message);
+  }
+  return messages.sort((left, right) => left.seq - right.seq);
+}
+
+function historyMessage(value: unknown, botUid: string): HistoryMessage | undefined {
+  if (!isJsonRecord(value)) return undefined;
+  const seq = value.message_seq;
+  const senderId = value.from_uid;
+  const timestamp = value.timestamp;
+  const payload = value.payload;
+  if (!Number.isSafeInteger(seq) || (seq as number) <= 0) return undefined;
+  if (typeof senderId !== "string" || senderId.length === 0 || senderId === botUid) return undefined;
+  if (!Number.isSafeInteger(timestamp) || (timestamp as number) <= 0) return undefined;
+  if (typeof payload !== "string") return undefined;
+  const envelope = decodedHistoryPayload(payload);
+  if (!isJsonRecord(envelope) || envelope.type !== TEXT_MESSAGE_TYPE) return undefined;
+  const text = typeof envelope.content === "string" ? envelope.content : "";
+  if (text.length === 0) return undefined;
+  return {
+    seq: seq as number,
+    senderId,
+    text,
+    timestamp: (timestamp as number) * 1000,
+  };
+}
+
+function decodedHistoryPayload(payload: string): unknown {
+  try {
+    return JSON.parse(Buffer.from(payload, "base64").toString("utf8")) as unknown;
+  } catch {
+    return undefined;
+  }
 }
 
 function stringArray(value: unknown, required = false): string[] | undefined | null {
@@ -1051,6 +1272,31 @@ export class OctoTransport implements ChannelTransport {
     }
   }
 
+  async fetchGroupMessages(target: ChatTarget, fetch: HistoryFetch): Promise<HistoryMessage[]> {
+    validateTarget(target);
+    if (target.channelType === 1) throw new OctoError("DM does not support group message history");
+    const response = await requestWithTimeout(
+      apiUrl(this.apiBase, "/v1/bot/messages/sync"),
+      {
+        method: "POST",
+        headers: { ...authHeaders(this.botToken), "Content-Type": "application/json" },
+        body: JSON.stringify({
+          channel_id: target.channelId,
+          channel_type: target.channelType,
+          start_message_seq: fetch.sinceSeq,
+          end_message_seq: fetch.untilSeq,
+          limit: fetch.limit,
+          pull_mode: 1,
+        }),
+      },
+      "message sync",
+      fetch.signal,
+      MAX_HTTP_BODY_BYTES,
+    );
+    if (response.status < 200 || response.status >= 300) throw httpStatusError("message sync", response.status);
+    return historyFromResponse(parseJson(response.body, "message sync"), this.registration?.uid ?? "");
+  }
+
   async getGroupContext(target: ChatTarget): Promise<GroupContext | null> {
     validateTarget(target);
     if (target.channelType === 1) return null;
@@ -1084,6 +1330,150 @@ export class OctoTransport implements ChannelTransport {
     );
     if (response.status < 200 || response.status >= 300) throw httpStatusError("group context update", response.status);
     return parseVersion(parseJson(response.body, "group context update"));
+  }
+
+  async getGroupInfo(groupId: string, signal?: AbortSignal): Promise<GroupInfo> {
+    return groupInfoFromResponse(
+      await botApiRequest(
+        this.apiBase,
+        this.botToken,
+        "group info",
+        groupPath(groupId),
+        "GET",
+        undefined,
+        signal,
+      ),
+    );
+  }
+
+  async getGroupMembers(groupId: string, signal?: AbortSignal): Promise<GroupMember[]> {
+    return membersFromResponse(
+      await botApiRequest(
+        this.apiBase,
+        this.botToken,
+        "group members",
+        `${groupPath(groupId)}/members`,
+        "GET",
+        undefined,
+        signal,
+      ),
+      "group members",
+    );
+  }
+
+  async updateGroupInfo(groupId: string, patch: GroupInfoPatch, signal?: AbortSignal): Promise<void> {
+    const body: JsonRecord = {};
+    if (patch.name !== undefined) body.name = patch.name;
+    if (patch.notice !== undefined) body.notice = patch.notice;
+    if (Object.keys(body).length === 0) {
+      throw new OctoError("Octo group update requires a name or a notice", { permanent: true });
+    }
+    await botApiRequest(
+      this.apiBase,
+      this.botToken,
+      "group info update",
+      `${groupPath(groupId)}/info`,
+      "PUT",
+      body,
+      signal,
+    );
+  }
+
+  async listThreads(groupId: string, signal?: AbortSignal): Promise<ThreadSummary[]> {
+    return threadsFromResponse(
+      await botApiRequest(
+        this.apiBase,
+        this.botToken,
+        "thread list",
+        `${groupPath(groupId)}/threads`,
+        "GET",
+        undefined,
+        signal,
+      ),
+    );
+  }
+
+  async createThread(groupId: string, name: string, signal?: AbortSignal): Promise<ThreadSummary> {
+    return threadFromResponse(
+      await botApiRequest(
+        this.apiBase,
+        this.botToken,
+        "thread create",
+        `${groupPath(groupId)}/threads`,
+        "POST",
+        { name },
+        signal,
+      ),
+    );
+  }
+
+  async getThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<ThreadSummary> {
+    return threadFromResponse(
+      await botApiRequest(
+        this.apiBase,
+        this.botToken,
+        "thread info",
+        threadPath(groupId, shortId),
+        "GET",
+        undefined,
+        signal,
+      ),
+    );
+  }
+
+  async getThreadMembers(
+    groupId: string,
+    shortId: string,
+    signal?: AbortSignal,
+  ): Promise<GroupMember[]> {
+    return membersFromResponse(
+      await botApiRequest(
+        this.apiBase,
+        this.botToken,
+        "thread members",
+        `${threadPath(groupId, shortId)}/members`,
+        "GET",
+        undefined,
+        signal,
+      ),
+      "thread members",
+    );
+  }
+
+  async joinThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void> {
+    await botApiRequest(
+      this.apiBase,
+      this.botToken,
+      "thread join",
+      `${threadPath(groupId, shortId)}/join`,
+      "POST",
+      undefined,
+      signal,
+    );
+  }
+
+  async leaveThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void> {
+    await botApiRequest(
+      this.apiBase,
+      this.botToken,
+      "thread leave",
+      `${threadPath(groupId, shortId)}/leave`,
+      "POST",
+      undefined,
+      signal,
+    );
+  }
+
+  async deleteThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void> {
+    await botApiRequest(
+      this.apiBase,
+      this.botToken,
+      "thread delete",
+      threadPath(groupId, shortId),
+      "DELETE",
+      undefined,
+      signal,
+    );
   }
 
   async sendFile(
@@ -1453,11 +1843,11 @@ export class OctoTransport implements ChannelTransport {
       void reader.string();
       const messageId = reader.int64();
       const messageSeq = reader.int32();
-      void reader.int32();
+      const timestamp = reader.int32();
       if ((setting & 0x08) !== 0) void reader.string();
       const payload = decryptPayload(reader.bytes(), state.aesKey!, state.aesIv!);
       const normalized = normalizedMessage(
-        { setting, senderId, rawChannelId, channelType, messageId, messageSeq, payload },
+        { setting, senderId, rawChannelId, channelType, messageId, messageSeq, timestamp, payload },
         this.registration?.uid ?? "",
         this.registration?.name ?? "",
       );

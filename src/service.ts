@@ -10,11 +10,14 @@ import type {
   ChannelService,
   ChannelServiceOptions,
   ChannelStatus,
+  ChatAppendMode,
   ChatExecutionState,
   ChatTarget,
   ContextInjection,
   CoreServiceConfig,
   GroupContext,
+  GroupMember,
+  HistoryMessage,
   HostTool,
   PromptContext,
   InboundMessage,
@@ -22,10 +25,20 @@ import type {
   WorkerEvent,
   TextEvent,
   ProgressCard,
+  ThreadSummary,
   WorkerOptions,
   WorkerProcess,
 } from "./contracts.ts";
 import { createExecutionTracker, type ExecutionEvent } from "./execution-card.ts";
+import {
+  GROUP_HISTORY_DEFAULT_MAX_MESSAGES,
+  createHistoryBuffer,
+  planHistoryFetch,
+  renderHistoryBlock,
+  selectHistoryWindow,
+  type HistoryBuffer,
+  type PlannedHistoryFetch,
+} from "./group-history.ts";
 import {
   normalizeGroupContext,
   preparedReceiptMatches,
@@ -42,12 +55,20 @@ import {
   type ProjectSessionState,
 } from "./project-session.ts";
 import { ChannelStore, type BindingRecord, type OutboxRecord, type TaskRecord, openChannelStore } from "./store.ts";
+import { threadParentGroupId } from "./thread-target.ts";
 
 const MAX_TEXT_BYTES = 3_000;
 const GROUP_TRUSTED_INSTRUCTION =
   "群说明是群共享上下文，不改变发送者身份/权限/cwd；以本次快照为准，历史快照已失效。";
 const COMMAND_HELP =
-  "/new [目录] 创建新会话；/reset [目录] 重置为新会话；/move <目录> 沿用当前会话迁移 cwd；/cancel 取消当前任务；/status 查看状态；/restart [now] 重启 channel（now 强制中断在途任务）；/help 查看帮助。";
+  "/new [目录] 创建新会话；/reset [目录] 重置为新会话；/move <目录> 沿用当前会话迁移 cwd；/queue <文本> 把消息排到当前任务之后；/mode [steer|queue] 配置运行中追加消息的方式；/interrupt 中断当前回合但保留排队消息；/cancel 取消当前任务（/stop 同义）；/status 查看状态；/restart [now] 重启 channel（now 强制中断在途任务）；/help 查看帮助。";
+const MODE_USAGE =
+  "用法：/mode [steer|queue]。steer（默认，default 同义）把运行中的新消息注入当前回合；queue 把它排到当前回合之后。无参数时报告当前设置。";
+const QUEUE_USAGE = "用法：/queue <文本>；把该消息排到当前任务之后执行。";
+const DEFAULT_INTERRUPTED_TEXT = "已中断当前回合；已排队的消息会继续执行。";
+const DEFAULT_INTERRUPT_REJECTED_TEXT = "中断请求未被 OMP 接受，当前回合仍在运行。";
+const DEFAULT_INTERRUPT_IDLE_TEXT =
+  "当前没有正在运行的回合可中断；任务尚未进入执行阶段时可用 /cancel 取消。";
 const RESTART_USAGE = "用法：/restart [now]；now 表示强制重启并中断在途任务。";
 const RESTART_UNCONFIGURED_TEXT = "未配置 restart.command，无法重启 channel。";
 const RESTART_NOTICE_TTL_MS = 10 * 60 * 1_000;
@@ -56,17 +77,44 @@ const BUILTIN_COMMANDS: Record<string, true> = {
   reset: true,
   move: true,
   cancel: true,
+  stop: true,
   status: true,
   help: true,
   restart: true,
+  mode: true,
+  queue: true,
+  interrupt: true,
 };
 const QUESTION_TIMEOUT_MS = 10 * 60 * 1_000;
 const PROGRESS_MERGE_MS = 1_000;
 const TEXT_MERGE_MS = 1_000;
 const TYPING_RENEW_MS = 3_000;
 const ACTIVITY_REQUEST_TIMEOUT_MS = 2_000;
+const GROUP_HISTORY_FETCH_TIMEOUT_MS = 10_000;
 const DEFAULT_CANCELLED_TEXT = "当前任务已取消；不回滚已发生的副作用。";
 const DEFAULT_RESTARTING_TEXT = "channel 正在重启，本会话任务已中断；重启完成后会在本会话确认。";
+const MANAGEMENT_BASE_ACTIONS = [
+  "group-info",
+  "group-members",
+  "group-update",
+  "description-read",
+  "description-write",
+  "list-threads",
+  "create-thread",
+  "thread-info",
+  "thread-members",
+  "thread-join",
+  "thread-leave",
+  "thread-delete",
+] as const;
+const MANAGEMENT_DISPATCH_ACTION = "thread-dispatch";
+/** Synthetic inbound id prefix: a dispatched task must not dispatch further. */
+const DISPATCH_MESSAGE_PREFIX = "dispatch:";
+const MAX_MANAGEMENT_MEMBERS = 200;
+const MAX_MANAGEMENT_THREADS = 50;
+const MAX_MANAGEMENT_NAME_CHARS = 200;
+const MAX_MANAGEMENT_NOTICE_CHARS = 2_000;
+const MAX_MANAGEMENT_TASK_CHARS = 4_000;
 type RuntimeTask = {
   taskId: string;
   target: ChatTarget;
@@ -74,6 +122,11 @@ type RuntimeTask = {
   worker?: OmpWorker;
   cancelRequested: boolean;
   cancelReplySent: boolean;
+  /** True only while this task's OMP prompt is in flight, so appended messages have a target. */
+  promptInFlight: boolean;
+  interruptRequested: boolean;
+  /** Set when the run produced events after `/interrupt`, i.e. the queued work really continued. */
+  workAfterInterrupt: boolean;
   stopActivity?: (abortProgress?: boolean) => void;
   stopText?: () => void;
 };
@@ -82,6 +135,16 @@ type QuestionWaiter = {
   taskId: string;
   resolve: (answer: string) => void;
   reject: (error: Error) => void;
+};
+
+/**
+ * Group history injected into one task turn together with the ledger attempt it
+ * claims; the attempt is committed once the prompt returns, cancellation included.
+ */
+type HistoryTurn = {
+  text: string;
+  lastSeq: number;
+  attemptId: string;
 };
 
 type LockHandle = {
@@ -133,8 +196,70 @@ function isPermanentOutboxError(error: unknown, item: OutboxRecord): boolean {
   return item.kind === "file" && candidate.code === "ENOENT";
 }
 
+/**
+ * A thread (channelType=5) inherits its parent group's allowlist entry, so a freshly
+ * created thread needs no extra configuration; an explicit full channel ID still wins.
+ */
+function isAllowlistedChat(
+  allowedGroupIds: readonly string[],
+  message: Pick<InboundMessage, "channelId" | "channelType">,
+): boolean {
+  if (allowedGroupIds.includes(message.channelId)) return true;
+  if (message.channelType !== 5) return false;
+  const parentGroupId = threadParentGroupId(message.channelId);
+  return parentGroupId !== null && allowedGroupIds.includes(parentGroupId);
+}
+
 function isGroupTarget(target: ChatTarget): boolean {
   return target.channelType !== 1;
+}
+
+function truncateForTool(value: string, maxChars: number): string {
+  return value.length > maxChars ? `${value.slice(0, maxChars)}…` : value;
+}
+
+function managementMembers(members: readonly GroupMember[]): {
+  members: Array<{ uid: string; name: string; role: number; robot: boolean }>;
+  count: number;
+  truncated: boolean;
+} {
+  const visible = members.slice(0, MAX_MANAGEMENT_MEMBERS);
+  return {
+    members: visible.map((member) => ({
+      uid: member.uid,
+      name: truncateForTool(member.name, MAX_MANAGEMENT_NAME_CHARS),
+      role: member.role,
+      robot: member.robot,
+    })),
+    count: members.length,
+    truncated: members.length > visible.length,
+  };
+}
+
+function managementThread(thread: ThreadSummary): {
+  short_id: string;
+  channel_id: string;
+  group_id: string;
+  name: string;
+  creator_uid: string;
+  status: number;
+  member_count: number;
+  message_count: number;
+  created_at: string;
+  updated_at: string;
+} {
+  return {
+    short_id: thread.shortId,
+    channel_id: thread.channelId,
+    group_id: thread.groupId,
+    name: truncateForTool(thread.name, MAX_MANAGEMENT_NAME_CHARS),
+    creator_uid: thread.creatorUid,
+    status: thread.status,
+    member_count: thread.memberCount,
+    message_count: thread.messageCount,
+    created_at: thread.createdAt,
+    updated_at: thread.updatedAt,
+  };
 }
 
 function throwIfAborted(signal: AbortSignal): void {
@@ -340,6 +465,7 @@ class CoreService implements ChannelService {
   private readonly textAbortControllers = new Map<string, AbortController>();
   private readonly textAttempts = new Set<AbortController>();
   private readonly blockedDirectories = new Set<string>();
+  private readonly groupHistoryBuffers = new Map<string, HistoryBuffer>();
   private readonly commandHandlers: ReadonlyMap<string, ChannelCommandHandler>;
   private bot: BotIdentity | undefined;
   private readonly activityOperations = new Set<Promise<void>>();
@@ -403,6 +529,7 @@ class CoreService implements ChannelService {
       await this.options.transport.start(
         (message) => this.handleInbound(message),
         () => {
+          this.resetHistoryCoverage();
           this.flushAllOutbox();
         },
       );
@@ -483,6 +610,7 @@ class CoreService implements ChannelService {
   async handleInbound(message: InboundMessage): Promise<void> {
     if (!this.started || !this.bot || this.stopping) return;
     if (message.messageId.trim().length === 0 || message.senderId.trim().length === 0) return;
+    this.recordHistoryMessage(message);
     const text = message.text.trim();
     if (this.store.hasOwnerEnrollment(this.bot.uid, message, message.messageId)) return;
     let ownerId = this.store.getOwnerId(this.bot.uid)?.trim() || null;
@@ -556,6 +684,7 @@ class CoreService implements ChannelService {
       return;
     }
     if (await this.answerPendingQuestion(message, text)) return;
+    if (await this.appendToRunningTask(message, text)) return;
     await this.acceptTask(message, message.text);
   }
 
@@ -565,6 +694,7 @@ class CoreService implements ChannelService {
         sessionId: null,
         cwd: null,
         state: "none",
+        mode: "steer",
         queued: 0,
         outbox: 0,
         unknownOutbox: 0,
@@ -581,6 +711,7 @@ class CoreService implements ChannelService {
       sessionId: binding?.sessionId ?? null,
       cwd: binding?.cwd ?? null,
       state: statusState(display, Boolean(binding)),
+      mode: this.store.getChatMode(this.bot.uid, target),
       queued: this.store.countQueuedTasks(this.bot.uid, target),
       outbox: this.store.countPendingOutbox(this.bot.uid, target),
       unknownOutbox: this.store.countUnknownOutbox(this.bot.uid, target),
@@ -623,7 +754,7 @@ class CoreService implements ChannelService {
     }
     return (
       senderId === ownerId &&
-      this.options.config.allowedGroupIds.includes(message.channelId) &&
+      isAllowlistedChat(this.options.config.allowedGroupIds, message) &&
       message.mentionedUserIds.includes(this.bot.uid)
     );
   }
@@ -674,6 +805,206 @@ class CoreService implements ChannelService {
     return false;
   }
 
+  /** The chat's task whose OMP prompt is currently in flight, if any. */
+  private runningRuntime(target: ChatTarget): RuntimeTask | undefined {
+    const key = targetKey(target);
+    for (const runtime of this.runtimes.values()) {
+      if (targetKey(runtime.target) === key && runtime.promptInFlight) return runtime;
+    }
+    return undefined;
+  }
+
+  /** Live per-chat coverage buffer; chats without one simply have no coverage history. */
+  private historyBufferFor(target: ChatTarget): HistoryBuffer {
+    const key = targetKey(target);
+    const existing = this.groupHistoryBuffers.get(key);
+    if (existing) return existing;
+    const created = createHistoryBuffer(
+      this.options.config.groupHistory?.maxMessages ?? GROUP_HISTORY_DEFAULT_MAX_MESSAGES,
+    );
+    this.groupHistoryBuffers.set(key, created);
+    return created;
+  }
+
+  /**
+   * Every group/thread message proves coverage before any permission gate; only text
+   * from other senders becomes a renderable entry.
+   */
+  private recordHistoryMessage(message: InboundMessage): void {
+    if (this.options.config.groupHistory?.enabled !== true) return;
+    if (message.channelType !== 2 && message.channelType !== 5) return;
+    const senderId = message.senderId.trim();
+    this.historyBufferFor(message).record({
+      seq: message.messageSeq,
+      supported: message.supported,
+      senderId,
+      text: message.text,
+      timestamp: message.messageTimestamp,
+      fromBot: senderId.length > 0 && senderId === this.bot?.uid,
+    });
+  }
+
+  /** A websocket connect/reconnect makes the covered seq range unknown again. */
+  private resetHistoryCoverage(): void {
+    for (const buffer of this.groupHistoryBuffers.values()) {
+      buffer.resetCoverage();
+    }
+  }
+
+  /** One bounded sync page; `null` marks a degraded turn that must not advance the watermark. */
+  private async fetchHistoryPage(
+    target: ChatTarget,
+    plan: PlannedHistoryFetch,
+  ): Promise<HistoryMessage[] | null> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), GROUP_HISTORY_FETCH_TIMEOUT_MS);
+    try {
+      return await this.options.transport.fetchGroupMessages(target, {
+        sinceSeq: plan.sinceSeq,
+        untilSeq: plan.untilSeq,
+        limit: plan.limit,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "fetch failed";
+      console.error(
+        `[group-history] sync failed target=${targetKey(target)} since=${plan.sinceSeq}`
+        + ` until=${plan.untilSeq}: ${reason}`,
+      );
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Builds the history block for one group/thread turn and claims the ledger attempt that
+   * the post-prompt commit closes.  A range the live buffer cannot prove covered is taken
+   * from sync; when that sync fails the turn keeps its plain text and the watermark stays
+   * put, so the next turn replays the same range instead of silently losing it.
+   */
+  private async historyTurnFor(
+    task: TaskRecord,
+    target: ChatTarget,
+    sessionId: string,
+  ): Promise<HistoryTurn | null> {
+    const config = this.options.config.groupHistory;
+    if (config?.enabled !== true) return null;
+    if (task.channelType !== 2 && task.channelType !== 5) return null;
+    if (!task.historyEligible || !Number.isInteger(task.messageSeq) || task.messageSeq <= 0) return null;
+    const botUid = this.bot!.uid;
+    const currentSeq = task.messageSeq;
+    // Session identity may have moved (`/new`, external rebinding); drop orphan rows first.
+    this.store.pruneHistoryLedger(botUid, target, sessionId);
+    const ledger = this.store.getHistoryLedger(botUid, target, sessionId);
+    // A committed row's lastSeq is the accounted-through watermark; a pending row still
+    // owes the range its previous attempt started from.
+    const watermark = ledger === null
+      ? null
+      : ledger.phase === "pending"
+        ? ledger.previousSeq
+        : ledger.lastSeq;
+    if (watermark !== null && watermark >= currentSeq) return null;
+    const buffer = this.historyBufferFor(target);
+    const candidates = buffer.entriesInRange(watermark ?? 0, currentSeq);
+    let truncatedEarlier = false;
+    if (!buffer.covers(watermark ?? 0, currentSeq)) {
+      const plan = planHistoryFetch({
+        previousSeq: watermark,
+        currentSeq,
+        maxMessages: config.maxMessages,
+      });
+      const page = await this.fetchHistoryPage(target, plan);
+      if (page === null) return null;
+      truncatedEarlier = plan.truncatedEarlier;
+      for (const message of page) {
+        if (!Number.isInteger(message.seq) || message.seq <= 0 || message.seq >= currentSeq) continue;
+        candidates.push({
+          seq: message.seq,
+          senderId: message.senderId,
+          text: message.text,
+          timestamp: message.timestamp,
+        });
+      }
+    }
+    const { kept, skipped } = selectHistoryWindow({
+      entries: candidates,
+      maxMessages: config.maxMessages,
+    });
+    const block = renderHistoryBlock(kept, { skipped, truncatedEarlier });
+    const prepared = this.store.prepareHistoryInjection(botUid, target, sessionId, currentSeq);
+    console.error(
+      `[group-history] target=${targetKey(target)} seq=${currentSeq}`
+      + ` injected=${kept.length} skipped=${skipped}${truncatedEarlier ? " truncated" : ""}`,
+    );
+    return {
+      text: block === null ? task.text : `${block}\n${task.text}`,
+      lastSeq: prepared.lastSeq,
+      attemptId: prepared.attemptId,
+    };
+  }
+
+  /**
+   * Closes the claimed attempt once the prompt returned.  A steer that landed mid-turn
+   * raised the row's lastSeq under the same attempt, so the commit follows it instead of
+   * reporting a CAS failure that would replay the steered message on the next turn.
+   */
+  private commitHistoryTurn(target: ChatTarget, sessionId: string, turn: HistoryTurn): void {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) return;
+    try {
+      const current = this.store.getHistoryLedger(botUid, target, sessionId);
+      const lastSeq = current === null ? turn.lastSeq : Math.max(turn.lastSeq, current.lastSeq);
+      if (this.store.commitHistoryInjection(botUid, target, sessionId, lastSeq, turn.attemptId)) return;
+      console.error(`[group-history] commit rejected target=${targetKey(target)} seq=${lastSeq}`);
+    } catch (error) {
+      console.error(
+        `[group-history] commit failed target=${targetKey(target)}:`
+        + ` ${error instanceof Error ? error.message : "unknown error"}`,
+      );
+    }
+  }
+
+  /** A steered message is already inside the running turn, so it is accounted for directly. */
+  private recordSteeredHistory(message: InboundMessage, runtime: RuntimeTask): void {
+    if (this.options.config.groupHistory?.enabled !== true) return;
+    const sessionId = runtime.worker?.sessionId ?? "";
+    if (sessionId.length === 0) return;
+    this.store.advanceHistoryLedger(this.bot!.uid, message, sessionId, message.messageSeq);
+  }
+
+  private async deliverSteer(target: ChatTarget, text: string): Promise<boolean> {
+    const runtime = this.runningRuntime(target);
+    if (!runtime?.worker) return false;
+    try {
+      await runtime.worker.steer(text);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * In `steer` mode a message that arrives while its chat runs an OMP prompt is injected into that
+   * turn instead of starting a second task.  Without a live streaming turn, or when OMP refuses
+   * the frame, the text becomes an ordinary durable queued task so nothing is dropped.
+   * Returns true when the message was consumed as a steering message.
+   */
+  private async appendToRunningTask(message: InboundMessage, text: string): Promise<boolean> {
+    if (this.store.getChatMode(this.bot!.uid, message) !== "steer") return false;
+    const runtime = this.runningRuntime(message);
+    if (!runtime) return false;
+    const claim = this.commandClaim(message, "steer");
+    if (!this.store.claimCommand(claim)) return true;
+    if (await this.deliverSteer(message, text)) {
+      this.store.completeCommand(claim);
+      this.recordSteeredHistory(message, runtime);
+      return true;
+    }
+    this.store.releaseClaim(claim);
+    return false;
+  }
+
   private directoryUnavailable(cwd: string): boolean {
     if (this.blockedDirectories.has(cwd) || this.directoryTails.has(cwd)) return true;
     for (const runtime of this.runtimes.values()) {
@@ -711,7 +1042,7 @@ class CoreService implements ChannelService {
     command: { name: string; argument: string },
     handler: ChannelCommandHandler,
   ): Promise<void> {
-    const accepted = await this.acceptTask(message, message.text);
+    const accepted = await this.acceptTask(message, message.text, false);
     if (!accepted) return;
     try {
       await handler.handle({
@@ -734,8 +1065,14 @@ class CoreService implements ChannelService {
         await this.handleNew(target, argument);
       } else if (name === "move") {
         await this.handleMove(target, argument);
-      } else if (name === "cancel") {
+      } else if (name === "cancel" || name === "stop") {
         await this.handleCancel(target);
+      } else if (name === "interrupt") {
+        await this.handleInterrupt(target);
+      } else if (name === "queue") {
+        await this.handleQueue(message, argument);
+      } else if (name === "mode") {
+        await this.handleMode(target, argument);
       } else if (name === "status") {
         await this.handleStatus(target);
       } else if (name === "help") {
@@ -752,6 +1089,26 @@ class CoreService implements ChannelService {
       this.store.failCommand(claim);
       throw new Error("命令未能持久完成，请重试。");
     }
+  }
+
+  private async defaultWorkDirectory(target: ChatTarget): Promise<string> {
+    const botUid = this.bot?.uid;
+    const binding = botUid === undefined ? null : this.store.getBinding(botUid, target);
+    if (binding?.sessionFile) return canonicalExistingDirectory(binding.cwd);
+    if (target.channelType === 5) {
+      const parentId = threadParentGroupId(target.channelId);
+      const parent = parentId === null || botUid === undefined
+        ? null
+        : this.store.getBinding(botUid, { channelId: parentId, channelType: 2 });
+      if (parent) {
+        try {
+          return await canonicalExistingDirectory(parent.cwd);
+        } catch {
+          // The parent cwd is unusable: fall back to the default work directory.
+        }
+      }
+    }
+    return resolveWorkDirectory("", this.options.config);
   }
 
   private async handleNew(target: ChatTarget, argument: string): Promise<void> {
@@ -771,9 +1128,7 @@ class CoreService implements ChannelService {
       }
       cwd = trimmed.length > 0
         ? await resolveWorkDirectory(argument, this.options.config)
-        : previous
-          ? await canonicalExistingDirectory(previous.cwd)
-          : await resolveWorkDirectory("", this.options.config);
+        : await this.defaultWorkDirectory(target);
     } catch (error) {
       await this.enqueueText(target, `目录无效：${safeErrorMessage(error, "无法访问该目录")}`, null);
       return;
@@ -986,6 +1341,72 @@ class CoreService implements ChannelService {
     }
   }
 
+  /**
+   * Aborts the running OMP turn without clearing the messages already queued in that run and
+   * without stopping the worker, so a steered or queued message still gets its turn.
+   */
+  private async handleInterrupt(target: ChatTarget): Promise<void> {
+    const runtime = this.runningRuntime(target);
+    if (!runtime?.worker) {
+      await this.enqueueText(target, DEFAULT_INTERRUPT_IDLE_TEXT, null);
+      return;
+    }
+    runtime.interruptRequested = true;
+    runtime.workAfterInterrupt = false;
+    try {
+      await runtime.worker.abortTurn();
+    } catch {
+      runtime.interruptRequested = false;
+      await this.enqueueText(target, DEFAULT_INTERRUPT_REJECTED_TEXT, null);
+      return;
+    }
+    await this.enqueueText(target, DEFAULT_INTERRUPTED_TEXT, null);
+  }
+
+  /**
+   * `/queue` is the explicit way to append behind the running task regardless of the chat's mode,
+   * so it always takes the durable task path minus the command prefix.
+   */
+  private async handleQueue(message: InboundMessage, argument: string): Promise<void> {
+    const text = argument.trim();
+    if (text.length === 0) {
+      await this.enqueueText(message, QUEUE_USAGE, null);
+      return;
+    }
+    this.store.releaseClaim(this.commandClaim(message, "queue"));
+    await this.acceptTask(message, text);
+  }
+
+  private async handleMode(target: ChatTarget, argument: string): Promise<void> {
+    const requested = argument.trim().toLowerCase();
+    if (requested.length === 0) {
+      await this.enqueueText(
+        target,
+        `当前追加模式：${this.store.getChatMode(this.bot!.uid, target)}。${MODE_USAGE}`,
+        null,
+      );
+      return;
+    }
+    const mode: ChatAppendMode | null =
+      requested === "steer" || requested === "default"
+        ? "steer"
+        : requested === "queue"
+          ? "queue"
+          : null;
+    if (!mode) {
+      await this.enqueueText(target, MODE_USAGE, null);
+      return;
+    }
+    this.store.setChatMode(this.bot!.uid, target, mode);
+    await this.enqueueText(
+      target,
+      mode === "steer"
+        ? "追加模式已设为 steer：运行中的新消息会注入当前回合。"
+        : "追加模式已设为 queue：运行中的新消息会排到当前回合之后。",
+      null,
+    );
+  }
+
   private async handleCancel(target: ChatTarget): Promise<void> {
     const queued = this.store.cancelQueued(this.bot!.uid, target);
     this.store.cancelQuestions(this.bot!.uid, target);
@@ -1073,7 +1494,7 @@ class CoreService implements ChannelService {
     const cwd = current.cwd ?? "无";
     await this.enqueueText(
       target,
-      `session=${session}\ncwd=${cwd}\nstate=${taskState}\nqueued=${current.queued}\noutbox=${current.outbox}\nunknown=${current.unknownOutbox}`,
+      `session=${session}\ncwd=${cwd}\nstate=${taskState}\nmode=${current.mode}\nqueued=${current.queued}\noutbox=${current.outbox}\nunknown=${current.unknownOutbox}`,
       null,
     );
   }
@@ -1132,7 +1553,11 @@ class CoreService implements ChannelService {
     return values.join(",");
   }
 
-  private async acceptTask(message: InboundMessage, text: string): Promise<boolean> {
+  private async acceptTask(
+    message: InboundMessage,
+    text: string,
+    historyEligible = true,
+  ): Promise<boolean> {
     let binding = await this.reconcileExternalBinding(
       message,
       this.store.getBinding(this.bot!.uid, message),
@@ -1140,7 +1565,7 @@ class CoreService implements ChannelService {
     if (!binding) {
       let cwd: string;
       try {
-        cwd = await resolveWorkDirectory("", this.options.config);
+        cwd = await this.defaultWorkDirectory(message);
       } catch {
         await this.enqueueText(message, "无法创建默认会话目录，未接收任务。", null);
         return false;
@@ -1158,6 +1583,17 @@ class CoreService implements ChannelService {
       } catch {
         throw new Error("本地状态盘写入失败，任务未接收。");
       }
+    } else if (!binding.sessionFile) {
+      const current = binding;
+      const cwd = await this.defaultWorkDirectory(message).catch(() => current.cwd);
+      if (cwd !== current.cwd) {
+        binding = { ...current, cwd };
+        try {
+          this.store.ensureBinding(binding);
+        } catch {
+          throw new Error("本地状态盘写入失败，任务未接收。");
+        }
+      }
     }
     const task: TaskRecord = {
       id: randomUUID(),
@@ -1172,6 +1608,8 @@ class CoreService implements ChannelService {
       state: "queued",
       resultText: null,
       errorText: null,
+      messageSeq: message.messageSeq,
+      historyEligible,
     };
     let accepted: boolean;
     try {
@@ -1334,6 +1772,9 @@ class CoreService implements ChannelService {
       cwd: task.cwd,
       cancelRequested: false,
       cancelReplySent: false,
+      promptInFlight: false,
+      interruptRequested: false,
+      workAfterInterrupt: false,
     };
     this.runtimes.set(taskId, runtime);
     let worker: OmpWorker | undefined;
@@ -1609,6 +2050,9 @@ class CoreService implements ChannelService {
       }
       const onEvent = (event: WorkerEvent): void => {
         if (runtime.cancelRequested || this.stopping) return;
+        if (runtime.interruptRequested && event.type !== "turn_end" && event.type !== "run_end") {
+          runtime.workAfterInterrupt = true;
+        }
         if (event.type === "text") {
           if (event.messageId.trim().length === 0 || (event.text.length === 0 && !event.final)) return;
           assistantTexts.set(event.messageId, event.text);
@@ -1669,15 +2113,25 @@ class CoreService implements ChannelService {
           scheduleProgressEdit();
         }
       };
+      const historyTurn = await this.historyTurnFor(task, target, verified.sessionId);
       const promptContext: PromptContext = {
         tools: this.createHostTools(task, snapshot),
         ...(contextInjection === undefined ? {} : { contextInjection }),
       };
-      await worker.prompt(task.text, onEvent, promptContext);
+      runtime.promptInFlight = true;
+      try {
+        await worker.prompt(historyTurn?.text ?? task.text, onEvent, promptContext);
+      } finally {
+        runtime.promptInFlight = false;
+        if (historyTurn) this.commitHistoryTurn(target, verified.sessionId, historyTurn);
+      }
       if (runtime.cancelRequested) {
         this.store.markCancelled(taskId);
         finishProgress("cancelled");
         await this.sendCancelledIfNeeded(runtime);
+      } else if (runtime.interruptRequested && !runtime.workAfterInterrupt) {
+        this.store.markInterrupted(taskId, "用户中断当前回合");
+        finishProgress("cancelled");
       } else {
         if (contextNeedsCommit) {
           const sidecarPath = currentContextSidecarPath;
@@ -1761,32 +2215,6 @@ class CoreService implements ChannelService {
 
   private createHostTools(task: TaskRecord, _snapshot: GroupContext | null): HostTool[] {
     const target = taskTarget(task);
-    const readTool: HostTool = {
-      name: "octo_group_read",
-      description: "读取当前群/线程绑定的实时共享说明；普通 prompt 注入由固定 OMP extension 处理。",
-      parameters: { type: "object", additionalProperties: false },
-      execute: async (_args, signal) => {
-        if (signal.aborted) throw new Error("host tool cancelled");
-        const current = await this.options.transport.getGroupContext(target);
-        return JSON.stringify(normalizeGroupContext(current));
-      },
-    };
-    const writeTool: HostTool = {
-      name: "octo_group_write",
-      description: "更新当前群/线程的共享说明；目标由当前聊天绑定。",
-      parameters: {
-        type: "object",
-        properties: { content: { type: "string" } },
-        required: ["content"],
-        additionalProperties: false,
-      },
-      execute: async (args, signal) => {
-        if (signal.aborted) throw new Error("host tool cancelled");
-        if (typeof args.content !== "string") throw new Error("content must be a string");
-        const result = await this.options.transport.updateGroupContext(target, args.content, signal);
-        return `群说明已更新到版本 ${result.version}`;
-      },
-    };
     const fileTool: HostTool = {
       name: "octo_send_file",
       description: "发送当前 cwd 下的图片或文件；目标由当前聊天绑定。",
@@ -1874,9 +2302,223 @@ class CoreService implements ChannelService {
       },
       execute: async (args, signal) => this.askQuestions(task, target, args, signal),
     };
-    return isGroupTarget(target) ? [readTool, writeTool, fileTool, askTool] : [fileTool, askTool];
-
+    const parentGroupId =
+      target.channelType === 2
+        ? target.channelId
+        : target.channelType === 5
+          ? threadParentGroupId(target.channelId)
+          : null;
+    if (parentGroupId === null) return [fileTool, askTool];
+    const currentShortId =
+      target.channelType === 5 ? target.channelId.slice(parentGroupId.length + 4) : null;
+    // A task that was itself dispatched must not dispatch further: depth stays one.
+    const dispatchable = !task.messageId.startsWith(DISPATCH_MESSAGE_PREFIX);
+    const actions = dispatchable
+      ? [...MANAGEMENT_BASE_ACTIONS, MANAGEMENT_DISPATCH_ACTION]
+      : [...MANAGEMENT_BASE_ACTIONS];
+    const managementTool: HostTool = {
+      name: "octo_management",
+      description:
+        "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；thread-dispatch 把一条任务派发给本群的某个 thread（在那边排队执行，本群收到回执），派发出去的任务不能再派发。目标固定为当前聊天，不能指向其他群。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: actions, description: actions.join(" | ") },
+          short_id: {
+            type: "string",
+            description:
+              "线程 short id；thread-* 动作使用，在 thread 聊天里省略即当前线程。",
+          },
+          name: { type: "string", description: "create-thread 的线程名；group-update 的新群名。" },
+          notice: { type: "string", description: "group-update 的新群公告。" },
+          content: { type: "string", description: "description-write 的共享说明正文。" },
+          text: { type: "string", description: "thread-dispatch 要派发的任务正文。" },
+        },
+        required: ["action"],
+        additionalProperties: false,
+      },
+      execute: async (args, signal) =>
+        this.runManagementTool(task, target, parentGroupId, currentShortId, args, signal),
+    };
+    return [managementTool, fileTool, askTool];
   }
+
+  private async runManagementTool(
+    task: TaskRecord,
+    target: ChatTarget,
+    groupId: string,
+    currentShortId: string | null,
+    args: Record<string, unknown>,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const action = args.action;
+    const known: readonly string[] = [...MANAGEMENT_BASE_ACTIONS, MANAGEMENT_DISPATCH_ACTION];
+    if (typeof action !== "string" || !known.includes(action)) {
+      throw new Error(`unknown action: ${typeof action === "string" ? action : String(action)}`);
+    }
+    const optionalText = (field: string): string | undefined => {
+      const value = args[field];
+      if (value === undefined) return undefined;
+      if (typeof value !== "string") throw new Error(`${field} must be a string`);
+      return value;
+    };
+    const namedText = (field: string, maxChars: number): string => {
+      const value = optionalText(field)?.trim();
+      if (value === undefined || value.length === 0) throw new Error(`${field} is required`);
+      if (value.length > maxChars) throw new Error(`${field} must be at most ${maxChars} characters`);
+      return value;
+    };
+    const threadId = (): string => {
+      const requested = optionalText("short_id")?.trim();
+      const resolved = requested !== undefined && requested.length > 0 ? requested : currentShortId;
+      if (resolved === null || resolved === undefined || resolved.length === 0) {
+        throw new Error("short_id is required when the chat itself is not a thread");
+      }
+      return resolved;
+    };
+    const transport = this.options.transport;
+    throwIfAborted(signal);
+    switch (action) {
+      case "description-read": {
+        return JSON.stringify(normalizeGroupContext(await transport.getGroupContext(target)));
+      }
+      case "description-write": {
+        const content = optionalText("content");
+        if (content === undefined) throw new Error("content is required");
+        const result = await transport.updateGroupContext(target, content, signal);
+        return `群说明已更新到版本 ${result.version}`;
+      }
+      case "group-info": {
+        const info = await transport.getGroupInfo(groupId, signal);
+        return JSON.stringify({
+          group_id: info.groupId,
+          name: truncateForTool(info.name, MAX_MANAGEMENT_NAME_CHARS),
+          notice: truncateForTool(info.notice, MAX_MANAGEMENT_NOTICE_CHARS),
+          creator: info.creator,
+          status: info.status,
+          created_at: info.createdAt,
+        });
+      }
+      case "group-members": {
+        return JSON.stringify(
+          managementMembers(await transport.getGroupMembers(groupId, signal)),
+        );
+      }
+      case "group-update": {
+        const name = optionalText("name");
+        const notice = optionalText("notice");
+        if (name === undefined && notice === undefined) {
+          throw new Error("name or notice is required");
+        }
+        const patch: { name?: string; notice?: string } = {};
+        if (name !== undefined) patch.name = namedText("name", MAX_MANAGEMENT_NAME_CHARS);
+        if (notice !== undefined) {
+          if (notice.length > MAX_MANAGEMENT_NOTICE_CHARS) {
+            throw new Error(`notice must be at most ${MAX_MANAGEMENT_NOTICE_CHARS} characters`);
+          }
+          patch.notice = notice;
+        }
+        await transport.updateGroupInfo(groupId, patch, signal);
+        return `群信息已更新：${Object.keys(patch).join(", ")}`;
+      }
+      case "list-threads": {
+        const threads = await transport.listThreads(groupId, signal);
+        const visible = threads.slice(0, MAX_MANAGEMENT_THREADS);
+        return JSON.stringify({
+          threads: visible.map(managementThread),
+          count: threads.length,
+          truncated: threads.length > visible.length,
+        });
+      }
+      case "create-thread": {
+        const name = namedText("name", MAX_MANAGEMENT_NAME_CHARS);
+        const thread = await transport.createThread(groupId, name, signal);
+        return JSON.stringify(managementThread(thread));
+      }
+      case "thread-info": {
+        return JSON.stringify(managementThread(await transport.getThread(groupId, threadId(), signal)));
+      }
+      case "thread-members": {
+        const shortId = threadId();
+        return JSON.stringify(
+          managementMembers(await transport.getThreadMembers(groupId, shortId, signal)),
+        );
+      }
+      case "thread-join": {
+        const shortId = threadId();
+        await transport.joinThread(groupId, shortId, signal);
+        return `已加入线程 ${shortId}`;
+      }
+      case "thread-leave": {
+        const shortId = threadId();
+        await transport.leaveThread(groupId, shortId, signal);
+        return `已退出线程 ${shortId}`;
+      }
+      case "thread-delete": {
+        const shortId = threadId();
+        await transport.deleteThread(groupId, shortId, signal);
+        return `已删除线程 ${shortId}`;
+      }
+      case "thread-dispatch": {
+        if (task.messageId.startsWith(DISPATCH_MESSAGE_PREFIX)) {
+          throw new Error("dispatched tasks cannot dispatch further");
+        }
+        const shortId = threadId();
+        const text = namedText("text", MAX_MANAGEMENT_TASK_CHARS);
+        return this.dispatchThreadTask(task, target, groupId, shortId, text, signal);
+      }
+      default: {
+        throw new Error(`unknown action: ${action}`);
+      }
+    }
+  }
+  /**
+   * Hands one task to a thread of the current group: the thread shows the handoff, the task
+   * is accepted through the same durable path as a real inbound message (so it keeps
+   * dedup, queueing and question semantics), and the current chat gets a receipt. Depth is
+   * one - the dispatch tool is withheld from tasks that arrived this way.
+   */
+  private async dispatchThreadTask(
+    task: TaskRecord,
+    target: ChatTarget,
+    groupId: string,
+    shortId: string,
+    text: string,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const thread = await this.options.transport.getThread(groupId, shortId, signal);
+    if (thread.groupId.length > 0 && thread.groupId !== groupId) {
+      throw new Error(`thread ${shortId} does not belong to the current group`);
+    }
+    const bot = this.bot;
+    const ownerId = bot ? this.store.getOwnerId(bot.uid)?.trim() ?? "" : "";
+    if (!bot || ownerId.length === 0) {
+      throw new Error("owner is not enrolled; cannot dispatch a task");
+    }
+    const threadTarget: ChatTarget = { channelId: thread.channelId, channelType: 5 };
+    this.enqueueText(threadTarget, `来自群会话的派发任务：\n\n${text}`, null);
+    const messageId = `${DISPATCH_MESSAGE_PREFIX}${randomUUID()}`;
+    await this.handleInbound({
+      channelId: threadTarget.channelId,
+      channelType: 5,
+      messageId,
+      senderId: ownerId,
+      text,
+      mentionedUserIds: [bot.uid],
+      supported: true,
+      messageSeq: 0,
+      messageTimestamp: Date.now(),
+    });
+    this.enqueueText(target, `已派发任务到线程 ${shortId}（${thread.channelId}）。`, null);
+    return JSON.stringify({
+      dispatched: true,
+      short_id: shortId,
+      channel_id: thread.channelId,
+      message_id: messageId,
+      task_id: task.id,
+    });
+  }
+
   private async askQuestions(
     task: TaskRecord,
     target: ChatTarget,

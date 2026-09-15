@@ -59,6 +59,14 @@ class WorkerProxy implements OmpWorker {
       : this.inner.prompt(text, onEvent, context);
   }
 
+  steer(text: string): Promise<void> {
+    return this.inner.steer(text);
+  }
+
+  abortTurn(): Promise<void> {
+    return this.inner.abortTurn();
+  }
+
   refreshState(): Promise<ProjectSessionState> {
     return this.inner.refreshState();
   }
@@ -292,7 +300,7 @@ test("same-chat tasks remain FIFO while distinct directories run concurrently", 
     );
     await firstStarted.promise;
     const secondAccepted = harness.service.handleInbound(
-      inbound({ messageId: "directory-a-second", ...firstTarget, text: "directory-a second" }),
+      inbound({ messageId: "directory-a-second", ...firstTarget, text: "/queue directory-a second" }),
     );
     const parallelAccepted = harness.service.handleInbound(
       inbound({ messageId: "directory-b-parallel", ...secondTarget, text: "directory-b parallel" }),

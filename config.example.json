@@ -1,9 +1,10 @@
 {
   "apiUrl": "https://im.deepminer.com.cn/",
   "botTokenEnv": "OCTO_BOT_TOKEN",
-  "allowedGroupIds": [],
+  "allowedGroupIds": ["e3bc5af0d4b84b18bb3770a74bd222c6"],
   "ompCommand": "omp",
   "stateDir": "~/.local/state/omp-channel-octo",
+  "groupHistory": { "enabled": true, "maxMessages": 50 },
   "restart": {
     "command": ["super", "-y", "restart", "omp-channel-octo"]
   }

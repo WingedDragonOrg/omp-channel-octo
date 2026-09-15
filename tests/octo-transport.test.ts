@@ -821,6 +821,132 @@ describe("Octo text send and target context", () => {
   });
 });
 
+describe("Octo group and thread management", () => {
+  test("drives group info, threads, and thread membership through their REST paths", async () => {
+    const groupId = "e3bc5af0d4b84b18bb3770a74bd222c6";
+    const encodedGroup = encodeURIComponent(groupId);
+    const currentFixture = await createOctoProtocolFixture();
+    fixture = currentFixture;
+    transport = createOctoTransport({
+      apiUrl: currentFixture.apiUrl,
+      botToken: currentFixture.botToken,
+    });
+    await transport.initialize();
+
+    await expect(transport.getGroupInfo(groupId)).resolves.toMatchObject({
+      groupId,
+      name: "Fixture Group",
+      creator: currentFixture.ownerUid,
+      status: 1,
+    });
+    await expect(transport.getGroupMembers(groupId)).resolves.toEqual([
+      {
+        uid: currentFixture.ownerUid,
+        name: "Fixture Owner",
+        role: 1,
+        robot: false,
+        joinedAt: "2026-09-12T00:00:00.000Z",
+      },
+      {
+        uid: currentFixture.botUid,
+        name: currentFixture.botName,
+        role: 0,
+        robot: true,
+        joinedAt: "2026-09-12T00:00:00.000Z",
+      },
+    ]);
+
+    await transport.updateGroupInfo(groupId, { name: "Renamed", notice: "New notice" });
+    await expect(transport.getGroupInfo(groupId)).resolves.toMatchObject({
+      name: "Renamed",
+      notice: "New notice",
+    });
+
+    await expect(transport.createThread(groupId, "Thread one")).resolves.toEqual({
+      shortId: "thread-0",
+      groupId,
+      channelId: `${groupId}____thread-0`,
+      name: "Thread one",
+      creatorUid: currentFixture.botUid,
+      status: 1,
+      memberCount: 1,
+      messageCount: 0,
+      createdAt: "2026-09-12T00:00:00.000Z",
+      updatedAt: "2026-09-12T00:00:00.000Z",
+    });
+    await expect(transport.listThreads(groupId)).resolves.toMatchObject([
+      { shortId: "thread-0", name: "Thread one" },
+    ]);
+    await expect(transport.getThread(groupId, "thread-0")).resolves.toMatchObject({
+      shortId: "thread-0",
+      name: "Thread one",
+    });
+    await expect(transport.getThreadMembers(groupId, "thread-0")).resolves.toEqual([
+      {
+        uid: currentFixture.botUid,
+        name: currentFixture.botName,
+        role: 1,
+        robot: false,
+        joinedAt: "2026-09-12T00:00:00.000Z",
+      },
+    ]);
+    await transport.joinThread(groupId, "thread-0");
+    await transport.leaveThread(groupId, "thread-0");
+    await transport.deleteThread(groupId, "thread-0");
+    await expect(transport.listThreads(groupId)).resolves.toEqual([]);
+
+    expect(
+      currentFixture.managementRequests.map(({ method, path }) => `${method} ${path}`),
+    ).toEqual([
+      `GET /v1/bot/groups/${encodedGroup}`,
+      `GET /v1/bot/groups/${encodedGroup}/members`,
+      `PUT /v1/bot/groups/${encodedGroup}/info`,
+      `GET /v1/bot/groups/${encodedGroup}`,
+      `POST /v1/bot/groups/${encodedGroup}/threads`,
+      `GET /v1/bot/groups/${encodedGroup}/threads`,
+      `GET /v1/bot/groups/${encodedGroup}/threads/thread-0`,
+      `GET /v1/bot/groups/${encodedGroup}/threads/thread-0/members`,
+      `POST /v1/bot/groups/${encodedGroup}/threads/thread-0/join`,
+      `POST /v1/bot/groups/${encodedGroup}/threads/thread-0/leave`,
+      `DELETE /v1/bot/groups/${encodedGroup}/threads/thread-0`,
+      `GET /v1/bot/groups/${encodedGroup}/threads`,
+    ]);
+    expect(currentFixture.managementRequests[2]?.body).toEqual({
+      name: "Renamed",
+      notice: "New notice",
+    });
+    expect(currentFixture.managementRequests[4]?.body).toEqual({ name: "Thread one" });
+    for (const request of currentFixture.managementRequests) {
+      expect(request.authorization).toBe(`Bearer ${currentFixture.botToken}`);
+    }
+  });
+
+  test("surfaces the server message, HTTP status, and invalid schemas", async () => {
+    const forbiddenGroup = "forbidden-group";
+    const brokenGroup = "broken-group";
+    const currentFixture = await createOctoProtocolFixture({
+      managementStatuses: { [`GET /v1/bot/groups/${forbiddenGroup}`]: 403 },
+      managementBodies: {
+        [`GET /v1/bot/groups/${brokenGroup}/members`]: [{ uid: 42 }],
+        [`GET /v1/bot/groups/${brokenGroup}/threads`]: { threads: [] },
+      },
+    });
+    fixture = currentFixture;
+    transport = createOctoTransport({
+      apiUrl: currentFixture.apiUrl,
+      botToken: currentFixture.botToken,
+    });
+    await transport.initialize();
+
+    await expect(transport.getGroupInfo(forbiddenGroup)).rejects.toThrow(/403/);
+    await expect(transport.getGroupMembers(brokenGroup)).rejects.toThrow(/schema|invalid/i);
+    await expect(transport.listThreads(brokenGroup)).rejects.toThrow(/schema|invalid/i);
+    await expect(transport.getThread("plain-group", "missing")).rejects.toThrow(/400.*请求参数有误/);
+    await expect(transport.createThread("bad/group", "x")).rejects.toThrow(/group id is invalid/);
+    await expect(transport.getThread("plain-group", "")).rejects.toThrow(/thread id is invalid/);
+  });
+});
+
 describe("Octo typing and progress cards", () => {
   test("posts typing to the target with the authenticated bot", async () => {
     fixture = await createOctoProtocolFixture();
@@ -1271,5 +1397,218 @@ describe("Octo presigned file sending", () => {
     ).rejects.toThrow(/image|MIME|unsupported|format/i);
     expect(fixture.presignRequests).toHaveLength(0);
     expect(fixture.sentMessages).toHaveLength(0);
+  });
+});
+
+/** WuKongIM carries the payload as base64-encoded JSON with the same shape as WS frames. */
+function encodedHistoryPayload(payload: Record<string, unknown>): string {
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64");
+}
+
+describe("Octo group history and inbound sequence metadata", () => {
+  test("carries the decoded RECV sequence and server timestamp into InboundMessage", async () => {
+    const received: InboundMessage[] = [];
+    const started = await startFixtureTransport({}, async (message) => {
+      received.push(message);
+    });
+    const currentFixture = fixture!;
+    currentFixture.sendInboundBatch(started.connection, [
+      {
+        fromUid: currentFixture.ownerUid,
+        channelId: "group-seq-carry",
+        channelType: 2,
+        text: "group with seq",
+        messageId: "9007199254741051",
+        messageSeq: 4_102,
+        timestamp: 1_757_656_000,
+      },
+      {
+        fromUid: currentFixture.ownerUid,
+        channelType: 1,
+        text: "dm with seq",
+        messageId: "9007199254741052",
+        messageSeq: 77,
+        timestamp: 1_757_656_001,
+      },
+      {
+        fromUid: currentFixture.ownerUid,
+        channelId: "group-seq-unknown",
+        channelType: 2,
+        text: "group without seq",
+        messageId: "9007199254741053",
+        messageSeq: 0,
+        timestamp: 1_757_656_002,
+      },
+    ]);
+
+    await waitForFixture(
+      () => received.length === 3 ? received : undefined,
+      2_000,
+      "fixture inbound messages were not delivered",
+    );
+
+    expect(received.map((message) => [
+      message.channelId,
+      message.messageSeq,
+      message.messageTimestamp,
+    ])).toEqual([
+      ["group-seq-carry", 4_102, 1_757_656_000_000],
+      [currentFixture.ownerUid, 77, 1_757_656_001_000],
+      ["group-seq-unknown", 0, 1_757_656_002_000],
+    ]);
+  });
+
+  test("posts the exact history window and decodes base64 text payloads in seq order", async () => {
+    fixture = await createOctoProtocolFixture();
+    transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
+    await transport.initialize();
+    const currentFixture = fixture;
+    currentFixture.setMessagesSync({
+      messages: [
+        {
+          message_seq: 14,
+          from_uid: "member-b",
+          timestamp: 1_757_656_005,
+          payload: encodedHistoryPayload({ type: 1, content: "newer line ✅" }),
+        },
+        {
+          message_seq: 12,
+          from_uid: "member-a",
+          timestamp: 1_757_656_000,
+          payload: encodedHistoryPayload({ type: 1, content: "older line" }),
+        },
+      ],
+    });
+
+    const history = await transport.fetchGroupMessages(
+      { channelId: "group-history-1", channelType: 2 },
+      { sinceSeq: 11, untilSeq: 15, limit: 50 },
+    );
+
+    expect(currentFixture.messagesSyncRequests).toEqual([
+      {
+        path: "/v1/bot/messages/sync",
+        authorization: `Bearer ${currentFixture.botToken}`,
+        body: {
+          channel_id: "group-history-1",
+          channel_type: 2,
+          start_message_seq: 11,
+          end_message_seq: 15,
+          limit: 50,
+          pull_mode: 1,
+        },
+      },
+    ]);
+    expect(history).toEqual([
+      { seq: 12, senderId: "member-a", text: "older line", timestamp: 1_757_656_000_000 },
+      { seq: 14, senderId: "member-b", text: "newer line ✅", timestamp: 1_757_656_005_000 },
+    ]);
+
+    // A thread keeps its full `group____topic` id, and (0, 0) asks for the newest window.
+    await transport.fetchGroupMessages(
+      { channelId: "group-history-1____topic-9", channelType: 5 },
+      { sinceSeq: 0, untilSeq: 0, limit: 20 },
+    );
+
+    expect(currentFixture.messagesSyncRequests[1]).toMatchObject({
+      path: "/v1/bot/messages/sync",
+      body: {
+        channel_id: "group-history-1____topic-9",
+        channel_type: 5,
+        start_message_seq: 0,
+        end_message_seq: 0,
+        limit: 20,
+        pull_mode: 1,
+      },
+    });
+  });
+
+  test("keeps only text from other senders and skips malformed rows individually", async () => {
+    fixture = await createOctoProtocolFixture();
+    transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
+    await transport.initialize();
+    const currentFixture = fixture;
+    const text = (content: string): string => encodedHistoryPayload({ type: 1, content });
+    currentFixture.setMessagesSync({
+      messages: [
+        { message_seq: 28, from_uid: "member-h", timestamp: 1_757_656_008, payload: text("kept two") },
+        { message_seq: 22, from_uid: currentFixture.botUid, timestamp: 1_757_656_002, payload: text("bot echo") },
+        { message_seq: 20, from_uid: "member-a", timestamp: 1_757_656_000, payload: text("kept one") },
+        { message_seq: 21, from_uid: "member-b", timestamp: 1_757_656_001, payload: encodedHistoryPayload({ type: 2, content: "image caption" }) },
+        { message_seq: 23, from_uid: "member-c", timestamp: 1_757_656_003, payload: "%%% not base64 json %%%" },
+        { message_seq: 24, from_uid: "member-d", timestamp: 1_757_656_004 },
+        { message_seq: 0, from_uid: "member-e", timestamp: 1_757_656_005, payload: text("no seq") },
+        { message_seq: 12.5, from_uid: "member-f", timestamp: 1_757_656_006, payload: text("fractional seq") },
+        { message_seq: 25, from_uid: "member-g", timestamp: 1_757_656_007, payload: text("") },
+        { message_seq: 26, from_uid: "", timestamp: 1_757_656_009, payload: text("no sender") },
+        { message_seq: 27, from_uid: "member-i", timestamp: "2026-09-16T00:00:00Z", payload: text("bad timestamp") },
+      ],
+    });
+
+    const history = await transport.fetchGroupMessages(
+      { channelId: "group-history-2", channelType: 2 },
+      { sinceSeq: 19, untilSeq: 29, limit: 50 },
+    );
+
+    expect(history).toEqual([
+      { seq: 20, senderId: "member-a", text: "kept one", timestamp: 1_757_656_000_000 },
+      { seq: 28, senderId: "member-h", text: "kept two", timestamp: 1_757_656_008_000 },
+    ]);
+  });
+
+  test("rejects history sync failures instead of returning an empty window", async () => {
+    fixture = await createOctoProtocolFixture();
+    transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
+    await transport.initialize();
+    const currentFixture = fixture;
+    const target = { channelId: "group-history-3", channelType: 2 as const };
+    const page = { sinceSeq: 0, untilSeq: 0, limit: 20 };
+
+    currentFixture.setMessagesSync({ messages: [] }, 500);
+    await expect(transport.fetchGroupMessages(target, page)).rejects.toThrow(/500|sync/i);
+
+    currentFixture.setMessagesSync("{not json");
+    await expect(transport.fetchGroupMessages(target, page)).rejects.toThrow(/JSON|sync/i);
+
+    currentFixture.setMessagesSync({ messages: "not-an-array" });
+    await expect(transport.fetchGroupMessages(target, page)).rejects.toThrow(/schema|sync/i);
+
+    expect(currentFixture.messagesSyncRequests).toHaveLength(3);
+  });
+
+  test("rejects history sync for DM targets without sending a request", async () => {
+    fixture = await createOctoProtocolFixture();
+    transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
+    await transport.initialize();
+    const currentFixture = fixture;
+
+    await expect(
+      transport.fetchGroupMessages(
+        { channelId: currentFixture.ownerUid, channelType: 1 },
+        { sinceSeq: 0, untilSeq: 0, limit: 20 },
+      ),
+    ).rejects.toThrow(/DM|group|history|thread/i);
+    expect(currentFixture.messagesSyncRequests).toHaveLength(0);
+  });
+
+  test("aborts an in-flight history sync through its AbortSignal", async () => {
+    fixture = await createOctoProtocolFixture({ messageSyncDelayMs: 100 });
+    transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
+    await transport.initialize();
+    const currentFixture = fixture;
+    const abort = new AbortController();
+    const pending = transport.fetchGroupMessages(
+      { channelId: "group-history-4", channelType: 2 },
+      { sinceSeq: 0, untilSeq: 0, limit: 20, signal: abort.signal },
+    );
+
+    await waitForFixture(
+      () => currentFixture.messagesSyncRequests.length === 1 ? true : undefined,
+      1_000,
+      "history sync request did not reach the protocol fixture",
+    );
+    abort.abort();
+    await expect(pending).rejects.toThrow(/abort/i);
+    expect(currentFixture.messagesSyncRequests).toHaveLength(1);
   });
 });

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { ChatTarget, ChatExecutionState, WorkerProcess } from "./contracts.ts";
+import type { ChatAppendMode, ChatTarget, ChatExecutionState, WorkerProcess } from "./contracts.ts";
 
 export interface BindingRecord extends ChatTarget {
   botUid: string;
@@ -32,6 +32,10 @@ export interface TaskRecord extends ChatTarget {
   state: ChatExecutionState;
   resultText: string | null;
   errorText: string | null;
+  /** Per-channel WuKongIM sequence of the triggering message; `0` means unknown. */
+  messageSeq: number;
+  /** Whether group history accounting applies to this task and its triggering message. */
+  historyEligible: boolean;
 }
 export interface RestartNoticeRecord extends ChatTarget {
   id: string;
@@ -96,6 +100,17 @@ export interface ContextLedgerRecord extends ChatTarget {
   previousVersion: number | null;
 }
 
+export interface HistoryLedgerRecord {
+  botUid: string;
+  channelType: 2 | 5;
+  channelId: string;
+  sessionId: string;
+  lastSeq: number;
+  phase: "pending" | "committed";
+  attemptId: string;
+  previousSeq: number | null;
+}
+
 type SqlValue = string | number | null | Uint8Array;
 type SqlRow = Record<string, unknown>;
 
@@ -105,6 +120,19 @@ function targetWhere(target: ChatTarget): string {
 
 function targetValues(target: ChatTarget): SqlValue[] {
   return [target.channelType, target.channelId];
+}
+
+/**
+ * Group history accounting is keyed on full group (2) / CommunityTopic thread (5)
+ * identities; anything else can never own a ledger row.
+ */
+function validHistoryIdentity(botUid: string, target: ChatTarget, sessionId: string): boolean {
+  return (
+    botUid.length > 0 &&
+    sessionId.length > 0 &&
+    target.channelId.length > 0 &&
+    (target.channelType === 2 || target.channelType === 5)
+  );
 }
 
 function asString(value: unknown): string {
@@ -202,7 +230,9 @@ export class ChannelStore {
         started_at INTEGER,
         finished_at INTEGER,
         result_text TEXT,
-        error_text TEXT
+        error_text TEXT,
+        message_seq INTEGER NOT NULL DEFAULT 0,
+        history_eligible INTEGER NOT NULL DEFAULT 1
       );
       CREATE INDEX IF NOT EXISTS tasks_chat_order
         ON tasks(bot_uid, channel_type, channel_id, accepted_at, id);
@@ -273,12 +303,34 @@ export class ChannelStore {
       );
       CREATE INDEX IF NOT EXISTS session_context_target
         ON session_context_ledger(bot_uid, channel_type, channel_id);
+      CREATE TABLE IF NOT EXISTS group_history_ledger (
+        bot_uid TEXT NOT NULL,
+        channel_type INTEGER NOT NULL CHECK(channel_type IN (2, 5)),
+        channel_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        last_seq INTEGER NOT NULL CHECK(last_seq >= 0),
+        phase TEXT NOT NULL CHECK(phase IN ('pending', 'committed')),
+        attempt_id TEXT NOT NULL,
+        previous_seq INTEGER CHECK(previous_seq IS NULL OR previous_seq >= 0),
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(bot_uid, channel_type, channel_id, session_id)
+      );
+      CREATE INDEX IF NOT EXISTS group_history_target
+        ON group_history_ledger(bot_uid, channel_type, channel_id);
       CREATE TABLE IF NOT EXISTS restart_notices (
         id TEXT PRIMARY KEY NOT NULL,
         bot_uid TEXT NOT NULL,
         channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
         channel_id TEXT NOT NULL,
         requested_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS chat_modes (
+        bot_uid TEXT NOT NULL,
+        channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
+        channel_id TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK(mode IN ('steer', 'queue')),
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(bot_uid, channel_type, channel_id)
       );
     `);
     for (const statement of [
@@ -288,6 +340,8 @@ export class ChannelStore {
       "ALTER TABLE outbox ADD COLUMN desired_version INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE outbox ADD COLUMN acked_version INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE worker_ledger ADD COLUMN move_target_cwd TEXT",
+      "ALTER TABLE tasks ADD COLUMN message_seq INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE tasks ADD COLUMN history_eligible INTEGER NOT NULL DEFAULT 1",
     ]) {
       try {
         this.db.exec(statement);
@@ -468,8 +522,11 @@ export class ChannelStore {
         ],
       );
       this.run(
-        `INSERT INTO tasks(id, bot_uid, channel_type, channel_id, message_id, sender_id, text, session_id, cwd, state, accepted_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)`,
+        `INSERT INTO tasks(
+           id, bot_uid, channel_type, channel_id, message_id, sender_id, text, session_id, cwd,
+           state, accepted_at, message_seq, history_eligible
+         )
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`,
         [
           task.id,
           task.botUid,
@@ -481,6 +538,8 @@ export class ChannelStore {
           task.sessionId,
           task.cwd,
           now,
+          task.messageSeq,
+          task.historyEligible ? 1 : 0,
         ],
       );
       return true;
@@ -534,6 +593,39 @@ export class ChannelStore {
   failCommand(claim: InboundClaim): void {
     this.run(
       `UPDATE inbound SET command_state = 'failed'
+       WHERE bot_uid = ? AND channel_type = ? AND channel_id = ? AND message_id = ? AND kind = 'command'`,
+      [claim.botUid, claim.target.channelType, claim.target.channelId, claim.messageId],
+    );
+  }
+
+  /**
+   * The chat's append mode, defaulting to `steer` for every chat that never set one.
+   * A stored value is durable across restarts; there is no per-bot default row.
+   */
+  getChatMode(botUid: string, target: ChatTarget): ChatAppendMode {
+    const row = this.query(
+      `SELECT mode FROM chat_modes WHERE bot_uid = ? AND ${targetWhere(target)}`,
+      [botUid, ...targetValues(target)],
+    )[0];
+    return row && row.mode === "queue" ? "queue" : "steer";
+  }
+
+  setChatMode(botUid: string, target: ChatTarget, mode: ChatAppendMode): void {
+    this.run(
+      `INSERT INTO chat_modes(bot_uid, channel_type, channel_id, mode, updated_at)
+       VALUES(?, ?, ?, ?, ?)
+       ON CONFLICT(bot_uid, channel_type, channel_id) DO UPDATE SET mode = excluded.mode, updated_at = excluded.updated_at`,
+      [botUid, target.channelType, target.channelId, mode, Date.now()],
+    );
+  }
+
+  /**
+   * Drops a command-class inbound claim so the same message can be claimed again,
+   * used when a claim was taken for a delivery path that then fell back.
+   */
+  releaseClaim(claim: InboundClaim): void {
+    this.run(
+      `DELETE FROM inbound
        WHERE bot_uid = ? AND channel_type = ? AND channel_id = ? AND message_id = ? AND kind = 'command'`,
       [claim.botUid, claim.target.channelType, claim.target.channelId, claim.messageId],
     );
@@ -600,6 +692,13 @@ export class ChannelStore {
   markCancelled(taskId: string, errorText = "cancelled"): void {
     this.run(
       "UPDATE tasks SET state = 'cancelled', finished_at = ?, error_text = ? WHERE id = ? AND state IN ('queued', 'started')",
+      [Date.now(), errorText, taskId],
+    );
+  }
+
+  markInterrupted(taskId: string, errorText: string): void {
+    this.run(
+      "UPDATE tasks SET state = 'interrupted', finished_at = ?, error_text = ? WHERE id = ? AND state IN ('queued', 'started')",
       [Date.now(), errorText, taskId],
     );
   }
@@ -846,6 +945,126 @@ export class ChannelStore {
        WHERE bot_uid = ? AND ${targetWhere(target)}${sessionClause}`,
       values,
     );
+  }
+
+  getHistoryLedger(botUid: string, target: ChatTarget, sessionId: string): HistoryLedgerRecord | null {
+    if (!validHistoryIdentity(botUid, target, sessionId)) return null;
+    const row = this.historyLedgerRow(botUid, target, sessionId);
+    return row ? this.historyLedgerFromRow(row) : null;
+  }
+
+  /**
+   * Start or extend the pending injection for this (chat, session).
+   * - existing pending row: keep its attemptId and previousSeq, raise lastSeq to max(existing, lastSeq)
+   * - otherwise: previousSeq = committed row's lastSeq (or null), fresh attemptId, phase = pending
+   * - invalid identity (channelType not 2/5, empty ids, non-integer/negative seq) throws
+   */
+  prepareHistoryInjection(
+    botUid: string,
+    target: ChatTarget,
+    sessionId: string,
+    lastSeq: number,
+  ): HistoryLedgerRecord {
+    if (
+      !validHistoryIdentity(botUid, target, sessionId)
+      || !Number.isSafeInteger(lastSeq)
+      || lastSeq < 0
+    ) {
+      throw new Error("group history ledger identity or seq is invalid");
+    }
+    return this.transaction(() => {
+      const existingRow = this.historyLedgerRow(botUid, target, sessionId);
+      if (existingRow) {
+        const existing = this.historyLedgerFromRow(existingRow);
+        const pending = existing.phase === "pending";
+        this.run(
+          `UPDATE group_history_ledger
+           SET last_seq = ?, phase = 'pending', attempt_id = ?, previous_seq = ?, updated_at = ?
+           WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?`,
+          [
+            Math.max(existing.lastSeq, lastSeq),
+            pending ? existing.attemptId : randomUUID(),
+            pending ? existing.previousSeq : existing.lastSeq,
+            Date.now(),
+            botUid,
+            ...targetValues(target),
+            sessionId,
+          ],
+        );
+      } else {
+        this.run(
+          `INSERT INTO group_history_ledger(
+             bot_uid, channel_type, channel_id, session_id, last_seq, phase, attempt_id, previous_seq, updated_at
+           ) VALUES(?, ?, ?, ?, ?, 'pending', ?, NULL, ?)`,
+          [botUid, target.channelType, target.channelId, sessionId, lastSeq, randomUUID(), Date.now()],
+        );
+      }
+      const row = this.historyLedgerRow(botUid, target, sessionId);
+      if (!row) throw new Error("group history ledger row disappeared after prepare");
+      return this.historyLedgerFromRow(row);
+    });
+  }
+
+  /** CAS commit; true only when phase/staleness/attempt all match. */
+  commitHistoryInjection(
+    botUid: string,
+    target: ChatTarget,
+    sessionId: string,
+    lastSeq: number,
+    attemptId: string,
+  ): boolean {
+    if (
+      !validHistoryIdentity(botUid, target, sessionId)
+      || attemptId.length === 0
+      || !Number.isSafeInteger(lastSeq)
+      || lastSeq < 0
+    ) {
+      return false;
+    }
+    return this.run(
+      `UPDATE group_history_ledger
+       SET phase = 'committed', updated_at = ?
+       WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?
+         AND last_seq = ? AND attempt_id = ? AND phase = 'pending'`,
+      [Date.now(), botUid, ...targetValues(target), sessionId, lastSeq, attemptId],
+    ).changes === 1;
+  }
+
+  /** Delete rows of the same chat whose session_id differs from keepSessionId. Returns deleted count. */
+  pruneHistoryLedger(botUid: string, target: ChatTarget, keepSessionId: string): number {
+    if (!validHistoryIdentity(botUid, target, keepSessionId)) return 0;
+    return this.run(
+      `DELETE FROM group_history_ledger
+       WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id != ?`,
+      [botUid, ...targetValues(target), keepSessionId],
+    ).changes;
+  }
+
+  /**
+   * Steered message accounting: raise last_seq to max(current, seq), creating a committed
+   * row when absent. An existing row keeps its phase, so a pending replay window stays open.
+   */
+  advanceHistoryLedger(botUid: string, target: ChatTarget, sessionId: string, seq: number): void {
+    if (!validHistoryIdentity(botUid, target, sessionId) || !Number.isSafeInteger(seq) || seq < 0) return;
+    this.transaction(() => {
+      const row = this.historyLedgerRow(botUid, target, sessionId);
+      if (!row) {
+        this.run(
+          `INSERT INTO group_history_ledger(
+             bot_uid, channel_type, channel_id, session_id, last_seq, phase, attempt_id, previous_seq, updated_at
+           ) VALUES(?, ?, ?, ?, ?, 'committed', ?, NULL, ?)`,
+          [botUid, target.channelType, target.channelId, sessionId, seq, randomUUID(), Date.now()],
+        );
+        return;
+      }
+      if (asNumber(row.last_seq) >= seq) return;
+      this.run(
+        `UPDATE group_history_ledger
+         SET last_seq = ?, updated_at = ?
+         WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?`,
+        [seq, Date.now(), botUid, ...targetValues(target), sessionId],
+      );
+    });
   }
 
   markWorkerStopped(id: string): void {
@@ -1141,6 +1360,30 @@ export class ChannelStore {
     return this.listPendingQuestions(botUid, target).map(({ id }) => id);
   }
 
+  private historyLedgerRow(botUid: string, target: ChatTarget, sessionId: string): SqlRow | undefined {
+    return this.query(
+      `SELECT bot_uid, channel_type, channel_id, session_id, last_seq, phase, attempt_id, previous_seq
+       FROM group_history_ledger
+       WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?`,
+      [botUid, ...targetValues(target), sessionId],
+    )[0];
+  }
+
+  private historyLedgerFromRow(row: SqlRow): HistoryLedgerRecord {
+    return {
+      botUid: asString(row.bot_uid),
+      channelType: asNumber(row.channel_type) as 2 | 5,
+      channelId: asString(row.channel_id),
+      sessionId: asString(row.session_id),
+      lastSeq: asNumber(row.last_seq),
+      phase: row.phase === "committed" ? "committed" : "pending",
+      attemptId: asString(row.attempt_id),
+      previousSeq: row.previous_seq === null || row.previous_seq === undefined
+        ? null
+        : asNumber(row.previous_seq),
+    };
+  }
+
   private contextLedgerFromRow(row: SqlRow): ContextLedgerRecord {
     return {
       botUid: asString(row.bot_uid),
@@ -1170,6 +1413,8 @@ export class ChannelStore {
       state: asState(row.state),
       resultText: asNullableString(row.result_text),
       errorText: asNullableString(row.error_text),
+      messageSeq: asNumber(row.message_seq),
+      historyEligible: asNumber(row.history_eligible) !== 0,
     };
   }
 

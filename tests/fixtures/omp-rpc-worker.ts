@@ -34,6 +34,8 @@ type Scenario =
 	| "v2"
 	| "ui"
 	| "cancel"
+	| "steer"
+	| "interrupt"
 	| "crash"
 	| "host-tool"
 	| "host-unknown"
@@ -167,6 +169,7 @@ type HostToolRegistration = {
 };
 const hostTools = new Map<string, HostToolRegistration>();
 let pendingHostToolRequestId: string | undefined;
+let streaming = false;
 function persistSessionHeader(): void {
 	writeFileSync(
 		sessionFile,
@@ -689,6 +692,7 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		return;
 	}
 	response(id, "prompt", { agentInvoked: true });
+	streaming = true;
 	if (scenario === "late-message-start") {
 		const message = { role: "assistant", content: [] };
 		emit({ type: "agent_start" });
@@ -775,6 +779,24 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		}, 15);
 		return;
 	}
+	if (scenario === "steer") {
+		// The run stays open until a steering frame arrives; only that frame ends it.
+		emit({ type: "agent_start" });
+		emitAssistantMessage("fixture first turn", 1, true);
+		promptTimer = setTimeout(() => {
+			if (!streaming) return;
+			failure(id, "prompt", "fixture steer scenario never received a steering frame", "fixture_steer_timeout");
+		}, numberFlag("--fixture-steer-timeout", 5_000));
+		return;
+	}
+	if (scenario === "interrupt") {
+		// A partial turn with no end frame: the host must abort it and keep the worker alive.
+		setTimeout(() => {
+			emit({ type: "agent_start" });
+			emitAssistantMessage("fixture partial turn", 1, true);
+		}, 10);
+		return;
+	}
 	if (scenario === "cancel" || scenario === "crash") await spawnDescendantIfRequested();
 	if (scenario === "crash") {
 		setTimeout(() => process.exit(71), 35);
@@ -857,10 +879,29 @@ function handleCommand(command: Frame): void {
 		void handlePrompt(id, typeof command.message === "string" ? command.message : "");
 		return;
 	}
+	if (type === "steer") {
+		appendLog({ kind: "steer", id, message: command.message });
+		if (!streaming) {
+			failure(id, type, "fixture is not streaming a turn", "fixture_not_streaming");
+			return;
+		}
+		response(id, type);
+		if (promptTimer) clearTimeout(promptTimer);
+		promptTimer = undefined;
+		const steered = typeof command.message === "string" ? command.message : "";
+		emitAssistantMessage(`fixture steered turn: ${steered}`, 2, true);
+		emit({ type: "agent_end", messages: [], willContinue: false });
+		streaming = false;
+		return;
+	}
 	if (type === "abort") {
 		if (promptTimer) clearTimeout(promptTimer);
 		promptTimer = undefined;
 		response(id, type);
+		if (scenario === "interrupt" && streaming) {
+			streaming = false;
+			emit({ type: "agent_end", messages: [], willContinue: false });
+		}
 		if (scenario === "cancel") {
 			// Exit the RPC parent immediately.  The descendant intentionally
 			// remains alive, so the host must stop the whole owned process group

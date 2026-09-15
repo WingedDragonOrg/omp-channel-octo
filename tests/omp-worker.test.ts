@@ -235,6 +235,53 @@ describe("OMP RPC worker", () => {
 		}, { sessionFile: "resume.jsonl" });
 	});
 
+	test("steer injects a message into the streaming turn until that run ends", async () => {
+		await withHarness("steer", async harness => {
+			const events: WorkerEvent[] = [];
+			const prompt = harness.worker.prompt("start work", event => events.push(event));
+			await waitUntil(() => events.some(event => event.type === "text" && event.text === "fixture first turn"));
+
+			await harness.worker.steer("also check the logs");
+
+			await prompt;
+			const finals = events
+				.filter((event): event is Extract<WorkerEvent, { type: "text" }> => event.type === "text" && event.final)
+				.map(event => event.text);
+			expect(finals).toEqual(["fixture first turn", "fixture steered turn: also check the logs"]);
+			const steered = (await readLog(harness.logPath)).filter(entry => entry.kind === "steer");
+			expect(steered).toHaveLength(1);
+			expect(steered[0]?.message).toBe("also check the logs");
+		});
+	});
+
+	test("steer fails without an accepted streaming turn instead of parking the message", async () => {
+		await withHarness("normal", async harness => {
+			await expect(harness.worker.steer("too early")).rejects.toThrow();
+
+			await harness.worker.prompt("run", () => {});
+			await expect(harness.worker.steer("too late")).rejects.toThrow();
+
+			const entries = await readLog(harness.logPath);
+			expect(entries.some(entry => entry.kind === "steer")).toBe(false);
+		});
+	});
+
+	test("abortTurn aborts the streaming turn while the worker keeps running", async () => {
+		await withHarness("interrupt", async harness => {
+			const events: WorkerEvent[] = [];
+			const prompt = harness.worker.prompt("long work", event => events.push(event));
+			await waitUntil(() => events.some(event => event.type === "text"));
+
+			await harness.worker.abortTurn();
+
+			await prompt;
+			expect(commandTypes(await readLog(harness.logPath))).toContain("abort");
+			expect(harness.spawned).toBeDefined();
+			expect(processIsAlive(harness.spawned!.pid)).toBe(true);
+		});
+	});
+
+
 	test("does not treat the prompt acknowledgement as completion", async () => {
 		await withHarness("normal", async harness => {
 			const events: WorkerEvent[] = [];

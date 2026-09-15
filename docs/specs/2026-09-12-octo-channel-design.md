@@ -1,7 +1,7 @@
 # OMP Octo 个人远程助手设计
 
 日期：2026-09-12
-修订日期：2026-09-15
+修订日期：2026-09-16
 状态：产品设计已确认
 
 ## 背景与目标
@@ -10,13 +10,13 @@
 
 ## 范围
 
-包含个人单 Bot、单服务实例、文本指令与回复、执行状态、新建会话、指定目录、取消、会话恢复、消息去重和连接重建。支持私聊、指定群及 CommunityTopic 线程（channelType=5）内明确 @Bot 的指令；支持群/线程共享说明、出站文件和持久化问答。
+包含个人单 Bot、单服务实例、文本指令与回复、执行状态、新建会话、指定目录、取消、会话恢复、消息去重和连接重建。支持私聊、指定群及 CommunityTopic 线程（channelType=5）内明确 @Bot 的指令；支持群/线程共享说明、线程默认继承父群工作目录、群/线程对话历史的增量上下文注入（详细设计见 `docs/specs/2026-09-16-group-history-context-design.md`）、出站文件和持久化问答。
 
-不包含终端会话接管、多用户服务、通用网络 Agent gateway、文档评论任务、服务端通用 bot_task、历史群消息采集、通用附件接收和交互 callback 系统。channel 仅提供由 OMP host tool 明确发起的出站图片/文件发送，以及由能力 profile 明确启用的 Octo raw type17 `octo/v1` AdaptiveCard 1.5 非交互进度展示。收到不支持的消息类型应明确告知，不作为成功执行。范围以个人 IM 交互为准，不继承参考适配器的其他任务入口。
+不包含终端会话接管、多用户服务、通用网络 Agent gateway、文档评论任务、服务端通用 bot_task、群历史归档与检索、通用附件接收和交互 callback 系统。channel 仅提供由 OMP host tool 明确发起的出站图片/文件发送，以及由能力 profile 明确启用的 Octo raw type17 `octo/v1` AdaptiveCard 1.5 非交互进度展示。收到不支持的消息类型应明确告知，不作为成功执行。范围以个人 IM 交互为准，不继承参考适配器的其他任务入口。
 
 ## 已知约束与资料
 
-- 本机当前 OMP v18.1.21 提供 `--mode rpc`、`--cwd`、`--resume`、`--approval-mode yolo`、`--extension` 及 `session.compacting` 生命周期能力；本地兼容解码器按 v18.1.18 保持 RPC 兼容。RPC 提供 prompt、abort、状态和会话事件；启动 ready 不代表模型调用可用。
+- 本机当前 OMP v18.1.21 提供 `--mode rpc`、`--cwd`、`--resume`、`--approval-mode yolo`、`--extension` 及 `session.compacting` 生命周期能力；本地兼容解码器按 v18.1.18 保持 RPC 兼容。RPC 提供 prompt、steer、abort、状态和会话事件；启动 ready 不代表模型调用可用。
 - OMP SDK 可嵌入，但本设计选择 RPC，保持进程边界。
 - Octo 运行参考：[openclaw-channel-octo](https://github.com/Mininglamp-OSS/openclaw-channel-octo)。其 README 确认 REST 注册、WebSocket 实时收发和自动重连。
 - 账户参考：[create-openclaw-octo](https://github.com/Mininglamp-OSS/octo-adapters/tree/main/create-openclaw-octo)。使用 BotFather 创建的 User Bot；`app_` App Bot 仅支持私聊，不能满足群聊验收。
@@ -31,7 +31,8 @@
 | 身份 | 唯一 owner 用户 ID、允许群 ID 列表 | 只有用户本人可以驱动本机 |
 | 执行 | yolo；channel 不添加逐次审批 | 保持全自动习惯 |
 | 会话 | 每个聊天一个当前会话，历史保留 | 隔离聊天上下文 |
-| 目录 | `/new [目录]`、`/reset [目录]`；省略目录沿用当前绑定，首次使用 `~/tmp` | 每次 fresh 会话都有确定工作目标 |
+| 目录 | `/new [目录]`、`/reset [目录]`；省略目录按目标默认目录解析（DM/群沿用当前绑定，首次 `~/tmp`） | 每次 fresh 会话都有确定工作目标 |
+| 线程目录 | CommunityTopic 线程尚无已验证会话时，默认目录取父群当前绑定 cwd；线程首次成功建立会话即固定，与父群解耦 | 线程默认落在父群项目上；cwd 可共享，session 与共享说明仍按聊天目标隔离 |
 | 迁移 | `/move <目录>` 使用 OMP 原生 `/move`，沿用当前 session ID、历史与附件 | 保持会话连续性，不伪造新会话 |
 | 调度 | 同会话串行，同规范化目录串行；迁移同时持有真实源、目标目录 lease | 避免 channel 内任务同时修改同一目录 |
 | 故障 | 保存历史，不自动重跑已交付 Agent 的任务 | 工具副作用无法安全推断或回滚 |
@@ -58,7 +59,7 @@ launchctl bootout "gui/$(id -u)/com.omp.channel-octo"
 
 ### 入站权限与路由
 
-路由键为 Bot 身份、聊天类型和真实聊天 ID 的组合，不使用昵称。私聊（channelType=1）在已有持久 owner 时必须来自 owner；未配置且尚无持久 owner 时，仅支持的非空文本、`senderId` 与 `messageId` 非空且发送者非 Bot 的首条有效私聊可原子绑定 owner，并只确认不执行任务。传输层可能携带 `owner@bot` 形式的 raw channel ID，但归一后的 `channelId` 与 `senderId` 始终取真实发送者 UID，`owner@bot` 只属于传输层 ID。群（channelType=2）和 CommunityTopic 线程（channelType=5）同时要求 owner、允许列表中的完整真实 channel ID、结构化 mention 指向当前 Bot，且不会触发首次认领。线程不继承父群的允许关系，文本中的名字或 @ 字符串不能替代 mention 元数据。先验证，再处理所有命令和普通消息。Bot 自发消息、其他成员消息、其他任务入口均不触发 Agent。
+路由键为 Bot 身份、聊天类型和真实聊天 ID 的组合，不使用昵称。私聊（channelType=1）在已有持久 owner 时必须来自 owner；未配置且尚无持久 owner 时，仅支持的非空文本、`senderId` 与 `messageId` 非空且发送者非 Bot 的首条有效私聊可原子绑定 owner，并只确认不执行任务。传输层可能携带 `owner@bot` 形式的 raw channel ID，但归一后的 `channelId` 与 `senderId` 始终取真实发送者 UID，`owner@bot` 只属于传输层 ID。群（channelType=2）和 CommunityTopic 线程（channelType=5）同时要求 owner、允许列表命中的真实 channel ID、结构化 mention 指向当前 Bot，且不会触发首次认领。线程的允许关系继承父群：允许列表里有该线程的完整真实 channel ID，或父群 ID（`____` 之前的段）在允许列表里，都算命中，因此白名单群下新建的线程无需额外配置即可对话；不在允许列表的群及其线程仍一律拒绝。文本中的名字或 @ 字符串不能替代 mention 元数据。目录继承复用父群绑定的 cwd，允许关系继承只决定该线程能否发起任务，两者都不改变 owner 判定、共享说明隔离或线程自身的绑定。先验证，再处理所有命令和普通消息。Bot 自发消息、其他成员消息、其他任务入口均不触发 Agent。
 
 入站记录绑定原始聊天、发送者、消息 ID、会话 ID 和目录；之后回复只使用该记录，不读取可变的“当前聊天”。群和线程输出对成员可见，不发送完整工具原始结果、模型思考或系统上下文；发送助手可见正文与真实工具执行的简短进度。进度不作为普通聊天文字，而是在首次真实工具进度时懒建同一张可编辑卡，后续按最新状态编辑；卡片不可用或状态接口故障不得阻断正文。助手正文仍可能包含用户明确要求的文件内容，不承诺自动识别所有敏感信息。
 
@@ -68,28 +69,41 @@ channel 在自身命令注册表中注册下列命令，`/help` 展示用法。�
 
 | 命令 | 行为 |
 | --- | --- |
-| `/new [目录]` | 创建并绑定 fresh OMP 会话；省略目录时沿用当前绑定的规范化 cwd，无绑定时使用 `~/tmp` |
+| `/new [目录]` | 创建并绑定 fresh OMP 会话；省略目录时按目标默认目录解析，无可用绑定时使用 `~/tmp` |
 | `/reset [目录]` | 与 `/new` 使用相同的目录解析，但明确重置为 fresh 会话；原会话历史文件保留 |
 | `/move <目录>` | 调用当前会话的 OMP 原生 `/move`，校验刷新后的 session state，沿用同一 session ID、历史和附件 |
-| `/cancel` | 取消当前聊天正在执行的任务，并清除该聊天待执行消息 |
-| `/status` | 返回当前会话、目录和运行/排队/中断状态 |
+| `/queue <文本>` | 把该文本作为排队任务追加在当前任务之后，不受当前追加模式影响 |
+| `/mode [steer\|queue]` | 设置/报告该聊天的追加模式：`steer`（默认，`default` 同义）把运行中的新消息注入当前回合，`queue` 把它变成排队任务；无参数时报告当前设置 |
+| `/interrupt` | 中止当前聊天的运行中回合，保留已排队消息与它后面的排队任务；不终止 worker |
+| `/cancel`（`/stop` 同义） | 取消当前聊天正在执行的任务，并清除该聊天待执行消息 |
+| `/status` | 返回当前会话、目录、追加模式和运行/排队/中断状态 |
 | `/restart [now]` | 通过部署方配置的重启命令安全重启 channel；省略参数时在有任何运行/排队任务时拒绝；`now` 强制重启并中断在途任务 |
 | `/help` | 展示 channel 命令及目录用法 |
 
-当前聊天有待回答问题时，owner 在该聊天的非命令回复就是答案本身：合法选项编号按选项校验，其他文本原样作为自填答案；没有待回答问题时同一文本按普通任务输入处理。
+当前聊天有待回答问题时，owner 在该聊天的非命令回复就是答案本身：合法选项编号按选项校验，其他文本原样作为自填答案；没有待回答问题时同一文本按普通任务输入处理。待回答问题的答案优先于追加模式，不能被 steering 或排队吞掉。
+
+追加模式决定该聊天在已有运行中任务时如何处置新消息，按 `botUid` 与真实聊天目标隔离并持久化，跨重启保留，未设置时默认 `steer`。`steer` 模式下的普通文本经持久 claim 后作为 OMP `steer` 帧注入当前运行中的回合，与当前回合共用同一条任务、进度卡和正文流；`queue` 模式下的普通文本走既有 durable acceptance，成为在该任务之后执行的排队任务，保留独立的正文消息与进度卡。OMP worker 只在其回合仍在流式输出时接受 steering：没有运行中的回合、回合已经结束或 OMP 拒绝该帧时，该文本回退为普通排队任务，不静默丢弃。`/queue <文本>` 始终走排队任务路径。steering 不产生新的任务记录、正文消息或进度卡，也不改写当前回合已建立的群说明快照。
+
+`/interrupt` 向该聊天运行中的回合发送 OMP `abort` 并保留同一 worker：不进入排队任务的 durable 取消路径，不清空已通过 steering 或 `/queue` 追加的消息，也不停止 worker 进程；该回合之后的排队任务按原顺序继续执行。回合因该中止结束且其后没有任何真实事件时，任务终态记为 interrupted，进度卡记为 cancelled；若回合继续产出正文或工具事件（例如处理已追加的消息），任务按正常完成结算。`/interrupt` 在运行时即时回复一条中断确认，失败时明确回复中断未被接受。
+
+`/cancel` 与 `/stop` 是控制路径：发送 abort、等待 worker 停止，并清除该聊天的待执行消息与排队任务，因此同时也丢弃尚未消费的 steering 与排队消息；不回滚已经发生的副作用。
 
 `/restart` 只在配置了 `restart.command`（非空字符串数组，例如 `["super","-y","restart","omp-channel-octo"]`）时可用；未配置时明确回复未配置且不猜测重启机制。命令由 channel 以独立会话派生，进程停止由该命令对应的进程管理器负责（Super 的 `restart` 会先给 channel 发 SIGTERM），channel 自己不会在命令未停止它时擅自退出，只记录一条告警。发起的聊天先收到“正在重启 channel”，请求被持久化；进程恢复后在原聊天投递“channel 已重启完成：PID …，启动于 …”。重启时被中断的在途任务发送“channel 正在重启，本会话任务已中断；重启完成后会在本会话确认。”，未开始的排队任务在下次启动按 interrupted 报告。重启完成通报超过 10 分钟未投递则丢弃，不对未发生的重启做确认。
 
-群中使用 `@Bot /new <目录>`、`@Bot /reset <目录>` 或 `@Bot /move <目录>` 等相同命令；剥离已验证的 Bot mention 后解析。命令与 mention 的先后顺序不固定：客户端可能发送 `@Bot /command <参数>` 或 `/command <参数> @Bot`，解析前剥离全部已验证的 Bot mention，无论它位于命令前、命令后还是参数中间，并清理剥离处残留的空白。结构化 span 与文本对不上或缺失时，退回按 mention uid 列表匹配独立出现的 `@BotName` 或 `@BotUid` 词元（两侧为空白或文本边界，允许尾随冒号）；未指向当前 Bot 的文本型 `@` 不剥离，用户正文中的其他 `@` 保持原样。命令只允许 owner 发起：群、线程和私聊中其他成员的命令一律拒绝，既不执行也不回复。channel 内置 `/new`、`/reset`、`/move`、`/cancel`、`/status`、`/help`、`/restart` 始终硬拦截，不发送给模型；若存在同名观察器也不能改变这一安全语义。其他 slash 输入按原始 `message.text` 作为普通 OMP task 透传，未知命令不再返回“不支持的命令”。
+群中使用 `@Bot /new <目录>`、`@Bot /reset <目录>` 或 `@Bot /move <目录>` 等相同命令；剥离已验证的 Bot mention 后解析。命令与 mention 的先后顺序不固定：客户端可能发送 `@Bot /command <参数>` 或 `/command <参数> @Bot`，解析前剥离全部已验证的 Bot mention，无论它位于命令前、命令后还是参数中间，并清理剥离处残留的空白。结构化 span 与文本对不上或缺失时，退回按 mention uid 列表匹配独立出现的 `@BotName` 或 `@BotUid` 词元（两侧为空白或文本边界，允许尾随冒号）；未指向当前 Bot 的文本型 `@` 不剥离，用户正文中的其他 `@` 保持原样。命令只允许 owner 发起：群、线程和私聊中其他成员的命令一律拒绝，既不执行也不回复。channel 内置 `/new`、`/reset`、`/move`、`/queue`、`/mode`、`/interrupt`、`/cancel`、`/stop`、`/status`、`/help`、`/restart` 始终硬拦截，不发送给模型；若存在同名观察器也不能改变这一安全语义。其他 slash 输入按原始 `message.text` 作为普通 OMP task 透传，未知命令不再返回“不支持的命令”。
 可通过服务选项注册自定义 `ChannelCommandHandler`：`name` 去除首尾空白并按小写规范化，`intercept` 明确决定是否消费，`handle(context)` 接收原始 `InboundMessage`、规范化命令名和解析后的 argument。`intercept=true` 在持久命令去重后执行 handler，成功后消费且不启动 OMP；失败保持可重试的命令状态且不启动 OMP。`intercept=false` 先完成现有任务 durable acceptance，再调用 handler 并继续透传原始文本；handler 异常不得阻断任务或 prompt，重复消息不得重复 handler 或 task。handler 必须经过既有 owner、群/线程 mention 和消息 ID 校验；空名、非法名或规范化后的重复注册在创建服务时拒绝，不能静默选择。
 
-`/new`、`/reset` 的完整剩余文本是一个路径；可移除一对匹配的外围单引号或双引号。支持绝对路径、当前运行账户的 `~/`；拒绝相对路径、其他用户的 `~name` 和空引号。路径不经 shell 执行，不展开环境变量、通配符或命令替换；特殊字符按文件名处理。无绑定时省略目录首次解析为 `~/tmp`，已有绑定时省略目录沿用其 cwd。
+`/new`、`/reset` 的完整剩余文本是一个路径；可移除一对匹配的外围单引号或双引号。支持绝对路径、当前运行账户的 `~/`；拒绝相对路径、其他用户的 `~name` 和空引号。路径不经 shell 执行，不展开环境变量、通配符或命令替换；特殊字符按文件名处理。
+
+省略目录时的默认目录按目标解析，顺序固定为：① 该目标已有绑定且绑定已有已验证会话文件，沿用其规范化 cwd；② 目标是 CommunityTopic 线程（channelType=5）且其父群存在绑定，取父群绑定 cwd；③ 其余情况首次解析为 `~/tmp`。父群指线程真实 channel ID 中 `____` 之前的父群 ID，按 channelType=2 目标查询；channelId 不含合法父群段、父群无绑定或父群 cwd 已不可用时按 ③ 处理，不因此拒绝任务。
+
+线程的目录继承只在它还没有已验证会话时生效。线程第一次成功建立会话（`refreshState` 确认并持久化 session 文件）后，其 cwd 固定为绑定 cwd；父群随后 `/new`、`/reset`、`/move` 不改变任何既有线程绑定。已建绑定但从未成功建立会话的线程在下一个任务重新按上述顺序解析，并把解析结果写回绑定。服务启动时不为存量绑定做一次性回填，也不新增用户可见提示；`/status` 按绑定 cwd 照常报告。
 
 `/move` 必须提供目标路径，按同样的安全规则解析；它只在当前绑定存在精确可恢复 session 文件时执行。channel 先取得并持有真实源目录与目标目录 lease，调用 OMP 原生 `/move <目录>`，再通过 `refreshState` 校验 session ID、session 文件和规范化目标 cwd，成功持久化后才更新绑定。源目录或目标目录有运行/排队任务、未确认停止的 worker 或 lease 冲突时拒绝，不隐式迁移或丢弃任务。
 
 显式目录必须已经存在、为目录且可访问。使用 realpath 规范化并记录，符号链接别名共享同一个调度锁。创建 fresh worker 时传入 `--cwd`，不靠会话内 cd 模拟目录切换；创建或持久化失败保留原会话绑定。`/new`、`/reset`、`/move` 成功后才确认成功。
 
-当前聊天有运行中或排队任务时 `/new`、`/reset`、`/move` 明确拒绝，并提示先 `/cancel`；没有会话时第一条合法普通文本按默认目录 `~/tmp` 创建会话，再处理消息。历史 OMP 会话文件保留，本次不提供 IM 历史列表或切回命令。
+当前聊天有运行中或排队任务时 `/new`、`/reset`、`/move` 明确拒绝，并提示先 `/cancel`；没有会话时第一条合法普通文本按同一默认目录解析顺序创建会话，再处理消息。历史 OMP 会话文件保留，本次不提供 IM 历史列表或切回命令。
 
 原生迁移的 worker 若无法确认停止，源目录和目标目录都持久标记为 blocked；服务重启恢复 worker ledger 时仍同时阻塞两目录，直到停止状态可确认。外部移动不通过最近文件猜测，而在后文定义的精确身份规则下自动重绑。
 
@@ -99,15 +113,19 @@ channel 在自身命令注册表中注册下列命令，`/help` 展示用法。�
 
 共享说明状态按 `botUid`、真实聊天目标和持久 OMP session 隔离。worker `create` 完成并由 `refreshState` 确认真实 OMP session ID 后，宿主才发布该 session 的受控 context sidecar；任务或绑定阶段产生的占位 session ID 不能作为 sidecar 或 marker 的身份。sidecar 只包含目标、真实 session ID、当前 turn 的 immutable snapshot、注入决策和不含秘密的 injection attempt ID，不包含 Bot token，extension 不得按 cwd、全局文件或模糊 session 回退。
 
-新建 session 在第一次 agent start 注入完整的最新共享说明。恢复已有 session 时，若持久 marker 已证明同一 session、目标和 version 已成功提交，则不重复注入；没有 marker 或 marker 处于 pending 时按首次注入处理。普通 turn 只有在当前 version 与已提交 marker 不同时才注入，注入内容为完整最新快照，并附带版本变化说明；不生成 old/new diff。普通 `worker.prompt` 只发送用户消息，群说明由固定 OMP extension 的 `before_agent_start` 生命周期从 sidecar 以 system-level context 注入；extension 的输入必须校验 Bot、目标和真实 session ID，缺失或不匹配时 fail closed。
+新建 session 在第一次 agent start 注入完整的最新共享说明。恢复已有 session 时，若持久 marker 已证明同一 session、目标和 version 已成功提交，则不重复注入；没有 marker 或 marker 处于 pending 时按首次注入处理。普通 turn 只有在当前 version 与已提交 marker 不同时才注入，注入内容为完整最新快照，并附带版本变化说明；不生成 old/new diff。普通 `worker.prompt` 的 system-level 共享说明只由固定 OMP extension 的 `before_agent_start` 生命周期从 sidecar 注入，prompt 文本本身不携带共享说明正文；extension 的输入必须校验 Bot、目标和真实 session ID，缺失或不匹配时 fail closed。启用群历史后，prompt 文本由宿主拼接"群对话历史块 + 原始用户文本"，历史块属于用户消息而不是 system-level 上下文，与共享说明互不合并，规则见 `docs/specs/2026-09-16-group-history-context-design.md`。
 
 注入采用 `pending`/`committed` 两阶段。宿主先原子发布 sidecar 和 pending 状态；extension 在返回 system-level context 前，以 injection attempt ID 原子写入同 sidecar 作用域的 `prepared` receipt。receipt 只证明 extension 已校验目标并生成了指定上下文，不代表模型已经接受；receipt 缺失、过期或绑定不匹配时，`before_agent_start` 必须失败，OMP 不得进入模型调用。宿主观察到 matching receipt 和 OMP prompt acceptance 后，才以同一 attempt ID 做 CAS，把该 version 标为 committed；未确认 acceptance 的 pending 在下一次任务中重放，不能静默跳过。正常成功路径同一 version 只注入一次；进程在 acceptance 与 marker 提交之间崩溃时按保守的 at-least-once 重放，以优先保证不丢共享说明。
 
-OMP `session.compacting` 生命周期在压缩时把当前 turn sidecar 中的完整共享说明和 version 边界加入压缩上下文，即使 version 未变化；这是为保证压缩后仍保留 group/thread 语义的恢复性注入例外，不推进普通 turn 的 committed marker。当前 turn 的 sidecar 在 `octo_group_write` 后保持 immutable，compaction 使用本 turn 已建立的快照；写入成功的新 version 只在下一 turn 重新读取并发布。恢复后的下一次普通 turn继续依据 committed marker 判断，不因 compaction 再次重复注入。GROUP.md/THREAD.md 中的内容是共享上下文，不改变发送者身份、权限或 cwd。
+OMP `session.compacting` 生命周期在压缩时把当前 turn sidecar 中的完整共享说明和 version 边界加入压缩上下文，即使 version 未变化；这是为保证压缩后仍保留 group/thread 语义的恢复性注入例外，不推进普通 turn 的 committed marker。当前 turn 的 sidecar 在 `octo_management` 的 `description-write` 后保持 immutable，compaction 使用本 turn 已建立的快照；写入成功的新 version 只在下一 turn 重新读取并发布。恢复后的下一次普通 turn继续依据 committed marker 判断，不因 compaction 再次重复注入。GROUP.md/THREAD.md 中的内容是共享上下文，不改变发送者身份、权限或 cwd。
 
-`octo_group_read` 每次通过实时 `getGroupContext` 读取服务端当前说明，不使用 prompt 或 compaction 快照；`octo_group_write` 只更新当前群/线程目标且需要服务端 `bot_admin` 权限，不能由模型传入任意 chat ID。写入成功后，后续任务和 extension sidecar 使用新的 version；当前 turn 已经建立的 context 不回写。私聊不读取或注入群说明，也不获得群说明工具。
+群和线程任务获得一个复合工具 `octo_management`，动作固定为 `group-info`、`group-members`、`group-update`、`description-read`、`description-write`、`list-threads`、`create-thread`、`thread-info`、`thread-members`、`thread-join`、`thread-leave`、`thread-delete`、`thread-dispatch`，对应服务端 `groups/{id}`、`groups/{id}/members`、`groups/{id}/info`、`groups/{id}/md`、`groups/{id}/threads`、`groups/{id}/threads/{short}` 及其 `members`/`join`/`leave` 路径。目标固定为当前聊天：群任务取当前 `group_no`，线程任务取父群 `group_no`，`thread-*` 动作省略 `short_id` 时取当前线程，模型不能传入其他群或线程 ID。`group-update`、`thread-delete`、`thread-join`、`thread-leave` 等写操作的授权由服务端判定（`bot_admin`、线程创建者或群管理员），客户端不放行服务端拒绝的动作，也不做额外提权。失败时把服务端错误正文压成单行、截断到 200 字符后作为工具错误返回，便于模型纠正参数；返回值按固定上限裁剪（成员 200、线程 50）并显式给出总数与截断标记，名称截断到 200 字符、公告截断到 2000 字符，不返回原始 HTTP 响应或凭据。
 
-所有任务都获得固定目标与 cwd 的 `ask`、`octo_send_file` 工具；群和线程额外获得 `octo_group_read`、`octo_group_write`。文件工具的相对路径按任务 cwd 解析，绝对路径可指向本地其他文件，系统不提供目录沙箱保证；发送前复制到 stateDir spool；outbox 保存稳定 client message ID，断线重试不重跑任务。文件永久失败标记 dead 并报告，但不得阻塞后续文字 outbox。
+`thread-dispatch` 让当前群/线程会话把一条任务派发给本群的某个 thread：先按服务端读取该 thread 的真实 `channel_id`（必须属于当前群），在该 thread 里投递一条可见的派发说明，再用与真实入站相同的 durable 路径为该 thread 接受一个任务（入站消息 ID 使用 `dispatch:` 前缀的唯一值、发送者为持久 owner、目标为该 thread），最后在当前聊天回执一行派发结果。派发不等待该任务完成，回执只表示已排队；被派发的任务在目标 thread 的绑定与 session 中执行，cwd 按线程默认目录规则解析（未建会话时继承父群绑定 cwd，因此与父群任务按目录串行），结果投递到该 thread 而不是发起聊天。由于派发复用真实入站路径，目标 thread 的问答、追加模式与排队语义照常生效。派发的深度固定为 1：任务记录的消息 ID 带 `dispatch:` 前缀时，该任务的 `octo_management` 不提供 `thread-dispatch` 动作，客户端也拒绝该动作。
+
+`octo_management` 的 `description-read` 每次通过实时 `getGroupContext` 读取服务端当前说明，不使用 prompt 或 compaction 快照；`description-write` 只更新当前群/线程目标且需要服务端 `bot_admin` 权限。写入成功后，后续任务和 extension sidecar 使用新的 version；当前 turn 已经建立的 context 不回写。私聊不读取或注入群说明，也不获得群说明动作。
+
+所有任务都获得固定目标与 cwd 的 `ask`、`octo_send_file` 工具；群和线程额外获得复合工具 `octo_management`。文件工具的相对路径按任务 cwd 解析，绝对路径可指向本地其他文件，系统不提供目录沙箱保证；发送前复制到 stateDir spool；outbox 保存稳定 client message ID，断线重试不重跑任务。文件永久失败标记 dead 并报告，但不得阻塞后续文字 outbox。
 
 `ask` 创建带持久化 ID 的问题后暂停当前任务，并给出一段包含问题正文、编号选项（如有）和回复规则的文本。只要该聊天存在待回答的问题，owner 在该聊天的下一条非命令文本即为该聊天最早待回答问题的答案：合法选项编号按单选/多选的数量和范围校验，其他文本原样作为自填答案返回给模型；命令仍然优先。不提供默认答案，无待回答问题、不同聊天、重复或过期后的回复都不作为答案，其中无待回答问题和过期后的文本按普通任务输入处理。问题十分钟无答案即过期；取消、服务重启会使等待失效。
 
@@ -135,8 +153,8 @@ OMP extension 在 worker 启动时由固定路径自动加载；sidecar 根路�
 
 ### 持久化、调度与恢复
 
-本地 SQLite 保存聊天绑定、任务、入站去重键、问题和出站记录，OMP 自身保存对话。入站唯一键使用 Bot 身份、聊天类型、真实聊天 ID 和服务器消息 ID。没有可靠 ID 的任务拒绝执行。去重记录与接收状态事务写入成功后才确认接收；状态盘写入失败时不发送成功 ACK、不启动 Agent，并保留可重试的命令状态。
-共享说明的持久 marker 与 sidecar 状态属于 SQLite 中的 session context ledger，至少记录 `botUid`、真实聊天目标、真实 OMP session ID、当前 server version、`pending`/`committed` 阶段和 injection attempt ID。marker 的提交必须是同 session/目标/version 的 CAS；同一 pending 在重放前沿用其 attempt ID，提交后不得再次接受旧 attempt。新 session 不能继承旧 session marker，外部移动若保持同一真实 session ID 则保留 marker，`/new`/`/reset` 产生新 session 时清空其 marker。sidecar 与 marker 发布、extension 注入确认和 `octo_group_write` 的后续 version 发布均不得以占位 session ID 完成。
+本地 SQLite 保存聊天绑定、任务、入站去重键、问题和出站记录，OMP 自身保存对话。入站唯一键使用 Bot 身份、聊天类型、真实聊天 ID 和服务器消息 ID。没有可靠 ID 的任务拒绝执行。去重记录与接收状态事务写入成功后才确认接收；状态盘写入失败时不发送成功 ACK、不启动 Agent，并保留可重试的命令状态。每个聊天的追加模式（`steer`/`queue`）持久化在与绑定、任务同一套状态盘中，未写入行时按 `steer` 处理。作为 steering 消费的入站消息同样先 durable claim 再发送 RPC 帧：claim 成功而 OMP 拒绝该帧时释放 claim 并回退为普通排队任务，已 claim 未确认的消息在服务器重投时不会重复注入。
+共享说明的持久 marker 与 sidecar 状态属于 SQLite 中的 session context ledger，至少记录 `botUid`、真实聊天目标、真实 OMP session ID、当前 server version、`pending`/`committed` 阶段和 injection attempt ID。marker 的提交必须是同 session/目标/version 的 CAS；同一 pending 在重放前沿用其 attempt ID，提交后不得再次接受旧 attempt。新 session 不能继承旧 session marker，外部移动若保持同一真实 session ID 则保留 marker，`/new`/`/reset` 产生新 session 时清空其 marker。sidecar 与 marker 发布、extension 注入确认和 `description-write` 的后续 version 发布均不得以占位 session ID 完成。
 
 状态为 queued、started、completed、failed、cancelled、interrupted。启动 Agent 前持久化 started；跨此边界后永不自动重跑，即使崩溃发生在写入与实际 prompt 之间。每条 assistant 正文 stream 的每个分段独立持久化 outbox，任务终态只保存真实 assistant 正文（无正文则为空），并与终态状态写入 durable store。保存的不只是内存队列。正常运行按接受顺序调度，同规范化目录串行；不同目录不提供重叠树、硬链接或外部终端写入隔离保证。
 
@@ -151,11 +169,11 @@ Octo 断线不取消已经开始的 Agent；正文 outbox 与任务状态持久�
 ## 验收标准
 
 1. 实际 Octo 私聊发起文件操作，在选定目录观察结果并收到完成回复；全程没有工具审批。
-2. owner 在允许群 @Bot 和允许的 CommunityTopic 线程（channelType=5）可执行；其他成员、未允许完整 channel ID、未 @、伪造文本 @、Bot 回声均不启动 worker 或命令。
-3. `/new`、`/reset` 省略目录时沿用当前绑定 cwd，首次无绑定使用 `~/tmp`；显式目录（含空格）规范化为真实目录；`/move <目录>` 使用原生 OMP `/move`，同一 session ID 保留历史与附件，非法目录或校验失败不改变绑定。
-4. 首次普通消息创建 `~/tmp` 会话；从其他目录再次 `/new` 或 `/reset` 仍沿用当前绑定目录并创建 fresh session。
+2. owner 在允许群 @Bot 和允许的 CommunityTopic 线程（channelType=5）可执行：线程的允许关系继承父群，父群在允许列表里时该群下新建的线程无需额外配置即可对话，父群不在允许列表的线程一律拒绝；其他成员、未 @、伪造文本 @、Bot 回声均不启动 worker 或命令。
+3. `/new`、`/reset` 省略目录时按目标默认目录解析的固定顺序取目录：已有已验证会话沿用绑定 cwd，线程尚无会话时取父群绑定 cwd，其余使用 `~/tmp`；显式目录（含空格）规范化为真实目录；`/move <目录>` 使用原生 OMP `/move`，同一 session ID 保留历史与附件，非法目录或校验失败不改变绑定。
+4. 首次普通消息创建默认目录会话（DM/群为 `~/tmp`）；从其他目录再次 `/new` 或 `/reset` 仍沿用当前绑定目录并创建 fresh session。
 5. 私聊与两个群/线程的上下文不串线；交错完成的结果各自返回原聊天；同一持久 session 在共享说明 version 不变时连续任务不重复注入，version 变化时只注入一次新的完整快照并给出变化说明；共享说明读取失败不启动 worker。
-6. 私聊获得 `ask` 与 `octo_send_file`，群/线程额外获得 `octo_group_read`，实时读取对应服务端 `GROUP.md` 或独立 `THREAD.md`（分别对应 `groups/{id}/md` 与 `groups/{parent}/threads/{short}/md`），以及需要服务端 `bot_admin` 权限的 `octo_group_write`；新建和无可靠 marker 的恢复 session 首次注入共享说明，普通未变化 turn 不注入；工具不能改写目标聊天或 cwd。
+6. 私聊获得 `ask` 与 `octo_send_file`；群/线程额外获得 `octo_management`，其 `description-read` 实时读取对应服务端 `GROUP.md` 或独立 `THREAD.md`（分别对应 `groups/{id}/md` 与 `groups/{parent}/threads/{short}/md`），`group-info`/`group-members`/`group-update`/`list-threads`/`create-thread`/`thread-info`/`thread-members`/`thread-join`/`thread-leave`/`thread-delete` 作用于当前群或当前线程，写操作依赖服务端授权；`thread-dispatch` 把一条任务派发给本群 thread 并在该 thread 排队执行、向两个聊天各投递一条可见说明，派发深度为 1；新建和无可靠 marker 的恢复 session 首次注入共享说明，普通未变化 turn 不注入；工具不能改写目标聊天或 cwd。
 7. 同规范化目录的两个聊天写入任务不重叠；`/new`、`/reset`、`/move` 在运行或排队时拒绝；`/move` 同时取得真实 source/target lease，未确认停止时两目录跨重启保持 blocked。
 8. 长正文保留原始换行、空格和 inline 标记；每个 assistant message 独立 stream，首次非空累计快照立即 create，后续累计快照以同一 message ID 每 1000ms 最多一次串行 edit，最终更短或空快照权威生效；正文按 3000 UTF-8 bytes 稳定分段并清理 stale tail，异步 prompt 失败、本地完成和 worker 异常退出均正确结束任务状态，不生成通用完成文字。
 9. 正文 outbox 在 create 前 durable 记录 `unknown`，保存 desired/acked 版本；断线、重启或送达未知恢复时沿用稳定 client ID、编辑最新快照且不重跑 Agent，不因失败重复创建。
@@ -166,16 +184,18 @@ Octo 断线不取消已经开始的 Agent；正文 outbox 与任务状态持久�
 14. 状态盘写入失败不启动新任务；同 Bot 第二实例不能启动；App Bot 配置不能被验收为支持群聊。
 15. `launchd install` 仅写入权限为 `0600` 的 plist，不调用 `launchctl`；实际启动、停止分别由 `launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.omp.channel-octo.plist"` 与 `launchctl bootout "gui/$(id -u)/com.omp.channel-octo"` 完成，`launchd uninstall` 只删除 plist。环境凭证会进入该私有 plist，runtime 复用 plist 中安装时解析出的 OMP 路径；退出交互终端后仍能从实际 Octo 收发，日志不包含 token。
 16. 新建 session 的第一次 agent start 会注入目标的完整共享说明；恢复 session 只在没有可靠的同 session/目标/version committed marker，或 marker 仍处于 pending 时补注入；已 committed 的恢复不会因重新启动 worker 自动重复注入。
-17. 同一 session 的共享说明 version 变化时，OMP 收到一次完整最新快照和明确的版本变化说明；删除也按带 server version 的变化处理并明确当前无说明；version 不变的普通 turn 的 OMP prompt 不包含共享说明正文。
-18. OMP compaction 后，压缩上下文保留当前 turn immutable snapshot 的完整共享说明和 version 边界；即使 version 不变也只在该 compaction 生命周期中恢复性注入，下一次普通 turn 不重复注入；当前 turn 的 `octo_group_write` 不改写这份 snapshot。
+17. 同一 session 的共享说明 version 变化时，OMP 收到一次完整最新快照和明确的版本变化说明；删除也按带 server version 的变化处理并明确当前无说明；version 不变的普通 turn 的 OMP prompt 不包含共享说明正文，也不把共享说明并入群历史块。
+18. OMP compaction 后，压缩上下文保留当前 turn immutable snapshot 的完整共享说明和 version 边界；即使 version 不变也只在该 compaction 生命周期中恢复性注入，下一次普通 turn 不重复注入；当前 turn 的 `octo_management` `description-write` 不改写这份 snapshot。
 19. 共享说明 sidecar、持久 marker 和 extension 输入按 Bot、真实聊天目标与真实 OMP session 隔离，不包含 Bot token；extension 或 sidecar 目标不匹配、输入不完整或 session ID 未确认时在进入模型前拒绝共享上下文；marker CAS 失败时保留 pending、不得标为 committed，并在下一任务重放。
 20. OMP prompt acceptance 与 context marker 提交之间发生崩溃时，pending 状态可恢复并在下一任务重放，不能静默跳过；正常成功路径不重复注入同一 version，重放使用明确的 injection attempt ID。
 21. `/restart` 只使用部署配置的 `restart.command`，未配置时明确拒绝且不猜测重启机制；存在运行或排队任务时默认拒绝并提示 `/cancel` 或 `/restart now`；`now` 先持久化重启请求再执行命令，发起聊天收到“正在重启 channel”，进程恢复后在发起聊天与被打断会话投递重启完成通报，超过 10 分钟的旧通报不投递；重启命令未停止进程时 channel 继续运行并记录告警。真实 CLI 端到端覆盖命令执行、进程自行以 0 退出以及重启后的确认投递。
+22. CommunityTopic 线程在尚无已验证会话时，其默认目录取父群当前绑定 cwd；父群无绑定、真实 channel ID 不含合法父群段或父群目录不可用时回退 `~/tmp`，不拒绝任务。线程首次成功建立会话后 cwd 固定，父群随后 `/new`、`/reset`、`/move` 不改写该线程；已建绑定但从未成功建立会话的线程在下一个任务重新按父群解析并写回绑定；启动时不对存量绑定做一次性回填。线程继承期间仍使用自己的 session、自己的 `THREAD.md` 与独立 marker，任务按规范化目录与父群串行，不新增用户可见提示。
+
+23. 追加模式按聊天目标持久化并在重启后保留，默认 `steer`：`steer` 模式下运行中收到的普通文本经持久 claim 后作为 OMP `steer` 注入当前回合，不新增任务、正文消息或进度卡；`/mode queue` 后同一文本走 durable acceptance 成为排队任务，独立正文与进度卡；`/queue <文本>` 在任何模式下都走排队任务；没有运行中的回合、回合已结束或 OMP 拒绝该帧时该文本回退为排队任务而不丢失；同一 messageId 重投只注入一次。`/interrupt` 中止运行中回合并保留该回合已追加的消息及其后的排队任务，worker 进程不被终止；回合因中止结束且无后续真实事件时任务记为 interrupted、进度卡记为 cancelled，回合继续产出时正常结算。`/stop` 与 `/cancel` 等价，清除排队任务与未消费的追加消息。
 
 ## 实施前提与未决事项
-
-既有实现已完成 `/new`/`/reset` 目录绑定、原生 `/move`、精确外部 session 恢复、正文 outbox、执行 tracker、卡片和生命周期边界；共享说明本次采用 session/version/OMP lifecycle context 设计，相关实现状态以本规格新增验收和代码为准。
-未决事项：无。本次规格只确认共享说明的 session/version/lifecycle 语义；实现阶段须按新增验收落地并补充真实 OMP compaction、删除 version、崩溃重放和凭证隔离验证。
+既有实现已完成 `/new`/`/reset` 目录绑定、原生 `/move`、精确外部 session 恢复、正文 outbox、执行 tracker、卡片和生命周期边界；共享说明采用 session/version/OMP lifecycle context 设计；线程默认继承父群工作目录已实现：`src/thread-target.ts` 是线程目标父群解析的单一来源，传输层 `contextPath` 与服务的默认目录解析都经它取父群 ID。
+未决事项：无。线程默认目录继承已按验收 3/4/22 落地并验证（见下）；真实 OMP compaction、删除 version、崩溃重放和凭证隔离验证仍按共享说明章节的验收补做。
 
 ```sh
 bun install
@@ -197,4 +217,7 @@ bun run launchd -- install --config ~/.config/omp-channel-octo/config.json
 显式配置的 owner 是权威来源，服务启动时会持久化它；即使之后删除配置中的 owner，也不会重新开放首次认领。绑定跨重启保留，重复的首条消息不会执行任务；`check`/`serve` 在配置未提供 owner 时会提示“若状态中尚无持久 owner，将等待首次有效私聊绑定”。
 
 本地实现还保留各阶段崩溃恢复、SQLite 故障注入、文件 outbox、`ask` 和 owner/群权限边界；状态与历史可恢复不代表已开始 Agent 自动续跑。AdaptiveCard 视觉边界仅记录真实 Octo AdaptiveCard SDK DOM：390px 宽度无横向溢出、折叠/展开可用、todo 可见、`completed`/`cancelled`/`failed` 三种终态 SDK 校验无错误；实时预览命令覆盖带登录态的真实卡片发送，截图像素与完整真人交互仍需单独观察，不能混同。
-验收证据（仅记录已完成的最终状态）：已在真实 `https://im.deepminer.com.cn/v1/bot/register` 注册成功并验证加密 WebSocket 认证成功；真实 CLI `check`/`serve`/`SIGTERM` 生命周期与 `plutil` 校验保持有效，真实 OMP fresh worker 可成功启停。真实 OMP 经加密 Octo wire 的正文为 2 次 create、19 次 edit，最终文本逐字一致；进度为 1 张卡、18 次 edit、6 个 phase、5 个 tool、2 个 todo，typing 18 次，stop 后无新增。真实 native project 20.66s 覆盖私聊与两个群隔离、含空格目录、native `/move` 同 ID 保留历史/附件、`/new`/`/reset` 复用绑定 cwd、外部 move 自动重绑后在新项目真实写入文件以及重启保持绑定。真实 Bot HTTP 已验证正文 create 加 2 次同 ID edit、卡片 create 加 2 次同 ID edit；实时预览验收命令已成功发送一张包含 11 次 tool 调用（`read`、`write`、`edit`、`bash`、`task`、`subagent_await`、`subagent_stop`、`hub`、`ask`）、4 个阶段、11 个 Todo 任务及全部状态的综合预览卡片。launchd 尚未加载，脱离终端和完整真人登录态仍未验证；第 168 行所述 SDK DOM 证据不等同截图像素或完整 Octo 登录态视觉验收。
+验收证据（仅记录已完成的最终状态）：已在真实 `https://im.deepminer.com.cn/v1/bot/register` 注册成功并验证加密 WebSocket 认证成功；真实 CLI `check`/`serve`/`SIGTERM` 生命周期与 `plutil` 校验保持有效，真实 OMP fresh worker 可成功启停。真实 OMP 经加密 Octo wire 的正文为 2 次 create、19 次 edit，最终文本逐字一致；进度为 1 张卡、18 次 edit、6 个 phase、5 个 tool、2 个 todo，typing 18 次，stop 后无新增。真实 native project 20.66s 覆盖私聊与两个群隔离、含空格目录、native `/move` 同 ID 保留历史/附件、`/new`/`/reset` 复用绑定 cwd、外部 move 自动重绑后在新项目真实写入文件以及重启保持绑定。真实 Bot HTTP 已验证正文 create 加 2 次同 ID edit、卡片 create 加 2 次同 ID edit；实时预览验收命令已成功发送一张包含 11 次 tool 调用（`read`、`write`、`edit`、`bash`、`task`、`subagent_await`、`subagent_stop`、`hub`、`ask`）、4 个阶段、11 个 Todo 任务及全部状态的综合预览卡片。launchd 尚未加载，脱离终端和完整真人登录态仍未验证；上文记录的 AdaptiveCard SDK DOM 证据不等同截图像素或完整 Octo 登录态视觉验收。
+
+线程默认继承父群工作目录的验收证据：核心矩阵 `tests/thread-cwd-inheritance.test.ts` 覆盖父群继承、父群无绑定 / channel ID 无合法父群段 / 父群目录已删除三类回退、`/new` 无参继承与后续沿用、线程会话建立后固定、未验证会话重解析并写回、显式目录覆盖、以及 DM/群既有语义保持，共 10 例；把 `src/service.ts` 回退到修改前版本时其中 5 例失败，单独移除父群分支或移除父群 cwd 不可用时的静默回退分别使 6 例、1 例失败，确认用例不是空转。真实进程验收在 `tests/cli-lifecycle.test.ts`：真实 CLI + 加密协议夹具 + 真实 SQLite 下，父群 `@Bot /new` 建立目录后，线程任务以该目录启动真实 worker 子进程（夹具日志的 startup cwd 恰为该继承目录）、线程按 `/v1/bot/groups/<group>/threads/<thread>/md` 读取自己的 `THREAD.md`、`/status` 报告继承 cwd，并在 SIGTERM 重启后保持。
+线程允许关系继承与派发的验收证据：`tests/core-host-tools.test.ts` 的 "threads inherit the parent group allowlist without their own entry" 覆盖父群在允许列表时其线程无需额外条目即可执行、父群不在允许列表时线程仍被拒绝并保持 `none`；"thread dispatch queues the task in the target thread and reports it in both chats" 覆盖 `create-thread` + `thread-dispatch` 在目标线程接受真实任务（继承父群 cwd、与父群任务同目录串行）、线程与发起群各收到一条可见说明、以及被派发的任务其 `octo_management` 动作集不再包含 `thread-dispatch`。把允许命中回退为只比较完整 channel ID 并移除派发深度守卫后，这两个用例分别失败，确认用例不是空转。
