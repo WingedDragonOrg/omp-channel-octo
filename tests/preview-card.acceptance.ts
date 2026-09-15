@@ -213,12 +213,15 @@ function previewSnapshot() {
       {
         name: "准备阶段",
         tasks: [
+          { content: "读取项目配置", status: "completed" },
+          { content: "确认卡片能力", status: "completed" },
           { content: "清理旧预览数据", status: "abandoned" },
         ],
       },
       {
         name: "执行阶段",
         tasks: [
+          { content: "启动子代理检查", status: "completed" },
           { content: "汇总混合工具样式", status: "in_progress" },
           { content: "等待授权后继续", status: "blocked", blocker: "等待用户确认" },
         ],
@@ -228,12 +231,15 @@ function previewSnapshot() {
         tasks: [
           { content: "验证成功状态", status: "completed" },
           { content: "验证等待状态", status: "pending" },
+          { content: "验证失败状态", status: "in_progress" },
         ],
       },
       {
         name: "交付阶段",
         tasks: [
+          { content: "发送真实预览", status: "in_progress" },
           { content: "确认移动端布局", status: "cancelled" },
+          { content: "记录验收结果", status: "pending" },
         ],
       },
     ],
@@ -248,6 +254,8 @@ function compactPreviewSnapshot() {
     toolCallId: "compact-subagent",
     toolName: "task",
     atMs: 1,
+    endAtMs: 2,
+    status: "succeeded",
     summary: "子代理 · compact",
   });
   addPreviewTool(tracker, {
@@ -299,16 +307,18 @@ test("preview snapshot shows every subagent state by default", () => {
   expect(visibleText).not.toContain("子代理 · reviewer");
   expect(visibleText).not.toContain("子代理 · scout");
   expect(visibleText).not.toContain("停止子代理 · cleanup");
-  const hiddenSubagents = nodeById(card, "subagent_omitted_steps");
-  expect(hiddenSubagents).toMatchObject({ isVisible: false });
-  const hiddenText = cardText(hiddenSubagents);
-  expect(hiddenText).toContain("子代理 · reviewer");
-  expect(hiddenText).toContain("子代理 · scout");
-  expect(hiddenText).toContain("停止子代理 · cleanup");
+  const hiddenSummary = nodeById(card, "subagent_hidden_summary");
+  expect(hiddenSummary.isVisible).not.toBe(false);
+  expect(cardText(hiddenSummary)).toContain("已隐藏 3 个子代理");
   const todoDetail = nodeById(card, "todo_detail");
-  expect(cardText(todoDetail)).not.toContain("已隐藏");
-  expect(cardNodes(card).some(node => node.id === "btn_expand_subagents")).toBe(true);
-  expect(cardNodes(card).some(node => node.id === "btn_expand_trace")).toBe(true);
+  const todoSummary = nodeById(card, "todo_hidden_summary");
+  const todoOmitted = nodeById(card, "todo_omitted_tasks");
+  expect(todoSummary.isVisible).not.toBe(false);
+  expect(todoOmitted).toMatchObject({ isVisible: false });
+  expect(cardText(todoDetail)).toContain("已隐藏");
+  expect(cardNodes(card).some(node => node.id === "btn_expand_todo")).toBe(true);
+  expect(cardNodes(card).some(node => node.id === "btn_collapse_todo")).toBe(true);
+  expect(cardNodes(card).some(node => node.id === "btn_expand_subagents")).toBe(false);
 });
 
 test("preview rich fallback expands older trace rows without ToggleVisibility", () => {
@@ -414,7 +424,7 @@ runPreviewTest(
         "running",
       ]);
       expect(preview.todos).toHaveLength(4);
-      expect(preview.todos.reduce((count, phase) => count + phase.tasks.length, 0)).toBe(6);
+      expect(preview.todos.reduce((count, phase) => count + phase.tasks.length, 0)).toBe(12);
       expect(new Set(preview.todos.flatMap(phase => phase.tasks.map(task => task.status)))).toEqual(new Set([
         "completed",
         "in_progress",
@@ -429,7 +439,7 @@ runPreviewTest(
         `preview-card-${Date.now()}-${process.pid}`,
       );
       expect(receipt?.messageId).toEqual(expect.any(String));
-      console.log(`综合预览卡片已发送到 ${targetId}，包含 11 次 tool 调用、9 类工具、4 个 Todo 阶段、6 个任务及成功/等待/失败/取消/进行中状态，请在 Octo 中打开最新卡片查看。`);
+      console.log(`综合预览卡片已发送到 ${targetId}，包含 11 次 tool 调用、9 类工具、4 个 Todo 阶段、12 个任务及成功/等待/失败/取消/进行中状态，请在 Octo 中打开最新卡片查看。`);
     } finally {
       await transport.stop();
     }

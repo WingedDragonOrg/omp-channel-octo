@@ -215,6 +215,7 @@ const MAX_VISIBLE_TOOLS = 3;
 const MAX_RENDERED_TOOLS = 32;
 const MAX_COMPACT_TOOL_ROWS = 8;
 const MAX_VISIBLE_TODO_TASKS = 96;
+const MAX_EXPANDED_TODO_TASKS = 12;
 const DEFAULT_MAX_NODES = 200;
 const DEFAULT_MAX_DEPTH = 16;
 const DEFAULT_MAX_PAYLOAD_BYTES = 512 * 1024;
@@ -864,16 +865,50 @@ function todoLines(
   return lines;
 }
 
+function makeExpandedTodoItems(
+  todos: readonly ExecutionTodoPhase[],
+  richTextSupported: boolean,
+): JsonNode[] {
+  const items: JsonNode[] = [];
+  const totalCount = todos.reduce((count, phase) => count + phase.tasks.length, 0);
+  let renderedCount = 0;
+  for (let phaseIndex = 0; phaseIndex < todos.length && renderedCount < MAX_EXPANDED_TODO_TASKS; phaseIndex += 1) {
+    const phase = todos[phaseIndex]!;
+    const taskCount = Math.min(phase.tasks.length, MAX_EXPANDED_TODO_TASKS - renderedCount);
+    if (taskCount === 0) continue;
+    items.push(makeTextBlock(phase.name, { weight: "Bolder", spacing: "None" }));
+    for (let taskIndex = 0; taskIndex < taskCount; taskIndex += 1) {
+      items.push(makeTodoTaskRow(
+        phase.tasks[taskIndex]!,
+        phaseIndex,
+        todos.length,
+        taskIndex,
+        taskCount,
+        richTextSupported,
+      ));
+    }
+    renderedCount += taskCount;
+  }
+  if (renderedCount < totalCount) {
+    items.push(makeTextBlock(`还有 ${totalCount - renderedCount} 个任务受卡片大小限制`, {
+      isSubtle: true,
+      spacing: "Small",
+    }));
+  }
+  return items;
+}
 function makeTodoItems(
   todos: readonly ExecutionTodoPhase[],
   hiddenCount: number,
   totalCount: number,
   structuredLayout: boolean,
   richTextSupported: boolean,
+  omittedTodos: readonly ExecutionTodoPhase[] = [],
 ): JsonNode[] {
   const items: JsonNode[] = [];
   if (hiddenCount > 0) {
     items.push(makeTextBlock(`已隐藏 ${hiddenCount} 个任务，共 ${totalCount} 个任务`, {
+      id: "todo_hidden_summary",
       isSubtle: true,
       spacing: "Small",
     }));
@@ -904,6 +939,16 @@ function makeTodoItems(
       type: "Container",
       spacing: "Small",
       items: phaseItems,
+    });
+  }
+  if (omittedTodos.length > 0) {
+    items.push({
+      type: "Container",
+      id: "todo_omitted_tasks",
+      isVisible: false,
+      style: "emphasis",
+      spacing: "Small",
+      items: makeExpandedTodoItems(omittedTodos, richTextSupported),
     });
   }
   return items;
@@ -1038,16 +1083,24 @@ function makeTodoContainer(
   totalCount: number,
   structuredLayout: boolean,
   richTextSupported: boolean,
+  omittedTodos: readonly ExecutionTodoPhase[] = [],
+  actionSets: readonly JsonNode[] = [],
 ): JsonNode | null {
-  if (todos.length === 0 || todos.every(phase => phase.tasks.length === 0)) return null;
+  if (
+    (todos.length === 0 || todos.every(phase => phase.tasks.length === 0))
+    && omittedTodos.length === 0
+  ) return null;
+  const heading = structuredLayout && actionSets.length > 0
+    ? makeSectionHeader("任务清单", actionSets)
+    : makeTextBlock("任务清单", { weight: "Bolder", size: "Medium", spacing: "None" });
   return {
     type: "Container",
     id: "todo_detail",
     style: "emphasis",
     spacing: "Medium",
     items: [
-      makeTextBlock("任务清单", { weight: "Bolder", size: "Medium", spacing: "None" }),
-      ...makeTodoItems(todos, hiddenCount, totalCount, structuredLayout, richTextSupported),
+      heading,
+      ...makeTodoItems(todos, hiddenCount, totalCount, structuredLayout, richTextSupported, omittedTodos),
     ],
   };
 }
@@ -1231,6 +1284,47 @@ function makeSubagentToggleSets(hiddenElementIds: readonly string[]): JsonNode[]
         {
           type: TOGGLE_ACTION,
           id: "subagents_expand",
+          title: "展开",
+          targetElements: targets.expanded,
+        },
+      ],
+    },
+  ];
+}
+function makeTodoToggleSets(hiddenElementIds: readonly string[]): JsonNode[] {
+  if (hiddenElementIds.length === 0) return [];
+  const targets = makeVisibilityTargets(
+    "todo_hidden_summary",
+    hiddenElementIds,
+    "btn_collapse_todo",
+    "btn_expand_todo",
+  );
+  return [
+    {
+      type: "ActionSet",
+      id: "btn_collapse_todo",
+      isVisible: false,
+      horizontalAlignment: "Right",
+      spacing: "None",
+      actions: [
+        {
+          type: TOGGLE_ACTION,
+          id: "todo_collapse",
+          title: "收起",
+          targetElements: targets.collapsed,
+        },
+      ],
+    },
+    {
+      type: "ActionSet",
+      id: "btn_expand_todo",
+      isVisible: true,
+      horizontalAlignment: "Right",
+      spacing: "None",
+      actions: [
+        {
+          type: TOGGLE_ACTION,
+          id: "todo_expand",
           title: "展开",
           targetElements: targets.expanded,
         },
@@ -1505,6 +1599,7 @@ function buildCandidate(
   capabilities: ExecutionCardCapabilities,
   visibleTools: readonly ExecutionToolSnapshot[],
   visibleTodos: readonly ExecutionTodoPhase[],
+  omittedTodos: readonly ExecutionTodoPhase[],
   totalTodoTasks: number,
 ): ExecutionCardResult {
   const hasContainer = supportsElement(capabilities, "Container");
@@ -1522,7 +1617,7 @@ function buildCandidate(
     ? snapshot.tools.filter(tool => isSubagentTool(tool.toolName)).length
     : 0;
   const visibleSubagents = richLayout
-    ? visibleTools.filter(isActiveSubagent)
+    ? snapshot.tools.filter(isActiveSubagent)
     : [];
   const olderSubagents: readonly ExecutionToolSnapshot[] = [];
   const visibleTraceTools = richLayout
@@ -1539,7 +1634,7 @@ function buildCandidate(
     : [];
   const omittedSubagentTools = richLayout
     ? [
-        ...omittedTools.filter(tool => isSubagentTool(tool.toolName)),
+        ...omittedTools.filter(tool => isSubagentTool(tool.toolName) && !isActiveSubagent(tool)),
         ...visibleTools.filter(tool => isSubagentTool(tool.toolName) && !isActiveSubagent(tool)),
       ]
     : [];
@@ -1551,6 +1646,15 @@ function buildCandidate(
   const hiddenSubagents = Math.max(0, totalSubagents - visibleSubagents.length);
   const visibleTodoTasks = visibleTodos.reduce((count, phase) => count + phase.tasks.length, 0);
   const hiddenTodoTasks = Math.max(0, totalTodoTasks - visibleTodoTasks);
+  const showTraceHistory = hiddenTodoTasks === 0;
+  const renderedOlderTraceTools = showTraceHistory ? olderTraceTools : [];
+  const renderedOmittedTraceTools = showTraceHistory && canToggle
+    ? expandableOmittedTraceTools
+    : [];
+  const showSubagentHistory = hiddenTodoTasks === 0;
+  const renderedOmittedSubagentTools = showSubagentHistory && canToggle
+    ? expandableOmittedSubagentTools
+    : [];
   const elapsed = formatDuration(snapshot.elapsedMs);
   const metrics = `${snapshot.phaseCount} 个阶段 · ${snapshot.toolCount} 次工具调用 · ${elapsed}`;
   const notice = executionNotice(snapshot, visibleTodos);
@@ -1559,13 +1663,13 @@ function buildCandidate(
     hiddenTraceTools,
     richLayout,
     visibleSubagents.length > 0 ? "暂无其他工具活动" : "正在准备",
-    olderTraceTools,
-    canToggle ? expandableOmittedTraceTools : [],
-    canToggle,
+    renderedOlderTraceTools,
+    renderedOmittedTraceTools,
+    showTraceHistory && canToggle,
   );
   const hasRenderedSubagentActivity = visibleSubagents.length > 0
     || olderSubagents.length > 0
-    || expandableOmittedSubagentTools.length > 0;
+    || renderedOmittedSubagentTools.length > 0;
   const subagentContainer = richLayout && hasRenderedSubagentActivity
     ? makeSubagentContainer(
       visibleSubagents,
@@ -1573,24 +1677,36 @@ function buildCandidate(
       totalSubagents,
       true,
       olderSubagents,
-      canToggle ? expandableOmittedSubagentTools : [],
+      renderedOmittedSubagentTools,
       canToggle,
     )
     : null;
   const traceHiddenIds = [
-    ...olderTraceTools.map((_tool, index) => `timeline_older_step_${index}`),
-    ...(canToggle && expandableOmittedTraceTools.length > 0 ? ["timeline_omitted_steps"] : []),
+    ...renderedOlderTraceTools.map((_tool, index) => `timeline_older_step_${index}`),
+    ...(renderedOmittedTraceTools.length > 0 ? ["timeline_omitted_steps"] : []),
   ];
   const subagentHiddenIds = [
     ...olderSubagents.map((_tool, index) => `subagent_older_step_${index}`),
-    ...(canToggle && expandableOmittedSubagentTools.length > 0 ? ["subagent_omitted_steps"] : []),
+    ...(renderedOmittedSubagentTools.length > 0 ? ["subagent_omitted_steps"] : []),
   ];
   const traceToggleSets = canToggle ? makeToggleSets(traceHiddenIds) : [];
   const subagentToggleSets = canToggle && subagentContainer
     ? makeSubagentToggleSets(subagentHiddenIds)
     : [];
+  const expandableOmittedTodos = canToggle ? omittedTodos : [];
+  const todoToggleSets = expandableOmittedTodos.length > 0
+    ? makeTodoToggleSets(["todo_omitted_tasks"])
+    : [];
   const todoContainer = hasContainer
-    ? makeTodoContainer(visibleTodos, hiddenTodoTasks, totalTodoTasks, richLayout, richTextSupported)
+    ? makeTodoContainer(
+      visibleTodos,
+      hiddenTodoTasks,
+      totalTodoTasks,
+      richLayout,
+      richTextSupported,
+      expandableOmittedTodos,
+      todoToggleSets,
+    )
     : null;
   const terminal = snapshot.state !== "running";
   const detailElementIds = [
@@ -1696,7 +1812,10 @@ function buildCandidate(
   return { card, plain: plainLines.join("\n") };
 }
 
-function trimTodos(todos: readonly ExecutionTodoPhase[], maximumTasks: number): ExecutionTodoPhase[] {
+function trimTodos(
+  todos: readonly ExecutionTodoPhase[],
+  maximumTasks: number,
+): { readonly visible: ExecutionTodoPhase[]; readonly omitted: ExecutionTodoPhase[] } {
   const taskRefs: Array<{ readonly task: ExecutionTodoTask }> = [];
   for (let phaseIndex = 0; phaseIndex < todos.length; phaseIndex += 1) {
     const phase = todos[phaseIndex]!;
@@ -1707,9 +1826,17 @@ function trimTodos(todos: readonly ExecutionTodoPhase[], maximumTasks: number): 
 
   const target = Math.min(taskRefs.length, Math.max(0, Math.floor(maximumTasks)));
   if (target === taskRefs.length) {
-    return todos.map(phase => ({ name: phase.name, tasks: phase.tasks.slice() }));
+    return {
+      visible: todos.map(phase => ({ name: phase.name, tasks: phase.tasks.slice() })),
+      omitted: [],
+    };
   }
-  if (target === 0) return [];
+  if (target === 0) {
+    return {
+      visible: [],
+      omitted: todos.map(phase => ({ name: phase.name, tasks: phase.tasks.slice() })),
+    };
+  }
 
   const selected = new Array<boolean>(taskRefs.length).fill(false);
   let selectedCount = 0;
@@ -1733,18 +1860,23 @@ function trimTodos(todos: readonly ExecutionTodoPhase[], maximumTasks: number): 
     select(refIndex);
   }
 
-  const trimmed: ExecutionTodoPhase[] = [];
+  const visible: ExecutionTodoPhase[] = [];
+  const omitted: ExecutionTodoPhase[] = [];
   let refIndex = 0;
   for (let phaseIndex = 0; phaseIndex < todos.length; phaseIndex += 1) {
     const phase = todos[phaseIndex]!;
-    const tasks: ExecutionTodoTask[] = [];
+    const visibleTasks: ExecutionTodoTask[] = [];
+    const omittedTasks: ExecutionTodoTask[] = [];
     for (let taskIndex = 0; taskIndex < phase.tasks.length; taskIndex += 1) {
-      if (selected[refIndex]) tasks.push(taskRefs[refIndex]!.task);
+      const task = taskRefs[refIndex]!.task;
+      if (selected[refIndex]) visibleTasks.push(task);
+      else omittedTasks.push(task);
       refIndex += 1;
     }
-    if (tasks.length > 0) trimmed.push({ name: phase.name, tasks });
+    if (visibleTasks.length > 0) visible.push({ name: phase.name, tasks: visibleTasks });
+    if (omittedTasks.length > 0) omitted.push({ name: phase.name, tasks: omittedTasks });
   }
-  return trimmed;
+  return { visible, omitted };
 }
 
 export function buildExecutionCard(
@@ -1760,8 +1892,15 @@ export function buildExecutionCard(
   let visibleTodoCount = Math.min(totalTodoTasks, MAX_VISIBLE_TODO_TASKS);
   while (visibleToolCount >= 0 && visibleTodoCount >= 0) {
     const visibleTools = snapshot.tools.slice(Math.max(0, totalTools - visibleToolCount));
-    const visibleTodos = trimTodos(snapshot.todos, visibleTodoCount);
-    const candidate = buildCandidate(snapshot, capabilities, visibleTools, visibleTodos, totalTodoTasks);
+    const trimmedTodos = trimTodos(snapshot.todos, visibleTodoCount);
+    const candidate = buildCandidate(
+      snapshot,
+      capabilities,
+      visibleTools,
+      trimmedTodos.visible,
+      trimmedTodos.omitted,
+      totalTodoTasks,
+    );
     if (cardWithinLimits(candidate.card, candidate.plain, limits)) return candidate;
     // Keep execution activity visible; reduce the less volatile todo detail first.
     if (visibleTodoCount > 0) {

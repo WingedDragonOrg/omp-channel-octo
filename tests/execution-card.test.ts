@@ -587,9 +587,9 @@ describe("execution card rendering", () => {
   test("uses the same compact row layout for omitted subagents and trace steps", () => {
     const tracker = createExecutionTracker({ runId: "compact-subagents" });
     startTurn(tracker, "turn-1", 0);
-    startTool(tracker, "verifier", "subagent_await", 1, "等待子代理 · verifier");
-    startTool(tracker, "old-trace", "read", 2, "旧轨迹");
-    tracker.apply({ type: "tool_end", toolCallId: "old-trace", atMs: 3, status: "succeeded" });
+    startTool(tracker, "verifier", "task", 1, "子代理 · verifier");
+    tracker.apply({ type: "tool_end", toolCallId: "verifier", atMs: 2, status: "succeeded" });
+    startTool(tracker, "old-trace", "read", 3, "旧轨迹");
     for (let index = 0; index < 32; index += 1) {
       const toolCallId = `visible-${index}`;
       startTool(tracker, toolCallId, "read", 10 + index, `步骤 ${index}`);
@@ -625,11 +625,9 @@ describe("execution card rendering", () => {
       });
     }
 
-    const traceMarker = ((traceRow.columns as JsonRecord[])[0]?.items as JsonRecord[])[0]!;
     const subagentMarker = ((subagentRow.columns as JsonRecord[])[0]?.items as JsonRecord[])[0]!;
-    expect(traceMarker.text).toBe("✓\u00a0");
-    expect(subagentMarker).toMatchObject({ text: "-\u00a0", color: "Default" });
-    expect(cardText(subagentRow)).toContain("等待子代理 · verifier");
+    expect(subagentMarker).toMatchObject({ text: "✓\u00a0", color: "Good" });
+    expect(cardText(subagentRow)).toContain("子代理 · verifier");
   });
 
   test("keeps waiting markers out of markdown list rendering", () => {
@@ -1172,7 +1170,7 @@ describe("execution card rendering", () => {
     expect((hiddenRows[0]!.columns as JsonRecord[]).map(column => column.width)).toEqual(["auto", "stretch"]);
     expect(cardText(hiddenRows[0]!)).toContain("步骤 0");
   });
-  test("keeps a trace expand control when older trace rows are budget-pruned", () => {
+  test("prioritizes Todo and active subagents within the card budget", () => {
     const tracker = createExecutionTracker({ runId: "trace-budget-toggle" });
     startTurn(tracker, "turn-1", 0);
     startTool(tracker, "read", "read", 100, "读取项目结构");
@@ -1235,11 +1233,12 @@ describe("execution card rendering", () => {
     expect(rendered).not.toBeNull();
     const card = rendered!.card as JsonRecord;
     const subagentDetail = nodeById(card, "subagent_detail");
-    expect(cardText(subagentDetail)).toContain("子代理 · scout");
-    expect(cardText(subagentDetail)).not.toContain("暂无可见子代理活动");
+    expect(cardText(subagentDetail)).toContain("已隐藏 2 个子代理，共 3 个子代理");
+    expect(cardText(subagentDetail)).toContain("等待子代理 · verifier");
+    expect(cardText(subagentDetail)).not.toContain("子代理 · scout");
     const timelineSection = nodeById(card, "timeline_section");
     const timelineHeader = (timelineSection.items as JsonRecord[])[0]!;
-    expect(nodes(timelineHeader).some(node => node.id === "btn_expand_trace")).toBe(true);
+    expect(nodes(timelineHeader).some(node => node.id === "btn_expand_trace")).toBe(false);
     const fullyBudgeted = buildExecutionCard(
       tracker.snapshot(1_800),
       {
@@ -1256,19 +1255,13 @@ describe("execution card rendering", () => {
     );
     expect(fullyBudgetedRows).toHaveLength(1);
     expect(fullyBudgetedRows.every(row => row.isVisible !== false)).toBe(true);
-    expect(nodes(fullyBudgetedCard).some(node => node.id === "btn_expand_subagents")).toBe(true);
+    expect(nodes(fullyBudgetedCard).some(node => node.id === "btn_expand_subagents")).toBe(false);
     const budgetedTimeline = nodeById(card, "timeline_detail");
     const budgetedTraceRows = (budgetedTimeline.items as JsonRecord[]).filter(item => item.type === "ColumnSet");
-    expect(budgetedTraceRows).toHaveLength(6);
-    expect(budgetedTraceRows.filter(row => row.isVisible !== false)).toHaveLength(2);
-    expect(budgetedTraceRows.filter(row => row.isVisible === false)).toHaveLength(4);
+    expect(budgetedTraceRows).toHaveLength(2);
+    expect(budgetedTraceRows.every(row => row.isVisible !== false)).toBe(true);
     expect(nodes(card).some(node => node.id === "timeline_omitted_steps")).toBe(false);
-    const expandTargets = targetElements(toggleActionById(card, "trace_expand"));
-    const olderTargets = expandTargets.filter(target => (
-      typeof target.elementId === "string" && target.elementId.startsWith("timeline_older_step_")
-    ));
-    expect(olderTargets).toHaveLength(4);
-    expect(olderTargets.every(target => target.isVisible === true)).toBe(true);
+    expect(nodes(card).some(node => node.id === "btn_expand_trace")).toBe(false);
   });
   test("prioritizes current and blocked todo tasks while preserving order and reporting omissions", () => {
     const tracker = createExecutionTracker({ runId: "todo-budget" });
@@ -1308,5 +1301,61 @@ describe("execution card rendering", () => {
     const hidden = text.match(/已隐藏(?:前)? (\d+) 个任务/);
     expect(hidden).not.toBeNull();
     expect(Number(hidden?.[1])).toBeGreaterThan(0);
+  });
+  test("offers an expand control for budget-hidden todo tasks", () => {
+    const tracker = createExecutionTracker({ runId: "todo-expand" });
+    startTurn(tracker, "turn-1", 0);
+    tracker.apply({
+      type: "todo_update",
+      atMs: 1,
+      op: "init",
+      phases: [{
+        name: "Plan",
+        tasks: Array.from({ length: 110 }, (_unused, index) => ({
+          content: `task-${index}`,
+          status: "pending" as const,
+        })),
+      }],
+    });
+
+    const rendered = buildExecutionCard(tracker.snapshot(2), {
+      ...fullCapabilities,
+      limits: { maxNodes: 200, maxDepth: 16, maxPayloadBytes: 32_768 },
+    });
+    expect(rendered).not.toBeNull();
+    const card = rendered!.card as JsonRecord;
+    const summary = nodeById(card, "todo_hidden_summary");
+    const omitted = nodeById(card, "todo_omitted_tasks");
+    expect(summary.isVisible).not.toBe(false);
+    expect(omitted).toMatchObject({ isVisible: false });
+    expect(cardText(omitted)).toContain("task-1");
+    const omittedTaskRow = nodes(omitted).find(node => node.type === "ColumnSet" && cardText(node).includes("task-1"));
+    expect(omittedTaskRow).toBeDefined();
+    if (!omittedTaskRow) throw new Error("omitted todo task row was not rendered");
+    const omittedTaskColumns = omittedTaskRow.columns as JsonRecord[];
+    expect(omittedTaskColumns).toHaveLength(2);
+    expect(omittedTaskColumns[0]).toMatchObject({ width: "80px" });
+    expect((omittedTaskColumns[0]?.items as JsonRecord[])[0]).toMatchObject({
+      fontType: "Monospace",
+      size: "Small",
+      wrap: false,
+    });
+
+    const expand = toggleActionById(card, "todo_expand");
+    expect(expand.title).toBe("展开");
+    expect(targetElements(expand)).toEqual([
+      { elementId: "todo_hidden_summary", isVisible: false },
+      { elementId: "todo_omitted_tasks", isVisible: true },
+      { elementId: "btn_collapse_todo", isVisible: true },
+      { elementId: "btn_expand_todo", isVisible: false },
+    ]);
+    const collapse = toggleActionById(card, "todo_collapse");
+    expect(collapse.title).toBe("收起");
+    expect(targetElements(collapse)).toEqual([
+      { elementId: "todo_hidden_summary", isVisible: true },
+      { elementId: "todo_omitted_tasks", isVisible: false },
+      { elementId: "btn_collapse_todo", isVisible: false },
+      { elementId: "btn_expand_todo", isVisible: true },
+    ]);
   });
 });
