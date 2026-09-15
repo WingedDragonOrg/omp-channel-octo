@@ -211,6 +211,25 @@ test("keeps an attachment-only reply's quote without an empty text section", () 
     .toBe("[引用]\n被引用的正文");
 });
 
+test("renders a video attachment line with its declared duration", () => {
+  const files = [
+    saved({
+      path: "/state/attachments/2-group-1/msg-1/1-clip.mp4",
+      name: "1-clip.mp4",
+      kind: "video",
+      bytes: 2048,
+      durationSeconds: 12,
+    }),
+  ];
+  expect(composePromptText("看视频", files)).toBe([
+    "看视频",
+    [
+      ATTACHMENT_HEADER,
+      "1. video 1-clip.mp4 2.0 KB (12s) → /state/attachments/2-group-1/msg-1/1-clip.mp4",
+    ].join("\n"),
+  ].join("\n\n"));
+});
+
 test("renders byte counts across the B, KB and MB boundaries", () => {
   expect(formatBytes(0)).toBe("0 B");
   expect(formatBytes(1023)).toBe("1023 B");

@@ -620,6 +620,35 @@ describe("Octo inbound attachment download", () => {
     expect(await readdir(directory)).toEqual([]);
   });
 
+  test("renders a merge-forward nested inside a merge-forward as a placeholder", async () => {
+    const inbox: InboundMessage[] = [];
+    const { current, connection } = await startFixtureTransport(async (message) => {
+      inbox.push(message);
+    });
+
+    const messages = await deliverInbound(current, connection, inbox, [
+      {
+        type: 11,
+        msgs: [
+          { from_uid: "member-a", timestamp: 1, payload: { type: 1, content: "外层第一条" } },
+          {
+            from_uid: "member-b",
+            timestamp: 2,
+            payload: {
+              type: 11,
+              msgs: [{ from_uid: "member-c", timestamp: 3, payload: { type: 1, content: "内层不该展开" } }],
+            },
+          },
+        ],
+      },
+    ]);
+
+    // 只展开一层：内层合并转发退化成占位符，内层正文不进提示词。
+    expect(messages[0]?.text).toBe("[合并转发]\nmember-a: 外层第一条\nmember-b: [合并转发]");
+    expect(messages[0]?.text).not.toContain("内层不该展开");
+    expect(messages[0]?.attachments).toEqual([]);
+  });
+
   test("transcribes a stored audio file through the fixture endpoint", async () => {
     const { current, channel } = await startRegisteredFixture();
     temporaryDirectory = await mkdtemp(join(tmpdir(), "octo-content-"));
@@ -659,6 +688,18 @@ describe("Octo inbound attachment download", () => {
     await handle.close();
     expect(await channel.transcribeAudio(oversized)).toBeNull();
     expect(current.transcriptionRequests).toHaveLength(3);
+  });
+
+  test("treats an unparsable transcription response as no transcription", async () => {
+    const { current, channel } = await startRegisteredFixture();
+    temporaryDirectory = await mkdtemp(join(tmpdir(), "octo-content-"));
+    const audioPath = join(temporaryDirectory, "voice.amr");
+    await writeFile(audioPath, Buffer.from("audio-bytes", "utf8"));
+    current.setTranscription("{not json", 200);
+
+    // 响应体不是 JSON：按「无转写」处理，音频照常保留路径。
+    expect(await channel.transcribeAudio(audioPath)).toBeNull();
+    expect(current.transcriptionRequests).toHaveLength(1);
   });
 });
 
