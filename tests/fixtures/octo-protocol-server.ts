@@ -72,6 +72,7 @@ export interface FixtureConnection {
 
 export interface FixtureGroupContext {
   content: string;
+  present?: boolean;
   version: number;
   updatedAt: string | null;
   updatedBy: string;
@@ -475,6 +476,8 @@ export class OctoProtocolFixture {
   readonly botUid = BOT_UID;
   readonly botName = BOT_NAME;
   readonly ownerUid = OWNER_UID;
+  private readonly groupContexts: Map<string, FixtureGroupContext | null>;
+  private readonly groupContextBodies: Map<string, unknown>;
   private readonly options: OctoProtocolFixtureOptions;
   private readonly issuedTokens: string[] = [];
   private readonly messageIdsByClientNo = new Map<string, string>();
@@ -490,6 +493,8 @@ export class OctoProtocolFixture {
 
   private constructor(options: OctoProtocolFixtureOptions, httpServer: Server, wsServer: WebSocketServer, port: number) {
     this.options = options;
+    this.groupContexts = new Map(Object.entries(options.groupContexts ?? {}));
+    this.groupContextBodies = new Map(Object.entries(options.groupContextBodies ?? {}));
     this.httpServer = httpServer;
     this.wsServer = wsServer;
     this.apiUrl = `http://127.0.0.1:${port}`;
@@ -764,6 +769,14 @@ export class OctoProtocolFixture {
           return;
         }
         const version = this.options.groupContextPutVersions?.[target] ?? 1;
+        this.groupContextBodies.delete(target);
+        this.groupContexts.set(target, {
+          content: parsedBody.content,
+          present: parsedBody.content.length > 0,
+          version,
+          updatedAt: new Date().toISOString(),
+          updatedBy: BOT_UID,
+        });
         writeJson(response, 200, { version });
         return;
       }
@@ -782,12 +795,12 @@ export class OctoProtocolFixture {
         writeJson(response, status, { error: "group context failure" });
         return;
       }
-      const rawBody = this.options.groupContextBodies?.[target];
+      const rawBody = this.groupContextBodies.get(target);
       if (rawBody !== undefined) {
         writeJson(response, 200, rawBody);
         return;
       }
-      const context = this.options.groupContexts?.[target];
+      const context = this.groupContexts.get(target);
       if (context === undefined || context === null) {
         writeJson(response, 404, { error: "group context not found" });
         return;

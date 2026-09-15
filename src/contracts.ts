@@ -71,12 +71,13 @@ export interface ChannelTransport {
   stop(): Promise<void>;
 }
 export interface GroupContext {
+  present: boolean;
   content: string;
   version: number;
   updatedAt: string | null;
   updatedBy: string;
 }
-
+ 
 export type ProgressCard = ExecutionSnapshot;
 
 export interface TextEvent {
@@ -95,10 +96,17 @@ export interface WorkerProcess {
   cwd: string;
 }
 
+export interface WorkerContextScope {
+  sidecarRoot: string;
+  botUid: string;
+  target: ChatTarget;
+}
+
 export interface WorkerOptions {
   cwd: string;
   sessionDir: string;
   sessionFile?: string;
+  contextScope?: WorkerContextScope;
   onSpawn: (process: WorkerProcess) => void;
 }
 
@@ -109,8 +117,16 @@ export interface HostTool {
   execute(args: Record<string, unknown>, signal: AbortSignal): Promise<string>;
 }
 
+export interface ContextInjection {
+  snapshot: GroupContext;
+  injectionDecision: "initial" | "version-change" | "unchanged";
+  attemptId: string;
+  explanation?: string;
+}
+
 export interface PromptContext {
   tools?: HostTool[];
+  contextInjection?: ContextInjection;
 }
 
 export interface OmpWorker {

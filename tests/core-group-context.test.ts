@@ -4,74 +4,118 @@ import {
   createCoreHarness,
   inbound,
   waitForStatus,
+  type CoreHarness,
 } from "./fixtures/core-fakes";
 
-test("each group task dispatches the target's current snapshot", async () => {
+type ContextInjection = {
+  readonly snapshot?: {
+    readonly content?: string;
+    readonly version?: number;
+  };
+  readonly injectionDecision?: string;
+  readonly attemptId?: string;
+  readonly explanation?: string;
+};
+
+function contextInjection(
+  prompt: { promptContext: unknown } | undefined,
+): ContextInjection | undefined {
+  return (prompt?.promptContext as { contextInjection?: ContextInjection } | undefined)
+    ?.contextInjection;
+}
+
+test("injects the complete group snapshot only on the first and changed-version turns", async () => {
   const harness = await createCoreHarness();
   try {
-    const groupA = { channelId: "group-a", channelType: 2 as const };
-    const groupB = { channelId: "group-b", channelType: 2 as const };
-    harness.transport.setGroupContext(groupA, {
+    const group = { channelId: "group-a", channelType: 2 as const };
+    harness.transport.setGroupContext(group, {
       content: "Group A instructions",
       version: 3,
       updatedAt: "2026-09-12T00:00:00.000Z",
       updatedBy: "admin-a",
     });
-    harness.transport.setGroupContext(groupB, {
-      content: "Group B instructions",
-      version: 8,
-      updatedAt: "2026-09-12T00:01:00.000Z",
-      updatedBy: "admin-b",
-    });
 
     await harness.service.handleInbound(
       inbound({
-        messageId: "group-a-message",
-        ...groupA,
-        text: "work for A",
+        messageId: "group-context-first",
+        ...group,
+        text: "first group turn",
         mentionedUserIds: [harness.bot.uid],
       }),
     );
     await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, group, (status) => status.state === "completed");
+
+    const firstPrompt = harness.workers.prompts[0];
+    const firstInjection = contextInjection(firstPrompt);
+    expect(firstPrompt?.text).toBe("first group turn");
+    expect(firstInjection?.snapshot).toMatchObject({
+      content: "Group A instructions",
+      version: 3,
+    });
+    expect(firstInjection?.injectionDecision).toEqual(expect.any(String));
+    expect(firstInjection?.attemptId).toEqual(expect.any(String));
+
     await harness.service.handleInbound(
       inbound({
-        messageId: "group-b-message",
-        ...groupB,
-        text: "work for B",
+        messageId: "group-context-unchanged",
+        ...group,
+        text: "second group turn",
         mentionedUserIds: [harness.bot.uid],
       }),
     );
     await harness.workers.waitForPromptCount(2);
-    await waitForStatus(harness.service, groupA, (status) => status.state === "completed");
-    await waitForStatus(harness.service, groupB, (status) => status.state === "completed");
+    await waitForStatus(harness.service, group, (status) => status.state === "completed");
 
-    const promptA = harness.workers.prompts.find(({ text }) => text.includes("work for A"));
-    const promptB = harness.workers.prompts.find(({ text }) => text.includes("work for B"));
-    expect(promptA).toBeDefined();
-    expect(promptB).toBeDefined();
-    const envelopeA = JSON.parse(promptA?.text ?? "{}");
-    const envelopeB = JSON.parse(promptB?.text ?? "{}");
-    expect(envelopeA.userMessage).toBe("work for A");
-    expect(envelopeA.groupContext.content).toBe("Group A instructions");
-    expect(envelopeA.groupContext.version).toBe(3);
-    expect(envelopeB.userMessage).toBe("work for B");
-    expect(envelopeB.groupContext.content).toBe("Group B instructions");
-    expect(envelopeB.groupContext.version).toBe(8);
-    expect(promptA?.text).toContain("群说明是群共享上下文");
-    expect(promptB?.text).toContain("群说明是群共享上下文");
-    expect(harness.transport.groupContextCalls).toEqual([groupA, groupB]);
+    const unchangedPrompt = harness.workers.prompts[1];
+    expect(unchangedPrompt?.sessionId).toBe(firstPrompt?.sessionId);
+    expect(unchangedPrompt?.text).toBe("second group turn");
+    expect(unchangedPrompt?.text).not.toContain("Group A instructions");
+    expect(unchangedPrompt?.text).not.toContain('"groupContext"');
+
+    harness.transport.setGroupContext(group, {
+      content: "Group A updated instructions",
+      version: 4,
+      updatedAt: "2026-09-12T00:02:00.000Z",
+      updatedBy: "admin-a",
+    });
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "group-context-changed",
+        ...group,
+        text: "third group turn",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(3);
+    await waitForStatus(harness.service, group, (status) => status.state === "completed");
+
+    const changedPrompt = harness.workers.prompts[2];
+    const changedInjection = contextInjection(changedPrompt);
+    expect(changedPrompt?.sessionId).toBe(firstPrompt?.sessionId);
+    expect(changedPrompt?.text).toBe("third group turn");
+    expect(changedInjection?.snapshot).toMatchObject({
+      content: "Group A updated instructions",
+      version: 4,
+    });
+    expect(changedInjection?.injectionDecision).toEqual(expect.any(String));
+    expect(changedInjection?.attemptId).toEqual(expect.any(String));
+    const explanation = changedInjection?.explanation ?? "";
+    expect(explanation).toMatch(/版本|更新/u);
+    expect(explanation).toContain("3");
+    expect(explanation).toContain("4");
   } finally {
     await closeCoreHarness(harness);
   }
 });
 
-test("updates and deletion are visible to the next group task, without private injection", async () => {
+test("reads group context from transport on every group turn and keeps private chats isolated", async () => {
   const harness = await createCoreHarness();
   try {
     const group = { channelId: "group-fresh", channelType: 2 as const };
     const privateChat = { channelId: "dm-private", channelType: 1 as const };
     harness.transport.setGroupContext(group, {
-      content: "initial shared note",
+      content: "shared group note",
       version: 1,
       updatedAt: "2026-09-12T00:00:00.000Z",
       updatedBy: "admin",
@@ -85,70 +129,114 @@ test("updates and deletion are visible to the next group task, without private i
 
     await harness.service.handleInbound(
       inbound({
-        messageId: "fresh-first",
+        messageId: "group-transport-first",
         ...group,
-        text: "first group task",
+        text: "group transport first",
         mentionedUserIds: [harness.bot.uid],
       }),
     );
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, group, (status) => status.state === "completed");
 
-    harness.transport.setGroupContext(group, {
-      content: "updated shared note",
-      version: 2,
-      updatedAt: "2026-09-12T00:02:00.000Z",
-      updatedBy: "admin-2",
-    });
     await harness.service.handleInbound(
       inbound({
-        messageId: "fresh-second",
+        messageId: "group-transport-second",
         ...group,
-        text: "second group task",
+        text: "group transport second",
         mentionedUserIds: [harness.bot.uid],
       }),
     );
     await harness.workers.waitForPromptCount(2);
     await waitForStatus(harness.service, group, (status) => status.state === "completed");
 
-    harness.transport.setGroupContext(group, null);
     await harness.service.handleInbound(
-      inbound({
-        messageId: "fresh-third",
-        ...group,
-        text: "third group task",
-        mentionedUserIds: [harness.bot.uid],
-      }),
+      inbound({ messageId: "private-isolated", ...privateChat, text: "private task" }),
     );
     await harness.workers.waitForPromptCount(3);
-    await waitForStatus(harness.service, group, (status) => status.state === "completed");
-
-    await harness.service.handleInbound(
-      inbound({ messageId: "fresh-private", ...privateChat, text: "private task" }),
-    );
-    await harness.workers.waitForPromptCount(4);
     await waitForStatus(
       harness.service,
       privateChat,
       (status) => status.state === "completed",
     );
 
-    const groupPrompts = harness.workers.prompts.filter(({ text }) => text.includes("group task"));
-    expect(JSON.parse(groupPrompts[0]?.text ?? "{}").groupContext.content).toBe(
-      "initial shared note",
-    );
-    expect(JSON.parse(groupPrompts[1]?.text ?? "{}").groupContext.content).toBe(
-      "updated shared note",
-    );
-    expect(JSON.parse(groupPrompts[2]?.text ?? "{}").groupContext).toBeNull();
-    expect(groupPrompts[2]?.text).toContain("当前无说明");
-
-    const privatePrompt = harness.workers.prompts.find(({ text }) => text.includes("private task"));
+    const privatePrompt = harness.workers.prompts.find(({ text }) => text === "private task");
+    expect(privatePrompt?.text).toBe("private task");
     expect(privatePrompt?.text).not.toContain("must never be injected");
     expect(privatePrompt?.text).not.toContain("群说明是群共享上下文");
-    expect(harness.transport.groupContextCalls).toEqual([group, group, group]);
+    expect(harness.transport.groupContextCalls).toEqual([group, group]);
   } finally {
     await closeCoreHarness(harness);
+  }
+});
+
+test("a recovered group session does not repeat a committed unchanged snapshot", async () => {
+  const first = await createCoreHarness();
+  const group = { channelId: "group-b", channelType: 2 as const };
+  let recovered: CoreHarness | undefined;
+  let sessionId: string | undefined;
+  try {
+    first.transport.setGroupContext(group, {
+      content: "persistent group instructions",
+      version: 8,
+      updatedAt: "2026-09-12T00:00:00.000Z",
+      updatedBy: "admin-b",
+    });
+
+    await first.service.handleInbound(
+      inbound({
+        messageId: "group-recovery-first",
+        ...group,
+        text: "before service recovery",
+        mentionedUserIds: [first.bot.uid],
+      }),
+    );
+    await first.workers.waitForPromptCount(1);
+    await waitForStatus(first.service, group, (status) => status.state === "completed");
+
+    const firstPrompt = first.workers.prompts[0];
+    if (!firstPrompt) throw new Error("first recovery prompt was not recorded");
+    const firstInjection = contextInjection(firstPrompt);
+    expect(firstPrompt.text).toBe("before service recovery");
+    expect(firstInjection?.snapshot).toMatchObject({
+      content: "persistent group instructions",
+      version: 8,
+    });
+    expect(firstInjection?.injectionDecision).toEqual(expect.any(String));
+    expect(firstInjection?.attemptId).toEqual(expect.any(String));
+    sessionId = firstPrompt.sessionId;
+    expect(sessionId).toBeDefined();
+
+    await closeCoreHarness(first, { remove: false });
+    recovered = await createCoreHarness({
+      root: first.root,
+      bot: first.bot,
+      transport: first.transport,
+    });
+    const restoredBinding = await recovered.service.status(group);
+    expect(restoredBinding.sessionId).toBe(sessionId);
+
+    await recovered.service.handleInbound(
+      inbound({
+        messageId: "group-recovery-second",
+        ...group,
+        text: "after service recovery",
+        mentionedUserIds: [recovered.bot.uid],
+      }),
+    );
+    await recovered.workers.waitForPromptCount(1);
+    await waitForStatus(recovered.service, group, (status) => status.state === "completed");
+
+    const recoveredPrompt = recovered.workers.prompts[0];
+    expect(recoveredPrompt?.sessionId).toBe(sessionId);
+    expect(recoveredPrompt?.text).toBe("after service recovery");
+    expect(recoveredPrompt?.text).not.toContain("persistent group instructions");
+    expect(recoveredPrompt?.text).not.toContain('"groupContext"');
+  } finally {
+    if (recovered) {
+      await closeCoreHarness(recovered);
+    } else {
+      await closeCoreHarness(first);
+    }
   }
 });
 

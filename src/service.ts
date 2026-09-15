@@ -12,6 +12,7 @@ import type {
   ChannelStatus,
   ChatExecutionState,
   ChatTarget,
+  ContextInjection,
   CoreServiceConfig,
   GroupContext,
   HostTool,
@@ -25,6 +26,14 @@ import type {
   WorkerProcess,
 } from "./contracts.ts";
 import { createExecutionTracker, type ExecutionEvent } from "./execution-card.ts";
+import {
+  normalizeGroupContext,
+  preparedReceiptMatches,
+  readContextSidecar,
+  removeContextSidecar,
+  writeContextSidecar,
+  type ContextSidecar,
+} from "./context-sidecar.ts";
 import {
   findMovedSession,
   verifyFreshSession,
@@ -54,7 +63,6 @@ const TEXT_MERGE_MS = 1_000;
 const TYPING_RENEW_MS = 3_000;
 const ACTIVITY_REQUEST_TIMEOUT_MS = 2_000;
 const DEFAULT_CANCELLED_TEXT = "当前任务已取消；不回滚已发生的副作用。";
-const DEFAULT_NO_CONTEXT_TEXT = "当前无说明";
 type RuntimeTask = {
   taskId: string;
   target: ChatTarget;
@@ -298,13 +306,17 @@ function createSessionId(): string {
   return randomUUID();
 }
 
-function contextPrompt(context: GroupContext | null, text: string): string {
-  return JSON.stringify({
-    groupContext: context,
-    userMessage: text,
-    trustedInstruction: `${GROUP_TRUSTED_INSTRUCTION}${context ? "" : ` ${DEFAULT_NO_CONTEXT_TEXT}`}`,
-  });
+function contextSidecarRoot(
+  config: CoreServiceConfig,
+  botUid: string,
+  target: ChatTarget,
+): string {
+  const scopeDigest = createHash("sha256")
+    .update(`${botUid}\u0000${target.channelType}\u0000${target.channelId}`, "utf8")
+    .digest("hex");
+  return join(config.stateDir, "context-sidecars", scopeDigest);
 }
+
 function genericTaskFailure(contextFailure: boolean): string {
   return contextFailure ? "群说明读取失败，未启动任务。" : "任务执行失败；未能可靠完成。";
 }
@@ -514,7 +526,7 @@ class CoreService implements ChannelService {
       await this.acceptTask(message, message.text);
       return;
     }
-    await this.acceptTask(message, text);
+    await this.acceptTask(message, message.text);
   }
 
   async status(target: ChatTarget): Promise<ChannelStatus> {
@@ -794,6 +806,7 @@ class CoreService implements ChannelService {
         persistenceFailed = true;
         throw new Error("本地状态盘写入失败，会话未切换。");
       }
+      this.store.clearContextLedger(this.bot!.uid, target);
       await this.enqueueText(target, `已创建会话 ${binding.sessionId}，cwd=${binding.cwd}`, null);
     } catch {
       if (candidate && !stopped) {
@@ -1250,6 +1263,10 @@ class CoreService implements ChannelService {
     let progressTickerDueAt: number | undefined;
     const assistantTexts = new Map<string, string>();
     const target = taskTarget(task);
+    let snapshot: GroupContext | null = null;
+    let contextInjection: ContextInjection | undefined;
+    let currentContextSidecarPath: string | undefined;
+    let contextNeedsCommit = false;
 
     const trackActivity = (operation: Promise<void>): void => {
       const settled = operation.catch(() => {});
@@ -1380,23 +1397,33 @@ class CoreService implements ChannelService {
       };
       renew();
     };
-
     runtime.stopActivity = stopActivity;
     runtime.stopText = () => textAbort.abort();
     startTyping();
 
     try {
       const groupTask = isGroupTarget(target);
-      const snapshot = groupTask ? await this.options.transport.getGroupContext(target) : null;
-      const prompt = groupTask ? contextPrompt(snapshot, task.text) : task.text;
+      snapshot = groupTask
+        ? normalizeGroupContext(await this.options.transport.getGroupContext(target))
+        : null;
       if (runtime.cancelRequested) {
         this.store.markCancelled(taskId);
         return;
       }
       const sessionDir = join(this.options.config.stateDir, "sessions");
+      const sidecarRoot = contextSidecarRoot(this.options.config, this.bot!.uid, target);
       await mkdir(sessionDir, { recursive: true });
       const binding = bindingAtStart ?? this.store.getBinding(this.bot!.uid, target);
       const workerOptions: WorkerOptions = {
+        ...(groupTask
+          ? {
+              contextScope: {
+                sidecarRoot,
+                botUid: this.bot!.uid,
+                target: { ...target },
+              },
+            }
+          : {}),
         cwd: task.cwd,
         sessionDir,
         onSpawn: (processInfo) => {
@@ -1448,6 +1475,61 @@ class CoreService implements ChannelService {
         verified.sessionId,
         verified.sessionFile,
       );
+      if (groupTask) {
+        const immutableSnapshot = snapshot;
+        if (!immutableSnapshot) throw new Error("群说明快照缺失");
+        const existingLedger = this.store.getContextLedger(this.bot!.uid, target, verified.sessionId);
+        if (existingLedger && existingLedger.version > immutableSnapshot.version) {
+          throw new Error("群说明版本回退，未启动任务");
+        }
+        let ledger = existingLedger;
+        if (!ledger || ledger.version < immutableSnapshot.version) {
+          ledger = this.store.prepareContextInjection(
+            this.bot!.uid,
+            target,
+            verified.sessionId,
+            immutableSnapshot.version,
+          );
+        }
+        const previousVersion = ledger.previousVersion;
+        const injectionDecision: ContextInjection["injectionDecision"] = ledger.phase === "committed"
+          && ledger.version === immutableSnapshot.version
+          ? "unchanged"
+          : previousVersion === null
+            ? "initial"
+            : "version-change";
+        const explanation = injectionDecision === "version-change" && previousVersion !== null
+          ? `群说明版本从 ${previousVersion} 更新为 ${immutableSnapshot.version}，注入最新完整快照。`
+          : injectionDecision === "initial"
+            ? "首次注入当前群/线程共享说明完整快照。"
+            : `群说明版本 ${immutableSnapshot.version} 未变化，本轮不重复注入正文。`;
+        contextInjection = {
+          snapshot: { ...immutableSnapshot },
+          injectionDecision,
+          attemptId: ledger.attemptId,
+          explanation,
+        };
+        contextNeedsCommit = injectionDecision !== "unchanged";
+        const sidecar: ContextSidecar = {
+          schemaVersion: 1,
+          botUid: this.bot!.uid,
+          target: { ...target },
+          sessionId: verified.sessionId,
+          snapshot: { ...immutableSnapshot },
+          injectionDecision,
+          attemptId: ledger.attemptId,
+          marker: {
+            phase: ledger.phase,
+            botUid: this.bot!.uid,
+            target: { ...target },
+            sessionId: verified.sessionId,
+            version: immutableSnapshot.version,
+            attemptId: ledger.attemptId,
+          },
+          ...(previousVersion === null ? {} : { previousVersion }),
+        };
+        currentContextSidecarPath = await writeContextSidecar(sidecarRoot, sidecar);
+      }
       const onEvent = (event: WorkerEvent): void => {
         if (runtime.cancelRequested || this.stopping) return;
         if (event.type === "text") {
@@ -1513,13 +1595,50 @@ class CoreService implements ChannelService {
           scheduleProgressEdit();
         }
       };
-      const promptContext: PromptContext = { tools: this.createHostTools(task, snapshot) };
-      await worker.prompt(prompt, onEvent, promptContext);
+      const promptContext: PromptContext = {
+        tools: this.createHostTools(task, snapshot),
+        ...(contextInjection === undefined ? {} : { contextInjection }),
+      };
+      await worker.prompt(task.text, onEvent, promptContext);
       if (runtime.cancelRequested) {
         this.store.markCancelled(taskId);
         finishProgress("cancelled");
         await this.sendCancelledIfNeeded(runtime);
       } else {
+        if (contextNeedsCommit) {
+          const sidecarPath = currentContextSidecarPath;
+          const injection = contextInjection;
+          if (!sidecarPath || !injection) {
+            throw new Error("群说明注入状态缺失，未提交");
+          }
+          const sidecar = await readContextSidecar(sidecarPath);
+          if (
+            sidecar.marker.phase !== "pending"
+            || sidecar.botUid !== this.bot!.uid
+            || sidecar.sessionId !== worker.sessionId
+            || sidecar.target.channelType !== target.channelType
+            || sidecar.target.channelId !== target.channelId
+            || sidecar.snapshot.version !== injection.snapshot.version
+            || sidecar.attemptId !== injection.attemptId
+            || !sidecar.prepared
+            || !preparedReceiptMatches(sidecar, sidecar.prepared)
+          ) {
+            throw new Error("群说明注入未获得匹配的 prepared receipt，未提交");
+          }
+          if (!this.store.commitContextInjection(
+            this.bot!.uid,
+            target,
+            worker.sessionId,
+            injection.snapshot.version,
+            injection.attemptId,
+          )) {
+            throw new Error("群说明 marker CAS 提交失败，保留待重放状态");
+          }
+        }
+        if (currentContextSidecarPath) {
+          await removeContextSidecar(currentContextSidecarPath).catch(() => {});
+          currentContextSidecarPath = undefined;
+        }
         const resultText = assistantTexts.size > 0 ? [...assistantTexts.values()].join("\n\n") : null;
         this.store.markCompleted(taskId, resultText);
         finishProgress("completed");
@@ -1534,7 +1653,7 @@ class CoreService implements ChannelService {
         const contextFailure = isGroupTarget(runtime.target) && !worker;
         this.store.markFailed(taskId, contextFailure ? "群说明读取失败" : safeErrorMessage(error, "worker failed"));
         finishProgress("failed");
-        await this.enqueueText(runtime.target, genericTaskFailure(false), taskId);
+        await this.enqueueText(runtime.target, genericTaskFailure(contextFailure), taskId);
       }
     } finally {
       runtime.stopActivity?.(!progressCardFinished);
@@ -1562,16 +1681,16 @@ class CoreService implements ChannelService {
     await this.enqueueText(runtime.target, DEFAULT_CANCELLED_TEXT, runtime.taskId);
   }
 
-  private createHostTools(task: TaskRecord, snapshot: GroupContext | null): HostTool[] {
+  private createHostTools(task: TaskRecord, _snapshot: GroupContext | null): HostTool[] {
     const target = taskTarget(task);
     const readTool: HostTool = {
       name: "octo_group_read",
-      description: "读取当前群/线程绑定的共享说明；prompt 注入仍使用任务开始时冻结的快照。",
+      description: "读取当前群/线程绑定的实时共享说明；普通 prompt 注入由固定 OMP extension 处理。",
       parameters: { type: "object", additionalProperties: false },
       execute: async (_args, signal) => {
         if (signal.aborted) throw new Error("host tool cancelled");
         const current = await this.options.transport.getGroupContext(target);
-        return current ? JSON.stringify(current) : DEFAULT_NO_CONTEXT_TEXT;
+        return JSON.stringify(normalizeGroupContext(current));
       },
     };
     const writeTool: HostTool = {

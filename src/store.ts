@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -78,6 +79,15 @@ export interface WorkerLedgerRecord extends WorkerProcess {
   sessionFile: string;
   moveTargetCwd: string | null;
   state: "running" | "stopping" | "stopped" | "unknown";
+}
+
+export interface ContextLedgerRecord extends ChatTarget {
+  botUid: string;
+  sessionId: string;
+  version: number;
+  phase: "pending" | "committed";
+  attemptId: string;
+  previousVersion: number | null;
 }
 
 type SqlValue = string | number | null | Uint8Array;
@@ -243,6 +253,20 @@ export class ChannelStore {
         state TEXT NOT NULL CHECK(state IN ('running', 'stopping', 'stopped', 'unknown')),
         updated_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS session_context_ledger (
+        bot_uid TEXT NOT NULL,
+        channel_type INTEGER NOT NULL CHECK(channel_type IN (2, 5)),
+        channel_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version >= 0),
+        phase TEXT NOT NULL CHECK(phase IN ('pending', 'committed')),
+        attempt_id TEXT NOT NULL,
+        previous_version INTEGER CHECK(previous_version IS NULL OR previous_version >= 0),
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(bot_uid, channel_type, channel_id, session_id)
+      );
+      CREATE INDEX IF NOT EXISTS session_context_target
+        ON session_context_ledger(bot_uid, channel_type, channel_id);
     `);
     for (const statement of [
       "ALTER TABLE outbox ADD COLUMN remote_message_id TEXT",
@@ -655,6 +679,137 @@ export class ChannelStore {
     );
   }
 
+  getContextLedger(
+    botUid: string,
+    target: ChatTarget,
+    sessionId: string,
+  ): ContextLedgerRecord | null {
+    if (target.channelType !== 2 && target.channelType !== 5) return null;
+    if (botUid.length === 0 || sessionId.length === 0) return null;
+    const row = this.query(
+      `SELECT bot_uid, channel_type, channel_id, session_id, version, phase, attempt_id, previous_version
+       FROM session_context_ledger
+       WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?`,
+      [botUid, ...targetValues(target), sessionId],
+    )[0];
+    return row ? this.contextLedgerFromRow(row) : null;
+  }
+
+  prepareContextInjection(
+    botUid: string,
+    target: ChatTarget,
+    sessionId: string,
+    version: number,
+    requestedAttemptId?: string,
+  ): ContextLedgerRecord {
+    if (
+      botUid.length === 0
+      || sessionId.length === 0
+      || (target.channelType !== 2 && target.channelType !== 5)
+      || !Number.isSafeInteger(version)
+      || version < 0
+    ) {
+      throw new Error("context ledger identity or version is invalid");
+    }
+    const attemptId = requestedAttemptId ?? randomUUID();
+    if (attemptId.length === 0) throw new Error("context ledger attempt ID is invalid");
+    return this.transaction(() => {
+      const existingRow = this.query(
+        `SELECT bot_uid, channel_type, channel_id, session_id, version, phase, attempt_id, previous_version
+         FROM session_context_ledger
+         WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?`,
+        [botUid, ...targetValues(target), sessionId],
+      )[0];
+      if (existingRow) {
+        const existing = this.contextLedgerFromRow(existingRow);
+        if (existing.version >= version) return existing;
+        const now = Date.now();
+        this.run(
+          `UPDATE session_context_ledger
+           SET version = ?, phase = 'pending', attempt_id = ?, previous_version = ?, updated_at = ?
+           WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?`,
+          [
+            version,
+            attemptId,
+            existing.version,
+            now,
+            botUid,
+            ...targetValues(target),
+            sessionId,
+          ],
+        );
+      } else {
+        this.run(
+          `INSERT INTO session_context_ledger(
+             bot_uid, channel_type, channel_id, session_id, version, phase, attempt_id, previous_version, updated_at
+           ) VALUES(?, ?, ?, ?, ?, 'pending', ?, NULL, ?)`,
+          [
+            botUid,
+            target.channelType,
+            target.channelId,
+            sessionId,
+            version,
+            attemptId,
+            Date.now(),
+          ],
+        );
+      }
+      const row = this.query(
+        `SELECT bot_uid, channel_type, channel_id, session_id, version, phase, attempt_id, previous_version
+         FROM session_context_ledger
+         WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?`,
+        [botUid, ...targetValues(target), sessionId],
+      )[0];
+      if (!row) throw new Error("context ledger row disappeared after prepare");
+      return this.contextLedgerFromRow(row);
+    });
+  }
+
+  commitContextInjection(
+    botUid: string,
+    target: ChatTarget,
+    sessionId: string,
+    version: number,
+    attemptId: string,
+  ): boolean {
+    if (
+      botUid.length === 0
+      || sessionId.length === 0
+      || attemptId.length === 0
+      || (target.channelType !== 2 && target.channelType !== 5)
+      || !Number.isSafeInteger(version)
+      || version < 0
+    ) {
+      return false;
+    }
+    return this.run(
+      `UPDATE session_context_ledger
+       SET phase = 'committed', updated_at = ?
+       WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?
+         AND version = ? AND attempt_id = ? AND phase = 'pending'`,
+      [
+        Date.now(),
+        botUid,
+        ...targetValues(target),
+        sessionId,
+        version,
+        attemptId,
+      ],
+    ).changes === 1;
+  }
+
+  clearContextLedger(botUid: string, target: ChatTarget, sessionId?: string): void {
+    if (botUid.length === 0 || (target.channelType !== 2 && target.channelType !== 5)) return;
+    const sessionClause = sessionId === undefined ? "" : " AND session_id = ?";
+    const values: SqlValue[] = [botUid, ...targetValues(target)];
+    if (sessionId !== undefined) values.push(sessionId);
+    this.run(
+      `DELETE FROM session_context_ledger
+       WHERE bot_uid = ? AND ${targetWhere(target)}${sessionClause}`,
+      values,
+    );
+  }
+
   markWorkerStopped(id: string): void {
     this.run("UPDATE worker_ledger SET state = 'stopped', updated_at = ? WHERE id = ?", [Date.now(), id]);
   }
@@ -946,6 +1101,21 @@ export class ChannelStore {
 
   pendingQuestionIds(botUid: string, target: ChatTarget): string[] {
     return this.listPendingQuestions(botUid, target).map(({ id }) => id);
+  }
+
+  private contextLedgerFromRow(row: SqlRow): ContextLedgerRecord {
+    return {
+      botUid: asString(row.bot_uid),
+      channelType: asNumber(row.channel_type) as 2 | 5,
+      channelId: asString(row.channel_id),
+      sessionId: asString(row.session_id),
+      version: asNumber(row.version),
+      phase: row.phase === "committed" ? "committed" : "pending",
+      attemptId: asString(row.attempt_id),
+      previousVersion: row.previous_version === null || row.previous_version === undefined
+        ? null
+        : asNumber(row.previous_version),
+    };
   }
 
   private taskFromRow(row: SqlRow): TaskRecord {

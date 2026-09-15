@@ -44,7 +44,7 @@ test("only the owner and an explicitly mentioned bot can execute", async () => {
     const effectsPath = join(harness.root, "tmp", "effects.log");
     const effects = (await readText(effectsPath)).trim().split("\n").filter(Boolean);
     expect(effects[0]).toBe("owner dm work");
-    expect(JSON.parse(effects[1] ?? "{}").userMessage).toBe("@Fixture Bot group work");
+    expect(effects[1]).toBe("@Fixture Bot group work");
 
   } finally {
     await closeCoreHarness(harness);

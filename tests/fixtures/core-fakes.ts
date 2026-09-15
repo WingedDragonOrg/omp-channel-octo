@@ -20,8 +20,15 @@ import type {
   WorkerOptions,
   WorkerProcess,
 } from "../../src/contracts";
+import {
+  contextSidecarPath,
+  normalizeGroupContext,
+  writePreparedReceipt,
+} from "../../src/context-sidecar";
 import type { ProjectSessionState } from "../../src/project-session";
 import { createChannelService } from "../../src/service";
+
+type GroupContextInput = Omit<GroupContext, "present"> & Partial<Pick<GroupContext, "present">>;
 
 export interface SentMessage {
   target: ChatTarget;
@@ -126,13 +133,16 @@ export class FakeTransport implements ChannelTransport {
       onOnline();
     }
   }
+
   async getGroupContext(target: ChatTarget): Promise<GroupContext | null> {
     this.groupContextCalls.push(target);
     if (this.groupContextFailure) {
       throw this.groupContextFailure;
     }
-    return this.contexts.get(`${target.channelType}:${target.channelId}`) ?? null;
+    if (target.channelType === 1) return null;
+    return this.contexts.get(`${target.channelType}:${target.channelId}`) ?? normalizeGroupContext(null);
   }
+
   async updateGroupContext(
     target: ChatTarget,
     content: string,
@@ -145,6 +155,7 @@ export class FakeTransport implements ChannelTransport {
     const previous = this.contexts.get(key);
     const version = (previous?.version ?? 0) + 1;
     this.contexts.set(key, {
+      present: content.length > 0,
       content,
       version,
       updatedAt: new Date().toISOString(),
@@ -153,9 +164,13 @@ export class FakeTransport implements ChannelTransport {
     return { version };
   }
 
-  setGroupContext(target: ChatTarget, context: GroupContext | null): void {
-    this.contexts.set(`${target.channelType}:${target.channelId}`, context);
+  setGroupContext(target: ChatTarget, context: GroupContextInput | null): void {
+    this.contexts.set(
+      `${target.channelType}:${target.channelId}`,
+      context === null ? null : normalizeGroupContext(context),
+    );
   }
+
   failGroupContextWith(error: Error): void {
     this.groupContextFailure = error;
   }
@@ -520,6 +535,20 @@ class FixtureWorker implements OmpWorker {
     onEvent: (event: WorkerEvent) => void,
     promptContext?: PromptContext,
   ): Promise<void> {
+    const injection = promptContext?.contextInjection;
+    const scope = this.options.contextScope;
+    if (scope && injection && injection.injectionDecision !== "unchanged") {
+      await writePreparedReceipt(
+        contextSidecarPath(scope.sidecarRoot, this.sessionId),
+        {
+          botUid: scope.botUid,
+          target: { ...scope.target },
+          sessionId: this.sessionId,
+          version: injection.snapshot.version,
+          attemptId: injection.attemptId,
+        },
+      );
+    }
     const cwd = this.currentCwd;
     this.recordPrompt({
       text,

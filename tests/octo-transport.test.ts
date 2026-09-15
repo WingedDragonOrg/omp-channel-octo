@@ -574,6 +574,7 @@ describe("Octo text send and target context", () => {
   test("resolves DM, group, and thread context through their actual REST paths", async () => {
     const groupId = "group/中文 & name";
     const threadId = `${groupId}____thread/42`;
+    const emptyThreadId = `${groupId}____empty-thread`;
     fixture = await createOctoProtocolFixture({
       groupContexts: {
         [groupId]: {
@@ -587,6 +588,12 @@ describe("Octo text send and target context", () => {
           version: 7,
           updatedAt: "2026-09-12T10:01:00Z",
           updatedBy: "thread-owner",
+        },
+        [emptyThreadId]: {
+          content: "",
+          version: 9,
+          updatedAt: null,
+          updatedBy: "",
         },
         "empty-group": {
           content: "",
@@ -609,6 +616,7 @@ describe("Octo text send and target context", () => {
       version: 3,
       updatedAt: "2026-09-12T10:00:00Z",
       updatedBy: "owner-user-uid",
+      present: true,
     });
     expect(fixture.groupContextRequests[0]).toMatchObject({
       path: `/v1/bot/groups/${encodeURIComponent(groupId)}/md`,
@@ -622,6 +630,7 @@ describe("Octo text send and target context", () => {
       version: 7,
       updatedAt: "2026-09-12T10:01:00Z",
       updatedBy: "thread-owner",
+      present: true,
     });
     expect(fixture.groupContextRequests[1]).toMatchObject({
       path: `/v1/bot/groups/${encodeURIComponent(groupId)}/threads/${encodeURIComponent("thread/42")}/md`,
@@ -630,10 +639,31 @@ describe("Octo text send and target context", () => {
 
     await expect(
       transport.getGroupContext({ channelId: "empty-group", channelType: 2 }),
-    ).resolves.toBeNull();
+    ).resolves.toEqual({
+      content: "",
+      version: 8,
+      updatedAt: null,
+      updatedBy: "",
+      present: false,
+    });
+    await expect(
+      transport.getGroupContext({ channelId: emptyThreadId, channelType: 5 }),
+    ).resolves.toEqual({
+      content: "",
+      version: 9,
+      updatedAt: null,
+      updatedBy: "",
+      present: false,
+    });
     await expect(
       transport.getGroupContext({ channelId: "missing-group", channelType: 2 }),
-    ).resolves.toBeNull();
+    ).resolves.toEqual({
+      content: "",
+      version: 0,
+      updatedAt: null,
+      updatedBy: "",
+      present: false,
+    });
   });
 
   test("fails closed on context HTTP errors, invalid schema, and a response over 64 KiB", async () => {

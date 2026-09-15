@@ -659,7 +659,7 @@ function contextPath(channelId: string, channelType: ChatTarget["channelType"]):
   return `/v1/bot/groups/${encodeURIComponent(channelId)}/md`;
 }
 
-function contextFromResponse(value: unknown): GroupContext | null {
+function contextFromResponse(value: unknown): GroupContext {
   if (!isJsonRecord(value)
     || typeof value.content !== "string"
     || !Number.isSafeInteger(value.version)
@@ -668,8 +668,8 @@ function contextFromResponse(value: unknown): GroupContext | null {
     || typeof value.updated_by !== "string") {
     throw new OctoError("Octo group context response has invalid schema");
   }
-  if (value.content.length === 0) return null;
   return {
+    present: value.content.length > 0,
     content: value.content,
     version: value.version as number,
     updatedAt: value.updated_at as string | null,
@@ -1014,7 +1014,9 @@ export class OctoTransport implements ChannelTransport {
       undefined,
       MAX_GROUP_CONTEXT_BYTES,
     );
-    if (response.status === 404) return null;
+    if (response.status === 404) {
+      return { present: false, content: "", version: 0, updatedAt: null, updatedBy: "" };
+    }
     if (response.status < 200 || response.status >= 300) throw httpStatusError("group context", response.status);
     return contextFromResponse(parseJson(response.body, "group context"));
   }

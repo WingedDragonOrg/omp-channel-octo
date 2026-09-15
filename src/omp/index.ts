@@ -6,12 +6,15 @@ import type {
 	HostTool,
 	OmpWorker,
 	PromptContext,
+	WorkerContextScope,
 	WorkerEvent,
 	WorkerFactory,
 	WorkerOptions,
 	WorkerProcess,
 } from "../contracts.ts";
 import type { ExecutionEvent, ExecutionTodoPhase, TodoOperation, TodoStatus } from "../execution-card.ts";
+
+const FIXED_CONTEXT_EXTENSION_PATH = resolve(import.meta.dir, "context-extension.ts");
 
 type RpcFrame = Record<string, unknown>;
 type RpcCommand = RpcFrame & { type: string };
@@ -85,6 +88,7 @@ const VALUE_FLAGS_TO_STRIP = new Set([
 	"--session",
 	"-r",
 ]);
+const FLAGS_WITHOUT_VALUE_TO_STRIP = new Set(["--no-extensions"]);
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 const WINDOWS_RESERVED_BASENAME_RE = /^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\..*)?$/iu;
 
@@ -586,19 +590,35 @@ function stripEnforcedArgs(args: readonly string[]): string[] {
 			if (equalsIndex < 0) index++;
 			continue;
 		}
+		if (FLAGS_WITHOUT_VALUE_TO_STRIP.has(flagName)) continue;
 		output.push(arg);
 	}
 	return output;
 }
 
-function workerEnv(): Record<string, string> {
+function workerEnv(scope?: WorkerContextScope): Record<string, string> {
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(Bun.env)) {
 		if (key.startsWith("OCTO_") || key.startsWith("OMP_CHANNEL_OCTO_")) continue;
 		if (value !== undefined) env[key] = value;
 	}
+	if (
+		!scope
+		|| scope.target.channelType === 1
+		|| !isAbsolute(scope.sidecarRoot)
+		|| scope.sidecarRoot.length === 0
+		|| scope.botUid.length === 0
+		|| scope.target.channelId.length === 0
+	) {
+		return env;
+	}
+	env.OMP_CHANNEL_OCTO_CONTEXT_ROOT = scope.sidecarRoot;
+	env.OMP_CHANNEL_OCTO_CONTEXT_BOT_UID = scope.botUid;
+	env.OMP_CHANNEL_OCTO_CONTEXT_CHANNEL_TYPE = String(scope.target.channelType);
+	env.OMP_CHANNEL_OCTO_CONTEXT_CHANNEL_ID = scope.target.channelId;
 	return env;
 }
+
 
 async function queryProcess(pid: number): Promise<ProcessSnapshot | undefined> {
 	if (!Number.isSafeInteger(pid) || pid < SAFE_MIN_PID) return undefined;
@@ -1521,6 +1541,8 @@ class OmpWorkerFactory implements WorkerFactory {
 		const command = [
 			this.#options.ompCommand,
 			...stripEnforcedArgs(this.#options.extraArgs ?? []),
+			"--extension",
+			FIXED_CONTEXT_EXTENSION_PATH,
 			"--mode",
 			"rpc",
 			"--approval-mode",
@@ -1537,7 +1559,7 @@ class OmpWorkerFactory implements WorkerFactory {
 				cwd,
 				stdin: "pipe",
 				stdout: "pipe",
-				env: workerEnv(),
+				env: workerEnv(options.contextScope),
 				stderr: "pipe",
 				detached: process.platform !== "win32",
 			}) as unknown as RpcChild;
