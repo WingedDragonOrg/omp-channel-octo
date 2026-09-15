@@ -199,7 +199,7 @@ const REQUIRED_ELEMENTS = ["TextBlock"] as const;
 const TOGGLE_ACTION = "Action.ToggleVisibility";
 const SUCCESS_GLYPH = "✓";
 const WAITING_GLYPH = "-";
-const FAILURE_GLYPH = "❌";
+const FAILURE_GLYPH = "×";
 const RUNNING_GLYPH = "●";
 const WAITING_TOOL_NAMES: Record<string, true> = {
   subagent_await: true,
@@ -793,23 +793,14 @@ function makeToolRow(
   const statusParts = [toolStatusLabel(tool)];
   if (tool.state === "failed" && tool.errorCategory) statusParts.push(errorCategoryLabel(tool.errorCategory));
   if (tool.durationMs !== null) statusParts.push(formatDuration(tool.durationMs));
-  // Web progress enhancement inspects direct timeline Containers; keep the colored panel nested.
+  const glyph = toolStateGlyph(tool);
+  // Keep timeline rows as direct ColumnSet children; nest the colored panel with its marker inside.
   return {
     type: "ColumnSet",
     ...(options.id === undefined ? {} : { id: options.id }),
     ...(options.isVisible === undefined ? {} : { isVisible: options.isVisible }),
     spacing: "None",
     columns: [
-      {
-        type: "Column",
-        width: "auto",
-        verticalContentAlignment: "Center",
-        items: [makeTextBlock(toolStateGlyph(tool), {
-          spacing: "None",
-          color: tone,
-          size: "Medium",
-        })],
-      },
       {
         type: "Column",
         width: "stretch",
@@ -823,6 +814,16 @@ function makeToolRow(
                 type: "ColumnSet",
                 spacing: "None",
                 columns: [
+                  {
+                    type: "Column",
+                    width: "auto",
+                    verticalContentAlignment: "Center",
+                    items: [makeTextBlock(glyph, {
+                      spacing: "None",
+                      color: tone,
+                      size: "Medium",
+                    })],
+                  },
                   {
                     type: "Column",
                     width: "stretch",

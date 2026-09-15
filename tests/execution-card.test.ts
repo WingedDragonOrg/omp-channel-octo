@@ -312,7 +312,7 @@ describe("execution tracker", () => {
     expect(text).toContain("Run checks");
     expect(text).toContain("├─ Foundation");
     expect(text).toContain("│  ├─ ✓ Wire storage");
-    expect(text).toContain("│  └─ ❌ Wait for access");
+    expect(text).toContain("│  └─ × Wait for access");
     expect(text).toContain("   └─ ● Run checks");
     expect(text).not.toContain("[已完成]");
     expect(text).not.toContain("[进行中]");
@@ -557,21 +557,26 @@ describe("execution card rendering", () => {
     if (!step) throw new Error("tool step was not rendered");
 
     const columns = step.columns as JsonRecord[];
-    expect(columns).toHaveLength(2);
-    expect(columns[0]).toMatchObject({ width: "auto", verticalContentAlignment: "Center" });
-    expect(columns[1]).toMatchObject({ width: "stretch" });
+    expect(columns).toHaveLength(1);
+    expect(columns[0]).toMatchObject({ width: "stretch" });
 
-    const panel = (columns[1]?.items as JsonRecord[])[0];
+    const panel = (columns[0]?.items as JsonRecord[])[0];
     expect(panel).toMatchObject({ type: "Container", style: "accent", spacing: "Small" });
     const row = nodes(panel!).find(item => item.type === "ColumnSet");
     expect(row).toMatchObject({ spacing: "None" });
     const rowColumns = row?.columns as JsonRecord[];
-    expect(rowColumns).toHaveLength(2);
+    expect(rowColumns).toHaveLength(3);
+    expect(rowColumns[0]).toMatchObject({ width: "auto", verticalContentAlignment: "Center" });
     expect(rowColumns[0]?.items).toEqual([
+      expect.objectContaining({ text: "●", color: "Accent", size: "Medium", spacing: "None" }),
+    ]);
+    expect(rowColumns[1]).toMatchObject({ width: "stretch" });
+    expect(rowColumns[1]?.items).toEqual([
       expect.objectContaining({ text: "写入文件", weight: "Bolder", spacing: "None" }),
       expect.objectContaining({ text: "generate_image", isSubtle: true, size: "Small", spacing: "None" }),
     ]);
-    expect(rowColumns[1]?.items).toEqual([
+    expect(rowColumns[2]).toMatchObject({ width: "auto", verticalContentAlignment: "Center" });
+    expect(rowColumns[2]?.items).toEqual([
       expect.objectContaining({
         text: "进行中 · 35.2s",
         horizontalAlignment: "Right",
@@ -852,8 +857,8 @@ describe("execution card rendering", () => {
     );
     expect(failed).not.toBeNull();
     const failedNodes = nodes(failed!.card as JsonRecord);
-    expect(failedNodes.filter(node => node.text === "❌")).toHaveLength(2);
-    expect(failedNodes.filter(node => node.text === "❌").every(node => node.color === "Attention")).toBe(true);
+    expect(failedNodes.filter(node => node.text === "×")).toHaveLength(2);
+    expect(failedNodes.filter(node => node.text === "×").every(node => node.color === "Attention")).toBe(true);
     const failedRow = failedNodes.find(node => (
       node.type === "Container"
       && node.style === "attention"
