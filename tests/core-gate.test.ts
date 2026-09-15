@@ -111,6 +111,29 @@ test("rejects non-owner, unallowed, unmentioned, textual-only, bot, and unsuppor
   }
 });
 
+test("a bare mention runs a normal turn instead of being refused as unsupported", async () => {
+  const harness = await createCoreHarness();
+  try {
+    const bare = inbound({
+      messageId: "gate-bare-mention",
+      channelId: "group-allowed",
+      channelType: 2,
+      text: "",
+      mentionedUserIds: [harness.bot.uid],
+    });
+
+    await harness.service.handleInbound(bare);
+    await waitForStatus(harness.service, bare, (status) => status.state === "completed");
+
+    expect(harness.workers.prompts).toHaveLength(1);
+    expect(harness.workers.prompts[0]!.text).toBe("");
+    expect(harness.transport.sent.map((message) => message.text))
+      .not.toContain("不支持的消息类型，不会启动任务。");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
 test("an unconfigured bot enrolls on the first supported non-empty DM without running it", async () => {
   const harness = await createCoreHarness({ ownerId: null });
   const first = inbound({

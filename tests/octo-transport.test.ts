@@ -945,6 +945,42 @@ describe("Octo group and thread management", () => {
     await expect(transport.createThread("bad/group", "x")).rejects.toThrow(/group id is invalid/);
     await expect(transport.getThread("plain-group", "")).rejects.toThrow(/thread id is invalid/);
   });
+
+  test("reads the group 免@ decision, including the legacy no_mention shape", async () => {
+    const openGroup = "no-mention-group";
+    const legacyGroup = "legacy-pref-group";
+    const brokenGroup = "broken-pref-group";
+    const currentFixture = await createOctoProtocolFixture({
+      managementBodies: {
+        [`GET /v1/bot/groups/${openGroup}/mention_pref`]: {
+          no_mention: 1,
+          group_allow_no_mention: 1,
+          effective: true,
+        },
+        [`GET /v1/bot/groups/${legacyGroup}/mention_pref`]: { no_mention: 1 },
+        [`GET /v1/bot/groups/${brokenGroup}/mention_pref`]: { effective: "yes" },
+      },
+    });
+    fixture = currentFixture;
+    transport = createOctoTransport({
+      apiUrl: currentFixture.apiUrl,
+      botToken: currentFixture.botToken,
+    });
+    await transport.initialize();
+
+    await expect(transport.getGroupMentionPref(openGroup)).resolves.toEqual({ effective: true });
+    await expect(transport.getGroupMentionPref(legacyGroup)).resolves.toEqual({ effective: true });
+    await expect(transport.getGroupMentionPref(brokenGroup)).rejects.toThrow(/schema|invalid/i);
+
+    expect(currentFixture.managementRequests.map(({ method, path }) => `${method} ${path}`)).toEqual([
+      `GET /v1/bot/groups/${openGroup}/mention_pref`,
+      `GET /v1/bot/groups/${legacyGroup}/mention_pref`,
+      `GET /v1/bot/groups/${brokenGroup}/mention_pref`,
+    ]);
+    for (const request of currentFixture.managementRequests) {
+      expect(request.authorization).toBe(`Bearer ${currentFixture.botToken}`);
+    }
+  });
 });
 
 describe("Octo typing and progress cards", () => {
@@ -1552,6 +1588,8 @@ describe("Octo group history and inbound sequence metadata", () => {
 
     expect(history).toEqual([
       { seq: 20, senderId: "member-a", text: "kept one", timestamp: 1_757_656_000_000 },
+      // 图片类型没有 caption 时退回 content：历史回填复用同一张类型表取文本，但不产生附件。
+      { seq: 21, senderId: "member-b", text: "image caption", timestamp: 1_757_656_001_000 },
       { seq: 28, senderId: "member-h", text: "kept two", timestamp: 1_757_656_008_000 },
     ]);
   });

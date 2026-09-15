@@ -1,11 +1,12 @@
 import { createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { open, stat } from "node:fs/promises";
-import { basename } from "node:path";
+import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
+import { basename, dirname, extname } from "node:path";
 import { Readable } from "node:stream";
 import { WebSocket } from "ws";
 import { generateKeyPair, sharedKey } from "curve25519-js";
 import type {
+  AttachmentDownload,
   BotIdentity,
   ChannelTransport,
   ChatTarget,
@@ -13,12 +14,16 @@ import type {
   GroupInfo,
   GroupInfoPatch,
   GroupMember,
+  GroupMentionPref,
   HistoryFetch,
   HistoryMessage,
+  InboundAttachment,
+  InboundAttachmentKind,
   InboundMessage,
   SendReceipt,
   ThreadSummary,
 } from "../contracts.ts";
+import { ATTACHMENT_DOWNLOAD_TIMEOUT_MS, AttachmentError } from "../attachments.ts";
 import { isJsonRecord, type JsonRecord } from "./type-guards.ts";
 import {
   buildExecutionCard,
@@ -109,11 +114,52 @@ const PROTOCOL_VERSION = 4;
 const DEVICE_FLAG = 0;
 const TEXT_MESSAGE_TYPE = 1;
 const IMAGE_MESSAGE_TYPE = 2;
+const GIF_MESSAGE_TYPE = 3;
+const VOICE_MESSAGE_TYPE = 4;
+const VIDEO_MESSAGE_TYPE = 5;
+const LOCATION_MESSAGE_TYPE = 6;
+const CONTACT_CARD_MESSAGE_TYPE = 7;
 const FILE_MESSAGE_TYPE = 8;
+/** Not an octo-lib enum value, but clients do send files as type 9. */
+const FILE_ALIAS_MESSAGE_TYPE = 9;
+const MERGE_FORWARD_MESSAGE_TYPE = 11;
+const RICH_TEXT_MESSAGE_TYPE = 14;
 const INTERACTIVE_CARD_MESSAGE_TYPE = 17;
+/**
+ * Types whose payload text *is* the message input: an empty text is a legitimate, if
+ * contentless, turn (`@bot` with nothing else), so these stay supported and run normally
+ * instead of being reported as an unsupported message type. Types outside this set carry
+ * their input as media, so they stay supported only when something was actually extracted.
+ */
+const TEXT_SHAPED_MESSAGE_TYPES: ReadonlySet<number> = new Set([
+  TEXT_MESSAGE_TYPE,
+  RICH_TEXT_MESSAGE_TYPE,
+  INTERACTIVE_CARD_MESSAGE_TYPE,
+]);
+const RICH_TEXT_IMAGE_BLOCK = "image";
+const RICH_TEXT_IMAGE_PLACEHOLDER = "[图片]";
+/** 交互卡片 `plain` 缺失时的降级文本，与 octo-server Decision 8 的 `[卡片]` 占位符一致。 */
+const CARD_PLACEHOLDER = "[卡片]";
+const MERGE_FORWARD_HEADER = "[合并转发]";
+const MAX_MERGE_FORWARD_MESSAGES = 30;
+const MAX_MERGE_FORWARD_CODE_POINTS = 4_000;
+const MAX_RICH_TEXT_CODE_POINTS = 2_000;
+/** Random bytes appended to the temp file a download writes before renaming it into place. */
+const ATTACHMENT_PART_BYTES = 6;
+/** Audio MIME types the transcription endpoint understands; anything else goes as opaque bytes. */
+const AUDIO_CONTENT_TYPES: Record<string, string> = {
+  ".amr": "audio/amr",
+  ".m4a": "audio/mp4",
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
+  ".ogg": "audio/ogg",
+  ".aac": "audio/aac",
+};
 const CARD_PROFILE = "octo/v1";
 const CARD_VERSION = "1.5";
 const MAX_TEXT_BYTES = 3_000;
+/** Transcribing anything larger is pointless and would only buffer a big file in memory. */
+const MAX_TRANSCRIBE_BYTES = 20 * 1024 * 1024;
 const MAX_GROUP_CONTEXT_BYTES = 64 * 1024;
 const MAX_HTTP_BODY_BYTES = 2 * 1024 * 1024;
 const HTTP_TIMEOUT_MS = 15_000;
@@ -401,6 +447,55 @@ function parseJsonWithInt64(bytes: Uint8Array, label: string): unknown {
   }
 }
 
+type RequestDeadline = {
+  signal: AbortSignal;
+  /** `true` when this deadline fired rather than the caller cancelling. */
+  timedOut: () => boolean;
+  /** `true` when the caller's signal was aborted before or during the request. */
+  aborted: () => boolean;
+  release: () => void;
+};
+
+/**
+ * Abort signal for one HTTP request: the caller's cancellation plus a deadline, keeping
+ * track of which of the two fired so the failure can be classified. Attachment downloads
+ * use it with their own timeout instead of `requestWithTimeout`, which buffers whole bodies.
+ */
+function requestDeadline(caller: AbortSignal | undefined, timeoutMs: number): RequestDeadline {
+  const controller = new AbortController();
+  let externalAbort = false;
+  const abortFromCaller = (): void => {
+    externalAbort = true;
+    controller.abort(caller?.reason);
+  };
+  if (caller?.aborted) abortFromCaller();
+  else caller?.addEventListener("abort", abortFromCaller, { once: true });
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  return {
+    signal: controller.signal,
+    timedOut: () => timedOut,
+    aborted: () => externalAbort || caller?.aborted === true,
+    release: () => {
+      clearTimeout(timer);
+      caller?.removeEventListener("abort", abortFromCaller);
+    },
+  };
+}
+
+/** Size of an attachment an earlier delivery already stored; `0` when there is none. */
+async function storedBytes(path: string): Promise<number> {
+  try {
+    const info = await stat(path);
+    return info.isFile() && Number.isSafeInteger(info.size) && info.size > 0 ? info.size : 0;
+  } catch {
+    return 0;
+  }
+}
+
 async function requestWithTimeout(
   url: string,
   init: RequestInit,
@@ -408,31 +503,18 @@ async function requestWithTimeout(
   signal: AbortSignal | undefined,
   maxBytes: number,
 ): Promise<HttpResult> {
-  const controller = new AbortController();
-  let externallyAborted = false;
-  const abortFromCaller = (): void => {
-    externallyAborted = true;
-    controller.abort(signal?.reason);
-  };
-  if (signal?.aborted) abortFromCaller();
-  else signal?.addEventListener("abort", abortFromCaller, { once: true });
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, HTTP_TIMEOUT_MS);
+  const deadline = requestDeadline(signal, HTTP_TIMEOUT_MS);
   try {
-    const response = await fetch(url, { ...init, signal: controller.signal });
+    const response = await fetch(url, { ...init, signal: deadline.signal });
     const body = await readBody(response, maxBytes);
     return { status: response.status, body };
   } catch (error) {
     if (error instanceof OctoError) throw error;
-    if (timedOut) throw new OctoError(`Octo ${label} request timed out`);
-    if (externallyAborted || signal?.aborted) throw new OctoError(`Octo ${label} request was aborted`);
+    if (deadline.timedOut()) throw new OctoError(`Octo ${label} request timed out`);
+    if (deadline.aborted()) throw new OctoError(`Octo ${label} request was aborted`);
     throw new OctoError(`Octo ${label} request failed`);
   } finally {
-    clearTimeout(timer);
-    signal?.removeEventListener("abort", abortFromCaller);
+    deadline.release();
   }
 }
 
@@ -664,16 +746,311 @@ function knownIntOrZero(value: number): number {
   return Number.isSafeInteger(value) && value > 0 ? value : 0;
 }
 
+type ExtractedContent = {
+  text: string;
+  attachments: InboundAttachment[];
+};
+
+/**
+ * Absolute http/https URL, or `undefined` when the value is missing, relative, or uses
+ * another scheme. Octo falls back to a relative `file/preview/...` path when it cannot
+ * mint a download URL, and that route needs a login the bot does not have — so relative
+ * references are unusable, never resolved against a guessed base.
+ */
+function absoluteHttpUrl(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
+  } catch {
+    return undefined;
+  }
+  return value;
+}
+
+function textField(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+/** Client-declared numbers are advisory: anything not finite and positive counts as unknown. */
+function declaredNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/** Types 8/9 carry the name and its extension in separate fields on some clients. */
+function fileName(payload: JsonRecord): string {
+  const name = textField(payload.name);
+  const extension = textField(payload.extension).replace(/^\./u, "").trim();
+  if (name.length === 0 || !/^[A-Za-z0-9]{1,12}$/u.test(extension)) return name;
+  return name.toLowerCase().endsWith(`.${extension.toLowerCase()}`) ? name : `${name}.${extension}`;
+}
+
+/** Types 2/8/9 carry the user's words in `caption` and fall back to `content`. */
+function captionOrContent(payload: JsonRecord): string {
+  const caption = textField(payload.caption);
+  return caption.length > 0 ? caption : textField(payload.content);
+}
+
+/** Voice and video clients disagree on the duration field, so the first usable one wins. */
+function declaredDuration(payload: JsonRecord): number {
+  for (const field of ["second", "timeTrad", "duration"] as const) {
+    const seconds = declaredNumber(payload[field]);
+    if (seconds > 0) return seconds;
+  }
+  return 0;
+}
+
+/**
+ * Records one attachment candidate. The URL is taken verbatim: whether it is usable is
+ * decided by `normalizedMessage` (live path) and `downloadAttachment` (fetch path), so
+ * this table only ever answers "what did the payload point at".
+ */
+function pushAttachment(
+  list: InboundAttachment[],
+  url: unknown,
+  kind: InboundAttachmentKind,
+  fields: { name?: unknown; size?: unknown; durationSeconds?: number } = {},
+): void {
+  if (typeof url !== "string" || url.length === 0) return;
+  list.push({
+    url,
+    kind,
+    name: textField(fields.name),
+    size: declaredNumber(fields.size),
+    durationSeconds: declaredNumber(fields.durationSeconds),
+  });
+}
+
+/** Type 6 coordinates live under two naming conventions across clients. */
+function locationText(payload: JsonRecord): string {
+  const latitude = scalarText(payload.latitude ?? payload.lat);
+  const longitude = scalarText(payload.longitude ?? payload.lng ?? payload.lon);
+  const details = [scalarText(payload.address), scalarText(payload.title)]
+    .filter((part) => part.length > 0);
+  const coordinates = latitude.length === 0 && longitude.length === 0 ? "" : `${latitude},${longitude}`;
+  const line = coordinates.length === 0 ? "" : `[位置信息: ${coordinates}]`;
+  return [line, ...details].filter((part) => part.length > 0).join(" ");
+}
+
+/** Type 7 renders one line so the agent sees the contact without a download. */
+function contactText(payload: JsonRecord): string {
+  const name = textField(payload.name);
+  const uid = textField(payload.uid);
+  if (name.length === 0 && uid.length === 0) return "";
+  if (name.length === 0) return `[名片: ${uid}]`;
+  if (uid.length === 0) return `[名片: ${name}]`;
+  return `[名片: ${name} (${uid})]`;
+}
+
+/** Coordinates may arrive as numbers or as strings; both keep their written form. */
+function scalarText(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return "";
+}
+
+/** Counts code points rather than UTF-16 units, so a cap means what it says. */
+function codePointLength(text: string): number {
+  let length = text.length;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    const next = text.charCodeAt(index + 1);
+    if (code >= 0xd800 && code <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+      length -= 1;
+      index += 1;
+    }
+  }
+  return length;
+}
+
+/** Truncates at a code point boundary without splitting a surrogate pair. */
+function truncateCodePoints(text: string, maximum: number): string {
+  let seen = 0;
+  let offset = 0;
+  for (const character of text) {
+    if (seen >= maximum) return text.slice(0, offset);
+    seen += 1;
+    offset += character.length;
+  }
+  return text;
+}
+
+/** Media that a forwarded chat or an unreadable block cannot deliver is named, not fetched. */
+function mediaPlaceholder(type: unknown): string {
+  switch (type) {
+    case IMAGE_MESSAGE_TYPE:
+    case GIF_MESSAGE_TYPE:
+      return "[图片]";
+    case VOICE_MESSAGE_TYPE:
+      return "[语音]";
+    case VIDEO_MESSAGE_TYPE:
+      return "[视频]";
+    case FILE_MESSAGE_TYPE:
+    case FILE_ALIAS_MESSAGE_TYPE:
+      return "[文件]";
+    default:
+      return "";
+  }
+}
+
+/**
+ * Type 11 carries a forwarded chat: a header line plus one line per inner message,
+ * expanded exactly one level deep and bounded in message count and total text. Inner
+ * media never downloads — it stays a placeholder — and a forward inside a forward is
+ * rendered as the header alone instead of recursing.
+ */
+function mergeForwardText(payload: JsonRecord): string {
+  const names = new Map<string, string>();
+  const users: unknown[] = Array.isArray(payload.users) ? payload.users : [];
+  for (const raw of users) {
+    if (!isJsonRecord(raw)) continue;
+    const uid = textField(raw.uid);
+    const name = textField(raw.name);
+    if (uid.length > 0 && name.length > 0) names.set(uid, name);
+  }
+  const messages: unknown[] = Array.isArray(payload.msgs) ? payload.msgs : [];
+  const lines: string[] = [MERGE_FORWARD_HEADER];
+  let budget = MAX_MERGE_FORWARD_CODE_POINTS;
+  let position = 0;
+  const limit = Math.min(messages.length, MAX_MERGE_FORWARD_MESSAGES);
+  for (; position < limit; position += 1) {
+    const raw = messages[position];
+    const line = isJsonRecord(raw) ? forwardedLine(raw, names) : undefined;
+    if (line === undefined) continue;
+    const cost = codePointLength(line) + 1;
+    if (cost > budget) break;
+    budget -= cost;
+    lines.push(line);
+  }
+  const omitted = messages.length - position;
+  if (omitted > 0) lines.push(`…（其余 ${omitted} 条省略）`);
+  return lines.join("\n");
+}
+
+/** One inner line of a forwarded chat: `sender: text`. */
+function forwardedLine(message: JsonRecord, names: ReadonlyMap<string, string>): string | undefined {
+  const payload = message.payload;
+  if (!isJsonRecord(payload)) return undefined;
+  const text = forwardedMessageText(payload);
+  if (text.length === 0) return undefined;
+  const sender = textField(message.from_uid);
+  const label = names.get(sender) ?? sender;
+  return label.length === 0 ? text : `${label}: ${text}`;
+}
+
+/** Inner text of one forwarded message; nested media and forwards never expand further. */
+function forwardedMessageText(payload: JsonRecord): string {
+  if (payload.type === MERGE_FORWARD_MESSAGE_TYPE) return MERGE_FORWARD_HEADER;
+  const content = messageContent(payload);
+  const text = content === undefined ? "" : content.text.trim();
+  return text.length > 0 ? text : mediaPlaceholder(payload.type);
+}
+
+/**
+ * Type 14 keeps the server-generated `plain` as the authoritative text, while the blocks
+ * still decide which images and files travel with the message. Without `plain` (old
+ * clients, or a client-sent payload the server has not rewritten) the blocks are
+ * flattened with `[图片]` standing in for every embedded image.
+ */
+function richTextContent(payload: JsonRecord): ExtractedContent {
+  const attachments: InboundAttachment[] = [];
+  const parts: string[] = [];
+  if (Array.isArray(payload.content)) {
+    const blocks: unknown[] = payload.content;
+    for (const raw of blocks) {
+      if (!isJsonRecord(raw)) continue;
+      if (raw.type === RICH_TEXT_IMAGE_BLOCK) {
+        pushAttachment(attachments, raw.url, "image", { name: raw.name, size: raw.size });
+        parts.push(RICH_TEXT_IMAGE_PLACEHOLDER);
+        continue;
+      }
+      // 未知块按 octo-lib 的宽容解析处理：有 text 就取 text，其余忽略（写入端 write-strict
+      // 会拒绝未知块类型，所以这里只可能是前向兼容的降级路径）。
+      const text = textField(raw.text);
+      if (text.length > 0) parts.push(text);
+    }
+  } else {
+    // Before blocks existed, `content` was the whole text.
+    const legacy = textField(payload.content);
+    if (legacy.length > 0) parts.push(legacy);
+  }
+  const plain = textField(payload.plain);
+  return {
+    text: plain.length > 0 ? plain : truncateCodePoints(parts.join(""), MAX_RICH_TEXT_CODE_POINTS),
+    attachments,
+  };
+}
+
+/**
+ * Type table for one inbound payload: the text and media a message contributes. The text
+ * is exactly what the client or server wrote (no mention stripping here — that applies to
+ * the extracted text afterwards), and `undefined` means the type yields no usable input,
+ * which is what keeps the "unsupported message type" refusal for stickers and notifications.
+ */
+function messageContent(payload: JsonRecord): ExtractedContent | undefined {
+  const attachments: InboundAttachment[] = [];
+  switch (payload.type) {
+    case TEXT_MESSAGE_TYPE:
+      return { text: textField(payload.content), attachments };
+    case IMAGE_MESSAGE_TYPE:
+      pushAttachment(attachments, payload.url, "image", { name: payload.name, size: payload.size });
+      return { text: captionOrContent(payload), attachments };
+    case GIF_MESSAGE_TYPE:
+      pushAttachment(attachments, payload.url, "image", { name: payload.name });
+      return { text: "", attachments };
+    case VOICE_MESSAGE_TYPE:
+      pushAttachment(attachments, payload.url, "audio", {
+        name: payload.name,
+        durationSeconds: declaredDuration(payload),
+      });
+      return { text: "", attachments };
+    case VIDEO_MESSAGE_TYPE:
+      pushAttachment(attachments, payload.url, "video", {
+        name: payload.name,
+        size: payload.size,
+        durationSeconds: declaredDuration(payload),
+      });
+      return { text: "", attachments };
+    case LOCATION_MESSAGE_TYPE:
+      return { text: locationText(payload), attachments };
+    case CONTACT_CARD_MESSAGE_TYPE:
+      return { text: contactText(payload), attachments };
+    case FILE_MESSAGE_TYPE:
+    case FILE_ALIAS_MESSAGE_TYPE:
+      pushAttachment(attachments, payload.url, "file", { name: fileName(payload), size: payload.size });
+      return { text: captionOrContent(payload), attachments };
+    case MERGE_FORWARD_MESSAGE_TYPE:
+      return { text: mergeForwardText(payload), attachments };
+    case RICH_TEXT_MESSAGE_TYPE:
+      return richTextContent(payload);
+    case INTERACTIVE_CARD_MESSAGE_TYPE: {
+      // 服务端保证 `plain` 非空；真为空时给占位符，避免把空正文交给 Agent。
+      const plain = textField(payload.plain);
+      return { text: plain.length > 0 ? plain : CARD_PLACEHOLDER, attachments };
+    }
+    default:
+      return undefined;
+  }
+}
+
 function normalizedMessage(data: DecodedInbound, botUid: string, botName: string): InboundMessage {
   if (!(data.channelType === 1 || data.channelType === 2 || data.channelType === 5)) {
     throw new OctoError(`Octo message channel type ${data.channelType} is unsupported`);
   }
   if (!isJsonRecord(data.payload)) throw new OctoError("Octo message payload has invalid schema");
-  const text = typeof data.payload.content === "string" ? data.payload.content : "";
-  const supported = data.payload.type === TEXT_MESSAGE_TYPE;
+  const content = messageContent(data.payload);
+  // Unusable references never become attachments, so a message left with neither text nor
+  // attachments stays unsupported — the same answer as before attachments existed. Text-shaped
+  // payloads are the exception: `@bot` alone still runs a normal (empty) turn.
+  const attachments = (content?.attachments ?? [])
+    .filter((attachment) => absoluteHttpUrl(attachment.url) !== undefined);
   const entities = mentionEntities(data.payload);
   const mentionedUserIds = mentionUids(data.payload);
-  const normalizedText = stripBotMention(text, botUid, botName, entities, mentionedUserIds);
+  const text = stripBotMention(content?.text ?? "", botUid, botName, entities, mentionedUserIds);
+  const payloadType = data.payload["type"];
+  const textShaped = typeof payloadType === "number" && TEXT_SHAPED_MESSAGE_TYPES.has(payloadType);
+  const supported = content !== undefined
+    && (textShaped || text.trim().length > 0 || attachments.length > 0);
   const channelId = data.channelType === 1 ? data.senderId : data.rawChannelId;
   if (channelId.length === 0) throw new OctoError("Octo group message has no channel id");
   return {
@@ -681,8 +1058,9 @@ function normalizedMessage(data: DecodedInbound, botUid: string, botName: string
     channelType: data.channelType as InboundMessage["channelType"],
     messageId: data.messageId.toString(),
     senderId: data.senderId,
-    text: normalizedText,
+    text,
     mentionedUserIds,
+    attachments,
     supported,
     messageSeq: knownIntOrZero(data.messageSeq),
     messageTimestamp: knownIntOrZero(data.timestamp) * 1000,
@@ -838,6 +1216,25 @@ function groupInfoFromResponse(value: unknown): GroupInfo {
   };
 }
 
+/**
+ * Reads the server's 免@ decision. `effective` is authoritative; the legacy 0/1
+ * `no_mention` field carries the same AND-combined value for adapters that predate
+ * it, so an older server that omits `effective` still works. Any other shape is a
+ * schema error, which keeps a bot that must be @mentioned from being let through.
+ */
+function mentionPrefFromResponse(value: unknown): GroupMentionPref {
+  if (!isJsonRecord(value)) {
+    throw new OctoError("Octo group mention preference response has invalid schema");
+  }
+  const effective = value["effective"];
+  if (typeof effective === "boolean") return { effective };
+  const noMention = value["no_mention"];
+  if (typeof noMention === "number" && Number.isFinite(noMention)) {
+    return { effective: noMention === 1 };
+  }
+  throw new OctoError("Octo group mention preference response has invalid schema");
+}
+
 function memberFromResponse(value: unknown, label: string): GroupMember {
   if (!isJsonRecord(value)) {
     throw new OctoError(`Octo ${label} response has invalid schema`);
@@ -903,8 +1300,8 @@ function threadsFromResponse(value: unknown): ThreadSummary[] {
 
 /**
  * `POST /v1/bot/messages/sync` answers with base64-encoded JSON payloads that follow the
- * same `{type, content}` shape as WS frames. Rows that are not group text from another
- * sender are skipped individually, so one malformed row cannot fail the whole page.
+ * same shape as WS frames. Rows are skipped individually when they carry no extractable
+ * text or come from the bot itself, so one malformed row cannot fail the whole page.
  */
 function historyFromResponse(value: unknown, botUid: string): HistoryMessage[] {
   if (!isJsonRecord(value) || !Array.isArray(value.messages)) {
@@ -929,9 +1326,11 @@ function historyMessage(value: unknown, botUid: string): HistoryMessage | undefi
   if (!Number.isSafeInteger(timestamp) || (timestamp as number) <= 0) return undefined;
   if (typeof payload !== "string") return undefined;
   const envelope = decodedHistoryPayload(payload);
-  if (!isJsonRecord(envelope) || envelope.type !== TEXT_MESSAGE_TYPE) return undefined;
-  const text = typeof envelope.content === "string" ? envelope.content : "";
-  if (text.length === 0) return undefined;
+  if (!isJsonRecord(envelope)) return undefined;
+  // Same type table as the live path, text only: history never downloads attachments and
+  // never checks URLs, so a stale or relative reference cannot trigger network work.
+  const text = messageContent(envelope)?.text ?? "";
+  if (text.trim().length === 0) return undefined;
   return {
     seq: seq as number,
     senderId,
@@ -1297,6 +1696,111 @@ export class OctoTransport implements ChannelTransport {
     return historyFromResponse(parseJson(response.body, "message sync"), this.registration?.uid ?? "");
   }
 
+  /**
+   * Streams one inbound attachment to `path` and returns the stored byte count. A message
+   * that was already accepted once reuses the file left by that delivery instead of
+   * downloading again, and a failed transfer leaves neither a partial file nor a temp file.
+   */
+  async downloadAttachment(request: AttachmentDownload): Promise<number> {
+    const stored = await storedBytes(request.path);
+    if (stored > 0) return stored;
+    const url = absoluteHttpUrl(request.url);
+    if (url === undefined) {
+      throw new AttachmentError("failed", "Octo attachment URL is not an absolute http(s) URL");
+    }
+    const deadline = requestDeadline(request.signal, ATTACHMENT_DOWNLOAD_TIMEOUT_MS);
+    const temporary = `${request.path}.part-${randomBytes(ATTACHMENT_PART_BYTES).toString("hex")}`;
+    try {
+      await mkdir(dirname(request.path), { recursive: true, mode: 0o700 });
+      const response = await fetch(url, { signal: deadline.signal, redirect: "follow" });
+      if (response.status < 200 || response.status >= 300) {
+        throw new AttachmentError("failed", `Octo attachment download answered HTTP ${response.status}`);
+      }
+      const declared = Number(response.headers.get("content-length"));
+      if (Number.isFinite(declared) && declared > request.maxBytes) {
+        throw new AttachmentError(
+          "oversize",
+          `Octo attachment declares ${declared} bytes, over the ${request.maxBytes} byte limit`,
+        );
+      }
+      if (!response.body) throw new AttachmentError("failed", "Octo attachment response has no body");
+      const handle = await open(temporary, "w", 0o600);
+      let written = 0;
+      try {
+        const reader = response.body.getReader();
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          written += chunk.value.byteLength;
+          if (written > request.maxBytes) {
+            throw new AttachmentError("oversize", `Octo attachment exceeds the ${request.maxBytes} byte limit`);
+          }
+          let offset = 0;
+          while (offset < chunk.value.byteLength) {
+            const { bytesWritten } = await handle.write(
+              chunk.value,
+              offset,
+              chunk.value.byteLength - offset,
+            );
+            if (bytesWritten <= 0) throw new AttachmentError("failed", "Octo attachment write stalled");
+            offset += bytesWritten;
+          }
+        }
+      } finally {
+        await handle.close();
+      }
+      // Only a fully written file becomes the attachment a task prompt may point at.
+      await rename(temporary, request.path);
+      return written;
+    } catch (error) {
+      await rm(temporary, { force: true }).catch(() => undefined);
+      if (error instanceof AttachmentError) throw error;
+      if (deadline.timedOut() || deadline.aborted()) {
+        throw new AttachmentError("timeout", "Octo attachment download timed out");
+      }
+      throw new AttachmentError("failed", "Octo attachment download failed");
+    } finally {
+      deadline.release();
+    }
+  }
+
+  /**
+   * Best-effort server-side transcription of a saved audio file. The endpoint forwards to
+   * the deployment's ASR service; when that service is missing or unhappy the audio file
+   * still reaches the agent, so every failure degrades to "no transcription".
+   */
+  async transcribeAudio(path: string, signal?: AbortSignal): Promise<string | null> {
+    const deadline = requestDeadline(signal, ATTACHMENT_DOWNLOAD_TIMEOUT_MS);
+    try {
+      // Real voice notes are small; anything past the cap is not worth buffering into memory
+      // and no ASR service would accept it.
+      if ((await stat(path)).size > MAX_TRANSCRIBE_BYTES) return null;
+      const audio = await readFile(path);
+      const name = basename(path);
+      const contentType = AUDIO_CONTENT_TYPES[extname(name).toLowerCase()] ?? "application/octet-stream";
+      const form = new FormData();
+      form.append("mode", "edit");
+      form.append("audio", new Blob([audio], { type: contentType }), name);
+      const response = await fetch(apiUrl(this.apiBase, "/v1/bot/voice/transcribe"), {
+        method: "POST",
+        headers: authHeaders(this.botToken),
+        body: form,
+        signal: deadline.signal,
+      });
+      // Drain the body either way: an unread stream would hold the connection open.
+      const body = await readBody(response, MAX_HTTP_BODY_BYTES);
+      if (response.status < 200 || response.status >= 300) return null;
+      const value = parseJson(body, "voice transcribe");
+      if (!isJsonRecord(value)) return null;
+      const text = textField(value.text);
+      return text.trim().length > 0 ? text : null;
+    } catch {
+      return null;
+    } finally {
+      deadline.release();
+    }
+  }
+
   async getGroupContext(target: ChatTarget): Promise<GroupContext | null> {
     validateTarget(target);
     if (target.channelType === 1) return null;
@@ -1339,6 +1843,20 @@ export class OctoTransport implements ChannelTransport {
         this.botToken,
         "group info",
         groupPath(groupId),
+        "GET",
+        undefined,
+        signal,
+      ),
+    );
+  }
+
+  async getGroupMentionPref(groupId: string, signal?: AbortSignal): Promise<GroupMentionPref> {
+    return mentionPrefFromResponse(
+      await botApiRequest(
+        this.apiBase,
+        this.botToken,
+        "group mention preference",
+        `${groupPath(groupId)}/mention_pref`,
         "GET",
         undefined,
         signal,

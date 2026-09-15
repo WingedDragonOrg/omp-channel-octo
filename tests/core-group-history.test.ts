@@ -835,3 +835,53 @@ test("accounts a steered message so the next turn never sends it back", async ()
     await closeCoreHarness(harness);
   }
 });
+
+test("a live image message contributes only its caption to history and downloads nothing", async () => {
+  const harness = await createCoreHarness({
+    groupHistory: { enabled: true, maxMessages: 5 },
+    allowedGroupIds: GROUP_IDS,
+  });
+  const image = (url: string, name: string) => ({
+    url,
+    kind: "image" as const,
+    name,
+    size: 12,
+    durationSeconds: 0,
+  });
+  try {
+    await deliverGroupMessages(harness, 1, 2);
+    // 实时缓冲走同一张类型表：带 caption 的图片按 caption 渲染。
+    await harness.service.handleInbound(inbound({
+      ...GROUP,
+      senderId: "member-2",
+      text: "这是设计稿",
+      attachments: [image("https://cdn.example.test/design.png", "design.png")],
+      messageSeq: 3,
+      messageTimestamp: T0 + 3 * 60_000,
+    }));
+    // 无 caption 的图片没有可渲染文本，只贡献覆盖。
+    await harness.service.handleInbound(inbound({
+      ...GROUP,
+      senderId: "member-2",
+      text: "",
+      attachments: [image("https://cdn.example.test/bare.png", "bare.png")],
+      messageSeq: 4,
+      messageTimestamp: T0 + 4 * 60_000,
+    }));
+
+    await harness.service.handleInbound(triggerMessage(harness, 5, "@bot 看下这张图"));
+    await waitForTask(harness, 1);
+
+    const prompt = harness.workers.prompts[0]!.text;
+    expect(historyLinesOf(prompt)).toEqual([
+      expectedLine(1, "群消息 1"),
+      expectedLine(2, "群消息 2"),
+      expectedLine(3, "这是设计稿", "member-2"),
+    ]);
+    expect(prompt).not.toContain("bare.png");
+    // 非 owner 的历史消息永不触发下载。
+    expect(harness.transport.downloadRequests).toHaveLength(0);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});

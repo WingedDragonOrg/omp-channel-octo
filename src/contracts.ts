@@ -6,11 +6,40 @@ export interface ChatTarget {
   channelType: 1 | 2 | 5;
 }
 
+export type InboundAttachmentKind = "image" | "file" | "audio" | "video";
+
+/**
+ * One downloadable object carried by an inbound message. `url` is always an absolute
+ * http/https URL; relative or otherwise unusable references never produce an entry.
+ */
+export interface InboundAttachment {
+  url: string;
+  kind: InboundAttachmentKind;
+  /** Client-declared name; empty when the client sent none. */
+  name: string;
+  /** Client-declared byte size; `0` when unknown. Only used for the pre-download size check. */
+  size: number;
+  /** Client-declared duration in seconds for audio/video; `0` when unknown. */
+  durationSeconds: number;
+}
+
+/** One attachment download performed by the transport. */
+export interface AttachmentDownload {
+  url: string;
+  path: string;
+  maxBytes: number;
+  signal?: AbortSignal;
+}
+
 export interface InboundMessage extends ChatTarget {
   messageId: string;
   senderId: string;
+  /** Text extractable from this message; empty for media without caption. */
   text: string;
   mentionedUserIds: string[];
+  /** Attachments carried by this message, already filtered to absolute http/https URLs. */
+  attachments: InboundAttachment[];
+  /** True when the message yields usable input: non-empty text or at least one attachment. */
   supported: boolean;
   /**
    * Per-channel monotonic WuKongIM sequence of this message. `0` means the
@@ -67,6 +96,10 @@ export interface ChannelTransport {
   ): Promise<void>;
   /** Group/thread history page; rejects when the server call fails. */
   fetchGroupMessages(target: ChatTarget, fetch: HistoryFetch): Promise<HistoryMessage[]>;
+  /** Downloads one inbound attachment to `path`; returns the stored byte count. */
+  downloadAttachment(request: AttachmentDownload): Promise<number>;
+  /** Best-effort Octo server-side transcription of a saved audio file; `null` when unavailable. */
+  transcribeAudio(path: string, signal?: AbortSignal): Promise<string | null>;
   getGroupContext(target: ChatTarget): Promise<GroupContext | null>;
   updateGroupContext(
     target: ChatTarget,
@@ -74,6 +107,8 @@ export interface ChannelTransport {
     signal?: AbortSignal,
   ): Promise<{ version: number }>;
   getGroupInfo(groupId: string, signal?: AbortSignal): Promise<GroupInfo>;
+  /** Group-level 免@ decision as the server computes it; rejects when the call fails. */
+  getGroupMentionPref(groupId: string, signal?: AbortSignal): Promise<GroupMentionPref>;
   getGroupMembers(groupId: string, signal?: AbortSignal): Promise<GroupMember[]>;
   updateGroupInfo(
     groupId: string,
@@ -142,6 +177,16 @@ export interface GroupInfo {
 export interface GroupInfoPatch {
   name?: string;
   notice?: string;
+}
+
+/**
+ * Per-group 免@ decision. The server AND-combines the bot owner's intent
+ * (`bot_mention_pref.no_mention`) with the group's own `allow_no_mention` switch,
+ * and reports the result in `effective`; only `effective` decides whether the bot
+ * may answer a group message without an @mention.
+ */
+export interface GroupMentionPref {
+  effective: boolean;
 }
 
 export interface GroupMember {
@@ -252,6 +297,14 @@ export interface CoreServiceConfig {
   homeDir?: string;
   /** `parseConfig` always supplies this (defaults to enabled with `maxMessages = 50`); omitting it disables history. */
   groupHistory?: GroupHistoryConfig;
+  /** Inbound attachment pipeline; `parseConfig` always supplies it (defaults to enabled, 25 MiB). */
+  attachments?: AttachmentConfig;
+}
+
+export interface AttachmentConfig {
+  enabled: boolean;
+  /** Per-attachment byte ceiling; also the pre-download check against the client-declared size. */
+  maxBytes: number;
 }
 
 export type ChatExecutionState =

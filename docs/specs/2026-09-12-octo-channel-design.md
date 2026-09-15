@@ -10,9 +10,9 @@
 
 ## 范围
 
-包含个人单 Bot、单服务实例、文本指令与回复、执行状态、新建会话、指定目录、取消、会话恢复、消息去重和连接重建。支持私聊、指定群及 CommunityTopic 线程（channelType=5）内明确 @Bot 的指令；支持群/线程共享说明、线程默认继承父群工作目录、群/线程对话历史的增量上下文注入（详细设计见 `docs/specs/2026-09-16-group-history-context-design.md`）、出站文件和持久化问答。
+包含个人单 Bot、单服务实例、文本指令与回复、执行状态、新建会话、指定目录、取消、会话恢复、消息去重和连接重建。支持私聊、指定群及 CommunityTopic 线程（channelType=5）内明确 @Bot 的指令；支持群/线程共享说明、线程默认继承父群工作目录、群/线程对话历史的增量上下文注入（详细设计见 `docs/specs/2026-09-16-group-history-context-design.md`）、常见入站消息类型的内容提取与附件接收（详细设计见 `docs/specs/2026-09-16-inbound-message-content-design.md`）、出站文件和持久化问答。
 
-不包含终端会话接管、多用户服务、通用网络 Agent gateway、文档评论任务、服务端通用 bot_task、群历史归档与检索、通用附件接收和交互 callback 系统。channel 仅提供由 OMP host tool 明确发起的出站图片/文件发送，以及由能力 profile 明确启用的 Octo raw type17 `octo/v1` AdaptiveCard 1.5 非交互进度展示。收到不支持的消息类型应明确告知，不作为成功执行。范围以个人 IM 交互为准，不继承参考适配器的其他任务入口。
+不包含终端会话接管、多用户服务、通用网络 Agent gateway、文档评论任务、服务端通用 bot_task、群历史归档与检索、出站附件之外的通用文件托管和交互 callback 系统。channel 仅提供由 OMP host tool 明确发起的出站图片/文件发送，以及由能力 profile 明确启用的 Octo raw type17 `octo/v1` AdaptiveCard 1.5 非交互进度展示。收到的入站消息按已确认的类型表提取内容，贴纸、系统与 CMD 等没有内容的类型明确告知，不作为成功执行。范围以个人 IM 交互为准，不继承参考适配器的其他任务入口。
 
 ## 已知约束与资料
 
@@ -37,6 +37,7 @@
 | 调度 | 同会话串行，同规范化目录串行；迁移同时持有真实源、目标目录 lease | 避免 channel 内任务同时修改同一目录 |
 | 故障 | 保存历史，不自动重跑已交付 Agent 的任务 | 工具副作用无法安全推断或回滚 |
 | 共享说明 | 按持久 OMP session 与聊天目标绑定 version；首次或 version 变化时注入，普通未变化 turn 不注入 | 降低重复输入并保持群/线程隔离；压缩生命周期单独负责恢复 |
+| 入站内容 | 按已确认类型表提取文本；媒体附件下载到状态目录后以本机绝对路径交给 Agent；贴纸、系统与 CMD 等仍明确告知不支持 | 让常见消息真正可驱动 Agent，同时保持权限门、单一体积上限和可解释的拒绝行为 |
 
 ## 设计
 
@@ -59,7 +60,7 @@ launchctl bootout "gui/$(id -u)/com.omp.channel-octo"
 
 ### 入站权限与路由
 
-路由键为 Bot 身份、聊天类型和真实聊天 ID 的组合，不使用昵称。私聊（channelType=1）在已有持久 owner 时必须来自 owner；未配置且尚无持久 owner 时，仅支持的非空文本、`senderId` 与 `messageId` 非空且发送者非 Bot 的首条有效私聊可原子绑定 owner，并只确认不执行任务。传输层可能携带 `owner@bot` 形式的 raw channel ID，但归一后的 `channelId` 与 `senderId` 始终取真实发送者 UID，`owner@bot` 只属于传输层 ID。群（channelType=2）和 CommunityTopic 线程（channelType=5）同时要求 owner、允许列表命中的真实 channel ID、结构化 mention 指向当前 Bot，且不会触发首次认领。线程的允许关系继承父群：允许列表里有该线程的完整真实 channel ID，或父群 ID（`____` 之前的段）在允许列表里，都算命中，因此白名单群下新建的线程无需额外配置即可对话；不在允许列表的群及其线程仍一律拒绝。文本中的名字或 @ 字符串不能替代 mention 元数据。目录继承复用父群绑定的 cwd，允许关系继承只决定该线程能否发起任务，两者都不改变 owner 判定、共享说明隔离或线程自身的绑定。先验证，再处理所有命令和普通消息。Bot 自发消息、其他成员消息、其他任务入口均不触发 Agent。
+路由键为 Bot 身份、聊天类型和真实聊天 ID 的组合，不使用昵称。私聊（channelType=1）在已有持久 owner 时必须来自 owner；未配置且尚无持久 owner 时，仅支持的非空文本、`senderId` 与 `messageId` 非空且发送者非 Bot 的首条有效私聊可原子绑定 owner，并只确认不执行任务。传输层可能携带 `owner@bot` 形式的 raw channel ID，但归一后的 `channelId` 与 `senderId` 始终取真实发送者 UID，`owner@bot` 只属于传输层 ID。群（channelType=2）和 CommunityTopic 线程（channelType=5）同时要求 owner、允许列表命中的真实 channel ID、结构化 mention 指向当前 Bot，且不会触发首次认领。群级免@开启时不再要求 mention：`GET /v1/bot/groups/{group_no}/mention_pref` 的 `effective` 由服务端把 bot owner 的免@意图与群级 `allow_no_mention` 开关 AND 后给出，为真时该群及其线程接受未 @Bot 的消息——这是群设置本身授予的豁免，不是 channel 放宽权限。判定按群缓存 60 秒（线程用父群 ID）；查询失败或响应不符合契约时保持「必须 @Bot」，并只做短暂负缓存，避免上游故障拖住入站处理。免@只解除 mention 条件，owner、允许列表、Bot 回声过滤与首次认领规则都不变。线程的允许关系继承父群：允许列表里有该线程的完整真实 channel ID，或父群 ID（`____` 之前的段）在允许列表里，都算命中，因此白名单群下新建的线程无需额外配置即可对话；不在允许列表的群及其线程仍一律拒绝。文本中的名字或 @ 字符串不能替代 mention 元数据。目录继承复用父群绑定的 cwd，允许关系继承只决定该线程能否发起任务，两者都不改变 owner 判定、共享说明隔离或线程自身的绑定。先验证，再处理所有命令和普通消息。Bot 自发消息、其他成员消息、其他任务入口均不触发 Agent。
 
 入站记录绑定原始聊天、发送者、消息 ID、会话 ID 和目录；之后回复只使用该记录，不读取可变的“当前聊天”。群和线程输出对成员可见，不发送完整工具原始结果、模型思考或系统上下文；发送助手可见正文与真实工具执行的简短进度。进度不作为普通聊天文字，而是在首次真实工具进度时懒建同一张可编辑卡，后续按最新状态编辑；卡片不可用或状态接口故障不得阻断正文。助手正文仍可能包含用户明确要求的文件内容，不承诺自动识别所有敏感信息。
 
@@ -193,6 +194,8 @@ Octo 断线不取消已经开始的 Agent；正文 outbox 与任务状态持久�
 
 23. 追加模式按聊天目标持久化并在重启后保留，默认 `steer`：`steer` 模式下运行中收到的普通文本经持久 claim 后作为 OMP `steer` 注入当前回合，不新增任务、正文消息或进度卡；`/mode queue` 后同一文本走 durable acceptance 成为排队任务，独立正文与进度卡；`/queue <文本>` 在任何模式下都走排队任务；没有运行中的回合、回合已结束或 OMP 拒绝该帧时该文本回退为排队任务而不丢失；同一 messageId 重投只注入一次。`/interrupt` 中止运行中回合并保留该回合已追加的消息及其后的排队任务，worker 进程不被终止；回合因中止结束且无后续真实事件时任务记为 interrupted、进度卡记为 cancelled，回合继续产出时正常结算。`/stop` 与 `/cancel` 等价，清除排队任务与未消费的追加消息。
 
+24. 群级免@：服务端 `mention_pref.effective` 为真时，owner 在该群及其线程发送的未 @Bot 文本正常启动任务；`effective` 为假、查询失败或响应不可解析时不启动任务、不回复也不落任何入站副作用；同一个群在 60 秒缓存窗口内只查询一次，带 mention 的消息不触发查询；非 owner、不在允许列表或 Bot 回声在任何情况下都不产生该查询。
+
 ## 实施前提与未决事项
 既有实现已完成 `/new`/`/reset` 目录绑定、原生 `/move`、精确外部 session 恢复、正文 outbox、执行 tracker、卡片和生命周期边界；共享说明采用 session/version/OMP lifecycle context 设计；线程默认继承父群工作目录已实现：`src/thread-target.ts` 是线程目标父群解析的单一来源，传输层 `contextPath` 与服务的默认目录解析都经它取父群 ID。
 未决事项：无。线程默认目录继承已按验收 3/4/22 落地并验证（见下）；真实 OMP compaction、删除 version、崩溃重放和凭证隔离验证仍按共享说明章节的验收补做。
@@ -221,3 +224,5 @@ bun run launchd -- install --config ~/.config/omp-channel-octo/config.json
 
 线程默认继承父群工作目录的验收证据：核心矩阵 `tests/thread-cwd-inheritance.test.ts` 覆盖父群继承、父群无绑定 / channel ID 无合法父群段 / 父群目录已删除三类回退、`/new` 无参继承与后续沿用、线程会话建立后固定、未验证会话重解析并写回、显式目录覆盖、以及 DM/群既有语义保持，共 10 例；把 `src/service.ts` 回退到修改前版本时其中 5 例失败，单独移除父群分支或移除父群 cwd 不可用时的静默回退分别使 6 例、1 例失败，确认用例不是空转。真实进程验收在 `tests/cli-lifecycle.test.ts`：真实 CLI + 加密协议夹具 + 真实 SQLite 下，父群 `@Bot /new` 建立目录后，线程任务以该目录启动真实 worker 子进程（夹具日志的 startup cwd 恰为该继承目录）、线程按 `/v1/bot/groups/<group>/threads/<thread>/md` 读取自己的 `THREAD.md`、`/status` 报告继承 cwd，并在 SIGTERM 重启后保持。
 线程允许关系继承与派发的验收证据：`tests/core-host-tools.test.ts` 的 "threads inherit the parent group allowlist without their own entry" 覆盖父群在允许列表时其线程无需额外条目即可执行、父群不在允许列表时线程仍被拒绝并保持 `none`；"thread dispatch queues the task in the target thread and reports it in both chats" 覆盖 `create-thread` + `thread-dispatch` 在目标线程接受真实任务（继承父群 cwd、与父群任务同目录串行）、线程与发起群各收到一条可见说明、以及被派发的任务其 `octo_management` 动作集不再包含 `thread-dispatch`。把允许命中回退为只比较完整 channel ID 并移除派发深度守卫后，这两个用例分别失败，确认用例不是空转。
+
+群级免@的验收证据：`tests/core-mention-pref.test.ts` 覆盖 `effective` 为真时未 @Bot 的群消息与线程消息各启动一个任务、为假或查询失败时保持不启动且不回复、同一个群两次未 @Bot 只查询一次而带 mention 的消息不查询、被 owner/允许列表/Bot 回声规则先拒的消息零查询；`tests/octo-transport.test.ts` 的 "reads the group 免@ decision, including the legacy no_mention shape" 用真实 HTTP 夹具断言端点路径与 Bot 鉴权头，覆盖 `effective` 布尔与旧版 `no_mention` 0/1 两种形状，以及不可解析响应被拒。把 `isAllowed` 的免@分支摘掉后 `tests/core-mention-pref.test.ts` 有 4 例失败，确认用例不是空转。线上只读实测（本群）：`GET /v1/bot/groups/e3bc5af0d4b84b18bb3770a74bd222c6/mention_pref` 返回 `{"no_mention":0,"group_allow_no_mention":1,"effective":false}`，即群开关已允许、bot owner 尚未开启，因此本群当前仍需 @Bot。

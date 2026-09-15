@@ -3,6 +3,7 @@ import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "n
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import type {
+  AttachmentDownload,
   BotIdentity,
   ChannelCommandHandler,
   ChannelService,
@@ -15,6 +16,7 @@ import type {
   GroupInfo,
   GroupInfoPatch,
   GroupMember,
+  GroupMentionPref,
   HistoryFetch,
   HistoryMessage,
   InboundMessage,
@@ -29,6 +31,7 @@ import type {
   WorkerOptions,
   WorkerProcess,
 } from "../../src/contracts";
+import { AttachmentError } from "../../src/attachments";
 import {
   contextSidecarPath,
   normalizeGroupContext,
@@ -103,6 +106,16 @@ export class FakeTransport implements ChannelTransport {
   readonly groupContextCalls: ChatTarget[] = [];
   readonly managementCalls: Array<{ action: string; groupId: string; shortId: string | null }> = [];
   readonly historyCalls: Array<{ target: ChatTarget } & HistoryFetch> = [];
+  readonly attachmentBodies = new Map<string, Uint8Array>();
+  readonly downloadRequests: Array<{ url: string; path: string; maxBytes: number }> = [];
+  readonly transcriptionRequests: string[] = [];
+  readonly transcriptionByPath = new Map<string, string>();
+  /** Groups whose 免@ decision was asked for, in call order. */
+  readonly mentionPrefCalls: string[] = [];
+  /** When set, `downloadAttachment` throws this instead of consulting `attachmentBodies`. */
+  attachmentFailure: AttachmentError | undefined;
+  /** When set, `transcribeAudio` throws this instead of consulting `transcriptionByPath`. */
+  transcriptionError: Error | undefined;
   readonly bot: BotIdentity;
   online: boolean;
   maxConcurrentTextRequests = 0;
@@ -110,6 +123,8 @@ export class FakeTransport implements ChannelTransport {
   private readonly startOnline: boolean;
   private readonly contexts = new Map<string, GroupContext | null>();
   private readonly histories = new Map<string, HistoryMessage[]>();
+  private readonly mentionPrefs = new Map<string, GroupMentionPref>();
+  private mentionPrefFailure: Error | undefined;
   private historyFailure: Error | undefined;
   private readonly attemptWaiters: Array<{
     predicate: (attempt: TransportAttempt) => boolean;
@@ -249,6 +264,26 @@ export class FakeTransport implements ChannelTransport {
   async getGroupInfo(groupId: string, signal?: AbortSignal): Promise<GroupInfo> {
     this.recordManagement("group-info", groupId, null, signal);
     return this.groupInfoFor(groupId);
+  }
+
+  /**
+   * 免@ decision for one group. Groups with nothing set answer `effective: false`, so a
+   * test only opts into the exemption it is about; `signal` is honoured like the real one.
+   */
+  async getGroupMentionPref(groupId: string, signal?: AbortSignal): Promise<GroupMentionPref> {
+    if (signal?.aborted) throw new Error("fixture mention preference aborted");
+    this.mentionPrefCalls.push(groupId);
+    if (this.mentionPrefFailure) throw this.mentionPrefFailure;
+    return this.mentionPrefs.get(groupId) ?? { effective: false };
+  }
+
+  setGroupMentionPref(groupId: string, pref: GroupMentionPref): void {
+    this.mentionPrefs.set(groupId, pref);
+  }
+
+  /** Passing `undefined` clears the failure so later lookups succeed again. */
+  failGroupMentionPrefWith(error?: Error): void {
+    this.mentionPrefFailure = error;
   }
 
   async getGroupMembers(groupId: string, signal?: AbortSignal): Promise<GroupMember[]> {
@@ -481,6 +516,33 @@ export class FakeTransport implements ChannelTransport {
     this.fileAttempts.push(file);
     this.sentFiles.push(file);
     return { messageId: clientMsgNo };
+  }
+
+  /**
+   * Resolves one attachment from `attachmentBodies` and writes it locally; no network request
+   * is made. `attachmentFailure` wins over the unknown-URL and oversize checks.
+   */
+  async downloadAttachment(request: AttachmentDownload): Promise<number> {
+    this.downloadRequests.push({ url: request.url, path: request.path, maxBytes: request.maxBytes });
+    if (request.signal?.aborted) {
+      throw new AttachmentError("failed", "fixture attachment download aborted");
+    }
+    if (this.attachmentFailure) throw this.attachmentFailure;
+    const body = this.attachmentBodies.get(request.url);
+    if (!body) throw new AttachmentError("failed", `fixture has no body for ${request.url}`);
+    if (body.byteLength > request.maxBytes) {
+      throw new AttachmentError("oversize", `fixture attachment exceeds ${request.maxBytes} bytes`);
+    }
+    await writeFile(request.path, body);
+    return body.byteLength;
+  }
+
+  /** Returns the transcription registered for `path`, `null` when none, or `transcriptionError`. */
+  async transcribeAudio(path: string, signal?: AbortSignal): Promise<string | null> {
+    this.transcriptionRequests.push(path);
+    if (signal?.aborted) throw new Error("fixture transcription aborted");
+    if (this.transcriptionError) throw this.transcriptionError;
+    return this.transcriptionByPath.get(path) ?? null;
   }
 
   async stop(): Promise<void> {
@@ -991,6 +1053,7 @@ export function inbound(
     senderId: "owner-1",
     text: "perform fixture work",
     mentionedUserIds: [],
+    attachments: [],
     supported: true,
     messageSeq: 0,
     messageTimestamp: 0,

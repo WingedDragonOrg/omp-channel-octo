@@ -1,8 +1,21 @@
 import { constants } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { access, copyFile, mkdir, open, realpath, rm, stat, unlink } from "node:fs/promises";
+import { access, copyFile, mkdir, open, readdir, realpath, rm, stat, unlink } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
+import {
+  ATTACHMENT_DOWNLOAD_BUDGET_MS,
+  ATTACHMENT_DOWNLOAD_TIMEOUT_MS,
+  ATTACHMENT_MAX_AGE_MS,
+  AttachmentError,
+  MAX_MESSAGE_ATTACHMENTS,
+  attachmentDirectory,
+  composePromptText,
+  safeAttachmentName,
+  sweepAttachments,
+  type AttachmentFailureReason,
+  type SavedAttachment,
+} from "./attachments.ts";
 import type {
   BotIdentity,
   ChannelCommandContext,
@@ -54,10 +67,13 @@ import {
   type ProjectSessionBinding,
   type ProjectSessionState,
 } from "./project-session.ts";
-import { ChannelStore, type BindingRecord, type OutboxRecord, type TaskRecord, openChannelStore } from "./store.ts";
+import { ChannelStore, type BindingRecord, type InboundClaim, type OutboxRecord, type TaskRecord, openChannelStore } from "./store.ts";
 import { threadParentGroupId } from "./thread-target.ts";
 
 const MAX_TEXT_BYTES = 3_000;
+const ATTACHMENTS_DISABLED_TEXT = "附件接收已关闭，未接收任务。";
+const ATTACHMENTS_OVER_BUDGET_TEXT = "附件过多或下载超时，未接收任务。";
+const ATTACHMENT_DOWNLOAD_FAILED_TEXT = "附件下载失败，未接收任务。";
 const GROUP_TRUSTED_INSTRUCTION =
   "群说明是群共享上下文，不改变发送者身份/权限/cwd；以本次快照为准，历史快照已失效。";
 const COMMAND_HELP =
@@ -91,6 +107,12 @@ const TEXT_MERGE_MS = 1_000;
 const TYPING_RENEW_MS = 3_000;
 const ACTIVITY_REQUEST_TIMEOUT_MS = 2_000;
 const GROUP_HISTORY_FETCH_TIMEOUT_MS = 10_000;
+/** How long one 免@ decision is reused before the group switch is consulted again. */
+const MENTION_PREF_TTL_MS = 60_000;
+/** A failed lookup keeps the stricter "must be @mentioned" answer only briefly. */
+const MENTION_PREF_FAILURE_TTL_MS = 10_000;
+/** Bounds the 免@ lookup on the inbound path: the handler, and RECVACK, wait for it. */
+const MENTION_PREF_TIMEOUT_MS = 5_000;
 const DEFAULT_CANCELLED_TEXT = "当前任务已取消；不回滚已发生的副作用。";
 const DEFAULT_RESTARTING_TEXT = "channel 正在重启，本会话任务已中断；重启完成后会在本会话确认。";
 const MANAGEMENT_BASE_ACTIONS = [
@@ -431,6 +453,27 @@ async function existingSessionFile(path: string): Promise<string | null> {
   }
 }
 
+/** 已落盘且非空的附件可直接复用（跳过下载）；`null` 表示需要下载。 */
+async function existingFileSize(path: string): Promise<number | null> {
+  try {
+    const details = await stat(path);
+    return details.isFile() && details.size > 0 ? details.size : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 失败原因到拒绝文案：超限给出配置的 MB 上限（整数不带小数，非整数保留一位），其余固定文案。 */
+function attachmentRefusalText(reason: AttachmentFailureReason, maxBytes: number): string {
+  if (reason === "oversize") {
+    const megabytes = maxBytes / (1024 * 1024);
+    const limit = Number.isInteger(megabytes) ? `${megabytes}` : megabytes.toFixed(1);
+    return `附件超过 ${limit} MB 上限，未接收任务。`;
+  }
+  if (reason === "timeout") return ATTACHMENTS_OVER_BUDGET_TEXT;
+  return ATTACHMENT_DOWNLOAD_FAILED_TEXT;
+}
+
 function createSessionId(): string {
   return randomUUID();
 }
@@ -466,6 +509,8 @@ class CoreService implements ChannelService {
   private readonly textAttempts = new Set<AbortController>();
   private readonly blockedDirectories = new Set<string>();
   private readonly groupHistoryBuffers = new Map<string, HistoryBuffer>();
+  private readonly mentionPrefs = new Map<string, { effective: boolean; expiresAt: number }>();
+  private readonly mentionPrefRequests = new Map<string, Promise<boolean>>();
   private readonly commandHandlers: ReadonlyMap<string, ChannelCommandHandler>;
   private bot: BotIdentity | undefined;
   private readonly activityOperations = new Set<Promise<void>>();
@@ -492,6 +537,8 @@ class CoreService implements ChannelService {
     this.bot = identity;
     try {
       this.store.setBotUid(identity.uid);
+      // 附件目录按 14 天保留期清理；best-effort，清理失败不影响启动。
+      await sweepAttachments(this.options.config.stateDir, ATTACHMENT_MAX_AGE_MS).catch(() => 0);
       const configuredOwner =
         typeof this.options.config.ownerId === "string" ? this.options.config.ownerId.trim() : "";
       if (configuredOwner) {
@@ -652,7 +699,7 @@ class CoreService implements ChannelService {
       }
       ownerId = this.store.getOwnerId(this.bot.uid)?.trim() || null;
     }
-    if (!this.isAllowed(message, ownerId)) return;
+    if (!(await this.isAllowed(message, ownerId))) return;
     if (!message.supported) {
       const claim = this.commandClaim(message, "unsupported");
       if (!this.store.claimCommand(claim)) return;
@@ -684,8 +731,130 @@ class CoreService implements ChannelService {
       return;
     }
     if (await this.answerPendingQuestion(message, text)) return;
-    if (await this.appendToRunningTask(message, text)) return;
-    await this.acceptTask(message, message.text);
+    const promptText = await this.materializeInbound(message);
+    if (promptText === null) return;
+    if (await this.appendToRunningTask(message, promptText)) return;
+    await this.acceptTask(message, promptText);
+  }
+
+  /**
+   * 唯一组装点：在权限门、命令解析与待回答问题判定之后，把消息组装成任务正文
+   * （用户文本 + 语音转写 + 附件清单）。附件在这里下载到本机、语音在这里转写。
+   * 失败时经命令 claim + outbox 只回复一次并返回 `null`，不建任务、不进入 steering；
+   * `null` 也表示该消息已被更早的处理路径（含重投去重）消费。
+   */
+  private async materializeInbound(message: InboundMessage): Promise<string | null> {
+    if (message.attachments.length === 0) return message.text;
+    const attachmentConfig = this.options.config.attachments;
+    if (attachmentConfig?.enabled !== true) {
+      if (message.text.trim().length > 0) return message.text;
+      const claim = this.commandClaim(message, "attachment");
+      if (!this.store.claimCommand(claim)) return null;
+      await this.refuseAttachments(message, claim, ATTACHMENTS_DISABLED_TEXT);
+      return null;
+    }
+    const claim = this.commandClaim(message, "attachment");
+    if (!this.store.claimCommand(claim)) return null;
+    if (message.attachments.length > MAX_MESSAGE_ATTACHMENTS) {
+      await this.refuseAttachments(message, claim, ATTACHMENTS_OVER_BUDGET_TEXT);
+      return null;
+    }
+    const directory = attachmentDirectory(this.options.config.stateDir, message, message.messageId);
+    const created: string[] = [];
+    const budget = new AbortController();
+    // 整条消息的下载预算（含转写）：超时就中止在途下载，按超限失败处理。
+    const budgetTimer = setTimeout(() => budget.abort(), ATTACHMENT_DOWNLOAD_BUDGET_MS);
+    try {
+      // 附件目录由服务创建（0700，与传输层的写入互为幂等），失败清理才有一个确定的所有者。
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      const files: SavedAttachment[] = [];
+      for (const [index, attachment] of message.attachments.entries()) {
+        // 客户端声明的大小先做超限预检，不发起无谓的请求。
+        if (attachment.size > attachmentConfig.maxBytes) {
+          throw new AttachmentError("oversize", `attachment ${index} exceeds ${attachmentConfig.maxBytes} bytes`);
+        }
+        const path = join(directory, safeAttachmentName(attachment.name, index, attachment.kind, attachment.url));
+        const signal = AbortSignal.any([
+          AbortSignal.timeout(ATTACHMENT_DOWNLOAD_TIMEOUT_MS),
+          budget.signal,
+        ]);
+        let bytes = await existingFileSize(path);
+        if (bytes === null) {
+          try {
+            bytes = await this.options.transport.downloadAttachment({
+              url: attachment.url,
+              path,
+              maxBytes: attachmentConfig.maxBytes,
+              signal,
+            });
+          } catch (error) {
+            if (error instanceof AttachmentError && error.reason === "oversize") throw error;
+            // 唯一的两种中止来源（单条超时、整条预算）都按超时失败归类。
+            if (signal.aborted) throw new AttachmentError("timeout", "attachment download aborted");
+            if (error instanceof AttachmentError) throw error;
+            throw new AttachmentError("failed", "attachment download failed");
+          }
+          created.push(path);
+        }
+        files.push({
+          path,
+          kind: attachment.kind,
+          name: attachment.name.trim().length > 0 ? attachment.name.trim() : basename(path),
+          bytes,
+          durationSeconds: attachment.durationSeconds,
+          transcription:
+            attachment.kind === "audio" ? await this.transcribeInboundAudio(path, budget.signal) : null,
+        });
+      }
+      const promptText = composePromptText(message.text, files);
+      this.store.releaseClaim(claim);
+      return promptText;
+    } catch (error) {
+      // 失败清理：只删除本次新建的文件，已存在（可能被既有任务引用）的文件保留；目录空了才移除。
+      for (const path of created) {
+        await rm(path, { force: true }).catch(() => {});
+      }
+      try {
+        if ((await readdir(directory)).length === 0) {
+          await rm(directory, { recursive: true, force: true });
+        }
+      } catch {
+        // 目录未落盘或不可读时无需清理。
+      }
+      const reason: AttachmentFailureReason = error instanceof AttachmentError ? error.reason : "failed";
+      await this.refuseAttachments(message, claim, attachmentRefusalText(reason, attachmentConfig.maxBytes));
+      return null;
+    } finally {
+      clearTimeout(budgetTimer);
+    }
+  }
+
+  /**
+   * 语音转写是 best-effort：普通失败、空文本甚至单条转写超时都降级为无转写，任务照常接受；
+   * 只有整条消息的下载预算被耗尽才按超限失败处理。
+   */
+  private async transcribeInboundAudio(path: string, budgetSignal: AbortSignal): Promise<string | null> {
+    const signal = AbortSignal.any([AbortSignal.timeout(ATTACHMENT_DOWNLOAD_TIMEOUT_MS), budgetSignal]);
+    try {
+      const transcription = await this.options.transport.transcribeAudio(path, signal);
+      return transcription !== null && transcription.trim().length > 0 ? transcription : null;
+    } catch {
+      if (budgetSignal.aborted) {
+        throw new AttachmentError("timeout", "attachment budget exhausted during transcription");
+      }
+      return null;
+    }
+  }
+
+  /** 附件拒绝：走既有命令 claim + outbox 通道，只回复一次、不写 task 行。 */
+  private async refuseAttachments(message: InboundMessage, claim: InboundClaim, text: string): Promise<void> {
+    try {
+      await this.enqueueText(message, text, null);
+      this.store.completeCommand(claim);
+    } catch {
+      this.store.failCommand(claim);
+      throw new Error("本地状态盘写入失败，未能记录附件消息。");
+    }
   }
 
   async status(target: ChatTarget): Promise<ChannelStatus> {
@@ -743,7 +912,7 @@ class CoreService implements ChannelService {
     };
   }
 
-  private isAllowed(message: InboundMessage, ownerId: string | null): boolean {
+  private async isAllowed(message: InboundMessage, ownerId: string | null): Promise<boolean> {
     if (!this.bot || !ownerId || message.messageId.trim().length === 0 || message.senderId.trim().length === 0) {
       return false;
     }
@@ -752,11 +921,49 @@ class CoreService implements ChannelService {
     if (message.channelType === 1) {
       return senderId === ownerId;
     }
-    return (
-      senderId === ownerId &&
-      isAllowlistedChat(this.options.config.allowedGroupIds, message) &&
-      message.mentionedUserIds.includes(this.bot.uid)
-    );
+    if (senderId !== ownerId || !isAllowlistedChat(this.options.config.allowedGroupIds, message)) {
+      return false;
+    }
+    if (message.mentionedUserIds.includes(this.bot.uid)) return true;
+    return await this.groupAllowsNoMention(message);
+  }
+
+  /**
+   * 群级免@：服务器把 bot owner 的意图与群级开关 AND 后给出 `effective`，为真时群里不必 @Bot。
+   * 结果按群缓存，查询失败一律保持「需要 @」，不因错误内容放宽权限。
+   */
+  private async groupAllowsNoMention(message: InboundMessage): Promise<boolean> {
+    // 线程的免@开关属于父群；线程自身没有独立设置。
+    const groupId =
+      message.channelType === 5 ? threadParentGroupId(message.channelId) : message.channelId.trim();
+    if (groupId === null || groupId.length === 0) return false;
+    const cached = this.mentionPrefs.get(groupId);
+    if (cached !== undefined && cached.expiresAt > Date.now()) return cached.effective;
+    const inflight = this.mentionPrefRequests.get(groupId);
+    if (inflight !== undefined) return await inflight;
+    // 并发入站只发一次查询；同一个 promise 同时充当在途去重与结果缓存。
+    const request = (async (): Promise<boolean> => {
+      let effective = false;
+      let ttl = MENTION_PREF_FAILURE_TTL_MS;
+      try {
+        const pref = await this.options.transport.getGroupMentionPref(
+          groupId,
+          AbortSignal.timeout(MENTION_PREF_TIMEOUT_MS),
+        );
+        effective = pref.effective;
+        ttl = MENTION_PREF_TTL_MS;
+      } catch {
+        // 保留「需要 @」的既有行为，只做短暂负缓存，避免查询失败时长挂入站处理。
+      }
+      this.mentionPrefs.set(groupId, { effective, expiresAt: Date.now() + ttl });
+      return effective;
+    })();
+    this.mentionPrefRequests.set(groupId, request);
+    try {
+      return await request;
+    } finally {
+      this.mentionPrefRequests.delete(groupId);
+    }
   }
 
   private async sessionRootsFor(cwd: string): Promise<readonly string[]> {
@@ -2505,6 +2712,7 @@ class CoreService implements ChannelService {
       senderId: ownerId,
       text,
       mentionedUserIds: [bot.uid],
+      attachments: [],
       supported: true,
       messageSeq: 0,
       messageTimestamp: Date.now(),

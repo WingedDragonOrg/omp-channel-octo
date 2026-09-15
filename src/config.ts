@@ -2,7 +2,7 @@ import { constants as fsConstants } from "node:fs";
 import { access, chmod, mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, normalize, resolve } from "node:path";
-import type { CoreServiceConfig, GroupHistoryConfig } from "./contracts.ts";
+import type { AttachmentConfig, CoreServiceConfig, GroupHistoryConfig } from "./contracts.ts";
 
 export const DEFAULT_CONFIG_PATH = "~/.config/omp-channel-octo/config.json";
 export const DEFAULT_BOT_TOKEN_ENV = "OCTO_BOT_TOKEN";
@@ -22,6 +22,7 @@ const CONFIG_KEYS = new Set([
   "cancelTimeoutMs",
   "restart",
   "groupHistory",
+  "attachments",
 ]);
 const TOKEN_ENV_PATTERN = /^(?:OCTO_|OMP_CHANNEL_OCTO_)[A-Za-z_][A-Za-z0-9_]*$/u;
 const MIN_TIMEOUT_MS = 100;
@@ -29,6 +30,9 @@ const MAX_TIMEOUT_MS = 300_000;
 const DEFAULT_GROUP_HISTORY_MAX_MESSAGES = 50;
 const MIN_GROUP_HISTORY_MESSAGES = 1;
 const MAX_GROUP_HISTORY_MESSAGES = 200;
+const DEFAULT_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
+const MIN_ATTACHMENT_MAX_BYTES = 1024;
+const MAX_ATTACHMENT_MAX_BYTES = 1024 * 1024 * 1024;
 
 export interface AppConfig extends CoreServiceConfig {
   apiUrl: string;
@@ -44,6 +48,8 @@ export interface AppConfig extends CoreServiceConfig {
   restartCommand?: string[];
   /** Group/thread history injection; defaults to enabled with 50 messages. */
   groupHistory: GroupHistoryConfig;
+  /** Inbound attachment pipeline; defaults to enabled with a 25 MiB per-attachment ceiling. */
+  attachments: AttachmentConfig;
 }
 
 export interface ConfigParseOptions {
@@ -155,6 +161,32 @@ function parseGroupHistory(value: unknown): GroupHistoryConfig {
   return { enabled, maxMessages };
 }
 
+function parseAttachments(value: unknown): AttachmentConfig {
+  if (value === undefined) return { enabled: true, maxBytes: DEFAULT_ATTACHMENT_MAX_BYTES };
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw configError("attachments 必须是 JSON 对象");
+  }
+  const document = value as Record<string, unknown>;
+  for (const key of Object.keys(document)) {
+    if (key !== "enabled" && key !== "maxBytes") throw configError(`不支持字段 attachments.${key}`);
+  }
+  const enabled = document.enabled === undefined ? true : document.enabled;
+  if (typeof enabled !== "boolean") throw configError("attachments.enabled 必须是布尔值");
+  if (document.maxBytes === undefined) return { enabled, maxBytes: DEFAULT_ATTACHMENT_MAX_BYTES };
+  const maxBytes = document.maxBytes;
+  if (
+    typeof maxBytes !== "number"
+    || !Number.isInteger(maxBytes)
+    || maxBytes < MIN_ATTACHMENT_MAX_BYTES
+    || maxBytes > MAX_ATTACHMENT_MAX_BYTES
+  ) {
+    throw configError(
+      `attachments.maxBytes 必须是 ${MIN_ATTACHMENT_MAX_BYTES} 到 ${MAX_ATTACHMENT_MAX_BYTES} 的整数`,
+    );
+  }
+  return { enabled, maxBytes };
+}
+
 function parseRestartCommand(value: unknown): string[] | undefined {
   if (value === undefined) return undefined;
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -223,6 +255,7 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
   const cancelTimeoutMs = parseTimeout(document.cancelTimeoutMs, "cancelTimeoutMs");
   const restartCommand = parseRestartCommand(document.restart);
   const groupHistory = parseGroupHistory(document.groupHistory);
+  const attachments = parseAttachments(document.attachments);
 
   return {
     apiUrl,
@@ -239,6 +272,7 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
     ...(cancelTimeoutMs === undefined ? {} : { cancelTimeoutMs }),
     ...(restartCommand === undefined ? {} : { restartCommand }),
     groupHistory,
+    attachments,
   };
 }
 
@@ -301,5 +335,6 @@ export function toCoreConfig(config: AppConfig): CoreServiceConfig {
     allowedGroupIds: [...config.allowedGroupIds],
     stateDir: config.stateDir,
     groupHistory: { ...config.groupHistory },
+    attachments: { ...config.attachments },
   };
 }

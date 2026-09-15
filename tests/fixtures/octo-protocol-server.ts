@@ -117,6 +117,7 @@ type ManagementRoute =
   | { kind: "group-info"; groupId: string }
   | { kind: "group-members"; groupId: string }
   | { kind: "group-info-update"; groupId: string }
+  | { kind: "group-mention-pref"; groupId: string }
   | { kind: "thread-list"; groupId: string }
   | { kind: "thread-create"; groupId: string }
   | { kind: "thread-info"; groupId: string; shortId: string }
@@ -173,6 +174,14 @@ export interface FixtureUploadRequest {
   contentDisposition: string | undefined;
   body: Buffer;
   accepted: boolean;
+}
+
+export interface FixtureTranscriptionRequest {
+  path: string;
+  authorization: string | undefined;
+  contentType: string | undefined;
+  /** Raw multipart body, so tests can assert the `mode` and `audio` parts. */
+  body: Buffer;
 }
 
 export interface OctoProtocolFixtureOptions {
@@ -242,6 +251,11 @@ export interface FixtureInboundMessage {
   channelType: 1 | 2 | 5;
   text: string;
   mention?: Record<string, unknown>;
+  /**
+   * Full payload override. When supplied it replaces the default `{ type: 1, content }`
+   * body and `text` is ignored; a separately supplied `mention` is still merged on top.
+   */
+  payload?: Record<string, unknown>;
   messageId?: string;
   messageSeq?: number;
   timestamp?: number;
@@ -470,11 +484,13 @@ function encodeInboundFrame(
   const messageId = message.messageId ?? "9007199254740993";
   const messageSeq = message.messageSeq ?? 1;
   const timestamp = message.timestamp ?? Math.floor(Date.now() / 1000);
-  const payload: Record<string, unknown> = {
-    type: 1,
-    content: message.text,
-    ...(message.mention ? { mention: message.mention } : {}),
-  };
+  const payload: Record<string, unknown> = message.payload
+    ? { ...message.payload, ...(message.mention ? { mention: message.mention } : {}) }
+    : {
+      type: 1,
+      content: message.text,
+      ...(message.mention ? { mention: message.mention } : {}),
+    };
   const body = new Writer()
     .byte(0)
     .string("")
@@ -520,6 +536,8 @@ export class OctoProtocolFixture {
   readonly managementRequests: FixtureManagementRequest[] = [];
   readonly presignRequests: FixturePresignRequest[] = [];
   readonly uploadRequests: FixtureUploadRequest[] = [];
+  readonly transcriptionRequests: FixtureTranscriptionRequest[] = [];
+  readonly downloadRequests: Array<{ path: string; authorization: string | undefined }> = [];
   readonly connections: FixtureConnection[] = [];
   readonly apiUrl: string;
   readonly wsUrl: string;
@@ -537,6 +555,12 @@ export class OctoProtocolFixture {
     contentType: string;
     contentDisposition: string | undefined;
   }>();
+  private readonly downloads = new Map<string, {
+    body: Buffer;
+    contentType: string;
+    status: number;
+    location: string | undefined;
+  }>();
   private registerCount = 0;
   private uploadCount = 0;
   private nextMessageId = FIRST_MESSAGE_ID;
@@ -545,6 +569,8 @@ export class OctoProtocolFixture {
   private nextThreadSequence = 0;
   private messageSyncStatus = 200;
   private messageSyncBody: unknown = { messages: [] };
+  private transcriptionStatus = 200;
+  private transcriptionBody: unknown = { status: 200, text: "fixture transcription" };
   private started = false;
 
   private constructor(options: OctoProtocolFixtureOptions, httpServer: Server, wsServer: WebSocketServer, port: number) {
@@ -649,6 +675,33 @@ export class OctoProtocolFixture {
     this.messageSyncStatus = status;
   }
 
+  /**
+   * Registers the body served by GET /fixture-download/<key>. Unregistered keys answer 404;
+   * a non-200 status answers with that status and an empty body, plus a `location` header when
+   * one is supplied so tests can exercise redirect following.
+   */
+  serveDownload(
+    key: string,
+    options: { body: Uint8Array | string; contentType?: string; status?: number; location?: string },
+  ): void {
+    this.downloads.set(key, {
+      body: typeof options.body === "string" ? Buffer.from(options.body, "utf8") : Buffer.from(options.body),
+      contentType: options.contentType ?? "application/octet-stream",
+      status: options.status ?? 200,
+      location: options.location,
+    });
+  }
+
+  /**
+   * Response returned by POST /v1/bot/voice/transcribe; defaults to `{ status: 200, text }`.
+   * Objects are JSON-serialized; a string is written verbatim so tests can exercise malformed-JSON
+   * handling. Non-2xx statuses answer with a JSON error body instead.
+   */
+  setTranscription(body: unknown, status = 200): void {
+    this.transcriptionBody = body;
+    this.transcriptionStatus = status;
+  }
+
   private managementRouteFor(method: string, pathname: string): ManagementRoute | null {
     const group = /^\/v1\/bot\/groups\/([^/]+)$/.exec(pathname);
     if (group?.[1] !== undefined && method === "GET") {
@@ -661,6 +714,10 @@ export class OctoProtocolFixture {
     const info = /^\/v1\/bot\/groups\/([^/]+)\/info$/.exec(pathname);
     if (info?.[1] !== undefined && method === "PUT") {
       return { kind: "group-info-update", groupId: decodeURIComponent(info[1]) };
+    }
+    const pref = /^\/v1\/bot\/groups\/([^/]+)\/mention_pref$/.exec(pathname);
+    if (pref?.[1] !== undefined && method === "GET") {
+      return { kind: "group-mention-pref", groupId: decodeURIComponent(pref[1]) };
     }
     const threads = /^\/v1\/bot\/groups\/([^/]+)\/threads$/.exec(pathname);
     if (threads?.[1] !== undefined) {
@@ -715,6 +772,11 @@ export class OctoProtocolFixture {
           { uid: OWNER_UID, name: "Fixture Owner", role: 1, robot: 0, created_at: FIXTURE_MANAGEMENT_CREATED_AT },
           { uid: BOT_UID, name: BOT_NAME, role: 0, robot: 1, created_at: FIXTURE_MANAGEMENT_CREATED_AT },
         ]);
+        return;
+      }
+      case "group-mention-pref": {
+        // 默认与群开关允许、bot owner 尚未开启的线上默认一致：仍需 @Bot。
+        writeJson(response, 200, { no_mention: 0, group_allow_no_mention: 1, effective: false });
         return;
       }
       case "group-info-update": {
@@ -816,12 +878,37 @@ export class OctoProtocolFixture {
     const url = new URL(request.url ?? "/", this.apiUrl);
     const rawRequestBody = await readRawBody(request);
     const uploadPath = request.method === "PUT" && url.pathname.startsWith("/fixture-upload/");
-    const parsedBody = uploadPath
+    const transcriptionPath = request.method === "POST" && url.pathname === "/v1/bot/voice/transcribe";
+    const parsedBody = uploadPath || transcriptionPath
       ? {}
       : rawRequestBody.byteLength > 0
         ? JSON.parse(rawRequestBody.toString("utf8")) as Record<string, unknown>
         : {};
     const authorization = request.headers.authorization;
+
+    if (request.method === "GET" && url.pathname.startsWith("/fixture-download/")) {
+      const key = decodeURIComponent(url.pathname.slice("/fixture-download/".length));
+      this.downloadRequests.push({ path: `${url.pathname}${url.search}`, authorization });
+      const download = this.downloads.get(key);
+      if (!download) {
+        writeJson(response, 404, { error: "not found" });
+        return;
+      }
+      if (download.status !== 200) {
+        response.writeHead(
+          download.status,
+          download.location === undefined ? {} : { location: download.location },
+        );
+        response.end();
+        return;
+      }
+      response.writeHead(200, {
+        "content-type": download.contentType,
+        "content-length": String(download.body.byteLength),
+      });
+      response.end(download.body);
+      return;
+    }
 
     if (request.method === "POST" && url.pathname === "/v1/bot/register") {
       this.registerRequests.push({ path: `${url.pathname}${url.search}`, authorization, body: parsedBody });
@@ -920,6 +1007,32 @@ export class OctoProtocolFixture {
         return;
       }
       writeJson(response, 200, { ok: true });
+      return;
+    }
+
+    if (transcriptionPath) {
+      this.transcriptionRequests.push({
+        path: url.pathname,
+        authorization,
+        contentType: typeof request.headers["content-type"] === "string"
+          ? request.headers["content-type"]
+          : undefined,
+        body: rawRequestBody,
+      });
+      if (authorization !== `Bearer ${BOT_TOKEN}`) {
+        writeJson(response, 401, { error: "invalid bot token" });
+        return;
+      }
+      if (this.transcriptionStatus < 200 || this.transcriptionStatus >= 300) {
+        writeJson(response, this.transcriptionStatus, { error: "transcription failed" });
+        return;
+      }
+      response.writeHead(this.transcriptionStatus, { "content-type": "application/json" });
+      response.end(
+        typeof this.transcriptionBody === "string"
+          ? this.transcriptionBody
+          : JSON.stringify(this.transcriptionBody),
+      );
       return;
     }
 

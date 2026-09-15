@@ -5,6 +5,7 @@
   "ompCommand": "omp",
   "stateDir": "~/.local/state/omp-channel-octo",
   "groupHistory": { "enabled": true, "maxMessages": 50 },
+  "attachments": { "enabled": true, "maxBytes": 26214400 },
   "restart": {
     "command": ["super", "-y", "restart", "omp-channel-octo"]
   }

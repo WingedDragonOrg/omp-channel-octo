@@ -122,13 +122,55 @@ test("group history rejects unknown fields and non-object values", () => {
   }
 });
 
-test("config.example.json stays parseable and documents the group history defaults", () => {
+test("attachments default to enabled with a 25 MiB ceiling", () => {
+  expect(toCoreConfig(parseConfig(configDocument())).attachments)
+    .toEqual({ enabled: true, maxBytes: 26_214_400 });
+  expect(toCoreConfig(parseConfig(configDocument({ attachments: {} }))).attachments)
+    .toEqual({ enabled: true, maxBytes: 26_214_400 });
+  // 只配上限不等于关掉：enabled 仍取默认值 true
+  expect(toCoreConfig(parseConfig(configDocument({ attachments: { maxBytes: 1024 } }))).attachments)
+    .toEqual({ enabled: true, maxBytes: 1024 });
+});
+
+test("attachments pass an explicit enabled flag and ceiling through", () => {
+  expect(toCoreConfig(parseConfig(configDocument({
+    attachments: { enabled: false, maxBytes: 1024 },
+  }))).attachments).toEqual({ enabled: false, maxBytes: 1024 });
+  expect(toCoreConfig(parseConfig(configDocument({
+    attachments: { maxBytes: 1_073_741_824 },
+  }))).attachments).toEqual({ enabled: true, maxBytes: 1_073_741_824 });
+});
+
+test("attachments reject an out-of-range or non-integer byte ceiling", () => {
+  for (const maxBytes of [0, 512, 1_073_741_825, 1024.5, "1024", null]) {
+    expect(() => parseConfig(configDocument({ attachments: { maxBytes } })))
+      .toThrow(/maxBytes/);
+  }
+});
+
+test("attachments reject a non-boolean enabled flag", () => {
+  for (const enabled of ["true", 1, null]) {
+    expect(() => parseConfig(configDocument({ attachments: { enabled } }))).toThrow(/enabled/);
+  }
+});
+
+test("attachments reject unknown fields and non-object values", () => {
+  expect(() => parseConfig(configDocument({ attachments: { enabled: true, foo: 1 } })))
+    .toThrow(/attachments\.foo/);
+  for (const attachments of [[], "on", null, 3]) {
+    expect(() => parseConfig(configDocument({ attachments }))).toThrow(/attachments/);
+  }
+});
+
+test("config.example.json stays parseable and documents the group history and attachment defaults", () => {
   const example = JSON.parse(
     readFileSync(new URL("../config.example.json", import.meta.url), "utf8"),
   ) as Record<string, unknown>;
   expect(example.groupHistory).toEqual({ enabled: true, maxMessages: 50 });
-  expect(toCoreConfig(parseConfig(example, { env: { OCTO_BOT_TOKEN: "example-token" } })).groupHistory)
-    .toEqual({ enabled: true, maxMessages: 50 });
+  expect(example.attachments).toEqual({ enabled: true, maxBytes: 26_214_400 });
+  const parsed = toCoreConfig(parseConfig(example, { env: { OCTO_BOT_TOKEN: "example-token" } }));
+  expect(parsed.groupHistory).toEqual({ enabled: true, maxMessages: 50 });
+  expect(parsed.attachments).toEqual({ enabled: true, maxBytes: 26_214_400 });
 });
 
 test("config still requires credentials and all other required fields", () => {
