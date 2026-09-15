@@ -75,6 +75,8 @@ bun run launchd -- uninstall --plist "$HOME/Library/LaunchAgents/com.omp.channel
 
 `launchd install` writes a private plist and does not call `launchctl`; loading and unloading are explicit operational steps. The generated plist uses the resolved OMP executable path and restrictive permissions.
 
+The resident service on this host is managed by Super: the stack at `~/.super/conf/conf.d/omp-channel-octo.toml` runs `bun run src/cli.ts serve --config ~/.config/omp-channel-octo/config.json` from the checkout, with `OCTO_BOT_TOKEN` sourced from `.envrc`. The private config holds the live values and `config.example.json` is only the template they are copied from. Apply stack edits with `super apply -f ~/.super/conf/conf.d/omp-channel-octo.toml`, then use `./restart.sh` to restart the service and wait for it to report healthy.
+
 ## Code Conventions & Common Patterns
 
 - Use strict TypeScript contracts from `src/contracts.ts` and explicit dependency injection through `createChannelService`, `createOctoTransport`, `createWorkerFactory`, and option interfaces. Keep transport, persistence, worker, and presentation seams independently testable.
@@ -100,7 +102,7 @@ bun run launchd -- uninstall --plist "$HOME/Library/LaunchAgents/com.omp.channel
 - `src/execution-card.ts` — `createExecutionTracker` and `buildExecutionCard`.
 - `src/group-history.ts` — history buffer, sync planner, window selection, and prompt-block rendering.
 - `src/launchd.ts` — plist generation, atomic installation, permission enforcement, and uninstall.
-- `config.example.json` — safe configuration template and the config this deployment serves from; defaults to the Octo API, `OCTO_BOT_TOKEN`, `allowedGroupIds` holding this deployment's group, `omp`, `~/.local/state/omp-channel-octo`, and an enabled `groupHistory` block (`{ "enabled": true, "maxMessages": 50 }`).
+- `config.example.json` — safe configuration template for the private `~/.config/omp-channel-octo/config.json` the resident service serves from; defaults to the Octo API, `OCTO_BOT_TOKEN`, no allowed groups, `omp`, `~/.local/state/omp-channel-octo`, and an enabled `groupHistory` block (`{ "enabled": true, "maxMessages": 50 }`).
 - `tests/fixtures/core-fakes.ts`, `octo-protocol-server.ts`, and `omp-rpc-worker.ts` — the primary deterministic, encrypted-protocol, and real-child test harnesses.
 
 ## Runtime/Tooling Preferences
