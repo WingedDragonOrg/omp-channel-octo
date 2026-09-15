@@ -1092,7 +1092,7 @@ function makeTimelineItems(
       type: "Container",
       id: "timeline_omitted_steps",
       isVisible: false,
-      style: "emphasis",
+      style: "default",
       spacing: "Small",
       items: omittedTools.map(tool => makeCompactToolRow(tool)),
     });
