@@ -197,7 +197,10 @@ const SUBAGENT_TOOL_NAMES: Record<string, true> = {
 const ADAPTIVE_CARD_SCHEMA = "http://adaptivecards.io/schemas/adaptive-card.json";
 const REQUIRED_ELEMENTS = ["TextBlock"] as const;
 const TOGGLE_ACTION = "Action.ToggleVisibility";
-const STATUS_GLYPH = "●";
+const SUCCESS_GLYPH = "✓";
+const WAITING_GLYPH = "-";
+const FAILURE_GLYPH = "❌";
+const RUNNING_GLYPH = "●";
 const WAITING_TOOL_NAMES: Record<string, true> = {
   subagent_await: true,
   wait: true,
@@ -559,14 +562,23 @@ function executionStateLabel(state: ExecutionState): string {
   }
 }
 
-function toolStateGlyph(state: ExecutionToolState): string {
+function executionStateGlyph(state: ExecutionState | ExecutionToolState): string {
   switch (state) {
     case "running":
+      return RUNNING_GLYPH;
+    case "completed":
     case "succeeded":
+      return SUCCESS_GLYPH;
     case "failed":
+      return FAILURE_GLYPH;
     case "cancelled":
-      return STATUS_GLYPH;
+      return WAITING_GLYPH;
   }
+}
+
+function toolStateGlyph(tool: ExecutionToolSnapshot): string {
+  if (tool.state === "running" && isWaitingTool(tool.toolName)) return WAITING_GLYPH;
+  return executionStateGlyph(tool.state);
 }
 
 function toolStateLabel(state: ExecutionToolState): string {
@@ -621,29 +633,30 @@ function toolVisualTone(tool: ExecutionToolSnapshot): "Accent" | "Good" | "Atten
   return executionTone(tool.state);
 }
 
-function todoStateLabel(status: TodoStatus): string {
+
+function todoStatusGlyph(status: TodoStatus): string {
   switch (status) {
-    case "pending":
-      return "等待";
     case "in_progress":
-      return "进行中";
+      return RUNNING_GLYPH;
     case "completed":
-      return "已完成";
+      return SUCCESS_GLYPH;
     case "abandoned":
-      return "已放弃";
+      return FAILURE_GLYPH;
+    case "pending":
     case "blocked":
-      return "已阻塞";
+      return WAITING_GLYPH;
   }
 }
 
-function todoTone(status: TodoStatus): "Accent" | "Good" | "Default" {
+function todoTone(status: TodoStatus): "Accent" | "Good" | "Attention" | "Default" {
   switch (status) {
     case "in_progress":
       return "Accent";
     case "completed":
       return "Good";
-    case "pending":
     case "abandoned":
+      return "Attention";
+    case "pending":
     case "blocked":
       return "Default";
   }
@@ -667,7 +680,7 @@ function errorCategoryLabel(category: ExecutionErrorCategory): string {
 }
 
 function toolLine(tool: ExecutionToolSnapshot, includeGlyph = false): string {
-  const parts = includeGlyph ? [toolStateGlyph(tool.state), displayToolName(tool.toolName)] : [displayToolName(tool.toolName)];
+  const parts = includeGlyph ? [toolStateGlyph(tool), displayToolName(tool.toolName)] : [displayToolName(tool.toolName)];
   if (tool.summary) parts.push(tool.summary);
   parts.push(toolStatusLabel(tool));
   if (tool.state === "failed" && tool.errorCategory) parts.push(errorCategoryLabel(tool.errorCategory));
@@ -690,7 +703,7 @@ function todoTaskText(
   const phaseIndent = phaseIndex === phaseCount - 1 ? "   " : "│  ";
   const branch = taskIndex === taskCount - 1 ? "└─" : "├─";
   const blocker = task.blocker === undefined ? "" : ` · ${task.blocker}`;
-  return `${phaseIndent}${branch} ${STATUS_GLYPH} [${todoStateLabel(task.status)}] ${task.content}${blocker}`;
+  return `${phaseIndent}${branch} ${todoStatusGlyph(task.status)} ${task.content}${blocker}`;
 }
 
 function todoLines(
@@ -791,7 +804,7 @@ function makeToolRow(
         type: "Column",
         width: "auto",
         verticalContentAlignment: "Center",
-        items: [makeTextBlock(STATUS_GLYPH, {
+        items: [makeTextBlock(toolStateGlyph(tool), {
           spacing: "None",
           color: tone,
           size: "Medium",
@@ -1213,6 +1226,7 @@ function makeStatusContainer(
   richLayout: boolean,
 ): JsonNode {
   const status = executionStateLabel(snapshot.state);
+  const glyph = executionStateGlyph(snapshot.state);
   const tone = executionTone(snapshot.state);
   if (richLayout) {
     return {
@@ -1228,7 +1242,7 @@ function makeStatusContainer(
               type: "Column",
               width: "auto",
               verticalContentAlignment: "Center",
-              items: [makeTextBlock(STATUS_GLYPH, { color: tone, size: "Medium", spacing: "None" })],
+              items: [makeTextBlock(glyph, { color: tone, size: "Medium", spacing: "None" })],
             },
             {
               type: "Column",
@@ -1261,7 +1275,7 @@ function makeStatusContainer(
     id: "execution_status",
     spacing: "Medium",
     items: [
-      makeTextBlock(`${STATUS_GLYPH} ${status}`, { color: tone, weight: "Bolder", spacing: "None" }),
+      makeTextBlock(`${glyph} ${status}`, { color: tone, weight: "Bolder", spacing: "None" }),
       makeTextBlock(metrics, { isSubtle: true, size: "Small", spacing: "Small" }),
     ],
   };
@@ -1284,8 +1298,8 @@ function executionNotice(
   if (blockedCount > 0) {
     return {
       text: firstBlocker === undefined
-        ? `${STATUS_GLYPH} ${blockedCount} 个任务等待处理`
-        : `${STATUS_GLYPH} ${blockedCount} 个任务等待处理 · ${firstBlocker}`,
+        ? `${WAITING_GLYPH} ${blockedCount} 个任务等待处理`
+        : `${WAITING_GLYPH} ${blockedCount} 个任务等待处理 · ${firstBlocker}`,
       style: "default",
     };
   }
@@ -1299,7 +1313,7 @@ function executionNotice(
   }
   if (failedCount > 0) {
     return {
-      text: `${STATUS_GLYPH} ${failedCount} 个步骤失败 · ${errorCategoryLabel(firstError ?? "unknown")}`,
+      text: `${FAILURE_GLYPH} ${failedCount} 个步骤失败 · ${errorCategoryLabel(firstError ?? "unknown")}`,
       style: "attention",
     };
   }
@@ -1440,7 +1454,7 @@ function buildCandidate(
   } else {
     body.push(
       ...makeHeader(false),
-      makeTextBlock(`${STATUS_GLYPH} ${executionStateLabel(snapshot.state)}`, {
+      makeTextBlock(`${executionStateGlyph(snapshot.state)} ${executionStateLabel(snapshot.state)}`, {
         weight: "Bolder",
         color: executionTone(snapshot.state),
         spacing: "Medium",

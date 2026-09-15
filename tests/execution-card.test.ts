@@ -282,10 +282,10 @@ describe("execution tracker", () => {
     expect(blockedRendered).not.toBeNull();
     expect(cardText(blockedRendered!.card as JsonRecord)).toContain("等待授权");
     expect(cardText(blockedRendered!.card as JsonRecord)).toContain("├─ Foundation");
-    expect(cardText(blockedRendered!.card as JsonRecord)).toContain("│  ├─ ● [进行中] Wire storage");
-    expect(cardText(blockedRendered!.card as JsonRecord)).toContain("│  └─ ● [已阻塞] Wait for access · 等待授权");
+    expect(cardText(blockedRendered!.card as JsonRecord)).toContain("│  ├─ ● Wire storage");
+    expect(cardText(blockedRendered!.card as JsonRecord)).toContain("│  └─ - Wait for access · 等待授权");
     expect(cardText(blockedRendered!.card as JsonRecord)).toContain("└─ Verification");
-    expect(cardText(blockedRendered!.card as JsonRecord)).toContain("   └─ ● [等待] Run checks");
+    expect(cardText(blockedRendered!.card as JsonRecord)).toContain("   └─ - Run checks");
     expect(blockedRendered!.plain).toContain("├─ Foundation");
 
     const updatedPhases = [
@@ -310,6 +310,15 @@ describe("execution tracker", () => {
     expect(text).toContain("Wire storage");
     expect(text).toContain("Wait for access");
     expect(text).toContain("Run checks");
+    expect(text).toContain("├─ Foundation");
+    expect(text).toContain("│  ├─ ✓ Wire storage");
+    expect(text).toContain("│  └─ ❌ Wait for access");
+    expect(text).toContain("   └─ ● Run checks");
+    expect(text).not.toContain("[已完成]");
+    expect(text).not.toContain("[进行中]");
+    expect(text).not.toContain("[等待]");
+    expect(text).not.toContain("[已阻塞]");
+    expect(text).not.toContain("[已放弃]");
     expect(text).not.toContain("等待授权");
   });
 
@@ -804,7 +813,9 @@ describe("execution card rendering", () => {
       && cardText(node).includes("完成步骤")
     ));
     expect(completedRow).toBeDefined();
-    expect(completedNodes.filter(node => node.text === "●").every(node => node.color === "Good")).toBe(true);
+    const completedGlyphs = completedNodes.filter(node => node.text === "✓");
+    expect(completedGlyphs).toHaveLength(2);
+    expect(completedGlyphs.every(node => node.color === "Good")).toBe(true);
 
     const waitingTracker = createExecutionTracker({ runId: "colors-waiting" });
     startTurn(waitingTracker, "turn-1", 0);
@@ -818,7 +829,7 @@ describe("execution card rendering", () => {
       && cardText(node).includes("等待子代理")
     ));
     expect(waitingRow).toBeDefined();
-    const waitingGlyph = waitingNodes.find(node => node.text === "●" && node.color === "Default");
+    const waitingGlyph = waitingNodes.find(node => node.text === "-" && node.color === "Default");
     expect(waitingGlyph).toBeDefined();
     const waitingStatus = nodes(waitingRow!).find(node => (
       typeof node.text === "string" && node.text.startsWith("等待 · ")
@@ -841,8 +852,8 @@ describe("execution card rendering", () => {
     );
     expect(failed).not.toBeNull();
     const failedNodes = nodes(failed!.card as JsonRecord);
-    expect(failedNodes.filter(node => node.text === "●")).toHaveLength(2);
-    expect(failedNodes.filter(node => node.text === "●").every(node => node.color === "Attention")).toBe(true);
+    expect(failedNodes.filter(node => node.text === "❌")).toHaveLength(2);
+    expect(failedNodes.filter(node => node.text === "❌").every(node => node.color === "Attention")).toBe(true);
     const failedRow = failedNodes.find(node => (
       node.type === "Container"
       && node.style === "attention"
