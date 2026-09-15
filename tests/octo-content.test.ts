@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createServer, type Server } from "node:http";
-import { mkdtemp, open as openFile, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, open as openFile, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AttachmentError } from "../src/attachments.ts";
@@ -525,6 +525,45 @@ describe("Octo inbound attachment download", () => {
       .toBe(bytes.byteLength);
     expect(current.downloadRequests).toHaveLength(1);
     expect(await readdir(temporaryDirectory)).toEqual(["0-shot.png"]);
+  });
+
+  test("follows a redirect and still enforces the byte limit on the target", async () => {
+    const { current, channel } = await startRegisteredFixture();
+    temporaryDirectory = await mkdtemp(join(tmpdir(), "octo-content-"));
+    const finalBytes = Buffer.alloc(16, 9);
+    current.serveDownload("moved", {
+      body: "",
+      status: 302,
+      location: `${current.apiUrl}/fixture-download/final`,
+    });
+    current.serveDownload("final", { body: finalBytes });
+    const path = join(temporaryDirectory, "redirected.bin");
+
+    expect(await channel.downloadAttachment({
+      url: `${current.apiUrl}/fixture-download/moved`,
+      path,
+      maxBytes: 1_024,
+    })).toBe(finalBytes.byteLength);
+    expect((await readFile(path)).equals(finalBytes)).toBe(true);
+    // 落盘文件是 0600：附件内容对同机其他用户不可读。
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+
+    // 重定向目标超限时仍然拒绝，中间态不落盘。
+    current.serveDownload("big-moved", {
+      body: "",
+      status: 302,
+      location: `${current.apiUrl}/fixture-download/big`,
+    });
+    current.serveDownload("big", { body: Buffer.alloc(4_096, 7) });
+    await expectAttachmentFailure(
+      channel.downloadAttachment({
+        url: `${current.apiUrl}/fixture-download/big-moved`,
+        path: join(temporaryDirectory, "big.bin"),
+        maxBytes: 1_024,
+      }),
+      "oversize",
+    );
+    expect(await readdir(temporaryDirectory)).toEqual(["redirected.bin"]);
   });
 
   test("classifies download failures and leaves no temporary file", async () => {

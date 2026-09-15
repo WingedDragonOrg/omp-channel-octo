@@ -546,7 +546,7 @@ export class FakeTransport implements ChannelTransport {
     if (body.byteLength > request.maxBytes) {
       throw new AttachmentError("oversize", `fixture attachment exceeds ${request.maxBytes} bytes`);
     }
-    await writeFile(request.path, body);
+    await writeFile(request.path, body, { mode: 0o600 });
     return body.byteLength;
   }
 

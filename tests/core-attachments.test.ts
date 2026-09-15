@@ -436,6 +436,31 @@ test("下载失败：回复失败文案、清理空目录、不建任务、重�
   }
 });
 
+test("附件目录与文件权限分别是 0700 与 0600", async () => {
+  const harness = await createAttachmentHarness();
+  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+  const url = "https://cdn.example.test/private.png";
+  harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
+  const message = inbound({
+    messageId: "attach-permissions",
+    ...target,
+    text: "看图",
+    attachments: [attachment(url, "image", "private.png", { size: IMAGE_BYTES.byteLength })],
+  });
+  try {
+    await harness.service.handleInbound(message);
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+
+    const directory = messageDirectory(harness, message, message.messageId);
+    const path = savedPath(harness, target, message.messageId, 0, "private.png", "image", url);
+    // 附件是私有数据：目录同机可读但不可列给别人，文件只有属主可读写。
+    expect((await stat(directory)).mode & 0o777).toBe(0o700);
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+  } finally {
+    await closeAttachmentHarness(harness);
+  }
+});
+
 test("单条附件超时：按「下载失败」文案拒绝，不建任务也不落盘", async () => {
   const harness = await createAttachmentHarness();
   const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
