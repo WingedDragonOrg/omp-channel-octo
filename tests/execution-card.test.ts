@@ -284,19 +284,17 @@ describe("execution tracker", () => {
     const blockedCard = blockedRendered!.card as JsonRecord;
     expect(cardText(blockedCard)).toContain("等待授权");
     const todoDetail = nodeById(blockedCard, "todo_detail");
-    const phaseContainers = (todoDetail.items as JsonRecord[]).filter(item => item.type === "Container");
-    expect(phaseContainers).toHaveLength(2);
-    const foundationItems = phaseContainers[0]?.items as JsonRecord[];
-    expect(foundationItems).toHaveLength(3);
-    const foundationHeader = foundationItems[0]!;
-    expect(foundationHeader.type).toBe("ColumnSet");
+    const todoRows = (todoDetail.items as JsonRecord[]).filter(item => item.type === "ColumnSet");
+    // Two phases flattened into one list of rows: 2 headings and 3 tasks.
+    expect(todoRows).toHaveLength(5);
+    const foundationHeader = todoRows[0]!;
     const phaseColumns = foundationHeader.columns as JsonRecord[];
     expect(phaseColumns).toHaveLength(2);
     expect(cardText(phaseColumns[0]!)).toBe("├─");
     const phasePrefix = (phaseColumns[0]?.items as JsonRecord[])[0]!;
     expect(phasePrefix.fontType).toBe("Monospace");
     expect(cardText(phaseColumns[1]!)).toBe("Foundation");
-    const foundationRows = foundationItems.slice(1);
+    const foundationRows = todoRows.slice(1, 3);
     expect(foundationRows.every(row => row.type === "ColumnSet")).toBe(true);
     const firstTaskColumns = foundationRows[0]?.columns as JsonRecord[];
     expect(firstTaskColumns).toHaveLength(2);
@@ -550,13 +548,23 @@ describe("execution card rendering", () => {
     const timeline = nodeById(card, "timeline_detail");
     expect(subagents).toMatchObject({ type: "Container", isVisible: true });
     const subagentItems = subagents.items as JsonRecord[];
-    const visibleRows = subagentItems.filter(item => item.type === "ColumnSet" && item.isVisible !== false);
-    const hiddenRows = subagentItems.filter(item => item.type === "ColumnSet" && item.isVisible === false);
+    const subagentRows = subagentItems.filter(item => item.type === "ColumnSet");
+    const visibleRows = subagentRows.filter(item => item.isVisible !== false);
+    const hiddenRows = subagentRows.filter(item => item.isVisible === false);
     expect(visibleRows).toHaveLength(2);
     expect(hiddenRows).toHaveLength(2);
     expect(visibleRows.map(row => cardText(row)).join("\n")).toContain("子代理步骤 3");
     expect(visibleRows.map(row => cardText(row)).join("\n")).toContain("子代理步骤 4");
     expect(hiddenRows.map(row => cardText(row)).join("\n")).toContain("子代理步骤 1");
+    for (const row of subagentRows) {
+      const panel = ((row.columns as JsonRecord[])[0]?.items as JsonRecord[])[0]!;
+      expect(panel).toMatchObject({ type: "Container", style: "accent", spacing: "Small" });
+      expect((panel.items as JsonRecord[]).map(item => item.text)).toEqual([
+        expect.stringMatching(/^• 子代理步骤 \d$/),
+        "运行子代理",
+        expect.stringMatching(/^进行中 · /),
+      ]);
+    }
     expect(cardText(timeline)).toContain("src/service.ts");
     expect(cardText(timeline)).not.toContain("子代理步骤 1");
 
@@ -632,46 +640,40 @@ describe("execution card rendering", () => {
     expect(nodes(card).some(node => node.type === "Action.ToggleVisibility")).toBe(false);
   });
 
-  test("renders step panels with an aligned marker, body, and status stack", () => {
-    const tracker = createExecutionTracker({ runId: "tool-row" });
+  test("renders every timeline step with the same panel row", () => {
+    const tracker = createExecutionTracker({ runId: "unified-rows" });
     startTurn(tracker, "turn-1", 0);
-    startTool(tracker, "tool-1", "generate_image", 1_000, "写入文件");
-    const rendered = buildExecutionCard(tracker.snapshot(36_200), fullCapabilities);
+    for (let index = 0; index < 5; index += 1) {
+      const toolCallId = `tool-${index}`;
+      startTool(tracker, toolCallId, "read", index * 10 + 10, `步骤 ${index + 1} 说明`);
+      tracker.apply({ type: "tool_end", toolCallId, atMs: index * 10 + 20, status: "succeeded" });
+    }
+    const rendered = buildExecutionCard(tracker.snapshot(100), fullCapabilities);
     expect(rendered).not.toBeNull();
 
     const timeline = nodeById(rendered!.card as JsonRecord, "timeline_detail");
-    const step = (timeline.items as JsonRecord[]).find(item => item.type === "ColumnSet");
-    expect(step).toBeDefined();
-    if (!step) throw new Error("tool step was not rendered");
-
-    const columns = step.columns as JsonRecord[];
-    expect(columns).toHaveLength(1);
-    expect(columns[0]).toMatchObject({ width: "stretch" });
-
-    const panel = (columns[0]?.items as JsonRecord[])[0];
-    expect(panel).toMatchObject({ type: "Container", style: "accent", spacing: "Small" });
-    const row = nodes(panel!).find(item => item.type === "ColumnSet");
-    expect(row).toMatchObject({ spacing: "None" });
-    const rowColumns = row?.columns as JsonRecord[];
-    expect(rowColumns).toHaveLength(2);
-    expect(rowColumns[0]).toMatchObject({ width: "24px", verticalContentAlignment: "Center" });
-    expect(rowColumns[0]?.items).toEqual([
-      expect.objectContaining({ text: "•", color: "Accent", size: "Small", spacing: "None" }),
-    ]);
-    expect(rowColumns[1]).toMatchObject({ width: "stretch" });
-    expect(rowColumns[1]?.items).toEqual([
-      expect.objectContaining({ text: "写入文件", weight: "Bolder", spacing: "None" }),
-      expect.objectContaining({ text: "generate_image", isSubtle: true, size: "Small", spacing: "None" }),
-      expect.objectContaining({
-        text: "进行中 · 35.2s",
-        isSubtle: true,
-        size: "Small",
-        spacing: "None",
-        color: "Accent",
-      }),
-    ]);
+    const rows = (timeline.items as JsonRecord[]).filter(item => item.type === "ColumnSet");
+    expect(rows).toHaveLength(5);
+    // Collapsed rows keep the newest three visible; order stays chronological.
+    expect(rows.map(row => row.isVisible !== false)).toEqual([false, false, true, true, true]);
+    for (const row of rows) {
+      const columns = row.columns as JsonRecord[];
+      expect(columns).toHaveLength(1);
+      expect(columns[0]).toMatchObject({ width: "stretch" });
+      const panel = (columns[0]?.items as JsonRecord[])[0];
+      expect(panel).toMatchObject({ type: "Container", style: "good", spacing: "Small" });
+      expect((panel!.items as JsonRecord[]).map(item => item.text)).toEqual([
+        expect.stringMatching(/^✓ 步骤 \d 说明$/),
+        "读取文件",
+        expect.stringMatching(/^已完成 · /),
+      ]);
+    }
+    const newestBody = ((rows[4]!.columns as JsonRecord[])[0]!.items as JsonRecord[])[0]!.items as JsonRecord[];
+    expect(newestBody[0]).toMatchObject({ color: "Good", weight: "Bolder", wrap: true });
+    expect(newestBody[1]).toMatchObject({ isSubtle: true, size: "Small" });
+    expect(newestBody[2]).toMatchObject({ color: "Good", isSubtle: true, size: "Small" });
   });
-  test("keeps long timeline summaries in the stretch body column", () => {
+  test("keeps long tool summaries and failure details in one panel row", () => {
     const tracker = createExecutionTracker({ runId: "tool-row-long-summary" });
     startTurn(tracker, "turn-1", 0);
     startTool(tracker, "hub-1", "hub", 1_000, "IRC → preview-agent · 未收到回复");
@@ -689,17 +691,18 @@ describe("execution card rendering", () => {
     const step = (timeline.items as JsonRecord[]).find(item => item.type === "ColumnSet");
     expect(step).toBeDefined();
     if (!step) throw new Error("long-summary tool step was not rendered");
-    const outerColumn = (step.columns as JsonRecord[])[0]!;
-    const panel = (outerColumn.items as JsonRecord[])[0]!;
-    const row = nodes(panel).find(item => item.type === "ColumnSet")!;
-    const rowColumns = row.columns as JsonRecord[];
-    expect(rowColumns).toHaveLength(2);
-    expect(rowColumns[0]).toMatchObject({ width: "24px" });
-    expect((rowColumns[1]?.items as JsonRecord[]).map(item => item.text)).toEqual([
-      "IRC → preview-agent · 未收到回复",
+    const panel = ((step.columns as JsonRecord[])[0]!.items as JsonRecord[])[0]!;
+    expect(panel).toMatchObject({ type: "Container", style: "attention" });
+    expect((panel.items as JsonRecord[]).map(item => item.text)).toEqual([
+      "× IRC → preview-agent · 未收到回复",
       "IRC 协作",
       "失败 · 执行器错误 · 140ms",
     ]);
+    expect((panel.items as JsonRecord[])[0]).toMatchObject({
+      color: "Attention",
+      weight: "Bolder",
+      wrap: true,
+    });
   });
 
   test("keeps todos visible while older execution details expand", () => {
@@ -909,16 +912,16 @@ describe("execution card rendering", () => {
     const running = buildExecutionCard(runningTracker.snapshot(2), fullCapabilities);
     expect(running).not.toBeNull();
     const runningNodes = nodes(running!.card as JsonRecord);
-    const runningGlyphs = runningNodes.filter(node => node.text === "•");
-    expect(runningGlyphs).toHaveLength(2);
-    expect(runningGlyphs.every(node => node.color === "Accent")).toBe(true);
+    expect(runningNodes.find(node => node.text === "• a.ts")).toMatchObject({
+      color: "Accent",
+      weight: "Bolder",
+    });
+    expect(runningNodes.find(node => node.text === "• 进行中")).toMatchObject({ color: "Accent" });
     const runningRow = runningNodes.find(node => (
       node.type === "ColumnSet"
       && cardText(node).includes("a.ts")
     ));
     expect(runningRow).toBeDefined();
-    const runningStatus = runningNodes.find(node => node.text === "进行中");
-    expect(runningStatus).toMatchObject({ color: "Accent" });
 
     const completedTracker = createExecutionTracker({ runId: "colors-completed" });
     startTurn(completedTracker, "turn-1", 0);
@@ -936,9 +939,8 @@ describe("execution card rendering", () => {
       && cardText(node).includes("完成步骤")
     ));
     expect(completedRow).toBeDefined();
-    const completedGlyphs = completedNodes.filter(node => node.text === "✓");
-    expect(completedGlyphs).toHaveLength(2);
-    expect(completedGlyphs.every(node => node.color === "Good")).toBe(true);
+    expect(completedNodes.find(node => node.text === "✓ 完成步骤")).toMatchObject({ color: "Good" });
+    expect(completedNodes.find(node => node.text === "✓ 已完成")).toMatchObject({ color: "Good" });
 
     const waitingTracker = createExecutionTracker({ runId: "colors-waiting" });
     startTurn(waitingTracker, "turn-1", 0);
@@ -952,8 +954,7 @@ describe("execution card rendering", () => {
       && cardText(node).includes("等待子代理")
     ));
     expect(waitingRow).toBeDefined();
-    const waitingGlyph = waitingNodes.find(node => node.text === "-" && node.color === "Default");
-    expect(waitingGlyph).toBeDefined();
+    expect(waitingNodes.find(node => node.text === "- 等待子代理")).toMatchObject({ color: "Default" });
     const waitingStatus = nodes(waitingRow!).find(node => (
       typeof node.text === "string" && node.text.startsWith("等待 · ")
     ));
@@ -975,15 +976,17 @@ describe("execution card rendering", () => {
     );
     expect(failed).not.toBeNull();
     const failedNodes = nodes(failed!.card as JsonRecord);
-    expect(failedNodes.filter(node => node.text === "×")).toHaveLength(2);
-    expect(failedNodes.filter(node => node.text === "×").every(node => node.color === "Attention")).toBe(true);
+    expect(failedNodes.find(node => node.text === "× bun test")).toMatchObject({ color: "Attention" });
+    expect(failedNodes.find(node => node.text === "× 失败")).toMatchObject({ color: "Attention" });
     const failedRow = failedNodes.find(node => (
       node.type === "Container"
       && node.style === "attention"
       && cardText(node).includes("bun test")
     ));
     expect(failedRow).toBeDefined();
-    const failedStatus = failedNodes.find(node => node.text === "失败");
+    const failedStatus = failedNodes.find(node => (
+      typeof node.text === "string" && node.text.startsWith("失败 · ")
+    ));
     expect(failedStatus).toMatchObject({ color: "Attention" });
   });
   test("uses column-set timeline steps for web renderer state surfaces", () => {
@@ -1143,36 +1146,49 @@ describe("execution card rendering", () => {
     const subagentDetail = nodeById(card, "subagent_detail");
     expect(cardText(subagentDetail)).toContain("子代理 · scout");
     expect(cardText(subagentDetail)).not.toContain("暂无可见子代理活动");
+    const subagentSection = nodeById(card, "subagent_section");
+    const subagentHeader = (subagentSection.items as JsonRecord[])[0]!;
+    expect(nodes(subagentHeader).some(node => node.id === "btn_expand_subagents")).toBe(true);
+    expect(targetElements(toggleActionById(card, "subagents_expand"))).toEqual([
+      { elementId: "subagent_hidden_summary", isVisible: false },
+      { elementId: "subagent_older_step_0", isVisible: true },
+      { elementId: "subagent_older_step_1", isVisible: true },
+      { elementId: "btn_collapse_subagents", isVisible: true },
+      { elementId: "btn_expand_subagents", isVisible: false },
+    ]);
     const timelineSection = nodeById(card, "timeline_section");
     const timelineHeader = (timelineSection.items as JsonRecord[])[0]!;
     expect(nodes(timelineHeader).some(node => node.id === "btn_expand_trace")).toBe(true);
-    const fullyBudgeted = buildExecutionCard(
-      tracker.snapshot(1_800),
-      {
-        ...fullCapabilities,
-        limits: { ...fullCapabilities.limits, maxNodes: 180 },
-      },
+    expect(targetElements(toggleActionById(card, "trace_expand")))
+      .toContainEqual({ elementId: "timeline_older_step_0", isVisible: true });
+
+    // A tight budget drops whole steps and reports the count; it never swaps a
+    // step for a different row shape.
+    const toolRows = (candidate: JsonRecord): JsonRecord[] => nodes(candidate).filter(node => (
+      node.type === "ColumnSet"
+      && Array.isArray(node.columns)
+      && (node.columns as JsonRecord[]).length === 1
+      && (node.columns as JsonRecord[])[0]?.width === "stretch"
+      && ((node.columns as JsonRecord[])[0]?.items as JsonRecord[] | undefined)?.[0]?.type === "Container"
+    ));
+    const PANEL_STYLES = new Set(["good", "accent", "attention", "emphasis"]);
+    const panelStyle = (row: JsonRecord): unknown => (
+      ((row.columns as JsonRecord[])[0]!.items as JsonRecord[])[0]!.style
     );
-    expect(fullyBudgeted).not.toBeNull();
-    const fullyBudgetedCard = fullyBudgeted!.card as JsonRecord;
-    expect(nodes(fullyBudgetedCard).some(node => node.id === "subagent_section")).toBe(false);
-    expect(cardText(fullyBudgetedCard)).not.toContain("暂无可见子代理活动");
-    const omitted = nodeById(card, "timeline_omitted_steps");
-    expect(omitted).toMatchObject({ type: "Container", style: "emphasis", isVisible: false });
-    const omittedItems = omitted.items as JsonRecord[];
-    expect(omittedItems.length).toBeGreaterThan(1);
-    expect(omittedItems.every(item => item.type === "ColumnSet")).toBe(true);
-    const omittedColumns = omittedItems.map(item => item.columns as JsonRecord[]);
-    expect(omittedColumns.every(columns => columns[0]?.width === "auto" && columns[1]?.width === "stretch")).toBe(true);
-    const cancelledRow = omittedItems.find(item => cardText(item).includes("运行命令"));
-    expect(cancelledRow).toBeDefined();
-    if (!cancelledRow) throw new Error("cancelled compact row was not rendered");
-    const cancelledColumns = cancelledRow.columns as JsonRecord[];
-    expect(cancelledColumns[0]?.items).toEqual([
-      expect.objectContaining({ text: "-\u00a0", color: "Default", fontType: "Monospace", size: "Small" }),
-    ]);
-    const expandTargets = targetElements(toggleActionById(card, "trace_expand"));
-    expect(expandTargets).toContainEqual({ elementId: "timeline_omitted_steps", isVisible: true });
+    const renderedRows = toolRows(card);
+    expect(renderedRows.length).toBeGreaterThan(1);
+    expect(renderedRows.every(row => PANEL_STYLES.has(String(panelStyle(row))))).toBe(true);
+
+    const tight = buildExecutionCard(tracker.snapshot(1_800), {
+      ...fullCapabilities,
+      limits: { ...fullCapabilities.limits, maxNodes: 120 },
+    });
+    expect(tight).not.toBeNull();
+    const tightCard = tight!.card as JsonRecord;
+    expect(cardText(tightCard)).toMatch(/更早的步骤未展示： \d+ 个/);
+    const tightRows = toolRows(tightCard);
+    expect(tightRows.length).toBeGreaterThan(0);
+    expect(tightRows.every(row => PANEL_STYLES.has(String(panelStyle(row))))).toBe(true);
   });
   test("prioritizes current and blocked todo tasks while preserving order and reporting omissions", () => {
     const tracker = createExecutionTracker({ runId: "todo-budget" });
