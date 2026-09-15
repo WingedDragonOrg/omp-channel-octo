@@ -4,6 +4,7 @@ import {
   createExecutionTracker,
   type ExecutionCardCapabilities,
   type ExecutionEvent,
+  type ExecutionSnapshot,
   type ExecutionState,
   type ExecutionTracker,
 } from "../src/execution-card.ts";
@@ -362,6 +363,51 @@ describe("execution tracker", () => {
     expect(rendered!.plain).toContain("│  ├─ ✓ Wire storage");
     expect(rendered!.plain).toContain("│  └─ × Wait for access");
     expect(rendered!.plain).toContain("   └─ • Run checks");
+  });
+
+  test("renders cancelled todo text with a strikethrough", () => {
+    const snapshot = {
+      runId: "cancelled-todo",
+      state: "running",
+      startedAtMs: 0,
+      endedAtMs: null,
+      elapsedMs: 100,
+      phaseCount: 0,
+      toolCount: 0,
+      tools: [],
+      todos: [{
+        name: "Plan",
+        tasks: [{ content: "Remove obsolete task", status: "cancelled" }],
+      }],
+    } as unknown as ExecutionSnapshot;
+    const rendered = buildExecutionCard(snapshot, fullCapabilities);
+    expect(rendered).not.toBeNull();
+    const card = rendered!.card as JsonRecord;
+    const todoDetail = nodeById(card, "todo_detail");
+    const taskRow = nodes(todoDetail).find(node => (
+      node.type === "ColumnSet" && cardText(node).includes("Remove obsolete task")
+    ));
+    expect(taskRow).toBeDefined();
+    if (!taskRow) throw new Error("cancelled todo row was not rendered");
+    const columns = taskRow.columns as JsonRecord[];
+    expect((columns[0]?.items as JsonRecord[])[0]).toMatchObject({
+      text: "\u00a0\u00a0└─\u2009[-]",
+      color: "Default",
+      fontType: "Monospace",
+      size: "Small",
+      wrap: false,
+    });
+    expect((columns[1]?.items as JsonRecord[])[0]).toMatchObject({
+      type: "RichTextBlock",
+      spacing: "None",
+      inlines: [
+        expect.objectContaining({
+          text: "Remove obsolete task",
+          color: "Default",
+          strikethrough: true,
+        }),
+      ],
+    });
   });
 
   test("run_end is authoritative for completed, failed, and cancelled terminal states", () => {

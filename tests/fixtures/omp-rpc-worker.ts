@@ -464,7 +464,8 @@ function emitTodoScenario(id: string | undefined, failed = false): void {
 			name: "Planning",
 			tasks: [
 				{ content: "draft plan", status: "completed" },
-				{ content: "ship plan", status: "blocked", blocker: "waiting on review" },
+				{ content: "ship plan", status: "cancelled" },
+				{ content: "wait for review", status: "blocked", blocker: "waiting on review" },
 			],
 		},
 	];

@@ -8,7 +8,7 @@ export type ExecutionErrorCategory =
   | "unavailable"
   | "unknown";
 
-export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned" | "blocked";
+export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned" | "blocked" | "cancelled";
 export type TodoOperation = "init" | "start" | "done" | "rm" | "drop" | "block" | "unblock" | "append" | "view";
 
 export interface ExecutionTodoTask {
@@ -232,6 +232,7 @@ const ALLOWED_TODO_STATUSES: Record<TodoStatus, true> = {
   completed: true,
   abandoned: true,
   blocked: true,
+  cancelled: true,
 };
 
 function finiteTime(value: number): number | null {
@@ -646,6 +647,7 @@ function todoStatusGlyph(status: TodoStatus): string {
       return FAILURE_GLYPH;
     case "pending":
     case "blocked":
+    case "cancelled":
       return WAITING_GLYPH;
   }
 }
@@ -660,6 +662,7 @@ function todoTone(status: TodoStatus): "Accent" | "Good" | "Attention" | "Defaul
       return "Attention";
     case "pending":
     case "blocked":
+    case "cancelled":
       return "Default";
   }
 }
@@ -737,6 +740,24 @@ function todoTaskLabel(task: ExecutionTodoTask): string {
   return `${task.content}${blocker}`;
 }
 
+function makeTodoTaskBody(task: ExecutionTodoTask, richTextSupported: boolean): JsonNode {
+  const text = todoTaskLabel(task);
+  const tone = todoTone(task.status);
+  if (task.status === "cancelled" && richTextSupported) {
+    return {
+      type: "RichTextBlock",
+      spacing: "None",
+      inlines: [{
+        type: "TextRun",
+        text,
+        color: tone,
+        strikethrough: true,
+      }],
+    };
+  }
+  return makeTextBlock(text, { color: tone, spacing: "None" });
+}
+
 function todoTaskContent(task: ExecutionTodoTask): string {
   return `${todoStatusGlyph(task.status)} ${todoTaskLabel(task)}`;
 }
@@ -759,6 +780,7 @@ function makeTodoTaskRow(
   phaseCount: number,
   taskIndex: number,
   taskCount: number,
+  richTextSupported: boolean,
 ): JsonNode {
   const continuation = phaseIndex === phaseCount - 1 ? "\u00a0" : "│";
   const branch = taskIndex === taskCount - 1 ? "└─" : "├─";
@@ -783,7 +805,7 @@ function makeTodoTaskRow(
         type: "Column",
         width: "stretch",
         verticalContentAlignment: "Center",
-        items: [makeTextBlock(todoTaskLabel(task), { color: tone, spacing: "None" })],
+        items: [makeTodoTaskBody(task, richTextSupported)],
       },
     ],
   };
@@ -838,6 +860,7 @@ function makeTodoItems(
   hiddenCount: number,
   totalCount: number,
   structuredLayout: boolean,
+  richTextSupported: boolean,
 ): JsonNode[] {
   const items: JsonNode[] = [];
   if (hiddenCount > 0) {
@@ -853,7 +876,7 @@ function makeTodoItems(
     for (let taskIndex = 0; taskIndex < phase.tasks.length; taskIndex += 1) {
       const task = phase.tasks[taskIndex]!;
       taskItems.push(structuredLayout
-        ? makeTodoTaskRow(task, phaseIndex, phaseCount, taskIndex, phase.tasks.length)
+        ? makeTodoTaskRow(task, phaseIndex, phaseCount, taskIndex, phase.tasks.length, richTextSupported)
         : makeTextBlock(
           todoTaskText(task, phaseIndex, phaseCount, taskIndex, phase.tasks.length),
           { color: todoTone(task.status), spacing: "None" },
@@ -1008,6 +1031,7 @@ function makeTodoContainer(
   hiddenCount: number,
   totalCount: number,
   structuredLayout: boolean,
+  richTextSupported: boolean,
 ): JsonNode | null {
   if (todos.length === 0 || todos.every(phase => phase.tasks.length === 0)) return null;
   return {
@@ -1017,7 +1041,7 @@ function makeTodoContainer(
     spacing: "Medium",
     items: [
       makeTextBlock("任务清单", { weight: "Bolder", size: "Medium", spacing: "None" }),
-      ...makeTodoItems(todos, hiddenCount, totalCount, structuredLayout),
+      ...makeTodoItems(todos, hiddenCount, totalCount, structuredLayout, richTextSupported),
     ],
   };
 }
@@ -1467,6 +1491,7 @@ function buildCandidate(
 ): ExecutionCardResult {
   const hasContainer = supportsElement(capabilities, "Container");
   const hasColumnSet = supportsElement(capabilities, "ColumnSet");
+  const richTextSupported = supportsElement(capabilities, "RichTextBlock");
   const richLayout = hasContainer && hasColumnSet;
   const stackedLayout = hasContainer;
   const canToggle = richLayout
@@ -1527,7 +1552,7 @@ function buildCandidate(
     ? makeSubagentToggleSets(subagentOlderIds)
     : [];
   const todoContainer = hasContainer
-    ? makeTodoContainer(visibleTodos, hiddenTodoTasks, totalTodoTasks, richLayout)
+    ? makeTodoContainer(visibleTodos, hiddenTodoTasks, totalTodoTasks, richLayout, richTextSupported)
     : null;
   const terminal = snapshot.state !== "running";
   const detailElementIds = [

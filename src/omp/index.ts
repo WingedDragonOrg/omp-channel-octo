@@ -826,6 +826,7 @@ const TODO_STATUSES: ReadonlySet<TodoStatus> = new Set([
 	"completed",
 	"abandoned",
 	"blocked",
+	"cancelled",
 ]);
 const TODO_OPERATIONS: ReadonlySet<TodoOperation> = new Set([
 	"init",

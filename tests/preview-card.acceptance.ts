@@ -166,7 +166,7 @@ function previewSnapshot() {
         name: "交付阶段",
         tasks: [
           { content: "发送真实预览", status: "in_progress" },
-          { content: "确认移动端布局", status: "pending" },
+          { content: "确认移动端布局", status: "cancelled" },
           { content: "记录验收结果", status: "pending" },
         ],
       },
@@ -227,6 +227,7 @@ runPreviewTest(
         "pending",
         "blocked",
         "abandoned",
+        "cancelled",
       ]));
       const receipt = await transport.sendProgressCard(
         { channelId: targetId, channelType: previewChannelType() },
