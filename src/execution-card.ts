@@ -203,6 +203,8 @@ const FAILURE_GLYPH = "×";
 const RUNNING_GLYPH = "•";
 // A fixed pixel slot prevents mobile glyph metrics from moving task content.
 const TODO_MARKER_COLUMN_WIDTH = "80px";
+// A fixed pixel slot keeps every tool row's marker on one column.
+const TOOL_MARKER_COLUMN_WIDTH = "24px";
 const WAITING_TOOL_NAMES: Record<string, true> = {
   subagent_await: true,
   wait: true,
@@ -704,7 +706,8 @@ function markdownSafeToolLine(tool: ExecutionToolSnapshot): string {
   return `${glyph}\u00a0${line.slice(glyph.length + 1)}`;
 }
 
-// Shared by budget-pruned trace and subagent rows.
+// Shared by budget-pruned trace and subagent rows. Both groups render as the same grey
+// emphasis band as the panel rows, so these rows keep the plain two-column grid.
 function makeCompactToolRow(
   tool: ExecutionToolSnapshot,
   options: { readonly id?: string; readonly isVisible?: boolean } = {},
@@ -1024,7 +1027,7 @@ function makeToolRow(
                 columns: [
                   {
                     type: "Column",
-                    width: "24px",
+                    width: TOOL_MARKER_COLUMN_WIDTH,
                     verticalContentAlignment: "Center",
                     items: [makeTextBlock(glyph, {
                       spacing: "None",
@@ -1057,13 +1060,31 @@ function makeToolRow(
   };
 }
 
+/**
+ * Omitted-step history band. It renders as a sibling of `timeline_detail` instead of a child:
+ * the web client's agent-progress layer repaints every filled Container that sits directly under
+ * `#timeline_detail` as a failed-step status chip (danger fill + border, inline fill cleared),
+ * which turned this grey band into a red block. Outside that container the band keeps the
+ * section's emphasis fill, matching the subagent history band.
+ */
+function makeTraceHistoryBand(tools: readonly ExecutionToolSnapshot[]): JsonNode {
+  return {
+    type: "Container",
+    id: "timeline_omitted_steps",
+    isVisible: false,
+    style: "emphasis",
+    spacing: "Small",
+    items: tools.map(tool => makeCompactToolRow(tool)),
+  };
+}
+
 function makeTimelineItems(
   tools: readonly ExecutionToolSnapshot[],
   hiddenCount: number,
   richLayout: boolean,
   emptyText = "正在准备",
   olderTools: readonly ExecutionToolSnapshot[] = [],
-  omittedTools: readonly ExecutionToolSnapshot[] = [],
+  hasOmittedSteps = false,
   hideOlder = true,
 ): JsonNode[] {
   const items: JsonNode[] = [];
@@ -1075,7 +1096,7 @@ function makeTimelineItems(
     }));
   }
   if (tools.length === 0 && olderTools.length === 0) {
-    if (omittedTools.length === 0) {
+    if (!hasOmittedSteps) {
       items.push(makeTextBlock(emptyText, { isSubtle: true, spacing: "Small" }));
     }
   } else if (richLayout) {
@@ -1086,16 +1107,6 @@ function makeTimelineItems(
     })));
   } else {
     items.push(...tools.map(tool => makeTextBlock(markdownSafeToolLine(tool), { spacing: "Small" })));
-  }
-  if (omittedTools.length > 0) {
-    items.push({
-      type: "Container",
-      id: "timeline_omitted_steps",
-      isVisible: false,
-      style: "default",
-      spacing: "Small",
-      items: omittedTools.map(tool => makeCompactToolRow(tool)),
-    });
   }
   return items;
 }
@@ -1194,7 +1205,7 @@ function makeSectionHeader(title: string, actionSets: readonly JsonNode[]): Json
 function makeCollapsibleSection(
   id: string,
   heading: string,
-  detail: JsonNode,
+  details: readonly JsonNode[],
   actionSets: readonly JsonNode[],
   isVisible = true,
 ): JsonNode {
@@ -1203,7 +1214,7 @@ function makeCollapsibleSection(
     id,
     ...(isVisible ? {} : { isVisible: false }),
     spacing: "Medium",
-    items: [makeSectionHeader(heading, actionSets), detail],
+    items: [makeSectionHeader(heading, actionSets), ...details],
   };
 }
 
@@ -1670,13 +1681,17 @@ function buildCandidate(
   const elapsed = formatDuration(snapshot.elapsedMs);
   const metrics = `${snapshot.phaseCount} 个阶段 · ${snapshot.toolCount} 次工具调用 · ${elapsed}`;
   const notice = executionNotice(snapshot, visibleTodos);
+  const canToggleTraceHistory = canToggle && expandableOmittedTraceTools.length > 0;
+  const traceHistoryBand = canToggleTraceHistory
+    ? makeTraceHistoryBand(expandableOmittedTraceTools)
+    : null;
   const timelineItems = makeTimelineItems(
     visibleTraceTools,
     hiddenTraceTools,
     richLayout,
     visibleSubagents.length > 0 ? "暂无其他工具活动" : "正在准备",
     olderTraceTools,
-    canToggle ? expandableOmittedTraceTools : [],
+    canToggleTraceHistory,
     canToggle,
   );
   const hasRenderedSubagentActivity = visibleSubagents.length > 0
@@ -1755,7 +1770,7 @@ function buildCandidate(
         body.push(makeCollapsibleSection(
           "subagent_section",
           `子代理 · ${totalSubagents}`,
-          subagentContainer,
+          [subagentContainer],
           subagentToggleSets,
           overallDetailsVisible,
         ));
@@ -1763,7 +1778,7 @@ function buildCandidate(
       body.push(makeCollapsibleSection(
         "timeline_section",
         "执行轨迹",
-        timelineDetail,
+        traceHistoryBand === null ? [timelineDetail] : [timelineDetail, traceHistoryBand],
         traceToggleSets,
         overallDetailsVisible,
       ));

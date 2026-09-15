@@ -607,6 +607,10 @@ describe("execution card rendering", () => {
     const traceRow = (omittedTrace.items as JsonRecord[])[0]!;
     const subagentRow = (omittedSubagents.items as JsonRecord[])[0]!;
 
+    // Both history groups render as the same grey emphasis band as the panel rows above them.
+    expect(omittedTrace).toMatchObject({ type: "Container", style: "emphasis", spacing: "Small" });
+    expect(omittedSubagents).toMatchObject({ type: "Container", style: "emphasis", spacing: "Small" });
+
     for (const row of [traceRow, subagentRow]) {
       expect(row).toMatchObject({ type: "ColumnSet", spacing: "Small" });
       const columns = row.columns as JsonRecord[];
@@ -628,6 +632,49 @@ describe("execution card rendering", () => {
     const subagentMarker = ((subagentRow.columns as JsonRecord[])[0]?.items as JsonRecord[])[0]!;
     expect(subagentMarker).toMatchObject({ text: "✓\u00a0", color: "Good" });
     expect(cardText(subagentRow)).toContain("子代理 · verifier");
+  });
+
+  test("keeps filled containers out of the step list so the client keeps the history band grey", () => {
+    // The web client's agent-progress layer repaints every filled Container that is a direct child
+    // of #timeline_detail as a failed-step status chip (danger fill + border, inline fill cleared),
+    // which turned the omitted-step history band red. The band therefore lives beside the step list.
+    const tracker = createExecutionTracker({ runId: "history-band-placement" });
+    startTurn(tracker, "turn-1", 0);
+    startTool(tracker, "old-trace", "read", 1, "最早步骤");
+    for (let index = 0; index < 33; index += 1) {
+      const toolCallId = `step-${index}`;
+      startTool(tracker, toolCallId, "read", 10 + index, `步骤 ${index}`);
+      tracker.apply({ type: "tool_end", toolCallId, atMs: 11 + index, status: "succeeded" });
+    }
+
+    const rendered = buildExecutionCard(tracker.snapshot(100), {
+      ...fullCapabilities,
+      limits: { maxNodes: 1_000, maxDepth: 16, maxPayloadBytes: 1_000_000 },
+    });
+    expect(rendered).not.toBeNull();
+    const card = rendered!.card as JsonRecord;
+    const traceSection = nodeById(card, "timeline_section");
+    const traceDetail = nodeById(card, "timeline_detail");
+    const historyBand = nodeById(card, "timeline_omitted_steps");
+
+    expect(historyBand).toMatchObject({ type: "Container", style: "emphasis", isVisible: false });
+    expect(cardText(historyBand)).toContain("最早步骤");
+    const traceSectionIds = (traceSection.items as JsonRecord[])
+      .map(item => item.id)
+      .filter((id): id is string => typeof id === "string");
+    expect(traceSectionIds).toEqual(["timeline_detail", "timeline_omitted_steps"]);
+    expect((traceDetail.items as JsonRecord[]).map(item => item.id)).not.toContain("timeline_omitted_steps");
+
+    // Same guarantee under the real 200-node budget, where more steps stay in the hidden summary.
+    const budgeted = buildExecutionCard(tracker.snapshot(100), fullCapabilities);
+    expect(budgeted).not.toBeNull();
+    for (const built of [card, budgeted!.card as JsonRecord]) {
+      const stepList = nodeById(built, "timeline_detail");
+      const filledStepListChildren = (stepList.items as JsonRecord[]).filter(
+        item => item.type === "Container" && item.style !== undefined,
+      );
+      expect(filledStepListChildren).toEqual([]);
+    }
   });
 
   test("keeps waiting markers out of markdown list rendering", () => {
