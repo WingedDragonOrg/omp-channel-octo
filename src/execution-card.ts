@@ -881,10 +881,12 @@ function makeCollapsibleSection(
   heading: string,
   detail: JsonNode,
   actionSets: readonly JsonNode[],
+  isVisible = true,
 ): JsonNode {
   return {
     type: "Container",
     id,
+    ...(isVisible ? {} : { isVisible: false }),
     spacing: "Medium",
     items: [makeSectionHeader(heading, actionSets), detail],
   };
@@ -995,6 +997,51 @@ function makeSubagentToggleSets(hiddenElementIds: readonly string[]): JsonNode[]
     },
   ];
 }
+function makeProgressToggleSets(detailElementIds: readonly string[]): JsonNode[] {
+  if (detailElementIds.length === 0) return [];
+  const collapsedTargets = [
+    ...detailElementIds.map(elementId => ({ elementId, isVisible: false })),
+    { elementId: "btn_collapse_progress", isVisible: false },
+    { elementId: "btn_expand_progress", isVisible: true },
+  ];
+  const expandedTargets = [
+    ...detailElementIds.map(elementId => ({ elementId, isVisible: true })),
+    { elementId: "btn_collapse_progress", isVisible: true },
+    { elementId: "btn_expand_progress", isVisible: false },
+  ];
+  return [
+    {
+      type: "ActionSet",
+      id: "btn_collapse_progress",
+      isVisible: false,
+      horizontalAlignment: "Right",
+      spacing: "None",
+      actions: [
+        {
+          type: TOGGLE_ACTION,
+          id: "progress_collapse",
+          title: "收起",
+          targetElements: collapsedTargets,
+        },
+      ],
+    },
+    {
+      type: "ActionSet",
+      id: "btn_expand_progress",
+      isVisible: true,
+      horizontalAlignment: "Right",
+      spacing: "None",
+      actions: [
+        {
+          type: TOGGLE_ACTION,
+          id: "progress_expand",
+          title: "展开",
+          targetElements: expandedTargets,
+        },
+      ],
+    },
+  ];
+}
 
 function cardStats(value: unknown, depth = 0): CardStats {
   if (Array.isArray(value)) {
@@ -1036,7 +1083,7 @@ function cardWithinLimits(card: AdaptiveCard, plain: string, limits: ResolvedCar
     && wirePayloadBytes(card, plain) <= limits.maxPayloadBytes;
 }
 
-function makeHeader(richLayout: boolean): JsonNode[] {
+function makeHeader(richLayout: boolean, actionSets: readonly JsonNode[] = []): JsonNode[] {
   const title = makeTextBlock("处理进度", { weight: "Bolder", size: "Large", spacing: "None" });
   const subtitle = makeTextBlock("OMP 执行", { isSubtle: true, size: "Small", spacing: "Small" });
   if (richLayout) {
@@ -1061,6 +1108,7 @@ function makeHeader(richLayout: boolean): JsonNode[] {
                 horizontalAlignment: "Right",
                 spacing: "None",
               }),
+              ...actionSets,
             ],
           },
         ],
@@ -1070,7 +1118,11 @@ function makeHeader(richLayout: boolean): JsonNode[] {
   return [title, subtitle];
 }
 
-function makeHeaderContainer(snapshot: ExecutionSnapshot, richLayout: boolean): JsonNode {
+function makeHeaderContainer(
+  snapshot: ExecutionSnapshot,
+  richLayout: boolean,
+  actionSets: readonly JsonNode[] = [],
+): JsonNode {
   return {
     type: "Container",
     id: "octo-execution-trace-header",
@@ -1083,7 +1135,7 @@ function makeHeaderContainer(snapshot: ExecutionSnapshot, richLayout: boolean): 
           : "emphasis",
     bleed: true,
     spacing: "None",
-    items: makeHeader(richLayout),
+    items: makeHeader(richLayout, actionSets),
   };
 }
 
@@ -1265,15 +1317,27 @@ function buildCandidate(
   const todoContainer = hasContainer
     ? makeTodoContainer(visibleTodos, hiddenTodoTasks, totalTodoTasks)
     : null;
+  const terminal = snapshot.state !== "running";
+  const detailElementIds = [
+    ...(todoContainer === null ? [] : ["todo_detail"]),
+    ...(subagentContainer === null ? [] : ["subagent_section"]),
+    "timeline_section",
+  ];
+  const overallToggleSets = terminal && canToggle
+    ? makeProgressToggleSets(detailElementIds)
+    : [];
+  const overallDetailsVisible = overallToggleSets.length === 0;
   const body: JsonNode[] = [];
 
   if (stackedLayout) {
     body.push(
-      makeHeaderContainer(snapshot, richLayout),
+      makeHeaderContainer(snapshot, richLayout, overallToggleSets),
       makeStatusContainer(snapshot, metrics, richLayout),
     );
     if (notice) body.push(makeNotice(notice));
-    if (todoContainer) body.push(todoContainer);
+    if (todoContainer) {
+      body.push(overallDetailsVisible ? todoContainer : { ...todoContainer, isVisible: false });
+    }
     if (richLayout) {
       const timelineDetail: JsonNode = {
         type: "Container",
@@ -1288,9 +1352,16 @@ function buildCandidate(
           `子代理 · ${totalSubagents}`,
           subagentContainer,
           subagentToggleSets,
+          overallDetailsVisible,
         ));
       }
-      body.push(makeCollapsibleSection("timeline_section", "执行轨迹", timelineDetail, traceToggleSets));
+      body.push(makeCollapsibleSection(
+        "timeline_section",
+        "执行轨迹",
+        timelineDetail,
+        traceToggleSets,
+        overallDetailsVisible,
+      ));
     } else {
       body.push({
         type: "Container",

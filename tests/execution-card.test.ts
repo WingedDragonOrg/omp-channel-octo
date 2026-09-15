@@ -562,7 +562,7 @@ describe("execution card rendering", () => {
       op: "init",
       phases: [{ name: "Plan", tasks: [{ content: "Keep this visible", status: "in_progress" }] }],
     });
-    const snapshot = tracker.apply({ type: "run_end", atMs: 70, state: "completed" });
+    const snapshot = tracker.snapshot(70);
     const rendered = buildExecutionCard(snapshot, fullCapabilities);
     expect(rendered).not.toBeNull();
     const card = rendered!.card as JsonRecord;
@@ -597,6 +597,50 @@ describe("execution card rendering", () => {
       const expandedTarget = expandTargets.find(target => target.elementId === id)!;
       expect(collapsedTarget.isVisible).toBe(!expandedTarget.isVisible);
     }
+  });
+  test("collapses completed progress details behind a header expand control", () => {
+    const tracker = createExecutionTracker({ runId: "terminal-collapse" });
+    startTurn(tracker, "turn-1", 0);
+    startTool(tracker, "tool-1", "read", 1, "完成步骤");
+    tracker.apply({ type: "tool_end", toolCallId: "tool-1", atMs: 2, status: "succeeded" });
+    startTool(tracker, "subagent-1", "task", 3, "完成子代理");
+    tracker.apply({ type: "tool_end", toolCallId: "subagent-1", atMs: 4, status: "succeeded" });
+    tracker.apply({
+      type: "todo_update",
+      atMs: 5,
+      op: "init",
+      phases: [{ name: "Plan", tasks: [{ content: "完成任务", status: "completed" }] }],
+    });
+    const snapshot = tracker.apply({ type: "run_end", atMs: 6, state: "completed" });
+    const rendered = buildExecutionCard(snapshot, fullCapabilities);
+
+    expect(rendered).not.toBeNull();
+    const card = rendered!.card as JsonRecord;
+    expect(nodeById(card, "execution_status").isVisible).not.toBe(false);
+    expect(nodeById(card, "todo_detail")).toMatchObject({ isVisible: false });
+    expect(nodeById(card, "subagent_section")).toMatchObject({ isVisible: false });
+    expect(nodeById(card, "timeline_section")).toMatchObject({ isVisible: false });
+    expect(nodeById(card, "btn_collapse_progress")).toMatchObject({ isVisible: false });
+    expect(nodeById(card, "btn_expand_progress")).toMatchObject({ isVisible: true });
+
+    const expandAction = toggleActionById(card, "progress_expand");
+    expect(expandAction.title).toBe("展开");
+    expect(targetElements(expandAction)).toEqual([
+      { elementId: "todo_detail", isVisible: true },
+      { elementId: "subagent_section", isVisible: true },
+      { elementId: "timeline_section", isVisible: true },
+      { elementId: "btn_collapse_progress", isVisible: true },
+      { elementId: "btn_expand_progress", isVisible: false },
+    ]);
+    const collapseAction = toggleActionById(card, "progress_collapse");
+    expect(collapseAction.title).toBe("收起");
+    expect(targetElements(collapseAction)).toEqual([
+      { elementId: "todo_detail", isVisible: false },
+      { elementId: "subagent_section", isVisible: false },
+      { elementId: "timeline_section", isVisible: false },
+      { elementId: "btn_collapse_progress", isVisible: false },
+      { elementId: "btn_expand_progress", isVisible: true },
+    ]);
   });
 
   test("omits ToggleVisibility when the negotiated action capability is absent", () => {
