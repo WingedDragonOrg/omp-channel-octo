@@ -121,7 +121,7 @@ OMP extension 在 worker 启动时由固定路径自动加载；sidecar 根路�
 
 正文编辑以最新累计快照为准，首次创建不等待整轮结束；编辑最多每 1000ms 一次并按目标串行，最终快照优先完成，不得由旧快照覆盖新快照。正文按 3000 UTF-8 bytes 稳定分段，保留原始换行、空格和 inline 标记；分段 stream 使用稳定的 client message ID，分段数量变化时清理 stale tail。每次网络操作前持久化该分段的目标快照及 `desiredVersion`/`ackedVersion`；首次 create 在网络请求前 durable 标为 `unknown`，送达未知时不重跑 Agent，重连/重启沿用稳定 ID 绑定已创建消息并将最新 desired 快照补做 edit。
 
-真实 `tool_start`/`tool_end`、`turn_start`/`turn_end`、`todo_update` 和 `run_end` 事件由单一 `ExecutionTracker` 累计阶段、工具、todo、终态和 elapsed；真实工具或 todo 进度首次出现时懒建一张可编辑卡，之后只编辑该卡。运行中 elapsed 每秒刷新；卡片 edit 使用严格递增的单卡 sequence，终态为 `completed`、`cancelled` 或 `failed`。卡片采用“摘要头部—当前状态—任务清单—子代理—执行轨迹”的进度通知布局；富布局能力下使用强调色 Container、状态/耗时摘要和带状态元数据的步骤面板，子代理列表位于执行轨迹之前；支持 `Action.ToggleVisibility` 时在各自标题行右侧提供“收起”/“展开”控件，默认展示最近五个步骤；状态图标统一，失败使用红色，已完成使用低饱和绿色，进行中使用浅紫高亮，等待使用中性灰色；能力不足时保持信息完整的降级文本。卡片只展示安全摘要，不转发工具参数/结果、原始 payload、模型思考或秘密。
+真实 `tool_start`/`tool_end`、`turn_start`/`turn_end`、`todo_update` 和 `run_end` 事件由单一 `ExecutionTracker` 累计阶段、工具、todo、终态和 elapsed；真实工具或 todo 进度首次出现时懒建一张可编辑卡，之后只编辑该卡。运行中 elapsed 每秒刷新；卡片 edit 使用严格递增的单卡 sequence，终态为 `completed`、`cancelled` 或 `failed`。卡片采用“摘要头部—当前状态—任务清单—子代理—执行轨迹”的进度通知布局；富布局能力下使用强调色 Container、状态/耗时摘要和带状态元数据的步骤面板，轨迹步骤使用 Web 端兼容的 ColumnSet 与嵌套状态面板，子代理列表位于执行轨迹之前；当对应区块超过三个步骤且能力支持 `Action.ToggleVisibility` 时，在标题行右侧提供“展开”/“收起”控件，默认展示最近三个步骤，其余步骤通过“展开”查看；状态图标统一，失败使用红色，已完成使用低饱和绿色，进行中使用浅紫高亮，等待使用中性灰色；能力不足时保持信息完整的降级文本。卡片只展示安全摘要，不转发工具参数/结果、原始 payload、模型思考或秘密。
 
 发卡前必须通过能力 profile 门禁：profile 启用，包含 `octo/v1` 与 card version 1.5，且 card/display/reasoning 开关均启用；`TextBlock` 是唯一硬依赖，`Container` 等布局元素缺失时使用扁平 fallback；`Action.ToggleVisibility` 仅在能力声明支持时渲染。遵守服务端声明的 payload、node、depth 等 limits，无法满足时不发卡且不阻断正文；同一执行最多一张卡。
 

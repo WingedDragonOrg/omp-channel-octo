@@ -149,15 +149,42 @@ const TOOL_DISPLAY_LABELS: Record<string, string> = {
   bash: "运行命令",
   grep: "搜索文件",
   glob: "搜索文件",
+  agent: "运行子代理",
+  delegate: "运行子代理",
+  run_subagent: "运行子代理",
+  spawn_agent: "运行子代理",
+  task: "运行子代理",
+  subagent: "运行子代理",
+  subagent_start: "启动子代理",
+  subagent_await: "等待子代理",
+  subagent_stop: "停止子代理",
   todo: "更新任务",
+};
+const SUBAGENT_TOOL_NAMES: Record<string, true> = {
+  agent: true,
+  delegate: true,
+  run_subagent: true,
+  spawn_agent: true,
+  subagent: true,
+  subagent_await: true,
+  subagent_start: true,
+  subagent_stop: true,
+  task: true,
 };
 const ADAPTIVE_CARD_SCHEMA = "http://adaptivecards.io/schemas/adaptive-card.json";
 const REQUIRED_ELEMENTS = ["TextBlock"] as const;
 const TOGGLE_ACTION = "Action.ToggleVisibility";
+const STATUS_GLYPH = "●";
+const WAITING_TOOL_NAMES: Record<string, true> = {
+  subagent_await: true,
+  wait: true,
+  waiting: true,
+};
 const MAX_LOCAL_VISIBLE_TEXT_CHARS = 240;
 const MAX_LOCAL_PHASES = 64;
 const MAX_LOCAL_TASKS = 128;
-const MAX_VISIBLE_TOOLS = 12;
+const MAX_VISIBLE_TOOLS = 3;
+const MAX_RENDERED_TOOLS = 32;
 const MAX_VISIBLE_TODO_TASKS = 96;
 const DEFAULT_MAX_NODES = 200;
 const DEFAULT_MAX_DEPTH = 16;
@@ -484,7 +511,7 @@ function capabilitiesAllowCard(capabilities: ExecutionCardCapabilities): boolean
 }
 
 function formatDuration(durationMs: number): string {
-  const safeDuration = Math.max(0, durationMs);
+  const safeDuration = Number.isFinite(durationMs) ? Math.max(0, durationMs) : 0;
   if (safeDuration < 1_000) return `${Number.isInteger(safeDuration) ? safeDuration : safeDuration.toFixed(1)}ms`;
   const totalSeconds = safeDuration / 1_000;
   if (totalSeconds < 60) return `${totalSeconds.toFixed(1)}s`;
@@ -512,12 +539,10 @@ function executionStateLabel(state: ExecutionState): string {
 function toolStateGlyph(state: ExecutionToolState): string {
   switch (state) {
     case "running":
-      return "◉";
     case "succeeded":
-      return "●";
     case "failed":
     case "cancelled":
-      return "○";
+      return STATUS_GLYPH;
   }
 }
 
@@ -534,7 +559,9 @@ function toolStateLabel(state: ExecutionToolState): string {
   }
 }
 
-function executionTone(state: ExecutionState | ExecutionToolState): "Accent" | "Good" | "Attention" | "Warning" {
+function executionTone(
+  state: ExecutionState | ExecutionToolState,
+): "Accent" | "Good" | "Attention" | "Default" {
   switch (state) {
     case "running":
       return "Accent";
@@ -542,20 +569,39 @@ function executionTone(state: ExecutionState | ExecutionToolState): "Accent" | "
     case "succeeded":
       return "Good";
     case "cancelled":
-      return "Warning";
+      return "Default";
     case "failed":
       return "Attention";
   }
 }
 
 function displayToolName(toolName: string): string {
-  return TOOL_DISPLAY_LABELS[toolName] ?? toolName;
+  const normalized = toolName.toLowerCase();
+  return TOOL_DISPLAY_LABELS[toolName] ?? TOOL_DISPLAY_LABELS[normalized] ?? toolName;
+}
+
+function isSubagentTool(toolName: string): boolean {
+  return SUBAGENT_TOOL_NAMES[toolName.toLowerCase()] === true;
+}
+
+function isWaitingTool(toolName: string): boolean {
+  return WAITING_TOOL_NAMES[toolName.toLowerCase()] === true;
+}
+
+function toolStatusLabel(tool: ExecutionToolSnapshot): string {
+  if (tool.state === "running" && isWaitingTool(tool.toolName)) return "等待";
+  return toolStateLabel(tool.state);
+}
+
+function toolVisualTone(tool: ExecutionToolSnapshot): "Accent" | "Good" | "Attention" | "Default" {
+  if (tool.state === "running" && isWaitingTool(tool.toolName)) return "Default";
+  return executionTone(tool.state);
 }
 
 function todoStateLabel(status: TodoStatus): string {
   switch (status) {
     case "pending":
-      return "待处理";
+      return "等待";
     case "in_progress":
       return "进行中";
     case "completed":
@@ -564,6 +610,19 @@ function todoStateLabel(status: TodoStatus): string {
       return "已放弃";
     case "blocked":
       return "已阻塞";
+  }
+}
+
+function todoTone(status: TodoStatus): "Accent" | "Good" | "Default" {
+  switch (status) {
+    case "in_progress":
+      return "Accent";
+    case "completed":
+      return "Good";
+    case "pending":
+    case "abandoned":
+    case "blocked":
+      return "Default";
   }
 }
 
@@ -587,11 +646,8 @@ function errorCategoryLabel(category: ExecutionErrorCategory): string {
 function toolLine(tool: ExecutionToolSnapshot, includeGlyph = false): string {
   const parts = includeGlyph ? [toolStateGlyph(tool.state), displayToolName(tool.toolName)] : [displayToolName(tool.toolName)];
   if (tool.summary) parts.push(tool.summary);
-  if (tool.state === "running") parts.push("进行中");
-  else {
-    parts.push(toolStateLabel(tool.state));
-    if (tool.state === "failed" && tool.errorCategory) parts.push(errorCategoryLabel(tool.errorCategory));
-  }
+  parts.push(toolStatusLabel(tool));
+  if (tool.state === "failed" && tool.errorCategory) parts.push(errorCategoryLabel(tool.errorCategory));
   if (tool.durationMs !== null) parts.push(formatDuration(tool.durationMs));
   return parts.join(" · ");
 }
@@ -607,10 +663,34 @@ function todoLines(
     lines.push(phase.name);
     for (const task of phase.tasks) {
       const blocker = task.blocker === undefined ? "" : ` · ${task.blocker}`;
-      lines.push(`• [${todoStateLabel(task.status)}] ${task.content}${blocker}`);
+      lines.push(`${STATUS_GLYPH} [${todoStateLabel(task.status)}] ${task.content}${blocker}`);
     }
   }
   return lines;
+}
+function makeTodoItems(
+  todos: readonly ExecutionTodoPhase[],
+  hiddenCount: number,
+  totalCount: number,
+): JsonNode[] {
+  const items: JsonNode[] = [];
+  if (hiddenCount > 0) {
+    items.push(makeTextBlock(`已隐藏 ${hiddenCount} 个任务，共 ${totalCount} 个任务`, {
+      isSubtle: true,
+      spacing: "Small",
+    }));
+  }
+  for (const phase of todos) {
+    items.push(makeTextBlock(phase.name, { spacing: "Small" }));
+    for (const task of phase.tasks) {
+      const blocker = task.blocker === undefined ? "" : ` · ${task.blocker}`;
+      items.push(makeTextBlock(
+        `${STATUS_GLYPH} [${todoStateLabel(task.status)}] ${task.content}${blocker}`,
+        { color: todoTone(task.status), spacing: "Small" },
+      ));
+    }
+  }
+  return items;
 }
 
 function makeTextBlock(text: string, options: JsonNode = {}): JsonNode {
@@ -622,43 +702,74 @@ function makeTextBlock(text: string, options: JsonNode = {}): JsonNode {
   };
 }
 
-function makeToolRow(tool: ExecutionToolSnapshot): JsonNode {
+function makeToolRow(
+  tool: ExecutionToolSnapshot,
+  options: { readonly id?: string; readonly isVisible?: boolean } = {},
+): JsonNode {
   const displayName = displayToolName(tool.toolName);
+  const tone = toolVisualTone(tool);
   const mainItems = tool.summary === undefined
     ? [makeTextBlock(displayName, { weight: "Bolder", spacing: "None" })]
     : [
         makeTextBlock(tool.summary, { weight: "Bolder", spacing: "None" }),
         makeTextBlock(displayName, { isSubtle: true, size: "Small", spacing: "None" }),
       ];
-  const statusParts = [toolStateLabel(tool.state)];
+  const statusParts = [toolStatusLabel(tool)];
   if (tool.state === "failed" && tool.errorCategory) statusParts.push(errorCategoryLabel(tool.errorCategory));
   if (tool.durationMs !== null) statusParts.push(formatDuration(tool.durationMs));
+  // Web progress enhancement inspects direct timeline Containers; keep the colored panel nested.
   return {
     type: "ColumnSet",
-    spacing: "Small",
+    ...(options.id === undefined ? {} : { id: options.id }),
+    ...(options.isVisible === undefined ? {} : { isVisible: options.isVisible }),
+    spacing: "None",
     columns: [
       {
         type: "Column",
         width: "auto",
         verticalContentAlignment: "Center",
-        items: [makeTextBlock(toolStateGlyph(tool.state), { spacing: "None", color: executionTone(tool.state) })],
+        items: [makeTextBlock(STATUS_GLYPH, {
+          spacing: "None",
+          color: tone,
+          size: "Medium",
+        })],
       },
       {
         type: "Column",
         width: "stretch",
-        items: mainItems,
-      },
-      {
-        type: "Column",
-        width: "auto",
-        verticalContentAlignment: "Center",
         items: [
-          makeTextBlock(statusParts.join(" · "), {
-            horizontalAlignment: "Right",
-            isSubtle: true,
-            size: "Small",
-            spacing: "None",
-          }),
+          {
+            type: "Container",
+            style: tone.toLowerCase(),
+            spacing: "Small",
+            items: [
+              {
+                type: "ColumnSet",
+                spacing: "None",
+                columns: [
+                  {
+                    type: "Column",
+                    width: "stretch",
+                    items: mainItems,
+                  },
+                  {
+                    type: "Column",
+                    width: "auto",
+                    verticalContentAlignment: "Center",
+                    items: [
+                      makeTextBlock(statusParts.join(" · "), {
+                        horizontalAlignment: "Right",
+                        isSubtle: true,
+                        size: "Small",
+                        spacing: "None",
+                        color: tone,
+                      }),
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
         ],
       },
     ],
@@ -669,13 +780,25 @@ function makeTimelineItems(
   tools: readonly ExecutionToolSnapshot[],
   hiddenCount: number,
   richLayout: boolean,
+  emptyText = "正在准备",
+  olderTools: readonly ExecutionToolSnapshot[] = [],
 ): JsonNode[] {
   const items: JsonNode[] = [];
-  if (hiddenCount > 0) items.push(makeTextBlock(`已隐藏前 ${hiddenCount} 个步骤`, { isSubtle: true, spacing: "None" }));
-  if (tools.length === 0) {
-    items.push(makeTextBlock("正在准备", { isSubtle: true, spacing: "None" }));
+  if (hiddenCount > 0) {
+    items.push(makeTextBlock(`已隐藏前 ${hiddenCount} 个步骤`, {
+      ...(richLayout ? { id: "timeline_hidden_summary" } : {}),
+      isSubtle: true,
+      spacing: "Small",
+    }));
+  }
+  if (tools.length === 0 && olderTools.length === 0) {
+    items.push(makeTextBlock(emptyText, { isSubtle: true, spacing: "Small" }));
   } else if (richLayout) {
-    items.push(...tools.map(makeToolRow));
+    items.push(...tools.map(tool => makeToolRow(tool)));
+    items.push(...olderTools.map((tool, index) => makeToolRow(tool, {
+      id: `timeline_older_step_${index}`,
+      isVisible: false,
+    })));
   } else {
     items.push(...tools.map(tool => makeTextBlock(toolLine(tool, true), { spacing: "Small" })));
   }
@@ -688,54 +811,185 @@ function makeTodoContainer(
   totalCount: number,
 ): JsonNode | null {
   if (todos.length === 0 || todos.every(phase => phase.tasks.length === 0)) return null;
-  const lines = todoLines(todos, hiddenCount, totalCount);
   return {
     type: "Container",
     id: "todo_detail",
+    style: "emphasis",
     spacing: "Medium",
     items: [
-      makeTextBlock("任务", { weight: "Bolder", spacing: "None" }),
-      ...lines.map(line => makeTextBlock(line, { spacing: "Small" })),
+      makeTextBlock("任务清单", { weight: "Bolder", size: "Medium", spacing: "None" }),
+      ...makeTodoItems(todos, hiddenCount, totalCount),
     ],
   };
 }
 
-function makeToggleSets(detailVisible: boolean, hasCollapsedSteps: boolean): JsonNode[] {
-  const targets = [
-    { elementId: "timeline_detail", isVisible: false },
-    ...(hasCollapsedSteps ? [{ elementId: "collapsed_steps", isVisible: true }] : []),
-    { elementId: "btn_collapse_trace", isVisible: false },
-    { elementId: "btn_expand_trace", isVisible: true },
+function makeSubagentContainer(
+  tools: readonly ExecutionToolSnapshot[],
+  hiddenCount: number,
+  totalCount: number,
+  detailVisible: boolean,
+  olderTools: readonly ExecutionToolSnapshot[] = [],
+): JsonNode {
+  const items: JsonNode[] = [];
+  if (hiddenCount > 0) {
+    items.push(makeTextBlock(`已隐藏 ${hiddenCount} 个子代理，共 ${totalCount} 个子代理`, {
+      id: "subagent_hidden_summary",
+      isSubtle: true,
+      spacing: "Small",
+    }));
+  }
+  if (tools.length === 0 && olderTools.length === 0) {
+    items.push(makeTextBlock("暂无可见子代理活动", { isSubtle: true, spacing: "Small" }));
+  } else {
+    items.push(...tools.map(tool => makeToolRow(tool)));
+    items.push(...olderTools.map((tool, index) => makeToolRow(tool, {
+      id: `subagent_older_step_${index}`,
+      isVisible: false,
+    })));
+  }
+  return {
+    type: "Container",
+    id: "subagent_detail",
+    isVisible: detailVisible,
+    spacing: "Small",
+    items,
+  };
+}
+
+function makeSectionHeader(title: string, actionSets: readonly JsonNode[]): JsonNode {
+  const columns: JsonNode[] = [
+    {
+      type: "Column",
+      width: "stretch",
+      verticalContentAlignment: "Center",
+      items: [makeTextBlock(title, { weight: "Bolder", size: "Medium", spacing: "None" })],
+    },
   ];
-  const expandTargets = targets.map(target => ({ ...target, isVisible: !target.isVisible }));
+  if (actionSets.length > 0) {
+    columns.push({
+      type: "Column",
+      width: "auto",
+      verticalContentAlignment: "Center",
+      items: actionSets,
+    });
+  }
+  return { type: "ColumnSet", spacing: "None", columns };
+}
+
+function makeCollapsibleSection(
+  id: string,
+  heading: string,
+  detail: JsonNode,
+  actionSets: readonly JsonNode[],
+): JsonNode {
+  return {
+    type: "Container",
+    id,
+    spacing: "Medium",
+    items: [makeSectionHeader(heading, actionSets), detail],
+  };
+}
+
+function makeVisibilityTargets(
+  summaryId: string,
+  hiddenElementIds: readonly string[],
+  collapseButtonId: string,
+  expandButtonId: string,
+): { readonly collapsed: JsonNode[]; readonly expanded: JsonNode[] } {
+  return {
+    collapsed: [
+      { elementId: summaryId, isVisible: true },
+      ...hiddenElementIds.map(elementId => ({ elementId, isVisible: false })),
+      { elementId: collapseButtonId, isVisible: false },
+      { elementId: expandButtonId, isVisible: true },
+    ],
+    expanded: [
+      { elementId: summaryId, isVisible: false },
+      ...hiddenElementIds.map(elementId => ({ elementId, isVisible: true })),
+      { elementId: collapseButtonId, isVisible: true },
+      { elementId: expandButtonId, isVisible: false },
+    ],
+  };
+}
+
+function makeToggleSets(hiddenElementIds: readonly string[]): JsonNode[] {
+  if (hiddenElementIds.length === 0) return [];
+  const targets = makeVisibilityTargets(
+    "timeline_hidden_summary",
+    hiddenElementIds,
+    "btn_collapse_trace",
+    "btn_expand_trace",
+  );
   return [
     {
       type: "ActionSet",
       id: "btn_collapse_trace",
-      isVisible: detailVisible,
+      isVisible: false,
       horizontalAlignment: "Right",
-      spacing: "Medium",
+      spacing: "None",
       actions: [
         {
           type: TOGGLE_ACTION,
           id: "trace_collapse",
-          title: "收起执行详情",
-          targetElements: targets,
+          title: "收起",
+          targetElements: targets.collapsed,
         },
       ],
     },
     {
       type: "ActionSet",
       id: "btn_expand_trace",
-      isVisible: !detailVisible,
+      isVisible: true,
       horizontalAlignment: "Right",
-      spacing: "Medium",
+      spacing: "None",
       actions: [
         {
           type: TOGGLE_ACTION,
           id: "trace_expand",
-          title: "展开执行详情",
-          targetElements: expandTargets,
+          title: "展开",
+          targetElements: targets.expanded,
+        },
+      ],
+    },
+  ];
+}
+
+function makeSubagentToggleSets(hiddenElementIds: readonly string[]): JsonNode[] {
+  if (hiddenElementIds.length === 0) return [];
+  const targets = makeVisibilityTargets(
+    "subagent_hidden_summary",
+    hiddenElementIds,
+    "btn_collapse_subagents",
+    "btn_expand_subagents",
+  );
+  return [
+    {
+      type: "ActionSet",
+      id: "btn_collapse_subagents",
+      isVisible: false,
+      horizontalAlignment: "Right",
+      spacing: "None",
+      actions: [
+        {
+          type: TOGGLE_ACTION,
+          id: "subagents_collapse",
+          title: "收起",
+          targetElements: targets.collapsed,
+        },
+      ],
+    },
+    {
+      type: "ActionSet",
+      id: "btn_expand_subagents",
+      isVisible: true,
+      horizontalAlignment: "Right",
+      spacing: "None",
+      actions: [
+        {
+          type: TOGGLE_ACTION,
+          id: "subagents_expand",
+          title: "展开",
+          targetElements: targets.expanded,
         },
       ],
     },
@@ -782,18 +1036,9 @@ function cardWithinLimits(card: AdaptiveCard, plain: string, limits: ResolvedCar
     && wirePayloadBytes(card, plain) <= limits.maxPayloadBytes;
 }
 
-function makeHeader(
-  status: string,
-  metrics: string,
-  state: ExecutionState,
-  richLayout: boolean,
-  stackedLayout: boolean,
-): JsonNode[] {
-  const statusBlock = makeTextBlock(status, {
-    weight: "Bolder",
-    spacing: "None",
-    color: executionTone(state),
-  });
+function makeHeader(richLayout: boolean): JsonNode[] {
+  const title = makeTextBlock("处理进度", { weight: "Bolder", size: "Large", spacing: "None" });
+  const subtitle = makeTextBlock("OMP 执行", { isSubtle: true, size: "Small", spacing: "Small" });
   if (richLayout) {
     return [
       {
@@ -803,56 +1048,161 @@ function makeHeader(
           {
             type: "Column",
             width: "stretch",
-            items: [
-              makeTextBlock("处理进度", { weight: "Bolder", size: "Large", spacing: "None" }),
-              makeTextBlock(metrics, { isSubtle: true, size: "Small", spacing: "Small" }),
-            ],
+            items: [title, subtitle],
           },
           {
             type: "Column",
             width: "auto",
-            items: [statusBlock],
+            verticalContentAlignment: "Center",
+            items: [
+              makeTextBlock("✦", {
+                color: "Accent",
+                size: "ExtraLarge",
+                horizontalAlignment: "Right",
+                spacing: "None",
+              }),
+            ],
           },
         ],
       },
     ];
   }
-  if (stackedLayout) {
-    return [
-      makeTextBlock("处理进度", { weight: "Bolder", size: "Large", spacing: "None" }),
-      makeTextBlock(metrics, { isSubtle: true, size: "Small", spacing: "Small" }),
-      statusBlock,
-    ];
-  }
-  return [
-    makeTextBlock(`处理进度 · ${status}`, {
-      weight: "Bolder",
-      color: executionTone(state),
-      spacing: "None",
-    }),
-    makeTextBlock(metrics, { isSubtle: true, size: "Small", spacing: "Small" }),
-  ];
+  return [title, subtitle];
 }
 
-function makeHeaderContainer(
-  snapshot: ExecutionSnapshot,
-  metrics: string,
-  richLayout: boolean,
-  stackedLayout: boolean,
-): JsonNode {
+function makeHeaderContainer(snapshot: ExecutionSnapshot, richLayout: boolean): JsonNode {
   return {
     type: "Container",
     id: "octo-execution-trace-header",
     style: snapshot.state === "failed"
       ? "attention"
       : snapshot.state === "cancelled"
-        ? "warning"
+        ? "default"
         : snapshot.state === "completed"
           ? "good"
           : "emphasis",
     bleed: true,
     spacing: "None",
-    items: makeHeader(executionStateLabel(snapshot.state), metrics, snapshot.state, richLayout, stackedLayout),
+    items: makeHeader(richLayout),
+  };
+}
+
+function metricCount(value: number): string {
+  if (!Number.isSafeInteger(value) || value < 0) return "0";
+  return String(value);
+}
+
+function makeStatusContainer(
+  snapshot: ExecutionSnapshot,
+  metrics: string,
+  richLayout: boolean,
+): JsonNode {
+  const status = executionStateLabel(snapshot.state);
+  const tone = executionTone(snapshot.state);
+  if (richLayout) {
+    return {
+      type: "Container",
+      id: "execution_status",
+      spacing: "Medium",
+      items: [
+        {
+          type: "ColumnSet",
+          spacing: "None",
+          columns: [
+            {
+              type: "Column",
+              width: "auto",
+              verticalContentAlignment: "Center",
+              items: [makeTextBlock(STATUS_GLYPH, { color: tone, size: "Medium", spacing: "None" })],
+            },
+            {
+              type: "Column",
+              width: "stretch",
+              items: [
+                makeTextBlock(status, { color: tone, weight: "Bolder", spacing: "None" }),
+                makeTextBlock(metrics, { isSubtle: true, size: "Small", spacing: "Small" }),
+              ],
+            },
+            {
+              type: "Column",
+              width: "auto",
+              verticalContentAlignment: "Center",
+              items: [
+                makeTextBlock(formatDuration(snapshot.elapsedMs), {
+                  color: tone,
+                  weight: "Bolder",
+                  horizontalAlignment: "Right",
+                  spacing: "None",
+                }),
+              ],
+            },
+          ],
+        },
+      ],
+    };
+  }
+  return {
+    type: "Container",
+    id: "execution_status",
+    spacing: "Medium",
+    items: [
+      makeTextBlock(`${STATUS_GLYPH} ${status}`, { color: tone, weight: "Bolder", spacing: "None" }),
+      makeTextBlock(metrics, { isSubtle: true, size: "Small", spacing: "Small" }),
+    ],
+  };
+}
+
+
+function executionNotice(
+  snapshot: ExecutionSnapshot,
+  todos: readonly ExecutionTodoPhase[],
+): { readonly text: string; readonly style: "default" | "attention" } | null {
+  let blockedCount = 0;
+  let firstBlocker: string | undefined;
+  for (const phase of todos) {
+    for (const task of phase.tasks) {
+      if (task.status !== "blocked") continue;
+      blockedCount += 1;
+      if (firstBlocker === undefined && task.blocker !== undefined) firstBlocker = task.blocker;
+    }
+  }
+  if (blockedCount > 0) {
+    return {
+      text: firstBlocker === undefined
+        ? `${STATUS_GLYPH} ${blockedCount} 个任务等待处理`
+        : `${STATUS_GLYPH} ${blockedCount} 个任务等待处理 · ${firstBlocker}`,
+      style: "default",
+    };
+  }
+
+  let failedCount = 0;
+  let firstError: ExecutionErrorCategory | undefined;
+  for (const tool of snapshot.tools) {
+    if (tool.state !== "failed") continue;
+    failedCount += 1;
+    if (firstError === undefined) firstError = tool.errorCategory ?? "unknown";
+  }
+  if (failedCount > 0) {
+    return {
+      text: `${STATUS_GLYPH} ${failedCount} 个步骤失败 · ${errorCategoryLabel(firstError ?? "unknown")}`,
+      style: "attention",
+    };
+  }
+  return null;
+}
+
+function makeNotice(notice: { readonly text: string; readonly style: "default" | "attention" }): JsonNode {
+  return {
+    type: "Container",
+    style: notice.style,
+    spacing: "Medium",
+    items: [
+      makeTextBlock(notice.text, {
+        color: notice.style === "attention" ? "Attention" : "Default",
+        weight: "Bolder",
+        spacing: "None",
+      }),
+    ],
   };
 }
 
@@ -870,56 +1220,116 @@ function buildCandidate(
   const canToggle = richLayout
     && supportsElement(capabilities, "ActionSet")
     && supportsAction(capabilities, TOGGLE_ACTION);
-  const terminal = snapshot.state !== "running";
-  const detailVisible = !(canToggle && terminal && visibleTools.length > 0);
   const hiddenTools = Math.max(0, snapshot.tools.length - visibleTools.length);
+  const recentTools = visibleTools.slice(Math.max(0, visibleTools.length - MAX_VISIBLE_TOOLS));
+  const olderTools = visibleTools.slice(0, Math.max(0, visibleTools.length - recentTools.length));
+  const totalSubagents = richLayout
+    ? snapshot.tools.filter(tool => isSubagentTool(tool.toolName)).length
+    : 0;
+  const visibleSubagents = richLayout
+    ? recentTools.filter(tool => isSubagentTool(tool.toolName))
+    : [];
+  const olderSubagents = richLayout
+    ? olderTools.filter(tool => isSubagentTool(tool.toolName))
+    : [];
+  const visibleTraceTools = richLayout
+    ? recentTools.filter(tool => !isSubagentTool(tool.toolName))
+    : visibleTools;
+  const olderTraceTools = richLayout
+    ? olderTools.filter(tool => !isSubagentTool(tool.toolName))
+    : [];
+  const totalTraceTools = richLayout ? snapshot.tools.length - totalSubagents : snapshot.tools.length;
+  const hiddenTraceTools = Math.max(0, totalTraceTools - visibleTraceTools.length);
+  const hiddenSubagents = Math.max(0, totalSubagents - visibleSubagents.length);
   const visibleTodoTasks = visibleTodos.reduce((count, phase) => count + phase.tasks.length, 0);
   const hiddenTodoTasks = Math.max(0, totalTodoTasks - visibleTodoTasks);
   const elapsed = formatDuration(snapshot.elapsedMs);
   const metrics = `${snapshot.phaseCount} 个阶段 · ${snapshot.toolCount} 次工具调用 · ${elapsed}`;
-  const timelineItems = makeTimelineItems(visibleTools, hiddenTools, richLayout);
-  const body: JsonNode[] = [];
-
-  if (stackedLayout) {
-    body.push(makeHeaderContainer(snapshot, metrics, richLayout, stackedLayout));
-    body.push({
-      type: "Container",
-      id: "timeline_detail",
-      isVisible: detailVisible,
-      spacing: "Medium",
-      items: timelineItems,
-    });
-  } else {
-    body.push(
-      makeTextBlock(`处理进度 · ${executionStateLabel(snapshot.state)}`, {
-        weight: "Bolder",
-        color: executionTone(snapshot.state),
-        spacing: "None",
-      }),
-      makeTextBlock(metrics, { isSubtle: true, size: "Small", spacing: "Small" }),
-      ...timelineItems,
-    );
-  }
-
-  if (richLayout && detailVisible === false && visibleTools.length > 0) {
-    body.push({
-      type: "Container",
-      id: "collapsed_steps",
-      isVisible: true,
-      spacing: "Medium",
-      items: [makeToolRow(visibleTools[visibleTools.length - 1]!)],
-    });
-  }
-
+  const notice = executionNotice(snapshot, visibleTodos);
+  const timelineItems = makeTimelineItems(
+    visibleTraceTools,
+    hiddenTraceTools,
+    richLayout,
+    visibleSubagents.length > 0 ? "暂无其他工具活动" : "正在准备",
+    olderTraceTools,
+  );
+  const subagentContainer = richLayout && totalSubagents > 0
+    ? makeSubagentContainer(visibleSubagents, hiddenSubagents, totalSubagents, true, olderSubagents)
+    : null;
+  const traceOlderIds = olderTraceTools.map((_tool, index) => `timeline_older_step_${index}`);
+  const subagentOlderIds = olderSubagents.map((_tool, index) => `subagent_older_step_${index}`);
+  const traceToggleSets = canToggle ? makeToggleSets(traceOlderIds) : [];
+  const subagentToggleSets = canToggle && subagentContainer
+    ? makeSubagentToggleSets(subagentOlderIds)
+    : [];
   const todoContainer = hasContainer
     ? makeTodoContainer(visibleTodos, hiddenTodoTasks, totalTodoTasks)
     : null;
-  if (todoContainer) {
-    body.push(todoContainer);
-  } else if (!hasContainer && visibleTodoTasks > 0) {
-    body.push(...todoLines(visibleTodos, hiddenTodoTasks, totalTodoTasks).map(line => makeTextBlock(line, { spacing: "Small" })));
+  const body: JsonNode[] = [];
+
+  if (stackedLayout) {
+    body.push(
+      makeHeaderContainer(snapshot, richLayout),
+      makeStatusContainer(snapshot, metrics, richLayout),
+    );
+    if (notice) body.push(makeNotice(notice));
+    if (todoContainer) body.push(todoContainer);
+    if (richLayout) {
+      const timelineDetail: JsonNode = {
+        type: "Container",
+        id: "timeline_detail",
+        isVisible: true,
+        spacing: "Small",
+        items: timelineItems,
+      };
+      if (subagentContainer) {
+        body.push(makeCollapsibleSection(
+          "subagent_section",
+          `子代理 · ${totalSubagents}`,
+          subagentContainer,
+          subagentToggleSets,
+        ));
+      }
+      body.push(makeCollapsibleSection("timeline_section", "执行轨迹", timelineDetail, traceToggleSets));
+    } else {
+      body.push({
+        type: "Container",
+        id: "timeline_detail",
+        isVisible: true,
+        spacing: "Medium",
+        items: [
+          makeTextBlock("执行轨迹", { weight: "Bolder", size: "Medium", spacing: "None" }),
+          ...timelineItems,
+        ],
+      });
+    }
+  } else {
+    body.push(
+      ...makeHeader(false),
+      makeTextBlock(`${STATUS_GLYPH} ${executionStateLabel(snapshot.state)}`, {
+        weight: "Bolder",
+        color: executionTone(snapshot.state),
+        spacing: "Medium",
+      }),
+      makeTextBlock(metrics, { isSubtle: true, size: "Small", spacing: "Small" }),
+      makeTextBlock(
+        `阶段 ${metricCount(snapshot.phaseCount)} · 工具 ${metricCount(snapshot.toolCount)} · 任务 ${metricCount(totalTodoTasks)} · 耗时 ${elapsed}`,
+        { isSubtle: true, size: "Small", spacing: "Small" },
+      ),
+    );
+    if (notice) {
+      body.push(makeTextBlock(notice.text, {
+        color: notice.style === "attention" ? "Attention" : "Default",
+        weight: "Bolder",
+        spacing: "Medium",
+      }));
+    }
+    if (visibleTodoTasks > 0) {
+      body.push(...todoLines(visibleTodos, hiddenTodoTasks, totalTodoTasks).map(line => makeTextBlock(line, { spacing: "Small" })));
+    }
+    body.push(makeTextBlock("执行轨迹", { weight: "Bolder", size: "Medium", spacing: "Medium" }), ...timelineItems);
   }
-  if (canToggle) body.push(...makeToggleSets(detailVisible, detailVisible === false && visibleTools.length > 0));
+
 
   const card: AdaptiveCard = {
     $schema: ADAPTIVE_CARD_SCHEMA,
@@ -930,11 +1340,13 @@ function buildCandidate(
   };
   const plainLines = [
     `处理进度 · ${executionStateLabel(snapshot.state)} · ${metrics}`,
+    "OMP 自动执行",
+    ...(notice ? [notice.text] : []),
     ...visibleTools.map(tool => toolLine(tool, true)),
     ...(hiddenTools > 0 ? [`已隐藏前 ${hiddenTools} 个步骤，共 ${snapshot.tools.length} 个步骤`] : []),
     ...todoLines(visibleTodos, hiddenTodoTasks, totalTodoTasks),
   ];
-  if (plainLines.length === 1) plainLines.push("正在准备");
+  if (visibleTools.length === 0 && visibleTodoTasks === 0) plainLines.push("正在准备");
   return { card, plain: plainLines.join("\n") };
 }
 
@@ -998,7 +1410,7 @@ export function buildExecutionCard(
   if (!limits) return null;
   const totalTools = snapshot.tools.length;
   const totalTodoTasks = snapshot.todos.reduce((count, phase) => count + phase.tasks.length, 0);
-  let visibleToolCount = Math.min(totalTools, MAX_VISIBLE_TOOLS);
+  let visibleToolCount = Math.min(totalTools, MAX_RENDERED_TOOLS);
   let visibleTodoCount = Math.min(totalTodoTasks, MAX_VISIBLE_TODO_TASKS);
   while (visibleToolCount >= 0 && visibleTodoCount >= 0) {
     const visibleTools = snapshot.tools.slice(Math.max(0, totalTools - visibleToolCount));
