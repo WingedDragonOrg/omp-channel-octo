@@ -595,7 +595,7 @@ describe("execution card rendering", () => {
     expect(rowColumns).toHaveLength(3);
     expect(rowColumns[0]).toMatchObject({ width: "auto", verticalContentAlignment: "Center" });
     expect(rowColumns[0]?.items).toEqual([
-      expect.objectContaining({ text: "●", color: "Accent", size: "Medium", spacing: "None" }),
+      expect.objectContaining({ text: "●", color: "Accent", size: "Small", spacing: "None" }),
     ]);
     expect(rowColumns[1]).toMatchObject({ width: "stretch" });
     expect(rowColumns[1]?.items).toEqual([

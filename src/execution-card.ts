@@ -885,7 +885,7 @@ function makeToolRow(
                     items: [makeTextBlock(glyph, {
                       spacing: "None",
                       color: tone,
-                      size: "Medium",
+                      size: "Small",
                     })],
                   },
                   {
