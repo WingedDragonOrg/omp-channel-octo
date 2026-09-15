@@ -693,6 +693,11 @@ function todoPhaseText(phase: ExecutionTodoPhase, phaseIndex: number, phaseCount
   return `${branch} ${phase.name}`;
 }
 
+function todoTaskContent(task: ExecutionTodoTask): string {
+  const blocker = task.blocker === undefined ? "" : ` · ${task.blocker}`;
+  return `${todoStatusGlyph(task.status)} ${task.content}${blocker}`;
+}
+
 function todoTaskText(
   task: ExecutionTodoTask,
   phaseIndex: number,
@@ -702,8 +707,64 @@ function todoTaskText(
 ): string {
   const phaseIndent = phaseIndex === phaseCount - 1 ? "   " : "│  ";
   const branch = taskIndex === taskCount - 1 ? "└─" : "├─";
-  const blocker = task.blocker === undefined ? "" : ` · ${task.blocker}`;
-  return `${phaseIndent}${branch} ${todoStatusGlyph(task.status)} ${task.content}${blocker}`;
+  return `${phaseIndent}${branch} ${todoTaskContent(task)}`;
+}
+
+function makeTodoTaskRow(
+  task: ExecutionTodoTask,
+  phaseIndex: number,
+  phaseCount: number,
+  taskIndex: number,
+  taskCount: number,
+): JsonNode {
+  const continuation = phaseIndex === phaseCount - 1 ? "\u00a0" : "│";
+  const branch = taskIndex === taskCount - 1 ? "└─" : "├─";
+  const tone = todoTone(task.status);
+  // Keep the tree prefix in its own auto-width column; body text cannot shift its alignment.
+  return {
+    type: "ColumnSet",
+    spacing: "None",
+    columns: [
+      {
+        type: "Column",
+        width: "auto",
+        verticalContentAlignment: "Center",
+        items: [makeTextBlock(`${continuation}\u00a0${branch}`, { color: tone, fontType: "Monospace", spacing: "None" })],
+      },
+      {
+        type: "Column",
+        width: "stretch",
+        verticalContentAlignment: "Center",
+        items: [makeTextBlock(todoTaskContent(task), { color: tone, spacing: "None" })],
+      },
+    ],
+  };
+}
+
+function makeTodoPhaseRow(
+  phase: ExecutionTodoPhase,
+  phaseIndex: number,
+  phaseCount: number,
+): JsonNode {
+  const branch = phaseIndex === phaseCount - 1 ? "└─" : "├─";
+  return {
+    type: "ColumnSet",
+    spacing: "None",
+    columns: [
+      {
+        type: "Column",
+        width: "auto",
+        verticalContentAlignment: "Center",
+        items: [makeTextBlock(branch, { fontType: "Monospace", spacing: "None" })],
+      },
+      {
+        type: "Column",
+        width: "stretch",
+        verticalContentAlignment: "Center",
+        items: [makeTextBlock(phase.name, { weight: "Bolder", spacing: "None" })],
+      },
+    ],
+  };
 }
 
 function todoLines(
@@ -728,6 +789,7 @@ function makeTodoItems(
   todos: readonly ExecutionTodoPhase[],
   hiddenCount: number,
   totalCount: number,
+  structuredLayout: boolean,
 ): JsonNode[] {
   const items: JsonNode[] = [];
   if (hiddenCount > 0) {
@@ -742,24 +804,22 @@ function makeTodoItems(
     const taskItems: JsonNode[] = [];
     for (let taskIndex = 0; taskIndex < phase.tasks.length; taskIndex += 1) {
       const task = phase.tasks[taskIndex]!;
-      taskItems.push(makeTextBlock(
-        todoTaskText(task, phaseIndex, phaseCount, taskIndex, phase.tasks.length),
-        { color: todoTone(task.status), spacing: "None" },
-      ));
+      taskItems.push(structuredLayout
+        ? makeTodoTaskRow(task, phaseIndex, phaseCount, taskIndex, phase.tasks.length)
+        : makeTextBlock(
+          todoTaskText(task, phaseIndex, phaseCount, taskIndex, phase.tasks.length),
+          { color: todoTone(task.status), spacing: "None" },
+        ));
     }
     const phaseItems: JsonNode[] = [
-      makeTextBlock(todoPhaseText(phase, phaseIndex, phaseCount), {
-        weight: "Bolder",
-        spacing: "None",
-      }),
+      structuredLayout
+        ? makeTodoPhaseRow(phase, phaseIndex, phaseCount)
+        : makeTextBlock(todoPhaseText(phase, phaseIndex, phaseCount), {
+          weight: "Bolder",
+          spacing: "None",
+        }),
+      ...taskItems,
     ];
-    if (taskItems.length > 0) {
-      phaseItems.push({
-        type: "Container",
-        spacing: "None",
-        items: taskItems,
-      });
-    }
     items.push({
       type: "Container",
       spacing: "Small",
@@ -886,6 +946,7 @@ function makeTodoContainer(
   todos: readonly ExecutionTodoPhase[],
   hiddenCount: number,
   totalCount: number,
+  structuredLayout: boolean,
 ): JsonNode | null {
   if (todos.length === 0 || todos.every(phase => phase.tasks.length === 0)) return null;
   return {
@@ -895,7 +956,7 @@ function makeTodoContainer(
     spacing: "Medium",
     items: [
       makeTextBlock("任务清单", { weight: "Bolder", size: "Medium", spacing: "None" }),
-      ...makeTodoItems(todos, hiddenCount, totalCount),
+      ...makeTodoItems(todos, hiddenCount, totalCount, structuredLayout),
     ],
   };
 }
@@ -1393,7 +1454,7 @@ function buildCandidate(
     ? makeSubagentToggleSets(subagentOlderIds)
     : [];
   const todoContainer = hasContainer
-    ? makeTodoContainer(visibleTodos, hiddenTodoTasks, totalTodoTasks)
+    ? makeTodoContainer(visibleTodos, hiddenTodoTasks, totalTodoTasks, richLayout)
     : null;
   const terminal = snapshot.state !== "running";
   const detailElementIds = [

@@ -280,13 +280,35 @@ describe("execution tracker", () => {
     expect(blockedSnapshot.todos).toEqual(initialPhases);
     const blockedRendered = buildExecutionCard(blockedSnapshot, fullCapabilities);
     expect(blockedRendered).not.toBeNull();
-    expect(cardText(blockedRendered!.card as JsonRecord)).toContain("等待授权");
-    expect(cardText(blockedRendered!.card as JsonRecord)).toContain("├─ Foundation");
-    expect(cardText(blockedRendered!.card as JsonRecord)).toContain("│  ├─ ● Wire storage");
-    expect(cardText(blockedRendered!.card as JsonRecord)).toContain("│  └─ - Wait for access · 等待授权");
-    expect(cardText(blockedRendered!.card as JsonRecord)).toContain("└─ Verification");
-    expect(cardText(blockedRendered!.card as JsonRecord)).toContain("   └─ - Run checks");
+    const blockedCard = blockedRendered!.card as JsonRecord;
+    expect(cardText(blockedCard)).toContain("等待授权");
+    const todoDetail = nodeById(blockedCard, "todo_detail");
+    const phaseContainers = (todoDetail.items as JsonRecord[]).filter(item => item.type === "Container");
+    expect(phaseContainers).toHaveLength(2);
+    const foundationItems = phaseContainers[0]?.items as JsonRecord[];
+    expect(foundationItems).toHaveLength(3);
+    const foundationHeader = foundationItems[0]!;
+    expect(foundationHeader.type).toBe("ColumnSet");
+    const phaseColumns = foundationHeader.columns as JsonRecord[];
+    expect(phaseColumns).toHaveLength(2);
+    expect(cardText(phaseColumns[0]!)).toBe("├─");
+    const phasePrefix = (phaseColumns[0]?.items as JsonRecord[])[0]!;
+    expect(phasePrefix.fontType).toBe("Monospace");
+    expect(cardText(phaseColumns[1]!)).toBe("Foundation");
+    const foundationRows = foundationItems.slice(1);
+    expect(foundationRows.every(row => row.type === "ColumnSet")).toBe(true);
+    const firstTaskColumns = foundationRows[0]?.columns as JsonRecord[];
+    expect(firstTaskColumns).toHaveLength(2);
+    const taskPrefix = (firstTaskColumns[0]?.items as JsonRecord[])[0]!;
+    expect(taskPrefix.fontType).toBe("Monospace");
+    expect((firstTaskColumns[0]?.items as JsonRecord[])[0]?.text).toBe("│\u00a0├─");
+    expect(cardText(firstTaskColumns[1]!)).toContain("● Wire storage");
+    expect(cardText(foundationRows[1]!)).toContain("- Wait for access · 等待授权");
+    expect(cardText(blockedCard)).not.toContain("│  ├─");
     expect(blockedRendered!.plain).toContain("├─ Foundation");
+    expect(blockedRendered!.plain).toContain("│  ├─ ● Wire storage");
+    expect(blockedRendered!.plain).toContain("│  └─ - Wait for access · 等待授权");
+    expect(blockedRendered!.plain).toContain("   └─ - Run checks");
 
     const updatedPhases = [
       {
@@ -310,16 +332,18 @@ describe("execution tracker", () => {
     expect(text).toContain("Wire storage");
     expect(text).toContain("Wait for access");
     expect(text).toContain("Run checks");
-    expect(text).toContain("├─ Foundation");
-    expect(text).toContain("│  ├─ ✓ Wire storage");
-    expect(text).toContain("│  └─ × Wait for access");
-    expect(text).toContain("   └─ ● Run checks");
+    expect(text).toContain("Foundation");
+    expect(text).not.toContain("│  ├─");
     expect(text).not.toContain("[已完成]");
     expect(text).not.toContain("[进行中]");
     expect(text).not.toContain("[等待]");
     expect(text).not.toContain("[已阻塞]");
     expect(text).not.toContain("[已放弃]");
     expect(text).not.toContain("等待授权");
+    expect(rendered!.plain).toContain("├─ Foundation");
+    expect(rendered!.plain).toContain("│  ├─ ✓ Wire storage");
+    expect(rendered!.plain).toContain("│  └─ × Wait for access");
+    expect(rendered!.plain).toContain("   └─ ● Run checks");
   });
 
   test("run_end is authoritative for completed, failed, and cancelled terminal states", () => {
@@ -782,6 +806,9 @@ describe("execution card rendering", () => {
       plain: rendered!.plain,
     };
     expect(payloadBytes(wirePayload)).toBeLessThanOrEqual(limits.maxPayloadBytes);
+    const wireStats = cardStats(wirePayload);
+    expect(wireStats.nodes).toBeLessThanOrEqual(limits.maxNodes);
+    expect(wireStats.maxDepth).toBeLessThanOrEqual(limits.maxDepth);
   });
 
   test("uses unified status markers and state-specific colors", () => {
