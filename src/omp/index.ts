@@ -906,9 +906,135 @@ function safeToolCallId(value: unknown): string | undefined {
 
 const PATH_SUMMARY_TOOLS: ReadonlySet<string> = new Set(["read", "glob", "grep", "write", "edit"]);
 const SAFE_SUMMARY_COMPONENT = /^[A-Za-z0-9._-]{1,64}$/u;
+const TODO_OPERATION_LABELS: Record<string, string> = {
+	init: "初始化",
+	start: "开始",
+	done: "完成",
+	rm: "清除",
+	drop: "放弃",
+	block: "阻塞",
+	unblock: "解除阻塞",
+	append: "追加",
+	view: "查看",
+};
+
+function safeSummaryComponent(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const component = value.trim();
+	return SAFE_SUMMARY_COMPONENT.test(component) ? component : undefined;
+}
+
+function safeHubSummary(args: unknown): string {
+	if (!isRecord(args)) return "Hub";
+	const op = typeof args.op === "string" ? args.op.trim().toLowerCase() : "";
+	const to = safeSummaryComponent(args.to);
+	const from = safeSummaryComponent(args.from);
+	const name = safeSummaryComponent(args.name);
+	switch (op) {
+		case "send": {
+			if (name && !to) return `进程输入 · ${name}`;
+			const parts = [`IRC → ${to ?? "agent"}`];
+			if (args.await === true) parts.push("等待回复");
+			if (to === "all") parts.push("广播");
+			return parts.join(" · ");
+		}
+		case "wait": {
+			if (name && !from) return `等待进程 · ${name}`;
+			if (from) return `IRC ← ${from}`;
+			const ids = Array.isArray(args.ids)
+				? args.ids.filter(id => safeSummaryComponent(id) !== undefined).length
+				: 0;
+			return ids > 0 ? `等待 ${ids} 个后台任务` : "等待消息或任务";
+		}
+		case "inbox":
+			return args.peek === true ? "IRC 收件箱 · 预览" : "IRC 收件箱";
+		case "list":
+			return "IRC 协作代理";
+		case "jobs":
+			return "后台任务";
+		case "cancel": {
+			const ids = Array.isArray(args.ids)
+				? args.ids.filter(id => safeSummaryComponent(id) !== undefined).length
+				: 0;
+			return ids > 0 ? `取消 ${ids} 个后台任务` : "取消后台任务";
+		}
+		case "start":
+		case "ps":
+		case "logs":
+		case "stop":
+		case "restart":
+		case "describe":
+			return name ? `进程 · ${op} · ${name}` : `进程 · ${op}`;
+		default:
+			return "Hub";
+	}
+}
+
+function safeTaskSummary(args: unknown): string {
+	if (!isRecord(args)) return "子代理 · 默认";
+	const entries = Array.isArray(args.tasks) ? args.tasks : undefined;
+	const count = Math.max(1, entries?.length ?? 1);
+	let agent = safeSummaryComponent(args.agent);
+	if (!agent && entries?.[0] && isRecord(entries[0])) agent = safeSummaryComponent(entries[0].agent);
+	const label = agent ?? "默认";
+	return count === 1 ? `子代理 · ${label}` : `子代理 · ${label} ×${count}`;
+}
+
+function safeTodoSummary(args: unknown): string {
+	const op = isRecord(args) && typeof args.op === "string" ? args.op.trim().toLowerCase() : "";
+	return `任务清单 · ${TODO_OPERATION_LABELS[op] ?? "更新"}`;
+}
+
+function safeAskSummary(args: unknown): string {
+	const count = isRecord(args) && Array.isArray(args.questions)
+		? Math.min(args.questions.length, 99)
+		: 0;
+	return count > 0 ? `等待用户回答 · ${count} 个问题` : "等待用户回答";
+}
+
+function safeSpecialToolSummary(toolName: string, args: unknown): string | undefined {
+	switch (toolName) {
+		case "hub":
+			return safeHubSummary(args);
+		case "task":
+			return safeTaskSummary(args);
+		case "todo":
+			return safeTodoSummary(args);
+		case "ask":
+			return safeAskSummary(args);
+		case "checkpoint":
+			return "建立上下文检查点";
+		case "rewind":
+			return "恢复上下文检查点";
+		case "context_notes":
+			return "读取上下文说明";
+		case "new_context":
+			return "切换上下文";
+		case "security_scan":
+			return "执行安全扫描";
+		case "web_search":
+			return "搜索网页";
+		case "lsp":
+			return "代码智能服务";
+		case "github":
+			return "GitHub 操作";
+		case "memory_edit":
+		case "retain":
+		case "recall":
+		case "reflect":
+		case "learn":
+		case "manage_skill":
+			return "管理上下文资料";
+		default:
+			return undefined;
+	}
+}
 
 function safeToolSummary(toolName: string, args: unknown): string | undefined {
-	if (!PATH_SUMMARY_TOOLS.has(toolName) || !isRecord(args) || typeof args.path !== "string") return undefined;
+	const normalized = toolName.toLowerCase();
+	const special = safeSpecialToolSummary(normalized, args);
+	if (special !== undefined) return special;
+	if (!PATH_SUMMARY_TOOLS.has(normalized) || !isRecord(args) || typeof args.path !== "string") return undefined;
 	let path = args.path.trim();
 	if (path.startsWith("skill://")) path = path.slice("skill://".length);
 	const queryStart = path.search(/[?#]/u);

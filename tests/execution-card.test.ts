@@ -281,6 +281,12 @@ describe("execution tracker", () => {
     const blockedRendered = buildExecutionCard(blockedSnapshot, fullCapabilities);
     expect(blockedRendered).not.toBeNull();
     expect(cardText(blockedRendered!.card as JsonRecord)).toContain("等待授权");
+    expect(cardText(blockedRendered!.card as JsonRecord)).toContain("├─ Foundation");
+    expect(cardText(blockedRendered!.card as JsonRecord)).toContain("│  ├─ ● [进行中] Wire storage");
+    expect(cardText(blockedRendered!.card as JsonRecord)).toContain("│  └─ ● [已阻塞] Wait for access · 等待授权");
+    expect(cardText(blockedRendered!.card as JsonRecord)).toContain("└─ Verification");
+    expect(cardText(blockedRendered!.card as JsonRecord)).toContain("   └─ ● [等待] Run checks");
+    expect(blockedRendered!.plain).toContain("├─ Foundation");
 
     const updatedPhases = [
       {
@@ -411,6 +417,25 @@ describe("execution card rendering", () => {
     expect(cardText(card)).toContain("运行子代理");
     expect(cardText(card)).toContain("梳理实现方案");
     expect(nodes(card).some(node => node.id === "execution_metrics")).toBe(false);
+  });
+  test("renders semantic labels for special tools in the execution trace", () => {
+    const tracker = createExecutionTracker({ runId: "special-tool-rendering" });
+    startTurn(tracker, "turn-1", 0);
+    startTool(tracker, "hub-1", "hub", 1, "IRC → agent-a · 等待回复");
+    startTool(tracker, "task-1", "task", 2, "子代理 · scout");
+    startTool(tracker, "todo-1", "todo", 3, "任务清单 · 完成");
+    startTool(tracker, "ask-1", "ask", 4, "等待用户回答 · 1 个问题");
+
+    const rendered = buildExecutionCard(tracker.snapshot(5), fullCapabilities);
+    expect(rendered).not.toBeNull();
+    const card = rendered!.card as JsonRecord;
+    const textNodes = nodes(card);
+    expect(cardText(card)).toContain("IRC → agent-a · 等待回复");
+    expect(cardText(card)).toContain("子代理 · scout");
+    expect(cardText(card)).toContain("任务清单 · 完成");
+    expect(cardText(card)).toContain("等待用户回答 · 1 个问题");
+    expect(textNodes.some(node => node.text === "IRC 协作")).toBe(true);
+    expect(textNodes.some(node => node.text === "询问用户")).toBe(true);
   });
 
   test("renders subagent activity with expand control only when older activity exists", () => {

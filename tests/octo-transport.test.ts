@@ -170,6 +170,8 @@ describe("Octo registration and WuKongIM transport", () => {
     const identity = await transport.initialize();
     expect(identity.uid).toBe(fixture.botUid);
     expect(identity.name).toBe(fixture.botName);
+    const ownerUid = "ownerUid" in identity && typeof identity.ownerUid === "string" ? identity.ownerUid : undefined;
+    expect(ownerUid).toBe(fixture.ownerUid);
     expect(fixture.registerRequests).toHaveLength(1);
     expect(fixture.registerRequests[0]).toMatchObject({
       path: "/v1/bot/register",

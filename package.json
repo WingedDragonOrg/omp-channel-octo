@@ -8,6 +8,7 @@
   },
   "scripts": {
     "test": "bun test",
+    "test:preview-card": "bun test ./tests/preview-card.acceptance.ts",
     "typecheck": "tsc --noEmit",
     "check": "bun run src/cli.ts check",
     "serve": "bun run src/cli.ts serve",

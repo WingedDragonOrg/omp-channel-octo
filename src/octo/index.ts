@@ -34,6 +34,7 @@ type Registration = {
   name: string;
   imToken: string;
   wsUrl: string;
+  ownerUid?: string;
 };
 
 
@@ -855,7 +856,11 @@ export class OctoTransport implements ChannelTransport {
   async initialize(): Promise<BotIdentity> {
     const registration = await this.registerBot();
     this.registration = registration;
-    return { uid: registration.uid, name: registration.name };
+    return {
+      uid: registration.uid,
+      name: registration.name,
+      ...(registration.ownerUid === undefined ? {} : { ownerUid: registration.ownerUid }),
+    };
   }
 
   start(
@@ -1112,10 +1117,19 @@ export class OctoTransport implements ChannelTransport {
     const uid = requiredString(value.robot_id, "robot_id");
     const name = typeof value.name === "string" && value.name.length > 0 ? value.name : uid;
     const imToken = requiredString(value.im_token, "im_token");
+    const ownerUid = typeof value.owner_uid === "string" && value.owner_uid.trim().length > 0
+      ? value.owner_uid.trim()
+      : undefined;
     const advertisedWsUrl = typeof value.ws_url === "string" ? value.ws_url : undefined;
     const wsUrl = this.configuredWsUrl ?? requiredString(advertisedWsUrl, "ws_url");
     webSocketUrl(wsUrl, "ws_url");
-    return { uid, name, imToken, wsUrl };
+    return {
+      uid,
+      name,
+      imToken,
+      wsUrl,
+      ...(ownerUid === undefined ? {} : { ownerUid }),
+    };
   }
 
   private async requestPresigned(

@@ -17,6 +17,8 @@ export interface InboundMessage extends ChatTarget {
 export interface BotIdentity {
   uid: string;
   name: string;
+  /** Owner private-chat UID returned by Bot registration, when available. */
+  ownerUid?: string;
 }
 
 export interface SendReceipt {

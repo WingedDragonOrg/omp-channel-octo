@@ -484,6 +484,48 @@ describe("OMP RPC worker", () => {
 			expect(serialized).not.toContain("SECRET_SUMMARY_RESULT");
 		});
 	});
+	test("publishes semantic summaries for special tools without leaking payloads", async () => {
+		await withHarness("hub-summary", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("show special tool summaries", event => events.push(event));
+			const toolEvents = events.filter(event => event.type === "tool_start" || event.type === "tool_end");
+			const summaries = toolEvents.map(event => {
+				if (event.type === "tool_start") {
+					return { type: event.type, toolName: event.toolName, summary: event.summary };
+				}
+				return { type: event.type, summary: event.summary };
+			});
+			expect(summaries).toEqual([
+				{ type: "tool_start", toolName: "hub", summary: "IRC → agent-a · 等待回复" },
+				{ type: "tool_end", summary: "IRC → agent-a · 等待回复" },
+				{ type: "tool_start", toolName: "hub", summary: "IRC ← agent-b" },
+				{ type: "tool_end", summary: "IRC ← agent-b" },
+				{ type: "tool_start", toolName: "hub", summary: "IRC 收件箱 · 预览" },
+				{ type: "tool_end", summary: "IRC 收件箱 · 预览" },
+				{ type: "tool_start", toolName: "hub", summary: "IRC 协作代理" },
+				{ type: "tool_end", summary: "IRC 协作代理" },
+				{ type: "tool_start", toolName: "task", summary: "子代理 · scout" },
+				{ type: "tool_end", summary: "子代理 · scout" },
+				{ type: "tool_start", toolName: "todo", summary: "任务清单 · 完成" },
+				{ type: "tool_end", summary: "任务清单 · 完成" },
+				{ type: "tool_start", toolName: "ask", summary: "等待用户回答 · 1 个问题" },
+				{ type: "tool_end", summary: "等待用户回答 · 1 个问题" },
+			]);
+			for (const event of toolEvents) {
+				expect(event).not.toHaveProperty("args");
+				expect(event).not.toHaveProperty("result");
+			}
+			const serialized = JSON.stringify(events);
+			expect(serialized).not.toContain("SECRET_IRC_MESSAGE");
+			expect(serialized).not.toContain("SECRET_IRC_RESULT");
+			expect(serialized).not.toContain("SECRET_TASK_PROMPT");
+			expect(serialized).not.toContain("SECRET_TASK_RESULT");
+			expect(serialized).not.toContain("SECRET_TODO_TASK");
+			expect(serialized).not.toContain("SECRET_TODO_RESULT");
+			expect(serialized).not.toContain("SECRET_QUESTION");
+			expect(serialized).not.toContain("SECRET_ASK_RESULT");
+		});
+	});
 
 	test("maps only successful todo tool details to a typed update", async () => {
 		await withHarness("todo-progress", async harness => {

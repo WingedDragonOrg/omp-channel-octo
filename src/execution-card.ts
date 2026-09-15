@@ -149,6 +149,29 @@ const TOOL_DISPLAY_LABELS: Record<string, string> = {
   bash: "运行命令",
   grep: "搜索文件",
   glob: "搜索文件",
+  ask: "询问用户",
+  ast_grep: "结构化搜索",
+  ast_edit: "结构化修改",
+  debug: "调试程序",
+  eval: "运行代码",
+  github: "GitHub 操作",
+  lsp: "代码智能",
+  checkpoint: "建立检查点",
+  rewind: "恢复检查点",
+  context_notes: "上下文说明",
+  new_context: "切换上下文",
+  security_scan: "安全扫描",
+  hub: "IRC 协作",
+  irc: "IRC 协作",
+  think: "思考",
+  yield: "提交结果",
+  web_search: "搜索网页",
+  memory_edit: "编辑记忆",
+  retain: "保存记忆",
+  recall: "检索记忆",
+  reflect: "整理记忆",
+  learn: "沉淀经验",
+  manage_skill: "管理技能",
   agent: "运行子代理",
   delegate: "运行子代理",
   run_subagent: "运行子代理",
@@ -652,6 +675,24 @@ function toolLine(tool: ExecutionToolSnapshot, includeGlyph = false): string {
   return parts.join(" · ");
 }
 
+function todoPhaseText(phase: ExecutionTodoPhase, phaseIndex: number, phaseCount: number): string {
+  const branch = phaseIndex === phaseCount - 1 ? "└─" : "├─";
+  return `${branch} ${phase.name}`;
+}
+
+function todoTaskText(
+  task: ExecutionTodoTask,
+  phaseIndex: number,
+  phaseCount: number,
+  taskIndex: number,
+  taskCount: number,
+): string {
+  const phaseIndent = phaseIndex === phaseCount - 1 ? "   " : "│  ";
+  const branch = taskIndex === taskCount - 1 ? "└─" : "├─";
+  const blocker = task.blocker === undefined ? "" : ` · ${task.blocker}`;
+  return `${phaseIndent}${branch} ${STATUS_GLYPH} [${todoStateLabel(task.status)}] ${task.content}${blocker}`;
+}
+
 function todoLines(
   todos: readonly ExecutionTodoPhase[],
   hiddenCount = 0,
@@ -659,15 +700,17 @@ function todoLines(
 ): string[] {
   const lines: string[] = [];
   if (hiddenCount > 0) lines.push(`已隐藏 ${hiddenCount} 个任务，共 ${totalCount} 个任务`);
-  for (const phase of todos) {
-    lines.push(phase.name);
-    for (const task of phase.tasks) {
-      const blocker = task.blocker === undefined ? "" : ` · ${task.blocker}`;
-      lines.push(`${STATUS_GLYPH} [${todoStateLabel(task.status)}] ${task.content}${blocker}`);
+  const phaseCount = todos.length;
+  for (let phaseIndex = 0; phaseIndex < phaseCount; phaseIndex += 1) {
+    const phase = todos[phaseIndex]!;
+    lines.push(todoPhaseText(phase, phaseIndex, phaseCount));
+    for (let taskIndex = 0; taskIndex < phase.tasks.length; taskIndex += 1) {
+      lines.push(todoTaskText(phase.tasks[taskIndex]!, phaseIndex, phaseCount, taskIndex, phase.tasks.length));
     }
   }
   return lines;
 }
+
 function makeTodoItems(
   todos: readonly ExecutionTodoPhase[],
   hiddenCount: number,
@@ -680,15 +723,35 @@ function makeTodoItems(
       spacing: "Small",
     }));
   }
-  for (const phase of todos) {
-    items.push(makeTextBlock(phase.name, { spacing: "Small" }));
-    for (const task of phase.tasks) {
-      const blocker = task.blocker === undefined ? "" : ` · ${task.blocker}`;
-      items.push(makeTextBlock(
-        `${STATUS_GLYPH} [${todoStateLabel(task.status)}] ${task.content}${blocker}`,
-        { color: todoTone(task.status), spacing: "Small" },
+  const phaseCount = todos.length;
+  for (let phaseIndex = 0; phaseIndex < phaseCount; phaseIndex += 1) {
+    const phase = todos[phaseIndex]!;
+    const taskItems: JsonNode[] = [];
+    for (let taskIndex = 0; taskIndex < phase.tasks.length; taskIndex += 1) {
+      const task = phase.tasks[taskIndex]!;
+      taskItems.push(makeTextBlock(
+        todoTaskText(task, phaseIndex, phaseCount, taskIndex, phase.tasks.length),
+        { color: todoTone(task.status), spacing: "None" },
       ));
     }
+    const phaseItems: JsonNode[] = [
+      makeTextBlock(todoPhaseText(phase, phaseIndex, phaseCount), {
+        weight: "Bolder",
+        spacing: "None",
+      }),
+    ];
+    if (taskItems.length > 0) {
+      phaseItems.push({
+        type: "Container",
+        spacing: "None",
+        items: taskItems,
+      });
+    }
+    items.push({
+      type: "Container",
+      spacing: "Small",
+      items: phaseItems,
+    });
   }
   return items;
 }
