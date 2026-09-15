@@ -212,6 +212,8 @@ const MAX_LOCAL_TASKS = 128;
 const MAX_VISIBLE_TOOLS = 3;
 const MAX_RENDERED_TOOLS = 32;
 const MAX_COMPACT_TRACE_TOOLS = 8;
+const TODO_MARKER_COLUMN_WEIGHT = 12;
+const TODO_CONTENT_COLUMN_WEIGHT = 80;
 const MAX_VISIBLE_TODO_TASKS = 96;
 const DEFAULT_MAX_NODES = 200;
 const DEFAULT_MAX_DEPTH = 16;
@@ -762,20 +764,24 @@ function makeTodoTaskRow(
   const continuation = phaseIndex === phaseCount - 1 ? "\u00a0" : "│";
   const branch = taskIndex === taskCount - 1 ? "└─" : "├─";
   const tone = todoTone(task.status);
-  // Keep the tree prefix and status token in their own auto-width column; body text cannot shift their alignment.
   return {
     type: "ColumnSet",
     spacing: "None",
     columns: [
       {
         type: "Column",
-        width: "auto",
+        width: TODO_MARKER_COLUMN_WEIGHT,
         verticalContentAlignment: "Center",
-        items: [makeTextBlock(`${continuation}\u00a0${branch}\u00a0${todoStatusGlyph(task.status)}`, { color: tone, fontType: "Monospace", spacing: "None" })],
+        items: [makeTextBlock(`${continuation}\u00a0${branch}\u00a0${todoStatusGlyph(task.status)}`, {
+          color: tone,
+          fontType: "Monospace",
+          size: "Small",
+          spacing: "None",
+        })],
       },
       {
         type: "Column",
-        width: "stretch",
+        width: TODO_CONTENT_COLUMN_WEIGHT,
         verticalContentAlignment: "Center",
         items: [makeTextBlock(todoTaskLabel(task), { color: tone, spacing: "None" })],
       },
@@ -1507,7 +1513,8 @@ function buildCandidate(
     olderTraceTools,
     canToggle ? expandableOmittedTraceTools : [],
   );
-  const subagentContainer = richLayout && totalSubagents > 0
+  const hasRenderedSubagentActivity = visibleSubagents.length > 0 || olderSubagents.length > 0;
+  const subagentContainer = richLayout && hasRenderedSubagentActivity
     ? makeSubagentContainer(visibleSubagents, hiddenSubagents, totalSubagents, true, olderSubagents)
     : null;
   const traceHiddenIds = [

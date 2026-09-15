@@ -299,13 +299,26 @@ describe("execution tracker", () => {
     expect(foundationRows.every(row => row.type === "ColumnSet")).toBe(true);
     const firstTaskColumns = foundationRows[0]?.columns as JsonRecord[];
     expect(firstTaskColumns).toHaveLength(2);
-    const taskPrefix = (firstTaskColumns[0]?.items as JsonRecord[])[0]!;
-    expect(taskPrefix.fontType).toBe("Monospace");
-    expect((firstTaskColumns[0]?.items as JsonRecord[])[0]?.text).toBe("│\u00a0├─\u00a0●");
+    const firstTaskMarker = (firstTaskColumns[0]?.items as JsonRecord[])[0]!;
+    expect(firstTaskMarker).toMatchObject({
+      color: "Accent",
+      fontType: "Monospace",
+      size: "Small",
+      text: "│\u00a0├─\u00a0●",
+    });
+    expect(firstTaskColumns[0]).toMatchObject({ width: 12, verticalContentAlignment: "Center" });
+    expect(firstTaskColumns[1]).toMatchObject({ width: 80, verticalContentAlignment: "Center" });
     expect(cardText(firstTaskColumns[1]!)).toBe("Wire storage");
     const blockedTaskColumns = foundationRows[1]?.columns as JsonRecord[];
     expect(blockedTaskColumns).toHaveLength(2);
-    expect((blockedTaskColumns[0]?.items as JsonRecord[])[0]?.text).toBe("│\u00a0└─\u00a0-");
+    expect((blockedTaskColumns[0]?.items as JsonRecord[])[0]).toMatchObject({
+      text: "│\u00a0└─\u00a0-",
+      color: "Default",
+      fontType: "Monospace",
+      size: "Small",
+    });
+    expect(blockedTaskColumns[0]).toMatchObject({ width: 12, verticalContentAlignment: "Center" });
+    expect(blockedTaskColumns[1]).toMatchObject({ width: 80, verticalContentAlignment: "Center" });
     expect(cardText(blockedTaskColumns[1]!)).toBe("Wait for access · 等待授权");
     expect(cardText(blockedCard)).not.toContain("│  ├─");
     expect(blockedRendered!.plain).toContain("├─ Foundation");
@@ -1052,9 +1065,23 @@ describe("execution card rendering", () => {
     const rendered = buildExecutionCard(tracker.snapshot(1_800), fullCapabilities);
     expect(rendered).not.toBeNull();
     const card = rendered!.card as JsonRecord;
+    const subagentDetail = nodeById(card, "subagent_detail");
+    expect(cardText(subagentDetail)).toContain("子代理 · scout");
+    expect(cardText(subagentDetail)).not.toContain("暂无可见子代理活动");
     const timelineSection = nodeById(card, "timeline_section");
     const timelineHeader = (timelineSection.items as JsonRecord[])[0]!;
     expect(nodes(timelineHeader).some(node => node.id === "btn_expand_trace")).toBe(true);
+    const fullyBudgeted = buildExecutionCard(
+      tracker.snapshot(1_800),
+      {
+        ...fullCapabilities,
+        limits: { ...fullCapabilities.limits, maxNodes: 180 },
+      },
+    );
+    expect(fullyBudgeted).not.toBeNull();
+    const fullyBudgetedCard = fullyBudgeted!.card as JsonRecord;
+    expect(nodes(fullyBudgetedCard).some(node => node.id === "subagent_section")).toBe(false);
+    expect(cardText(fullyBudgetedCard)).not.toContain("暂无可见子代理活动");
     const omitted = nodeById(card, "timeline_omitted_steps");
     expect(omitted).toMatchObject({ type: "Container", style: "emphasis", isVisible: false });
     const omittedItems = omitted.items as JsonRecord[];
