@@ -211,6 +211,7 @@ const MAX_LOCAL_PHASES = 64;
 const MAX_LOCAL_TASKS = 128;
 const MAX_VISIBLE_TOOLS = 3;
 const MAX_RENDERED_TOOLS = 32;
+const MAX_COMPACT_TRACE_TOOLS = 8;
 const MAX_VISIBLE_TODO_TASKS = 96;
 const DEFAULT_MAX_NODES = 200;
 const DEFAULT_MAX_DEPTH = 16;
@@ -688,6 +689,43 @@ function toolLine(tool: ExecutionToolSnapshot, includeGlyph = false): string {
   return parts.join(" · ");
 }
 
+function markdownSafeToolLine(tool: ExecutionToolSnapshot): string {
+  const line = toolLine(tool, true);
+  const glyph = toolStateGlyph(tool);
+  if (glyph !== WAITING_GLYPH || !line.startsWith(`${glyph} `)) return line;
+  return `${glyph}\u00a0${line.slice(glyph.length + 1)}`;
+}
+
+function makeCompactTimelineRow(tool: ExecutionToolSnapshot): JsonNode {
+  const tone = toolVisualTone(tool);
+  return {
+    type: "ColumnSet",
+    spacing: "Small",
+    columns: [
+      {
+        type: "Column",
+        width: "auto",
+        verticalContentAlignment: "Center",
+        items: [makeTextBlock(`${toolStateGlyph(tool)}\u00a0`, {
+          color: tone,
+          fontType: "Monospace",
+          size: "Small",
+          spacing: "None",
+        })],
+      },
+      {
+        type: "Column",
+        width: "stretch",
+        verticalContentAlignment: "Center",
+        items: [makeTextBlock(`· ${toolLine(tool)}`, {
+          color: tone,
+          spacing: "None",
+        })],
+      },
+    ],
+  };
+}
+
 function todoPhaseText(phase: ExecutionTodoPhase, phaseIndex: number, phaseCount: number): string {
   const branch = phaseIndex === phaseCount - 1 ? "└─" : "├─";
   return `${branch} ${phase.name}`;
@@ -871,7 +909,7 @@ function makeToolRow(
         items: [
           {
             type: "Container",
-            style: tone.toLowerCase(),
+            style: tone === "Default" ? "emphasis" : tone.toLowerCase(),
             spacing: "Small",
             items: [
               {
@@ -923,6 +961,7 @@ function makeTimelineItems(
   richLayout: boolean,
   emptyText = "正在准备",
   olderTools: readonly ExecutionToolSnapshot[] = [],
+  omittedTools: readonly ExecutionToolSnapshot[] = [],
 ): JsonNode[] {
   const items: JsonNode[] = [];
   if (hiddenCount > 0) {
@@ -933,7 +972,9 @@ function makeTimelineItems(
     }));
   }
   if (tools.length === 0 && olderTools.length === 0) {
-    items.push(makeTextBlock(emptyText, { isSubtle: true, spacing: "Small" }));
+    if (omittedTools.length === 0) {
+      items.push(makeTextBlock(emptyText, { isSubtle: true, spacing: "Small" }));
+    }
   } else if (richLayout) {
     items.push(...tools.map(tool => makeToolRow(tool)));
     items.push(...olderTools.map((tool, index) => makeToolRow(tool, {
@@ -941,7 +982,17 @@ function makeTimelineItems(
       isVisible: false,
     })));
   } else {
-    items.push(...tools.map(tool => makeTextBlock(toolLine(tool, true), { spacing: "Small" })));
+    items.push(...tools.map(tool => makeTextBlock(markdownSafeToolLine(tool), { spacing: "Small" })));
+  }
+  if (omittedTools.length > 0) {
+    items.push({
+      type: "Container",
+      id: "timeline_omitted_steps",
+      isVisible: false,
+      style: "emphasis",
+      spacing: "Small",
+      items: omittedTools.map(makeCompactTimelineRow),
+    });
   }
   return items;
 }
@@ -1418,6 +1469,7 @@ function buildCandidate(
   const hiddenTools = Math.max(0, snapshot.tools.length - visibleTools.length);
   const recentTools = visibleTools.slice(Math.max(0, visibleTools.length - MAX_VISIBLE_TOOLS));
   const olderTools = visibleTools.slice(0, Math.max(0, visibleTools.length - recentTools.length));
+  const omittedTools = snapshot.tools.slice(0, hiddenTools);
   const totalSubagents = richLayout
     ? snapshot.tools.filter(tool => isSubagentTool(tool.toolName)).length
     : 0;
@@ -1433,6 +1485,12 @@ function buildCandidate(
   const olderTraceTools = richLayout
     ? olderTools.filter(tool => !isSubagentTool(tool.toolName))
     : [];
+  const omittedTraceTools = richLayout
+    ? omittedTools.filter(tool => !isSubagentTool(tool.toolName))
+    : [];
+  const expandableOmittedTraceTools = omittedTraceTools.length <= MAX_COMPACT_TRACE_TOOLS
+    ? omittedTraceTools
+    : [];
   const totalTraceTools = richLayout ? snapshot.tools.length - totalSubagents : snapshot.tools.length;
   const hiddenTraceTools = Math.max(0, totalTraceTools - visibleTraceTools.length);
   const hiddenSubagents = Math.max(0, totalSubagents - visibleSubagents.length);
@@ -1447,13 +1505,17 @@ function buildCandidate(
     richLayout,
     visibleSubagents.length > 0 ? "暂无其他工具活动" : "正在准备",
     olderTraceTools,
+    canToggle ? expandableOmittedTraceTools : [],
   );
   const subagentContainer = richLayout && totalSubagents > 0
     ? makeSubagentContainer(visibleSubagents, hiddenSubagents, totalSubagents, true, olderSubagents)
     : null;
-  const traceOlderIds = olderTraceTools.map((_tool, index) => `timeline_older_step_${index}`);
+  const traceHiddenIds = [
+    ...olderTraceTools.map((_tool, index) => `timeline_older_step_${index}`),
+    ...(canToggle && expandableOmittedTraceTools.length > 0 ? ["timeline_omitted_steps"] : []),
+  ];
   const subagentOlderIds = olderSubagents.map((_tool, index) => `subagent_older_step_${index}`);
-  const traceToggleSets = canToggle ? makeToggleSets(traceOlderIds) : [];
+  const traceToggleSets = canToggle ? makeToggleSets(traceHiddenIds) : [];
   const subagentToggleSets = canToggle && subagentContainer
     ? makeSubagentToggleSets(subagentOlderIds)
     : [];
@@ -1556,7 +1618,7 @@ function buildCandidate(
     `处理进度 · ${executionStateLabel(snapshot.state)} · ${metrics}`,
     "OMP 自动执行",
     ...(notice ? [notice.text] : []),
-    ...visibleTools.map(tool => toolLine(tool, true)),
+    ...visibleTools.map(tool => markdownSafeToolLine(tool)),
     ...(hiddenTools > 0 ? [`已隐藏前 ${hiddenTools} 个步骤，共 ${snapshot.tools.length} 个步骤`] : []),
     ...todoLines(visibleTodos, hiddenTodoTasks, totalTodoTasks),
   ];

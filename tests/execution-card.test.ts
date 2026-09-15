@@ -860,7 +860,7 @@ describe("execution card rendering", () => {
     const waitingNodes = nodes(waiting!.card as JsonRecord);
     const waitingRow = waitingNodes.find(node => (
       node.type === "Container"
-      && node.style === "default"
+      && node.style === "emphasis"
       && cardText(node).includes("等待子代理")
     ));
     expect(waitingRow).toBeDefined();
@@ -989,6 +989,88 @@ describe("execution card rendering", () => {
     ));
     expect(olderTargets).toHaveLength(4);
     expect(olderTargets.every(target => target.isVisible === true)).toBe(true);
+  });
+  test("keeps a trace expand control when older trace rows are budget-pruned", () => {
+    const tracker = createExecutionTracker({ runId: "trace-budget-toggle" });
+    startTurn(tracker, "turn-1", 0);
+    startTool(tracker, "read", "read", 100, "读取项目结构");
+    tracker.apply({ type: "tool_end", toolCallId: "read", atMs: 200, status: "succeeded" });
+    startTool(tracker, "write", "write", 220, "写入配置");
+    tracker.apply({ type: "tool_end", toolCallId: "write", atMs: 320, status: "succeeded" });
+    startTool(tracker, "edit", "edit", 340, "修改卡片布局");
+    tracker.apply({ type: "tool_end", toolCallId: "edit", atMs: 460, status: "failed" });
+    startTool(tracker, "bash", "bash", 480, "运行回归检查");
+    tracker.apply({ type: "tool_end", toolCallId: "bash", atMs: 600, status: "cancelled" });
+    startTool(tracker, "reviewer", "task", 620, "子代理 · reviewer");
+    tracker.apply({ type: "tool_end", toolCallId: "reviewer", atMs: 740, status: "failed" });
+    startTool(tracker, "verifier", "subagent_await", 780, "等待子代理 · verifier");
+    startTool(tracker, "scout", "task", 860, "子代理 · scout");
+    tracker.apply({ type: "tool_end", toolCallId: "scout", atMs: 1_000, status: "succeeded" });
+    startTool(tracker, "hub", "hub", 1_020, "IRC → preview-agent · 未收到回复");
+    tracker.apply({ type: "tool_end", toolCallId: "hub", atMs: 1_160, status: "failed" });
+    startTool(tracker, "ask", "ask", 1_180, "等待用户回答 · 2 个问题");
+    tracker.apply({
+      type: "todo_update",
+      atMs: 1_360,
+      op: "start",
+      phases: [
+        {
+          name: "准备阶段",
+          tasks: [
+            { content: "读取项目配置", status: "completed" },
+            { content: "确认卡片能力", status: "completed" },
+            { content: "清理旧预览数据", status: "abandoned" },
+          ],
+        },
+        {
+          name: "执行阶段",
+          tasks: [
+            { content: "启动子代理检查", status: "completed" },
+            { content: "汇总混合工具样式", status: "in_progress" },
+            { content: "等待授权后继续", status: "blocked", blocker: "等待用户确认" },
+          ],
+        },
+        {
+          name: "验收阶段",
+          tasks: [
+            { content: "验证成功状态", status: "completed" },
+            { content: "验证等待状态", status: "pending" },
+            { content: "验证失败状态", status: "in_progress" },
+          ],
+        },
+        {
+          name: "交付阶段",
+          tasks: [
+            { content: "发送真实预览", status: "in_progress" },
+            { content: "确认移动端布局", status: "pending" },
+            { content: "记录验收结果", status: "pending" },
+          ],
+        },
+      ],
+    });
+
+    const rendered = buildExecutionCard(tracker.snapshot(1_800), fullCapabilities);
+    expect(rendered).not.toBeNull();
+    const card = rendered!.card as JsonRecord;
+    const timelineSection = nodeById(card, "timeline_section");
+    const timelineHeader = (timelineSection.items as JsonRecord[])[0]!;
+    expect(nodes(timelineHeader).some(node => node.id === "btn_expand_trace")).toBe(true);
+    const omitted = nodeById(card, "timeline_omitted_steps");
+    expect(omitted).toMatchObject({ type: "Container", style: "emphasis", isVisible: false });
+    const omittedItems = omitted.items as JsonRecord[];
+    expect(omittedItems.length).toBeGreaterThan(1);
+    expect(omittedItems.every(item => item.type === "ColumnSet")).toBe(true);
+    const omittedColumns = omittedItems.map(item => item.columns as JsonRecord[]);
+    expect(omittedColumns.every(columns => columns[0]?.width === "auto" && columns[1]?.width === "stretch")).toBe(true);
+    const cancelledRow = omittedItems.find(item => cardText(item).includes("运行命令"));
+    expect(cancelledRow).toBeDefined();
+    if (!cancelledRow) throw new Error("cancelled compact row was not rendered");
+    const cancelledColumns = cancelledRow.columns as JsonRecord[];
+    expect(cancelledColumns[0]?.items).toEqual([
+      expect.objectContaining({ text: "-\u00a0", color: "Default", fontType: "Monospace", size: "Small" }),
+    ]);
+    const expandTargets = targetElements(toggleActionById(card, "trace_expand"));
+    expect(expandTargets).toContainEqual({ elementId: "timeline_omitted_steps", isVisible: true });
   });
   test("prioritizes current and blocked todo tasks while preserving order and reporting omissions", () => {
     const tracker = createExecutionTracker({ runId: "todo-budget" });
