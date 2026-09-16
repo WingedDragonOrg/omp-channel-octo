@@ -102,6 +102,8 @@ const DEFAULT_INTERRUPT_IDLE_TEXT =
   "当前没有正在运行的回合可中断；任务尚未进入执行阶段时可用 /cancel 取消。";
 const RESTART_USAGE = "用法：/restart [now]；now 表示强制重启并中断在途任务。";
 const RESTART_UNCONFIGURED_TEXT = "未配置 restart.command，无法重启 channel。";
+const CHANNEL_RESTART_SCHEDULED_TEXT =
+  "已排定重启：本回合结束后、channel 没有运行中或排队任务时执行部署配置的重启命令；重启完成后会在本会话通报 PID。";
 const RESTART_NOTICE_TTL_MS = 10 * 60 * 1_000;
 const BUILTIN_COMMANDS: Record<string, true> = {
   new: true,
@@ -538,6 +540,11 @@ class CoreService implements ChannelService {
   private started = false;
   private stopping = false;
   private restartRequested = false;
+  /**
+   * A restart requested through `channel_control`, kept until every chat is idle so the turn that
+   * asked for it still delivers its reply.
+   */
+  private pendingRestart: ChatTarget | null = null;
   private stopPromise: Promise<void> | undefined;
   constructor(
     private readonly options: ChannelServiceOptions,
@@ -2587,6 +2594,7 @@ class CoreService implements ChannelService {
       }
       this.releaseTextAbortIfIdle(taskId);
       this.runtimes.delete(taskId);
+      this.maybeRunDeferredRestart();
     }
   }
 
@@ -2689,13 +2697,14 @@ class CoreService implements ChannelService {
       },
       execute: async (args, signal) => this.askQuestions(task, target, args, signal),
     };
+    const channelTool = this.createChannelTool(target);
     const parentGroupId =
       target.channelType === 2
         ? target.channelId
         : target.channelType === 5
           ? threadParentGroupId(target.channelId)
           : null;
-    if (parentGroupId === null) return [fileTool, askTool];
+    if (parentGroupId === null) return [channelTool, fileTool, askTool];
     const currentShortId =
       target.channelType === 5 ? target.channelId.slice(parentGroupId.length + 4) : null;
     // A task that was itself dispatched must not dispatch further: depth stays one.
@@ -2727,7 +2736,73 @@ class CoreService implements ChannelService {
       execute: async (args, signal) =>
         this.runManagementTool(task, target, parentGroupId, currentShortId, args, signal),
     };
-    return [managementTool, fileTool, askTool];
+    return [channelTool, managementTool, fileTool, askTool];
+  }
+
+  /**
+   * Channel-level control for the agent. Available in every chat, because the restart it can
+   * request is a property of the channel, not of a group.
+   */
+  private createChannelTool(target: ChatTarget): HostTool {
+    return {
+      name: "channel_control",
+      description:
+        "控制当前 channel（omp-channel-octo）自身：restart 排定一次重启，在本回合结束后、channel 没有运行中或排队任务时执行部署配置的重启命令，重启完成后会在本会话通报 PID；status 返回 channel 的进程 PID、运行中的会话、排队任务数、被阻塞目录数与是否已排定重启。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["restart", "status"], description: "restart | status" },
+        },
+        required: ["action"],
+        additionalProperties: false,
+      },
+      execute: async (args) => this.runChannelTool(target, args),
+    };
+  }
+
+  private async runChannelTool(target: ChatTarget, args: Record<string, unknown>): Promise<string> {
+    const action = args.action;
+    if (action === "status") {
+      return JSON.stringify({
+        pid: process.pid,
+        restart_pending: this.pendingRestart !== null,
+        running_targets: [...this.runtimes.values()].map((runtime) => targetKey(runtime.target)),
+        queued_tasks: this.store.listQueuedTasks().length,
+        blocked_cwds: this.blockedDirectories.size,
+      });
+    }
+    if (action === "restart") {
+      if (!this.options.restart) return RESTART_UNCONFIGURED_TEXT;
+      this.pendingRestart = { channelType: target.channelType, channelId: target.channelId };
+      return CHANNEL_RESTART_SCHEDULED_TEXT;
+    }
+    throw new Error(`unknown action: ${typeof action === "string" ? action : String(action)}`);
+  }
+
+  /**
+   * Runs a restart the agent asked for once it cannot cost work: every chat idle and no queued
+   * task. The request is fire-and-forget, because the configured command stops this process.
+   */
+  private maybeRunDeferredRestart(): void {
+    const target = this.pendingRestart;
+    if (!target || this.stopping) return;
+    if (this.runtimes.size > 0 || this.store.listQueuedTasks().length > 0) return;
+    this.pendingRestart = null;
+    this.restartRequested = true;
+    this.store.addRestartNotice({
+      id: randomUUID(),
+      botUid: this.bot!.uid,
+      channelType: target.channelType,
+      channelId: target.channelId,
+      requestedAt: Date.now(),
+    });
+    const restart = this.options.restart;
+    if (!restart) return;
+    void restart.request().catch((error: unknown) => {
+      console.error(
+        `[restart] 重启命令执行失败：${error instanceof Error ? error.message : "unknown error"}`,
+      );
+    });
   }
 
   private async runManagementTool(

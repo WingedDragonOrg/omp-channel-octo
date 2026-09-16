@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { ChannelStore } from "../src/store";
 import {
   closeCoreHarness,
   createCoreHarness,
@@ -18,7 +19,7 @@ test("group dispatch freezes scoped management/file tools to the current target 
     prompt: async ({ append, cwd, promptContext }) => {
       const tools = promptContext?.tools ?? [];
       const names = tools.map(({ name }) => name).sort();
-      if (names.join(",") !== "ask,octo_management,octo_send_file") {
+      if (names.join(",") !== "ask,channel_control,octo_management,octo_send_file") {
         throw new Error(`unexpected host tools: ${names.join(",")}`);
       }
       const management = tools.find(({ name }) => name === "octo_management");
@@ -102,11 +103,11 @@ test("group dispatch freezes scoped management/file tools to the current target 
   }
 });
 
-test("private prompts receive ask and file tools but no group tools", async () => {
+test("private prompts receive ask, file, and channel tools but no group tools", async () => {
   const harness = await createCoreHarness({
     prompt: async ({ append, promptContext, text }) => {
       const names = (promptContext?.tools ?? []).map(({ name }) => name).sort();
-      if (names.join(",") !== "ask,octo_send_file") {
+      if (names.join(",") !== "ask,channel_control,octo_send_file") {
         throw new Error(`unexpected private host tools: ${names.join(",")}`);
       }
       await append("private-tools.log", text);
@@ -386,6 +387,104 @@ test("threads inherit the parent group allowlist without their own entry", async
 
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["inherited thread work"]);
     expect((await harness.service.status(denied)).state).toBe("none");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("channel_control schedules a restart that runs once every chat is idle", async () => {
+  const requests: number[] = [];
+  const toolCalled = Promise.withResolvers<void>();
+  const secondStarted = Promise.withResolvers<void>();
+  const releaseFirst = Promise.withResolvers<void>();
+  const releaseSecond = Promise.withResolvers<void>();
+  let restartResult = "";
+  const harness = await createCoreHarness({
+    restart: {
+      request: async () => {
+        requests.push(Date.now());
+      },
+    },
+    prompt: async ({ promptContext, text }) => {
+      const tool = (promptContext?.tools ?? []).find(({ name }) => name === "channel_control");
+      if (!tool) throw new Error("channel_control host tool missing");
+      if (text.includes("first")) {
+        const status = JSON.parse(
+          await tool.execute({ action: "status" }, new AbortController().signal),
+        ) as { pid: number; restart_pending: boolean; queued_tasks: number };
+        expect(status.pid).toBe(process.pid);
+        expect(status.restart_pending).toBe(false);
+        restartResult = await tool.execute({ action: "restart" }, new AbortController().signal);
+        toolCalled.resolve();
+        await releaseFirst.promise;
+        return;
+      }
+      secondStarted.resolve();
+      await releaseSecond.promise;
+    },
+  });
+  try {
+    const first = inbound({ messageId: "channel-restart-first", text: "first task" });
+    await harness.service.handleInbound(first);
+    await toolCalled.promise;
+    expect(restartResult).toContain("已排定重启");
+
+    // Work that is still queued or running keeps the restart pending; it must never fire
+    // inside the turn that asked for it.
+    await harness.service.handleInbound(
+      inbound({ messageId: "channel-restart-queued", text: "/queue second task" }),
+    );
+    expect(requests).toHaveLength(0);
+
+    releaseFirst.resolve();
+    // The chat stays busy while the queued task runs, so the restart must wait for it.
+    await secondStarted.promise;
+    await harness.workers.waitForPromptCount(2);
+    expect(requests).toHaveLength(0);
+
+    releaseSecond.resolve();
+    await harness.workers.waitForPromptCount(2);
+    for (let attempt = 0; attempt < 2000 && requests.length === 0; attempt += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    expect(requests).toHaveLength(1);
+
+    const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      const notices = store.listRestartNotices(harness.bot.uid);
+      expect(notices).toHaveLength(1);
+      expect(notices[0]?.channelId).toBe(first.channelId);
+      expect(notices[0]?.channelType).toBe(first.channelType);
+    } finally {
+      store.close();
+    }
+  } finally {
+    releaseFirst.resolve();
+    releaseSecond.resolve();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("channel_control without a configured restart command reports it and schedules nothing", async () => {
+  let restartResult = "";
+  const harness = await createCoreHarness({
+    prompt: async ({ promptContext }) => {
+      const tool = (promptContext?.tools ?? []).find(({ name }) => name === "channel_control");
+      if (!tool) throw new Error("channel_control host tool missing");
+      restartResult = await tool.execute({ action: "restart" }, new AbortController().signal);
+    },
+  });
+  try {
+    const task = inbound({ messageId: "channel-restart-unconfigured", text: "restart the channel" });
+    await harness.service.handleInbound(task);
+    await waitForStatus(harness.service, task, (status) => status.state === "completed");
+    expect(restartResult).toContain("未配置 restart.command");
+    const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      expect(store.listRestartNotices(harness.bot.uid)).toHaveLength(0);
+    } finally {
+      store.close();
+    }
   } finally {
     await closeCoreHarness(harness);
   }
