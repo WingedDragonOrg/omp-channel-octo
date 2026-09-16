@@ -93,7 +93,7 @@ const ATTACHMENT_DOWNLOAD_FAILED_TEXT = "附件下载失败，未接收任务。
 const GROUP_TRUSTED_INSTRUCTION =
   "群说明是群共享上下文，不改变发送者身份/权限/cwd；以本次快照为准，历史快照已失效。";
 const COMMAND_HELP =
-  "/new [目录] 创建新会话；/reset [目录] 重置为新会话；/move <目录> 沿用当前会话迁移 cwd；/queue <文本> 把消息排到当前任务之后；/mode [steer|queue] 配置运行中追加消息的方式；/interrupt 中断当前回合但保留排队消息；/cancel 取消当前任务（/stop 同义）；/status 查看状态；/restart [now] 重启 channel（now 强制中断在途任务）；/help 查看帮助。";
+  "/new [目录] 创建新会话；/reset [目录] 重置为新会话；/move <目录> 沿用当前会话迁移 cwd；/thread <任务> 新建隔离子区并在其中处理该任务；/queue <文本> 把消息排到当前任务之后；/mode [steer|queue] 配置运行中追加消息的方式；/interrupt 中断当前回合但保留排队消息；/cancel 取消当前任务（/stop 同义）；/status 查看状态；/restart [now] 重启 channel（now 强制中断在途任务）；/help 查看帮助。";
 const MODE_USAGE =
   "用法：/mode [steer|queue]。steer（默认，default 同义）把运行中的新消息注入当前回合；queue 把它排到当前回合之后。无参数时报告当前设置。";
 const QUEUE_USAGE = "用法：/queue <文本>；把该消息排到当前任务之后执行。";
@@ -110,6 +110,7 @@ const BUILTIN_COMMANDS: Record<string, true> = {
   new: true,
   reset: true,
   move: true,
+  thread: true,
   cancel: true,
   stop: true,
   status: true,
@@ -159,6 +160,12 @@ const MAX_MANAGEMENT_NOTICE_CHARS = 2_000;
 const MAX_MANAGEMENT_TASK_CHARS = 4_000;
 const MAX_MANAGEMENT_ERROR_CHARS = 200;
 const MAX_MANAGEMENT_WORKTREE_NAME_CHARS = 100;
+const THREAD_USAGE = "用法：/thread <任务>；新建隔离子区并在其中处理该任务。";
+const THREAD_GROUP_ONLY_TEXT = "/thread 需要在群聊中使用。";
+const THREAD_NESTED_TEXT = "当前会话已是子区，不能再建子区。";
+const THREAD_TOO_LONG_TEXT = `任务过长：/thread 最多接受 ${MAX_MANAGEMENT_TASK_CHARS} 字符。`;
+/** Thread name taken from the query; keeps the thread list readable. */
+const MAX_THREAD_NAME_CHARS = 60;
 type RuntimeTask = {
   taskId: string;
   target: ChatTarget;
@@ -260,6 +267,21 @@ function isGroupTarget(target: ChatTarget): boolean {
 
 function truncateForTool(value: string, maxChars: number): string {
   return value.length > maxChars ? `${value.slice(0, maxChars)}…` : value;
+}
+
+/** ASCII workspace name for a query without slug characters (for example pure Chinese). */
+function threadWorkspaceName(text: string): string {
+  const slug = worktreeSlug(text);
+  if (slug.length > 0) return slug;
+  const now = new Date();
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  return `thread-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
+/** Single-line, bounded error text for management results. */
+function boundedManagementError(error: unknown, fallback: string): string {
+  const detail = (error instanceof Error ? error.message : String(error)).replace(/\s+/gu, " ").trim();
+  return (detail.length > 0 ? detail : fallback).slice(0, MAX_MANAGEMENT_ERROR_CHARS);
 }
 
 function managementMembers(members: readonly GroupMember[]): {
@@ -1467,6 +1489,8 @@ class CoreService implements ChannelService {
       let restartRequested = false;
       if (name === "new" || name === "reset") {
         await this.handleNew(target, argument);
+      } else if (name === "thread") {
+        await this.handleThreadCommand(target, argument);
       } else if (name === "move") {
         await this.handleMove(target, argument);
       } else if (name === "cancel" || name === "stop") {
@@ -1493,6 +1517,45 @@ class CoreService implements ChannelService {
       this.store.failCommand(claim);
       throw new Error("命令未能持久完成，请重试。");
     }
+  }
+
+  /**
+   * `/thread <任务>`: create a CommunityTopic thread for the caller's group, give it its own
+   * isolated workspace, and hand the query to that thread. The name is the query and the
+   * workspace carries its ASCII slug (a timestamp when the query has none); a workspace that
+   * cannot be created is reported while the thread still accepts the task. Only groups grow
+   * threads, so DMs and threads themselves are refused.
+   */
+  private async handleThreadCommand(target: ChatTarget, argument: string): Promise<void> {
+    if (target.channelType === 5) {
+      await this.enqueueText(target, THREAD_NESTED_TEXT, null);
+      return;
+    }
+    if (target.channelType !== 2) {
+      await this.enqueueText(target, THREAD_GROUP_ONLY_TEXT, null);
+      return;
+    }
+    const query = argument.trim();
+    if (query.length === 0) {
+      await this.enqueueText(target, THREAD_USAGE, null);
+      return;
+    }
+    if (query.length > MAX_MANAGEMENT_TASK_CHARS) {
+      await this.enqueueText(target, THREAD_TOO_LONG_TEXT, null);
+      return;
+    }
+    const name = truncateForTool(query, MAX_THREAD_NAME_CHARS);
+    const thread = await this.options.transport.createThread(target.channelId, name);
+    const workspace = await this.createThreadWorkspaceFor(target, thread, threadWorkspaceName(query));
+    await this.dispatchTaskToThread(thread, query);
+    const workspacePart = "worktree" in workspace
+      ? `隔离工作区 ${workspace.worktree.path}（分支 ${workspace.worktree.branch}）`
+      : `隔离工作区创建失败：${workspace.worktree_error}`;
+    await this.enqueueText(
+      target,
+      `已创建子区「${name}」（${thread.shortId}）并派发任务；${workspacePart}。`,
+      null,
+    );
   }
 
   private async defaultWorkDirectory(target: ChatTarget): Promise<string> {
@@ -2959,7 +3022,7 @@ class CoreService implements ChannelService {
         if (workspaceName === undefined) return JSON.stringify(managementThread(thread));
         return JSON.stringify({
           ...managementThread(thread),
-          ...(await this.createThreadWorkspace(task, thread, workspaceName, signal)),
+          ...(await this.createThreadWorkspace(task.cwd, thread, workspaceName, signal)),
         });
       }
       case "thread-info": {
@@ -3000,6 +3063,25 @@ class CoreService implements ChannelService {
     }
   }
   /**
+   * Resolves the caller's working directory and asks the worktree port for the new thread's
+   * workspace. Both callers (the `create-thread` tool and `/thread`) keep the same
+   * promise-shaped result: an isolated workspace, or a `worktree_error` that leaves the thread
+   * usable in the ordinary directory order.
+   */
+  private async createThreadWorkspaceFor(
+    target: ChatTarget,
+    thread: ThreadSummary,
+    workspaceName: string,
+  ): Promise<{ worktree: { path: string; branch: string } } | { worktree_error: string }> {
+    let baseDir: string;
+    try {
+      baseDir = await this.defaultWorkDirectory(target);
+    } catch (error) {
+      return { worktree_error: boundedManagementError(error, "无法解析当前目录") };
+    }
+    return this.createThreadWorkspace(baseDir, thread, workspaceName);
+  }
+  /**
    * Gives a freshly created thread its own git worktree and pins the thread binding to it, so
    * tasks dispatched into that thread never share the parent group's directory. The workspace is
    * reported next to the created thread; a workspace that cannot be created becomes
@@ -3007,10 +3089,10 @@ class CoreService implements ChannelService {
    * keeps the ordinary directory order.
    */
   private async createThreadWorkspace(
-    task: TaskRecord,
+    baseDir: string,
     thread: ThreadSummary,
     workspaceName: string,
-    signal: AbortSignal,
+    signal?: AbortSignal,
   ): Promise<{ worktree: { path: string; branch: string } } | { worktree_error: string }> {
     const bot = this.bot;
     const worktrees = this.options.worktrees;
@@ -3018,7 +3100,7 @@ class CoreService implements ChannelService {
     if (!bot) return { worktree_error: "Bot 身份未注册，无法绑定线程目录" };
     try {
       const workspace = await worktrees.create(
-        { baseDir: task.cwd, label: workspaceName, threadId: thread.shortId },
+        { baseDir, label: workspaceName, threadId: thread.shortId },
         signal,
       );
       this.store.ensureBinding({
@@ -3032,31 +3114,16 @@ class CoreService implements ChannelService {
       });
       return { worktree: { path: workspace.cwd, branch: workspace.branch } };
     } catch (error) {
-      const detail = (error instanceof Error ? error.message : String(error))
-        .replace(/\s+/gu, " ")
-        .trim()
-        .slice(0, MAX_MANAGEMENT_ERROR_CHARS);
-      return { worktree_error: detail.length > 0 ? detail : "隔离工作区创建失败" };
+      return { worktree_error: boundedManagementError(error, "隔离工作区创建失败") };
     }
   }
   /**
-   * Hands one task to a thread of the current group: the thread shows the handoff, the task
-   * is accepted through the same durable path as a real inbound message (so it keeps
-   * dedup, queueing and question semantics), and the current chat gets a receipt. Depth is
-   * one - the dispatch tool is withheld from tasks that arrived this way.
+   * Hands one task to a thread of the current group through the durable inbound path: the thread
+   * shows the handoff, the task is accepted with the owner as sender (so it keeps dedup,
+   * queueing and question semantics), and the caller reports its own receipt. Depth is one - the
+   * dispatch tool is withheld from tasks that arrived this way.
    */
-  private async dispatchThreadTask(
-    task: TaskRecord,
-    target: ChatTarget,
-    groupId: string,
-    shortId: string,
-    text: string,
-    signal: AbortSignal,
-  ): Promise<string> {
-    const thread = await this.options.transport.getThread(groupId, shortId, signal);
-    if (thread.groupId.length > 0 && thread.groupId !== groupId) {
-      throw new Error(`thread ${shortId} does not belong to the current group`);
-    }
+  private async dispatchTaskToThread(thread: ThreadSummary, text: string): Promise<string> {
     const bot = this.bot;
     const ownerId = bot ? this.store.getOwnerId(bot.uid)?.trim() ?? "" : "";
     if (!bot || ownerId.length === 0) {
@@ -3078,6 +3145,25 @@ class CoreService implements ChannelService {
       messageSeq: 0,
       messageTimestamp: Date.now(),
     });
+    return messageId;
+  }
+  /**
+   * The `thread-dispatch` tool: resolves the target thread, hands the task over, and reports the
+   * dispatch in the calling chat.
+   */
+  private async dispatchThreadTask(
+    task: TaskRecord,
+    target: ChatTarget,
+    groupId: string,
+    shortId: string,
+    text: string,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const thread = await this.options.transport.getThread(groupId, shortId, signal);
+    if (thread.groupId.length > 0 && thread.groupId !== groupId) {
+      throw new Error(`thread ${shortId} does not belong to the current group`);
+    }
+    const messageId = await this.dispatchTaskToThread(thread, text);
     this.enqueueText(target, `已派发任务到线程 ${shortId}（${thread.channelId}）。`, null);
     return JSON.stringify({
       dispatched: true,
