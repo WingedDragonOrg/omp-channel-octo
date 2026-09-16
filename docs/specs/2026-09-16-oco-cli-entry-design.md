@@ -34,7 +34,7 @@ channel 的日常操作目前散落在四处：`bun run src/cli.ts serve --confi
 - `super add`/`super update` 不暴露按服务指定日志路径的参数（stack 里存在 `stdout_logfile`/`stderr_logfile` 字段，但默认 null），服务日志实际写在 `~/.super/logs/<id>.out|.err` 且不轮转；因此 oco 的日志读取只依赖自持文件，Super 那份捕获只是副产品。
 - 探测可用的 Super 数据面：`super export --format json` 给出全部程序的 `name`/`command`/`args`/`cwd`；`super info <program>` 给出 `State:`/`PID:`/`Full Cmd:`/`CWD:`；`super list` 给出程序名与 PID。三者都是本机 CLI 调用，没有稳定的 JSON 状态接口。
 - 同一 Bot 只允许一个实例（`CoreService` 抢 Bot 独占锁）；前台 `start`/`run` 与常驻实例并存时，第二个实例若先重新注册 Bot 就会中断在线会话，因此启动前先查该锁：锁由存活进程持有时直接报错退出，不注册 Bot。
-- 服务运行期输出全部经 `console.log`/`console.error`；`src/omp/index.ts` 的 watchdog 直接写 `process.stdout`（协议标记），不得被日志层包装。
+- 服务运行期输出全部经 `console.log`/`console.error`；`src/omp/process.ts` 的 watchdog 直接写 `process.stdout`（协议标记），不得被日志层包装。
 - 配置含 `botToken` 时文件权限必须为 `0600`（现有 `loadConfig` 校验），迁移必须保持该权限。
 
 ## 关键决策

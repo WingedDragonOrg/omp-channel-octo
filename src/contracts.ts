@@ -1,4 +1,4 @@
-import type { ExecutionEvent, ExecutionSnapshot } from "./execution-card.ts";
+import type { ExecutionEvent, ExecutionSnapshot } from "./execution-tracker.ts";
 import type { ProjectSessionState } from "./project-session.ts";
 
 export interface ChatTarget {

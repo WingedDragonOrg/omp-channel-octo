@@ -1,454 +1,27 @@
-import { randomUUID } from "node:crypto";
+/**
+ * `ChannelStore` 门面：SQLite 之上的一层持久化 API。物理形状与 db 辅助在 `store-schema.ts`，
+ * 记录类型在 `store-records.ts`，各领域读写分布在 `store-chats/tasks/cards/ledgers/outbox/questions.ts`。
+ */
+
 import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { ChatAppendMode, ChatTarget, ChatExecutionState, WorkerProcess } from "./contracts.ts";
-
-export interface BindingRecord extends ChatTarget {
-  botUid: string;
-  sessionId: string;
-  cwd: string;
-  sessionFile: string | null;
-  /**
-   * The cwd was assigned explicitly (an isolated thread workspace) rather than derived, so the
-   * default work directory order must keep it even when the binding has no verified session yet.
-   */
-  cwdPinned?: boolean;
-}
-
-export interface InboundClaim {
-  botUid: string;
-  target: ChatTarget;
-  messageId: string;
-  senderId: string;
-  text: string;
-  supported: boolean;
-  kind: "task" | "command";
-}
-
-export interface TaskRecord extends ChatTarget {
-  id: string;
-  botUid: string;
-  messageId: string;
-  senderId: string;
-  text: string;
-  sessionId: string;
-  cwd: string;
-  state: ChatExecutionState;
-  resultText: string | null;
-  errorText: string | null;
-  /** Per-channel WuKongIM sequence of the triggering message; `0` means unknown. */
-  messageSeq: number;
-  /** Whether group history accounting applies to this task and its triggering message. */
-  historyEligible: boolean;
-}
-export interface RestartNoticeRecord extends ChatTarget {
-  id: string;
-  botUid: string;
-  requestedAt: number;
-}
-
-/**
- * The last progress-card frame the server accepted for a task. Card identity only exists in the
- * process that observed the run, so this row lets the next process submit one terminal edit
- * instead of leaving the client on the last running state.
- */
-export interface ProgressCardRecord extends ChatTarget {
-  botUid: string;
-  taskId: string;
-  messageId: string;
-  lastSeq: number;
-  /** Encoded `ExecutionSnapshot` of the last accepted frame. */
-  snapshot: string;
-  /** Recovery attempts already spent on this row. */
-  attempts: number;
-}
-
-export interface OutboxRecord extends ChatTarget {
-  id: string;
-  botUid: string;
-  taskId: string | null;
-  kind: "text" | "file";
-  text: string | null;
-  path: string | null;
-  fileKind: "image" | "file" | null;
-  clientMsgNo: string;
-  state: "pending" | "unknown" | "sent" | "dead";
-  attempts: number;
-  lastError: string | null;
-  remoteMessageId: string | null;
-  streamMessageId: string | null;
-  segmentIndex: number;
-  desiredVersion: number;
-  ackedVersion: number;
-}
-
-export type OutboxInsert = Omit<
-  OutboxRecord,
-  "state" | "attempts" | "lastError" | "remoteMessageId" | "streamMessageId" | "segmentIndex" | "desiredVersion" | "ackedVersion"
-> & {
-  remoteMessageId?: string | null;
-  streamMessageId?: string | null;
-  segmentIndex?: number;
-  desiredVersion?: number;
-  ackedVersion?: number;
-};
-
-export interface QuestionRecord extends ChatTarget {
-  id: string;
-  botUid: string;
-  taskId: string;
-  payload: string;
-  state: "pending" | "answered" | "cancelled" | "expired";
-  answer: string | null;
-  /** Remote id of the interactive card carrying this question; `null` for text-only questions. */
-  cardMessageId: string | null;
-}
-
-export interface WorkerLedgerRecord extends WorkerProcess {
-  id: string;
-  botUid: string;
-  sessionId: string;
-  sessionFile: string;
-  moveTargetCwd: string | null;
-  state: "running" | "stopping" | "stopped" | "unknown";
-}
-
-export interface ContextLedgerRecord extends ChatTarget {
-  botUid: string;
-  sessionId: string;
-  version: number;
-  phase: "pending" | "committed";
-  attemptId: string;
-  previousVersion: number | null;
-}
-
-export interface HistoryLedgerRecord {
-  botUid: string;
-  channelType: 2 | 5;
-  channelId: string;
-  sessionId: string;
-  lastSeq: number;
-  phase: "pending" | "committed";
-  attemptId: string;
-  previousSeq: number | null;
-}
-
-/**
- * One chat the owner enabled at runtime instead of in the config's `allowedGroupIds`. The two
- * sets are consulted as one allowlist, so a granted chat needs no restart and no config reload.
- */
-export interface AllowedChatRecord extends ChatTarget {
-  botUid: string;
-  channelType: 2 | 5;
-  channelId: string;
-  grantedBy: string;
-  grantedAt: number;
-}
-
-type SqlValue = string | number | null | Uint8Array;
-type SqlRow = Record<string, unknown>;
-
-function targetWhere(target: ChatTarget): string {
-  return "channel_type = ? AND channel_id = ?";
-}
-
-function targetValues(target: ChatTarget): SqlValue[] {
-  return [target.channelType, target.channelId];
-}
-
-/**
- * One row per progress card. A run opens a new card for every user round it serves, so the row is
- * keyed by the card's server message id: each card is then closed, retried, and dropped on its own.
- */
-const PROGRESS_CARD_COLUMNS = `
-        bot_uid TEXT NOT NULL,
-        task_id TEXT NOT NULL,
-        channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
-        channel_id TEXT NOT NULL,
-        message_id TEXT NOT NULL,
-        last_seq INTEGER NOT NULL CHECK(last_seq >= 1),
-        snapshot TEXT NOT NULL,
-        attempts INTEGER NOT NULL DEFAULT 0,
-        updated_at INTEGER NOT NULL,
-        PRIMARY KEY(bot_uid, task_id, message_id)`;
-
-/**
- * Group history accounting is keyed on full group (2) / CommunityTopic thread (5)
- * identities; anything else can never own a ledger row.
- */
-function validHistoryIdentity(botUid: string, target: ChatTarget, sessionId: string): boolean {
-  return (
-    botUid.length > 0 &&
-    sessionId.length > 0 &&
-    target.channelId.length > 0 &&
-    (target.channelType === 2 || target.channelType === 5)
-  );
-}
-
-function asString(value: unknown): string {
-  return typeof value === "string" ? value : "";
-}
-
-function asNullableString(value: unknown): string | null {
-  return typeof value === "string" ? value : null;
-}
-
-function asNumber(value: unknown): number {
-  return typeof value === "number" ? value : Number(value ?? 0);
-}
-
-function asState(value: unknown): ChatExecutionState {
-  if (
-    value === "none" ||
-    value === "idle" ||
-    value === "queued" ||
-    value === "started" ||
-    value === "running" ||
-    value === "completed" ||
-    value === "failed" ||
-    value === "cancelled" ||
-    value === "interrupted"
-  ) {
-    return value === "started" ? "running" : value;
-  }
-  return "failed";
-}
+import type { ChatAppendMode, ChatTarget } from "./contracts.ts";
+import type { BindingRecord, InboundClaim, TaskRecord, RestartNoticeRecord, ProgressCardRecord, OutboxRecord, OutboxInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord } from "./store-records.ts";
+import { applySchema } from "./store-schema.ts";
+import { claimOwnerEnrollment, ensureBinding, getBinding, getBotUid, getChatMode, getOwnerId, grantAllowedChat, hasOwnerEnrollment, listAllowedChats, setBotUid, setChatMode, setOwnerId, updateBindingSession } from "./store-chats.ts";
+import { acceptTask, addRestartNotice, cancelQueued, claimCommand, clearRestartNotice, completeCommand, countQueuedTasks, failCommand, getActiveTask, getLatestTask, getTask, listQueuedTasks, listRestartNotices, markCancelled, markCompleted, markFailed, markInterrupted, markInterruptedOnStart, markStarted, releaseClaim } from "./store-tasks.ts";
+import { clearProgressCard, listProgressCards, listWorkerLedger, markWorkerMoveTarget, markWorkerStopped, recordProgressCardAttempt, recordWorker, saveProgressCard } from "./store-cards.ts";
+import { advanceHistoryLedger, clearContextLedger, commitContextInjection, commitHistoryInjection, getContextLedger, getHistoryLedger, prepareContextInjection, prepareHistoryInjection, pruneHistoryLedger } from "./store-ledgers.ts";
+import { acknowledgeTextOutbox, beginTextCreate, bindTextOutbox, countPendingOutbox, countUnknownOutbox, enqueueOutbox, failTextOutbox, getBotEventCursor, getOutbox, listPendingOutbox, listPendingOutboxTargets, listTextStream, markOutboxDead, markOutboxFailure, markOutboxSent, setBotEventCursor, updateTextOutbox } from "./store-outbox.ts";
+import { answerQuestion, answerQuestions, cancelQuestion, cancelQuestions, createQuestion, expireQuestion, getQuestion, listPendingQuestions, listQuestionsByCard, pendingQuestionIds, setQuestionCard, setQuestionsCard } from "./store-questions.ts";
 
 export class ChannelStore {
   private readonly db: Database;
 
   private constructor(readonly path: string) {
     this.db = new Database(path);
-    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS meta (
-        key TEXT PRIMARY KEY NOT NULL,
-        value TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS owners (
-        bot_uid TEXT PRIMARY KEY NOT NULL,
-        owner_id TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS owner_enrollments (
-        bot_uid TEXT NOT NULL,
-        channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
-        channel_id TEXT NOT NULL,
-        message_id TEXT NOT NULL,
-        sender_id TEXT NOT NULL,
-        text TEXT NOT NULL,
-        accepted_at INTEGER NOT NULL,
-        PRIMARY KEY(bot_uid, channel_type, channel_id, message_id)
-      );
-      CREATE TABLE IF NOT EXISTS allowed_chats (
-        bot_uid TEXT NOT NULL,
-        channel_type INTEGER NOT NULL CHECK(channel_type IN (2, 5)),
-        channel_id TEXT NOT NULL,
-        granted_by TEXT NOT NULL,
-        granted_at INTEGER NOT NULL,
-        PRIMARY KEY(bot_uid, channel_type, channel_id)
-      );
-      CREATE TABLE IF NOT EXISTS chats (
-        bot_uid TEXT NOT NULL,
-        channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
-        channel_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        cwd TEXT NOT NULL,
-        session_file TEXT,
-        cwd_pinned INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        PRIMARY KEY(bot_uid, channel_type, channel_id)
-      );
-      CREATE TABLE IF NOT EXISTS inbound (
-        bot_uid TEXT NOT NULL,
-        channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
-        channel_id TEXT NOT NULL,
-        message_id TEXT NOT NULL,
-        sender_id TEXT NOT NULL,
-        text TEXT NOT NULL,
-        supported INTEGER NOT NULL,
-        kind TEXT NOT NULL CHECK(kind IN ('task', 'command')),
-        command_state TEXT NOT NULL DEFAULT 'pending' CHECK(command_state IN ('pending', 'completed', 'failed')),
-        task_id TEXT,
-        accepted_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS tasks (
-        id TEXT PRIMARY KEY NOT NULL,
-        bot_uid TEXT NOT NULL,
-        channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
-        channel_id TEXT NOT NULL,
-        message_id TEXT NOT NULL,
-        sender_id TEXT NOT NULL,
-        text TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        cwd TEXT NOT NULL,
-        state TEXT NOT NULL CHECK(state IN ('queued', 'started', 'completed', 'failed', 'cancelled', 'interrupted')),
-        accepted_at INTEGER NOT NULL,
-        started_at INTEGER,
-        finished_at INTEGER,
-        result_text TEXT,
-        error_text TEXT,
-        message_seq INTEGER NOT NULL DEFAULT 0,
-        history_eligible INTEGER NOT NULL DEFAULT 1
-      );
-      CREATE INDEX IF NOT EXISTS tasks_chat_order
-        ON tasks(bot_uid, channel_type, channel_id, accepted_at, id);
-      CREATE INDEX IF NOT EXISTS tasks_active
-        ON tasks(bot_uid, channel_type, channel_id, state);
-      CREATE TABLE IF NOT EXISTS outbox (
-        id TEXT PRIMARY KEY NOT NULL,
-        bot_uid TEXT NOT NULL,
-        channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
-        channel_id TEXT NOT NULL,
-        task_id TEXT,
-        kind TEXT NOT NULL CHECK(kind IN ('text', 'file')),
-        text TEXT,
-        path TEXT,
-        file_kind TEXT CHECK(file_kind IN ('image', 'file')),
-        client_msg_no TEXT NOT NULL UNIQUE,
-        state TEXT NOT NULL CHECK(state IN ('pending', 'unknown', 'sent', 'dead')),
-        attempts INTEGER NOT NULL DEFAULT 0,
-        last_error TEXT,
-        remote_message_id TEXT,
-        stream_message_id TEXT,
-        segment_index INTEGER NOT NULL DEFAULT 0,
-        desired_version INTEGER NOT NULL DEFAULT 0,
-        acked_version INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL,
-        sent_at INTEGER
-      );
-      CREATE INDEX IF NOT EXISTS outbox_order
-        ON outbox(bot_uid, channel_type, channel_id, created_at, id);
-      CREATE TABLE IF NOT EXISTS questions (
-        id TEXT PRIMARY KEY NOT NULL,
-        task_id TEXT NOT NULL,
-        bot_uid TEXT NOT NULL,
-        channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
-        channel_id TEXT NOT NULL,
-        payload TEXT NOT NULL,
-        state TEXT NOT NULL CHECK(state IN ('pending', 'answered', 'cancelled', 'expired')),
-        answer TEXT,
-        created_at INTEGER NOT NULL,
-        answered_at INTEGER
-      );
-      CREATE INDEX IF NOT EXISTS questions_chat_pending
-        ON questions(bot_uid, channel_type, channel_id, state);
-      CREATE TABLE IF NOT EXISTS worker_ledger (
-        id TEXT PRIMARY KEY NOT NULL,
-        bot_uid TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        session_file TEXT NOT NULL,
-        pid INTEGER NOT NULL,
-        pgid INTEGER NOT NULL,
-        identity TEXT NOT NULL,
-        cwd TEXT NOT NULL,
-        move_target_cwd TEXT,
-        state TEXT NOT NULL CHECK(state IN ('running', 'stopping', 'stopped', 'unknown')),
-        updated_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS session_context_ledger (
-        bot_uid TEXT NOT NULL,
-        channel_type INTEGER NOT NULL CHECK(channel_type IN (2, 5)),
-        channel_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        version INTEGER NOT NULL CHECK(version >= 0),
-        phase TEXT NOT NULL CHECK(phase IN ('pending', 'committed')),
-        attempt_id TEXT NOT NULL,
-        previous_version INTEGER CHECK(previous_version IS NULL OR previous_version >= 0),
-        updated_at INTEGER NOT NULL,
-        PRIMARY KEY(bot_uid, channel_type, channel_id, session_id)
-      );
-      CREATE INDEX IF NOT EXISTS session_context_target
-        ON session_context_ledger(bot_uid, channel_type, channel_id);
-      CREATE TABLE IF NOT EXISTS group_history_ledger (
-        bot_uid TEXT NOT NULL,
-        channel_type INTEGER NOT NULL CHECK(channel_type IN (2, 5)),
-        channel_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        last_seq INTEGER NOT NULL CHECK(last_seq >= 0),
-        phase TEXT NOT NULL CHECK(phase IN ('pending', 'committed')),
-        attempt_id TEXT NOT NULL,
-        previous_seq INTEGER CHECK(previous_seq IS NULL OR previous_seq >= 0),
-        updated_at INTEGER NOT NULL,
-        PRIMARY KEY(bot_uid, channel_type, channel_id, session_id)
-      );
-      CREATE INDEX IF NOT EXISTS group_history_target
-        ON group_history_ledger(bot_uid, channel_type, channel_id);
-      CREATE TABLE IF NOT EXISTS restart_notices (
-        id TEXT PRIMARY KEY NOT NULL,
-        bot_uid TEXT NOT NULL,
-        channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
-        channel_id TEXT NOT NULL,
-        requested_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS chat_modes (
-        bot_uid TEXT NOT NULL,
-        channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
-        channel_id TEXT NOT NULL,
-        mode TEXT NOT NULL CHECK(mode IN ('steer', 'queue')),
-        updated_at INTEGER NOT NULL,
-        PRIMARY KEY(bot_uid, channel_type, channel_id)
-      );
-      CREATE TABLE IF NOT EXISTS progress_cards (${PROGRESS_CARD_COLUMNS}
-      );
-      CREATE TABLE IF NOT EXISTS bot_event_cursor (
-        bot_uid TEXT PRIMARY KEY NOT NULL,
-        event_id INTEGER NOT NULL CHECK(event_id >= 0),
-        updated_at INTEGER NOT NULL
-      );
-    `);
-    for (const statement of [
-      "ALTER TABLE outbox ADD COLUMN remote_message_id TEXT",
-      "ALTER TABLE outbox ADD COLUMN stream_message_id TEXT",
-      "ALTER TABLE outbox ADD COLUMN segment_index INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE outbox ADD COLUMN desired_version INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE outbox ADD COLUMN acked_version INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE worker_ledger ADD COLUMN move_target_cwd TEXT",
-      "ALTER TABLE tasks ADD COLUMN message_seq INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE tasks ADD COLUMN history_eligible INTEGER NOT NULL DEFAULT 1",
-      "ALTER TABLE chats ADD COLUMN cwd_pinned INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE questions ADD COLUMN card_message_id TEXT",
-    ]) {
-      try {
-        this.db.exec(statement);
-      } catch (error) {
-        if (!String(error).includes("duplicate column")) throw error;
-      }
-    }
-    this.db.exec(
-      "CREATE INDEX IF NOT EXISTS outbox_stream ON outbox(bot_uid, task_id, stream_message_id, segment_index)",
-    );
-    this.db.exec(
-      "CREATE INDEX IF NOT EXISTS questions_card ON questions(bot_uid, channel_type, channel_id, card_message_id)",
-    );
-    this.migrateProgressCards();
-  }
-
-  /**
-   * Databases written before a run could open several cards kept one row per task. Rebuild the
-   * table once, in a single transaction, so every card owns its row.
-   */
-  private migrateProgressCards(): void {
-    const sql = asString(
-      this.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'progress_cards'")[0]?.sql,
-    );
-    if (sql.includes("PRIMARY KEY(bot_uid, task_id, message_id)")) return;
-    this.transaction(() => {
-      this.db.exec(`
-        ALTER TABLE progress_cards RENAME TO progress_cards_legacy;
-        CREATE TABLE progress_cards (${PROGRESS_CARD_COLUMNS}
-        );
-        INSERT INTO progress_cards(
-          bot_uid, task_id, channel_type, channel_id, message_id, last_seq, snapshot, attempts, updated_at
-        )
-        SELECT bot_uid, task_id, channel_type, channel_id, message_id, last_seq, snapshot, attempts, updated_at
-        FROM progress_cards_legacy;
-        DROP TABLE progress_cards_legacy;
-      `);
-    });
+    applySchema(this.db);
   }
 
   static async open(path: string): Promise<ChannelStore> {
@@ -460,64 +33,24 @@ export class ChannelStore {
     this.db.close(false);
   }
 
-  private query(sql: string, values: readonly SqlValue[] = []): SqlRow[] {
-    return this.db.query(sql).all(...values) as SqlRow[];
-  }
-  private run(sql: string, values: readonly SqlValue[] = []): { changes: number } {
-    const result = this.db.query(sql).run(...values) as { changes?: number };
-    return { changes: result.changes ?? 0 };
-  }
-
-  private transaction<T>(work: () => T): T {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const result = work();
-      this.db.exec("COMMIT");
-      return result;
-    } catch (error) {
-      try {
-        this.db.exec("ROLLBACK");
-      } catch {
-        // Preserve the original database failure.
-      }
-      throw error;
-    }
-  }
-
   setBotUid(botUid: string): void {
-    this.run(
-      "INSERT INTO meta(key, value) VALUES('bot_uid', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      [botUid],
-    );
+    setBotUid(this.db, botUid);
   }
 
   getBotUid(): string | null {
-    const row = this.query("SELECT value FROM meta WHERE key = 'bot_uid'")[0];
-    return row ? asNullableString(row.value) : null;
+    return getBotUid(this.db);
   }
 
   getOwnerId(botUid: string): string | null {
-    const row = this.query("SELECT owner_id FROM owners WHERE bot_uid = ?", [botUid])[0];
-    return row ? asNullableString(row.owner_id) : null;
+    return getOwnerId(this.db, botUid);
   }
 
   setOwnerId(botUid: string, ownerId: string): void {
-    const now = Date.now();
-    this.run(
-      `INSERT INTO owners(bot_uid, owner_id, created_at, updated_at)
-       VALUES(?, ?, ?, ?)
-       ON CONFLICT(bot_uid) DO UPDATE SET owner_id = excluded.owner_id, updated_at = excluded.updated_at`,
-      [botUid, ownerId, now, now],
-    );
+    setOwnerId(this.db, botUid, ownerId);
   }
 
   hasOwnerEnrollment(botUid: string, target: ChatTarget, messageId: string): boolean {
-    const row = this.query(
-      `SELECT 1 FROM owner_enrollments
-       WHERE bot_uid = ? AND ${targetWhere(target)} AND message_id = ?`,
-      [botUid, ...targetValues(target), messageId],
-    )[0];
-    return Boolean(row);
+    return hasOwnerEnrollment(this.db, botUid, target, messageId);
   }
 
   claimOwnerEnrollment(
@@ -528,374 +61,128 @@ export class ChannelStore {
     text: string,
     outbox: OutboxInsert,
   ): boolean {
-    return this.transaction(() => {
-      const existingEnrollment = this.query(
-        `SELECT 1 FROM owner_enrollments
-         WHERE bot_uid = ? AND ${targetWhere(target)} AND message_id = ?`,
-        [botUid, ...targetValues(target), messageId],
-      )[0];
-      if (existingEnrollment) return false;
-      const existingOwner = this.query("SELECT 1 FROM owners WHERE bot_uid = ?", [botUid])[0];
-      if (existingOwner) return false;
-      const now = Date.now();
-      this.run(
-        "INSERT INTO owners(bot_uid, owner_id, created_at, updated_at) VALUES(?, ?, ?, ?)",
-        [botUid, senderId, now, now],
-      );
-      this.run(
-        `INSERT INTO owner_enrollments(
-           bot_uid, channel_type, channel_id, message_id, sender_id, text, accepted_at
-         ) VALUES(?, ?, ?, ?, ?, ?, ?)`,
-        [botUid, target.channelType, target.channelId, messageId, senderId, text, now],
-      );
-      this.enqueueOutbox(outbox);
-      return true;
-    });
+    return claimOwnerEnrollment(this.db, botUid, target, messageId, senderId, text, outbox);
   }
 
   /**
    * Records one chat the owner enabled at runtime. Idempotent: a replayed passphrase or a second
    * grant keeps the first row, so `granted_at`/`granted_by` stay the original decision.
    */
+
   grantAllowedChat(record: {
     botUid: string;
     channelType: 2 | 5;
     channelId: string;
     grantedBy: string;
   }): boolean {
-    return this.run(
-      `INSERT INTO allowed_chats(bot_uid, channel_type, channel_id, granted_by, granted_at)
-       VALUES(?, ?, ?, ?, ?)
-       ON CONFLICT(bot_uid, channel_type, channel_id) DO NOTHING`,
-      [record.botUid, record.channelType, record.channelId, record.grantedBy, Date.now()],
-    ).changes === 1;
+    return grantAllowedChat(this.db, record);
   }
 
   listAllowedChats(botUid: string): AllowedChatRecord[] {
-    return this.query(
-      "SELECT * FROM allowed_chats WHERE bot_uid = ? ORDER BY granted_at ASC, channel_id ASC",
-      [botUid],
-    ).map((row) => ({
-      botUid: asString(row.bot_uid),
-      channelType: asNumber(row.channel_type) === 5 ? 5 : 2,
-      channelId: asString(row.channel_id),
-      grantedBy: asString(row.granted_by),
-      grantedAt: asNumber(row.granted_at),
-    }));
+    return listAllowedChats(this.db, botUid);
   }
 
   ensureBinding(binding: BindingRecord): void {
-    const now = Date.now();
-    this.transaction(() => {
-      this.run(
-        `INSERT INTO chats(bot_uid, channel_type, channel_id, session_id, cwd, session_file, cwd_pinned, created_at, updated_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(bot_uid, channel_type, channel_id) DO UPDATE SET
-           session_id = excluded.session_id,
-           cwd = excluded.cwd,
-           session_file = excluded.session_file,
-           cwd_pinned = excluded.cwd_pinned,
-           updated_at = excluded.updated_at`,
-        [
-          binding.botUid,
-          binding.channelType,
-          binding.channelId,
-          binding.sessionId,
-          binding.cwd,
-          binding.sessionFile,
-          binding.cwdPinned === true ? 1 : 0,
-          now,
-          now,
-        ],
-      );
-    });
+    ensureBinding(this.db, binding);
   }
 
   getBinding(botUid: string, target: ChatTarget): BindingRecord | null {
-    const row = this.query(
-      `SELECT bot_uid, channel_type, channel_id, session_id, cwd, session_file, cwd_pinned
-       FROM chats WHERE bot_uid = ? AND ${targetWhere(target)}`,
-      [botUid, ...targetValues(target)],
-    )[0];
-    if (!row) return null;
-    return {
-      botUid: asString(row.bot_uid),
-      channelType: asNumber(row.channel_type) as 1 | 2 | 5,
-      channelId: asString(row.channel_id),
-      sessionId: asString(row.session_id),
-      cwd: asString(row.cwd),
-      sessionFile: asNullableString(row.session_file),
-      ...(asNumber(row.cwd_pinned) === 1 ? { cwdPinned: true } : {}),
-    };
+    return getBinding(this.db, botUid, target);
   }
 
   acceptTask(claim: InboundClaim, task: TaskRecord): boolean {
-    return this.transaction(() => {
-      const existing = this.query(
-        `SELECT 1 FROM inbound WHERE bot_uid = ? AND channel_type = ? AND channel_id = ? AND message_id = ?`,
-        [claim.botUid, claim.target.channelType, claim.target.channelId, claim.messageId],
-      )[0];
-      if (existing) return false;
-      const now = Date.now();
-      this.run(
-        `INSERT INTO inbound(bot_uid, channel_type, channel_id, message_id, sender_id, text, supported, kind, task_id, accepted_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, 'task', ?, ?)`,
-        [
-          claim.botUid,
-          claim.target.channelType,
-          claim.target.channelId,
-          claim.messageId,
-          claim.senderId,
-          claim.text,
-          claim.supported ? 1 : 0,
-          task.id,
-          now,
-        ],
-      );
-      this.run(
-        `INSERT INTO tasks(
-           id, bot_uid, channel_type, channel_id, message_id, sender_id, text, session_id, cwd,
-           state, accepted_at, message_seq, history_eligible
-         )
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`,
-        [
-          task.id,
-          task.botUid,
-          task.channelType,
-          task.channelId,
-          task.messageId,
-          task.senderId,
-          task.text,
-          task.sessionId,
-          task.cwd,
-          now,
-          task.messageSeq,
-          task.historyEligible ? 1 : 0,
-        ],
-      );
-      return true;
-    });
+    return acceptTask(this.db, claim, task);
   }
 
   claimCommand(claim: InboundClaim): boolean {
-    return this.transaction(() => {
-      const existing = this.query(
-        `SELECT kind, command_state FROM inbound
-         WHERE bot_uid = ? AND channel_type = ? AND channel_id = ? AND message_id = ?`,
-        [claim.botUid, claim.target.channelType, claim.target.channelId, claim.messageId],
-      )[0];
-      if (existing) {
-        if (existing.kind !== "command" || existing.command_state === "completed" || existing.command_state === "pending") {
-          return false;
-        }
-        this.run(
-          `UPDATE inbound SET command_state = 'pending'
-           WHERE bot_uid = ? AND channel_type = ? AND channel_id = ? AND message_id = ?`,
-          [claim.botUid, claim.target.channelType, claim.target.channelId, claim.messageId],
-        );
-        return true;
-      }
-      this.run(
-        `INSERT INTO inbound(bot_uid, channel_type, channel_id, message_id, sender_id, text, supported, kind, command_state, accepted_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, 'command', 'pending', ?)`,
-        [
-          claim.botUid,
-          claim.target.channelType,
-          claim.target.channelId,
-          claim.messageId,
-          claim.senderId,
-          claim.text,
-          claim.supported ? 1 : 0,
-          Date.now(),
-        ],
-      );
-      return true;
-    });
+    return claimCommand(this.db, claim);
   }
 
   completeCommand(claim: InboundClaim): void {
-    this.run(
-      `UPDATE inbound SET command_state = 'completed'
-       WHERE bot_uid = ? AND channel_type = ? AND channel_id = ? AND message_id = ? AND kind = 'command'`,
-      [claim.botUid, claim.target.channelType, claim.target.channelId, claim.messageId],
-    );
+    completeCommand(this.db, claim);
   }
 
   failCommand(claim: InboundClaim): void {
-    this.run(
-      `UPDATE inbound SET command_state = 'failed'
-       WHERE bot_uid = ? AND channel_type = ? AND channel_id = ? AND message_id = ? AND kind = 'command'`,
-      [claim.botUid, claim.target.channelType, claim.target.channelId, claim.messageId],
-    );
+    failCommand(this.db, claim);
   }
 
   /**
    * The chat's append mode, defaulting to `steer` for every chat that never set one.
    * A stored value is durable across restarts; there is no per-bot default row.
    */
+
   getChatMode(botUid: string, target: ChatTarget): ChatAppendMode {
-    const row = this.query(
-      `SELECT mode FROM chat_modes WHERE bot_uid = ? AND ${targetWhere(target)}`,
-      [botUid, ...targetValues(target)],
-    )[0];
-    return row && row.mode === "queue" ? "queue" : "steer";
+    return getChatMode(this.db, botUid, target);
   }
 
   setChatMode(botUid: string, target: ChatTarget, mode: ChatAppendMode): void {
-    this.run(
-      `INSERT INTO chat_modes(bot_uid, channel_type, channel_id, mode, updated_at)
-       VALUES(?, ?, ?, ?, ?)
-       ON CONFLICT(bot_uid, channel_type, channel_id) DO UPDATE SET mode = excluded.mode, updated_at = excluded.updated_at`,
-      [botUid, target.channelType, target.channelId, mode, Date.now()],
-    );
+    setChatMode(this.db, botUid, target, mode);
   }
 
   /**
    * Drops a command-class inbound claim so the same message can be claimed again,
    * used when a claim was taken for a delivery path that then fell back.
    */
+
   releaseClaim(claim: InboundClaim): void {
-    this.run(
-      `DELETE FROM inbound
-       WHERE bot_uid = ? AND channel_type = ? AND channel_id = ? AND message_id = ? AND kind = 'command'`,
-      [claim.botUid, claim.target.channelType, claim.target.channelId, claim.messageId],
-    );
+    releaseClaim(this.db, claim);
   }
 
   getTask(taskId: string): TaskRecord | null {
-    const row = this.query("SELECT * FROM tasks WHERE id = ?", [taskId])[0];
-    return row ? this.taskFromRow(row) : null;
+    return getTask(this.db, taskId);
   }
 
   getLatestTask(botUid: string, target: ChatTarget): TaskRecord | null {
-    const row = this.query(
-      `SELECT * FROM tasks WHERE bot_uid = ? AND ${targetWhere(target)} ORDER BY accepted_at DESC, rowid DESC LIMIT 1`,
-      [botUid, ...targetValues(target)],
-    )[0];
-    return row ? this.taskFromRow(row) : null;
+    return getLatestTask(this.db, botUid, target);
   }
 
   getActiveTask(botUid: string, target: ChatTarget): TaskRecord | null {
-    const row = this.query(
-      `SELECT * FROM tasks WHERE bot_uid = ? AND ${targetWhere(target)} AND state IN ('queued', 'started')
-       ORDER BY accepted_at ASC, rowid ASC LIMIT 1`,
-      [botUid, ...targetValues(target)],
-    )[0];
-    return row ? this.taskFromRow(row) : null;
+    return getActiveTask(this.db, botUid, target);
   }
 
   countQueuedTasks(botUid: string, target: ChatTarget): number {
-    const row = this.query(
-      `SELECT COUNT(*) AS count FROM tasks WHERE bot_uid = ? AND ${targetWhere(target)} AND state = 'queued'`,
-      [botUid, ...targetValues(target)],
-    )[0];
-    return asNumber(row?.count);
+    return countQueuedTasks(this.db, botUid, target);
   }
 
   listQueuedTasks(): TaskRecord[] {
-    return this.query(
-      "SELECT * FROM tasks WHERE state = 'queued' ORDER BY accepted_at ASC, rowid ASC",
-    ).map((row) => this.taskFromRow(row));
+    return listQueuedTasks(this.db);
   }
 
   markStarted(taskId: string): boolean {
-    return this.run(
-      "UPDATE tasks SET state = 'started', started_at = ? WHERE id = ? AND state = 'queued'",
-      [Date.now(), taskId],
-    ).changes === 1;
+    return markStarted(this.db, taskId);
   }
 
   markCompleted(taskId: string, resultText: string | null): void {
-    this.run(
-      "UPDATE tasks SET state = 'completed', finished_at = ?, result_text = ?, error_text = NULL WHERE id = ?",
-      [Date.now(), resultText, taskId],
-    );
+    markCompleted(this.db, taskId, resultText);
   }
 
-
   markFailed(taskId: string, errorText: string): void {
-    this.run(
-      "UPDATE tasks SET state = 'failed', finished_at = ?, error_text = ?, result_text = NULL WHERE id = ?",
-      [Date.now(), errorText, taskId],
-    );
+    markFailed(this.db, taskId, errorText);
   }
 
   markCancelled(taskId: string, errorText = "cancelled"): void {
-    this.run(
-      "UPDATE tasks SET state = 'cancelled', finished_at = ?, error_text = ? WHERE id = ? AND state IN ('queued', 'started')",
-      [Date.now(), errorText, taskId],
-    );
+    markCancelled(this.db, taskId, errorText);
   }
 
   markInterrupted(taskId: string, errorText: string): void {
-    this.run(
-      "UPDATE tasks SET state = 'interrupted', finished_at = ?, error_text = ? WHERE id = ? AND state IN ('queued', 'started')",
-      [Date.now(), errorText, taskId],
-    );
+    markInterrupted(this.db, taskId, errorText);
   }
 
   markInterruptedOnStart(botUid: string): TaskRecord[] {
-    return this.transaction(() => {
-      const rows = this.query(
-        "SELECT * FROM tasks WHERE bot_uid = ? AND state IN ('queued', 'started')",
-        [botUid],
-      );
-      this.run(
-        "UPDATE tasks SET state = 'interrupted', finished_at = ?, error_text = 'service restarted before task completion' WHERE bot_uid = ? AND state IN ('queued', 'started')",
-        [Date.now(), botUid],
-      );
-      this.run(
-        "UPDATE questions SET state = 'cancelled', answered_at = ? WHERE bot_uid = ? AND state = 'pending'",
-        [Date.now(), botUid],
-      );
-      return rows.map((row) => this.taskFromRow(row));
-    });
+    return markInterruptedOnStart(this.db, botUid);
   }
 
   /**
    * Records the card frame the server accepted. Reads back through {@link listProgressCards} when
    * a later process has to finalize a card this one cannot.
    */
+
   saveProgressCard(record: Omit<ProgressCardRecord, "attempts">): void {
-    this.run(
-      `INSERT INTO progress_cards(
-         bot_uid, task_id, channel_type, channel_id, message_id, last_seq, snapshot, attempts, updated_at
-       )
-       VALUES(?, ?, ?, ?, ?, ?, ?, 0, ?)
-       ON CONFLICT(bot_uid, task_id, message_id) DO UPDATE SET
-         channel_type = excluded.channel_type,
-         channel_id = excluded.channel_id,
-         last_seq = excluded.last_seq,
-         snapshot = excluded.snapshot,
-         attempts = 0,
-         updated_at = excluded.updated_at`,
-      [
-        record.botUid,
-        record.taskId,
-        record.channelType,
-        record.channelId,
-        record.messageId,
-        record.lastSeq,
-        record.snapshot,
-        Date.now(),
-      ],
-    );
+    saveProgressCard(this.db, record);
   }
 
   listProgressCards(botUid: string): ProgressCardRecord[] {
-    return this.query(
-      "SELECT * FROM progress_cards WHERE bot_uid = ? ORDER BY updated_at ASC, task_id ASC",
-      [botUid],
-    ).map((row) => ({
-      botUid: asString(row.bot_uid),
-      taskId: asString(row.task_id),
-      channelType: asNumber(row.channel_type) as 1 | 2 | 5,
-      channelId: asString(row.channel_id),
-      messageId: asString(row.message_id),
-      lastSeq: asNumber(row.last_seq),
-      snapshot: asString(row.snapshot),
-      attempts: asNumber(row.attempts),
-    }));
+    return listProgressCards(this.db, botUid);
   }
 
   /**
@@ -903,120 +190,45 @@ export class ChannelStore {
    * attempt whose response was lost may already have been accepted, so the next one must stay
    * strictly above every sequence the server has seen.
    */
+
   recordProgressCardAttempt(botUid: string, taskId: string, messageId: string): number {
-    this.run(
-      `UPDATE progress_cards
-       SET attempts = attempts + 1, last_seq = last_seq + 1, updated_at = ?
-       WHERE bot_uid = ? AND task_id = ? AND message_id = ?`,
-      [Date.now(), botUid, taskId, messageId],
-    );
-    const row = this.query(
-      "SELECT attempts FROM progress_cards WHERE bot_uid = ? AND task_id = ? AND message_id = ?",
-      [botUid, taskId, messageId],
-    )[0];
-    return asNumber(row?.attempts);
+    return recordProgressCardAttempt(this.db, botUid, taskId, messageId);
   }
 
   clearProgressCard(botUid: string, taskId: string, messageId: string): void {
-    this.run(
-      "DELETE FROM progress_cards WHERE bot_uid = ? AND task_id = ? AND message_id = ?",
-      [botUid, taskId, messageId],
-    );
+    clearProgressCard(this.db, botUid, taskId, messageId);
   }
 
   addRestartNotice(record: RestartNoticeRecord): void {
-    this.run(
-      `INSERT INTO restart_notices(id, bot_uid, channel_type, channel_id, requested_at)
-       VALUES(?, ?, ?, ?, ?)`,
-      [record.id, record.botUid, record.channelType, record.channelId, record.requestedAt],
-    );
+    addRestartNotice(this.db, record);
   }
 
   listRestartNotices(botUid: string): RestartNoticeRecord[] {
-    return this.query(
-      "SELECT * FROM restart_notices WHERE bot_uid = ? ORDER BY requested_at ASC, rowid ASC",
-      [botUid],
-    ).map((row) => ({
-      id: asString(row.id),
-      botUid: asString(row.bot_uid),
-      channelType: asNumber(row.channel_type) as 1 | 2 | 5,
-      channelId: asString(row.channel_id),
-      requestedAt: asNumber(row.requested_at),
-    }));
+    return listRestartNotices(this.db, botUid);
   }
 
   clearRestartNotice(id: string): void {
-    this.run("DELETE FROM restart_notices WHERE id = ?", [id]);
+    clearRestartNotice(this.db, id);
   }
 
   cancelQueued(botUid: string, target: ChatTarget): string[] {
-    return this.transaction(() => {
-      const rows = this.query(
-        `SELECT id FROM tasks WHERE bot_uid = ? AND ${targetWhere(target)} AND state = 'queued'`,
-        [botUid, ...targetValues(target)],
-      );
-      this.run(
-        `UPDATE tasks SET state = 'cancelled', finished_at = ?, error_text = 'cancelled before start'
-         WHERE bot_uid = ? AND ${targetWhere(target)} AND state = 'queued'`,
-        [Date.now(), botUid, ...targetValues(target)],
-      );
-      return rows.map((row) => asString(row.id));
-    });
+    return cancelQueued(this.db, botUid, target);
   }
 
   recordWorker(worker: WorkerLedgerRecord): void {
-    this.run(
-      `INSERT INTO worker_ledger(
-         id, bot_uid, session_id, session_file, pid, pgid, identity, cwd, move_target_cwd, state, updated_at
-       )
-       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at,
-         pid = excluded.pid, pgid = excluded.pgid, identity = excluded.identity, cwd = excluded.cwd,
-         move_target_cwd = excluded.move_target_cwd`,
-      [
-        worker.id,
-        worker.botUid,
-        worker.sessionId,
-        worker.sessionFile,
-        worker.pid,
-        worker.pgid,
-        worker.identity,
-        worker.cwd,
-        worker.moveTargetCwd,
-        worker.state,
-        Date.now(),
-      ],
-    );
+    recordWorker(this.db, worker);
   }
 
   markWorkerMoveTarget(id: string, cwd: string): void {
-    this.run(
-      "UPDATE worker_ledger SET move_target_cwd = ?, updated_at = ? WHERE id = ?",
-      [cwd, Date.now(), id],
-    );
+    markWorkerMoveTarget(this.db, id, cwd);
   }
 
   listWorkerLedger(botUid: string): WorkerLedgerRecord[] {
-    return this.query("SELECT * FROM worker_ledger WHERE bot_uid = ? AND state != 'stopped'", [botUid]).map(
-      (row) => ({
-        id: asString(row.id),
-        botUid: asString(row.bot_uid),
-        sessionId: asString(row.session_id),
-        sessionFile: asString(row.session_file),
-        pid: asNumber(row.pid),
-        pgid: asNumber(row.pgid),
-        identity: asString(row.identity),
-        cwd: asString(row.cwd),
-        moveTargetCwd: asNullableString(row.move_target_cwd),
-        state: row.state === "running" || row.state === "stopping" || row.state === "unknown" ? row.state : "stopped",
-      }),
-    );
+    return listWorkerLedger(this.db, botUid);
   }
+
   updateBindingSession(botUid: string, target: ChatTarget, sessionId: string, sessionFile: string | null): void {
-    this.run(
-      `UPDATE chats SET session_id = ?, session_file = ?, updated_at = ? WHERE bot_uid = ? AND ${targetWhere(target)}`,
-      [sessionId, sessionFile, Date.now(), botUid, ...targetValues(target)],
-    );
+    updateBindingSession(this.db, botUid, target, sessionId, sessionFile);
   }
 
   getContextLedger(
@@ -1024,15 +236,7 @@ export class ChannelStore {
     target: ChatTarget,
     sessionId: string,
   ): ContextLedgerRecord | null {
-    if (target.channelType !== 2 && target.channelType !== 5) return null;
-    if (botUid.length === 0 || sessionId.length === 0) return null;
-    const row = this.query(
-      `SELECT bot_uid, channel_type, channel_id, session_id, version, phase, attempt_id, previous_version
-       FROM session_context_ledger
-       WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?`,
-      [botUid, ...targetValues(target), sessionId],
-    )[0];
-    return row ? this.contextLedgerFromRow(row) : null;
+    return getContextLedger(this.db, botUid, target, sessionId);
   }
 
   prepareContextInjection(
@@ -1042,67 +246,7 @@ export class ChannelStore {
     version: number,
     requestedAttemptId?: string,
   ): ContextLedgerRecord {
-    if (
-      botUid.length === 0
-      || sessionId.length === 0
-      || (target.channelType !== 2 && target.channelType !== 5)
-      || !Number.isSafeInteger(version)
-      || version < 0
-    ) {
-      throw new Error("context ledger identity or version is invalid");
-    }
-    const attemptId = requestedAttemptId ?? randomUUID();
-    if (attemptId.length === 0) throw new Error("context ledger attempt ID is invalid");
-    return this.transaction(() => {
-      const existingRow = this.query(
-        `SELECT bot_uid, channel_type, channel_id, session_id, version, phase, attempt_id, previous_version
-         FROM session_context_ledger
-         WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?`,
-        [botUid, ...targetValues(target), sessionId],
-      )[0];
-      if (existingRow) {
-        const existing = this.contextLedgerFromRow(existingRow);
-        if (existing.version >= version) return existing;
-        const now = Date.now();
-        this.run(
-          `UPDATE session_context_ledger
-           SET version = ?, phase = 'pending', attempt_id = ?, previous_version = ?, updated_at = ?
-           WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?`,
-          [
-            version,
-            attemptId,
-            existing.version,
-            now,
-            botUid,
-            ...targetValues(target),
-            sessionId,
-          ],
-        );
-      } else {
-        this.run(
-          `INSERT INTO session_context_ledger(
-             bot_uid, channel_type, channel_id, session_id, version, phase, attempt_id, previous_version, updated_at
-           ) VALUES(?, ?, ?, ?, ?, 'pending', ?, NULL, ?)`,
-          [
-            botUid,
-            target.channelType,
-            target.channelId,
-            sessionId,
-            version,
-            attemptId,
-            Date.now(),
-          ],
-        );
-      }
-      const row = this.query(
-        `SELECT bot_uid, channel_type, channel_id, session_id, version, phase, attempt_id, previous_version
-         FROM session_context_ledger
-         WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?`,
-        [botUid, ...targetValues(target), sessionId],
-      )[0];
-      if (!row) throw new Error("context ledger row disappeared after prepare");
-      return this.contextLedgerFromRow(row);
-    });
+    return prepareContextInjection(this.db, botUid, target, sessionId, version, requestedAttemptId);
   }
 
   commitContextInjection(
@@ -1112,48 +256,15 @@ export class ChannelStore {
     version: number,
     attemptId: string,
   ): boolean {
-    if (
-      botUid.length === 0
-      || sessionId.length === 0
-      || attemptId.length === 0
-      || (target.channelType !== 2 && target.channelType !== 5)
-      || !Number.isSafeInteger(version)
-      || version < 0
-    ) {
-      return false;
-    }
-    return this.run(
-      `UPDATE session_context_ledger
-       SET phase = 'committed', updated_at = ?
-       WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?
-         AND version = ? AND attempt_id = ? AND phase = 'pending'`,
-      [
-        Date.now(),
-        botUid,
-        ...targetValues(target),
-        sessionId,
-        version,
-        attemptId,
-      ],
-    ).changes === 1;
+    return commitContextInjection(this.db, botUid, target, sessionId, version, attemptId);
   }
 
   clearContextLedger(botUid: string, target: ChatTarget, sessionId?: string): void {
-    if (botUid.length === 0 || (target.channelType !== 2 && target.channelType !== 5)) return;
-    const sessionClause = sessionId === undefined ? "" : " AND session_id = ?";
-    const values: SqlValue[] = [botUid, ...targetValues(target)];
-    if (sessionId !== undefined) values.push(sessionId);
-    this.run(
-      `DELETE FROM session_context_ledger
-       WHERE bot_uid = ? AND ${targetWhere(target)}${sessionClause}`,
-      values,
-    );
+    clearContextLedger(this.db, botUid, target, sessionId);
   }
 
   getHistoryLedger(botUid: string, target: ChatTarget, sessionId: string): HistoryLedgerRecord | null {
-    if (!validHistoryIdentity(botUid, target, sessionId)) return null;
-    const row = this.historyLedgerRow(botUid, target, sessionId);
-    return row ? this.historyLedgerFromRow(row) : null;
+    return getHistoryLedger(this.db, botUid, target, sessionId);
   }
 
   /**
@@ -1162,53 +273,18 @@ export class ChannelStore {
    * - otherwise: previousSeq = committed row's lastSeq (or null), fresh attemptId, phase = pending
    * - invalid identity (channelType not 2/5, empty ids, non-integer/negative seq) throws
    */
+
   prepareHistoryInjection(
     botUid: string,
     target: ChatTarget,
     sessionId: string,
     lastSeq: number,
   ): HistoryLedgerRecord {
-    if (
-      !validHistoryIdentity(botUid, target, sessionId)
-      || !Number.isSafeInteger(lastSeq)
-      || lastSeq < 0
-    ) {
-      throw new Error("group history ledger identity or seq is invalid");
-    }
-    return this.transaction(() => {
-      const existingRow = this.historyLedgerRow(botUid, target, sessionId);
-      if (existingRow) {
-        const existing = this.historyLedgerFromRow(existingRow);
-        const pending = existing.phase === "pending";
-        this.run(
-          `UPDATE group_history_ledger
-           SET last_seq = ?, phase = 'pending', attempt_id = ?, previous_seq = ?, updated_at = ?
-           WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?`,
-          [
-            Math.max(existing.lastSeq, lastSeq),
-            pending ? existing.attemptId : randomUUID(),
-            pending ? existing.previousSeq : existing.lastSeq,
-            Date.now(),
-            botUid,
-            ...targetValues(target),
-            sessionId,
-          ],
-        );
-      } else {
-        this.run(
-          `INSERT INTO group_history_ledger(
-             bot_uid, channel_type, channel_id, session_id, last_seq, phase, attempt_id, previous_seq, updated_at
-           ) VALUES(?, ?, ?, ?, ?, 'pending', ?, NULL, ?)`,
-          [botUid, target.channelType, target.channelId, sessionId, lastSeq, randomUUID(), Date.now()],
-        );
-      }
-      const row = this.historyLedgerRow(botUid, target, sessionId);
-      if (!row) throw new Error("group history ledger row disappeared after prepare");
-      return this.historyLedgerFromRow(row);
-    });
+    return prepareHistoryInjection(this.db, botUid, target, sessionId, lastSeq);
   }
 
   /** CAS commit; true only when phase/staleness/attempt all match. */
+
   commitHistoryInjection(
     botUid: string,
     target: ChatTarget,
@@ -1216,172 +292,50 @@ export class ChannelStore {
     lastSeq: number,
     attemptId: string,
   ): boolean {
-    if (
-      !validHistoryIdentity(botUid, target, sessionId)
-      || attemptId.length === 0
-      || !Number.isSafeInteger(lastSeq)
-      || lastSeq < 0
-    ) {
-      return false;
-    }
-    return this.run(
-      `UPDATE group_history_ledger
-       SET phase = 'committed', updated_at = ?
-       WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?
-         AND last_seq = ? AND attempt_id = ? AND phase = 'pending'`,
-      [Date.now(), botUid, ...targetValues(target), sessionId, lastSeq, attemptId],
-    ).changes === 1;
+    return commitHistoryInjection(this.db, botUid, target, sessionId, lastSeq, attemptId);
   }
 
   /** Delete rows of the same chat whose session_id differs from keepSessionId. Returns deleted count. */
+
   pruneHistoryLedger(botUid: string, target: ChatTarget, keepSessionId: string): number {
-    if (!validHistoryIdentity(botUid, target, keepSessionId)) return 0;
-    return this.run(
-      `DELETE FROM group_history_ledger
-       WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id != ?`,
-      [botUid, ...targetValues(target), keepSessionId],
-    ).changes;
+    return pruneHistoryLedger(this.db, botUid, target, keepSessionId);
   }
 
   /**
    * Steered message accounting: raise last_seq to max(current, seq), creating a committed
    * row when absent. An existing row keeps its phase, so a pending replay window stays open.
    */
+
   advanceHistoryLedger(botUid: string, target: ChatTarget, sessionId: string, seq: number): void {
-    if (!validHistoryIdentity(botUid, target, sessionId) || !Number.isSafeInteger(seq) || seq < 0) return;
-    this.transaction(() => {
-      const row = this.historyLedgerRow(botUid, target, sessionId);
-      if (!row) {
-        this.run(
-          `INSERT INTO group_history_ledger(
-             bot_uid, channel_type, channel_id, session_id, last_seq, phase, attempt_id, previous_seq, updated_at
-           ) VALUES(?, ?, ?, ?, ?, 'committed', ?, NULL, ?)`,
-          [botUid, target.channelType, target.channelId, sessionId, seq, randomUUID(), Date.now()],
-        );
-        return;
-      }
-      if (asNumber(row.last_seq) >= seq) return;
-      this.run(
-        `UPDATE group_history_ledger
-         SET last_seq = ?, updated_at = ?
-         WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?`,
-        [seq, Date.now(), botUid, ...targetValues(target), sessionId],
-      );
-    });
+    advanceHistoryLedger(this.db, botUid, target, sessionId, seq);
   }
 
   markWorkerStopped(id: string): void {
-    this.run("UPDATE worker_ledger SET state = 'stopped', updated_at = ? WHERE id = ?", [Date.now(), id]);
+    markWorkerStopped(this.db, id);
   }
-
 
   enqueueOutbox(record: OutboxInsert): void {
-    this.run(
-      `INSERT INTO outbox(
-         id, bot_uid, channel_type, channel_id, task_id, kind, text, path, file_kind, client_msg_no,
-         remote_message_id, stream_message_id, segment_index, desired_version, acked_version, state, created_at
-       )
-       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
-      [
-        record.id,
-        record.botUid,
-        record.channelType,
-        record.channelId,
-        record.taskId,
-        record.kind,
-        record.text,
-        record.path,
-        record.fileKind,
-        record.clientMsgNo,
-        record.remoteMessageId ?? null,
-        record.streamMessageId ?? null,
-        record.segmentIndex ?? 0,
-        record.desiredVersion ?? 0,
-        record.ackedVersion ?? 0,
-        Date.now(),
-      ],
-    );
+    enqueueOutbox(this.db, record);
   }
+
   getOutbox(id: string): OutboxRecord | null {
-    const row = this.query("SELECT * FROM outbox WHERE id = ?", [id])[0];
-    return row ? this.outboxFromRow(row) : null;
+    return getOutbox(this.db, id);
   }
 
   beginTextCreate(id: string): boolean {
-    return this.transaction(() => {
-      const row = this.query(
-        "SELECT kind, remote_message_id, state FROM outbox WHERE id = ?",
-        [id],
-      )[0];
-      if (!row || row.kind !== "text" || asNullableString(row.remote_message_id)) return false;
-      if (row.state === "unknown") return true;
-      if (row.state !== "pending") return false;
-      return this.run(
-        "UPDATE outbox SET state = 'unknown', last_error = NULL WHERE id = ? AND state = 'pending' AND remote_message_id IS NULL",
-        [id],
-      ).changes === 1;
-    });
+    return beginTextCreate(this.db, id);
   }
 
   listTextStream(botUid: string, taskId: string, streamMessageId: string): OutboxRecord[] {
-    return this.query(
-      `SELECT * FROM outbox
-       WHERE bot_uid = ? AND task_id = ? AND stream_message_id = ?
-       ORDER BY segment_index ASC, created_at ASC, rowid ASC`,
-      [botUid, taskId, streamMessageId],
-    ).map((row) => this.outboxFromRow(row));
+    return listTextStream(this.db, botUid, taskId, streamMessageId);
   }
 
   updateTextOutbox(id: string, text: string, desiredVersion: number): boolean {
-    return this.transaction(() => {
-      const row = this.query(
-        "SELECT kind, remote_message_id, state, desired_version, acked_version FROM outbox WHERE id = ?",
-        [id],
-      )[0];
-      if (!row || row.kind !== "text") return false;
-      const currentDesired = asNumber(row.desired_version);
-      if (desiredVersion <= currentDesired) return false;
-      const remoteMessageId = asNullableString(row.remote_message_id);
-      const currentAcked = asNumber(row.acked_version);
-      const preservesUnknownCreate = row.state === "unknown" && !remoteMessageId;
-      const nextState = preservesUnknownCreate
-        ? "unknown"
-        : remoteMessageId && currentAcked >= desiredVersion
-          ? "sent"
-          : "pending";
-      this.run(
-        `UPDATE outbox
-         SET text = ?, desired_version = ?, acked_version = ?, state = ?, last_error = NULL
-         WHERE id = ? AND desired_version < ?`,
-        [text, desiredVersion, currentAcked, nextState, id, desiredVersion],
-      );
-      return true;
-    });
+    return updateTextOutbox(this.db, id, text, desiredVersion);
   }
 
   bindTextOutbox(id: string, remoteMessageId: string): boolean {
-    const normalizedRemoteMessageId = remoteMessageId.trim();
-    if (normalizedRemoteMessageId.length === 0) return false;
-    return this.transaction(() => {
-      const row = this.query(
-        "SELECT kind, remote_message_id, desired_version, acked_version FROM outbox WHERE id = ?",
-        [id],
-      )[0];
-      if (!row || row.kind !== "text") return false;
-      const currentRemoteMessageId = asNullableString(row.remote_message_id);
-      if (currentRemoteMessageId && currentRemoteMessageId !== normalizedRemoteMessageId) return false;
-      const desiredVersion = asNumber(row.desired_version);
-      const ackedVersion = asNumber(row.acked_version);
-      const state = ackedVersion >= desiredVersion ? "sent" : "pending";
-      this.run(
-        `UPDATE outbox
-         SET remote_message_id = ?, state = ?, last_error = NULL,
-             sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END
-         WHERE id = ?`,
-        [normalizedRemoteMessageId, state, state, Date.now(), id],
-      );
-      return true;
-    });
+    return bindTextOutbox(this.db, id, remoteMessageId);
   }
 
   acknowledgeTextOutbox(
@@ -1389,153 +343,55 @@ export class ChannelStore {
     attemptedVersion: number,
     remoteMessageId: string | null,
   ): boolean {
-    return this.transaction(() => {
-      const row = this.query(
-        "SELECT kind, remote_message_id, desired_version, acked_version FROM outbox WHERE id = ?",
-        [id],
-      )[0];
-      if (!row || row.kind !== "text") return false;
-      const currentRemote = asNullableString(row.remote_message_id);
-      const nextRemote = remoteMessageId ?? currentRemote;
-      const desiredVersion = asNumber(row.desired_version);
-      const nextAcked = Math.max(
-        asNumber(row.acked_version),
-        Math.min(attemptedVersion, desiredVersion),
-      );
-      const knownRemote = typeof nextRemote === "string" && nextRemote.length > 0;
-      const currentText = asNullableString(
-        this.query("SELECT text FROM outbox WHERE id = ?", [id])[0]?.text,
-      );
-      const emptyWithoutRemote = currentText === "" && !knownRemote;
-      const nextState = emptyWithoutRemote || (knownRemote && nextAcked >= desiredVersion)
-        ? "sent"
-        : knownRemote
-          ? "pending"
-          : "unknown";
-      this.run(
-        `UPDATE outbox
-         SET remote_message_id = ?, acked_version = ?, state = ?,
-             last_error = NULL,
-             sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END
-         WHERE id = ?`,
-        [nextRemote, nextAcked, nextState, nextState, Date.now(), id],
-      );
-      return true;
-    });
+    return acknowledgeTextOutbox(this.db, id, attemptedVersion, remoteMessageId);
   }
 
   failTextOutbox(id: string, attemptedVersion: number, errorText: string): boolean {
-    return this.transaction(() => {
-      const row = this.query(
-        "SELECT desired_version, remote_message_id FROM outbox WHERE id = ?",
-        [id],
-      )[0];
-      if (!row) return false;
-      const desiredVersion = asNumber(row.desired_version);
-      const remoteMessageId = asNullableString(row.remote_message_id);
-      const state = !remoteMessageId
-        ? "unknown"
-        : attemptedVersion < desiredVersion
-          ? "pending"
-          : "unknown";
-      this.run(
-        "UPDATE outbox SET state = ?, attempts = attempts + 1, last_error = ? WHERE id = ?",
-        [state, errorText, id],
-      );
-      return true;
-    });
+    return failTextOutbox(this.db, id, attemptedVersion, errorText);
   }
 
   listPendingOutbox(botUid: string, target?: ChatTarget): OutboxRecord[] {
-    const clauses = ["bot_uid = ?", "state IN ('pending', 'unknown')"];
-    const values: SqlValue[] = [botUid];
-    if (target) {
-      clauses.push(targetWhere(target));
-      values.push(...targetValues(target));
-    }
-    return this.query(
-      `SELECT * FROM outbox WHERE ${clauses.join(" AND ")} ORDER BY created_at ASC, rowid ASC`,
-      values,
-    ).map((row) => this.outboxFromRow(row));
+    return listPendingOutbox(this.db, botUid, target);
   }
 
   listPendingOutboxTargets(botUid: string): ChatTarget[] {
-    return this.query(
-      `SELECT DISTINCT channel_type, channel_id FROM outbox WHERE bot_uid = ? AND state IN ('pending', 'unknown')`,
-      [botUid],
-    ).map((row) => ({
-      channelType: asNumber(row.channel_type) as 1 | 2 | 5,
-      channelId: asString(row.channel_id),
-    }));
+    return listPendingOutboxTargets(this.db, botUid);
   }
 
   countPendingOutbox(botUid: string, target: ChatTarget): number {
-    const row = this.query(
-      `SELECT COUNT(*) AS count FROM outbox WHERE bot_uid = ? AND ${targetWhere(target)} AND state IN ('pending', 'unknown')`,
-      [botUid, ...targetValues(target)],
-    )[0];
-    return asNumber(row?.count);
-  }
-  countUnknownOutbox(botUid: string, target: ChatTarget): number {
-    const row = this.query(
-      `SELECT COUNT(*) AS count FROM outbox WHERE bot_uid = ? AND ${targetWhere(target)} AND state = 'unknown'`,
-      [botUid, ...targetValues(target)],
-    )[0];
-    return asNumber(row?.count);
+    return countPendingOutbox(this.db, botUid, target);
   }
 
+  countUnknownOutbox(botUid: string, target: ChatTarget): number {
+    return countUnknownOutbox(this.db, botUid, target);
+  }
 
   markOutboxSent(id: string): void {
-    this.run("UPDATE outbox SET state = 'sent', sent_at = ?, last_error = NULL WHERE id = ?", [Date.now(), id]);
+    markOutboxSent(this.db, id);
   }
 
   markOutboxFailure(id: string, errorText: string): void {
-    this.run(
-      "UPDATE outbox SET state = 'unknown', attempts = attempts + 1, last_error = ? WHERE id = ?",
-      [errorText, id],
-    );
+    markOutboxFailure(this.db, id, errorText);
   }
+
   markOutboxDead(id: string, errorText: string): void {
-    this.run(
-      "UPDATE outbox SET state = 'dead', last_error = ?, sent_at = ? WHERE id = ?",
-      [errorText, Date.now(), id],
-    );
+    markOutboxDead(this.db, id, errorText);
   }
 
   createQuestion(record: Omit<QuestionRecord, "state" | "answer" | "cardMessageId">): void {
-    this.run(
-      `INSERT INTO questions(id, task_id, bot_uid, channel_type, channel_id, payload, state, created_at)
-       VALUES(?, ?, ?, ?, ?, ?, 'pending', ?)`,
-      [
-        record.id,
-        record.taskId,
-        record.botUid,
-        record.channelType,
-        record.channelId,
-        record.payload,
-        Date.now(),
-      ],
-    );
+    createQuestion(this.db, record);
   }
 
   getQuestion(id: string): QuestionRecord | null {
-    const row = this.query("SELECT * FROM questions WHERE id = ?", [id])[0];
-    return row ? this.questionFromRow(row) : null;
+    return getQuestion(this.db, id);
   }
 
   listPendingQuestions(botUid: string, target: ChatTarget): QuestionRecord[] {
-    return this.query(
-      `SELECT * FROM questions WHERE bot_uid = ? AND ${targetWhere(target)} AND state = 'pending' ORDER BY created_at ASC, rowid ASC`,
-      [botUid, ...targetValues(target)],
-    ).map((row) => this.questionFromRow(row));
+    return listPendingQuestions(this.db, botUid, target);
   }
 
   answerQuestion(id: string, botUid: string, target: ChatTarget, answer: string): boolean {
-    return this.run(
-      `UPDATE questions SET state = 'answered', answer = ?, answered_at = ?
-       WHERE id = ? AND bot_uid = ? AND ${targetWhere(target)} AND state = 'pending'`,
-      [answer, Date.now(), id, botUid, ...targetValues(target)],
-    ).changes === 1;
+    return answerQuestion(this.db, id, botUid, target, answer);
   }
 
   /**
@@ -1543,55 +399,41 @@ export class ChannelStore {
    * on its own `pending` state, so a question that another path already answered is left alone;
    * the returned ids are the ones that landed.
    */
+
   answerQuestions(
     botUid: string,
     target: ChatTarget,
     answers: ReadonlyArray<{ id: string; answer: string }>,
   ): string[] {
-    return this.transaction(() => {
-      const landed: string[] = [];
-      for (const { id, answer } of answers) {
-        if (this.answerQuestion(id, botUid, target, answer)) landed.push(id);
-      }
-      return landed;
-    });
+    return answerQuestions(this.db, botUid, target, answers);
   }
 
   cancelQuestions(botUid: string, target: ChatTarget): void {
-    this.run(
-      `UPDATE questions SET state = 'cancelled', answered_at = ?
-       WHERE bot_uid = ? AND ${targetWhere(target)} AND state = 'pending'`,
-      [Date.now(), botUid, ...targetValues(target)],
-    );
+    cancelQuestions(this.db, botUid, target);
   }
+
   cancelQuestion(id: string): boolean {
-    return this.run(
-      "UPDATE questions SET state = 'cancelled', answered_at = ? WHERE id = ? AND state = 'pending'",
-      [Date.now(), id],
-    ).changes === 1;
+    return cancelQuestion(this.db, id);
   }
 
   expireQuestion(id: string): boolean {
-    return this.run(
-      "UPDATE questions SET state = 'expired', answered_at = ? WHERE id = ? AND state = 'pending'",
-      [Date.now(), id],
-    ).changes === 1;
+    return expireQuestion(this.db, id);
   }
 
   pendingQuestionIds(botUid: string, target: ChatTarget): string[] {
-    return this.listPendingQuestions(botUid, target).map(({ id }) => id);
+    return pendingQuestionIds(this.db, botUid, target);
   }
 
   /** Records the remote message id once the server accepted the question card. */
+
   setQuestionCard(id: string, messageId: string): void {
-    this.run("UPDATE questions SET card_message_id = ? WHERE id = ?", [messageId, id]);
+    setQuestionCard(this.db, id, messageId);
   }
 
   /** Records the same card message id on every row of one multi-question card. */
+
   setQuestionsCard(ids: readonly string[], messageId: string): void {
-    this.transaction(() => {
-      for (const id of ids) this.setQuestionCard(id, messageId);
-    });
+    setQuestionsCard(this.db, ids, messageId);
   }
 
   /**
@@ -1599,126 +441,19 @@ export class ChannelStore {
    * unfiltered: a click on an answered or expired card is a distinct outcome from a click on a
    * foreign card, and one submission of a multi-question card needs all of its rows.
    */
+
   listQuestionsByCard(botUid: string, target: ChatTarget, messageId: string): QuestionRecord[] {
-    return this.query(
-      `SELECT * FROM questions WHERE bot_uid = ? AND ${targetWhere(target)} AND card_message_id = ?
-       ORDER BY rowid ASC`,
-      [botUid, ...targetValues(target), messageId],
-    ).map((row) => this.questionFromRow(row));
+    return listQuestionsByCard(this.db, botUid, target, messageId);
   }
 
   getBotEventCursor(botUid: string): number {
-    const row = this.query("SELECT event_id FROM bot_event_cursor WHERE bot_uid = ?", [botUid])[0];
-    return row === undefined ? 0 : asNumber(row.event_id);
+    return getBotEventCursor(this.db, botUid);
   }
 
   /** Advances the Bot event cursor; a lower id never overwrites a higher one. */
+
   setBotEventCursor(botUid: string, eventId: number): void {
-    this.run(
-      `INSERT INTO bot_event_cursor(bot_uid, event_id, updated_at) VALUES(?, ?, ?)
-       ON CONFLICT(bot_uid) DO UPDATE SET event_id = excluded.event_id, updated_at = excluded.updated_at
-       WHERE excluded.event_id > bot_event_cursor.event_id`,
-      [botUid, eventId, Date.now()],
-    );
-  }
-
-  private historyLedgerRow(botUid: string, target: ChatTarget, sessionId: string): SqlRow | undefined {
-    return this.query(
-      `SELECT bot_uid, channel_type, channel_id, session_id, last_seq, phase, attempt_id, previous_seq
-       FROM group_history_ledger
-       WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ?`,
-      [botUid, ...targetValues(target), sessionId],
-    )[0];
-  }
-
-  private historyLedgerFromRow(row: SqlRow): HistoryLedgerRecord {
-    return {
-      botUid: asString(row.bot_uid),
-      channelType: asNumber(row.channel_type) as 2 | 5,
-      channelId: asString(row.channel_id),
-      sessionId: asString(row.session_id),
-      lastSeq: asNumber(row.last_seq),
-      phase: row.phase === "committed" ? "committed" : "pending",
-      attemptId: asString(row.attempt_id),
-      previousSeq: row.previous_seq === null || row.previous_seq === undefined
-        ? null
-        : asNumber(row.previous_seq),
-    };
-  }
-
-  private contextLedgerFromRow(row: SqlRow): ContextLedgerRecord {
-    return {
-      botUid: asString(row.bot_uid),
-      channelType: asNumber(row.channel_type) as 2 | 5,
-      channelId: asString(row.channel_id),
-      sessionId: asString(row.session_id),
-      version: asNumber(row.version),
-      phase: row.phase === "committed" ? "committed" : "pending",
-      attemptId: asString(row.attempt_id),
-      previousVersion: row.previous_version === null || row.previous_version === undefined
-        ? null
-        : asNumber(row.previous_version),
-    };
-  }
-
-  private taskFromRow(row: SqlRow): TaskRecord {
-    return {
-      id: asString(row.id),
-      botUid: asString(row.bot_uid),
-      channelType: asNumber(row.channel_type) as 1 | 2 | 5,
-      channelId: asString(row.channel_id),
-      messageId: asString(row.message_id),
-      senderId: asString(row.sender_id),
-      text: asString(row.text),
-      sessionId: asString(row.session_id),
-      cwd: asString(row.cwd),
-      state: asState(row.state),
-      resultText: asNullableString(row.result_text),
-      errorText: asNullableString(row.error_text),
-      messageSeq: asNumber(row.message_seq),
-      historyEligible: asNumber(row.history_eligible) !== 0,
-    };
-  }
-
-  private outboxFromRow(row: SqlRow): OutboxRecord {
-    const kind = row.kind === "file" ? "file" : "text";
-    const fileKind = row.file_kind === "image" || row.file_kind === "file" ? row.file_kind : null;
-    const state = row.state === "sent" || row.state === "unknown" || row.state === "dead" ? row.state : "pending";
-    return {
-      id: asString(row.id),
-      botUid: asString(row.bot_uid),
-      channelType: asNumber(row.channel_type) as 1 | 2 | 5,
-      channelId: asString(row.channel_id),
-      taskId: asNullableString(row.task_id),
-      kind,
-      text: asNullableString(row.text),
-      path: asNullableString(row.path),
-      fileKind,
-      clientMsgNo: asString(row.client_msg_no),
-      state,
-      attempts: asNumber(row.attempts),
-      lastError: asNullableString(row.last_error),
-      remoteMessageId: asNullableString(row.remote_message_id),
-      streamMessageId: asNullableString(row.stream_message_id),
-      segmentIndex: asNumber(row.segment_index),
-      desiredVersion: asNumber(row.desired_version),
-      ackedVersion: asNumber(row.acked_version),
-    };
-  }
-
-  private questionFromRow(row: SqlRow): QuestionRecord {
-    const state = row.state === "answered" || row.state === "cancelled" || row.state === "expired" ? row.state : "pending";
-    return {
-      id: asString(row.id),
-      taskId: asString(row.task_id),
-      botUid: asString(row.bot_uid),
-      channelType: asNumber(row.channel_type) as 1 | 2 | 5,
-      channelId: asString(row.channel_id),
-      payload: asString(row.payload),
-      state,
-      answer: asNullableString(row.answer),
-      cardMessageId: asNullableString(row.card_message_id),
-    };
+    setBotEventCursor(this.db, botUid, eventId);
   }
 }
 

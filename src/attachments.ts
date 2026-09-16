@@ -10,6 +10,10 @@ export const MAX_MESSAGE_ATTACHMENTS = 8;
 export const ATTACHMENT_DOWNLOAD_BUDGET_MS = 120_000;
 /** Per-attachment download and transcription timeout. */
 export const ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 60_000;
+/** 附件被拒时的用户可见文案：接收关闭、整条消息超限、单条取不回来。 */
+export const ATTACHMENTS_DISABLED_TEXT = "附件接收已关闭，未接收任务。";
+export const ATTACHMENTS_OVER_BUDGET_TEXT = "附件过多或下载超时，未接收任务。";
+export const ATTACHMENT_DOWNLOAD_FAILED_TEXT = "附件下载失败，未接收任务。";
 const MAX_ATTACHMENT_NAME_LENGTH = 80;
 
 /** One attachment already stored on this machine, as referenced by the task prompt. */
@@ -181,4 +185,28 @@ function errnoCode(error: unknown): string | undefined {
     return error.code;
   }
   return undefined;
+}
+
+/** 已落盘且非空的附件可直接复用（跳过下载）；`null` 表示需要下载。 */
+export async function existingFileSize(path: string): Promise<number | null> {
+  try {
+    const details = await stat(path);
+    return details.isFile() && details.size > 0 ? details.size : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 失败原因到拒绝文案：单条超限给出配置的 MB 上限（整数不带小数，非整数保留一位），
+ * 整条消息的预算耗尽给出超限文案，单条附件取不回来给出下载失败文案。
+ */
+export function attachmentRefusalText(reason: AttachmentFailureReason, maxBytes: number): string {
+  if (reason === "oversize") {
+    const megabytes = maxBytes / (1024 * 1024);
+    const limit = Number.isInteger(megabytes) ? `${megabytes}` : megabytes.toFixed(1);
+    return `附件超过 ${limit} MB 上限，未接收任务。`;
+  }
+  if (reason === "budget") return ATTACHMENTS_OVER_BUDGET_TEXT;
+  return ATTACHMENT_DOWNLOAD_FAILED_TEXT;
 }

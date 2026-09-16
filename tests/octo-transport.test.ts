@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { createOctoTransport } from "../src/octo/index";
 import { buildAskCard, buildAskCardSet } from "../src/ask-card";
 import type { ChannelTransport, InboundMessage } from "../src/contracts";
-import type { ExecutionSnapshot } from "../src/execution-card";
+import type { ExecutionSnapshot } from "../src/execution-tracker";
 import {
   createOctoProtocolFixture,
   waitForFixture,
@@ -449,6 +449,38 @@ describe("Octo registration and WuKongIM transport", () => {
     expect(fixture.registerRequests.length).toBeGreaterThanOrEqual(2);
     expect(second.connect?.token).toBe("im-token-second");
   });
+
+  test("recovers from a server kick by reconnecting with backoff", async () => {
+    fixture = await createOctoProtocolFixture({
+      registrationTokens: ["im-token-first", "im-token-second"],
+    });
+    const logs: string[] = [];
+    transport = createOctoTransport({
+      apiUrl: fixture.apiUrl,
+      botToken: fixture.botToken,
+      logger: (message) => logs.push(message),
+    });
+    await transport.initialize();
+    const online = { count: 0 };
+    const startPromise = transport.start(async () => {}, () => {
+      online.count += 1;
+    });
+    const first = await fixture.waitForConnection(1);
+    await readyConnection(first);
+    await startPromise;
+
+    fixture.kickConnection(0, 12, "connect kicked");
+    const second = await fixture.waitForConnection(2, 6_000);
+    await readyConnection(second);
+    await waitForFixture(
+      () => online.count >= 2 ? online.count : undefined,
+      6_000,
+      "transport did not recover from the server kick",
+    );
+    expect(second.connect?.token).toBe("im-token-second");
+    expect(fixture.registerRequests.length).toBeGreaterThanOrEqual(2);
+    expect(logs.some((line) => line.includes("reason 12") && line.includes("reconnecting"))).toBe(true);
+  }, 15_000);
 
   test("stops on permanent REST registration authentication failure", async () => {
     fixture = await createOctoProtocolFixture({ registerStatus: 401 });
