@@ -56,6 +56,12 @@ test("injects the complete group snapshot only on the first and changed-version 
     expect(firstInjection?.injectionDecision).toEqual(expect.any(String));
     expect(firstInjection?.attemptId).toEqual(expect.any(String));
 
+    // The scope publishes the session it drives before prompting and keeps it
+    // as the current session; OMP opens sub-sessions in the same scope.
+    const scopeRoot = firstPrompt?.sidecarRoot;
+    expect(scopeRoot).toEqual(expect.any(String));
+    expect(firstPrompt?.boundSessionId).toBe(firstPrompt?.sessionId);
+
     await harness.service.handleInbound(
       inbound({
         messageId: "group-context-unchanged",

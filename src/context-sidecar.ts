@@ -40,6 +40,18 @@ export interface ContextSidecar {
 
 const SIDECAR_FILE_PREFIX = "context-";
 const SIDECAR_FILE_SUFFIX = ".json";
+const BOUND_SESSION_FILE = "bound-session.json";
+
+/**
+ * The session the host is currently driving inside this scope.  One worker
+ * process serves one chat binding, but OMP opens further sessions in it for
+ * subagents and eval children; only this session is a channel turn.
+ */
+export interface BoundContextSession {
+  botUid: string;
+  target: ChatTarget;
+  sessionId: string;
+}
 
 export function isContextSidecarObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -213,6 +225,11 @@ export function contextSidecarPath(sidecarRoot: string, realSessionId: string): 
   return join(resolve(sidecarRoot), contextSidecarFileName(realSessionId));
 }
 
+export function boundSessionPath(sidecarRoot: string): string {
+  requiredNonEmptyString(sidecarRoot, "sidecar root");
+  return join(resolve(sidecarRoot), BOUND_SESSION_FILE);
+}
+
 export function formatSharedContext(
   snapshot: GroupContext,
   decision: InjectionDecision = "initial",
@@ -297,6 +314,44 @@ export async function writeContextSidecar(
 export async function writeContextSidecarFile(path: string, sidecar: ContextSidecar): Promise<void> {
   assertSidecarIdentity(sidecar);
   await atomicWriteJson(resolve(path), sidecar);
+}
+
+/**
+ * Publish the session this scope's next turn belongs to before prompting, so
+ * the extension can tell a channel turn apart from a sub-session OMP opened in
+ * the same process.
+ */
+export async function writeBoundSession(
+  sidecarRoot: string,
+  bound: BoundContextSession,
+): Promise<string> {
+  const path = boundSessionPath(sidecarRoot);
+  await atomicWriteJson(path, {
+    botUid: requiredNonEmptyString(bound.botUid, "bound botUid"),
+    target: targetFromUnknown(bound.target, "bound target"),
+    sessionId: requiredNonEmptyString(bound.sessionId, "bound sessionId"),
+  });
+  return path;
+}
+
+/** The published bound session, or `undefined` when this scope has none. */
+export async function readBoundSession(sidecarRoot: string): Promise<BoundContextSession | undefined> {
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(boundSessionPath(sidecarRoot), "utf8")) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (!isContextSidecarObject(value)) return undefined;
+  try {
+    return {
+      botUid: requiredNonEmptyString(value.botUid, "bound botUid"),
+      target: targetFromUnknown(value.target, "bound target"),
+      sessionId: requiredNonEmptyString(value.sessionId, "bound sessionId"),
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 export async function readContextSidecar(path: string): Promise<ContextSidecar> {

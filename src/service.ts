@@ -64,6 +64,7 @@ import {
   preparedReceiptMatches,
   readContextSidecar,
   removeContextSidecar,
+  writeBoundSession,
   writeContextSidecar,
   type ContextSidecar,
 } from "./context-sidecar.ts";
@@ -2484,6 +2485,14 @@ class CoreService implements ChannelService {
           },
           ...(previousVersion === null ? {} : { previousVersion }),
         };
+        // The scope publishes the session this turn belongs to; it stays as the
+        // scope's current session so sub-sessions OMP opens in the same worker
+        // are never mistaken for a channel turn.
+        await writeBoundSession(sidecarRoot, {
+          botUid: this.bot!.uid,
+          target: { ...target },
+          sessionId: verified.sessionId,
+        });
         currentContextSidecarPath = await writeContextSidecar(sidecarRoot, sidecar);
       }
       /**
