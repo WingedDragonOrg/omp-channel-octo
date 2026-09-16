@@ -432,6 +432,15 @@ export interface ChannelServiceOptions {
    * `octo_management` reaches it through `create-thread`'s `isolate` argument.
    */
   worktrees?: WorktreePort;
+  /**
+   * Per-bot octo-cli credential. `provision` runs once the bot identity is known, so OMP tasks
+   * can call `octo-cli` as this bot; failures leave the agent without a CLI identity.
+   */
+  cliCredentials?: CliCredentialPort;
+}
+
+export interface CliCredentialPort {
+  provision(botUid: string): Promise<void>;
 }
 
 export interface RestartPort {

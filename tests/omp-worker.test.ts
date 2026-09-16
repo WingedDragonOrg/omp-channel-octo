@@ -15,6 +15,8 @@ type Harness = {
 	tempDir: string;
 	logPath: string;
 	markerPath: string;
+	/** Environment the fixture child actually received; written only with `envReport`. */
+	envPath: string;
 	worker: OmpWorker;
 	spawned: WorkerProcess | undefined;
 	cleanup: () => Promise<void>;
@@ -69,11 +71,17 @@ async function waitForProcessExit(pid: number, timeoutMs = 1500): Promise<void> 
 async function withHarness<T>(
 	scenario: string,
 	run: (harness: Harness) => Promise<T>,
-	options: { descendantDelayMs?: number; sessionFile?: string } = {},
+	options: {
+		descendantDelayMs?: number;
+		sessionFile?: string;
+		envReport?: boolean;
+		cliEnv?: () => Record<string, string> | undefined;
+	} = {},
 ): Promise<T> {
 	const tempDir = await realpath(await mkdtemp(join(tmpdir(), "omp-rpc-worker-")));
 	const logPath = join(tempDir, "fixture.log");
 	const markerPath = join(tempDir, "descendant.alive");
+	const envPath = join(tempDir, "child-env.json");
 	const conflictingCwd = join(tempDir, "wrong-cwd");
 	const conflictingSessionDir = join(tempDir, "wrong-session-dir");
 	const extraArgs = [
@@ -94,6 +102,7 @@ async function withHarness<T>(
 		markerPath,
 		"--fixture-descendant-delay",
 		String(options.descendantDelayMs ?? 0),
+		...(options.envReport === true ? ["--env-out", envPath] : []),
 	];
 	const requestedSessionFile =
 		options.sessionFile && !options.sessionFile.startsWith("/") ? join(tempDir, options.sessionFile) : options.sessionFile;
@@ -102,6 +111,7 @@ async function withHarness<T>(
 		extraArgs,
 		startupTimeoutMs: 2_000,
 		cancelTimeoutMs: 800,
+		...(options.cliEnv === undefined ? {} : { cliEnv: options.cliEnv }),
 	});
 	let spawned: WorkerProcess | undefined;
 	const workerOptions: WorkerOptions = {
@@ -117,6 +127,7 @@ async function withHarness<T>(
 		tempDir,
 		logPath,
 		markerPath,
+		envPath,
 		worker,
 		get spawned() {
 			return spawned;
@@ -209,6 +220,40 @@ describe("OMP RPC worker", () => {
 			expect(argumentValue(startup.argv, "--session-dir")).toBe(harness.tempDir);
 		});
 	});
+	test("carries the CLI credential names into the child and strips every other OCTO_ variable", async () => {
+		const hostToken = Bun.env["OCTO_BOT_TOKEN"];
+		Bun.env["OCTO_BOT_TOKEN"] = "host-secret-token";
+		try {
+			await withHarness(
+				"normal",
+				async harness => {
+					const childEnv = JSON.parse(await readFile(harness.envPath, "utf8")) as Record<string, string>;
+					expect(childEnv["OCTO_CONFIG_DIR"]).toBe("/tmp/oco-cred/bot-1");
+					expect(childEnv["OCTO_API_BASE_URL"]).toBe("https://im.example.test");
+					expect(childEnv["OCTO_BOT_ID"]).toBe("bot-1");
+					// Both the host's token and anything a caller smuggles past the API stay out.
+					expect(childEnv["OCTO_BOT_TOKEN"]).toBeUndefined();
+					for (const name of Object.keys(childEnv)) {
+						if (!name.startsWith("OCTO_")) continue;
+						expect(["OCTO_CONFIG_DIR", "OCTO_API_BASE_URL", "OCTO_BOT_ID"]).toContain(name);
+					}
+				},
+				{
+					envReport: true,
+					cliEnv: () => ({
+						OCTO_CONFIG_DIR: "/tmp/oco-cred/bot-1",
+						OCTO_API_BASE_URL: "https://im.example.test",
+						OCTO_BOT_ID: "bot-1",
+						OCTO_BOT_TOKEN: "smuggled-token",
+					}),
+				},
+			);
+		} finally {
+			if (hostToken === undefined) delete Bun.env["OCTO_BOT_TOKEN"];
+			else Bun.env["OCTO_BOT_TOKEN"] = hostToken;
+		}
+	});
+
 	test("materializes a valid fresh session before returning the worker", async () => {
 		await withHarness("normal", async harness => {
 			expect(existsSync(harness.worker.sessionFile)).toBe(true);

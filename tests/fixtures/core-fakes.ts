@@ -14,6 +14,7 @@ import type {
   ChannelStatus,
   ChannelTransport,
   ChatTarget,
+  CliCredentialPort,
   CoreServiceConfig,
   GroupContext,
   GroupHistoryConfig,
@@ -1174,6 +1175,8 @@ export interface CoreHarnessOptions {
   restart?: RestartPort;
   /** Isolated thread workspaces; `null` omits the port so isolate reports an unconfigured deployment. */
   worktrees?: FakeWorktrees | null;
+  /** Per-bot octo-cli credential port; absent means the deployment has no such capability. */
+  cliCredentials?: CliCredentialPort;
 }
 
 export async function createCoreHarness(options: CoreHarnessOptions = {}): Promise<CoreHarness> {
@@ -1213,6 +1216,7 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
     ...(worktrees === undefined ? {} : { worktrees }),
     ...(options.commandHandlers === undefined ? {} : { commandHandlers: options.commandHandlers }),
     ...(options.restart === undefined ? {} : { restart: options.restart }),
+    ...(options.cliCredentials === undefined ? {} : { cliCredentials: options.cliCredentials }),
   });
   await service.start();
   return {

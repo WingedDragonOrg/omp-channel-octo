@@ -727,6 +727,13 @@ class CoreService implements ChannelService {
     this.bot = identity;
     try {
       this.store.setBotUid(identity.uid);
+      // The agent's own Octo identity: the per-bot octo-cli store every later worker inherits.
+      // Best effort by contract - a missing CLI must not keep the channel from starting.
+      await this.options.cliCredentials?.provision(identity.uid).catch((error: unknown) => {
+        console.error(
+          `[octo-cli] 凭据准备失败：${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
       // 附件目录按 14 天保留期清理；best-effort，清理失败不影响启动。
       await sweepAttachments(this.options.config.stateDir, ATTACHMENT_MAX_AGE_MS).catch(() => 0);
       const configuredOwner =
@@ -3021,7 +3028,7 @@ class CoreService implements ChannelService {
     return {
       name: "channel_control",
       description:
-        "控制当前 channel（omp-channel-octo）自身：restart 排定一次重启，在本回合结束后、channel 没有运行中或排队任务时执行部署配置的重启命令，重启完成后会在本会话通报 PID；status 返回 channel 的进程 PID、运行中的会话、排队任务数、被阻塞目录数与是否已排定重启。",
+        "控制当前 channel（omp-channel-octo）自身：restart 排定一次重启，在本回合结束后、channel 没有运行中或排队任务时执行部署配置的重启命令，重启完成后会在本会话通报 PID；status 返回 channel 的进程 PID、运行中的会话、排队任务数、被阻塞目录数与是否已排定重启。本机装有 octo-cli 时，宿主已为本 bot 注入凭据（OCTO_CONFIG_DIR/OCTO_API_BASE_URL/OCTO_BOT_ID），可直接用 octo-cli 调用未被工具包装的 Octo API；先用 octo-cli auth status 确认身份是本 bot，不符或报错就不要使用。",
       parameters: {
         type: "object",
         properties: {

@@ -69,6 +69,21 @@ function appendLog(value: Frame): void {
 	}
 }
 
+/**
+ * Optional environment report (`--env-out <path>`): lets tests assert exactly which
+ * environment the host hands to OMP children, including the names it must strip.
+ */
+function writeEnvReport(): void {
+	const path = flag("--env-out");
+	if (!path) return;
+	try {
+		writeFileSync(path, `${JSON.stringify(process.env)}\n`, "utf8");
+	} catch {
+		// Same rule as the fixture log: a diagnostic write must not fail the child.
+	}
+}
+writeEnvReport();
+
 function writeFrame(frame: Frame): void {
 	process.stdout.write(`${JSON.stringify(frame)}\n`);
 }

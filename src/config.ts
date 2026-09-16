@@ -22,6 +22,18 @@ export function ocoLogsDir(home = homedir()): string {
   return join(ocoHome(home), "logs");
 }
 
+/**
+ * Private octo-cli config directory for one bot (`~/.oco/octo-cli/<botUid>`). The channel
+ * provisions the bot's own credential here and points the OMP worker at it, so the agent can
+ * call `octo-cli` as this bot without the raw token entering its environment. One directory per
+ * bot keeps identities apart once a host serves more than one bot.
+ */
+export function octoCliConfigDir(botUid: string, home = homedir()): string {
+  const uid = botUid.trim();
+  if (!BOT_UID_PATTERN.test(uid)) throw configError("bot uid 不能作为 octo-cli 凭据目录名");
+  return join(ocoHome(home), "octo-cli", uid);
+}
+
 const CONFIG_KEYS: Record<string, true> = {
   apiUrl: true,
   wsUrl: true,
@@ -38,6 +50,8 @@ const CONFIG_KEYS: Record<string, true> = {
   attachments: true,
 };
 const TOKEN_ENV_PATTERN = /^(?:OCTO_|OMP_CHANNEL_OCTO_)[A-Za-z_][A-Za-z0-9_]*$/u;
+/** Bot uids reach the filesystem as directory names; only the server's alphabet is allowed. */
+const BOT_UID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/u;
 const MIN_TIMEOUT_MS = 100;
 const MAX_TIMEOUT_MS = 300_000;
 const DEFAULT_GROUP_HISTORY_MAX_MESSAGES = 50;

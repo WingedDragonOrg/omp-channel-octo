@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { OCTO_CLI_ENV_ALLOWLIST } from "../octo-cli.ts";
 import { loadValidatedSessionState, type ProjectSessionState } from "../project-session.ts";
 import type {
 	HostTool,
@@ -71,6 +72,11 @@ type WorkerFactoryOptions = {
 	extraArgs?: string[];
 	startupTimeoutMs?: number;
 	cancelTimeoutMs?: number;
+	/**
+	 * Extra environment for OMP children, read at spawn time so a credential prepared after
+	 * startup reaches later workers. Only `OCTO_CLI_ENV_NAMES` pass through; see `workerEnv`.
+	 */
+	cliEnv?: () => Record<string, string> | undefined;
 };
 
 const DEFAULT_STARTUP_TIMEOUT_MS = 10_000;
@@ -596,11 +602,22 @@ function stripEnforcedArgs(args: readonly string[]): string[] {
 	return output;
 }
 
-function workerEnv(scope?: WorkerContextScope): Record<string, string> {
+/**
+ * Environment names an OMP child may receive on top of the inherited one. Everything else with
+ * an `OCTO_`/`OMP_CHANNEL_OCTO_` prefix stays stripped, so handing over a bot token by mistake
+ * cannot put this channel's credential into an agent shell.
+ */
+function workerEnv(scope?: WorkerContextScope, cliEnv?: Record<string, string>): Record<string, string> {
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(Bun.env)) {
 		if (key.startsWith("OCTO_") || key.startsWith("OMP_CHANNEL_OCTO_")) continue;
 		if (value !== undefined) env[key] = value;
+	}
+	if (cliEnv) {
+		for (const [key, value] of Object.entries(cliEnv)) {
+			if (OCTO_CLI_ENV_ALLOWLIST[key] !== true) continue;
+			env[key] = value;
+		}
 	}
 	if (
 		!scope
@@ -1731,7 +1748,7 @@ class OmpWorkerFactory implements WorkerFactory {
 				cwd,
 				stdin: "pipe",
 				stdout: "pipe",
-				env: workerEnv(options.contextScope),
+				env: workerEnv(options.contextScope, this.#options.cliEnv?.()),
 				stderr: "pipe",
 				detached: process.platform !== "win32",
 			}) as unknown as RpcChild;

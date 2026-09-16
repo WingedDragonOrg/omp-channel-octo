@@ -4,6 +4,7 @@ import { access, mkdtemp, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { createOctoTransport } from "./octo/index.ts";
+import { createOctoCliCredentialProvisioner } from "./octo-cli.ts";
 import { createWorkerFactory } from "./omp/index.ts";
 import {
   DEFAULT_CONFIG_PATH,
@@ -246,11 +247,18 @@ async function runService(
     botToken: config.botToken,
     logger: (message) => console.error(message),
   });
+  const cliCredentials = createOctoCliCredentialProvisioner({
+    botToken: config.botToken,
+    apiUrl: config.apiUrl,
+    ...(config.homeDir === undefined ? {} : { homeDir: config.homeDir }),
+    logger: (message) => console.error(message),
+  });
   const workerFactory = createWorkerFactory({
     ompCommand,
     extraArgs: config.ompExtraArgs,
     ...(config.startupTimeoutMs === undefined ? {} : { startupTimeoutMs: config.startupTimeoutMs }),
     ...(config.cancelTimeoutMs === undefined ? {} : { cancelTimeoutMs: config.cancelTimeoutMs }),
+    cliEnv: () => cliCredentials.env(),
   });
   const supervised = mode === "start" ? await detectSelfTarget() : undefined;
   if (mode === "run") {
@@ -277,6 +285,7 @@ async function runService(
       transport,
       workerFactory,
       worktrees: createOmpWorktreePort({ command: ompCommand }),
+      cliCredentials,
       ...(supervised === undefined
         ? {}
         : {

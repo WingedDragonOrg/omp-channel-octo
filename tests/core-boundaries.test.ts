@@ -415,6 +415,40 @@ test("a recovery failure after acquiring the Bot lock releases it for a later in
   }
 });
 
+test("starting the channel provisions the CLI credential for the bot it registered", async () => {
+  const provisioned: string[] = [];
+  const harness = await createCoreHarness({
+    cliCredentials: {
+      provision: async (botUid: string) => {
+        provisioned.push(botUid);
+      },
+    },
+  });
+  try {
+    expect(provisioned).toEqual([harness.bot.uid]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a credential provisioning failure does not keep the channel from serving", async () => {
+  const harness = await createCoreHarness({
+    cliCredentials: {
+      provision: async () => {
+        throw new Error("octo-cli 不可用");
+      },
+    },
+  });
+  try {
+    const message = inbound({ messageId: "provision-failure-still-serves", channelId: "dm-provision" });
+    await harness.service.handleInbound(message);
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, message, (status) => status.state === "completed");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
 test("concurrent stop calls wait for the worker and reject new work while stopping", async () => {
   const bot: BotIdentity = { uid: `bot-stop-${randomUUID()}`, name: "Stop Bot" };
   const workers = new ConcurrentStopFactory();
