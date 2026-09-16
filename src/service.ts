@@ -49,6 +49,7 @@ import {
   type ExecutionEvent,
   type ExecutionSnapshot,
   type ExecutionState,
+  type ExecutionTracker,
 } from "./execution-card.ts";
 import {
   GROUP_HISTORY_DEFAULT_MAX_MESSAGES,
@@ -180,6 +181,34 @@ type RuntimeTask = {
   workAfterInterrupt: boolean;
   stopActivity?: (abortProgress?: boolean) => void;
   stopText?: () => void;
+  /** Closes the progress card of the round that just ended; a steered message starts a new round. */
+  rollProgressCard?: () => void;
+};
+
+/**
+ * One user round's progress card inside a run. A run serves every message of its chat, and each
+ * appended message is answered in the card that appears right below it, so a round owns its own
+ * card, idempotency key, and sequence.
+ */
+type ProgressRound = {
+  /** Server idempotency key: stable across creation retries, distinct between rounds. */
+  readonly clientMsgNo: string;
+  readonly tracker: ExecutionTracker;
+  /** True once creation of this round's card has been queued. */
+  started: boolean;
+  /** True once a terminal edit for this card has been queued. */
+  finished: boolean;
+  /** True once a later round took over; only this card's terminal edit may still run. */
+  retired: boolean;
+  disabled: boolean;
+  /** Set after this card's first running-edit failure so a repeating error logs once. */
+  failureLogged: boolean;
+  messageId: string | undefined;
+  seq: number;
+  latest: ProgressCard | undefined;
+  version: number;
+  sentVersion: number;
+  nextEditAt: number;
 };
 
 type QuestionWaiter = {
@@ -1298,11 +1327,11 @@ class CoreService implements ChannelService {
   }
 
   /** Drops the persisted card row. Bookkeeping failures are logged, never fatal. */
-  private forgetProgressCard(taskId: string): void {
+  private forgetProgressCard(taskId: string, messageId: string): void {
     const botUid = this.bot?.uid;
     if (botUid === undefined) return;
     try {
-      this.store.clearProgressCard(botUid, taskId);
+      this.store.clearProgressCard(botUid, taskId, messageId);
     } catch (error) {
       console.error(
         `[progress-card] 无法清除卡片记录 task=${taskId}：`
@@ -1317,11 +1346,11 @@ class CoreService implements ChannelService {
    * failing state disk must not keep the channel from starting, so that failure is logged and
    * reported as the last attempt.
    */
-  private recordProgressCardAttempt(taskId: string): number {
+  private recordProgressCardAttempt(taskId: string, messageId: string): number {
     const botUid = this.bot?.uid;
     if (botUid === undefined) return PROGRESS_CARD_RECOVERY_ATTEMPTS;
     try {
-      return this.store.recordProgressCardAttempt(botUid, taskId);
+      return this.store.recordProgressCardAttempt(botUid, taskId, messageId);
     } catch (error) {
       console.error(
         `[progress-card] 无法记录补发尝试 task=${taskId}：`
@@ -1349,23 +1378,25 @@ class CoreService implements ChannelService {
           : "cancelled";
       const snapshot = restoreExecutionSnapshot(card.snapshot, { state, atMs: Date.now() });
       if (snapshot === null) {
-        this.forgetProgressCard(card.taskId);
+        this.forgetProgressCard(card.taskId, card.messageId);
         console.error(`[progress-card] 丢弃无法解析的卡片记录 task=${card.taskId}`);
         continue;
       }
       try {
         await this.submitRecoveredCard(target, card, snapshot);
-        this.forgetProgressCard(card.taskId);
+        this.forgetProgressCard(card.taskId, card.messageId);
         console.error(
           `[progress-card] 已补发终态卡片 task=${card.taskId} target=${targetKey(target)} state=${state}`,
         );
       } catch (error) {
-        const attempts = this.recordProgressCardAttempt(card.taskId);
+        const attempts = this.recordProgressCardAttempt(card.taskId, card.messageId);
         console.error(
           `[progress-card] 补发终态失败 task=${card.taskId} attempt=${attempts}：`
           + `${error instanceof Error ? error.message : "unknown error"}`,
         );
-        if (attempts >= PROGRESS_CARD_RECOVERY_ATTEMPTS) this.forgetProgressCard(card.taskId);
+        if (attempts >= PROGRESS_CARD_RECOVERY_ATTEMPTS) {
+          this.forgetProgressCard(card.taskId, card.messageId);
+        }
       }
     }
   }
@@ -1404,6 +1435,8 @@ class CoreService implements ChannelService {
     if (!runtime?.worker) return false;
     try {
       await runtime.worker.steer(text);
+      // The message starts a new round: its progress belongs below the message, not above it.
+      runtime.rollProgressCard?.();
       return true;
     } catch {
       return false;
@@ -2263,20 +2296,25 @@ class CoreService implements ChannelService {
     const textAbort = new AbortController();
     this.textAbortControllers.set(taskId, textAbort);
     let typingAbort: AbortController | undefined;
-    let progressCardStarted = false;
-    let progressCardDisabled = false;
-    let progressCardFinished = false;
-    /** Set after the first running-card failure so a repeating error logs once per task. */
-    let progressFailureLogged = false;
-    let progressCardId: string | undefined;
-    let progressCardSeq = 0;
-    let latestProgress: ProgressCard | undefined;
-    const progressTracker = createExecutionTracker({ runId: task.id });
-    let progressVersion = 0;
-    let progressSentVersion = 0;
-    let progressNextEditAt = 0;
-    const assistantTexts = new Map<string, string>();
     const target = taskTarget(task);
+    let roundIndex = 0;
+    const createRound = (): ProgressRound => ({
+      clientMsgNo: `progress-${taskId}-${roundIndex}`,
+      tracker: createExecutionTracker({ runId: taskId }),
+      started: false,
+      finished: false,
+      retired: false,
+      disabled: false,
+      failureLogged: false,
+      messageId: undefined,
+      seq: 0,
+      latest: undefined,
+      version: 0,
+      sentVersion: 0,
+      nextEditAt: 0,
+    });
+    let progressRound = createRound();
+    const assistantTexts = new Map<string, string>();
     let snapshot: GroupContext | null = null;
     let contextInjection: ContextInjection | undefined;
     let currentContextSidecarPath: string | undefined;
@@ -2313,76 +2351,107 @@ class CoreService implements ChannelService {
       trackActivity(progressTail);
     };
     const scheduleProgressEdit = (): void => {
-      if (this.stopping || !progressCardStarted || progressCardDisabled || progressTimer) return;
-      if (progressVersion <= progressSentVersion) return;
+      const current = progressRound;
+      if (this.stopping || current.retired || !current.started || current.disabled || progressTimer) return;
+      if (current.version <= current.sentVersion) return;
       progressTimer = setTimeout(() => {
         progressTimer = undefined;
-        if (progressVersion > progressSentVersion) {
-          queueProgress(() => editLatestProgress());
+        const pending = progressRound;
+        if (!pending.retired && pending.version > pending.sentVersion) {
+          queueProgress(() => editProgress(pending));
         }
-      }, Math.max(0, progressNextEditAt - Date.now()));
+      }, Math.max(0, current.nextEditAt - Date.now()));
     };
-    const editLatestProgress = async (): Promise<void> => {
-      const messageId = progressCardId;
-      const progress = latestProgress;
-      if (!messageId || !progress || progressCardDisabled) return;
-      if (progressVersion <= progressSentVersion) {
-        scheduleProgressEdit();
+    const editProgress = async (round: ProgressRound): Promise<void> => {
+      const messageId = round.messageId;
+      const progress = round.latest;
+      if (round.disabled || !messageId || !progress) return;
+      if (round.version <= round.sentVersion) {
+        if (!round.retired) scheduleProgressEdit();
         return;
       }
       const running = progress.state === "running";
-      if (running && Date.now() < progressNextEditAt) {
+      // A superseded card only still receives the terminal edit that closes it.
+      if (running && round.retired) return;
+      if (running && Date.now() < round.nextEditAt) {
         scheduleProgressEdit();
         return;
       }
-      const version = progressVersion;
-      const cardSeq = ++progressCardSeq;
-      if (running) progressNextEditAt = Date.now() + PROGRESS_MERGE_MS;
+      const version = round.version;
+      const cardSeq = ++round.seq;
+      if (running) round.nextEditAt = Date.now() + PROGRESS_MERGE_MS;
       const parentSignal = running ? progressAbort.signal : undefined;
       try {
         await runActivityRequest(
           (signal) => this.options.transport.editProgressCard(target, messageId, progress, cardSeq, signal),
           parentSignal,
         );
-        if (progressVersion === version) progressSentVersion = version;
+        if (round.version === version) round.sentVersion = version;
         if (running) {
           this.rememberProgressCard(taskId, target, messageId, cardSeq, progress);
         } else {
-          this.forgetProgressCard(taskId);
+          this.forgetProgressCard(taskId, messageId);
         }
       } catch (error) {
         const reason = error instanceof Error ? error.message : "unknown error";
         if (!running) {
-          progressCardDisabled = true;
-          clearTimeout(progressTimer);
-          progressTimer = undefined;
+          round.disabled = true;
+          if (!round.retired) {
+            clearTimeout(progressTimer);
+            progressTimer = undefined;
+          }
           console.error(
             `[progress-card] 终态编辑失败 target=${targetKey(target)} state=${progress.state}`
             + ` seq=${cardSeq}：${reason}`,
           );
-        } else if (!progressFailureLogged) {
-          progressFailureLogged = true;
+        } else if (!round.failureLogged) {
+          round.failureLogged = true;
           console.error(`[progress-card] 运行中编辑失败 target=${targetKey(target)} seq=${cardSeq}：${reason}`);
         }
       } finally {
-        scheduleProgressEdit();
+        if (!round.retired) scheduleProgressEdit();
       }
     };
     const finishProgress = (state: Exclude<ProgressCard["state"], "running">): void => {
-      if (!progressCardStarted || progressCardFinished) return;
-      progressCardFinished = true;
+      const current = progressRound;
+      if (!current.started || current.finished) return;
+      current.finished = true;
       clearTimeout(progressTimer);
       progressTimer = undefined;
-      latestProgress = progressTracker.apply({
+      current.latest = current.tracker.apply({
         type: "run_end",
         atMs: Date.now(),
         state,
       });
-      progressVersion += 1;
-      queueProgress(() => editLatestProgress());
+      current.version += 1;
+      queueProgress(() => editProgress(current));
+    };
+    /**
+     * A steered message opens the next user round. The card the reader is looking at must sit
+     * below that message instead of staying where the first tool call of the run happened, so the
+     * round in progress is closed and the next real tool progress opens a card of its own.
+     */
+    const rollProgressCard = (): void => {
+      const previous = progressRound;
+      if (previous.retired) return;
+      previous.retired = true;
+      clearTimeout(progressTimer);
+      progressTimer = undefined;
+      roundIndex += 1;
+      progressRound = createRound();
+      // The todo list belongs to the task rather than to one round, so the new card keeps it.
+      const todos = previous.latest?.todos ?? [];
+      if (todos.length > 0) {
+        progressRound.tracker.apply({ type: "todo_update", atMs: Date.now(), phases: todos });
+      }
+      if (!previous.started || previous.finished || previous.disabled) return;
+      previous.finished = true;
+      previous.latest = previous.tracker.apply({ type: "run_end", atMs: Date.now(), state: "completed" });
+      previous.version += 1;
+      queueProgress(() => editProgress(previous));
     };
     const stopActivity = (abortProgress = true): void => {
-      if (!progressCardFinished || abortProgress) {
+      if (!progressRound.finished || abortProgress) {
         clearTimeout(progressTimer);
         progressTimer = undefined;
       }
@@ -2408,6 +2477,7 @@ class CoreService implements ChannelService {
     };
     runtime.stopActivity = stopActivity;
     runtime.stopText = () => textAbort.abort();
+    runtime.rollProgressCard = rollProgressCard;
     startTyping();
 
     try {
@@ -2539,6 +2609,74 @@ class CoreService implements ChannelService {
         };
         currentContextSidecarPath = await writeContextSidecar(sidecarRoot, sidecar);
       }
+      /**
+       * Feeds one real execution event into the current round's card. The card is created lazily
+       * on the round's first real tool/todo progress, so a round without tool work shows no card.
+       */
+      const trackProgress = (event: WorkerEvent, progress: ProgressCard): void => {
+        const current = progressRound;
+        current.latest = progress;
+        if (current.retired) return;
+        if (current.finished && progress.state !== "running") return;
+        current.version += 1;
+        const startsCard = event.type === "tool_start" ||
+          event.type === "tool_end" ||
+          event.type === "todo_update";
+        if (!current.started && !startsCard) return;
+        if (!current.started) {
+          current.started = true;
+          const initial = progress;
+          const initialVersion = current.version;
+          if (progress.state !== "running") {
+            current.finished = true;
+          }
+          queueProgress(async () => {
+            try {
+              const receipt = await runActivityRequest(
+                (signal) => this.options.transport.sendProgressCard(
+                  target,
+                  initial,
+                  current.clientMsgNo,
+                  signal,
+                ),
+                progressAbort.signal,
+              );
+              if (!receipt?.messageId) {
+                current.disabled = true;
+                console.error(
+                  `[progress-card] 未创建进度卡 target=${targetKey(target)}：卡片能力不可用或内容超出限制`,
+                );
+                return;
+              }
+              current.messageId = receipt.messageId;
+              current.seq = 1;
+              current.sentVersion = initialVersion;
+              this.rememberProgressCard(taskId, target, current.messageId, 1, initial);
+              if (current.version > current.sentVersion) {
+                if (current.finished) queueProgress(() => editProgress(current));
+                else scheduleProgressEdit();
+              } else if (!current.finished) {
+                scheduleProgressEdit();
+              }
+            } catch (error) {
+              current.started = false;
+              console.error(
+                `[progress-card] 创建失败 target=${targetKey(target)}：`
+                + `${error instanceof Error ? error.message : "unknown error"}`,
+              );
+            }
+          });
+          return;
+        }
+        if (progress.state !== "running") {
+          current.finished = true;
+          clearTimeout(progressTimer);
+          progressTimer = undefined;
+          queueProgress(() => editProgress(current));
+        } else {
+          scheduleProgressEdit();
+        }
+      };
       const onEvent = (event: WorkerEvent): void => {
         if (runtime.cancelRequested || this.stopping) return;
         if (runtime.interruptRequested && event.type !== "turn_end" && event.type !== "run_end") {
@@ -2550,67 +2688,7 @@ class CoreService implements ChannelService {
           this.enqueueStreamText(target, task.id, event);
           return;
         }
-        const progress = progressTracker.apply(event);
-        latestProgress = progress;
-        if (progressCardFinished && progress.state !== "running") return;
-        progressVersion += 1;
-        const startsCard = event.type === "tool_start" ||
-          event.type === "tool_end" ||
-          event.type === "todo_update";
-        if (!progressCardStarted && !startsCard) return;
-        if (!progressCardStarted) {
-          progressCardStarted = true;
-          const initial = progress;
-          const initialVersion = progressVersion;
-          if (progress.state !== "running") {
-            progressCardFinished = true;
-          }
-          queueProgress(async () => {
-            try {
-              const receipt = await runActivityRequest(
-                (signal) => this.options.transport.sendProgressCard(
-                  target,
-                  initial,
-                  `progress-${task.id}`,
-                  signal,
-                ),
-                progressAbort.signal,
-              );
-              if (!receipt?.messageId) {
-                progressCardDisabled = true;
-                console.error(
-                  `[progress-card] 未创建进度卡 target=${targetKey(target)}：卡片能力不可用或内容超出限制`,
-                );
-                return;
-              }
-              progressCardId = receipt.messageId;
-              progressCardSeq = 1;
-              progressSentVersion = initialVersion;
-              this.rememberProgressCard(taskId, target, progressCardId, 1, initial);
-              if (progressVersion > progressSentVersion) {
-                if (progressCardFinished) queueProgress(() => editLatestProgress());
-                else scheduleProgressEdit();
-              } else if (!progressCardFinished) {
-                scheduleProgressEdit();
-              }
-            } catch (error) {
-              progressCardStarted = false;
-              console.error(
-                `[progress-card] 创建失败 target=${targetKey(target)}：`
-                + `${error instanceof Error ? error.message : "unknown error"}`,
-              );
-            }
-          });
-          return;
-        }
-        if (progress.state !== "running") {
-          progressCardFinished = true;
-          clearTimeout(progressTimer);
-          progressTimer = undefined;
-          queueProgress(() => editLatestProgress());
-        } else {
-          scheduleProgressEdit();
-        }
+        trackProgress(event, progressRound.tracker.apply(event));
       };
       const historyTurn = await this.historyTurnFor(task, target, verified.sessionId);
       const promptContext: PromptContext = {
@@ -2683,7 +2761,7 @@ class CoreService implements ChannelService {
         await this.enqueueText(runtime.target, genericTaskFailure(contextFailure), taskId);
       }
     } finally {
-      runtime.stopActivity?.(!progressCardFinished);
+      runtime.stopActivity?.(!progressRound.finished);
       this.rejectQuestionsForTask(taskId, new Error("task finished"));
       if (worker) {
         const stopped = await worker.stop().catch(() => false);

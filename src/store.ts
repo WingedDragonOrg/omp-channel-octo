@@ -144,6 +144,22 @@ function targetValues(target: ChatTarget): SqlValue[] {
 }
 
 /**
+ * One row per progress card. A run opens a new card for every user round it serves, so the row is
+ * keyed by the card's server message id: each card is then closed, retried, and dropped on its own.
+ */
+const PROGRESS_CARD_COLUMNS = `
+        bot_uid TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
+        channel_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        last_seq INTEGER NOT NULL CHECK(last_seq >= 1),
+        snapshot TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(bot_uid, task_id, message_id)`;
+
+/**
  * Group history accounting is keyed on full group (2) / CommunityTopic thread (5)
  * identities; anything else can never own a ledger row.
  */
@@ -354,17 +370,7 @@ export class ChannelStore {
         updated_at INTEGER NOT NULL,
         PRIMARY KEY(bot_uid, channel_type, channel_id)
       );
-      CREATE TABLE IF NOT EXISTS progress_cards (
-        bot_uid TEXT NOT NULL,
-        task_id TEXT NOT NULL,
-        channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
-        channel_id TEXT NOT NULL,
-        message_id TEXT NOT NULL,
-        last_seq INTEGER NOT NULL CHECK(last_seq >= 1),
-        snapshot TEXT NOT NULL,
-        attempts INTEGER NOT NULL DEFAULT 0,
-        updated_at INTEGER NOT NULL,
-        PRIMARY KEY(bot_uid, task_id)
+      CREATE TABLE IF NOT EXISTS progress_cards (${PROGRESS_CARD_COLUMNS}
       );
     `);
     for (const statement of [
@@ -387,6 +393,31 @@ export class ChannelStore {
     this.db.exec(
       "CREATE INDEX IF NOT EXISTS outbox_stream ON outbox(bot_uid, task_id, stream_message_id, segment_index)",
     );
+    this.migrateProgressCards();
+  }
+
+  /**
+   * Databases written before a run could open several cards kept one row per task. Rebuild the
+   * table once, in a single transaction, so every card owns its row.
+   */
+  private migrateProgressCards(): void {
+    const sql = asString(
+      this.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'progress_cards'")[0]?.sql,
+    );
+    if (sql.includes("PRIMARY KEY(bot_uid, task_id, message_id)")) return;
+    this.transaction(() => {
+      this.db.exec(`
+        ALTER TABLE progress_cards RENAME TO progress_cards_legacy;
+        CREATE TABLE progress_cards (${PROGRESS_CARD_COLUMNS}
+        );
+        INSERT INTO progress_cards(
+          bot_uid, task_id, channel_type, channel_id, message_id, last_seq, snapshot, attempts, updated_at
+        )
+        SELECT bot_uid, task_id, channel_type, channel_id, message_id, last_seq, snapshot, attempts, updated_at
+        FROM progress_cards_legacy;
+        DROP TABLE progress_cards_legacy;
+      `);
+    });
   }
 
   static async open(path: string): Promise<ChannelStore> {
@@ -769,10 +800,9 @@ export class ChannelStore {
          bot_uid, task_id, channel_type, channel_id, message_id, last_seq, snapshot, attempts, updated_at
        )
        VALUES(?, ?, ?, ?, ?, ?, ?, 0, ?)
-       ON CONFLICT(bot_uid, task_id) DO UPDATE SET
+       ON CONFLICT(bot_uid, task_id, message_id) DO UPDATE SET
          channel_type = excluded.channel_type,
          channel_id = excluded.channel_id,
-         message_id = excluded.message_id,
          last_seq = excluded.last_seq,
          snapshot = excluded.snapshot,
          attempts = 0,
@@ -811,22 +841,25 @@ export class ChannelStore {
    * attempt whose response was lost may already have been accepted, so the next one must stay
    * strictly above every sequence the server has seen.
    */
-  recordProgressCardAttempt(botUid: string, taskId: string): number {
+  recordProgressCardAttempt(botUid: string, taskId: string, messageId: string): number {
     this.run(
       `UPDATE progress_cards
        SET attempts = attempts + 1, last_seq = last_seq + 1, updated_at = ?
-       WHERE bot_uid = ? AND task_id = ?`,
-      [Date.now(), botUid, taskId],
+       WHERE bot_uid = ? AND task_id = ? AND message_id = ?`,
+      [Date.now(), botUid, taskId, messageId],
     );
     const row = this.query(
-      "SELECT attempts FROM progress_cards WHERE bot_uid = ? AND task_id = ?",
-      [botUid, taskId],
+      "SELECT attempts FROM progress_cards WHERE bot_uid = ? AND task_id = ? AND message_id = ?",
+      [botUid, taskId, messageId],
     )[0];
     return asNumber(row?.attempts);
   }
 
-  clearProgressCard(botUid: string, taskId: string): void {
-    this.run("DELETE FROM progress_cards WHERE bot_uid = ? AND task_id = ?", [botUid, taskId]);
+  clearProgressCard(botUid: string, taskId: string, messageId: string): void {
+    this.run(
+      "DELETE FROM progress_cards WHERE bot_uid = ? AND task_id = ? AND message_id = ?",
+      [botUid, taskId, messageId],
+    );
   }
 
   addRestartNotice(record: RestartNoticeRecord): void {

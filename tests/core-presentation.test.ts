@@ -388,6 +388,106 @@ test("tool progress uses one editable card, keeps typing alive, and closes compl
   }
 });
 
+test("a steered message closes the current card and the next round opens a new one", async () => {
+  const transport = new PresentationTransport();
+  const promptReady = Promise.withResolvers<void>();
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ emit: emitEvent, waitForAppend }) => {
+      emitEvent({ type: "turn_start", turnId: "round-1-turn-1", atMs: 1 });
+      emitEvent({
+        type: "tool_start",
+        toolCallId: "read-1",
+        toolName: "read",
+        atMs: 2,
+        summary: "tool_execution_start read",
+      });
+      emitEvent({ type: "tool_end", toolCallId: "read-1", atMs: 3, status: "succeeded" });
+      emitEvent({
+        type: "todo_update",
+        atMs: 4,
+        op: "init",
+        phases: [
+          {
+            name: "Plan",
+            tasks: [
+              { content: "Wire streaming", status: "in_progress" },
+              { content: "Verify delivery", status: "pending" },
+            ],
+          },
+        ],
+      });
+      emitEvent({ type: "turn_end", turnId: "round-1-turn-1", atMs: 4 });
+      emitEvent({ type: "turn_start", turnId: "round-1-turn-2", atMs: 5 });
+      emitEvent({
+        type: "tool_start",
+        toolCallId: "grep-1",
+        toolName: "grep",
+        atMs: 6,
+        summary: "tool_execution_start grep",
+      });
+      emitEvent({ type: "tool_end", toolCallId: "grep-1", atMs: 7, status: "succeeded" });
+      promptReady.resolve();
+      await waitForAppend();
+      // The appended message must close the card of the round it interrupted before the next
+      // round opens the card that sits below it.
+      await transport.waitForProgressCard((edit) => edit.progress.state === "completed");
+      emitEvent({ type: "turn_end", turnId: "round-1-turn-2", atMs: 8 });
+      emitEvent({ type: "turn_start", turnId: "round-2-turn-1", atMs: 9 });
+      emitEvent({
+        type: "tool_start",
+        toolCallId: "bash-1",
+        toolName: "bash",
+        atMs: 10,
+        summary: "tool_execution_start bash",
+      });
+      emitEvent({ type: "tool_end", toolCallId: "bash-1", atMs: 11, status: "succeeded" });
+      emitEvent(assistantText("assistant-round-2", "second round done", true));
+    },
+  });
+  const target = { channelId: "dm-steer-card", channelType: 1 as const };
+  try {
+    const running = harness.service.handleInbound(
+      inbound({ messageId: "steer-card-first", ...target, text: "run the first tool" }),
+    );
+    await promptReady.promise;
+    await harness.service.handleInbound(
+      inbound({ messageId: "steer-card-second", ...target, text: "second note" }),
+    );
+    await running;
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.outbox === 0,
+    );
+
+    expect(transport.progressCardSends).toHaveLength(2);
+    const [firstCard, secondCard] = transport.progressCardSends;
+    expect(firstCard!.clientMsgNo).not.toBe(secondCard!.clientMsgNo);
+    // The card opens on the round's first tool event, and the round's later work lands on it.
+    expect(firstCard!.progress.tools.map((tool) => tool.toolCallId)).toEqual(["read-1"]);
+    // The new card tracks the round it belongs to: its own phases and tools only.
+    expect(secondCard!.progress.phaseCount).toBe(1);
+    expect(secondCard!.progress.tools.map((tool) => tool.toolCallId)).toEqual(["bash-1"]);
+    // The task's todo list carries over: it belongs to the task, not to one round.
+    expect(secondCard!.progress.todos.map((phase) => phase.name)).toEqual(["Plan"]);
+
+    const closedFirstCard = transport.progressCardEdits.filter(
+      (edit) => edit.messageId === "progress-card-1",
+    );
+    expect(closedFirstCard.map((edit) => edit.progress.state)).toEqual(["completed"]);
+    expect(closedFirstCard[0]!.progress.tools.map((tool) => tool.toolCallId)).toEqual([
+      "read-1",
+      "grep-1",
+    ]);
+    expect(transport.progressCardEdits.filter((edit) => edit.messageId === "progress-card-2"))
+      .not.toHaveLength(0);
+    expect(transport.sent.map(({ text }) => text)).toEqual(["second round done"]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
 test("todo phases and tool summaries remain on the terminal completed card", async () => {
   vi.useFakeTimers();
   const transport = new PresentationTransport();

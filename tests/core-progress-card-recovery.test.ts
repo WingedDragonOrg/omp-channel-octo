@@ -1,7 +1,8 @@
+import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { BotIdentity, ChatTarget, ProgressCard, SendReceipt } from "../src/contracts";
 import { createExecutionTracker, encodeExecutionSnapshot } from "../src/execution-card";
 import { ChannelStore, type InboundClaim, type ProgressCardRecord, type TaskRecord } from "../src/store";
@@ -54,6 +55,8 @@ class RecoveryTransport extends FakeTransport {
 type SeededCard = {
   taskId: string;
   messageId: string;
+  /** Further cards of the same task, i.e. rounds the process died between. */
+  extraMessageIds: string[];
   target: ChatTarget;
 };
 
@@ -69,6 +72,8 @@ async function seedOpenCard(
     cardSeq: number;
     taskState: "started" | "completed" | "failed";
     tools: number;
+    /** Cards the same task opened after this one; a run opens one per user round. */
+    extraCards?: number;
     snapshot?: string;
   },
 ): Promise<SeededCard> {
@@ -135,6 +140,7 @@ async function seedOpenCard(
       });
     }
     const messageId = `card-${taskId}`;
+    const snapshot = options.snapshot ?? encodeExecutionSnapshot(tracker.snapshot(3_000));
     store.saveProgressCard({
       botUid,
       taskId,
@@ -142,9 +148,23 @@ async function seedOpenCard(
       channelId: target.channelId,
       messageId,
       lastSeq: options.cardSeq,
-      snapshot: options.snapshot ?? encodeExecutionSnapshot(tracker.snapshot(3_000)),
+      snapshot,
     });
-    return { taskId, messageId, target };
+    const extraMessageIds: string[] = [];
+    for (let index = 0; index < (options.extraCards ?? 0); index += 1) {
+      const extraMessageId = `${messageId}-round-${index + 2}`;
+      store.saveProgressCard({
+        botUid,
+        taskId,
+        channelType: target.channelType,
+        channelId: target.channelId,
+        messageId: extraMessageId,
+        lastSeq: options.cardSeq,
+        snapshot,
+      });
+      extraMessageIds.push(extraMessageId);
+    }
+    return { taskId, messageId, extraMessageIds, target };
   } finally {
     store.close();
   }
@@ -257,6 +277,34 @@ test("a failed recovery keeps the row and the next start retries it", async () =
   });
 });
 
+test("every card a task left open is closed on the next start", async () => {
+  await withRoot(async (root) => {
+    const bot = await prepareRoot(root);
+    const seeded = await seedOpenCard(root, bot.uid, {
+      cardSeq: 5,
+      taskState: "started",
+      tools: 2,
+      extraCards: 1,
+    });
+    const transport = new RecoveryTransport({ bot });
+    const harness = await restartWith(root, bot, transport);
+    try {
+      expect(transport.progressCardEdits.map((edit) => edit.messageId).sort()).toEqual(
+        [seeded.messageId, ...seeded.extraMessageIds].sort(),
+      );
+      // Each card carries its own sequence, so both advance one past what they had stored.
+      expect(transport.progressCardEdits.map((edit) => edit.cardSeq)).toEqual([6, 6]);
+      expect(transport.progressCardEdits.map((edit) => edit.progress.state)).toEqual([
+        "cancelled",
+        "cancelled",
+      ]);
+      expect(await openCards(root, bot.uid)).toHaveLength(0);
+    } finally {
+      await closeCoreHarness(harness, { remove: false });
+    }
+  });
+});
+
 test("recovery attempts stay bounded", async () => {
   await withRoot(async (root) => {
     const bot = await prepareRoot(root);
@@ -346,6 +394,78 @@ test("a live turn stores its card row and clears it once the terminal edit lands
     } finally {
       held.resolve();
       await closeCoreHarness(harness, { remove: false });
+    }
+  });
+});
+
+test("a database written before per-round cards keeps its rows and gains card identity", async () => {
+  await withRoot(async (root) => {
+    const path = join(root, "state", "channel.sqlite");
+    await mkdir(dirname(path), { recursive: true });
+    // The shape a run wrote before it could open several cards: one row per task.
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE progress_cards (
+        bot_uid TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
+        channel_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        last_seq INTEGER NOT NULL CHECK(last_seq >= 1),
+        snapshot TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(bot_uid, task_id)
+      );
+      INSERT INTO progress_cards(
+        bot_uid, task_id, channel_type, channel_id, message_id, last_seq, snapshot, attempts, updated_at
+      ) VALUES('bot-legacy-cards', 'task-legacy', 1, 'dm-legacy', 'card-legacy-1', 4, '{"state":"running"}', 2, 7);
+    `);
+    legacy.close();
+
+    const store = await ChannelStore.open(path);
+    try {
+      const migrated = store.listProgressCards("bot-legacy-cards");
+      expect(migrated).toHaveLength(1);
+      expect(migrated[0]!.messageId).toBe("card-legacy-1");
+      expect(migrated[0]!.lastSeq).toBe(4);
+      expect(migrated[0]!.attempts).toBe(2);
+
+      // Cards of one task are separate rows now, so a round closes without its successor.
+      store.saveProgressCard({
+        botUid: "bot-legacy-cards",
+        taskId: "task-legacy",
+        channelType: 1,
+        channelId: "dm-legacy",
+        messageId: "card-legacy-2",
+        lastSeq: 1,
+        snapshot: "{\"state\":\"running\"}",
+      });
+      expect(store.listProgressCards("bot-legacy-cards")).toHaveLength(2);
+      store.clearProgressCard("bot-legacy-cards", "task-legacy", "card-legacy-1");
+      expect(store.listProgressCards("bot-legacy-cards").map((card) => card.messageId)).toEqual([
+        "card-legacy-2",
+      ]);
+    } finally {
+      store.close();
+    }
+
+    const reopened = await ChannelStore.open(path);
+    try {
+      expect(reopened.listProgressCards("bot-legacy-cards").map((card) => card.messageId)).toEqual([
+        "card-legacy-2",
+      ]);
+    } finally {
+      reopened.close();
+    }
+    const schema = new Database(path);
+    try {
+      const row = schema
+        .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'progress_cards'")
+        .get() as { sql?: string } | undefined;
+      expect(row?.sql ?? "").toContain("PRIMARY KEY(bot_uid, task_id, message_id)");
+    } finally {
+      schema.close();
     }
   });
 });
