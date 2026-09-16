@@ -96,6 +96,8 @@ export interface FixtureManagementRequest {
   path: string;
   authorization: string | undefined;
   body: Record<string, unknown>;
+  /** Client-side port of the TCP connection this request arrived on; new port = new connection. */
+  remotePort: number | undefined;
 }
 
 /** Thread record returned by the fixture's group/thread management routes. */
@@ -1073,6 +1075,7 @@ export class OctoProtocolFixture {
         path: url.pathname,
         authorization,
         body: parsedBody,
+        remotePort: request.socket.remotePort,
       });
       if (authorization !== `Bearer ${BOT_TOKEN}`) {
         writeJson(response, 401, { error: { message: "invalid bot token" } });
@@ -1081,7 +1084,7 @@ export class OctoProtocolFixture {
       const key = `${request.method} ${url.pathname}`;
       const overrideStatus = this.options.managementStatuses?.[key];
       if (overrideStatus !== undefined && (overrideStatus < 200 || overrideStatus >= 300)) {
-        writeJson(response, overrideStatus, {
+        writeJson(response, overrideStatus, this.options.managementBodies?.[key] ?? {
           error: { message: "management route failed" },
           msg: "management route failed",
         });

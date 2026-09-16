@@ -15,6 +15,7 @@ import type {
   CardProfile,
   ChannelTransport,
   ChatTarget,
+  DeleteThreadOptions,
   GroupContext,
   GroupInfo,
   GroupInfoPatch,
@@ -182,12 +183,18 @@ const AES_BLOCK_BYTES = 16;
 class OctoError extends Error {
   readonly status: number | undefined;
   readonly permanent: boolean;
+  /** Server error identifier from the response body (`error.code`), when the body carries one. */
+  readonly code: string | undefined;
 
-  constructor(message: string, options: { status?: number; permanent?: boolean } = {}) {
+  constructor(
+    message: string,
+    options: { status?: number; permanent?: boolean; code?: string } = {},
+  ) {
     super(message);
     this.name = "OctoError";
     this.status = options.status;
     this.permanent = options.permanent ?? false;
+    this.code = options.code;
   }
 }
 
@@ -1203,13 +1210,41 @@ function serverErrorMessage(body: Uint8Array): string | null {
   return single.length > 200 ? `${single.slice(0, 200)}…` : single;
 }
 
+/**
+ * Machine-readable identifier of a failed bot API call (`error.code`, e.g.
+ * `err.server.bot_api.store_failed`). Transient server failures are recognized by this
+ * code even when the wire status alone would not say so.
+ */
+function serverErrorCode(body: Uint8Array): string | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(decodeUtf8(body, "error"));
+  } catch {
+    return undefined;
+  }
+  if (!isJsonRecord(value)) return undefined;
+  const nested = isJsonRecord(value["error"]) ? value["error"]["code"] : undefined;
+  const code = typeof nested === "string" && nested.length > 0 ? nested : value["code"];
+  return typeof code === "string" && code.length > 0 ? code : undefined;
+}
+
 function managementError(label: string, status: number, body: Uint8Array): OctoError {
   const detail = serverErrorMessage(body);
+  const code = serverErrorCode(body);
+  // The bot API answers every error with the same legacy wire status 400, so the body's
+  // machine code is what separates a request mistake (`err.server.bot_api.request_invalid`)
+  // from an internal failure (`err.server.bot_api.store_failed`); keep it in the message so
+  // the distinction survives into logs and tool results.
+  const reason = code === undefined ? `HTTP ${status}` : `HTTP ${status} (${code})`;
   return new OctoError(
     detail === null
-      ? `Octo ${label} request failed with HTTP ${status}`
-      : `Octo ${label} failed with HTTP ${status}: ${detail}`,
-    { status, permanent: status === 400 || status === 401 || status === 403 || status === 404 },
+      ? `Octo ${label} request failed with ${reason}`
+      : `Octo ${label} failed with ${reason}: ${detail}`,
+    {
+      status,
+      permanent: status === 400 || status === 401 || status === 403 || status === 404,
+      ...(code === undefined ? {} : { code }),
+    },
   );
 }
 
@@ -1221,6 +1256,7 @@ async function botApiRequest(
   method: "GET" | "POST" | "PUT" | "DELETE",
   body: JsonRecord | undefined,
   signal: AbortSignal | undefined,
+  options: DeleteThreadOptions = {},
 ): Promise<unknown> {
   const response = await requestWithTimeout(
     apiUrl(apiBase, path),
@@ -1231,6 +1267,10 @@ async function botApiRequest(
           ? authHeaders(botToken)
           : { ...authHeaders(botToken), "Content-Type": "application/json" },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      // Bun pools keep-alive connections per origin; an explicit `keepalive: false` spends a
+      // dedicated connection on this request instead of reusing a pooled socket. Retries ask
+      // for it so they cannot run on the connection state the failed attempt ran on.
+      ...(options.freshConnection === true ? { keepalive: false } : {}),
     },
     label,
     signal,
@@ -2218,7 +2258,12 @@ export class OctoTransport implements ChannelTransport {
     );
   }
 
-  async deleteThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void> {
+  async deleteThread(
+    groupId: string,
+    shortId: string,
+    signal?: AbortSignal,
+    options: DeleteThreadOptions = {},
+  ): Promise<void> {
     await botApiRequest(
       this.apiBase,
       this.botToken,
@@ -2227,6 +2272,7 @@ export class OctoTransport implements ChannelTransport {
       "DELETE",
       undefined,
       signal,
+      options,
     );
   }
 

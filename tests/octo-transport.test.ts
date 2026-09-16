@@ -947,6 +947,38 @@ describe("Octo group and thread management", () => {
     await expect(transport.getThread("plain-group", "")).rejects.toThrow(/thread id is invalid/);
   });
 
+  test("keeps the server's machine error code for an internal store failure", async () => {
+    const groupId = "store-failed-group";
+    const routeKey = `DELETE /v1/bot/groups/${groupId}/threads/thread-0`;
+    const currentFixture = await createOctoProtocolFixture({
+      managementStatuses: { [routeKey]: 400 },
+      managementBodies: {
+        [routeKey]: {
+          error: {
+            code: "err.server.bot_api.store_failed",
+            details: {},
+            http_status: 500,
+            message: "服务器内部错误。",
+          },
+          msg: "服务器内部错误。",
+          status: 400,
+        },
+      },
+    });
+    fixture = currentFixture;
+    transport = createOctoTransport({
+      apiUrl: currentFixture.apiUrl,
+      botToken: currentFixture.botToken,
+    });
+    await transport.initialize();
+
+    // The wire status is the bot API's legacy compatibility 400; the body's code carries the
+    // real category, and it must survive into the error the retry policy classifies.
+    await expect(transport.deleteThread(groupId, "thread-0")).rejects.toThrow(
+      /HTTP 400 \(err\.server\.bot_api\.store_failed\): 服务器内部错误。/u,
+    );
+  });
+
   test("reads the group 免@ decision, including the legacy no_mention shape", async () => {
     const openGroup = "no-mention-group";
     const legacyGroup = "legacy-pref-group";
@@ -981,6 +1013,29 @@ describe("Octo group and thread management", () => {
     for (const request of currentFixture.managementRequests) {
       expect(request.authorization).toBe(`Bearer ${currentFixture.botToken}`);
     }
+  });
+
+  test("spends a connection of its own on a delete that asks for one", async () => {
+    const groupId = "fresh-connection-group";
+    const currentFixture = await createOctoProtocolFixture();
+    fixture = currentFixture;
+    transport = createOctoTransport({
+      apiUrl: currentFixture.apiUrl,
+      botToken: currentFixture.botToken,
+    });
+    await transport.initialize();
+
+    await transport.createThread(groupId, "First");
+    await transport.createThread(groupId, "Second");
+    await transport.deleteThread(groupId, "thread-1", undefined, { freshConnection: true });
+
+    const [first, second, deleted] = currentFixture.managementRequests;
+    expect(deleted?.path).toBe(`/v1/bot/groups/${groupId}/threads/thread-1`);
+    expect(deleted?.authorization).toBe(`Bearer ${currentFixture.botToken}`);
+    // The retry connection bypasses the pool, so this delete arrives on a TCP connection that
+    // no earlier request used; without it the request would share the pooled connection.
+    expect(deleted?.remotePort).toBeDefined();
+    expect([first?.remotePort, second?.remotePort]).not.toContain(deleted?.remotePort);
   });
 });
 

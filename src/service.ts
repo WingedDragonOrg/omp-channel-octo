@@ -346,6 +346,19 @@ function boundedManagementError(error: unknown, fallback: string): string {
   return (detail.length > 0 ? detail : fallback).slice(0, MAX_MANAGEMENT_ERROR_CHARS);
 }
 
+/**
+ * Transient server failures a retry can clear: any 5xx, plus the internal `store_failed`
+ * error the bot API reports as HTTP 400 while the body itself declares an internal 500.
+ * The fields are read structurally, like `isPermanentOutboxError`, so the fake transport
+ * can reproduce the shape without the real transport module.
+ */
+function isTransientManagementError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { code?: unknown; status?: unknown };
+  if (typeof candidate.status === "number" && candidate.status >= 500) return true;
+  return candidate.code === "err.server.bot_api.store_failed";
+}
+
 function managementMembers(members: readonly GroupMember[]): {
   members: Array<{ uid: string; name: string; role: number; robot: boolean }>;
   count: number;
@@ -3235,7 +3248,7 @@ class CoreService implements ChannelService {
       }
       case "thread-delete": {
         const shortId = threadId();
-        await transport.deleteThread(groupId, shortId, signal);
+        await this.deleteThread(groupId, shortId, signal);
         return `已删除线程 ${shortId}`;
       }
       case "thread-dispatch": {
@@ -3249,6 +3262,29 @@ class CoreService implements ChannelService {
       default: {
         throw new Error(`unknown action: ${action}`);
       }
+    }
+  }
+
+  /**
+   * Deletes one thread, retrying once on a fresh connection when the server answers with a
+   * transient storage failure (5xx, or the `store_failed` internal error the bot API wraps as
+   * HTTP 400). The server's delete is idempotent, so the retry cannot delete anything twice;
+   * a final failure surfaces as one bounded single-line error.
+   */
+  private async deleteThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void> {
+    const transport = this.options.transport;
+    try {
+      await transport.deleteThread(groupId, shortId, signal);
+      return;
+    } catch (error) {
+      if (signal?.aborted === true || !isTransientManagementError(error)) {
+        throw new Error(boundedManagementError(error, "删除线程失败"));
+      }
+    }
+    try {
+      await transport.deleteThread(groupId, shortId, signal, { freshConnection: true });
+    } catch (error) {
+      throw new Error(boundedManagementError(error, "删除线程失败"));
     }
   }
   /**

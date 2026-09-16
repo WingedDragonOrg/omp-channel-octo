@@ -145,6 +145,11 @@ export interface HistoryFetch {
   signal?: AbortSignal;
 }
 
+/** Retry knob for `deleteThread`; see the method's doc comment. */
+export interface DeleteThreadOptions {
+  freshConnection?: boolean;
+}
+
 export interface ChannelTransport {
   initialize(): Promise<BotIdentity>;
   start(
@@ -178,7 +183,17 @@ export interface ChannelTransport {
   getThreadMembers(groupId: string, shortId: string, signal?: AbortSignal): Promise<GroupMember[]>;
   joinThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void>;
   leaveThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void>;
-  deleteThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void>;
+  /**
+   * Deletes one thread. `freshConnection` is the retry knob: it makes the call spend a
+   * connection of its own instead of a pooled one, so a retry after a transient server
+   * failure cannot run on the connection the failed attempt used.
+   */
+  deleteThread(
+    groupId: string,
+    shortId: string,
+    signal?: AbortSignal,
+    options?: DeleteThreadOptions,
+  ): Promise<void>;
   sendFile(
     target: ChatTarget,
     path: string,

@@ -16,6 +16,7 @@ import type {
   ChatTarget,
   CliCredentialPort,
   CoreServiceConfig,
+  DeleteThreadOptions,
   GroupContext,
   GroupHistoryConfig,
   GroupInfo,
@@ -144,7 +145,13 @@ export class FakeTransport implements ChannelTransport {
   readonly textRequests: TextRequest[] = [];
   readonly remoteTextMessages = new Map<string, RemoteTextMessage>();
   readonly groupContextCalls: ChatTarget[] = [];
-  readonly managementCalls: Array<{ action: string; groupId: string; shortId: string | null }> = [];
+  readonly managementCalls: Array<{
+    action: string;
+    groupId: string;
+    shortId: string | null;
+    /** Present when the caller asked for a connection of its own (a retry). */
+    freshConnection?: boolean;
+  }> = [];
   readonly historyCalls: Array<{ target: ChatTarget } & HistoryFetch> = [];
   readonly attachmentBodies = new Map<string, Uint8Array>();
   readonly downloadRequests: Array<{ url: string; path: string; maxBytes: number }> = [];
@@ -198,6 +205,7 @@ export class FakeTransport implements ChannelTransport {
   private readonly threads = new Map<string, ThreadSummary[]>();
   private readonly threadMembers = new Map<string, GroupMember[]>();
   private managementFailure: Error | undefined;
+  private managementFailures: Error[] = [];
   private nextThreadId = 1;
   constructor(options: FakeTransportOptions = {}) {
     this.bot = options.bot ?? { uid: "bot-fixture", name: "Fixture Bot" };
@@ -295,10 +303,18 @@ export class FakeTransport implements ChannelTransport {
     groupId: string,
     shortId: string | null,
     signal?: AbortSignal,
+    options?: DeleteThreadOptions,
   ): void {
     if (signal?.aborted) throw new Error("fixture management aborted");
+    this.managementCalls.push({
+      action,
+      groupId,
+      shortId,
+      ...(options?.freshConnection === true ? { freshConnection: true } : {}),
+    });
+    const queued = this.managementFailures.shift();
+    if (queued) throw queued;
     if (this.managementFailure) throw this.managementFailure;
-    this.managementCalls.push({ action, groupId, shortId });
   }
 
   private groupInfoFor(groupId: string): GroupInfo {
@@ -407,8 +423,13 @@ export class FakeTransport implements ChannelTransport {
     this.recordManagement("thread-leave", groupId, shortId, signal);
   }
 
-  async deleteThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void> {
-    this.recordManagement("thread-delete", groupId, shortId, signal);
+  async deleteThread(
+    groupId: string,
+    shortId: string,
+    signal?: AbortSignal,
+    options?: DeleteThreadOptions,
+  ): Promise<void> {
+    this.recordManagement("thread-delete", groupId, shortId, signal, options);
     this.threads.set(
       groupId,
       (this.threads.get(groupId) ?? []).filter((entry) => entry.shortId !== shortId),
@@ -443,6 +464,11 @@ export class FakeTransport implements ChannelTransport {
   /** Passing `undefined` clears the failure so later calls succeed again. */
   failManagementWith(error?: Error): void {
     this.managementFailure = error;
+  }
+
+  /** Fails the next management calls, one queued error per call, then lets them succeed again. */
+  failManagementTimes(errors: readonly Error[]): void {
+    this.managementFailures = [...errors];
   }
 
   async sendText(
