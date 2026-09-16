@@ -29,9 +29,26 @@ function cardActions(edit: { frame: { card: Record<string, unknown> } }): string
   return actions.map((action) => String((action as Record<string, unknown>).id));
 }
 
-function startAskHarness(question: Record<string, unknown>, options: { cards?: boolean } = {}) {
+function cardBody(card: Record<string, unknown>): Record<string, unknown>[] {
+  const body = card.body;
+  return Array.isArray(body) ? (body as Record<string, unknown>[]) : [];
+}
+
+/** Ids of the inputs one frame renders, in body order. */
+function inputIds(card: { frame: { card: Record<string, unknown> } }): string[] {
+  return cardBody(card.frame.card)
+    .map((element) => element.id)
+    .filter((id): id is string => typeof id === "string");
+}
+
+function startAskHarness(
+  question: Record<string, unknown> | Array<Record<string, unknown>>,
+  options: { cards?: boolean; setup?: (transport: FakeTransport) => void } = {},
+) {
   const transport = new FakeTransport();
   transport.cardSupported = options.cards ?? true;
+  options.setup?.(transport);
+  const questions = Array.isArray(question) ? question : [question];
   return createCoreHarness({
     transport,
     prompt: async ({ append, promptContext }) => {
@@ -39,7 +56,7 @@ function startAskHarness(question: Record<string, unknown>, options: { cards?: b
       if (!ask) {
         throw new Error("ask host tool missing");
       }
-      const result = await ask.execute({ questions: [question] }, new AbortController().signal);
+      const result = await ask.execute({ questions }, new AbortController().signal);
       await append("answer.log", result);
     },
   });
@@ -400,6 +417,377 @@ test("a failed card send falls back to the text question", async () => {
     );
     expect(await readAnswers(harness)).toMatchObject({
       answers: [{ id: "deployment-target", answer: "1" }],
+    });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("one submit answers every question of a multi-question card", async () => {
+  const harness = await startAskHarness([
+    {
+      id: "target",
+      question: "Which deployment target?",
+      options: [{ label: "staging" }, { label: "production" }],
+    },
+    { id: "window", question: "When do we ship?" },
+    {
+      id: "caps",
+      question: "Which capabilities?",
+      multi: true,
+      options: [{ label: "read" }, { label: "write" }, { label: "admin" }],
+    },
+    { id: "note", question: "Anything else?", options: [{ label: "none" }] },
+  ]);
+  try {
+    const target: ChatTarget = { channelId: "dm-set-submit", channelType: 1 };
+    await harness.service.handleInbound(
+      inbound({ messageId: "set-submit-start", ...target, text: "needs answers" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    const pending = await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.pendingQuestionIds.length === 4,
+    );
+    expect(pending.pendingQuestionIds).toHaveLength(4);
+
+    // One card carries all four questions: per-question inputs and a single submit.
+    expect(harness.transport.sent).toHaveLength(0);
+    expect(harness.transport.sentCards).toHaveLength(1);
+    const card = harness.transport.sentCards[0];
+    if (!card) {
+      throw new Error("ask card was not sent");
+    }
+    expect(cardActions(card)).toEqual(["ask_submit"]);
+    expect(inputIds(card)).toEqual([
+      "ask_choices_1",
+      "ask_text_1",
+      "ask_text_2",
+      "ask_choices_3",
+      "ask_text_3",
+      "ask_choices_4",
+      "ask_text_4",
+    ]);
+    expect(card.frame.plain).toContain("问题 1/4：Which deployment target?");
+    expect(card.frame.plain).toContain("问题 4/4：Anything else?");
+    expect(card.frame.plain).toContain("直接回复本消息即作为整组答案");
+
+    harness.transport.pushBotEvent(cardActionEvent(101, {
+      messageId: card.messageId,
+      channelType: 1,
+      channelId: target.channelId,
+      actionId: "ask_submit",
+      operatorUid: "owner-1",
+      inputs: {
+        ask_choices_1: "2",
+        ask_text_2: "tonight",
+        ask_choices_3: "1,3",
+        ask_choices_4: "1",
+        // A filled free-form field answers as typed, whatever the selection says.
+        ask_text_4: "actually, use canary",
+      },
+    }));
+
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    await harness.transport.waitForAck(101);
+    expect(await readAnswers(harness)).toEqual({
+      answers: [
+        { id: "target", questionId: expect.any(String), answer: "2" },
+        { id: "window", questionId: expect.any(String), answer: "tonight" },
+        { id: "caps", questionId: expect.any(String), answer: "1,3" },
+        { id: "note", questionId: expect.any(String), answer: "actually, use canary" },
+      ],
+    });
+
+    const edit = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
+    expect(cardActions(edit)).toHaveLength(0);
+    const rendered = JSON.stringify(edit.frame.card);
+    expect(rendered).toContain("已回复：2. production");
+    expect(rendered).toContain("已回复：tonight");
+    expect(rendered).toContain("已回复：1. read；3. admin");
+    expect(rendered).toContain("已回复：actually, use canary");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a partial set submission answers what it filled and leaves the rest open", async () => {
+  const harness = await startAskHarness([
+    { id: "target", question: "Which deployment target?", options: [{ label: "staging" }] },
+    { id: "window", question: "When do we ship?" },
+  ]);
+  try {
+    const target: ChatTarget = { channelId: "dm-set-partial", channelType: 1 };
+    await harness.service.handleInbound(
+      inbound({ messageId: "set-partial-start", ...target, text: "needs answers" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 2);
+    const card = harness.transport.sentCards[0];
+    if (!card) {
+      throw new Error("ask card was not sent");
+    }
+
+    harness.transport.pushBotEvent(cardActionEvent(111, {
+      messageId: card.messageId,
+      channelType: 1,
+      channelId: target.channelId,
+      actionId: "ask_submit",
+      operatorUid: "owner-1",
+      inputs: { ask_choices_1: "1" },
+    }));
+
+    // The answered question is kept, the open one stays behind a fresh submit id.
+    const rerendered = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
+    expect(rerendered.cardSeq).toBe(2);
+    expect(cardActions(rerendered)).toEqual(["ask_submit#2"]);
+    expect(JSON.stringify(rerendered.frame.card)).toContain("已回复：1. staging");
+    await expect(harness.service.status(target)).resolves.toMatchObject({
+      pendingQuestionIds: [expect.any(String)],
+    });
+
+    harness.transport.pushBotEvent(cardActionEvent(112, {
+      messageId: card.messageId,
+      channelType: 1,
+      channelId: target.channelId,
+      actionId: "ask_submit#2",
+      operatorUid: "owner-1",
+      inputs: { ask_text_2: "ship it tonight" },
+    }));
+
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(await readAnswers(harness)).toEqual({
+      answers: [
+        { id: "target", questionId: expect.any(String), answer: "1" },
+        { id: "window", questionId: expect.any(String), answer: "ship it tonight" },
+      ],
+    });
+    const closed = await harness.transport.waitForCardEdit(
+      ({ messageId, cardSeq }) => messageId === card.messageId && cardSeq === 3,
+    );
+    expect(cardActions(closed)).toHaveLength(0);
+    expect(JSON.stringify(closed.frame.card)).not.toContain("Input.Text");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a plain reply answers the whole set at once", async () => {
+  const harness = await startAskHarness([
+    {
+      id: "target",
+      question: "Which deployment target?",
+      options: [{ label: "staging" }, { label: "production" }],
+    },
+    { id: "window", question: "When do we ship?" },
+  ]);
+  try {
+    const target: ChatTarget = { channelId: "dm-set-text", channelType: 1 };
+    await harness.service.handleInbound(
+      inbound({ messageId: "set-text-start", ...target, text: "needs answers" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 2);
+    const card = harness.transport.sentCards[0];
+    if (!card) {
+      throw new Error("ask card was not sent");
+    }
+
+    await harness.service.handleInbound(
+      inbound({ messageId: "set-text-reply", ...target, text: "1" }),
+    );
+
+    const completed = await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(completed.pendingQuestionIds).toHaveLength(0);
+    // The one reply answers every open question: an option index here, the raw text there.
+    expect(await readAnswers(harness)).toEqual({
+      answers: [
+        { id: "target", questionId: expect.any(String), answer: "1" },
+        { id: "window", questionId: expect.any(String), answer: "1" },
+      ],
+    });
+
+    const closed = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
+    expect(cardActions(closed)).toHaveLength(0);
+    expect(JSON.stringify(closed.frame.card)).toContain("已回复：1. staging");
+    expect(JSON.stringify(closed.frame.card)).not.toContain("Input.Text");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a replayed set submission answers nothing twice", async () => {
+  const harness = await startAskHarness([
+    { id: "target", question: "Which deployment target?", options: [{ label: "staging" }] },
+    { id: "window", question: "When do we ship?" },
+  ]);
+  try {
+    const target: ChatTarget = { channelId: "dm-set-replay", channelType: 1 };
+    await harness.service.handleInbound(
+      inbound({ messageId: "set-replay-start", ...target, text: "needs answers" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 2);
+    const card = harness.transport.sentCards[0];
+    if (!card) {
+      throw new Error("ask card was not sent");
+    }
+
+    const click = {
+      messageId: card.messageId,
+      channelType: 1 as const,
+      channelId: target.channelId,
+      actionId: "ask_submit",
+      operatorUid: "owner-1",
+      inputs: { ask_choices_1: "1", ask_text_2: "tonight" },
+    };
+    harness.transport.pushBotEvent(cardActionEvent(121, click));
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    await harness.transport.waitForAck(121);
+    expect(await readAnswers(harness)).toMatchObject({
+      answers: [{ id: "target", answer: "1" }, { id: "window", answer: "tonight" }],
+    });
+    const editsAfterAnswer = harness.transport.cardEdits.length;
+    const textsAfterAnswer = harness.transport.sent.length;
+
+    // At-least-once delivery: the submission that answered the card is delivered again.
+    harness.transport.pushBotEvent(cardActionEvent(122, click));
+    await harness.transport.waitForAck(122);
+    expect(harness.transport.cardEdits).toHaveLength(editsAfterAnswer);
+    expect(harness.transport.sent).toHaveLength(textsAfterAnswer);
+    expect(await readAnswers(harness)).toMatchObject({
+      answers: [{ id: "target", answer: "1" }, { id: "window", answer: "tonight" }],
+    });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a set frame the deployment refuses falls back to one card per question", async () => {
+  const harness = await startAskHarness(
+    [
+      {
+        id: "target",
+        question: "Which deployment target?",
+        options: [{ label: "staging" }, { label: "production" }],
+      },
+      { id: "window", question: "When do we ship?" },
+    ],
+    {
+      setup: (transport) => {
+        // The deployment can carry single-question cards but not the set frame.
+        transport.cardSendRefusal = ({ card }) =>
+          cardBody(card).filter(({ type }) => type === "Input.Text").length > 1;
+      },
+    },
+  );
+  try {
+    const target: ChatTarget = { channelId: "dm-set-fallback", channelType: 1 };
+    await harness.service.handleInbound(
+      inbound({ messageId: "set-fallback-start", ...target, text: "needs answers" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 2);
+
+    const first = await harness.transport.waitForCardSend(({ messageId }) => messageId === "card-1");
+    expect(inputIds(first)).toEqual(["ask_text"]);
+    expect(cardActions(first)).toEqual(["ask_opt_1", "ask_opt_2", "ask_submit"]);
+    expect(first.frame.plain).toContain("问题 1/2：Which deployment target?");
+
+    harness.transport.pushBotEvent(cardActionEvent(131, {
+      messageId: first.messageId,
+      channelType: 1,
+      channelId: target.channelId,
+      actionId: "ask_opt_2",
+      operatorUid: "owner-1",
+      inputs: {},
+    }));
+    const second = await harness.transport.waitForCardSend(({ messageId }) => messageId !== first.messageId);
+    expect(inputIds(second)).toEqual(["ask_text"]);
+    expect(second.frame.plain).toContain("问题 2/2：When do we ship?");
+    await expect(harness.service.status(target)).resolves.toMatchObject({
+      pendingQuestionIds: [expect.any(String)],
+    });
+
+    harness.transport.pushBotEvent(cardActionEvent(132, {
+      messageId: second.messageId,
+      channelType: 1,
+      channelId: target.channelId,
+      actionId: "ask_submit",
+      operatorUid: "owner-1",
+      inputs: { ask_text: "tonight" },
+    }));
+
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(await readAnswers(harness)).toEqual({
+      answers: [
+        { id: "target", questionId: expect.any(String), answer: "2" },
+        { id: "window", questionId: expect.any(String), answer: "tonight" },
+      ],
+    });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a set without card support asks in text and one reply answers the rest", async () => {
+  const harness = await startAskHarness(
+    [
+      { id: "target", question: "Which deployment target?", options: [{ label: "staging" }] },
+      { id: "window", question: "When do we ship?" },
+    ],
+    { cards: false },
+  );
+  try {
+    const target: ChatTarget = { channelId: "dm-set-plain", channelType: 1 };
+    await harness.service.handleInbound(
+      inbound({ messageId: "set-plain-start", ...target, text: "needs answers" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 2);
+
+    // Only the first question had to be shown: one reply settles the whole set.
+    const question = await harness.transport.waitForRemoteText(({ text }) =>
+      text.includes("问题 1/2：Which deployment target?"));
+    expect(question.text).toContain("直接回复本消息即作为整组答案");
+    expect(harness.transport.sent).toHaveLength(1);
+
+    await harness.service.handleInbound(
+      inbound({ messageId: "set-plain-reply", ...target, text: "production, tonight" }),
+    );
+
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(harness.transport.sent).toHaveLength(1);
+    expect(await readAnswers(harness)).toEqual({
+      answers: [
+        { id: "target", questionId: expect.any(String), answer: "production, tonight" },
+        { id: "window", questionId: expect.any(String), answer: "production, tonight" },
+      ],
     });
   } finally {
     await closeCoreHarness(harness);

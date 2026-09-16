@@ -135,6 +135,8 @@ export class FakeTransport implements ChannelTransport {
   readonly eventFetches: number[] = [];
   readonly ackedEvents: number[] = [];
   cardSendFailure: Error | undefined;
+  /** Test hook: a frame the deployment cannot carry, refused the way the real limits refuse it. */
+  cardSendRefusal: ((frame: CardFrame) => boolean) | undefined;
   cardEditFailure: Error | undefined;
   /** When true, `fetchBotEvents` reports a deployment without a Bot event endpoint. */
   botEventsUnsupported = false;
@@ -188,6 +190,10 @@ export class FakeTransport implements ChannelTransport {
   private readonly cardEditWaiters: Array<{
     predicate: (edit: CardEdit) => boolean;
     resolve: (edit: CardEdit) => void;
+  }> = [];
+  private readonly cardSendWaiters: Array<{
+    predicate: (card: SentCard) => boolean;
+    resolve: (card: SentCard) => void;
   }> = [];
   private readonly ackWaiters: Array<{ eventId: number; resolve: (eventId: number) => void }> = [];
   private readonly eventWaiters: Array<() => void> = [];
@@ -588,6 +594,7 @@ export class FakeTransport implements ChannelTransport {
   ): Promise<SendReceipt | null> {
     if (signal?.aborted) throw new Error("fixture card send aborted");
     if (!this.cardSupported) return null;
+    if (this.cardSendRefusal?.(frame) === true) return null;
     if (this.cardSendFailure) throw this.cardSendFailure;
     const messageId = `card-${this.sentCards.length + 1}`;
     this.sentCards.push({ target, frame, clientMsgNo, messageId });
@@ -648,6 +655,14 @@ export class FakeTransport implements ChannelTransport {
     });
   }
 
+  waitForCardSend(predicate: (card: SentCard) => boolean): Promise<SentCard> {
+    const existing = this.sentCards.find(predicate);
+    if (existing) return Promise.resolve(existing);
+    return new Promise<SentCard>((resolve) => {
+      this.cardSendWaiters.push({ predicate, resolve });
+    });
+  }
+
   waitForAck(eventId: number): Promise<number> {
     if (this.ackedEvents.includes(eventId)) return Promise.resolve(eventId);
     return new Promise<number>((resolve) => {
@@ -669,6 +684,10 @@ export class FakeTransport implements ChannelTransport {
   private notifyCardEdit(): void {
     for (const waiter of this.cardEditWaiters) {
       const hit = this.cardEdits.find(waiter.predicate);
+      if (hit) waiter.resolve(hit);
+    }
+    for (const waiter of this.cardSendWaiters) {
+      const hit = this.sentCards.find(waiter.predicate);
       if (hit) waiter.resolve(hit);
     }
     for (const waiter of this.ackWaiters) {

@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createOctoTransport } from "../src/octo/index";
-import { buildAskCard } from "../src/ask-card";
+import { buildAskCard, buildAskCardSet } from "../src/ask-card";
 import type { ChannelTransport, InboundMessage } from "../src/contracts";
 import type { ExecutionSnapshot } from "../src/execution-card";
 import {
@@ -1375,7 +1375,11 @@ describe("Octo interactive cards and Bot events", () => {
     expect((payload.card as Record<string, unknown>).actions).toMatchObject([
       { type: "Action.Submit", id: "ask_opt_1", title: "1. staging" },
       { type: "Action.Submit", id: "ask_opt_2", title: "2. production" },
+      { type: "Action.Submit", id: "ask_submit", title: "提交其他答案" },
     ]);
+    expect((payload.card as Record<string, unknown>).body).toContainEqual(
+      expect.objectContaining({ type: "Input.Text", id: "ask_text" }),
+    );
 
     await transport.editCard(
       target,
@@ -1388,6 +1392,67 @@ describe("Octo interactive cards and Bot events", () => {
     const envelope = JSON.parse(String(currentFixture.messageEdits[0]!.body.content_edit)) as Record<string, unknown>;
     expect(envelope).toMatchObject({ type: 17, profile: "octo/v2", card_seq: 2 });
     expect((envelope.card as Record<string, unknown>).actions).toBeUndefined();
+  });
+
+  test("sends a multi-question set frame with one submit and per-question inputs", async () => {
+    fixture = await createOctoProtocolFixture({ cardProfileBody: interactiveProfile() });
+    transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
+    await transport.initialize();
+    const currentFixture = fixture;
+
+    const receipt = await transport.sendCard(
+      { channelId: currentFixture.ownerUid, channelType: 1 },
+      buildAskCardSet(
+        [
+          { question: askQuestion, answer: null },
+          { question: { question: "When do we ship?", options: [], multi: false }, answer: null },
+        ],
+        { kind: "open", generation: 1 },
+        "问题 1/2：Which deployment target?\n问题 2/2：When do we ship?",
+      ),
+      "ask-set-1",
+    );
+
+    expect(receipt).toEqual({ messageId: "9007199254740993" });
+    const payload = currentFixture.sentMessages[0]!.body.payload as Record<string, unknown>;
+    expect(payload).toMatchObject({ type: 17, profile: "octo/v2", card_version: "1.5" });
+    expect(payload.plain).toContain("问题 2/2");
+    const card = payload.card as Record<string, unknown>;
+    expect(card.actions).toMatchObject([
+      { type: "Action.Submit", id: "ask_submit", title: "提交全部答案" },
+    ]);
+    const inputIds = (card.body as Record<string, unknown>[])
+      .map((element) => element.id)
+      .filter((id) => typeof id === "string");
+    expect(inputIds).toEqual(["ask_choices_1", "ask_text_1", "ask_text_2"]);
+  });
+
+  test("declines a set frame the advertised node limit cannot carry", async () => {
+    fixture = await createOctoProtocolFixture({
+      cardProfileBody: cardProfile({
+        profiles: ["octo/v1", "octo/v2"],
+        config: { ...SUPPORTED_CARD_CONFIG, interaction_enabled: true },
+        limits: { max_nodes: 10 },
+      }),
+    });
+    transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
+    await transport.initialize();
+
+    const receipt = await transport.sendCard(
+      { channelId: fixture.ownerUid, channelType: 1 },
+      buildAskCardSet(
+        [
+          { question: askQuestion, answer: null },
+          { question: { question: "When do we ship?", options: [], multi: false }, answer: null },
+        ],
+        { kind: "open", generation: 1 },
+        "问题 1/2：Which deployment target?\n问题 2/2：When do we ship?",
+      ),
+      "ask-set-too-big",
+    );
+
+    expect(receipt).toBeNull();
+    expect(fixture.sentMessages).toHaveLength(0);
   });
 
   test("declines an interactive card while the deployment keeps interaction off", async () => {

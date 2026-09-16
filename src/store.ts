@@ -1487,6 +1487,25 @@ export class ChannelStore {
     ).changes === 1;
   }
 
+  /**
+   * Applies one answer per question inside a single transaction. Every row still compares-and-sets
+   * on its own `pending` state, so a question that another path already answered is left alone;
+   * the returned ids are the ones that landed.
+   */
+  answerQuestions(
+    botUid: string,
+    target: ChatTarget,
+    answers: ReadonlyArray<{ id: string; answer: string }>,
+  ): string[] {
+    return this.transaction(() => {
+      const landed: string[] = [];
+      for (const { id, answer } of answers) {
+        if (this.answerQuestion(id, botUid, target, answer)) landed.push(id);
+      }
+      return landed;
+    });
+  }
+
   cancelQuestions(botUid: string, target: ChatTarget): void {
     this.run(
       `UPDATE questions SET state = 'cancelled', answered_at = ?
@@ -1517,17 +1536,24 @@ export class ChannelStore {
     this.run("UPDATE questions SET card_message_id = ? WHERE id = ?", [messageId, id]);
   }
 
+  /** Records the same card message id on every row of one multi-question card. */
+  setQuestionsCard(ids: readonly string[], messageId: string): void {
+    this.transaction(() => {
+      for (const id of ids) this.setQuestionCard(id, messageId);
+    });
+  }
+
   /**
-   * Resolves the question a card click belongs to. The state is deliberately unfiltered: a click
-   * on an already answered or expired card is a distinct outcome from a click on a foreign card.
+   * Every question row one card message carries, oldest first. The state is deliberately
+   * unfiltered: a click on an answered or expired card is a distinct outcome from a click on a
+   * foreign card, and one submission of a multi-question card needs all of its rows.
    */
-  getQuestionByCard(botUid: string, target: ChatTarget, messageId: string): QuestionRecord | null {
-    const row = this.query(
+  listQuestionsByCard(botUid: string, target: ChatTarget, messageId: string): QuestionRecord[] {
+    return this.query(
       `SELECT * FROM questions WHERE bot_uid = ? AND ${targetWhere(target)} AND card_message_id = ?
-       ORDER BY created_at DESC, rowid DESC`,
+       ORDER BY rowid ASC`,
       [botUid, ...targetValues(target), messageId],
-    )[0];
-    return row ? this.questionFromRow(row) : null;
+    ).map((row) => this.questionFromRow(row));
   }
 
   getBotEventCursor(botUid: string): number {
