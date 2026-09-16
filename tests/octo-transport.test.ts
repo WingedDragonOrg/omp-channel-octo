@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { createOctoTransport } from "../src/octo/index";
 import { buildAskCard, buildAskCardSet } from "../src/ask-card";
 import type { ChannelTransport, InboundMessage } from "../src/contracts";
-import type { ExecutionSnapshot } from "../src/execution-card";
+import type { ExecutionSnapshot } from "../src/execution-tracker";
 import {
   createOctoProtocolFixture,
   waitForFixture,

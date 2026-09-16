@@ -223,7 +223,7 @@
 
 自动化证据按层分布（`bun test` 与 `bun run typecheck` 全绿）：
 
-- 传输层（`src/octo/index.ts`，夹具为真实 HTTP/WebSocket 与加密协议的 `tests/octo-protocol-server.ts`）：`tests/octo-content.test.ts` 覆盖全类型抽取（1/2/3/4/5/6/7/8/9/11/14/17）与贴纸仍不支持、相对 URL 被丢弃、合并转发的条数/码点上限与内层嵌套占位、富文本 image 块摊平、引用消息四例（有文字 / 无文字 / 被引用不可下载 / 与本条同 URL 去重）、下载落盘与复用、跟随重定向且重定向目标超限仍拒绝、落盘文件 `0600`、语音转写（成功 / 503 / 空白 / 不可解析 / 超 20 MiB / 本地文件缺失）、群历史 sync 回填。
+- 传输层（`src/octo/index.ts` 与其 `src/octo/content.ts` 归一化层，夹具为真实 HTTP/WebSocket 与加密协议的 `tests/octo-protocol-server.ts`）：`tests/octo-content.test.ts` 覆盖全类型抽取（1/2/3/4/5/6/7/8/9/11/14/17）与贴纸仍不支持、相对 URL 被丢弃、合并转发的条数/码点上限与内层嵌套占位、富文本 image 块摊平、引用消息四例（有文字 / 无文字 / 被引用不可下载 / 与本条同 URL 去重）、下载落盘与复用、跟随重定向且重定向目标超限仍拒绝、落盘文件 `0600`、语音转写（成功 / 503 / 空白 / 不可解析 / 超 20 MiB / 本地文件缺失）、群历史 sync 回填。
 - 服务层（`tests/core-attachments.test.ts`，确定性假传输与假 worker）：图片与「文字 + 图片」各产生一条任务且提示词含绝对路径与真实字节、`file` 附件行、语音转写块、声明超限与真实字节超限、单条超时 →「附件下载失败」与总预算耗尽 →「附件过多或下载超时」、数量上限 8、`enabled=false`、不支持类型回复固定文案且重投不重复、拒绝路径（非 owner / 未 @ / 非允许群 / 未认领私聊 / 待回答问题）零下载、steering 复用同一份组装正文、组装正文按命令是否消费正文分流（`/status` 与答案路径零下载；`/queue <文本>`、`/thread <任务>` 与注册 handler 的正文都取附件；被权限门拒绝的命令消息零下载）、重投不重复下载、半失败清理、14 天清理、附件目录 `0700`。
 - 组装层（`tests/attachments.test.ts`）：提示词版式（用户文本 / `[引用 <发送者>]` / `[语音转写]` / 附件行）、按 code point 截断的落盘名、`formatBytes`、`AttachmentError` 原因、清理失败记日志而目录本就不存在时保持静默。
 - 群历史与配置：`tests/core-group-history.test.ts` 断言带 caption 的图片在实时缓冲里只贡献文本且零下载；`tests/octo-transport.test.ts` 断言 sync 回填对 `type: 2` 取 caption、对畸形行逐条跳过；`tests/config-launchd.test.ts` 断言 `attachments` 的缺省、未知字段拒绝、范围校验与 `enabled: false`。

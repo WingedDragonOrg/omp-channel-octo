@@ -4,7 +4,8 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatTarget } from "../src/contracts";
-import { type ChannelStore, openChannelStore, type TaskRecord, type InboundClaim } from "../src/store";
+import { type ChannelStore, openChannelStore } from "../src/store";
+import type { TaskRecord, InboundClaim } from "../src/store-records";
 
 const botUid = "bot-group-history";
 const group: ChatTarget = { channelId: "group-history", channelType: 2 };
