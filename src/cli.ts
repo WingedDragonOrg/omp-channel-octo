@@ -20,6 +20,7 @@ import {
   uninstallLaunchdPlist,
 } from "./launchd.ts";
 import { createChannelService } from "./service.ts";
+import { createOmpWorktreePort } from "./worktree.ts";
 import type { ChannelService, OmpWorker } from "./contracts.ts";
 
 const HELP = `用法：
@@ -180,6 +181,7 @@ async function runServe(configPath: string | undefined, ompCommandOverride: stri
       config: toCoreConfig(config),
       transport,
       workerFactory,
+      worktrees: createOmpWorktreePort({ command: ompCommand }),
       ...(restartCommand === undefined
         ? {}
         : {

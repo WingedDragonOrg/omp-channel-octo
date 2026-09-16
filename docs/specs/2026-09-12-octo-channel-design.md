@@ -16,7 +16,7 @@
 
 ## 已知约束与资料
 
-- 本机当前 OMP v18.1.21 提供 `--mode rpc`、`--cwd`、`--resume`、`--approval-mode yolo`、`--extension` 及 `session.compacting` 生命周期能力；本地兼容解码器按 v18.1.18 保持 RPC 兼容。RPC 提供 prompt、steer、abort、状态和会话事件；启动 ready 不代表模型调用可用。
+- 本机当前 OMP v18.1.21 提供 `--mode rpc`、`--cwd`、`--resume`、`--approval-mode yolo`、`--extension` 及 `session.compacting` 生命周期能力；本地兼容解码器按 v18.1.18 保持 RPC 兼容。RPC 提供 prompt、steer、abort、状态和会话事件；启动 ready 不代表模型调用可用。线程隔离工作区另外使用 `omp worktree add`（v18.2.1 实测，clone-first 由 `worktree.clone` 设置决定）。
 - OMP SDK 可嵌入，但本设计选择 RPC，保持进程边界。
 - Octo 运行参考：[openclaw-channel-octo](https://github.com/Mininglamp-OSS/openclaw-channel-octo)。其 README 确认 REST 注册、WebSocket 实时收发和自动重连。
 - 账户参考：[create-openclaw-octo](https://github.com/Mininglamp-OSS/octo-adapters/tree/main/create-openclaw-octo)。使用 BotFather 创建的 User Bot；`app_` App Bot 仅支持私聊，不能满足群聊验收。
@@ -33,6 +33,7 @@
 | 会话 | 每个聊天一个当前会话，历史保留 | 隔离聊天上下文 |
 | 目录 | `/new [目录]`、`/reset [目录]`；省略目录按目标默认目录解析（DM/群沿用当前绑定，首次 `~/tmp`） | 每次 fresh 会话都有确定工作目标 |
 | 线程目录 | CommunityTopic 线程尚无已验证会话时，默认目录取父群当前绑定 cwd；线程首次成功建立会话即固定，与父群解耦 | 线程默认落在父群项目上；cwd 可共享，session 与共享说明仍按聊天目标隔离 |
+| 线程隔离 | `create-thread` 带 `isolate` 时在调用方目录所属仓库旁建立 git worktree，并把新线程绑定到该目录（`cwd_pinned`） | 需要独立工作区的线程不必共享父群目录；绑定与目录解析顺序一致，`/move` 可显式退出 |
 | 迁移 | `/move <目录>` 使用 OMP 原生 `/move`，沿用当前 session ID、历史与附件 | 保持会话连续性，不伪造新会话 |
 | 调度 | 同会话串行，同规范化目录串行；迁移同时持有真实源、目标目录 lease | 避免 channel 内任务同时修改同一目录 |
 | 故障 | 保存历史，不自动重跑已交付 Agent 的任务 | 工具副作用无法安全推断或回滚 |
@@ -96,9 +97,9 @@ channel 在自身命令注册表中注册下列命令，`/help` 展示用法。�
 
 `/new`、`/reset` 的完整剩余文本是一个路径；可移除一对匹配的外围单引号或双引号。支持绝对路径、当前运行账户的 `~/`；拒绝相对路径、其他用户的 `~name` 和空引号。路径不经 shell 执行，不展开环境变量、通配符或命令替换；特殊字符按文件名处理。
 
-省略目录时的默认目录按目标解析，顺序固定为：① 该目标已有绑定且绑定已有已验证会话文件，沿用其规范化 cwd；② 目标是 CommunityTopic 线程（channelType=5）且其父群存在绑定，取父群绑定 cwd；③ 其余情况首次解析为 `~/tmp`。父群指线程真实 channel ID 中 `____` 之前的父群 ID，按 channelType=2 目标查询；channelId 不含合法父群段、父群无绑定或父群 cwd 已不可用时按 ③ 处理，不因此拒绝任务。
+省略目录时的默认目录按目标解析，顺序固定为：① 该目标已有绑定且绑定已有已验证会话文件，或该绑定目录是显式指定的隔离工作区（`cwd_pinned`，尚未建立会话时同样生效），沿用其规范化 cwd；② 目标是 CommunityTopic 线程（channelType=5）且其父群存在绑定，取父群绑定 cwd；③ 其余情况首次解析为 `~/tmp`。父群指线程真实 channel ID 中 `____` 之前的父群 ID，按 channelType=2 目标查询；channelId 不含合法父群段、父群无绑定或父群 cwd 已不可用时按 ③ 处理，不因此拒绝任务。显式绑定的隔离目录不可用时按后续顺序继续解析（线程回退父群或 `~/tmp`），不拒绝任务。
 
-线程的目录继承只在它还没有已验证会话时生效。线程第一次成功建立会话（`refreshState` 确认并持久化 session 文件）后，其 cwd 固定为绑定 cwd；父群随后 `/new`、`/reset`、`/move` 不改变任何既有线程绑定。已建绑定但从未成功建立会话的线程在下一个任务重新按上述顺序解析，并把解析结果写回绑定。服务启动时不为存量绑定做一次性回填，也不新增用户可见提示；`/status` 按绑定 cwd 照常报告。
+线程的目录继承只在它还没有已验证会话且没有显式隔离绑定时生效。线程第一次成功建立会话（`refreshState` 确认并持久化 session 文件）后，其 cwd 固定为绑定 cwd；父群随后 `/new`、`/reset`、`/move` 不改变任何既有线程绑定。已建绑定但从未成功建立会话的线程在下一个任务重新按上述顺序解析，并把解析结果写回绑定，显式 `/new <目录>` 会解除隔离绑定。服务启动时不为存量绑定做一次性回填，也不新增用户可见提示；`/status` 按绑定 cwd 照常报告。
 
 `/move` 必须提供目标路径，按同样的安全规则解析；它只在当前绑定存在精确可恢复 session 文件时执行。channel 先取得并持有真实源目录与目标目录 lease，调用 OMP 原生 `/move <目录>`，再通过 `refreshState` 校验 session ID、session 文件和规范化目标 cwd，成功持久化后才更新绑定。源目录或目标目录有运行/排队任务、未确认停止的 worker 或 lease 冲突时拒绝，不隐式迁移或丢弃任务。
 
@@ -123,6 +124,8 @@ OMP `session.compacting` 生命周期在压缩时把当前 turn sidecar 中的�
 群和线程任务获得一个复合工具 `octo_management`，动作固定为 `group-info`、`group-members`、`group-update`、`description-read`、`description-write`、`list-threads`、`create-thread`、`thread-info`、`thread-members`、`thread-join`、`thread-leave`、`thread-delete`、`thread-dispatch`，对应服务端 `groups/{id}`、`groups/{id}/members`、`groups/{id}/info`、`groups/{id}/md`、`groups/{id}/threads`、`groups/{id}/threads/{short}` 及其 `members`/`join`/`leave` 路径。目标固定为当前聊天：群任务取当前 `group_no`，线程任务取父群 `group_no`，`thread-*` 动作省略 `short_id` 时取当前线程，模型不能传入其他群或线程 ID。`group-update`、`thread-delete`、`thread-join`、`thread-leave` 等写操作的授权由服务端判定（`bot_admin`、线程创建者或群管理员），客户端不放行服务端拒绝的动作，也不做额外提权。失败时把服务端错误正文压成单行、截断到 200 字符后作为工具错误返回，便于模型纠正参数；返回值按固定上限裁剪（成员 200、线程 50）并显式给出总数与截断标记，名称截断到 200 字符、公告截断到 2000 字符，不返回原始 HTTP 响应或凭据。
 
 `thread-dispatch` 让当前群/线程会话把一条任务派发给本群的某个 thread：先按服务端读取该 thread 的真实 `channel_id`（必须属于当前群），在该 thread 里投递一条可见的派发说明，再用与真实入站相同的 durable 路径为该 thread 接受一个任务（入站消息 ID 使用 `dispatch:` 前缀的唯一值、发送者为持久 owner、目标为该 thread），最后在当前聊天回执一行派发结果。派发不等待该任务完成，回执只表示已排队；被派发的任务在目标 thread 的绑定与 session 中执行，cwd 按线程默认目录规则解析（未建会话时继承父群绑定 cwd，因此与父群任务按目录串行），结果投递到该 thread 而不是发起聊天。由于派发复用真实入站路径，目标 thread 的问答、追加模式与排队语义照常生效。派发的深度固定为 1：任务记录的消息 ID 带 `dispatch:` 前缀时，该任务的 `octo_management` 不提供 `thread-dispatch` 动作，客户端也拒绝该动作。
+
+`create-thread` 另有布尔参数 `isolate`：为真时宿主在调用方当前目录所属的仓库（`git rev-parse --show-toplevel`）旁建立独立 git worktree，并把新线程绑定固定到该目录。工作区目录与分支取线程名的 ASCII slug（`<repo>.<slug>`；slug 为空或已被占用时退到 `<repo>.<slug>-<short_id>`，非 ASCII 名直接用 `<repo>.<short_id>`），创建调用部署解析出的 OMP 可执行文件的 `omp worktree add`，因此继承 OMP 自身的 clone-first 行为（未跟踪与被忽略的文件如 `node_modules` 一并克隆，无需重新安装依赖），有界超时 120 秒并随工具取消信号中止。绑定写入 `chats.cwd_pinned`，线程随后按该目录建立自己的 session；worktree 创建失败不改写已经创建的线程，工具结果返回单行、截断 200 字符的 `isolate_error`，线程仍按普通目录顺序使用。成功时结果在 `worktree` 字段返回路径与分支。部署未提供隔离能力时同样以 `isolate_error` 说明，不伪装成功。
 
 `octo_management` 的 `description-read` 每次通过实时 `getGroupContext` 读取服务端当前说明，不使用 prompt 或 compaction 快照；`description-write` 只更新当前群/线程目标且需要服务端 `bot_admin` 权限。写入成功后，后续任务和 extension sidecar 使用新的 version；当前 turn 已经建立的 context 不回写。私聊不读取或注入群说明，也不获得群说明动作。
 
@@ -198,8 +201,10 @@ Octo 断线不取消已经开始的 Agent；正文 outbox 与任务状态持久�
 
 24. 群级免@：服务端 `mention_pref.effective` 为真时，owner 在该群及其线程发送的未 @Bot 文本正常启动任务；`effective` 为假、查询失败或响应不可解析时不启动任务、不回复也不落任何入站副作用；同一个群在 60 秒缓存窗口内只查询一次，带 mention 的消息不触发查询；非 owner、不在允许列表或 Bot 回声在任何情况下都不产生该查询。
 
+25. 线程隔离：`octo_management` 的 `create-thread` 带 `isolate` 时，在调用方当前目录所属仓库旁建立独立 git worktree（经部署的 OMP 可执行文件的 `omp worktree add`，clone-first 复制被忽略文件）并把新线程绑定固定到该目录（`chats.cwd_pinned`）；该线程下一个任务以工作区目录启动自己的 session，父群随后 `/new` 改目录不影响它；工作区目录被删除时线程按普通目录顺序回退父群目录而不是拒绝任务；显式 `/new <目录>`、`/move <目录>` 解除固定；worktree 创建失败时不改写已创建的线程，工具结果返回单行、≤200 字符的 `isolate_error`；工作区名称按线程名 slug 生成，被占用时退到 `<slug>-<short_id>`，非 ASCII 名称使用线程 short id。
+
 ## 实施前提与未决事项
-既有实现已完成 `/new`/`/reset` 目录绑定、原生 `/move`、精确外部 session 恢复、正文 outbox、执行 tracker、卡片和生命周期边界；共享说明采用 session/version/OMP lifecycle context 设计；线程默认继承父群工作目录已实现：`src/thread-target.ts` 是线程目标父群解析的单一来源，传输层 `contextPath` 与服务的默认目录解析都经它取父群 ID。
+既有实现已完成 `/new`/`/reset` 目录绑定、原生 `/move`、精确外部 session 恢复、正文 outbox、执行 tracker、卡片和生命周期边界；共享说明采用 session/version/OMP lifecycle context 设计；线程默认继承父群工作目录已实现：`src/thread-target.ts` 是线程目标父群解析的单一来源，传输层 `contextPath` 与服务的默认目录解析都经它取父群 ID。线程隔离工作区已按验收 25 落地（`src/worktree.ts` 的 worktree port + 绑定的 `cwd_pinned`），依赖部署解析出的 OMP 可执行文件提供 `worktree add`；OMP 未启用 `worktree.clone` 时新工作区不含被忽略文件。
 未决事项：无。线程默认目录继承已按验收 3/4/22 落地并验证（见下）；真实 OMP compaction、删除 version、崩溃重放和凭证隔离验证仍按共享说明章节的验收补做。
 
 ```sh
@@ -226,6 +231,8 @@ bun run launchd -- install --config ~/.config/omp-channel-octo/config.json
 
 线程默认继承父群工作目录的验收证据：核心矩阵 `tests/thread-cwd-inheritance.test.ts` 覆盖父群继承、父群无绑定 / channel ID 无合法父群段 / 父群目录已删除三类回退、`/new` 无参继承与后续沿用、线程会话建立后固定、未验证会话重解析并写回、显式目录覆盖、以及 DM/群既有语义保持，共 10 例；把 `src/service.ts` 回退到修改前版本时其中 5 例失败，单独移除父群分支或移除父群 cwd 不可用时的静默回退分别使 6 例、1 例失败，确认用例不是空转。真实进程验收在 `tests/cli-lifecycle.test.ts`：真实 CLI + 加密协议夹具 + 真实 SQLite 下，父群 `@Bot /new` 建立目录后，线程任务以该目录启动真实 worker 子进程（夹具日志的 startup cwd 恰为该继承目录）、线程按 `/v1/bot/groups/<group>/threads/<thread>/md` 读取自己的 `THREAD.md`、`/status` 报告继承 cwd，并在 SIGTERM 重启后保持。
 线程允许关系继承与派发的验收证据：`tests/core-host-tools.test.ts` 的 "threads inherit the parent group allowlist without their own entry" 覆盖父群在允许列表时其线程无需额外条目即可执行、父群不在允许列表时线程仍被拒绝并保持 `none`；"thread dispatch queues the task in the target thread and reports it in both chats" 覆盖 `create-thread` + `thread-dispatch` 在目标线程接受真实任务（继承父群 cwd、与父群任务同目录串行）、线程与发起群各收到一条可见说明、以及被派发的任务其 `octo_management` 动作集不再包含 `thread-dispatch`。把允许命中回退为只比较完整 channel ID 并移除派发深度守卫后，这两个用例分别失败，确认用例不是空转。
+
+线程隔离工作区的验收证据：`tests/worktree.test.ts` 用真实 git 夹具 + 等价 argv 的可执行 stub 覆盖 slug 与候选命名、成功创建同名工作区、分支或目录被占用时退到 `<slug>-<short_id>`、非 ASCII 名称改用 short id、非 git 目录与命令失败的 ≤200 字符单行错误、以及超时与已取消请求；`tests/core-host-tools.test.ts` 的 "create-thread isolate binds the new thread to a workspace of its own" 断言 isolate 请求携带当前绑定 cwd、新线程被绑定到工作区（其第一个任务以该目录启动）、成功结果含 `worktree.path/branch`，"create-thread isolate reports a workspace failure while keeping the thread usable" 断言工作区失败时线程仍按父群目录执行且结果含 `isolate_error`；`tests/thread-cwd-inheritance.test.ts` 的 C11 覆盖父群 `/new` 换目录后隔离线程仍留在工作区，C12 覆盖工作区被删除时任务按父群目录完成而不是被拒绝。把 `defaultWorkDirectory` 的 `cwdPinned` 分支、或隔离线程的绑定写入分别移除后，C11 与 "create-thread isolate binds…" 用例各自失败，确认用例不是空转。真机冒烟（本机真实 `omp`）：`createOmpWorktreePort` 在临时仓库创建 `smoke-project.smoke-isolate`（359 ms，clone-first 把被忽略的 `node_modules` 一并带进新工作区），同名第二次调用按 `smoke-isolate-123456789012345` 退让，验证后 `git worktree remove` 清理。
 
 群级免@的验收证据：`tests/core-mention-pref.test.ts` 覆盖 `effective` 为真时未 @Bot 的群消息与线程消息各启动一个任务、为假或查询失败时保持不启动且不回复、同一个群两次未 @Bot 只查询一次而带 mention 的消息不查询、被 owner/允许列表/Bot 回声规则先拒的消息零查询；`tests/octo-transport.test.ts` 的 "reads the group 免@ decision, including the legacy no_mention shape" 用真实 HTTP 夹具断言端点路径与 Bot 鉴权头，覆盖 `effective` 布尔与旧版 `no_mention` 0/1 两种形状，以及不可解析响应被拒。把 `isAllowed` 的免@分支摘掉后 `tests/core-mention-pref.test.ts` 有 4 例失败，确认用例不是空转。线上只读实测（本群）：`GET /v1/bot/groups/e3bc5af0d4b84b18bb3770a74bd222c6/mention_pref` 返回 `{"no_mention":0,"group_allow_no_mention":1,"effective":false}`，即群开关已允许、bot owner 尚未开启，因此本群当前仍需 @Bot。
 进度卡持久化与重启补发的验收证据：`tests/core-progress-card-recovery.test.ts` 覆盖 6 例——在线回合把服务端已接受的卡片帧（message ID、sequence、快照）写入状态盘并在终态编辑成功后清除该行；重启后遗留的 started 任务以 `cancelled` 补发一次终态编辑，已 completed 的任务以 `completed` 补发，序号均为持久值 +1，重放出的快照保留原有工具轨迹与耗时；补发失败保留该行（attempts 与序号同时 +1，避免与可能已落地的尝试撞车）并在下一次启动成功收尾；连续失败达到上限后该行被丢弃；不可解析的载荷不产生任何编辑且不阻断启动。把 `start()` 中的补发调用移除后这 5 例补发/丢弃用例全部失败，把建卡成功后的持久化调用移除后在线回合用例失败，确认用例不是空转。

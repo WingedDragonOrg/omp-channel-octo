@@ -212,6 +212,7 @@ test("management actions reject bad arguments, bound listings, and surface trans
         { action: "no-such-action" },
         { action: "group-update" },
         { action: "create-thread" },
+        { action: "create-thread", name: "isolate type check", isolate: "yes" },
         { action: "thread-info" },
         { action: "description-write" },
       ]) {
@@ -273,6 +274,7 @@ test("management actions reject bad arguments, bound listings, and surface trans
     expect(log).toContain("unknown action: no-such-action");
     expect(log).toContain("name or notice is required");
     expect(log).toContain("name is required");
+    expect(log).toContain("isolate must be a boolean");
     expect(log).toContain("short_id is required when the chat itself is not a thread");
     expect(log).toContain("content is required");
     expect(log).toContain("201/200/true");
@@ -359,6 +361,126 @@ test("thread dispatch queues the task in the target thread and reports it in bot
       { action: "create-thread", groupId: "group-tools", shortId: null },
       { action: "thread-info", groupId: "group-tools", shortId: "thread-1" },
     ]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("create-thread isolate binds the new thread to a workspace of its own", async () => {
+  const harness = await createCoreHarness({
+    prompt: async ({ append, promptContext }) => {
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("management tool missing");
+      const created = JSON.parse(
+        await management.execute(
+          { action: "create-thread", name: "isolated work", isolate: true },
+          new AbortController().signal,
+        ),
+      ) as { short_id: string; worktree?: { path: string; branch: string }; isolate_error?: string };
+      await append(
+        "isolate.log",
+        `${created.short_id}|${created.worktree?.path ?? "none"}|${created.worktree?.branch ?? "none"}|${created.isolate_error ?? "none"}\n`,
+      );
+    },
+  });
+  try {
+    const worktrees = harness.worktrees;
+    if (!worktrees) throw new Error("expected a worktree port in the harness");
+    const cwd = join(harness.root, "isolate cwd");
+    await mkdir(cwd, { recursive: true });
+    await harness.service.handleInbound(
+      inbound({ messageId: "isolate-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "isolate-create",
+        ...GROUP_TOOLS,
+        text: "create an isolated thread",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+
+    const workspace = join(harness.root, "worktrees", "thread-1");
+    expect(worktrees.requests).toEqual([
+      { baseDir: cwd, label: "isolated work", threadId: "thread-1" },
+    ]);
+    expect(await readText(join(cwd, "isolate.log"))).toBe(
+      `thread-1|${workspace}|thread-1|none\n`,
+    );
+
+    const thread = { channelId: "group-tools____thread-1", channelType: 5 as const };
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "isolate-thread-task",
+        ...thread,
+        text: "work in isolation",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(2);
+    await waitForStatus(harness.service, thread, (status) => status.state === "completed");
+    expect(harness.workers.prompts[1]?.cwd).toBe(workspace);
+    await expect(harness.service.status(thread)).resolves.toMatchObject({ cwd: workspace });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("create-thread isolate reports a workspace failure while keeping the thread usable", async () => {
+  const harness = await createCoreHarness({
+    prompt: async ({ append, promptContext }) => {
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("management tool missing");
+      const created = JSON.parse(
+        await management.execute(
+          { action: "create-thread", name: "no workspace", isolate: true },
+          new AbortController().signal,
+        ),
+      ) as { short_id: string; worktree?: { path: string }; isolate_error?: string };
+      await append(
+        "isolate.log",
+        `${created.short_id}|${created.worktree ? "worktree" : "none"}|${created.isolate_error ?? "none"}\n`,
+      );
+    },
+  });
+  try {
+    const worktrees = harness.worktrees;
+    if (!worktrees) throw new Error("expected a worktree port in the harness");
+    worktrees.failure = new Error("目录不是 git 仓库，无法创建隔离工作区：/fixture/non-repo");
+    const cwd = join(harness.root, "reused cwd");
+    await mkdir(cwd, { recursive: true });
+    await harness.service.handleInbound(
+      inbound({ messageId: "isolate-fail-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "isolate-fail-create",
+        ...GROUP_TOOLS,
+        text: "create without a workspace",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+    expect(await readText(join(cwd, "isolate.log"))).toBe(
+      "thread-1|none|目录不是 git 仓库，无法创建隔离工作区：/fixture/non-repo\n",
+    );
+
+    const thread = { channelId: "group-tools____thread-1", channelType: 5 as const };
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "isolate-fail-thread",
+        ...thread,
+        text: "still deliver work",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(2);
+    await waitForStatus(harness.service, thread, (status) => status.state === "completed");
+    expect(harness.workers.prompts[1]?.cwd).toBe(cwd);
+    await expect(harness.service.status(thread)).resolves.toMatchObject({ cwd });
   } finally {
     await closeCoreHarness(harness);
   }

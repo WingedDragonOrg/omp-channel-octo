@@ -26,10 +26,13 @@ import type {
   RestartPort,
   SendReceipt,
   ThreadSummary,
+  ThreadWorkspace,
+  ThreadWorkspaceRequest,
   WorkerEvent,
   WorkerFactory,
   WorkerOptions,
   WorkerProcess,
+  WorktreePort,
 } from "../../src/contracts";
 import { AttachmentError } from "../../src/attachments";
 import {
@@ -989,7 +992,25 @@ export interface CoreHarness {
   readonly bot: BotIdentity;
   readonly transport: FakeTransport;
   readonly workers: FakeWorkerFactory;
+  readonly worktrees: FakeWorktrees | undefined;
   readonly service: ChannelService;
+}
+
+/** Records isolate requests and materializes a directory per thread under the harness root. */
+export class FakeWorktrees implements WorktreePort {
+  readonly requests: ThreadWorkspaceRequest[] = [];
+  /** When set, `create` rejects with this error instead of returning a workspace. */
+  failure: Error | undefined;
+
+  constructor(private readonly root: string) {}
+
+  async create(request: ThreadWorkspaceRequest): Promise<ThreadWorkspace> {
+    this.requests.push({ ...request });
+    if (this.failure) throw this.failure;
+    const cwd = join(this.root, "worktrees", request.threadId);
+    await mkdir(cwd, { recursive: true });
+    return { cwd: await realpath(cwd), branch: request.threadId };
+  }
 }
 
 export interface CoreHarnessOptions {
@@ -1010,6 +1031,8 @@ export interface CoreHarnessOptions {
   /** Extra command handlers, e.g. an observing handler that still runs a prompt. */
   commandHandlers?: readonly ChannelCommandHandler[];
   restart?: RestartPort;
+  /** Isolated thread workspaces; `null` omits the port so isolate reports an unconfigured deployment. */
+  worktrees?: FakeWorktrees | null;
 }
 
 export async function createCoreHarness(options: CoreHarnessOptions = {}): Promise<CoreHarness> {
@@ -1026,6 +1049,8 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
       startOnline: options.startOnline ?? true,
     });
   const workers = options.workers ?? new FakeWorkerFactory(options.prompt);
+  const worktrees =
+    options.worktrees === null ? undefined : (options.worktrees ?? new FakeWorktrees(root));
   const config = {
     ...(options.ownerId === null ? {} : { ownerId: options.ownerId ?? "owner-1" }),
     allowedGroupIds: options.allowedGroupIds ?? [
@@ -1044,11 +1069,21 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
     config,
     transport,
     workerFactory: workers,
+    ...(worktrees === undefined ? {} : { worktrees }),
     ...(options.commandHandlers === undefined ? {} : { commandHandlers: options.commandHandlers }),
     ...(options.restart === undefined ? {} : { restart: options.restart }),
   });
   await service.start();
-  return { root, stateDir, config, bot: transport.bot, transport, workers, service };
+  return {
+    root,
+    stateDir,
+    config,
+    bot: transport.bot,
+    transport,
+    workers,
+    worktrees,
+    service,
+  };
 }
 
 export async function closeCoreHarness(

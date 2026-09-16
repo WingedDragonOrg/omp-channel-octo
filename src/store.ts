@@ -9,6 +9,11 @@ export interface BindingRecord extends ChatTarget {
   sessionId: string;
   cwd: string;
   sessionFile: string | null;
+  /**
+   * The cwd was assigned explicitly (an isolated thread workspace) rather than derived, so the
+   * default work directory order must keep it even when the binding has no verified session yet.
+   */
+  cwdPinned?: boolean;
 }
 
 export interface InboundClaim {
@@ -214,6 +219,7 @@ export class ChannelStore {
         session_id TEXT NOT NULL,
         cwd TEXT NOT NULL,
         session_file TEXT,
+        cwd_pinned INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY(bot_uid, channel_type, channel_id)
@@ -370,6 +376,7 @@ export class ChannelStore {
       "ALTER TABLE worker_ledger ADD COLUMN move_target_cwd TEXT",
       "ALTER TABLE tasks ADD COLUMN message_seq INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE tasks ADD COLUMN history_eligible INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE chats ADD COLUMN cwd_pinned INTEGER NOT NULL DEFAULT 0",
     ]) {
       try {
         this.db.exec(statement);
@@ -488,12 +495,13 @@ export class ChannelStore {
     const now = Date.now();
     this.transaction(() => {
       this.run(
-        `INSERT INTO chats(bot_uid, channel_type, channel_id, session_id, cwd, session_file, created_at, updated_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO chats(bot_uid, channel_type, channel_id, session_id, cwd, session_file, cwd_pinned, created_at, updated_at)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(bot_uid, channel_type, channel_id) DO UPDATE SET
            session_id = excluded.session_id,
            cwd = excluded.cwd,
            session_file = excluded.session_file,
+           cwd_pinned = excluded.cwd_pinned,
            updated_at = excluded.updated_at`,
         [
           binding.botUid,
@@ -502,6 +510,7 @@ export class ChannelStore {
           binding.sessionId,
           binding.cwd,
           binding.sessionFile,
+          binding.cwdPinned === true ? 1 : 0,
           now,
           now,
         ],
@@ -511,7 +520,7 @@ export class ChannelStore {
 
   getBinding(botUid: string, target: ChatTarget): BindingRecord | null {
     const row = this.query(
-      `SELECT bot_uid, channel_type, channel_id, session_id, cwd, session_file
+      `SELECT bot_uid, channel_type, channel_id, session_id, cwd, session_file, cwd_pinned
        FROM chats WHERE bot_uid = ? AND ${targetWhere(target)}`,
       [botUid, ...targetValues(target)],
     )[0];
@@ -523,6 +532,7 @@ export class ChannelStore {
       sessionId: asString(row.session_id),
       cwd: asString(row.cwd),
       sessionFile: asNullableString(row.session_file),
+      ...(asNumber(row.cwd_pinned) === 1 ? { cwdPinned: true } : {}),
     };
   }
 

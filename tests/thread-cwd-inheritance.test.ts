@@ -79,6 +79,40 @@ async function runFailingTask(
   await waitForStatus(harness.service, target, (status) => status.state === "failed");
 }
 
+const ISOLATE_PROMPT_TEXT = "spin off an isolated thread";
+
+/** Group worker that turns one thread into an isolated workspace through `octo_management`. */
+function createIsolationHarness(): Promise<CoreHarness> {
+  return createCoreHarness({
+    allowedGroupIds: ALLOWED_GROUP_IDS,
+    prompt: async ({ promptContext, text }) => {
+      if (text !== ISOLATE_PROMPT_TEXT) return;
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("expected octo_management in a group prompt");
+      await management.execute(
+        { action: "create-thread", name: "isolated case", isolate: true },
+        new AbortController().signal,
+      );
+    },
+  });
+}
+
+/** Creates one isolated thread in the group and returns its chat target and workspace directory. */
+async function isolateThread(
+  harness: CoreHarness,
+): Promise<{ target: ChatTarget; workspace: string; threadId: string }> {
+  const provider = harness.worktrees;
+  if (!provider) throw new Error("expected a worktree port in the harness");
+  await runTask(harness, GROUP, "isolate-create", ISOLATE_PROMPT_TEXT);
+  const request = provider.requests.at(-1);
+  if (!request) throw new Error("expected the isolate request to be recorded");
+  return {
+    target: { channelId: `group-a____${request.threadId}`, channelType: 5 },
+    workspace: join(harness.root, "worktrees", request.threadId),
+    threadId: request.threadId,
+  };
+}
+
 test("C1 a thread's first task inherits the parent group cwd without sharing its session", async () => {
   const harness = await createHarness();
   try {
@@ -303,6 +337,44 @@ test("C10 thread inheritance stays isolated from the parent and keeps explicit t
     expect(after.cwd).toBe(dirX);
     expect(after.sessionId).toBe(explicitSessionId);
     expect((await harness.service.status(THREAD)).cwd).toBe(dirX);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("C11 an isolated thread keeps its pinned workspace when the parent switches directories", async () => {
+  const harness = await createIsolationHarness();
+  try {
+    const dirA = await createWorkDirectory(harness, "dirA");
+    await deliver(harness, GROUP, "c11-parent-new-a", `/new ${dirA}`);
+    const isolated = await isolateThread(harness);
+    expect(harness.worktrees?.requests).toEqual([
+      { baseDir: dirA, label: "isolated case", threadId: isolated.threadId },
+    ]);
+
+    const dirB = await createWorkDirectory(harness, "dirB");
+    await deliver(harness, GROUP, "c11-parent-new-b", `/new ${dirB}`);
+    expect((await harness.service.status(GROUP)).cwd).toBe(dirB);
+
+    const prompt = await runTask(harness, isolated.target, "c11-thread-task", "thread turn");
+    expect(prompt.cwd).toBe(isolated.workspace);
+    expect((await harness.service.status(isolated.target)).cwd).toBe(isolated.workspace);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("C12 a pinned thread whose workspace vanished falls back to the parent group cwd", async () => {
+  const harness = await createIsolationHarness();
+  try {
+    const dirA = await createWorkDirectory(harness, "dirA");
+    await deliver(harness, GROUP, "c12-parent-new", `/new ${dirA}`);
+    const isolated = await isolateThread(harness);
+    await rm(isolated.workspace, { recursive: true, force: true });
+
+    const prompt = await runTask(harness, isolated.target, "c12-thread-task", "thread turn");
+    expect(prompt.cwd).toBe(dirA);
+    expect((await harness.service.status(isolated.target)).cwd).toBe(dirA);
   } finally {
     await closeCoreHarness(harness);
   }

@@ -366,10 +366,36 @@ export interface ChannelServiceOptions {
    * `request` runs that command and the host then stops this process.
    */
   restart?: RestartPort;
+  /**
+   * Isolated thread workspaces, present when the host can materialize git worktrees.
+   * `octo_management` reaches it through `create-thread`'s `isolate` argument.
+   */
+  worktrees?: WorktreePort;
 }
 
 export interface RestartPort {
   request(): Promise<void>;
+}
+
+export interface ThreadWorkspaceRequest {
+  /** Chat directory the workspace is derived from: the calling chat's cwd. */
+  baseDir: string;
+  /** Thread name, used for the workspace directory and branch. */
+  label: string;
+  /** Server-assigned thread id, used to keep the workspace name unique. */
+  threadId: string;
+}
+
+export interface ThreadWorkspace {
+  /** Absolute directory the new thread is bound to. */
+  cwd: string;
+  /** Branch the workspace checks out. */
+  branch: string;
+}
+
+export interface WorktreePort {
+  /** Creates a new git worktree beside the repository that contains `baseDir`. */
+  create(request: ThreadWorkspaceRequest, signal?: AbortSignal): Promise<ThreadWorkspace>;
 }
 
 export interface ChannelService {
