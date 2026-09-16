@@ -963,17 +963,22 @@ class CoreService implements ChannelService {
    * （用户文本 + 语音转写 + 附件清单）。附件在这里下载到本机、语音在这里转写。
    * 失败时经命令 claim + outbox 只回复一次并返回 `null`，不建任务、不进入 steering；
    * `null` 也表示该消息已被更早的处理路径（含重投去重）消费。
+   *
+   * `text` 默认是整条消息正文。命令路径传入自己的正文：`/thread <任务>` 与 `/queue <文本>` 传
+   * 命令参数，注册 handler 传整条消息——凡是把正文交给 Agent 的命令路径都经这里组装，附件
+   * （图片/文件/语音/视频）与引用块因此不会被命令吃掉。不消费正文的控制命令（`/status`、
+   * `/cancel`、`/mode` 等）与待回答问题的答案不经过这里。
    */
-  private async materializeInbound(message: InboundMessage): Promise<string | null> {
+  private async materializeInbound(message: InboundMessage, text = message.text): Promise<string | null> {
     const quotedText = message.quoted?.text.trim() ?? "";
     // 只带引用、不带附件时也要把引用块交给 Agent；普通文本任务的正文保持逐字不变。
     if (message.attachments.length === 0) {
-      return quotedText.length === 0 ? message.text : composePromptText(message.text, [], message.quoted);
+      return quotedText.length === 0 ? text : composePromptText(text, [], message.quoted);
     }
     const attachmentConfig = this.options.config.attachments;
     if (attachmentConfig?.enabled !== true) {
-      if (message.text.trim().length > 0 || quotedText.length > 0) {
-        return composePromptText(message.text, [], message.quoted);
+      if (text.trim().length > 0 || quotedText.length > 0) {
+        return composePromptText(text, [], message.quoted);
       }
       const claim = this.commandClaim(message, "attachment");
       if (!this.store.claimCommand(claim)) return null;
@@ -1034,7 +1039,7 @@ class CoreService implements ChannelService {
             attachment.kind === "audio" ? await this.transcribeInboundAudio(path, budget.signal) : null,
         });
       }
-      const promptText = composePromptText(message.text, files, message.quoted);
+      const promptText = composePromptText(text, files, message.quoted);
       this.store.releaseClaim(claim);
       return promptText;
     } catch (error) {
@@ -1587,11 +1592,14 @@ class CoreService implements ChannelService {
     command: { name: string; argument: string },
     handler: ChannelCommandHandler,
   ): Promise<void> {
+    // handler 拿到的是这条消息的正文，因此正文先经唯一组装点：注册命令同样不吃掉附件。
+    const body = await this.materializeInbound(message);
+    if (body === null) return;
     const claim = this.commandClaim(message, command.name);
     if (!this.store.claimCommand(claim)) return;
     try {
       await handler.handle({
-        message,
+        message: { ...message, text: body },
         name: command.name,
         argument: command.argument,
       });
@@ -1607,11 +1615,13 @@ class CoreService implements ChannelService {
     command: { name: string; argument: string },
     handler: ChannelCommandHandler,
   ): Promise<void> {
-    const accepted = await this.acceptTask(message, message.text, false);
+    const body = await this.materializeInbound(message);
+    if (body === null) return;
+    const accepted = await this.acceptTask(message, body, false);
     if (!accepted) return;
     try {
       await handler.handle({
-        message,
+        message: { ...message, text: body },
         name: command.name,
         argument: command.argument,
       });
@@ -1679,8 +1689,12 @@ class CoreService implements ChannelService {
       await this.enqueueText(message, THREAD_USAGE, null);
       return;
     }
+    // 这条命令的正文就是交给助手的任务正文：先释放命令 claim，再走与普通任务同一条组装点
+    // （claim + 下载 + 转写 + 附件块），否则随消息发来的图片只剩 `[图片]` 占位。
     this.store.releaseClaim(this.commandClaim(message, "thread"));
-    await this.acceptTask(message, threadIntentPrompt(intent));
+    const request = await this.materializeInbound(message, intent);
+    if (request === null) return;
+    await this.acceptTask(message, threadIntentPrompt(request));
   }
 
   private async defaultWorkDirectory(target: ChatTarget): Promise<string> {
@@ -1974,8 +1988,12 @@ class CoreService implements ChannelService {
       await this.enqueueText(message, QUEUE_USAGE, null);
       return;
     }
+    // 排队任务的正文就是这条命令的参数：和 `/thread` 一样先释放命令 claim，再走唯一组装点，
+    // 附件（任意类型）与引用块随正文进入排队任务。
     this.store.releaseClaim(this.commandClaim(message, "queue"));
-    await this.acceptTask(message, text);
+    const body = await this.materializeInbound(message, text);
+    if (body === null) return;
+    await this.acceptTask(message, body);
   }
 
   private async handleMode(target: ChatTarget, argument: string): Promise<void> {

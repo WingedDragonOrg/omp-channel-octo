@@ -806,7 +806,7 @@ test("运行中的回合收到 caption + 图片：steering 注入组装正文且
   }
 });
 
-test("命令消息带附件不下载：/status 与 /queue <文本>", async () => {
+test("控制命令不吃附件：/status 带附件不下载", async () => {
   const harness = await createAttachmentHarness();
   const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
   const url = "https://cdn.example.test/command.png";
@@ -820,20 +820,139 @@ test("命令消息带附件不下载：/status 与 /queue <文本>", async () =>
         attachments: [attachment(url, "image", "command.png")],
       }),
     );
+    await settleReplies(harness, target);
+
+    // /status 不消费正文，没有把资源交给 Agent 的出口，因此不产生任何外网请求。
+    expect(harness.transport.downloadRequests).toHaveLength(0);
+    expect(taskCount(harness, target)).toBe(0);
+  } finally {
+    await closeAttachmentHarness(harness);
+  }
+});
+
+test("/queue <文本> 带附件：排队任务的正文经组装点带上附件块", async () => {
+  const harness = await createAttachmentHarness();
+  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+  const url = "https://cdn.example.test/queue.png";
+  harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
+  try {
     await harness.service.handleInbound(
       inbound({
         messageId: "command-queue",
         ...target,
         text: "/queue 看下这个报错",
-        attachments: [attachment(url, "image", "command.png")],
+        attachments: [attachment(url, "image", "报错.png", { size: IMAGE_BYTES.byteLength })],
       }),
     );
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
-    expect(harness.transport.downloadRequests).toHaveLength(0);
-    // /queue 的正文仍是命令参数本身，不带附件块。
-    expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["看下这个报错"]);
+    // 排队任务的正文就是命令参数，因此和普通任务一样取回附件并给出绝对路径。
+    expect(harness.transport.downloadRequests).toHaveLength(1);
+    expect(taskCount(harness, target)).toBe(1);
+    const prompt = harness.workers.prompts[0]!.text;
+    expect(prompt).toContain("看下这个报错");
+    expect(prompt.startsWith("看下这个报错")).toBe(true);
+    expect(prompt).toContain(ATTACHMENT_HEADER);
+    const path = savedPath(harness, target, "command-queue", 0, "报错.png", "image", url);
+    expect(attachmentPathsFromPrompt(prompt)).toEqual([path]);
+    await expectSameBytes(path, IMAGE_BYTES);
+  } finally {
+    await closeAttachmentHarness(harness);
+  }
+});
+
+test("注册 handler 的正文同样经组装点：拦截型拿到附件块、观察型接受带附件块的任务", async () => {
+  const intercepted: string[] = [];
+  const observed: string[] = [];
+  const handlers: ChannelCommandHandler[] = [
+    {
+      name: "intercepting",
+      intercept: true,
+      handle({ message }) {
+        intercepted.push(message.text);
+      },
+    },
+    {
+      name: "observing",
+      intercept: false,
+      handle({ message }) {
+        observed.push(message.text);
+      },
+    },
+  ];
+  const harness = await createAttachmentHarness({ commandHandlers: handlers });
+  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+  const url = "https://cdn.example.test/handler.png";
+  const size = IMAGE_BYTES.byteLength;
+  harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
+  try {
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "command-intercepting",
+        ...target,
+        text: "/intercepting 看图",
+        attachments: [attachment(url, "image", "handler.png", { size })],
+      }),
+    );
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "command-observing",
+        ...target,
+        text: "/observing 看图",
+        attachments: [attachment(url, "image", "handler.png", { size })],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+
+    // 两条消息各自的附件目录不同，因此各下载一次；handler 看到的正文都已带上附件块。
+    expect(harness.transport.downloadRequests).toHaveLength(2);
+    expect(intercepted).toHaveLength(1);
+    expect(observed).toHaveLength(1);
+    expect(intercepted[0]!).toContain(ATTACHMENT_HEADER);
+    expect(observed[0]!).toContain(ATTACHMENT_HEADER);
+    expect(attachmentPathsFromPrompt(intercepted[0]!)).toEqual([
+      savedPath(harness, target, "command-intercepting", 0, "handler.png", "image", url),
+    ]);
+    expect(attachmentPathsFromPrompt(observed[0]!)).toEqual([
+      savedPath(harness, target, "command-observing", 0, "handler.png", "image", url),
+    ]);
+    // 拦截型不启动任务；观察型的任务正文与 handler 看到的正文是同一份组装文本。
+    expect(taskCount(harness, target)).toBe(1);
+    expect(harness.workers.prompts.map(({ text }) => text)).toEqual([observed[0]!]);
+  } finally {
+    await closeAttachmentHarness(harness);
+  }
+});
+
+test("/thread 带附件：意图走同一条组装点，附件随交付说明一起交给助手", async () => {
+  const harness = await createAttachmentHarness();
+  const target: ChatTarget = { channelId: "group-allowed", channelType: 2 };
+  const url = "https://cdn.example.test/thread-intent.png";
+  harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
+  const intent = "进度卡片：\n1. todos 默认全显示，可以收起";
+  try {
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "command-thread",
+        ...target,
+        text: `/thread ${intent}`,
+        mentionedUserIds: [harness.bot.uid],
+        attachments: [attachment(url, "image", "截图.png", { size: IMAGE_BYTES.byteLength })],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+
+    // 这条命令的正文就是交给助手的任务正文，因此与普通任务共用组装点：附件落盘，
+    // 绝对路径进入「原始意图」，不再只剩 `[图片]` 占位。
+    expect(harness.transport.downloadRequests).toHaveLength(1);
+    const prompt = harness.workers.prompts[0]!.text;
+    expect(prompt).toContain("原始意图：");
+    expect(prompt).toContain(intent);
+    expect(prompt).toContain("create-thread");
+    const path = savedPath(harness, target, "command-thread", 0, "截图.png", "image", url);
+    expect(attachmentPathsFromPrompt(prompt)).toEqual([path]);
+    await expectSameBytes(path, IMAGE_BYTES);
   } finally {
     await closeAttachmentHarness(harness);
   }
@@ -1103,37 +1222,26 @@ test("回答问题时的附件不下载也不落盘：答案路径优先于附�
   }
 });
 
-test("注册的观察型 handler 带附件不下载，命令语义与正文不受影响", async () => {
-  const observed: Array<{ name: string; argument: string }> = [];
-  const harness = await createAttachmentHarness({
-    commandHandlers: [
-      {
-        name: "log",
-        intercept: false,
-        handle: (context) => {
-          observed.push({ name: context.name, argument: context.argument });
-        },
-      },
-    ],
-  });
-  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
-  const url = "https://cdn.example.test/observed.png";
+test("权限门先于命令附件组装：非 owner 的命令消息零下载、不建任务", async () => {
+  const harness = await createAttachmentHarness();
+  const target: ChatTarget = { channelId: "dm-other", channelType: 1 };
+  const url = "https://cdn.example.test/denied-command.png";
   harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
-  const message = inbound({
-    messageId: "observed-with-image",
-    ...target,
-    text: "/log 带附件的观察命令",
-    attachments: [attachment(url, "image", "observed.png", { size: IMAGE_BYTES.byteLength })],
-  });
   try {
-    await harness.service.handleInbound(message);
-    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "denied-command-queue",
+        ...target,
+        senderId: "other-user",
+        text: "/queue 看下这个报错",
+        attachments: [attachment(url, "image", "denied.png", { size: IMAGE_BYTES.byteLength })],
+      }),
+    );
 
-    expect(observed).toEqual([{ name: "log", argument: "带附件的观察命令" }]);
-    // 观察型 handler 拿到的是原始命令文本，附件不参与组装、不产生外网请求。
+    // 命令路径的组装点在权限门之后：被拒的命令消息既不取资源也不建任务。
     expect(harness.transport.downloadRequests).toHaveLength(0);
-    expect(existsSync(messageDirectory(harness, message, message.messageId))).toBe(false);
-    expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["/log 带附件的观察命令"]);
+    expect(harness.workers.prompts).toHaveLength(0);
+    expect(taskCount(harness, target)).toBe(0);
   } finally {
     await closeAttachmentHarness(harness);
   }
