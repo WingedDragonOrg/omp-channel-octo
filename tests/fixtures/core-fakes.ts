@@ -39,7 +39,12 @@ import type {
   WorkerFactory,
   WorkerOptions,
   WorkerProcess,
+  WorktreeMergeRequest,
+  WorktreeMergeSummary,
   WorktreePort,
+  WorktreeRemovalOutcome,
+  WorktreeRemovalRequest,
+  WorktrunkProbe,
 } from "../../src/contracts";
 import { AttachmentError } from "../../src/attachments";
 import {
@@ -1204,6 +1209,18 @@ export class FakeWorktrees implements WorktreePort {
   readonly requests: ThreadWorkspaceRequest[] = [];
   /** When set, `create` rejects with this error instead of returning a workspace. */
   failure: Error | undefined;
+  /** Merge requests recorded by `merge`; the fake never runs wt. */
+  readonly merges: WorktreeMergeRequest[] = [];
+  /** Removal requests recorded by `remove`. */
+  readonly removals: WorktreeRemovalRequest[] = [];
+  /** The probe answer `worktrunk()` reports; tests flip it to model a missing or old wt. */
+  probe: WorktrunkProbe = { available: true, command: "wt", version: "v0.76.0" };
+  /** When set, `merge` rejects with this error instead of returning a summary. */
+  mergeFailure: Error | undefined;
+  /** When set, `remove` rejects with this error instead of reporting an outcome. */
+  removeFailure: Error | undefined;
+  /** What `remove` reports; `missing` models a workspace that is already gone. */
+  removal: WorktreeRemovalOutcome = { kind: "removed", via: "wt", branchOutcome: "deleted" };
 
   constructor(private readonly root: string) {}
 
@@ -1213,6 +1230,29 @@ export class FakeWorktrees implements WorktreePort {
     const cwd = join(this.root, "worktrees", request.threadId);
     await mkdir(cwd, { recursive: true });
     return { cwd: await realpath(cwd), branch: request.threadId };
+  }
+
+  async merge(request: WorktreeMergeRequest): Promise<WorktreeMergeSummary> {
+    this.merges.push({ ...request });
+    if (this.mergeFailure) throw this.mergeFailure;
+    return {
+      branch: "fixture-branch",
+      target: request.target ?? "main",
+      squashed: true,
+      rebased: true,
+      committed: true,
+      removed: request.remove !== false,
+    };
+  }
+
+  async remove(request: WorktreeRemovalRequest): Promise<WorktreeRemovalOutcome> {
+    this.removals.push({ ...request });
+    if (this.removeFailure) throw this.removeFailure;
+    return this.removal;
+  }
+
+  async worktrunk(): Promise<WorktrunkProbe> {
+    return this.probe;
   }
 }
 

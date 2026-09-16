@@ -500,9 +500,62 @@ export interface ThreadWorkspace {
   branch: string;
 }
 
+/** Result of probing the local Worktrunk CLI; only stable v0.76.x counts as available. */
+export type WorktrunkProbe =
+  | { available: true; command: string; version: string }
+  | { available: false; reason: "missing" }
+  | { available: false; reason: "incompatible"; command: string; version: string };
+
+/** One `wt merge` invocation; every optional field maps to a wt flag, wt's defaults apply otherwise. */
+export interface WorktreeMergeRequest {
+  /** The worktree to merge; `wt merge` merges the branch checked out here into the target. */
+  cwd: string;
+  /** Target branch; wt defaults to the repository's default branch. */
+  target?: string;
+  squash?: boolean;
+  commit?: boolean;
+  rebase?: boolean;
+  /** Whether wt removes the worktree (and a merged branch) after a successful merge. */
+  remove?: boolean;
+  ff?: boolean;
+  stage?: "all" | "tracked" | "none";
+}
+
+export interface WorktreeMergeSummary {
+  branch: string;
+  target: string;
+  squashed: boolean;
+  rebased: boolean;
+  committed: boolean;
+  removed: boolean;
+}
+
+export interface WorktreeRemovalRequest {
+  /** Worktree directory to remove. */
+  path: string;
+  /** Discard uncommitted changes instead of refusing to remove a dirty worktree. */
+  force?: boolean;
+}
+
+export type WorktreeRemovalOutcome =
+  | { kind: "missing" }
+  | { kind: "removed"; via: "wt" | "git"; branchOutcome: "deleted" | "kept" | null };
+
 export interface WorktreePort {
   /** Creates a new git worktree beside the repository that contains `baseDir`. */
   create(request: ThreadWorkspaceRequest, signal?: AbortSignal): Promise<ThreadWorkspace>;
+  /**
+   * Merges the workspace's branch into the target branch through the Worktrunk pipeline.
+   * There is no fallback: without a compatible wt this rejects with a bounded reason.
+   */
+  merge(request: WorktreeMergeRequest, signal?: AbortSignal): Promise<WorktreeMergeSummary>;
+  /**
+   * Removes one workspace (the `thread-delete` linkage): through wt when available, otherwise
+   * through plain git. A workspace that is already gone reports `missing`.
+   */
+  remove(request: WorktreeRemovalRequest, signal?: AbortSignal): Promise<WorktreeRemovalOutcome>;
+  /** Probes the local Worktrunk; the result drives creation, merging and the command prompts. */
+  worktrunk(signal?: AbortSignal): Promise<WorktrunkProbe>;
 }
 
 export interface ChannelService {

@@ -86,11 +86,12 @@ import { createQuestionDesk, type QuestionDesk } from "./questions.ts";
 import { threadParentGroupId } from "./thread-target.ts";
 import { canonicalExistingDirectory, existingSessionFile, resolveWorkDirectory, stripOuterQuotes } from "./workdir.ts";
 import { worktreeSlug } from "./worktree.ts";
+import { worktrunkUnavailableText } from "./worktrunk.ts";
 
 const GROUP_TRUSTED_INSTRUCTION =
   "群说明是群共享上下文，不改变发送者身份/权限/cwd；以本次快照为准，历史快照已失效。";
 const COMMAND_HELP =
-  "/new [目录] 创建新会话；/reset [目录] 重置为新会话；/move <目录> 沿用当前会话迁移 cwd；/thread <任务> 新建隔离子区并在其中处理该任务；/queue <文本> 把消息排到当前任务之后；/mode [steer|queue] 配置运行中追加消息的方式；/interrupt 中断当前回合但保留排队消息；/cancel 取消当前任务（/stop 同义）；/status 查看状态；/restart [now] 重启 channel（now 强制中断在途任务）；/help 查看帮助。";
+  "/new [目录] 创建新会话；/reset [目录] 重置为新会话；/move <目录> 沿用当前会话迁移 cwd；/thread <任务> 新建隔离子区并在其中处理该任务（子区内 /thread merge 把本区隔离工作区的分支合并回目标分支）；/queue <文本> 把消息排到当前任务之后；/mode [steer|queue] 配置运行中追加消息的方式；/interrupt 中断当前回合但保留排队消息；/cancel 取消当前任务（/stop 同义）；/status 查看状态；/restart [now] 重启 channel（now 强制中断在途任务）；/help 查看帮助。";
 const MODE_USAGE =
   "用法：/mode [steer|queue]。steer（默认，default 同义）把运行中的新消息注入当前回合；queue 把它排到当前回合之后。无参数时报告当前设置。";
 const QUEUE_USAGE = "用法：/queue <文本>；把该消息排到当前任务之后执行。";
@@ -144,9 +145,14 @@ const UNLISTED_CHAT_NOTICE_TTL_MS = 10 * 60 * 1_000;
 const DEFAULT_CANCELLED_TEXT = "当前任务已取消；不回滚已发生的副作用。";
 const DEFAULT_RESTARTING_TEXT = "channel 正在重启，本会话任务已中断；重启完成后会在本会话确认。";
 const THREAD_USAGE =
-  "用法：/thread <任务>；助手会先明确意图、确定子区名称与 worktree_name，然后新建隔离子区并把任务派发进去。";
+  "用法：/thread <任务>；助手会先明确意图、确定子区名称与 worktree_name，然后新建隔离子区并把任务派发进去；子区内 /thread merge 把本区工作合并回目标分支。";
 const THREAD_GROUP_ONLY_TEXT = "/thread 需要在群聊中使用。";
 const THREAD_NESTED_TEXT = "当前会话已是子区，不能再建子区。";
+const THREAD_MERGE_THREAD_ONLY_TEXT = "/thread merge 只在子区中使用。";
+const THREAD_MERGE_NO_WORKSPACE_TEXT =
+  "当前子区未绑定隔离工作区，/thread merge 不可用。";
+const THREAD_MERGE_UNCONFIGURED_TEXT =
+  "本部署未配置隔离工作区能力，/thread merge 不可用。";
 type RuntimeTask = {
   taskId: string;
   target: ChatTarget;
@@ -259,6 +265,26 @@ function threadIntentPrompt(intent: string): string {
     "",
     "原始意图：",
     intent,
+  ].join("\n");
+}
+
+/**
+ * Instruction block for a `/thread merge` message: like the creation prompt it hands the intent
+ * to the assistant instead of acting itself — the assistant decides the behaviour and parameters,
+ * while the merge itself is executed by the host through `octo_management`'s `thread-merge`.
+ * wt's default pipeline stages and commits the workspace changes, squashes, rebases onto the
+ * target branch, fast-forwards it, and then removes the worktree and its merged branch; every
+ * outcome, including a conflict that must be resolved before retrying, is reported to the owner.
+ */
+function threadMergePrompt(workspacePath: string): string {
+  return [
+    "用户要求把本子区（隔离工作区）已完成的工作合并回目标分支，走本机 Worktrunk（wt）的 merge pipeline。",
+    "合并由宿主执行：调用 octo_management 的 thread-merge 动作，不要自己运行 wt。",
+    "先确认本子区的工作已收尾——pipeline 默认会暂存工作区改动并提交、squash、rebase 到目标分支、fast-forward，并在合并后删除工作区与分支；是否调整参数（目标分支、是否保留工作区等）由你判断。",
+    "成功后向 owner 汇报目标分支与结果细节；失败时（例如 rebase 冲突或 pre-merge 检查失败）先在本子区处置再重试，并把最终结果告诉 owner。",
+    "",
+    "隔离工作区：",
+    workspacePath,
   ].join("\n");
 }
 
@@ -1443,6 +1469,10 @@ class CoreService implements ChannelService {
    * Only groups grow threads, so DMs and threads themselves are refused.
    */
   private async handleThreadCommand(message: InboundMessage, argument: string): Promise<void> {
+    if (argument.trim().toLowerCase() === "merge") {
+      await this.handleThreadMergeCommand(message);
+      return;
+    }
     if (message.channelType === 5) {
       await this.outbox.enqueueText(message, THREAD_NESTED_TEXT, null);
       return;
@@ -1462,6 +1492,45 @@ class CoreService implements ChannelService {
     const request = await this.materializeInbound(message, intent);
     if (request === null) return;
     const body = threadIntentPrompt(request);
+    if (await this.appendToRunningTask(message, body)) return;
+    await this.acceptTask(message, body);
+  }
+
+  /**
+   * `/thread merge`: a sub-thread that is bound to an isolated workspace can hand the merge
+   * instruction to the assistant; a compatible local Worktrunk must exist, because merging has no
+   * fallback. Every other caller — the main group, DMs, a thread without a bound workspace, a
+   * deployment without the capability, a missing or incompatible wt — gets one prompt and no
+   * task. The command runs nothing itself: the prompt is delivered like any other message the
+   * assistant has to read (steering when the running turn accepts it, otherwise a durable task),
+   * and the assistant drives `octo_management`'s `thread-merge`.
+   */
+  private async handleThreadMergeCommand(message: InboundMessage): Promise<void> {
+    if (message.channelType !== 5) {
+      await this.outbox.enqueueText(message, THREAD_MERGE_THREAD_ONLY_TEXT, null);
+      return;
+    }
+    const worktrees = this.options.worktrees;
+    if (!worktrees) {
+      await this.outbox.enqueueText(message, THREAD_MERGE_UNCONFIGURED_TEXT, null);
+      return;
+    }
+    const binding = this.store.getBinding(this.bot!.uid, message);
+    if (!binding || binding.cwdPinned !== true) {
+      await this.outbox.enqueueText(message, THREAD_MERGE_NO_WORKSPACE_TEXT, null);
+      return;
+    }
+    const available = await worktrees.worktrunk();
+    if (!available.available) {
+      await this.outbox.enqueueText(
+        message,
+        `${worktrunkUnavailableText(available)}，/thread merge 不可用。`,
+        null,
+      );
+      return;
+    }
+    this.store.releaseClaim(this.commandClaim(message, "thread"));
+    const body = threadMergePrompt(binding.cwd);
     if (await this.appendToRunningTask(message, body)) return;
     await this.acceptTask(message, body);
   }

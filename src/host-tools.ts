@@ -11,11 +11,12 @@ import type {
   HostTool,
   InboundMessage,
   ThreadSummary,
+  WorktreeMergeRequest,
 } from "./contracts.ts";
 import type { ChannelStore } from "./store.ts";
 import type { TaskRecord } from "./store-records.ts";
 import { taskTarget } from "./target.ts";
-import { threadParentGroupId } from "./thread-target.ts";
+import { threadChannelId, threadParentGroupId } from "./thread-target.ts";
 import { worktreeSlug } from "./worktree.ts";
 
 /**
@@ -62,6 +63,7 @@ const MANAGEMENT_BASE_ACTIONS = [
   "thread-join",
   "thread-leave",
   "thread-delete",
+  "thread-merge",
 ] as const;
 const MANAGEMENT_DISPATCH_ACTION = "thread-dispatch";
 /** Synthetic inbound id prefix: a dispatched task must not dispatch further. */
@@ -248,7 +250,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord, _snapshot:
   const managementTool: HostTool = {
     name: "octo_management",
     description:
-      "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；create-thread 可带 worktree_name 为线程建立独立 git worktree 并把线程目录绑定到它；thread-dispatch 把一条任务派发给本群的某个 thread，结果按该子区的追加模式处置——steer 且该子区有可接收 steering 的运行中回合时并入该回合（delivery=steered），否则在该子区作为独立任务执行（delivery=queued），两种情况本群都收到一条回执；派发出去的任务不能再派发。目标固定为当前聊天，不能指向其他群。",
+      "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；create-thread 可带 worktree_name 为线程建立独立 git worktree 并把线程目录绑定到它（本机有兼容 Worktrunk 时经 wt 创建，否则经 OMP）；thread-delete 默认清理干净的工作区，force=true 时连同未提交改动一起强制清理（本机无兼容 wt 时回退 git）；thread-merge 把当前子区隔离工作区的分支经本机 Worktrunk（wt）的 merge pipeline 合并回目标分支，仅绑定隔离工作区的子区可用，省略参数即 wt 默认 pipeline；thread-dispatch 把一条任务派发给本群的某个 thread，结果按该子区的追加模式处置——steer 且该子区有可接收 steering 的运行中回合时并入该回合（delivery=steered），否则在该子区作为独立任务执行（delivery=queued），两种情况本群都收到一条回执；派发出去的任务不能再派发。目标固定为当前聊天，不能指向其他群。",
     parameters: {
       type: "object",
       properties: {
@@ -262,6 +264,28 @@ export function createHostTools(host: HostToolHost, task: TaskRecord, _snapshot:
         notice: { type: "string", description: "group-update 的新群公告。" },
         content: { type: "string", description: "description-write 的共享说明正文。" },
         text: { type: "string", description: "thread-dispatch 要派发的任务正文。" },
+        force: {
+          type: "boolean",
+          description:
+            "thread-delete：为 true 时丢弃工作区里的未提交改动并强制清理（默认只清理干净工作区）。",
+        },
+        target: {
+          type: "string",
+          description: "thread-merge：目标分支；省略使用仓库默认分支。",
+        },
+        squash: { type: "boolean", description: "thread-merge：是否 squash（默认 true）。" },
+        commit: { type: "boolean", description: "thread-merge：是否提交待合并内容（默认 true）。" },
+        rebase: { type: "boolean", description: "thread-merge：是否 rebase 到目标分支（默认 true）。" },
+        remove: {
+          type: "boolean",
+          description: "thread-merge：合并成功后是否删除工作区与已合并分支（默认 true）。",
+        },
+        ff: { type: "boolean", description: "thread-merge：是否 fast-forward 目标分支（默认 true）。" },
+        stage: {
+          type: "string",
+          enum: ["all", "tracked", "none"],
+          description: "thread-merge：提交前的暂存范围（默认 all）。",
+        },
         worktree_name: {
           type: "string",
           description:
@@ -328,6 +352,38 @@ async function runManagementTool(
     if (value === undefined) return undefined;
     if (typeof value !== "string") throw new Error(`${field} must be a string`);
     return value;
+  };
+  const optionalBoolean = (field: string): boolean | undefined => {
+    const value = args[field];
+    if (value === undefined) return undefined;
+    if (typeof value !== "boolean") throw new Error(`${field} must be a boolean`);
+    return value;
+  };
+  /**
+   * `thread-merge` parameters, one-to-one with wt's merge flags; every omitted field keeps wt's
+   * default (squash, commit, rebase, fast-forward, remove the worktree, stage everything).
+   */
+  const mergeRequest = (cwd: string): WorktreeMergeRequest => {
+    const request: WorktreeMergeRequest = { cwd };
+    const target = optionalText("target")?.trim();
+    if (target !== undefined && target.length > 0) {
+      if (target.length > MAX_MANAGEMENT_NAME_CHARS) {
+        throw new Error(`target must be at most ${MAX_MANAGEMENT_NAME_CHARS} characters`);
+      }
+      request.target = target;
+    }
+    const stage = optionalText("stage")?.trim();
+    if (stage !== undefined && stage.length > 0) {
+      if (stage !== "all" && stage !== "tracked" && stage !== "none") {
+        throw new Error("stage must be all, tracked or none");
+      }
+      request.stage = stage;
+    }
+    for (const field of ["squash", "commit", "rebase", "remove", "ff"] as const) {
+      const value = optionalBoolean(field);
+      if (value !== undefined) request[field] = value;
+    }
+    return request;
   };
   const namedText = (field: string, maxChars: number): string => {
     const value = optionalText(field)?.trim();
@@ -441,8 +497,30 @@ async function runManagementTool(
     }
     case "thread-delete": {
       const shortId = threadId();
+      const force = optionalBoolean("force") ?? false;
       await deleteThread(host, groupId, shortId, signal);
-      return `已删除线程 ${shortId}`;
+      const note = await cleanupThreadWorkspace(host, groupId, shortId, force, signal);
+      return note === null ? `已删除线程 ${shortId}` : `已删除线程 ${shortId}；${note}`;
+    }
+    case "thread-merge": {
+      if (currentShortId === null) {
+        throw new Error("thread-merge 只能在子区中调用");
+      }
+      const workspace = host.store.getBinding(host.botUid, {
+        channelId: threadChannelId(groupId, currentShortId),
+        channelType: 5,
+      });
+      if (!workspace || workspace.cwdPinned !== true) {
+        throw new Error("当前子区未绑定隔离工作区，无法合并");
+      }
+      const worktrees = host.options.worktrees;
+      if (!worktrees) throw new Error("本部署未配置隔离工作区能力");
+      try {
+        const summary = await worktrees.merge(mergeRequest(workspace.cwd), signal);
+        return JSON.stringify({ merged: true, ...summary });
+      } catch (error) {
+        throw new Error(boundedManagementError(error, "合并隔离工作区失败"));
+      }
     }
     case "thread-dispatch": {
       if (task.messageId.startsWith(DISPATCH_MESSAGE_PREFIX)) {
@@ -483,6 +561,44 @@ async function deleteThread(
     await transport.deleteThread(groupId, shortId, signal, { freshConnection: true });
   } catch (error) {
     throw new Error(boundedManagementError(error, "删除线程失败"));
+  }
+}
+
+/**
+ * The `thread-delete` linkage: once the server has deleted the thread, its isolated workspace is
+ * removed through wt, or through plain git when no compatible wt exists. Only a `cwd_pinned`
+ * binding is touched; a workspace with uncommitted changes stays in place unless `force` discards
+ * them. The result is one bounded single-line note appended to the delete receipt — a cleanup
+ * failure never turns the (already effective) delete into a failure.
+ */
+async function cleanupThreadWorkspace(
+  host: HostToolHost,
+  groupId: string,
+  shortId: string,
+  force: boolean,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const worktrees = host.options.worktrees;
+  if (!worktrees) return null;
+  const binding = host.store.getBinding(host.botUid, {
+    channelId: threadChannelId(groupId, shortId),
+    channelType: 5,
+  });
+  if (!binding || binding.cwdPinned !== true) return null;
+  try {
+    const outcome = await worktrees.remove({ path: binding.cwd, force }, signal);
+    if (outcome.kind === "missing") return "隔离工作区已不存在";
+    if (outcome.branchOutcome === "deleted") return "隔离工作区已清理（分支已删除）";
+    return "隔离工作区已清理";
+  } catch (error) {
+    const prefix = force ? "隔离工作区清理失败：" : "隔离工作区未清理：";
+    const suffix = force ? "" : "（可传 force=true 强制删除）";
+    const room = MAX_MANAGEMENT_ERROR_CHARS - prefix.length - suffix.length;
+    const reason = truncateForTool(
+      boundedManagementError(error, "无法清理隔离工作区"),
+      room,
+    );
+    return `${prefix}${reason}${suffix}`;
   }
 }
 /**

@@ -816,6 +816,395 @@ test("create-thread worktree_name reports a workspace failure while keeping the 
   }
 });
 
+test("thread-merge merges the bound workspace through the port and reports wt's result", async () => {
+  const log: string[] = [];
+  const harness = await createCoreHarness({
+    prompt: async ({ promptContext, text }) => {
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("management tool missing");
+      const signal = new AbortController().signal;
+      if (text === "create the merge thread") {
+        const created = JSON.parse(
+          await management.execute(
+            { action: "create-thread", name: "合并线程", worktree_name: "merge-workspace" },
+            signal,
+          ),
+        ) as { short_id: string };
+        log.push(`created:${created.short_id}\n`);
+        return;
+      }
+      if (text === "merge with parameters") {
+        const result = await management.execute(
+          { action: "thread-merge", target: "release-1", remove: false },
+          signal,
+        );
+        log.push(`merged:${result}\n`);
+        return;
+      }
+      if (text === "merge with a bad stage") {
+        const outcome = await management
+          .execute({ action: "thread-merge", stage: "sideways" }, signal)
+          .then((value) => `resolved:${value}`)
+          .catch((error: Error) => `rejected:${error.message}`);
+        log.push(`${outcome}\n`);
+        return;
+      }
+      if (text === "merge in the group") {
+        const outcome = await management
+          .execute({ action: "thread-merge" }, signal)
+          .then((value) => `resolved:${value}`)
+          .catch((error: Error) => `rejected:${error.message}`);
+        log.push(`${outcome}\n`);
+      }
+    },
+  });
+  try {
+    const worktrees = harness.worktrees;
+    if (!worktrees) throw new Error("expected a worktree port in the harness");
+    const cwd = join(harness.root, "merge cwd");
+    await mkdir(cwd, { recursive: true });
+    await harness.service.handleInbound(
+      inbound({ messageId: "merge-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "merge-create",
+        ...GROUP_TOOLS,
+        text: "create the merge thread",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+
+    const thread = { channelId: "group-tools____thread-1", channelType: 5 as const };
+    const workspace = join(harness.root, "worktrees", "thread-1");
+    await waitForStatus(harness.service, thread, (status) => status.cwd === workspace);
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "merge-run",
+        ...thread,
+        text: "merge with parameters",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(2);
+    await waitForStatus(harness.service, thread, (status) => status.state === "completed");
+
+    // The workspace's own directory goes to the port; wt's defaults are left alone except for the
+    // caller's parameters, and the tool result carries wt's result object back to the agent.
+    expect(worktrees.merges).toEqual([{ cwd: workspace, target: "release-1", remove: false }]);
+    expect(log.join("\n")).toContain(
+      'merged:{"merged":true,"branch":"fixture-branch","target":"release-1","squashed":true,"rebased":true,"committed":true,"removed":false}',
+    );
+
+    // A bad parameter, and a group that tries to merge, are both rejected with one bounded line.
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "merge-bad-stage",
+        ...thread,
+        text: "merge with a bad stage",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(3);
+    await waitForStatus(harness.service, thread, (status) => status.state === "completed");
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "merge-in-group",
+        ...GROUP_TOOLS,
+        text: "merge in the group",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(4);
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+    expect(log.join("\n")).toContain("rejected:stage must be all, tracked or none");
+    expect(log.join("\n")).toContain("rejected:thread-merge 只能在子区中调用");
+    expect(worktrees.merges).toHaveLength(1);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("thread-merge reports the port's failure and refuses a thread without a workspace", async () => {
+  const log: string[] = [];
+  const harness = await createCoreHarness({
+    prompt: async ({ promptContext, text }) => {
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("management tool missing");
+      const signal = new AbortController().signal;
+      if (text === "create the failing merge thread") {
+        const created = JSON.parse(
+          await management.execute(
+            { action: "create-thread", name: "失败合并", worktree_name: "merge-failure" },
+            signal,
+          ),
+        ) as { short_id: string };
+        log.push(`created:${created.short_id}\n`);
+        return;
+      }
+      if (text === "merge without a workspace") {
+        const outcome = await management
+          .execute({ action: "thread-merge" }, signal)
+          .then((value) => `resolved:${value}`)
+          .catch((error: Error) => `rejected:${error.message}`);
+        log.push(`${outcome}\n`);
+        return;
+      }
+      if (text === "merge that conflicts") {
+        const outcome = await management
+          .execute({ action: "thread-merge" }, signal)
+          .then((value) => `resolved:${value}`)
+          .catch((error: Error) => `rejected:${error.message}`);
+        log.push(`${outcome}\n`);
+      }
+    },
+  });
+  try {
+    const worktrees = harness.worktrees;
+    if (!worktrees) throw new Error("expected a worktree port in the harness");
+    const cwd = join(harness.root, "merge failure cwd");
+    await mkdir(cwd, { recursive: true });
+    await harness.service.handleInbound(
+      inbound({ messageId: "merge-fail-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "merge-fail-create",
+        ...GROUP_TOOLS,
+        text: "create the failing merge thread",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+
+    // A thread that never got a workspace cannot merge.
+    const unbound = { channelId: "group-tools____topic-8", channelType: 5 as const };
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "merge-fail-unbound",
+        ...unbound,
+        text: "merge without a workspace",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(2);
+    await waitForStatus(harness.service, unbound, (status) => status.state === "completed");
+
+    // A failing wt merge surfaces as one bounded line.
+    const thread = { channelId: "group-tools____thread-1", channelType: 5 as const };
+    const workspace = join(harness.root, "worktrees", "thread-1");
+    await waitForStatus(harness.service, thread, (status) => status.cwd === workspace);
+    worktrees.mergeFailure = new Error(
+      "合并失败（退出码 1）：Rebase onto main incomplete CONFLICT (content): Merge conflict in shared.txt",
+    );
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "merge-fail-run",
+        ...thread,
+        text: "merge that conflicts",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(3);
+    await waitForStatus(harness.service, thread, (status) => status.state === "completed");
+
+    expect(log.join("\n")).toContain("rejected:当前子区未绑定隔离工作区，无法合并");
+    const failing = log.join("\n").split("\n").find((line) => line.includes("Rebase onto main"));
+    expect(failing).toBeDefined();
+    expect(failing?.startsWith("rejected:合并失败")).toBe(true);
+    expect((failing ?? "").length).toBeLessThanOrEqual(210);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("thread-delete cleans the deleted thread's bound workspace and reports it", async () => {
+  const log: string[] = [];
+  const harness = await createCoreHarness({
+    prompt: async ({ promptContext, text }) => {
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("management tool missing");
+      const signal = new AbortController().signal;
+      if (text === "create two workspace threads") {
+        for (const name of ["清理一", "清理二"]) {
+          const created = JSON.parse(
+            await management.execute(
+              { action: "create-thread", name, worktree_name: `cleanup-${name === "清理一" ? "one" : "two"}` },
+              signal,
+            ),
+          ) as { short_id: string };
+          log.push(`created:${created.short_id}\n`);
+        }
+        return;
+      }
+      if (text === "delete the first thread") {
+        const result = await management.execute({ action: "thread-delete", short_id: "thread-1" }, signal);
+        log.push(`${result}\n`);
+        return;
+      }
+      if (text === "delete the missing-workspace thread") {
+        const result = await management.execute({ action: "thread-delete", short_id: "thread-2" }, signal);
+        log.push(`${result}\n`);
+      }
+    },
+  });
+  try {
+    const worktrees = harness.worktrees;
+    if (!worktrees) throw new Error("expected a worktree port in the harness");
+    const cwd = join(harness.root, "cleanup cwd");
+    await mkdir(cwd, { recursive: true });
+    await harness.service.handleInbound(
+      inbound({ messageId: "cleanup-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "cleanup-create",
+        ...GROUP_TOOLS,
+        text: "create two workspace threads",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+
+    // The delete removes the workspace through the port (wt by default, git fallback inside) and
+    // the receipt names the outcome.
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "cleanup-delete-one",
+        ...GROUP_TOOLS,
+        text: "delete the first thread",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(2);
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+    expect(worktrees.removals).toEqual([
+      { path: join(harness.root, "worktrees", "thread-1"), force: false },
+    ]);
+
+    // A workspace that is already gone is reported instead of failing the delete.
+    worktrees.removal = { kind: "missing" };
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "cleanup-delete-two",
+        ...GROUP_TOOLS,
+        text: "delete the missing-workspace thread",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(3);
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+    expect(worktrees.removals).toEqual([
+      { path: join(harness.root, "worktrees", "thread-1"), force: false },
+      { path: join(harness.root, "worktrees", "thread-2"), force: false },
+    ]);
+
+    expect(log.join("\n")).toContain("已删除线程 thread-1；隔离工作区已清理（分支已删除）");
+    expect(log.join("\n")).toContain("已删除线程 thread-2；隔离工作区已不存在");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("thread-delete keeps a dirty workspace unless force discards it", async () => {
+  const log: string[] = [];
+  const harness = await createCoreHarness({
+    prompt: async ({ promptContext, text }) => {
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("management tool missing");
+      const signal = new AbortController().signal;
+      if (text === "create two dirty threads") {
+        for (const name of ["脏一", "脏二"]) {
+          const created = JSON.parse(
+            await management.execute(
+              { action: "create-thread", name, worktree_name: `dirty-${name === "脏一" ? "one" : "two"}` },
+              signal,
+            ),
+          ) as { short_id: string };
+          log.push(`created:${created.short_id}\n`);
+        }
+        return;
+      }
+      if (text === "delete without force") {
+        const result = await management.execute(
+          { action: "thread-delete", short_id: "thread-1" },
+          signal,
+        );
+        log.push(`${result}\n`);
+        return;
+      }
+      if (text === "delete with force") {
+        const result = await management.execute(
+          { action: "thread-delete", short_id: "thread-2", force: true },
+          signal,
+        );
+        log.push(`${result}\n`);
+      }
+    },
+  });
+  try {
+    const worktrees = harness.worktrees;
+    if (!worktrees) throw new Error("expected a worktree port in the harness");
+    const cwd = join(harness.root, "dirty cwd");
+    await mkdir(cwd, { recursive: true });
+    await harness.service.handleInbound(
+      inbound({ messageId: "dirty-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "dirty-create",
+        ...GROUP_TOOLS,
+        text: "create two dirty threads",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+
+    worktrees.removeFailure = new Error(
+      "删除隔离工作区失败（退出码 1）：Cannot remove worktree: dirty-one has uncommitted changes",
+    );
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "dirty-delete-one",
+        ...GROUP_TOOLS,
+        text: "delete without force",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(2);
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+
+    // The workspace stays; the receipt names the reason and how to discard it.
+    expect(log.join("\n")).toContain(
+      "已删除线程 thread-1；隔离工作区未清理：删除隔离工作区失败（退出码 1）：Cannot remove worktree: dirty-one has uncommitted changes（可传 force=true 强制删除）",
+    );
+
+    worktrees.removeFailure = undefined;
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "dirty-delete-two",
+        ...GROUP_TOOLS,
+        text: "delete with force",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(3);
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+    expect(worktrees.removals).toEqual([
+      { path: join(harness.root, "worktrees", "thread-1"), force: false },
+      { path: join(harness.root, "worktrees", "thread-2"), force: true },
+    ]);
+    expect(log.join("\n")).toContain("已删除线程 thread-2；隔离工作区已清理（分支已删除）");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
 test("threads inherit the parent group allowlist without their own entry", async () => {
   const harness = await createCoreHarness({ allowedGroupIds: ["group-allowed"] });
   try {
