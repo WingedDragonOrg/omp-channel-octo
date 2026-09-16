@@ -183,12 +183,10 @@ const MAX_MANAGEMENT_NOTICE_CHARS = 2_000;
 const MAX_MANAGEMENT_TASK_CHARS = 4_000;
 const MAX_MANAGEMENT_ERROR_CHARS = 200;
 const MAX_MANAGEMENT_WORKTREE_NAME_CHARS = 100;
-const THREAD_USAGE = "用法：/thread <任务>；新建隔离子区并在其中处理该任务。";
+const THREAD_USAGE =
+  "用法：/thread <任务>；助手会先明确意图、确定子区名称与 worktree_name，然后新建隔离子区并把任务派发进去。";
 const THREAD_GROUP_ONLY_TEXT = "/thread 需要在群聊中使用。";
 const THREAD_NESTED_TEXT = "当前会话已是子区，不能再建子区。";
-const THREAD_TOO_LONG_TEXT = `任务过长：/thread 最多接受 ${MAX_MANAGEMENT_TASK_CHARS} 字符。`;
-/** Thread name taken from the query; keeps the thread list readable. */
-const MAX_THREAD_NAME_CHARS = 60;
 type RuntimeTask = {
   taskId: string;
   target: ChatTarget;
@@ -320,13 +318,26 @@ function truncateForTool(value: string, maxChars: number): string {
   return value.length > maxChars ? `${value.slice(0, maxChars)}…` : value;
 }
 
-/** ASCII workspace name for a query without slug characters (for example pure Chinese). */
-function threadWorkspaceName(text: string): string {
-  const slug = worktreeSlug(text);
-  if (slug.length > 0) return slug;
-  const now = new Date();
-  const pad = (value: number): string => String(value).padStart(2, "0");
-  return `thread-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+/**
+ * Instruction block for a `/thread` message: the command hands the intent over instead of
+ * creating anything, and the assistant names the sub-thread and its workspace itself, then drives
+ * `octo_management` - dispatching the work directly when the intent is clear, and a request for
+ * the owner to clarify (inside the thread) when it is not.
+ */
+function threadIntentPrompt(intent: string): string {
+  return [
+    "用户希望把下面这件事放进一个新的隔离子区处理，而不是在当前会话直接执行。",
+    "先理解意图，并据此确定子区名称（简洁、能说明这件事）与 worktree_name（ASCII 小写连字符，如 fix-login-flow）。",
+    "然后调用 octo_management：create-thread（name=子区名称，worktree_name=你定的名字）创建隔离子区，",
+    "再用 thread-dispatch（short_id=该子区）把任务派发进去；派发的任务正文按需求明确程度二选一：",
+    "- 需求明确：直接写清要做什么（可整理原始意图，但不要丢信息），让子区立刻开工；",
+    "- 需求不明确：写明已知的原始意图，并要求子区先用 ask 向 owner 提问澄清，明确后再执行。",
+    "澄清发生在子区里：不要在当前会话执行这件事，也不要在当前会话提问。",
+    "完成后简要汇报子区名称、short_id 与工作区路径。",
+    "",
+    "原始意图：",
+    intent,
+  ].join("\n");
 }
 
 /** Single-line, bounded error text for management results. */
@@ -1618,7 +1629,7 @@ class CoreService implements ChannelService {
       if (name === "new" || name === "reset") {
         await this.handleNew(target, argument);
       } else if (name === "thread") {
-        await this.handleThreadCommand(target, argument);
+        await this.handleThreadCommand(message, argument);
       } else if (name === "move") {
         await this.handleMove(target, argument);
       } else if (name === "cancel" || name === "stop") {
@@ -1648,42 +1659,28 @@ class CoreService implements ChannelService {
   }
 
   /**
-   * `/thread <任务>`: create a CommunityTopic thread for the caller's group, give it its own
-   * isolated workspace, and hand the query to that thread. The name is the query and the
-   * workspace carries its ASCII slug (a timestamp when the query has none); a workspace that
-   * cannot be created is reported while the thread still accepts the task. Only groups grow
-   * threads, so DMs and threads themselves are refused.
+   * `/thread <任务>`: hand the intent to the assistant instead of creating a sub-thread here. The
+   * message becomes a task carrying an instruction block, so the agent reads the intent, names
+   * the sub-thread and its workspace itself, and drives `octo_management`: a clear intent is
+   * dispatched as the work itself, an underspecified one as a request for the owner to clarify in
+   * the thread. Only groups grow threads, so DMs and threads themselves are refused.
    */
-  private async handleThreadCommand(target: ChatTarget, argument: string): Promise<void> {
-    if (target.channelType === 5) {
-      await this.enqueueText(target, THREAD_NESTED_TEXT, null);
+  private async handleThreadCommand(message: InboundMessage, argument: string): Promise<void> {
+    if (message.channelType === 5) {
+      await this.enqueueText(message, THREAD_NESTED_TEXT, null);
       return;
     }
-    if (target.channelType !== 2) {
-      await this.enqueueText(target, THREAD_GROUP_ONLY_TEXT, null);
+    if (message.channelType !== 2) {
+      await this.enqueueText(message, THREAD_GROUP_ONLY_TEXT, null);
       return;
     }
-    const query = argument.trim();
-    if (query.length === 0) {
-      await this.enqueueText(target, THREAD_USAGE, null);
+    const intent = argument.trim();
+    if (intent.length === 0) {
+      await this.enqueueText(message, THREAD_USAGE, null);
       return;
     }
-    if (query.length > MAX_MANAGEMENT_TASK_CHARS) {
-      await this.enqueueText(target, THREAD_TOO_LONG_TEXT, null);
-      return;
-    }
-    const name = truncateForTool(query, MAX_THREAD_NAME_CHARS);
-    const thread = await this.options.transport.createThread(target.channelId, name);
-    const workspace = await this.createThreadWorkspaceFor(target, thread, threadWorkspaceName(query));
-    await this.dispatchTaskToThread(thread, query);
-    const workspacePart = "worktree" in workspace
-      ? `隔离工作区 ${workspace.worktree.path}（分支 ${workspace.worktree.branch}）`
-      : `隔离工作区创建失败：${workspace.worktree_error}`;
-    await this.enqueueText(
-      target,
-      `已创建子区「${name}」（${thread.shortId}）并派发任务；${workspacePart}。`,
-      null,
-    );
+    this.store.releaseClaim(this.commandClaim(message, "thread"));
+    await this.acceptTask(message, threadIntentPrompt(intent));
   }
 
   private async defaultWorkDirectory(target: ChatTarget): Promise<string> {
@@ -3232,25 +3229,6 @@ class CoreService implements ChannelService {
         throw new Error(`unknown action: ${action}`);
       }
     }
-  }
-  /**
-   * Resolves the caller's working directory and asks the worktree port for the new thread's
-   * workspace. Both callers (the `create-thread` tool and `/thread`) keep the same
-   * promise-shaped result: an isolated workspace, or a `worktree_error` that leaves the thread
-   * usable in the ordinary directory order.
-   */
-  private async createThreadWorkspaceFor(
-    target: ChatTarget,
-    thread: ThreadSummary,
-    workspaceName: string,
-  ): Promise<{ worktree: { path: string; branch: string } } | { worktree_error: string }> {
-    let baseDir: string;
-    try {
-      baseDir = await this.defaultWorkDirectory(target);
-    } catch (error) {
-      return { worktree_error: boundedManagementError(error, "无法解析当前目录") };
-    }
-    return this.createThreadWorkspace(baseDir, thread, workspaceName);
   }
   /**
    * Gives a freshly created thread its own git worktree and pins the thread binding to it, so

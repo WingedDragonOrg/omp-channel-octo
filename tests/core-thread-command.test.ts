@@ -4,12 +4,12 @@ import { join } from "node:path";
 import { closeCoreHarness, createCoreHarness, inbound, waitForStatus } from "./fixtures/core-fakes";
 
 /**
- * `/thread <任务>` composes three pieces the suite already covers separately - a CommunityTopic
- * thread, its isolated workspace, and the durable dispatch path - so these tests follow the task
- * into the new thread instead of asserting transport calls alone.
+ * `/thread <任务>` hands the intent to the assistant: the command itself creates nothing, it turns
+ * the message into a task carrying the hand-over instruction, so the agent - not a fixed naming
+ * rule - decides the sub-thread name and its `worktree_name` and drives octo_management.
  */
 
-test("/thread creates an isolated thread and dispatches the query into its workspace", async () => {
+test("/thread turns the message into an instructed task without creating anything itself", async () => {
   const harness = await createCoreHarness();
   try {
     const group = { channelId: "group-allowed", channelType: 2 as const };
@@ -23,62 +23,60 @@ test("/thread creates an isolated thread and dispatches the query into its works
         mentionedUserIds: [harness.bot.uid],
       }),
     );
+    const intent = "把进度卡片的样式调整得更紧凑，先看一遍现有渲染再改";
     await harness.service.handleInbound(
       inbound({
-        messageId: "thread-create",
+        messageId: "thread-intent",
         ...group,
-        text: "/thread fix the login bug",
+        text: `/thread ${intent}`,
         mentionedUserIds: [harness.bot.uid],
       }),
     );
     await harness.workers.waitForPromptCount(1);
 
-    const thread = { channelId: `${group.channelId}____thread-1`, channelType: 5 as const };
-    const workspace = join(harness.root, "worktrees", "thread-1");
-    expect(harness.transport.managementCalls).toContainEqual({
-      action: "create-thread",
-      groupId: group.channelId,
-      shortId: null,
-    });
-    expect(harness.worktrees?.requests).toEqual([
-      { baseDir: parentCwd, label: "fix-the-login-bug", threadId: "thread-1" },
-    ]);
-    // The dispatched task runs in the workspace, not in the parent group's directory.
-    expect(harness.workers.prompts[0]).toMatchObject({ text: "fix the login bug", cwd: workspace });
-    expect((await harness.service.status(thread)).cwd).toBe(workspace);
+    // Nothing is created up front: no thread, no workspace, no receipt.
+    expect(harness.transport.managementCalls).toEqual([]);
+    expect(harness.worktrees?.requests).toEqual([]);
+    expect(harness.transport.sent.some(({ text }) => text.includes("子区"))).toBe(false);
 
-    // The thread name comes from the query; the group gets the receipt and the thread the note.
-    expect(
-      harness.transport.sent.some(
-        ({ target, text }) =>
-          target.channelId === group.channelId &&
-          text.includes("已创建子区「fix the login bug」（thread-1）并派发任务；隔离工作区"),
-      ),
-    ).toBe(true);
-    expect(
-      harness.transport.sent.some(
-        ({ target, text }) =>
-          target.channelId === thread.channelId &&
-          text.startsWith("来自群会话的派发任务") &&
-          text.includes("fix the login bug"),
-      ),
-    ).toBe(true);
-
-    await waitForStatus(harness.service, thread, (status) => status.state === "completed");
+    // The task carries the raw intent plus how to hand it over, and runs in the group's directory.
+    const prompt = harness.workers.prompts[0];
+    expect(prompt?.cwd).toBe(parentCwd);
+    expect(prompt?.text.endsWith(intent)).toBe(true);
+    for (const step of ["create-thread", "worktree_name", "thread-dispatch", "ask", "需求明确", "需求不明确"]) {
+      expect(prompt?.text).toContain(step);
+    }
   } finally {
     await closeCoreHarness(harness);
   }
 });
 
-test("/thread names the workspace from the query and falls back to a timestamp without ASCII text", async () => {
-  const harness = await createCoreHarness();
+test("the instructed task sets the sub-thread up with the agent's own names", async () => {
+  const harness = await createCoreHarness({
+    prompt: async ({ promptContext, text }) => {
+      if (!text.includes("原始意图")) return; // only the hand-over task drives octo_management
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("management tool missing");
+      const signal = new AbortController().signal;
+      const created = JSON.parse(
+        await management.execute(
+          { action: "create-thread", name: "进度卡样式", worktree_name: "progress-card-style" },
+          signal,
+        ),
+      ) as { short_id: string };
+      await management.execute(
+        { action: "thread-dispatch", short_id: created.short_id, text: "调整进度卡片的样式" },
+        signal,
+      );
+    },
+  });
   try {
     const group = { channelId: "group-allowed", channelType: 2 as const };
     const parentCwd = join(harness.root, "project");
     await mkdir(parentCwd, { recursive: true });
     await harness.service.handleInbound(
       inbound({
-        messageId: "thread-unicode-bind",
+        messageId: "thread-agent-bind",
         ...group,
         text: `/new ${parentCwd}`,
         mentionedUserIds: [harness.bot.uid],
@@ -86,30 +84,38 @@ test("/thread names the workspace from the query and falls back to a timestamp w
     );
     await harness.service.handleInbound(
       inbound({
-        messageId: "thread-unicode-create",
+        messageId: "thread-agent-run",
         ...group,
-        text: "/thread 修复登录流程",
+        text: "/thread 调整进度卡片的样式",
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
+    const thread = { channelId: `${group.channelId}____thread-1`, channelType: 5 as const };
+    const workspace = join(harness.root, "worktrees", "thread-1");
+    await harness.workers.waitForPromptCount(2);
 
-    const request = harness.worktrees?.requests[0];
-    if (!request) throw new Error("expected a recorded workspace request");
-    expect(request.label).toMatch(/^thread-\d{8}-\d{6}$/);
-    // The thread name keeps the query itself even when the workspace needs a generated name.
+    // The workspace request carries the agent-chosen name against the group's own directory.
+    expect(harness.worktrees?.requests).toEqual([
+      { baseDir: parentCwd, label: "progress-card-style", threadId: "thread-1" },
+    ]);
+    // The dispatched work runs in that workspace, the thread shows the handoff, and the group
+    // hears where the work went.
+    expect(harness.workers.prompts[1]?.cwd).toBe(workspace);
+    expect(harness.workers.prompts[1]?.text).toBe("调整进度卡片的样式");
     expect(
       harness.transport.sent.some(
         ({ target, text }) =>
-          target.channelId === group.channelId &&
-          text.includes("已创建子区「修复登录流程」（thread-1）并派发任务；隔离工作区"),
+          target.channelId === thread.channelId && text.startsWith("来自群会话的派发任务"),
       ),
     ).toBe(true);
-    await waitForStatus(
-      harness.service,
-      { channelId: `${group.channelId}____thread-1`, channelType: 5 },
-      (status) => status.state === "completed",
-    );
+    expect((await harness.service.status(thread)).cwd).toBe(workspace);
+    expect(
+      harness.transport.sent.some(
+        ({ target, text }) =>
+          target.channelId === group.channelId && text.includes("已派发任务到线程 thread-1"),
+      ),
+    ).toBe(true);
+    await waitForStatus(harness.service, thread, (status) => status.state === "completed");
   } finally {
     await closeCoreHarness(harness);
   }
@@ -143,8 +149,8 @@ test("/thread without a task replies with usage, and DMs and threads are refused
     );
     expect(harness.transport.sent.some(({ text }) => text === "当前会话已是子区，不能再建子区。")).toBe(true);
 
-    // Refusals and the usage hint must not create a thread or start any work.
-    expect(harness.transport.managementCalls.filter(({ action }) => action === "create-thread")).toEqual([]);
+    // Refusals and the usage hint never accept a task or touch the management surface.
+    expect(harness.transport.managementCalls).toEqual([]);
     expect(harness.worktrees?.requests).toEqual([]);
     expect(harness.workers.prompts).toEqual([]);
   } finally {
@@ -152,51 +158,7 @@ test("/thread without a task replies with usage, and DMs and threads are refused
   }
 });
 
-test("/thread keeps the thread and the task when the workspace cannot be created", async () => {
-  const harness = await createCoreHarness();
-  try {
-    const worktrees = harness.worktrees;
-    if (!worktrees) throw new Error("expected a worktree port in the harness");
-    worktrees.failure = new Error("workspace boom");
-    const group = { channelId: "group-allowed", channelType: 2 as const };
-    const parentCwd = join(harness.root, "project");
-    await mkdir(parentCwd, { recursive: true });
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "thread-fail-bind",
-        ...group,
-        text: `/new ${parentCwd}`,
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "thread-fail-create",
-        ...group,
-        text: "/thread still deliver the work",
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    await harness.workers.waitForPromptCount(1);
-
-    const thread = { channelId: `${group.channelId}____thread-1`, channelType: 5 as const };
-    // The thread falls back to the parent directory and still runs the dispatched query.
-    expect(harness.workers.prompts[0]).toMatchObject({ text: "still deliver the work", cwd: parentCwd });
-    expect(
-      harness.transport.sent.some(
-        ({ text }) =>
-          text.includes(
-            "已创建子区「still deliver the work」（thread-1）并派发任务；隔离工作区创建失败：workspace boom",
-          ),
-      ),
-    ).toBe(true);
-    await waitForStatus(harness.service, thread, (status) => status.state === "completed");
-  } finally {
-    await closeCoreHarness(harness);
-  }
-});
-
-test("/thread works while the current chat has a running task", async () => {
+test("/thread queues the hand-over behind a running turn instead of steering it", async () => {
   let release: (() => void) | undefined;
   let promptCount = 0;
   const harness = await createCoreHarness({
@@ -230,21 +192,19 @@ test("/thread works while the current chat has a running task", async () => {
       }),
     );
     await harness.workers.waitForPromptCount(1);
-
-    // Pulling work aside is most useful exactly when the chat is busy.
     await harness.service.handleInbound(
       inbound({
         messageId: "thread-busy-run",
         ...group,
-        text: "/thread move this aside",
+        text: "/thread 把这件事放到子区里慢慢做",
         mentionedUserIds: [harness.bot.uid],
       }),
     );
+    release?.();
     await harness.workers.waitForPromptCount(2);
-    expect(harness.workers.prompts[1]).toMatchObject({
-      text: "move this aside",
-      cwd: join(harness.root, "worktrees", "thread-1"),
-    });
+    // The hand-over waits its turn as its own task in the group's directory.
+    expect(harness.workers.prompts[1]?.cwd).toBe(parentCwd);
+    expect(harness.workers.prompts[1]?.text).toContain("把这件事放到子区里慢慢做");
   } finally {
     release?.();
     await closeCoreHarness(harness);
