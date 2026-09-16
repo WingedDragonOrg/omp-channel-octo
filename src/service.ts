@@ -1028,16 +1028,6 @@ class CoreService implements ChannelService {
       await this.acceptTask(message, slashPrompt);
       return;
     }
-    // A dispatched task is an explicit hand-over into this chat (see `dispatchTaskToThread`), so
-    // it always becomes its own durable task: it never answers an open question and never joins a
-    // running turn as steering — either diversion would leave the dispatch receipt ("已派发任务到
-    // 线程 …，在那边排队执行") describing something that did not happen.
-    if (message.messageId.startsWith(DISPATCH_MESSAGE_PREFIX)) {
-      const dispatchPrompt = await this.materializeInbound(message);
-      if (dispatchPrompt === null) return;
-      await this.acceptTask(message, dispatchPrompt);
-      return;
-    }
     if (await this.answerPendingQuestion(message, text)) return;
     const promptText = await this.materializeInbound(message);
     if (promptText === null) return;
@@ -3302,7 +3292,7 @@ class CoreService implements ChannelService {
     const managementTool: HostTool = {
       name: "octo_management",
       description:
-        "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；create-thread 可带 worktree_name 为线程建立独立 git worktree 并把线程目录绑定到它；thread-dispatch 把一条任务派发给本群的某个 thread（在那边排队执行，本群收到回执），派发出去的任务不能再派发。目标固定为当前聊天，不能指向其他群。",
+        "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；create-thread 可带 worktree_name 为线程建立独立 git worktree 并把线程目录绑定到它；thread-dispatch 把一条任务派发给本群的某个 thread，结果按该子区的追加模式处置——steer 且该子区有可接收 steering 的运行中回合时并入该回合（delivery=steered），否则在该子区作为独立任务执行（delivery=queued），两种情况本群都收到一条回执；派发出去的任务不能再派发。目标固定为当前聊天，不能指向其他群。",
       parameters: {
         type: "object",
         properties: {
@@ -3604,12 +3594,18 @@ class CoreService implements ChannelService {
     }
   }
   /**
-   * Hands one task to a thread of the current group through the durable inbound path: the thread
-   * shows the handoff, the task is accepted with the owner as sender (so it keeps dedup,
-   * queueing and question semantics), and the caller reports its own receipt. Depth is one - the
-   * dispatch tool is withheld from tasks that arrived this way.
+   * Hands one task to a thread of the current group: the thread shows the handoff, and the content
+   * is delivered the way the target thread handles anything arriving while its run is in flight -
+   * its own append mode (a steerable running turn takes it as steering, otherwise it becomes the
+   * thread's next durable task). A dispatch is a hand-over rather than the owner's reply, so it is
+   * never taken as the answer to an open question, and it keeps the synthetic `dispatch:` id with
+   * the owner as sender, so dedup and the depth guard hold. The caller reports which delivery
+   * happened. Depth is one: the dispatch tool is withheld from tasks that arrived this way.
    */
-  private async dispatchTaskToThread(thread: ThreadSummary, text: string): Promise<string> {
+  private async dispatchTaskToThread(
+    thread: ThreadSummary,
+    text: string,
+  ): Promise<{ messageId: string; delivery: "steered" | "queued" }> {
     const bot = this.bot;
     const ownerId = bot ? this.store.getOwnerId(bot.uid)?.trim() ?? "" : "";
     if (!bot || ownerId.length === 0) {
@@ -3618,7 +3614,7 @@ class CoreService implements ChannelService {
     const threadTarget: ChatTarget = { channelId: thread.channelId, channelType: 5 };
     this.enqueueText(threadTarget, `来自群会话的派发任务：\n\n${text}`, null);
     const messageId = `${DISPATCH_MESSAGE_PREFIX}${randomUUID()}`;
-    await this.handleInbound({
+    const message: InboundMessage = {
       channelId: threadTarget.channelId,
       channelType: 5,
       messageId,
@@ -3630,12 +3626,14 @@ class CoreService implements ChannelService {
       supported: true,
       messageSeq: 0,
       messageTimestamp: Date.now(),
-    });
-    return messageId;
+    };
+    if (await this.appendToRunningTask(message, text)) return { messageId, delivery: "steered" };
+    await this.acceptTask(message, text);
+    return { messageId, delivery: "queued" };
   }
   /**
    * The `thread-dispatch` tool: resolves the target thread, hands the task over, and reports the
-   * dispatch in the calling chat.
+   * delivery in the calling chat.
    */
   private async dispatchThreadTask(
     task: TaskRecord,
@@ -3649,10 +3647,17 @@ class CoreService implements ChannelService {
     if (thread.groupId.length > 0 && thread.groupId !== groupId) {
       throw new Error(`thread ${shortId} does not belong to the current group`);
     }
-    const messageId = await this.dispatchTaskToThread(thread, text);
-    this.enqueueText(target, `已派发任务到线程 ${shortId}（${thread.channelId}）。`, null);
+    const { messageId, delivery } = await this.dispatchTaskToThread(thread, text);
+    this.enqueueText(
+      target,
+      delivery === "steered"
+        ? `已把任务并入线程 ${shortId}（${thread.channelId}）的运行中回合。`
+        : `已在子区 ${shortId}（${thread.channelId}）作为独立任务执行。`,
+      null,
+    );
     return JSON.stringify({
       dispatched: true,
+      delivery,
       short_id: shortId,
       channel_id: thread.channelId,
       message_id: messageId,

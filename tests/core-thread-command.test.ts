@@ -112,7 +112,7 @@ test("the instructed task sets the sub-thread up with the agent's own names", as
     expect(
       harness.transport.sent.some(
         ({ target, text }) =>
-          target.channelId === group.channelId && text.includes("已派发任务到线程 thread-1"),
+          target.channelId === group.channelId && text.includes("已在子区 thread-1"),
       ),
     ).toBe(true);
     await waitForStatus(harness.service, thread, (status) => status.state === "completed");

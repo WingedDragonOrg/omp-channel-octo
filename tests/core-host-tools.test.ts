@@ -479,10 +479,10 @@ test("thread dispatch queues the task in the target thread and reports it in bot
             { action: "thread-dispatch", short_id: created.short_id, text: "检查部署状态" },
             signal,
           ),
-        ) as { dispatched: boolean; short_id: string; channel_id: string };
+        ) as { dispatched: boolean; delivery: string; short_id: string; channel_id: string };
         await append(
           "dispatch.log",
-          `group|${actions.includes("thread-dispatch")}|${dispatched.dispatched}|${dispatched.short_id}|${dispatched.channel_id}|${cwd}\n`,
+          `group|${actions.includes("thread-dispatch")}|${dispatched.dispatched}|${dispatched.delivery}|${dispatched.short_id}|${dispatched.channel_id}|${cwd}\n`,
         );
         return;
       }
@@ -518,16 +518,16 @@ test("thread dispatch queues the task in the target thread and reports it in bot
     );
 
     const lines = (await readText(join(cwd, "dispatch.log"))).trim().split("\n");
-    expect(lines[0]).toBe(`group|true|true|thread-1|${dispatchedChannelId}|${cwd}`);
+    expect(lines[0]).toBe(`group|true|true|queued|thread-1|${dispatchedChannelId}|${cwd}`);
     expect(lines[1]).toBe(`thread|false|检查部署状态|${cwd}`);
     expect(harness.workers.prompts[1]?.cwd).toBe(cwd);
     const handoff = harness.transport.sent.filter(
-      ({ text }) => text.startsWith("来自群会话的派发任务") || text.startsWith("已派发任务到线程"),
+      ({ text }) => text.startsWith("来自群会话的派发任务") || text.startsWith("已在子区 "),
     );
     expect(handoff.map(({ target, text }) => `${target.channelType}:${target.channelId}|${text}`))
       .toEqual([
         `5:${dispatchedChannelId}|来自群会话的派发任务：\n\n检查部署状态`,
-        `2:group-tools|已派发任务到线程 thread-1（${dispatchedChannelId}）。`,
+        `2:group-tools|已在子区 thread-1（${dispatchedChannelId}）作为独立任务执行。`,
       ]);
     expect(harness.transport.managementCalls).toEqual([
       { action: "create-thread", groupId: "group-tools", shortId: null },
@@ -538,7 +538,7 @@ test("thread dispatch queues the task in the target thread and reports it in bot
   }
 });
 
-test("a dispatch into a busy thread waits there as its own task", async () => {
+test("a dispatch into a queue-mode thread lands as its own task, never an answer", async () => {
   const threadStarted = Promise.withResolvers<void>();
   const threadRelease = Promise.withResolvers<void>();
   const harness = await createCoreHarness({
@@ -552,15 +552,15 @@ test("a dispatch into a busy thread waits there as its own task", async () => {
           { questions: [{ question: "先确认哪一批能力？" }] },
           new AbortController().signal,
         );
-        const appended = await Promise.race([
-          threadRelease.promise.then(() => ({ text: "closed" })),
-          asked.then(() => ({ text: "answered" })),
+        const settled = await Promise.race([
+          threadRelease.promise.then(() => "closed"),
+          asked.then(() => "answered"),
         ]);
-        await append("busy.log", `hold:${appended.text}\n`);
+        await append("queue-mode.log", `hold:${settled}\n`);
         await threadRelease.promise;
         return;
       }
-      await append("busy.log", `task:${text}\n`);
+      await append("queue-mode.log", `task:${text}\n`);
     },
   });
   try {
@@ -570,21 +570,23 @@ test("a dispatch into a busy thread waits there as its own task", async () => {
     await mkdir(threadCwd, { recursive: true });
     harness.transport.setThreads("group-tools", [threadRecord("topic-7")]);
     await harness.service.handleInbound(
-      inbound({ messageId: "busy-group-bind", ...GROUP_TOOLS, text: `/new ${groupCwd}`, mentionedUserIds: [harness.bot.uid] }),
+      inbound({ messageId: "queue-group-bind", ...GROUP_TOOLS, text: `/new ${groupCwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
     await harness.service.handleInbound(
-      inbound({ messageId: "busy-thread-bind", ...THREAD_TOOLS, text: `/new ${threadCwd}`, mentionedUserIds: [harness.bot.uid] }),
+      inbound({ messageId: "queue-thread-bind", ...THREAD_TOOLS, text: `/new ${threadCwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
     await harness.service.handleInbound(
-      inbound({ messageId: "busy-thread-hold", ...THREAD_TOOLS, text: "hold the thread", mentionedUserIds: [harness.bot.uid] }),
+      inbound({ messageId: "queue-thread-mode", ...THREAD_TOOLS, text: "/mode queue", mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.service.handleInbound(
+      inbound({ messageId: "queue-thread-hold", ...THREAD_TOOLS, text: "hold the thread", mentionedUserIds: [harness.bot.uid] }),
     );
     await threadStarted.promise;
     await harness.workers.waitForPromptCount(1);
-    // The thread is mid-turn with an open question, so its own dispatch must not disturb it.
     expect((await harness.service.status(THREAD_TOOLS)).pendingQuestionIds).toHaveLength(1);
 
     await harness.service.handleInbound(
-      inbound({ messageId: "busy-group-work", ...GROUP_TOOLS, text: "handoff into the busy topic", mentionedUserIds: [harness.bot.uid] }),
+      inbound({ messageId: "queue-group-work", ...GROUP_TOOLS, text: "handoff into the busy topic", mentionedUserIds: [harness.bot.uid] }),
     );
     await harness.workers.waitForPromptCount(2);
     const management = (harness.workers.prompts[1]?.promptContext?.tools ?? []).find(
@@ -596,11 +598,11 @@ test("a dispatch into a busy thread waits there as its own task", async () => {
         { action: "thread-dispatch", short_id: "topic-7", text: "第二件事" },
         new AbortController().signal,
       ),
-    ) as { dispatched: boolean; message_id: string };
+    ) as { dispatched: boolean; delivery: string; message_id: string };
 
-    // The hand-over is its own queued task in the target thread: the running turn keeps its open
-    // question (the dispatch is not an answer) and never receives the dispatch as steering.
+    // queue mode: its own task behind the run, and the open question stays the owner's to answer.
     expect(dispatched.dispatched).toBe(true);
+    expect(dispatched.delivery).toBe("queued");
     expect(dispatched.message_id.startsWith("dispatch:")).toBe(true);
     const threadStatus = await harness.service.status(THREAD_TOOLS);
     expect(threadStatus.pendingQuestionIds).toHaveLength(1);
@@ -609,9 +611,9 @@ test("a dispatch into a busy thread waits there as its own task", async () => {
       "hold the thread",
       "handoff into the busy topic",
     ]);
-    expect(await readText(join(threadCwd, "busy.log"))).toBe("");
+    expect(await readText(join(threadCwd, "queue-mode.log"))).toBe("");
     expect(
-      harness.transport.sent.some(({ text }) => text.includes("已派发任务到线程 topic-7")),
+      harness.transport.sent.some(({ text }) => text === "已在子区 topic-7（group-tools____topic-7）作为独立任务执行。"),
     ).toBe(true);
     expect(
       harness.transport.sent.some(({ text }) => text.startsWith("来自群会话的派发任务")),
@@ -622,7 +624,7 @@ test("a dispatch into a busy thread waits there as its own task", async () => {
   }
 });
 
-test("a dispatch into a running thread does not join that turn", async () => {
+test("a dispatch into a running thread joins that turn in steer mode", async () => {
   const threadStarted = Promise.withResolvers<void>();
   const threadRelease = Promise.withResolvers<void>();
   const harness = await createCoreHarness({
@@ -653,7 +655,7 @@ test("a dispatch into a running thread does not join that turn", async () => {
     await harness.service.handleInbound(
       inbound({ messageId: "steer-thread-bind", ...THREAD_TOOLS, text: `/new ${threadCwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    const held = harness.service.handleInbound(
       inbound({ messageId: "steer-thread-hold", ...THREAD_TOOLS, text: "hold the thread", mentionedUserIds: [harness.bot.uid] }),
     );
     await threadStarted.promise;
@@ -667,18 +669,27 @@ test("a dispatch into a running thread does not join that turn", async () => {
       ({ name }) => name === "octo_management",
     );
     if (!management) throw new Error("management tool missing");
-    await management.execute(
-      { action: "thread-dispatch", short_id: "topic-7", text: "第二件事" },
-      new AbortController().signal,
-    );
+    const dispatched = JSON.parse(
+      await management.execute(
+        { action: "thread-dispatch", short_id: "topic-7", text: "第二件事" },
+        new AbortController().signal,
+      ),
+    ) as { delivery: string };
 
-    // The dispatched work waits in the target thread instead of joining its running turn.
-    expect((await harness.service.status(THREAD_TOOLS)).queued).toBe(1);
+    // steer mode: the running turn takes it as steering, so no second task appears.
+    expect(dispatched.delivery).toBe("steered");
+    expect((await harness.service.status(THREAD_TOOLS)).queued).toBe(0);
+    expect(
+      harness.transport.sent.some(({ text }) => text === "已把任务并入线程 topic-7（group-tools____topic-7）的运行中回合。"),
+    ).toBe(true);
     threadRelease.resolve();
-    await harness.workers.waitForPromptCount(3);
+    await held;
     await waitForStatus(harness.service, THREAD_TOOLS, (status) => status.state === "completed");
-    expect(harness.workers.prompts[2]?.text).toBe("第二件事");
-    expect(await readText(join(threadCwd, "steer.log"))).toBe("closed\ntask:第二件事\n");
+    expect(harness.workers.prompts.map(({ text }) => text)).toEqual([
+      "hold the thread",
+      "handoff into the running topic",
+    ]);
+    expect(await readText(join(threadCwd, "steer.log"))).toBe("steered:第二件事\n");
   } finally {
     threadRelease.resolve();
     await closeCoreHarness(harness);
