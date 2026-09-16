@@ -221,7 +221,17 @@ const MAX_COMPACT_TOOL_ROWS = 8;
 /** Hidden-row budgets tried in order by the card fit search. */
 const HIDDEN_ROW_LIMITS = [MAX_COMPACT_TOOL_ROWS, 4, 2];
 const MAX_VISIBLE_TODO_TASKS = 96;
-const MAX_EXPANDED_TODO_TASKS = 4;
+/**
+ * Visible todo-band rungs tried after the execution trace has been compressed to its floor. The
+ * rungs step by a few rows each so the search stays cheap, and every rung still carries the
+ * handoff band; the final attempt keeps the hidden-task summary alone.
+ */
+const TODO_BAND_LADDER = [32, 24, 16, 12, 8, 6, 4, 2] as const;
+/**
+ * Expandable hidden todo rows. They are the omitted tasks closest to the handoff band, so this is
+ * how much context around the boundary the reader can still recover on a budget-trimmed card.
+ */
+const MAX_EXPANDED_TODO_TASKS = 6;
 const DEFAULT_MAX_NODES = 200;
 const DEFAULT_MAX_DEPTH = 16;
 const DEFAULT_MAX_PAYLOAD_BYTES = 512 * 1024;
@@ -637,6 +647,17 @@ function formatDuration(durationMs: number): string {
   return `${totalMinutes}m ${seconds}s`;
 }
 
+function padTwo(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+/** Local wall-clock label of a step; null when the snapshot carries no usable start time. */
+function clockLabel(atMs: number): string | null {
+  if (finiteTime(atMs) === null || atMs <= 0) return null;
+  const at = new Date(atMs);
+  return `${padTwo(at.getHours())}:${padTwo(at.getMinutes())}:${padTwo(at.getSeconds())}`;
+}
+
 function executionStateLabel(state: ExecutionState): string {
   switch (state) {
     case "running":
@@ -771,8 +792,14 @@ function errorCategoryLabel(category: ExecutionErrorCategory): string {
   }
 }
 
-function toolLine(tool: ExecutionToolSnapshot, includeGlyph = false): string {
-  const parts = includeGlyph ? [toolStateGlyph(tool), displayToolName(tool.toolName)] : [displayToolName(tool.toolName)];
+function toolLine(tool: ExecutionToolSnapshot, includeGlyph = false, includeTime = false): string {
+  const parts: string[] = [];
+  if (includeGlyph) parts.push(toolStateGlyph(tool));
+  if (includeTime) {
+    const started = clockLabel(tool.startedAtMs);
+    if (started !== null) parts.push(started);
+  }
+  parts.push(displayToolName(tool.toolName));
   if (tool.summary) parts.push(tool.summary);
   parts.push(toolStatusLabel(tool));
   if (tool.state === "failed" && tool.errorCategory) parts.push(errorCategoryLabel(tool.errorCategory));
@@ -781,47 +808,24 @@ function toolLine(tool: ExecutionToolSnapshot, includeGlyph = false): string {
 }
 
 function markdownSafeToolLine(tool: ExecutionToolSnapshot): string {
-  const line = toolLine(tool, true);
+  const line = toolLine(tool, true, true);
   const glyph = toolStateGlyph(tool);
   if (glyph !== WAITING_GLYPH || !line.startsWith(`${glyph} `)) return line;
   return `${glyph}\u00a0${line.slice(glyph.length + 1)}`;
 }
 
-// Shared by budget-pruned trace and subagent rows. Both groups render as the same grey
-// emphasis band as the panel rows, so these rows keep the plain two-column grid.
+// Shared by budget-pruned trace and subagent rows. These rows are the compact tier: one text
+// line each, which is what keeps the hidden-row budget affordable next to the visible panels.
 function makeCompactToolRow(
   tool: ExecutionToolSnapshot,
   options: { readonly id?: string; readonly isVisible?: boolean } = {},
 ): JsonNode {
-  const tone = toolVisualTone(tool);
-  return {
-    type: "ColumnSet",
+  return makeTextBlock(`${toolStateGlyph(tool)}\u00a0· ${toolLine(tool)}`, {
+    color: toolVisualTone(tool),
+    spacing: "Small",
     ...(options.id === undefined ? {} : { id: options.id }),
     ...(options.isVisible === undefined ? {} : { isVisible: options.isVisible }),
-    spacing: "Small",
-    columns: [
-      {
-        type: "Column",
-        width: "auto",
-        verticalContentAlignment: "Center",
-        items: [makeTextBlock(`${toolStateGlyph(tool)}\u00a0`, {
-          color: tone,
-          fontType: "Monospace",
-          size: "Small",
-          spacing: "None",
-        })],
-      },
-      {
-        type: "Column",
-        width: "stretch",
-        verticalContentAlignment: "Center",
-        items: [makeTextBlock(`· ${toolLine(tool)}`, {
-          color: tone,
-          spacing: "None",
-        })],
-      },
-    ],
-  };
+  });
 }
 
 function todoPhaseText(phase: ExecutionTodoPhase, phaseIndex: number, phaseCount: number): string {
@@ -957,11 +961,11 @@ function makeTodoItems(
   allTodos: readonly ExecutionTodoPhase[],
   todos: readonly ExecutionTodoPhase[],
   omittedTodos: readonly ExecutionTodoPhase[],
+  omittedRowIds: ReadonlySet<string>,
   hiddenCount: number,
   totalCount: number,
   structuredLayout: boolean,
   richTextSupported: boolean,
-  omittedRowLimit: number,
 ): JsonNode[] {
   const items: JsonNode[] = [];
   if (hiddenCount > 0) {
@@ -976,14 +980,18 @@ function makeTodoItems(
     readonly sourceIndex: number;
     readonly phase: ExecutionTodoPhase;
     readonly visibleTasks: ReadonlySet<ExecutionTodoTask>;
-    readonly omittedTasks: ReadonlySet<ExecutionTodoTask>;
   }> = [];
   for (let sourceIndex = 0; sourceIndex < allTodos.length; sourceIndex += 1) {
     const phase = allTodos[sourceIndex]!;
     const visibleTasks = new Set(todos[sourceIndex]?.tasks ?? []);
-    const omittedTasks = new Set(omittedTodos[sourceIndex]?.tasks ?? []);
-    if (!phase.tasks.some(task => visibleTasks.has(task) || (structuredLayout && omittedTasks.has(task)))) continue;
-    phaseEntries.push({ sourceIndex, phase, visibleTasks, omittedTasks });
+    // A phase row with nothing under it is noise: keep the phase only when it actually renders a
+    // visible task or a hidden row the reader can expand.
+    const hasRenderedTask = phase.tasks.some((_task, taskIndex) => (
+      visibleTasks.has(phase.tasks[taskIndex]!)
+      || (structuredLayout && omittedRowIds.has(`todo_omitted_task_${sourceIndex}_${taskIndex}`))
+    ));
+    if (!hasRenderedTask) continue;
+    phaseEntries.push({ sourceIndex, phase, visibleTasks });
   }
 
   let renderedOmittedCount = 0;
@@ -1006,25 +1014,23 @@ function makeTodoItems(
             todoTaskText(task, phaseIndex, phaseEntries.length, taskIndex, entry.phase.tasks.length),
             { color: todoTone(task.status), spacing: "None" },
           ));
-      } else if (
-        structuredLayout
-        && entry.omittedTasks.has(task)
-        && renderedOmittedCount < omittedRowLimit
-      ) {
-        phaseItems.push(makeTodoTaskRow(
-          task,
-          phaseIndex,
-          phaseEntries.length,
-          taskIndex,
-          entry.phase.tasks.length,
-          richTextSupported,
-          {
-            id: `todo_omitted_task_${entry.sourceIndex}_${taskIndex}`,
-            isVisible: false,
-          },
-        ));
-        renderedOmittedCount += 1;
+        continue;
       }
+      const omittedId = `todo_omitted_task_${entry.sourceIndex}_${taskIndex}`;
+      if (!structuredLayout || !omittedRowIds.has(omittedId)) continue;
+      phaseItems.push(makeTodoTaskRow(
+        task,
+        phaseIndex,
+        phaseEntries.length,
+        taskIndex,
+        entry.phase.tasks.length,
+        richTextSupported,
+        {
+          id: omittedId,
+          isVisible: false,
+        },
+      ));
+      renderedOmittedCount += 1;
     }
     items.push({
       type: "Container",
@@ -1043,24 +1049,37 @@ function makeTodoItems(
   return items;
 }
 
+/**
+ * Ids of the hidden rows the expand control restores: the omitted tasks closest to the handoff
+ * anchor, so expanding grows the readable band outward instead of jumping to the list's ends.
+ */
 function todoOmittedTaskIds(
   allTodos: readonly ExecutionTodoPhase[],
   omittedTodos: readonly ExecutionTodoPhase[],
-  limit: number = MAX_EXPANDED_TODO_TASKS,
+  limit: number,
 ): string[] {
-  const ids: string[] = [];
-  let renderedCount = 0;
+  const anchor = handoffAnchorIndex(allTodos);
+  const candidates: Array<{ readonly id: string; readonly index: number; readonly distance: number }> = [];
+  let flatIndex = 0;
   for (let sourceIndex = 0; sourceIndex < allTodos.length; sourceIndex += 1) {
     const phase = allTodos[sourceIndex]!;
     const omittedTasks = new Set(omittedTodos[sourceIndex]?.tasks ?? []);
     for (let taskIndex = 0; taskIndex < phase.tasks.length; taskIndex += 1) {
+      const index = flatIndex;
+      flatIndex += 1;
       if (!omittedTasks.has(phase.tasks[taskIndex]!)) continue;
-      if (renderedCount >= limit) return ids;
-      ids.push(`todo_omitted_task_${sourceIndex}_${taskIndex}`);
-      renderedCount += 1;
+      candidates.push({
+        id: `todo_omitted_task_${sourceIndex}_${taskIndex}`,
+        index,
+        distance: anchor < 0 ? index : Math.abs(index - anchor),
+      });
     }
   }
-  return ids;
+  candidates.sort((left, right) => left.distance - right.distance || left.index - right.index);
+  return candidates
+    .slice(0, Math.max(0, Math.floor(limit)))
+    .sort((left, right) => left.index - right.index)
+    .map(candidate => candidate.id);
 }
 
 function makeTextBlock(text: string, options: JsonNode = {}): JsonNode {
@@ -1084,7 +1103,10 @@ function makeToolRow(
         makeTextBlock(tool.summary, { weight: "Bolder", spacing: "None" }),
         makeTextBlock(displayName, { isSubtle: true, size: "Small", spacing: "None" }),
       ];
-  const statusParts = [toolStatusLabel(tool)];
+  const statusParts: string[] = [];
+  const started = clockLabel(tool.startedAtMs);
+  if (started !== null) statusParts.push(started);
+  statusParts.push(toolStatusLabel(tool));
   if (tool.state === "failed" && tool.errorCategory) statusParts.push(errorCategoryLabel(tool.errorCategory));
   if (tool.durationMs !== null) statusParts.push(formatDuration(tool.durationMs));
   const glyph = toolStateGlyph(tool);
@@ -1203,7 +1225,7 @@ function makeTodoContainer(
   richTextSupported: boolean,
   omittedTodos: readonly ExecutionTodoPhase[] = [],
   actionSets: readonly JsonNode[] = [],
-  omittedRowLimit: number = MAX_EXPANDED_TODO_TASKS,
+  omittedRowIds: ReadonlySet<string> = new Set<string>(),
 ): JsonNode | null {
   if (!allTodos.some(phase => phase.tasks.length > 0)) return null;
   const heading = structuredLayout && actionSets.length > 0
@@ -1220,11 +1242,11 @@ function makeTodoContainer(
         allTodos,
         todos,
         omittedTodos,
+        omittedRowIds,
         hiddenCount,
         totalCount,
         structuredLayout,
         richTextSupported,
-        omittedRowLimit,
       ),
     ],
   };
@@ -1528,7 +1550,9 @@ function cardStats(value: unknown, depth = 0): CardStats {
   return { nodes, maxDepth };
 }
 
-function wirePayloadBytes(card: AdaptiveCard, plain: string): number {
+function cardWithinLimits(card: AdaptiveCard, plain: string, limits: ResolvedCardLimits): boolean {
+  // The deployment measures the wire envelope, not the bare card, so the fit search must count
+  // the frame wrapper too — a candidate one node over the card budget would never be sent.
   const envelope = {
     type: 17,
     profile: "octo/v1",
@@ -1536,14 +1560,10 @@ function wirePayloadBytes(card: AdaptiveCard, plain: string): number {
     card,
     plain,
   };
-  return new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
-}
-
-function cardWithinLimits(card: AdaptiveCard, plain: string, limits: ResolvedCardLimits): boolean {
-  const stats = cardStats(card);
+  const stats = cardStats(envelope);
   return stats.nodes <= limits.maxNodes
     && stats.maxDepth <= limits.maxDepth
-    && wirePayloadBytes(card, plain) <= limits.maxPayloadBytes;
+    && new TextEncoder().encode(JSON.stringify(envelope)).byteLength <= limits.maxPayloadBytes;
 }
 
 function makeHeader(richLayout: boolean, actionSets: readonly JsonNode[] = []): JsonNode[] {
@@ -1839,7 +1859,7 @@ function buildCandidate(
       richTextSupported,
       expandableOmittedTodos,
       todoToggleSets,
-      todoRowLimit,
+      new Set(todoHiddenIds),
     )
     : null;
   const terminal = snapshot.state !== "running";
@@ -1948,6 +1968,25 @@ function buildCandidate(
   return { card, plain: plainLines.join("\n") };
 }
 
+/**
+ * Index (in source order across phases) of the task the run stands on: the first in-progress task,
+ * else the first still-open task, else the tail of a settled list. The visible band grows outward
+ * from here, so the completed ↔ open boundary survives a budget trim.
+ */
+function handoffAnchorIndex(todos: readonly ExecutionTodoPhase[]): number {
+  let openIndex = -1;
+  let index = 0;
+  for (const phase of todos) {
+    for (const task of phase.tasks) {
+      if (task.status === "in_progress") return index;
+      if (openIndex < 0 && (task.status === "blocked" || task.status === "pending")) openIndex = index;
+      index += 1;
+    }
+  }
+  if (index === 0) return -1;
+  return openIndex >= 0 ? openIndex : index - 1;
+}
+
 function trimTodos(
   todos: readonly ExecutionTodoPhase[],
   maximumTasks: number,
@@ -1982,15 +2021,21 @@ function trimTodos(
     selectedCount += 1;
   };
 
-  // Keep active work and blockers before filling the remaining budget with
-  // recent context, then older context. Re-sort by source index below so the
-  // card always preserves the todo's original relative order.
+  // The card is read where the run currently stands. Pin active work and blockers, then grow a
+  // window outward from the handoff anchor — completed side first — so the boundary between done
+  // and open work and its neighbours stay readable instead of the middle being punched out.
+  // Re-sort by source index below so the card always preserves the todo's original order.
   for (let refIndex = 0; refIndex < taskRefs.length && selectedCount < target; refIndex += 1) {
     const status = taskRefs[refIndex]!.task.status;
     if (status === "in_progress" || status === "blocked") select(refIndex);
   }
-  for (let refIndex = taskRefs.length - 1; refIndex >= 0 && selectedCount < target; refIndex -= 1) {
-    select(refIndex);
+  const anchor = handoffAnchorIndex(todos);
+  if (anchor >= 0) {
+    select(anchor);
+    for (let distance = 1; distance <= taskRefs.length && selectedCount < target; distance += 1) {
+      select(anchor - distance);
+      select(anchor + distance);
+    }
   }
   for (let refIndex = 0; refIndex < taskRefs.length && selectedCount < target; refIndex += 1) {
     select(refIndex);
@@ -2024,35 +2069,49 @@ export function buildExecutionCard(
   if (!limits) return null;
   const totalTools = snapshot.tools.length;
   const totalTodoTasks = snapshot.todos.reduce((count, phase) => count + phase.tasks.length, 0);
-  let visibleToolCount = Math.min(totalTools, MAX_RENDERED_TOOLS);
-  let visibleTodoCount = Math.min(totalTodoTasks, MAX_VISIBLE_TODO_TASKS);
-  while (visibleToolCount >= 0 && visibleTodoCount >= 0) {
-    const visibleTools = snapshot.tools.slice(Math.max(0, totalTools - visibleToolCount));
+
+  const attempt = (
+    visibleTodoCount: number,
+    visibleToolCounts: readonly number[],
+  ): ExecutionCardResult | null => {
     const trimmedTodos = trimTodos(snapshot.todos, visibleTodoCount);
-    // Visible content wins over expandable hidden rows: keep this much detail and
-    // shrink the hidden-row budget until the card fits.
-    for (const hiddenRowLimit of HIDDEN_ROW_LIMITS) {
-      const candidate = buildCandidate(
-        snapshot,
-        capabilities,
-        visibleTools,
-        trimmedTodos.visible,
-        trimmedTodos.omitted,
-        totalTodoTasks,
-        hiddenRowLimit,
-      );
-      if (cardWithinLimits(candidate.card, candidate.plain, limits)) return candidate;
+    for (const visibleToolCount of visibleToolCounts) {
+      const visibleTools = snapshot.tools.slice(Math.max(0, totalTools - visibleToolCount));
+      // Visible content wins over expandable hidden rows: keep this much detail and shrink the
+      // hidden-row budget until the card fits.
+      for (const hiddenRowLimit of HIDDEN_ROW_LIMITS) {
+        const candidate = buildCandidate(
+          snapshot,
+          capabilities,
+          visibleTools,
+          trimmedTodos.visible,
+          trimmedTodos.omitted,
+          totalTodoTasks,
+          hiddenRowLimit,
+        );
+        if (cardWithinLimits(candidate.card, candidate.plain, limits)) return candidate;
+      }
     }
-    // Keep execution activity visible; reduce the less volatile todo detail first.
-    if (visibleTodoCount > 0) {
-      visibleTodoCount -= 1;
-      continue;
-    }
-    if (visibleToolCount > 0) {
-      visibleToolCount -= 1;
-      continue;
-    }
-    break;
+    return null;
+  };
+
+  // The todo list is the run's contract; the trace is a rolling log whose older rows the reader
+  // can still expand. The trace therefore yields first: shed tool rows and hidden-row budget while
+  // the todo list stays whole, and only shrink the visible band once the trace is at its floor.
+  const maximumVisibleTodos = Math.min(totalTodoTasks, MAX_VISIBLE_TODO_TASKS);
+  const toolCounts: number[] = [];
+  for (let count = Math.min(totalTools, MAX_RENDERED_TOOLS); count >= 0; count -= 1) {
+    toolCounts.push(count);
   }
-  return null;
+  const wholeList = attempt(maximumVisibleTodos, toolCounts);
+  if (wholeList) return wholeList;
+
+  // Largest readable band first, keeping room for the newest steps while they still fit.
+  const floorToolCounts = [...new Set([Math.min(totalTools, MAX_VISIBLE_TOOLS), 0])];
+  for (const band of TODO_BAND_LADDER) {
+    if (band >= maximumVisibleTodos) continue;
+    const candidate = attempt(band, floorToolCounts);
+    if (candidate) return candidate;
+  }
+  return attempt(0, floorToolCounts);
 }

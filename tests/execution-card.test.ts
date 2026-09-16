@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import {
   buildExecutionCard,
   createExecutionTracker,
+  encodeExecutionSnapshot,
+  restoreExecutionSnapshot,
   type ExecutionCardCapabilities,
   type ExecutionEvent,
   type ExecutionSnapshot,
@@ -60,6 +62,22 @@ function nodeById(card: JsonRecord, id: string): JsonRecord {
   const node = nodes(card).find(candidate => candidate.id === id);
   if (!node) throw new Error(`card node ${id} was not rendered`);
   return node;
+}
+
+/** Labels of the todo rows the reader actually sees, in card order. */
+function visibleTodoTaskLabels(card: JsonRecord): string[] {
+  const todoDetail = nodes(card).find(node => node.id === "todo_detail");
+  if (!todoDetail) return [];
+  const labels: string[] = [];
+  for (const row of nodes(todoDetail)) {
+    if (row.type !== "ColumnSet" || row.isVisible === false) continue;
+    const columns = row.columns as JsonRecord[] | undefined;
+    if (columns?.[0]?.width !== "80px") continue;
+    const body = (columns[1]?.items as JsonRecord[] | undefined)?.[0];
+    const text = typeof body?.text === "string" ? body.text : cardText(body ?? {});
+    labels.push(text);
+  }
+  return labels;
 }
 
 function toggleActionById(card: JsonRecord, id: string): JsonRecord {
@@ -128,6 +146,13 @@ function startTool(
     ...(summary === undefined ? {} : { summary }),
   };
   tracker.apply(event);
+}
+
+function clockAt(atMs: number): string {
+  const at = new Date(atMs);
+  return [at.getHours(), at.getMinutes(), at.getSeconds()]
+    .map(part => String(part).padStart(2, "0"))
+    .join(":");
 }
 
 describe("execution tracker", () => {
@@ -578,9 +603,14 @@ describe("execution card rendering", () => {
     expect(rendered).not.toBeNull();
     const card = rendered!.card as JsonRecord;
     const timeline = nodeById(card, "timeline_detail");
-    const rows = (timeline.items as JsonRecord[]).filter(item => item.type === "ColumnSet");
-    expect(rows).toHaveLength(4);
-    expect(rows.every(row => row.isVisible !== false)).toBe(true);
+    const items = timeline.items as JsonRecord[];
+    const richRows = items.filter(item => item.type === "ColumnSet");
+    const compactRows = items.filter(item => (
+      item.type === "TextBlock" && typeof item.text === "string" && item.text.includes("轨迹步骤 1")
+    ));
+    expect(richRows).toHaveLength(3);
+    expect(compactRows).toHaveLength(1);
+    expect(compactRows.every(row => row.isVisible !== false)).toBe(true);
     expect(cardText(timeline)).toContain("轨迹步骤 1");
     expect(cardText(timeline)).toContain("轨迹步骤 4");
     expect(nodes(card).some(node => node.id === "btn_expand_trace")).toBe(false);
@@ -608,30 +638,19 @@ describe("execution card rendering", () => {
     const traceRow = (omittedTrace.items as JsonRecord[])[0]!;
     const subagentRow = (omittedSubagents.items as JsonRecord[])[0]!;
 
-    // Both history groups render as the same grey emphasis band as the panel rows above them.
+    // Both history groups render as the same grey emphasis band as the panel rows above them, as
+    // one compact text line per step so hidden rows stay affordable next to user-visible content.
     expect(omittedTrace).toMatchObject({ type: "Container", style: "emphasis", spacing: "Small" });
     expect(omittedSubagents).toMatchObject({ type: "Container", style: "emphasis", spacing: "Small" });
 
     for (const row of [traceRow, subagentRow]) {
-      expect(row).toMatchObject({ type: "ColumnSet", spacing: "Small" });
-      const columns = row.columns as JsonRecord[];
-      expect(columns).toHaveLength(2);
-      expect(columns[0]).toMatchObject({ width: "auto", verticalContentAlignment: "Center" });
-      expect(columns[1]).toMatchObject({ width: "stretch", verticalContentAlignment: "Center" });
-      expect((columns[0]?.items as JsonRecord[])[0]).toMatchObject({
-        type: "TextBlock",
-        fontType: "Monospace",
-        size: "Small",
-        spacing: "None",
-      });
-      expect((columns[1]?.items as JsonRecord[])[0]).toMatchObject({
-        type: "TextBlock",
-        spacing: "None",
-      });
+      expect(row).toMatchObject({ type: "TextBlock", wrap: true, spacing: "Small" });
+      expect(row.text).toMatch(/^[✓×•-]\u00a0· /u);
     }
-
-    const subagentMarker = ((subagentRow.columns as JsonRecord[])[0]?.items as JsonRecord[])[0]!;
-    expect(subagentMarker).toMatchObject({ text: "✓\u00a0", color: "Good" });
+    expect(subagentRow).toMatchObject({
+      color: "Good",
+      text: "✓\u00a0· 运行子代理 · 子代理 · verifier · 已完成 · 1ms",
+    });
     expect(cardText(subagentRow)).toContain("子代理 · verifier");
   });
 
@@ -687,11 +706,13 @@ describe("execution card rendering", () => {
     expect(rendered).not.toBeNull();
     const card = rendered!.card as JsonRecord;
     expect(nodes(card).find(node => node.text === "-")).toMatchObject({ color: "Default" });
-    expect(nodes(card).some(node => node.text === "- 等待子代理 · verifier")).toBe(false);
+    expect(cardText(card)).not.toContain("- 等待子代理 · verifier");
 
     const flat = buildExecutionCard(snapshot, { ...fullCapabilities, elements: ["TextBlock"] });
     expect(flat).not.toBeNull();
-    expect(cardText(flat!.card as JsonRecord)).toContain("-\u00a0· 等待子代理 ·");
+    const flatText = cardText(flat!.card as JsonRecord);
+    expect(flatText).toContain(`-\u00a0· ${clockAt(900)} · 等待子代理`);
+    expect(flatText).toContain("等待 · 900ms");
   });
 
   test("keeps subagent activity visible without ToggleVisibility support", () => {
@@ -778,7 +799,7 @@ describe("execution card rendering", () => {
       expect.objectContaining({ text: "写入文件", weight: "Bolder", spacing: "None" }),
       expect.objectContaining({ text: "generate_image", isSubtle: true, size: "Small", spacing: "None" }),
       expect.objectContaining({
-        text: "进行中 · 35.2s",
+        text: `${clockAt(1_000)} · 进行中 · 35.2s`,
         isSubtle: true,
         size: "Small",
         spacing: "None",
@@ -813,10 +834,29 @@ describe("execution card rendering", () => {
     expect((rowColumns[1]?.items as JsonRecord[]).map(item => item.text)).toEqual([
       "IRC → preview-agent · 未收到回复",
       "IRC 协作",
-      "失败 · 执行器错误 · 140ms",
+      `${clockAt(1_000)} · 失败 · 执行器错误 · 140ms`,
     ]);
   });
 
+  test("keeps stored step times in the terminal card replayed after a restart", () => {
+    const tracker = createExecutionTracker({ runId: "restart-replay", initialAtMs: 1_000 });
+    startTurn(tracker, "turn-1", 1_000);
+    startTool(tracker, "read", "read", 1_200, "读取配置");
+    tracker.apply({ type: "tool_end", toolCallId: "read", atMs: 1_400, status: "succeeded" });
+
+    const restored = restoreExecutionSnapshot(encodeExecutionSnapshot(tracker.snapshot(1_500)), {
+      state: "cancelled",
+      atMs: 900_000,
+    });
+    expect(restored).not.toBeNull();
+    const rendered = buildExecutionCard(restored!, fullCapabilities);
+    expect(rendered).not.toBeNull();
+    const status = nodes(rendered!.card as JsonRecord).find(node => (
+      typeof node.text === "string"
+      && node.text.startsWith(`${clockAt(1_200)} · 已完成 · `)
+    ));
+    expect(status).toBeDefined();
+  });
   test("keeps todos visible while older execution details expand", () => {
     const tracker = createExecutionTracker({ runId: "fold" });
     startTurn(tracker, "turn-1", 0);
@@ -839,9 +879,15 @@ describe("execution card rendering", () => {
     const timeline = nodeById(card, "timeline_detail");
     const todos = nodeById(card, "todo_detail");
     expect(timeline.isVisible).toBe(true);
-    const timelineRows = (timeline.items as JsonRecord[]).filter(item => item.type === "ColumnSet");
-    expect(timelineRows.filter(row => row.isVisible !== false)).toHaveLength(3);
-    expect(timelineRows.filter(row => row.isVisible === false)).toHaveLength(1);
+    const timelineItems = timeline.items as JsonRecord[];
+    const richRows = timelineItems.filter(item => item.type === "ColumnSet");
+    const olderRows = timelineItems.filter(item => (
+      item.type === "TextBlock" && item.id === "timeline_older_step_0"
+    ));
+    expect(richRows).toHaveLength(3);
+    expect(richRows.every(row => row.isVisible !== false)).toBe(true);
+    expect(olderRows).toHaveLength(1);
+    expect(olderRows[0]).toMatchObject({ isVisible: false, wrap: true });
     expect(todos.isVisible).not.toBe(false);
     expect(cardText(todos)).toContain("Keep this visible");
     expect(nodes(card).some(node => node.id === "collapsed_steps")).toBe(false);
@@ -1117,7 +1163,7 @@ describe("execution card rendering", () => {
     const waitingGlyph = waitingNodes.find(node => node.text === "-" && node.color === "Default");
     expect(waitingGlyph).toBeDefined();
     const waitingStatus = nodes(waitingRow!).find(node => (
-      typeof node.text === "string" && node.text.startsWith("等待 · ")
+      typeof node.text === "string" && node.text.startsWith(`${clockAt(1)} · 等待 · `)
     ));
     expect(waitingStatus).toMatchObject({ color: "Default" });
 
@@ -1213,13 +1259,18 @@ describe("execution card rendering", () => {
     expect(timeline.isVisible).toBe(true);
     const timelineItems = timeline.items as JsonRecord[];
     const visibleRows = timelineItems.filter(item => item.type === "ColumnSet" && item.isVisible !== false);
-    const hiddenRows = timelineItems.filter(item => item.type === "ColumnSet" && item.isVisible === false);
+    const olderRows = timelineItems.filter(item => (
+      item.type === "TextBlock"
+      && typeof item.id === "string"
+      && item.id.startsWith("timeline_older_step_")
+    ));
     expect(visibleRows).toHaveLength(3);
-    expect(hiddenRows).toHaveLength(4);
+    expect(olderRows).toHaveLength(4);
+    expect(olderRows.every(row => row.isVisible === false)).toBe(true);
     expect(nodeById(card, "timeline_hidden_summary").isVisible).not.toBe(false);
 
     const visibleText = visibleRows.map(row => cardText(row)).join("\n");
-    const hiddenText = hiddenRows.map(row => cardText(row)).join("\n");
+    const hiddenText = olderRows.map(row => cardText(row)).join("\n");
     expect(visibleText).not.toContain("步骤 0");
     expect(visibleText).not.toContain("步骤 1");
     expect(visibleText).not.toContain("步骤 2");
@@ -1258,17 +1309,21 @@ describe("execution card rendering", () => {
     expect(rendered).not.toBeNull();
     const card = rendered!.card as JsonRecord;
     const timeline = nodeById(card, "timeline_detail");
-    const rows = (timeline.items as JsonRecord[]).filter(item => item.type === "ColumnSet");
-    const visibleRows = rows.filter(row => row.isVisible !== false);
-    const hiddenRows = rows.filter(row => row.isVisible === false);
+    const items = timeline.items as JsonRecord[];
+    const visibleRows = items.filter(item => item.type === "ColumnSet");
+    const olderRows = items.filter(item => (
+      item.type === "TextBlock"
+      && typeof item.id === "string"
+      && item.id.startsWith("timeline_older_step_")
+    ));
     expect(visibleRows).toHaveLength(3);
-    expect(hiddenRows).toHaveLength(1);
+    expect(visibleRows.every(row => row.isVisible !== false)).toBe(true);
     expect(nodes(visibleRows[0]!).some(node => node.type === "Container" && node.style === "good")).toBe(true);
-    expect(hiddenRows[0]).toMatchObject({ type: "ColumnSet", spacing: "Small" });
-    expect((hiddenRows[0]!.columns as JsonRecord[]).map(column => column.width)).toEqual(["auto", "stretch"]);
-    expect(cardText(hiddenRows[0]!)).toContain("步骤 0");
+    expect(olderRows).toHaveLength(1);
+    expect(olderRows[0]).toMatchObject({ type: "TextBlock", isVisible: false, wrap: true });
+    expect(cardText(olderRows[0]!)).toContain("步骤 0");
   });
-  test("prioritizes Todo and active subagents within the card budget", () => {
+  test("keeps the todo list whole and trims the execution trace first", () => {
     const tracker = createExecutionTracker({ runId: "trace-budget-toggle" });
     startTurn(tracker, "turn-1", 0);
     startTool(tracker, "read", "read", 100, "读取项目结构");
@@ -1330,6 +1385,24 @@ describe("execution card rendering", () => {
     const rendered = buildExecutionCard(tracker.snapshot(1_800), fullCapabilities);
     expect(rendered).not.toBeNull();
     const card = rendered!.card as JsonRecord;
+    // The todo list is the run's contract: at the default budget every task stays visible.
+    const todoDetail = nodeById(card, "todo_detail");
+    expect(cardText(todoDetail)).not.toContain("已隐藏");
+    expect(visibleTodoTaskLabels(card)).toEqual([
+      "读取项目配置",
+      "确认卡片能力",
+      "清理旧预览数据",
+      "启动子代理检查",
+      "汇总混合工具样式",
+      "等待授权后继续 · 等待用户确认",
+      "验证成功状态",
+      "验证等待状态",
+      "验证失败状态",
+      "发送真实预览",
+      "确认移动端布局",
+      "记录验收结果",
+    ]);
+    // The trace is the budget donor: its older rows fold into the grey history band.
     const subagentDetail = nodeById(card, "subagent_detail");
     expect(cardText(subagentDetail)).toContain("已隐藏 2 个子代理，共 3 个子代理");
     expect(cardText(subagentDetail)).toContain("等待子代理 · verifier");
@@ -1339,8 +1412,10 @@ describe("execution card rendering", () => {
     const timelineSection = nodeById(card, "timeline_section");
     const timelineHeader = (timelineSection.items as JsonRecord[])[0]!;
     expect(nodes(timelineHeader).some(node => node.id === "btn_expand_trace")).toBe(true);
-    // Budget just above the smallest viable running card: the subagent section
-    // survives while trace rows are dropped first.
+    const timeline = nodeById(card, "timeline_detail");
+    expect(cardText(timeline)).toContain("已隐藏前");
+
+    // Under a tighter budget the trace sheds another row rather than the todo list.
     const fullyBudgeted = buildExecutionCard(
       tracker.snapshot(1_800),
       {
@@ -1350,24 +1425,11 @@ describe("execution card rendering", () => {
     );
     expect(fullyBudgeted).not.toBeNull();
     const fullyBudgetedCard = fullyBudgeted!.card as JsonRecord;
-    expect(nodes(fullyBudgetedCard).some(node => node.id === "subagent_section")).toBe(true);
-    const fullyBudgetedSubagents = nodeById(fullyBudgetedCard, "subagent_detail");
-    const fullyBudgetedRows = (fullyBudgetedSubagents.items as JsonRecord[]).filter(
-      item => item.type === "ColumnSet",
-    );
-    expect(fullyBudgetedRows).toHaveLength(1);
-    expect(fullyBudgetedRows.every(row => row.isVisible !== false)).toBe(true);
-    expect(nodes(fullyBudgetedCard).some(node => node.id === "btn_expand_subagents")).toBe(true);
-    const budgetedTimeline = nodeById(fullyBudgetedCard, "timeline_detail");
-    const budgetedTraceRows = (budgetedTimeline.items as JsonRecord[]).filter(item => item.type === "ColumnSet");
-    // A tight budget keeps recent trace steps visible and hides older ones
-    // behind the expand control instead of dropping trace detail entirely.
-    expect(budgetedTraceRows.length).toBeGreaterThan(0);
-    expect(budgetedTraceRows.filter(row => row.isVisible !== false).length).toBeLessThanOrEqual(3);
-    expect(budgetedTraceRows.some(row => row.isVisible === false)).toBe(true);
+    expect(visibleTodoTaskLabels(fullyBudgetedCard)).toHaveLength(12);
     expect(nodes(fullyBudgetedCard).some(node => node.id === "btn_expand_trace")).toBe(true);
+    expect(nodes(fullyBudgetedCard).some(node => node.id === "btn_expand_subagents")).toBe(true);
   });
-  test("prioritizes current and blocked todo tasks while preserving order and reporting omissions", () => {
+  test("centres the visible todo band on the handoff instead of the list ends", () => {
     const tracker = createExecutionTracker({ runId: "todo-budget" });
     startTurn(tracker, "turn-1", 0);
     const tasks = Array.from({ length: 110 }, (_unused, index) => ({
@@ -1394,19 +1456,148 @@ describe("execution card rendering", () => {
     });
 
     expect(rendered).not.toBeNull();
-    const text = cardText(rendered!.card as JsonRecord);
-    expect(text).toContain("task-0");
-    expect(text).toContain("task-55");
-    expect(text).toContain("task-109");
-    expect(text).toContain("等待外部依赖");
-    expect(text.indexOf("task-0")).toBeLessThan(text.indexOf("task-55"));
-    expect(text.indexOf("task-55")).toBeLessThan(text.indexOf("task-109"));
+    const card = rendered!.card as JsonRecord;
+    const labels = visibleTodoTaskLabels(card);
+    // The band starts on the in-progress task and runs contiguously through the open tasks, so the
+    // completed ↔ open boundary reads top-down instead of the middle being punched out.
+    expect(labels.slice(0, 4)).toEqual(["task-0", "task-1", "task-2", "task-3"]);
+    expect(labels.length).toBeGreaterThan(8);
+    expect(labels.length).toBeLessThan(110);
+    // A blocked task is pinned wherever it sits, so waiting work never disappears.
+    expect(labels).toContain("task-55 · 等待外部依赖");
+    const text = cardText(card);
     expect(text).toContain("共 110 个任务");
-    const hidden = text.match(/已隐藏(?:前)? (\d+) 个任务/);
+    const hidden = text.match(/已隐藏 (\d+) 个任务/);
     expect(hidden).not.toBeNull();
     expect(Number(hidden?.[1])).toBeGreaterThan(0);
   });
-  test("offers an expand control for budget-hidden todo tasks", () => {
+  test("drops phase rows that have neither visible nor expandable tasks", () => {
+    // A phase title with nothing under it is noise: the card must render a phase only when it
+    // actually shows a task or offers a hidden row to expand.
+    const tracker = createExecutionTracker({ runId: "bare-phase" });
+    startTurn(tracker, "turn-1", 0);
+    tracker.apply({
+      type: "todo_update",
+      atMs: 1,
+      op: "init",
+      phases: [
+        {
+          name: "Active phase",
+          tasks: [
+            { content: "active-0", status: "in_progress" },
+            { content: "active-1", status: "pending" },
+          ],
+        },
+        {
+          name: "Middle phase",
+          tasks: Array.from({ length: 50 }, (_unused, index) => ({
+            content: `middle-${index}`,
+            status: "pending" as const,
+          })),
+        },
+        {
+          name: "Far phase",
+          tasks: Array.from({ length: 40 }, (_unused, index) => ({
+            content: `far-${index}`,
+            status: "pending" as const,
+          })),
+        },
+      ],
+    });
+    const rendered = buildExecutionCard(tracker.snapshot(2), fullCapabilities);
+
+    expect(rendered).not.toBeNull();
+    const card = rendered!.card as JsonRecord;
+    const todoDetail = nodeById(card, "todo_detail");
+    const todoText = cardText(todoDetail);
+    expect(todoText).toContain("Active phase");
+    expect(todoText).toContain("active-0");
+    expect(todoText).toContain("Middle phase");
+    // The whole far phase sits past the visible band and past the expandable hidden rows.
+    expect(todoText).not.toContain("Far phase");
+    const phaseContainers = (todoDetail.items as JsonRecord[]).filter(item => item.type === "Container");
+    expect(phaseContainers).not.toHaveLength(0);
+    for (const phase of phaseContainers) {
+      expect(nodes(phase).some(node => node.type === "ColumnSet")).toBe(true);
+    }
+  });
+  test("keeps a long run's todo handoff readable under the real node budget", () => {
+    // The reported card: 96 turns, 116 tool calls, and a todo list gutted to two rows with bare
+    // phase titles left behind. The trace must be the content that gives way.
+    const tracker = createExecutionTracker({ runId: "hardening-run", initialAtMs: 1_000 });
+    for (let turn = 0; turn < 96; turn += 1) {
+      tracker.apply({ type: "turn_start", turnId: `turn-${turn}`, atMs: 1_000 + turn * 9_000 });
+      tracker.apply({ type: "turn_end", turnId: `turn-${turn}`, atMs: 1_000 + turn * 9_000 + 4_000 });
+    }
+    for (let index = 0; index < 116; index += 1) {
+      const toolCallId = `tool-${index}`;
+      const atMs = 2_000 + index * 7_500;
+      startTool(tracker, toolCallId, "bash", atMs, `步骤 ${index}`);
+      tracker.apply({ type: "tool_end", toolCallId, atMs: atMs + 1_200, status: "succeeded" });
+    }
+    tracker.apply({
+      type: "todo_update",
+      atMs: 800_000,
+      op: "start",
+      phases: [
+        {
+          name: "Hardening",
+          tasks: [
+            { content: "Transport: error code + fresh-connection option", status: "in_progress" },
+            { content: "Service: bounded retry on transient delete failure", status: "pending" },
+          ],
+        },
+        {
+          name: "Tests",
+          tasks: [
+            { content: "Cover the new retry path", status: "pending" },
+            { content: "Re-run lifecycle suite", status: "pending" },
+          ],
+        },
+        {
+          name: "Docs",
+          tasks: [{ content: "Record the option in the design spec", status: "pending" }],
+        },
+        {
+          name: "Verification",
+          tasks: [
+            { content: "Send the live preview card", status: "pending" },
+            { content: "Confirm on the real client", status: "pending" },
+          ],
+        },
+      ],
+    });
+
+    const rendered = buildExecutionCard(tracker.snapshot(870_000), fullCapabilities);
+    expect(rendered).not.toBeNull();
+    const card = rendered!.card as JsonRecord;
+    // The handoff band stays readable: the in-progress task and every neighbour around it.
+    expect(visibleTodoTaskLabels(card)).toEqual([
+      "Transport: error code + fresh-connection option",
+      "Service: bounded retry on transient delete failure",
+      "Cover the new retry path",
+      "Re-run lifecycle suite",
+      "Record the option in the design spec",
+      "Send the live preview card",
+      "Confirm on the real client",
+    ]);
+    // No bare phase titles: every rendered phase carries at least one task row.
+    const phaseContainers = (nodeById(card, "todo_detail").items as JsonRecord[])
+      .filter(item => item.type === "Container");
+    expect(phaseContainers).toHaveLength(4);
+    for (const phase of phaseContainers) {
+      expect(nodes(phase).some(node => node.type === "ColumnSet")).toBe(true);
+    }
+    // The trace is what compresses: newest steps keep their panels and the rest fold away.
+    const timeline = nodeById(card, "timeline_detail");
+    const timelineText = cardText(timeline);
+    expect(timelineText).toContain("已隐藏前");
+    expect(timelineText).toContain("步骤 115");
+    const richRows = (timeline.items as JsonRecord[]).filter(item => item.type === "ColumnSet");
+    expect(richRows.length).toBeLessThanOrEqual(3);
+    expect(cardStats(card).nodes).toBeLessThanOrEqual(fullCapabilities.limits!.maxNodes! - 1);
+  });
+  test("offers an expand control for the budget-hidden tasks nearest the band", () => {
     const tracker = createExecutionTracker({ runId: "todo-expand" });
     startTurn(tracker, "turn-1", 0);
     tracker.apply({
@@ -1428,11 +1619,23 @@ describe("execution card rendering", () => {
     });
     expect(rendered).not.toBeNull();
     const card = rendered!.card as JsonRecord;
+    const labels = visibleTodoTaskLabels(card);
+    expect(labels[0]).toBe("task-0");
     const summary = nodeById(card, "todo_hidden_summary");
-    const omitted = nodeById(card, "todo_omitted_task_0_1");
-    expect(omitted).toMatchObject({ type: "ColumnSet", isVisible: false });
-    expect(cardText(omitted)).toContain("task-1");
-    const omittedTaskColumns = omitted.columns as JsonRecord[];
+    expect(summary.isVisible).not.toBe(false);
+    expect(cardText(summary)).toContain("共 110 个任务");
+
+    // The hidden rows continue the band, so expanding grows the readable run outward instead of
+    // jumping to the far end of the list.
+    const omittedRows = nodes(card).filter(node => (
+      typeof node.id === "string" && node.id.startsWith("todo_omitted_task_")
+    ));
+    expect(omittedRows.length).toBeGreaterThan(0);
+    expect(omittedRows.every(row => row.isVisible === false)).toBe(true);
+    expect(cardText(omittedRows[0]!)).toContain(`task-${labels.length}`);
+    const firstOmitted = omittedRows[0]!;
+    expect(firstOmitted).toMatchObject({ type: "ColumnSet" });
+    const omittedTaskColumns = firstOmitted.columns as JsonRecord[];
     expect(omittedTaskColumns).toHaveLength(2);
     expect(omittedTaskColumns[0]).toMatchObject({ width: "80px" });
     expect((omittedTaskColumns[0]?.items as JsonRecord[])[0]).toMatchObject({
@@ -1444,17 +1647,20 @@ describe("execution card rendering", () => {
     const phaseContainers = (todoDetail.items as JsonRecord[]).filter(item => (
       item.type === "Container" && item.id === undefined
     ));
-    expect(phaseContainers.some(phase => nodes(phase).some(node => node.id === "todo_omitted_task_0_1"))).toBe(true);
-    expect((todoDetail.items as JsonRecord[]).some(item => item.id === "todo_omitted_task_0_1")).toBe(false);
+    expect(phaseContainers.some(phase => nodes(phase).some(node => (
+      typeof node.id === "string" && node.id.startsWith("todo_omitted_task_")
+    )))).toBe(true);
+    expect((todoDetail.items as JsonRecord[]).some(item => (
+      typeof item.id === "string" && item.id.startsWith("todo_omitted_task_")
+    ))).toBe(false);
 
     const expand = toggleActionById(card, "todo_expand");
     expect(expand.title).toBe("展开");
     const expandedTodoTargets = targetElements(expand).filter(target => (
       typeof target.elementId === "string" && target.elementId.startsWith("todo_omitted_task_")
     ));
-    expect(expandedTodoTargets.length).toBeGreaterThan(0);
+    expect(expandedTodoTargets).toHaveLength(omittedRows.length);
     expect(expandedTodoTargets.every(target => target.isVisible === true)).toBe(true);
-    expect(expandedTodoTargets.some(target => target.elementId === "todo_omitted_task_0_1")).toBe(true);
     const collapse = toggleActionById(card, "todo_collapse");
     expect(collapse.title).toBe("收起");
     const collapsedTodoTargets = targetElements(collapse).filter(target => (
