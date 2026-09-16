@@ -362,8 +362,9 @@ export interface ChannelServiceOptions {
   workerFactory: WorkerFactory;
   commandHandlers?: readonly ChannelCommandHandler[];
   /**
-   * Deployment restart port, present only when a restart command is configured.
-   * `request` runs that command and the host then stops this process.
+   * Supervisor restart port, present only when the host detected the process supervisor that
+   * runs this channel. `request` asks that supervisor to restart the program, which stops this
+   * process.
    */
   restart?: RestartPort;
   /**

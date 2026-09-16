@@ -126,6 +126,8 @@ export class FakeTransport implements ChannelTransport {
   readonly bot: BotIdentity;
   online: boolean;
   maxConcurrentTextRequests = 0;
+  /** How often the service asked for its Bot identity, i.e. how often it registered. */
+  initializeCalls = 0;
 
   private readonly startOnline: boolean;
   private readonly contexts = new Map<string, GroupContext | null>();
@@ -161,6 +163,7 @@ export class FakeTransport implements ChannelTransport {
   }
 
   initialize(): Promise<BotIdentity> {
+    this.initializeCalls += 1;
     return Promise.resolve(this.bot);
   }
 

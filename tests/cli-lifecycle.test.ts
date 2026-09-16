@@ -29,6 +29,20 @@ async function waitForChildExit(child: Bun.Subprocess, timeoutMs = 5_000): Promi
   }
 }
 
+const CHECKOUT_ROOT = resolve(import.meta.dir, "..");
+
+/**
+ * Environment for the spawned CLI: it writes its own logs under `$HOME/.oco`, so the tests keep
+ * that inside their temp root instead of the developer's home.
+ */
+function cliEnvironment(root: string, binDir?: string): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    HOME: root,
+    ...(binDir === undefined ? {} : { PATH: `${binDir}:${process.env.PATH ?? ""}` }),
+  };
+}
+
 /** Working directories of the OMP RPC workers whose startup lines appear in a fixture-log slice. */
 function workerStartupCwds(logText: string): string[] {
   const cwds: string[] = [];
@@ -72,8 +86,8 @@ test("real CLI serve handles a status message and exits cleanly on SIGTERM", asy
     );
 
     const spawned = Bun.spawn(
-      [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "serve", "--config", configPath],
-      { stdout: "pipe", stderr: "pipe" },
+      [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "start", "--config", configPath],
+      { stdout: "pipe", stderr: "pipe", env: cliEnvironment(currentRoot) },
     );
     child = spawned;
     const stdout = new Response(spawned.stdout).text();
@@ -132,6 +146,86 @@ test("real CLI serve handles a status message and exits cleanly on SIGTERM", asy
   }
 });
 
+test("a second start refuses before it registers the Bot and leaves the running instance serving", async () => {
+  let root: string | undefined;
+  let fixture: OctoProtocolFixture | undefined;
+  let child: Bun.Subprocess | undefined;
+  let outputPromise: Promise<[string, string]> | undefined;
+  try {
+    const currentRoot = await mkdtemp(join(tmpdir(), "octo-cli-duplicate-start-"));
+    root = currentRoot;
+    const currentFixture = await createOctoProtocolFixture();
+    fixture = currentFixture;
+    const configPath = join(currentRoot, "config.json");
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        apiUrl: currentFixture.apiUrl,
+        botToken: currentFixture.botToken,
+        ownerId: currentFixture.ownerUid,
+        allowedGroupIds: [],
+        stateDir: join(currentRoot, "state"),
+        ompCommand: process.execPath,
+      }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const spawned = Bun.spawn(
+      [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "start", "--config", configPath],
+      { stdout: "pipe", stderr: "pipe", env: cliEnvironment(currentRoot) },
+    );
+    child = spawned;
+    const stdout = new Response(spawned.stdout).text();
+    const stderr = new Response(spawned.stderr).text();
+    outputPromise = Promise.all([stdout, stderr]);
+    const connection = await currentFixture.waitForConnection(1, 5_000);
+    await waitForFixture(
+      () => connection.ready ? connection : undefined,
+      5_000,
+      "CLI did not authenticate its WebSocket connection",
+    );
+
+    const duplicate = Bun.spawn(
+      [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "start", "--config", configPath],
+      { stdout: "pipe", stderr: "pipe", env: cliEnvironment(currentRoot) },
+    );
+    const [duplicateCode, , duplicateErr] = await Promise.all([
+      waitForChildExit(duplicate, 10_000),
+      new Response(duplicate.stdout).text(),
+      new Response(duplicate.stderr).text(),
+    ]);
+    expect(duplicateCode).toBe(1);
+    expect(duplicateErr).toContain("同一 Bot 已有 channel 实例运行");
+    // Registering again is what would cut the online instance off, so the refusal must precede it.
+    expect(currentFixture.registerRequests).toHaveLength(1);
+    expect(spawned.exitCode).toBeNull();
+
+    currentFixture.sendInbound(connection, {
+      fromUid: currentFixture.ownerUid,
+      channelId: `${currentFixture.ownerUid}@${currentFixture.botUid}`,
+      channelType: 1,
+      text: "/status",
+      messageId: "9007199254742201",
+    });
+    await waitForFixture(
+      () => currentFixture.sentMessages.some(({ body }) => body.channel_id === currentFixture.ownerUid),
+      5_000,
+      "the running instance stopped answering after the refused duplicate start",
+    );
+
+    spawned.kill("SIGTERM");
+    expect(await waitForChildExit(spawned)).toBe(0);
+  } finally {
+    if (child && child.exitCode === null) {
+      child.kill("SIGKILL");
+      await child.exited;
+    }
+    if (outputPromise) await outputPromise.catch(() => {});
+    if (fixture) await fixture.close();
+    if (root) await rm(root, { recursive: true, force: true });
+  }
+}, 20_000);
+
 test("real CLI runs the owner's group command with the bot mention placed before or after it", async () => {
   let root: string | undefined;
   let fixture: OctoProtocolFixture | undefined;
@@ -158,8 +252,8 @@ test("real CLI runs the owner's group command with the bot mention placed before
     );
 
     const spawned = Bun.spawn(
-      [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "serve", "--config", configPath],
-      { stdout: "pipe", stderr: "pipe" },
+      [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "start", "--config", configPath],
+      { stdout: "pipe", stderr: "pipe", env: cliEnvironment(currentRoot) },
     );
     child = spawned;
     const stdout = new Response(spawned.stdout).text();
@@ -260,7 +354,7 @@ test("real CLI runs the owner's group command with the bot mention placed before
   }
 });
 
-test("real CLI restarts through the configured command and confirms it after coming back", async () => {
+test("real CLI restarts through the detected supervisor program and confirms it after coming back", async () => {
   let root: string | undefined;
   let fixture: OctoProtocolFixture | undefined;
   const children: Bun.Subprocess[] = [];
@@ -269,7 +363,33 @@ test("real CLI restarts through the configured command and confirms it after com
     root = currentRoot;
     const currentFixture = await createOctoProtocolFixture();
     fixture = currentFixture;
-    const markerPath = join(currentRoot, "restart-command-ran");
+    const markerPath = join(currentRoot, "super-restart-ran");
+    const fakeBin = join(currentRoot, "bin");
+    await mkdir(fakeBin, { recursive: true });
+    // Stands in for the real `super` client: it answers the two calls detection makes (the program
+    // list and one program's live PID) and, on restart, stops the CLI the way a supervisor does.
+    const fakeSuper = join(fakeBin, "super");
+    await writeFile(
+      fakeSuper,
+      `#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    export)
+      printf '{"prune":false,"services":[{"name":"omp-channel-octo","command":"/bin/sh","args":["-c",". ./.envrc; exec bun run src/cli.ts start"],"cwd":"/tmp/oco-test-not-this-checkout"}]}'
+      exit 0 ;;
+    info)
+      printf 'PID: %s\\nState: Healthy\\n' "$PPID"
+      exit 0 ;;
+    restart)
+      printf restarted > '${markerPath}'
+      kill -TERM "$PPID"
+      exit 0 ;;
+  esac
+done
+exit 2
+`,
+      { mode: 0o755 },
+    );
     const configPath = join(currentRoot, "config.json");
     await writeFile(
       configPath,
@@ -280,20 +400,19 @@ test("real CLI restarts through the configured command and confirms it after com
         allowedGroupIds: [],
         stateDir: join(currentRoot, "state"),
         ompCommand: process.execPath,
-        // Stands in for a supervisor restart: the command stops this process, like `super restart`.
-        restart: { command: ["/bin/sh", "-c", `printf restarted > '${markerPath}'; kill -TERM $PPID`] },
       }),
       { encoding: "utf8", mode: 0o600 },
     );
     const cliArgs = [
       process.execPath,
       resolve(import.meta.dir, "../src/cli.ts"),
-      "serve",
+      "start",
       "--config",
       configPath,
     ];
+    const cliEnv = cliEnvironment(currentRoot, fakeBin);
 
-    const first = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe" });
+    const first = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe", env: cliEnv });
     children.push(first);
     const firstOutput = Promise.all([new Response(first.stdout).text(), new Response(first.stderr).text()]);
     const firstConnection = await currentFixture.waitForConnection(1, 5_000);
@@ -322,11 +441,11 @@ test("real CLI restarts through the configured command and confirms it after com
     await waitForFixture(
       () => existsSync(markerPath) ? true : undefined,
       5_000,
-      "the configured restart command did not run",
+      "the detected supervisor program did not restart the CLI",
     );
 
     const beforeRestart = currentFixture.sentMessages.length;
-    const second = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe" });
+    const second = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe", env: cliEnv });
     children.push(second);
     const secondOutput = Promise.all([new Response(second.stdout).text(), new Response(second.stderr).text()]);
     const secondConnection = await currentFixture.waitForConnection(2, 5_000);
@@ -348,6 +467,83 @@ test("real CLI restarts through the configured command and confirms it after com
     second.kill("SIGTERM");
     expect(await waitForChildExit(second)).toBe(0);
     await secondOutput.catch(() => {});
+  } finally {
+    for (const child of children) {
+      if (child.exitCode === null) {
+        child.kill("SIGKILL");
+        await child.exited;
+      }
+    }
+    if (fixture) await fixture.close();
+    if (root) await rm(root, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test("real CLI run stays out of the supervisor's way and refuses a restart", async () => {
+  let root: string | undefined;
+  let fixture: OctoProtocolFixture | undefined;
+  const children: Bun.Subprocess[] = [];
+  try {
+    const currentRoot = await mkdtemp(join(tmpdir(), "octo-cli-run-"));
+    root = currentRoot;
+    const currentFixture = await createOctoProtocolFixture();
+    fixture = currentFixture;
+    const fakeBin = join(currentRoot, "bin");
+    const callsPath = join(currentRoot, "super-calls.log");
+    await mkdir(fakeBin, { recursive: true });
+    // A supervisor this checkout could be detected through: `run` must never consult it.
+    await writeFile(
+      join(fakeBin, "super"),
+      `#!/bin/sh
+printf '%s\\n' "$*" >> '${callsPath}'
+printf '{"prune":false,"services":[{"name":"omp-channel-octo","command":"/bin/sh","args":["-c",". ./.envrc; exec bun run src/cli.ts start"],"cwd":"${CHECKOUT_ROOT}"}]}'
+exit 0
+`,
+      { mode: 0o755 },
+    );
+    const configPath = join(currentRoot, "config.json");
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        apiUrl: currentFixture.apiUrl,
+        botToken: currentFixture.botToken,
+        ownerId: currentFixture.ownerUid,
+        allowedGroupIds: [],
+        stateDir: join(currentRoot, "state"),
+        ompCommand: process.execPath,
+      }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const spawned = Bun.spawn(
+      [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "run", "--config", configPath],
+      { stdout: "pipe", stderr: "pipe", env: cliEnvironment(currentRoot, fakeBin) },
+    );
+    children.push(spawned);
+
+    const connection = await currentFixture.waitForConnection(1, 5_000);
+    await waitForFixture(
+      () => connection.ready ? connection : undefined,
+      5_000,
+      "the debugging CLI did not authenticate its WebSocket connection",
+    );
+    currentFixture.sendInbound(connection, {
+      fromUid: currentFixture.ownerUid,
+      channelId: `${currentFixture.ownerUid}@${currentFixture.botUid}`,
+      channelType: 1,
+      text: "/restart",
+      messageId: "9007199254742101",
+    });
+    const reply = await waitForFixture(
+      () => currentFixture.sentMessages.find((message) => sentText(message).includes("无法重启 channel")),
+      5_000,
+      "the debugging CLI did not refuse the restart request",
+    );
+    expect(sentText(reply)).toContain("未检测到守护进程");
+    expect(existsSync(callsPath)).toBe(false);
+
+    spawned.kill("SIGTERM");
+    expect(await waitForChildExit(spawned)).toBe(0);
   } finally {
     for (const child of children) {
       if (child.exitCode === null) {
@@ -428,11 +624,12 @@ test("real CLI gives a CommunityTopic thread the parent group's work directory",
       }),
       { encoding: "utf8", mode: 0o600 },
     );
-    const cliArgs = [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "serve", "--config", configPath];
+    const cliArgs = [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "start", "--config", configPath];
+    const cliEnv = cliEnvironment(currentRoot);
     const botPrefix = `@${currentFixture.botName}`;
     const botMention = { entities: [{ uid: currentFixture.botUid, offset: 0, length: botPrefix.length }] };
 
-    const first = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe" });
+    const first = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe", env: cliEnv });
     children.push(first);
     const firstOutput = Promise.all([new Response(first.stdout).text(), new Response(first.stderr).text()]);
     const firstConnection = await currentFixture.waitForConnection(1, 5_000);
@@ -512,7 +709,7 @@ test("real CLI gives a CommunityTopic thread the parent group's work directory",
     expect(await waitForChildExit(first, 10_000)).toBe(0);
     await firstOutput.catch(() => {});
 
-    const second = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe" });
+    const second = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe", env: cliEnv });
     children.push(second);
     const secondOutput = Promise.all([new Response(second.stdout).text(), new Response(second.stderr).text()]);
     const secondConnection = await currentFixture.waitForConnection(2, 5_000);

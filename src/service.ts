@@ -102,9 +102,9 @@ const DEFAULT_INTERRUPT_REJECTED_TEXT = "中断请求未被 OMP 接受，当前�
 const DEFAULT_INTERRUPT_IDLE_TEXT =
   "当前没有正在运行的回合可中断；任务尚未进入执行阶段时可用 /cancel 取消。";
 const RESTART_USAGE = "用法：/restart [now]；now 表示强制重启并中断在途任务。";
-const RESTART_UNCONFIGURED_TEXT = "未配置 restart.command，无法重启 channel。";
+const RESTART_UNAVAILABLE_TEXT = "未检测到守护进程，无法重启 channel。";
 const CHANNEL_RESTART_SCHEDULED_TEXT =
-  "已排定重启：本回合结束后、channel 没有运行中或排队任务时执行部署配置的重启命令；重启完成后会在本会话通报 PID。";
+  "已排定重启：本回合结束后、channel 没有运行中或排队任务时执行守护进程的重启；重启完成后会在本会话通报 PID。";
 const RESTART_NOTICE_TTL_MS = 10 * 60 * 1_000;
 const BUILTIN_COMMANDS: Record<string, true> = {
   new: true,
@@ -386,6 +386,41 @@ async function processAlive(pid: number): Promise<boolean> {
   }
 }
 
+/**
+ * Live holder of this Bot's lock, or `undefined` when the lock is free. A lock file whose process
+ * is gone counts as free, so a crashed instance never blocks the next one.
+ */
+async function botLockHolder(botUid: string): Promise<{ path: string; pid?: number } | undefined> {
+  const path = lockFilePath(botUid);
+  let text: string;
+  try {
+    text = await Bun.file(path).text();
+  } catch {
+    return undefined;
+  }
+  let parsed: { pid?: unknown; botUid?: unknown } = {};
+  try {
+    parsed = JSON.parse(text) as { pid?: unknown; botUid?: unknown };
+  } catch {
+    parsed = {};
+  }
+  const pid = typeof parsed.pid === "number" ? parsed.pid : undefined;
+  if (parsed.botUid === botUid && pid !== undefined && !(await processAlive(pid))) return undefined;
+  return { path, ...(pid === undefined ? {} : { pid }) };
+}
+
+/**
+ * Refuses to continue while another live process serves this Bot, and does so before the Bot is
+ * registered: a second instance would otherwise re-register the Bot and cut off the WebSocket of
+ * the instance that is already serving messages.
+ */
+async function assertBotLockFree(botUid: string): Promise<void> {
+  const holder = await botLockHolder(botUid);
+  if (holder === undefined) return;
+  const owner = holder.pid === undefined ? "" : `（PID ${holder.pid}）`;
+  throw new Error(`同一 Bot 已有 channel 实例运行${owner}：一个 Bot 同时只服务一个实例，请先停止该实例再启动。`);
+}
+
 async function acquireBotLock(botUid: string): Promise<LockHandle> {
   const path = lockFilePath(botUid);
   await mkdir(dirname(path), { recursive: true });
@@ -410,15 +445,7 @@ async function acquireBotLock(botUid: string): Promise<LockHandle> {
       if (appError.code !== "EEXIST" || attempt !== 0) {
         throw new Error("同一 Bot 已有 channel 实例运行");
       }
-      let stale = false;
-      try {
-        const lockText = await Bun.file(path).text();
-        const parsed = JSON.parse(lockText) as { pid?: unknown; botUid?: unknown };
-        stale = parsed.botUid === botUid && typeof parsed.pid === "number" && !(await processAlive(parsed.pid));
-      } catch {
-        stale = false;
-      }
-      if (!stale) throw new Error("同一 Bot 已有 channel 实例运行");
+      if (await botLockHolder(botUid)) throw new Error("同一 Bot 已有 channel 实例运行");
       await unlink(path).catch(() => {});
     }
   }
@@ -560,6 +587,9 @@ class CoreService implements ChannelService {
   async start(): Promise<void> {
     if (this.started) return;
     if (this.stopping) throw new Error("channel 正在停止");
+    // Checked before `initialize`, because registering is what interrupts a running instance.
+    const knownBotUid = this.store.getBotUid();
+    if (knownBotUid !== null) await assertBotLockFree(knownBotUid);
     const identity = await this.options.transport.initialize();
     if (!identity.uid || !identity.name) throw new Error("Octo Bot 身份无效");
     const lock = await acquireBotLock(identity.uid);
@@ -1832,11 +1862,11 @@ class CoreService implements ChannelService {
     return targets;
   }
 
-  /** Returns true when the host should run the configured restart command. */
+  /** Returns true when the host should ask the detected supervisor to restart this process. */
   private async handleRestart(target: ChatTarget, argument: string): Promise<boolean> {
     const restart = this.options.restart;
     if (!restart) {
-      await this.enqueueText(target, RESTART_UNCONFIGURED_TEXT, null);
+      await this.enqueueText(target, RESTART_UNAVAILABLE_TEXT, null);
       return false;
     }
     const mode = argument.trim();
@@ -2789,7 +2819,7 @@ class CoreService implements ChannelService {
       });
     }
     if (action === "restart") {
-      if (!this.options.restart) return RESTART_UNCONFIGURED_TEXT;
+      if (!this.options.restart) return RESTART_UNAVAILABLE_TEXT;
       this.pendingRestart = { channelType: target.channelType, channelId: target.channelId };
       return CHANNEL_RESTART_SCHEDULED_TEXT;
     }
@@ -2798,7 +2828,7 @@ class CoreService implements ChannelService {
 
   /**
    * Runs a restart the agent asked for once it cannot cost work: every chat idle and no queued
-   * task. The request is fire-and-forget, because the configured command stops this process.
+   * task. The request is fire-and-forget, because the supervisor stops this process.
    */
   private maybeRunDeferredRestart(): void {
     const target = this.pendingRestart;

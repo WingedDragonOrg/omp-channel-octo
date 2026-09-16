@@ -21,9 +21,11 @@ Octo HTTP/WebSocket
   -> Octo text, file, typing, and progress-card operations
 ```
 
-- `src/cli.ts` owns command dispatch and process lifecycle. `main` handles `check`, `serve`/`start`, and `launchd`; `runServe` constructs the transport, worker factory, and service, then owns SIGINT/SIGTERM shutdown. Signal handlers must be removed only by the code that installed them; preserve unrelated host-process listeners.
+- `src/cli.ts` owns command dispatch and process lifecycle. `main` handles `start`, `run`, `check`, `restart`, `status`, `logs`, `test --card`, and `launchd`; the two entries installed by `bun link` are `oco` and `omp-channel-octo` (same program). `start` is the supervisor-hosted service process (it detects the daemon that runs it and exposes the restart port); `run` is the debugging entry point that stays out of the daemon's way. `runService` constructs the transport, worker factory, and service, then owns SIGINT/SIGTERM shutdown. Signal handlers must be removed only by the code that installed them; preserve unrelated host-process listeners.
+- `src/supervisor.ts` detects which local supervisor hosts this checkout and under what program name — nothing about it is configured. It parses `super export --format json` / `super info` / `super list`, matches by live PID (service side) or by checkout directory and CLI command line (CLI side), and returns every candidate so an ambiguous machine is refused instead of guessed. `SupervisorTarget.kind` is where additional supervisor types (for example launchd) slot in.
+- `src/logs.ts` owns the service's own log files under `~/.oco/logs` (`channel-YYYY-MM-DD.log`, 14-day retention): the console tee that mirrors output into the day's file with a `[YYYY-MM-DD HH:MM:SS]` prefix, the tail reader, and the follow loop that rolls over to the next day's file. Only `console` is wrapped — `process.stdout` also carries the OMP worker's protocol traffic.
 - `OctoTransport` performs Bot registration, encrypted WebSocket communication, HTTP operations, inbound normalization, reconnection, message/file delivery, and AdaptiveCard capability checks. `ChatTarget` is keyed by the real `channelType` and `channelId`, not a display name.
-- `CoreService` validates owner, group allowlist, thread identity, and structured bot mentions before handling commands or starting OMP. A group whose server-side 免@ decision (`GET /v1/bot/groups/{group_no}/mention_pref`, the server's AND of the bot owner's intent and the group's `allow_no_mention` switch) is effective lets the owner talk without an @mention; the decision is cached per group for 60 seconds (threads use the parent group), and a failed or unparsable lookup keeps the mention requirement. Built-ins are `/new`, `/reset`, `/move`, `/cancel`, `/status`, `/help`, and `/restart`; while a chat has a pending `ask` question, the owner's next non-command text in that chat is its answer rather than a new task. With no persisted owner, the first valid private message claims ownership, is durably deduplicated, and only receives confirmation; it does not execute that message. Host tools are assembled per task: `ask` and `octo_send_file` everywhere, `octo_management` only in groups and threads, and `channel_control` everywhere — its `restart` runs the configured restart command once the channel is idle (so the asking turn still delivers its reply, which is what makes self-iteration possible), and its `status` reports the channel PID, running targets, queued tasks, blocked directories, and whether a restart is pending. `octo_management`'s `create-thread` accepts `worktree_name`: the host materializes a git worktree beside the calling chat's repository (directory and branch named after it, so the name must contain ASCII letters or digits) and pins the new thread's binding cwd to it (`chats.cwd_pinned`), so the thread runs in its own workspace; a workspace that cannot be created is reported as `worktree_error` while the thread stays usable, and only an explicit `/new <dir>` or `/move <dir>` replaces that directory.
+- `CoreService` validates owner, group allowlist, thread identity, and structured bot mentions before handling commands or starting OMP. A group whose server-side 免@ decision (`GET /v1/bot/groups/{group_no}/mention_pref`, the server's AND of the bot owner's intent and the group's `allow_no_mention` switch) is effective lets the owner talk without an @mention; the decision is cached per group for 60 seconds (threads use the parent group), and a failed or unparsable lookup keeps the mention requirement. Built-ins are `/new`, `/reset`, `/move`, `/cancel`, `/status`, `/help`, and `/restart`; while a chat has a pending `ask` question, the owner's next non-command text in that chat is its answer rather than a new task. With no persisted owner, the first valid private message claims ownership, is durably deduplicated, and only receives confirmation; it does not execute that message. Host tools are assembled per task: `ask` and `octo_send_file` everywhere, `octo_management` only in groups and threads, and `channel_control` everywhere — its `restart` asks the detected supervisor to restart this process once the channel is idle (so the asking turn still delivers its reply, which is what makes self-iteration possible), and its `status` reports the channel PID, running targets, queued tasks, blocked directories, and whether a restart is pending. `octo_management`'s `create-thread` accepts `worktree_name`: the host materializes a git worktree beside the calling chat's repository (directory and branch named after it, so the name must contain ASCII letters or digits) and pins the new thread's binding cwd to it (`chats.cwd_pinned`), so the thread runs in its own workspace; a workspace that cannot be created is reported as `worktree_error` while the thread stays usable, and only an explicit `/new <dir>` or `/move <dir>` replaces that directory.
 - `ChannelStore` opens `channel.sqlite` under `stateDir` with SQLite WAL/foreign keys. It persists owners, bindings, inbound claims, tasks, outbox records, questions, progress-card rows, and the worker ledger. Durable acceptance precedes side effects; after a task crosses the `started` boundary, restart or reconnect must not automatically rerun it.
 - `src/omp/index.ts` launches the installed OMP executable with an explicit RPC mode, yolo approval mode, cwd, and session directory. Keep the RPC decoder and OMP process lifecycle isolated from the host service. Worker cancellation uses bounded process/group shutdown and watchdog bookkeeping.
 - `src/project-session.ts` validates session headers, canonical cwd, session IDs, and `previousSessionFiles` breadcrumbs. Native `/move` preserves session identity; external recovery accepts only an exact, uniquely verified session rather than a recent or fuzzy file match.
@@ -57,27 +59,37 @@ bun test
 Create a local configuration and exercise the service:
 
 ```sh
-mkdir -p ~/.config/omp-channel-octo
-cp config.example.json ~/.config/omp-channel-octo/config.json
-chmod 600 ~/.config/omp-channel-octo/config.json
-bun run check -- --config ~/.config/omp-channel-octo/config.json
-bun run serve -- --config ~/.config/omp-channel-octo/config.json
+bun link   # installs both bin names (~/.bun/bin/oco → this checkout)
+mkdir -p ~/.oco/config
+cp config.example.json ~/.oco/config/config.json
+chmod 600 ~/.oco/config/config.json
+oco check --config ~/.oco/config/config.json
+oco start --config ~/.oco/config/config.json
 ```
 
-`check` validates configuration, Bot registration, and an OMP fresh-worker start/stop path; it deliberately does not call a model. `start` is an alias for `serve`. The default config path is `~/.config/omp-channel-octo/config.json`.
+`check` validates configuration, Bot registration, and an OMP fresh-worker start/stop path; it deliberately does not call a model. `start` runs the service in the foreground — it is what a supervisor hosts — while `run` is the same process without supervisor participation (no detection, no restart port), for debugging. The default config path is `~/.oco/config/config.json`; service logs land in `~/.oco/logs/`. The package also keeps `bun run check` / `bun run start` / `bun run launchd` scripts as an install-free path.
+
+Day-2 operations go through the same entry point, with the supervisor and program detected from the checkout:
+
+```sh
+oco restart            # super -y restart --wait-healthy + PID comparison
+oco status             # supervisor state, PID, uptime, config and log paths
+oco logs --tail 200    # service-owned log file; -f follows across midnight
+oco test --card        # live preview card (applies ./.envrc first)
+```
 
 For macOS launchd:
 
 ```sh
-bun run launchd -- install --config ~/.config/omp-channel-octo/config.json
+oco launchd install --config ~/.oco/config/config.json
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.omp.channel-octo.plist"
 launchctl bootout "gui/$(id -u)/com.omp.channel-octo"
-bun run launchd -- uninstall --plist "$HOME/Library/LaunchAgents/com.omp.channel-octo.plist"
+oco launchd uninstall --plist "$HOME/Library/LaunchAgents/com.omp.channel-octo.plist"
 ```
 
-`launchd install` writes a private plist and does not call `launchctl`; loading and unloading are explicit operational steps. The generated plist uses the resolved OMP executable path and restrictive permissions.
+`launchd install` writes a private plist and does not call `launchctl`; loading and unloading are explicit operational steps. The generated plist runs `start` and writes its stdout/stderr into `~/.oco/logs/`.
 
-The resident service on this host is managed by Super: the stack at `~/.super/conf/conf.d/omp-channel-octo.toml` runs `bun run src/cli.ts serve --config ~/.config/omp-channel-octo/config.json` from the checkout, with `OCTO_BOT_TOKEN` sourced from `.envrc`. The private config holds the live values and `config.example.json` is only the template they are copied from. Apply stack edits with `super apply -f ~/.super/conf/conf.d/omp-channel-octo.toml`, then use `./restart.sh` to restart the service and wait for it to report healthy.
+The resident service on this host is managed by Super: the stack at `~/.super/conf/conf.d/omp-channel-octo.toml` runs `bun run src/cli.ts start --config ~/.oco/config/config.json` from the checkout, with `OCTO_BOT_TOKEN` sourced from `.envrc`. The private config holds the live values and `config.example.json` is only the template they are copied from. Apply stack edits with `super apply -f ~/.super/conf/conf.d/omp-channel-octo.toml`, then use `oco restart` to restart the service and wait for it to report healthy. Nothing about the supervisor or the program name lives in the channel config: both the CLI and the service detect it (`src/supervisor.ts`).
 
 ## Code Conventions & Common Patterns
 
@@ -93,7 +105,7 @@ The resident service on this host is managed by Super: the stack at `~/.super/co
 
 ## Important Files
 
-- `src/cli.ts` — executable entry point, `main`, `check`, `serve`, and launchd command handling.
+- `src/cli.ts` — executable entry point (`oco` / `omp-channel-octo`), `main`, `start`/`run`, `check`, `restart`/`status`/`logs`/`test --card`, and launchd command handling.
 - `src/config.ts` — config parsing, path resolution, credential source validation, state-directory checks, and `toCoreConfig`.
 - `src/service.ts` — `CoreService`, command routing, authorization, scheduling, worker coordination, outbox delivery, questions, and progress activity.
 - `src/contracts.ts` — transport, inbound message, worker, service, command-handler, and status interfaces.
@@ -105,8 +117,10 @@ The resident service on this host is managed by Super: the stack at `~/.super/co
 - `src/group-history.ts` — history buffer, sync planner, window selection, and prompt-block rendering.
 - `src/attachments.ts` — inbound attachment storage layout, safe naming, prompt-block composition, and retention sweep.
 - `src/worktree.ts` — isolated thread workspaces: `omp worktree add` invocation, name candidates, and bounded errors; wired into `create-thread`'s `isolate` argument.
+- `src/supervisor.ts` — supervisor detection for the CLI and the channel's restart path: `super export`/`info` parsing, PID and checkout matching, and the restart argv builders.
+- `src/logs.ts` — service-owned log files under `~/.oco/logs`: day-stamped naming, the console tee, retention pruning, tail reading, and the follow loop.
 - `src/launchd.ts` — plist generation, atomic installation, permission enforcement, and uninstall.
-- `config.example.json` — safe configuration template for the private `~/.config/omp-channel-octo/config.json` the resident service serves from; defaults to the Octo API, `OCTO_BOT_TOKEN`, no allowed groups, `omp`, `~/.local/state/omp-channel-octo`, and an enabled `groupHistory` block (`{ "enabled": true, "maxMessages": 50 }`) plus an enabled `attachments` block (`{ "enabled": true, "maxBytes": 26214400 }`).
+- `config.example.json` — safe configuration template for the private `~/.oco/config/config.json` the resident service serves from; defaults to the Octo API, `OCTO_BOT_TOKEN`, no allowed groups, `omp`, `~/.local/state/omp-channel-octo`, and an enabled `groupHistory` block (`{ "enabled": true, "maxMessages": 50 }`) plus an enabled `attachments` block (`{ "enabled": true, "maxBytes": 26214400 }`).
 - `tests/fixtures/core-fakes.ts`, `octo-protocol-server.ts`, and `omp-rpc-worker.ts` — the primary deterministic, encrypted-protocol, and real-child test harnesses.
 
 ## Runtime/Tooling Preferences
@@ -121,8 +135,9 @@ The resident service on this host is managed by Super: the stack at `~/.super/co
 ## Testing & QA
 
 - Run `bun run typecheck` and `bun test` for a normal change. There is no coverage command in `package.json`.
-- The suite intentionally separates layers: `tests/cli-lifecycle.test.ts` spawns the real CLI and Octo fixture; `tests/omp-worker.test.ts` spawns the real Bun RPC fixture; core streaming, bindings, recovery, and boundary tests use deterministic fakes and temporary directories.
-- For lifecycle changes, preserve real-process coverage for `/status`, clean SIGTERM exit, WebSocket closure, and absence of the bot token from captured output. `tests/cli-lifecycle.test.ts` is the reference test.
+- The suite intentionally separates layers: `tests/cli-lifecycle.test.ts` spawns the real CLI and Octo fixture; `tests/cli-ops.test.ts` spawns the real CLI against a fake `super` on `PATH`; `tests/omp-worker.test.ts` spawns the real Bun RPC fixture; core streaming, bindings, recovery, and boundary tests use deterministic fakes and temporary directories.
+- For lifecycle changes, preserve real-process coverage for `/status`, clean SIGTERM exit, WebSocket closure, and absence of the bot token from captured output. `tests/cli-lifecycle.test.ts` is the reference test; it also covers a supervisor restart end to end (a fake `super` reports the CLI's own PID, so detection matches by PID rather than by name).
+- For supervisor detection, the oco command surface, or service-owned logs, use `tests/supervisor.test.ts` (export/info parsing, PID and checkout matching, ambiguity, restart argv, failure and timeout paths), `tests/logs.test.ts` (day naming, tee prefixing and rollover, retention, tail, follow), and `tests/cli-ops.test.ts` (`restart`/`status`/`logs` through the real CLI with a recorded fake `super`).
 - For host-tool changes, use `tests/core-host-tools.test.ts`: it asserts the per-chat tool set and exercises `octo_management`, `octo_send_file`, and `channel_control` against the fakes.
 - For RPC changes, use `tests/omp-worker.test.ts` and `tests/fixtures/omp-rpc-worker.ts`; cover ready negotiation, v1/v2 chunk reassembly, prompt acknowledgement versus completion, cumulative text events, late/repeated starts, cancellation, crashes, and process-group cleanup.
 - For output/outbox changes, consult `core-streaming.test.ts`, `core-outbox.test.ts`, `core-recovery.test.ts`, and `core-presentation.test.ts`. Preserve fake-timer coverage for one-second serialized edits, final corrections/empty finals, stable IDs, and lost-receipt recovery. `tests/core-progress-card-recovery.test.ts` covers the durable card row: a live turn stores and clears it, and a restart either finalizes or bounds the attempts on a leftover card.
@@ -130,5 +145,5 @@ The resident service on this host is managed by Super: the stack at `~/.super/co
 - For group/thread history changes, use `tests/group-history.test.ts` (buffer, planner, window, renderer), `tests/core-group-history.test.ts` (injection, watermark, failure modes), and `tests/core-history-ledger.test.ts` (schema, migration, CAS). Coverage decisions, the fetch range, and the injected block are asserted through the fake transport's recorded `fetchGroupMessages` calls and the prompt text.
 - For inbound type and attachment changes, use `tests/attachments.test.ts` (naming, prompt composition, sweep), `tests/octo-content.test.ts` (per-type extraction through the protocol fixture, including the real download route), and `tests/core-attachments.test.ts` (assembly point, refusal messages, steering, dedup, disabled pipeline). The fake transport records `downloadRequests` and `transcriptionRequests`; assert prompt text and recorded calls rather than internals.
 - Test fixtures enforce important boundaries: `core-fakes.ts` records transport attempts and the 3,000-byte text limit; `octo-protocol-server.ts` exercises real HTTP/WebSocket crypto and configurable server failures; `omp-rpc-worker.ts` emits deterministic JSONL without calling a model.
-- Card layout can only be judged on the real client, so every change to `src/execution-card.ts` ends by sending the live preview card: `set -a && . ./.envrc && set +a && bun run test:preview-card`. `.envrc` (gitignored) supplies `OCTO_BOT_TOKEN`, the target chat, and the API URL. Send it as part of the change; never wait for a reminder.
+- Card layout can only be judged on the real client, so every change to `src/execution-card.ts` ends by sending the live preview card: `oco test --card` (equivalently `set -a && . ./.envrc && set +a && bun run test:preview-card`; the `oco` form applies `.envrc` itself, so it works from a shell that never loaded direnv). `.envrc` (gitignored) supplies `OCTO_BOT_TOKEN`, the target chat, and the API URL. Send it as part of the change; never wait for a reminder.
 - `check` and the RPC fixture prove startup and protocol behavior, not model quality. Live launchd loading, detached-terminal operation, full logged-in Octo end-to-end behavior, screenshot-pixel validation, and typing visibility beyond the server's long-TTL window require separate environment-specific verification.

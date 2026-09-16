@@ -1,7 +1,13 @@
 import { readFileSync } from "node:fs";
 import { expect, test } from "bun:test";
 import { generateLaunchdPlist } from "../src/launchd.ts";
-import { parseConfig, toCoreConfig } from "../src/config.ts";
+import {
+  DEFAULT_CONFIG_PATH,
+  ocoConfigDir,
+  ocoLogsDir,
+  parseConfig,
+  toCoreConfig,
+} from "../src/config.ts";
 
 function configDocument(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -70,16 +76,16 @@ test("explicit API URL and owner remain configured", () => {
   expect(config.ownerId).toBe("explicit-owner");
 });
 
-test("restart command is optional and validated when present", () => {
-  expect(parseConfig(configDocument())).not.toHaveProperty("restartCommand");
-  expect(parseConfig(configDocument({ restart: {} }))).not.toHaveProperty("restartCommand");
-  expect(parseConfig(configDocument({
-    restart: { command: ["super", "-y", "restart", "omp-channel-octo"] },
-  })).restartCommand).toEqual(["super", "-y", "restart", "omp-channel-octo"]);
+test("the retired restart command is refused instead of silently ignored", () => {
+  expect(() => parseConfig(configDocument({ restart: { command: ["super", "-y", "restart", "omp-channel-octo"] } })))
+    .toThrow(/restart/);
+  expect(() => parseConfig(configDocument({ restart: {} }))).toThrow(/restart/);
+});
 
-  for (const restart of [[], "super restart", { command: [] }, { command: [""] }, { command: "super" }, { unknown: true }]) {
-    expect(() => parseConfig(configDocument({ restart }))).toThrow(/restart/);
-  }
+test("the default config path lives under the oco home", () => {
+  expect(DEFAULT_CONFIG_PATH).toBe("~/.oco/config/config.json");
+  expect(ocoConfigDir("/home/test")).toBe("/home/test/.oco/config");
+  expect(ocoLogsDir("/home/test")).toBe("/home/test/.oco/logs");
 });
 
 test("group history defaults to enabled with 50 messages", () => {

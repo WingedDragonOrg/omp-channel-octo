@@ -589,7 +589,7 @@ test("channel_control schedules a restart that runs once every chat is idle", as
   }
 });
 
-test("channel_control without a configured restart command reports it and schedules nothing", async () => {
+test("channel_control without a detected supervisor reports it and schedules nothing", async () => {
   let restartResult = "";
   const harness = await createCoreHarness({
     prompt: async ({ promptContext }) => {
@@ -602,7 +602,7 @@ test("channel_control without a configured restart command reports it and schedu
     const task = inbound({ messageId: "channel-restart-unconfigured", text: "restart the channel" });
     await harness.service.handleInbound(task);
     await waitForStatus(harness.service, task, (status) => status.state === "completed");
-    expect(restartResult).toContain("未配置 restart.command");
+    expect(restartResult).toContain("未检测到守护进程");
     const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
     try {
       expect(store.listRestartNotices(harness.bot.uid)).toHaveLength(0);

@@ -27,7 +27,7 @@ const textsFor = (harness: CoreHarness, target: ChatTarget): string[] =>
     .filter(({ target: sent }) => sent.channelId === target.channelId && sent.channelType === target.channelType)
     .map(({ text }) => text);
 
-test("an unconfigured restart command is refused instead of restarting", async () => {
+test("a restart without a detected supervisor is refused instead of guessed", async () => {
   const harness = await createCoreHarness();
   const target: ChatTarget = { channelId: "dm-restart-unconfigured", channelType: 1 };
   try {
@@ -35,7 +35,7 @@ test("an unconfigured restart command is refused instead of restarting", async (
       inbound({ messageId: "restart-unconfigured", ...target, text: "/restart" }),
     );
     await waitForStatus(harness.service, target, (status) => status.outbox === 0);
-    expect(textsFor(harness, target).some((text) => text.includes("未配置 restart.command"))).toBe(true);
+    expect(textsFor(harness, target).some((text) => text.includes("未检测到守护进程"))).toBe(true);
   } finally {
     await closeCoreHarness(harness);
   }

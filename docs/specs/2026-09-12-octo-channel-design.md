@@ -46,6 +46,8 @@
 
 使用 TypeScript/Bun 常驻服务，主动连接 Octo，启动并管理 OMP RPC worker。无需为 RPC 开放网络监听端口。macOS 使用 launchd 托管；机器休眠或离线期间不承诺可用。
 
+本机入口为 `oco`（`omp-channel-octo` 的别名，`bun link` 安装）：`start` 是守护进程托管的服务进程入口，`run` 是不探测守护进程的调试入口，`restart`/`status`/`logs` 通过自动识别出的守护进程程序操作常驻实例，`test --card` 发送真实预览卡。配置在 `~/.oco/config/config.json`，服务日志由服务自持在 `~/.oco/logs/`，状态目录仍在 `~/.local/state/omp-channel-octo`；守护进程与程序名不写进配置。详见 `2026-09-16-oco-cli-entry-design.md`。
+
 配置包含 Octo API 地址（缺省为 `https://im.deepminer.com.cn/`）、Bot token、可选 owner 用户 ID、允许群 ID、OMP 可执行文件及本地状态目录；WebSocket 地址可按现有发现机制取得或显式配置。未配置 owner 时，服务仅在该 Bot 尚无持久 owner 的条件下接受首次有效私聊绑定。凭证只来自本地配置或环境，不通过聊天设置，不写入日志。使用环境凭证时环境变量名默认 `OCTO_BOT_TOKEN`，显式名称仅允许 `OCTO_` 或 `OMP_CHANNEL_OCTO_` 前缀；所有这两类前缀的变量都会从 worker/watchdog 环境中剔除，以免子进程继承凭证。启动时校验配置、账户能力和状态目录可写性。同一 Bot 只允许一个 channel 实例，使用本机独占锁；不支持跨机器复制运行同一账户。
 发卡前必须通过同一能力门禁：profile `enabled=true`（兼容服务端返回 `1`），`profiles` 包含 `octo/v1`，`card_version=1.5`，且 `config.card_enabled=true`、`config.display_enabled=true`、`config.reasoning_enabled=true`；`TextBlock` 是唯一硬依赖，`Container` 等可选元素缺失时使用 fallback；若响应提供 `elements` 或 `limits`，则遵守所需元素和各项限额（包括 payload、node、depth 限额）。能力响应明确不满足必需条件时按未启用处理；HTTP 失败属于请求失败，不等同未启用，不通过发送试探能力。
 `launchd install` 只负责生成并写入权限为 `0600` 的 plist，不调用 `launchctl`；需要实际加载服务时由运维显式执行：
@@ -187,7 +189,7 @@ Octo 断线不取消已经开始的 Agent；正文 outbox 与任务状态持久�
 11. `ask` 问题可跨消息持久等待；owner 在同一聊天的下一条非命令文本被当作答案（编号选项按单选/多选校验，其他文本原样返回），不同聊天、无待回答问题、重复或过期后的文本都不作为答案并按普通任务处理，取消不使用默认答案。
 12. 在接收、started 落盘、执行、回复阶段分别终止服务再启动：绑定可恢复，历史可读，遗留任务报告中断，同消息重投不再执行副作用；外部移动只按精确 session ID 与 breadcrumb 唯一重绑，roots 依 native profile/`.env` 有效 cwd 解析，不选最近文件。
 13. Octo 断开再连接不重跑任务；已持久化正文从 outbox 继续投递，送达未知明确呈现；真实 `ExecutionEvent` tracker 用一张卡累计工具/turn/todo/run 终态与 elapsed，只在真实事件到达时随卡片刷新（编辑按 1000ms 合并窗口推进，无周期重绘），遵守 TextBlock/Container fallback、ToggleVisibility 能力和 payload/node/depth limits，卡片 edit sequence 单调递增，安全摘要不含原始 payload 与参数对象（命令类工具显示单行、截断到 72 字符并经凭据脱敏的命令文本）；typing 每 3 秒续期、活动请求 2 秒有界，终态卡片失败只做一次 best-effort，均不阻断正文；卡片身份、sequence 与最近快照按任务持久化，终态编辑成功后删除该行，进程重启后仍遗留的卡片由下一次启动补发一次终态编辑（序号严格递增、状态取任务终态、失败按有界次数重试后丢弃），使客户端无需重新执行任务即可离开「进行中」。
-14. 状态盘写入失败不启动新任务；同 Bot 第二实例不能启动；App Bot 配置不能被验收为支持群聊。
+14. 状态盘写入失败不启动新任务；同 Bot 第二实例不能启动（在重新注册 Bot 之前即报错退出）；App Bot 配置不能被验收为支持群聊。
 15. `launchd install` 仅写入权限为 `0600` 的 plist，不调用 `launchctl`；实际启动、停止分别由 `launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.omp.channel-octo.plist"` 与 `launchctl bootout "gui/$(id -u)/com.omp.channel-octo"` 完成，`launchd uninstall` 只删除 plist。环境凭证会进入该私有 plist，runtime 复用 plist 中安装时解析出的 OMP 路径；退出交互终端后仍能从实际 Octo 收发，日志不包含 token。
 16. 新建 session 的第一次 agent start 会注入目标的完整共享说明；恢复 session 只在没有可靠的同 session/目标/version committed marker，或 marker 仍处于 pending 时补注入；已 committed 的恢复不会因重新启动 worker 自动重复注入。
 17. 同一 session 的共享说明 version 变化时，OMP 收到一次完整最新快照和明确的版本变化说明；删除也按带 server version 的变化处理并明确当前无说明；version 不变的普通 turn 的 OMP prompt 不包含共享说明正文，也不把共享说明并入群历史块。
@@ -209,18 +211,26 @@ Octo 断线不取消已经开始的 Agent；正文 outbox 与任务状态持久�
 
 ```sh
 bun install
-mkdir -p ~/.config/omp-channel-octo
-cp config.example.json ~/.config/omp-channel-octo/config.json
-chmod 600 ~/.config/omp-channel-octo/config.json
+bun link   # 安装短入口 oco（~/.bun/bin/oco → 本 checkout）
+mkdir -p ~/.oco/config
+cp config.example.json ~/.oco/config/config.json
+chmod 600 ~/.oco/config/config.json
 # 可按需编辑 apiUrl（缺省为 https://im.deepminer.com.cn/）、ownerId（可省略）、allowedGroupIds，并在 botToken 与 botTokenEnv 中二选一
-bun run check -- --config ~/.config/omp-channel-octo/config.json
-# 前台运行：
-bun run serve -- --config ~/.config/omp-channel-octo/config.json
+oco check --config ~/.oco/config/config.json
+# 前台运行（守护进程托管的入口）：
+oco start --config ~/.oco/config/config.json
+# 调试运行（不参与守护进程）：
+oco run --config ~/.oco/config/config.json
 # 交由 launchd 管理时：
-bun run launchd -- install --config ~/.config/omp-channel-octo/config.json
+oco launchd install --config ~/.oco/config/config.json
+# 重启 / 看状态 / 看日志 / 发预览卡：
+oco restart
+oco status
+oco logs --tail 200
+oco test --card
 ```
 
-真实卡片视觉验收使用独立命令 `bun run test:preview-card`，仅在显式指定该命令时向真实 Octo 会话发送一张综合预览卡片，包含 11 次 tool 调用（`read`、`write`、`edit`、`bash`、`task`、`subagent_await`、`subagent_stop`、`hub`、`ask`）、4 个阶段和 12 个 Todo 任务，覆盖成功、等待、失败、取消和进行中状态；它读取 `BOT_TOKEN` 或 `OCTO_BOT_TOKEN`，目标优先读取 `OCTO_PREVIEW_TARGET_UID` 或 `OCTO_OWNER_ID`，未指定时使用 Bot 注册响应中的 owner UID，并可选读取 `OCTO_API_URL` 与 `OCTO_PREVIEW_CHANNEL_TYPE`（`1`、`2` 或 `5`）。普通 `bun test` 不执行该真实发送测试。
+真实卡片视觉验收使用 `oco test --card`（等价于 `bun run test:preview-card`），仅在显式指定时向真实 Octo 会话发送一张综合预览卡片，包含 11 次 tool 调用（`read`、`write`、`edit`、`bash`、`task`、`subagent_await`、`subagent_stop`、`hub`、`ask`）、4 个阶段和 12 个 Todo 任务，覆盖成功、等待、失败、取消和进行中状态；它读取 `BOT_TOKEN` 或 `OCTO_BOT_TOKEN`，目标优先读取 `OCTO_PREVIEW_TARGET_UID` 或 `OCTO_OWNER_ID`，未指定时使用 Bot 注册响应中的 owner UID，并可选读取 `OCTO_API_URL` 与 `OCTO_PREVIEW_CHANNEL_TYPE`（`1`、`2` 或 `5`），并会先应用 checkout 的 `.envrc`。普通 `bun test` 不执行该真实发送测试。
 `botToken` 与 `botTokenEnv` 互斥；使用环境凭证时先设置 `OCTO_BOT_TOKEN`（或配置中允许前缀的变量名）。安装 launchd 后按上文命令显式执行 `bootstrap`/`bootout`；实际项目级 OMP/Octo 协议、会话迁移、正文与进度卡行为已完成实现。launchd 尚未加载；脱离终端运行和真人登录态完整自动触发回合尚未验证，仍以用户本机 Bot 配置和部署可达为前提。
 首条有效私聊必须是支持的非空文本，且 `senderId`、`messageId` 非空并且发送者不是 Bot；它会原子持久化 owner 绑定和稳定去重确认，只发送确认，不执行任务。群聊和线程永远不会触发首次认领。首次认领存在风险：未配置 owner 时，第一个满足这些条件的私聊用户会成为 owner，请先确认 Bot 私聊入口的可信范围。
 
@@ -236,4 +246,4 @@ bun run launchd -- install --config ~/.config/omp-channel-octo/config.json
 
 群级免@的验收证据：`tests/core-mention-pref.test.ts` 覆盖 `effective` 为真时未 @Bot 的群消息与线程消息各启动一个任务、为假或查询失败时保持不启动且不回复、同一个群两次未 @Bot 只查询一次而带 mention 的消息不查询、被 owner/允许列表/Bot 回声规则先拒的消息零查询；`tests/octo-transport.test.ts` 的 "reads the group 免@ decision, including the legacy no_mention shape" 用真实 HTTP 夹具断言端点路径与 Bot 鉴权头，覆盖 `effective` 布尔与旧版 `no_mention` 0/1 两种形状，以及不可解析响应被拒。把 `isAllowed` 的免@分支摘掉后 `tests/core-mention-pref.test.ts` 有 4 例失败，确认用例不是空转。线上只读实测（本群）：`GET /v1/bot/groups/e3bc5af0d4b84b18bb3770a74bd222c6/mention_pref` 返回 `{"no_mention":0,"group_allow_no_mention":1,"effective":false}`，即群开关已允许、bot owner 尚未开启，因此本群当前仍需 @Bot。
 进度卡持久化与重启补发的验收证据：`tests/core-progress-card-recovery.test.ts` 覆盖 6 例——在线回合把服务端已接受的卡片帧（message ID、sequence、快照）写入状态盘并在终态编辑成功后清除该行；重启后遗留的 started 任务以 `cancelled` 补发一次终态编辑，已 completed 的任务以 `completed` 补发，序号均为持久值 +1，重放出的快照保留原有工具轨迹与耗时；补发失败保留该行（attempts 与序号同时 +1，避免与可能已落地的尝试撞车）并在下一次启动成功收尾；连续失败达到上限后该行被丢弃；不可解析的载荷不产生任何编辑且不阻断启动。把 `start()` 中的补发调用移除后这 5 例补发/丢弃用例全部失败，把建卡成功后的持久化调用移除后在线回合用例失败，确认用例不是空转。
-`channel_control` 的验收证据：`tests/core-host-tools.test.ts` 覆盖私聊与群/线程的工具集合断言（`ask,channel_control,octo_send_file`，群内追加 `octo_management`），以及 `channel_control` 的 `restart`/`status` 行为——`status` 返回本进程 PID 且初始 `restart_pending=false`；`restart` 在回合内只返回「已排定重启」，此刻重启命令一次都没有执行过；同一聊天排队任务运行期间重启保持等待；队列清空后重启命令恰好执行一次，并为发起会话写入重启通报（下次启动据此投递新 PID）；未配置重启端口（即未配置 `restart.command`）时返回未配置文本且不写通报。把 `createHostTools` 中的 `channel_control` 摘掉后，上述工具集合断言与两例 `channel_control` 行为用例全部失败，确认用例不是空转。
+`channel_control` 的验收证据：`tests/core-host-tools.test.ts` 覆盖私聊与群/线程的工具集合断言（`ask,channel_control,octo_send_file`，群内追加 `octo_management`），以及 `channel_control` 的 `restart`/`status` 行为——`status` 返回本进程 PID 且初始 `restart_pending=false`；`restart` 在回合内只返回「已排定重启」，此刻重启命令一次都没有执行过；同一聊天排队任务运行期间重启保持等待；队列清空后重启命令恰好执行一次，并为发起会话写入重启通报（下次启动据此投递新 PID）；未注入重启端口（即未检测到守护进程）时返回未检测到守护进程的文本且不写通报。把 `createHostTools` 中的 `channel_control` 摘掉后，上述工具集合断言与两例 `channel_control` 行为用例全部失败，确认用例不是空转。
