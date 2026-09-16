@@ -77,7 +77,7 @@
 
 对每个 `(botUid, channelType, channelId, sessionId)` 维护水位线 `injectedThroughSeq`：所有 `seq <= injectedThroughSeq` 的频道消息都已被完整记账——要么作为 task prompt 进入 session，要么作为历史注入过，要么被窗口显式标注为省略。
 
-任务开始时（仅群/线程任务、且 `groupHistory.enabled`，且该消息不是命令）：
+任务开始时（仅群/线程任务、且 `groupHistory.enabled`，且该任务的 prompt 正文不以 `/` 开头——命令与命令形状的文本都不注入，见"注入位置与块格式"）：
 
 1. 取当前任务消息的 `seq = S`；令 `P = injectedThroughSeq`（无记录时视为"首轮"，见步骤 6）。
 2. 候选区间 = `P < seq < S`。
@@ -94,7 +94,7 @@
 ### 注入位置与块格式
 
 - `worker.prompt` 的文本 = 历史块（可选）+ 原始用户文本，两者之间用空行 + `---` 分隔。
-- **命令永不注入历史**：内置命令与已注册 `ChannelCommandHandler`（含 `intercept=false` 的观察型 handler，它同样走 `acceptTask` → `prompt`）一律不拼接历史块，也不发起 sync。
+- **命令与命令形状的文本永不注入历史**：内置命令、已注册 `ChannelCommandHandler`（含 `intercept=false` 的观察型 handler，它同样走 `acceptTask` → `prompt`）、以及未注册因而按普通任务转交 OMP 的 `/xxx` 一律不拼接历史块，也不发起 sync，水位线也不因这一轮推进。原因不只是归属清晰：`/` 开头是 OMP 自己的输入语言，内置命令（`/move`）与插件命令（`/wtm`）由 OMP 从 prompt **首行**分派，块前缀会让整行退化为普通模型输入，命令不再执行。转交 OMP 的命令形状任务因此必须原样送达；它们不记账，区间留到下一个普通任务再注入。
 - 块格式（示例）：
 
   ```
@@ -156,7 +156,7 @@
 10. 显式 `groupHistory.enabled=false` 时行为与今天完全一致：非 @ 消息被丢弃、prompt 不含历史块、不产生 `group_history_ledger` 行、不发起 sync；未配置 `groupHistory` 时按开启解析（`enabled: true`、`maxMessages: 50`）。
 11. 非 owner 或未 @ 的群消息仍不触发任务，也不推进水位线；私聊与群/线程的缓冲与水位线不串线。
 12. 历史 ledger 的提交与群说明 CAS 解耦：群说明 version 未变（`contextNeedsCommit=false`）的连续两轮任务，第二轮不重复注入第一轮注入过的历史；历史 CAS 失败不导致任务失败。
-13. 命令（`/status`、`/new`、`/help`，以及注册的观察型 handler）的 prompt 路径不含历史块，也不发起 sync。
+13. 命令（`/status`、`/new`、`/help`，以及注册的观察型 handler）的 prompt 路径不含历史块，也不发起 sync；未注册的 `/xxx`（例如插件命令 `/wtm rm self`）按普通任务转交 OMP 时同样原样送达——prompt 文本逐字等于该消息，不带历史块、不发起 sync、不产生 ledger 行，且水位线停在其前，随后第一个普通任务仍把这条命令当历史注入。
 14. 每轮注入的历史正文不进入 system prompt 与群说明块：`before_agent_start` 的共享说明内容与历史条数无关。
 15. 单条超长正文按 code point 截断到 1000 且不出现半个代理对；块总大小不超过 32 KiB。
 16. steer 模式下的追加消息被成功投递后，下一轮不把该消息当历史重发（水位线已推进到它的 seq）。

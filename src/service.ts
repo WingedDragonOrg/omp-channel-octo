@@ -2226,7 +2226,10 @@ class CoreService implements ChannelService {
       resultText: null,
       errorText: null,
       messageSeq: message.messageSeq,
-      historyEligible,
+      // 以 `/` 开头的任务正文是 OMP 自己的输入语言：内置命令（`/move`）与插件命令（`/wtm`）
+      // 由 OMP 从 prompt 首行分派，历史块前缀会把这一行变回普通模型输入，因此不带历史块、
+      // 不发起 sync，水位线也不因这轮推进。
+      historyEligible: historyEligible && !isCommand(text),
     };
     let accepted: boolean;
     try {

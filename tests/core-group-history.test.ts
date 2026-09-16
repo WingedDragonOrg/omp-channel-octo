@@ -771,6 +771,36 @@ test("commands and observing handlers never inject history", async () => {
   }
 });
 
+test("an unregistered slash task reaches OMP verbatim and stays out of history accounting", async () => {
+  const harness = await createCoreHarness({
+    groupHistory: { enabled: true, maxMessages: 10 },
+    allowedGroupIds: GROUP_IDS,
+  });
+  try {
+    await deliverGroupMessages(harness, 1, 3);
+    await harness.service.handleInbound(triggerMessage(harness, 4, "/wtm rm self"));
+    await waitForTask(harness, 1);
+
+    // OMP dispatches its own builtin and plugin commands from the first prompt line, so a
+    // history block in front of this text would stop the command from ever running.
+    expect(harness.workers.prompts[0]!.text).toBe("/wtm rm self");
+    expect(harness.transport.historyCalls).toHaveLength(0);
+    expect(ledgerRows(harness)).toEqual([]);
+
+    await harness.service.handleInbound(triggerMessage(harness, 5, "@bot 普通任务"));
+    await waitForTask(harness, 2);
+    // The slash turn advanced nothing: the group text around it is still history.
+    expect(historyLinesOf(harness.workers.prompts[1]!.text)).toEqual([
+      expectedLine(1, "群消息 1"),
+      expectedLine(2, "群消息 2"),
+      expectedLine(3, "群消息 3"),
+      `- ${stampFor(4)} <owner-1>: /wtm rm self`,
+    ]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
 test("truncates an oversized history body inside the block budget", async () => {
   const harness = await createCoreHarness({
     groupHistory: { enabled: true, maxMessages: 5 },
