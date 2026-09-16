@@ -639,6 +639,19 @@ export class OctoProtocolFixture {
     this.started = false;
   }
 
+  /**
+   * Send a DISCONNECT frame (packet type 9) over a live connection, the way the server does when it
+   * kicks a session: one reason byte plus the reason text WuKongIM carries along.
+   */
+  kickConnection(index = 0, reason = 12, detail = "connect kicked"): void {
+    const connection = this.connections[index];
+    if (!connection || connection.socket.readyState !== WebSocket.OPEN) {
+      throw new Error("fixture connection is not open");
+    }
+    const body = new Writer().byte(reason).string(detail).finish();
+    connection.socket.send(encodeFrame(9, body));
+  }
+
   closeConnection(index = 0): void {
     const connection = this.connections[index];
     if (!connection) throw new Error(`fixture connection ${index} does not exist`);

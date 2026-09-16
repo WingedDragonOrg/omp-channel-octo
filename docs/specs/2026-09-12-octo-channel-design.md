@@ -184,7 +184,7 @@ OMP extension 在 worker 启动时由固定路径自动加载；sidecar 根路�
 
 取消是控制路径，不在普通任务队列后等待：发送 abort，等待 worker 停止；超过 10 秒关闭该 worker 进程树。只有确认进程退出且 channel 管理的执行已停止后才释放目录锁；无法确认则保持该目录阻塞并报告未知状态。取消不回滚已发生的副作用，不保证已派生到外部系统的工作停止。服务启动恢复前核查自身管理的遗留 worker；不能确认停止时不运行冲突目录的新任务。迁移操作无法确认停止时同时保留 source/target 两目录 blocked，跨重启继续生效。
 
-Octo 断线不取消已经开始的 Agent；正文 outbox 与任务状态持久化，重连后按聊天顺序继续投递，不重跑任务。重连采用有上限退避并重新认证，重复消息经持久去重；永久认证失败停止重连并给出本地明确错误。文字和文件 outbox 按聊天顺序发送，送达未知时沿用稳定 client message ID；文件永久失败标记 dead 并报告，不阻塞后续文字回复。
+Octo 断线不取消已经开始的 Agent；正文 outbox 与任务状态持久化，重连后按聊天顺序继续投递，不重跑任务。重连采用有上限退避（1s 起、翻倍、上限 30s，向下抖动）并重新认证；服务端主动 DISCONNECT（被踢，如同一 Bot 的另一次登录接管会话）与底层断线走同一条退避重连路径；只有注册或 CONNACK 认证失败才停止重连并给出本地明确错误。重复消息经持久去重。文字和文件 outbox 按聊天顺序发送，送达未知时沿用稳定 client message ID；文件永久失败标记 dead 并报告，不阻塞后续文字回复。
 
 外部移动恢复只接受精确 session ID 且通过 session 文件的 `previousSessionFiles` breadcrumb 证明身份；不按最近文件、不按时间、不按模糊 basename 选择。候选 roots 按 OMP native profile 与 `.env` 对当前有效 cwd 的解析结果取得，再加 channel state sessions root。候选不唯一、无法读取或无法验证时保持原绑定，不自动猜测；唯一候选通过 session header 的身份与 cwd 校验后立即持久化重绑，不启动 worker。`refreshState` 仅用于原生 `/move` 与 fresh 命令的 worker state 校验。
 

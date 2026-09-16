@@ -160,8 +160,14 @@ const AUDIO_CONTENT_TYPES: Record<string, string> = {
 };
 /** Transcribing anything larger is pointless and would only buffer a big file in memory. */
 const MAX_TRANSCRIBE_BYTES = 20 * 1024 * 1024;
-const RECONNECT_BASE_MS = 100;
+/**
+ * A dropped or kicked socket reconnects with an exponential backoff that doubles from the base
+ * until the cap, jittered downward so several bots kicked at the same moment do not return in
+ * lockstep. Only registration/authentication failures stop the transport for good.
+ */
+const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
+const RECONNECT_JITTER_MIN = 0.75;
 const PING_INTERVAL_MS = 30_000;
 const PONG_TIMEOUT_MS = 10_000;
 
@@ -1077,7 +1083,7 @@ export class OctoTransport implements ChannelTransport {
     const reason = body.byte();
     if (reason !== 1) {
       const message = reason === 0
-        ? "Octo WebSocket was kicked by the server"
+        ? "Octo WebSocket was kicked while connecting; another login holds this bot session"
         : `Octo WebSocket authentication failed with reason ${reason}`;
       this.failPermanently(new OctoError(message, { permanent: true }));
       return;
@@ -1130,17 +1136,27 @@ export class OctoTransport implements ChannelTransport {
       this.logger(this.safeError(error, "Octo online callback failed"));
     }
   }
+  /**
+   * The server kicks a live connection when another login for the same bot takes over, when the
+   * session expires, or when the cluster moves the connection. That is not an authentication
+   * failure: drop the socket and let the reconnect schedule re-register with backoff.
+   */
   private handleDisconnect(state: SocketState, frameBody: Uint8Array): void {
     let reason = 0;
+    let detail = "";
     try {
-      if (frameBody.byteLength > 0) reason = new ByteReader(frameBody).byte();
+      const reader = new ByteReader(frameBody);
+      if (frameBody.byteLength > 0) reason = reader.byte();
+      if (reason !== 0) detail = reader.string();
     } catch {
       reason = 0;
+      detail = "";
     }
     const message = reason === 0
-      ? "Octo WebSocket was kicked by the server"
-      : `Octo WebSocket disconnected with reason ${reason}`;
-    this.failPermanently(new OctoError(message, { permanent: true }));
+      ? "Octo WebSocket was kicked by the server; reconnecting"
+      : `Octo WebSocket disconnected with reason ${reason}; reconnecting`;
+    this.logger(detail.length > 0 ? `${message} (${detail})` : message);
+    this.closeSocket(state);
   }
 
   private handleRecv(state: SocketState, frameBody: Uint8Array): void {
@@ -1249,7 +1265,8 @@ export class OctoTransport implements ChannelTransport {
 
   private scheduleReconnect(): void {
     if (this.stopped || this.reconnectTimer) return;
-    const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** Math.min(this.reconnectAttempt, 8));
+    const exponential = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** Math.min(this.reconnectAttempt, 20));
+    const delay = Math.round(exponential * (RECONNECT_JITTER_MIN + Math.random() * (1 - RECONNECT_JITTER_MIN)));
     this.reconnectAttempt += 1;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
