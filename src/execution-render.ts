@@ -4,7 +4,7 @@
  * 取舍——那是 `./execution-card.ts` 的事。
  */
 
-import type { ExecutionToolSnapshot, ExecutionTodoPhase, ExecutionTodoTask, ExecutionState, ExecutionToolState, TodoStatus, ExecutionErrorCategory, ExecutionSnapshot } from "./execution-tracker.ts";
+import type { ExecutionToolSnapshot, ExecutionTodoPhase, ExecutionTodoTask, ExecutionState, ExecutionToolState, ExecutionSubagentState, ExecutionSubagentSnapshot, TodoStatus, ExecutionErrorCategory, ExecutionSnapshot } from "./execution-tracker.ts";
 import { finiteTime } from "./execution-tracker.ts";
 import type { AdaptiveCard, ExecutionCardCapabilities } from "./execution-card.ts";
 
@@ -53,17 +53,6 @@ const TOOL_DISPLAY_LABELS: Record<string, string> = {
   subagent_await: "等待子代理",
   subagent_stop: "停止子代理",
   todo: "更新任务",
-};
-const SUBAGENT_TOOL_NAMES: Record<string, true> = {
-  agent: true,
-  delegate: true,
-  run_subagent: true,
-  spawn_agent: true,
-  subagent: true,
-  subagent_await: true,
-  subagent_start: true,
-  subagent_stop: true,
-  task: true,
 };
 const REQUIRED_ELEMENTS = ["TextBlock"] as const;
 export const TOGGLE_ACTION = "Action.ToggleVisibility";
@@ -163,7 +152,7 @@ export function executionStateLabel(state: ExecutionState): string {
   }
 }
 
-export function executionStateGlyph(state: ExecutionState | ExecutionToolState): string {
+export function executionStateGlyph(state: ExecutionState | ExecutionToolState | ExecutionSubagentState): string {
   switch (state) {
     case "running":
       return RUNNING_GLYPH;
@@ -172,6 +161,7 @@ export function executionStateGlyph(state: ExecutionState | ExecutionToolState):
       return SUCCESS_GLYPH;
     case "failed":
       return FAILURE_GLYPH;
+    case "pending":
     case "cancelled":
       return WAITING_GLYPH;
   }
@@ -196,7 +186,7 @@ function toolStateLabel(state: ExecutionToolState): string {
 }
 
 export function executionTone(
-  state: ExecutionState | ExecutionToolState,
+  state: ExecutionState | ExecutionToolState | ExecutionSubagentState,
 ): "Accent" | "Good" | "Attention" | "Default" {
   switch (state) {
     case "running":
@@ -204,6 +194,7 @@ export function executionTone(
     case "completed":
     case "succeeded":
       return "Good";
+    case "pending":
     case "cancelled":
       return "Default";
     case "failed":
@@ -216,13 +207,6 @@ function displayToolName(toolName: string): string {
   return TOOL_DISPLAY_LABELS[toolName] ?? TOOL_DISPLAY_LABELS[normalized] ?? toolName;
 }
 
-export function isSubagentTool(toolName: string): boolean {
-  return SUBAGENT_TOOL_NAMES[toolName.toLowerCase()] === true;
-}
-export function isActiveSubagent(tool: ExecutionToolSnapshot): boolean {
-  return isSubagentTool(tool.toolName) && tool.state === "running";
-}
-
 function isWaitingTool(toolName: string): boolean {
   return WAITING_TOOL_NAMES[toolName.toLowerCase()] === true;
 }
@@ -230,6 +214,36 @@ function isWaitingTool(toolName: string): boolean {
 function toolStatusLabel(tool: ExecutionToolSnapshot): string {
   if (tool.state === "running" && isWaitingTool(tool.toolName)) return "等待";
   return toolStateLabel(tool.state);
+}
+
+function subagentStateLabel(state: ExecutionSubagentState): string {
+  switch (state) {
+    case "pending":
+      return "待启动";
+    case "running":
+      return "进行中";
+    case "completed":
+      return "已完成";
+    case "failed":
+      return "失败";
+    case "cancelled":
+      return "已取消";
+  }
+}
+
+/**
+ * One child's line: who it is, what it is for, the lifecycle state, and the tool activity that
+ * state is made of. No clock and no duration — timing is not part of the overall state.
+ */
+export function subagentLine(subagent: ExecutionSubagentSnapshot, includeGlyph = false): string {
+  const parts: string[] = [];
+  if (includeGlyph) parts.push(executionStateGlyph(subagent.state));
+  parts.push(subagent.agent);
+  if (subagent.summary) parts.push(subagent.summary);
+  parts.push(subagentStateLabel(subagent.state));
+  if (subagent.currentTool) parts.push(subagent.currentTool);
+  if (subagent.toolCount !== undefined) parts.push(`${subagent.toolCount} 次调用`);
+  return parts.join(" · ");
 }
 
 function toolVisualTone(tool: ExecutionToolSnapshot): "Accent" | "Good" | "Attention" | "Default" {
@@ -304,6 +318,19 @@ export function markdownSafeToolLine(tool: ExecutionToolSnapshot): string {
   const glyph = toolStateGlyph(tool);
   if (glyph !== WAITING_GLYPH || !line.startsWith(`${glyph} `)) return line;
   return `${glyph}\u00a0${line.slice(glyph.length + 1)}`;
+}
+
+/** Compact tier of a subagent row: the same single-line shape as an omitted trace step. */
+function makeCompactSubagentRow(
+  subagent: ExecutionSubagentSnapshot,
+  options: { readonly id?: string; readonly isVisible?: boolean } = {},
+): JsonNode {
+  return makeTextBlock(`${executionStateGlyph(subagent.state)}\u00a0· ${subagentLine(subagent)}`, {
+    color: executionTone(subagent.state),
+    spacing: "Small",
+    ...(options.id === undefined ? {} : { id: options.id }),
+    ...(options.isVisible === undefined ? {} : { isVisible: options.isVisible }),
+  });
 }
 
 // Shared by budget-pruned trace and subagent rows. These rows are the compact tier: one text
@@ -744,13 +771,89 @@ export function makeTodoContainer(
   };
 }
 
+/**
+ * Rich tier of a subagent row: agent name headline, its purpose, then the lifecycle state with the
+ * tool it is currently running and how many it has used. Rows for subagents still on the wire stay
+ * the default visible band, so this mirrors the tool row layout — without the row's clock/duration.
+ */
+function makeSubagentRow(
+  subagent: ExecutionSubagentSnapshot,
+  options: { readonly id?: string; readonly isVisible?: boolean } = {},
+): JsonNode {
+  const tone = executionTone(subagent.state);
+  return {
+    type: "ColumnSet",
+    ...(options.id === undefined ? {} : { id: options.id }),
+    ...(options.isVisible === undefined ? {} : { isVisible: options.isVisible }),
+    spacing: "None",
+    columns: [
+      {
+        type: "Column",
+        width: "stretch",
+        items: [
+          {
+            type: "Container",
+            style: tone === "Default" ? "emphasis" : tone.toLowerCase(),
+            spacing: "Small",
+            items: [
+              {
+                type: "ColumnSet",
+                spacing: "None",
+                columns: [
+                  {
+                    type: "Column",
+                    width: TOOL_MARKER_COLUMN_WIDTH,
+                    verticalContentAlignment: "Center",
+                    items: [makeTextBlock(executionStateGlyph(subagent.state), {
+                      spacing: "None",
+                      color: tone,
+                      fontType: "Monospace",
+                      size: "Small",
+                      wrap: false,
+                    })],
+                  },
+                  {
+                    type: "Column",
+                    width: "stretch",
+                    items: [
+                      makeTextBlock(subagent.agent, { weight: "Bolder", spacing: "None" }),
+                      ...(subagent.summary === undefined
+                        ? []
+                        : [makeTextBlock(subagent.summary, { isSubtle: true, size: "Small", spacing: "None" })]),
+                      makeTextBlock([
+                        subagentStateLabel(subagent.state),
+                        ...(subagent.currentTool === undefined ? [] : [subagent.currentTool]),
+                        ...(subagent.toolCount === undefined ? [] : [`${subagent.toolCount} 次调用`]),
+                      ].join(" · "), {
+                        isSubtle: true,
+                        size: "Small",
+                        spacing: "None",
+                        color: tone,
+                      }),
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+/**
+ * The subagent section. It is fed by the OMP subagent events alone: live children render as rich
+ * rows, finished ones sink into the expandable history band, and the count in the heading is the
+ * number of subagents the session actually reported.
+ */
 export function makeSubagentContainer(
-  tools: readonly ExecutionToolSnapshot[],
+  subagents: readonly ExecutionSubagentSnapshot[],
   hiddenCount: number,
   totalCount: number,
   detailVisible: boolean,
-  olderTools: readonly ExecutionToolSnapshot[] = [],
-  omittedTools: readonly ExecutionToolSnapshot[] = [],
+  olderSubagents: readonly ExecutionSubagentSnapshot[] = [],
+  omittedSubagents: readonly ExecutionSubagentSnapshot[] = [],
   hideOlder = true,
 ): JsonNode {
   const items: JsonNode[] = [];
@@ -761,22 +864,22 @@ export function makeSubagentContainer(
       spacing: "Small",
     }));
   }
-  if (tools.length === 0 && olderTools.length === 0 && omittedTools.length === 0) {
+  if (subagents.length === 0 && olderSubagents.length === 0 && omittedSubagents.length === 0) {
     items.push(makeTextBlock("暂无可见子代理活动", { isSubtle: true, spacing: "Small" }));
   } else {
-    items.push(...tools.map(tool => makeToolRow(tool)));
-    items.push(...olderTools.map((tool, index) => makeCompactToolRow(tool, {
+    items.push(...subagents.map(subagent => makeSubagentRow(subagent)));
+    items.push(...olderSubagents.map((subagent, index) => makeCompactSubagentRow(subagent, {
       id: `subagent_older_step_${index}`,
       ...(hideOlder ? { isVisible: false } : {}),
     })));
-    if (omittedTools.length > 0) {
+    if (omittedSubagents.length > 0) {
       items.push({
         type: "Container",
         id: "subagent_omitted_steps",
         isVisible: false,
         style: "emphasis",
         spacing: "Small",
-        items: omittedTools.map(tool => makeCompactToolRow(tool)),
+        items: omittedSubagents.map(subagent => makeCompactSubagentRow(subagent)),
       });
     }
   }

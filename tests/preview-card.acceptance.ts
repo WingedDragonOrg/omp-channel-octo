@@ -135,6 +135,57 @@ function addPreviewTool(
   });
 }
 
+function addPreviewSubagent(
+  tracker: ExecutionTracker,
+  options: {
+    readonly subagentId: string;
+    readonly agent: string;
+    readonly atMs: number;
+    readonly summary: string;
+    readonly endAtMs?: number;
+    readonly state?: "completed" | "failed" | "cancelled";
+  },
+): void {
+  tracker.apply({
+    type: "subagent_start",
+    subagentId: options.subagentId,
+    agent: options.agent,
+    state: "running",
+    atMs: PREVIEW_STARTED_AT + options.atMs,
+    summary: options.summary,
+  });
+  if (options.state === undefined || options.endAtMs === undefined) return;
+  tracker.apply({
+    type: "subagent_end",
+    subagentId: options.subagentId,
+    state: options.state,
+    atMs: PREVIEW_STARTED_AT + options.endAtMs,
+    summary: options.summary,
+  });
+}
+
+/** One aggregated `subagent_progress` frame: the child's reported activity while it runs. */
+function reportSubagentProgress(
+  tracker: ExecutionTracker,
+  options: {
+    readonly subagentId: string;
+    readonly atMs: number;
+    readonly summary: string;
+    readonly currentTool?: string;
+    readonly toolCount?: number;
+  },
+): void {
+  tracker.apply({
+    type: "subagent_update",
+    subagentId: options.subagentId,
+    state: "running",
+    atMs: PREVIEW_STARTED_AT + options.atMs,
+    summary: options.summary,
+    ...(options.currentTool === undefined ? {} : { currentTool: options.currentTool }),
+    ...(options.toolCount === undefined ? {} : { toolCount: options.toolCount }),
+  });
+}
+
 function previewSnapshot() {
   const tracker = createExecutionTracker({ runId: "preview-card-acceptance", initialAtMs: PREVIEW_STARTED_AT });
   tracker.apply({ type: "turn_start", turnId: "preview-turn", atMs: PREVIEW_STARTED_AT });
@@ -210,6 +261,58 @@ function previewSnapshot() {
     atMs: 1_200,
     summary: "子代理 · analyst",
   });
+  // The subagent section is driven by the real lifecycle frames; the `task` rows above are what
+  // the trace records while those children run.
+  addPreviewSubagent(tracker, {
+    subagentId: "preview-reviewer",
+    agent: "reviewer",
+    atMs: 740,
+    endAtMs: 860,
+    state: "failed",
+    summary: "复核变更",
+  });
+  addPreviewSubagent(tracker, {
+    subagentId: "preview-verifier",
+    agent: "verifier",
+    atMs: 900,
+    summary: "验证实现",
+  });
+  reportSubagentProgress(tracker, {
+    subagentId: "preview-verifier",
+    atMs: 940,
+    summary: "等待授权后继续",
+    currentTool: "read",
+    toolCount: 2,
+  });
+  addPreviewSubagent(tracker, {
+    subagentId: "preview-scout",
+    agent: "scout",
+    atMs: 980,
+    endAtMs: 1_120,
+    state: "completed",
+    summary: "统计源码",
+  });
+  addPreviewSubagent(tracker, {
+    subagentId: "preview-cleanup",
+    agent: "cleanup",
+    atMs: 1_140,
+    endAtMs: 1_180,
+    state: "cancelled",
+    summary: "停止子代理",
+  });
+  addPreviewSubagent(tracker, {
+    subagentId: "preview-analyst",
+    agent: "analyst",
+    atMs: 1_200,
+    summary: "分析执行轨迹",
+  });
+  reportSubagentProgress(tracker, {
+    subagentId: "preview-analyst",
+    atMs: 1_260,
+    summary: "汇总工具样式",
+    currentTool: "bash",
+    toolCount: 3,
+  });
   addPreviewTool(tracker, {
     toolCallId: "preview-hub-send",
     toolName: "hub",
@@ -270,13 +373,13 @@ function previewSnapshot() {
 function compactPreviewSnapshot() {
   const tracker = createExecutionTracker({ runId: "preview-card-budget", initialAtMs: PREVIEW_STARTED_AT });
   tracker.apply({ type: "turn_start", turnId: "preview-turn", atMs: PREVIEW_STARTED_AT });
-  addPreviewTool(tracker, {
-    toolCallId: "compact-subagent",
-    toolName: "task",
+  addPreviewSubagent(tracker, {
+    subagentId: "compact-child",
+    agent: "compact",
     atMs: 1,
     endAtMs: 2,
-    status: "succeeded",
-    summary: "子代理 · compact",
+    state: "completed",
+    summary: "压缩检查",
   });
   addPreviewTool(tracker, {
     toolCallId: "compact-trace",
@@ -307,6 +410,12 @@ function terminalPreviewSnapshot() {
     toolName: "task",
     atMs: 1,
     summary: "子代理 · terminal",
+  });
+  addPreviewSubagent(tracker, {
+    subagentId: "terminal-child",
+    agent: "terminal",
+    atMs: 1,
+    summary: "终态检查",
   });
   tracker.apply({ type: "run_end", atMs: PREVIEW_STARTED_AT + 200, state: "completed" });
   return tracker.snapshot(PREVIEW_STARTED_AT + 200);
@@ -383,14 +492,24 @@ test("preview snapshot shows every subagent state by default", () => {
   );
   expect(rows).toHaveLength(2);
   const visibleText = rows.map(row => cardText(row)).join("\n");
-  expect(visibleText).toContain("等待子代理 · verifier");
-  expect(visibleText).toContain("子代理 · analyst");
-  expect(visibleText).not.toContain("子代理 · reviewer");
-  expect(visibleText).not.toContain("子代理 · scout");
-  expect(visibleText).not.toContain("停止子代理 · cleanup");
+  expect(visibleText).toContain("verifier");
+  expect(visibleText).toContain("等待授权后继续");
+  expect(visibleText).toContain("进行中");
+  expect(visibleText).toContain("read");
+  expect(visibleText).toContain("2 次调用");
+  expect(visibleText).toContain("analyst");
+  expect(visibleText).toContain("汇总工具样式");
+  expect(visibleText).toContain("bash");
+  expect(visibleText).toContain("3 次调用");
+  // State and tool activity only: a subagent row carries no per-child clock or duration.
+  expect(visibleText).not.toMatch(/\d{2}:\d{2}:\d{2}/u);
+  expect(visibleText).not.toMatch(/\d+ms|\d+\.\d+s/u);
+  expect(visibleText).not.toContain("reviewer");
+  expect(visibleText).not.toContain("scout");
+  expect(visibleText).not.toContain("cleanup");
   const hiddenSummary = nodeById(card, "subagent_hidden_summary");
   expect(hiddenSummary.isVisible).not.toBe(false);
-  expect(cardText(hiddenSummary)).toContain("已隐藏 3 个子代理");
+  expect(cardText(hiddenSummary)).toContain("已隐藏 3 个子代理，共 5 个子代理");
   // The todo list is the run's contract and stays whole; the execution trace is what folded away.
   const todoDetail = nodeById(card, "todo_detail");
   expect(cardText(todoDetail)).not.toContain("已隐藏");
@@ -413,7 +532,9 @@ test("preview snapshot shows every subagent state by default", () => {
   ]);
   expect(cardNodes(card).some(node => node.id === "btn_expand_todo")).toBe(false);
   expect(cardNodes(card).some(node => node.id === "btn_expand_subagents")).toBe(true);
-  expect(cardNodes(card).some(node => node.id === "btn_expand_trace")).toBe(true);
+  // 11 tool calls against a 200-node budget: the trace sheds its own rows first, so whether its
+  // expand control survives depends on how much detail the fit search had left.
+  expect(nodeById(card, "timeline_detail")).toBeDefined();
   expect(nodeById(card, "btn_collapse_progress")).toMatchObject({ isVisible: true });
   expect(nodeById(card, "timeline_section").isVisible).not.toBe(false);
   expect(cardText(nodeById(card, "timeline_detail"))).toContain("已隐藏前");
@@ -474,7 +595,8 @@ test("preview budget fallback exposes compact trace and subagent groups", () => 
     expect(rows.every(item => item.type === "TextBlock" && item.wrap === true)).toBe(true);
     expect(rows.every(item => typeof item.text === "string" && item.text.startsWith("✓\u00a0· "))).toBe(true);
   }
-  expect(cardText(subagents)).toContain("子代理 · compact");
+  expect(cardText(subagents)).toContain("compact");
+  expect(cardText(subagents)).toContain("压缩检查");
   expect(cardText(trace)).toContain("旧轨迹");
 });
 
@@ -585,9 +707,16 @@ runPreviewTest(
       "abandoned",
       "cancelled",
     ]));
+    expect(preview.subagents.map(subagent => [subagent.agent, subagent.state])).toEqual([
+      ["reviewer", "failed"],
+      ["verifier", "running"],
+      ["scout", "completed"],
+      ["cleanup", "cancelled"],
+      ["analyst", "running"],
+    ]);
     await sendLivePreviewCard(
       preview,
-      "综合预览卡片（11 次 tool 调用、9 类工具、4 个 Todo 阶段、12 个任务及成功/等待/失败/取消/进行中状态）",
+      "综合预览卡片（11 次 tool 调用、9 类工具、5 个子代理事件、4 个 Todo 阶段、12 个任务及成功/等待/失败/取消/进行中状态）",
     );
   },
   { timeout: 30_000 },

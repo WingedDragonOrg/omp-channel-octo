@@ -14,8 +14,6 @@ import {
   executionTone,
   formatDuration,
   handoffAnchorIndex,
-  isActiveSubagent,
-  isSubagentTool,
   makeCollapsibleSection,
   makeHeader,
   makeHeaderContainer,
@@ -31,6 +29,7 @@ import {
   makeToggleSets,
   makeTraceHistoryBand,
   markdownSafeToolLine,
+  subagentLine,
   metricCount,
   resolveCardLimits,
   supportsAction,
@@ -107,42 +106,35 @@ function buildCandidate(
   const canToggle = richLayout
     && supportsElement(capabilities, "ActionSet")
     && supportsAction(capabilities, TOGGLE_ACTION);
+  // Snapshots written before subagent tracking existed (and hand-built fixtures) simply have no
+  // subagent field; they render as a run with zero children.
+  const subagents = Array.isArray(snapshot.subagents) ? snapshot.subagents : [];
   const hiddenTools = Math.max(0, snapshot.tools.length - visibleTools.length);
   const recentTools = visibleTools.slice(Math.max(0, visibleTools.length - MAX_VISIBLE_TOOLS));
   const omittedTools = snapshot.tools.slice(0, hiddenTools);
-  const totalSubagents = richLayout
-    ? snapshot.tools.filter(tool => isSubagentTool(tool.toolName)).length
-    : 0;
-  const visibleSubagents = richLayout
-    ? snapshot.tools.filter(isActiveSubagent)
-    : [];
-  const olderSubagents: readonly ExecutionToolSnapshot[] = [];
-  const visibleTraceTools = richLayout
-    ? recentTools.filter(tool => !isSubagentTool(tool.toolName))
-    : visibleTools;
+  const visibleTraceTools = richLayout ? recentTools : visibleTools;
   const olderTraceTools = richLayout
-    ? visibleTools.filter(tool => !isSubagentTool(tool.toolName) && !recentTools.includes(tool))
+    ? visibleTools.filter(tool => !recentTools.includes(tool))
     : [];
-  const omittedTraceTools = richLayout
-    ? omittedTools.filter(tool => !isSubagentTool(tool.toolName))
-    : [];
+  const omittedTraceTools = richLayout ? omittedTools : [];
   const cappedOmittedTraceTools = omittedTraceTools.length <= MAX_COMPACT_TOOL_ROWS ? omittedTraceTools : [];
   const expandableOmittedTraceTools = cappedOmittedTraceTools.slice(
     Math.max(0, cappedOmittedTraceTools.length - hiddenRowLimit),
   );
-  const omittedSubagentTools = richLayout
-    ? [
-        ...omittedTools.filter(tool => isSubagentTool(tool.toolName) && !isActiveSubagent(tool)),
-        ...visibleTools.filter(tool => isSubagentTool(tool.toolName) && !isActiveSubagent(tool)),
-      ]
+  const totalSubagents = richLayout ? subagents.length : 0;
+  // Live children (the ones still on the wire) are the default rich band; finished ones are the
+  // history the toggle can bring back. Both come from the OMP subagent events, not tool names.
+  const visibleSubagents = richLayout
+    ? subagents.filter(subagent => subagent.state === "running" || subagent.state === "pending")
     : [];
-  const cappedOmittedSubagentTools = omittedSubagentTools.length <= MAX_COMPACT_TOOL_ROWS
-    ? omittedSubagentTools
+  const olderSubagents = richLayout
+    ? subagents.filter(subagent => subagent.state !== "running" && subagent.state !== "pending")
     : [];
-  const expandableOmittedSubagentTools = cappedOmittedSubagentTools.slice(
-    Math.max(0, cappedOmittedSubagentTools.length - hiddenRowLimit),
+  const cappedOlderSubagents = olderSubagents.length <= MAX_COMPACT_TOOL_ROWS ? olderSubagents : [];
+  const expandableOmittedSubagents = cappedOlderSubagents.slice(
+    Math.max(0, cappedOlderSubagents.length - hiddenRowLimit),
   );
-  const totalTraceTools = richLayout ? snapshot.tools.length - totalSubagents : snapshot.tools.length;
+  const totalTraceTools = snapshot.tools.length;
   const hiddenTraceTools = Math.max(0, totalTraceTools - visibleTraceTools.length);
   const hiddenSubagents = Math.max(0, totalSubagents - visibleSubagents.length);
   const visibleTodoTasks = visibleTodos.reduce((count, phase) => count + phase.tasks.length, 0);
@@ -165,7 +157,7 @@ function buildCandidate(
   );
   const hasRenderedSubagentActivity = visibleSubagents.length > 0
     || olderSubagents.length > 0
-    || expandableOmittedSubagentTools.length > 0;
+    || hiddenSubagents > 0;
   const subagentContainer = richLayout && hasRenderedSubagentActivity
     ? makeSubagentContainer(
       visibleSubagents,
@@ -173,7 +165,7 @@ function buildCandidate(
       totalSubagents,
       true,
       olderSubagents,
-      canToggle ? expandableOmittedSubagentTools : [],
+      canToggle ? expandableOmittedSubagents : [],
       canToggle,
     )
     : null;
@@ -183,7 +175,7 @@ function buildCandidate(
   ];
   const subagentHiddenIds = [
     ...olderSubagents.map((_tool, index) => `subagent_older_step_${index}`),
-    ...(expandableOmittedSubagentTools.length > 0 ? ["subagent_omitted_steps"] : []),
+    ...(expandableOmittedSubagents.length > 0 ? ["subagent_omitted_steps"] : []),
   ];
   const traceToggleSets = canToggle ? makeToggleSets(traceHiddenIds) : [];
   const subagentToggleSets = canToggle && subagentContainer
@@ -309,9 +301,13 @@ function buildCandidate(
     ...(notice ? [notice.text] : []),
     ...visibleTools.map(tool => markdownSafeToolLine(tool)),
     ...(hiddenTools > 0 ? [`已隐藏前 ${hiddenTools} 个步骤，共 ${snapshot.tools.length} 个步骤`] : []),
+    ...subagents.map(subagent => subagentLine(subagent, true)),
+    ...(hiddenSubagents > 0 ? [`已隐藏 ${hiddenSubagents} 个子代理，共 ${totalSubagents} 个子代理`] : []),
     ...todoLines(visibleTodos, hiddenTodoTasks, totalTodoTasks),
   ];
-  if (visibleTools.length === 0 && visibleTodoTasks === 0) plainLines.push("正在准备");
+  // The rich card keeps finished subagents behind the section toggle; the plain rendering has no
+  // toggle, so it lists every subagent the session reported.
+  if (visibleTools.length === 0 && visibleTodoTasks === 0 && subagents.length === 0) plainLines.push("正在准备");
   return { card, plain: plainLines.join("\n") };
 }
 

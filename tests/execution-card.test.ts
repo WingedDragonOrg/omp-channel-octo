@@ -154,6 +154,40 @@ function clockAt(atMs: number): string {
     .join(":");
 }
 
+/** The worker's `subagent_lifecycle` with status `started` / `subagent_progress` arrival. */
+function startSubagent(
+  tracker: ExecutionTracker,
+  subagentId: string,
+  agent: string,
+  atMs: number,
+  summary?: string,
+): void {
+  tracker.apply({
+    type: "subagent_start",
+    subagentId,
+    agent,
+    state: "running",
+    atMs,
+    ...(summary === undefined ? {} : { summary }),
+  });
+}
+
+function endSubagent(
+  tracker: ExecutionTracker,
+  subagentId: string,
+  atMs: number,
+  state: "completed" | "failed" | "cancelled",
+  summary?: string,
+): void {
+  tracker.apply({
+    type: "subagent_end",
+    subagentId,
+    state,
+    atMs,
+    ...(summary === undefined ? {} : { summary }),
+  });
+}
+
 describe("execution tracker", () => {
   test("projects turn phases, tool counts, elapsed time, and terminal state", () => {
     const tracker = createExecutionTracker({ runId: "run-1" });
@@ -559,11 +593,11 @@ describe("execution card rendering", () => {
     expect(textNodes.some(node => node.text === "询问用户")).toBe(true);
   });
 
-  test("renders all subagent activity independently of the recent trace window", () => {
+  test("keeps live subagents as their own band above the trace", () => {
     const tracker = createExecutionTracker({ runId: "subagents" });
     startTurn(tracker, "turn-1", 0);
     for (let index = 0; index < 4; index += 1) {
-      startTool(tracker, `subagent-${index}`, "task", 100 + index, `子代理步骤 ${index + 1}`);
+      startSubagent(tracker, `child-${index}`, `agent-${index + 1}`, 100 + index, `子代理步骤 ${index + 1}`);
     }
     startTool(tracker, "tool-1", "read", 200, "src/service.ts");
     const rendered = buildExecutionCard(tracker.snapshot(1_600), fullCapabilities);
@@ -575,18 +609,153 @@ describe("execution card rendering", () => {
     expect(subagents).toMatchObject({ type: "Container", isVisible: true });
     const subagentItems = subagents.items as JsonRecord[];
     const visibleRows = subagentItems.filter(item => item.type === "ColumnSet" && item.isVisible !== false);
-    const hiddenRows = subagentItems.filter(item => item.type === "ColumnSet" && item.isVisible === false);
     expect(visibleRows).toHaveLength(4);
-    expect(hiddenRows).toHaveLength(0);
     const visibleText = visibleRows.map(row => cardText(row)).join("\n");
+    expect(visibleText).toContain("agent-1");
     expect(visibleText).toContain("子代理步骤 1");
-    expect(visibleText).toContain("子代理步骤 2");
-    expect(visibleText).toContain("子代理步骤 3");
-    expect(visibleText).toContain("子代理步骤 4");
+    expect(visibleText).toContain("agent-4");
+    expect(visibleText).toContain("进行中");
+    // Subagents are their own section, never rows of the trace window.
     expect(cardText(timeline)).toContain("src/service.ts");
-    expect(cardText(timeline)).not.toContain("子代理步骤 1");
-    expect(nodes(card).some(node => node.id === "btn_collapse_subagents")).toBe(false);
-    expect(nodes(card).some(node => node.id === "btn_expand_subagents")).toBe(false);
+    expect(cardText(timeline)).not.toContain("agent-1");
+    expect(nodeById(card, "subagent_section").isVisible).not.toBe(false);
+    expect(cardText(nodeById(card, "subagent_section"))).toContain("子代理 · 4");
+  });
+
+  test("move a finished subagent into the expandable history band", () => {
+    const tracker = createExecutionTracker({ runId: "subagent-history" });
+    startTurn(tracker, "turn-1", 0);
+    startSubagent(tracker, "CountSrc", "scout", 100, "统计源码文件");
+    tracker.apply({
+      type: "subagent_update",
+      subagentId: "CountSrc",
+      state: "running",
+      atMs: 200,
+      summary: "扫描 src",
+      currentTool: "glob",
+      toolCount: 2,
+    });
+    endSubagent(tracker, "CountSrc", 400, "completed", "统计源码文件");
+    startSubagent(tracker, "Verify", "reviewer", 500, "复核结果");
+    const rendered = buildExecutionCard(tracker.snapshot(1_600), fullCapabilities);
+
+    expect(rendered).not.toBeNull();
+    const card = rendered!.card as JsonRecord;
+    const liveRows = (nodeById(card, "subagent_detail").items as JsonRecord[])
+      .filter(item => item.type === "ColumnSet" && item.isVisible !== false);
+    expect(liveRows).toHaveLength(1);
+    expect(cardText(liveRows[0]!)).toContain("reviewer");
+    const hiddenSummary = nodeById(card, "subagent_hidden_summary");
+    expect(cardText(hiddenSummary)).toContain("已隐藏 1 个子代理，共 2 个子代理");
+    const historyBand = nodeById(card, "subagent_omitted_steps");
+    expect(historyBand).toMatchObject({ type: "Container", style: "emphasis", isVisible: false });
+    expect(cardText(historyBand)).toContain("scout");
+    expect(cardText(historyBand)).toContain("已完成");
+    // The last reported activity survives into the history row; the child's own prompt does not.
+    expect(cardText(historyBand)).toContain("统计源码文件");
+    expect(nodes(card).some(node => node.id === "btn_expand_subagents")).toBe(true);
+  });
+
+  test("renders subagent state with its tool activity and no per-child timing", () => {
+    const tracker = createExecutionTracker({ runId: "subagent-state-only" });
+    startTurn(tracker, "turn-1", 0);
+    startSubagent(tracker, "Live", "scout", 100, "统计源码");
+    tracker.apply({
+      type: "subagent_update",
+      subagentId: "Live",
+      state: "running",
+      atMs: 140,
+      summary: "扫描 src",
+      currentTool: "glob",
+      toolCount: 2,
+    });
+    startSubagent(tracker, "Done2", "reviewer", 200, "复核变更");
+    endSubagent(tracker, "Done2", 900, "completed", "复核变更");
+    const rendered = buildExecutionCard(tracker.snapshot(1_000), fullCapabilities);
+
+    expect(rendered).not.toBeNull();
+    const card = rendered!.card as JsonRecord;
+    const text = cardText(nodeById(card, "subagent_detail"));
+    expect(text).toContain("scout");
+    expect(text).toContain("扫描 src");
+    expect(text).toContain("进行中");
+    expect(text).toContain("glob");
+    expect(text).toContain("2 次调用");
+    // State and activity only: no per-child clock and no duration.
+    expect(text).not.toMatch(/\d{2}:\d{2}:\d{2}/u);
+    expect(text).not.toMatch(/\d+ms|\d+\.\d+s|\d+m \d+s/u);
+    expect(rendered!.plain).toContain("scout · 扫描 src · 进行中 · glob · 2 次调用");
+  });
+
+  test("ends a subagent only when its own terminal event arrives", () => {
+    const tracker = createExecutionTracker({ runId: "subagent-terminal" });
+    startTurn(tracker, "turn-1", 0);
+    startSubagent(tracker, "Failed", "scout", 100, "检查实现");
+    endSubagent(tracker, "Failed", 300, "failed");
+    startSubagent(tracker, "Cancelled", "sonic", 400, "整理数据");
+    endSubagent(tracker, "Cancelled", 500, "cancelled");
+    // Late progress and a repeated start cannot revive a finished child.
+    tracker.apply({ type: "subagent_update", subagentId: "Failed", state: "running", atMs: 600, summary: "不应出现" });
+    startSubagent(tracker, "Failed", "scout", 700, "不应出现");
+    const snapshot = tracker.snapshot(800);
+
+    expect(snapshot.subagents.map(subagent => [subagent.subagentId, subagent.state])).toEqual([
+      ["Failed", "failed"],
+      ["Cancelled", "cancelled"],
+    ]);
+    expect(snapshot.subagents[0]!.summary).toBe("检查实现");
+    expect(snapshot.subagentCount).toBe(2);
+  });
+  test("settles a still-live subagent when the run ends without its terminal event", () => {
+    const tracker = createExecutionTracker({ runId: "subagent-run-end" });
+    startTurn(tracker, "turn-1", 0);
+    startSubagent(tracker, "Orphan", "scout", 100, "中断前的工作");
+    tracker.apply({ type: "run_end", atMs: 500, state: "cancelled" });
+
+    const snapshot = tracker.snapshot(500);
+    expect(snapshot.subagents[0]).toMatchObject({
+      subagentId: "Orphan",
+      agent: "scout",
+      state: "cancelled",
+      summary: "中断前的工作",
+    });
+  });
+  test("round-trips subagents through the durable card payload", () => {
+    const tracker = createExecutionTracker({ runId: "subagent-restore" });
+    startTurn(tracker, "turn-1", 0);
+    startSubagent(tracker, "Done", "scout", 400, "完成的工作");
+    endSubagent(tracker, "Done", 900, "completed", "完成的工作");
+    startSubagent(tracker, "Live", "verifier", 1_200, "重启时仍在跑");
+    tracker.apply({
+      type: "subagent_update",
+      subagentId: "Live",
+      state: "running",
+      atMs: 1_250,
+      summary: "重启时仍在跑",
+      currentTool: "read",
+      toolCount: 4,
+    });
+    const encoded = encodeExecutionSnapshot(tracker.snapshot(1_300));
+
+    const restored = restoreExecutionSnapshot(encoded, { state: "cancelled", atMs: 2_000 });
+    expect(restored).not.toBeNull();
+    expect(restored!.state).toBe("cancelled");
+    expect(restored!.subagents.map(subagent => [subagent.subagentId, subagent.agent, subagent.state])).toEqual([
+      ["Done", "scout", "completed"],
+      ["Live", "verifier", "cancelled"],
+    ]);
+    expect(restored!.subagents[1]).toMatchObject({ currentTool: "read", toolCount: 4 });
+    expect(restored!.subagents[0]).not.toHaveProperty("toolCount");
+    const rendered = buildExecutionCard(restored!, fullCapabilities);
+    expect(rendered).not.toBeNull();
+    const card = rendered!.card as JsonRecord;
+    // A child the restart could not observe ending is settled by the run's own terminal frame,
+    // so the restored card lists it in the history band with the state the run ended in.
+    const historyBand = cardText(nodeById(card, "subagent_omitted_steps"));
+    expect(historyBand).toContain("scout");
+    expect(historyBand).toContain("已完成");
+    expect(historyBand).toContain("verifier");
+    expect(historyBand).toContain("已取消");
   });
   test("expands older rich rows when ToggleVisibility is unavailable", () => {
     const tracker = createExecutionTracker({ runId: "trace-no-toggle" });
@@ -617,8 +786,8 @@ describe("execution card rendering", () => {
   test("uses the same compact row layout for omitted subagents and trace steps", () => {
     const tracker = createExecutionTracker({ runId: "compact-subagents" });
     startTurn(tracker, "turn-1", 0);
-    startTool(tracker, "verifier", "task", 1, "子代理 · verifier");
-    tracker.apply({ type: "tool_end", toolCallId: "verifier", atMs: 2, status: "succeeded" });
+    startSubagent(tracker, "verifier", "reviewer", 1, "验证实现");
+    endSubagent(tracker, "verifier", 2, "completed", "验证实现");
     startTool(tracker, "old-trace", "read", 3, "旧轨迹");
     for (let index = 0; index < 32; index += 1) {
       const toolCallId = `visible-${index}`;
@@ -648,9 +817,9 @@ describe("execution card rendering", () => {
     }
     expect(subagentRow).toMatchObject({
       color: "Good",
-      text: "✓\u00a0· 运行子代理 · 子代理 · verifier · 已完成 · 1ms",
+      text: "✓\u00a0· reviewer · 验证实现 · 已完成",
     });
-    expect(cardText(subagentRow)).toContain("子代理 · verifier");
+    expect(cardText(subagentRow)).toContain("reviewer");
   });
 
   test("keeps filled containers out of the step list so the client keeps the history band grey", () => {
@@ -717,7 +886,9 @@ describe("execution card rendering", () => {
   test("keeps subagent activity visible without ToggleVisibility support", () => {
     const tracker = createExecutionTracker({ runId: "subagents-fallback" });
     startTurn(tracker, "turn-1", 0);
-    startTool(tracker, "subagent-1", "task", 100, "检查回退布局");
+    startSubagent(tracker, "child-1", "scout", 100, "检查回退布局");
+    startSubagent(tracker, "child-2", "reviewer", 200, "复核回退布局");
+    endSubagent(tracker, "child-2", 300, "completed", "复核回退布局");
     const rendered = buildExecutionCard(tracker.snapshot(1_600), {
       ...fullCapabilities,
       actions: ["Action.OpenUrl"],
@@ -728,12 +899,20 @@ describe("execution card rendering", () => {
     expect(nodeById(card, "subagent_detail")).toMatchObject({ isVisible: true });
     expect(nodes(card).some(node => node.id === "btn_collapse_subagents")).toBe(false);
     expect(cardText(card)).toContain("检查回退布局");
+    // Without the toggle action, hiding would strand the rows: the finished child stays a plain
+    // visible compact line instead of a collapsed band.
+    const finished = (nodeById(card, "subagent_detail").items as JsonRecord[]).filter(
+      item => item.type === "TextBlock" && cardText(item).includes("reviewer"),
+    );
+    expect(finished).toHaveLength(1);
+    expect(finished[0]!.isVisible).not.toBe(false);
+    expect(nodes(card).some(node => node.id === "subagent_omitted_steps")).toBe(false);
   });
 
   test("orders subagents before trace and omits toggles when three steps fit", () => {
     const tracker = createExecutionTracker({ runId: "section-layout" });
     startTurn(tracker, "turn-1", 0);
-    startTool(tracker, "subagent-1", "task", 100, "执行子代理");
+    startSubagent(tracker, "child-1", "scout", 100, "执行子代理");
     startTool(tracker, "tool-1", "read", 200, "读取文件");
     const rendered = buildExecutionCard(tracker.snapshot(1_600), fullCapabilities);
 
@@ -917,7 +1096,7 @@ describe("execution card rendering", () => {
     startTurn(tracker, "turn-1", 0);
     startTool(tracker, "tool-1", "read", 1, "读取文件");
     tracker.apply({ type: "tool_end", toolCallId: "tool-1", atMs: 2, status: "succeeded" });
-    startTool(tracker, "subagent-1", "task", 3, "运行子代理");
+    startSubagent(tracker, "child-1", "scout", 3, "运行子代理");
     tracker.apply({
       type: "todo_update",
       atMs: 4,
@@ -963,8 +1142,8 @@ describe("execution card rendering", () => {
     startTurn(tracker, "turn-1", 0);
     startTool(tracker, "tool-1", "read", 1, "完成步骤");
     tracker.apply({ type: "tool_end", toolCallId: "tool-1", atMs: 2, status: "succeeded" });
-    startTool(tracker, "subagent-1", "task", 3, "完成子代理");
-    tracker.apply({ type: "tool_end", toolCallId: "subagent-1", atMs: 4, status: "succeeded" });
+    startSubagent(tracker, "child-1", "scout", 3, "完成子代理");
+    endSubagent(tracker, "child-1", 4, "completed", "完成子代理");
     tracker.apply({
       type: "todo_update",
       atMs: 5,
@@ -1335,9 +1514,14 @@ describe("execution card rendering", () => {
     tracker.apply({ type: "tool_end", toolCallId: "bash", atMs: 600, status: "cancelled" });
     startTool(tracker, "reviewer", "task", 620, "子代理 · reviewer");
     tracker.apply({ type: "tool_end", toolCallId: "reviewer", atMs: 740, status: "failed" });
+    startSubagent(tracker, "reviewer-child", "reviewer", 620, "复核变更");
+    endSubagent(tracker, "reviewer-child", 740, "failed", "复核变更");
     startTool(tracker, "verifier", "subagent_await", 780, "等待子代理 · verifier");
+    startSubagent(tracker, "verifier-child", "verifier", 780, "验证变更");
     startTool(tracker, "scout", "task", 860, "子代理 · scout");
     tracker.apply({ type: "tool_end", toolCallId: "scout", atMs: 1_000, status: "succeeded" });
+    startSubagent(tracker, "scout-child", "scout", 860, "统计源码");
+    endSubagent(tracker, "scout-child", 1_000, "completed", "统计源码");
     startTool(tracker, "hub", "hub", 1_020, "IRC → preview-agent · 未收到回复");
     tracker.apply({ type: "tool_end", toolCallId: "hub", atMs: 1_160, status: "failed" });
     startTool(tracker, "ask", "ask", 1_180, "等待用户回答 · 2 个问题");
@@ -1404,10 +1588,14 @@ describe("execution card rendering", () => {
     // The trace is the budget donor: its older rows fold into the grey history band.
     const subagentDetail = nodeById(card, "subagent_detail");
     expect(cardText(subagentDetail)).toContain("已隐藏 2 个子代理，共 3 个子代理");
-    expect(cardText(subagentDetail)).toContain("等待子代理 · verifier");
+    // The live child keeps its rich row; the finished ones stay behind the history band.
+    const liveSubagentRows = (subagentDetail.items as JsonRecord[])
+      .filter(item => item.type === "ColumnSet" && item.isVisible !== false);
+    expect(liveSubagentRows).toHaveLength(1);
+    expect(cardText(liveSubagentRows[0]!)).toContain("verifier");
     const hiddenSubagentSteps = nodeById(subagentDetail, "subagent_omitted_steps");
     expect(hiddenSubagentSteps).toMatchObject({ isVisible: false });
-    expect(cardText(hiddenSubagentSteps)).toContain("子代理 · scout");
+    expect(cardText(hiddenSubagentSteps)).toContain("统计源码");
     const timelineSection = nodeById(card, "timeline_section");
     const timelineHeader = (timelineSection.items as JsonRecord[])[0]!;
     expect(nodes(timelineHeader).some(node => node.id === "btn_expand_trace")).toBe(true);

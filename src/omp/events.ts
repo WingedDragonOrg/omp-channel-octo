@@ -336,6 +336,69 @@ export function todoDetailsFromResult(result: unknown): { phases: ExecutionTodoP
 }
 
 
+/**
+ * Subagent lifecycle as OMP reports it, instead of as a tool name implies. The frame's payload is
+ * the same `SubagentLifecyclePayload` the interactive HUD consumes; `aborted` is the child's own
+ * cancellation and normalizes to the run-level `cancelled` state.
+ */
+export type SubagentLifecycleEvent = Extract<ExecutionEvent, { type: "subagent_start" | "subagent_end" }>;
+export type SubagentProgressEvent = Extract<ExecutionEvent, { type: "subagent_update" }>;
+
+export function subagentLifecycleEvent(payload: unknown, atMs: number): SubagentLifecycleEvent | undefined {
+	if (!isRecord(payload) || typeof payload.id !== "string" || payload.id.length === 0) return undefined;
+	const status = payload.status;
+	if (status !== "started" && status !== "completed" && status !== "failed" && status !== "aborted") return undefined;
+	const agent = typeof payload.agent === "string" ? payload.agent : "";
+	const description = typeof payload.description === "string" ? payload.description : undefined;
+	if (status === "started") {
+		return {
+			type: "subagent_start",
+			subagentId: payload.id,
+			agent,
+			state: "running",
+			atMs,
+			...(description === undefined ? {} : { summary: description }),
+		};
+	}
+	return {
+		type: "subagent_end",
+		subagentId: payload.id,
+		state: status === "aborted" ? "cancelled" : status,
+		atMs,
+		...(description === undefined ? {} : { summary: description }),
+	};
+}
+
+/**
+ * One aggregated progress frame: the child's `status`, the intent it is working on, the tool it is
+ * currently running, and how many tools it has used. The prompt text (`task`) and the child's
+ * recent tool arguments are dropped — the card shows a bounded state line, and raw arguments
+ * belong to the child's own transcript.
+ */
+export function subagentProgressEvent(payload: unknown, atMs: number): SubagentProgressEvent | undefined {
+	if (!isRecord(payload) || !isRecord(payload.progress)) return undefined;
+	const progress = payload.progress;
+	if (typeof progress.id !== "string" || progress.id.length === 0) return undefined;
+	const status = progress.status;
+	if (status !== "pending" && status !== "running") return undefined;
+	const intent = typeof progress.lastIntent === "string" ? progress.lastIntent : undefined;
+	const currentTool = typeof progress.currentTool === "string" && progress.currentTool.length > 0
+		? progress.currentTool
+		: undefined;
+	const toolCount = typeof progress.toolCount === "number" && Number.isSafeInteger(progress.toolCount) && progress.toolCount >= 0
+		? progress.toolCount
+		: undefined;
+	return {
+		type: "subagent_update",
+		subagentId: progress.id,
+		state: status,
+		atMs,
+		...(intent === undefined ? {} : { summary: intent }),
+		...(currentTool === undefined ? {} : { currentTool }),
+		...(toolCount === undefined ? {} : { toolCount }),
+	};
+}
+
 export function describeUiFailure(method: string): Error {
 	return new Error(`OMP requested unsupported interactive UI (${method}); worker stopped safely`);
 }

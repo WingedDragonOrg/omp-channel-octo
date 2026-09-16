@@ -40,7 +40,9 @@ type Scenario =
 	| "host-tool"
 	| "host-unknown"
 	| "host-cancel"
-	| "host-stop";
+	| "host-stop"
+	| "subagent-events"
+	| "no-subagent-subscription";
 
 const argv = process.argv.slice(2);
 
@@ -185,6 +187,8 @@ type HostToolRegistration = {
 const hostTools = new Map<string, HostToolRegistration>();
 let pendingHostToolRequestId: string | undefined;
 let streaming = false;
+/** Subagent subscription level the fixture last accepted; lifecycle frames follow it. */
+let subagentSubscription = "off";
 function persistSessionHeader(): void {
 	writeFileSync(
 		sessionFile,
@@ -828,6 +832,10 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		setTimeout(() => process.exit(71), 35);
 		return;
 	}
+	if (scenario === "subagent-events" || scenario === "no-subagent-subscription") {
+		await emitSubagentScenario(id);
+		return;
+	}
 	if (scenario === "v2") {
 		setTimeout(() => {
 			if (!negotiated) {
@@ -839,6 +847,84 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		return;
 	}
 	promptTimer = setTimeout(() => emitAgentTurn(id), scenario === "normal" ? 90 : 60);
+}
+
+async function emitSubagentScenario(id: string | undefined): Promise<void> {
+	emit({ type: "agent_start" });
+	emit({ type: "turn_start", turnIndex: 0, timestamp: 1_000 });
+	// The parent spawns one child through `task`; the child's own lifetime is only observable
+	// through the subagent channels, never through that tool call's name or result.
+	emit({
+		type: "tool_execution_start",
+		toolCallId: "fixture-task-call",
+		toolName: "task",
+		args: { tasks: [{ agent: "scout", task: "SECRET_CHILD_ASSIGNMENT" }] },
+	});
+	if (subagentSubscription !== "progress" && subagentSubscription !== "events") {
+		emitAssistantMessage("fixture subagent turn", 1, true);
+		emit({ type: "agent_end", messages: [], willContinue: false });
+		appendLog({ kind: "turn_complete", id, subagentFrames: 0 });
+		return;
+	}
+	emit({
+		type: "subagent_lifecycle",
+		payload: {
+			id: "CountSrc",
+			agent: "scout",
+			agentSource: "bundled",
+			status: "started",
+			description: "统计源码文件",
+			index: 0,
+			parentToolCallId: "fixture-task-call",
+			detached: true,
+		},
+	});
+	emit({
+		type: "subagent_progress",
+		payload: {
+			index: 0,
+			agent: "scout",
+			agentSource: "bundled",
+			task: "SECRET_CHILD_ASSIGNMENT",
+			parentToolCallId: "fixture-task-call",
+			detached: true,
+			progress: {
+				id: "CountSrc",
+				index: 0,
+				agent: "scout",
+				agentSource: "bundled",
+				status: "running",
+				task: "SECRET_CHILD_ASSIGNMENT",
+				lastIntent: "扫描 src",
+				currentTool: "glob",
+				toolCount: 2,
+				recentTools: [{ tool: "glob", args: "SECRET_CHILD_ARGS", endMs: 1_500 }],
+			},
+		},
+	});
+	await Bun.sleep(5);
+	emit({
+		type: "subagent_lifecycle",
+		payload: {
+			id: "CountSrc",
+			agent: "scout",
+			agentSource: "bundled",
+			status: "completed",
+			description: "统计源码文件",
+			index: 0,
+			parentToolCallId: "fixture-task-call",
+			detached: true,
+		},
+	});
+	emit({
+		type: "tool_execution_end",
+		toolCallId: "fixture-task-call",
+		toolName: "task",
+		result: { content: [{ type: "text", text: "Spawned 1 background agent" }] },
+	});
+	emitAssistantMessage("fixture subagent turn", 1, true);
+	emit({ type: "agent_end", messages: [], willContinue: false });
+	appendLog({ kind: "turn_complete", id, subagentFrames: 2 });
 }
 
 function handleCommand(command: Frame): void {
@@ -879,6 +965,15 @@ function handleCommand(command: Frame): void {
 			queuedMessageCount: 0,
 			todoPhases: [],
 		});
+		return;
+	}
+	if (type === "set_subagent_subscription") {
+		if (scenario === "no-subagent-subscription") {
+			failure(id, type, "fixture rejects subagent subscriptions", "fixture_subagent_unsupported");
+			return;
+		}
+		subagentSubscription = typeof command.level === "string" ? command.level : "off";
+		response(id, type, { level: subagentSubscription });
 		return;
 	}
 	if (type === "set_host_tools") {

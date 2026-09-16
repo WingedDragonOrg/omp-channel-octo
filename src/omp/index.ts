@@ -50,6 +50,8 @@ import {
 	safeToolCallId,
 	safeToolName,
 	safeToolSummary,
+	subagentLifecycleEvent,
+	subagentProgressEvent,
 	todoDetailsFromResult,
 	turnIdValue,
 } from "./events.ts";
@@ -83,6 +85,8 @@ class RpcWorker implements OmpWorker {
 	#protocolV2 = false;
 	#ready = false;
 	#readyV2Supported = false;
+	/** True once OMP confirmed it will stream `subagent_lifecycle`/`subagent_progress` frames. */
+	#subagentFrames = false;
 	#closed = false;
 	#stopping = false;
 	#stopPromise: Promise<boolean> | undefined;
@@ -142,6 +146,7 @@ class RpcWorker implements OmpWorker {
 			if (!isRecord(data) || data.protocolVersion !== 2) throw new Error("OMP RPC protocol negotiation returned an invalid version");
 			this.#protocolV2 = true;
 		}
+		await this.#subscribeToSubagents();
 		if (this.#newSessionOnStart) {
 			const newSession = await this.#request({ type: "new_session" }, this.#startupTimeoutMs);
 			this.#assertSuccess(newSession, "new_session");
@@ -149,6 +154,30 @@ class RpcWorker implements OmpWorker {
 			if (!isRecord(data) || data.cancelled !== false) throw new Error("OMP RPC new_session was cancelled");
 		}
 		await this.refreshState();
+	}
+
+	/**
+	 * Ask OMP to stream `subagent_lifecycle`/`subagent_progress` frames — the registry defaults to
+	 * `off`, so without this command a spawned child is invisible to the channel. The aggregated
+	 * `progress` level is enough for the card and a fraction of the volume of raw child events;
+	 * an OMP that does not offer the command keeps the worker usable, its subagent section just
+	 * stays empty.
+	 */
+	async #subscribeToSubagents(): Promise<void> {
+		try {
+			const response = await this.#request(
+				{ type: "set_subagent_subscription", level: "progress" },
+				this.#startupTimeoutMs,
+			);
+			const data = isRecord(response.data) ? response.data : undefined;
+			if (response.success !== true || data?.level !== "progress") {
+				console.warn("[omp] subagent 事件订阅未生效，进度卡不再显示子代理区块");
+				return;
+			}
+			this.#subagentFrames = true;
+		} catch {
+			console.warn("[omp] 无法订阅 subagent 事件，进度卡不再显示子代理区块");
+		}
 	}
 
 	async refreshState(): Promise<ProjectSessionState> {
@@ -572,6 +601,18 @@ class RpcWorker implements OmpWorker {
 				if (turnId === undefined) emitExecutionEvent(active, { type: "turn_end", atMs });
 				else emitExecutionEvent(active, { type: "turn_end", turnId, atMs });
 				active.activeTurnId = undefined;
+				return;
+			}
+			if (frame.type === "subagent_lifecycle") {
+				if (!this.#subagentFrames) return;
+				const event = subagentLifecycleEvent(frame.payload, eventTime(frame.timestamp));
+				if (event) emitExecutionEvent(active, event);
+				return;
+			}
+			if (frame.type === "subagent_progress") {
+				if (!this.#subagentFrames) return;
+				const event = subagentProgressEvent(frame.payload, eventTime(frame.timestamp));
+				if (event) emitExecutionEvent(active, event);
 				return;
 			}
 			if (frame.type === "tool_execution_start") {

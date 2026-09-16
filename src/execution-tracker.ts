@@ -14,6 +14,8 @@ export type ExecutionErrorCategory =
   | "unavailable"
   | "unknown";
 
+export type ExecutionSubagentState = "pending" | "running" | "completed" | "failed" | "cancelled";
+
 export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned" | "blocked" | "cancelled";
 export type TodoOperation = "init" | "start" | "done" | "rm" | "drop" | "block" | "unblock" | "append" | "view";
 
@@ -65,6 +67,35 @@ export type ExecutionEvent =
       readonly atMs: number;
       readonly state: Exclude<ExecutionState, "running">;
       readonly errorCategory?: ExecutionErrorCategory;
+    }
+  /**
+   * Real subagent lifecycle as reported by the worker's `subagent_lifecycle`/`subagent_progress`
+   * frames: the child's state is what the event says, never what a tool name suggests. `started`
+   * means the child exists, and only `completed`/`failed`/`cancelled` end it.
+   */
+  | {
+      readonly type: "subagent_start";
+      readonly subagentId: string;
+      readonly agent: string;
+      readonly state: Extract<ExecutionSubagentState, "pending" | "running">;
+      readonly atMs: number;
+      readonly summary?: string;
+    }
+  | {
+      readonly type: "subagent_update";
+      readonly subagentId: string;
+      readonly state: Extract<ExecutionSubagentState, "pending" | "running">;
+      readonly atMs: number;
+      readonly summary?: string;
+      readonly currentTool?: string;
+      readonly toolCount?: number;
+    }
+  | {
+      readonly type: "subagent_end";
+      readonly subagentId: string;
+      readonly state: Extract<ExecutionSubagentState, "completed" | "failed" | "cancelled">;
+      readonly atMs: number;
+      readonly summary?: string;
     };
 
 export interface ExecutionToolSnapshot {
@@ -78,6 +109,20 @@ export interface ExecutionToolSnapshot {
   readonly errorCategory?: ExecutionErrorCategory;
 }
 
+/**
+ * One subagent as the card reports it: who it is, what it is for, the lifecycle state OMP last
+ * reported, and the tool activity that state is made of. Timing is deliberately absent — the card
+ * tracks a child's overall state and current tool, never its clock or duration.
+ */
+export interface ExecutionSubagentSnapshot {
+  readonly subagentId: string;
+  readonly agent: string;
+  readonly state: ExecutionSubagentState;
+  readonly summary?: string;
+  readonly currentTool?: string;
+  readonly toolCount?: number;
+}
+
 export interface ExecutionSnapshot {
   readonly runId: string;
   readonly state: ExecutionState;
@@ -86,7 +131,9 @@ export interface ExecutionSnapshot {
   readonly elapsedMs: number;
   readonly phaseCount: number;
   readonly toolCount: number;
+  readonly subagentCount: number;
   readonly tools: readonly ExecutionToolSnapshot[];
+  readonly subagents: readonly ExecutionSubagentSnapshot[];
   readonly todos: readonly ExecutionTodoPhase[];
 }
 
@@ -114,6 +161,15 @@ interface MutableTool {
   endedAtMs: number | null;
   summary: string | undefined;
   errorCategory: ExecutionErrorCategory | undefined;
+}
+
+interface MutableSubagent {
+  readonly subagentId: string;
+  agent: string;
+  state: ExecutionSubagentState;
+  summary: string | undefined;
+  currentTool: string | undefined;
+  toolCount: number | undefined;
 }
 
 const MAX_LOCAL_VISIBLE_TEXT_CHARS = 240;
@@ -247,6 +303,8 @@ class ExecutionTrackerState implements ExecutionTracker {
   readonly #phases: MutablePhase[] = [];
   readonly #tools = new Map<string, MutableTool>();
   readonly #toolOrder: string[] = [];
+  readonly #subagents = new Map<string, MutableSubagent>();
+  readonly #subagentOrder: string[] = [];
   #todos: ExecutionTodoPhase[] = [];
   #startedAtMs: number | null;
   #endedAtMs: number | null = null;
@@ -278,6 +336,15 @@ class ExecutionTrackerState implements ExecutionTracker {
         break;
       case "todo_update":
         this.#updateTodos(event);
+        break;
+      case "subagent_start":
+        this.#startSubagent(event, atMs);
+        break;
+      case "subagent_update":
+        this.#updateSubagent(event, atMs);
+        break;
+      case "subagent_end":
+        this.#endSubagent(event, atMs);
         break;
       case "run_end":
         this.#endRun(event, atMs);
@@ -318,7 +385,20 @@ class ExecutionTrackerState implements ExecutionTracker {
       elapsedMs,
       phaseCount: this.#phases.length,
       toolCount: this.#toolOrder.length,
+      subagentCount: this.#subagentOrder.length,
       tools,
+      subagents: this.#subagentOrder.flatMap(subagentId => {
+        const subagent = this.#subagents.get(subagentId);
+        if (!subagent) return [];
+        return [{
+          subagentId: subagent.subagentId,
+          agent: subagent.agent,
+          state: subagent.state,
+          ...(subagent.summary === undefined ? {} : { summary: subagent.summary }),
+          ...(subagent.currentTool === undefined ? {} : { currentTool: subagent.currentTool }),
+          ...(subagent.toolCount === undefined ? {} : { toolCount: subagent.toolCount }),
+        }];
+      }),
       todos: copySnapshotTodos(this.#todos),
     };
   }
@@ -372,6 +452,66 @@ class ExecutionTrackerState implements ExecutionTracker {
     this.#todos = copyTodoPhases(event.phases);
   }
 
+  #startSubagent(event: Extract<ExecutionEvent, { type: "subagent_start" }>, atMs: number): void {
+    const subagent = this.#subagent(event.subagentId, atMs);
+    if (!subagent) return;
+    if (subagent.state === "completed" || subagent.state === "failed" || subagent.state === "cancelled") return;
+    subagent.state = event.state;
+    // Only a real start may name the child; a row that exists from an earlier frame keeps its name.
+    subagent.agent = safeDisplayText(event.agent, 64) ?? subagent.agent;
+    const summary = safeDisplayText(event.summary);
+    if (summary !== undefined) subagent.summary = summary;
+  }
+
+  #updateSubagent(event: Extract<ExecutionEvent, { type: "subagent_update" }>, atMs: number): void {
+    const subagent = this.#subagent(event.subagentId, atMs);
+    if (!subagent || subagent.state !== "pending" && subagent.state !== "running") return;
+    subagent.state = event.state;
+    const summary = safeDisplayText(event.summary);
+    if (summary !== undefined) subagent.summary = summary;
+    const currentTool = safeDisplayText(event.currentTool, 64);
+    if (currentTool !== undefined) subagent.currentTool = currentTool;
+    if (typeof event.toolCount === "number" && Number.isSafeInteger(event.toolCount) && event.toolCount >= 0) {
+      subagent.toolCount = event.toolCount;
+    }
+  }
+
+  #endSubagent(event: Extract<ExecutionEvent, { type: "subagent_end" }>, atMs: number): void {
+    const subagent = this.#subagent(event.subagentId, atMs);
+    if (!subagent) return;
+    if (subagent.state === "completed" || subagent.state === "failed" || subagent.state === "cancelled") {
+      // A terminal frame is the authoritative end of that run; it is never overwritten.
+      return;
+    }
+    subagent.state = event.state;
+    const summary = safeDisplayText(event.summary);
+    if (summary !== undefined) subagent.summary = summary;
+  }
+
+  /**
+   * Resolve the child a frame belongs to, registering it on first sight. A lifecycle frame can
+   * arrive without its `started` predecessor — a mid-turn spawn the worker only observed after the
+   * fact, or a replay of a durable payload — and dropping such a child would hide a real run.
+   */
+  #subagent(subagentIdValue: unknown, atMs: number): MutableSubagent | undefined {
+    if (this.#state !== "running") return undefined;
+    const subagentId = safeDisplayText(subagentIdValue, 96);
+    if (subagentId === undefined) return undefined;
+    const existing = this.#subagents.get(subagentId);
+    if (existing) return existing;
+    const subagent: MutableSubagent = {
+      subagentId,
+      agent: "子代理",
+      state: "pending",
+      summary: undefined,
+      currentTool: undefined,
+      toolCount: undefined,
+    };
+    this.#subagents.set(subagentId, subagent);
+    this.#subagentOrder.push(subagentId);
+    return subagent;
+  }
+
   #endRun(event: Extract<ExecutionEvent, { type: "run_end" }>, atMs: number): void {
     if (this.#state !== "running") return;
     this.#ensureStarted(atMs);
@@ -386,6 +526,12 @@ class ExecutionTrackerState implements ExecutionTracker {
       tool.state = event.state === "cancelled" ? "cancelled" : event.state === "failed" ? "failed" : "succeeded";
       if (tool.state === "cancelled") tool.errorCategory = "cancelled";
       else if (tool.state === "failed") tool.errorCategory = safeErrorCategory(event.errorCategory, "unknown");
+    }
+    // A subagent that never reported a terminal frame cannot stay live on a settled card; the
+    // turn's own outcome is the only evidence left after the worker stopped reporting.
+    for (const subagent of this.#subagents.values()) {
+      if (subagent.state === "completed" || subagent.state === "failed" || subagent.state === "cancelled") continue;
+      subagent.state = event.state === "completed" ? "completed" : event.state === "cancelled" ? "cancelled" : "failed";
     }
   }
 
@@ -423,7 +569,13 @@ export function restoreExecutionSnapshot(
     return null;
   }
   if (parsed === null || typeof parsed !== "object") return null;
-  const record = parsed as { runId?: unknown; startedAtMs?: unknown; tools?: unknown; todos?: unknown };
+  const record = parsed as {
+    runId?: unknown;
+    startedAtMs?: unknown;
+    tools?: unknown;
+    subagents?: unknown;
+    todos?: unknown;
+  };
   if (!Array.isArray(record.tools) || !Array.isArray(record.todos)) return null;
   const startedAtMs = typeof record.startedAtMs === "number" ? finiteTime(record.startedAtMs) : null;
   const tracker = createExecutionTracker({
@@ -468,9 +620,61 @@ export function restoreExecutionSnapshot(
       phases: record.todos as readonly ExecutionTodoPhase[],
     });
   }
+  // The stored rows carry identity, summary, lifecycle state, and the tool activity the card
+  // shows; replaying them keeps the restored card's subagent band identical to the live one.
+  for (const value of Array.isArray(record.subagents) ? record.subagents : []) {
+    if (value === null || typeof value !== "object") continue;
+    const subagent = value as Record<string, unknown>;
+    if (typeof subagent.subagentId !== "string" || subagent.subagentId.length === 0) continue;
+    const state = savedSubagentState(subagent.state);
+    if (state === null) continue;
+    const summary = typeof subagent.summary === "string" ? subagent.summary : undefined;
+    const currentTool = typeof subagent.currentTool === "string" ? subagent.currentTool : undefined;
+    const toolCount = typeof subagent.toolCount === "number" ? subagent.toolCount : undefined;
+    tracker.apply({
+      type: "subagent_start",
+      subagentId: subagent.subagentId,
+      agent: typeof subagent.agent === "string" ? subagent.agent : "",
+      state: "running",
+      atMs: options.atMs,
+      ...(summary === undefined ? {} : { summary }),
+    });
+    if (state === "completed" || state === "failed" || state === "cancelled") {
+      tracker.apply({
+        type: "subagent_end",
+        subagentId: subagent.subagentId,
+        state,
+        atMs: options.atMs,
+      });
+      continue;
+    }
+    if (currentTool !== undefined || toolCount !== undefined) {
+      tracker.apply({
+        type: "subagent_update",
+        subagentId: subagent.subagentId,
+        state,
+        atMs: options.atMs,
+        ...(currentTool === undefined ? {} : { currentTool }),
+        ...(toolCount === undefined ? {} : { toolCount }),
+      });
+    }
+  }
   return tracker.apply({ type: "run_end", atMs: options.atMs, state: options.state });
 }
 
 function savedToolState(value: unknown): Exclude<ExecutionToolState, "running"> | null {
   return value === "succeeded" || value === "failed" || value === "cancelled" ? value : null;
+}
+
+function savedSubagentState(value: unknown): ExecutionSubagentState | null {
+  switch (value) {
+    case "pending":
+    case "running":
+    case "completed":
+    case "failed":
+    case "cancelled":
+      return value;
+    default:
+      return null;
+  }
 }

@@ -556,6 +556,86 @@ describe("OMP RPC worker", () => {
 		});
 	});
 
+	test("subscribes to subagent frames and maps their lifecycle without leaking child payloads", async () => {
+		await withHarness("subagent-events", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("run a subagent", event => events.push(event));
+			const log = await readLog(harness.logPath);
+			const commands = log
+				.filter(entry => entry.kind === "command")
+				.map(entry => entry.command as Record<string, unknown> | undefined)
+				.filter((command): command is Record<string, unknown> => command !== undefined);
+			// The registry defaults to `off`, so the worker has to ask for the frames it renders.
+			const subscription = commands.filter(command => command.type === "set_subagent_subscription");
+			expect(subscription).toHaveLength(1);
+			expect(subscription[0]?.level).toBe("progress");
+
+			type SubagentReport = Record<string, unknown> & { readonly subagentId: string };
+			const subagentEvents: SubagentReport[] = [];
+			for (const event of events) {
+				if (event.type === "subagent_start") {
+					subagentEvents.push({
+						type: event.type,
+						subagentId: event.subagentId,
+						agent: event.agent,
+						state: event.state,
+						summary: event.summary,
+					});
+					continue;
+				}
+				if (event.type === "subagent_update") {
+					subagentEvents.push({
+						type: event.type,
+						subagentId: event.subagentId,
+						state: event.state,
+						summary: event.summary,
+						currentTool: event.currentTool,
+						toolCount: event.toolCount,
+					});
+					continue;
+				}
+				if (event.type === "subagent_end") {
+					subagentEvents.push({
+						type: event.type,
+						subagentId: event.subagentId,
+						state: event.state,
+						summary: event.summary,
+					});
+				}
+			}
+			expect(subagentEvents).toEqual([
+				{ type: "subagent_start", subagentId: "CountSrc", agent: "scout", state: "running", summary: "统计源码文件" },
+				{
+					type: "subagent_update",
+					subagentId: "CountSrc",
+					state: "running",
+					summary: "扫描 src",
+					currentTool: "glob",
+					toolCount: 2,
+				},
+				{ type: "subagent_end", subagentId: "CountSrc", state: "completed", summary: "统计源码文件" },
+			]);
+			for (const event of subagentEvents) {
+				expect(typeof event.subagentId).toBe("string");
+			}
+			// The child's own prompt and tool arguments stay in its transcript.
+			const serialized = JSON.stringify(subagentEvents);
+			expect(serialized).not.toContain("SECRET_CHILD_ASSIGNMENT");
+			expect(serialized).not.toContain("SECRET_CHILD_ARGS");
+		});
+	});
+
+	test("keeps the worker usable when the deployment offers no subagent subscription", async () => {
+		await withHarness("no-subagent-subscription", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("run a subagent", event => events.push(event));
+			expect(events.some(event => event.type === "subagent_start" || event.type === "subagent_end")).toBe(false);
+			// The parent's own tool lifecycle still arrives, so only the subagent band is missing.
+			expect(events.some(event => event.type === "tool_start" && event.toolName === "task")).toBe(true);
+			expect(events.some(event => event.type === "text" && event.text.includes("fixture subagent turn"))).toBe(true);
+		});
+	});
+
 	test("publishes only a safe skill name as a read tool summary", async () => {
 		await withHarness("tool-summary", async harness => {
 			const events: WorkerEvent[] = [];
