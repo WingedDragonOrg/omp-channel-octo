@@ -8,6 +8,8 @@ export type ExecutionErrorCategory =
   | "unavailable"
   | "unknown";
 
+export type ExecutionSubagentState = "pending" | "running" | "completed" | "failed" | "cancelled";
+
 export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned" | "blocked" | "cancelled";
 export type TodoOperation = "init" | "start" | "done" | "rm" | "drop" | "block" | "unblock" | "append" | "view";
 
@@ -22,6 +24,13 @@ export interface ExecutionTodoPhase {
   readonly tasks: readonly ExecutionTodoTask[];
 }
 
+/**
+ * The tracker's input. Turn, tool, todo, and run events come from the generic RPC stream;
+ * `subagent_start`/`subagent_update`/`subagent_end` come from the worker's `subagent_lifecycle`
+ * and `subagent_progress` frames, so a subagent's state is what the event says rather than what a
+ * tool name suggests: `started` means the child exists, and only `completed`/`failed`/`aborted`
+ * end it.
+ */
 export type ExecutionEvent =
   | {
       readonly type: "turn_start";
@@ -59,6 +68,35 @@ export type ExecutionEvent =
       readonly atMs: number;
       readonly state: Exclude<ExecutionState, "running">;
       readonly errorCategory?: ExecutionErrorCategory;
+    }
+  /**
+   * Real subagent lifecycle as reported by the OMP worker's `subagent_lifecycle` frames. The run's
+   * state is whatever the event says, never what a tool name suggests: `started` means the child
+   * exists, and only `completed`/`failed`/`cancelled` end it.
+   */
+  | {
+      readonly type: "subagent_start";
+      readonly subagentId: string;
+      readonly agent: string;
+      readonly state: Extract<ExecutionSubagentState, "pending" | "running">;
+      readonly atMs: number;
+      readonly summary?: string;
+    }
+  | {
+      readonly type: "subagent_update";
+      readonly subagentId: string;
+      readonly state: Extract<ExecutionSubagentState, "pending" | "running">;
+      readonly atMs: number;
+      readonly summary?: string;
+      readonly currentTool?: string;
+      readonly toolCount?: number;
+    }
+  | {
+      readonly type: "subagent_end";
+      readonly subagentId: string;
+      readonly state: Extract<ExecutionSubagentState, "completed" | "failed" | "cancelled">;
+      readonly atMs: number;
+      readonly summary?: string;
     };
 
 export interface ExecutionToolSnapshot {
@@ -72,6 +110,20 @@ export interface ExecutionToolSnapshot {
   readonly errorCategory?: ExecutionErrorCategory;
 }
 
+/**
+ * One subagent as the card reports it: who it is, what it is for, the lifecycle state OMP last
+ * reported, and the tool activity that state is made of. Timing is deliberately absent — the card
+ * tracks a child's overall state and current tool, never its clock or duration.
+ */
+export interface ExecutionSubagentSnapshot {
+  readonly subagentId: string;
+  readonly agent: string;
+  readonly state: ExecutionSubagentState;
+  readonly summary?: string;
+  readonly currentTool?: string;
+  readonly toolCount?: number;
+}
+
 export interface ExecutionSnapshot {
   readonly runId: string;
   readonly state: ExecutionState;
@@ -80,7 +132,9 @@ export interface ExecutionSnapshot {
   readonly elapsedMs: number;
   readonly phaseCount: number;
   readonly toolCount: number;
+  readonly subagentCount: number;
   readonly tools: readonly ExecutionToolSnapshot[];
+  readonly subagents: readonly ExecutionSubagentSnapshot[];
   readonly todos: readonly ExecutionTodoPhase[];
 }
 
@@ -143,6 +197,15 @@ interface MutableTool {
   errorCategory: ExecutionErrorCategory | undefined;
 }
 
+interface MutableSubagent {
+  readonly subagentId: string;
+  agent: string;
+  state: ExecutionSubagentState;
+  summary: string | undefined;
+  currentTool: string | undefined;
+  toolCount: number | undefined;
+}
+
 const DEFAULT_ELEMENTS: readonly string[] = ["TextBlock", "Container"];
 const TOOL_DISPLAY_LABELS: Record<string, string> = {
   read: "读取文件",
@@ -184,17 +247,6 @@ const TOOL_DISPLAY_LABELS: Record<string, string> = {
   subagent_await: "等待子代理",
   subagent_stop: "停止子代理",
   todo: "更新任务",
-};
-const SUBAGENT_TOOL_NAMES: Record<string, true> = {
-  agent: true,
-  delegate: true,
-  run_subagent: true,
-  spawn_agent: true,
-  subagent: true,
-  subagent_await: true,
-  subagent_start: true,
-  subagent_stop: true,
-  task: true,
 };
 const ADAPTIVE_CARD_SCHEMA = "http://adaptivecards.io/schemas/adaptive-card.json";
 const REQUIRED_ELEMENTS = ["TextBlock"] as const;
@@ -363,6 +415,8 @@ class ExecutionTrackerState implements ExecutionTracker {
   readonly #phases: MutablePhase[] = [];
   readonly #tools = new Map<string, MutableTool>();
   readonly #toolOrder: string[] = [];
+  readonly #subagents = new Map<string, MutableSubagent>();
+  readonly #subagentOrder: string[] = [];
   #todos: ExecutionTodoPhase[] = [];
   #startedAtMs: number | null;
   #endedAtMs: number | null = null;
@@ -394,6 +448,15 @@ class ExecutionTrackerState implements ExecutionTracker {
         break;
       case "todo_update":
         this.#updateTodos(event);
+        break;
+      case "subagent_start":
+        this.#startSubagent(event, atMs);
+        break;
+      case "subagent_update":
+        this.#updateSubagent(event, atMs);
+        break;
+      case "subagent_end":
+        this.#endSubagent(event, atMs);
         break;
       case "run_end":
         this.#endRun(event, atMs);
@@ -434,7 +497,20 @@ class ExecutionTrackerState implements ExecutionTracker {
       elapsedMs,
       phaseCount: this.#phases.length,
       toolCount: this.#toolOrder.length,
+      subagentCount: this.#subagentOrder.length,
       tools,
+      subagents: this.#subagentOrder.flatMap(subagentId => {
+        const subagent = this.#subagents.get(subagentId);
+        if (!subagent) return [];
+        return [{
+          subagentId: subagent.subagentId,
+          agent: subagent.agent,
+          state: subagent.state,
+          ...(subagent.summary === undefined ? {} : { summary: subagent.summary }),
+          ...(subagent.currentTool === undefined ? {} : { currentTool: subagent.currentTool }),
+          ...(subagent.toolCount === undefined ? {} : { toolCount: subagent.toolCount }),
+        }];
+      }),
       todos: copySnapshotTodos(this.#todos),
     };
   }
@@ -488,6 +564,66 @@ class ExecutionTrackerState implements ExecutionTracker {
     this.#todos = copyTodoPhases(event.phases);
   }
 
+  #startSubagent(event: Extract<ExecutionEvent, { type: "subagent_start" }>, atMs: number): void {
+    const subagent = this.#subagent(event.subagentId, atMs);
+    if (!subagent) return;
+    if (subagent.state === "completed" || subagent.state === "failed" || subagent.state === "cancelled") return;
+    subagent.state = event.state;
+    // Only a real start may name the child; a row that exists from an earlier frame keeps its name.
+    subagent.agent = safeDisplayText(event.agent, 64) ?? subagent.agent;
+    const summary = safeDisplayText(event.summary);
+    if (summary !== undefined) subagent.summary = summary;
+  }
+
+  #updateSubagent(event: Extract<ExecutionEvent, { type: "subagent_update" }>, atMs: number): void {
+    const subagent = this.#subagent(event.subagentId, atMs);
+    if (!subagent || subagent.state !== "pending" && subagent.state !== "running") return;
+    subagent.state = event.state;
+    const summary = safeDisplayText(event.summary);
+    if (summary !== undefined) subagent.summary = summary;
+    const currentTool = safeDisplayText(event.currentTool, 64);
+    if (currentTool !== undefined) subagent.currentTool = currentTool;
+    if (typeof event.toolCount === "number" && Number.isSafeInteger(event.toolCount) && event.toolCount >= 0) {
+      subagent.toolCount = event.toolCount;
+    }
+  }
+
+  #endSubagent(event: Extract<ExecutionEvent, { type: "subagent_end" }>, atMs: number): void {
+    const subagent = this.#subagent(event.subagentId, atMs);
+    if (!subagent) return;
+    if (subagent.state === "completed" || subagent.state === "failed" || subagent.state === "cancelled") {
+      // A terminal frame is the authoritative end of that run; it is never overwritten.
+      return;
+    }
+    subagent.state = event.state;
+    const summary = safeDisplayText(event.summary);
+    if (summary !== undefined) subagent.summary = summary;
+  }
+
+  /**
+   * Resolve the child a frame belongs to, registering it on first sight. A lifecycle frame can
+   * arrive without its `started` predecessor — a mid-turn spawn the worker only observed after the
+   * fact, or a replay of a durable payload — and dropping such a child would hide a real run.
+   */
+  #subagent(subagentIdValue: unknown, atMs: number): MutableSubagent | undefined {
+    if (this.#state !== "running") return undefined;
+    const subagentId = safeDisplayText(subagentIdValue, 96);
+    if (subagentId === undefined) return undefined;
+    const existing = this.#subagents.get(subagentId);
+    if (existing) return existing;
+    const subagent: MutableSubagent = {
+      subagentId,
+      agent: "子代理",
+      state: "pending",
+      summary: undefined,
+      currentTool: undefined,
+      toolCount: undefined,
+    };
+    this.#subagents.set(subagentId, subagent);
+    this.#subagentOrder.push(subagentId);
+    return subagent;
+  }
+
   #endRun(event: Extract<ExecutionEvent, { type: "run_end" }>, atMs: number): void {
     if (this.#state !== "running") return;
     this.#ensureStarted(atMs);
@@ -502,6 +638,12 @@ class ExecutionTrackerState implements ExecutionTracker {
       tool.state = event.state === "cancelled" ? "cancelled" : event.state === "failed" ? "failed" : "succeeded";
       if (tool.state === "cancelled") tool.errorCategory = "cancelled";
       else if (tool.state === "failed") tool.errorCategory = safeErrorCategory(event.errorCategory, "unknown");
+    }
+    // A subagent that never reported a terminal frame cannot stay live on a settled card; the
+    // turn's own outcome is the only evidence left after the worker stopped reporting.
+    for (const subagent of this.#subagents.values()) {
+      if (subagent.state === "completed" || subagent.state === "failed" || subagent.state === "cancelled") continue;
+      subagent.state = event.state === "completed" ? "completed" : event.state === "cancelled" ? "cancelled" : "failed";
     }
   }
 
@@ -539,7 +681,13 @@ export function restoreExecutionSnapshot(
     return null;
   }
   if (parsed === null || typeof parsed !== "object") return null;
-  const record = parsed as { runId?: unknown; startedAtMs?: unknown; tools?: unknown; todos?: unknown };
+  const record = parsed as {
+    runId?: unknown;
+    startedAtMs?: unknown;
+    tools?: unknown;
+    subagents?: unknown;
+    todos?: unknown;
+  };
   if (!Array.isArray(record.tools) || !Array.isArray(record.todos)) return null;
   const startedAtMs = typeof record.startedAtMs === "number" ? finiteTime(record.startedAtMs) : null;
   const tracker = createExecutionTracker({
@@ -584,11 +732,63 @@ export function restoreExecutionSnapshot(
       phases: record.todos as readonly ExecutionTodoPhase[],
     });
   }
+  // The stored rows carry identity, summary, lifecycle state, and the tool activity the card
+  // shows; replaying them keeps the restored card's subagent band identical to the live one.
+  for (const value of Array.isArray(record.subagents) ? record.subagents : []) {
+    if (value === null || typeof value !== "object") continue;
+    const subagent = value as Record<string, unknown>;
+    if (typeof subagent.subagentId !== "string" || subagent.subagentId.length === 0) continue;
+    const state = savedSubagentState(subagent.state);
+    if (state === null) continue;
+    const summary = typeof subagent.summary === "string" ? subagent.summary : undefined;
+    const currentTool = typeof subagent.currentTool === "string" ? subagent.currentTool : undefined;
+    const toolCount = typeof subagent.toolCount === "number" ? subagent.toolCount : undefined;
+    tracker.apply({
+      type: "subagent_start",
+      subagentId: subagent.subagentId,
+      agent: typeof subagent.agent === "string" ? subagent.agent : "",
+      state: "running",
+      atMs: options.atMs,
+      ...(summary === undefined ? {} : { summary }),
+    });
+    if (state === "completed" || state === "failed" || state === "cancelled") {
+      tracker.apply({
+        type: "subagent_end",
+        subagentId: subagent.subagentId,
+        state,
+        atMs: options.atMs,
+      });
+      continue;
+    }
+    if (currentTool !== undefined || toolCount !== undefined) {
+      tracker.apply({
+        type: "subagent_update",
+        subagentId: subagent.subagentId,
+        state,
+        atMs: options.atMs,
+        ...(currentTool === undefined ? {} : { currentTool }),
+        ...(toolCount === undefined ? {} : { toolCount }),
+      });
+    }
+  }
   return tracker.apply({ type: "run_end", atMs: options.atMs, state: options.state });
 }
 
 function savedToolState(value: unknown): Exclude<ExecutionToolState, "running"> | null {
   return value === "succeeded" || value === "failed" || value === "cancelled" ? value : null;
+}
+
+function savedSubagentState(value: unknown): ExecutionSubagentState | null {
+  switch (value) {
+    case "pending":
+    case "running":
+    case "completed":
+    case "failed":
+    case "cancelled":
+      return value;
+    default:
+      return null;
+  }
 }
 
 interface JsonNode {
@@ -671,7 +871,7 @@ function executionStateLabel(state: ExecutionState): string {
   }
 }
 
-function executionStateGlyph(state: ExecutionState | ExecutionToolState): string {
+function executionStateGlyph(state: ExecutionState | ExecutionToolState | ExecutionSubagentState): string {
   switch (state) {
     case "running":
       return RUNNING_GLYPH;
@@ -681,6 +881,8 @@ function executionStateGlyph(state: ExecutionState | ExecutionToolState): string
     case "failed":
       return FAILURE_GLYPH;
     case "cancelled":
+      return WAITING_GLYPH;
+    case "pending":
       return WAITING_GLYPH;
   }
 }
@@ -704,7 +906,7 @@ function toolStateLabel(state: ExecutionToolState): string {
 }
 
 function executionTone(
-  state: ExecutionState | ExecutionToolState,
+  state: ExecutionState | ExecutionToolState | ExecutionSubagentState,
 ): "Accent" | "Good" | "Attention" | "Default" {
   switch (state) {
     case "running":
@@ -713,6 +915,7 @@ function executionTone(
     case "succeeded":
       return "Good";
     case "cancelled":
+    case "pending":
       return "Default";
     case "failed":
       return "Attention";
@@ -724,13 +927,6 @@ function displayToolName(toolName: string): string {
   return TOOL_DISPLAY_LABELS[toolName] ?? TOOL_DISPLAY_LABELS[normalized] ?? toolName;
 }
 
-function isSubagentTool(toolName: string): boolean {
-  return SUBAGENT_TOOL_NAMES[toolName.toLowerCase()] === true;
-}
-function isActiveSubagent(tool: ExecutionToolSnapshot): boolean {
-  return isSubagentTool(tool.toolName) && tool.state === "running";
-}
-
 function isWaitingTool(toolName: string): boolean {
   return WAITING_TOOL_NAMES[toolName.toLowerCase()] === true;
 }
@@ -738,6 +934,36 @@ function isWaitingTool(toolName: string): boolean {
 function toolStatusLabel(tool: ExecutionToolSnapshot): string {
   if (tool.state === "running" && isWaitingTool(tool.toolName)) return "等待";
   return toolStateLabel(tool.state);
+}
+
+function subagentStateLabel(state: ExecutionSubagentState): string {
+  switch (state) {
+    case "pending":
+      return "待启动";
+    case "running":
+      return "进行中";
+    case "completed":
+      return "已完成";
+    case "failed":
+      return "失败";
+    case "cancelled":
+      return "已取消";
+  }
+}
+
+/**
+ * One child's line: who it is, what it is for, the lifecycle state, and the tool activity that
+ * state is made of. No clock and no duration — timing is not part of the overall state.
+ */
+function subagentLine(subagent: ExecutionSubagentSnapshot, includeGlyph = false): string {
+  const parts: string[] = [];
+  if (includeGlyph) parts.push(executionStateGlyph(subagent.state));
+  parts.push(subagent.agent);
+  if (subagent.summary) parts.push(subagent.summary);
+  parts.push(subagentStateLabel(subagent.state));
+  if (subagent.currentTool) parts.push(subagent.currentTool);
+  if (subagent.toolCount !== undefined) parts.push(`${subagent.toolCount} 次调用`);
+  return parts.join(" · ");
 }
 
 function toolVisualTone(tool: ExecutionToolSnapshot): "Accent" | "Good" | "Attention" | "Default" {
@@ -822,6 +1048,19 @@ function makeCompactToolRow(
 ): JsonNode {
   return makeTextBlock(`${toolStateGlyph(tool)}\u00a0· ${toolLine(tool)}`, {
     color: toolVisualTone(tool),
+    spacing: "Small",
+    ...(options.id === undefined ? {} : { id: options.id }),
+    ...(options.isVisible === undefined ? {} : { isVisible: options.isVisible }),
+  });
+}
+
+/** Compact tier of a subagent row: the same single-line shape as an omitted trace step. */
+function makeCompactSubagentRow(
+  subagent: ExecutionSubagentSnapshot,
+  options: { readonly id?: string; readonly isVisible?: boolean } = {},
+): JsonNode {
+  return makeTextBlock(`${executionStateGlyph(subagent.state)}\u00a0· ${subagentLine(subagent)}`, {
+    color: executionTone(subagent.state),
     spacing: "Small",
     ...(options.id === undefined ? {} : { id: options.id }),
     ...(options.isVisible === undefined ? {} : { isVisible: options.isVisible }),
@@ -1166,6 +1405,77 @@ function makeToolRow(
 }
 
 /**
+ * Rich tier of a subagent row: agent name headline, its purpose, then the lifecycle state with the
+ * tool it is currently running and how many it has used. Rows for subagents still on the wire stay
+ * the default visible band, so this mirrors the tool row layout — without the row's clock/duration.
+ */
+function makeSubagentRow(
+  subagent: ExecutionSubagentSnapshot,
+  options: { readonly id?: string; readonly isVisible?: boolean } = {},
+): JsonNode {
+  const tone = executionTone(subagent.state);
+  return {
+    type: "ColumnSet",
+    ...(options.id === undefined ? {} : { id: options.id }),
+    ...(options.isVisible === undefined ? {} : { isVisible: options.isVisible }),
+    spacing: "None",
+    columns: [
+      {
+        type: "Column",
+        width: "stretch",
+        items: [
+          {
+            type: "Container",
+            style: tone === "Default" ? "emphasis" : tone.toLowerCase(),
+            spacing: "Small",
+            items: [
+              {
+                type: "ColumnSet",
+                spacing: "None",
+                columns: [
+                  {
+                    type: "Column",
+                    width: TOOL_MARKER_COLUMN_WIDTH,
+                    verticalContentAlignment: "Center",
+                    items: [makeTextBlock(executionStateGlyph(subagent.state), {
+                      spacing: "None",
+                      color: tone,
+                      fontType: "Monospace",
+                      size: "Small",
+                      wrap: false,
+                    })],
+                  },
+                  {
+                    type: "Column",
+                    width: "stretch",
+                    items: [
+                      makeTextBlock(subagent.agent, { weight: "Bolder", spacing: "None" }),
+                      ...(subagent.summary === undefined
+                        ? []
+                        : [makeTextBlock(subagent.summary, { isSubtle: true, size: "Small", spacing: "None" })]),
+                      makeTextBlock([
+                        subagentStateLabel(subagent.state),
+                        ...(subagent.currentTool === undefined ? [] : [subagent.currentTool]),
+                        ...(subagent.toolCount === undefined ? [] : [`${subagent.toolCount} 次调用`]),
+                      ].join(" · "), {
+                        isSubtle: true,
+                        size: "Small",
+                        spacing: "None",
+                        color: tone,
+                      }),
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+/**
  * Omitted-step history band. It renders as a sibling of `timeline_detail` instead of a child:
  * the web client's agent-progress layer repaints every filled Container that sits directly under
  * `#timeline_detail` as a failed-step status chip (danger fill + border, inline fill cleared),
@@ -1252,13 +1562,18 @@ function makeTodoContainer(
   };
 }
 
+/**
+ * The subagent section. It is fed by the OMP subagent events alone: live children render as rich
+ * rows, finished ones sink into the expandable history band, and the count in the heading is the
+ * number of subagents the session actually reported.
+ */
 function makeSubagentContainer(
-  tools: readonly ExecutionToolSnapshot[],
+  subagents: readonly ExecutionSubagentSnapshot[],
   hiddenCount: number,
   totalCount: number,
   detailVisible: boolean,
-  olderTools: readonly ExecutionToolSnapshot[] = [],
-  omittedTools: readonly ExecutionToolSnapshot[] = [],
+  olderSubagents: readonly ExecutionSubagentSnapshot[] = [],
+  omittedSubagents: readonly ExecutionSubagentSnapshot[] = [],
   hideOlder = true,
 ): JsonNode {
   const items: JsonNode[] = [];
@@ -1269,22 +1584,22 @@ function makeSubagentContainer(
       spacing: "Small",
     }));
   }
-  if (tools.length === 0 && olderTools.length === 0 && omittedTools.length === 0) {
+  if (subagents.length === 0 && olderSubagents.length === 0 && omittedSubagents.length === 0) {
     items.push(makeTextBlock("暂无可见子代理活动", { isSubtle: true, spacing: "Small" }));
   } else {
-    items.push(...tools.map(tool => makeToolRow(tool)));
-    items.push(...olderTools.map((tool, index) => makeCompactToolRow(tool, {
+    items.push(...subagents.map(subagent => makeSubagentRow(subagent)));
+    items.push(...olderSubagents.map((subagent, index) => makeCompactSubagentRow(subagent, {
       id: `subagent_older_step_${index}`,
       ...(hideOlder ? { isVisible: false } : {}),
     })));
-    if (omittedTools.length > 0) {
+    if (omittedSubagents.length > 0) {
       items.push({
         type: "Container",
         id: "subagent_omitted_steps",
         isVisible: false,
         style: "emphasis",
         spacing: "Small",
-        items: omittedTools.map(tool => makeCompactToolRow(tool)),
+        items: omittedSubagents.map(subagent => makeCompactSubagentRow(subagent)),
       });
     }
   }
@@ -1760,42 +2075,35 @@ function buildCandidate(
   const canToggle = richLayout
     && supportsElement(capabilities, "ActionSet")
     && supportsAction(capabilities, TOGGLE_ACTION);
+  // Snapshots written before subagent tracking existed (and hand-built fixtures) simply have no
+  // subagent field; they render as a run with zero children.
+  const subagents = Array.isArray(snapshot.subagents) ? snapshot.subagents : [];
   const hiddenTools = Math.max(0, snapshot.tools.length - visibleTools.length);
   const recentTools = visibleTools.slice(Math.max(0, visibleTools.length - MAX_VISIBLE_TOOLS));
   const omittedTools = snapshot.tools.slice(0, hiddenTools);
-  const totalSubagents = richLayout
-    ? snapshot.tools.filter(tool => isSubagentTool(tool.toolName)).length
-    : 0;
-  const visibleSubagents = richLayout
-    ? snapshot.tools.filter(isActiveSubagent)
-    : [];
-  const olderSubagents: readonly ExecutionToolSnapshot[] = [];
-  const visibleTraceTools = richLayout
-    ? recentTools.filter(tool => !isSubagentTool(tool.toolName))
-    : visibleTools;
+  const visibleTraceTools = richLayout ? recentTools : visibleTools;
   const olderTraceTools = richLayout
-    ? visibleTools.filter(tool => !isSubagentTool(tool.toolName) && !recentTools.includes(tool))
+    ? visibleTools.filter(tool => !recentTools.includes(tool))
     : [];
-  const omittedTraceTools = richLayout
-    ? omittedTools.filter(tool => !isSubagentTool(tool.toolName))
-    : [];
+  const omittedTraceTools = richLayout ? omittedTools : [];
   const cappedOmittedTraceTools = omittedTraceTools.length <= MAX_COMPACT_TOOL_ROWS ? omittedTraceTools : [];
   const expandableOmittedTraceTools = cappedOmittedTraceTools.slice(
     Math.max(0, cappedOmittedTraceTools.length - hiddenRowLimit),
   );
-  const omittedSubagentTools = richLayout
-    ? [
-        ...omittedTools.filter(tool => isSubagentTool(tool.toolName) && !isActiveSubagent(tool)),
-        ...visibleTools.filter(tool => isSubagentTool(tool.toolName) && !isActiveSubagent(tool)),
-      ]
+  const totalSubagents = richLayout ? subagents.length : 0;
+  // Live children (the ones still on the wire) are the default rich band; finished ones are the
+  // history the toggle can bring back. Both come from the OMP subagent events, not tool names.
+  const visibleSubagents = richLayout
+    ? subagents.filter(subagent => subagent.state === "running" || subagent.state === "pending")
     : [];
-  const cappedOmittedSubagentTools = omittedSubagentTools.length <= MAX_COMPACT_TOOL_ROWS
-    ? omittedSubagentTools
+  const olderSubagents = richLayout
+    ? subagents.filter(subagent => subagent.state !== "running" && subagent.state !== "pending")
     : [];
-  const expandableOmittedSubagentTools = cappedOmittedSubagentTools.slice(
-    Math.max(0, cappedOmittedSubagentTools.length - hiddenRowLimit),
+  const cappedOlderSubagents = olderSubagents.length <= MAX_COMPACT_TOOL_ROWS ? olderSubagents : [];
+  const expandableOmittedSubagents = cappedOlderSubagents.slice(
+    Math.max(0, cappedOlderSubagents.length - hiddenRowLimit),
   );
-  const totalTraceTools = richLayout ? snapshot.tools.length - totalSubagents : snapshot.tools.length;
+  const totalTraceTools = snapshot.tools.length;
   const hiddenTraceTools = Math.max(0, totalTraceTools - visibleTraceTools.length);
   const hiddenSubagents = Math.max(0, totalSubagents - visibleSubagents.length);
   const visibleTodoTasks = visibleTodos.reduce((count, phase) => count + phase.tasks.length, 0);
@@ -1818,7 +2126,7 @@ function buildCandidate(
   );
   const hasRenderedSubagentActivity = visibleSubagents.length > 0
     || olderSubagents.length > 0
-    || expandableOmittedSubagentTools.length > 0;
+    || hiddenSubagents > 0;
   const subagentContainer = richLayout && hasRenderedSubagentActivity
     ? makeSubagentContainer(
       visibleSubagents,
@@ -1826,7 +2134,7 @@ function buildCandidate(
       totalSubagents,
       true,
       olderSubagents,
-      canToggle ? expandableOmittedSubagentTools : [],
+      canToggle ? expandableOmittedSubagents : [],
       canToggle,
     )
     : null;
@@ -1834,10 +2142,7 @@ function buildCandidate(
     ...olderTraceTools.map((_tool, index) => `timeline_older_step_${index}`),
     ...(expandableOmittedTraceTools.length > 0 ? ["timeline_omitted_steps"] : []),
   ];
-  const subagentHiddenIds = [
-    ...olderSubagents.map((_tool, index) => `subagent_older_step_${index}`),
-    ...(expandableOmittedSubagentTools.length > 0 ? ["subagent_omitted_steps"] : []),
-  ];
+  const subagentHiddenIds = expandableOmittedSubagents.length > 0 ? ["subagent_omitted_steps"] : [];
   const traceToggleSets = canToggle ? makeToggleSets(traceHiddenIds) : [];
   const subagentToggleSets = canToggle && subagentContainer
     ? makeSubagentToggleSets(subagentHiddenIds)
@@ -1945,6 +2250,13 @@ function buildCandidate(
     if (visibleTodoTasks > 0) {
       body.push(...todoLines(visibleTodos, hiddenTodoTasks, totalTodoTasks).map(line => makeTextBlock(line, { spacing: "Small" })));
     }
+    if (subagents.length > 0) {
+      body.push(makeTextBlock(
+        `子代理 · ${subagents.length}`,
+        { weight: "Bolder", size: "Medium", spacing: "Medium" },
+      ));
+      body.push(...subagents.map(subagent => makeCompactSubagentRow(subagent)));
+    }
     body.push(makeTextBlock("执行轨迹", { weight: "Bolder", size: "Medium", spacing: "Medium" }), ...timelineItems);
   }
 
@@ -1962,9 +2274,13 @@ function buildCandidate(
     ...(notice ? [notice.text] : []),
     ...visibleTools.map(tool => markdownSafeToolLine(tool)),
     ...(hiddenTools > 0 ? [`已隐藏前 ${hiddenTools} 个步骤，共 ${snapshot.tools.length} 个步骤`] : []),
+    ...subagents.map(subagent => subagentLine(subagent, true)),
+    ...(hiddenSubagents > 0 ? [`已隐藏 ${hiddenSubagents} 个子代理，共 ${totalSubagents} 个子代理`] : []),
     ...todoLines(visibleTodos, hiddenTodoTasks, totalTodoTasks),
   ];
-  if (visibleTools.length === 0 && visibleTodoTasks === 0) plainLines.push("正在准备");
+  // The rich card keeps finished subagents behind the section toggle; the plain rendering has no
+  // toggle, so it lists every subagent the session reported.
+  if (visibleTools.length === 0 && visibleTodoTasks === 0 && subagents.length === 0) plainLines.push("正在准备");
   return { card, plain: plainLines.join("\n") };
 }
 

@@ -1113,6 +1113,69 @@ function todoDetailsFromResult(result: unknown): { phases: ExecutionTodoPhase[];
 	return { phases, op: asTodoOperation(result.details.op) };
 }
 
+/**
+ * Subagent lifecycle as OMP reports it, instead of as a tool name implies. The frame's payload is
+ * the same `SubagentLifecyclePayload` the interactive HUD consumes; `aborted` is the child's own
+ * cancellation and normalizes to the run-level `cancelled` state.
+ */
+type SubagentLifecycleEvent = Extract<ExecutionEvent, { type: "subagent_start" | "subagent_end" }>;
+type SubagentProgressEvent = Extract<ExecutionEvent, { type: "subagent_update" }>;
+
+function subagentLifecycleEvent(payload: unknown, atMs: number): SubagentLifecycleEvent | undefined {
+	if (!isRecord(payload) || typeof payload.id !== "string" || payload.id.length === 0) return undefined;
+	const status = payload.status;
+	if (status !== "started" && status !== "completed" && status !== "failed" && status !== "aborted") return undefined;
+	const agent = typeof payload.agent === "string" ? payload.agent : "";
+	const description = typeof payload.description === "string" ? payload.description : undefined;
+	if (status === "started") {
+		return {
+			type: "subagent_start",
+			subagentId: payload.id,
+			agent,
+			state: "running",
+			atMs,
+			...(description === undefined ? {} : { summary: description }),
+		};
+	}
+	return {
+		type: "subagent_end",
+		subagentId: payload.id,
+		state: status === "aborted" ? "cancelled" : status,
+		atMs,
+		...(description === undefined ? {} : { summary: description }),
+	};
+}
+
+/**
+ * One aggregated progress frame: the child's `status`, the intent it is working on, the tool it is
+ * currently running, and how many tools it has used. The prompt text (`task`) and the child's
+ * recent tool arguments are dropped — the card shows a bounded state line, and raw arguments
+ * belong to the child's own transcript.
+ */
+function subagentProgressEvent(payload: unknown, atMs: number): SubagentProgressEvent | undefined {
+	if (!isRecord(payload) || !isRecord(payload.progress)) return undefined;
+	const progress = payload.progress;
+	if (typeof progress.id !== "string" || progress.id.length === 0) return undefined;
+	const status = progress.status;
+	if (status !== "pending" && status !== "running") return undefined;
+	const intent = typeof progress.lastIntent === "string" ? progress.lastIntent : undefined;
+	const currentTool = typeof progress.currentTool === "string" && progress.currentTool.length > 0
+		? progress.currentTool
+		: undefined;
+	const toolCount = typeof progress.toolCount === "number" && Number.isSafeInteger(progress.toolCount) && progress.toolCount >= 0
+		? progress.toolCount
+		: undefined;
+	return {
+		type: "subagent_update",
+		subagentId: progress.id,
+		state: status,
+		atMs,
+		...(intent === undefined ? {} : { summary: intent }),
+		...(currentTool === undefined ? {} : { currentTool }),
+		...(toolCount === undefined ? {} : { toolCount }),
+	};
+}
+
 
 function describeUiFailure(method: string): Error {
 	return new Error(`OMP requested unsupported interactive UI (${method}); worker stopped safely`);
@@ -1130,6 +1193,8 @@ class RpcWorker implements OmpWorker {
 	#protocolV2 = false;
 	#ready = false;
 	#readyV2Supported = false;
+	/** True once OMP confirmed it will stream `subagent_lifecycle`/`subagent_progress` frames. */
+	#subagentFrames = false;
 	#closed = false;
 	#stopping = false;
 	#stopPromise: Promise<boolean> | undefined;
@@ -1189,6 +1254,7 @@ class RpcWorker implements OmpWorker {
 			if (!isRecord(data) || data.protocolVersion !== 2) throw new Error("OMP RPC protocol negotiation returned an invalid version");
 			this.#protocolV2 = true;
 		}
+		await this.#subscribeToSubagents();
 		if (this.#newSessionOnStart) {
 			const newSession = await this.#request({ type: "new_session" }, this.#startupTimeoutMs);
 			this.#assertSuccess(newSession, "new_session");
@@ -1196,6 +1262,30 @@ class RpcWorker implements OmpWorker {
 			if (!isRecord(data) || data.cancelled !== false) throw new Error("OMP RPC new_session was cancelled");
 		}
 		await this.refreshState();
+	}
+
+	/**
+	 * Ask OMP to stream `subagent_lifecycle`/`subagent_progress` frames — the registry defaults to
+	 * `off`, so without this command a spawned child is invisible to the channel. The aggregated
+	 * `progress` level is enough for the card and a fraction of the volume of raw child events;
+	 * an OMP that does not offer the command keeps the worker usable, its subagent section just
+	 * stays empty.
+	 */
+	async #subscribeToSubagents(): Promise<void> {
+		try {
+			const response = await this.#request(
+				{ type: "set_subagent_subscription", level: "progress" },
+				this.#startupTimeoutMs,
+			);
+			const data = isRecord(response.data) ? response.data : undefined;
+			if (response.success !== true || data?.level !== "progress") {
+				console.warn("[omp] subagent 事件订阅未生效，进度卡不再显示子代理区块");
+				return;
+			}
+			this.#subagentFrames = true;
+		} catch {
+			console.warn("[omp] 无法订阅 subagent 事件，进度卡不再显示子代理区块");
+		}
 	}
 
 	async refreshState(): Promise<ProjectSessionState> {
@@ -1619,6 +1709,18 @@ class RpcWorker implements OmpWorker {
 				if (turnId === undefined) emitExecutionEvent(active, { type: "turn_end", atMs });
 				else emitExecutionEvent(active, { type: "turn_end", turnId, atMs });
 				active.activeTurnId = undefined;
+				return;
+			}
+			if (frame.type === "subagent_lifecycle") {
+				if (!this.#subagentFrames) return;
+				const event = subagentLifecycleEvent(frame.payload, eventTime(frame.timestamp));
+				if (event) emitExecutionEvent(active, event);
+				return;
+			}
+			if (frame.type === "subagent_progress") {
+				if (!this.#subagentFrames) return;
+				const event = subagentProgressEvent(frame.payload, eventTime(frame.timestamp));
+				if (event) emitExecutionEvent(active, event);
 				return;
 			}
 			if (frame.type === "tool_execution_start") {

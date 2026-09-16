@@ -122,6 +122,8 @@ function executionSnapshot(
       durationMs: terminal ? 1_000 : null,
       summary: terminal ? "Completed shell" : "Running shell",
     }],
+    subagentCount: 0,
+    subagents: [],
     todos: [{
       name: "Execution",
       tasks: [{ content: "Run command", status: todoStatus }],
