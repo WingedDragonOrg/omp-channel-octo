@@ -238,18 +238,23 @@ function receiptText(prefix: string, text: string): string {
 /**
  * Instruction block for a `/thread` message: the command hands the intent over instead of
  * creating anything, and the assistant names the sub-thread and its workspace itself, then drives
- * `octo_management` - dispatching the work directly when the intent is clear, and a request for
- * the owner to clarify (inside the thread) when it is not.
+ * `octo_management`. The dispatch body always follows SDD shape (goal, scope, constraints,
+ * acceptance): a requirement clear enough to generate the SDD from is dispatched without a
+ * clarification round, so the thread generates the SDD and starts at once; anything else is
+ * dispatched after at most the few SDD-shaped answers it takes to hand it over, with the remaining
+ * clarification left to the thread (guided by a clarification skill when the environment has one).
+ * Detailed clarification never happens in the originating chat.
  */
 function threadIntentPrompt(intent: string): string {
   return [
     "用户希望把下面这件事放进一个新的隔离子区处理，而不是在当前会话直接执行。",
     "先理解意图，并据此确定子区名称（简洁、能说明这件事）与 worktree_name（ASCII 小写连字符，如 fix-login-flow）。",
+    "需求简单或非常明确时不要在这里澄清；其余情况先按 SDD 的要素（目标、范围、约束与验收标准）向 owner 问最少必要的问题（够派发即可，不要在当前会话展开细节），再派发。",
     "然后调用 octo_management：create-thread（name=子区名称，worktree_name=你定的名字）创建隔离子区，",
-    "再用 thread-dispatch（short_id=该子区）把任务派发进去；派发的任务正文按需求明确程度二选一：",
-    "- 需求明确：直接写清要做什么（可整理原始意图，但不要丢信息），让子区立刻开工；",
-    "- 需求不明确：写明已知的原始意图，并要求子区先用 ask 向 owner 提问澄清，明确后再执行。",
-    "澄清发生在子区里：不要在当前会话执行这件事，也不要在当前会话提问。",
+    "再用 thread-dispatch（short_id=该子区）把任务派发进去；派发的任务正文按 SDD 格式写（目标、范围、约束与验收标准），需求明确程度决定子区能否直接生成 SDD：",
+    "- 简单或非常明确（目标与验收标准能直接写清、足以直接生成 SDD、没有需要 owner 决策的歧义或取舍）：直接按 SDD 格式写清要做什么（可整理原始意图，但不要丢信息），让子区直接生成 SDD 并立刻开工；",
+    "- 否则：按 SDD 格式写明已知的目标、范围、约束与验收标准，并要求子区先按 SDD 格式把尚不明确的需求澄清成 SDD（可实施的设计）再动手，需要 owner 拍板的问题在子区内用 ask 提出；环境里有 spec-design 等需求澄清或设计技能时，引导子区用该技能完成澄清。",
+    "详细的需求澄清在子区内进行：不要在当前会话执行这件事，也不要在当前会话做过于详细的需求澄清。",
     "完成后简要汇报子区名称、short_id 与工作区路径。",
     "",
     "原始意图：",
@@ -1429,12 +1434,13 @@ class CoreService implements ChannelService {
   /**
    * `/thread <任务>`: hand the intent to the assistant instead of creating a sub-thread here. The
    * message carries an instruction block, so the agent reads the intent, names the sub-thread and
-   * its workspace itself, and drives `octo_management`: a clear intent is dispatched as the work
-   * itself, an underspecified one as a request for the owner to clarify in the thread. The body
-   * follows the chat's append mode like any other message the assistant has to read: a running
-   * turn that accepts steering gets the instruction inside that turn, otherwise it becomes a
-   * durable task (`queue` mode included) that waits behind the run. Only groups grow threads, so
-   * DMs and threads themselves are refused.
+   * its workspace itself, and drives `octo_management`: a simple or unambiguous intent is
+   * dispatched as the work itself so the thread starts at once, an underspecified one after at
+   * most the few answers it takes to hand it over, with the detailed, SDD-shaped clarification
+   * left to the thread. The body follows the chat's append mode like any other message the
+   * assistant has to read: a running turn that accepts steering gets the instruction inside that
+   * turn, otherwise it becomes a durable task (`queue` mode included) that waits behind the run.
+   * Only groups grow threads, so DMs and threads themselves are refused.
    */
   private async handleThreadCommand(message: InboundMessage, argument: string): Promise<void> {
     if (message.channelType === 5) {
