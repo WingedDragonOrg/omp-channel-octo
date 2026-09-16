@@ -14,6 +14,7 @@ import {
   resolveConfigPath,
   toCoreConfig,
 } from "./config.ts";
+import { createAllowlistWriteback } from "./config-writeback.ts";
 import {
   DEFAULT_LAUNCHD_LABEL,
   DEFAULT_LAUNCHD_PLIST_PATH,
@@ -286,6 +287,10 @@ async function runService(
       workerFactory,
       worktrees: createOmpWorktreePort({ command: ompCommand }),
       cliCredentials,
+      // Only a config that came from a file can be written back; a hand-built config has no path.
+      ...(config.configPath === undefined
+        ? {}
+        : { allowlistWriteback: createAllowlistWriteback(config.configPath) }),
       ...(supervised === undefined
         ? {}
         : {

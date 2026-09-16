@@ -167,6 +167,14 @@ const MENTION_PREF_TTL_MS = 60_000;
 const MENTION_PREF_FAILURE_TTL_MS = 10_000;
 /** Bounds the 免@ lookup on the inbound path: the handler, and RECVACK, wait for it. */
 const MENTION_PREF_TIMEOUT_MS = 5_000;
+/**
+ * The one exception that lets an allowlist rejection speak: an owner's @Bot mention in an unlisted
+ * group or thread gets a short notice carrying this exact reply text (compared after Bot-mention
+ * stripping and outer whitespace trimming), and that reply enables the chat durably.
+ */
+const UNLISTED_CHAT_PASSPHRASE = "开通本群";
+/** One notice per unlisted chat per window, so a burst of messages cannot become a burst of replies. */
+const UNLISTED_CHAT_NOTICE_TTL_MS = 10 * 60 * 1_000;
 const DEFAULT_CANCELLED_TEXT = "当前任务已取消；不回滚已发生的副作用。";
 const DEFAULT_RESTARTING_TEXT = "channel 正在重启，本会话任务已中断；重启完成后会在本会话确认。";
 const MANAGEMENT_BASE_ACTIONS = [
@@ -767,6 +775,8 @@ class CoreService implements ChannelService {
   private readonly groupHistoryBuffers = new Map<string, HistoryBuffer>();
   private readonly mentionPrefs = new Map<string, { effective: boolean; expiresAt: number }>();
   private readonly mentionPrefRequests = new Map<string, Promise<boolean>>();
+  /** Last unlisted-chat notice per chat; process-local, so a restart may re-notify once. */
+  private readonly unlistedChatNotices = new Map<string, number>();
   private readonly commandHandlers: ReadonlyMap<string, ChannelCommandHandler>;
   private bot: BotIdentity | undefined;
   private readonly activityOperations = new Set<Promise<void>>();
@@ -980,7 +990,11 @@ class CoreService implements ChannelService {
       }
       ownerId = this.store.getOwnerId(this.bot.uid)?.trim() || null;
     }
-    if (!(await this.isAllowed(message, ownerId))) return;
+    const allowed = await this.isAllowed(message, ownerId);
+    if (!allowed) {
+      await this.handleUnlistedOwnerContact(message, ownerId);
+      return;
+    }
     if (!message.supported) {
       const claim = this.commandClaim(message, "unsupported");
       if (!this.store.claimCommand(claim)) return;
@@ -1208,6 +1222,18 @@ class CoreService implements ChannelService {
     };
   }
 
+  /**
+   * The allowlist is the config's `allowedGroupIds` plus the chats the owner enabled at runtime
+   * (durable in the state store). Threads keep the same inheritance rule over both sets: a thread
+   * is permitted by its own id or by its parent group's.
+   */
+  private isPermittedChat(message: Pick<InboundMessage, "channelId" | "channelType">): boolean {
+    if (isAllowlistedChat(this.options.config.allowedGroupIds, message)) return true;
+    if (!this.bot) return false;
+    const granted = this.store.listAllowedChats(this.bot.uid);
+    return granted.length > 0 && isAllowlistedChat(granted.map((chat) => chat.channelId), message);
+  }
+
   private async isAllowed(message: InboundMessage, ownerId: string | null): Promise<boolean> {
     if (!this.bot || !ownerId || message.messageId.trim().length === 0 || message.senderId.trim().length === 0) {
       return false;
@@ -1217,11 +1243,90 @@ class CoreService implements ChannelService {
     if (message.channelType === 1) {
       return senderId === ownerId;
     }
-    if (senderId !== ownerId || !isAllowlistedChat(this.options.config.allowedGroupIds, message)) {
+    if (senderId !== ownerId || !this.isPermittedChat(message)) {
       return false;
     }
     if (message.mentionedUserIds.includes(this.bot.uid)) return true;
     return await this.groupAllowsNoMention(message);
+  }
+
+  /**
+   * The single exception to "an allowlist rejection is silent": an owner's @Bot mention in an
+   * unlisted group or thread gets one short, throttled notice with the passphrase, and the exact
+   * passphrase enables that chat durably. Every other rejection path is unchanged - a non-owner,
+   * an unmentioned message, a bot echo, and every DM stay reply-less, task-less and unlogged, and
+   * a chat the owner already enabled never reaches here.
+   */
+  private async handleUnlistedOwnerContact(message: InboundMessage, ownerId: string | null): Promise<void> {
+    const bot = this.bot;
+    if (!bot || !ownerId) return;
+    const senderId = message.senderId.trim();
+    if (senderId !== ownerId || senderId === bot.uid) return;
+    if (message.channelType !== 2 && message.channelType !== 5) return;
+    if (!message.mentionedUserIds.includes(bot.uid)) return;
+    if (this.isPermittedChat(message)) return;
+    if (message.text.trim() === UNLISTED_CHAT_PASSPHRASE) {
+      await this.grantUnlistedChat(message);
+      return;
+    }
+    this.noticeUnlistedChat(message, bot.name.trim().length > 0 ? bot.name.trim() : bot.uid);
+  }
+
+  /** 本群 vs 本子区: the notice, the confirmation and the grant row all name the same scope. */
+  private noticeUnlistedChat(message: InboundMessage, botName: string): void {
+    const key = targetKey(message);
+    const lastNoticedAt = this.unlistedChatNotices.get(key);
+    if (lastNoticedAt !== undefined && Date.now() - lastNoticedAt < UNLISTED_CHAT_NOTICE_TTL_MS) return;
+    const scope = message.channelType === 5 ? "本子区" : "本群";
+    this.enqueueText(message, `${scope}未开通。回复「@${botName} ${UNLISTED_CHAT_PASSPHRASE}」即可开通${scope}。`, null);
+    // Only a queued notice opens the window: a failed enqueue still leaves the next message free to try again.
+    this.unlistedChatNotices.set(key, Date.now());
+  }
+
+  /**
+   * Enables the chat the owner answered the passphrase in. The grant row is the durable permission
+   * (the next message needs no restart and no config reload); the config file is then updated as
+   * the operator-visible mirror, and a mirror failure is reported without taking the grant back.
+   */
+  private async grantUnlistedChat(message: InboundMessage): Promise<void> {
+    const botUid = this.bot!.uid;
+    // The passphrase is a control action, not a task: one durable claim per message id, so a
+    // redelivery after the grant cannot fall through to a task that prompts the model with it.
+    const claim = this.commandClaim(message, "allow-chat");
+    if (!this.store.claimCommand(claim)) return;
+    const scope = message.channelType === 5 ? "本子区" : "本群";
+    let mirrorFailed = false;
+    try {
+      this.store.grantAllowedChat({
+        botUid,
+        channelType: message.channelType === 5 ? 5 : 2,
+        channelId: message.channelId,
+        grantedBy: message.senderId.trim(),
+      });
+      if (this.options.allowlistWriteback) {
+        try {
+          await this.options.allowlistWriteback.append(message.channelId);
+        } catch {
+          mirrorFailed = true;
+        }
+      }
+      console.error(
+        `[allow] 已开通${scope} ${targetKey(message)}（owner ${message.senderId.trim()}）${
+          mirrorFailed ? "；配置文件写回失败，仅状态盘生效" : ""
+        }`,
+      );
+      await this.enqueueText(
+        message,
+        mirrorFailed
+          ? `已开通${scope}；配置文件写回失败，本次开通仅在状态盘生效。`
+          : `已开通${scope}，后续 @${this.bot!.name} 即可正常使用。`,
+        null,
+      );
+      this.store.completeCommand(claim);
+    } catch {
+      this.store.failCommand(claim);
+      throw new Error("本地状态盘写入失败，未记录开通结果。");
+    }
   }
 
   /**

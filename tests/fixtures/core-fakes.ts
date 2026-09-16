@@ -3,6 +3,7 @@ import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "n
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import type {
+  AllowlistWriteback,
   AttachmentDownload,
   BotCardAction,
   BotEvent,
@@ -1222,6 +1223,8 @@ export interface CoreHarnessOptions {
   worktrees?: FakeWorktrees | null;
   /** Per-bot octo-cli credential port; absent means the deployment has no such capability. */
   cliCredentials?: CliCredentialPort;
+  /** Allowlist mirror into the config file; absent means a hand-built config with no path. */
+  allowlistWriteback?: AllowlistWriteback;
 }
 
 export async function createCoreHarness(options: CoreHarnessOptions = {}): Promise<CoreHarness> {
@@ -1262,6 +1265,7 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
     ...(options.commandHandlers === undefined ? {} : { commandHandlers: options.commandHandlers }),
     ...(options.restart === undefined ? {} : { restart: options.restart }),
     ...(options.cliCredentials === undefined ? {} : { cliCredentials: options.cliCredentials }),
+    ...(options.allowlistWriteback === undefined ? {} : { allowlistWriteback: options.allowlistWriteback }),
   });
   await service.start();
   return {

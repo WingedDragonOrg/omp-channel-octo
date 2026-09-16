@@ -75,6 +75,11 @@ export interface AppConfig extends CoreServiceConfig {
   groupHistory: GroupHistoryConfig;
   /** Inbound attachment pipeline; defaults to enabled with a 25 MiB per-attachment ceiling. */
   attachments: AttachmentConfig;
+  /**
+   * Resolved path of the file `loadConfig` read; absent for configs built by hand. Runtime
+   * write-back (the allowlist mirror) writes here, so it edits exactly the operator's file.
+   */
+  configPath?: string;
 }
 
 export interface ConfigParseOptions {
@@ -314,7 +319,7 @@ export async function loadConfig(
   ) {
     throw new Error("配置无效：包含 botToken 的配置文件必须是私有权限");
   }
-  return parseConfig(document, options);
+  return { ...parseConfig(document, options), configPath: resolvedPath };
 }
 
 export async function ensureStateDirectory(config: Pick<AppConfig, "stateDir">): Promise<void> {

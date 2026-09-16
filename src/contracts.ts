@@ -463,6 +463,17 @@ export interface ChannelServiceOptions {
    * can call `octo-cli` as this bot; failures leave the agent without a CLI identity.
    */
   cliCredentials?: CliCredentialPort;
+  /**
+   * Operator-visible allowlist baseline. A chat the owner enables at runtime is durable in the
+   * state store on its own; this port is what keeps the config file's `allowedGroupIds` in step,
+   * and a failure there only costs that mirror.
+   */
+  allowlistWriteback?: AllowlistWriteback;
+}
+
+export interface AllowlistWriteback {
+  /** Appends one chat id to the config file's allowlist; idempotent, atomic, mode-preserving. */
+  append(groupId: string): Promise<void>;
 }
 
 export interface CliCredentialPort {

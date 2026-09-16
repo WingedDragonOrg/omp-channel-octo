@@ -134,6 +134,18 @@ export interface HistoryLedgerRecord {
   previousSeq: number | null;
 }
 
+/**
+ * One chat the owner enabled at runtime instead of in the config's `allowedGroupIds`. The two
+ * sets are consulted as one allowlist, so a granted chat needs no restart and no config reload.
+ */
+export interface AllowedChatRecord extends ChatTarget {
+  botUid: string;
+  channelType: 2 | 5;
+  channelId: string;
+  grantedBy: string;
+  grantedAt: number;
+}
+
 type SqlValue = string | number | null | Uint8Array;
 type SqlRow = Record<string, unknown>;
 
@@ -229,6 +241,14 @@ export class ChannelStore {
         text TEXT NOT NULL,
         accepted_at INTEGER NOT NULL,
         PRIMARY KEY(bot_uid, channel_type, channel_id, message_id)
+      );
+      CREATE TABLE IF NOT EXISTS allowed_chats (
+        bot_uid TEXT NOT NULL,
+        channel_type INTEGER NOT NULL CHECK(channel_type IN (2, 5)),
+        channel_id TEXT NOT NULL,
+        granted_by TEXT NOT NULL,
+        granted_at INTEGER NOT NULL,
+        PRIMARY KEY(bot_uid, channel_type, channel_id)
       );
       CREATE TABLE IF NOT EXISTS chats (
         bot_uid TEXT NOT NULL,
@@ -531,6 +551,37 @@ export class ChannelStore {
       this.enqueueOutbox(outbox);
       return true;
     });
+  }
+
+  /**
+   * Records one chat the owner enabled at runtime. Idempotent: a replayed passphrase or a second
+   * grant keeps the first row, so `granted_at`/`granted_by` stay the original decision.
+   */
+  grantAllowedChat(record: {
+    botUid: string;
+    channelType: 2 | 5;
+    channelId: string;
+    grantedBy: string;
+  }): boolean {
+    return this.run(
+      `INSERT INTO allowed_chats(bot_uid, channel_type, channel_id, granted_by, granted_at)
+       VALUES(?, ?, ?, ?, ?)
+       ON CONFLICT(bot_uid, channel_type, channel_id) DO NOTHING`,
+      [record.botUid, record.channelType, record.channelId, record.grantedBy, Date.now()],
+    ).changes === 1;
+  }
+
+  listAllowedChats(botUid: string): AllowedChatRecord[] {
+    return this.query(
+      "SELECT * FROM allowed_chats WHERE bot_uid = ? ORDER BY granted_at ASC, channel_id ASC",
+      [botUid],
+    ).map((row) => ({
+      botUid: asString(row.bot_uid),
+      channelType: asNumber(row.channel_type) === 5 ? 5 : 2,
+      channelId: asString(row.channel_id),
+      grantedBy: asString(row.granted_by),
+      grantedAt: asNumber(row.granted_at),
+    }));
   }
 
   ensureBinding(binding: BindingRecord): void {
