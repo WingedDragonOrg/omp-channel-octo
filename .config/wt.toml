@@ -1,9 +1,12 @@
 # Worktrunk project configuration — https://worktrunk.dev/config/
 # Hooks run inside each new worktree. `bun install` is blocking so a worktree is
-# never handed over with dependencies half-installed.
+# never handed over with dependencies half-installed. `direnv allow` runs only
+# when both direnv and an .envrc exist in the new worktree; otherwise it is a
+# no-op, so a worktree without an env file still gets created.
 
 [pre-start]
 deps = "bun install"
+direnv = "if [ -f .envrc ] && command -v direnv >/dev/null; then direnv allow; fi"
 
 # Merge gate. Both commands run concurrently and every one must pass.
 
