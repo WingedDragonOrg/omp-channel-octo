@@ -620,14 +620,25 @@ function emitV2AgentTurn(id: string | undefined): void {
 
 function emitHostToolCall(): void {
 	pendingHostToolRequestId = "fixture-host-1";
-	const toolName = scenario === "host-unknown" ? "missing_fixture_tool" : "fixture_echo";
+	const toolName =
+		flag("--host-tool-name") ??
+		(scenario === "host-unknown" ? "missing_fixture_tool" : "fixture_echo");
+	const customArguments = flag("--host-tool-args");
+	let toolArguments: Frame = { message: "hello from fixture" };
+	if (customArguments !== undefined) {
+		const parsed: unknown = JSON.parse(customArguments);
+		if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+			throw new Error("--host-tool-args must be a JSON object");
+		}
+		toolArguments = parsed as Frame;
+	}
 	emit({ type: "agent_start" });
 	emit({
 		type: "host_tool_call",
 		id: pendingHostToolRequestId,
 		toolCallId: "fixture-tool-call-1",
 		toolName,
-		arguments: { message: "hello from fixture" },
+		arguments: toolArguments,
 	});
 	if (scenario === "host-cancel") {
 		setTimeout(() => {

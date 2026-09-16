@@ -754,3 +754,194 @@ test("real CLI gives a CommunityTopic thread the parent group's work directory",
     if (root) await rm(root, { recursive: true, force: true });
   }
 }, 30_000);
+
+test("real CLI creates a thread's isolated workspace through the resolved OMP command", async () => {
+  let root: string | undefined;
+  let fixture: OctoProtocolFixture | undefined;
+  let child: Bun.Subprocess | undefined;
+  let outputPromise: Promise<[string, string]> | undefined;
+  try {
+    const currentRoot = await mkdtemp(join(tmpdir(), "octo-cli-thread-worktree-"));
+    root = currentRoot;
+    const currentFixture = await createOctoProtocolFixture();
+    fixture = currentFixture;
+    const groupId = "group-thread-worktree";
+    // The group works in a real repository, so the workspace has a branch to start from.
+    const repoDir = join(currentRoot, "project");
+    await mkdir(repoDir);
+    await writeFile(join(repoDir, "file.txt"), "hello\n", "utf8");
+    const runGit = async (args: string[]): Promise<void> => {
+      const git = Bun.spawn(["git", "-C", repoDir, ...args], {
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const stderr = await new Response(git.stderr).text();
+      if ((await git.exited) !== 0) throw new Error(`git ${args.join(" ")} failed: ${stderr}`);
+    };
+    await runGit(["init", "-q", "-b", "main"]);
+    await runGit(["add", "."]);
+    await runGit([
+      "-c",
+      "user.email=test@example.com",
+      "-c",
+      "user.name=Fixture",
+      "commit",
+      "-q",
+      "-m",
+      "init",
+    ]);
+    const repoCwd = await realpath(repoDir);
+    // One executable stands in for the OMP CLI: `worktree add` performs the real git command that
+    // the deployment's `omp worktree add` wraps, and every other invocation starts the RPC worker
+    // fixture, so the service path under test is exactly the deployed one.
+    const ompWrapper = join(currentRoot, "omp");
+    await writeFile(
+      ompWrapper,
+      `#!/bin/sh
+if [ "$1" = "worktree" ] && [ "$2" = "add" ]; then
+  shift 2
+  exec git -C "$5" worktree add "$1" -b "$3" -q
+fi
+exec '${process.execPath}' "$@"
+`,
+      { mode: 0o755 },
+    );
+    const rpcLogPath = join(currentRoot, "omp-rpc.log");
+    const stateDir = join(currentRoot, "state");
+    const fixtureScenario = "host-tool";
+    // The RPC fixture cannot run the real OMP extension that writes the prepared-context receipt,
+    // so seed the steady state "this session already committed its shared context" (the fixture
+    // always reports `fixture-session-<scenario>`) and let the task reach the management call.
+    const fixtureSessionId = `fixture-session-${fixtureScenario}`;
+    await mkdir(stateDir, { recursive: true });
+    const seed = new Database(join(stateDir, "channel.sqlite"));
+    seed.run(`CREATE TABLE IF NOT EXISTS session_context_ledger (
+        bot_uid TEXT NOT NULL,
+        channel_type INTEGER NOT NULL CHECK(channel_type IN (2, 5)),
+        channel_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version >= 0),
+        phase TEXT NOT NULL CHECK(phase IN ('pending', 'committed')),
+        attempt_id TEXT NOT NULL,
+        previous_version INTEGER CHECK(previous_version IS NULL OR previous_version >= 0),
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(bot_uid, channel_type, channel_id, session_id)
+      )`);
+    seed.run(
+      `INSERT INTO session_context_ledger(
+         bot_uid, channel_type, channel_id, session_id, version, phase, attempt_id, previous_version, updated_at
+       ) VALUES(?, 2, ?, ?, 0, 'committed', ?, NULL, ?)`,
+      [currentFixture.botUid, groupId, fixtureSessionId, "thread-worktree-seed", Date.now()],
+    );
+    seed.close();
+
+    const configPath = join(currentRoot, "config.json");
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        apiUrl: currentFixture.apiUrl,
+        botToken: currentFixture.botToken,
+        ownerId: currentFixture.ownerUid,
+        allowedGroupIds: [groupId],
+        stateDir,
+        ompCommand: ompWrapper,
+        ompExtraArgs: [
+          resolve(import.meta.dir, "fixtures/omp-rpc-worker.ts"),
+          "--fixture-scenario",
+          fixtureScenario,
+          "--fixture-log",
+          rpcLogPath,
+          "--host-tool-name",
+          "octo_management",
+          "--host-tool-args",
+          JSON.stringify({ action: "create-thread", name: "隔离线程", worktree_name: "cli-workspace" }),
+        ],
+        startupTimeoutMs: 5_000,
+        cancelTimeoutMs: 2_000,
+      }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const spawned = Bun.spawn(
+      [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "start", "--config", configPath],
+      { stdout: "pipe", stderr: "pipe", env: cliEnvironment(currentRoot) },
+    );
+    child = spawned;
+    const stdout = new Response(spawned.stdout).text();
+    const stderr = new Response(spawned.stderr).text();
+    const capturedOutput = Promise.all([stdout, stderr]);
+    outputPromise = capturedOutput;
+    const connection = await currentFixture.waitForConnection(1, 5_000);
+    await waitForFixture(
+      () => connection.ready ? connection : undefined,
+      5_000,
+      "CLI did not authenticate its WebSocket connection",
+    );
+    const botPrefix = `@${currentFixture.botName}`;
+    const botMention = { entities: [{ uid: currentFixture.botUid, offset: 0, length: botPrefix.length }] };
+
+    // Bind the group to the repository: the task's base directory is then a real checkout.
+    currentFixture.sendInbound(connection, {
+      fromUid: currentFixture.ownerUid,
+      channelId: groupId,
+      channelType: 2,
+      text: `${botPrefix} /new ${repoDir}`,
+      mention: botMention,
+      messageId: "9007199254745001",
+    });
+    const bound = await waitForFixture(
+      () => currentFixture.sentMessages.find((message) => message.body.channel_id === groupId),
+      10_000,
+      "the parent group /new command did not get a reply",
+    );
+    expect(sentText(bound)).toContain(`cwd=${repoCwd}`);
+
+    // The task calls the management tool; the host must materialize the workspace through the
+    // resolved OMP command and answer with the created worktree instead of `worktree_error`.
+    currentFixture.sendInbound(connection, {
+      fromUid: currentFixture.ownerUid,
+      channelId: groupId,
+      channelType: 2,
+      text: `${botPrefix} 建一个隔离线程`,
+      mention: botMention,
+      messageId: "9007199254745002",
+    });
+    const reply = await waitForFixture(
+      () =>
+        currentFixture.sentMessages.find(
+          (message) =>
+            message.body.channel_id === groupId && sentText(message).includes("fixture tool returned:"),
+        ),
+      15_000,
+      "the group task did not return the octo_management result",
+    );
+    const replyText = sentText(reply);
+    expect(replyText).not.toContain("worktree_error");
+    const resultJson = replyText
+      .slice(replyText.indexOf("fixture tool returned:") + "fixture tool returned:".length)
+      .trim();
+    const created = JSON.parse(resultJson) as { worktree?: { path: string; branch: string } };
+    expect(created.worktree?.branch).toBe("cli-workspace");
+    const workspacePath = created.worktree?.path ?? "";
+    expect(workspacePath.length).toBeGreaterThan(0);
+    // The reported workspace is a real git worktree on disk.
+    expect(existsSync(join(workspacePath, ".git"))).toBe(true);
+    expect(
+      currentFixture.managementRequests.some(
+        (request) => request.method === "POST" && request.path === `/v1/bot/groups/${groupId}/threads`,
+      ),
+    ).toBe(true);
+
+    spawned.kill("SIGTERM");
+    expect(await waitForChildExit(spawned)).toBe(0);
+  } finally {
+    if (child && child.exitCode === null) {
+      child.kill("SIGKILL");
+      await child.exited;
+    }
+    if (outputPromise) await outputPromise.catch(() => {});
+    if (fixture) await fixture.close();
+    if (root) await rm(root, { recursive: true, force: true });
+  }
+}, 30_000);

@@ -31,6 +31,7 @@ import {
 } from "./logs.ts";
 import { createSupervisorClient, type SupervisorClient, type SupervisorTarget } from "./supervisor.ts";
 import { createChannelService } from "./service.ts";
+import { createOmpWorktreePort } from "./worktree.ts";
 import type { ChannelService, OmpWorker } from "./contracts.ts";
 
 /** The checkout this CLI runs from; supervisor detection is scoped to it. */
@@ -275,6 +276,7 @@ async function runService(
       config: toCoreConfig(config),
       transport,
       workerFactory,
+      worktrees: createOmpWorktreePort({ command: ompCommand }),
       ...(supervised === undefined
         ? {}
         : {
