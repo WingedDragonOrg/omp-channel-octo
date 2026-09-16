@@ -26,7 +26,11 @@ import type { ChannelStore } from "./store.ts";
 import type { InboundClaim, QuestionRecord, TaskRecord } from "./store-records.ts";
 import { targetKey } from "./target.ts";
 
-const QUESTION_TIMEOUT_MS = 10 * 60 * 1_000;
+/**
+ * 等待超时哨兵：工具调用以此结束等待。停回合的 `abort` 帧先行写入 worker，正常路径上模型
+ * 看不到这条消息；即便看到，它也只说明等待已停止，不含内部细节。
+ */
+const ASK_STOPPED_MESSAGE = "ask wait stopped: the turn was halted after the question timeout";
 /** Card rewrite budget; a card edit never gates the answer, which is durable before it starts. */
 const ASK_CARD_EDIT_TIMEOUT_MS = 5_000;
 const ASK_CARD_SEND_TIMEOUT_MS = 10_000;
@@ -103,12 +107,21 @@ export interface QuestionDeskDeps {
   operationSet(operation: Promise<void>): void;
   /** 与文本回复路径共用的持久 claim，保证一条消息只作一次答案。 */
   commandClaim(message: InboundMessage, name: string): InboundClaim;
+  /** 提问等待的超时（毫秒），来自配置。 */
+  askTimeoutMs(): number;
+  /** 等待超时：像取消 tool call 一样停住当前回合；问题行保持待答、卡片不改写。 */
+  stopTurnForQuestion(taskId: string): void;
+  /** 已无等待者的答案（停回合后 owner 才答复）：作为该聊天的新回合输入交付。 */
+  wakeTurn(target: ChatTarget, text: string): void;
 }
 
 export interface QuestionDesk {
   /** 待回答问题的一条普通回复即答案；没有待回答问题返回 false。 */
   answerPendingQuestion(message: InboundMessage, text: string): Promise<boolean>;
-  /** `ask` host tool：提问并等到答案（含卡片、文本回退与超时）。 */
+  /**
+   * `ask` host tool：提问并等到答案（含卡片与文本回退）。等待超过配置的超时不落状态：
+   * 问题保持待答、卡片保持可提交，当前回合被停住；owner 之后的答复唤醒新回合。
+   */
   askQuestions(
     task: TaskRecord,
     target: ChatTarget,
@@ -214,7 +227,15 @@ function answerQuestionSetFromText(
   });
   const landed = deps.store.answerQuestions(botUid, message, answers);
   const byId = new Map(answers.map(({ id, answer }) => [id, answer]));
-  for (const id of landed) releaseQuestion(id, byId.get(id) ?? text);
+  const byQuestion = new Map(pending.map((question) => [question.id, question]));
+  const speaking: Array<{ question: QuestionRecord; answer: string }> = [];
+  for (const id of landed) {
+    const answer = byId.get(id) ?? text;
+    const question = byQuestion.get(id);
+    if (!releaseQuestion(id, answer) && question !== undefined) {
+      speaking.push({ question, answer });
+    }
+  }
   for (const [messageId, rows] of questionsByCard(pending)) {
     forgetAskGeneration(messageId);
     const first = rows[0];
@@ -226,6 +247,7 @@ function answerQuestionSetFromText(
       rewriteAskCardSet(fresh, { kind: "closed", note: null }, null);
     }
   }
+  wakeForAnswers(speaking);
 }
 
 function normalizeAnswer(question: { payload: string }, answer: string): string {
@@ -338,23 +360,22 @@ async function askSingleQuestion(
     resolve: completion.resolve,
     reject: completion.reject,
   });
+  /** 等待超时后为真：本地拒绝结束等待，但行保持 pending、卡片不改写、不落取消状态。 */
+  let stopped = false;
   const abort = () => {
+    if (stopped) return;
     deps.store.cancelQuestion(id);
     questionWaiters.delete(id);
     completion.reject(new Error("question cancelled"));
   };
   signal.addEventListener("abort", abort, { once: true });
   const timer = setTimeout(() => {
-    if (!deps.store.expireQuestion(id)) return;
-    questionTimers.delete(id);
+    stopped = true;
     questionWaiters.delete(id);
-    const expired = deps.store.getQuestion(id);
-    if (expired !== null) {
-      rewriteAskCard(expired, { kind: "inactive", note: "问题已过期：未在 10 分钟内收到答案。" });
-      forgetAskGeneration(expired.cardMessageId);
-    }
-    completion.reject(new Error("question timed out"));
-  }, QUESTION_TIMEOUT_MS);
+    // 先写 abort（同步入帧）再本地拒绝：模型不会先拿到 tool 错误再自行继续。
+    deps.stopTurnForQuestion(task.id);
+    completion.reject(new Error(ASK_STOPPED_MESSAGE));
+  }, deps.askTimeoutMs());
   questionTimers.set(id, timer);
   try {
     throwIfAborted(signal);
@@ -367,8 +388,10 @@ async function askSingleQuestion(
     clearTimeout(timer);
     questionTimers.delete(id);
     questionWaiters.delete(id);
-    forgetAskGeneration(deps.store.getQuestion(id)?.cardMessageId ?? null);
-    deps.store.cancelQuestion(id);
+    if (!stopped) {
+      forgetAskGeneration(deps.store.getQuestion(id)?.cardMessageId ?? null);
+      deps.store.cancelQuestion(id);
+    }
   }
 }
 
@@ -387,6 +410,8 @@ async function askQuestionSet(
 ): Promise<Array<{ id: string; questionId: string; answer: string }>> {
   const completions = specs.map(() => Promise.withResolvers<string>());
   const cleanups: Array<() => void> = [];
+  /** 整组共用一次停回合：任一题到点即整组停止等待，全部行保持 pending、卡片不改写。 */
+  let stopped = false;
   specs.forEach((spec, index) => {
     deps.store.createQuestion({
       id: spec.id,
@@ -403,6 +428,7 @@ async function askQuestionSet(
       reject: completion.reject,
     });
     const abort = () => {
+      if (stopped) return;
       deps.store.cancelQuestion(spec.id);
       questionWaiters.delete(spec.id);
       completion.reject(new Error("question cancelled"));
@@ -410,15 +436,12 @@ async function askQuestionSet(
     signal.addEventListener("abort", abort, { once: true });
     cleanups.push(() => signal.removeEventListener("abort", abort));
     const timer = setTimeout(() => {
-      if (!deps.store.expireQuestion(spec.id)) return;
-      questionTimers.delete(spec.id);
-      questionWaiters.delete(spec.id);
-      const expired = deps.store.getQuestion(spec.id);
-      if (expired !== null) {
-        closeQuestionCard(expired, "问题已过期：未在 10 分钟内收到全部答案。");
-      }
-      completion.reject(new Error("question timed out"));
-    }, QUESTION_TIMEOUT_MS);
+      if (stopped) return;
+      stopped = true;
+      for (const open of specs) questionWaiters.delete(open.id);
+      deps.stopTurnForQuestion(task.id);
+      for (const pending of completions) pending.reject(new Error(ASK_STOPPED_MESSAGE));
+    }, deps.askTimeoutMs());
     questionTimers.set(spec.id, timer);
   });
   try {
@@ -451,8 +474,10 @@ async function askQuestionSet(
       clearTimeout(questionTimers.get(spec.id));
       questionTimers.delete(spec.id);
       questionWaiters.delete(spec.id);
-      forgetAskGeneration(deps.store.getQuestion(spec.id)?.cardMessageId ?? null);
-      deps.store.cancelQuestion(spec.id);
+      if (!stopped) {
+        forgetAskGeneration(deps.store.getQuestion(spec.id)?.cardMessageId ?? null);
+        deps.store.cancelQuestion(spec.id);
+      }
     }
     for (const cleanup of cleanups) cleanup();
   }
@@ -587,20 +612,49 @@ function applyQuestionAnswer(question: QuestionRecord, answer: string): boolean 
   const botUid = deps.botUid();
   if (!botUid) return false;
   if (!deps.store.answerQuestion(question.id, botUid, question, answer)) return false;
-  releaseQuestion(question.id, answer);
+  const waiting = releaseQuestion(question.id, answer);
   forgetAskGeneration(question.cardMessageId);
   rewriteAskCard(question, { kind: "answered", answer });
+  if (!waiting) wakeForAnswers([{ question, answer }]);
   return true;
 }
 
-/** Releases the waiting task of one recorded answer; the store CAS already decided it landed. */
-function releaseQuestion(questionId: string, answer: string): void {
+/**
+ * Releases the waiting task of one recorded answer; `false` when no ask waits anymore — the wait
+ * timed out and the turn was stopped, so this answer has to wake the agent instead.
+ */
+function releaseQuestion(questionId: string, answer: string): boolean {
   const waiter = questionWaiters.get(questionId);
-  if (!waiter) return;
+  if (!waiter) return false;
   questionWaiters.delete(questionId);
   clearTimeout(questionTimers.get(questionId));
   questionTimers.delete(questionId);
   waiter.resolve(answer);
+  return true;
+}
+
+/**
+ * Delivers an answer that no live `ask` is waiting on — the wait timed out and the turn was
+ * stopped — as a new turn input of the same chat, so the agent continues from where it halted.
+ * The answer is already durable; a failed wake costs the continuation, never the answer. Option
+ * indexes render as their labels, and a caller-provided id names the question it answers.
+ */
+function wakeForAnswers(entries: readonly { question: QuestionRecord; answer: string }[]): void {
+  const first = entries[0]?.question;
+  if (first === undefined) return;
+  const lines = ["[ask 答复] 先前询问的等待已超时停住，owner 现已回复；请据此继续："];
+  for (const { question, answer } of entries) {
+    const payload = parseQuestionPayload(question);
+    const ask = payload === null ? null : askQuestionFromPayload(payload);
+    if (ask === null) {
+      lines.push(`答案：${answer}`);
+      continue;
+    }
+    const sourceId = payload?.sourceId;
+    lines.push(`问题${typeof sourceId === "string" ? `（id=${sourceId}）` : ""}：${ask.question}`);
+    lines.push(`答案：${askAnswerText(ask, answer)}`);
+  }
+  deps.wakeTurn({ channelType: first.channelType, channelId: first.channelId }, lines.join("\n"));
 }
 
 /**
@@ -703,24 +757,6 @@ function forgetAskGeneration(cardMessageId: string | null): void {
 }
 
 /**
- * Closes the card one question belongs to: a set card gets a single rewrite covering every row
- * it carries, a single card its own closed frame, and a question that was asked in plain text
- * has no card to rewrite at all.
- */
-function closeQuestionCard(question: QuestionRecord, note: string): void {
-  const botUid = deps.botUid();
-  const messageId = question.cardMessageId;
-  if (botUid === undefined || messageId === null) return;
-  forgetAskGeneration(messageId);
-  const rows = deps.store.listQuestionsByCard(botUid, question, messageId);
-  if (rows.length <= 1) {
-    rewriteAskCard(question, { kind: "inactive", note });
-    return;
-  }
-  rewriteAskCardSet(rows, { kind: "closed", note }, null);
-}
-
-/**
  * Applies one card click. Only the owner's click can answer; a foreign operator, an unknown
  * action id or a card whose question already closed is acknowledged and dropped so the event
  * queue keeps moving.
@@ -818,7 +854,15 @@ function answerSetCardClick(
     return "retry";
   }
   const byId = new Map(filled.map(({ id, answer }) => [id, answer]));
-  for (const id of landed) releaseQuestion(id, byId.get(id) ?? "");
+  const byQuestion = new Map(pending.map((question) => [question.id, question]));
+  const speaking: Array<{ question: QuestionRecord; answer: string }> = [];
+  for (const id of landed) {
+    const answer = byId.get(id) ?? "";
+    const question = byQuestion.get(id);
+    if (!releaseQuestion(id, answer) && question !== undefined) {
+      speaking.push({ question, answer });
+    }
+  }
   const fresh = deps.store.listQuestionsByCard(currentBotUid(), target, action.messageId);
   if (fresh.some(({ state }) => state === "pending")) {
     rewriteAskCardSet(
@@ -830,6 +874,7 @@ function answerSetCardClick(
     forgetAskGeneration(action.messageId);
     rewriteAskCardSet(fresh, { kind: "closed", note: null }, null);
   }
+  wakeForAnswers(speaking);
   return "handled";
 }
 

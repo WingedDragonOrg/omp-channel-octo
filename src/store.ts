@@ -14,7 +14,7 @@ import { acceptTask, addRestartNotice, cancelQueued, claimCommand, clearRestartN
 import { clearProgressCard, listProgressCards, listWorkerLedger, markWorkerMoveTarget, markWorkerStopped, recordProgressCardAttempt, recordWorker, saveProgressCard } from "./store-cards.ts";
 import { advanceHistoryLedger, clearContextLedger, commitContextInjection, commitHistoryInjection, getContextLedger, getHistoryLedger, prepareContextInjection, prepareHistoryInjection, pruneHistoryLedger } from "./store-ledgers.ts";
 import { acknowledgeTextOutbox, beginTextCreate, bindTextOutbox, countPendingOutbox, countUnknownOutbox, enqueueOutbox, failTextOutbox, getBotEventCursor, getOutbox, listPendingOutbox, listPendingOutboxTargets, listTextStream, markOutboxDead, markOutboxFailure, markOutboxSent, setBotEventCursor, updateTextOutbox } from "./store-outbox.ts";
-import { answerQuestion, answerQuestions, cancelQuestion, cancelQuestions, createQuestion, expireQuestion, getQuestion, listPendingQuestions, listQuestionsByCard, pendingQuestionIds, setQuestionCard, setQuestionsCard } from "./store-questions.ts";
+import { answerQuestion, answerQuestions, cancelQuestion, cancelQuestions, createQuestion, getQuestion, listPendingQuestions, listQuestionsByCard, pendingQuestionIds, setQuestionCard, setQuestionsCard } from "./store-questions.ts";
 
 export class ChannelStore {
   private readonly db: Database;
@@ -414,10 +414,6 @@ export class ChannelStore {
 
   cancelQuestion(id: string): boolean {
     return cancelQuestion(this.db, id);
-  }
-
-  expireQuestion(id: string): boolean {
-    return expireQuestion(this.db, id);
   }
 
   pendingQuestionIds(botUid: string, target: ChatTarget): string[] {

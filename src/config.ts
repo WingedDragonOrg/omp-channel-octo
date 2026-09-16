@@ -2,7 +2,13 @@ import { constants as fsConstants } from "node:fs";
 import { access, chmod, mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, normalize, resolve } from "node:path";
-import type { AttachmentConfig, CoreServiceConfig, GroupHistoryConfig } from "./contracts.ts";
+import {
+  DEFAULT_ASK_TIMEOUT_MS,
+  type AskConfig,
+  type AttachmentConfig,
+  type CoreServiceConfig,
+  type GroupHistoryConfig,
+} from "./contracts.ts";
 
 export const OCO_HOME_DIRNAME = ".oco";
 export const DEFAULT_CONFIG_PATH = "~/.oco/config/config.json";
@@ -48,6 +54,7 @@ const CONFIG_KEYS: Record<string, true> = {
   cancelTimeoutMs: true,
   groupHistory: true,
   attachments: true,
+  ask: true,
 };
 const TOKEN_ENV_PATTERN = /^(?:OCTO_|OMP_CHANNEL_OCTO_)[A-Za-z_][A-Za-z0-9_]*$/u;
 /** Bot uids reach the filesystem as directory names; only the server's alphabet is allowed. */
@@ -60,6 +67,9 @@ const MAX_GROUP_HISTORY_MESSAGES = 200;
 const DEFAULT_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
 const MIN_ATTACHMENT_MAX_BYTES = 1024;
 const MAX_ATTACHMENT_MAX_BYTES = 1024 * 1024 * 1024;
+/** `ask` waits below half an hour or above a week are configuration mistakes, not preferences. */
+const MIN_ASK_TIMEOUT_MS = 30 * 60 * 1_000;
+const MAX_ASK_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1_000;
 
 export interface AppConfig extends CoreServiceConfig {
   apiUrl: string;
@@ -75,6 +85,8 @@ export interface AppConfig extends CoreServiceConfig {
   groupHistory: GroupHistoryConfig;
   /** Inbound attachment pipeline; defaults to enabled with a 25 MiB per-attachment ceiling. */
   attachments: AttachmentConfig;
+  /** `ask` wait behavior; defaults to a 6-hour timeout. */
+  ask: AskConfig;
   /**
    * Resolved path of the file `loadConfig` read; absent for configs built by hand. Runtime
    * write-back (the allowlist mirror) writes here, so it edits exactly the operator's file.
@@ -217,6 +229,30 @@ function parseAttachments(value: unknown): AttachmentConfig {
   return { enabled, maxBytes };
 }
 
+function parseAsk(value: unknown): AskConfig {
+  if (value === undefined) return { timeoutMs: DEFAULT_ASK_TIMEOUT_MS };
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw configError("ask 必须是 JSON 对象");
+  }
+  const document = value as Record<string, unknown>;
+  for (const key of Object.keys(document)) {
+    if (key !== "timeoutMs") throw configError(`不支持字段 ask.${key}`);
+  }
+  const timeoutMs = document.timeoutMs;
+  if (timeoutMs === undefined) return { timeoutMs: DEFAULT_ASK_TIMEOUT_MS };
+  if (
+    typeof timeoutMs !== "number"
+    || !Number.isInteger(timeoutMs)
+    || timeoutMs < MIN_ASK_TIMEOUT_MS
+    || timeoutMs > MAX_ASK_TIMEOUT_MS
+  ) {
+    throw configError(
+      `ask.timeoutMs 必须是 ${MIN_ASK_TIMEOUT_MS} 到 ${MAX_ASK_TIMEOUT_MS} 的整数毫秒数（30 分钟到 7 天）`,
+    );
+  }
+  return { timeoutMs };
+}
+
 export function parseConfig(input: unknown, options: ConfigParseOptions = {}): AppConfig {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw configError("根值必须是 JSON 对象");
@@ -269,6 +305,7 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
   const cancelTimeoutMs = parseTimeout(document.cancelTimeoutMs, "cancelTimeoutMs");
   const groupHistory = parseGroupHistory(document.groupHistory);
   const attachments = parseAttachments(document.attachments);
+  const ask = parseAsk(document.ask);
 
   return {
     apiUrl,
@@ -285,6 +322,7 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
     ...(cancelTimeoutMs === undefined ? {} : { cancelTimeoutMs }),
     groupHistory,
     attachments,
+    ask,
   };
 }
 
@@ -348,5 +386,6 @@ export function toCoreConfig(config: AppConfig): CoreServiceConfig {
     stateDir: config.stateDir,
     groupHistory: { ...config.groupHistory },
     attachments: { ...config.attachments },
+    ask: { ...config.ask },
   };
 }

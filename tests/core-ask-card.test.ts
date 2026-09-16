@@ -62,6 +62,37 @@ function startAskHarness(
   });
 }
 
+/**
+ * One `ask` whose wait times out: the deployment timeout is 40 ms, the first prompt runs the
+ * tool exactly like OMP does and ends when the stop aborts the run, and any later prompt is a
+ * woke turn whose text is recorded.
+ */
+function startAskTimeoutHarness(question: Record<string, unknown> | Array<Record<string, unknown>>) {
+  const transport = new FakeTransport();
+  transport.cardSupported = true;
+  const questions = Array.isArray(question) ? question : [question];
+  return createCoreHarness({
+    transport,
+    ask: { timeoutMs: 40 },
+    prompt: async ({ append, promptContext, text, waitForAbort }) => {
+      if (text.startsWith("[ask 答复]")) {
+        await append("wake.log", text);
+        return;
+      }
+      const ask = promptContext?.tools?.find(({ name }) => name === "ask");
+      if (!ask) {
+        throw new Error("ask host tool missing");
+      }
+      try {
+        await append("answer.log", await ask.execute({ questions }, new AbortController().signal));
+      } catch {
+        // The stop cancels the tool call; OMP ends the run without delivering it an answer.
+        await waitForAbort();
+      }
+    },
+  });
+}
+
 test("a card click answers the pending question and rewrites the card", async () => {
   const harness = await startAskHarness({
     id: "deployment-target",
@@ -789,6 +820,187 @@ test("a set without card support asks in text and one reply answers the rest", a
         { id: "window", questionId: expect.any(String), answer: "production, tonight" },
       ],
     });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a timed-out question stops the turn and stays pending until the reply wakes the agent", async () => {
+  const harness = await startAskTimeoutHarness({
+    id: "deployment-target",
+    question: "Which deployment target?",
+    options: [{ label: "staging" }, { label: "production" }],
+  });
+  try {
+    const target: ChatTarget = { channelId: "dm-ask-timeout", channelType: 1 };
+    await harness.service.handleInbound(
+      inbound({ messageId: "ask-timeout-start", ...target, text: "needs an answer" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+
+    const stopped = await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "interrupted" && status.pendingQuestionIds.length === 1,
+    );
+    expect(stopped.pendingQuestionIds).toHaveLength(1);
+    // 静默停住：一次 abort、没有提示消息、卡片没有被改写（按钮保持可提交）。
+    expect(harness.workers.workers[0]?.abortCalls).toBe(1);
+    expect(harness.transport.cardEdits).toHaveLength(0);
+    expect(harness.transport.sent).toHaveLength(0);
+    const card = harness.transport.sentCards[0];
+    if (!card) {
+      throw new Error("ask card was not sent");
+    }
+
+    await harness.service.handleInbound(
+      inbound({ messageId: "ask-timeout-reply", ...target, text: "1" }),
+    );
+    await harness.workers.waitForPromptCount(2);
+
+    // 唤醒：同一 session 的新回合，正文带题面、调用方 id 与还原后的答案。
+    const wake = harness.workers.prompts[1];
+    expect(wake?.sessionId).toBe(harness.workers.prompts[0]?.sessionId);
+    expect(wake?.text).toContain("[ask 答复]");
+    expect(wake?.text).toContain("（id=deployment-target）");
+    expect(wake?.text).toContain("Which deployment target?");
+    expect(wake?.text).toContain("答案：1. staging");
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(await readText(join(harness.root, "tmp", "wake.log"))).toContain("答案：1. staging");
+    const edit = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
+    expect(cardActions(edit)).toHaveLength(0);
+    expect(JSON.stringify(edit.frame.card)).toContain("已回复：1. staging");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a card submission after the timeout answers once and wakes the agent", async () => {
+  const harness = await startAskTimeoutHarness({
+    id: "release-window",
+    question: "When do we ship?",
+  });
+  try {
+    const target: ChatTarget = { channelId: "dm-ask-timeout-card", channelType: 1 };
+    await harness.service.handleInbound(
+      inbound({ messageId: "ask-timeout-card-start", ...target, text: "needs an answer" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "interrupted" && status.pendingQuestionIds.length === 1,
+    );
+    const card = harness.transport.sentCards[0];
+    if (!card) {
+      throw new Error("ask card was not sent");
+    }
+    // 卡片从未被改写，原始 action id 因此仍可提交。
+    expect(harness.transport.cardEdits).toHaveLength(0);
+
+    const click = {
+      messageId: card.messageId,
+      channelType: 1 as const,
+      channelId: target.channelId,
+      actionId: "ask_submit",
+      operatorUid: "owner-1",
+      inputs: { ask_text: "ship it tonight" },
+    };
+    harness.transport.pushBotEvent(cardActionEvent(41, click));
+    await harness.workers.waitForPromptCount(2);
+    await harness.transport.waitForAck(41);
+    expect(harness.workers.prompts[1]?.text).toContain("答案：ship it tonight");
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+
+    // 至少一次投递的重复点击不再作答、不再改写卡片、也不再唤醒。
+    const editsAfterAnswer = harness.transport.cardEdits.length;
+    const promptsAfterAnswer = harness.workers.prompts.length;
+    harness.transport.pushBotEvent(cardActionEvent(42, click));
+    await harness.transport.waitForAck(42);
+    expect(harness.transport.cardEdits).toHaveLength(editsAfterAnswer);
+    expect(harness.workers.prompts).toHaveLength(promptsAfterAnswer);
+    expect(harness.transport.sent.map(({ text }) => text)).not.toContain(
+      "该问题已失效，本次点击未作为答案。",
+    );
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a timed-out question set stops the turn once and keeps every row answerable", async () => {
+  const harness = await startAskTimeoutHarness([
+    {
+      id: "target",
+      question: "Which deployment target?",
+      options: [{ label: "staging" }, { label: "production" }],
+    },
+    { id: "window", question: "When do we ship?" },
+  ]);
+  try {
+    const target: ChatTarget = { channelId: "dm-ask-timeout-set", channelType: 1 };
+    await harness.service.handleInbound(
+      inbound({ messageId: "ask-timeout-set-start", ...target, text: "needs answers" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    const stopped = await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "interrupted" && status.pendingQuestionIds.length === 2,
+    );
+    expect(stopped.pendingQuestionIds).toHaveLength(2);
+    // 整组共用一次停回合与一张卡片：卡片保持原样，两题都还可以作答。
+    expect(harness.workers.workers[0]?.abortCalls).toBe(1);
+    expect(harness.transport.cardEdits).toHaveLength(0);
+    const card = harness.transport.sentCards[0];
+    if (!card) {
+      throw new Error("ask set card was not sent");
+    }
+
+    // 部分提交按既有规则作答已填问题，其余保持待答；答案唤醒一个新回合。
+    harness.transport.pushBotEvent(cardActionEvent(51, {
+      messageId: card.messageId,
+      channelType: 1,
+      channelId: target.channelId,
+      actionId: "ask_submit",
+      operatorUid: "owner-1",
+      inputs: { ask_text_2: "ship it tonight" },
+    }));
+    await harness.workers.waitForPromptCount(2);
+    expect(harness.workers.prompts[1]?.text).toContain("答案：ship it tonight");
+    expect(harness.workers.prompts[1]?.text).not.toContain("Which deployment target?");
+    const reopened = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
+    expect(cardActions(reopened)).toEqual(["ask_submit#2"]);
+    // 唤醒回合本身结束（其提示同一题不会重复作答）后，再交付第二题的回答。
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 1,
+    );
+
+    // 第二题之后用文本作答：同样记录并唤醒，两题都不重复作答。
+    await harness.service.handleInbound(
+      inbound({ messageId: "ask-timeout-set-reply", ...target, text: "2" }),
+    );
+    await harness.workers.waitForPromptCount(3);
+    expect(harness.workers.prompts[2]?.text).toContain("Which deployment target?");
+    expect(harness.workers.prompts[2]?.text).toContain("答案：2. production");
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    const closed = await harness.transport.waitForCardEdit(
+      ({ messageId, cardSeq }) => messageId === card.messageId && cardSeq === 3,
+    );
+    expect(cardActions(closed)).toHaveLength(0);
   } finally {
     await closeCoreHarness(harness);
   }

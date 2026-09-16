@@ -41,6 +41,7 @@ import type {
   WorkerOptions,
   WorkerProcess,
 } from "./contracts.ts";
+import { DEFAULT_ASK_TIMEOUT_MS } from "./contracts.ts";
 import {
   createExecutionTracker,
   encodeExecutionSnapshot,
@@ -162,9 +163,13 @@ type RuntimeTask = {
   cancelReplySent: boolean;
   /** True only while this task's OMP prompt is in flight, so appended messages have a target. */
   promptInFlight: boolean;
-  interruptRequested: boolean;
-  /** Set when the run produced events after `/interrupt`, i.e. the queued work really continued. */
-  workAfterInterrupt: boolean;
+  /**
+   * Why the running turn was asked to stop: `/interrupt`, or an `ask` wait that timed out.
+   * `null` means no stop request is in effect.
+   */
+  stopCause: "interrupt" | "question" | null;
+  /** Set when the run produced events after the stop request, i.e. the turn really continued. */
+  workAfterStop: boolean;
   /** Steered messages not yet observed as consumed, in delivery order (OMP's queue is FIFO). */
   steerDeliveries: { text: string }[];
   stopActivity?: (abortProgress?: boolean) => void;
@@ -408,6 +413,11 @@ class CoreService implements ChannelService {
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
       operationSet: (operation) => this.operationSet(operation),
       commandClaim: (message, name) => this.commandClaim(message, name),
+      askTimeoutMs: () => this.options.config.ask?.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS,
+      stopTurnForQuestion: (taskId) => this.stopTurnForQuestion(taskId),
+      wakeTurn: (target, text) => {
+        void this.wakeTurn(target, text);
+      },
     });
     this.botEvents = createBotEventLoop({
       store: this.store,
@@ -1804,16 +1814,64 @@ class CoreService implements ChannelService {
       await this.outbox.enqueueText(target, DEFAULT_INTERRUPT_IDLE_TEXT, null);
       return;
     }
-    runtime.interruptRequested = true;
-    runtime.workAfterInterrupt = false;
+    runtime.stopCause = "interrupt";
+    runtime.workAfterStop = false;
     try {
       await runtime.worker.abortTurn();
     } catch {
-      runtime.interruptRequested = false;
+      runtime.stopCause = null;
       await this.outbox.enqueueText(target, DEFAULT_INTERRUPT_REJECTED_TEXT, null);
       return;
     }
     await this.outbox.enqueueText(target, DEFAULT_INTERRUPTED_TEXT, null);
+  }
+
+  /**
+   * Stops the turn whose `ask` wait timed out, the way a cancelled tool call stops it: the abort
+   * frame goes out first, so the model cannot use a tool error to keep going. The questions stay
+   * pending and their cards stay submittable; the run settles as interrupted unless the turn
+   * really produced work after the stop. Nothing is delivered to the chat (the owner is silent
+   * by contract); their later answer wakes the agent through `wakeTurn`.
+   */
+  private stopTurnForQuestion(taskId: string): void {
+    const runtime = this.runtimes.get(taskId);
+    if (!runtime?.worker || !runtime.promptInFlight) return;
+    runtime.stopCause = "question";
+    runtime.workAfterStop = false;
+    void runtime.worker.abortTurn().catch(() => {
+      if (runtime.stopCause === "question") runtime.stopCause = null;
+    });
+  }
+
+  /**
+   * Delivers an answer recorded with no live `ask` waiting on it (the wait timed out and the turn
+   * was stopped) as new input for that chat: a running turn takes it as a steering append, a
+   * quieter chat runs it as a durable task in the same session. The answer itself is already
+   * durable; a failed wake only costs the automatic continuation and is logged.
+   */
+  private async wakeTurn(target: ChatTarget, text: string): Promise<void> {
+    const bot = this.bot;
+    if (!bot) return;
+    const message: InboundMessage = {
+      ...target,
+      messageId: `answer:${randomUUID()}`,
+      senderId: this.store.getOwnerId(bot.uid)?.trim() || bot.uid,
+      text,
+      mentionedUserIds: [],
+      attachments: [],
+      quoted: null,
+      supported: true,
+      messageSeq: 0,
+      messageTimestamp: Date.now(),
+    };
+    try {
+      if (await this.appendToRunningTask(message, text)) return;
+      await this.acceptTask(message, text);
+    } catch (error) {
+      console.error(
+        `[ask] 答复唤醒交付失败 target=${targetKey(target)}：${safeErrorMessage(error, "wake failed")}`,
+      );
+    }
   }
 
   /**
@@ -2235,8 +2293,8 @@ class CoreService implements ChannelService {
       cancelRequested: false,
       cancelReplySent: false,
       promptInFlight: false,
-      interruptRequested: false,
-      workAfterInterrupt: false,
+      stopCause: null,
+      workAfterStop: false,
       steerDeliveries: [],
     };
     this.runtimes.set(taskId, runtime);
@@ -2640,8 +2698,8 @@ class CoreService implements ChannelService {
       };
       const onEvent = (event: WorkerEvent): void => {
         if (runtime.cancelRequested || this.stopping) return;
-        if (runtime.interruptRequested && event.type !== "turn_end" && event.type !== "run_end") {
-          runtime.workAfterInterrupt = true;
+        if (runtime.stopCause !== null && event.type !== "turn_end" && event.type !== "run_end") {
+          runtime.workAfterStop = true;
         }
         if (event.type === "text") {
           if (event.messageId.trim().length === 0 || (event.text.length === 0 && !event.final)) return;
@@ -2671,8 +2729,13 @@ class CoreService implements ChannelService {
         this.store.markCancelled(taskId);
         finishProgress("cancelled");
         await this.sendCancelledIfNeeded(runtime);
-      } else if (runtime.interruptRequested && !runtime.workAfterInterrupt) {
-        this.store.markInterrupted(taskId, "用户中断当前回合");
+      } else if (runtime.stopCause !== null && !runtime.workAfterStop) {
+        this.store.markInterrupted(
+          taskId,
+          runtime.stopCause === "question"
+            ? "等待回答超时，回合已停止"
+            : "用户中断当前回合",
+        );
         finishProgress("cancelled");
       } else {
         if (contextNeedsCommit) {

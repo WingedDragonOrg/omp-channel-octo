@@ -168,15 +168,39 @@ test("attachments reject unknown fields and non-object values", () => {
   }
 });
 
-test("config.example.json stays parseable and documents the group history and attachment defaults", () => {
+test("config.example.json stays parseable and documents the group history, attachment and ask defaults", () => {
   const example = JSON.parse(
     readFileSync(new URL("../config.example.json", import.meta.url), "utf8"),
   ) as Record<string, unknown>;
   expect(example.groupHistory).toEqual({ enabled: true, maxMessages: 50 });
   expect(example.attachments).toEqual({ enabled: true, maxBytes: 26_214_400 });
+  expect(example.ask).toEqual({ timeoutMs: 21_600_000 });
   const parsed = toCoreConfig(parseConfig(example, { env: { OCTO_BOT_TOKEN: "example-token" } }));
   expect(parsed.groupHistory).toEqual({ enabled: true, maxMessages: 50 });
   expect(parsed.attachments).toEqual({ enabled: true, maxBytes: 26_214_400 });
+  expect(parsed.ask).toEqual({ timeoutMs: 21_600_000 });
+});
+
+test("ask defaults to a six-hour wait and carries a configured timeout", () => {
+  expect(toCoreConfig(parseConfig(configDocument())).ask).toEqual({ timeoutMs: 21_600_000 });
+  expect(toCoreConfig(parseConfig(configDocument({ ask: {} }))).ask).toEqual({ timeoutMs: 21_600_000 });
+  expect(toCoreConfig(parseConfig(configDocument({ ask: { timeoutMs: 1_800_000 } }))).ask)
+    .toEqual({ timeoutMs: 1_800_000 });
+  expect(toCoreConfig(parseConfig(configDocument({ ask: { timeoutMs: 54 * 60 * 1_000 } }))).ask)
+    .toEqual({ timeoutMs: 3_240_000 });
+});
+
+test("ask rejects a wait under 30 minutes, over a week, or not an integer", () => {
+  for (const timeoutMs of [1_799_999, 0, -1, 1.5, 604_800_001, "21600000", null]) {
+    expect(() => parseConfig(configDocument({ ask: { timeoutMs } }))).toThrow(/ask\.timeoutMs/);
+  }
+});
+
+test("ask rejects unknown fields and non-object values", () => {
+  expect(() => parseConfig(configDocument({ ask: { waitMs: 1_800_000 } }))).toThrow(/ask\.waitMs/);
+  for (const ask of [[], "6h", null, 3]) {
+    expect(() => parseConfig(configDocument({ ask }))).toThrow(/ask/);
+  }
 });
 
 test("config still requires credentials and all other required fields", () => {

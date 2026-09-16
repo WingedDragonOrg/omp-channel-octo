@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import type {
   AllowlistWriteback,
+  AskConfig,
   AttachmentDownload,
   BotCardAction,
   BotEvent,
@@ -935,6 +936,8 @@ class FixtureWorker implements OmpWorker {
   readonly sessionFile: string;
   readonly sessionId: string;
   stopped = false;
+  /** How often the host asked this turn to abort (`/interrupt`, `/cancel`, a question stop). */
+  abortCalls = 0;
 
   private currentCwd: string;
   private readonly stopCallbacks = new Set<() => void>();
@@ -1110,6 +1113,7 @@ class FixtureWorker implements OmpWorker {
 
   async abortTurn(): Promise<void> {
     if (!this.promptInFlight) throw new Error("fixture worker has no prompt in progress");
+    this.abortCalls += 1;
     this.abortSignaled = true;
     for (const callback of this.abortWaiters.splice(0)) callback();
   }
@@ -1271,6 +1275,8 @@ export interface CoreHarnessOptions {
   allowedGroupIds?: string[];
   /** Group history configuration; absent means the service default (disabled). */
   groupHistory?: GroupHistoryConfig;
+  /** `ask` wait configuration; absent means the service default (6-hour timeout). */
+  ask?: AskConfig;
   /** Extra command handlers, e.g. an observing handler that still runs a prompt. */
   commandHandlers?: readonly ChannelCommandHandler[];
   restart?: RestartPort;
@@ -1311,6 +1317,7 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
     stateDir,
     homeDir: root,
     ...(options.groupHistory === undefined ? {} : { groupHistory: options.groupHistory }),
+    ...(options.ask === undefined ? {} : { ask: options.ask }),
   } as CoreServiceConfig;
   const service = await createChannelService({
     config,

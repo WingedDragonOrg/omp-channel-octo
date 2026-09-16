@@ -1,5 +1,6 @@
 /**
- * 提问记录：创建、答复的比较并交换、取消与过期，以及卡片消息 id 的回填。
+ * 提问记录：创建、答复的比较并交换、取消，以及卡片消息 id 的回填。等待超时不落状态——
+ * 超时只是停止当前回合，问题行保持 `pending` 直到被答复或取消（`expired` 仅为旧库遗留的读值）。
  */
 
 import { Database } from "bun:sqlite";
@@ -66,13 +67,6 @@ export function cancelQuestions(db: Database, botUid: string, target: ChatTarget
 export function cancelQuestion(db: Database, id: string): boolean {
   return run(db,
     "UPDATE questions SET state = 'cancelled', answered_at = ? WHERE id = ? AND state = 'pending'",
-    [Date.now(), id],
-  ).changes === 1;
-}
-
-export function expireQuestion(db: Database, id: string): boolean {
-  return run(db,
-    "UPDATE questions SET state = 'expired', answered_at = ? WHERE id = ? AND state = 'pending'",
     [Date.now(), id],
   ).changes === 1;
 }

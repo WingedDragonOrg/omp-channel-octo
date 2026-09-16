@@ -195,7 +195,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord, _snapshot:
   };
   const askTool: HostTool = {
     name: "ask",
-    description: "向当前聊天提问并等待用户回答；多个问题会在一张卡片上整体提交，也可直接回复文本一次作为整组答案。",
+    description: "向当前聊天提问并等待用户回答；多个问题会在一张卡片上整体提交，也可直接回复文本一次作为整组答案。等待超时的提问会保持待答并停住当前回合：用户之后的答复会作为新消息送达，据此继续即可，不要自行换个方式重复提问。",
     parameters: {
       type: "object",
       properties: {

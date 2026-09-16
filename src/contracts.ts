@@ -401,6 +401,8 @@ export interface CoreServiceConfig {
   groupHistory?: GroupHistoryConfig;
   /** Inbound attachment pipeline; `parseConfig` always supplies it (defaults to enabled, 25 MiB). */
   attachments?: AttachmentConfig;
+  /** `ask` wait behavior; omitting it uses `DEFAULT_ASK_TIMEOUT_MS`. */
+  ask?: AskConfig;
 }
 
 export interface AttachmentConfig {
@@ -408,6 +410,19 @@ export interface AttachmentConfig {
   /** Per-attachment byte ceiling; also the pre-download check against the client-declared size. */
   maxBytes: number;
 }
+
+/**
+ * `ask` wait behavior. A question that waits past `timeoutMs` does not expire: the rows stay
+ * pending, the cards stay submittable, and the turn waiting on them is stopped like a cancelled
+ * tool call until the owner's answer arrives as a new turn input.
+ */
+export interface AskConfig {
+  /** How long an `ask` waits for its answer. */
+  timeoutMs: number;
+}
+
+/** Default `ask` wait (6 hours, the confirmed deployment default). */
+export const DEFAULT_ASK_TIMEOUT_MS = 6 * 60 * 60 * 1_000;
 
 export type ChatExecutionState =
   | "none"
