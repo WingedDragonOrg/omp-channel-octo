@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createOctoTransport } from "../src/octo/index";
+import { buildAskCard } from "../src/ask-card";
 import type { ChannelTransport, InboundMessage } from "../src/contracts";
 import type { ExecutionSnapshot } from "../src/execution-card";
 import {
@@ -1285,6 +1286,161 @@ describe("Octo typing and progress cards", () => {
       ),
     ).rejects.toThrow(/abort/i);
     expect(currentFixture.messageEdits).toHaveLength(0);
+  });
+});
+
+describe("Octo interactive cards and Bot events", () => {
+  const interactiveProfile = (): Record<string, unknown> => cardProfile({
+    profiles: ["octo/v1", "octo/v2"],
+    config: { ...SUPPORTED_CARD_CONFIG, interaction_enabled: true },
+  });
+  const askQuestion = {
+    question: "Which deployment target?",
+    options: [{ label: "staging" }, { label: "production" }],
+    multi: false,
+  };
+
+  test("sends an octo/v2 ask card and rewrites it into the answered frame", async () => {
+    fixture = await createOctoProtocolFixture({ cardProfileBody: interactiveProfile() });
+    transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
+    await transport.initialize();
+    const currentFixture = fixture;
+    const target = { channelId: currentFixture.ownerUid, channelType: 1 as const };
+
+    const receipt = await transport.sendCard(
+      target,
+      buildAskCard(askQuestion, { kind: "pending", generation: 1 }, "问题：Which deployment target?"),
+      "ask-card-1",
+    );
+
+    expect(receipt).toEqual({ messageId: "9007199254740993" });
+    const payload = currentFixture.sentMessages[0]!.body.payload as Record<string, unknown>;
+    expect(payload).toMatchObject({ type: 17, profile: "octo/v2", card_version: "1.5" });
+    expect(payload.plain).toContain("Which deployment target?");
+    expect((payload.card as Record<string, unknown>).actions).toMatchObject([
+      { type: "Action.Submit", id: "ask_opt_1", title: "1. staging" },
+      { type: "Action.Submit", id: "ask_opt_2", title: "2. production" },
+    ]);
+
+    await transport.editCard(
+      target,
+      receipt!.messageId!,
+      buildAskCard(askQuestion, { kind: "answered", answer: "2" }, "已回复：2. production"),
+      2,
+    );
+
+    expect(currentFixture.messageEdits).toHaveLength(1);
+    const envelope = JSON.parse(String(currentFixture.messageEdits[0]!.body.content_edit)) as Record<string, unknown>;
+    expect(envelope).toMatchObject({ type: 17, profile: "octo/v2", card_seq: 2 });
+    expect((envelope.card as Record<string, unknown>).actions).toBeUndefined();
+  });
+
+  test("declines an interactive card while the deployment keeps interaction off", async () => {
+    fixture = await createOctoProtocolFixture({ cardProfileBody: cardProfile() });
+    transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
+    await transport.initialize();
+
+    const receipt = await transport.sendCard(
+      { channelId: fixture.ownerUid, channelType: 1 },
+      buildAskCard(askQuestion, { kind: "pending", generation: 1 }, "问题：Which deployment target?"),
+      "ask-card-off",
+    );
+
+    expect(receipt).toBeNull();
+    expect(fixture.sentMessages).toHaveLength(0);
+  });
+
+  test("reads card actions from the Bot event queue and acknowledges the processed id", async () => {
+    fixture = await createOctoProtocolFixture({
+      botEventBatches: [[
+        {
+          event_id: 41,
+          event_type: "card_action",
+          event_data: {
+            message_id: "card-message",
+            channel_id: "group-1",
+            channel_type: 2,
+            action_id: "ask_opt_2",
+            operator_uid: "owner-1",
+            inputs: { ask_text: "ship it" },
+          },
+        },
+        { event_id: 42, event_type: "bot_task", event_data: {} },
+        {
+          event_id: 43,
+          event_type: "card_action",
+          event_data: {
+            message_id: "card-other",
+            channel_id: "group-1",
+            channel_type: 9,
+            action_id: "ask_opt_1",
+            operator_uid: "owner-1",
+          },
+        },
+      ]],
+    });
+    transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
+    await transport.initialize();
+    const currentFixture = fixture;
+
+    const events = await transport.fetchBotEvents({ afterEventId: 40, limit: 20, waitSeconds: 0 });
+
+    expect(currentFixture.botEventRequests[0]).toMatchObject({
+      path: "/v1/bot/events",
+      authorization: `Bearer ${currentFixture.botToken}`,
+      body: { event_id: 40, limit: 20, wait: 0 },
+    });
+    expect(events).toEqual([
+      {
+        eventId: 41,
+        kind: "card_action",
+        action: {
+          messageId: "card-message",
+          channelType: 2,
+          channelId: "group-1",
+          actionId: "ask_opt_2",
+          operatorUid: "owner-1",
+          inputs: { ask_text: "ship it" },
+        },
+      },
+      { eventId: 42, kind: "other" },
+      // An unknown channel type is not a click this channel could have sent.
+      { eventId: 43, kind: "other" },
+    ]);
+
+    await transport.ackBotEvent(41);
+    expect(currentFixture.botEventAcks).toEqual([
+      { path: "/v1/bot/events/41/ack", authorization: `Bearer ${currentFixture.botToken}` },
+    ]);
+  });
+
+  test("clamps the event cursor hold to what the client is willing to wait for", async () => {
+    fixture = await createOctoProtocolFixture({});
+    transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
+    await transport.initialize();
+
+    await transport.fetchBotEvents({ afterEventId: 0, limit: 500, waitSeconds: 60 });
+
+    expect(fixture.botEventRequests[0]!.body).toMatchObject({ limit: 100, wait: 25 });
+  });
+
+  test("treats a missing Bot event endpoint as no event support", async () => {
+    fixture = await createOctoProtocolFixture({ botEventsStatus: 404 });
+    transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
+    await transport.initialize();
+
+    expect(await transport.fetchBotEvents({ afterEventId: 0, limit: 20, waitSeconds: 0 })).toBeNull();
+  });
+
+  test("propagates Bot event queue and acknowledgement failures", async () => {
+    fixture = await createOctoProtocolFixture({ botEventsStatus: 500, botEventAckStatus: 503 });
+    transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
+    await transport.initialize();
+
+    await expect(
+      transport.fetchBotEvents({ afterEventId: 0, limit: 20, waitSeconds: 0 }),
+    ).rejects.toThrow(/500/);
+    await expect(transport.ackBotEvent(41)).rejects.toThrow(/503/);
   });
 });
 

@@ -155,6 +155,12 @@ export interface FixtureMessageSyncRequest {
   body: Record<string, unknown>;
 }
 
+export interface FixtureBotEventRequest {
+  path: string;
+  authorization: string | undefined;
+  body: Record<string, unknown>;
+}
+
 export type FixtureCardProfile = Record<string, unknown>;
 
 
@@ -229,6 +235,12 @@ export interface OctoProtocolFixtureOptions {
   cardProfileBody?: FixtureCardProfile;
   /** Response status for POST /v1/bot/typing. */
   typingStatus?: number;
+  /** Response status for POST /v1/bot/events. */
+  botEventsStatus?: number;
+  /** `results` arrays returned by POST /v1/bot/events, consumed in call order. */
+  botEventBatches?: unknown[][];
+  /** Response status for POST /v1/bot/events/:id/ack. */
+  botEventAckStatus?: number;
   /** Response status for POST /v1/bot/message/edit. */
   messageEditStatus?: number;
   /** Delay before responding to POST /v1/bot/sendMessage. */
@@ -528,6 +540,8 @@ export class OctoProtocolFixture {
   readonly cardProfileRequests: FixtureCardProfileRequest[] = [];
   readonly messageEdits: FixtureMessageEdit[] = [];
   readonly messagesSyncRequests: FixtureMessageSyncRequest[] = [];
+  readonly botEventRequests: FixtureBotEventRequest[] = [];
+  readonly botEventAcks: Array<{ path: string; authorization: string | undefined }> = [];
   /** Latest type-1 text body accepted by message_id. */
   readonly latestEditedTextByMessageId = new Map<string, string>();
 
@@ -1258,8 +1272,50 @@ export class OctoProtocolFixture {
       return;
     }
 
+    if (request.method === "POST" && url.pathname === "/v1/bot/events") {
+      this.botEventRequests.push({
+        path: `${url.pathname}${url.search}`,
+        authorization,
+        body: parsedBody,
+      });
+      if (authorization !== `Bearer ${BOT_TOKEN}`) {
+        writeJson(response, 401, { error: "invalid bot token" });
+        return;
+      }
+      const status = this.options.botEventsStatus ?? 200;
+      if (status < 200 || status >= 300) {
+        writeJson(response, status, { error: "bot events failed" });
+        return;
+      }
+      const batches = this.options.botEventBatches ?? [];
+      const index = Math.min(this.botEventBatchIndex, Math.max(0, batches.length - 1));
+      this.botEventBatchIndex += 1;
+      writeJson(response, 200, { status: 1, results: batches[index] ?? [] });
+      return;
+    }
+
+    const ackMatch = request.method === "POST"
+      ? /^\/v1\/bot\/events\/(\d+)\/ack$/u.exec(url.pathname)
+      : null;
+    if (ackMatch !== null) {
+      this.botEventAcks.push({ path: url.pathname, authorization });
+      if (authorization !== `Bearer ${BOT_TOKEN}`) {
+        writeJson(response, 401, { error: "invalid bot token" });
+        return;
+      }
+      const status = this.options.botEventAckStatus ?? 200;
+      if (status < 200 || status >= 300) {
+        writeJson(response, status, { error: "bot event ack failed" });
+        return;
+      }
+      writeJson(response, 200, { status: 200 });
+      return;
+    }
+
     writeJson(response, 404, { error: "not found" });
   }
+
+  private botEventBatchIndex = 0;
 
 
   private handleClientFrames(connection: FixtureConnection & { aesKey?: string; aesIv?: string }, data: Uint8Array): void {

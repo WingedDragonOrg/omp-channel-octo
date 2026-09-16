@@ -32,6 +32,7 @@ function previewChannelType(): ChatTarget["channelType"] {
 
 const previewCapabilities: ExecutionCardCapabilities = {
   enabled: true,
+  interactive: true,
   profiles: ["octo/v1", "octo/v2"],
   cardVersion: "1.5",
   elements: ["TextBlock", "RichTextBlock", "Container", "ColumnSet", "ActionSet"],

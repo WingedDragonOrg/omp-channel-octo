@@ -101,6 +101,8 @@ export interface QuestionRecord extends ChatTarget {
   payload: string;
   state: "pending" | "answered" | "cancelled" | "expired";
   answer: string | null;
+  /** Remote id of the interactive card carrying this question; `null` for text-only questions. */
+  cardMessageId: string | null;
 }
 
 export interface WorkerLedgerRecord extends WorkerProcess {
@@ -372,6 +374,11 @@ export class ChannelStore {
       );
       CREATE TABLE IF NOT EXISTS progress_cards (${PROGRESS_CARD_COLUMNS}
       );
+      CREATE TABLE IF NOT EXISTS bot_event_cursor (
+        bot_uid TEXT PRIMARY KEY NOT NULL,
+        event_id INTEGER NOT NULL CHECK(event_id >= 0),
+        updated_at INTEGER NOT NULL
+      );
     `);
     for (const statement of [
       "ALTER TABLE outbox ADD COLUMN remote_message_id TEXT",
@@ -383,6 +390,7 @@ export class ChannelStore {
       "ALTER TABLE tasks ADD COLUMN message_seq INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE tasks ADD COLUMN history_eligible INTEGER NOT NULL DEFAULT 1",
       "ALTER TABLE chats ADD COLUMN cwd_pinned INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE questions ADD COLUMN card_message_id TEXT",
     ]) {
       try {
         this.db.exec(statement);
@@ -392,6 +400,9 @@ export class ChannelStore {
     }
     this.db.exec(
       "CREATE INDEX IF NOT EXISTS outbox_stream ON outbox(bot_uid, task_id, stream_message_id, segment_index)",
+    );
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS questions_card ON questions(bot_uid, channel_type, channel_id, card_message_id)",
     );
     this.migrateProgressCards();
   }
@@ -1440,7 +1451,7 @@ export class ChannelStore {
     );
   }
 
-  createQuestion(record: Omit<QuestionRecord, "state" | "answer">): void {
+  createQuestion(record: Omit<QuestionRecord, "state" | "answer" | "cardMessageId">): void {
     this.run(
       `INSERT INTO questions(id, task_id, bot_uid, channel_type, channel_id, payload, state, created_at)
        VALUES(?, ?, ?, ?, ?, ?, 'pending', ?)`,
@@ -1499,6 +1510,39 @@ export class ChannelStore {
 
   pendingQuestionIds(botUid: string, target: ChatTarget): string[] {
     return this.listPendingQuestions(botUid, target).map(({ id }) => id);
+  }
+
+  /** Records the remote message id once the server accepted the question card. */
+  setQuestionCard(id: string, messageId: string): void {
+    this.run("UPDATE questions SET card_message_id = ? WHERE id = ?", [messageId, id]);
+  }
+
+  /**
+   * Resolves the question a card click belongs to. The state is deliberately unfiltered: a click
+   * on an already answered or expired card is a distinct outcome from a click on a foreign card.
+   */
+  getQuestionByCard(botUid: string, target: ChatTarget, messageId: string): QuestionRecord | null {
+    const row = this.query(
+      `SELECT * FROM questions WHERE bot_uid = ? AND ${targetWhere(target)} AND card_message_id = ?
+       ORDER BY created_at DESC, rowid DESC`,
+      [botUid, ...targetValues(target), messageId],
+    )[0];
+    return row ? this.questionFromRow(row) : null;
+  }
+
+  getBotEventCursor(botUid: string): number {
+    const row = this.query("SELECT event_id FROM bot_event_cursor WHERE bot_uid = ?", [botUid])[0];
+    return row === undefined ? 0 : asNumber(row.event_id);
+  }
+
+  /** Advances the Bot event cursor; a lower id never overwrites a higher one. */
+  setBotEventCursor(botUid: string, eventId: number): void {
+    this.run(
+      `INSERT INTO bot_event_cursor(bot_uid, event_id, updated_at) VALUES(?, ?, ?)
+       ON CONFLICT(bot_uid) DO UPDATE SET event_id = excluded.event_id, updated_at = excluded.updated_at
+       WHERE excluded.event_id > bot_event_cursor.event_id`,
+      [botUid, eventId, Date.now()],
+    );
   }
 
   private historyLedgerRow(botUid: string, target: ChatTarget, sessionId: string): SqlRow | undefined {
@@ -1596,6 +1640,7 @@ export class ChannelStore {
       payload: asString(row.payload),
       state,
       answer: asNullableString(row.answer),
+      cardMessageId: asNullableString(row.card_message_id),
     };
   }
 }

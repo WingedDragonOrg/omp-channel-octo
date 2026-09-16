@@ -102,6 +102,8 @@ export interface ExecutionCardLimits {
 
 export interface ExecutionCardCapabilities {
   readonly enabled: boolean;
+  /** Deployment accepts `octo/v2` frames: `Action.Submit` plus `Input.*` (interaction switch). */
+  readonly interactive: boolean;
   readonly profiles: readonly string[];
   readonly cardVersion: string;
   readonly elements?: readonly string[];

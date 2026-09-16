@@ -84,6 +84,47 @@ export interface SendReceipt {
   messageId?: string;
 }
 
+/**
+ * Capability tier an Octo card frame needs: `octo/v1` carries display elements and local
+ * actions, `octo/v2` adds `Action.Submit` and `Input.*`.
+ */
+export type CardProfile = "octo/v1" | "octo/v2";
+
+/** One Octo interactive card message (raw type 17) with its authoritative plain text. */
+export interface CardFrame {
+  card: Record<string, unknown>;
+  plain: string;
+  profile: CardProfile;
+}
+
+/** A `card_action` event: one answered click on a card this Bot sent. */
+export interface BotCardAction {
+  messageId: string;
+  channelType: 1 | 2 | 5;
+  /** Consumer-side channel id: the peer uid in a DM, the channel itself in groups/threads. */
+  channelId: string;
+  actionId: string;
+  operatorUid: string;
+  inputs: Record<string, string>;
+}
+
+/**
+ * One entry of this Bot's event queue. Event types the channel does not consume stay
+ * addressable so they can be acknowledged instead of redelivered forever.
+ */
+export type BotEvent =
+  | { eventId: number; kind: "card_action"; action: BotCardAction }
+  | { eventId: number; kind: "other" };
+
+export interface BotEventFetch {
+  /** Exclusive cursor: the read returns events with a strictly greater id. */
+  afterEventId: number;
+  limit: number;
+  /** Long-poll hold in seconds; `0` reads once and answers immediately. */
+  waitSeconds: number;
+  signal?: AbortSignal;
+}
+
 /** One text message of a group/thread channel history window. */
 export interface HistoryMessage {
   seq: number;
@@ -171,6 +212,25 @@ export interface ChannelTransport {
     cardSeq: number,
     signal?: AbortSignal,
   ): Promise<void>;
+  /** Sends one card frame; `null` when the deployment profile cannot carry it. */
+  sendCard(
+    target: ChatTarget,
+    frame: CardFrame,
+    clientMsgNo: string,
+    signal?: AbortSignal,
+  ): Promise<SendReceipt | null>;
+  /** Edits a card this Bot sent; rejects when the frame cannot be carried. */
+  editCard(
+    target: ChatTarget,
+    messageId: string,
+    frame: CardFrame,
+    cardSeq: number,
+    signal?: AbortSignal,
+  ): Promise<void>;
+  /** Reads this Bot's event queue; `null` when the deployment has no Bot event endpoint. */
+  fetchBotEvents(fetch: BotEventFetch): Promise<BotEvent[] | null>;
+  /** Acknowledges one processed event so the server stops redelivering it. */
+  ackBotEvent(eventId: number, signal?: AbortSignal): Promise<void>;
   stop(): Promise<void>;
 }
 export interface GroupContext {

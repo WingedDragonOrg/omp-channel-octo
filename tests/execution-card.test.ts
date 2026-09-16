@@ -13,6 +13,7 @@ type JsonRecord = Record<string, unknown>;
 
 const fullCapabilities: ExecutionCardCapabilities = {
   enabled: true,
+  interactive: true,
   profiles: ["octo/v1", "octo/v2"],
   cardVersion: "1.5",
   elements: ["TextBlock", "RichTextBlock", "Container", "ColumnSet", "ActionSet"],
@@ -983,6 +984,7 @@ describe("execution card rendering", () => {
     const snapshot = tracker.apply({ type: "run_end", atMs: 3, state: "completed" });
     const rendered = buildExecutionCard(snapshot, {
       enabled: true,
+      interactive: false,
       profiles: ["octo/v1"],
       cardVersion: "1.5",
     });

@@ -12,7 +12,7 @@
 
 包含个人单 Bot、单服务实例、文本指令与回复、执行状态、新建会话、指定目录、取消、会话恢复、消息去重和连接重建。支持私聊、指定群及 CommunityTopic 线程（channelType=5）内明确 @Bot 的指令；支持群/线程共享说明、线程默认继承父群工作目录、群/线程对话历史的增量上下文注入（详细设计见 `docs/specs/2026-09-16-group-history-context-design.md`）、常见入站消息类型的内容提取与附件接收（详细设计见 `docs/specs/2026-09-16-inbound-message-content-design.md`）、出站文件和持久化问答。
 
-不包含终端会话接管、多用户服务、通用网络 Agent gateway、文档评论任务、服务端通用 bot_task、群历史归档与检索、出站附件之外的通用文件托管和交互 callback 系统。channel 仅提供由 OMP host tool 明确发起的出站图片/文件发送，以及由能力 profile 明确启用的 Octo raw type17 `octo/v1` AdaptiveCard 1.5 非交互进度展示。收到的入站消息按已确认的类型表提取内容，贴纸、系统与 CMD 等没有内容的类型明确告知，不作为成功执行。范围以个人 IM 交互为准，不继承参考适配器的其他任务入口。
+不包含终端会话接管、多用户服务、通用网络 Agent gateway、文档评论任务、服务端通用 bot_task、群历史归档与检索、出站附件之外的通用文件托管和交互 callback 系统。channel 仅提供由 OMP host tool 明确发起的出站图片/文件发送，以及由能力 profile 明确启用的 Octo raw type17 `octo/v1` AdaptiveCard 1.5 进度展示和 `octo/v2` 交互问答卡片；交互卡片的上行只使用该 Bot 自己的事件队列（`/v1/bot/events` 轮询与 ack），不注册回调地址、不实现通用 callback 或审批流。收到的入站消息按已确认的类型表提取内容，贴纸、系统与 CMD 等没有内容的类型明确告知，不作为成功执行。范围以个人 IM 交互为准，不继承参考适配器的其他任务入口。
 
 ## 已知约束与资料
 
@@ -85,7 +85,7 @@ channel 在自身命令注册表中注册下列命令，`/help` 展示用法。�
 | `/restart [now]` | 通过部署方配置的重启命令安全重启 channel；省略参数时在有任何运行/排队任务时拒绝；`now` 强制重启并中断在途任务 |
 | `/help` | 展示 channel 命令及目录用法 |
 
-当前聊天有待回答问题时，owner 在该聊天的非命令回复就是答案本身：合法选项编号按选项校验，其他文本原样作为自填答案；没有待回答问题时同一文本按普通任务输入处理。待回答问题的答案优先于追加模式，不能被 steering 或排队吞掉。
+当前聊天有待回答问题时，owner 在该聊天的非命令回复就是答案本身：合法选项编号按选项校验，其他文本原样作为自填答案；没有待回答问题时同一文本按普通任务输入处理。待回答问题的答案优先于追加模式，不能被 steering 或排队吞掉。问题以交互卡片投递时，owner 对该卡片的一次按钮点击同样是这个问题的答案：点击与文本回复共用同一个答案 compare-and-set，只有一方生效，其他人的点击只 ack 不生效，卡片只是多一条作答路径而非唯一路径。
 
 追加模式决定该聊天在已有运行中任务时如何处置新消息，按 `botUid` 与真实聊天目标隔离并持久化，跨重启保留，未设置时默认 `steer`。`steer` 模式下的普通文本经持久 claim 后作为 OMP `steer` 帧注入当前运行中的回合，与当前回合共用同一条任务和正文流；每条被注入的消息都是新的一轮，进度随之在新卡片上继续（见进度卡章节）。`queue` 模式下的普通文本走既有 durable acceptance，成为在该任务之后执行的排队任务，保留独立的正文消息与进度卡。OMP worker 只在其回合仍在流式输出时接受 steering：没有运行中的回合、回合已经结束或 OMP 拒绝该帧时，该文本回退为普通排队任务，不静默丢弃。`/queue <文本>` 始终走排队任务路径。steering 不产生新的任务记录或正文消息，也不改写当前回合已建立的群说明快照。
 
@@ -138,6 +138,10 @@ OMP `session.compacting` 生命周期在压缩时把当前 turn sidecar 中的�
 
 `ask` 创建带持久化 ID 的问题后暂停当前任务，并给出一段包含问题正文、编号选项（如有）和回复规则的文本。只要该聊天存在待回答的问题，owner 在该聊天的下一条非命令文本即为该聊天最早待回答问题的答案：合法选项编号按单选/多选的数量和范围校验，其他文本原样作为自填答案返回给模型；命令仍然优先。不提供默认答案，无待回答问题、不同聊天、重复或过期后的回复都不作为答案，其中无待回答问题和过期后的文本按普通任务输入处理。问题十分钟无答案即过期；取消、服务重启会使等待失效。
 
+部署宣布交互档时（`GET /v1/bot/card/profile` 的 `profiles` 含 `octo/v2`、`config.card_enabled`/`display_enabled`/`interaction_enabled` 为真），问题改以一张 type-17 交互卡片投递，并把卡片的远端 message ID 记在问题行上：卡体是问题正文与编号选项，单选问题为每个选项一个 `Action.Submit` 按钮，多选问题为 `Input.ChoiceSet` 加提交按钮，无选项问题为 `Input.Text` 加提交按钮；信封的 `plain` 与纯文本路径逐字一致，所以不认该 profile 的客户端照常显示问题文本。卡片发送失败（含未宣布交互档）时退回原有的纯文本投递，问题语义不变。点击与文本回复共用同一个答案 compare-and-set：只有一方生效，非 owner 的点击不生效，问题关闭后的点击不覆盖已记录的答案；服务端对同一 `(message_id, action_id, operator_uid)` 只受理一次点击，因此未成答的点击（例如空内容提交）用新的 action id 重绘卡片并回复一次提示，用户仍可继续作答。答案落盘后卡片被 best-effort 改写成终态（已回复并带上所选项、已过期、已取消），改写失败只记日志，不影响答案。
+
+交互卡片的上行由 channel 主动消费 Bot 事件队列：`POST /v1/bot/events` 长轮询读取（`wait` 上限低于客户端请求超时并留余量），游标按 `botUid` 持久化且单调递增，事件处理完成后才 `POST /v1/bot/events/{event_id}/ack`，ack 失败或处理可重试时保留游标让同一事件下轮重读。投递是至少一次：重复投递的点击按已记录答案处理，不再作答也不重复改写。该队列只有本 channel 一个消费者；非 `card_action` 的事件（含无 `event_type` 的旧式消息事件）ack 后略过，不参与聊天路由。部署没有该端点时事件轮询自行停止，问答退回纯文本路径。
+
 
 ### RPC 与输出
 
@@ -189,7 +193,7 @@ Octo 断线不取消已经开始的 Agent；正文 outbox 与任务状态持久�
 8. 长正文保留原始换行、空格和 inline 标记；每个 assistant message 独立 stream，首次非空累计快照立即 create，后续累计快照以同一 message ID 每 1000ms 最多一次串行 edit，最终更短或空快照权威生效；正文按 3000 UTF-8 bytes 稳定分段并清理 stale tail，异步 prompt 失败、本地完成和 worker 异常退出均正确结束任务状态，不生成通用完成文字。
 9. 正文 outbox 在 create 前 durable 记录 `unknown`，保存 desired/acked 版本；断线、重启或送达未知恢复时沿用稳定 client ID、编辑最新快照且不重跑 Agent，不因失败重复创建。
 10. 执行过程中取消能越过待执行队列；后续队列被清除，取消不被宣称为回滚。未确认停止时不启动同目录新任务。
-11. `ask` 问题可跨消息持久等待；owner 在同一聊天的下一条非命令文本被当作答案（编号选项按单选/多选校验，其他文本原样返回），不同聊天、无待回答问题、重复或过期后的文本都不作为答案并按普通任务处理，取消不使用默认答案。
+11. `ask` 问题可跨消息持久等待；owner 在同一聊天的下一条非命令文本被当作答案（编号选项按单选/多选校验，其他文本原样返回），不同聊天、无待回答问题、重复或过期后的文本都不作为答案并按普通任务处理，取消不使用默认答案。宣布交互档时问题以 `octo/v2` 卡片投递，单选/多选/无选项三种卡形各自带选项按钮、选择列表或自由输入，点击只由 owner 生效并与文本回复争用同一个答案判定；未成答的点击用新 action id 重绘后仍可作答，答案落盘后卡片改写为终态，卡片不可用时退回纯文本；事件队列按持久游标消费、处理后才 ack，重复投递不重复作答，非 `card_action` 事件与无端点部署都不影响问答。
 12. 在接收、started 落盘、执行、回复阶段分别终止服务再启动：绑定可恢复，历史可读，遗留任务报告中断，同消息重投不再执行副作用；外部移动只按精确 session ID 与 breadcrumb 唯一重绑，roots 依 native profile/`.env` 有效 cwd 解析，不选最近文件。
 13. Octo 断开再连接不重跑任务；已持久化正文从 outbox 继续投递，送达未知明确呈现；真实 `ExecutionEvent` tracker 每轮用一张卡累计工具/turn/todo/run 终态与 elapsed，只在真实事件到达时随卡片刷新（编辑按 1000ms 合并窗口推进，无周期重绘），遵守 TextBlock/Container fallback、ToggleVisibility 能力和 payload/node/depth limits，卡片 edit sequence 单调递增，安全摘要不含原始 payload 与参数对象（命令类工具显示单行、截断到 72 字符并经凭据脱敏的命令文本）；typing 每 3 秒续期、活动请求 2 秒有界，终态卡片失败只做一次 best-effort，均不阻断正文；每张卡的身份、sequence 与最近快照各占一行持久化，终态编辑成功后删除该行，进程重启后仍遗留的卡片（同一任务可能多张）由下一次启动逐张补发一次终态编辑（序号严格递增、状态取任务终态、失败按有界次数重试后丢弃），使客户端无需重新执行任务即可离开「进行中」。
 14. 状态盘写入失败不启动新任务；同 Bot 第二实例不能启动（在重新注册 Bot 之前即报错退出）；App Bot 配置不能被验收为支持群聊。
@@ -253,3 +257,4 @@ oco test --card
 群级免@的验收证据：`tests/core-mention-pref.test.ts` 覆盖 `effective` 为真时未 @Bot 的群消息与线程消息各启动一个任务、为假或查询失败时保持不启动且不回复、同一个群两次未 @Bot 只查询一次而带 mention 的消息不查询、被 owner/允许列表/Bot 回声规则先拒的消息零查询；`tests/octo-transport.test.ts` 的 "reads the group 免@ decision, including the legacy no_mention shape" 用真实 HTTP 夹具断言端点路径与 Bot 鉴权头，覆盖 `effective` 布尔与旧版 `no_mention` 0/1 两种形状，以及不可解析响应被拒。把 `isAllowed` 的免@分支摘掉后 `tests/core-mention-pref.test.ts` 有 4 例失败，确认用例不是空转。线上只读实测（本群）：`GET /v1/bot/groups/e3bc5af0d4b84b18bb3770a74bd222c6/mention_pref` 返回 `{"no_mention":0,"group_allow_no_mention":1,"effective":false}`，即群开关已允许、bot owner 尚未开启，因此本群当前仍需 @Bot。
 进度卡持久化与重启补发的验收证据：`tests/core-progress-card-recovery.test.ts` 覆盖 7 例——在线回合把服务端已接受的卡片帧（message ID、sequence、快照）写入状态盘并在终态编辑成功后清除该行；重启后遗留的 started 任务以 `cancelled` 补发一次终态编辑，已 completed 的任务以 `completed` 补发，序号均为持久值 +1，重放出的快照保留原有工具轨迹与耗时；同一任务遗留的多张卡各占一行、各自补发一次终态编辑（每张卡的序号各取自己的持久值 +1）；补发失败保留该行（attempts 与序号同时 +1，避免与可能已落地的尝试撞车）并在下一次启动成功收尾；连续失败达到上限后该行被丢弃；不可解析的载荷不产生任何编辑且不阻断启动。把 `start()` 中的补发调用移除后这 6 例补发/丢弃用例全部失败，把建卡成功后的持久化调用移除后在线回合用例失败，确认用例不是空转。追加消息换卡由 `tests/core-presentation.test.ts` 的 "a steered message closes the current card and the next round opens a new one" 端到端断言：被追加的消息让上一轮的卡收到唯一一次 `completed` 终态编辑（其轨迹保留该轮两个工具），新的一轮在下一份真实工具进度时以不同的 client message ID 另建一张卡，且该卡的阶段与工具只统计本轮、todo 清单沿用上一轮；把 `deliverSteer` 里的 `rollProgressCard` 调用去掉后该用例失败，确认用例不是空转。旧库升级由同一文件的 "a database written before per-round cards keeps its rows and gains card identity" 覆盖：按旧结构 `PRIMARY KEY(bot_uid, task_id)` 建立的数据库在打开后保留遗留行（含 attempts 与 sequence）、表结构变为 `PRIMARY KEY(bot_uid, task_id, message_id)`、同一任务的第二张卡可与第一张并存、删除其中一张只影响它自己，且重复打开不再次重建；把 `migrateProgressCards` 调用去掉后该用例失败，确认用例不是空转。
 `channel_control` 的验收证据：`tests/core-host-tools.test.ts` 覆盖私聊与群/线程的工具集合断言（`ask,channel_control,octo_send_file`，群内追加 `octo_management`），以及 `channel_control` 的 `restart`/`status` 行为——`status` 返回本进程 PID 且初始 `restart_pending=false`；`restart` 在回合内只返回「已排定重启」，此刻重启命令一次都没有执行过；同一聊天排队任务运行期间重启保持等待；队列清空后重启命令恰好执行一次，并为发起会话写入重启通报（下次启动据此投递新 PID）；未注入重启端口（即未检测到守护进程）时返回未检测到守护进程的文本且不写通报。把 `createHostTools` 中的 `channel_control` 摘掉后，上述工具集合断言与两例 `channel_control` 行为用例全部失败，确认用例不是空转。
+交互问答卡片与 Bot 事件队列的验收证据：`tests/core-ask-card.test.ts` 覆盖 8 例——单选问题的卡片点击被记录为答案并把同一张卡改写成已回复状态（含所选项、`card_seq` 递增、按钮消失）、同一问题的纯文本回复同样作答并改写同一张卡、无选项问题由自由输入提交作答、多选按所选索引作答、空提交用新 action id 重绘卡片且问题保持可答、非 owner 的点击保持问题待答且不产生答案、答案记录后的重复投递点击静默且不更新卡片、卡片发送失败退回纯文本问题（问题仍可被文本作答、事件仍被 ack）；把 `deliverQuestion` 的卡片分支关掉后 7 例失败，单独去掉点击的 owner 校验后非 owner 用例失败，确认用例不是空转。`tests/octo-transport.test.ts` 的 "Octo interactive cards and Bot events" 用真实 HTTP/WS 夹具覆盖 `octo/v2` 卡片发送与已答复改写、交互未开启时拒绝出卡、`POST /v1/bot/events` 的游标与 ack、`wait` 上限被夹到客户端请求超时以内、端点缺失视为无事件支持、队列与 ack 失败传播。线上实测：本 Bot 的 `GET /v1/bot/card/profile` 宣布 `octo/v2` 与交互开关；探针向真实私聊发送交互卡片被服务端接受并返回 message id；服务实现启动后经 `POST /v1/bot/events` 与逐条 ack 清空既有 54 条非交互事件积压（含无 `event_type` 的旧式消息事件与 `bot_joined_group`），无重试与错误日志，游标持久化。真人点击一轮（在服务发出的 `ask` 卡片上点击并观察答案入账与卡片改写）仍需在真实客户端单独完成，未计入本节证据。

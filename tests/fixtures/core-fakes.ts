@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import type {
   AttachmentDownload,
+  BotCardAction,
+  BotEvent,
+  BotEventFetch,
   BotIdentity,
+  CardFrame,
   ChannelCommandHandler,
   ChannelService,
   ChannelStatus,
@@ -77,6 +81,25 @@ export interface TextRequest {
   error?: string;
 }
 
+export interface SentCard {
+  target: ChatTarget;
+  frame: CardFrame;
+  clientMsgNo: string;
+  messageId: string;
+}
+
+export interface CardEdit {
+  target: ChatTarget;
+  messageId: string;
+  frame: CardFrame;
+  cardSeq: number;
+}
+
+/** One `card_action` event exactly as the Bot event queue delivers it. */
+export function cardActionEvent(eventId: number, action: BotCardAction): BotEvent {
+  return { eventId, kind: "card_action", action };
+}
+
 export function assistantText(
   messageId: string,
   text: string,
@@ -102,6 +125,19 @@ export interface FakeTransportOptions {
 export class FakeTransport implements ChannelTransport {
   readonly attempts: TransportAttempt[] = [];
   readonly sent: SentMessage[] = [];
+  /** Cards stay opt-in so the text-only path is what every other test exercises. */
+  cardSupported = false;
+  readonly sentCards: SentCard[] = [];
+  readonly cardEdits: CardEdit[] = [];
+  readonly botEvents: BotEvent[] = [];
+  readonly eventFetches: number[] = [];
+  readonly ackedEvents: number[] = [];
+  cardSendFailure: Error | undefined;
+  cardEditFailure: Error | undefined;
+  /** When true, `fetchBotEvents` reports a deployment without a Bot event endpoint. */
+  botEventsUnsupported = false;
+  eventFetchFailure: Error | undefined;
+  ackFailure: Error | undefined;
   readonly fileAttempts: Array<SentFile & { error?: string }> = [];
   readonly sentFiles: SentFile[] = [];
   readonly textRequests: TextRequest[] = [];
@@ -141,6 +177,12 @@ export class FakeTransport implements ChannelTransport {
   }> = [];
   private readonly textRequestWaiters: TextRequestWaiter[] = [];
   private readonly remoteTextWaiters: RemoteTextWaiter[] = [];
+  private readonly cardEditWaiters: Array<{
+    predicate: (edit: CardEdit) => boolean;
+    resolve: (edit: CardEdit) => void;
+  }> = [];
+  private readonly ackWaiters: Array<{ eventId: number; resolve: (eventId: number) => void }> = [];
+  private readonly eventWaiters: Array<() => void> = [];
   private readonly editGates: Array<Promise<void>> = [];
   private readonly remoteTextByClientMsgNo = new Map<string, string>();
   private activeTextRequests = 0;
@@ -509,6 +551,102 @@ export class FakeTransport implements ChannelTransport {
     signal?: AbortSignal,
   ): Promise<void> {
     if (signal?.aborted) throw new Error("fixture progress card edit aborted");
+  }
+
+  async sendCard(
+    target: ChatTarget,
+    frame: CardFrame,
+    clientMsgNo: string,
+    signal?: AbortSignal,
+  ): Promise<SendReceipt | null> {
+    if (signal?.aborted) throw new Error("fixture card send aborted");
+    if (!this.cardSupported) return null;
+    if (this.cardSendFailure) throw this.cardSendFailure;
+    const messageId = `card-${this.sentCards.length + 1}`;
+    this.sentCards.push({ target, frame, clientMsgNo, messageId });
+    this.notifyCardEdit();
+    return { messageId };
+  }
+
+  async editCard(
+    target: ChatTarget,
+    messageId: string,
+    frame: CardFrame,
+    cardSeq: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (signal?.aborted) throw new Error("fixture card edit aborted");
+    if (this.cardEditFailure) throw this.cardEditFailure;
+    this.cardEdits.push({ target, messageId, frame, cardSeq });
+    this.notifyCardEdit();
+  }
+
+  async fetchBotEvents(fetch: BotEventFetch): Promise<BotEvent[] | null> {
+    this.eventFetches.push(fetch.afterEventId);
+    if (this.botEventsUnsupported) return null;
+    for (;;) {
+      if (fetch.signal?.aborted) throw new Error("fixture bot events aborted");
+      if (this.eventFetchFailure) throw this.eventFetchFailure;
+      const ready = this.botEvents
+        .filter((event) => event.eventId > fetch.afterEventId)
+        .sort((left, right) => left.eventId - right.eventId)
+        .slice(0, fetch.limit);
+      if (ready.length > 0) {
+        this.botEvents.splice(0, ready.length);
+        return ready;
+      }
+      // Hold like the server does: the next pushed event wakes every waiting fetch.
+      await this.holdForBotEvent(fetch.signal);
+    }
+  }
+
+  async ackBotEvent(eventId: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw new Error("fixture bot event ack aborted");
+    if (this.ackFailure) throw this.ackFailure;
+    this.ackedEvents.push(eventId);
+    this.notifyCardEdit();
+  }
+
+  /** Queues one event as if the server delivered it. */
+  pushBotEvent(event: BotEvent): void {
+    this.botEvents.push(event);
+    for (const wake of this.eventWaiters.splice(0)) wake();
+  }
+
+  waitForCardEdit(predicate: (edit: CardEdit) => boolean): Promise<CardEdit> {
+    const existing = this.cardEdits.find(predicate);
+    if (existing) return Promise.resolve(existing);
+    return new Promise<CardEdit>((resolve) => {
+      this.cardEditWaiters.push({ predicate, resolve });
+    });
+  }
+
+  waitForAck(eventId: number): Promise<number> {
+    if (this.ackedEvents.includes(eventId)) return Promise.resolve(eventId);
+    return new Promise<number>((resolve) => {
+      this.ackWaiters.push({ eventId, resolve });
+    });
+  }
+
+  private holdForBotEvent(signal: AbortSignal | undefined): Promise<void> {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    const wake = (): void => {
+      signal?.removeEventListener("abort", wake);
+      resolve();
+    };
+    this.eventWaiters.push(wake);
+    signal?.addEventListener("abort", wake, { once: true });
+    return promise;
+  }
+
+  private notifyCardEdit(): void {
+    for (const waiter of this.cardEditWaiters) {
+      const hit = this.cardEdits.find(waiter.predicate);
+      if (hit) waiter.resolve(hit);
+    }
+    for (const waiter of this.ackWaiters) {
+      if (this.ackedEvents.includes(waiter.eventId)) waiter.resolve(waiter.eventId);
+    }
   }
 
   async sendFile(

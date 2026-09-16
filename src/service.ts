@@ -17,6 +17,8 @@ import {
   type SavedAttachment,
 } from "./attachments.ts";
 import type {
+  BotCardAction,
+  BotEvent,
   BotIdentity,
   ChannelCommandContext,
   ChannelCommandHandler,
@@ -42,6 +44,15 @@ import type {
   WorkerOptions,
   WorkerProcess,
 } from "./contracts.ts";
+import {
+  askAnswerText,
+  buildAskCard,
+  parseAskActionId,
+  resolveAskAnswer,
+  type AskCardOption,
+  type AskCardQuestion,
+  type AskCardState,
+} from "./ask-card.ts";
 import {
   createExecutionTracker,
   encodeExecutionSnapshot,
@@ -81,6 +92,7 @@ import {
   type InboundClaim,
   type OutboxRecord,
   type ProgressCardRecord,
+  type QuestionRecord,
   type TaskRecord,
   openChannelStore,
 } from "./store.ts";
@@ -122,6 +134,16 @@ const BUILTIN_COMMANDS: Record<string, true> = {
   interrupt: true,
 };
 const QUESTION_TIMEOUT_MS = 10 * 60 * 1_000;
+/** Card rewrite budget; a card edit never gates the answer, which is durable before it starts. */
+const ASK_CARD_EDIT_TIMEOUT_MS = 5_000;
+const ASK_CARD_SEND_TIMEOUT_MS = 10_000;
+/** Long-poll hold and the pause between rounds that returned immediately or failed. */
+const BOT_EVENT_POLL_WAIT_SECONDS = 20;
+const BOT_EVENT_POLL_LIMIT = 50;
+const BOT_EVENT_POLL_IDLE_MS = 1_000;
+const BOT_EVENT_POLL_BACKOFF_MS = 5_000;
+/** Attempts applied to one event before it is acknowledged and dropped, so the queue keeps moving. */
+const BOT_EVENT_MAX_ATTEMPTS = 5;
 const PROGRESS_MERGE_MS = 1_000;
 const TEXT_MERGE_MS = 1_000;
 const TYPING_RENEW_MS = 3_000;
@@ -595,6 +617,56 @@ function contextSidecarRoot(
 function genericTaskFailure(contextFailure: boolean): string {
   return contextFailure ? "群说明读取失败，未启动任务。" : "任务执行失败；未能可靠完成。";
 }
+
+/** Cancellable pause that resolves early when the caller's signal aborts. */
+function waitFor(ms: number, signal: AbortSignal): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const onAbort = (): void => {
+    clearTimeout(timer);
+    resolve();
+  };
+  const timer = setTimeout(() => {
+    signal.removeEventListener("abort", onAbort);
+    resolve();
+  }, ms);
+  signal.addEventListener("abort", onAbort, { once: true });
+  return promise;
+}
+
+/** Parsed question payload; `null` when the stored row cannot be read. */
+function parseQuestionPayload(question: QuestionRecord): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(question.payload);
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+    return value as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/** One question payload as the card understands it: text, options, multi select. */
+function askQuestionFromPayload(payload: Record<string, unknown>): AskCardQuestion | null {
+  const text = typeof payload.question === "string" ? payload.question.trim() : "";
+  if (text.length === 0) return null;
+  const raw = Array.isArray(payload.options) ? payload.options : [];
+  const options: AskCardOption[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const option = entry as Record<string, unknown>;
+    const label = typeof option.label === "string" ? option.label.trim() : "";
+    if (label.length === 0) continue;
+    const description = typeof option.description === "string" ? option.description.trim() : "";
+    options.push(description.length > 0 ? { label, description } : { label });
+  }
+  return { question: text, options, multi: payload.multi === true };
+}
+
+/**
+ * Result of applying one Bot event: `handled` and `ignored` are terminal (the event is
+ * acknowledged), `retry` keeps the cursor so the same event is read again.
+ */
+type BotEventOutcome = "handled" | "ignored" | "retry";
+
 class CoreService implements ChannelService {
   private readonly taskOperations = new Set<Promise<void>>();
   private readonly chatTails = new Map<string, Promise<void>>();
@@ -603,6 +675,13 @@ class CoreService implements ChannelService {
   private readonly runtimes = new Map<string, RuntimeTask>();
   private readonly questionWaiters = new Map<string, QuestionWaiter>();
   private readonly questionTimers = new Map<string, NodeJS.Timeout>();
+  /** Card frame sequence per question card, strictly increasing as the server requires. */
+  private readonly askCardSeq = new Map<string, number>();
+  /** Card action-id generation per open question: a click that must not answer re-renders. */
+  private readonly askCardGeneration = new Map<string, number>();
+  private readonly botEventAttempts = new Map<number, number>();
+  private eventAbort: AbortController | undefined;
+  private eventLoop: Promise<void> | undefined;
   private readonly outboxFlushes = new Map<string, Promise<void>>();
   private readonly outboxActive = new Set<string>();
   private readonly retryTimers = new Map<string, NodeJS.Timeout>();
@@ -693,9 +772,14 @@ class CoreService implements ChannelService {
       );
       if (this.stopping) throw new Error("channel 正在停止");
       this.flushAllOutbox();
+      this.startBotEventLoop();
       await this.recoverProgressCards();
     } catch (error) {
       this.started = false;
+      this.eventAbort?.abort();
+      await this.eventLoop?.catch(() => {});
+      this.eventAbort = undefined;
+      this.eventLoop = undefined;
       await this.options.transport.stop().catch(() => {});
       await lock.release().catch(() => {});
       this.lock = undefined;
@@ -744,6 +828,10 @@ class CoreService implements ChannelService {
     }
     await Promise.allSettled([...this.taskOperations]);
     await Promise.allSettled([...this.activityOperations]);
+    this.eventAbort?.abort();
+    await this.eventLoop?.catch(() => {});
+    this.eventAbort = undefined;
+    this.eventLoop = undefined;
     for (const timer of this.questionTimers.values()) {
       clearTimeout(timer);
     }
@@ -1918,7 +2006,12 @@ class CoreService implements ChannelService {
 
   private async handleCancel(target: ChatTarget): Promise<void> {
     const queued = this.store.cancelQueued(this.bot!.uid, target);
+    const openQuestions = this.store.listPendingQuestions(this.bot!.uid, target);
     this.store.cancelQuestions(this.bot!.uid, target);
+    for (const question of openQuestions) {
+      this.askCardGeneration.delete(question.id);
+      this.rewriteAskCard(question, { kind: "inactive", note: "任务已取消：该问题不再接受回答。" });
+    }
     let active = false;
     for (const runtime of this.runtimes.values()) {
       if (targetKey(runtime.target) !== targetKey(target)) continue;
@@ -2028,17 +2121,10 @@ class CoreService implements ChannelService {
         this.store.completeCommand(claim);
         return true;
       }
-      if (!this.store.answerQuestion(question.id, this.bot!.uid, message, normalized)) {
+      if (!this.applyQuestionAnswer(question, normalized)) {
         await this.enqueueText(message, "问题已失效，本次回复未作为答案记录。", null);
         this.store.completeCommand(claim);
         return true;
-      }
-      const waiter = this.questionWaiters.get(question.id);
-      if (waiter) {
-        this.questionWaiters.delete(question.id);
-        clearTimeout(this.questionTimers.get(question.id));
-        this.questionTimers.delete(question.id);
-        waiter.resolve(normalized);
       }
       this.store.completeCommand(claim);
       return true;
@@ -3322,12 +3408,17 @@ class CoreService implements ChannelService {
         if (!this.store.expireQuestion(id)) return;
         this.questionTimers.delete(id);
         this.questionWaiters.delete(id);
+        const expired = this.store.getQuestion(id);
+        if (expired !== null) {
+          this.rewriteAskCard(expired, { kind: "inactive", note: "问题已过期：未在 10 分钟内收到答案。" });
+        }
+        this.askCardGeneration.delete(id);
         completion.reject(new Error("question timed out"));
       }, QUESTION_TIMEOUT_MS);
       this.questionTimers.set(id, timer);
       try {
         throwIfAborted(signal);
-        await this.enqueueText(target, this.formatQuestion(question), task.id);
+        await this.deliverQuestion(question, target, id, task.id, signal);
         throwIfAborted(signal);
         const answer = await completion.promise;
         answers.push({ id: sourceId ?? id, questionId: id, answer });
@@ -3336,6 +3427,7 @@ class CoreService implements ChannelService {
         clearTimeout(timer);
         this.questionTimers.delete(id);
         this.questionWaiters.delete(id);
+        this.askCardGeneration.delete(id);
         this.store.cancelQuestion(id);
       }
     }
@@ -3368,8 +3460,226 @@ class CoreService implements ChannelService {
       this.questionWaiters.delete(id);
       clearTimeout(this.questionTimers.get(id));
       this.questionTimers.delete(id);
+      this.askCardGeneration.delete(id);
       waiter.reject(error);
     }
+  }
+
+  /**
+   * Posts one question: the interactive card when the deployment carries interactive frames,
+   * otherwise the plain text the channel has always sent. Both carry the same question text, so a
+   * client that cannot render the card shows the question instead of nothing.
+   */
+  private async deliverQuestion(
+    payload: Record<string, unknown>,
+    target: ChatTarget,
+    questionId: string,
+    taskId: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const ask = askQuestionFromPayload(payload);
+    if (ask !== null) {
+      try {
+        const receipt = await this.options.transport.sendCard(
+          target,
+          buildAskCard(ask, { kind: "pending", generation: 1 }, this.formatQuestion(payload)),
+          randomUUID(),
+          AbortSignal.any([signal, AbortSignal.timeout(ASK_CARD_SEND_TIMEOUT_MS)]),
+        );
+        if (receipt?.messageId !== undefined) {
+          this.store.setQuestionCard(questionId, receipt.messageId);
+          return;
+        }
+      } catch (error) {
+        if (signal.aborted) throw error;
+        console.error(`[ask-card] send failed target=${targetKey(target)}：${safeErrorMessage(error, "send failed")}`);
+      }
+    }
+    this.enqueueText(target, this.formatQuestion(payload), taskId);
+  }
+
+  /**
+   * Records one answer durably and releases the waiting task. The compare-and-set on the question
+   * row is the single arbitration point between a text reply and a card click: whoever loses it
+   * must not answer a second time.
+   */
+  private applyQuestionAnswer(question: QuestionRecord, answer: string): boolean {
+    const botUid = this.bot?.uid;
+    if (!botUid) return false;
+    if (!this.store.answerQuestion(question.id, botUid, question, answer)) return false;
+    const waiter = this.questionWaiters.get(question.id);
+    if (waiter) {
+      this.questionWaiters.delete(question.id);
+      clearTimeout(this.questionTimers.get(question.id));
+      this.questionTimers.delete(question.id);
+      waiter.resolve(answer);
+    }
+    this.askCardGeneration.delete(question.id);
+    this.rewriteAskCard(question, { kind: "answered", answer });
+    return true;
+  }
+
+  /**
+   * Rewrites one question card. Best-effort by contract: the state it renders is already durable
+   * in the question row, so a failed edit changes nothing but the card's appearance.
+   */
+  private rewriteAskCard(question: QuestionRecord, state: AskCardState, hint?: string): void {
+    const messageId = question.cardMessageId;
+    if (messageId === null) return;
+    const payload = parseQuestionPayload(question);
+    const ask = payload === null ? null : askQuestionFromPayload(payload);
+    if (ask === null) return;
+    const note = state.kind === "answered"
+      ? `已回复：${askAnswerText(ask, state.answer)}`
+      : state.kind === "inactive"
+        ? state.note
+        : hint;
+    const base = this.formatQuestion(payload ?? {});
+    const frame = buildAskCard(ask, state, note === undefined ? base : `${base}\n${note}`);
+    const seq = (this.askCardSeq.get(messageId) ?? 1) + 1;
+    this.askCardSeq.set(messageId, seq);
+    const operation = this.options.transport
+      .editCard(question, messageId, frame, seq, AbortSignal.timeout(ASK_CARD_EDIT_TIMEOUT_MS))
+      .catch((error: unknown) => {
+        console.error(
+          `[ask-card] edit failed target=${targetKey(question)}：${safeErrorMessage(error, "edit failed")}`,
+        );
+      });
+    this.operationSet(operation);
+  }
+
+  /**
+   * A click that must not answer leaves the question open. The server accepts one click per
+   * `(message, action, operator)`, so answering it later needs a frame whose action ids differ —
+   * this is where the next generation comes from.
+   */
+  private retryAskCard(question: QuestionRecord, generation: number, hint: string): void {
+    const next = Math.max(generation, this.askCardGeneration.get(question.id) ?? 0) + 1;
+    this.askCardGeneration.set(question.id, next);
+    this.rewriteAskCard(question, { kind: "pending", generation: next }, hint);
+    this.enqueueText(question, hint, null);
+  }
+
+  /**
+   * Applies one card click. Only the owner's click can answer; a foreign operator, an unknown
+   * action id or a card whose question already closed is acknowledged and dropped so the event
+   * queue keeps moving.
+   */
+  private async answerQuestionFromCard(action: BotCardAction): Promise<BotEventOutcome> {
+    const botUid = this.bot?.uid;
+    if (!botUid || this.stopping) return "retry";
+    const ownerId = this.store.getOwnerId(botUid)?.trim() ?? "";
+    if (ownerId.length === 0 || action.operatorUid !== ownerId) return "ignored";
+    const target: ChatTarget = { channelType: action.channelType, channelId: action.channelId };
+    let question: QuestionRecord | null;
+    try {
+      question = this.store.getQuestionByCard(botUid, target, action.messageId);
+    } catch {
+      return "retry";
+    }
+    if (question === null) return "ignored";
+    // An answered question can only be reached by a replay of the click that answered it (the
+    // rewrite removed its buttons), so it stays silent; a question that never got an answer is
+    // worth telling the operator about.
+    if (question.state === "answered") return "handled";
+    if (question.state !== "pending") {
+      this.enqueueText(target, "该问题已失效，本次点击未作为答案。", null);
+      return "handled";
+    }
+    const ref = parseAskActionId(action.actionId);
+    const payload = parseQuestionPayload(question);
+    const ask = payload === null ? null : askQuestionFromPayload(payload);
+    if (ref === null || ask === null) return "handled";
+    const resolved = resolveAskAnswer(ask, ref, action.inputs);
+    if (resolved.kind === "invalid") {
+      this.retryAskCard(question, ref.generation, "未收到内容：请填写后重新提交，或直接回复本消息作答。");
+      return "handled";
+    }
+    let answer: string;
+    try {
+      answer = this.normalizeAnswer(question, resolved.answer);
+    } catch {
+      this.retryAskCard(question, ref.generation, "答案无效：请重新选择，或直接回复本消息作答。");
+      return "handled";
+    }
+    try {
+      this.applyQuestionAnswer(question, answer);
+    } catch {
+      return "retry";
+    }
+    return "handled";
+  }
+
+  /**
+   * Consumes this Bot's event queue for the life of the process: long poll, apply, acknowledge,
+   * advance the cursor. Delivery is at-least-once, so an event whose acknowledgement was lost is
+   * replayed and the answer compare-and-set turns the replay into a no-op.
+   */
+  private startBotEventLoop(): void {
+    if (this.eventLoop) return;
+    const controller = new AbortController();
+    this.eventAbort = controller;
+    this.eventLoop = this.runBotEventLoop(controller.signal).catch((error: unknown) => {
+      console.error(`[bot-events] poller stopped：${safeErrorMessage(error, "poll failed")}`);
+    });
+  }
+
+  private async runBotEventLoop(signal: AbortSignal): Promise<void> {
+    const botUid = this.bot?.uid;
+    if (!botUid) return;
+    let cursor = this.store.getBotEventCursor(botUid);
+    while (!signal.aborted && !this.stopping) {
+      let events: BotEvent[] | null;
+      try {
+        events = await this.options.transport.fetchBotEvents({
+          afterEventId: cursor,
+          limit: BOT_EVENT_POLL_LIMIT,
+          waitSeconds: BOT_EVENT_POLL_WAIT_SECONDS,
+          signal,
+        });
+      } catch (error) {
+        if (signal.aborted || this.stopping) return;
+        console.error(`[bot-events] poll failed：${safeErrorMessage(error, "poll failed")}`);
+        await waitFor(BOT_EVENT_POLL_BACKOFF_MS, signal);
+        continue;
+      }
+      // A deployment without an event endpoint answers once and is never asked again.
+      if (events === null) return;
+      for (const event of events) {
+        if (signal.aborted || this.stopping) return;
+        const outcome = event.kind === "card_action"
+          ? await this.answerQuestionFromCard(event.action).catch((): BotEventOutcome => "retry")
+          : "ignored";
+        if (outcome === "retry") {
+          const attempts = (this.botEventAttempts.get(event.eventId) ?? 0) + 1;
+          this.botEventAttempts.set(event.eventId, attempts);
+          // Keep the cursor: the next round re-reads this event from the same place.
+          if (attempts < BOT_EVENT_MAX_ATTEMPTS) break;
+          console.error(`[bot-events] dropped event ${event.eventId} after ${attempts} attempts`);
+        }
+        try {
+          await this.options.transport.ackBotEvent(event.eventId, signal);
+        } catch (error) {
+          if (signal.aborted || this.stopping) return;
+          console.error(`[bot-events] ack failed：${safeErrorMessage(error, "ack failed")}`);
+          return;
+        }
+        this.botEventAttempts.delete(event.eventId);
+        cursor = Math.max(cursor, event.eventId);
+        try {
+          this.store.setBotEventCursor(botUid, cursor);
+        } catch {
+          console.error("[bot-events] cursor write failed");
+        }
+      }
+      if (events.length === 0) await waitFor(BOT_EVENT_POLL_IDLE_MS, signal);
+    }
+  }
+
+  /** Tracks a background operation so shutdown waits for it without blocking a caller. */
+  private operationSet(operation: Promise<void>): void {
+    this.activityOperations.add(operation);
+    void operation.finally(() => this.activityOperations.delete(operation));
   }
   private releaseTextAbortIfIdle(taskId: string): void {
     if (!this.bot) return;

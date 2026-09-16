@@ -7,7 +7,12 @@ import { WebSocket } from "ws";
 import { generateKeyPair, sharedKey } from "curve25519-js";
 import type {
   AttachmentDownload,
+  BotCardAction,
+  BotEvent,
+  BotEventFetch,
   BotIdentity,
+  CardFrame,
+  CardProfile,
   ChannelTransport,
   ChatTarget,
   GroupContext,
@@ -505,8 +510,9 @@ async function requestWithTimeout(
   label: string,
   signal: AbortSignal | undefined,
   maxBytes: number,
+  timeoutMs = HTTP_TIMEOUT_MS,
 ): Promise<HttpResult> {
-  const deadline = requestDeadline(signal, HTTP_TIMEOUT_MS);
+  const deadline = requestDeadline(signal, timeoutMs);
   try {
     const response = await fetch(url, { ...init, signal: deadline.signal });
     const body = await readBody(response, maxBytes);
@@ -1432,18 +1438,78 @@ function cardProfileCapabilities(value: unknown): ExecutionCardCapabilities | nu
     throw error;
   }
   if (limits === null) return null;
-  const enabled = (profile.enabled === true || profile.enabled === 1)
+  const displayEnabled = (profile.enabled === true || profile.enabled === 1)
     && config.card_enabled === true
-    && config.display_enabled === true
-    && config.reasoning_enabled === true;
+    && config.display_enabled === true;
+  const enabled = displayEnabled && config.reasoning_enabled === true;
+  const interactive = displayEnabled
+    && config.interaction_enabled === true
+    && profiles.includes("octo/v2");
   return {
     enabled,
+    interactive,
     profiles,
     cardVersion: typeof profile.card_version === "string" ? profile.card_version : "",
     ...(elements === undefined ? {} : { elements }),
     ...(actions === undefined ? {} : { actions }),
     ...(limits === undefined ? {} : { limits }),
   };
+}
+
+/** `octo/v2` needs the interaction switch; `octo/v1` display frames need the existing gate. */
+function cardProfileSupported(
+  capabilities: ExecutionCardCapabilities,
+  profile: CardProfile,
+): boolean {
+  if (!capabilities.profiles.includes(profile)) return false;
+  return profile === "octo/v2" ? capabilities.interactive : capabilities.enabled;
+}
+
+const BOT_EVENT_MAX_LIMIT = 100;
+/** The server clamps the hold to [0, 30]; staying below keeps a cancellation responsive. */
+const BOT_EVENT_MAX_WAIT_SECONDS = 25;
+const BOT_EVENT_TIMEOUT_MARGIN_MS = 10_000;
+
+function eventString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/** Event ids are queue counters; they arrive as JSON numbers and are compared, never computed. */
+function botEventId(value: unknown): number | null {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value;
+  if (typeof value === "string" && /^\d+$/u.test(value)) {
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+/**
+ * Parses the frozen `card_action` envelope. Anything that does not match exactly — another event
+ * type, a missing field, an unknown channel — is left to the caller as an unclassified event so
+ * it can be acknowledged instead of blocking the queue.
+ */
+function cardActionFromEvent(event: JsonRecord): BotCardAction | null {
+  if (event.event_type !== "card_action" || !isJsonRecord(event.event_data)) return null;
+  const data = event.event_data;
+  const messageId = eventString(data.message_id);
+  const channelId = eventString(data.channel_id);
+  const actionId = eventString(data.action_id);
+  const operatorUid = eventString(data.operator_uid);
+  const channelType = data.channel_type;
+  if (messageId === null || channelId === null || actionId === null || operatorUid === null) {
+    return null;
+  }
+  if (channelType !== 1 && channelType !== 2 && channelType !== 5) return null;
+  const inputs: Record<string, string> = {};
+  if (isJsonRecord(data.inputs)) {
+    for (const [key, value] of Object.entries(data.inputs)) {
+      if (typeof value === "string") inputs[key] = value;
+    }
+  }
+  return { messageId, channelId, channelType, actionId, operatorUid, inputs };
 }
 
 type CardStats = {
@@ -1490,16 +1556,35 @@ function cardWithinLimits(
 function executionCardEnvelope(
   snapshot: ExecutionSnapshot,
   capabilities: ExecutionCardCapabilities,
+  options: { cardSeq?: number; transient?: boolean } = {},
 ): JsonRecord | null {
   const built = buildExecutionCard(snapshot, capabilities);
   if (!built) return null;
+  return cardFrameEnvelope(
+    { card: built.card, plain: built.plain, profile: CARD_PROFILE },
+    capabilities,
+    options,
+  );
+}
+
+/**
+ * Builds the wire envelope every card path shares (progress and ask cards alike) and refuses
+ * frames the deployment's declared limits cannot carry.
+ */
+function cardFrameEnvelope(
+  frame: CardFrame,
+  capabilities: ExecutionCardCapabilities,
+  options: { cardSeq?: number; transient?: boolean } = {},
+): JsonRecord | null {
   const envelope: JsonRecord = {
     type: INTERACTIVE_CARD_MESSAGE_TYPE,
-    profile: CARD_PROFILE,
+    profile: frame.profile,
     card_version: CARD_VERSION,
-    card: built.card,
-    plain: built.plain,
+    card: frame.card,
+    plain: frame.plain,
   };
+  if (options.cardSeq !== undefined) envelope.card_seq = options.cardSeq;
+  if (options.transient === true) envelope.transient = true;
   return cardWithinLimits(envelope, capabilities.limits ?? {}) ? envelope : null;
 }
 
@@ -1681,15 +1766,126 @@ export class OctoTransport implements ChannelTransport {
     if (!capabilities) {
       throw new OctoError("Octo execution card profile does not support progress cards");
     }
-    const content = executionCardEnvelope(progress, capabilities);
+    const content = executionCardEnvelope(progress, capabilities, {
+      cardSeq,
+      ...(progress.state === "running" ? { transient: true } : {}),
+    });
     if (!content) {
       throw new OctoError("Octo execution card profile does not support this progress card");
     }
-    content.card_seq = cardSeq;
-    if (progress.state === "running") content.transient = true;
-    if (!cardWithinLimits(content, capabilities.limits ?? {})) {
-      throw new OctoError("Octo execution card profile does not support this progress card");
+    await this.postCardEdit(target, messageId, content, signal);
+  }
+
+  async sendCard(
+    target: ChatTarget,
+    frame: CardFrame,
+    clientMsgNo: string,
+    signal?: AbortSignal,
+  ): Promise<SendReceipt | null> {
+    validateTarget(target);
+    const capabilities = await this.cardCapabilitiesFor(signal);
+    if (!capabilities || !cardProfileSupported(capabilities, frame.profile)) return null;
+    const content = cardFrameEnvelope(frame, capabilities);
+    if (!content) return null;
+    return this.sendMessage(target, content, clientMsgNo, signal);
+  }
+
+  async editCard(
+    target: ChatTarget,
+    messageId: string,
+    frame: CardFrame,
+    cardSeq: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    validateTarget(target);
+    if (messageId.length === 0) throw new OctoError("Octo card message id is required");
+    if (!Number.isSafeInteger(cardSeq) || cardSeq <= 0) {
+      throw new OctoError("Octo card sequence must be a positive safe integer");
     }
+    const capabilities = await this.cardCapabilitiesFor(signal);
+    if (!capabilities || !cardProfileSupported(capabilities, frame.profile)) {
+      throw new OctoError("Octo card profile does not support this card");
+    }
+    const content = cardFrameEnvelope(frame, capabilities, { cardSeq });
+    if (!content) throw new OctoError("Octo card profile does not support this card");
+    await this.postCardEdit(target, messageId, content, signal);
+  }
+
+  async fetchBotEvents(fetch: BotEventFetch): Promise<BotEvent[] | null> {
+    const afterEventId = Number.isSafeInteger(fetch.afterEventId) && fetch.afterEventId > 0
+      ? fetch.afterEventId
+      : 0;
+    const limit = Math.min(Math.max(Math.trunc(fetch.limit), 1), BOT_EVENT_MAX_LIMIT);
+    const waitSeconds = Math.min(Math.max(Math.trunc(fetch.waitSeconds), 0), BOT_EVENT_MAX_WAIT_SECONDS);
+    const response = await requestWithTimeout(
+      apiUrl(this.apiBase, "/v1/bot/events"),
+      {
+        method: "POST",
+        headers: { ...authHeaders(this.botToken), "Content-Type": "application/json" },
+        body: JSON.stringify({ event_id: afterEventId, limit, wait: waitSeconds }),
+      },
+      "bot events",
+      fetch.signal,
+      MAX_HTTP_BODY_BYTES,
+      waitSeconds * 1000 + BOT_EVENT_TIMEOUT_MARGIN_MS,
+    );
+    if (response.status === 404) return null;
+    if (response.status < 200 || response.status >= 300) {
+      throw httpStatusError("bot events", response.status);
+    }
+    const value = parseJsonWithInt64(response.body, "bot events");
+    if (!isJsonRecord(value) || !Array.isArray(value.results)) {
+      throw new OctoError("Octo bot events response has invalid schema");
+    }
+    const events: BotEvent[] = [];
+    for (const entry of value.results) {
+      if (!isJsonRecord(entry)) continue;
+      const eventId = botEventId(entry.event_id);
+      if (eventId === null) continue;
+      const action = cardActionFromEvent(entry);
+      events.push(action ? { eventId, kind: "card_action", action } : { eventId, kind: "other" });
+    }
+    return events;
+  }
+
+  async ackBotEvent(eventId: number, signal?: AbortSignal): Promise<void> {
+    if (!Number.isSafeInteger(eventId) || eventId < 0) {
+      throw new OctoError("Octo bot event id must be a non-negative safe integer");
+    }
+    const response = await requestWithTimeout(
+      apiUrl(this.apiBase, `/v1/bot/events/${eventId}/ack`),
+      {
+        method: "POST",
+        headers: { ...authHeaders(this.botToken), "Content-Type": "application/json" },
+        body: "{}",
+      },
+      "bot event ack",
+      signal,
+      MAX_HTTP_BODY_BYTES,
+    );
+    if (response.status < 200 || response.status >= 300) {
+      throw httpStatusError("bot event ack", response.status);
+    }
+  }
+
+  /**
+   * Card capability snapshot. A probe that answered is reused for the life of the process; a
+   * failed probe is retried, so a transient outage cannot degrade the chat to text-only cards.
+   */
+  private async cardCapabilitiesFor(signal?: AbortSignal): Promise<ExecutionCardCapabilities | undefined> {
+    if (this.cardCapabilities) return this.cardCapabilities;
+    const capabilities = await cardProfileCapabilitiesFromApi(this.apiBase, this.botToken, signal);
+    if (capabilities) this.cardCapabilities = capabilities;
+    return capabilities ?? undefined;
+  }
+
+  /** Shared card edit path: progress and ask cards differ only in the frame they build. */
+  private async postCardEdit(
+    target: ChatTarget,
+    messageId: string,
+    content: JsonRecord,
+    signal?: AbortSignal,
+  ): Promise<void> {
     const response = await requestWithTimeout(
       apiUrl(this.apiBase, "/v1/bot/message/edit"),
       {
