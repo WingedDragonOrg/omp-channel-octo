@@ -1028,6 +1028,16 @@ class CoreService implements ChannelService {
       await this.acceptTask(message, slashPrompt);
       return;
     }
+    // A dispatched task is an explicit hand-over into this chat (see `dispatchTaskToThread`), so
+    // it always becomes its own durable task: it never answers an open question and never joins a
+    // running turn as steering — either diversion would leave the dispatch receipt ("已派发任务到
+    // 线程 …，在那边排队执行") describing something that did not happen.
+    if (message.messageId.startsWith(DISPATCH_MESSAGE_PREFIX)) {
+      const dispatchPrompt = await this.materializeInbound(message);
+      if (dispatchPrompt === null) return;
+      await this.acceptTask(message, dispatchPrompt);
+      return;
+    }
     if (await this.answerPendingQuestion(message, text)) return;
     const promptText = await this.materializeInbound(message);
     if (promptText === null) return;
@@ -1861,10 +1871,13 @@ class CoreService implements ChannelService {
 
   /**
    * `/thread <任务>`: hand the intent to the assistant instead of creating a sub-thread here. The
-   * message becomes a task carrying an instruction block, so the agent reads the intent, names
-   * the sub-thread and its workspace itself, and drives `octo_management`: a clear intent is
-   * dispatched as the work itself, an underspecified one as a request for the owner to clarify in
-   * the thread. Only groups grow threads, so DMs and threads themselves are refused.
+   * message carries an instruction block, so the agent reads the intent, names the sub-thread and
+   * its workspace itself, and drives `octo_management`: a clear intent is dispatched as the work
+   * itself, an underspecified one as a request for the owner to clarify in the thread. The body
+   * follows the chat's append mode like any other message the assistant has to read: a running
+   * turn that accepts steering gets the instruction inside that turn, otherwise it becomes a
+   * durable task (`queue` mode included) that waits behind the run. Only groups grow threads, so
+   * DMs and threads themselves are refused.
    */
   private async handleThreadCommand(message: InboundMessage, argument: string): Promise<void> {
     if (message.channelType === 5) {
@@ -1885,7 +1898,9 @@ class CoreService implements ChannelService {
     this.store.releaseClaim(this.commandClaim(message, "thread"));
     const request = await this.materializeInbound(message, intent);
     if (request === null) return;
-    await this.acceptTask(message, threadIntentPrompt(request));
+    const body = threadIntentPrompt(request);
+    if (await this.appendToRunningTask(message, body)) return;
+    await this.acceptTask(message, body);
   }
 
   private async defaultWorkDirectory(target: ChatTarget): Promise<string> {

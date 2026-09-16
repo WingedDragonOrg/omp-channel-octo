@@ -158,7 +158,7 @@ test("/thread without a task replies with usage, and DMs and threads are refused
   }
 });
 
-test("/thread queues the hand-over behind a running turn instead of steering it", async () => {
+test("queue mode keeps the hand-over behind the running turn as its own task", async () => {
   let release: (() => void) | undefined;
   let promptCount = 0;
   const harness = await createCoreHarness({
@@ -185,6 +185,14 @@ test("/thread queues the hand-over behind a running turn instead of steering it"
     );
     await harness.service.handleInbound(
       inbound({
+        messageId: "thread-busy-mode",
+        ...group,
+        text: "/mode queue",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.service.handleInbound(
+      inbound({
         messageId: "thread-busy-hold",
         ...group,
         text: "hold the group",
@@ -200,6 +208,7 @@ test("/thread queues the hand-over behind a running turn instead of steering it"
         mentionedUserIds: [harness.bot.uid],
       }),
     );
+    expect((await harness.service.status(group)).queued).toBe(1);
     release?.();
     await harness.workers.waitForPromptCount(2);
     // The hand-over waits its turn as its own task in the group's directory.

@@ -219,6 +219,55 @@ test("/queue forces a task behind the run even in steer mode", async () => {
   }
 });
 
+test("/thread joins the running turn in steer mode instead of waiting behind it", async () => {
+  const started = gate();
+  const harness = await createCoreHarness({
+    prompt: async ({ append, onStop, text, waitForAppend }) => {
+      if (text !== "hold the group") return;
+      started.release();
+      // A run that is stopped before the hand-over arrives records that nothing joined it, so a
+      // missing steer fails on the log instead of hanging on `waitForAppend`.
+      const appended = await Promise.race([
+        waitForAppend(),
+        new Promise<{ text: string }>((resolve) => onStop(() => resolve({ text: "closed" }))),
+      ]);
+      await append(
+        "thread-steer.log",
+        `joined:${appended.text.includes("原始意图")}:${appended.text.includes("thread-dispatch")}\n`,
+      );
+    },
+  });
+  try {
+    const group = { channelId: "group-allowed", channelType: 2 as const };
+    const running = harness.service.handleInbound(
+      inbound({
+        messageId: "thread-steer-hold",
+        ...group,
+        text: "hold the group",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await started.promise;
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "thread-steer-late",
+        ...group,
+        text: "/thread 把样式调一调",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+
+    // The hand-over instruction reached the running turn; it did not become a second task.
+    expect((await harness.service.status(group)).queued).toBe(0);
+    await waitForStatus(harness.service, group, (status) => status.state === "completed");
+    expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["hold the group"]);
+    expect(await readText(join(harness.root, "tmp", "thread-steer.log"))).toBe("joined:true:true\n");
+    await running;
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
 test("a refused steer falls back to a durable task instead of dropping the message", async () => {
   const started = gate();
   const release = gate();

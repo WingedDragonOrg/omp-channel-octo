@@ -538,6 +538,153 @@ test("thread dispatch queues the task in the target thread and reports it in bot
   }
 });
 
+test("a dispatch into a busy thread waits there as its own task", async () => {
+  const threadStarted = Promise.withResolvers<void>();
+  const threadRelease = Promise.withResolvers<void>();
+  const harness = await createCoreHarness({
+    prompt: async ({ append, onStop, promptContext, text }) => {
+      if (text === "hold the thread") {
+        threadStarted.resolve();
+        onStop(() => threadRelease.resolve());
+        const ask = (promptContext?.tools ?? []).find(({ name }) => name === "ask");
+        if (!ask) throw new Error("ask tool missing");
+        const asked = ask.execute(
+          { questions: [{ question: "先确认哪一批能力？" }] },
+          new AbortController().signal,
+        );
+        const appended = await Promise.race([
+          threadRelease.promise.then(() => ({ text: "closed" })),
+          asked.then(() => ({ text: "answered" })),
+        ]);
+        await append("busy.log", `hold:${appended.text}\n`);
+        await threadRelease.promise;
+        return;
+      }
+      await append("busy.log", `task:${text}\n`);
+    },
+  });
+  try {
+    const groupCwd = join(harness.root, "group cwd");
+    const threadCwd = join(harness.root, "thread cwd");
+    await mkdir(groupCwd, { recursive: true });
+    await mkdir(threadCwd, { recursive: true });
+    harness.transport.setThreads("group-tools", [threadRecord("topic-7")]);
+    await harness.service.handleInbound(
+      inbound({ messageId: "busy-group-bind", ...GROUP_TOOLS, text: `/new ${groupCwd}`, mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.service.handleInbound(
+      inbound({ messageId: "busy-thread-bind", ...THREAD_TOOLS, text: `/new ${threadCwd}`, mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.service.handleInbound(
+      inbound({ messageId: "busy-thread-hold", ...THREAD_TOOLS, text: "hold the thread", mentionedUserIds: [harness.bot.uid] }),
+    );
+    await threadStarted.promise;
+    await harness.workers.waitForPromptCount(1);
+    // The thread is mid-turn with an open question, so its own dispatch must not disturb it.
+    expect((await harness.service.status(THREAD_TOOLS)).pendingQuestionIds).toHaveLength(1);
+
+    await harness.service.handleInbound(
+      inbound({ messageId: "busy-group-work", ...GROUP_TOOLS, text: "handoff into the busy topic", mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.workers.waitForPromptCount(2);
+    const management = (harness.workers.prompts[1]?.promptContext?.tools ?? []).find(
+      ({ name }) => name === "octo_management",
+    );
+    if (!management) throw new Error("management tool missing");
+    const dispatched = JSON.parse(
+      await management.execute(
+        { action: "thread-dispatch", short_id: "topic-7", text: "第二件事" },
+        new AbortController().signal,
+      ),
+    ) as { dispatched: boolean; message_id: string };
+
+    // The hand-over is its own queued task in the target thread: the running turn keeps its open
+    // question (the dispatch is not an answer) and never receives the dispatch as steering.
+    expect(dispatched.dispatched).toBe(true);
+    expect(dispatched.message_id.startsWith("dispatch:")).toBe(true);
+    const threadStatus = await harness.service.status(THREAD_TOOLS);
+    expect(threadStatus.pendingQuestionIds).toHaveLength(1);
+    expect(threadStatus.queued).toBe(1);
+    expect(harness.workers.prompts.map(({ text }) => text)).toEqual([
+      "hold the thread",
+      "handoff into the busy topic",
+    ]);
+    expect(await readText(join(threadCwd, "busy.log"))).toBe("");
+    expect(
+      harness.transport.sent.some(({ text }) => text.includes("已派发任务到线程 topic-7")),
+    ).toBe(true);
+    expect(
+      harness.transport.sent.some(({ text }) => text.startsWith("来自群会话的派发任务")),
+    ).toBe(true);
+  } finally {
+    threadRelease.resolve();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a dispatch into a running thread does not join that turn", async () => {
+  const threadStarted = Promise.withResolvers<void>();
+  const threadRelease = Promise.withResolvers<void>();
+  const harness = await createCoreHarness({
+    prompt: async ({ append, onStop, promptContext, text, waitForAppend }) => {
+      if (text === "hold the thread") {
+        threadStarted.resolve();
+        onStop(() => threadRelease.resolve());
+        const joined = await Promise.race([
+          waitForAppend().then((appended) => `steered:${appended.text}`),
+          threadRelease.promise.then(() => "closed"),
+        ]);
+        await append("steer.log", `${joined}\n`);
+        await threadRelease.promise;
+        return;
+      }
+      await append("steer.log", `task:${text}\n`);
+    },
+  });
+  try {
+    const groupCwd = join(harness.root, "group cwd");
+    const threadCwd = join(harness.root, "thread cwd");
+    await mkdir(groupCwd, { recursive: true });
+    await mkdir(threadCwd, { recursive: true });
+    harness.transport.setThreads("group-tools", [threadRecord("topic-7")]);
+    await harness.service.handleInbound(
+      inbound({ messageId: "steer-group-bind", ...GROUP_TOOLS, text: `/new ${groupCwd}`, mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.service.handleInbound(
+      inbound({ messageId: "steer-thread-bind", ...THREAD_TOOLS, text: `/new ${threadCwd}`, mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.service.handleInbound(
+      inbound({ messageId: "steer-thread-hold", ...THREAD_TOOLS, text: "hold the thread", mentionedUserIds: [harness.bot.uid] }),
+    );
+    await threadStarted.promise;
+    await harness.workers.waitForPromptCount(1);
+
+    await harness.service.handleInbound(
+      inbound({ messageId: "steer-group-work", ...GROUP_TOOLS, text: "handoff into the running topic", mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.workers.waitForPromptCount(2);
+    const management = (harness.workers.prompts[1]?.promptContext?.tools ?? []).find(
+      ({ name }) => name === "octo_management",
+    );
+    if (!management) throw new Error("management tool missing");
+    await management.execute(
+      { action: "thread-dispatch", short_id: "topic-7", text: "第二件事" },
+      new AbortController().signal,
+    );
+
+    // The dispatched work waits in the target thread instead of joining its running turn.
+    expect((await harness.service.status(THREAD_TOOLS)).queued).toBe(1);
+    threadRelease.resolve();
+    await harness.workers.waitForPromptCount(3);
+    await waitForStatus(harness.service, THREAD_TOOLS, (status) => status.state === "completed");
+    expect(harness.workers.prompts[2]?.text).toBe("第二件事");
+    expect(await readText(join(threadCwd, "steer.log"))).toBe("closed\ntask:第二件事\n");
+  } finally {
+    threadRelease.resolve();
+    await closeCoreHarness(harness);
+  }
+});
+
 test("create-thread worktree_name binds the new thread to a workspace of its own", async () => {
   const harness = await createCoreHarness({
     prompt: async ({ append, promptContext }) => {
