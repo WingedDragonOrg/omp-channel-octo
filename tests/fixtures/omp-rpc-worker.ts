@@ -912,9 +912,21 @@ function handleCommand(command: Frame): void {
 			return;
 		}
 		response(id, type);
-		if (promptTimer) clearTimeout(promptTimer);
+		clearTimeout(promptTimer);
 		promptTimer = undefined;
 		const steered = typeof command.message === "string" ? command.message : "";
+		// Mirrors OMP: the queue drains at the next injection boundary, the message enters the
+		// transcript, and only then does the model turn run.
+		const steerMessage = {
+			role: "user",
+			content: [{ type: "text", text: steered }],
+			steering: true,
+			attribution: "user",
+			timestamp: Date.now(),
+		};
+		emit({ type: "turn_start", turnIndex: 1, timestamp: Date.now() });
+		emit({ type: "message_start", message: steerMessage });
+		emit({ type: "message_end", message: steerMessage });
 		emitAssistantMessage(`fixture steered turn: ${steered}`, 2, true);
 		emit({ type: "agent_end", messages: [], willContinue: false });
 		streaming = false;

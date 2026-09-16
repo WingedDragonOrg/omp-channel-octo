@@ -870,12 +870,21 @@ function asAssistantMessageKey(message: RpcFrame): string | undefined {
 	return typeof id === "string" && id.length > 0 ? id : undefined;
 }
 
-function assistantText(message: RpcFrame): string {
+/** Text blocks of one message frame; image and other blocks are skipped. */
+function messageText(message: RpcFrame): string {
 	if (!Array.isArray(message.content)) return "";
 	return message.content
 		.filter(item => isRecord(item) && item.type === "text" && typeof item.text === "string")
 		.map(item => (item as RpcFrame).text as string)
 		.join("");
+}
+
+/**
+ * A steering frame is a user-attributed message marked `steering: true`. The IRC bridge steers
+ * its own user-role frames with `attribution: "agent"`, so those stay unreported.
+ */
+function isUserSteerMessage(value: unknown): value is RpcFrame {
+	return isRecord(value) && value.role === "user" && value.steering === true && value.attribution !== "agent";
 }
 
 function emitExecutionEvent(active: PromptRun, event: ExecutionEvent): void {
@@ -1549,6 +1558,10 @@ class RpcWorker implements OmpWorker {
 		try {
 			if (frame.type === "message_start") {
 				const message = frame.message;
+				if (isUserSteerMessage(message)) {
+					active.onEvent({ type: "steer_consumed", text: messageText(message), atMs: eventTime(frame.timestamp) });
+					return;
+				}
 				if (isRecord(message) && message.role === "assistant") {
 					const key = asAssistantMessageKey(message);
 					if (!(key && active.completedAssistantMessageKeys.has(key))) ensureAssistantMessage(active, message);
@@ -1585,7 +1598,7 @@ class RpcWorker implements OmpWorker {
 				if (active.assistantMessageEnded && (!key || active.assistantMessageKey === key)) return;
 				const messageId = ensureAssistantMessage(active, message);
 				if (!messageId || active.assistantMessageEnded || active.completedAssistantMessageIds.has(messageId)) return;
-				const text = assistantText(message);
+				const text = messageText(message);
 				active.assistantMessageText = text;
 				active.assistantMessageEnded = true;
 				active.completedAssistantMessageIds.add(messageId);

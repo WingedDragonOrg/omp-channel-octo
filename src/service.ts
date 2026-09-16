@@ -39,6 +39,7 @@ import type {
   OmpWorker,
   WorkerEvent,
   TextEvent,
+  SteerConsumedEvent,
   ProgressCard,
   ThreadSummary,
   WorkerOptions,
@@ -150,6 +151,10 @@ const TYPING_RENEW_MS = 3_000;
 const ACTIVITY_REQUEST_TIMEOUT_MS = 2_000;
 /** Recovery attempts for a card left by a previous process before the row is dropped. */
 const PROGRESS_CARD_RECOVERY_ATTEMPTS = 3;
+/** Steered messages tracked for the consumption receipt; older entries fall out of observation. */
+const MAX_PENDING_STEERS = 32;
+/** Characters of the triggering message shown in a start/consumption receipt. */
+const RECEIPT_EXCERPT_CHARS = 20;
 const GROUP_HISTORY_FETCH_TIMEOUT_MS = 10_000;
 /** How long one 免@ decision is reused before the group switch is consulted again. */
 const MENTION_PREF_TTL_MS = 60_000;
@@ -199,6 +204,8 @@ type RuntimeTask = {
   interruptRequested: boolean;
   /** Set when the run produced events after `/interrupt`, i.e. the queued work really continued. */
   workAfterInterrupt: boolean;
+  /** Steered messages not yet observed as consumed, in delivery order (OMP's queue is FIFO). */
+  steerDeliveries: { text: string }[];
   stopActivity?: (abortProgress?: boolean) => void;
   stopText?: () => void;
   /** Closes the progress card of the round that just ended; a steered message starts a new round. */
@@ -316,6 +323,16 @@ function isGroupTarget(target: ChatTarget): boolean {
 
 function truncateForTool(value: string, maxChars: number): string {
   return value.length > maxChars ? `${value.slice(0, maxChars)}…` : value;
+}
+
+/** Single-line, bounded excerpt of the triggering message for a start/consumption receipt. */
+function receiptText(prefix: string, text: string): string {
+  const excerpt = text.replaceAll(/\s+/gu, " ").trim();
+  if (excerpt.length === 0) return `${prefix}。`;
+  const bounded = excerpt.length > RECEIPT_EXCERPT_CHARS
+    ? `${excerpt.slice(0, RECEIPT_EXCERPT_CHARS)}…`
+    : excerpt;
+  return `${prefix} ▸ ${bounded}`;
 }
 
 /**
@@ -695,6 +712,12 @@ class CoreService implements ChannelService {
   private readonly taskOperations = new Set<Promise<void>>();
   private readonly chatTails = new Map<string, Promise<void>>();
   private readonly scheduledTasks = new Map<string, Promise<void>>();
+  /**
+   * Tasks accepted while their chat or directory was already busy. They get one start receipt
+   * when they finally begin, so a message that waited is distinguishable from one that started
+   * right away. In-memory only: a restart interrupts such tasks instead of starting them.
+   */
+  private readonly queuedBehind = new Set<string>();
   private readonly directoryTails = new Map<string, Promise<void>>();
   private readonly runtimes = new Map<string, RuntimeTask>();
   private readonly questionWaiters = new Map<string, QuestionWaiter>();
@@ -1557,14 +1580,37 @@ class CoreService implements ChannelService {
   private async deliverSteer(target: ChatTarget, text: string): Promise<boolean> {
     const runtime = this.runningRuntime(target);
     if (!runtime?.worker) return false;
+    // Recorded before the request so the delivery order matches the RPC command order even when
+    // two appends race; a refused frame removes its own entry.
+    const delivery = { text };
+    runtime.steerDeliveries.push(delivery);
+    if (runtime.steerDeliveries.length > MAX_PENDING_STEERS) runtime.steerDeliveries.shift();
     try {
       await runtime.worker.steer(text);
       // The message starts a new round: its progress belongs below the message, not above it.
       runtime.rollProgressCard?.();
       return true;
     } catch {
+      const index = runtime.steerDeliveries.indexOf(delivery);
+      if (index >= 0) runtime.steerDeliveries.splice(index, 1);
       return false;
     }
+  }
+
+  /**
+   * A steered message left OMP's queue and joined the running turn's context. The queue is FIFO
+   * and this channel is its only user-attributed producer, so the consumption follows the
+   * delivery order; a mismatch is worth a log line but never changes the answer already sent.
+   */
+  private noteSteerConsumed(runtime: RuntimeTask, event: SteerConsumedEvent): void {
+    const delivered = runtime.steerDeliveries.shift();
+    if (delivered === undefined) {
+      console.error(`[steer] 消费事件没有对应投递 task=${runtime.taskId}`);
+    } else if (delivered.text !== event.text) {
+      console.error(`[steer] 消费顺序与投递不一致 task=${runtime.taskId}`);
+    }
+    console.error(`[steer] 已并入当前回合 task=${runtime.taskId} chars=${event.text.length}`);
+    this.enqueueText(runtime.target, receiptText("已并入当前回合", event.text), null);
   }
 
   /**
@@ -2041,6 +2087,7 @@ class CoreService implements ChannelService {
 
   private async handleCancel(target: ChatTarget): Promise<void> {
     const queued = this.store.cancelQueued(this.bot!.uid, target);
+    for (const taskId of queued) this.queuedBehind.delete(taskId);
     const openQuestions = this.store.listPendingQuestions(this.bot!.uid, target);
     this.store.cancelQuestions(this.bot!.uid, target);
     for (const question of openQuestions) {
@@ -2245,15 +2292,28 @@ class CoreService implements ChannelService {
       historyEligible: historyEligible && !isCommand(text),
     };
     let accepted: boolean;
+    // Measured before acceptance so the new task's own row cannot count itself as the work it waits for.
+    const startsBehind = this.hasBlockingWork(message, task.cwd);
     try {
       accepted = this.store.acceptTask(this.taskClaim(message), task);
     } catch {
       throw new Error("本地状态盘写入失败，任务未接收。");
     }
     if (!accepted) return false;
+    if (startsBehind) this.queuedBehind.add(task.id);
     this.scheduleTask(task.id);
     this.flushTarget(message);
     return true;
+  }
+
+  /** True when a new task on this chat cannot start at once: the chat or its directory is busy. */
+  private hasBlockingWork(target: ChatTarget, cwd: string): boolean {
+    if (this.chatTails.has(targetKey(target))) return true;
+    if (this.store.listQueuedTasks().some((queued) => queued.cwd === cwd)) return true;
+    for (const runtime of this.runtimes.values()) {
+      if (runtime.cwd === cwd) return true;
+    }
+    return false;
   }
   private scheduleTask(taskId: string): void {
     const task = this.store.getTask(taskId);
@@ -2371,6 +2431,7 @@ class CoreService implements ChannelService {
       }
       const task = this.store.getTask(taskId);
       if (!task || task.state !== "queued") return;
+      this.queuedBehind.delete(taskId);
       this.store.markFailed(taskId, "绑定目录在启动前持续变更，任务未启动。");
       await this.enqueueText(taskTarget(task), genericTaskFailure(false), taskId);
     } finally {
@@ -2389,16 +2450,21 @@ class CoreService implements ChannelService {
       ? { ...persistedTask, cwd: bindingAtStart.cwd, sessionId: bindingAtStart.sessionId }
       : persistedTask;
     if (lockedCwd !== undefined && task.cwd !== lockedCwd) {
+      this.queuedBehind.delete(taskId);
       this.store.markFailed(taskId, "绑定目录在启动前再次变更，任务未启动。");
       await this.enqueueText(taskTarget(task), genericTaskFailure(false), taskId);
       return;
     }
     if (this.blockedDirectories.has(task.cwd)) {
+      this.queuedBehind.delete(taskId);
       this.store.markFailed(taskId, "directory remains blocked by an unconfirmed worker");
       await this.enqueueText(taskTarget(task), genericTaskFailure(false), taskId);
       return;
     }
     if (!this.store.markStarted(taskId)) return;
+    if (this.queuedBehind.delete(taskId)) {
+      this.enqueueText(taskTarget(task), receiptText("开始执行排队消息", task.text), null);
+    }
     const runtime: RuntimeTask = {
       taskId,
       target: taskTarget(task),
@@ -2408,6 +2474,7 @@ class CoreService implements ChannelService {
       promptInFlight: false,
       interruptRequested: false,
       workAfterInterrupt: false,
+      steerDeliveries: [],
     };
     this.runtimes.set(taskId, runtime);
     let worker: OmpWorker | undefined;
@@ -2810,6 +2877,10 @@ class CoreService implements ChannelService {
           if (event.messageId.trim().length === 0 || (event.text.length === 0 && !event.final)) return;
           assistantTexts.set(event.messageId, event.text);
           this.enqueueStreamText(target, task.id, event);
+          return;
+        }
+        if (event.type === "steer_consumed") {
+          this.noteSteerConsumed(runtime, event);
           return;
         }
         trackProgress(event, progressRound.tracker.apply(event));

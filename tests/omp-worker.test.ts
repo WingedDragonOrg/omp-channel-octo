@@ -293,6 +293,11 @@ describe("OMP RPC worker", () => {
 				.filter((event): event is Extract<WorkerEvent, { type: "text" }> => event.type === "text" && event.final)
 				.map(event => event.text);
 			expect(finals).toEqual(["fixture first turn", "fixture steered turn: also check the logs"]);
+			const consumed = events.filter(
+				(event): event is Extract<WorkerEvent, { type: "steer_consumed" }> => event.type === "steer_consumed",
+			);
+			expect(consumed).toHaveLength(1);
+			expect(consumed[0]?.text).toBe("also check the logs");
 			const steered = (await readLog(harness.logPath)).filter(entry => entry.kind === "steer");
 			expect(steered).toHaveLength(1);
 			expect(steered[0]?.message).toBe("also check the logs");
@@ -399,6 +404,8 @@ describe("OMP RPC worker", () => {
 			expect(textEvents.some(event => event.text.includes("SECRET_TOOL_RESULT"))).toBe(false);
 			expect(textEvents.some(event => event.text.includes("turn_start"))).toBe(false);
 			expect(textEvents.some(event => event.text.includes("turn_end"))).toBe(false);
+			// A user message the host did not steer into the queue is not a steering receipt.
+			expect(events.some(event => event.type === "steer_consumed")).toBe(false);
 		});
 	});
 	test("emits an assistant message_end body even when no text delta arrived", async () => {

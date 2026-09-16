@@ -310,7 +310,18 @@ export interface TextEvent {
   final: boolean;
 }
 
-export type WorkerEvent = TextEvent | ExecutionEvent;
+/**
+ * A user-attributed steering message left OMP's steering queue and joined the running turn's
+ * context, so the next provider call carries it. The queue is FIFO, so consumption follows the
+ * order the messages were delivered in.
+ */
+export interface SteerConsumedEvent {
+  type: "steer_consumed";
+  text: string;
+  atMs: number;
+}
+
+export type WorkerEvent = TextEvent | ExecutionEvent | SteerConsumedEvent;
 
 export interface WorkerProcess {
   pid: number;

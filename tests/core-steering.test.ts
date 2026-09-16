@@ -88,6 +88,41 @@ test("a message during a run steers that turn instead of becoming a task", async
   }
 });
 
+test("a steered message reports the moment it joins the running turn", async () => {
+  const started = gate();
+  const harness = await createCoreHarness({
+    prompt: async ({ emit, text, waitForAppend }) => {
+      if (text !== "first task") return;
+      started.release();
+      const appended = await waitForAppend();
+      emit({ type: "steer_consumed", text: appended.text, atMs: Date.now() });
+    },
+  });
+  try {
+    const target = { channelId: "dm-steer-receipt", channelType: 1 as const };
+    await harness.service.handleInbound(
+      inbound({ messageId: "receipt-bind", ...target, text: "/new" }),
+    );
+    const first = harness.service.handleInbound(
+      inbound({ messageId: "receipt-first", ...target, text: "first task" }),
+    );
+    await started.promise;
+    await harness.service.handleInbound(
+      inbound({ messageId: "receipt-second", ...target, text: "second note with a longer body" }),
+    );
+    await first;
+    await waitForStatus(harness.service, target, (next) => next.state === "completed");
+
+    expect(
+      harness.transport.sent
+        .map(({ text }) => text)
+        .filter((text) => text.startsWith("已并入当前回合")),
+    ).toEqual(["已并入当前回合 ▸ second note with a l…"]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
 test("queue mode turns a message during a run into a task that follows it", async () => {
   const started = gate();
   const release = gate();
@@ -124,6 +159,12 @@ test("queue mode turns a message during a run into a task that follows it", asyn
     await harness.workers.waitForPromptCount(2);
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["hold", "second task"]);
     expect(await readText(join(harness.root, "tmp", "queue.log"))).toBe("start:hold\n");
+    // The message that waited for the run gets one start receipt; the immediate one gets none.
+    expect(
+      harness.transport.sent
+        .map(({ text }) => text)
+        .filter((text) => text.startsWith("开始执行排队消息")),
+    ).toEqual(["开始执行排队消息 ▸ second task"]);
   } finally {
     release.release();
     await closeCoreHarness(harness);
