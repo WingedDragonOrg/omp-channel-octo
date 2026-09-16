@@ -212,7 +212,8 @@ test("management actions reject bad arguments, bound listings, and surface trans
         { action: "no-such-action" },
         { action: "group-update" },
         { action: "create-thread" },
-        { action: "create-thread", name: "isolate type check", isolate: "yes" },
+        { action: "create-thread", name: "worktree type check", worktree_name: 7 },
+        { action: "create-thread", name: "worktree slug check", worktree_name: "修复登录" },
         { action: "thread-info" },
         { action: "description-write" },
       ]) {
@@ -274,7 +275,8 @@ test("management actions reject bad arguments, bound listings, and surface trans
     expect(log).toContain("unknown action: no-such-action");
     expect(log).toContain("name or notice is required");
     expect(log).toContain("name is required");
-    expect(log).toContain("isolate must be a boolean");
+    expect(log).toContain("worktree_name must be a string");
+    expect(log).toContain("worktree_name must contain ASCII letters or digits");
     expect(log).toContain("short_id is required when the chat itself is not a thread");
     expect(log).toContain("content is required");
     expect(log).toContain("201/200/true");
@@ -366,20 +368,20 @@ test("thread dispatch queues the task in the target thread and reports it in bot
   }
 });
 
-test("create-thread isolate binds the new thread to a workspace of its own", async () => {
+test("create-thread worktree_name binds the new thread to a workspace of its own", async () => {
   const harness = await createCoreHarness({
     prompt: async ({ append, promptContext }) => {
       const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
       if (!management) throw new Error("management tool missing");
       const created = JSON.parse(
         await management.execute(
-          { action: "create-thread", name: "isolated work", isolate: true },
+          { action: "create-thread", name: "独立线程", worktree_name: "owl-workspace" },
           new AbortController().signal,
         ),
-      ) as { short_id: string; worktree?: { path: string; branch: string }; isolate_error?: string };
+      ) as { short_id: string; worktree?: { path: string; branch: string }; worktree_error?: string };
       await append(
-        "isolate.log",
-        `${created.short_id}|${created.worktree?.path ?? "none"}|${created.worktree?.branch ?? "none"}|${created.isolate_error ?? "none"}\n`,
+        "worktree.log",
+        `${created.short_id}|${created.worktree?.path ?? "none"}|${created.worktree?.branch ?? "none"}|${created.worktree_error ?? "none"}\n`,
       );
     },
   });
@@ -404,9 +406,9 @@ test("create-thread isolate binds the new thread to a workspace of its own", asy
 
     const workspace = join(harness.root, "worktrees", "thread-1");
     expect(worktrees.requests).toEqual([
-      { baseDir: cwd, label: "isolated work", threadId: "thread-1" },
+      { baseDir: cwd, label: "owl-workspace", threadId: "thread-1" },
     ]);
-    expect(await readText(join(cwd, "isolate.log"))).toBe(
+    expect(await readText(join(cwd, "worktree.log"))).toBe(
       `thread-1|${workspace}|thread-1|none\n`,
     );
 
@@ -428,20 +430,20 @@ test("create-thread isolate binds the new thread to a workspace of its own", asy
   }
 });
 
-test("create-thread isolate reports a workspace failure while keeping the thread usable", async () => {
+test("create-thread worktree_name reports a workspace failure while keeping the thread usable", async () => {
   const harness = await createCoreHarness({
     prompt: async ({ append, promptContext }) => {
       const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
       if (!management) throw new Error("management tool missing");
       const created = JSON.parse(
         await management.execute(
-          { action: "create-thread", name: "no workspace", isolate: true },
+          { action: "create-thread", name: "no workspace", worktree_name: "broken-workspace" },
           new AbortController().signal,
         ),
-      ) as { short_id: string; worktree?: { path: string }; isolate_error?: string };
+      ) as { short_id: string; worktree?: { path: string }; worktree_error?: string };
       await append(
-        "isolate.log",
-        `${created.short_id}|${created.worktree ? "worktree" : "none"}|${created.isolate_error ?? "none"}\n`,
+        "worktree.log",
+        `${created.short_id}|${created.worktree ? "worktree" : "none"}|${created.worktree_error ?? "none"}\n`,
       );
     },
   });
@@ -464,7 +466,7 @@ test("create-thread isolate reports a workspace failure while keeping the thread
     );
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
-    expect(await readText(join(cwd, "isolate.log"))).toBe(
+    expect(await readText(join(cwd, "worktree.log"))).toBe(
       "thread-1|none|目录不是 git 仓库，无法创建隔离工作区：/fixture/non-repo\n",
     );
 

@@ -55,9 +55,6 @@ test("worktreeCandidates prefer the thread name and keep the thread id as fallba
     { path: "/repo.fix-login", branch: "fix-login" },
     { path: "/repo.fix-login-123456789012345", branch: "fix-login-123456789012345" },
   ]);
-  expect(worktreeCandidates("/repo", "", "123456789012345")).toEqual([
-    { path: "/repo.123456789012345", branch: "123456789012345" },
-  ]);
 });
 
 test("creates a sibling worktree and steps aside when the name is taken", async () => {
@@ -92,13 +89,10 @@ test("creates a sibling worktree and steps aside when the name is taken", async 
       branch: "occupied-222333444555666",
     });
 
-    // Non-ASCII names have no slug at all and use the thread id directly.
+    // Non-ASCII names cannot name a workspace, so they are refused instead of renamed.
     await expect(
       port.create({ baseDir: repo, label: "修复登录", threadId: "987654321098765" }),
-    ).resolves.toEqual({
-      cwd: join(root, "project.987654321098765"),
-      branch: "987654321098765",
-    });
+    ).rejects.toThrow(/ASCII/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

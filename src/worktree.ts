@@ -27,9 +27,9 @@ export interface OmpWorktreePortOptions {
 }
 
 /**
- * ASCII slug used for the worktree directory and branch. Thread names without usable ASCII
- * characters (for example Chinese names) yield an empty slug, and the caller falls back to the
- * numeric thread id, which is also what keeps repeated names apart.
+ * ASCII slug used for the worktree directory and branch. Names without usable ASCII characters
+ * (for example Chinese names) yield an empty slug; `octo_management` rejects that up front so a
+ * workspace always carries the name the caller gave it.
  */
 export function worktreeSlug(label: string): string {
   return label
@@ -39,15 +39,16 @@ export function worktreeSlug(label: string): string {
     .replace(/^-+|-+$/gu, "");
 }
 
-/** Workspace locations to try, most readable first; the first free candidate wins. */
+/**
+ * Workspace locations to try, most readable first; the first free candidate wins. `slug` must be
+ * a non-empty `worktreeSlug` result: a name that carries no ASCII letters or digits cannot name a
+ * workspace, and callers reject it before reaching this point.
+ */
 export function worktreeCandidates(
   repoRoot: string,
   slug: string,
   threadId: string,
 ): WorktreeCandidate[] {
-  if (slug.length === 0) {
-    return [{ path: `${repoRoot}.${threadId}`, branch: threadId }];
-  }
   return [
     { path: `${repoRoot}.${slug}`, branch: slug },
     { path: `${repoRoot}.${slug}-${threadId}`, branch: `${slug}-${threadId}` },
@@ -104,6 +105,10 @@ export function createOmpWorktreePort(options: OmpWorktreePortOptions): Worktree
       if (signal?.aborted === true) {
         throw new Error(`创建隔离工作区已取消：${request.baseDir}`);
       }
+      const slug = worktreeSlug(request.label);
+      if (slug.length === 0) {
+        throw new Error(`worktree 名称必须包含 ASCII 字母或数字：${request.label}`);
+      }
       const root = await runCommand(
         ["git", "-C", request.baseDir, "rev-parse", "--show-toplevel"],
         timeoutMs,
@@ -123,11 +128,7 @@ export function createOmpWorktreePort(options: OmpWorktreePortOptions): Worktree
       }
       const taken = new Set(branches.stdout.split("\n").map((line) => line.trim()));
       let candidate: WorktreeCandidate | undefined;
-      for (const entry of worktreeCandidates(
-        repoRoot,
-        worktreeSlug(request.label),
-        request.threadId,
-      )) {
+      for (const entry of worktreeCandidates(repoRoot, slug, request.threadId)) {
         if (taken.has(entry.branch)) continue;
         const occupied = await stat(entry.path).then(
           () => true,
@@ -138,9 +139,7 @@ export function createOmpWorktreePort(options: OmpWorktreePortOptions): Worktree
         break;
       }
       if (!candidate) {
-        throw new Error(
-          `无法为线程分配隔离工作区目录：${repoRoot}.${worktreeSlug(request.label) || request.threadId} 已被占用`,
-        );
+        throw new Error(`无法为线程分配隔离工作区目录：${repoRoot}.${slug} 已被占用`);
       }
       const created = await runCommand(
         [

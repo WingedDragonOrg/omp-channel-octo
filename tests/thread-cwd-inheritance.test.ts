@@ -90,7 +90,7 @@ function createIsolationHarness(): Promise<CoreHarness> {
       const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
       if (!management) throw new Error("expected octo_management in a group prompt");
       await management.execute(
-        { action: "create-thread", name: "isolated case", isolate: true },
+        { action: "create-thread", name: "isolated case", worktree_name: "isolated-case" },
         new AbortController().signal,
       );
     },
@@ -349,7 +349,7 @@ test("C11 an isolated thread keeps its pinned workspace when the parent switches
     await deliver(harness, GROUP, "c11-parent-new-a", `/new ${dirA}`);
     const isolated = await isolateThread(harness);
     expect(harness.worktrees?.requests).toEqual([
-      { baseDir: dirA, label: "isolated case", threadId: isolated.threadId },
+      { baseDir: dirA, label: "isolated-case", threadId: isolated.threadId },
     ]);
 
     const dirB = await createWorkDirectory(harness, "dirB");

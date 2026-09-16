@@ -84,6 +84,7 @@ import {
   openChannelStore,
 } from "./store.ts";
 import { threadParentGroupId } from "./thread-target.ts";
+import { worktreeSlug } from "./worktree.ts";
 
 const MAX_TEXT_BYTES = 3_000;
 const ATTACHMENTS_DISABLED_TEXT = "附件接收已关闭，未接收任务。";
@@ -157,6 +158,7 @@ const MAX_MANAGEMENT_NAME_CHARS = 200;
 const MAX_MANAGEMENT_NOTICE_CHARS = 2_000;
 const MAX_MANAGEMENT_TASK_CHARS = 4_000;
 const MAX_MANAGEMENT_ERROR_CHARS = 200;
+const MAX_MANAGEMENT_WORKTREE_NAME_CHARS = 100;
 type RuntimeTask = {
   taskId: string;
   target: ChatTarget;
@@ -2725,7 +2727,7 @@ class CoreService implements ChannelService {
     const managementTool: HostTool = {
       name: "octo_management",
       description:
-        "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；create-thread 可带 isolate 为线程建立独立 git worktree 并把线程目录绑定到它；thread-dispatch 把一条任务派发给本群的某个 thread（在那边排队执行，本群收到回执），派发出去的任务不能再派发。目标固定为当前聊天，不能指向其他群。",
+        "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；create-thread 可带 worktree_name 为线程建立独立 git worktree 并把线程目录绑定到它；thread-dispatch 把一条任务派发给本群的某个 thread（在那边排队执行，本群收到回执），派发出去的任务不能再派发。目标固定为当前聊天，不能指向其他群。",
       parameters: {
         type: "object",
         properties: {
@@ -2739,10 +2741,10 @@ class CoreService implements ChannelService {
           notice: { type: "string", description: "group-update 的新群公告。" },
           content: { type: "string", description: "description-write 的共享说明正文。" },
           text: { type: "string", description: "thread-dispatch 要派发的任务正文。" },
-          isolate: {
-            type: "boolean",
+          worktree_name: {
+            type: "string",
             description:
-              "create-thread：在调用方当前目录所属仓库旁建立 git worktree 并把新线程绑定过去，线程任务因而有独立工作区；返回 worktree 路径与分支，失败时返回 isolate_error。",
+              "create-thread：给出名称即为新线程建立独立 git worktree（建在调用方当前目录所属仓库旁，目录 <仓库名>.<名称>，如 omp-channel-octo.fix-login），并把线程目录绑定过去；名称需包含 ASCII 字母或数字（如 fix-login）。成功返回 worktree 路径与分支，失败返回 worktree_error。省略则线程按默认目录继承。",
           },
         },
         required: ["action"],
@@ -2845,10 +2847,17 @@ class CoreService implements ChannelService {
       if (value.length > maxChars) throw new Error(`${field} must be at most ${maxChars} characters`);
       return value;
     };
-    const optionalBoolean = (field: string): boolean | undefined => {
-      const value = args[field];
-      if (value === undefined) return undefined;
-      if (typeof value !== "boolean") throw new Error(`${field} must be a boolean`);
+    const worktreeName = (): string | undefined => {
+      const value = optionalText("worktree_name")?.trim();
+      if (value === undefined || value.length === 0) return undefined;
+      if (value.length > MAX_MANAGEMENT_WORKTREE_NAME_CHARS) {
+        throw new Error(
+          `worktree_name must be at most ${MAX_MANAGEMENT_WORKTREE_NAME_CHARS} characters`,
+        );
+      }
+      if (worktreeSlug(value).length === 0) {
+        throw new Error("worktree_name must contain ASCII letters or digits (e.g. fix-login)");
+      }
       return value;
     };
     const threadId = (): string => {
@@ -2915,12 +2924,12 @@ class CoreService implements ChannelService {
       }
       case "create-thread": {
         const name = namedText("name", MAX_MANAGEMENT_NAME_CHARS);
-        const isolate = optionalBoolean("isolate") === true;
+        const workspaceName = worktreeName();
         const thread = await transport.createThread(groupId, name, signal);
-        if (!isolate) return JSON.stringify(managementThread(thread));
+        if (workspaceName === undefined) return JSON.stringify(managementThread(thread));
         return JSON.stringify({
           ...managementThread(thread),
-          ...(await this.isolateThread(task, thread, name, signal)),
+          ...(await this.createThreadWorkspace(task, thread, workspaceName, signal)),
         });
       }
       case "thread-info": {
@@ -2964,22 +2973,22 @@ class CoreService implements ChannelService {
    * Gives a freshly created thread its own git worktree and pins the thread binding to it, so
    * tasks dispatched into that thread never share the parent group's directory. The workspace is
    * reported next to the created thread; a workspace that cannot be created becomes
-   * `isolate_error` instead of a thrown rejection, because the thread itself already exists and
+   * `worktree_error` instead of a thrown rejection, because the thread itself already exists and
    * keeps the ordinary directory order.
    */
-  private async isolateThread(
+  private async createThreadWorkspace(
     task: TaskRecord,
     thread: ThreadSummary,
-    name: string,
+    workspaceName: string,
     signal: AbortSignal,
-  ): Promise<{ worktree: { path: string; branch: string } } | { isolate_error: string }> {
+  ): Promise<{ worktree: { path: string; branch: string } } | { worktree_error: string }> {
     const bot = this.bot;
     const worktrees = this.options.worktrees;
-    if (!worktrees) return { isolate_error: "本部署未配置隔离工作区能力" };
-    if (!bot) return { isolate_error: "Bot 身份未注册，无法绑定线程目录" };
+    if (!worktrees) return { worktree_error: "本部署未配置隔离工作区能力" };
+    if (!bot) return { worktree_error: "Bot 身份未注册，无法绑定线程目录" };
     try {
       const workspace = await worktrees.create(
-        { baseDir: task.cwd, label: name, threadId: thread.shortId },
+        { baseDir: task.cwd, label: workspaceName, threadId: thread.shortId },
         signal,
       );
       this.store.ensureBinding({
@@ -2997,7 +3006,7 @@ class CoreService implements ChannelService {
         .replace(/\s+/gu, " ")
         .trim()
         .slice(0, MAX_MANAGEMENT_ERROR_CHARS);
-      return { isolate_error: detail.length > 0 ? detail : "隔离工作区创建失败" };
+      return { worktree_error: detail.length > 0 ? detail : "隔离工作区创建失败" };
     }
   }
   /**
