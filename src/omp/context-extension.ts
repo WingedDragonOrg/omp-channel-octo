@@ -3,6 +3,7 @@ import {
 	contextSidecarPath,
 	formatSharedContext,
 	preparedReceiptFor,
+	readBoundSession,
 	readContextSidecar,
 	writePreparedReceipt,
 	type ContextSidecar,
@@ -94,6 +95,23 @@ function abortAndThrow(context: ExtensionContext, reason: string): never {
 	throw new Error(`Octo context extension rejected the turn: ${reason}`);
 }
 
+/**
+ * Extension handlers are registered once per worker process, so every session
+ * OMP opens in it reaches them, subagent and eval sessions included.  The host
+ * publishes the session it drives for this scope before every prompt and keeps
+ * it as the scope's current session; a published session that is not this one
+ * runs untouched.  A scope that never published a pointer keeps the original
+ * strict behavior, so a turn the host prepared is still validated.
+ */
+async function boundSessionFor(scope: ExtensionScope, context: ExtensionContext): Promise<string | undefined> {
+	const bound = await readBoundSession(scope.root);
+	if (bound === undefined) return undefined;
+	if (bound.botUid !== scope.botUid || !sameTarget(bound.target, scope.target)) {
+		return abortAndThrow(context, "bound session scope mismatch");
+	}
+	return bound.sessionId;
+}
+
 function sidecarForScope(
 	scope: ExtensionScope,
 	sessionId: string,
@@ -182,6 +200,8 @@ async function beforeAgentStart(event: ExtensionEvent, context: ExtensionContext
 	} catch (error) {
 		return abortAndThrow(context, error instanceof Error ? error.message : "session identity is invalid");
 	}
+	const bound = await boundSessionFor(scope, context);
+	if (bound !== undefined && bound !== sessionId) return undefined;
 	const sidecar = validateSidecar(await sidecarForScope(scope, sessionId, context), scope, sessionId, context);
 	const originalSystemPrompt = systemPromptFromEvent(event, context);
 	if (sidecar.injectionDecision === "unchanged") return { systemPrompt: [...originalSystemPrompt] };
@@ -218,6 +238,8 @@ async function sessionCompacting(event: ExtensionEvent, context: ExtensionContex
 	} catch (error) {
 		return abortAndThrow(context, error instanceof Error ? error.message : "session identity is invalid");
 	}
+	const bound = await boundSessionFor(scope, context);
+	if (bound !== undefined && bound !== sessionId) return undefined;
 	const sidecar = validateSidecar(await sidecarForScope(scope, sessionId, context), scope, sessionId, context);
 	return {
 		context: [formatCompactionContext(sidecar)],

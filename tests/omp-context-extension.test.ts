@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import contextExtension, { contextSidecarFileName } from "../src/omp/context-extension.ts";
+import { boundSessionPath } from "../src/context-sidecar.ts";
 
 type Target = {
   channelType: number;
@@ -53,6 +54,8 @@ type CompactingResult = {
 const BOT_UID = "bot-context-test";
 const TARGET: Target = { channelType: 2, channelId: "group-context-test" };
 const SESSION_ID = "omp-session-real-context-test";
+/** A subagent session OMP opened inside the same worker process. */
+const SUBAGENT_SESSION_ID = "01a0aa43-a96d-704e-be11-ba2e50ab559b";
 const ENVIRONMENT_KEYS = [
   "OMP_CHANNEL_OCTO_CONTEXT_ROOT",
   "OMP_CHANNEL_OCTO_CONTEXT_BOT_UID",
@@ -102,20 +105,40 @@ function sidecarFor(
   };
 }
 
+type ScopeOptions = {
+  /** Bot identity the worker environment carries; defaults to the sidecar's. */
+  botUid?: string;
+  /** Target the worker environment carries; defaults to the sidecar's. */
+  target?: Target;
+  /** Session the host publishes as bound; `null` publishes none. */
+  boundSessionId?: string | null;
+};
+
 async function withSidecar<T>(
   sidecar: Sidecar,
   run: (root: string, sidecarPath: string) => Promise<T>,
+  scope: ScopeOptions = {},
 ): Promise<T> {
   const previous = saveEnvironment();
+  const botUid = scope.botUid ?? sidecar.botUid;
+  const target = scope.target ?? sidecar.target;
+  const boundSessionId = scope.boundSessionId === undefined ? sidecar.sessionId : scope.boundSessionId;
   const root = await mkdtemp(join(tmpdir(), "omp-context-extension-"));
-  const sidecarPath = join(root, contextSidecarFileName(sidecar.sessionId));
+  const sidecarPath = join(root, contextSidecarFileName(boundSessionId ?? sidecar.sessionId));
+  if (boundSessionId !== null) {
+    await writeFile(
+      boundSessionPath(root),
+      JSON.stringify({ botUid, target, sessionId: boundSessionId }),
+      "utf8",
+    );
+  }
   await writeFile(sidecarPath, JSON.stringify(sidecar), "utf8");
 
   try {
     process.env.OMP_CHANNEL_OCTO_CONTEXT_ROOT = root;
-    process.env.OMP_CHANNEL_OCTO_CONTEXT_BOT_UID = sidecar.botUid;
-    process.env.OMP_CHANNEL_OCTO_CONTEXT_CHANNEL_TYPE = String(sidecar.target.channelType);
-    process.env.OMP_CHANNEL_OCTO_CONTEXT_CHANNEL_ID = sidecar.target.channelId;
+    process.env.OMP_CHANNEL_OCTO_CONTEXT_BOT_UID = botUid;
+    process.env.OMP_CHANNEL_OCTO_CONTEXT_CHANNEL_TYPE = String(target.channelType);
+    process.env.OMP_CHANNEL_OCTO_CONTEXT_CHANNEL_ID = target.channelId;
     return await run(root, sidecarPath);
   } finally {
     restoreEnvironment(previous);
@@ -331,34 +354,43 @@ test("restores the immutable current snapshot during compaction without changing
   );
 });
 
-test("fails closed on session, bot, or target mismatches without returning shared context", async () => {
+test("fails closed on a defective sidecar for the bound session without returning shared context", async () => {
   const snapshot: Snapshot = {
     content: "Secret shared context must never cross its identity boundary.",
     present: true,
     version: 21,
   };
-  const mismatches: Array<{
+  const defects: Array<{
     name: string;
-    sessionId: string;
-    botUid: string;
-    target: Target;
+    /** Sidecar identity that contradicts the scope the host published. */
+    stored?: Partial<Sidecar>;
+    /** Drop the sidecar file after the host published the turn. */
+    drop?: boolean;
+    /** Bot identity the worker environment carries. */
+    scopeBotUid?: string;
+    scopeTarget?: Target;
   }> = [
-    { name: "session", sessionId: "wrong-session", botUid: BOT_UID, target: TARGET },
-    { name: "bot", sessionId: SESSION_ID, botUid: "wrong-bot", target: TARGET },
-    { name: "target", sessionId: SESSION_ID, botUid: BOT_UID, target: { channelType: 5, channelId: "wrong-target" } },
+    { name: "missing-sidecar", drop: true },
+    { name: "bot", stored: { botUid: "wrong-bot" } },
+    { name: "target", stored: { target: { channelType: 5, channelId: "wrong-target" } } },
+    { name: "session", stored: { sessionId: "wrong-session" } },
+    { name: "scope", scopeBotUid: "wrong-scope-bot", scopeTarget: { channelType: 2, channelId: "wrong-scope-target" } },
   ];
 
-  for (const mismatch of mismatches) {
+  for (const defect of defects) {
     await withSidecar(
-      sidecarFor("initial", snapshot, "pending", `attempt-${mismatch.name}`),
+      { ...sidecarFor("initial", snapshot, "pending", `attempt-${defect.name}`), ...defect.stored },
       async (_root, sidecarPath) => {
-        process.env.OMP_CHANNEL_OCTO_CONTEXT_BOT_UID = mismatch.botUid;
-        process.env.OMP_CHANNEL_OCTO_CONTEXT_CHANNEL_TYPE = String(mismatch.target.channelType);
-        process.env.OMP_CHANNEL_OCTO_CONTEXT_CHANNEL_ID = mismatch.target.channelId;
+        if (defect.drop) await rm(sidecarPath, { force: true });
+        if (defect.scopeBotUid !== undefined) process.env.OMP_CHANNEL_OCTO_CONTEXT_BOT_UID = defect.scopeBotUid;
+        if (defect.scopeTarget !== undefined) {
+          process.env.OMP_CHANNEL_OCTO_CONTEXT_CHANNEL_TYPE = String(defect.scopeTarget.channelType);
+          process.env.OMP_CHANNEL_OCTO_CONTEXT_CHANNEL_ID = defect.scopeTarget.channelId;
+        }
         const { beforeAgentStart, sessionCompacting } = captureHandlers();
         const originalSystemPrompt = ["base system rule"];
         let abortCalls = 0;
-        const context = extensionContext(mismatch.sessionId, () => {
+        const context = extensionContext(SESSION_ID, () => {
           abortCalls += 1;
         });
 
@@ -367,26 +399,120 @@ test("fails closed on session, bot, or target mismatches without returning share
           beforeAgentStart,
           {
             type: "before_agent_start",
-            prompt: `mismatched ${mismatch.name} ordinary turn`,
+            prompt: `defective ${defect.name} ordinary turn`,
             systemPrompt: [...originalSystemPrompt],
           },
           context,
         );
         expect(beforeOutcome.error).toBeDefined();
+        expect(returnedSystemPrompt(beforeOutcome.value)).toEqual([]);
         expect(abortCalls).toBe(beforeAbortCalls + 1);
 
         const compactAbortCalls = abortCalls;
         const compactOutcome = await invoke(
           sessionCompacting,
-          { type: "session.compacting", sessionId: mismatch.sessionId, messages: [] },
+          { type: "session.compacting", sessionId: SESSION_ID, messages: [] },
           context,
         );
         expect(compactOutcome.error).toBeDefined();
         expect(abortCalls).toBe(compactAbortCalls + 1);
 
-        const written = await readSidecar(sidecarPath);
-        expect(recordValue(written).prepared).toBeUndefined();
+        if (defect.drop) {
+          expect(await readFile(sidecarPath, "utf8").catch(() => undefined)).toBeUndefined();
+        } else {
+          expect(recordValue(await readSidecar(sidecarPath)).prepared).toBeUndefined();
+        }
       },
+      { botUid: BOT_UID, target: TARGET, boundSessionId: SESSION_ID },
     );
   }
+});
+
+test("leaves a session the scope does not govern untouched instead of failing closed", async () => {
+  // OMP runs subagents in their own session inside the worker process, so their
+  // turns reach the extension while the host is driving the parent session.
+  const snapshot: Snapshot = {
+    content: "Group instructions belong to the channel turn only.",
+    present: true,
+    version: 33,
+  };
+  await withSidecar(
+    sidecarFor("initial", snapshot, "pending", "attempt-subagent"),
+    async (root, sidecarPath) => {
+      const bound = JSON.parse(await readFile(boundSessionPath(root), "utf8")) as Record<string, unknown>;
+      expect(bound).toEqual({ botUid: BOT_UID, target: TARGET, sessionId: SESSION_ID });
+
+      const { beforeAgentStart, sessionCompacting } = captureHandlers();
+      let abortCalls = 0;
+      const context = extensionContext(SUBAGENT_SESSION_ID, () => {
+        abortCalls += 1;
+      });
+      const subagentSystemPrompt = ["subagent system rule"];
+      const event = {
+        type: "before_agent_start",
+        prompt: "subagent probe",
+        systemPrompt: [...subagentSystemPrompt],
+      };
+
+      const outcome = await invoke(beforeAgentStart, event, context);
+      expect(outcome.error).toBeUndefined();
+      expect(outcome.value).toBeUndefined();
+      expect(event.systemPrompt).toEqual(subagentSystemPrompt);
+
+      const compactOutcome = await invoke(
+        sessionCompacting,
+        { type: "session.compacting", sessionId: SUBAGENT_SESSION_ID, messages: [] },
+        context,
+      );
+      expect(compactOutcome.error).toBeUndefined();
+      expect(compactOutcome.value).toBeUndefined();
+
+      // The sub-session neither aborts nor touches the bound turn's receipt.
+      expect(abortCalls).toBe(0);
+      expect(recordValue(await readSidecar(sidecarPath)).prepared).toBeUndefined();
+    },
+  );
+});
+
+test("keeps the strict path in a scope that published no bound session", async () => {
+  const snapshot: Snapshot = {
+    content: "A scope without a published session keeps its original guarantee.",
+    present: true,
+    version: 34,
+  };
+  await withSidecar(
+    sidecarFor("initial", snapshot, "pending", "attempt-unpublished"),
+    async (root, sidecarPath) => {
+      expect(await readFile(boundSessionPath(root), "utf8").catch(() => undefined)).toBeUndefined();
+      const { beforeAgentStart } = captureHandlers();
+
+      // The prepared turn still injects, exactly as before the pointer existed.
+      const prepared = await invoke(
+        beforeAgentStart,
+        { type: "before_agent_start", prompt: "turn without a published scope", systemPrompt: ["base rule"] },
+        extensionContext(SESSION_ID, () => {
+          throw new Error("the prepared turn unexpectedly aborted");
+        }),
+      );
+      expect(prepared.error).toBeUndefined();
+      const prompt = returnedSystemPrompt(prepared.value);
+      expect(prompt.at(-1)).toContain(snapshot.content);
+      expect(recordValue(await readSidecar(sidecarPath)).prepared).toBeDefined();
+
+      // A session the host never prepared still fails closed instead of
+      // running contextless; the channel publishes a pointer before prompting,
+      // so this branch only covers scopes that never went through a turn.
+      let abortCalls = 0;
+      const unprepared = await invoke(
+        beforeAgentStart,
+        { type: "before_agent_start", prompt: "unprepared session", systemPrompt: [] },
+        extensionContext(SUBAGENT_SESSION_ID, () => {
+          abortCalls += 1;
+        }),
+      );
+      expect(unprepared.error).toBeDefined();
+      expect(abortCalls).toBe(1);
+    },
+    { boundSessionId: null },
+  );
 });

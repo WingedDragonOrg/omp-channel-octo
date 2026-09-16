@@ -45,6 +45,7 @@ import { AttachmentError } from "../../src/attachments";
 import {
   contextSidecarPath,
   normalizeGroupContext,
+  readBoundSession,
   writePreparedReceipt,
 } from "../../src/context-sidecar";
 import type { ProjectSessionState } from "../../src/project-session";
@@ -919,6 +920,10 @@ export interface PromptRecord {
   cwd: string;
   sessionId: string;
   promptContext: PromptContext | undefined;
+  /** Scope root this prompt ran under, for group and thread turns. */
+  sidecarRoot?: string;
+  /** Session the host published as bound in that scope when this prompt started. */
+  boundSessionId?: string;
 }
 
 class FixtureWorker implements OmpWorker {
@@ -1008,7 +1013,15 @@ class FixtureWorker implements OmpWorker {
   ): Promise<void> {
     const injection = promptContext?.contextInjection;
     const scope = this.options.contextScope;
-    if (scope && injection && injection.injectionDecision !== "unchanged") {
+    // Mirrors the OMP extension: a published pointer naming another session
+    // belongs to a sub-session, and only the driven session records the receipt.
+    const bound = scope === undefined ? undefined : await readBoundSession(scope.sidecarRoot);
+    if (
+      scope !== undefined
+      && (bound === undefined || bound.sessionId === this.sessionId)
+      && injection
+      && injection.injectionDecision !== "unchanged"
+    ) {
       await writePreparedReceipt(
         contextSidecarPath(scope.sidecarRoot, this.sessionId),
         {
@@ -1026,6 +1039,8 @@ class FixtureWorker implements OmpWorker {
       cwd,
       sessionId: this.sessionId,
       promptContext,
+      ...(scope === undefined ? {} : { sidecarRoot: scope.sidecarRoot }),
+      ...(bound === undefined ? {} : { boundSessionId: bound.sessionId }),
     });
     if (text.startsWith("/move ")) {
       const targetCwd = await realpath(text.slice("/move ".length).trim());
