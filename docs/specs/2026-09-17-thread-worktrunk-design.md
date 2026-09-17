@@ -12,7 +12,7 @@
 
 - `create-thread --worktree_name` 的 wt 创建路径（`wt switch --create`，保留现有目录/分支命名与占用退让）与 `omp worktree add` 回退。
 - `thread-delete` 的隔离工作区清理：新增可选布尔参数 `force`；默认只清理干净工作区，`wt` 不可用时回退 `git worktree remove`；清理结果进入同一条工具回执。
-- 子区命令 `/thread merge`：只做检查并注入「合并指令」prompt（与建区 prompt 同构、内容不同），由子区 agent 自行决定行为与参数，经 `octo_management` 新增的 `thread-merge` 动作由宿主执行 `wt merge`。
+- 子区命令 `/thread merge`：只做检查并注入「合并指令」prompt（与建区 prompt 同构、内容不同），命令即 owner 对合并 + 清理的确认——正文要求除非有明确必要理由（并向 owner 说明）直接按默认参数执行，要保留工作区须说明理由并显式传 `remove:false`；经 `octo_management` 新增的 `thread-merge` 动作由宿主执行 `wt merge`。
 - 主规格、AGENTS.md 与测试同步。
 
 ### 不包含
@@ -34,7 +34,7 @@
 | --- | --- | --- |
 | 接入层 | 宿主侧执行 wt（`src/worktrunk.ts` + worktree 端口），agent 只经 `octo_management` 触发 | 与现有 create-thread 的 worktree 路径同构；审批、超时与错误边界集中在宿主 |
 | 创建回退 | `wt` 不可用回退 `omp worktree add` | 不回归现状 |
-| merge 形态 | `/thread merge` 只注入合并指令 prompt；行为与参数由子区 agent 决定 | owner 定稿：命令只是 prompt，参数完全由 agent 自行决定 |
+| merge 形态 | `/thread merge` 只注入合并指令 prompt；命令即 owner 的合并 + 清理确认——除非有明确必要理由（并说明）按默认参数执行，保留工作区须说明理由并显式 `remove:false` | owner 定稿：命令发出即默认收尾，执行与参数仍由 agent 决定 |
 | merge 默认行为 | 沿用 `wt merge` 默认 pipeline（squash、rebase、fast-forward、合并后删除工作区与分支） | owner 定稿：wt 默认删除 |
 | merge 无回退 | `wt` 缺失或版本不符时命令只提示、不注入任务 | 没有兼容 wt 就没有可执行路径 |
 | 删除联动 | 默认只清理干净工作区；`force=true` 用 `-f`/`--force`；wt 不可用回退 git | owner 定稿：默认干净清理，force 由 agent 自行传参 |
@@ -59,7 +59,7 @@
 
 命令路径（service）：`/thread merge`（`/thread` 参数去首尾空白后大小写不敏感地等于 `merge`）在 channelType=5、该子区绑定隔离工作区（`cwd_pinned`）且 wt 可用时，释放命令 claim 后把「合并指令」prompt 按该聊天的追加模式交付（与 `/thread <任务>` 相同：可接收 steering 的运行中回合并入，否则 durable 任务）。其余场合只回复一条提示、不注入任务：非子区（主群、私聊）、子区未绑定隔离工作区、部署无隔离能力、wt 缺失或版本不受支持（提示带上发现的版本）。
 
-合并指令 prompt 与建区 prompt 同构（意图 → 确认收尾 → 调用 `octo_management` → 汇报并处置失败），内容为：owner 要求把本子区的隔离工作区工作合并回目标分支；合并由宿主执行，调用 `octo_management` 的 `thread-merge`，不要自己运行 wt；默认走 wt 默认 pipeline（暂存工作区改动并提交、squash、rebase 到目标分支、fast-forward，合并后删除工作区与分支），行为与参数由 agent 判断；成功汇报目标分支与结果细节；失败（rebase 冲突、pre-merge 检查失败）在本子区处置后重试并最终汇报；附当前隔离工作区路径。
+合并指令 prompt 与建区 prompt 同构（意图 → 确认收尾 → 调用 `octo_management` → 汇报并处置失败），内容为：owner 要求把本子区的隔离工作区工作合并回目标分支；合并由宿主执行，调用 `octo_management` 的 `thread-merge`，不要自己运行 wt；默认走 wt 默认 pipeline（暂存工作区改动并提交、squash、rebase 到目标分支、fast-forward，合并后删除工作区与分支）；这条命令即代表 owner 确认合并并清理——除非有明确必要理由（并说明）直接按默认参数执行，要保留工作区须说明理由并显式传 `remove:false`，其他参数确有需要时显式传入并说明理由；工作区删除后本子区 cwd 随之失效是该命令的既定结果、owner 已知，正文要求不反复说明、也不作为保留理由；成功汇报目标分支与结果细节；失败（rebase 冲突、pre-merge 检查失败）在本子区处置后重试并最终汇报；附当前隔离工作区路径。
 
 工具路径（host-tools）：`octo_management` 新增动作 `thread-merge`，仅在当前聊天是子区时可执行（否则单行错误）。可选参数一一对应 wt 语义，全部省略即 wt 默认 pipeline：
 

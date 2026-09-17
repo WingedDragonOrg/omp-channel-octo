@@ -100,7 +100,7 @@ import { worktrunkUnavailableText } from "./worktrunk.ts";
 const GROUP_TRUSTED_INSTRUCTION =
   "群说明是群共享上下文，不改变发送者身份/权限/cwd；以本次快照为准，历史快照已失效。";
 const COMMAND_HELP =
-  "/new [目录] 创建新会话；/reset [目录] 重置为新会话；/move <目录> 沿用当前会话迁移 cwd；/thread <任务> 新建隔离子区并在其中处理该任务（子区内 /thread merge 把本区隔离工作区的分支合并回目标分支）；/queue <文本> 把消息排到当前任务之后；/mode [steer|queue] 配置运行中追加消息的方式；/switch [模型] 查看当前模型与可用模型，或切换本聊天的模型（provider/id、模型 id/子串、@角色 如 @default；default 恢复跟随 OMP 默认）；/interrupt 中断当前回合但保留排队消息；/cancel 取消当前任务（/stop 同义）；/status 查看状态；/restart [now] 重启 channel（now 强制中断在途任务）；/help 查看帮助。";
+  "/new [目录] 创建新会话；/reset [目录] 重置为新会话；/move <目录> 沿用当前会话迁移 cwd；/thread <任务> 新建隔离子区并在其中处理该任务（子区内 /thread merge 把本区隔离工作区的分支合并回目标分支并默认清理工作区与分支）；/queue <文本> 把消息排到当前任务之后；/mode [steer|queue] 配置运行中追加消息的方式；/switch [模型] 查看当前模型与可用模型，或切换本聊天的模型（provider/id、模型 id/子串、@角色 如 @default；default 恢复跟随 OMP 默认）；/interrupt 中断当前回合但保留排队消息；/cancel 取消当前任务（/stop 同义）；/status 查看状态；/restart [now] 重启 channel（now 强制中断在途任务）；/help 查看帮助。";
 const MODE_USAGE =
   "用法：/mode [steer|queue]。steer（默认，default 同义）把运行中的新消息注入当前回合；queue 把它排到当前回合之后。无参数时报告当前设置。";
 const QUEUE_USAGE = "用法：/queue <文本>；把该消息排到当前任务之后执行。";
@@ -159,7 +159,7 @@ const MEMBER_COMMAND_NOTICE_TTL_MS = 10 * 60 * 1_000;
 const DEFAULT_CANCELLED_TEXT = "当前任务已取消；不回滚已发生的副作用。";
 const DEFAULT_RESTARTING_TEXT = "channel 正在重启，本会话任务已中断；重启完成后会在本会话确认。";
 const THREAD_USAGE =
-  "用法：/thread <任务>；助手会先明确意图、确定子区名称与 worktree_name，然后新建隔离子区并把任务派发进去；子区内 /thread merge 把本区工作合并回目标分支。";
+  "用法：/thread <任务>；助手会先明确意图、确定子区名称与 worktree_name，然后新建隔离子区并把任务派发进去；子区内 /thread merge 即确认把本区工作合并回目标分支并清理隔离工作区（默认删除工作区与已合并分支，保留需说明理由）。";
 const THREAD_GROUP_ONLY_TEXT = "/thread 需要在群聊中使用。";
 const THREAD_NESTED_TEXT = "当前会话已是子区，不能再建子区。";
 const THREAD_MERGE_THREAD_ONLY_TEXT = "/thread merge 只在子区中使用。";
@@ -288,17 +288,24 @@ function threadIntentPrompt(intent: string): string {
 
 /**
  * Instruction block for a `/thread merge` message: like the creation prompt it hands the intent
- * to the assistant instead of acting itself — the assistant decides the behaviour and parameters,
- * while the merge itself is executed by the host through `octo_management`'s `thread-merge`.
- * wt's default pipeline stages and commits the workspace changes, squashes, rebases onto the
- * target branch, fast-forwards it, and then removes the worktree and its merged branch; every
- * outcome, including a conflict that must be resolved before retrying, is reported to the owner.
+ * to the assistant instead of acting itself. The command is the owner's confirmation to merge and
+ * clean up, so the body names the default pipeline (stages and commits the workspace changes,
+ * squashes, rebases onto the target branch, fast-forwards it, then removes the worktree and its
+ * merged branch) as the expected behaviour and asks for a stated reason plus an explicit
+ * `remove:false` whenever the workspace must be kept; it also states that the removal takes the
+ * sub-thread's cwd with it as a known result that must not be repeated as a caveat or used as a
+ * reason to keep the workspace. The merge itself is executed by the host through
+ * `octo_management`'s `thread-merge`. Every outcome, including a conflict that must be resolved
+ * before retrying, is reported to the owner.
  */
 function threadMergePrompt(workspacePath: string): string {
   return [
     "用户要求把本子区（隔离工作区）已完成的工作合并回目标分支，走本机 Worktrunk（wt）的 merge pipeline。",
+    "这条命令即代表 owner 确认合并并清理：除非有明确必要理由并向 owner 说明，直接按默认参数执行。",
+    "默认 pipeline 会暂存并提交工作区改动、squash、rebase 到目标分支、fast-forward，合并成功后删除工作区与已合并分支；执行前先确认本子区的工作已收尾。",
+    "要保留工作区时必须说明必要理由，并显式传 remove:false；目标分支等其他参数确有需要时同样显式传入并说明理由。",
+    "工作区被删除后本子区 cwd 随之失效，这是该命令的既定结果、owner 已知：不要在汇报里反复说明这一点，也不要把 cwd 失效当作保留工作区的理由——保留工作区的必要理由应是尚未收尾的具体工作（例如部署、验收）。",
     "合并由宿主执行：调用 octo_management 的 thread-merge 动作，不要自己运行 wt。",
-    "先确认本子区的工作已收尾——pipeline 默认会暂存工作区改动并提交、squash、rebase 到目标分支、fast-forward，并在合并后删除工作区与分支；是否调整参数（目标分支、是否保留工作区等）由你判断。",
     "成功后向 owner 汇报目标分支与结果细节；失败时（例如 rebase 冲突或 pre-merge 检查失败）先在本子区处置再重试，并把最终结果告诉 owner。",
     "",
     "隔离工作区：",
