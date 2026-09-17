@@ -422,6 +422,53 @@ export interface WorkerFactory {
   recover(process: WorkerProcess): Promise<boolean>;
 }
 
+/**
+ * Why a task could not start. A bounded vocabulary: values reach service logs, the owner-only task
+ * row and the chat notice, so they never carry paths, payloads or credentials.
+ */
+export type TaskStartupCode =
+  /** The bound cwd (including an isolated workspace) is gone. */
+  | "cwd-missing"
+  /** The state directory's sessions folder is missing or unusable. */
+  | "session-dir-missing"
+  /** The bound session file is gone, or the resumed session state failed validation. */
+  | "session-invalid"
+  /** The child process could not be spawned. */
+  | "spawn-failed"
+  /** The spawned child's process identity could not be verified. */
+  | "identity-unverified"
+  /** The parent-death watchdog did not become ready. */
+  | "watchdog-unavailable"
+  /** No `ready` frame arrived within the worker startup budget. */
+  | "not-ready"
+  /** The child exited, or its output ended, before the worker was usable. */
+  | "exited"
+  /** Protocol negotiation, session creation or state handshake failed. */
+  | "handshake-failed";
+
+/**
+ * Typed startup failure thrown by the worker factory and by the host's binding checks. The message
+ * keeps the human wording; `code` is what the channel classifies, logs and records.
+ */
+export class TaskStartupError extends Error {
+  readonly code: TaskStartupCode;
+
+  constructor(code: TaskStartupCode, message: string) {
+    super(message);
+    this.name = "TaskStartupError";
+    this.code = code;
+  }
+}
+
+/** Tags `error` with `code`, keeping an existing classification untouched. */
+export function taskStartupError(code: TaskStartupCode, error: unknown): TaskStartupError {
+  if (error instanceof TaskStartupError) return error;
+  const message = error instanceof Error && error.message.trim().length > 0
+    ? error.message
+    : "task startup failed";
+  return new TaskStartupError(code, message);
+}
+
 export interface GroupHistoryConfig {
   enabled: boolean;
   /** Upper bound of history entries injected per task turn (1..200). */

@@ -12,6 +12,7 @@ import type {
 	WorkerOptions,
 	WorkerProcess,
 } from "../contracts.ts";
+import { TaskStartupError, taskStartupError } from "../contracts.ts";
 import { loadValidatedSessionState, type ProjectSessionState } from "../project-session.ts";
 import {
 	RpcCommand,
@@ -73,7 +74,13 @@ type WorkerFactoryOptions = {
 	cliEnv?: () => Record<string, string> | undefined;
 };
 
-const DEFAULT_STARTUP_TIMEOUT_MS = 10_000;
+/**
+ * How long a freshly spawned OMP child may take to become ready. A cold start on a loaded machine
+ * (memory pressure, a concurrent Bun process spawned by another LaunchAgent) can take tens of
+ * seconds while the child makes progress; a smaller budget kills it and fails the task even though
+ * nothing about the workspace, session or lock is wrong.
+ */
+const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 const DEFAULT_CANCEL_TIMEOUT_MS = 10_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const PASSIVE_UI_METHODS = new Set(["notify", "setStatus", "setWidget", "setTitle", "set_editor_text", "open_url"]);
@@ -154,22 +161,36 @@ class RpcWorker implements OmpWorker {
 	}
 
 	async initialize(): Promise<void> {
-		await this.#waitWithTimeout(this.#readyPromise, this.#startupTimeoutMs, "OMP worker did not become ready");
-		if (this.#readyV2Supported) {
-			const negotiated = await this.#request({ type: "negotiate_protocol", protocolVersion: 2 }, this.#startupTimeoutMs);
-			this.#assertSuccess(negotiated, "negotiate_protocol");
-			const data = negotiated.data;
-			if (!isRecord(data) || data.protocolVersion !== 2) throw new Error("OMP RPC protocol negotiation returned an invalid version");
-			this.#protocolV2 = true;
+		try {
+			await this.#waitWithTimeout(this.#readyPromise, this.#startupTimeoutMs, "OMP worker did not become ready");
+		} catch (error) {
+			// The ready promise may already carry a typed reason (the child exited, or its output
+			// ended); only a plain timeout is the "never became ready" case.
+			throw taskStartupError("not-ready", error);
 		}
-		await this.#subscribeToSubagents();
-		if (this.#newSessionOnStart) {
-			const newSession = await this.#request({ type: "new_session" }, this.#startupTimeoutMs);
-			this.#assertSuccess(newSession, "new_session");
-			const data = newSession.data;
-			if (!isRecord(data) || data.cancelled !== false) throw new Error("OMP RPC new_session was cancelled");
+		try {
+			if (this.#readyV2Supported) {
+				const negotiated = await this.#request({ type: "negotiate_protocol", protocolVersion: 2 }, this.#startupTimeoutMs);
+				this.#assertSuccess(negotiated, "negotiate_protocol");
+				const data = negotiated.data;
+				if (!isRecord(data) || data.protocolVersion !== 2) throw new Error("OMP RPC protocol negotiation returned an invalid version");
+				this.#protocolV2 = true;
+			}
+			await this.#subscribeToSubagents();
+			if (this.#newSessionOnStart) {
+				const newSession = await this.#request({ type: "new_session" }, this.#startupTimeoutMs);
+				this.#assertSuccess(newSession, "new_session");
+				const data = newSession.data;
+				if (!isRecord(data) || data.cancelled !== false) throw new Error("OMP RPC new_session was cancelled");
+			}
+		} catch (error) {
+			throw taskStartupError("handshake-failed", error);
 		}
-		await this.refreshState();
+		try {
+			await this.refreshState();
+		} catch (error) {
+			throw taskStartupError("session-invalid", error);
+		}
 	}
 
 	/**
@@ -471,11 +492,11 @@ class RpcWorker implements OmpWorker {
 				}
 			}
 			buffered += decoder.decode();
-			if (buffered.trim().length > 0) throw new Error("OMP RPC output ended with an unterminated frame");
-			if (!this.#ready) this.#readyReject(new Error("OMP output ended before ready"));
+			if (buffered.trim().length > 0) throw new TaskStartupError("exited", "OMP RPC output ended with an unterminated frame");
+			if (!this.#ready) this.#readyReject(new TaskStartupError("exited", "OMP output ended before ready"));
 			else if (!this.#stopping) this.#onFatal(new Error("OMP output ended unexpectedly"));
 		} catch (error) {
-			if (!this.#ready) this.#readyReject(asError(error, "OMP RPC output could not be decoded"));
+			if (!this.#ready) this.#readyReject(taskStartupError("handshake-failed", error));
 			else if (!this.#stopping) this.#onFatal(asError(error, "OMP RPC output could not be decoded"));
 		}
 	}
@@ -776,8 +797,7 @@ class RpcWorker implements OmpWorker {
 
 	#onChildExit(code: number): void {
 		if (this.#stopping || this.#closed) return;
-		const error = new Error(`OMP worker exited with code ${code}`);
-		this.#onFatal(error);
+		this.#onFatal(new TaskStartupError("exited", `OMP worker exited with code ${code}`));
 	}
 
 	#onFatal(error: Error): void {
@@ -814,11 +834,11 @@ class OmpWorkerFactory implements WorkerFactory {
 
 		if (!options || !isAbsolute(options.cwd) || !isAbsolute(options.sessionDir))
 			throw new Error("OMP worker cwd and sessionDir must be absolute");
-		if (!existsSync(options.cwd)) throw new Error(`OMP worker cwd does not exist: ${options.cwd}`);
-		if (!existsSync(options.sessionDir)) throw new Error(`OMP worker sessionDir does not exist: ${options.sessionDir}`);
+		if (!existsSync(options.cwd)) throw new TaskStartupError("cwd-missing", `OMP worker cwd does not exist: ${options.cwd}`);
+		if (!existsSync(options.sessionDir)) throw new TaskStartupError("session-dir-missing", `OMP worker sessionDir does not exist: ${options.sessionDir}`);
 		const cwd = realpathSync(options.cwd);
 		const sessionDir = realpathSync(options.sessionDir);
-		if (!existsSync(sessionDir)) throw new Error(`OMP worker sessionDir does not exist: ${sessionDir}`);
+		if (!existsSync(sessionDir)) throw new TaskStartupError("session-dir-missing", `OMP worker sessionDir does not exist: ${sessionDir}`);
 		const command = [
 			this.#options.ompCommand,
 			...stripEnforcedArgs(this.#options.extraArgs ?? []),
@@ -846,7 +866,7 @@ class OmpWorkerFactory implements WorkerFactory {
 				detached: process.platform !== "win32",
 			}) as unknown as RpcChild;
 		} catch (error) {
-			throw asError(error, "Could not spawn OMP RPC worker");
+			throw taskStartupError("spawn-failed", asError(error, "Could not spawn OMP RPC worker"));
 		}
 		const parentSnapshot = await queryProcess(process.pid);
 		const snapshot = await queryProcess(child.pid);
@@ -857,12 +877,12 @@ class OmpWorkerFactory implements WorkerFactory {
 			} catch {
 				// Spawn failure cleanup is best effort; no worker is returned.
 			}
-			throw new Error("Could not verify the OMP worker process identity");
+			throw new TaskStartupError("identity-unverified", "Could not verify the OMP worker process identity");
 		}
 		const watchdog = await createWatchdog(child.pid, snapshot.pgid, parentSnapshot?.identity ?? "");
 		if (process.platform !== "win32" && !watchdog) {
 			await terminateOwnedProcess(child, snapshot.pgid, this.#cancelTimeoutMs);
-			throw new Error("Could not start the OMP parent-death watchdog");
+			throw new TaskStartupError("watchdog-unavailable", "Could not start the OMP parent-death watchdog");
 		}
 		const processInfo: WorkerProcess = { pid: child.pid, pgid: snapshot.pgid, identity: snapshot.identity, cwd };
 		try {
@@ -878,7 +898,7 @@ class OmpWorkerFactory implements WorkerFactory {
 			return worker;
 		} catch (error) {
 			await worker.stop();
-			throw asError(error, "OMP RPC worker failed during startup");
+			throw taskStartupError("handshake-failed", asError(error, "OMP RPC worker failed during startup"));
 		}
 	}
 

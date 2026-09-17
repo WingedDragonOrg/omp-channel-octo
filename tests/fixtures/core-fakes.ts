@@ -1231,6 +1231,8 @@ export class FakeWorkerFactory implements WorkerFactory {
     fast: { model: "other/fast", level: "max" },
     default: { model: "fixture/default", level: null },
   };
+  /** When set, `create` rejects with this error instead of materializing a worker. */
+  createFailure: Error | undefined;
 
   private nextSessionId = 1;
   private readonly promptWaiters: Array<{
@@ -1244,8 +1246,14 @@ export class FakeWorkerFactory implements WorkerFactory {
     },
   ) {}
 
+  /** Passing `undefined` clears the failure so later creates succeed again. */
+  failCreateWith(error?: Error): void {
+    this.createFailure = error;
+  }
+
   async create(options: WorkerOptions): Promise<OmpWorker> {
     this.creations.push(options);
+    if (this.createFailure) throw this.createFailure;
     const worker = new FixtureWorker(
       options,
       this.promptHandler,

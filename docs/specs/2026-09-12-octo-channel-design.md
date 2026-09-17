@@ -1,7 +1,7 @@
 # OMP Octo 个人远程助手设计
 
 日期：2026-09-12
-修订日期：2026-09-16
+修订日期：2026-09-17
 状态：产品设计已确认
 
 ## 背景与目标
@@ -10,7 +10,7 @@
 
 ## 范围
 
-包含个人单 Bot、单服务实例、文本指令与回复、执行状态、新建会话、指定目录、取消、会话恢复、消息去重和连接重建。支持私聊、指定群及 CommunityTopic 线程（channelType=5）内明确 @Bot 的指令；支持群/线程共享说明、线程默认继承父群工作目录、群/线程对话历史的增量上下文注入（详细设计见 `docs/specs/2026-09-16-group-history-context-design.md`）、线程隔离工作区的 Worktrunk 生命周期（详细设计见 `docs/specs/2026-09-17-thread-worktrunk-design.md`）、常见入站消息类型的内容提取与附件接收（详细设计见 `docs/specs/2026-09-16-inbound-message-content-design.md`）、`create-thread` 的子区任务完成回传（`notify` 开关，详细设计见 `docs/specs/2026-09-17-thread-completion-notify-design.md`）、出站文件和持久化问答。
+包含个人单 Bot、单服务实例、文本指令与回复、执行状态、新建会话、指定目录、取消、会话恢复、消息去重和连接重建。支持私聊、指定群及 CommunityTopic 线程（channelType=5）内明确 @Bot 的指令；支持群/线程共享说明、线程默认继承父群工作目录、群/线程对话历史的增量上下文注入（详细设计见 `docs/specs/2026-09-16-group-history-context-design.md`）、线程隔离工作区的 Worktrunk 生命周期（详细设计见 `docs/specs/2026-09-17-thread-worktrunk-design.md`）、任务启动失败的分类报错与可观测性（详细设计见 `docs/specs/2026-09-17-task-startup-failure-design.md`）、常见入站消息类型的内容提取与附件接收（详细设计见 `docs/specs/2026-09-16-inbound-message-content-design.md`）、`create-thread` 的子区任务完成回传（`notify` 开关，详细设计见 `docs/specs/2026-09-17-thread-completion-notify-design.md`）、出站文件和持久化问答。
 
 不包含终端会话接管、多用户服务、通用网络 Agent gateway、文档评论任务、服务端通用 bot_task、群历史归档与检索、出站附件之外的通用文件托管和交互 callback 系统。channel 仅提供由 OMP host tool 明确发起的出站图片/文件发送，以及由能力 profile 明确启用的 Octo raw type17 `octo/v1` AdaptiveCard 1.5 进度展示和 `octo/v2` 交互问答卡片；交互卡片的上行只使用该 Bot 自己的事件队列（`/v1/bot/events` 轮询与 ack），不注册回调地址、不实现通用 callback 或审批流。收到的入站消息按已确认的类型表提取内容，贴纸、系统与 CMD 等没有内容的类型明确告知，不作为成功执行。范围以个人 IM 交互为准，不继承参考适配器的其他任务入口。
 

@@ -20,6 +20,7 @@ import {
   type SavedAttachment,
 } from "./attachments.ts";
 import { acquireBotLock, assertBotLockFree, type LockHandle } from "./bot-lock.ts";
+import { TaskStartupError } from "./contracts.ts";
 import type {
   BotIdentity,
   ChannelCommandHandler,
@@ -76,6 +77,7 @@ import { createBotEventLoop, type BotEventLoop } from "./bot-events.ts";
 import { createOutboxDelivery, type Outbox } from "./outbox.ts";
 import { createHostTools, type HostToolHost } from "./host-tools.ts";
 import { safeErrorMessage } from "./errors.ts";
+import { classifyStartupFailure, classifyTaskFailure, GENERIC_TASK_FAILURE_NOTICE, type TaskStartupPhase } from "./task-failure.ts";
 import {
   findMovedSession,
   verifyFreshSession,
@@ -370,12 +372,6 @@ function contextSidecarRoot(
     .digest("hex");
   return join(config.stateDir, "context-sidecars", scopeDigest);
 }
-
-function genericTaskFailure(contextFailure: boolean): string {
-  return contextFailure ? "群说明读取失败，未启动任务。" : "任务执行失败；未能可靠完成。";
-}
-
-
 
 class CoreService implements ChannelService {
   private readonly taskOperations = new Set<Promise<void>>();
@@ -2499,7 +2495,7 @@ class CoreService implements ChannelService {
       if (!task || task.state !== "queued") return;
       this.queuedBehind.delete(taskId);
       this.store.markFailed(taskId, "绑定目录在启动前持续变更，任务未启动。");
-      await this.outbox.enqueueText(taskTarget(task), genericTaskFailure(false), taskId);
+      await this.outbox.enqueueText(taskTarget(task), GENERIC_TASK_FAILURE_NOTICE, taskId);
       await this.notifyThreadOutcome(taskId);
     } finally {
       lease?.complete();
@@ -2554,14 +2550,14 @@ class CoreService implements ChannelService {
     if (lockedCwd !== undefined && task.cwd !== lockedCwd) {
       this.queuedBehind.delete(taskId);
       this.store.markFailed(taskId, "绑定目录在启动前再次变更，任务未启动。");
-      await this.outbox.enqueueText(taskTarget(task), genericTaskFailure(false), taskId);
+      await this.outbox.enqueueText(taskTarget(task), GENERIC_TASK_FAILURE_NOTICE, taskId);
       await this.notifyThreadOutcome(taskId);
       return;
     }
     if (this.blockedDirectories.has(task.cwd)) {
       this.queuedBehind.delete(taskId);
       this.store.markFailed(taskId, "directory remains blocked by an unconfirmed worker");
-      await this.outbox.enqueueText(taskTarget(task), genericTaskFailure(false), taskId);
+      await this.outbox.enqueueText(taskTarget(task), GENERIC_TASK_FAILURE_NOTICE, taskId);
       await this.notifyThreadOutcome(taskId);
       return;
     }
@@ -2613,6 +2609,7 @@ class CoreService implements ChannelService {
     let contextInjection: ContextInjection | undefined;
     let currentContextSidecarPath: string | undefined;
     let contextNeedsCommit = false;
+    let startupPhase: TaskStartupPhase = "context";
 
     const trackActivity = (operation: Promise<void>): void => {
       const settled = operation.catch(() => {});
@@ -2783,6 +2780,9 @@ class CoreService implements ChannelService {
         this.store.markCancelled(taskId);
         return;
       }
+      // Everything past the group-context read is "startup": a failure here is no longer a context
+      // read problem, so the classification must not keep reporting one.
+      startupPhase = "startup";
       const sessionDir = join(this.options.config.stateDir, "sessions");
       const sidecarRoot = contextSidecarRoot(this.options.config, this.bot!.uid, target);
       await mkdir(sessionDir, { recursive: true });
@@ -2820,7 +2820,7 @@ class CoreService implements ChannelService {
       };
       if (binding?.sessionFile) {
         const sessionFile = await existingSessionFile(binding.sessionFile);
-        if (!sessionFile) throw new Error("绑定的 OMP 会话文件不存在");
+        if (!sessionFile) throw new TaskStartupError("session-invalid", "绑定的 OMP 会话文件不存在");
         workerOptions.sessionFile = sessionFile;
       }
       worker = await this.options.workerFactory.create(workerOptions);
@@ -3068,10 +3068,16 @@ class CoreService implements ChannelService {
         finishProgress("cancelled");
         await this.sendCancelledIfNeeded(runtime);
       } else {
-        const contextFailure = isGroupTarget(runtime.target) && !worker;
-        this.store.markFailed(taskId, contextFailure ? "群说明读取失败" : safeErrorMessage(error, "worker failed"));
+        const failure = worker
+          ? classifyTaskFailure(error)
+          : classifyStartupFailure(error, startupPhase);
+        console.error(
+          `[task] ${worker ? "执行失败" : "启动失败"} task=${taskId} target=${targetKey(runtime.target)}`
+          + ` kind=${failure.kind} code=${failure.code} phase=${startupPhase} detail=${failure.detail}`,
+        );
+        this.store.markFailed(taskId, failure.row);
         finishProgress("failed");
-        await this.outbox.enqueueText(runtime.target, genericTaskFailure(contextFailure), taskId);
+        await this.outbox.enqueueText(runtime.target, failure.notice, taskId);
       }
     } finally {
       runtime.stopActivity?.(!progressRound.finished);

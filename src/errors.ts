@@ -15,3 +15,17 @@ export function asAppError(error: unknown): AppError {
 export function safeErrorMessage(_error: unknown, fallback: string): string {
   return fallback;
 }
+
+/**
+ * 任务启动失败的有界原因文本：单行化、清除控制字符、截断到固定长度，供服务日志与 owner 侧
+ * 任务行使用。它只放行本仓库构造的消息（原因码、HTTP 状态、路径），不携带错误对象本身、
+ * 协议载荷或凭据；群消息里仍是各类别的固定文案。
+ */
+export const FAILURE_TEXT_LIMIT = 200;
+
+export function failureText(error: unknown, fallback: string): string {
+  const raw = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  const flat = raw.replace(/[\p{Cc}\p{Cf}]+/gu, " ").replace(/\s+/gu, " ").trim();
+  if (flat.length === 0) return fallback;
+  return flat.length <= FAILURE_TEXT_LIMIT ? flat : `${flat.slice(0, FAILURE_TEXT_LIMIT - 1)}…`;
+}
