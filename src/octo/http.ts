@@ -2,6 +2,7 @@ import { createReadStream } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { OctoError } from "./error.ts";
 import { decodeUtf8 } from "./protocol.ts";
+import { isJsonRecord } from "./type-guards.ts";
 
 /**
  * 与 Octo 服务端说话的 HTTP 层：请求超时与取消、响应体读取与解析、下载与上传用的响应字段，
@@ -175,9 +176,80 @@ export async function requestWithTimeout(
   }
 }
 
-export function httpStatusError(label: string, status: number): OctoError {
-  const permanent = status === 401 || status === 403;
-  return new OctoError(`Octo ${label} request failed with HTTP ${status}`, { status, permanent });
+/**
+ * Body of a failed bot API call, reduced to a single bounded line. The server message is
+ * operator-facing text about the request itself; it never carries bot credentials.
+ */
+export function serverErrorMessage(body: Uint8Array): string | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(decodeUtf8(body, "error"));
+  } catch {
+    return null;
+  }
+  if (!isJsonRecord(value)) return null;
+  const nested = isJsonRecord(value["error"]) ? value["error"]["message"] : undefined;
+  const message = typeof nested === "string" && nested.length > 0 ? nested : value["msg"];
+  if (typeof message !== "string" || message.length === 0) return null;
+  const single = message.replace(/\s+/gu, " ").trim();
+  return single.length > 200 ? `${single.slice(0, 200)}…` : single;
+}
+
+/**
+ * Machine-readable identifier of a failed bot API call (`error.code`, e.g.
+ * `err.server.bot_api.store_failed`). Transient server failures are recognized by this
+ * code even when the wire status alone would not say so.
+ */
+export function serverErrorCode(body: Uint8Array): string | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(decodeUtf8(body, "error"));
+  } catch {
+    return undefined;
+  }
+  if (!isJsonRecord(value)) return undefined;
+  const nested = isJsonRecord(value["error"]) ? value["error"]["code"] : undefined;
+  const code = typeof nested === "string" && nested.length > 0 ? nested : value["code"];
+  return typeof code === "string" && code.length > 0 ? code : undefined;
+}
+
+/**
+ * One HTTP failure, carrying the bot API's own answer whenever the body is one. Every bot API
+ * error is a JSON envelope with a machine code (most of them travel as the legacy compatibility
+ * 400 on the wire), so a response that is not an envelope did not come from the API at all: the
+ * deployment's edge answers such a request with its own status and page. Those refusals keep
+ * `status` set and `code` undefined, which is what lets callers tell an edge refusal from a bot
+ * API refusal — an edge refusal is shaped by the request body and is transient, not a verdict on
+ * the request's meaning.
+ *
+ * `permanent` is the caller's retry verdict for this status. The default marks only 401/403 final,
+ * which leaves a body-shaped 400 to the delivery layer's own retry budget; a call path with a
+ * stricter reading (management calls) passes its own.
+ */
+export function httpStatusError(
+  label: string,
+  status: number,
+  body?: Uint8Array,
+  permanent = status === 401 || status === 403,
+): OctoError {
+  if (body === undefined || body.byteLength === 0) {
+    return new OctoError(`Octo ${label} request failed with HTTP ${status}`, { status, permanent });
+  }
+  const code = serverErrorCode(body);
+  const detail = serverErrorMessage(body);
+  if (code === undefined && detail === null) {
+    return new OctoError(
+      `Octo ${label} request failed with HTTP ${status} (non-bot-API response body)`,
+      { status, permanent },
+    );
+  }
+  const reason = code === undefined ? `HTTP ${status}` : `HTTP ${status} (${code})`;
+  return new OctoError(
+    detail === null
+      ? `Octo ${label} request failed with ${reason}`
+      : `Octo ${label} request failed with ${reason}: ${detail}`,
+    { status, permanent, ...(code === undefined ? {} : { code }) },
+  );
 }
 
 export function responseUrl(value: unknown, field: string): string {

@@ -30,10 +30,7 @@ import {
   mentionPrefFromResponse,
   memberFromResponse,
   membersFromResponse,
-  messageWriteError,
   parseVersion,
-  serverErrorCode,
-  serverErrorMessage,
   threadFromResponse,
   threadPath,
   threadsFromResponse,
@@ -276,7 +273,7 @@ export class OctoTransport implements ChannelTransport {
       MAX_HTTP_BODY_BYTES,
     );
     if (response.status < 200 || response.status >= 300) {
-      throw messageWriteError("message edit", response.status, response.body);
+      throw httpStatusError("message edit", response.status, response.body);
     }
   }
 
@@ -296,7 +293,7 @@ export class OctoTransport implements ChannelTransport {
       signal,
       MAX_HTTP_BODY_BYTES,
     );
-    if (response.status < 200 || response.status >= 300) throw httpStatusError("typing", response.status);
+    if (response.status < 200 || response.status >= 300) throw httpStatusError("typing", response.status, response.body);
   }
 
   async sendProgressCard(
@@ -398,7 +395,7 @@ export class OctoTransport implements ChannelTransport {
     );
     if (response.status === 404) return null;
     if (response.status < 200 || response.status >= 300) {
-      throw httpStatusError("bot events", response.status);
+      throw httpStatusError("bot events", response.status, response.body);
     }
     const value = parseJsonWithInt64(response.body, "bot events");
     if (!isJsonRecord(value) || !Array.isArray(value.results)) {
@@ -431,7 +428,7 @@ export class OctoTransport implements ChannelTransport {
       MAX_HTTP_BODY_BYTES,
     );
     if (response.status < 200 || response.status >= 300) {
-      throw httpStatusError("bot event ack", response.status);
+      throw httpStatusError("bot event ack", response.status, response.body);
     }
   }
 
@@ -470,7 +467,7 @@ export class OctoTransport implements ChannelTransport {
       MAX_HTTP_BODY_BYTES,
     );
     if (response.status < 200 || response.status >= 300) {
-      throw httpStatusError("message edit", response.status);
+      throw httpStatusError("message edit", response.status, response.body);
     }
   }
 
@@ -495,7 +492,7 @@ export class OctoTransport implements ChannelTransport {
       fetch.signal,
       MAX_HTTP_BODY_BYTES,
     );
-    if (response.status < 200 || response.status >= 300) throw httpStatusError("message sync", response.status);
+    if (response.status < 200 || response.status >= 300) throw httpStatusError("message sync", response.status, response.body);
     return historyFromResponse(parseJson(response.body, "message sync"), this.registration?.uid ?? "");
   }
 
@@ -617,7 +614,7 @@ export class OctoTransport implements ChannelTransport {
     if (response.status === 404) {
       return { present: false, content: "", version: 0, updatedAt: null, updatedBy: "" };
     }
-    if (response.status < 200 || response.status >= 300) throw httpStatusError("group context", response.status);
+    if (response.status < 200 || response.status >= 300) throw httpStatusError("group context", response.status, response.body);
     return contextFromResponse(parseJson(response.body, "group context"));
   }
 
@@ -635,7 +632,7 @@ export class OctoTransport implements ChannelTransport {
       signal,
       MAX_GROUP_CONTEXT_BYTES,
     );
-    if (response.status < 200 || response.status >= 300) throw httpStatusError("group context update", response.status);
+    if (response.status < 200 || response.status >= 300) throw httpStatusError("group context update", response.status, response.body);
     return parseVersion(parseJson(response.body, "group context update"));
   }
 
@@ -870,7 +867,7 @@ export class OctoTransport implements ChannelTransport {
       undefined,
       MAX_HTTP_BODY_BYTES,
     );
-    if (response.status < 200 || response.status >= 300) throw httpStatusError("bot register", response.status);
+    if (response.status < 200 || response.status >= 300) throw httpStatusError("bot register", response.status, response.body);
     const value = parseJson(response.body, "bot register");
     if (!isJsonRecord(value)) throw new OctoError("Octo bot register response has invalid schema");
     const uid = requiredString(value.robot_id, "robot_id");
@@ -908,7 +905,7 @@ export class OctoTransport implements ChannelTransport {
       signal,
       MAX_HTTP_BODY_BYTES,
     );
-    if (response.status < 200 || response.status >= 300) throw httpStatusError("presigned upload", response.status);
+    if (response.status < 200 || response.status >= 300) throw httpStatusError("presigned upload", response.status, response.body);
     const value = parseJson(response.body, "presigned upload");
     if (!isJsonRecord(value)) throw new OctoError("Octo presigned upload response has invalid schema");
     return {
@@ -946,7 +943,7 @@ export class OctoTransport implements ChannelTransport {
       stream.destroy();
       throw error;
     });
-    if (response.status < 200 || response.status >= 300) throw httpStatusError("presigned upload transfer", response.status);
+    if (response.status < 200 || response.status >= 300) throw httpStatusError("presigned upload transfer", response.status, response.body);
   }
 
   private async sendMessage(
@@ -971,9 +968,7 @@ export class OctoTransport implements ChannelTransport {
       signal,
       MAX_HTTP_BODY_BYTES,
     );
-    if (response.status < 200 || response.status >= 300) {
-      throw messageWriteError("send message", response.status, response.body);
-    }
+    if (response.status < 200 || response.status >= 300) throw httpStatusError("send message", response.status, response.body);
     const value = parseJsonWithInt64(response.body, "send message");
     if (!isJsonRecord(value)) throw new OctoError("Octo send message response has invalid schema");
     if (value.message_id === undefined || value.message_id === null) return {};

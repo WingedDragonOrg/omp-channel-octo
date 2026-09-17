@@ -1,5 +1,6 @@
 import { expect, test, vi } from "bun:test";
 import type { ChatTarget, OmpWorker, ProgressCard, SendReceipt, WorkerOptions } from "../src/contracts";
+import { OctoError } from "../src/octo/error";
 import {
   assistantText,
   closeCoreHarness,
@@ -178,6 +179,28 @@ class AbortableEditTransport extends PresentationTransport {
     await super.editProgressCard(target, messageId, progress, cardSeq, signal);
   }
 }
+class EdgeRefusedEditTransport extends PresentationTransport {
+  /** Edits the deployment's edge refused, in order, before the card fell back to a safe shape. */
+  readonly refusedEdits: ProgressCardEdit[] = [];
+
+  override async editProgressCard(
+    target: ChatTarget,
+    messageId: string,
+    progress: ProgressCard,
+    cardSeq: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (this.refusedEdits.length === 0 && progress.tools.some((tool) => tool.summary !== undefined)) {
+      this.refusedEdits.push({ target, messageId, progress, cardSeq });
+      throw new OctoError("Octo message edit request failed with HTTP 403 (non-bot-API response body)", {
+        status: 403,
+        permanent: true,
+      });
+    }
+    return super.editProgressCard(target, messageId, progress, cardSeq, signal);
+  }
+}
+
 class AbortableTypingTransport extends PresentationTransport {
   readonly typingStarted = Promise.withResolvers<void>();
   typingAbortSeen = false;
@@ -864,6 +887,95 @@ test("a progress-card API failure does not block the assistant body", async () =
     await closeCoreHarness(harness);
   }
 });
+
+test("an edge-refused card body is retried without step summaries and still closes", async () => {
+  const transport = new EdgeRefusedEditTransport();
+  const promptStarted = Promise.withResolvers<void>();
+  const workerGate = Promise.withResolvers<void>();
+  let emitLater: FakePromptContext["emit"] | undefined;
+  const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+  const task = inbound({
+    messageId: "presentation-card-edge-refusal",
+    channelId: "dm-presentation-card-edge-refusal",
+    text: "run a command the edge dislikes",
+  });
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ emit }) => {
+      emitLater = emit;
+      emit({ type: "turn_start", turnId: "turn-edge", atMs: Date.now() });
+      emit({
+        type: "todo_update",
+        atMs: Date.now(),
+        phases: [{ name: "核对", tasks: [{ content: "核对卡片", status: "in_progress" }] }],
+      });
+      emit({
+        type: "tool_start",
+        toolCallId: "tool-edge",
+        toolName: "shell",
+        atMs: Date.now(),
+        summary: "cat > /tmp/probe.ts <<'EOF'",
+      });
+      promptStarted.resolve();
+      await workerGate.promise;
+    },
+  });
+  try {
+    vi.useFakeTimers();
+    await harness.service.handleInbound(task);
+    await promptStarted.promise;
+    await flushMicrotasks();
+    expect(transport.progressCardSends).toHaveLength(1);
+
+    emitLater?.({
+      type: "tool_end",
+      toolCallId: "tool-edge",
+      atMs: Date.now(),
+      status: "succeeded",
+      summary: "cat > /tmp/probe.ts <<'EOF'",
+    });
+    vi.advanceTimersByTime(1_000);
+    await flushMicrotasks();
+    expect(transport.refusedEdits).toHaveLength(1);
+    expect(transport.refusedEdits[0]?.messageId).toBe("progress-card-1");
+    expect(transport.refusedEdits[0]?.progress.tools.map((tool) => tool.summary)).toEqual([
+      "cat > /tmp/probe.ts <<'EOF'",
+    ]);
+    expect(transport.progressCardEdits).toHaveLength(0);
+
+    vi.advanceTimersByTime(1_000);
+    await flushMicrotasks();
+    const retried = transport.progressCardEdits[0];
+    expect(retried?.messageId).toBe("progress-card-1");
+    expect(retried?.progress.tools.map((tool) => [tool.toolName, tool.state])).toEqual([
+      ["shell", "succeeded"],
+    ]);
+    expect(Object.hasOwn(retried!.progress.tools[0]!, "summary")).toBe(false);
+    expect(retried?.progress.todos[0]?.tasks.map((todo) => [todo.content, todo.status])).toEqual([
+      ["核对卡片", "in_progress"],
+    ]);
+
+    workerGate.resolve();
+    for (let step = 0; step < 10 && transport.progressCardEdits.at(-1)?.progress.state !== "completed"; step += 1) {
+      vi.advanceTimersByTime(1_000);
+      await flushMicrotasks();
+    }
+    const terminal = transport.progressCardEdits.at(-1);
+    expect(terminal?.progress.state).toBe("completed");
+    expect(Object.hasOwn(terminal!.progress.tools[0]!, "summary")).toBe(false);
+    expect(transport.progressCardSends).toHaveLength(1);
+    expect(transport.refusedEdits).toHaveLength(1);
+
+    const lines = logged.mock.calls.map((call) => String(call[0] ?? ""));
+    expect(lines.some((line) => line.includes("运行中编辑失败"))).toBe(true);
+    expect(lines.some((line) => line.includes("改用不带步骤摘要的形态重试"))).toBe(true);
+  } finally {
+    workerGate.resolve();
+    logged.mockRestore();
+    vi.useRealTimers();
+    await closeCoreHarness(harness);
+  }
+}, 10_000);
 
 test("typing starts before group context and worker startup and renews", async () => {
   vi.useFakeTimers();

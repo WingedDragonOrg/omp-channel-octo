@@ -51,6 +51,7 @@ import {
   createExecutionTracker,
   encodeExecutionSnapshot,
   restoreExecutionSnapshot,
+  stripCardSummaries,
   type ExecutionEvent,
   type ExecutionSnapshot,
   type ExecutionState,
@@ -210,6 +211,12 @@ type ProgressRound = {
   disabled: boolean;
   /** Set after this card's first running-edit failure so a repeating error logs once. */
   failureLogged: boolean;
+  /**
+   * True once the deployment's edge refused a card body and the retry dropped the free-text step
+   * summaries. The rest of the round keeps that shape — including the terminal edit — so the card
+   * keeps updating instead of freezing on the refusal.
+   */
+  degraded: boolean;
   messageId: string | undefined;
   seq: number;
   latest: ProgressCard | undefined;
@@ -234,7 +241,21 @@ type DirectoryLease = {
   complete(): void;
 };
 
-
+/**
+ * The edge in front of the bot API refuses a request body it dislikes with its own 4xx and page,
+ * while every bot API error — transient or not — arrives as a JSON envelope carrying `error.code`.
+ * So a 4xx with no code is a refusal of the body rather than a verdict on the request's meaning,
+ * and the same call can go out again in a different shape. Read structurally, like
+ * `isPermanentOutboxError`, so a fake transport can reproduce the shape without the real module.
+ */
+function isEdgeRefusal(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { code?: unknown; status?: unknown };
+  return typeof candidate.status === "number"
+    && candidate.status >= 400
+    && candidate.status < 500
+    && candidate.code === undefined;
+}
 
 /**
  * A thread (channelType=5) inherits its parent group's allowlist entry, so a freshly
@@ -2673,6 +2694,7 @@ class CoreService implements ChannelService {
       retired: false,
       disabled: false,
       failureLogged: false,
+      degraded: false,
       messageId: undefined,
       seq: 0,
       latest: undefined,
@@ -2747,16 +2769,17 @@ class CoreService implements ChannelService {
       }
       const version = round.version;
       const cardSeq = ++round.seq;
+      const snapshot = round.degraded ? stripCardSummaries(progress) : progress;
       if (running) round.nextEditAt = Date.now() + PROGRESS_MERGE_MS;
       const parentSignal = running ? progressAbort.signal : undefined;
       try {
         await runActivityRequest(
-          (signal) => this.options.transport.editProgressCard(target, messageId, progress, cardSeq, signal),
+          (signal) => this.options.transport.editProgressCard(target, messageId, snapshot, cardSeq, signal),
           parentSignal,
         );
         if (round.version === version) round.sentVersion = version;
         if (running) {
-          this.rememberProgressCard(taskId, target, messageId, cardSeq, progress);
+          this.rememberProgressCard(taskId, target, messageId, cardSeq, snapshot);
         } else {
           this.forgetProgressCard(taskId, messageId);
         }
@@ -2772,9 +2795,20 @@ class CoreService implements ChannelService {
             `[progress-card] 终态编辑失败 target=${targetKey(target)} state=${progress.state}`
             + ` seq=${cardSeq}：${reason}`,
           );
-        } else if (!round.failureLogged) {
-          round.failureLogged = true;
-          console.error(`[progress-card] 运行中编辑失败 target=${targetKey(target)} seq=${cardSeq}：${reason}`);
+        } else {
+          if (!round.failureLogged) {
+            round.failureLogged = true;
+            console.error(`[progress-card] 运行中编辑失败 target=${targetKey(target)} seq=${cardSeq}：${reason}`);
+          }
+          // The edge refused the body rather than the request: the same card goes out once without
+          // the free-text step summaries, and the round keeps that shape from here on.
+          if (!round.degraded && isEdgeRefusal(error)) {
+            round.degraded = true;
+            console.error(
+              `[progress-card] 卡片正文被网关拒绝，改用不带步骤摘要的形态重试`
+              + ` target=${targetKey(target)} seq=${cardSeq}`,
+            );
+          }
         }
       } finally {
         if (!round.retired) scheduleProgressEdit();

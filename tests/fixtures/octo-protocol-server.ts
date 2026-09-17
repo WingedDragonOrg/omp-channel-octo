@@ -245,6 +245,13 @@ export interface OctoProtocolFixtureOptions {
   botEventAckStatus?: number;
   /** Response status for POST /v1/bot/message/edit. */
   messageEditStatus?: number;
+  /**
+   * Raw body answered by POST /v1/bot/message/edit when `messageEditStatus` is a failure, with
+   * `messageEditErrorContentType` as its type. Omitted keeps the fixture's JSON error envelope;
+   * a page body reproduces what a deployment's edge answers on its way to the bot API.
+   */
+  messageEditErrorBody?: string;
+  messageEditErrorContentType?: string;
   /** Delay before responding to POST /v1/bot/sendMessage. */
   sendMessageDelayMs?: number;
   /** Delay before responding to POST /v1/bot/message/edit. */
@@ -1222,7 +1229,15 @@ export class OctoProtocolFixture {
       }
       const status = this.options.messageEditStatus ?? 200;
       if (status < 200 || status >= 300) {
-        writeJson(response, status, { error: "message edit failed" });
+        const body = this.options.messageEditErrorBody;
+        if (body === undefined) {
+          writeJson(response, status, { error: "message edit failed" });
+        } else {
+          response.writeHead(status, {
+            "content-type": this.options.messageEditErrorContentType ?? "application/json",
+          });
+          response.end(body);
+        }
         return;
       }
       const responseDelay = this.options.messageEditDelayMs ?? 0;

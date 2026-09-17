@@ -10,7 +10,6 @@ import type {
 } from "../contracts.ts";
 import { isJsonRecord, type JsonRecord } from "./type-guards.ts";
 import { OctoError } from "./error.ts";
-import { decodeUtf8 } from "./protocol.ts";
 import {
   MAX_HTTP_BODY_BYTES,
   authHeaders,
@@ -84,83 +83,17 @@ export function threadPath(groupId: string, shortId: string): string {
 }
 
 /**
- * Body of a failed bot API call, reduced to a single bounded line. The server message is
- * operator-facing text about the request itself; it never carries bot credentials.
+ * Failed management call: it reads the same body as every other bot API failure, with this path's
+ * own retry policy — a 4xx is the request's verdict (the bot API reports every error as the legacy
+ * wire 400, permanent or not), while a 5xx stays retryable.
  */
-export function serverErrorMessage(body: Uint8Array): string | null {
-  let value: unknown;
-  try {
-    value = JSON.parse(decodeUtf8(body, "error"));
-  } catch {
-    return null;
-  }
-  if (!isJsonRecord(value)) return null;
-  const nested = isJsonRecord(value["error"]) ? value["error"]["message"] : undefined;
-  const message = typeof nested === "string" && nested.length > 0 ? nested : value["msg"];
-  if (typeof message !== "string" || message.length === 0) return null;
-  const single = message.replace(/\s+/gu, " ").trim();
-  return single.length > 200 ? `${single.slice(0, 200)}…` : single;
-}
-
-/**
- * Machine-readable identifier of a failed bot API call (`error.code`, e.g.
- * `err.server.bot_api.store_failed`). Transient server failures are recognized by this
- * code even when the wire status alone would not say so.
- */
-export function serverErrorCode(body: Uint8Array): string | undefined {
-  let value: unknown;
-  try {
-    value = JSON.parse(decodeUtf8(body, "error"));
-  } catch {
-    return undefined;
-  }
-  if (!isJsonRecord(value)) return undefined;
-  const nested = isJsonRecord(value["error"]) ? value["error"]["code"] : undefined;
-  const code = typeof nested === "string" && nested.length > 0 ? nested : value["code"];
-  return typeof code === "string" && code.length > 0 ? code : undefined;
-}
-
-/** Bot API 的失败：带上 body 的机器码与说明，只有 `permanent` 由调用方按各自口径判定。 */
-function botApiError(
-  label: string,
-  status: number,
-  body: Uint8Array,
-  permanent: (status: number) => boolean,
-): OctoError {
-  const detail = serverErrorMessage(body);
-  const code = serverErrorCode(body);
-  // The bot API answers every error with the same legacy wire status 400, so the body's
-  // machine code is what separates a request mistake (`err.server.bot_api.request_invalid`)
-  // from an internal failure (`err.server.bot_api.store_failed`); keep it in the message so
-  // the distinction survives into logs and tool results.
-  const reason = code === undefined ? `HTTP ${status}` : `HTTP ${status} (${code})`;
-  return new OctoError(
-    detail === null
-      ? `Octo ${label} request failed with ${reason}`
-      : `Octo ${label} failed with ${reason}: ${detail}`,
-    {
-      status,
-      permanent: permanent(status),
-      ...(code === undefined ? {} : { code }),
-    },
-  );
-}
-
 export function managementError(label: string, status: number, body: Uint8Array): OctoError {
-  return botApiError(
+  return httpStatusError(
     label,
     status,
     body,
-    (status) => status === 400 || status === 401 || status === 403 || status === 404,
+    status === 400 || status === 401 || status === 403 || status === 404,
   );
-}
-
-/**
- * 发送与编辑的失败：可重试性按传输层口径——只有 401/403 视为永久，其余（含 bot API 包成
- * 线缆 400 的瞬时内部失败）交给投递层的重试预算判定。
- */
-export function messageWriteError(label: string, status: number, body: Uint8Array): OctoError {
-  return botApiError(label, status, body, (status) => status === 401 || status === 403);
 }
 
 export async function botApiRequest(

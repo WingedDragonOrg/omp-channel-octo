@@ -232,7 +232,7 @@ export async function cardProfileCapabilitiesFromApi(
   );
   if (response.status === 404) return null;
   if (response.status < 200 || response.status >= 300) {
-    throw httpStatusError("card profile", response.status);
+    throw httpStatusError("card profile", response.status, response.body);
   }
   try {
     return cardProfileCapabilities(parseJson(response.body, "card profile"));

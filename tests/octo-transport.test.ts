@@ -625,6 +625,54 @@ describe("Octo text send and target context", () => {
     expect(currentFixture.getLatestEditedText(receipt.messageId!)).toBeUndefined();
   });
 
+  test("names the bot API code a refused edit carries in its answer", async () => {
+    fixture = await createOctoProtocolFixture({
+      messageEditStatus: 400,
+      messageEditErrorBody: JSON.stringify({
+        error: {
+          code: "err.server.bot_api.request_invalid",
+          message: "消息不存在或无权限编辑。",
+        },
+      }),
+    });
+    transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
+    await transport.initialize();
+    const currentFixture = fixture;
+    const target = { channelId: currentFixture.ownerUid, channelType: 1 as const };
+    const receipt = await transport.sendText(target, "seed", "edit-refusal-code");
+
+    const failure = await transport
+      .editText(target, receipt.messageId!, "refused edit")
+      .then(() => null, (error: unknown) => error as { code?: unknown; message?: unknown; status?: unknown });
+    expect(failure?.status).toBe(400);
+    expect(failure?.code).toBe("err.server.bot_api.request_invalid");
+    expect(String(failure?.message)).toContain("err.server.bot_api.request_invalid");
+    expect(String(failure?.message)).toContain("消息不存在或无权限编辑");
+  });
+
+  test("marks an edit refused before the bot API instead of reading a code out of it", async () => {
+    fixture = await createOctoProtocolFixture({
+      messageEditStatus: 403,
+      messageEditErrorBody: "<html><head><title>403 Forbidden</title></head><body>blocked</body></html>",
+      messageEditErrorContentType: "text/html",
+    });
+    transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
+    await transport.initialize();
+    const currentFixture = fixture;
+    const target = { channelId: currentFixture.ownerUid, channelType: 1 as const };
+    const receipt = await transport.sendText(target, "seed", "edit-edge-refusal");
+
+    const failure = await transport
+      .editText(target, receipt.messageId!, "edge refused edit")
+      .then(() => null, (error: unknown) => error as { code?: unknown; message?: unknown; status?: unknown });
+    expect(failure?.status).toBe(403);
+    expect(failure?.code).toBeUndefined();
+    expect(String(failure?.message)).toContain("HTTP 403");
+    expect(String(failure?.message)).toContain("non-bot-API response body");
+    expect(currentFixture.sentMessages).toHaveLength(1);
+    expect(currentFixture.getLatestEditedText(receipt.messageId!)).toBeUndefined();
+  });
+
   test("times out an ordinary text edit when the protocol fixture does not respond", async () => {
     fixture = await createOctoProtocolFixture({ messageEditDelayMs: 15_100 });
     transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });

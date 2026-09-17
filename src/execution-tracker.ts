@@ -545,6 +545,34 @@ export function createExecutionTracker(options: ExecutionTrackerOptions = {}): E
 }
 
 /**
+ * The same snapshot without the free-text step summaries the card prints under each step. A
+ * deployment's edge inspects every card body and refuses one whose text matches its injection
+ * rules, and a bounded command line can do that on its own, so a card refused that way is retried
+ * in this shape: run state, counts, todos and subagent rows stay, and the command text does not.
+ */
+export function stripCardSummaries(snapshot: ExecutionSnapshot): ExecutionSnapshot {
+  return {
+    ...snapshot,
+    tools: snapshot.tools.map((tool) => ({
+      toolCallId: tool.toolCallId,
+      toolName: tool.toolName,
+      state: tool.state,
+      startedAtMs: tool.startedAtMs,
+      endedAtMs: tool.endedAtMs,
+      durationMs: tool.durationMs,
+      ...(tool.errorCategory === undefined ? {} : { errorCategory: tool.errorCategory }),
+    })),
+    subagents: snapshot.subagents.map((subagent) => ({
+      subagentId: subagent.subagentId,
+      agent: subagent.agent,
+      state: subagent.state,
+      ...(subagent.currentTool === undefined ? {} : { currentTool: subagent.currentTool }),
+      ...(subagent.toolCount === undefined ? {} : { toolCount: subagent.toolCount }),
+    })),
+  };
+}
+
+/**
  * Serializes a snapshot for durable storage. A process that did not observe the run (for example
  * the one that starts after a restart interrupted it) can then replay the same trajectory and
  * submit one terminal card edit instead of leaving the client on the last running state.
