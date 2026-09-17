@@ -321,30 +321,36 @@ export function markdownSafeToolLine(tool: ExecutionToolSnapshot): string {
 }
 
 /** Compact tier of a subagent row: the same single-line shape as an omitted trace step. */
-function makeCompactSubagentRow(
-  subagent: ExecutionSubagentSnapshot,
-  options: { readonly id?: string; readonly isVisible?: boolean } = {},
-): JsonNode {
+function makeCompactSubagentRow(subagent: ExecutionSubagentSnapshot): JsonNode {
   return makeTextBlock(`${executionStateGlyph(subagent.state)}\u00a0· ${subagentLine(subagent)}`, {
     color: executionTone(subagent.state),
     spacing: "Small",
-    ...(options.id === undefined ? {} : { id: options.id }),
-    ...(options.isVisible === undefined ? {} : { isVisible: options.isVisible }),
   });
 }
 
 // Shared by budget-pruned trace and subagent rows. These rows are the compact tier: one text
 // line each, which is what keeps the hidden-row budget affordable next to the visible panels.
-function makeCompactToolRow(
-  tool: ExecutionToolSnapshot,
-  options: { readonly id?: string; readonly isVisible?: boolean } = {},
-): JsonNode {
+function makeCompactToolRow(tool: ExecutionToolSnapshot): JsonNode {
   return makeTextBlock(`${toolStateGlyph(tool)}\u00a0· ${toolLine(tool)}`, {
     color: toolVisualTone(tool),
     spacing: "Small",
-    ...(options.id === undefined ? {} : { id: options.id }),
-    ...(options.isVisible === undefined ? {} : { isVisible: options.isVisible }),
   });
+}
+
+/**
+ * Grey band the compact history rows live in — the trace's omitted steps and the finished
+ * subagents alike. The rows sit on the section's emphasis fill, matching the rich panels above
+ * them instead of floating on the card background as bare text lines.
+ */
+function makeHistoryBand(id: string, rows: readonly JsonNode[], visible: boolean): JsonNode {
+  return {
+    type: "Container",
+    id,
+    ...(visible ? {} : { isVisible: false }),
+    style: "emphasis",
+    spacing: "Small",
+    items: rows,
+  };
 }
 
 function todoPhaseText(phase: ExecutionTodoPhase, phaseIndex: number, phaseCount: number): string {
@@ -685,21 +691,23 @@ function makeToolRow(
 }
 
 /**
- * Omitted-step history band. It renders as a sibling of `timeline_detail` instead of a child:
- * the web client's agent-progress layer repaints every filled Container that sits directly under
- * `#timeline_detail` as a failed-step status chip (danger fill + border, inline fill cleared),
- * which turned this grey band into a red block. Outside that container the band keeps the
- * section's emphasis fill, matching the subagent history band.
+ * Omitted-step history band: the trace's compact tier, holding the older rows the rich window
+ * trimmed away followed by the budget-pruned steps. It renders as a sibling of `timeline_detail`
+ * instead of a child: the web client's agent-progress layer repaints every filled Container that
+ * sits directly under `#timeline_detail` as a failed-step status chip (danger fill + border,
+ * inline fill cleared), which turned this grey band into a red block. Outside that container the
+ * band keeps the section's emphasis fill, matching the subagent history band. It stays hidden
+ * while the section offers its expand control and visible when the deployment cannot toggle.
  */
-export function makeTraceHistoryBand(tools: readonly ExecutionToolSnapshot[]): JsonNode {
-  return {
-    type: "Container",
-    id: "timeline_omitted_steps",
-    isVisible: false,
-    style: "emphasis",
-    spacing: "Small",
-    items: tools.map(tool => makeCompactToolRow(tool)),
-  };
+export function makeTraceHistoryBand(
+  tools: readonly ExecutionToolSnapshot[],
+  options: { readonly visible?: boolean } = {},
+): JsonNode {
+  return makeHistoryBand(
+    "timeline_omitted_steps",
+    tools.map(tool => makeCompactToolRow(tool)),
+    options.visible === true,
+  );
 }
 
 export function makeTimelineItems(
@@ -707,9 +715,7 @@ export function makeTimelineItems(
   hiddenCount: number,
   richLayout: boolean,
   emptyText = "正在准备",
-  olderTools: readonly ExecutionToolSnapshot[] = [],
-  hasOmittedSteps = false,
-  hideOlder = true,
+  hasHistoryRows = false,
 ): JsonNode[] {
   const items: JsonNode[] = [];
   if (hiddenCount > 0) {
@@ -719,16 +725,12 @@ export function makeTimelineItems(
       spacing: "Small",
     }));
   }
-  if (tools.length === 0 && olderTools.length === 0) {
-    if (!hasOmittedSteps) {
+  if (tools.length === 0) {
+    if (!hasHistoryRows) {
       items.push(makeTextBlock(emptyText, { isSubtle: true, spacing: "Small" }));
     }
   } else if (richLayout) {
     items.push(...tools.map(tool => makeToolRow(tool)));
-    items.push(...olderTools.map((tool, index) => makeCompactToolRow(tool, {
-      id: `timeline_older_step_${index}`,
-      ...(hideOlder ? { isVisible: false } : {}),
-    })));
   } else {
     items.push(...tools.map(tool => makeTextBlock(markdownSafeToolLine(tool), { spacing: "Small" })));
   }
@@ -844,17 +846,16 @@ function makeSubagentRow(
 
 /**
  * The subagent section. It is fed by the OMP subagent events alone: live children render as rich
- * rows, finished ones sink into the expandable history band, and the count in the heading is the
- * number of subagents the session actually reported.
+ * rows, finished ones render once in the expandable history band, and the count in the heading is
+ * the number of subagents the session actually reported.
  */
 export function makeSubagentContainer(
   subagents: readonly ExecutionSubagentSnapshot[],
   hiddenCount: number,
   totalCount: number,
   detailVisible: boolean,
-  olderSubagents: readonly ExecutionSubagentSnapshot[] = [],
-  omittedSubagents: readonly ExecutionSubagentSnapshot[] = [],
-  hideOlder = true,
+  historySubagents: readonly ExecutionSubagentSnapshot[] = [],
+  historyVisible = false,
 ): JsonNode {
   const items: JsonNode[] = [];
   if (hiddenCount > 0) {
@@ -864,23 +865,16 @@ export function makeSubagentContainer(
       spacing: "Small",
     }));
   }
-  if (subagents.length === 0 && olderSubagents.length === 0 && omittedSubagents.length === 0) {
+  if (subagents.length === 0 && historySubagents.length === 0) {
     items.push(makeTextBlock("暂无可见子代理活动", { isSubtle: true, spacing: "Small" }));
   } else {
     items.push(...subagents.map(subagent => makeSubagentRow(subagent)));
-    items.push(...olderSubagents.map((subagent, index) => makeCompactSubagentRow(subagent, {
-      id: `subagent_older_step_${index}`,
-      ...(hideOlder ? { isVisible: false } : {}),
-    })));
-    if (omittedSubagents.length > 0) {
-      items.push({
-        type: "Container",
-        id: "subagent_omitted_steps",
-        isVisible: false,
-        style: "emphasis",
-        spacing: "Small",
-        items: omittedSubagents.map(subagent => makeCompactSubagentRow(subagent)),
-      });
+    if (historySubagents.length > 0) {
+      items.push(makeHistoryBand(
+        "subagent_omitted_steps",
+        historySubagents.map(subagent => makeCompactSubagentRow(subagent)),
+        historyVisible,
+      ));
     }
   }
   return {

@@ -539,7 +539,7 @@ test("preview snapshot shows every subagent state by default", () => {
   expect(nodeById(card, "timeline_section").isVisible).not.toBe(false);
   expect(cardText(nodeById(card, "timeline_detail"))).toContain("已隐藏前");
 });
-test("preview rich fallback expands older trace rows without ToggleVisibility", () => {
+test("preview rich fallback keeps the compact history band readable without ToggleVisibility", () => {
   const built = buildExecutionCard(previewSnapshot(), {
     ...previewCapabilities,
     actions: ["Action.OpenUrl"],
@@ -547,20 +547,21 @@ test("preview rich fallback expands older trace rows without ToggleVisibility", 
   expect(built).not.toBeNull();
   const card = built!.card as JsonRecord;
   const timeline = nodeById(card, "timeline_detail");
-  const items = timeline.items as JsonRecord[];
-  const richRows = items.filter(item => item.type === "ColumnSet");
-  const olderRows = items.filter(item => (
-    item.type === "TextBlock"
-    && typeof item.id === "string"
-    && item.id.startsWith("timeline_older_step_")
-  ));
+  const richRows = (timeline.items as JsonRecord[]).filter(item => item.type === "ColumnSet");
   expect(richRows.length).toBeGreaterThan(0);
   expect(richRows.every(row => row.isVisible !== false)).toBe(true);
-  // Without the toggle action, hiding is pointless: older rows render as visible compact lines.
-  expect(olderRows.length).toBeGreaterThan(0);
-  expect(olderRows.every(row => row.isVisible !== false)).toBe(true);
-  expect(olderRows.every(row => typeof row.text === "string" && row.text.includes("·"))).toBe(true);
-  expect(cardText(timeline)).toContain("修改卡片布局");
+  // Without the toggle action, hiding is pointless: the trimmed rows render as visible compact
+  // lines inside the section's grey band.
+  const traceBand = nodeById(card, "timeline_omitted_steps");
+  expect(traceBand).toMatchObject({ type: "Container", style: "emphasis" });
+  expect(traceBand.isVisible).not.toBe(false);
+  const bandRows = traceBand.items as JsonRecord[];
+  expect(bandRows.length).toBeGreaterThan(0);
+  expect(bandRows.every(row => (
+    row.type === "TextBlock" && row.wrap === true && typeof row.text === "string" && row.text.includes("·")
+  ))).toBe(true);
+  expect(cardText(timeline)).toContain("已隐藏前");
+  expect(cardText(traceBand)).toContain("修改卡片布局");
   expect(cardNodes(card).some(node => node.id === "btn_expand_trace")).toBe(false);
   expect(cardNodes(card).some(node => node.id === "btn_expand_subagents")).toBe(false);
 });

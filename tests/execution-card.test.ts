@@ -757,7 +757,7 @@ describe("execution card rendering", () => {
     expect(historyBand).toContain("verifier");
     expect(historyBand).toContain("已取消");
   });
-  test("expands older rich rows when ToggleVisibility is unavailable", () => {
+  test("keeps the compact history band visible when ToggleVisibility is unavailable", () => {
     const tracker = createExecutionTracker({ runId: "trace-no-toggle" });
     startTurn(tracker, "turn-1", 0);
     for (let index = 0; index < 4; index += 1) {
@@ -771,16 +771,16 @@ describe("execution card rendering", () => {
     expect(rendered).not.toBeNull();
     const card = rendered!.card as JsonRecord;
     const timeline = nodeById(card, "timeline_detail");
-    const items = timeline.items as JsonRecord[];
-    const richRows = items.filter(item => item.type === "ColumnSet");
-    const compactRows = items.filter(item => (
-      item.type === "TextBlock" && typeof item.text === "string" && item.text.includes("轨迹步骤 1")
-    ));
+    const richRows = (timeline.items as JsonRecord[]).filter(item => item.type === "ColumnSet");
     expect(richRows).toHaveLength(3);
-    expect(compactRows).toHaveLength(1);
-    expect(compactRows.every(row => row.isVisible !== false)).toBe(true);
-    expect(cardText(timeline)).toContain("轨迹步骤 1");
+    // Without the toggle action there is nothing to hide behind: the trimmed row stays readable
+    // in the grey band instead of folding away.
+    const band = nodeById(card, "timeline_omitted_steps");
+    expect(band).toMatchObject({ type: "Container", style: "emphasis" });
+    expect(band.isVisible).not.toBe(false);
+    expect(cardText(band)).toContain("轨迹步骤 1");
     expect(cardText(timeline)).toContain("轨迹步骤 4");
+    expect(cardText(timeline)).not.toContain("轨迹步骤 1");
     expect(nodes(card).some(node => node.id === "btn_expand_trace")).toBe(false);
   });
   test("uses the same compact row layout for omitted subagents and trace steps", () => {
@@ -810,6 +810,16 @@ describe("execution card rendering", () => {
     // one compact text line per step so hidden rows stay affordable next to user-visible content.
     expect(omittedTrace).toMatchObject({ type: "Container", style: "emphasis", spacing: "Small" });
     expect(omittedSubagents).toMatchObject({ type: "Container", style: "emphasis", spacing: "Small" });
+    // The trace band is the whole compact tier in source order: the rows the rich window trimmed
+    // away first, then the budget-pruned old steps.
+    const traceBandText = cardText(omittedTrace);
+    expect(traceBandText).toContain("步骤 0");
+    expect(traceBandText).toContain("旧轨迹");
+    expect(traceBandText.indexOf("步骤 0")).toBeLessThan(traceBandText.indexOf("旧轨迹"));
+    // A finished child renders once: its row lives in the band, not again as a bare line.
+    expect(nodes(card).filter(node => (
+      typeof node.text === "string" && node.text.includes("reviewer · 验证实现")
+    ))).toHaveLength(1);
 
     for (const row of [traceRow, subagentRow]) {
       expect(row).toMatchObject({ type: "TextBlock", wrap: true, spacing: "Small" });
@@ -865,6 +875,56 @@ describe("execution card rendering", () => {
     }
   });
 
+  test("keeps the compact tier inside the grey history bands", () => {
+    const tracker = createExecutionTracker({ runId: "compact-band-scope" });
+    startTurn(tracker, "turn-1", 0);
+    startSubagent(tracker, "Done1", "scout", 1, "统计源码");
+    endSubagent(tracker, "Done1", 2, "completed", "统计源码");
+    startSubagent(tracker, "Live", "verifier", 3, "验证实现");
+    for (let index = 0; index < 6; index += 1) {
+      const toolCallId = `tool-${index}`;
+      startTool(tracker, toolCallId, "read", 10 + index, `步骤 ${index}`);
+      tracker.apply({ type: "tool_end", toolCallId, atMs: 11 + index, status: "succeeded" });
+    }
+
+    const rendered = buildExecutionCard(tracker.snapshot(100), fullCapabilities);
+    expect(rendered).not.toBeNull();
+    const card = rendered!.card as JsonRecord;
+    expect(cardStats(card).nodes).toBeLessThanOrEqual(fullCapabilities.limits!.maxNodes! - 1);
+
+    // Inside the detail containers only the summaries stay: every compact row sits in a grey band,
+    // so no step line is left bare on the card background.
+    const stepListChildren = nodeById(card, "timeline_detail").items as JsonRecord[];
+    expect(stepListChildren.filter(item => item.type === "TextBlock").map(item => item.id))
+      .toEqual(["timeline_hidden_summary"]);
+    const subagentChildren = nodeById(card, "subagent_detail").items as JsonRecord[];
+    expect(subagentChildren.filter(item => item.type === "TextBlock").map(item => item.id))
+      .toEqual(["subagent_hidden_summary"]);
+    const traceBand = nodeById(card, "timeline_omitted_steps");
+    const subagentBand = nodeById(card, "subagent_omitted_steps");
+    for (const band of [traceBand, subagentBand]) {
+      expect(band).toMatchObject({ type: "Container", style: "emphasis", isVisible: false });
+      const rows = band.items as JsonRecord[];
+      expect(rows.length).toBeGreaterThan(0);
+      expect(rows.every(row => row.type === "TextBlock" && row.wrap === true)).toBe(true);
+    }
+    expect(cardText(traceBand)).toContain("步骤 0");
+    // A finished child renders once: its row lives in the band, not again as a bare line.
+    expect(nodes(card).filter(node => (
+      typeof node.text === "string" && node.text.includes("scout · 统计源码")
+    ))).toHaveLength(1);
+
+    // The section controls move exactly these bands, in both directions.
+    expect(targetElements(toggleActionById(card, "trace_expand"))
+      .find(target => target.elementId === "timeline_omitted_steps")).toMatchObject({ isVisible: true });
+    expect(targetElements(toggleActionById(card, "trace_collapse"))
+      .find(target => target.elementId === "timeline_omitted_steps")).toMatchObject({ isVisible: false });
+    expect(targetElements(toggleActionById(card, "subagents_expand"))
+      .find(target => target.elementId === "subagent_omitted_steps")).toMatchObject({ isVisible: true });
+    expect(targetElements(toggleActionById(card, "subagents_collapse"))
+      .find(target => target.elementId === "subagent_omitted_steps")).toMatchObject({ isVisible: false });
+  });
+
   test("keeps waiting markers out of markdown list rendering", () => {
     const tracker = createExecutionTracker({ runId: "waiting-marker" });
     startTurn(tracker, "turn-1", 0);
@@ -899,14 +959,14 @@ describe("execution card rendering", () => {
     expect(nodeById(card, "subagent_detail")).toMatchObject({ isVisible: true });
     expect(nodes(card).some(node => node.id === "btn_collapse_subagents")).toBe(false);
     expect(cardText(card)).toContain("检查回退布局");
-    // Without the toggle action, hiding would strand the rows: the finished child stays a plain
-    // visible compact line instead of a collapsed band.
-    const finished = (nodeById(card, "subagent_detail").items as JsonRecord[]).filter(
-      item => item.type === "TextBlock" && cardText(item).includes("reviewer"),
-    );
-    expect(finished).toHaveLength(1);
-    expect(finished[0]!.isVisible).not.toBe(false);
-    expect(nodes(card).some(node => node.id === "subagent_omitted_steps")).toBe(false);
+    // Without the toggle action, hiding would strand the rows: the finished child stays readable
+    // in the visible grey history band instead of a collapsed one.
+    const band = nodeById(card, "subagent_omitted_steps");
+    expect(band).toMatchObject({ type: "Container", style: "emphasis" });
+    expect(band.isVisible).not.toBe(false);
+    expect(cardText(band)).toContain("reviewer");
+    expect(cardText(band)).toContain("已完成");
+    expect(nodes(card).some(node => node.id === "subagent_older_step_0")).toBe(false);
   });
 
   test("orders subagents before trace and omits toggles when three steps fit", () => {
@@ -1059,13 +1119,12 @@ describe("execution card rendering", () => {
     expect(timeline.isVisible).toBe(true);
     const timelineItems = timeline.items as JsonRecord[];
     const richRows = timelineItems.filter(item => item.type === "ColumnSet");
-    const olderRows = timelineItems.filter(item => (
-      item.type === "TextBlock" && item.id === "timeline_older_step_0"
-    ));
     expect(richRows).toHaveLength(3);
     expect(richRows.every(row => row.isVisible !== false)).toBe(true);
-    expect(olderRows).toHaveLength(1);
-    expect(olderRows[0]).toMatchObject({ isVisible: false, wrap: true });
+    // The trimmed step sits in the section's grey band, which is what the expand control reveals.
+    const historyBand = nodeById(card, "timeline_omitted_steps");
+    expect(historyBand).toMatchObject({ type: "Container", style: "emphasis", isVisible: false });
+    expect(cardText(historyBand)).toContain("步骤 1");
     expect(todos.isVisible).not.toBe(false);
     expect(cardText(todos)).toContain("Keep this visible");
     expect(nodes(card).some(node => node.id === "collapsed_steps")).toBe(false);
@@ -1077,7 +1136,7 @@ describe("execution card rendering", () => {
     expect(collapseIds).toEqual(expandIds);
     expect(collapseIds).toEqual(new Set([
       "timeline_hidden_summary",
-      "timeline_older_step_0",
+      "timeline_omitted_steps",
       "btn_collapse_trace",
       "btn_expand_trace",
     ]));
@@ -1437,37 +1496,29 @@ describe("execution card rendering", () => {
     expect(timeline.isVisible).toBe(true);
     const timelineItems = timeline.items as JsonRecord[];
     const visibleRows = timelineItems.filter(item => item.type === "ColumnSet" && item.isVisible !== false);
-    const olderRows = timelineItems.filter(item => (
-      item.type === "TextBlock"
-      && typeof item.id === "string"
-      && item.id.startsWith("timeline_older_step_")
-    ));
     expect(visibleRows).toHaveLength(3);
-    expect(olderRows).toHaveLength(4);
-    expect(olderRows.every(row => row.isVisible === false)).toBe(true);
     expect(nodeById(card, "timeline_hidden_summary").isVisible).not.toBe(false);
 
     const visibleText = visibleRows.map(row => cardText(row)).join("\n");
-    const hiddenText = olderRows.map(row => cardText(row)).join("\n");
     expect(visibleText).not.toContain("步骤 0");
     expect(visibleText).not.toContain("步骤 1");
     expect(visibleText).not.toContain("步骤 2");
     expect(visibleText).not.toContain("步骤 3");
     expect(visibleText).toContain("步骤 4");
     expect(visibleText).toContain("步骤 6");
-    expect(hiddenText).toContain("步骤 0");
-    expect(hiddenText).toContain("步骤 3");
+    // The four trimmed steps are the grey band the expand control reveals.
+    const historyBand = nodeById(card, "timeline_omitted_steps");
+    expect(historyBand).toMatchObject({ type: "Container", style: "emphasis", isVisible: false });
+    const bandText = cardText(historyBand);
+    expect(bandText).toContain("步骤 0");
+    expect(bandText).toContain("步骤 3");
     expect(nodes(card).some(node => node.id === "collapsed_steps")).toBe(false);
 
     expect(nodeById(card, "btn_collapse_trace")).toMatchObject({ isVisible: false });
     expect(nodeById(card, "btn_expand_trace")).toMatchObject({ isVisible: true });
     const expandTargets = targetElements(toggleActionById(card, "trace_expand"));
     expect(expandTargets.find(target => target.elementId === "timeline_hidden_summary")).toMatchObject({ isVisible: false });
-    const olderTargets = expandTargets.filter(target => (
-      typeof target.elementId === "string" && target.elementId.startsWith("timeline_older_step_")
-    ));
-    expect(olderTargets).toHaveLength(4);
-    expect(olderTargets.every(target => target.isVisible === true)).toBe(true);
+    expect(expandTargets.find(target => target.elementId === "timeline_omitted_steps")).toMatchObject({ isVisible: true });
   });
   test("keeps only recent trace rows rich while older rows stay compact", () => {
     const tracker = createExecutionTracker({ runId: "compact-older-trace" });
@@ -1487,19 +1538,15 @@ describe("execution card rendering", () => {
     expect(rendered).not.toBeNull();
     const card = rendered!.card as JsonRecord;
     const timeline = nodeById(card, "timeline_detail");
-    const items = timeline.items as JsonRecord[];
-    const visibleRows = items.filter(item => item.type === "ColumnSet");
-    const olderRows = items.filter(item => (
-      item.type === "TextBlock"
-      && typeof item.id === "string"
-      && item.id.startsWith("timeline_older_step_")
-    ));
+    const visibleRows = (timeline.items as JsonRecord[]).filter(item => item.type === "ColumnSet");
     expect(visibleRows).toHaveLength(3);
     expect(visibleRows.every(row => row.isVisible !== false)).toBe(true);
     expect(nodes(visibleRows[0]!).some(node => node.type === "Container" && node.style === "good")).toBe(true);
-    expect(olderRows).toHaveLength(1);
-    expect(olderRows[0]).toMatchObject({ type: "TextBlock", isVisible: false, wrap: true });
-    expect(cardText(olderRows[0]!)).toContain("步骤 0");
+    // The trimmed step keeps the compact single-line tier, inside the section's grey band.
+    const bandRows = nodeById(card, "timeline_omitted_steps").items as JsonRecord[];
+    expect(bandRows).toHaveLength(1);
+    expect(bandRows[0]).toMatchObject({ type: "TextBlock", wrap: true });
+    expect(cardText(bandRows[0]!)).toContain("步骤 0");
   });
   test("keeps the todo list whole and trims the execution trace first", () => {
     const tracker = createExecutionTracker({ runId: "trace-budget-toggle" });

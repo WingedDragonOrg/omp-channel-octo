@@ -121,6 +121,10 @@ function buildCandidate(
   const expandableOmittedTraceTools = cappedOmittedTraceTools.slice(
     Math.max(0, cappedOmittedTraceTools.length - hiddenRowLimit),
   );
+  // The trace's whole compact tier: the rows the rich window trimmed away, then the pruned steps.
+  const traceHistoryTools = richLayout
+    ? [...olderTraceTools, ...expandableOmittedTraceTools]
+    : [];
   const totalSubagents = richLayout ? subagents.length : 0;
   // Live children (the ones still on the wire) are the default rich band; finished ones are the
   // history the toggle can bring back. Both come from the OMP subagent events, not tool names.
@@ -142,18 +146,16 @@ function buildCandidate(
   const elapsed = formatDuration(snapshot.elapsedMs);
   const metrics = `${snapshot.phaseCount} 个阶段 · ${snapshot.toolCount} 次工具调用 · ${elapsed}`;
   const notice = executionNotice(snapshot, visibleTodos);
-  const canToggleTraceHistory = canToggle && expandableOmittedTraceTools.length > 0;
-  const traceHistoryBand = canToggleTraceHistory
-    ? makeTraceHistoryBand(expandableOmittedTraceTools)
+  const canToggleTraceHistory = canToggle && traceHistoryTools.length > 0;
+  const traceHistoryBand = traceHistoryTools.length > 0
+    ? makeTraceHistoryBand(traceHistoryTools, { visible: !canToggle })
     : null;
   const timelineItems = makeTimelineItems(
     visibleTraceTools,
     hiddenTraceTools,
     richLayout,
     visibleSubagents.length > 0 ? "暂无其他工具活动" : "正在准备",
-    olderTraceTools,
-    canToggleTraceHistory,
-    canToggle,
+    traceHistoryTools.length > 0,
   );
   const hasRenderedSubagentActivity = visibleSubagents.length > 0
     || olderSubagents.length > 0
@@ -164,19 +166,12 @@ function buildCandidate(
       hiddenSubagents,
       totalSubagents,
       true,
-      olderSubagents,
-      canToggle ? expandableOmittedSubagents : [],
-      canToggle,
+      expandableOmittedSubagents,
+      !canToggle,
     )
     : null;
-  const traceHiddenIds = [
-    ...olderTraceTools.map((_tool, index) => `timeline_older_step_${index}`),
-    ...(expandableOmittedTraceTools.length > 0 ? ["timeline_omitted_steps"] : []),
-  ];
-  const subagentHiddenIds = [
-    ...olderSubagents.map((_tool, index) => `subagent_older_step_${index}`),
-    ...(expandableOmittedSubagents.length > 0 ? ["subagent_omitted_steps"] : []),
-  ];
+  const traceHiddenIds = canToggleTraceHistory ? ["timeline_omitted_steps"] : [];
+  const subagentHiddenIds = expandableOmittedSubagents.length > 0 ? ["subagent_omitted_steps"] : [];
   const traceToggleSets = canToggle ? makeToggleSets(traceHiddenIds) : [];
   const subagentToggleSets = canToggle && subagentContainer
     ? makeSubagentToggleSets(subagentHiddenIds)
