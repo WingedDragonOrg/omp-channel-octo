@@ -816,141 +816,153 @@ test("create-thread worktree_name reports a workspace failure while keeping the 
   }
 });
 
-test("create-thread notify registers the completion relay and thread-delete clears it", async () => {
+test("thread-dispatch notify registers a completion relay on the dispatched task", async () => {
+  const relaySeen = Promise.withResolvers<void>();
   const harness = await createCoreHarness({
     prompt: async ({ append, promptContext, text }) => {
       const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
       if (!management) throw new Error("management tool missing");
       const signal = new AbortController().signal;
-      if (text === "create the relay thread") {
+      if (text === "handoff with notify") {
         const created = JSON.parse(
-          await management.execute({ action: "create-thread", name: "回传线程", notify: true }, signal),
-        ) as { short_id: string; channel_id: string; notify?: boolean };
+          await management.execute({ action: "create-thread", name: "回传线程" }, signal),
+        ) as { short_id: string; channel_id: string };
+        const registered = JSON.parse(
+          await management.execute(
+            { action: "thread-dispatch", short_id: created.short_id, text: "检查部署状态", notify: true },
+            signal,
+          ),
+        ) as { delivery: string; notify?: string };
         const rejected = await management
-          .execute({ action: "create-thread", name: "坏参数", notify: "yes" }, signal)
+          .execute({ action: "thread-dispatch", short_id: created.short_id, text: "第三条", notify: "yes" }, signal)
           .then(() => "resolved")
           .catch((error: Error) => error.message);
-        await append("relay.log", `${created.notify}|${created.short_id}|${created.channel_id}|${rejected}\n`);
+        await append("notify.log", `${registered.delivery}|${registered.notify}|${rejected}\n`);
         return;
       }
-      if (text === "delete the relay thread") {
-        await management.execute({ action: "thread-delete", short_id: "thread-1" }, signal);
+      if (text.startsWith("[子区任务回传]")) {
+        await append("notify.log", "relay\n");
+        relaySeen.resolve();
         return;
       }
-      throw new Error(`unexpected prompt: ${text}`);
+      await append("notify.log", `thread:${text}\n`);
     },
   });
   try {
-    const cwd = join(harness.root, "relay cwd");
-    await mkdir(cwd, { recursive: true });
-    await harness.service.handleInbound(
-      inbound({ messageId: "relay-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
-    );
     await harness.service.handleInbound(
       inbound({
-        messageId: "relay-create",
+        messageId: "notify-handoff",
         ...GROUP_TOOLS,
-        text: "create the relay thread",
+        text: "handoff with notify",
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
-    expect(await readText(join(cwd, "relay.log"))).toBe(
-      "true|thread-1|group-tools____thread-1|notify must be a boolean\n",
+    await relaySeen.promise;
+
+    expect(await readText(join(harness.root, "tmp", "notify.log"))).toBe(
+      "queued|registered|notify must be a boolean\nthread:检查部署状态\nrelay\n",
     );
+    expect(
+      harness.transport.sent.some(
+        ({ text }) =>
+          text === "已在子区 thread-1（group-tools____thread-1）作为独立任务执行；结束时将把结果回传到这里。",
+      ),
+    ).toBe(true);
 
     const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
     try {
       expect(
-        store.getThreadNotify(harness.bot.uid, { channelId: "group-tools____thread-1", channelType: 5 }),
+        store.getLatestTask(harness.bot.uid, { channelId: "group-tools____thread-1", channelType: 5 }),
       ).toMatchObject({
-        creatorChannelId: "group-tools",
-        creatorChannelType: 2,
-        threadName: "回传线程",
+        relayChannelType: 2,
+        relayChannelId: "group-tools",
+        relayThreadName: "回传线程",
       });
     } finally {
       store.close();
     }
-
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "relay-delete",
-        ...GROUP_TOOLS,
-        text: "delete the relay thread",
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
-
-    const reopened = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
-    try {
-      expect(
-        reopened.getThreadNotify(harness.bot.uid, { channelId: "group-tools____thread-1", channelType: 5 }),
-      ).toBeNull();
-    } finally {
-      reopened.close();
-    }
-    expect(harness.transport.managementCalls).toEqual([
-      { action: "create-thread", groupId: "group-tools", shortId: null },
-      { action: "thread-delete", groupId: "group-tools", shortId: "thread-1" },
-    ]);
   } finally {
     await closeCoreHarness(harness);
   }
 });
 
-test("a plain create-thread clears a stale relay registration for a reused thread id", async () => {
+test("a steered dispatch reports its requested notify as skipped", async () => {
+  const threadStarted = Promise.withResolvers<void>();
+  const threadRelease = Promise.withResolvers<void>();
   const harness = await createCoreHarness({
-    prompt: async ({ promptContext, text }) => {
-      if (text === "create a plain thread") {
-        const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
-        if (!management) throw new Error("management tool missing");
-        await management.execute(
-          { action: "create-thread", name: "新线程" },
-          new AbortController().signal,
-        );
+    prompt: async ({ append, onStop, promptContext, text, waitForAppend }) => {
+      if (text === "hold the thread") {
+        threadStarted.resolve();
+        onStop(() => threadRelease.resolve());
+        const joined = await Promise.race([
+          waitForAppend().then((appended) => `steered:${appended.text}`),
+          threadRelease.promise.then(() => "closed"),
+        ]);
+        await append("steer-notify.log", `${joined}\n`);
+        await threadRelease.promise;
         return;
       }
-      throw new Error(`unexpected prompt: ${text}`);
+      await append("steer-notify.log", `task:${text}\n`);
     },
   });
   try {
+    const groupCwd = join(harness.root, "group cwd");
+    const threadCwd = join(harness.root, "thread cwd");
+    await mkdir(groupCwd, { recursive: true });
+    await mkdir(threadCwd, { recursive: true });
+    harness.transport.setThreads("group-tools", [threadRecord("topic-7")]);
+    await harness.service.handleInbound(
+      inbound({ messageId: "steer-notify-group-bind", ...GROUP_TOOLS, text: `/new ${groupCwd}`, mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.service.handleInbound(
+      inbound({ messageId: "steer-notify-thread-bind", ...THREAD_TOOLS, text: `/new ${threadCwd}`, mentionedUserIds: [harness.bot.uid] }),
+    );
+    const held = harness.service.handleInbound(
+      inbound({ messageId: "steer-notify-hold", ...THREAD_TOOLS, text: "hold the thread", mentionedUserIds: [harness.bot.uid] }),
+    );
+    await threadStarted.promise;
+    await harness.workers.waitForPromptCount(1);
+    await harness.service.handleInbound(
+      inbound({ messageId: "steer-notify-work", ...GROUP_TOOLS, text: "handoff into the running topic", mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.workers.waitForPromptCount(2);
+    const management = (harness.workers.prompts[1]?.promptContext?.tools ?? []).find(
+      ({ name }) => name === "octo_management",
+    );
+    if (!management) throw new Error("management tool missing");
+    const dispatched = JSON.parse(
+      await management.execute(
+        { action: "thread-dispatch", short_id: "topic-7", text: "第二件事", notify: true },
+        new AbortController().signal,
+      ),
+    ) as { delivery: string; notify?: string; notify_note?: string };
+
+    // steer mode: the running turn takes it as steering, so there is no task row to carry a relay.
+    expect(dispatched.delivery).toBe("steered");
+    expect(dispatched.notify).toBe("skipped");
+    expect(dispatched.notify_note).toContain("不会单独回传");
+    expect((await harness.service.status(THREAD_TOOLS)).queued).toBe(0);
+    expect(
+      harness.transport.sent.some(
+        ({ text }) =>
+          text === "已把任务并入线程 topic-7（group-tools____topic-7）的运行中回合；并入的这部分不会单独回传结果。",
+      ),
+    ).toBe(true);
+
+    threadRelease.resolve();
+    await held;
+    await waitForStatus(harness.service, THREAD_TOOLS, (status) => status.state === "completed");
+    for (let attempt = 0; attempt < 50; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
     const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
     try {
-      store.registerThreadNotify({
-        botUid: harness.bot.uid,
-        channelType: 5,
-        channelId: "group-tools____thread-1",
-        creatorChannelType: 2,
-        creatorChannelId: "group-stale",
-        threadName: "旧线程",
-        createdAt: 1,
-      });
+      expect(store.getLatestTask(harness.bot.uid, GROUP_TOOLS)?.messageId.startsWith("notify:")).toBe(false);
+      expect(store.getLatestTask(harness.bot.uid, THREAD_TOOLS)?.relayChannelId).toBeNull();
     } finally {
       store.close();
     }
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "stale-create",
-        ...GROUP_TOOLS,
-        text: "create a plain thread",
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
-
-    const reopened = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
-    try {
-      expect(
-        reopened.getThreadNotify(harness.bot.uid, {
-          channelId: "group-tools____thread-1",
-          channelType: 5,
-        }),
-      ).toBeNull();
-    } finally {
-      reopened.close();
-    }
+    expect(await readText(join(threadCwd, "steer-notify.log"))).toBe("steered:第二件事\n");
   } finally {
+    threadRelease.resolve();
     await closeCoreHarness(harness);
   }
 });

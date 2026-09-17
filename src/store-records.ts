@@ -41,6 +41,14 @@ export interface TaskRecord extends ChatTarget {
   messageSeq: number;
   /** Whether group history accounting applies to this task and its triggering message. */
   historyEligible: boolean;
+  /**
+   * The completion relay a dispatch asked for (`thread-dispatch --notify`): when this task reaches
+   * a terminal state, one bounded notice goes to the chat that dispatched it. Null means no relay.
+   */
+  relayChannelType: 2 | 5 | null;
+  relayChannelId: string | null;
+  /** Thread display name captured at dispatch time for the notice; only set with a relay target. */
+  relayThreadName: string | null;
 }
 export interface RestartNoticeRecord extends ChatTarget {
   id: string;
@@ -146,19 +154,5 @@ export interface AllowedChatRecord extends ChatTarget {
   channelId: string;
   grantedBy: string;
   grantedAt: number;
-}
-
-/**
- * One thread's completion relay: every task that ends in this thread (channelType=5) is reported
- * to the chat that created it. `create-thread` writes the row, `thread-delete` clears it, and it
- * is independent of whether the thread already has a binding.
- */
-export interface ThreadNotifyRecord extends ChatTarget {
-  botUid: string;
-  /** The chat that invoked `create-thread`; the completion notice is delivered there. */
-  creatorChannelType: 2 | 5;
-  creatorChannelId: string;
-  threadName: string;
-  createdAt: number;
 }
 

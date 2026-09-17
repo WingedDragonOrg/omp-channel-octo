@@ -173,6 +173,9 @@ test("a task that never started reports the restart on the next start", async ()
         errorText: null,
         messageSeq: 0,
         historyEligible: true,
+        relayChannelType: null,
+        relayChannelId: null,
+        relayThreadName: null,
       },
     );
   } finally {

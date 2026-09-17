@@ -10,6 +10,7 @@ import type {
   GroupMember,
   HostTool,
   InboundMessage,
+  TaskRelayTarget,
   ThreadSummary,
   WorktreeMergeRequest,
 } from "./contracts.ts";
@@ -30,8 +31,8 @@ export interface HostToolHost {
   readonly botUid: string;
   enqueueText(target: ChatTarget, text: string, taskId: string | null): void;
   flushTarget(target: ChatTarget): Promise<void>;
-  /** 把一条合成消息交付到它的聊天（thread-dispatch 用）：按该聊天的追加模式并入运行中回合，否则接受为该聊天自己的任务。 */
-  deliverToChat(message: InboundMessage): Promise<"steered" | "queued">;
+  /** 把一条合成消息交付到它的聊天（thread-dispatch 用）：按该聊天的追加模式并入运行中回合，否则接受为该聊天自己的任务；relay 只在任务真正落盘时随任务持久化。 */
+  deliverToChat(message: InboundMessage, relay?: TaskRelayTarget | null): Promise<"steered" | "queued">;
   /** `ask`：提问并等待答案。 */
   askQuestions(
     task: TaskRecord,
@@ -250,7 +251,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord, _snapshot:
   const managementTool: HostTool = {
     name: "octo_management",
     description:
-      "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；create-thread 可带 worktree_name 为线程建立独立 git worktree 并把线程目录绑定到它（本机有兼容 Worktrunk 时经 wt 创建，否则经 OMP），带 notify=true 时该子区每个任务结束（完成/失败/取消/中断）都会向创建它的聊天回传一条有界通知（默认 false）；thread-delete 默认清理干净的工作区，force=true 时连同未提交改动一起强制清理（本机无兼容 wt 时回退 git）；thread-merge 把当前子区隔离工作区的分支经本机 Worktrunk（wt）的 merge pipeline 合并回目标分支，仅绑定隔离工作区的子区可用，省略参数即 wt 默认 pipeline；thread-dispatch 把一条任务派发给本群的某个 thread，结果按该子区的追加模式处置——steer 且该子区有可接收 steering 的运行中回合时并入该回合（delivery=steered），否则在该子区作为独立任务执行（delivery=queued），两种情况本群都收到一条回执；派发出去的任务不能再派发。目标固定为当前聊天，不能指向其他群。",
+      "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；create-thread 可带 worktree_name 为线程建立独立 git worktree 并把线程目录绑定到它（本机有兼容 Worktrunk 时经 wt 创建，否则经 OMP）；thread-delete 默认清理干净的工作区，force=true 时连同未提交改动一起强制清理（本机无兼容 wt 时回退 git）；thread-merge 把当前子区隔离工作区的分支经本机 Worktrunk（wt）的 merge pipeline 合并回目标分支，仅绑定隔离工作区的子区可用，省略参数即 wt 默认 pipeline；thread-dispatch 把一条任务派发给本群的某个 thread，结果按该子区的追加模式处置——steer 且该子区有可接收 steering 的运行中回合时并入该回合（delivery=steered），否则在该子区作为独立任务执行（delivery=queued），两种情况本群都收到一条回执；可选 notify=true 让这条派发任务在结束（完成/失败/取消/中断）时向本聊天回传一条有界结果通知（默认 false，自行判断是否需要）；派发出去的任务不能再派发。目标固定为当前聊天，不能指向其他群。",
     parameters: {
       type: "object",
       properties: {
@@ -294,7 +295,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord, _snapshot:
         notify: {
           type: "boolean",
           description:
-            "create-thread：为 true 时该子区每个任务结束（完成/失败/取消/中断）都会向创建它的聊天回传一条有界通知，由那边的助手作为新输入处理（可并入运行中回合，否则成为该聊天的一个任务）；默认 false。",
+            "thread-dispatch：为 true 时这条派发的任务结束（完成/失败/取消/中断）时向本聊天回传一条有界结果通知，由本聊天的助手作为新输入处理（可并入运行中回合，否则成为该聊天的一个任务）；默认 false。派发后你不再盯这份活、又需要知道它结束时的结果（含失败）时才开启；派发被并入运行中回合时不生效（工具结果里 notify=skipped 且收据会说明）。",
         },
       },
       required: ["action"],
@@ -474,13 +475,11 @@ async function runManagementTool(
     case "create-thread": {
       const name = namedText("name", MAX_MANAGEMENT_NAME_CHARS);
       const workspaceName = worktreeName();
-      const notify = optionalBoolean("notify") ?? false;
       const thread = await transport.createThread(groupId, name, signal);
-      const relay = syncThreadRelay(host, target, thread, notify);
       const workspace = workspaceName === undefined
         ? {}
         : await createThreadWorkspace(host, task.cwd, thread, workspaceName, signal);
-      return JSON.stringify({ ...managementThread(thread), ...relay, ...workspace });
+      return JSON.stringify({ ...managementThread(thread), ...workspace });
     }
     case "thread-info": {
       return JSON.stringify(managementThread(await transport.getThread(groupId, threadId(), signal)));
@@ -505,13 +504,10 @@ async function runManagementTool(
       const shortId = threadId();
       const force = optionalBoolean("force") ?? false;
       await deleteThread(host, groupId, shortId, signal);
-      const notes = [
-        clearThreadRelay(host, groupId, shortId),
-        await cleanupThreadWorkspace(host, groupId, shortId, force, signal),
-      ].filter((note): note is string => note !== null);
-      return notes.length === 0
+      const cleaned = await cleanupThreadWorkspace(host, groupId, shortId, force, signal);
+      return cleaned === null
         ? `已删除线程 ${shortId}`
-        : `已删除线程 ${shortId}；${notes.join("；")}`;
+        : `已删除线程 ${shortId}；${cleaned}`;
     }
     case "thread-merge": {
       if (currentShortId === null) {
@@ -539,7 +535,8 @@ async function runManagementTool(
       }
       const shortId = threadId();
       const text = namedText("text", MAX_MANAGEMENT_TASK_CHARS);
-      return dispatchThreadTask(host, task, target, groupId, shortId, text, signal);
+      const notify = optionalBoolean("notify") ?? false;
+      return dispatchThreadTask(host, task, target, groupId, shortId, text, notify, signal);
     }
     default: {
       throw new Error(`unknown action: ${action}`);
@@ -614,58 +611,6 @@ async function cleanupThreadWorkspace(
 }
 
 /**
- * The `create-thread` completion relay: a thread created with `notify` reports every task that
- * ends in it to the calling chat. The freshly created thread is authoritative for its own relay
- * state — `notify` writes the registration, and a plain create clears one a reused thread id may
- * still carry, so a new thread can never inherit a stale creator. Both writes happen after the
- * thread exists, so a state-store failure becomes `notify_error` instead of failing the
- * (already effective) create.
- */
-function syncThreadRelay(
-  host: HostToolHost,
-  creator: ChatTarget,
-  thread: ThreadSummary,
-  notify: boolean,
-): { notify?: true; notify_error?: string } {
-  const threadTarget: ChatTarget = { channelId: thread.channelId, channelType: 5 };
-  if (creator.channelType === 1) return notify ? { notify_error: "只有群聊或子区可以回传" } : {};
-  try {
-    if (notify) {
-      host.store.registerThreadNotify({
-        botUid: host.botUid,
-        channelType: 5,
-        channelId: thread.channelId,
-        creatorChannelType: creator.channelType,
-        creatorChannelId: creator.channelId,
-        threadName: thread.name,
-        createdAt: Date.now(),
-      });
-      return { notify: true };
-    }
-    host.store.clearThreadNotify(host.botUid, threadTarget);
-    return {};
-  } catch (error) {
-    return { notify_error: boundedManagementError(error, notify ? "回传登记失败" : "回传登记清理失败") };
-  }
-}
-
-/**
- * Clears the deleted thread's completion relay registration. The server-side delete is already
- * effective, so a local failure only becomes a bounded receipt note, like the workspace cleanup.
- */
-function clearThreadRelay(host: HostToolHost, groupId: string, shortId: string): string | null {
-  try {
-    host.store.clearThreadNotify(host.botUid, {
-      channelId: threadChannelId(groupId, shortId),
-      channelType: 5,
-    });
-    return null;
-  } catch (error) {
-    return `回传登记未清理：${boundedManagementError(error, "状态盘写入失败")}`;
-  }
-}
-
-/**
  * Gives a freshly created thread its own git worktree and pins the thread binding to it, so
  * tasks dispatched into that thread never share the parent group's directory. The workspace is
  * reported next to the created thread; a workspace that cannot be created becomes
@@ -706,13 +651,16 @@ async function createThreadWorkspace(
  * its own append mode (a steerable running turn takes it as steering, otherwise it becomes the
  * thread's next durable task). A dispatch is a hand-over rather than the owner's reply, so it is
  * never taken as the answer to an open question, and it keeps the synthetic `dispatch:` id with
- * the owner as sender, so dedup and the depth guard hold. The caller reports which delivery
- * happened. Depth is one: the dispatch tool is withheld from tasks that arrived this way.
+ * the owner as sender, so dedup and the depth guard hold. `relay` rides only on the durable-task
+ * path: a steered dispatch has no task row to carry it, so it reports no completion. The caller
+ * reports which delivery happened. Depth is one: the dispatch tool is withheld from tasks that
+ * arrived this way.
  */
 async function dispatchTaskToThread(
   host: HostToolHost,
   thread: ThreadSummary,
   text: string,
+  relay: TaskRelayTarget | null,
 ): Promise<{ messageId: string; delivery: "steered" | "queued" }> {
   const ownerId = host.store.getOwnerId(host.botUid)?.trim() ?? "";
   if (ownerId.length === 0) {
@@ -733,12 +681,14 @@ async function dispatchTaskToThread(
     supported: true,
     messageSeq: 0,
     messageTimestamp: Date.now(),
-  });
+  }, relay);
   return { messageId, delivery };
 }
 /**
  * The `thread-dispatch` tool: resolves the target thread, hands the task over, and reports the
- * delivery in the calling chat.
+ * delivery in the calling chat. `notify` is the dispatching assistant's own choice: when set,
+ * the task carries a completion relay back to the calling chat, which only takes effect if the
+ * hand-off becomes a task of its own.
  */
 async function dispatchThreadTask(
   host: HostToolHost,
@@ -747,18 +697,26 @@ async function dispatchThreadTask(
   groupId: string,
   shortId: string,
   text: string,
+  notify: boolean,
   signal: AbortSignal,
 ): Promise<string> {
   const thread = await host.options.transport.getThread(groupId, shortId, signal);
   if (thread.groupId.length > 0 && thread.groupId !== groupId) {
     throw new Error(`thread ${shortId} does not belong to the current group`);
   }
-  const { messageId, delivery } = await dispatchTaskToThread(host, thread, text);
+  const relay: TaskRelayTarget | null = notify && target.channelType !== 1
+    ? { channelType: target.channelType, channelId: target.channelId, threadName: thread.name }
+    : null;
+  const { messageId, delivery } = await dispatchTaskToThread(host, thread, text, relay);
   host.enqueueText(
     target,
     delivery === "steered"
-      ? `已把任务并入线程 ${shortId}（${thread.channelId}）的运行中回合。`
-      : `已在子区 ${shortId}（${thread.channelId}）作为独立任务执行。`,
+      ? relay === null
+        ? `已把任务并入线程 ${shortId}（${thread.channelId}）的运行中回合。`
+        : `已把任务并入线程 ${shortId}（${thread.channelId}）的运行中回合；并入的这部分不会单独回传结果。`
+      : relay === null
+        ? `已在子区 ${shortId}（${thread.channelId}）作为独立任务执行。`
+        : `已在子区 ${shortId}（${thread.channelId}）作为独立任务执行；结束时将把结果回传到这里。`,
     null,
   );
   return JSON.stringify({
@@ -768,5 +726,10 @@ async function dispatchThreadTask(
     channel_id: thread.channelId,
     message_id: messageId,
     task_id: task.id,
+    ...(relay === null
+      ? {}
+      : delivery === "queued"
+        ? { notify: "registered" }
+        : { notify: "skipped", notify_note: "内容并入运行中回合，不会单独回传结果" }),
   });
 }

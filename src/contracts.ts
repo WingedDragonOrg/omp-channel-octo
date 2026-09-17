@@ -6,6 +6,17 @@ export interface ChatTarget {
   channelType: 1 | 2 | 5;
 }
 
+/**
+ * The completion relay one dispatched task carries (`thread-dispatch --notify`): when the task
+ * reaches a terminal state, one bounded notice is delivered to this chat — the chat that
+ * dispatched it — following that chat's append mode.
+ */
+export interface TaskRelayTarget extends ChatTarget {
+  channelType: 2 | 5;
+  /** Thread display name captured at dispatch time; rendered in the notice. */
+  threadName: string;
+}
+
 export type InboundAttachmentKind = "image" | "file" | "audio" | "video";
 
 /**

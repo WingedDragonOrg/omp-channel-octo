@@ -33,9 +33,10 @@ export function acceptTask(db: Database, claim: InboundClaim, task: TaskRecord):
     run(db,
       `INSERT INTO tasks(
          id, bot_uid, channel_type, channel_id, message_id, sender_id, text, session_id, cwd,
-         state, accepted_at, message_seq, history_eligible
+         state, accepted_at, message_seq, history_eligible,
+         relay_channel_type, relay_channel_id, relay_thread_name
        )
-       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`,
+       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)`,
       [
         task.id,
         task.botUid,
@@ -49,6 +50,9 @@ export function acceptTask(db: Database, claim: InboundClaim, task: TaskRecord):
         now,
         task.messageSeq,
         task.historyEligible ? 1 : 0,
+        task.relayChannelType,
+        task.relayChannelId,
+        task.relayThreadName,
       ],
     );
     return true;

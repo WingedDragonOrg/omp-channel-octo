@@ -71,6 +71,9 @@ function taskFor(
     errorText: null,
     messageSeq: meta.messageSeq,
     historyEligible: meta.historyEligible,
+    relayChannelType: null,
+    relayChannelId: null,
+    relayThreadName: null,
   };
 }
 

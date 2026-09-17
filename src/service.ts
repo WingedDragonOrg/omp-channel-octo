@@ -42,6 +42,7 @@ import type {
   WorkerModelSwitch,
   SteerConsumedEvent,
   ProgressCard,
+  TaskRelayTarget,
   WorkerOptions,
   WorkerProcess,
 } from "./contracts.ts";
@@ -267,7 +268,9 @@ function receiptText(prefix: string, text: string): string {
  * clarification round, so the thread generates the SDD and starts at once; anything else is
  * dispatched after at most the few SDD-shaped answers it takes to hand it over, with the remaining
  * clarification left to the thread (guided by a clarification skill when the environment has one).
- * Detailed clarification never happens in the originating chat.
+ * Detailed clarification never happens in the originating chat. The dispatch's `notify` flag stays
+ * the assistant's own judgment: it asks for a completion relay only for hand-offs it will not keep
+ * watching.
  */
 function threadIntentPrompt(intent: string): string {
   return [
@@ -278,6 +281,7 @@ function threadIntentPrompt(intent: string): string {
     "再用 thread-dispatch（short_id=该子区）把任务派发进去；派发的任务正文按 SDD 格式写（目标、范围、约束与验收标准），需求明确程度决定子区能否直接生成 SDD：",
     "- 简单或非常明确（目标与验收标准能直接写清、足以直接生成 SDD、没有需要 owner 决策的歧义或取舍）：直接按 SDD 格式写清要做什么（可整理原始意图，但不要丢信息），让子区直接生成 SDD 并立刻开工；",
     "- 否则：按 SDD 格式写明已知的目标、范围、约束与验收标准，并要求子区先按 SDD 格式把尚不明确的需求澄清成 SDD（可实施的设计）再动手，需要 owner 拍板的问题在子区内用 ask 提出；环境里有 spec-design 等需求澄清或设计技能时，引导子区用该技能完成澄清。",
+    "派发时自行判断是否要回执：只有你派发后不会再盯着这份活、又需要在它结束（完成/失败/取消/中断）时知道结果，才给 thread-dispatch 传 notify=true；你会在子区里持续交互、或结果不需要回报时不要开（默认 false，不开就不回报）。",
     "详细的需求澄清在子区内进行：不要在当前会话执行这件事，也不要在当前会话做过于详细的需求澄清。",
     "完成后简要汇报子区名称、short_id 与工作区路径。",
     "",
@@ -1978,17 +1982,18 @@ class CoreService implements ChannelService {
   }
 
   /**
-   * The completion relay of `create-thread --notify`: once a task in that thread has settled
-   * (`completed`/`failed`/`cancelled`/`interrupted`), one bounded notice is delivered to the
-   * chat that created the thread. The notice is a synthetic inbound message with a deterministic
-   * id (`notify:<task>`), so a replay or a restart can never deliver it twice; like `wakeTurn`
-   * it follows the target chat's append mode and never touches the pending-question path or the
-   * permission gate. A failed delivery only costs the relay and is logged.
+   * The completion relay of `thread-dispatch --notify`: a dispatched task whose row carries a
+   * relay target (`relayChannelType`/`relayChannelId`) reports one bounded notice to the chat
+   * that dispatched it once it reaches a terminal state. The notice is a synthetic inbound
+   * message with a deterministic id (`notify:<task>`), so a replay or a restart can never deliver
+   * it twice; like `wakeTurn` it follows the target chat's append mode and never touches the
+   * pending-question path or the permission gate. A failed delivery only costs the relay and is
+   * logged.
    *
    * A graceful stop settles its in-flight tasks as `cancelled` (the stop sets
    * `runtime.cancelRequested`), and that lifecycle outcome is never relayed: the notice would be
    * accepted right before this process goes down, only to be interrupted by the next start and
-   * read as a bogus "task interrupted by restart" in the creator chat. The `stopping` flag
+   * read as a bogus "task interrupted by restart" in the dispatching chat. The `stopping` flag
    * separates that path from the owner's `/cancel`, which still relays.
    */
   private async notifyThreadOutcome(taskId: string): Promise<void> {
@@ -1998,6 +2003,7 @@ class CoreService implements ChannelService {
       if (botUid === undefined) return;
       const task = this.store.getTask(taskId);
       if (!task || task.channelType !== 5) return;
+      if (task.relayChannelType === null || task.relayChannelId === null) return;
       const state = task.state;
       if (
         state !== "completed"
@@ -2007,12 +2013,10 @@ class CoreService implements ChannelService {
       ) {
         return;
       }
-      const relay = this.store.getThreadNotify(botUid, task);
-      if (!relay) return;
-      const text = threadOutcomeNotice(task, relay);
+      const text = threadOutcomeNotice(task);
       const message: InboundMessage = {
-        channelId: relay.creatorChannelId,
-        channelType: relay.creatorChannelType,
+        channelId: task.relayChannelId,
+        channelType: task.relayChannelType,
         messageId: threadNotifyMessageId(task.id),
         senderId: this.store.getOwnerId(botUid)?.trim() || botUid,
         text,
@@ -2365,6 +2369,7 @@ class CoreService implements ChannelService {
     message: InboundMessage,
     text: string,
     historyEligible = true,
+    relay: TaskRelayTarget | null = null,
   ): Promise<boolean> {
     let binding = await this.reconcileExternalBinding(
       message,
@@ -2421,6 +2426,9 @@ class CoreService implements ChannelService {
       // 由 OMP 从 prompt 首行分派，历史块前缀会把这一行变回普通模型输入，因此不带历史块、
       // 不发起 sync，水位线也不因这轮推进。
       historyEligible: historyEligible && !isCommand(text),
+      relayChannelType: relay?.channelType ?? null,
+      relayChannelId: relay?.channelId ?? null,
+      relayThreadName: relay?.threadName ?? null,
     };
     let accepted: boolean;
     // Measured before acceptance so the new task's own row cannot count itself as the work it waits for.
@@ -2584,9 +2592,9 @@ class CoreService implements ChannelService {
       botUid,
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
       flushTarget: (target) => this.outbox.flush(target),
-      deliverToChat: async (message) => {
+      deliverToChat: async (message, relay) => {
         if (await this.appendToRunningTask(message, message.text)) return "steered";
-        await this.acceptTask(message, message.text);
+        await this.acceptTask(message, message.text, true, relay ?? null);
         return "queued";
       },
       askQuestions: (task, target, args, signal) => this.questions.askQuestions(task, target, args, signal),

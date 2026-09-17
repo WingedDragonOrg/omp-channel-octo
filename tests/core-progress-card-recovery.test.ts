@@ -116,6 +116,9 @@ async function seedOpenCard(
       errorText: null,
       messageSeq: 0,
       historyEligible: true,
+      relayChannelType: null,
+      relayChannelId: null,
+      relayThreadName: null,
     };
     expect(store.acceptTask(claim, task)).toBe(true);
     expect(store.markStarted(taskId)).toBe(true);

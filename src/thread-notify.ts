@@ -1,12 +1,12 @@
 /**
- * 子区任务完成回传的纯函数与边界：通知消息 ID、文本模板和两段可变内容的截断上限。
- * 交付路径（合成入站消息、追加模式、去重、失败处理）留在 `CoreService`。
+ * 子区任务回传的纯函数与边界：通知消息 ID、文本模板和两段可变内容的截断上限。
+ * 回传登记随任务行持久化（`TaskRecord.relay*` 字段），交付路径留在 `CoreService`。
  */
 
-import type { TaskRecord, ThreadNotifyRecord } from "./store-records.ts";
+import type { TaskRecord } from "./store-records.ts";
 import { threadShortId } from "./thread-target.ts";
 
-/** Synthetic inbound id prefix: one notice per thread task, deduplicated by the inbound claim. */
+/** Synthetic inbound id prefix: one notice per relayed task, deduplicated by the inbound claim. */
 export const THREAD_NOTIFY_MESSAGE_PREFIX = "notify:";
 
 export function threadNotifyMessageId(threadTaskId: string): string {
@@ -60,18 +60,22 @@ function outcomeLine(task: TaskRecord): string {
 }
 
 /**
- * The notice one finished thread task delivers to the chat that created the thread: bounded,
- * free of tokens and raw tool payloads, and readable as the creator assistant's next input.
+ * The notice one relayed task delivers to the chat that dispatched it (the task carries its
+ * relay target and the thread name captured at dispatch time): bounded, free of tokens and raw
+ * tool payloads, and readable as the dispatching assistant's next input.
  */
-export function threadOutcomeNotice(task: TaskRecord, registration: ThreadNotifyRecord): string {
+export function threadOutcomeNotice(task: TaskRecord): string {
   const excerpt = task.text.trim();
+  const name = task.relayThreadName?.trim() ?? "";
   return [
-    `[子区任务回传] 「${registration.threadName}」的一条任务已结束。`,
+    name.length > 0
+      ? `[子区任务回传] 「${name}」的一条任务已结束。`
+      : "[子区任务回传] 一条子区任务已结束。",
     `子区：short_id ${threadShortId(task.channelId) ?? "-"}；channel_id ${task.channelId}`,
     `任务 ID：${task.id}`,
     `状态：${stateLabel(task.state)}`,
     ...(excerpt.length === 0 ? [] : [`任务：${bounded(excerpt, MAX_TASK_CHARS)}`]),
     outcomeLine(task),
-    "这是系统自动回传的子区任务通知；如需向本群反馈或继续处理，直接回复即可。",
+    "这是派发这条任务时要求的回传通知；如需向本群反馈或继续处理，直接回复即可。",
   ].join("\n");
 }

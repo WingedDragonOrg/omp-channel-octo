@@ -150,7 +150,10 @@ export function applySchema(db: Database): void {
       result_text TEXT,
       error_text TEXT,
       message_seq INTEGER NOT NULL DEFAULT 0,
-      history_eligible INTEGER NOT NULL DEFAULT 1
+      history_eligible INTEGER NOT NULL DEFAULT 1,
+      relay_channel_type INTEGER,
+      relay_channel_id TEXT,
+      relay_thread_name TEXT
     );
     CREATE INDEX IF NOT EXISTS tasks_chat_order
       ON tasks(bot_uid, channel_type, channel_id, accepted_at, id);
@@ -259,16 +262,6 @@ export function applySchema(db: Database): void {
       updated_at INTEGER NOT NULL,
       PRIMARY KEY(bot_uid, channel_type, channel_id)
     );
-    CREATE TABLE IF NOT EXISTS thread_notify (
-      bot_uid TEXT NOT NULL,
-      channel_type INTEGER NOT NULL CHECK(channel_type = 5),
-      channel_id TEXT NOT NULL,
-      creator_channel_type INTEGER NOT NULL CHECK(creator_channel_type IN (2, 5)),
-      creator_channel_id TEXT NOT NULL,
-      thread_name TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      PRIMARY KEY(bot_uid, channel_type, channel_id)
-    );
     CREATE TABLE IF NOT EXISTS progress_cards (${PROGRESS_CARD_COLUMNS}
     );
     CREATE TABLE IF NOT EXISTS bot_event_cursor (
@@ -286,6 +279,9 @@ export function applySchema(db: Database): void {
     "ALTER TABLE worker_ledger ADD COLUMN move_target_cwd TEXT",
     "ALTER TABLE tasks ADD COLUMN message_seq INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN history_eligible INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE tasks ADD COLUMN relay_channel_type INTEGER",
+    "ALTER TABLE tasks ADD COLUMN relay_channel_id TEXT",
+    "ALTER TABLE tasks ADD COLUMN relay_thread_name TEXT",
     "ALTER TABLE chats ADD COLUMN cwd_pinned INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE questions ADD COLUMN card_message_id TEXT",
     "ALTER TABLE questions ADD COLUMN answered_by TEXT",
@@ -296,6 +292,8 @@ export function applySchema(db: Database): void {
       if (!String(error).includes("duplicate column")) throw error;
     }
   }
+  // 回传登记已由任务行的 relay 字段承载，旧的子区级登记表没有读者。
+  db.exec("DROP TABLE IF EXISTS thread_notify");
   db.exec(
     "CREATE INDEX IF NOT EXISTS outbox_stream ON outbox(bot_uid, task_id, stream_message_id, segment_index)",
   );
@@ -405,6 +403,11 @@ export function taskFromRow(row: SqlRow): TaskRecord {
     errorText: asNullableString(row.error_text),
     messageSeq: asNumber(row.message_seq),
     historyEligible: asNumber(row.history_eligible) !== 0,
+    relayChannelType: row.relay_channel_type === null || row.relay_channel_type === undefined
+      ? null
+      : (asNumber(row.relay_channel_type) as 2 | 5),
+    relayChannelId: asNullableString(row.relay_channel_id),
+    relayThreadName: asNullableString(row.relay_thread_name),
   };
 }
 
