@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { throwIfAborted } from "./abort.ts";
 import {
+  askAnsweredText,
   askAnswerText,
   buildAskCard,
   buildAskCardSet,
@@ -36,9 +37,12 @@ const ASK_CARD_EDIT_TIMEOUT_MS = 5_000;
 const ASK_CARD_SEND_TIMEOUT_MS = 10_000;
 /** Long-poll hold and the pause between rounds that returned immediately or failed. */
 
+/** One recorded answer plus who gave it; `answeredBy` is `null` only for rows written before attribution. */
+type QuestionAnswer = { answer: string; answeredBy: string | null };
+
 type QuestionWaiter = {
   taskId: string;
-  resolve: (answer: string) => void;
+  resolve: (value: QuestionAnswer) => void;
   reject: (error: Error) => void;
 };
 
@@ -113,6 +117,11 @@ export interface QuestionDeskDeps {
   stopTurnForQuestion(taskId: string): void;
   /** 已无等待者的答案（停回合后 owner 才答复）：作为该聊天的新回合输入交付。 */
   wakeTurn(target: ChatTarget, text: string): void;
+  /**
+   * 成员作答授权：问题所在聊天是否允许非 owner 的成员作答（已开通群/子区；私聊与未开通聊天
+   * 为假）。与消息权限门共用同一允许列表，不引入第二套授权。
+   */
+  memberAnswerAllowed(target: ChatTarget): boolean;
 }
 
 export interface QuestionDesk {
@@ -153,20 +162,23 @@ export function createQuestionDesk(deps: QuestionDeskDeps): QuestionDesk {
   }
 
 /**
- * A plain reply in the chat holding the pending question is the answer itself: a valid
+ * A plain reply in the chat holding the pending question is the answer itself — from the owner
+ * or, in an enabled group/thread, from any member the gate already let through: a valid
  * option index selects that option, any other text is returned verbatim as the free-form
- * answer. Returns false when nothing is pending, so the text stays ordinary task input.
+ * answer. The sender is recorded as the answerer. Returns false when nothing is pending, so the
+ * text stays ordinary task input.
  */
 async function answerPendingQuestion(message: InboundMessage, text: string): Promise<boolean> {
   if (text.length === 0) return false;
   const pending = deps.store.listPendingQuestions(currentBotUid(), message);
   const question = pending[0];
   if (!question) return false;
+  const answeredBy = message.senderId.trim();
   const claim = deps.commandClaim(message, "answer");
   if (!deps.store.claimCommand(claim)) return true;
   try {
     if (pending.length > 1) {
-      answerQuestionSetFromText(message, pending, text);
+      answerQuestionSetFromText(message, pending, text, answeredBy);
       deps.store.completeCommand(claim);
       return true;
     }
@@ -178,7 +190,7 @@ async function answerPendingQuestion(message: InboundMessage, text: string): Pro
       deps.store.completeCommand(claim);
       return true;
     }
-    if (!applyQuestionAnswer(question, normalized)) {
+    if (!applyQuestionAnswer(question, normalized, answeredBy)) {
       await deps.enqueueText(message, "问题已失效，本次回复未作为答案记录。", null);
       deps.store.completeCommand(claim);
       return true;
@@ -214,6 +226,7 @@ function answerQuestionSetFromText(
   message: InboundMessage,
   pending: readonly QuestionRecord[],
   text: string,
+  answeredBy: string,
 ): void {
   const botUid = currentBotUid();
   const answers = pending.map((question) => {
@@ -223,17 +236,17 @@ function answerQuestionSetFromText(
     } catch {
       // A numeric reply that does not name this question's options is still an answer as typed.
     }
-    return { id: question.id, answer };
+    return { id: question.id, answer, answeredBy };
   });
   const landed = deps.store.answerQuestions(botUid, message, answers);
   const byId = new Map(answers.map(({ id, answer }) => [id, answer]));
   const byQuestion = new Map(pending.map((question) => [question.id, question]));
-  const speaking: Array<{ question: QuestionRecord; answer: string }> = [];
+  const speaking: Array<{ question: QuestionRecord; answer: string; answeredBy: string }> = [];
   for (const id of landed) {
     const answer = byId.get(id) ?? text;
     const question = byQuestion.get(id);
-    if (!releaseQuestion(id, answer) && question !== undefined) {
-      speaking.push({ question, answer });
+    if (!releaseQuestion(id, { answer, answeredBy }) && question !== undefined) {
+      speaking.push({ question, answer, answeredBy });
     }
   }
   for (const [messageId, rows] of questionsByCard(pending)) {
@@ -241,7 +254,7 @@ function answerQuestionSetFromText(
     const first = rows[0];
     if (first === undefined) continue;
     if (rows.length === 1) {
-      rewriteAskCard(first, { kind: "answered", answer: byId.get(first.id) ?? text });
+      rewriteAskCard(first, { kind: "answered", answer: byId.get(first.id) ?? text, answeredBy });
     } else {
       const fresh = deps.store.listQuestionsByCard(botUid, message, messageId);
       rewriteAskCardSet(fresh, { kind: "closed", note: null }, null);
@@ -344,7 +357,7 @@ async function askSingleQuestion(
   target: ChatTarget,
   spec: AskSpec,
   signal: AbortSignal,
-): Promise<{ id: string; questionId: string; answer: string }> {
+): Promise<{ id: string; questionId: string; answer: string; answeredBy: string | null }> {
   const { id, sourceId, payload } = spec;
   deps.store.createQuestion({
     id,
@@ -353,7 +366,7 @@ async function askSingleQuestion(
     ...target,
     payload: JSON.stringify(payload),
   });
-  const completion = Promise.withResolvers<string>();
+  const completion = Promise.withResolvers<QuestionAnswer>();
   void completion.promise.catch(() => {});
   questionWaiters.set(id, {
     taskId: task.id,
@@ -382,7 +395,7 @@ async function askSingleQuestion(
     await deliverQuestion(payload, target, id, task.id, signal);
     throwIfAborted(signal);
     const answer = await completion.promise;
-    return { id: sourceId ?? id, questionId: id, answer };
+    return { id: sourceId ?? id, questionId: id, answer: answer.answer, answeredBy: answer.answeredBy };
   } finally {
     signal.removeEventListener("abort", abort);
     clearTimeout(timer);
@@ -407,8 +420,8 @@ async function askQuestionSet(
   target: ChatTarget,
   specs: readonly AskSpec[],
   signal: AbortSignal,
-): Promise<Array<{ id: string; questionId: string; answer: string }>> {
-  const completions = specs.map(() => Promise.withResolvers<string>());
+): Promise<Array<{ id: string; questionId: string; answer: string; answeredBy: string | null }>> {
+  const completions = specs.map(() => Promise.withResolvers<QuestionAnswer>());
   const cleanups: Array<() => void> = [];
   /** 整组共用一次停回合：任一题到点即整组停止等待，全部行保持 pending、卡片不改写。 */
   let stopped = false;
@@ -451,22 +464,21 @@ async function askQuestionSet(
     if (messageId !== null) {
       deps.store.setQuestionsCard(specs.map(({ id }) => id), messageId);
       const settled = await Promise.all(completions.map(({ promise }) => promise));
-      return specs.map(({ id, sourceId }, index) => ({
-        id: sourceId ?? id,
-        questionId: id,
-        answer: settled[index] ?? "",
-      }));
+      return specs.map(({ id, sourceId }, index) => {
+        const answer = settled[index] ?? { answer: "", answeredBy: null };
+        return { id: sourceId ?? id, questionId: id, answer: answer.answer, answeredBy: answer.answeredBy };
+      });
     }
     // The set frame was refused: ask each question exactly like a single-question ask would. A
     // text reply can settle the remaining rows before their turn, so only still-open ones are
     // delivered and every resolved completion is read back in question order.
-    const answers: Array<{ id: string; questionId: string; answer: string }> = [];
+    const answers: Array<{ id: string; questionId: string; answer: string; answeredBy: string | null }> = [];
     for (const [index, spec] of specs.entries()) {
       if (deps.store.getQuestion(spec.id)?.state === "pending") {
         await deliverQuestion(spec.payload, target, spec.id, task.id, signal);
       }
       const answer = await completions[index]!.promise;
-      answers.push({ id: spec.sourceId ?? spec.id, questionId: spec.id, answer });
+      answers.push({ id: spec.sourceId ?? spec.id, questionId: spec.id, answer: answer.answer, answeredBy: answer.answeredBy });
     }
     return answers;
   } finally {
@@ -498,7 +510,7 @@ async function deliverQuestionSet(
   for (const spec of specs) {
     const ask = askQuestionFromPayload(spec.payload);
     if (ask === null) return null;
-    entries.push({ question: ask, answer: null });
+    entries.push({ question: ask, answer: null, answeredBy: null });
     payloads.push(spec.payload);
   }
   const frame = buildAskCardSet(entries, { kind: "open", generation: 1 }, formatQuestionSet(payloads));
@@ -608,14 +620,14 @@ async function deliverQuestion(
  * row is the single arbitration point between a text reply and a card click: whoever loses it
  * must not answer a second time.
  */
-function applyQuestionAnswer(question: QuestionRecord, answer: string): boolean {
+function applyQuestionAnswer(question: QuestionRecord, answer: string, answeredBy: string | null): boolean {
   const botUid = deps.botUid();
   if (!botUid) return false;
-  if (!deps.store.answerQuestion(question.id, botUid, question, answer)) return false;
-  const waiting = releaseQuestion(question.id, answer);
+  if (!deps.store.answerQuestion(question.id, botUid, question, answer, answeredBy)) return false;
+  const waiting = releaseQuestion(question.id, { answer, answeredBy });
   forgetAskGeneration(question.cardMessageId);
-  rewriteAskCard(question, { kind: "answered", answer });
-  if (!waiting) wakeForAnswers([{ question, answer }]);
+  rewriteAskCard(question, { kind: "answered", answer, answeredBy });
+  if (!waiting) wakeForAnswers([{ question, answer, answeredBy }]);
   return true;
 }
 
@@ -623,13 +635,13 @@ function applyQuestionAnswer(question: QuestionRecord, answer: string): boolean 
  * Releases the waiting task of one recorded answer; `false` when no ask waits anymore — the wait
  * timed out and the turn was stopped, so this answer has to wake the agent instead.
  */
-function releaseQuestion(questionId: string, answer: string): boolean {
+function releaseQuestion(questionId: string, value: QuestionAnswer): boolean {
   const waiter = questionWaiters.get(questionId);
   if (!waiter) return false;
   questionWaiters.delete(questionId);
   clearTimeout(questionTimers.get(questionId));
   questionTimers.delete(questionId);
-  waiter.resolve(answer);
+  waiter.resolve(value);
   return true;
 }
 
@@ -639,20 +651,22 @@ function releaseQuestion(questionId: string, answer: string): boolean {
  * The answer is already durable; a failed wake costs the continuation, never the answer. Option
  * indexes render as their labels, and a caller-provided id names the question it answers.
  */
-function wakeForAnswers(entries: readonly { question: QuestionRecord; answer: string }[]): void {
+function wakeForAnswers(entries: readonly { question: QuestionRecord; answer: string; answeredBy: string | null }[]): void {
   const first = entries[0]?.question;
   if (first === undefined) return;
-  const lines = ["[ask 答复] 先前询问的等待已超时停住，owner 现已回复；请据此继续："];
-  for (const { question, answer } of entries) {
+  const lines = ["[ask 答复] 先前询问的等待已超时停住，现已收到回复；请据此继续："];
+  for (const { question, answer, answeredBy } of entries) {
     const payload = parseQuestionPayload(question);
     const ask = payload === null ? null : askQuestionFromPayload(payload);
+    const who = answeredBy?.trim() ?? "";
+    const attribution = who.length === 0 ? "" : `（由 ${who} 回复）`;
     if (ask === null) {
-      lines.push(`答案：${answer}`);
+      lines.push(`答案${attribution}：${answer}`);
       continue;
     }
     const sourceId = payload?.sourceId;
     lines.push(`问题${typeof sourceId === "string" ? `（id=${sourceId}）` : ""}：${ask.question}`);
-    lines.push(`答案：${askAnswerText(ask, answer)}`);
+    lines.push(`答案${attribution}：${askAnswerText(ask, answer)}`);
   }
   deps.wakeTurn({ channelType: first.channelType, channelId: first.channelId }, lines.join("\n"));
 }
@@ -668,7 +682,7 @@ function rewriteAskCard(question: QuestionRecord, state: AskCardState, hint?: st
   const ask = payload === null ? null : askQuestionFromPayload(payload);
   if (ask === null) return;
   const note = state.kind === "answered"
-    ? `已回复：${askAnswerText(ask, state.answer)}`
+    ? askAnsweredText(ask, state.answer, state.answeredBy)
     : state.kind === "inactive"
       ? state.note
       : hint;
@@ -696,7 +710,11 @@ function rewriteAskCardSet(
     const payload = parseQuestionPayload(row);
     const ask = payload === null ? null : askQuestionFromPayload(payload);
     if (payload === null || ask === null) return;
-    entries.push({ question: ask, answer: row.state === "answered" ? row.answer ?? "" : null });
+    entries.push({
+      question: ask,
+      answer: row.state === "answered" ? row.answer ?? "" : null,
+      answeredBy: row.state === "answered" ? row.answeredBy : null,
+    });
     payloads.push(payload);
   }
   const base = formatQuestionSet(payloads);
@@ -757,16 +775,22 @@ function forgetAskGeneration(cardMessageId: string | null): void {
 }
 
 /**
- * Applies one card click. Only the owner's click can answer; a foreign operator, an unknown
- * action id or a card whose question already closed is acknowledged and dropped so the event
- * queue keeps moving.
+ * Applies one card click. The owner answers anywhere; a member answers only inside an enabled
+ * group or thread (the same allowlist the message gate uses), so a foreign operator elsewhere —
+ * a DM, an unlisted chat, an empty operator id — is acknowledged and dropped with no effect so
+ * the event queue keeps moving. An unknown action id or a card whose question already closed is
+ * acknowledged and dropped the same way.
  */
 async function answerFromCard(action: BotCardAction): Promise<BotEventOutcome> {
   const botUid = deps.botUid();
   if (!botUid || deps.stopping()) return "retry";
-  const ownerId = deps.store.getOwnerId(botUid)?.trim() ?? "";
-  if (ownerId.length === 0 || action.operatorUid !== ownerId) return "ignored";
+  const operator = action.operatorUid.trim();
   const target: ChatTarget = { channelType: action.channelType, channelId: action.channelId };
+  const ownerId = deps.store.getOwnerId(botUid)?.trim() ?? "";
+  if (ownerId.length === 0) return "ignored";
+  if (operator !== ownerId && (operator.length === 0 || !deps.memberAnswerAllowed(target))) {
+    return "ignored";
+  }
   let rows: QuestionRecord[];
   try {
     rows = deps.store.listQuestionsByCard(botUid, target, action.messageId);
@@ -775,8 +799,8 @@ async function answerFromCard(action: BotCardAction): Promise<BotEventOutcome> {
   }
   const first = rows[0];
   if (first === undefined) return "ignored";
-  if (rows.length === 1) return answerSingleCardClick(first, action);
-  return answerSetCardClick(target, rows, action);
+  if (rows.length === 1) return answerSingleCardClick(first, action, operator);
+  return answerSetCardClick(target, rows, action, operator);
 }
 
 /**
@@ -784,7 +808,7 @@ async function answerFromCard(action: BotCardAction): Promise<BotEventOutcome> {
  * replay of the click that answered it (the rewrite removed its buttons), so it stays silent; a
  * question that never got an answer is worth telling the operator about.
  */
-function answerSingleCardClick(question: QuestionRecord, action: BotCardAction): BotEventOutcome {
+function answerSingleCardClick(question: QuestionRecord, action: BotCardAction, answeredBy: string): BotEventOutcome {
   if (question.state === "answered") return "handled";
   if (question.state !== "pending") {
     deps.enqueueText(question, "该问题已失效，本次点击未作为答案。", null);
@@ -807,7 +831,7 @@ function answerSingleCardClick(question: QuestionRecord, action: BotCardAction):
     return "handled";
   }
   try {
-    applyQuestionAnswer(question, answer);
+    applyQuestionAnswer(question, answer, answeredBy);
   } catch {
     return "retry";
   }
@@ -824,6 +848,7 @@ function answerSetCardClick(
   target: ChatTarget,
   rows: readonly QuestionRecord[],
   action: BotCardAction,
+  answeredBy: string,
 ): BotEventOutcome {
   const pending = rows.filter(({ state }) => state === "pending");
   if (pending.length === 0) {
@@ -834,14 +859,14 @@ function answerSetCardClick(
   }
   const ref = parseAskActionId(action.actionId);
   if (ref === null || ref.kind !== "submit") return "handled";
-  const filled: Array<{ id: string; answer: string }> = [];
+  const filled: Array<{ id: string; answer: string; answeredBy: string }> = [];
   for (const question of pending) {
     const payload = parseQuestionPayload(question);
     const ask = payload === null ? null : askQuestionFromPayload(payload);
     const position = payload === null ? null : questionPosition(payload);
     if (ask === null || position === null) continue;
     const answer = resolveAskSetAnswer(ask, position.index, action.inputs);
-    if (answer !== null) filled.push({ id: question.id, answer });
+    if (answer !== null) filled.push({ id: question.id, answer, answeredBy });
   }
   if (filled.length === 0) {
     retryAskCardSet(rows, ref.generation, "未收到内容：请至少填写一题后重新提交，或直接回复本消息作答。");
@@ -855,12 +880,12 @@ function answerSetCardClick(
   }
   const byId = new Map(filled.map(({ id, answer }) => [id, answer]));
   const byQuestion = new Map(pending.map((question) => [question.id, question]));
-  const speaking: Array<{ question: QuestionRecord; answer: string }> = [];
+  const speaking: Array<{ question: QuestionRecord; answer: string; answeredBy: string }> = [];
   for (const id of landed) {
     const answer = byId.get(id) ?? "";
     const question = byQuestion.get(id);
-    if (!releaseQuestion(id, answer) && question !== undefined) {
-      speaking.push({ question, answer });
+    if (!releaseQuestion(id, { answer, answeredBy }) && question !== undefined) {
+      speaking.push({ question, answer, answeredBy });
     }
   }
   const fresh = deps.store.listQuestionsByCard(currentBotUid(), target, action.messageId);

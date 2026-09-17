@@ -1418,7 +1418,7 @@ describe("Octo interactive cards and Bot events", () => {
     await transport.editCard(
       target,
       receipt!.messageId!,
-      buildAskCard(askQuestion, { kind: "answered", answer: "2" }, "已回复：2. production"),
+      buildAskCard(askQuestion, { kind: "answered", answer: "2", answeredBy: null }, "已回复：2. production"),
       2,
     );
 
@@ -1438,8 +1438,8 @@ describe("Octo interactive cards and Bot events", () => {
       { channelId: currentFixture.ownerUid, channelType: 1 },
       buildAskCardSet(
         [
-          { question: askQuestion, answer: null },
-          { question: { question: "When do we ship?", options: [], multi: false }, answer: null },
+          { question: askQuestion, answer: null, answeredBy: null },
+          { question: { question: "When do we ship?", options: [], multi: false }, answer: null, answeredBy: null },
         ],
         { kind: "open", generation: 1 },
         "问题 1/2：Which deployment target?\n问题 2/2：When do we ship?",
@@ -1476,8 +1476,8 @@ describe("Octo interactive cards and Bot events", () => {
       { channelId: fixture.ownerUid, channelType: 1 },
       buildAskCardSet(
         [
-          { question: askQuestion, answer: null },
-          { question: { question: "When do we ship?", options: [], multi: false }, answer: null },
+          { question: askQuestion, answer: null, answeredBy: null },
+          { question: { question: "When do we ship?", options: [], multi: false }, answer: null, answeredBy: null },
         ],
         { kind: "open", generation: 1 },
         "问题 1/2：Which deployment target?\n问题 2/2：When do we ship?",

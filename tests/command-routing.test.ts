@@ -299,6 +299,51 @@ test("custom handlers cannot bypass owner, group, mention, or message-id validat
   }
 });
 
+test("a member's command earns one throttled notice and never reaches a handler, the worker or a task", async () => {
+  const contexts: ChannelCommandContext[] = [];
+  const handler: ChannelCommandHandler = {
+    name: "compact",
+    intercept: false,
+    async handle(context) {
+      contexts.push(context);
+    },
+  };
+  const harness = await openRoutingHarness([handler]);
+  try {
+    const first = inbound({
+      messageId: "routing-member-command-1",
+      channelId: "group-allowed",
+      channelType: 2,
+      senderId: "other-user",
+      mentionedUserIds: [harness.transport.bot.uid],
+      text: "/compact denied",
+    });
+    await harness.service.handleInbound(first);
+    const notice = await harness.transport.waitForRemoteText(({ text }) => text.includes("命令仅 owner 可用"));
+    expect(notice.target).toMatchObject({ channelId: "group-allowed", channelType: 2 });
+
+    // The window is open for this chat: a second command and a replay of the first stay silent.
+    await harness.service.handleInbound(inbound({
+      messageId: "routing-member-command-2",
+      channelId: "group-allowed",
+      channelType: 2,
+      senderId: "other-user",
+      mentionedUserIds: [harness.transport.bot.uid],
+      text: "/status",
+    }));
+    await harness.service.handleInbound({ ...first });
+
+    expect(contexts).toHaveLength(0);
+    expect(harness.workers.prompts).toHaveLength(0);
+    expect(
+      harness.transport.sent.filter(({ text }) => text.includes("命令仅 owner 可用")),
+    ).toHaveLength(1);
+    expect((await harness.service.status({ channelId: "group-allowed", channelType: 2 })).state).toBe("none");
+  } finally {
+    await closeRoutingHarness(harness);
+  }
+});
+
 test("handler registration rejects blank names and normalized duplicates", async () => {
   const fixture = await createRoutingFixture();
   try {

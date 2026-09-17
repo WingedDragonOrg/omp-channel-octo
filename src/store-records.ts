@@ -101,6 +101,8 @@ export interface QuestionRecord extends ChatTarget {
   payload: string;
   state: "pending" | "answered" | "cancelled" | "expired";
   answer: string | null;
+  /** Uid of whoever answered (owner or an allowed group member); `null` for old rows and open questions. */
+  answeredBy: string | null;
   /** Remote id of the interactive card carrying this question; `null` for text-only questions. */
   cardMessageId: string | null;
 }

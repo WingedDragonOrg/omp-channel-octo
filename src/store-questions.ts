@@ -8,7 +8,7 @@ import type { ChatTarget } from "./contracts.ts";
 import type { QuestionRecord } from "./store-records.ts";
 import { query, questionFromRow, run, targetValues, targetWhere, transaction } from "./store-schema.ts";
 
-export function createQuestion(db: Database, record: Omit<QuestionRecord, "state" | "answer" | "cardMessageId">): void {
+export function createQuestion(db: Database, record: Omit<QuestionRecord, "state" | "answer" | "answeredBy" | "cardMessageId">): void {
   run(db,
     `INSERT INTO questions(id, task_id, bot_uid, channel_type, channel_id, payload, state, created_at)
      VALUES(?, ?, ?, ?, ?, ?, 'pending', ?)`,
@@ -36,21 +36,21 @@ export function listPendingQuestions(db: Database, botUid: string, target: ChatT
   ).map((row) => questionFromRow(row));
 }
 
-export function answerQuestion(db: Database, id: string, botUid: string, target: ChatTarget, answer: string): boolean {
+export function answerQuestion(db: Database, id: string, botUid: string, target: ChatTarget, answer: string, answeredBy: string | null): boolean {
   return run(db,
-    `UPDATE questions SET state = 'answered', answer = ?, answered_at = ?
+    `UPDATE questions SET state = 'answered', answer = ?, answered_by = ?, answered_at = ?
      WHERE id = ? AND bot_uid = ? AND ${targetWhere(target)} AND state = 'pending'`,
-    [answer, Date.now(), id, botUid, ...targetValues(target)],
+    [answer, answeredBy, Date.now(), id, botUid, ...targetValues(target)],
   ).changes === 1;
 }
 
 export function answerQuestions(db: Database, botUid: string,
   target: ChatTarget,
-  answers: ReadonlyArray<{ id: string; answer: string }>,): string[] {
+  answers: ReadonlyArray<{ id: string; answer: string; answeredBy: string | null }>,): string[] {
   return transaction(db, () => {
     const landed: string[] = [];
-    for (const { id, answer } of answers) {
-      if (answerQuestion(db, id, botUid, target, answer)) landed.push(id);
+    for (const { id, answer, answeredBy } of answers) {
+      if (answerQuestion(db, id, botUid, target, answer, answeredBy)) landed.push(id);
     }
     return landed;
   });

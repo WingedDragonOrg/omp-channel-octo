@@ -48,7 +48,7 @@ export interface AskCardQuestion {
  */
 export type AskCardState =
   | { kind: "pending"; generation: number }
-  | { kind: "answered"; answer: string }
+  | { kind: "answered"; answer: string; answeredBy: string | null }
   | { kind: "inactive"; note: string };
 
 /** One question of a set frame together with the answer recorded for it so far. */
@@ -56,6 +56,8 @@ export interface AskCardSetQuestion {
   question: AskCardQuestion;
   /** Recorded answer; `null` while the question still waits for one. */
   answer: string | null;
+  /** Who answered it; `null` while open or when the row predates attribution. */
+  answeredBy: string | null;
 }
 
 /**
@@ -131,6 +133,13 @@ export function askAnswerText(question: AskCardQuestion, answer: string): string
     return option ? `${index}. ${option.label.trim()}` : value;
   });
   return labels.join("；");
+}
+
+/** The sentence both frame kinds and their text fallback show for a recorded answer, attributed when the answerer is known. */
+export function askAnsweredText(question: AskCardQuestion, answer: string, answeredBy: string | null): string {
+  const body = askAnswerText(question, answer);
+  const who = answeredBy?.trim() ?? "";
+  return who.length === 0 ? `已回复：${body}` : `已由 ${who} 回复：${body}`;
 }
 
 /** Reads a comma-separated option selection; `null` when it does not name options of `question`. */
@@ -287,7 +296,7 @@ export function buildAskCard(
     card.actions = pendingActions(question, state.generation);
   } else {
     const note = state.kind === "answered"
-      ? `已回复：${cardText(askAnswerText(question, state.answer))}`
+      ? cardText(askAnsweredText(question, state.answer, state.answeredBy))
       : state.note;
     card.body = [...questionBody(question), { type: "TextBlock", text: note, wrap: true, spacing: "Medium" }];
   }
@@ -314,7 +323,7 @@ function setQuestionBody(
   if (entry.answer !== null) {
     body.push({
       type: "TextBlock",
-      text: `已回复：${cardText(askAnswerText(question, entry.answer))}`,
+      text: cardText(askAnsweredText(question, entry.answer, entry.answeredBy)),
       wrap: true,
       spacing: "Medium",
     });

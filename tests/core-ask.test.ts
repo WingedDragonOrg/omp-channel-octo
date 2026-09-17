@@ -76,7 +76,7 @@ test("a plain reply answers the pending question with its option index", async (
     );
     expect(completed.pendingQuestionIds).toHaveLength(0);
     expect(JSON.parse(await readText(join(harness.root, "tmp", "answer.log")))).toEqual({
-      answers: [{ id: "deployment-target", questionId, answer: "2" }],
+      answers: [{ id: "deployment-target", questionId, answeredBy: "owner-1", answer: "2" }],
     });
     expect(harness.workers.prompts).toHaveLength(1);
   } finally {
@@ -129,7 +129,7 @@ test("a free-form reply is returned as the free-form answer instead of starting 
     );
     expect(completed.pendingQuestionIds).toHaveLength(0);
     expect(JSON.parse(await readText(join(harness.root, "tmp", "answer.log")))).toEqual({
-      answers: [{ id: "release-window", questionId, answer: "先不发布，等周四" }],
+      answers: [{ id: "release-window", questionId, answeredBy: "owner-1", answer: "先不发布，等周四" }],
     });
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["when do we ship?"]);
   } finally {

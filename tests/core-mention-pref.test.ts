@@ -131,6 +131,36 @@ test("never asks for a 免@ decision on a message that is rejected first", async
   }
 });
 
+test("the 免@ exemption stays the owner's: an unmentioned member's message never runs", async () => {
+  const harness = await createCoreHarness();
+  try {
+    harness.transport.setGroupMentionPref("group-allowed", { effective: true });
+    const owner = inbound({
+      messageId: "member-free-owner",
+      channelId: "group-allowed",
+      channelType: 2,
+      text: "owner work",
+    });
+    const member = inbound({
+      messageId: "member-free-member",
+      channelId: "group-allowed",
+      channelType: 2,
+      senderId: "other-user",
+      text: "member work",
+    });
+
+    await harness.service.handleInbound(owner);
+    await harness.service.handleInbound(member);
+    await waitForStatus(harness.service, owner, (status) => status.state === "completed");
+
+    expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["owner work"]);
+    // Only the owner's message needed the upstream decision; the member's never asks for it.
+    expect(harness.transport.mentionPrefCalls).toEqual(["group-allowed"]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
 test("uses the parent group's 免@ decision inside a thread", async () => {
   const harness = await createCoreHarness();
   try {

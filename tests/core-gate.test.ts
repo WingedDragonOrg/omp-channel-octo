@@ -51,7 +51,29 @@ test("only the owner and an explicitly mentioned bot can execute", async () => {
   }
 });
 
-test("rejects non-owner, unallowed, unmentioned, textual-only, bot, and unsupported messages", async () => {
+test("an enabled group lets a mentioned member run a task like the owner", async () => {
+  const harness = await createCoreHarness();
+  try {
+    const member = inbound({
+      messageId: "gate-member-group",
+      channelId: "group-allowed",
+      channelType: 2,
+      senderId: "other-user",
+      mentionedUserIds: [harness.bot.uid],
+      text: "member group work",
+    });
+
+    await harness.service.handleInbound(member);
+    await waitForStatus(harness.service, member, (status) => status.state === "completed");
+
+    const effects = (await readText(join(harness.root, "tmp", "effects.log"))).trim().split("\n").filter(Boolean);
+    expect(effects).toEqual(["member group work"]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("rejects unmentioned members, unallowed chats, foreign DMs, bots, and unsupported messages", async () => {
   const harness = await createCoreHarness();
   try {
     const rejected = [
@@ -63,11 +85,10 @@ test("rejects non-owner, unallowed, unmentioned, textual-only, bot, and unsuppor
         text: "other dm work",
       }),
       inbound({
-        messageId: "gate-other-group",
+        messageId: "gate-other-group-unmentioned",
         channelId: "group-allowed",
         channelType: 2,
         senderId: "other-user",
-        mentionedUserIds: [harness.bot.uid],
         text: "other member work",
       }),
       inbound({

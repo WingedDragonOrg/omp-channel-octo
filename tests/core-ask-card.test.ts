@@ -138,14 +138,14 @@ test("a card click answers the pending question and rewrites the card", async ()
     );
     expect(completed.pendingQuestionIds).toHaveLength(0);
     expect(await readAnswers(harness)).toEqual({
-      answers: [{ id: "deployment-target", questionId, answer: "2" }],
+      answers: [{ id: "deployment-target", questionId, answeredBy: "owner-1", answer: "2" }],
     });
     await harness.transport.waitForAck(7);
 
     const edit = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
     expect(edit.cardSeq).toBe(2);
     expect(cardActions(edit)).toHaveLength(0);
-    expect(JSON.stringify(edit.frame.card)).toContain("已回复：2. production");
+    expect(JSON.stringify(edit.frame.card)).toContain("已由 owner-1 回复：2. production");
   } finally {
     await closeCoreHarness(harness);
   }
@@ -185,7 +185,7 @@ test("a plain reply answers the card question and rewrites the same card", async
 
     const edit = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
     expect(cardActions(edit)).toHaveLength(0);
-    expect(JSON.stringify(edit.frame.card)).toContain("已回复：1. staging");
+    expect(JSON.stringify(edit.frame.card)).toContain("已由 owner-1 回复：1. staging");
   } finally {
     await closeCoreHarness(harness);
   }
@@ -326,7 +326,7 @@ test("a multi-select submission answers with the selected indexes", async () => 
   }
 });
 
-test("a click from anyone but the owner leaves the question pending", async () => {
+test("a click from anyone but the owner in a DM leaves the question pending", async () => {
   const harness = await startAskHarness({
     id: "deployment-target",
     question: "Which deployment target?",
@@ -358,6 +358,190 @@ test("a click from anyone but the owner leaves the question pending", async () =
     expect(harness.workers.prompts).toHaveLength(1);
     const status = await harness.service.status(target);
     expect(status.pendingQuestionIds).toHaveLength(1);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a member's click in an enabled group answers the card and records the submitter", async () => {
+  const harness = await startAskHarness({
+    id: "deploy-target",
+    question: "Which deployment target?",
+    options: [{ label: "staging" }, { label: "production" }],
+  });
+  try {
+    const target: ChatTarget = { channelId: "group-allowed", channelType: 2 };
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "group-card-start",
+        ...target,
+        text: "needs an answer",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 1);
+    const card = harness.transport.sentCards[0];
+    if (!card) {
+      throw new Error("ask card was not sent");
+    }
+
+    harness.transport.pushBotEvent(cardActionEvent(7, {
+      messageId: card.messageId,
+      channelType: 2,
+      channelId: target.channelId,
+      actionId: "ask_opt_2",
+      operatorUid: "member-9",
+      inputs: {},
+    }));
+
+    await harness.transport.waitForAck(7);
+    const completed = await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(completed.pendingQuestionIds).toHaveLength(0);
+    expect(await readAnswers(harness)).toEqual({
+      answers: [{ id: "deploy-target", questionId: expect.any(String), answeredBy: "member-9", answer: "2" }],
+    });
+    const edit = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
+    expect(cardActions(edit)).toHaveLength(0);
+    expect(JSON.stringify(edit.frame.card)).toContain("已由 member-9 回复：2. production");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a member's click works in a thread of an enabled group", async () => {
+  const harness = await startAskHarness({
+    id: "thread-answer",
+    question: "Proceed in this thread?",
+  });
+  try {
+    const target: ChatTarget = { channelId: "group-allowed____thread-1", channelType: 5 };
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "thread-card-start",
+        ...target,
+        text: "needs an answer",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 1);
+    const card = harness.transport.sentCards[0];
+    if (!card) {
+      throw new Error("ask card was not sent");
+    }
+
+    harness.transport.pushBotEvent(cardActionEvent(8, {
+      messageId: card.messageId,
+      channelType: 5,
+      channelId: target.channelId,
+      actionId: "ask_submit",
+      operatorUid: "member-9",
+      inputs: { ask_text: "yes, go ahead" },
+    }));
+
+    await harness.transport.waitForAck(8);
+    const completed = await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(completed.pendingQuestionIds).toHaveLength(0);
+    expect(await readAnswers(harness)).toEqual({
+      answers: [{ id: "thread-answer", questionId: expect.any(String), answeredBy: "member-9", answer: "yes, go ahead" }],
+    });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a member's click addressed to another chat cannot answer a question that lives elsewhere", async () => {
+  const harness = await startAskHarness({
+    id: "deploy-target",
+    question: "Which deployment target?",
+    options: [{ label: "staging" }, { label: "production" }],
+  });
+  try {
+    const target: ChatTarget = { channelId: "group-allowed", channelType: 2 };
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "elsewhere-start",
+        ...target,
+        text: "needs an answer",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 1);
+    const card = harness.transport.sentCards[0];
+    if (!card) {
+      throw new Error("ask card was not sent");
+    }
+
+    // An unlisted chat is refused outright; an allowed but different chat finds no question row.
+    for (const [eventId, channelId] of [[9, "group-denied"], [10, "group-a"]] as const) {
+      harness.transport.pushBotEvent(cardActionEvent(eventId, {
+        messageId: card.messageId,
+        channelType: 2,
+        channelId,
+        actionId: "ask_opt_2",
+        operatorUid: "member-9",
+        inputs: {},
+      }));
+      await harness.transport.waitForAck(eventId);
+    }
+
+    expect(harness.transport.cardEdits).toHaveLength(0);
+    expect(harness.workers.prompts).toHaveLength(1);
+    expect((await harness.service.status(target)).pendingQuestionIds).toHaveLength(1);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a member's text reply in an enabled group answers the pending question with attribution", async () => {
+  const harness = await startAskHarness({
+    id: "release-window",
+    question: "When do we ship?",
+  });
+  try {
+    const target: ChatTarget = { channelId: "group-allowed", channelType: 2 };
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "group-text-start",
+        ...target,
+        text: "needs an answer",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 1);
+
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "group-text-reply",
+        ...target,
+        senderId: "member-9",
+        text: "ship it tonight",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+
+    const completed = await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(completed.pendingQuestionIds).toHaveLength(0);
+    expect(await readAnswers(harness)).toEqual({
+      answers: [{ id: "release-window", questionId: expect.any(String), answeredBy: "member-9", answer: "ship it tonight" }],
+    });
+    // The reply was the answer, not a task of its own.
+    expect(harness.workers.prompts).toHaveLength(1);
   } finally {
     await closeCoreHarness(harness);
   }
@@ -528,20 +712,20 @@ test("one submit answers every question of a multi-question card", async () => {
     await harness.transport.waitForAck(101);
     expect(await readAnswers(harness)).toEqual({
       answers: [
-        { id: "target", questionId: expect.any(String), answer: "2" },
-        { id: "window", questionId: expect.any(String), answer: "tonight" },
-        { id: "caps", questionId: expect.any(String), answer: "1,3" },
-        { id: "note", questionId: expect.any(String), answer: "actually, use canary" },
+        { id: "target", questionId: expect.any(String), answeredBy: "owner-1", answer: "2" },
+        { id: "window", questionId: expect.any(String), answeredBy: "owner-1", answer: "tonight" },
+        { id: "caps", questionId: expect.any(String), answeredBy: "owner-1", answer: "1,3" },
+        { id: "note", questionId: expect.any(String), answeredBy: "owner-1", answer: "actually, use canary" },
       ],
     });
 
     const edit = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
     expect(cardActions(edit)).toHaveLength(0);
     const rendered = JSON.stringify(edit.frame.card);
-    expect(rendered).toContain("已回复：2. production");
-    expect(rendered).toContain("已回复：tonight");
-    expect(rendered).toContain("已回复：1. read；3. admin");
-    expect(rendered).toContain("已回复：actually, use canary");
+    expect(rendered).toContain("已由 owner-1 回复：2. production");
+    expect(rendered).toContain("已由 owner-1 回复：tonight");
+    expect(rendered).toContain("已由 owner-1 回复：1. read；3. admin");
+    expect(rendered).toContain("已由 owner-1 回复：actually, use canary");
   } finally {
     await closeCoreHarness(harness);
   }
@@ -577,7 +761,7 @@ test("a partial set submission answers what it filled and leaves the rest open",
     const rerendered = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
     expect(rerendered.cardSeq).toBe(2);
     expect(cardActions(rerendered)).toEqual(["ask_submit#2"]);
-    expect(JSON.stringify(rerendered.frame.card)).toContain("已回复：1. staging");
+    expect(JSON.stringify(rerendered.frame.card)).toContain("已由 owner-1 回复：1. staging");
     await expect(harness.service.status(target)).resolves.toMatchObject({
       pendingQuestionIds: [expect.any(String)],
     });
@@ -598,8 +782,8 @@ test("a partial set submission answers what it filled and leaves the rest open",
     );
     expect(await readAnswers(harness)).toEqual({
       answers: [
-        { id: "target", questionId: expect.any(String), answer: "1" },
-        { id: "window", questionId: expect.any(String), answer: "ship it tonight" },
+        { id: "target", questionId: expect.any(String), answeredBy: "owner-1", answer: "1" },
+        { id: "window", questionId: expect.any(String), answeredBy: "owner-1", answer: "ship it tonight" },
       ],
     });
     const closed = await harness.transport.waitForCardEdit(
@@ -646,14 +830,14 @@ test("a plain reply answers the whole set at once", async () => {
     // The one reply answers every open question: an option index here, the raw text there.
     expect(await readAnswers(harness)).toEqual({
       answers: [
-        { id: "target", questionId: expect.any(String), answer: "1" },
-        { id: "window", questionId: expect.any(String), answer: "1" },
+        { id: "target", questionId: expect.any(String), answeredBy: "owner-1", answer: "1" },
+        { id: "window", questionId: expect.any(String), answeredBy: "owner-1", answer: "1" },
       ],
     });
 
     const closed = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
     expect(cardActions(closed)).toHaveLength(0);
-    expect(JSON.stringify(closed.frame.card)).toContain("已回复：1. staging");
+    expect(JSON.stringify(closed.frame.card)).toContain("已由 owner-1 回复：1. staging");
     expect(JSON.stringify(closed.frame.card)).not.toContain("Input.Text");
   } finally {
     await closeCoreHarness(harness);
@@ -773,8 +957,8 @@ test("a set frame the deployment refuses falls back to one card per question", a
     );
     expect(await readAnswers(harness)).toEqual({
       answers: [
-        { id: "target", questionId: expect.any(String), answer: "2" },
-        { id: "window", questionId: expect.any(String), answer: "tonight" },
+        { id: "target", questionId: expect.any(String), answeredBy: "owner-1", answer: "2" },
+        { id: "window", questionId: expect.any(String), answeredBy: "owner-1", answer: "tonight" },
       ],
     });
   } finally {
@@ -816,8 +1000,8 @@ test("a set without card support asks in text and one reply answers the rest", a
     expect(harness.transport.sent).toHaveLength(1);
     expect(await readAnswers(harness)).toEqual({
       answers: [
-        { id: "target", questionId: expect.any(String), answer: "production, tonight" },
-        { id: "window", questionId: expect.any(String), answer: "production, tonight" },
+        { id: "target", questionId: expect.any(String), answeredBy: "owner-1", answer: "production, tonight" },
+        { id: "window", questionId: expect.any(String), answeredBy: "owner-1", answer: "production, tonight" },
       ],
     });
   } finally {
@@ -864,16 +1048,16 @@ test("a timed-out question stops the turn and stays pending until the reply wake
     expect(wake?.text).toContain("[ask 答复]");
     expect(wake?.text).toContain("（id=deployment-target）");
     expect(wake?.text).toContain("Which deployment target?");
-    expect(wake?.text).toContain("答案：1. staging");
+    expect(wake?.text).toContain("答案（由 owner-1 回复）：1. staging");
     await waitForStatus(
       harness.service,
       target,
       (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
     );
-    expect(await readText(join(harness.root, "tmp", "wake.log"))).toContain("答案：1. staging");
+    expect(await readText(join(harness.root, "tmp", "wake.log"))).toContain("答案（由 owner-1 回复）：1. staging");
     const edit = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
     expect(cardActions(edit)).toHaveLength(0);
-    expect(JSON.stringify(edit.frame.card)).toContain("已回复：1. staging");
+    expect(JSON.stringify(edit.frame.card)).toContain("已由 owner-1 回复：1. staging");
   } finally {
     await closeCoreHarness(harness);
   }
@@ -913,7 +1097,7 @@ test("a card submission after the timeout answers once and wakes the agent", asy
     harness.transport.pushBotEvent(cardActionEvent(41, click));
     await harness.workers.waitForPromptCount(2);
     await harness.transport.waitForAck(41);
-    expect(harness.workers.prompts[1]?.text).toContain("答案：ship it tonight");
+    expect(harness.workers.prompts[1]?.text).toContain("答案（由 owner-1 回复）：ship it tonight");
     await waitForStatus(
       harness.service,
       target,
@@ -974,7 +1158,7 @@ test("a timed-out question set stops the turn once and keeps every row answerabl
       inputs: { ask_text_2: "ship it tonight" },
     }));
     await harness.workers.waitForPromptCount(2);
-    expect(harness.workers.prompts[1]?.text).toContain("答案：ship it tonight");
+    expect(harness.workers.prompts[1]?.text).toContain("答案（由 owner-1 回复）：ship it tonight");
     expect(harness.workers.prompts[1]?.text).not.toContain("Which deployment target?");
     const reopened = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
     expect(cardActions(reopened)).toEqual(["ask_submit#2"]);
@@ -991,7 +1175,7 @@ test("a timed-out question set stops the turn once and keeps every row answerabl
     );
     await harness.workers.waitForPromptCount(3);
     expect(harness.workers.prompts[2]?.text).toContain("Which deployment target?");
-    expect(harness.workers.prompts[2]?.text).toContain("答案：2. production");
+    expect(harness.workers.prompts[2]?.text).toContain("答案（由 owner-1 回复）：2. production");
     await waitForStatus(
       harness.service,
       target,

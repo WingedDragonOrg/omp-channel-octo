@@ -154,6 +154,8 @@ const MENTION_PREF_TIMEOUT_MS = 5_000;
 const UNLISTED_CHAT_PASSPHRASE = "开通本群";
 /** One notice per unlisted chat per window, so a burst of messages cannot become a burst of replies. */
 const UNLISTED_CHAT_NOTICE_TTL_MS = 10 * 60 * 1_000;
+/** Same window for the members-cannot-command notice: the first command of a chat is explained once. */
+const MEMBER_COMMAND_NOTICE_TTL_MS = 10 * 60 * 1_000;
 const DEFAULT_CANCELLED_TEXT = "当前任务已取消；不回滚已发生的副作用。";
 const DEFAULT_RESTARTING_TEXT = "channel 正在重启，本会话任务已中断；重启完成后会在本会话确认。";
 const THREAD_USAGE =
@@ -392,6 +394,8 @@ class CoreService implements ChannelService {
   private readonly mentionPrefRequests = new Map<string, Promise<boolean>>();
   /** Last unlisted-chat notice per chat; process-local, so a restart may re-notify once. */
   private readonly unlistedChatNotices = new Map<string, number>();
+  /** Last members-cannot-command notice per chat; same process-local window pattern. */
+  private readonly memberCommandNotices = new Map<string, number>();
   /** 问题与问答卡：等待者、卡片代次与问题行的所有者。 */
   /** 出站投递：文字、流式编辑与文件共用的队列。 */
   private readonly outbox: Outbox;
@@ -436,6 +440,7 @@ class CoreService implements ChannelService {
       wakeTurn: (target, text) => {
         void this.wakeTurn(target, text);
       },
+      memberAnswerAllowed: (target) => target.channelType !== 1 && this.isPermittedChat(target),
     });
     this.botEvents = createBotEventLoop({
       store: this.store,
@@ -631,6 +636,12 @@ class CoreService implements ChannelService {
         this.store.failCommand(claim);
         throw new Error("本地状态盘写入失败，未能记录不支持消息。");
       }
+      return;
+    }
+    // Members never run commands: the slash text would otherwise be passed to OMP, whose own
+    // builtin dispatch consumes it, so it only earns one throttled notice instead.
+    if (isCommand(text) && message.senderId.trim() !== ownerId) {
+      await this.noticeMemberCommand(message);
       return;
     }
     const command = isCommand(text) ? parseCommand(text) : null;
@@ -871,10 +882,11 @@ class CoreService implements ChannelService {
     if (message.channelType === 1) {
       return senderId === ownerId;
     }
-    if (senderId !== ownerId || !this.isPermittedChat(message)) {
-      return false;
-    }
+    if (!this.isPermittedChat(message)) return false;
     if (message.mentionedUserIds.includes(this.bot.uid)) return true;
+    // The 免@ exemption belongs to the owner: a member's unmentioned message never runs — and
+    // never triggers the upstream lookup either, so a rejected member costs no request.
+    if (senderId !== ownerId) return false;
     return await this.groupAllowsNoMention(message);
   }
 
@@ -909,6 +921,33 @@ class CoreService implements ChannelService {
     this.outbox.enqueueText(message, `${scope}未开通。回复「@${botName} ${UNLISTED_CHAT_PASSPHRASE}」即可开通${scope}。`, null);
     // Only a queued notice opens the window: a failed enqueue still leaves the next message free to try again.
     this.unlistedChatNotices.set(key, Date.now());
+  }
+
+  /**
+   * The only visible effect of a member's `/` message: the command is not executed and never
+   * reaches the agent. One durable claim per message id keeps a redelivery silent, and one
+   * notice per chat per window keeps a stream of attempts from becoming a stream of replies.
+   */
+  private async noticeMemberCommand(message: InboundMessage): Promise<void> {
+    const bot = this.bot;
+    if (!bot) return;
+    const claim = this.commandClaim(message, "member-command");
+    if (!this.store.claimCommand(claim)) return;
+    const key = targetKey(message);
+    const lastNoticedAt = this.memberCommandNotices.get(key);
+    if (lastNoticedAt !== undefined && Date.now() - lastNoticedAt < MEMBER_COMMAND_NOTICE_TTL_MS) {
+      this.store.completeCommand(claim);
+      return;
+    }
+    const botName = bot.name.trim().length > 0 ? bot.name.trim() : bot.uid;
+    try {
+      await this.outbox.enqueueText(message, `命令仅 owner 可用；需要助手做事请直接 @${botName} 说明。`, null);
+      this.memberCommandNotices.set(key, Date.now());
+      this.store.completeCommand(claim);
+    } catch {
+      this.store.failCommand(claim);
+      throw new Error("本地状态盘写入失败，未能记录成员命令提示。");
+    }
   }
 
   /**

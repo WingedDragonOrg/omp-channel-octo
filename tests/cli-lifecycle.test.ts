@@ -320,9 +320,9 @@ test("real CLI runs the owner's group command with the bot mention placed before
     ]);
 
     await waitForFixture(
-      () => currentFixture.sentMessages.length === 3 ? currentFixture.sentMessages : undefined,
+      () => currentFixture.sentMessages.length === 4 ? currentFixture.sentMessages : undefined,
       5_000,
-      "CLI did not answer the two owner commands and the sentinel status request",
+      "CLI did not answer the two owner commands, the member notice, and the sentinel status request",
     );
     // Every inbound frame was acknowledged after handling, so a rejected message cannot still be answered later.
     await waitForFixture(
@@ -335,9 +335,15 @@ test("real CLI runs the owner's group command with the bot mention placed before
       channelId: message.body.channel_id,
       content: sentText(message),
     }));
-    expect(currentFixture.sentMessages).toHaveLength(3);
-    expect(replies.filter(({ channelId }) => channelId === groupId)).toHaveLength(2);
-    expect(replies.every(({ content }) => content.includes("state=none"))).toBe(true);
+    expect(currentFixture.sentMessages).toHaveLength(4);
+    const statusReplies = replies.filter(({ content }) => content.includes("state=none"));
+    expect(statusReplies).toHaveLength(3);
+    expect(replies.filter(({ channelId }) => channelId === groupId)).toHaveLength(3);
+    // The member's mentioned `/status` runs nothing: the command notice is the whole answer.
+    expect(replies).toContainEqual({
+      channelId: groupId,
+      content: `命令仅 owner 可用；需要助手做事请直接 @${currentFixture.botName} 说明。`,
+    });
     expect(replies.filter(({ channelId }) => channelId === currentFixture.ownerUid)).toHaveLength(1);
     expect(replies.some(({ channelId }) => channelId === "other-member")).toBe(false);
 

@@ -189,6 +189,7 @@ export function applySchema(db: Database): void {
       payload TEXT NOT NULL,
       state TEXT NOT NULL CHECK(state IN ('pending', 'answered', 'cancelled', 'expired')),
       answer TEXT,
+      answered_by TEXT,
       created_at INTEGER NOT NULL,
       answered_at INTEGER
     );
@@ -287,6 +288,7 @@ export function applySchema(db: Database): void {
     "ALTER TABLE tasks ADD COLUMN history_eligible INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE chats ADD COLUMN cwd_pinned INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE questions ADD COLUMN card_message_id TEXT",
+    "ALTER TABLE questions ADD COLUMN answered_by TEXT",
   ]) {
     try {
       db.exec(statement);
@@ -443,6 +445,7 @@ export function questionFromRow(row: SqlRow): QuestionRecord {
     payload: asString(row.payload),
     state,
     answer: asNullableString(row.answer),
+    answeredBy: asNullableString(row.answered_by),
     cardMessageId: asNullableString(row.card_message_id),
   };
 }

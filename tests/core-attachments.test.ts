@@ -1215,7 +1215,7 @@ test("回答问题时的附件不下载也不落盘：答案路径优先于附�
     expect(harness.workers.prompts).toHaveLength(1);
     expect(taskCount(harness, target)).toBe(1);
     expect(JSON.parse(await readText(join(harness.root, "tmp", "answer.log")))).toEqual({
-      answers: [{ id: "deploy-target", questionId: pending.pendingQuestionIds[0]!, answer: "2" }],
+      answers: [{ id: "deploy-target", questionId: pending.pendingQuestionIds[0]!, answeredBy: "owner-1", answer: "2" }],
     });
   } finally {
     await closeAttachmentHarness(harness);

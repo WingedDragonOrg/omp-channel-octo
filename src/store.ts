@@ -404,7 +404,7 @@ export class ChannelStore {
     markOutboxDead(this.db, id, errorText);
   }
 
-  createQuestion(record: Omit<QuestionRecord, "state" | "answer" | "cardMessageId">): void {
+  createQuestion(record: Omit<QuestionRecord, "state" | "answer" | "answeredBy" | "cardMessageId">): void {
     createQuestion(this.db, record);
   }
 
@@ -416,8 +416,8 @@ export class ChannelStore {
     return listPendingQuestions(this.db, botUid, target);
   }
 
-  answerQuestion(id: string, botUid: string, target: ChatTarget, answer: string): boolean {
-    return answerQuestion(this.db, id, botUid, target, answer);
+  answerQuestion(id: string, botUid: string, target: ChatTarget, answer: string, answeredBy: string | null): boolean {
+    return answerQuestion(this.db, id, botUid, target, answer, answeredBy);
   }
 
   /**
@@ -429,7 +429,7 @@ export class ChannelStore {
   answerQuestions(
     botUid: string,
     target: ChatTarget,
-    answers: ReadonlyArray<{ id: string; answer: string }>,
+    answers: ReadonlyArray<{ id: string; answer: string; answeredBy: string | null }>,
   ): string[] {
     return answerQuestions(this.db, botUid, target, answers);
   }
