@@ -3,9 +3,12 @@
  * the owner answers from the card, or by replying in the chat.
  *
  * A single question keeps its own card: one option per button for a single choice, a selectable
- * list plus one submit for a multiple choice. Several questions share one card — every question
- * carries its own inputs and the whole set is answered by one submit. Every option question also
- * carries a free-form field whose value wins over the selection when it is filled.
+ * list plus one submit for a multiple choice. Every option button stands in an `ActionSet` row
+ * of its own inside the body: body actionsets stack vertically, while the card-level `actions`
+ * area draws one horizontal row that clips longer labels at the card edge. Several questions
+ * share one card — every question carries its own inputs and the whole set is answered by one
+ * submit. Every option question also carries a free-form field whose value wins over the
+ * selection when it is filled.
  *
  * The frame is an ordinary message as well — `plain` is what the text-only path would have sent
  * — and a plain reply in the chat still answers (see `CoreService.answerPendingQuestion`).
@@ -19,8 +22,16 @@ export const ASK_CHOICES_INPUT_ID = "ask_choices";
 
 const OPTION_ACTION_PREFIX = "ask_opt_";
 const SUBMIT_ACTION_PREFIX = "ask_submit";
-/** Buttons are titles in a row; the full label stays in the card body. */
-const MAX_ACTION_TITLE_CHARS = 60;
+/**
+ * Button titles must fit the narrowest card: the client lays each action out at its intrinsic
+ * width on one line, so a title wider than the card overflows the edge instead of wrapping.
+ * The budget is in half-width columns (about 20 full-width glyphs); the full label and its
+ * description stay in the numbered body lines above.
+ */
+const MAX_ACTION_TITLE_COLUMNS = 40;
+/** Full-width code points (CJK, kana, hangul, full-width forms, emoji) cost two columns. */
+const WIDE_GLYPH =
+  /[\u1100-\u115F\u2E80-\u303F\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7A3\uF900-\uFAFF\uFF00-\uFF60\uFFE0-\uFFE6]/u;
 const OPTION_ACTION_ID = new RegExp(`^${OPTION_ACTION_PREFIX}(\\d+)(?:#(\\d+))?$`, "u");
 const SUBMIT_ACTION_ID = new RegExp(`^${SUBMIT_ACTION_PREFIX}(?:#(\\d+))?$`, "u");
 /** One set runs one submit; its title says the click answers every question at once. */
@@ -86,12 +97,29 @@ function cardText(text: string): string {
   return text.replace(/\\/gu, "\\\\").replace(/\[/gu, "\\[");
 }
 
+/** Display columns of one code point, matching the client's half/full-width glyph split. */
+function glyphColumns(char: string): number {
+  if ((char.codePointAt(0) ?? 0) >= 0x1F000) return 2;
+  return WIDE_GLYPH.test(char) ? 2 : 1;
+}
+
+/** Truncates to the column budget, appending an ellipsis only when something was dropped. */
+function truncateToColumns(text: string, budget: number): string {
+  let kept = "";
+  let columns = 0;
+  for (const char of text) {
+    const width = glyphColumns(char);
+    if (columns + width > budget) return `${kept}…`;
+    kept += char;
+    columns += width;
+  }
+  return kept;
+}
+
 function actionTitle(index: number, label: string): string {
   const prefix = `${index}. `;
-  const trimmed = label.trim();
-  const room = MAX_ACTION_TITLE_CHARS - prefix.length;
-  const title = trimmed.length > room ? `${trimmed.slice(0, Math.max(1, room - 1))}…` : trimmed;
-  return `${prefix}${title}`;
+  // One column is reserved for the ellipsis so a truncated title never exceeds the budget.
+  return `${prefix}${truncateToColumns(label.trim(), MAX_ACTION_TITLE_COLUMNS - prefix.length - 1)}`;
 }
 
 function optionActionId(index: number, generation: number): string {
@@ -258,21 +286,44 @@ function pendingInputs(question: AskCardQuestion): Record<string, unknown>[] {
   return [answerInput(ASK_TEXT_INPUT_ID, true)];
 }
 
+/**
+ * The option buttons of a single choice, one body `ActionSet` per option. Body actionsets stack
+ * vertically, so every button owns a row and a long label is never clipped at the card edge the
+ * way a shared horizontal action row clips it. Full labels (and descriptions) stay in the
+ * numbered body lines above; the button title keeps its own bound.
+ */
+function optionActionSets(
+  question: AskCardQuestion,
+  generation: number,
+): Record<string, unknown>[] {
+  if (question.options.length === 0 || question.multi) return [];
+  return question.options.map((option, index) => ({
+    type: "ActionSet",
+    spacing: "Small",
+    actions: [{
+      type: "Action.Submit",
+      id: optionActionId(index + 1, generation),
+      title: actionTitle(index + 1, option.label),
+    }],
+  }));
+}
+
+/**
+ * The card-level action area, which holds only the submit: the option buttons are body
+ * `ActionSet` rows (`optionActionSets`), because this area renders every action in one
+ * horizontal row and clips the overflow.
+ */
 function pendingActions(
   question: AskCardQuestion,
   generation: number,
 ): Record<string, unknown>[] {
-  if (question.options.length === 0 || question.multi) {
-    return [{ type: "Action.Submit", id: submitActionId(generation), title: "提交", style: "positive" }];
-  }
-  return [
-    ...question.options.map((option, index) => ({
-      type: "Action.Submit",
-      id: optionActionId(index + 1, generation),
-      title: actionTitle(index + 1, option.label),
-    })),
-    { type: "Action.Submit", id: submitActionId(generation), title: "提交其他答案", style: "positive" },
-  ];
+  const freeFormOnly = question.options.length === 0 || question.multi;
+  return [{
+    type: "Action.Submit",
+    id: submitActionId(generation),
+    title: freeFormOnly ? "提交" : "提交其他答案",
+    style: "positive",
+  }];
 }
 
 /**
@@ -291,8 +342,11 @@ export function buildAskCard(
     body: questionBody(question),
   };
   if (state.kind === "pending") {
-    const inputs = pendingInputs(question);
-    if (inputs.length > 0) card.body = [...questionBody(question), ...inputs];
+    card.body = [
+      ...questionBody(question),
+      ...pendingInputs(question),
+      ...optionActionSets(question, state.generation),
+    ];
     card.actions = pendingActions(question, state.generation);
   } else {
     const note = state.kind === "answered"

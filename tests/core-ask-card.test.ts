@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
 import type { ChannelStatus, ChatTarget } from "../src/contracts";
+import { cardStats } from "../src/octo/cards";
 import {
   FakeTransport,
   cardActionEvent,
@@ -32,6 +33,14 @@ function cardActions(edit: { frame: { card: Record<string, unknown> } }): string
 function cardBody(card: Record<string, unknown>): Record<string, unknown>[] {
   const body = card.body;
   return Array.isArray(body) ? (body as Record<string, unknown>[]) : [];
+}
+
+/** Action ids of the card's body `ActionSet` rows in body order; one entry per row. */
+function bodyActionRows(card: { frame: { card: Record<string, unknown> } }): string[][] {
+  return cardBody(card.frame.card)
+    .filter((element) => element.type === "ActionSet")
+    .map((element) => (Array.isArray(element.actions) ? element.actions : [])
+      .map((item) => String((item as Record<string, unknown>).id)));
 }
 
 /** Ids of the inputs one frame renders, in body order. */
@@ -146,6 +155,96 @@ test("a card click answers the pending question and rewrites the card", async ()
     expect(edit.cardSeq).toBe(2);
     expect(cardActions(edit)).toHaveLength(0);
     expect(JSON.stringify(edit.frame.card)).toContain("已由 owner-1 回复：2. production");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a single-choice card stacks every option as its own body row", async () => {
+  const longLabel =
+    "确认，直接按现有设计调整：先测量现有字号与布局，提出统一调整方案，再由赵奕在桌面端与窄屏各确认一次视觉方案后实施，实施前同步更新文档。";
+  const longAscii = "deploy to the staging cluster with the canary flag and wait for owner approval";
+  const harness = await startAskHarness({
+    id: "deployment-target",
+    question: "Which deployment target?",
+    options: [
+      { label: "staging", description: "shared" },
+      { label: longLabel },
+      { label: longAscii },
+      { label: "production" },
+    ],
+  });
+  try {
+    const target: ChatTarget = { channelId: "dm-card-stack", channelType: 1 };
+    await harness.service.handleInbound(
+      inbound({ messageId: "card-stack-start", ...target, text: "needs an answer" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 1);
+    const card = harness.transport.sentCards[0];
+    if (!card) {
+      throw new Error("ask card was not sent");
+    }
+
+    // 每个选项各占一个 ActionSet 行：客户端把 body 的 actionset 纵向堆叠，没有按钮与别的
+    // 按钮共用一行，因此不会被卡片边缘裁掉；action id 与选项顺序不变。
+    expect(bodyActionRows(card)).toEqual([
+      ["ask_opt_1"],
+      ["ask_opt_2"],
+      ["ask_opt_3"],
+      ["ask_opt_4"],
+    ]);
+    // 动作区只剩自由输入的提交按钮，不再承载选项。
+    expect(cardActions(card)).toEqual(["ask_submit"]);
+    // 完整选项文案留在编号行里；按钮标题按显示宽度有界（40 列，即约 20 个全角字形），
+    // 因为客户端按一行固有宽度摆放按钮，超宽只会溢出卡片边缘而不会换行。
+    expect(longLabel.length).toBeGreaterThan(60);
+    expect(JSON.stringify(card.frame.card)).toContain(longLabel);
+    const rows = cardBody(card.frame.card).filter((element) => element.type === "ActionSet");
+    const titles = rows.map((row) =>
+      String((row.actions as Record<string, unknown>[])[0]?.title ?? ""));
+    expect(titles[0]).toBe("1. staging");
+    expect(titles[3]).toBe("4. production");
+    // 全角：3（前缀）+18（正文）+1（省略号）= 22 个码点；半角文案在 40 列内。
+    expect(titles[1]?.endsWith("…")).toBe(true);
+    expect([...(titles[1] ?? "")].length).toBeLessThanOrEqual(22);
+    expect(titles[2]?.endsWith("…")).toBe(true);
+    expect([...(titles[2] ?? "")].length).toBeLessThanOrEqual(40);
+    // 新增的每行一个 ActionSet 仍远在部署上限（max_nodes=200 / max_depth=16）之内。
+    const stats = cardStats({
+      type: 17,
+      profile: card.frame.profile,
+      card_version: "1.5",
+      card: card.frame.card,
+      plain: card.frame.plain,
+    });
+    expect(stats.nodes).toBeLessThanOrEqual(200);
+    expect(stats.maxDepth).toBeLessThanOrEqual(16);
+
+    // 布局不改变答案语义：点击第二个选项照旧记录为答案 "2" 并改写同一张卡。
+    harness.transport.pushBotEvent(cardActionEvent(61, {
+      messageId: card.messageId,
+      channelType: 1,
+      channelId: target.channelId,
+      actionId: "ask_opt_2",
+      operatorUid: "owner-1",
+      inputs: {},
+    }));
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(await readAnswers(harness)).toEqual({
+      answers: [
+        { id: "deployment-target", questionId: expect.any(String), answeredBy: "owner-1", answer: "2" },
+      ],
+    });
+    const answered = await harness.transport.waitForCardEdit(
+      ({ messageId }) => messageId === card.messageId,
+    );
+    expect(bodyActionRows(answered)).toEqual([]);
+    expect(JSON.stringify(answered.frame.card)).toContain(`已由 owner-1 回复：2. ${longLabel}`);
   } finally {
     await closeCoreHarness(harness);
   }
@@ -923,7 +1022,8 @@ test("a set frame the deployment refuses falls back to one card per question", a
 
     const first = await harness.transport.waitForCardSend(({ messageId }) => messageId === "card-1");
     expect(inputIds(first)).toEqual(["ask_text"]);
-    expect(cardActions(first)).toEqual(["ask_opt_1", "ask_opt_2", "ask_submit"]);
+    expect(bodyActionRows(first)).toEqual([["ask_opt_1"], ["ask_opt_2"]]);
+    expect(cardActions(first)).toEqual(["ask_submit"]);
     expect(first.frame.plain).toContain("问题 1/2：Which deployment target?");
 
     harness.transport.pushBotEvent(cardActionEvent(131, {

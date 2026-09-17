@@ -1406,12 +1406,18 @@ describe("Octo interactive cards and Bot events", () => {
     const payload = currentFixture.sentMessages[0]!.body.payload as Record<string, unknown>;
     expect(payload).toMatchObject({ type: 17, profile: "octo/v2", card_version: "1.5" });
     expect(payload.plain).toContain("Which deployment target?");
-    expect((payload.card as Record<string, unknown>).actions).toMatchObject([
-      { type: "Action.Submit", id: "ask_opt_1", title: "1. staging" },
-      { type: "Action.Submit", id: "ask_opt_2", title: "2. production" },
+    const card = payload.card as Record<string, unknown>;
+    const body = card.body as Record<string, unknown>[];
+    // Option buttons ride the body as one `ActionSet` row per option, so the client stacks them
+    // vertically; the action area keeps only the free-form submit.
+    expect(body.filter((element) => element.type === "ActionSet")).toMatchObject([
+      { actions: [{ type: "Action.Submit", id: "ask_opt_1", title: "1. staging" }] },
+      { actions: [{ type: "Action.Submit", id: "ask_opt_2", title: "2. production" }] },
+    ]);
+    expect(card.actions).toMatchObject([
       { type: "Action.Submit", id: "ask_submit", title: "提交其他答案" },
     ]);
-    expect((payload.card as Record<string, unknown>).body).toContainEqual(
+    expect(body).toContainEqual(
       expect.objectContaining({ type: "Input.Text", id: "ask_text" }),
     );
 
