@@ -10,23 +10,89 @@ const MAX_TEXT_BYTES = 3_000;
 /** 同一条文本流两次编辑之间的最小间隔，合并高频快照。 */
 const TEXT_MERGE_MS = 1_000;
 
-function splitUtf8(text: string, maxBytes = MAX_TEXT_BYTES): string[] {
-  if (text.length === 0) return [""];
-  const encoder = new TextEncoder();
-  const chunks: string[] = [];
-  let current = "";
-  let currentBytes = 0;
-  for (const character of text) {
-    const bytes = encoder.encode(character).byteLength;
-    if (current.length > 0 && currentBytes + bytes > maxBytes) {
-      chunks.push(current);
-      current = "";
-      currentBytes = 0;
-    }
-    current += character;
-    currentBytes += bytes;
+/**
+ * 分段断点候选，层级从高到低：换行 > 句末标点 > 逗号/顿号 > 空白，都没有才在窗口末尾硬切。
+ * ASCII 标点只有后面是空白或文本结尾才算断点，免得小数、URL 和缩写被当成断点。
+ */
+const SENTENCE_CUTS: Record<string, true> = { "。": true, "！": true, "？": true, "；": true, "…": true };
+const CLAUSE_CUTS: Record<string, true> = { "，": true, "、": true, ",": true, ";": true };
+const WORD_CUTS: Record<string, true> = { " ": true, "\t": true };
+const ASCII_CUTS: Record<string, true> = { ".": true, "!": true, "?": true, ",": true, ";": true };
+const SPACE_CHARS: Record<string, true> = { " ": true, "\t": true, "\n": true, "\r": true };
+
+/** 每个 code point 的 UTF-8 字节数；不落地编码结果，避免逐字符分配。 */
+function utf8ByteLength(codePoint: number): number {
+  if (codePoint < 0x80) return 1;
+  if (codePoint < 0x800) return 2;
+  if (codePoint < 0x10000) return 3;
+  return 4;
+}
+
+/** 在 `cut` 处断开的层级：0 不是断点，1 换行，2 句末标点，3 逗号/顿号，4 空白。 */
+function cutTier(characters: readonly string[], cut: number): number {
+  const character = characters[cut - 1] as string;
+  if (character === "\n") return 1;
+  const following = characters[cut];
+  if (
+    ASCII_CUTS[character] === true &&
+    following !== undefined &&
+    SPACE_CHARS[following] !== true
+  ) {
+    return 0;
   }
-  if (current.length > 0) chunks.push(current);
+  if (SENTENCE_CUTS[character] === true) return 2;
+  if (CLAUSE_CUTS[character] === true) return 3;
+  if (WORD_CUTS[character] === true) return 4;
+  return 0;
+}
+
+/** 在 `(start, end]` 里取层级最高、同层最靠后的断点；没有断点时返回窗口末尾。 */
+function findCut(characters: readonly string[], start: number, end: number): number {
+  let sentence = -1;
+  let clause = -1;
+  let word = -1;
+  for (let cut = end; cut > start; cut -= 1) {
+    const tier = cutTier(characters, cut);
+    if (tier === 0) continue;
+    if (tier === 1) return cut;
+    if (tier === 2 && sentence < 0) sentence = cut;
+    else if (tier === 3 && clause < 0) clause = cut;
+    else if (tier === 4 && word < 0) word = cut;
+  }
+  if (sentence > 0) return sentence;
+  if (clause > 0) return clause;
+  if (word > 0) return word;
+  return end;
+}
+
+/**
+ * 按 UTF-8 字节上限贪心分段：剩余内容放得下就是当前最后一段（流式增量继续编辑它），
+ * 放不下就在恰好放得下的窗口内取最后一个自然断点——换行、句末标点、逗号/顿号、
+ * 空白——都没有才在窗口末尾硬切。断点字符归上一段，其后的空白留在下一段开头，
+ * 不修剪也不吞并。每段的边界只由它自己的窗口决定，所以已切出的段不随流式增量重排。
+ */
+export function splitUtf8(text: string, maxBytes = MAX_TEXT_BYTES): string[] {
+  if (text.length === 0) return [""];
+  const characters = Array.from(text);
+  const chunks: string[] = [];
+  let start = 0;
+  while (start < characters.length) {
+    let bytes = 0;
+    let end = start;
+    while (end < characters.length) {
+      const size = utf8ByteLength(characters[end]?.codePointAt(0) ?? 0);
+      if (bytes + size > maxBytes) break;
+      bytes += size;
+      end += 1;
+    }
+    if (end === characters.length) {
+      chunks.push(characters.slice(start).join(""));
+      break;
+    }
+    const cut = end > start ? findCut(characters, start, end) : start + 1;
+    chunks.push(characters.slice(start, cut).join(""));
+    start = cut;
+  }
   return chunks;
 }
 

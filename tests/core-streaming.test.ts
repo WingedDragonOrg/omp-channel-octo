@@ -793,6 +793,62 @@ test("a long UTF-8 snapshot is split at 3000 bytes and a shorter final snapshot 
   }
 });
 
+test("a long reply cuts at paragraph breaks and never reshuffles finished segments as it streams", async () => {
+  vi.useFakeTimers();
+  const transport = new FakeTransport();
+  const paragraph = `${"这是一个完整的段落，句末标点齐全。".repeat(20)}\n`;
+  const firstSnapshot = paragraph.repeat(5);
+  const secondSnapshot = paragraph.repeat(9);
+  const emitMore = Promise.withResolvers<void>();
+  const finish = Promise.withResolvers<void>();
+  const task = inbound({
+    messageId: "stream-natural-break",
+    channelId: "dm-stream-natural-break",
+    text: "stream a paragraph reply",
+  });
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ emit }) => {
+      emit(assistantText("assistant-natural", firstSnapshot, false));
+      await emitMore.promise;
+      emit(assistantText("assistant-natural", secondSnapshot, false));
+      await finish.promise;
+      emit(assistantText("assistant-natural", secondSnapshot, true));
+    },
+  });
+  try {
+    const run = harness.service.handleInbound(task);
+    await harness.workers.waitForPromptCount(1);
+    expect(await flushUntilRemoteCount(transport, task, 3)).toBe(true);
+    const settled = transport.listRemoteText(task).map(({ messageId, text }) => ({ messageId, text }));
+    expect(settled).toHaveLength(3);
+    // 两段完整的段落窗口各 2042 bytes 且结尾是换行，而不是在句子中间量到 3000
+    expect(settled.slice(0, 2).map(({ text }) => Buffer.byteLength(text, "utf8"))).toEqual([2_042, 2_042]);
+    expect(settled.slice(0, 2).every(({ text }) => text.endsWith("\n"))).toBe(true);
+
+    emitMore.resolve();
+    for (let attempt = 0; attempt < 10 && transport.listRemoteText(task).length < 5; attempt += 1) {
+      vi.advanceTimersByTime(1_000);
+      await flushPromises();
+    }
+    const grown = transport.listRemoteText(task);
+    expect(grown).toHaveLength(5);
+    // 已由满窗口定界的段保持原样：同一条远端消息、同一段文本
+    expect(grown.slice(0, 2).map(({ messageId, text }) => ({ messageId, text }))).toEqual(settled.slice(0, 2));
+
+    finish.resolve();
+    await run;
+    await waitForStatus(harness.service, task, (status) => status.state === "completed" && status.outbox === 0);
+    const final = transport.listRemoteText(task);
+    expect(final.map(({ text }) => text).join("")).toBe(secondSnapshot);
+    expect(final.every(({ text }) => Buffer.byteLength(text, "utf8") <= 3_000)).toBe(true);
+    expect(final.at(-1)?.text).toBe(paragraph);
+  } finally {
+    vi.useRealTimers();
+    await closeCoreHarness(harness);
+  }
+});
+
 test("cancel aborts an in-flight assistant edit promptly and preserves its latest snapshot for reconnect", async () => {
   vi.useFakeTimers();
   const transport = new FakeTransport();
