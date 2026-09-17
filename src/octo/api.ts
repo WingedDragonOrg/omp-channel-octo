@@ -120,7 +120,13 @@ export function serverErrorCode(body: Uint8Array): string | undefined {
   return typeof code === "string" && code.length > 0 ? code : undefined;
 }
 
-export function managementError(label: string, status: number, body: Uint8Array): OctoError {
+/** Bot API 的失败：带上 body 的机器码与说明，只有 `permanent` 由调用方按各自口径判定。 */
+function botApiError(
+  label: string,
+  status: number,
+  body: Uint8Array,
+  permanent: (status: number) => boolean,
+): OctoError {
   const detail = serverErrorMessage(body);
   const code = serverErrorCode(body);
   // The bot API answers every error with the same legacy wire status 400, so the body's
@@ -134,10 +140,27 @@ export function managementError(label: string, status: number, body: Uint8Array)
       : `Octo ${label} failed with ${reason}: ${detail}`,
     {
       status,
-      permanent: status === 400 || status === 401 || status === 403 || status === 404,
+      permanent: permanent(status),
       ...(code === undefined ? {} : { code }),
     },
   );
+}
+
+export function managementError(label: string, status: number, body: Uint8Array): OctoError {
+  return botApiError(
+    label,
+    status,
+    body,
+    (status) => status === 400 || status === 401 || status === 403 || status === 404,
+  );
+}
+
+/**
+ * 发送与编辑的失败：可重试性按传输层口径——只有 401/403 视为永久，其余（含 bot API 包成
+ * 线缆 400 的瞬时内部失败）交给投递层的重试预算判定。
+ */
+export function messageWriteError(label: string, status: number, body: Uint8Array): OctoError {
+  return botApiError(label, status, body, (status) => status === 401 || status === 403);
 }
 
 export async function botApiRequest(

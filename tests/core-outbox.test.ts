@@ -1,6 +1,9 @@
-import { expect, test } from "bun:test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { expect, test, vi } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ChatTarget, SendReceipt } from "../src/contracts.ts";
 import { splitUtf8 } from "../src/outbox";
 import {
   assistantText,
@@ -14,6 +17,40 @@ import {
 
 function isBody(text: string, expected: string): boolean {
   return text === expected;
+}
+
+async function flushPromises(): Promise<void> {
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    await Promise.resolve();
+  }
+}
+
+/**
+ * A server that keeps refusing one particular body with a transient-shaped HTTP 500 while every
+ * other message to the same chat goes through. Models the live failure where one delivery can
+ * never be confirmed.
+ */
+class RefusingBodyTransport extends FakeTransport {
+  failBody: string | undefined;
+
+  override async sendText(
+    target: ChatTarget,
+    text: string,
+    clientMsgNo: string,
+    signal?: AbortSignal,
+  ): Promise<SendReceipt> {
+    if (text === this.failBody) {
+      const error = Object.assign(
+        new Error(
+          "Octo send message failed with HTTP 500 (err.server.bot_api.send_failed): internal error",
+        ),
+        { status: 500 },
+      );
+      this.attempts.push({ target: { ...target }, text, clientMsgNo, error: error.message });
+      throw error;
+    }
+    return super.sendText(target, text, clientMsgNo, signal);
+  }
 }
 
 test("a completed task is not rerun when an assistant body outbox item is resent after reconnect", async () => {
@@ -65,26 +102,17 @@ test("a completed task is not rerun when an assistant body outbox item is resent
   }
 });
 
-test("a failed earlier assistant body blocks later replies until the next reconnect", async () => {
-  let bodyFailures = 0;
+test("a body that fails once is retried by itself and the next reply follows without a reconnect", async () => {
+  vi.useFakeTimers();
   const transport = new FakeTransport({
     bot: { uid: "bot-outbox-order", name: "Outbox Bot" },
-    online: false,
-    startOnline: false,
   });
   const firstBody = "first assistant body";
   const secondBody = "second assistant body";
-  transport.failOnceWhen(({ text }) => {
-    if (isBody(text, firstBody) && bodyFailures === 0) {
-      bodyFailures += 1;
-      return true;
-    }
-    return false;
-  });
+  transport.failOnceWhen(({ text }) => text === firstBody);
   const harness = await createCoreHarness({
     transport,
-    prompt: async ({ append, emit, text }) => {
-      await append("effects.log", `${text}\n`);
+    prompt: async ({ emit, text }) => {
       emit(assistantText(
         text === "first" ? "assistant-first-body" : "assistant-second-body",
         text === "first" ? firstBody : secondBody,
@@ -97,38 +125,150 @@ test("a failed earlier assistant body blocks later replies until the next reconn
     const first = inbound({ messageId: "outbox-first", ...target, text: "first" });
     const second = inbound({ messageId: "outbox-second", ...target, text: "second" });
     await harness.service.handleInbound(first);
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(
+      harness.service,
+      first,
+      (status) => status.state === "completed" && status.outbox > 0,
+    );
     await harness.service.handleInbound(second);
     await harness.workers.waitForPromptCount(2);
-    await waitForStatus(harness.service, first, (status) => status.state === "completed");
-    await waitForStatus(harness.service, second, (status) => status.state === "completed");
 
-    await transport.reconnect();
-    const failedFirst = await transport.waitForAttempt(
-      (attempt) => Boolean(attempt.error) && isBody(attempt.text, firstBody),
-    );
-    expect(transport.sent.filter(({ text }) => isBody(text, firstBody) || isBody(text, secondBody))).toHaveLength(0);
-
-    await transport.reconnect();
-    await waitForStatus(harness.service, second, (status) => status.outbox === 0);
-    const bodyAttempts = transport.attempts.filter(({ text }) => isBody(text, firstBody) || isBody(text, secondBody));
-    const firstAttempts = bodyAttempts.filter(({ text }) => isBody(text, firstBody));
-    const secondAttempts = bodyAttempts.filter(({ text }) => isBody(text, secondBody));
+    for (let elapsed = 0; elapsed < 60_000; elapsed += 250) {
+      vi.advanceTimersByTime(250);
+      await flushPromises();
+      if (transport.sent.some(({ text }) => text === secondBody)) break;
+    }
+    // The failed body is retried by itself (stable client ID) and the queue keeps its order.
+    expect(
+      transport.sent
+        .filter(({ text }) => isBody(text, firstBody) || isBody(text, secondBody))
+        .map(({ text }) => text),
+    ).toEqual([firstBody, secondBody]);
+    const firstAttempts = transport.attempts.filter(({ text }) => isBody(text, firstBody));
     expect(firstAttempts.length).toBeGreaterThanOrEqual(2);
-    expect(firstAttempts.every(({ clientMsgNo }) => clientMsgNo === failedFirst.clientMsgNo)).toBe(true);
-    expect(firstAttempts.some(({ error }) => error === undefined)).toBe(true);
-    expect(secondAttempts.length).toBeGreaterThanOrEqual(1);
-    expect(new Set(secondAttempts.map(({ clientMsgNo }) => clientMsgNo)).size).toBe(1);
-    expect(secondAttempts[0]?.clientMsgNo).not.toBe(failedFirst.clientMsgNo);
-    expect(transport.sent.filter(({ text }) => isBody(text, firstBody) || isBody(text, secondBody)).map(({ text }) => text)).toEqual([
-      firstBody,
-      secondBody,
-    ]);
-    expect((await readText(join(harness.root, "tmp", "effects.log"))).trim().split("\n")).toEqual([
-      "first",
-      "second",
-    ]);
+    expect(new Set(firstAttempts.map(({ clientMsgNo }) => clientMsgNo)).size).toBe(1);
+    await waitForStatus(harness.service, target, (status) => status.outbox === 0);
   } finally {
+    vi.useRealTimers();
     await closeCoreHarness(harness);
+  }
+});
+
+test("a body the server keeps refusing is given up within a bounded budget and never mutes later replies", async () => {
+  vi.useFakeTimers();
+  const firstBody = "body the server keeps refusing";
+  const secondBody = "body after the refused one";
+  const transport = new RefusingBodyTransport({
+    bot: { uid: "bot-outbox-budget", name: "Outbox Bot" },
+  });
+  transport.failBody = firstBody;
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ emit, text }) => {
+      emit(assistantText(
+        text === "first" ? "assistant-budget-first" : "assistant-budget-second",
+        text === "first" ? firstBody : secondBody,
+        true,
+      ));
+    },
+  });
+  try {
+    const target = { channelId: "dm-outbox-budget", channelType: 1 as const };
+    const first = inbound({ messageId: "budget-first", ...target, text: "first" });
+    const second = inbound({ messageId: "budget-second", ...target, text: "second" });
+    await harness.service.handleInbound(first);
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(
+      harness.service,
+      first,
+      (status) => status.state === "completed" && status.outbox > 0,
+    );
+    // The first body is still being retried; the second message arrives behind it and must get
+    // its delivery once the refused one is given up — no reconnect, no manual cleanup.
+    await harness.service.handleInbound(second);
+    await harness.workers.waitForPromptCount(2);
+
+    let delivered = false;
+    for (let elapsed = 0; elapsed < 300_000 && !delivered; elapsed += 500) {
+      vi.advanceTimersByTime(500);
+      await flushPromises();
+      delivered = transport.sent.some(({ text }) => isBody(text, secondBody));
+    }
+
+    // Bounded: retries back off instead of resending once per second for hours. Five minutes of
+    // attempted retries stay within a handful of attempts.
+    const firstAttempts = transport.attempts.filter(({ text }) => isBody(text, firstBody));
+    expect(firstAttempts.length).toBeGreaterThanOrEqual(2);
+    expect(firstAttempts.length).toBeLessThanOrEqual(8);
+    expect(new Set(firstAttempts.map(({ clientMsgNo }) => clientMsgNo)).size).toBe(1);
+    expect(delivered).toBe(true);
+
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.outbox === 0 && status.unknownOutbox === 0,
+    );
+    // The abandoned row stays on disk with the real failure reason, and no longer occupies the queue.
+    const database = new Database(join(harness.stateDir, "channel.sqlite"), { readonly: true });
+    try {
+      const row = database
+        .query("SELECT state, last_error FROM outbox WHERE client_msg_no = ?")
+        .get(firstAttempts[0]!.clientMsgNo) as { state?: string; last_error?: string } | null;
+      expect(row?.state).toBe("dead");
+      expect(row?.last_error).toContain("HTTP 500");
+    } finally {
+      database.close();
+    }
+  } finally {
+    vi.useRealTimers();
+    await closeCoreHarness(harness);
+  }
+});
+
+
+test("a restart delivers the pending outbox the previous process left behind", async () => {
+  const bot = { uid: "bot-outbox-restart", name: "Outbox Bot" };
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-outbox-restart-")));
+  const body = "body pending across the restart";
+  const message = inbound({
+    messageId: "outbox-restart",
+    channelId: "dm-outbox-restart",
+    text: "run while the transport is down",
+  });
+  try {
+    const offline = new FakeTransport({ bot, online: false, startOnline: false });
+    const first = await createCoreHarness({
+      root,
+      bot,
+      transport: offline,
+      prompt: async ({ emit }) => {
+        emit(assistantText("assistant-outbox-restart", body, true));
+      },
+    });
+    try {
+      await first.service.handleInbound(message);
+      await first.workers.waitForPromptCount(1);
+      await waitForStatus(
+        first.service,
+        message,
+        (status) => status.state === "completed" && status.outbox > 0,
+      );
+    } finally {
+      await closeCoreHarness(first, { remove: false });
+    }
+
+    const online = new FakeTransport({ bot });
+    const second = await createCoreHarness({ root, bot, transport: online });
+    try {
+      expect(second.workers.prompts).toHaveLength(0);
+      await waitForStatus(second.service, message, (status) => status.outbox === 0);
+      expect(online.sent.some(({ text }) => isBody(text, body))).toBe(true);
+    } finally {
+      await closeCoreHarness(second);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

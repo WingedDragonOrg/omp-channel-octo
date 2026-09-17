@@ -30,6 +30,7 @@ import {
   mentionPrefFromResponse,
   memberFromResponse,
   membersFromResponse,
+  messageWriteError,
   parseVersion,
   serverErrorCode,
   serverErrorMessage,
@@ -275,7 +276,7 @@ export class OctoTransport implements ChannelTransport {
       MAX_HTTP_BODY_BYTES,
     );
     if (response.status < 200 || response.status >= 300) {
-      throw httpStatusError("message edit", response.status);
+      throw messageWriteError("message edit", response.status, response.body);
     }
   }
 
@@ -970,7 +971,9 @@ export class OctoTransport implements ChannelTransport {
       signal,
       MAX_HTTP_BODY_BYTES,
     );
-    if (response.status < 200 || response.status >= 300) throw httpStatusError("send message", response.status);
+    if (response.status < 200 || response.status >= 300) {
+      throw messageWriteError("send message", response.status, response.body);
+    }
     const value = parseJsonWithInt64(response.body, "send message");
     if (!isJsonRecord(value)) throw new OctoError("Octo send message response has invalid schema");
     if (value.message_id === undefined || value.message_id === null) return {};

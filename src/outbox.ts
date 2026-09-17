@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
 import type { ChannelTransport, ChatTarget, TextEvent } from "./contracts.ts";
-import { asAppError, type AppError } from "./errors.ts";
+import { asAppError, failureText, type AppError } from "./errors.ts";
 import type { ChannelStore } from "./store.ts";
 import type { OutboxRecord } from "./store-records.ts";
 import { streamTargetKey, targetKey } from "./target.ts";
@@ -9,6 +9,16 @@ import { streamTargetKey, targetKey } from "./target.ts";
 const MAX_TEXT_BYTES = 3_000;
 /** 同一条文本流两次编辑之间的最小间隔，合并高频快照。 */
 const TEXT_MERGE_MS = 1_000;
+/**
+ * 单条投递在放弃（`dead`）前的最大尝试次数：到点就把队首让给后面的消息，一条投不出去的
+ * 消息不能让整个聊天永久静音。预算按当前内容的连续失败次数计——成功投递或内容更新都会
+ * 清零 `attempts`，因此流式消息不会把历史失败攒成一次误判。
+ */
+const MAX_OUTBOX_ATTEMPTS = 6;
+/** 投递重试退避：1s 起、翻倍、上限 30s，向下抖动（与传输层重连同口径）。 */
+const OUTBOX_RETRY_BASE_MS = 1_000;
+const OUTBOX_RETRY_MAX_MS = 30_000;
+const OUTBOX_RETRY_JITTER_MIN = 0.75;
 
 /**
  * 分段断点候选，层级从高到低：换行 > 句末标点 > 逗号/顿号 > 空白，都没有才在窗口末尾硬切。
@@ -103,6 +113,8 @@ function isPermanentOutboxError(error: unknown, item: OutboxRecord): boolean {
     permanent?: unknown;
     status?: unknown;
   };
+  // bot API 把内部失败（含瞬时 500）包在线缆 400 上：机器码比状态码更可信。
+  if (candidate.code === "err.server.bot_api.store_failed") return false;
   if (candidate.permanent === true) return true;
   if (
     typeof candidate.status === "number" &&
@@ -375,17 +387,25 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
             if (item.taskId) releaseTextAbortIfIdle(item.taskId);
           }
         } catch (error) {
+          const reason = failureText(error, "transport unavailable; delivery is unknown");
           if (item.streamMessageId) {
-            deps.store.failTextOutbox(item.id, item.desiredVersion, "transport unavailable; delivery is unknown");
+            deps.store.failTextOutbox(item.id, item.desiredVersion, reason);
           } else {
-            deps.store.markOutboxFailure(item.id, "transport unavailable; delivery is unknown");
+            deps.store.markOutboxFailure(item.id, reason);
           }
-          if (item.kind === "file" && isPermanentOutboxError(error, item)) {
-            deps.store.markOutboxDead(item.id, "file delivery failed permanently");
-            await enqueueText(target, "文件发送失败，未阻塞后续文字回复。", item.taskId);
+          const attempts = item.attempts + 1;
+          // 永久失败或重试预算耗尽：标记 dead 后继续排空队尾，不把后面的消息一起拖住。
+          if (isPermanentOutboxError(error, item) || attempts >= MAX_OUTBOX_ATTEMPTS) {
+            console.error(
+              `[outbox] 放弃投递 ${item.kind} ${item.id} target=${key} attempts=${attempts}：${reason}`,
+            );
+            deps.store.markOutboxDead(item.id, reason);
+            if (item.kind === "file") {
+              enqueueText(target, "文件发送失败，未阻塞后续文字回复。", item.taskId);
+            }
             continue;
           }
-          scheduleOutboxRetry(target);
+          scheduleOutboxRetry(target, attempts);
           return;
         }
       }
@@ -397,13 +417,20 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
     }
   }
 
-  function scheduleOutboxRetry(target: ChatTarget): void {
+  function scheduleOutboxRetry(target: ChatTarget, attempts: number): void {
     const key = targetKey(target);
     if (retryTimers.has(key) || !deps.started()) return;
+    const exponential = Math.min(
+      OUTBOX_RETRY_MAX_MS,
+      OUTBOX_RETRY_BASE_MS * 2 ** Math.max(0, attempts - 1),
+    );
+    const delay = Math.round(
+      exponential * (OUTBOX_RETRY_JITTER_MIN + Math.random() * (1 - OUTBOX_RETRY_JITTER_MIN)),
+    );
     const timer = setTimeout(() => {
       retryTimers.delete(key);
       flushTarget(target);
-    }, 1_000);
+    }, delay);
     retryTimers.set(key, timer);
   }
 

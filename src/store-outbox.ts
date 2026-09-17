@@ -84,7 +84,7 @@ export function updateTextOutbox(db: Database, id: string, text: string, desired
         : "pending";
     run(db,
       `UPDATE outbox
-       SET text = ?, desired_version = ?, acked_version = ?, state = ?, last_error = NULL
+       SET text = ?, desired_version = ?, acked_version = ?, state = ?, attempts = 0, last_error = NULL
        WHERE id = ? AND desired_version < ?`,
       [text, desiredVersion, currentAcked, nextState, id, desiredVersion],
     );
@@ -108,7 +108,7 @@ export function bindTextOutbox(db: Database, id: string, remoteMessageId: string
     const state = ackedVersion >= desiredVersion ? "sent" : "pending";
     run(db,
       `UPDATE outbox
-       SET remote_message_id = ?, state = ?, last_error = NULL,
+       SET remote_message_id = ?, state = ?, attempts = 0, last_error = NULL,
            sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END
        WHERE id = ?`,
       [normalizedRemoteMessageId, state, state, Date.now(), id],
@@ -145,7 +145,7 @@ export function acknowledgeTextOutbox(db: Database, id: string,
         : "unknown";
     run(db,
       `UPDATE outbox
-       SET remote_message_id = ?, acked_version = ?, state = ?,
+       SET remote_message_id = ?, acked_version = ?, state = ?, attempts = 0,
            last_error = NULL,
            sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END
        WHERE id = ?`,

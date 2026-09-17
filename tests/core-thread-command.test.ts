@@ -206,6 +206,78 @@ test("a sub-thread's /thread merge hands over a merge instruction instead of run
   }
 });
 
+test("a sub-thread's /thread merge is recognised by its first word and carries the trailing note", async () => {
+  const harness = await createCoreHarness({
+    prompt: async ({ promptContext, text }) => {
+      if (!text.includes("原始意图")) return; // only the creation hand-over drives octo_management
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("management tool missing");
+      await management.execute(
+        { action: "create-thread", name: "合并补充", worktree_name: "merge-note" },
+        new AbortController().signal,
+      );
+    },
+  });
+  try {
+    const group = { channelId: "group-allowed", channelType: 2 as const };
+    const parentCwd = join(harness.root, "project");
+    await mkdir(parentCwd, { recursive: true });
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "merge-note-bind",
+        ...group,
+        text: `/new ${parentCwd}`,
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "merge-note-create",
+        ...group,
+        text: "/thread 先建一个子区",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+
+    const thread = { channelId: `${group.channelId}____thread-1`, channelType: 5 as const };
+    const workspace = join(harness.root, "worktrees", "thread-1");
+    await waitForStatus(harness.service, thread, (status) => status.cwd === workspace);
+
+    // A comma (or any other separator) right after the keyword still selects merge, and the
+    // rest of the argument reaches the assistant as the owner's supplement.
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "merge-note-run",
+        ...thread,
+        text: "/thread merge, 已经完成的话，merge 一下",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(2);
+    expect(harness.workers.prompts[1]?.cwd).toBe(workspace);
+    expect(harness.workers.prompts[1]?.text).toContain("thread-merge");
+    expect(harness.workers.prompts[1]?.text).toContain("owner 补充说明：");
+    expect(harness.workers.prompts[1]?.text).toContain("已经完成的话，merge 一下");
+
+    // A thread name that merely starts with the keyword is still an ordinary creation intent.
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "merge-note-name",
+        ...thread,
+        text: "/thread merge-fix",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.transport.waitForAttempt(
+      ({ text }) => text === "当前会话已是子区，不能再建子区。",
+    );
+    expect(harness.workers.prompts).toHaveLength(2);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
 test("merge outside a bound sub-thread only replies, and never accepts a task", async () => {
   const harness = await createCoreHarness({
     prompt: async ({ promptContext, text }) => {

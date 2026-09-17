@@ -159,7 +159,7 @@ const MEMBER_COMMAND_NOTICE_TTL_MS = 10 * 60 * 1_000;
 const DEFAULT_CANCELLED_TEXT = "当前任务已取消；不回滚已发生的副作用。";
 const DEFAULT_RESTARTING_TEXT = "channel 正在重启，本会话任务已中断；重启完成后会在本会话确认。";
 const THREAD_USAGE =
-  "用法：/thread <任务>；助手会先明确意图、确定子区名称与 worktree_name，然后新建隔离子区并把任务派发进去；子区内 /thread merge 即确认把本区工作合并回目标分支并清理隔离工作区（默认删除工作区与已合并分支，保留需说明理由）。";
+  "用法：/thread <任务>；助手会先明确意图、确定子区名称与 worktree_name，然后新建隔离子区并把任务派发进去；子区内 /thread merge [补充说明] 即确认把本区工作合并回目标分支并清理隔离工作区（默认删除工作区与已合并分支，保留需说明理由；补充说明随合并指令一起交给助手）。";
 const THREAD_GROUP_ONLY_TEXT = "/thread 需要在群聊中使用。";
 const THREAD_NESTED_TEXT = "当前会话已是子区，不能再建子区。";
 const THREAD_MERGE_THREAD_ONLY_TEXT = "/thread merge 只在子区中使用。";
@@ -287,6 +287,23 @@ function threadIntentPrompt(intent: string): string {
 }
 
 /**
+ * `/thread` 参数按首词识别合并意图：首词是 `merge`（其后为行尾或非字母数字、下划线、连字符
+ * 的分隔符——`merge-fix` 这类名字不算）时返回去掉分隔符并单行化后的补充说明（可为空串），
+ * 其余情况返回 `undefined`。
+ */
+function readThreadMergeNote(argument: string): string | undefined {
+  const trimmed = argument.trim();
+  if (!/^merge(?:$|[^\p{L}\p{N}_-])/iu.test(trimmed)) return undefined;
+  const note = trimmed
+    .slice("merge".length)
+    .replace(/^[\s,，、:：]+/u, "")
+    .replace(/[\p{Cc}\p{Cf}]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return note.length > 200 ? `${note.slice(0, 199)}…` : note;
+}
+
+/**
  * Instruction block for a `/thread merge` message: like the creation prompt it hands the intent
  * to the assistant instead of acting itself. The command is the owner's confirmation to merge and
  * clean up, so the body names the default pipeline (stages and commits the workspace changes,
@@ -294,11 +311,12 @@ function threadIntentPrompt(intent: string): string {
  * merged branch) as the expected behaviour and asks for a stated reason plus an explicit
  * `remove:false` whenever the workspace must be kept; it also states that the removal takes the
  * sub-thread's cwd with it as a known result that must not be repeated as a caveat or used as a
- * reason to keep the workspace. The merge itself is executed by the host through
+ * reason to keep the workspace. A trailing note after the `merge` keyword is the owner's own
+ * supplement and is carried along verbatim. The merge itself is executed by the host through
  * `octo_management`'s `thread-merge`. Every outcome, including a conflict that must be resolved
  * before retrying, is reported to the owner.
  */
-function threadMergePrompt(workspacePath: string): string {
+function threadMergePrompt(workspacePath: string, note: string): string {
   return [
     "用户要求把本子区（隔离工作区）已完成的工作合并回目标分支，走本机 Worktrunk（wt）的 merge pipeline。",
     "这条命令即代表 owner 确认合并并清理：除非有明确必要理由并向 owner 说明，直接按默认参数执行。",
@@ -307,6 +325,7 @@ function threadMergePrompt(workspacePath: string): string {
     "工作区被删除后本子区 cwd 随之失效，这是该命令的既定结果、owner 已知：不要在汇报里反复说明这一点，也不要把 cwd 失效当作保留工作区的理由——保留工作区的必要理由应是尚未收尾的具体工作（例如部署、验收）。",
     "合并由宿主执行：调用 octo_management 的 thread-merge 动作，不要自己运行 wt。",
     "成功后向 owner 汇报目标分支与结果细节；失败时（例如 rebase 冲突或 pre-merge 检查失败）先在本子区处置再重试，并把最终结果告诉 owner。",
+    ...(note.length === 0 ? [] : ["", "owner 补充说明：", note]),
     "",
     "隔离工作区：",
     workspacePath,
@@ -1560,8 +1579,9 @@ class CoreService implements ChannelService {
    * Only groups grow threads, so DMs and threads themselves are refused.
    */
   private async handleThreadCommand(message: InboundMessage, argument: string): Promise<void> {
-    if (argument.trim().toLowerCase() === "merge") {
-      await this.handleThreadMergeCommand(message);
+    const mergeNote = readThreadMergeNote(argument);
+    if (mergeNote !== undefined) {
+      await this.handleThreadMergeCommand(message, mergeNote);
       return;
     }
     if (message.channelType === 5) {
@@ -1596,7 +1616,7 @@ class CoreService implements ChannelService {
    * assistant has to read (steering when the running turn accepts it, otherwise a durable task),
    * and the assistant drives `octo_management`'s `thread-merge`.
    */
-  private async handleThreadMergeCommand(message: InboundMessage): Promise<void> {
+  private async handleThreadMergeCommand(message: InboundMessage, mergeNote: string): Promise<void> {
     if (message.channelType !== 5) {
       await this.outbox.enqueueText(message, THREAD_MERGE_THREAD_ONLY_TEXT, null);
       return;
@@ -1621,7 +1641,7 @@ class CoreService implements ChannelService {
       return;
     }
     this.store.releaseClaim(this.commandClaim(message, "thread"));
-    const body = threadMergePrompt(binding.cwd);
+    const body = threadMergePrompt(binding.cwd, mergeNote);
     if (await this.appendToRunningTask(message, body)) return;
     await this.acceptTask(message, body);
   }
