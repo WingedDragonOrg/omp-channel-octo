@@ -57,7 +57,7 @@ channel 需要一个 owner 可见的模型切换入口：在聊天里查看当�
 | 报告当前模型 | 有运行中回合时用该会话的 `get_state`；否则用探测 worker；再否则用本聊天指定值 | 「当前正在使用」以活会话为准；空闲时探测反映新会话会用到的默认 |
 | 持久化粒度 | 每聊天目标（DM/群/子区各自独立，不继承），新表 `chat_models` | 与 `chat_modes` 的既有惯例一致；不耦合 `chats` 绑定的重建/外部重绑 |
 | 探测 worker | 复用 `WorkerFactory`，记录 worker ledger，不取目录 lease | 与 `/new` 候选 worker 同构；fresh、无 agent 回合，不与运行中的回合争用 |
-| 探测会话目录 | 每次 `mkdtemp` 临时目录，停止后删除 | 探测会话文件无长期价值；不污染 `<stateDir>/sessions` |
+| 探测会话目录 | 每次 `mkdtemp` 临时目录，停止后删除 | 探测会话文件无长期价值；不污染 `sessionsDir` 下的项目会话目录 |
 
 ## 设计
 

@@ -50,6 +50,7 @@ const CONFIG_KEYS: Record<string, true> = {
   ompCommand: true,
   ompExtraArgs: true,
   stateDir: true,
+  sessionsDir: true,
   startupTimeoutMs: true,
   cancelTimeoutMs: true,
   groupHistory: true,
@@ -79,6 +80,8 @@ export interface AppConfig extends CoreServiceConfig {
   botTokenSource: "config" | "environment";
   ompCommand: string;
   ompExtraArgs: string[];
+  /** Always resolved by `parseConfig`, defaulting to `~/.oco/sessions`. */
+  sessionsDir: string;
   startupTimeoutMs?: number;
   cancelTimeoutMs?: number;
   /** Group/thread history injection; defaults to enabled with 50 messages. */
@@ -318,6 +321,11 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
     ompCommand,
     ompExtraArgs: [...ompExtraArgs],
     stateDir: resolveLocalPath(document.stateDir, "stateDir", home),
+    // Sessions default to `~/.oco/sessions`, one project directory per task cwd; the state
+    // directory only keeps the database, attachments, sidecars, and spool.
+    sessionsDir: document.sessionsDir === undefined
+      ? join(ocoHome(home), "sessions")
+      : resolveLocalPath(document.sessionsDir, "sessionsDir", home),
     ...(startupTimeoutMs === undefined ? {} : { startupTimeoutMs }),
     ...(cancelTimeoutMs === undefined ? {} : { cancelTimeoutMs }),
     groupHistory,
@@ -384,6 +392,7 @@ export function toCoreConfig(config: AppConfig): CoreServiceConfig {
     ...(config.ownerId === undefined ? {} : { ownerId: config.ownerId }),
     allowedGroupIds: [...config.allowedGroupIds],
     stateDir: config.stateDir,
+    sessionsDir: config.sessionsDir,
     groupHistory: { ...config.groupHistory },
     attachments: { ...config.attachments },
     ask: { ...config.ask },

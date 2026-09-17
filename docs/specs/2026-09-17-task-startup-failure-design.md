@@ -64,7 +64,7 @@
 ```ts
 export type TaskStartupCode =
   | "cwd-missing"           // 绑定 cwd（含隔离工作区）不存在
-  | "session-dir-missing"   // 状态目录的 sessions 目录不存在/不可用
+  | "session-dir-missing"   // 会话目录（sessionsDir 下的项目目录）不存在/不可用
   | "session-invalid"       // 绑定会话文件缺失，或恢复会话状态校验失败
   | "spawn-failed"          // 子进程无法 spawn
   | "identity-unverified"   // 子进程身份探测失败

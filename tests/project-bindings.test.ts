@@ -557,7 +557,10 @@ for (const commandKind of ["new", "move"] as const) {
       );
       const binding = await harness.service.status(firstTarget);
       if (!binding.sessionId) throw new Error("fresh binding did not return a session id");
-      const sessionFile = join(harness.stateDir, "sessions", `${binding.sessionId}.session`);
+      const bindingStore = await openChannelStore(harness.stateDir);
+      const sessionFile = bindingStore.getBinding(harness.bot.uid, firstTarget)?.sessionFile;
+      bindingStore.close();
+      if (!sessionFile) throw new Error("fresh binding did not persist a session file");
       holdTask = harness.service.handleInbound(
         inbound({ messageId: `command-lease-hold-${commandKind}`, ...firstTarget, text: "command-lease-hold" }),
       );
@@ -716,7 +719,10 @@ test("a queued task reacquires the moved cwd lock after its chat predecessor wit
     );
     const before = await harness.service.status(target);
     if (!before.sessionId) throw new Error("fresh binding did not return a session id");
-    const sessionFile = join(harness.stateDir, "sessions", `${before.sessionId}.session`);
+    const beforeStore = await openChannelStore(harness.stateDir);
+    const sessionFile = beforeStore.getBinding(harness.bot.uid, target)?.sessionFile;
+    beforeStore.close();
+    if (!sessionFile) throw new Error("fresh binding did not persist a session file");
     firstTask = harness.service.handleInbound(
       inbound({ messageId: "queued-move-hold", ...target, text: "hold-x" }),
     );

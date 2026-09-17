@@ -479,6 +479,12 @@ export interface CoreServiceConfig {
   ownerId?: string;
   allowedGroupIds: string[];
   stateDir: string;
+  /**
+   * Root of the per-project OMP session directories. `parseConfig` always supplies it
+   * (defaults to `~/.oco/sessions`); a config that omits it falls back to
+   * `<stateDir>/sessions` for the pre-isolation layout.
+   */
+  sessionsDir?: string;
   /** Injectable home for deterministic tests; production defaults to os.homedir(). */
   homeDir?: string;
   /** `parseConfig` always supplies this (defaults to enabled with `maxMessages = 50`); omitting it disables history. */

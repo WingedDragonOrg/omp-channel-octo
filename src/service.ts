@@ -85,6 +85,7 @@ import {
   type ProjectSessionBinding,
   type ProjectSessionState,
 } from "./project-session.ts";
+import { ensureProjectSessionDir, projectSessionDir, sessionsRoot } from "./session-dir.ts";
 import { ChannelStore, openChannelStore } from "./store.ts";
 import { boundedSelectorText, formatModelCatalog, modelWithLevel } from "./model-switch.ts";
 import type { BindingRecord, InboundClaim, OutboxRecord, ProgressCardRecord, TaskRecord } from "./store-records.ts";
@@ -995,12 +996,16 @@ class CoreService implements ChannelService {
   }
 
   private async sessionRootsFor(cwd: string): Promise<readonly string[]> {
-    const stateSessions = join(this.options.config.stateDir, "sessions");
-    if (!this.options.workerFactory.sessionRootsFor) return [stateSessions];
+    // 项目目录在前，改动前的扁平根留在候选里，旧会话仍能被找回。
+    const roots = [
+      projectSessionDir(sessionsRoot(this.options.config), cwd),
+      join(this.options.config.stateDir, "sessions"),
+    ];
+    if (!this.options.workerFactory.sessionRootsFor) return roots;
     try {
-      return [stateSessions, ...(await this.options.workerFactory.sessionRootsFor(cwd))];
+      return [...roots, ...(await this.options.workerFactory.sessionRootsFor(cwd))];
     } catch {
-      return [stateSessions];
+      return roots;
     }
   }
 
@@ -1632,87 +1637,86 @@ class CoreService implements ChannelService {
     try {
       await commandLease.ready;
       const sessionId = createSessionId();
-    const sessionDir = join(this.options.config.stateDir, "sessions");
-    await mkdir(sessionDir, { recursive: true });
-    const ledgerId = `new-${sessionId}`;
-    const ledgerSessionFile = join(sessionDir, `${sessionId}.jsonl`);
-    let spawned: WorkerProcess | undefined;
-    let candidate: OmpWorker | undefined;
-    let stopped = false;
-    let persistenceFailed = false;
-    try {
-      const chatModel = this.store.getChatModel(this.bot!.uid, target);
-      candidate = await this.options.workerFactory.create({
-        cwd,
-        sessionDir,
-        ...(chatModel === null ? {} : { model: chatModel }),
-        onSpawn: (processInfo) => {
-          spawned = processInfo;
-          this.store.recordWorker({
-            id: ledgerId,
-            botUid: this.bot!.uid,
-            sessionId,
-            sessionFile: ledgerSessionFile,
-            pid: processInfo.pid,
-            pgid: processInfo.pgid,
-            identity: processInfo.identity,
-            cwd: processInfo.cwd,
-            moveTargetCwd: null,
-            state: "running",
-          });
-        },
-      });
-      const freshState: ProjectSessionState = await candidate.refreshState();
-      const previousForFresh: ProjectSessionBinding = previous ?? {
-        sessionId: "",
-        cwd,
-        sessionFile: null,
-      };
-      const fresh = await verifyFreshSession(previousForFresh, freshState, cwd);
-      stopped = await candidate.stop();
-      if (!stopped) {
-        this.blockedDirectories.add(cwd);
-        throw new Error("worker did not stop");
-      }
-      this.store.markWorkerStopped(ledgerId);
-      const binding: BindingRecord = {
-        botUid: this.bot!.uid,
-        channelId: target.channelId,
-        channelType: target.channelType,
-        sessionId: fresh.sessionId,
-        cwd: fresh.cwd,
-        sessionFile: fresh.sessionFile,
-      };
+      const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.options.config), cwd);
+      const ledgerId = `new-${sessionId}`;
+      const ledgerSessionFile = join(sessionDir, `${sessionId}.jsonl`);
+      let spawned: WorkerProcess | undefined;
+      let candidate: OmpWorker | undefined;
+      let stopped = false;
+      let persistenceFailed = false;
       try {
-        this.store.ensureBinding(binding);
+        const chatModel = this.store.getChatModel(this.bot!.uid, target);
+        candidate = await this.options.workerFactory.create({
+          cwd,
+          sessionDir,
+          ...(chatModel === null ? {} : { model: chatModel }),
+          onSpawn: (processInfo) => {
+            spawned = processInfo;
+            this.store.recordWorker({
+              id: ledgerId,
+              botUid: this.bot!.uid,
+              sessionId,
+              sessionFile: ledgerSessionFile,
+              pid: processInfo.pid,
+              pgid: processInfo.pgid,
+              identity: processInfo.identity,
+              cwd: processInfo.cwd,
+              moveTargetCwd: null,
+              state: "running",
+            });
+          },
+        });
+        const freshState: ProjectSessionState = await candidate.refreshState();
+        const previousForFresh: ProjectSessionBinding = previous ?? {
+          sessionId: "",
+          cwd,
+          sessionFile: null,
+        };
+        const fresh = await verifyFreshSession(previousForFresh, freshState, cwd);
+        stopped = await candidate.stop();
+        if (!stopped) {
+          this.blockedDirectories.add(cwd);
+          throw new Error("worker did not stop");
+        }
+        this.store.markWorkerStopped(ledgerId);
+        const binding: BindingRecord = {
+          botUid: this.bot!.uid,
+          channelId: target.channelId,
+          channelType: target.channelType,
+          sessionId: fresh.sessionId,
+          cwd: fresh.cwd,
+          sessionFile: fresh.sessionFile,
+        };
+        try {
+          this.store.ensureBinding(binding);
+        } catch {
+          persistenceFailed = true;
+          throw new Error("本地状态盘写入失败，会话未切换。");
+        }
+        this.store.clearContextLedger(this.bot!.uid, target);
+        await this.outbox.enqueueText(target, `已创建会话 ${binding.sessionId}，cwd=${binding.cwd}`, null);
       } catch {
-        persistenceFailed = true;
-        throw new Error("本地状态盘写入失败，会话未切换。");
-      }
-      this.store.clearContextLedger(this.bot!.uid, target);
-      await this.outbox.enqueueText(target, `已创建会话 ${binding.sessionId}，cwd=${binding.cwd}`, null);
-    } catch {
-      if (candidate && !stopped) {
-        const verified = await candidate.stop().catch(() => false);
-        if (verified) {
-          this.store.markWorkerStopped(ledgerId);
-        } else {
-          this.blockedDirectories.add(cwd);
+        if (candidate && !stopped) {
+          const verified = await candidate.stop().catch(() => false);
+          if (verified) {
+            this.store.markWorkerStopped(ledgerId);
+          } else {
+            this.blockedDirectories.add(cwd);
+          }
+        } else if (spawned && !stopped) {
+          const verified = await this.options.workerFactory.recover(spawned).catch(() => false);
+          if (verified) {
+            this.store.markWorkerStopped(ledgerId);
+          } else {
+            this.blockedDirectories.add(cwd);
+          }
         }
-      } else if (spawned && !stopped) {
-        const verified = await this.options.workerFactory.recover(spawned).catch(() => false);
-        if (verified) {
-          this.store.markWorkerStopped(ledgerId);
-        } else {
-          this.blockedDirectories.add(cwd);
-        }
+        if (persistenceFailed) throw new Error("本地状态盘写入失败，会话未切换。");
+        await this.outbox.enqueueText(target, "无法创建可恢复的 OMP 会话，当前绑定未改变。", null);
       }
-      if (persistenceFailed) throw new Error("本地状态盘写入失败，会话未切换。");
-      await this.outbox.enqueueText(target, "无法创建可恢复的 OMP 会话，当前绑定未改变。", null);
-    }
     } finally {
       commandLease.complete();
-  }
+    }
   }
 
   private async handleMove(target: ChatTarget, argument: string): Promise<void> {
@@ -1756,83 +1760,82 @@ class CoreService implements ChannelService {
     }
     try {
       await commandLease.ready;
-    const sessionDir = join(this.options.config.stateDir, "sessions");
-    await mkdir(sessionDir, { recursive: true });
-    const ledgerId = `move-${randomUUID()}`;
-    let spawned: WorkerProcess | undefined;
-    let candidate: OmpWorker | undefined;
-    let stopped = false;
-    let persistenceFailed = false;
-    try {
-      const chatModel = this.store.getChatModel(this.bot!.uid, target);
-      candidate = await this.options.workerFactory.create({
-        cwd: previous.cwd,
-        sessionDir,
-        sessionFile,
-        ...(chatModel === null ? {} : { model: chatModel }),
-        onSpawn: (processInfo) => {
-          spawned = processInfo;
-          this.store.recordWorker({
-            id: ledgerId,
-            botUid: this.bot!.uid,
-            sessionId: previous.sessionId,
-            sessionFile,
-            pid: processInfo.pid,
-            pgid: processInfo.pgid,
-            identity: processInfo.identity,
-            cwd: processInfo.cwd,
-            moveTargetCwd: null,
-            state: "running",
-          });
-        },
-      });
-      this.store.markWorkerMoveTarget(ledgerId, cwd);
-      await candidate.prompt(`/move ${cwd}`, () => {});
-      const movedState: ProjectSessionState = await candidate.refreshState();
-      const moved = await verifyMovedSession(previous, movedState, cwd);
-      stopped = await candidate.stop();
-      if (!stopped) {
-        this.blockedDirectories.add(previous.cwd);
-        this.blockedDirectories.add(cwd);
-        throw new Error("worker did not stop");
-      }
-      this.store.markWorkerStopped(ledgerId);
-      const binding: BindingRecord = {
-        ...previous,
-        sessionId: moved.sessionId,
-        cwd: moved.cwd,
-        sessionFile: moved.sessionFile,
-        // An explicit /move leaves an isolated thread workspace behind.
-        cwdPinned: false,
-      };
+      const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.options.config), cwd);
+      const ledgerId = `move-${randomUUID()}`;
+      let spawned: WorkerProcess | undefined;
+      let candidate: OmpWorker | undefined;
+      let stopped = false;
+      let persistenceFailed = false;
       try {
-        this.store.ensureBinding(binding);
+        const chatModel = this.store.getChatModel(this.bot!.uid, target);
+        candidate = await this.options.workerFactory.create({
+          cwd: previous.cwd,
+          sessionDir,
+          sessionFile,
+          ...(chatModel === null ? {} : { model: chatModel }),
+          onSpawn: (processInfo) => {
+            spawned = processInfo;
+            this.store.recordWorker({
+              id: ledgerId,
+              botUid: this.bot!.uid,
+              sessionId: previous.sessionId,
+              sessionFile,
+              pid: processInfo.pid,
+              pgid: processInfo.pgid,
+              identity: processInfo.identity,
+              cwd: processInfo.cwd,
+              moveTargetCwd: null,
+              state: "running",
+            });
+          },
+        });
+        this.store.markWorkerMoveTarget(ledgerId, cwd);
+        await candidate.prompt(`/move ${cwd}`, () => {});
+        const movedState: ProjectSessionState = await candidate.refreshState();
+        const moved = await verifyMovedSession(previous, movedState, cwd);
+        stopped = await candidate.stop();
+        if (!stopped) {
+          this.blockedDirectories.add(previous.cwd);
+          this.blockedDirectories.add(cwd);
+          throw new Error("worker did not stop");
+        }
+        this.store.markWorkerStopped(ledgerId);
+        const binding: BindingRecord = {
+          ...previous,
+          sessionId: moved.sessionId,
+          cwd: moved.cwd,
+          sessionFile: moved.sessionFile,
+          // An explicit /move leaves an isolated thread workspace behind.
+          cwdPinned: false,
+        };
+        try {
+          this.store.ensureBinding(binding);
+        } catch {
+          persistenceFailed = true;
+          throw new Error("本地状态盘写入失败，会话未迁移。");
+        }
+        await this.outbox.enqueueText(target, `已迁移会话 ${binding.sessionId}，cwd=${binding.cwd}`, null);
       } catch {
-        persistenceFailed = true;
-        throw new Error("本地状态盘写入失败，会话未迁移。");
-      }
-      await this.outbox.enqueueText(target, `已迁移会话 ${binding.sessionId}，cwd=${binding.cwd}`, null);
-    } catch {
-      if (candidate && !stopped) {
-        const verified = await candidate.stop().catch(() => false);
-        if (verified) {
-          this.store.markWorkerStopped(ledgerId);
-        } else {
-          this.blockedDirectories.add(previous.cwd);
-          this.blockedDirectories.add(cwd);
+        if (candidate && !stopped) {
+          const verified = await candidate.stop().catch(() => false);
+          if (verified) {
+            this.store.markWorkerStopped(ledgerId);
+          } else {
+            this.blockedDirectories.add(previous.cwd);
+            this.blockedDirectories.add(cwd);
+          }
+        } else if (spawned && !stopped) {
+          const verified = await this.options.workerFactory.recover(spawned).catch(() => false);
+          if (verified) {
+            this.store.markWorkerStopped(ledgerId);
+          } else {
+            this.blockedDirectories.add(previous.cwd);
+            this.blockedDirectories.add(cwd);
+          }
         }
-      } else if (spawned && !stopped) {
-        const verified = await this.options.workerFactory.recover(spawned).catch(() => false);
-        if (verified) {
-          this.store.markWorkerStopped(ledgerId);
-        } else {
-          this.blockedDirectories.add(previous.cwd);
-          this.blockedDirectories.add(cwd);
-        }
+        if (persistenceFailed) throw new Error("本地状态盘写入失败，会话未迁移。");
+        await this.outbox.enqueueText(target, "无法验证 OMP 原生 /move，当前绑定未改变。", null);
       }
-      if (persistenceFailed) throw new Error("本地状态盘写入失败，会话未迁移。");
-      await this.outbox.enqueueText(target, "无法验证 OMP 原生 /move，当前绑定未改变。", null);
-    }
     } finally {
       commandLease.complete();
     }
@@ -2783,9 +2786,8 @@ class CoreService implements ChannelService {
       // Everything past the group-context read is "startup": a failure here is no longer a context
       // read problem, so the classification must not keep reporting one.
       startupPhase = "startup";
-      const sessionDir = join(this.options.config.stateDir, "sessions");
+      const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.options.config), task.cwd);
       const sidecarRoot = contextSidecarRoot(this.options.config, this.bot!.uid, target);
-      await mkdir(sessionDir, { recursive: true });
       const binding = bindingAtStart ?? this.store.getBinding(this.bot!.uid, target);
       const chatModel = this.store.getChatModel(this.bot!.uid, target);
       const workerOptions: WorkerOptions = {

@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { expect, test } from "bun:test";
 import { generateLaunchdPlist } from "../src/launchd.ts";
 import {
@@ -33,6 +34,9 @@ test("config parser resolves paths and accepts only filtered token env names", (
     { homeDir: "/home/test", env: { OCTO_BOT_TOKEN: "secret-value" } },
   );
   expect(config.stateDir).toBe("/home/test/state/octo");
+  expect(config.sessionsDir).toBe(join("/home/test", ".oco", "sessions"));
+  expect(toCoreConfig(parseConfig(configDocument({ sessionsDir: "~/sessions/octo" }), { homeDir: "/home/test" })).sessionsDir)
+    .toBe("/home/test/sessions/octo");
   expect(config.botToken).toBe("secret-value");
   expect(config.wsUrl).toBeUndefined();
   expect(() => parseConfig(
