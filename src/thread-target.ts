@@ -13,3 +13,10 @@ export function threadParentGroupId(channelId: string): string | null {
 export function threadChannelId(groupId: string, shortId: string): string {
   return `${groupId}____${shortId}`;
 }
+
+/** The short id segment of a thread channel id; `null` when the id has no thread shape. */
+export function threadShortId(channelId: string): string | null {
+  const parent = threadParentGroupId(channelId);
+  if (parent === null) return null;
+  return channelId.slice(parent.length + 4);
+}

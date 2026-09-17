@@ -258,6 +258,16 @@ export function applySchema(db: Database): void {
       updated_at INTEGER NOT NULL,
       PRIMARY KEY(bot_uid, channel_type, channel_id)
     );
+    CREATE TABLE IF NOT EXISTS thread_notify (
+      bot_uid TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type = 5),
+      channel_id TEXT NOT NULL,
+      creator_channel_type INTEGER NOT NULL CHECK(creator_channel_type IN (2, 5)),
+      creator_channel_id TEXT NOT NULL,
+      thread_name TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY(bot_uid, channel_type, channel_id)
+    );
     CREATE TABLE IF NOT EXISTS progress_cards (${PROGRESS_CARD_COLUMNS}
     );
     CREATE TABLE IF NOT EXISTS bot_event_cursor (

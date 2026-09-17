@@ -146,3 +146,17 @@ export interface AllowedChatRecord extends ChatTarget {
   grantedAt: number;
 }
 
+/**
+ * One thread's completion relay: every task that ends in this thread (channelType=5) is reported
+ * to the chat that created it. `create-thread` writes the row, `thread-delete` clears it, and it
+ * is independent of whether the thread already has a binding.
+ */
+export interface ThreadNotifyRecord extends ChatTarget {
+  botUid: string;
+  /** The chat that invoked `create-thread`; the completion notice is delivered there. */
+  creatorChannelType: 2 | 5;
+  creatorChannelId: string;
+  threadName: string;
+  createdAt: number;
+}
+

@@ -89,6 +89,7 @@ import type { BindingRecord, InboundClaim, OutboxRecord, ProgressCardRecord, Tas
 import { isGroupTarget, streamTargetKey, targetKey, taskTarget } from "./target.ts";
 import { createQuestionDesk, type QuestionDesk } from "./questions.ts";
 import { threadParentGroupId } from "./thread-target.ts";
+import { threadNotifyMessageId, threadOutcomeNotice } from "./thread-notify.ts";
 import { canonicalExistingDirectory, existingSessionFile, resolveWorkDirectory, stripOuterQuotes } from "./workdir.ts";
 import { worktreeSlug } from "./worktree.ts";
 import { worktrunkUnavailableText } from "./worktrunk.ts";
@@ -1912,6 +1913,61 @@ class CoreService implements ChannelService {
   }
 
   /**
+   * The completion relay of `create-thread --notify`: once a task in that thread has settled
+   * (`completed`/`failed`/`cancelled`/`interrupted`), one bounded notice is delivered to the
+   * chat that created the thread. The notice is a synthetic inbound message with a deterministic
+   * id (`notify:<task>`), so a replay or a restart can never deliver it twice; like `wakeTurn`
+   * it follows the target chat's append mode and never touches the pending-question path or the
+   * permission gate. A failed delivery only costs the relay and is logged.
+   *
+   * A graceful stop settles its in-flight tasks as `cancelled` (the stop sets
+   * `runtime.cancelRequested`), and that lifecycle outcome is never relayed: the notice would be
+   * accepted right before this process goes down, only to be interrupted by the next start and
+   * read as a bogus "task interrupted by restart" in the creator chat. The `stopping` flag
+   * separates that path from the owner's `/cancel`, which still relays.
+   */
+  private async notifyThreadOutcome(taskId: string): Promise<void> {
+    try {
+      if (this.stopping) return;
+      const botUid = this.bot?.uid;
+      if (botUid === undefined) return;
+      const task = this.store.getTask(taskId);
+      if (!task || task.channelType !== 5) return;
+      const state = task.state;
+      if (
+        state !== "completed"
+        && state !== "failed"
+        && state !== "cancelled"
+        && state !== "interrupted"
+      ) {
+        return;
+      }
+      const relay = this.store.getThreadNotify(botUid, task);
+      if (!relay) return;
+      const text = threadOutcomeNotice(task, relay);
+      const message: InboundMessage = {
+        channelId: relay.creatorChannelId,
+        channelType: relay.creatorChannelType,
+        messageId: threadNotifyMessageId(task.id),
+        senderId: this.store.getOwnerId(botUid)?.trim() || botUid,
+        text,
+        mentionedUserIds: [],
+        attachments: [],
+        quoted: null,
+        supported: true,
+        messageSeq: 0,
+        messageTimestamp: Date.now(),
+      };
+      if (await this.appendToRunningTask(message, text)) return;
+      await this.acceptTask(message, text);
+    } catch (error) {
+      console.error(
+        `[thread-notify] 回传投递失败 task=${taskId}：${safeErrorMessage(error, "notify failed")}`,
+      );
+    }
+  }
+
+  /**
    * `/queue` is the explicit way to append behind the running task regardless of the chat's mode,
    * so it always takes the durable task path minus the command prefix.
    */
@@ -2148,6 +2204,7 @@ class CoreService implements ChannelService {
   private async handleCancel(target: ChatTarget): Promise<void> {
     const queued = this.store.cancelQueued(this.bot!.uid, target);
     for (const taskId of queued) this.queuedBehind.delete(taskId);
+    for (const taskId of queued) await this.notifyThreadOutcome(taskId);
     this.questions.cancelForTarget(target);
     let active = false;
     for (const runtime of this.runtimes.values()) {
@@ -2443,6 +2500,7 @@ class CoreService implements ChannelService {
       this.queuedBehind.delete(taskId);
       this.store.markFailed(taskId, "绑定目录在启动前持续变更，任务未启动。");
       await this.outbox.enqueueText(taskTarget(task), genericTaskFailure(false), taskId);
+      await this.notifyThreadOutcome(taskId);
     } finally {
       lease?.complete();
     }
@@ -2497,12 +2555,14 @@ class CoreService implements ChannelService {
       this.queuedBehind.delete(taskId);
       this.store.markFailed(taskId, "绑定目录在启动前再次变更，任务未启动。");
       await this.outbox.enqueueText(taskTarget(task), genericTaskFailure(false), taskId);
+      await this.notifyThreadOutcome(taskId);
       return;
     }
     if (this.blockedDirectories.has(task.cwd)) {
       this.queuedBehind.delete(taskId);
       this.store.markFailed(taskId, "directory remains blocked by an unconfirmed worker");
       await this.outbox.enqueueText(taskTarget(task), genericTaskFailure(false), taskId);
+      await this.notifyThreadOutcome(taskId);
       return;
     }
     if (!this.store.markStarted(taskId)) return;
@@ -3029,7 +3089,10 @@ class CoreService implements ChannelService {
         else this.blockedDirectories.add(task.cwd);
       }
       this.outbox.releaseIfIdle(taskId);
+      // Deregistered before the relay so a creator chat that shares this directory does not read
+      // the relay as work that queued behind this run.
       this.runtimes.delete(taskId);
+      await this.notifyThreadOutcome(taskId);
       this.maybeRunDeferredRestart();
     }
   }

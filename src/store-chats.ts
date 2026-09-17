@@ -4,7 +4,7 @@
 
 import { Database } from "bun:sqlite";
 import type { ChatAppendMode, ChatTarget } from "./contracts.ts";
-import type { AllowedChatRecord, BindingRecord, OutboxInsert } from "./store-records.ts";
+import type { AllowedChatRecord, BindingRecord, OutboxInsert, ThreadNotifyRecord } from "./store-records.ts";
 import { asNullableString, asNumber, asString, query, run, targetValues, targetWhere, transaction } from "./store-schema.ts";
 import { enqueueOutbox } from "./store-outbox.ts";
 
@@ -199,5 +199,56 @@ export function updateBindingSession(db: Database, botUid: string, target: ChatT
   run(db,
     `UPDATE chats SET session_id = ?, session_file = ?, updated_at = ? WHERE bot_uid = ? AND ${targetWhere(target)}`,
     [sessionId, sessionFile, Date.now(), botUid, ...targetValues(target)],
+  );
+}
+
+/**
+ * The `create-thread` completion relay: tasks that end in this thread are reported to the chat
+ * that created it. Written at creation time, independent of whether the thread already has a
+ * binding; a repeated write for the same thread keeps the newest creator target.
+ */
+export function registerThreadNotify(db: Database, record: ThreadNotifyRecord): void {
+  run(db,
+    `INSERT INTO thread_notify(
+       bot_uid, channel_type, channel_id, creator_channel_type, creator_channel_id, thread_name, created_at
+     ) VALUES(?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(bot_uid, channel_type, channel_id) DO UPDATE SET
+       creator_channel_type = excluded.creator_channel_type,
+       creator_channel_id = excluded.creator_channel_id,
+       thread_name = excluded.thread_name`,
+    [
+      record.botUid,
+      record.channelType,
+      record.channelId,
+      record.creatorChannelType,
+      record.creatorChannelId,
+      record.threadName,
+      record.createdAt,
+    ],
+  );
+}
+
+export function getThreadNotify(db: Database, botUid: string, target: ChatTarget): ThreadNotifyRecord | null {
+  const row = query(db,
+    `SELECT bot_uid, channel_type, channel_id, creator_channel_type, creator_channel_id, thread_name, created_at
+     FROM thread_notify WHERE bot_uid = ? AND ${targetWhere(target)}`,
+    [botUid, ...targetValues(target)],
+  )[0];
+  if (!row) return null;
+  return {
+    botUid: asString(row.bot_uid),
+    channelType: 5,
+    channelId: asString(row.channel_id),
+    creatorChannelType: asNumber(row.creator_channel_type) === 5 ? 5 : 2,
+    creatorChannelId: asString(row.creator_channel_id),
+    threadName: asString(row.thread_name),
+    createdAt: asNumber(row.created_at),
+  };
+}
+
+export function clearThreadNotify(db: Database, botUid: string, target: ChatTarget): void {
+  run(db,
+    `DELETE FROM thread_notify WHERE bot_uid = ? AND ${targetWhere(target)}`,
+    [botUid, ...targetValues(target)],
   );
 }

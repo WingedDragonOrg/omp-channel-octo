@@ -16,7 +16,7 @@ import type {
 import type { ChannelStore } from "./store.ts";
 import type { TaskRecord } from "./store-records.ts";
 import { taskTarget } from "./target.ts";
-import { threadChannelId, threadParentGroupId } from "./thread-target.ts";
+import { threadChannelId, threadParentGroupId, threadShortId } from "./thread-target.ts";
 import { worktreeSlug } from "./worktree.ts";
 
 /**
@@ -241,7 +241,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord, _snapshot:
         : null;
   if (parentGroupId === null) return [channelTool, fileTool, askTool];
   const currentShortId =
-    target.channelType === 5 ? target.channelId.slice(parentGroupId.length + 4) : null;
+    target.channelType === 5 ? threadShortId(target.channelId) : null;
   // A task that was itself dispatched must not dispatch further: depth stays one.
   const dispatchable = !task.messageId.startsWith(DISPATCH_MESSAGE_PREFIX);
   const actions = dispatchable
@@ -250,7 +250,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord, _snapshot:
   const managementTool: HostTool = {
     name: "octo_management",
     description:
-      "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；create-thread 可带 worktree_name 为线程建立独立 git worktree 并把线程目录绑定到它（本机有兼容 Worktrunk 时经 wt 创建，否则经 OMP）；thread-delete 默认清理干净的工作区，force=true 时连同未提交改动一起强制清理（本机无兼容 wt 时回退 git）；thread-merge 把当前子区隔离工作区的分支经本机 Worktrunk（wt）的 merge pipeline 合并回目标分支，仅绑定隔离工作区的子区可用，省略参数即 wt 默认 pipeline；thread-dispatch 把一条任务派发给本群的某个 thread，结果按该子区的追加模式处置——steer 且该子区有可接收 steering 的运行中回合时并入该回合（delivery=steered），否则在该子区作为独立任务执行（delivery=queued），两种情况本群都收到一条回执；派发出去的任务不能再派发。目标固定为当前聊天，不能指向其他群。",
+      "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；create-thread 可带 worktree_name 为线程建立独立 git worktree 并把线程目录绑定到它（本机有兼容 Worktrunk 时经 wt 创建，否则经 OMP），带 notify=true 时该子区每个任务结束（完成/失败/取消/中断）都会向创建它的聊天回传一条有界通知（默认 false）；thread-delete 默认清理干净的工作区，force=true 时连同未提交改动一起强制清理（本机无兼容 wt 时回退 git）；thread-merge 把当前子区隔离工作区的分支经本机 Worktrunk（wt）的 merge pipeline 合并回目标分支，仅绑定隔离工作区的子区可用，省略参数即 wt 默认 pipeline；thread-dispatch 把一条任务派发给本群的某个 thread，结果按该子区的追加模式处置——steer 且该子区有可接收 steering 的运行中回合时并入该回合（delivery=steered），否则在该子区作为独立任务执行（delivery=queued），两种情况本群都收到一条回执；派发出去的任务不能再派发。目标固定为当前聊天，不能指向其他群。",
     parameters: {
       type: "object",
       properties: {
@@ -290,6 +290,11 @@ export function createHostTools(host: HostToolHost, task: TaskRecord, _snapshot:
           type: "string",
           description:
             "create-thread：给出名称即为新线程建立独立 git worktree（建在调用方当前目录所属仓库旁，目录 <仓库名>.<名称>，如 omp-channel-octo.fix-login），并把线程目录绑定过去；名称需包含 ASCII 字母或数字（如 fix-login）。成功返回 worktree 路径与分支，失败返回 worktree_error。省略则线程按默认目录继承。",
+        },
+        notify: {
+          type: "boolean",
+          description:
+            "create-thread：为 true 时该子区每个任务结束（完成/失败/取消/中断）都会向创建它的聊天回传一条有界通知，由那边的助手作为新输入处理（可并入运行中回合，否则成为该聊天的一个任务）；默认 false。",
         },
       },
       required: ["action"],
@@ -469,12 +474,13 @@ async function runManagementTool(
     case "create-thread": {
       const name = namedText("name", MAX_MANAGEMENT_NAME_CHARS);
       const workspaceName = worktreeName();
+      const notify = optionalBoolean("notify") ?? false;
       const thread = await transport.createThread(groupId, name, signal);
-      if (workspaceName === undefined) return JSON.stringify(managementThread(thread));
-      return JSON.stringify({
-        ...managementThread(thread),
-        ...(await createThreadWorkspace(host, task.cwd, thread, workspaceName, signal)),
-      });
+      const relay = syncThreadRelay(host, target, thread, notify);
+      const workspace = workspaceName === undefined
+        ? {}
+        : await createThreadWorkspace(host, task.cwd, thread, workspaceName, signal);
+      return JSON.stringify({ ...managementThread(thread), ...relay, ...workspace });
     }
     case "thread-info": {
       return JSON.stringify(managementThread(await transport.getThread(groupId, threadId(), signal)));
@@ -499,8 +505,13 @@ async function runManagementTool(
       const shortId = threadId();
       const force = optionalBoolean("force") ?? false;
       await deleteThread(host, groupId, shortId, signal);
-      const note = await cleanupThreadWorkspace(host, groupId, shortId, force, signal);
-      return note === null ? `已删除线程 ${shortId}` : `已删除线程 ${shortId}；${note}`;
+      const notes = [
+        clearThreadRelay(host, groupId, shortId),
+        await cleanupThreadWorkspace(host, groupId, shortId, force, signal),
+      ].filter((note): note is string => note !== null);
+      return notes.length === 0
+        ? `已删除线程 ${shortId}`
+        : `已删除线程 ${shortId}；${notes.join("；")}`;
     }
     case "thread-merge": {
       if (currentShortId === null) {
@@ -601,6 +612,59 @@ async function cleanupThreadWorkspace(
     return `${prefix}${reason}${suffix}`;
   }
 }
+
+/**
+ * The `create-thread` completion relay: a thread created with `notify` reports every task that
+ * ends in it to the calling chat. The freshly created thread is authoritative for its own relay
+ * state — `notify` writes the registration, and a plain create clears one a reused thread id may
+ * still carry, so a new thread can never inherit a stale creator. Both writes happen after the
+ * thread exists, so a state-store failure becomes `notify_error` instead of failing the
+ * (already effective) create.
+ */
+function syncThreadRelay(
+  host: HostToolHost,
+  creator: ChatTarget,
+  thread: ThreadSummary,
+  notify: boolean,
+): { notify?: true; notify_error?: string } {
+  const threadTarget: ChatTarget = { channelId: thread.channelId, channelType: 5 };
+  if (creator.channelType === 1) return notify ? { notify_error: "只有群聊或子区可以回传" } : {};
+  try {
+    if (notify) {
+      host.store.registerThreadNotify({
+        botUid: host.botUid,
+        channelType: 5,
+        channelId: thread.channelId,
+        creatorChannelType: creator.channelType,
+        creatorChannelId: creator.channelId,
+        threadName: thread.name,
+        createdAt: Date.now(),
+      });
+      return { notify: true };
+    }
+    host.store.clearThreadNotify(host.botUid, threadTarget);
+    return {};
+  } catch (error) {
+    return { notify_error: boundedManagementError(error, notify ? "回传登记失败" : "回传登记清理失败") };
+  }
+}
+
+/**
+ * Clears the deleted thread's completion relay registration. The server-side delete is already
+ * effective, so a local failure only becomes a bounded receipt note, like the workspace cleanup.
+ */
+function clearThreadRelay(host: HostToolHost, groupId: string, shortId: string): string | null {
+  try {
+    host.store.clearThreadNotify(host.botUid, {
+      channelId: threadChannelId(groupId, shortId),
+      channelType: 5,
+    });
+    return null;
+  } catch (error) {
+    return `回传登记未清理：${boundedManagementError(error, "状态盘写入失败")}`;
+  }
+}
+
 /**
  * Gives a freshly created thread its own git worktree and pins the thread binding to it, so
  * tasks dispatched into that thread never share the parent group's directory. The workspace is

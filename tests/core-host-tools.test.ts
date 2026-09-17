@@ -816,6 +816,145 @@ test("create-thread worktree_name reports a workspace failure while keeping the 
   }
 });
 
+test("create-thread notify registers the completion relay and thread-delete clears it", async () => {
+  const harness = await createCoreHarness({
+    prompt: async ({ append, promptContext, text }) => {
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("management tool missing");
+      const signal = new AbortController().signal;
+      if (text === "create the relay thread") {
+        const created = JSON.parse(
+          await management.execute({ action: "create-thread", name: "回传线程", notify: true }, signal),
+        ) as { short_id: string; channel_id: string; notify?: boolean };
+        const rejected = await management
+          .execute({ action: "create-thread", name: "坏参数", notify: "yes" }, signal)
+          .then(() => "resolved")
+          .catch((error: Error) => error.message);
+        await append("relay.log", `${created.notify}|${created.short_id}|${created.channel_id}|${rejected}\n`);
+        return;
+      }
+      if (text === "delete the relay thread") {
+        await management.execute({ action: "thread-delete", short_id: "thread-1" }, signal);
+        return;
+      }
+      throw new Error(`unexpected prompt: ${text}`);
+    },
+  });
+  try {
+    const cwd = join(harness.root, "relay cwd");
+    await mkdir(cwd, { recursive: true });
+    await harness.service.handleInbound(
+      inbound({ messageId: "relay-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "relay-create",
+        ...GROUP_TOOLS,
+        text: "create the relay thread",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+    expect(await readText(join(cwd, "relay.log"))).toBe(
+      "true|thread-1|group-tools____thread-1|notify must be a boolean\n",
+    );
+
+    const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      expect(
+        store.getThreadNotify(harness.bot.uid, { channelId: "group-tools____thread-1", channelType: 5 }),
+      ).toMatchObject({
+        creatorChannelId: "group-tools",
+        creatorChannelType: 2,
+        threadName: "回传线程",
+      });
+    } finally {
+      store.close();
+    }
+
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "relay-delete",
+        ...GROUP_TOOLS,
+        text: "delete the relay thread",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+
+    const reopened = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      expect(
+        reopened.getThreadNotify(harness.bot.uid, { channelId: "group-tools____thread-1", channelType: 5 }),
+      ).toBeNull();
+    } finally {
+      reopened.close();
+    }
+    expect(harness.transport.managementCalls).toEqual([
+      { action: "create-thread", groupId: "group-tools", shortId: null },
+      { action: "thread-delete", groupId: "group-tools", shortId: "thread-1" },
+    ]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a plain create-thread clears a stale relay registration for a reused thread id", async () => {
+  const harness = await createCoreHarness({
+    prompt: async ({ promptContext, text }) => {
+      if (text === "create a plain thread") {
+        const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+        if (!management) throw new Error("management tool missing");
+        await management.execute(
+          { action: "create-thread", name: "新线程" },
+          new AbortController().signal,
+        );
+        return;
+      }
+      throw new Error(`unexpected prompt: ${text}`);
+    },
+  });
+  try {
+    const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      store.registerThreadNotify({
+        botUid: harness.bot.uid,
+        channelType: 5,
+        channelId: "group-tools____thread-1",
+        creatorChannelType: 2,
+        creatorChannelId: "group-stale",
+        threadName: "旧线程",
+        createdAt: 1,
+      });
+    } finally {
+      store.close();
+    }
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "stale-create",
+        ...GROUP_TOOLS,
+        text: "create a plain thread",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+
+    const reopened = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      expect(
+        reopened.getThreadNotify(harness.bot.uid, {
+          channelId: "group-tools____thread-1",
+          channelType: 5,
+        }),
+      ).toBeNull();
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
 test("thread-merge merges the bound workspace through the port and reports wt's result", async () => {
   const log: string[] = [];
   const harness = await createCoreHarness({

@@ -7,9 +7,9 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ChatAppendMode, ChatTarget } from "./contracts.ts";
-import type { BindingRecord, InboundClaim, TaskRecord, RestartNoticeRecord, ProgressCardRecord, OutboxRecord, OutboxInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord } from "./store-records.ts";
+import type { BindingRecord, InboundClaim, TaskRecord, RestartNoticeRecord, ProgressCardRecord, OutboxRecord, OutboxInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ThreadNotifyRecord } from "./store-records.ts";
 import { applySchema } from "./store-schema.ts";
-import { claimOwnerEnrollment, clearChatModel, ensureBinding, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, grantAllowedChat, hasOwnerEnrollment, listAllowedChats, setBotUid, setChatMode, setChatModel, setOwnerId, updateBindingSession } from "./store-chats.ts";
+import { claimOwnerEnrollment, clearChatModel, clearThreadNotify, ensureBinding, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, getThreadNotify, grantAllowedChat, hasOwnerEnrollment, listAllowedChats, registerThreadNotify, setBotUid, setChatMode, setChatModel, setOwnerId, updateBindingSession } from "./store-chats.ts";
 import { acceptTask, addRestartNotice, cancelQueued, claimCommand, clearRestartNotice, completeCommand, countQueuedTasks, failCommand, getActiveTask, getLatestTask, getTask, listQueuedTasks, listRestartNotices, markCancelled, markCompleted, markFailed, markInterrupted, markInterruptedOnStart, markStarted, releaseClaim } from "./store-tasks.ts";
 import { clearProgressCard, listProgressCards, listWorkerLedger, markWorkerMoveTarget, markWorkerStopped, recordProgressCardAttempt, recordWorker, saveProgressCard } from "./store-cards.ts";
 import { advanceHistoryLedger, clearContextLedger, commitContextInjection, commitHistoryInjection, getContextLedger, getHistoryLedger, prepareContextInjection, prepareHistoryInjection, pruneHistoryLedger } from "./store-ledgers.ts";
@@ -130,6 +130,19 @@ export class ChannelStore {
 
   clearChatModel(botUid: string, target: ChatTarget): void {
     clearChatModel(this.db, botUid, target);
+  }
+
+  /** Registers (or refreshes) one thread's completion relay target; see `ThreadNotifyRecord`. */
+  registerThreadNotify(record: ThreadNotifyRecord): void {
+    registerThreadNotify(this.db, record);
+  }
+
+  getThreadNotify(botUid: string, target: ChatTarget): ThreadNotifyRecord | null {
+    return getThreadNotify(this.db, botUid, target);
+  }
+
+  clearThreadNotify(botUid: string, target: ChatTarget): void {
+    clearThreadNotify(this.db, botUid, target);
   }
 
   /**
