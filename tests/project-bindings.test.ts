@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createWorkerFactory } from "../src/omp/index";
-import type { OmpWorker, PromptContext, WorkerEvent, WorkerOptions } from "../src/contracts";
+import type { OmpWorker, PromptContext, WorkerEvent, WorkerModelCatalog, WorkerModelSwitch, WorkerOptions } from "../src/contracts";
 import {
   findMovedSession,
   loadValidatedSessionState,
@@ -103,6 +103,14 @@ class DelayedStopWorker implements OmpWorker {
     return this.inner.refreshState();
   }
 
+  models(): Promise<WorkerModelCatalog> {
+    return this.inner.models();
+  }
+
+  switchModel(selector: string): Promise<WorkerModelSwitch> {
+    return this.inner.switchModel(selector);
+  }
+
   stop(): Promise<boolean> {
     this.stopStarted.release();
     return this.releaseStop.promise.then(() => this.inner.stop());
@@ -162,6 +170,14 @@ class StopFalseWorker implements OmpWorker {
 
   refreshState(): Promise<ProjectSessionState> {
     return this.inner.refreshState();
+  }
+
+  models(): Promise<WorkerModelCatalog> {
+    return this.inner.models();
+  }
+
+  switchModel(selector: string): Promise<WorkerModelSwitch> {
+    return this.inner.switchModel(selector);
   }
 
   stop(): Promise<boolean> {
@@ -225,6 +241,14 @@ class CommandLeaseWorker implements OmpWorker {
     this.refreshStarted.release();
     await this.releaseRefresh.promise;
     return this.inner.refreshState();
+  }
+
+  async models(): Promise<WorkerModelCatalog> {
+    return this.inner.models();
+  }
+
+  async switchModel(selector: string): Promise<WorkerModelSwitch> {
+    return this.inner.switchModel(selector);
   }
 
   async stop(): Promise<boolean> {

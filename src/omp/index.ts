@@ -6,6 +6,9 @@ import type {
 	PromptContext,
 	WorkerEvent,
 	WorkerFactory,
+	WorkerModelCatalog,
+	WorkerModelInfo,
+	WorkerModelSwitch,
 	WorkerOptions,
 	WorkerProcess,
 } from "../contracts.ts";
@@ -74,6 +77,14 @@ const DEFAULT_STARTUP_TIMEOUT_MS = 10_000;
 const DEFAULT_CANCEL_TIMEOUT_MS = 10_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const PASSIVE_UI_METHODS = new Set(["notify", "setStatus", "setWidget", "setTitle", "set_editor_text", "open_url"]);
+
+/** The thinking level a `get_state` or `config_update` frame reports, or null when it carries none. */
+function modelLevel(frame: unknown): string | null {
+	if (!isRecord(frame)) return null;
+	const level = frame.thinkingLevel;
+	return typeof level === "string" && level.length > 0 ? level : null;
+}
+
 class RpcWorker implements OmpWorker {
 	#child: RpcChild;
 	#watchdog: RpcChild | undefined;
@@ -99,6 +110,11 @@ class RpcWorker implements OmpWorker {
 	#hostCalls = new Map<string, HostCall>();
 	#sessionFile = "";
 	#sessionId = "";
+	/**
+	 * The session model OMP last announced through `config_update` — the frame its `/switch`
+	 * builtin emits after a successful switch, carrying the resolved model and thinking level.
+	 */
+	#modelUpdate: { model: string; level: string | null; seq: number } | undefined;
 	#readyPromise: Promise<void>;
 	#readyResolve: () => void;
 	#readyReject: (error: Error) => void;
@@ -196,6 +212,71 @@ class RpcWorker implements OmpWorker {
 		this.#sessionFile = loaded.state.sessionFile;
 		this.#sessionId = loaded.state.sessionId;
 		return loaded.state;
+	}
+
+	/**
+	 * The live session's model plus everything OMP currently offers. No prompt is involved, so a
+	 * freshly started worker answers with the model a fresh session would use — the default the
+	 * `/switch` command reports for a chat that never set one.
+	 */
+	async models(): Promise<WorkerModelCatalog> {
+		if (this.#closed) throw new Error("OMP worker is not running");
+		const stateResponse = await this.#request({ type: "get_state" }, this.#startupTimeoutMs);
+		this.#assertSuccess(stateResponse, "get_state");
+		const state = stateResponse.data;
+		const model = isRecord(state) && isRecord(state.model) ? state.model : undefined;
+		const current =
+			model && typeof model.provider === "string" && typeof model.id === "string" && model.provider.length > 0 && model.id.length > 0
+				? `${model.provider}/${model.id}`
+				: null;
+		const level = modelLevel(state);
+		const listResponse = await this.#request({ type: "get_available_models" }, DEFAULT_REQUEST_TIMEOUT_MS);
+		this.#assertSuccess(listResponse, "get_available_models");
+		const data = listResponse.data;
+		const raw = isRecord(data) && Array.isArray(data.models) ? data.models : [];
+		const available: WorkerModelInfo[] = [];
+		for (const entry of raw) {
+			if (!isRecord(entry)) continue;
+			const provider = entry.provider;
+			const id = entry.id;
+			if (typeof provider !== "string" || provider.length === 0 || typeof id !== "string" || id.length === 0) continue;
+			available.push({
+				provider,
+				id,
+				...(typeof entry.name === "string" && entry.name.length > 0 ? { name: entry.name } : {}),
+			});
+		}
+		return { current, level, available };
+	}
+
+	/**
+	 * Hand a selector to OMP's own `/switch` builtin and report what it resolved to. The dispatch
+	 * is a prompt frame that OMP consumes locally (`agentInvoked: false`) — it never reaches the
+	 * model and is accepted while a turn is streaming, so a running session switches in place.
+	 * Success is the `config_update` frame OMP emits after switching; without one the selector was
+	 * rejected and the session is untouched.
+	 */
+	async switchModel(selector: string): Promise<WorkerModelSwitch> {
+		if (this.#closed) throw new Error("OMP worker is not running");
+		const before = this.#modelUpdate?.seq ?? 0;
+		const response = await this.#request({ type: "prompt", message: `/switch ${selector}` }, DEFAULT_REQUEST_TIMEOUT_MS);
+		this.#assertSuccess(response, "prompt");
+		const update = this.#modelUpdate;
+		if (!update || update.seq === before) return { ok: false };
+		return { ok: true, model: update.model, level: update.level };
+	}
+
+	/**
+	 * Fold a `config_update` frame: OMP announces the session model here after `/switch` succeeds.
+	 * Frames without a usable provider/id are ignored, so a malformed update cannot be mistaken
+	 * for a switch.
+	 */
+	#handleConfigUpdate(frame: RpcFrame): void {
+		const model = isRecord(frame.model) ? frame.model : undefined;
+		const provider = typeof model?.provider === "string" ? model.provider : undefined;
+		const id = typeof model?.id === "string" ? model.id : undefined;
+		if (provider === undefined || id === undefined || provider.length === 0 || id.length === 0) return;
+		this.#modelUpdate = { model: `${provider}/${id}`, level: modelLevel(frame), seq: (this.#modelUpdate?.seq ?? 0) + 1 };
 	}
 
 	async prompt(text: string, onEvent: (event: WorkerEvent) => void, context?: PromptContext): Promise<void> {
@@ -445,6 +526,10 @@ class RpcWorker implements OmpWorker {
 		}
 		if (frame.type === "host_tool_cancel") {
 			this.#handleHostToolCancel(frame);
+			return;
+		}
+		if (frame.type === "config_update") {
+			this.#handleConfigUpdate(frame);
 			return;
 		}
 		const active = this.#activePrompt;
@@ -748,6 +833,7 @@ class OmpWorkerFactory implements WorkerFactory {
 			"--session-dir",
 			sessionDir,
 		];
+		if (options.model) command.push("--model", options.model);
 		if (options.sessionFile) command.push("--resume", resolve(options.sessionFile));
 		let child: RpcChild;
 		try {

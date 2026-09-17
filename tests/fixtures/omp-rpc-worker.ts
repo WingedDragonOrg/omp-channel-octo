@@ -42,7 +42,8 @@ type Scenario =
 	| "host-cancel"
 	| "host-stop"
 	| "subagent-events"
-	| "no-subagent-subscription";
+	| "no-subagent-subscription"
+	| "no-models";
 
 const argv = process.argv.slice(2);
 
@@ -174,6 +175,69 @@ const sessionFile = resumeArg && (resumeArg.includes("/") || resumeArg.endsWith(
 	? resolve(resumeArg)
 	: join(sessionDir, `fixture-${scenario}.jsonl`);
 const sessionId = `fixture-session-${scenario}`;
+/**
+ * `--model` mirrors the real CLI: the first slash separates provider from model id, an optional
+ * `:level` suffix sets the thinking level, and a worker started with it reports both.
+ */
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+/** The level a session runs at when `--model` names none; OMP always reports a level. */
+const FIXTURE_DEFAULT_LEVEL = "xhigh";
+const modelFlag = flag("--model");
+const modelSelection = ((): { provider: string; id: string; level?: string } | undefined => {
+	if (!modelFlag) return undefined;
+	const slash = modelFlag.indexOf("/");
+	if (slash <= 0 || slash === modelFlag.length - 1) return undefined;
+	const tail = modelFlag.slice(slash + 1);
+	const level = THINKING_LEVELS.find(candidate => tail.endsWith(`:${candidate}`));
+	return level === undefined
+		? { provider: modelFlag.slice(0, slash), id: tail }
+		: { provider: modelFlag.slice(0, slash), id: tail.slice(0, -level.length - 1), level };
+})();
+let currentModel =
+	modelSelection === undefined ? { provider: "fixture", id: "default" } : { provider: modelSelection.provider, id: modelSelection.id };
+let currentLevel: string | null = modelSelection?.level ?? FIXTURE_DEFAULT_LEVEL;
+/** Deliberately mixed shapes: a named model, an empty name, a nested id, and one junk entry. */
+const availableModels: Array<{ provider: string; id?: string; name?: string }> = [
+	{ provider: "fixture", id: "default", name: "Fixture Default" },
+	{ provider: "fixture", id: "fast", name: "" },
+	{ provider: "fixture", id: "nested/model", name: "Nested" },
+	{ provider: "other", id: "fast", name: "Other Fast" },
+	{ provider: "broken" },
+];
+/** Models a selector can resolve to; the junk entry above stays list-only, like an unparsable row. */
+const resolvableModels = availableModels.filter(
+	(model): model is { provider: string; id: string; name?: string } => typeof model.id === "string",
+);
+/** Role aliases OMP would expand from `settings.modelRoles`; `@fast` carries a level, `@default` none. */
+const fixtureRoles: Record<string, { provider: string; id: string; level?: string }> = {
+	fast: { provider: "other", id: "fast", level: "max" },
+	default: { provider: "fixture", id: "default" },
+};
+
+/**
+ * Mirror of OMP's `/switch` resolution over the fixture catalog: `@role` first, then an exact
+ * `provider/id`, then a unique model id, then a unique substring; a trailing `:level` sets the
+ * thinking level. An unresolvable selector stays unresolved — OMP answers `Unknown model`.
+ */
+function resolveFixtureSelector(selector: string): { provider: string; id: string; level?: string } | undefined {
+	const trimmed = selector.trim();
+	if (trimmed.startsWith("@")) {
+		const role = fixtureRoles[trimmed.slice(1).toLowerCase()];
+		return role === undefined ? undefined : { ...role };
+	}
+	const level = THINKING_LEVELS.find(candidate => trimmed.endsWith(`:${candidate}`));
+	const body = level === undefined ? trimmed : trimmed.slice(0, -level.length - 1);
+	if (body.length === 0) return undefined;
+	const withLevel = (model: { provider: string; id: string }) =>
+		level === undefined ? { provider: model.provider, id: model.id } : { provider: model.provider, id: model.id, level };
+	const matches = [
+		resolvableModels.filter(model => `${model.provider}/${model.id}` === body),
+		resolvableModels.filter(model => model.id === body),
+		resolvableModels.filter(model => model.id.includes(body) || `${model.provider}/${model.id}`.includes(body)),
+	].find(candidates => candidates.length > 0);
+	if (matches === undefined) return undefined;
+	return matches.length === 1 ? withLevel(matches[0]!) : undefined;
+}
 const marker = flag("--fixture-marker");
 const descendantDelay = numberFlag("--fixture-descendant-delay", 0);
 let negotiated = false;
@@ -701,6 +765,24 @@ function completeHostToolTurn(command: Frame): void {
 
 async function handlePrompt(id: string | undefined, message: string): Promise<void> {
 	appendLog({ kind: "prompt", id, message });
+	if (message.startsWith("/switch")) {
+		// OMP dispatches `/switch` as a builtin: no agent turn, a `command_output` line, and on
+		// success the `config_update` frame that announces the resolved model and level. The
+		// dispatch is local, so it is served even while another prompt is streaming.
+		const selector = message.slice("/switch".length).trim();
+		const resolved = resolveFixtureSelector(selector);
+		if (resolved === undefined) {
+			emit({ type: "command_output", text: `Unknown model: ${selector}` });
+			response(id, "prompt", { agentInvoked: false });
+			return;
+		}
+		currentModel = { provider: resolved.provider, id: resolved.id };
+		if (resolved.level !== undefined) currentLevel = resolved.level;
+		emit({ type: "command_output", text: `Session-only model: ${currentModel.provider}/${currentModel.id}.` });
+		emit({ type: "config_update", model: { ...currentModel }, thinkingLevel: currentLevel });
+		response(id, "prompt", { agentInvoked: false });
+		return;
+	}
 	if (scenario === "local") {
 		response(id, "prompt", { agentInvoked: false });
 		setTimeout(() => emit({ type: "prompt_result", id, agentInvoked: false }), 1);
@@ -948,8 +1030,8 @@ function handleCommand(command: Frame): void {
 	}
 	if (type === "get_state") {
 		response(id, type, {
-			model: undefined,
-			thinkingLevel: "off",
+			model: { ...currentModel, name: currentModel.id },
+			thinkingLevel: currentLevel ?? "off",
 			isStreaming: false,
 			isCompacting: false,
 			steeringMode: "one-at-a-time",
@@ -965,6 +1047,14 @@ function handleCommand(command: Frame): void {
 			queuedMessageCount: 0,
 			todoPhases: [],
 		});
+		return;
+	}
+	if (type === "get_available_models") {
+		if (scenario === "no-models") {
+			response(id, type, { models: [] });
+			return;
+		}
+		response(id, type, { models: availableModels.map(model => ({ ...model })) });
 		return;
 	}
 	if (type === "set_subagent_subscription") {

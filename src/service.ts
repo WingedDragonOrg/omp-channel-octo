@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
   ATTACHMENTS_DISABLED_TEXT,
@@ -36,6 +37,8 @@ import type {
   InboundMessage,
   OmpWorker,
   WorkerEvent,
+  WorkerModelCatalog,
+  WorkerModelSwitch,
   SteerConsumedEvent,
   ProgressCard,
   WorkerOptions,
@@ -81,6 +84,7 @@ import {
   type ProjectSessionState,
 } from "./project-session.ts";
 import { ChannelStore, openChannelStore } from "./store.ts";
+import { boundedSelectorText, formatModelCatalog, modelWithLevel } from "./model-switch.ts";
 import type { BindingRecord, InboundClaim, OutboxRecord, ProgressCardRecord, TaskRecord } from "./store-records.ts";
 import { isGroupTarget, streamTargetKey, targetKey, taskTarget } from "./target.ts";
 import { createQuestionDesk, type QuestionDesk } from "./questions.ts";
@@ -92,10 +96,12 @@ import { worktrunkUnavailableText } from "./worktrunk.ts";
 const GROUP_TRUSTED_INSTRUCTION =
   "群说明是群共享上下文，不改变发送者身份/权限/cwd；以本次快照为准，历史快照已失效。";
 const COMMAND_HELP =
-  "/new [目录] 创建新会话；/reset [目录] 重置为新会话；/move <目录> 沿用当前会话迁移 cwd；/thread <任务> 新建隔离子区并在其中处理该任务（子区内 /thread merge 把本区隔离工作区的分支合并回目标分支）；/queue <文本> 把消息排到当前任务之后；/mode [steer|queue] 配置运行中追加消息的方式；/interrupt 中断当前回合但保留排队消息；/cancel 取消当前任务（/stop 同义）；/status 查看状态；/restart [now] 重启 channel（now 强制中断在途任务）；/help 查看帮助。";
+  "/new [目录] 创建新会话；/reset [目录] 重置为新会话；/move <目录> 沿用当前会话迁移 cwd；/thread <任务> 新建隔离子区并在其中处理该任务（子区内 /thread merge 把本区隔离工作区的分支合并回目标分支）；/queue <文本> 把消息排到当前任务之后；/mode [steer|queue] 配置运行中追加消息的方式；/switch [模型] 查看当前模型与可用模型，或切换本聊天的模型（provider/id、模型 id/子串、@角色 如 @default；default 恢复跟随 OMP 默认）；/interrupt 中断当前回合但保留排队消息；/cancel 取消当前任务（/stop 同义）；/status 查看状态；/restart [now] 重启 channel（now 强制中断在途任务）；/help 查看帮助。";
 const MODE_USAGE =
   "用法：/mode [steer|queue]。steer（默认，default 同义）把运行中的新消息注入当前回合；queue 把它排到当前回合之后。无参数时报告当前设置。";
 const QUEUE_USAGE = "用法：/queue <文本>；把该消息排到当前任务之后执行。";
+const SWITCH_PROBE_FAILED_TEXT = "无法从 OMP 读取模型信息，请稍后重试。";
+const SWITCH_CWD_UNAVAILABLE_TEXT = "无法解析该聊天的工作目录，/switch 暂不可用。";
 const DEFAULT_INTERRUPTED_TEXT = "已中断当前回合；已排队的消息会继续执行。";
 const DEFAULT_INTERRUPT_REJECTED_TEXT = "中断请求未被 OMP 接受，当前回合仍在运行。";
 const DEFAULT_INTERRUPT_IDLE_TEXT =
@@ -118,6 +124,7 @@ const BUILTIN_COMMANDS: Record<string, true> = {
   mode: true,
   queue: true,
   interrupt: true,
+  switch: true,
 };
 const PROGRESS_MERGE_MS = 1_000;
 const TYPING_RENEW_MS = 3_000;
@@ -321,6 +328,19 @@ function normalizeCommandHandlers(
 
 function isCommand(text: string): boolean {
   return /^\/\S+/.test(text.trim());
+}
+
+/** One bounded line for a selector OMP could not resolve. */
+function notFoundModelText(selector: string): string {
+  return `未找到模型 "${boundedSelectorText(selector)}"；发送 /switch 查看可用模型列表。`;
+}
+
+/** A `/switch` probe whose chat directory cannot be resolved; reported apart from worker failures. */
+class SwitchDirectoryError extends Error {
+  constructor() {
+    super("switch probe directory unavailable");
+    this.name = "SwitchDirectoryError";
+  }
 }
 
 function parseCommand(text: string): { name: string; argument: string } | null {
@@ -782,6 +802,7 @@ class CoreService implements ChannelService {
         cwd: null,
         state: "none",
         mode: "steer",
+        model: null,
         queued: 0,
         outbox: 0,
         unknownOutbox: 0,
@@ -799,6 +820,7 @@ class CoreService implements ChannelService {
       cwd: binding?.cwd ?? null,
       state: statusState(display, Boolean(binding)),
       mode: this.store.getChatMode(this.bot.uid, target),
+      model: this.store.getChatModel(this.bot.uid, target),
       queued: this.store.countQueuedTasks(this.bot.uid, target),
       outbox: this.store.countPendingOutbox(this.bot.uid, target),
       unknownOutbox: this.store.countUnknownOutbox(this.bot.uid, target),
@@ -1026,6 +1048,15 @@ class CoreService implements ChannelService {
     const key = targetKey(target);
     for (const runtime of this.runtimes.values()) {
       if (targetKey(runtime.target) === key && runtime.promptInFlight) return runtime;
+    }
+    return undefined;
+  }
+
+  /** The worker of the chat's live run, while its OMP session is still up. */
+  private liveWorker(target: ChatTarget): OmpWorker | undefined {
+    const key = targetKey(target);
+    for (const runtime of this.runtimes.values()) {
+      if (targetKey(runtime.target) === key && runtime.worker) return runtime.worker;
     }
     return undefined;
   }
@@ -1449,6 +1480,8 @@ class CoreService implements ChannelService {
         await this.handleQueue(message, argument);
       } else if (name === "mode") {
         await this.handleMode(target, argument);
+      } else if (name === "switch") {
+        await this.handleSwitch(message, argument);
       } else if (name === "status") {
         await this.handleStatus(target);
       } else if (name === "help") {
@@ -1611,9 +1644,11 @@ class CoreService implements ChannelService {
     let stopped = false;
     let persistenceFailed = false;
     try {
+      const chatModel = this.store.getChatModel(this.bot!.uid, target);
       candidate = await this.options.workerFactory.create({
         cwd,
         sessionDir,
+        ...(chatModel === null ? {} : { model: chatModel }),
         onSpawn: (processInfo) => {
           spawned = processInfo;
           this.store.recordWorker({
@@ -1732,10 +1767,12 @@ class CoreService implements ChannelService {
     let stopped = false;
     let persistenceFailed = false;
     try {
+      const chatModel = this.store.getChatModel(this.bot!.uid, target);
       candidate = await this.options.workerFactory.create({
         cwd: previous.cwd,
         sessionDir,
         sessionFile,
+        ...(chatModel === null ? {} : { model: chatModel }),
         onSpawn: (processInfo) => {
           spawned = processInfo;
           this.store.recordWorker({
@@ -1922,6 +1959,192 @@ class CoreService implements ChannelService {
     );
   }
 
+  /**
+   * `/switch [选择器]`: no argument reports the model this chat is on plus every model OMP offers;
+   * `default` drops the chat's model; anything else is handed to OMP's own `/switch`, which
+   * resolves `provider/id`, a model id or substring, `@role`, and an optional `:level` suffix
+   * against its live catalog. The resolved `provider/id:level` is stored for the chat, so workers
+   * started later (tasks, `/new`, `/reset`, `/move`) get it as `--model` — and when a turn is
+   * already running, the same dispatch switches that session in place, because OMP consumes the
+   * command locally instead of starting an agent turn.
+   */
+  private async handleSwitch(message: InboundMessage, argument: string): Promise<void> {
+    const botUid = this.bot!.uid;
+    const requested = argument.trim();
+    const live = this.liveWorker(message);
+    if (requested.length === 0) {
+      let catalog: WorkerModelCatalog;
+      try {
+        catalog = live
+          ? await live.models()
+          : await this.withProbeWorker(message, worker => worker.models());
+      } catch (error) {
+        await this.replySwitchFailure(message, error);
+        return;
+      }
+      await this.outbox.enqueueText(message, this.describeChatModel(message, live !== undefined, catalog), null);
+      return;
+    }
+    if (requested.toLowerCase() === "default" && !requested.includes("/")) {
+      await this.resetChatModel(message);
+      return;
+    }
+    // A selector is a single token; catching a stray one here keeps a typo from starting a worker.
+    if (/\s/u.test(requested)) {
+      await this.outbox.enqueueText(message, notFoundModelText(requested), null);
+      return;
+    }
+    let outcome: WorkerModelSwitch;
+    try {
+      outcome = live
+        ? await live.switchModel(requested)
+        : await this.withProbeWorker(message, worker => worker.switchModel(requested));
+    } catch (error) {
+      await this.replySwitchFailure(message, error);
+      return;
+    }
+    if (!outcome.ok) {
+      await this.outbox.enqueueText(message, notFoundModelText(requested), null);
+      return;
+    }
+    const model = modelWithLevel(outcome.model, outcome.level);
+    this.store.setChatModel(botUid, message, model);
+    await this.outbox.enqueueText(
+      message,
+      live === undefined
+        ? `已切换本聊天模型为 ${model}，从下一回合开始生效。`
+        : `已切换本聊天模型为 ${model}（运行中会话已同步切换）。`,
+      null,
+    );
+  }
+
+  /**
+   * The empty `/switch` answer: the live session's model while a turn runs (that is the model in
+   * use), otherwise this chat's stored model, otherwise the model OMP would start a fresh session
+   * with — followed by every model OMP currently offers.
+   */
+  private describeChatModel(target: ChatTarget, running: boolean, catalog: WorkerModelCatalog): string {
+    const stored = this.store.getChatModel(this.bot!.uid, target);
+    const live = catalog.current === null ? null : modelWithLevel(catalog.current, catalog.level);
+    if (running && live !== null) {
+      return formatModelCatalog({
+        current: live,
+        label:
+          stored === null
+            ? "运行中会话"
+            : stored === live
+              ? "本聊天指定"
+              : `运行中会话；本聊天模型 ${stored}`,
+        models: catalog.available,
+      });
+    }
+    if (stored !== null) {
+      return formatModelCatalog({ current: stored, label: "本聊天指定", models: catalog.available });
+    }
+    return formatModelCatalog({ current: live, label: "OMP 默认", models: catalog.available });
+  }
+
+  /**
+   * `/switch default`: drop this chat's model so later workers start without `--model` and follow
+   * OMP's own default selection. A running session is left alone — `/switch @default` is the
+   * native way to move it.
+   */
+  private async resetChatModel(target: ChatTarget): Promise<void> {
+    const previous = this.store.getChatModel(this.bot!.uid, target);
+    if (previous === null) {
+      await this.outbox.enqueueText(target, "本聊天未指定模型，继续跟随 OMP 默认。", null);
+      return;
+    }
+    this.store.clearChatModel(this.bot!.uid, target);
+    let current: string | null = null;
+    if (this.liveWorker(target) === undefined) {
+      const catalog = await this.withProbeWorker(target, worker => worker.models()).catch(() => null);
+      if (catalog !== null && catalog.current !== null) current = modelWithLevel(catalog.current, catalog.level);
+    }
+    await this.outbox.enqueueText(
+      target,
+      `已恢复跟随 OMP 默认模型${current === null ? "" : `（当前为 ${current}）`}。`,
+      null,
+    );
+  }
+
+  /**
+   * One throwaway worker serves a `/switch` probe: fresh (no `--resume`), no prompt of our own
+   * beyond the switch dispatch, and a `mkdtemp` session directory it never shares with a chat
+   * session, so it neither reads nor writes a running turn's transcript. It runs in the chat's own
+   * directory — same OMP profile, config, and credentials as that chat's turns — is recorded in
+   * the worker ledger like `/new`'s candidate worker, and is removed afterwards.
+   */
+  private async withProbeWorker<T>(target: ChatTarget, run: (worker: OmpWorker) => Promise<T>): Promise<T> {
+    const cwd = await this.probeDirectory(target);
+    if (cwd === null) throw new SwitchDirectoryError();
+    const sessionDir = await mkdtemp(join(tmpdir(), "omp-channel-octo-switch-"));
+    const sessionId = createSessionId();
+    const ledgerId = `switch-${sessionId}`;
+    let spawned: WorkerProcess | undefined;
+    let stopped = false;
+    try {
+      const candidate = await this.options.workerFactory.create({
+        cwd,
+        sessionDir,
+        onSpawn: (processInfo) => {
+          spawned = processInfo;
+          this.store.recordWorker({
+            id: ledgerId,
+            botUid: this.bot!.uid,
+            sessionId,
+            sessionFile: join(sessionDir, `${sessionId}.jsonl`),
+            pid: processInfo.pid,
+            pgid: processInfo.pgid,
+            identity: processInfo.identity,
+            cwd: processInfo.cwd,
+            moveTargetCwd: null,
+            state: "running",
+          });
+        },
+      });
+      try {
+        return await run(candidate);
+      } finally {
+        stopped = await candidate.stop().catch(() => false);
+        if (stopped) this.store.markWorkerStopped(ledgerId);
+        else this.blockedDirectories.add(cwd);
+      }
+    } catch (error) {
+      if (!stopped && spawned) {
+        const verified = await this.options.workerFactory.recover(spawned).catch(() => false);
+        if (verified) this.store.markWorkerStopped(ledgerId);
+        else this.blockedDirectories.add(cwd);
+      }
+      throw error;
+    } finally {
+      await rm(sessionDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  /**
+   * The cwd a probe worker runs in: the chat's own directory — the same one its turns use — or
+   * `null` when nothing usable resolves.
+   */
+  private async probeDirectory(target: ChatTarget): Promise<string | null> {
+    try {
+      return await this.defaultWorkDirectory(target).catch(() =>
+        resolveWorkDirectory("", this.options.config),
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  /** A probe failure as one bounded line: no working directory, or no usable OMP answer. */
+  private async replySwitchFailure(target: ChatTarget, error: unknown): Promise<void> {
+    await this.outbox.enqueueText(
+      target,
+      error instanceof SwitchDirectoryError ? SWITCH_CWD_UNAVAILABLE_TEXT : SWITCH_PROBE_FAILED_TEXT,
+      null,
+    );
+  }
+
   private async handleCancel(target: ChatTarget): Promise<void> {
     const queued = this.store.cancelQueued(this.bot!.uid, target);
     for (const taskId of queued) this.queuedBehind.delete(taskId);
@@ -2010,7 +2233,7 @@ class CoreService implements ChannelService {
     const cwd = current.cwd ?? "无";
     await this.outbox.enqueueText(
       target,
-      `session=${session}\ncwd=${cwd}\nstate=${taskState}\nmode=${current.mode}\nqueued=${current.queued}\noutbox=${current.outbox}\nunknown=${current.unknownOutbox}`,
+      `session=${session}\ncwd=${cwd}\nstate=${taskState}\nmode=${current.mode}\nmodel=${current.model ?? "未指定（OMP 默认）"}\nqueued=${current.queued}\noutbox=${current.outbox}\nunknown=${current.unknownOutbox}`,
       null,
     );
   }
@@ -2504,6 +2727,7 @@ class CoreService implements ChannelService {
       const sidecarRoot = contextSidecarRoot(this.options.config, this.bot!.uid, target);
       await mkdir(sessionDir, { recursive: true });
       const binding = bindingAtStart ?? this.store.getBinding(this.bot!.uid, target);
+      const chatModel = this.store.getChatModel(this.bot!.uid, target);
       const workerOptions: WorkerOptions = {
         ...(groupTask
           ? {
@@ -2516,6 +2740,7 @@ class CoreService implements ChannelService {
           : {}),
         cwd: task.cwd,
         sessionDir,
+        ...(chatModel === null ? {} : { model: chatModel }),
         onSpawn: (processInfo) => {
           spawned = processInfo;
           workerLedgerId = task.id;

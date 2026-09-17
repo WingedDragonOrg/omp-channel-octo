@@ -9,7 +9,7 @@ import { dirname } from "node:path";
 import type { ChatAppendMode, ChatTarget } from "./contracts.ts";
 import type { BindingRecord, InboundClaim, TaskRecord, RestartNoticeRecord, ProgressCardRecord, OutboxRecord, OutboxInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord } from "./store-records.ts";
 import { applySchema } from "./store-schema.ts";
-import { claimOwnerEnrollment, ensureBinding, getBinding, getBotUid, getChatMode, getOwnerId, grantAllowedChat, hasOwnerEnrollment, listAllowedChats, setBotUid, setChatMode, setOwnerId, updateBindingSession } from "./store-chats.ts";
+import { claimOwnerEnrollment, clearChatModel, ensureBinding, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, grantAllowedChat, hasOwnerEnrollment, listAllowedChats, setBotUid, setChatMode, setChatModel, setOwnerId, updateBindingSession } from "./store-chats.ts";
 import { acceptTask, addRestartNotice, cancelQueued, claimCommand, clearRestartNotice, completeCommand, countQueuedTasks, failCommand, getActiveTask, getLatestTask, getTask, listQueuedTasks, listRestartNotices, markCancelled, markCompleted, markFailed, markInterrupted, markInterruptedOnStart, markStarted, releaseClaim } from "./store-tasks.ts";
 import { clearProgressCard, listProgressCards, listWorkerLedger, markWorkerMoveTarget, markWorkerStopped, recordProgressCardAttempt, recordWorker, saveProgressCard } from "./store-cards.ts";
 import { advanceHistoryLedger, clearContextLedger, commitContextInjection, commitHistoryInjection, getContextLedger, getHistoryLedger, prepareContextInjection, prepareHistoryInjection, pruneHistoryLedger } from "./store-ledgers.ts";
@@ -117,6 +117,19 @@ export class ChannelStore {
 
   setChatMode(botUid: string, target: ChatTarget, mode: ChatAppendMode): void {
     setChatMode(this.db, botUid, target, mode);
+  }
+
+  /** The chat's `provider/id` model, or null when it follows OMP's default. */
+  getChatModel(botUid: string, target: ChatTarget): string | null {
+    return getChatModel(this.db, botUid, target);
+  }
+
+  setChatModel(botUid: string, target: ChatTarget, model: string): void {
+    setChatModel(this.db, botUid, target, model);
+  }
+
+  clearChatModel(botUid: string, target: ChatTarget): void {
+    clearChatModel(this.db, botUid, target);
   }
 
   /**

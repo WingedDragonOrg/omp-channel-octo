@@ -38,6 +38,8 @@ import type {
   ThreadWorkspaceRequest,
   WorkerEvent,
   WorkerFactory,
+  WorkerModelCatalog,
+  WorkerModelSwitch,
   WorkerOptions,
   WorkerProcess,
   WorktreeMergeRequest,
@@ -932,14 +934,47 @@ export interface PromptRecord {
   boundSessionId?: string;
 }
 
+/**
+ * Stand-in for OMP's `/switch` resolution: `@role` through the fixture's role map, then an exact
+ * `provider/id`, then a unique model id, then a unique substring, with an optional `:level`
+ * suffix. Anything unresolvable (including an ambiguous match) is `null` — OMP's answer for a
+ * selector it cannot pin down.
+ */
+function resolveFixtureModel(
+  selector: string,
+  roles: Readonly<Record<string, { model: string; level: string | null }>>,
+  catalog: WorkerModelCatalog,
+): { model: string; level: string | null } | null {
+  const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+  const trimmed = selector.trim();
+  if (trimmed.startsWith("@")) {
+    const role = roles[trimmed.slice(1).toLowerCase()];
+    return role === undefined ? null : { ...role };
+  }
+  const level = levels.find(candidate => trimmed.endsWith(`:${candidate}`));
+  const body = level === undefined ? trimmed : trimmed.slice(0, -level.length - 1);
+  if (body.length === 0) return null;
+  const matches = [
+    catalog.available.filter(model => `${model.provider}/${model.id}` === body),
+    catalog.available.filter(model => model.id === body),
+    catalog.available.filter(model => model.id.includes(body) || `${model.provider}/${model.id}`.includes(body)),
+  ].find(candidates => candidates.length > 0);
+  if (matches === undefined || matches.length !== 1) return null;
+  const match = matches[0]!;
+  return { model: `${match.provider}/${match.id}`, level: level ?? catalog.level };
+}
+
 class FixtureWorker implements OmpWorker {
   readonly sessionFile: string;
   readonly sessionId: string;
   stopped = false;
   /** How often the host asked this turn to abort (`/interrupt`, `/cancel`, a question stop). */
   abortCalls = 0;
+  /** Selectors this session was asked to switch to, in order — the native `/switch` dispatches. */
+  readonly switchDispatches: string[] = [];
 
   private currentCwd: string;
+  private switchedModel: { model: string; level: string | null } | undefined;
   private readonly stopCallbacks = new Set<() => void>();
   private promptInFlight = false;
   private abortSignaled = false;
@@ -953,6 +988,8 @@ class FixtureWorker implements OmpWorker {
     private readonly promptHandler: FakePrompt,
     private readonly recordPrompt: (record: PromptRecord) => void,
     sessionId: string,
+    private readonly catalog: () => WorkerModelCatalog,
+    private readonly resolveModel: (selector: string) => { model: string; level: string | null } | null,
   ) {
     this.sessionFile = options.sessionFile ?? join(options.sessionDir, `${sessionId}.session`);
     let persistedSessionId: string | undefined;
@@ -997,6 +1034,25 @@ class FixtureWorker implements OmpWorker {
     const cwd = await realpath(header.cwd as string);
     const sessionFile = await realpath(this.sessionFile);
     return { sessionId: this.sessionId, sessionFile, cwd };
+  }
+
+  /** Mirrors OMP: a worker started with `--model` reports that model, and `/switch` moves it. */
+  async models(): Promise<WorkerModelCatalog> {
+    const catalog = this.catalog();
+    return {
+      current: this.switchedModel?.model ?? this.options.model ?? catalog.current,
+      level: this.switchedModel?.level ?? catalog.level,
+      available: catalog.available.map(model => ({ ...model })),
+    };
+  }
+
+  /** Mirrors OMP's builtin `/switch`: the selector resolves against the catalog or is rejected. */
+  async switchModel(selector: string): Promise<WorkerModelSwitch> {
+    this.switchDispatches.push(selector);
+    const resolved = this.resolveModel(selector);
+    if (resolved === null) return { ok: false };
+    this.switchedModel = resolved;
+    return { ok: true, model: resolved.model, level: resolved.level };
   }
 
   private async writeSessionHeader(previousSessionFiles: readonly string[] = []): Promise<void> {
@@ -1152,6 +1208,29 @@ class FixtureWorker implements OmpWorker {
 export class FakeWorkerFactory implements WorkerFactory {
   readonly workers: FixtureWorker[] = [];
   readonly prompts: PromptRecord[] = [];
+  /** Options every creation was asked for, in call order, for model and target assertions. */
+  readonly creations: WorkerOptions[] = [];
+
+  /**
+   * Catalog fixture workers report for `/switch`. A worker created with `WorkerOptions.model`
+   * reports that model as `current`, mirroring OMP's `--model` startup; a successful `/switch`
+   * dispatch moves the session instead.
+   */
+  catalog: WorkerModelCatalog = {
+    current: "fixture/default",
+    level: null,
+    available: [
+      { provider: "fixture", id: "default", name: "Fixture Default" },
+      { provider: "fixture", id: "fast", name: "Fixture Fast" },
+      { provider: "other", id: "fast", name: "Other Fast" },
+    ],
+  };
+
+  /** Role aliases the fixture `/switch` resolves, standing in for OMP's `settings.modelRoles`. */
+  roles: Record<string, { model: string; level: string | null }> = {
+    fast: { model: "other/fast", level: "max" },
+    default: { model: "fixture/default", level: null },
+  };
 
   private nextSessionId = 1;
   private readonly promptWaiters: Array<{
@@ -1166,6 +1245,7 @@ export class FakeWorkerFactory implements WorkerFactory {
   ) {}
 
   async create(options: WorkerOptions): Promise<OmpWorker> {
+    this.creations.push(options);
     const worker = new FixtureWorker(
       options,
       this.promptHandler,
@@ -1178,6 +1258,8 @@ export class FakeWorkerFactory implements WorkerFactory {
         }
       },
       String(this.nextSessionId++),
+      () => this.catalog,
+      selector => resolveFixtureModel(selector, this.roles, this.catalog),
     );
     this.workers.push(worker);
     return worker;

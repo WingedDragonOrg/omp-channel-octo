@@ -12,6 +12,8 @@ import type {
   PromptContext,
   WorkerEvent,
   WorkerFactory,
+  WorkerModelCatalog,
+  WorkerModelSwitch,
   WorkerOptions,
   WorkerProcess,
 } from "../src/contracts";
@@ -69,6 +71,14 @@ class WorkerProxy implements OmpWorker {
 
   refreshState(): Promise<ProjectSessionState> {
     return this.inner.refreshState();
+  }
+
+  models(): Promise<WorkerModelCatalog> {
+    return this.inner.models();
+  }
+
+  switchModel(selector: string): Promise<WorkerModelSwitch> {
+    return this.inner.switchModel(selector);
   }
 
   stop(): Promise<boolean> {

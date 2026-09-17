@@ -340,9 +340,38 @@ export interface WorkerOptions {
   cwd: string;
   sessionDir: string;
   sessionFile?: string;
+  /**
+   * Canonical `provider/id` the worker starts with (`--model`). It wins over the model recorded in
+   * a resumed session, so a chat's switch applies from the next started turn on.
+   */
+  model?: string;
   contextScope?: WorkerContextScope;
   onSpawn: (process: WorkerProcess) => void;
 }
+
+/** One model OMP can use right now; `provider`/`id` are the canonical selector parts. */
+export interface WorkerModelInfo {
+  provider: string;
+  id: string;
+  name?: string;
+}
+
+/** What a single probe of the worker reports for the `/switch` command. */
+export interface WorkerModelCatalog {
+  /** The live session's model as `provider/id`; null when OMP reports none. */
+  current: string | null;
+  /** The session's thinking level (`off`…`max`); null when OMP reports none. */
+  level: string | null;
+  available: WorkerModelInfo[];
+}
+
+/**
+ * Outcome of handing a selector to OMP's own `/switch`: either the resolved model and thinking
+ * level the session now runs, or a selector OMP rejected (session unchanged).
+ */
+export type WorkerModelSwitch =
+  | { ok: true; model: string; level: string | null }
+  | { ok: false };
 
 export interface HostTool {
   name: string;
@@ -376,6 +405,14 @@ export interface OmpWorker {
   /** Aborts the current OMP turn without clearing its queued messages or killing the worker. */
   abortTurn(): Promise<void>;
   refreshState(): Promise<ProjectSessionState>;
+  /** Reads the live session's model and the models OMP currently offers, without prompting. */
+  models(): Promise<WorkerModelCatalog>;
+  /**
+   * Hands a model selector to OMP's own `/switch`, which resolves it against the live catalog
+   * (`provider/id`, model id or substring, `@role`, an optional `:level` suffix) and switches
+   * this session. Works mid-turn: the dispatch is not an agent prompt.
+   */
+  switchModel(selector: string): Promise<WorkerModelSwitch>;
   stop(): Promise<boolean>;
 }
 
@@ -439,6 +476,8 @@ export interface ChannelStatus {
   cwd: string | null;
   state: ChatExecutionState;
   mode: ChatAppendMode;
+  /** The chat's `provider/id` model, or null when it follows OMP's default. */
+  model: string | null;
   queued: number;
   outbox: number;
   unknownOutbox: number;

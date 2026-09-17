@@ -76,6 +76,7 @@ async function withHarness<T>(
 		sessionFile?: string;
 		envReport?: boolean;
 		cliEnv?: () => Record<string, string> | undefined;
+		model?: string;
 	} = {},
 ): Promise<T> {
 	const tempDir = await realpath(await mkdtemp(join(tmpdir(), "omp-rpc-worker-")));
@@ -118,6 +119,7 @@ async function withHarness<T>(
 		cwd: tempDir,
 		sessionDir: tempDir,
 		...(requestedSessionFile === undefined ? {} : { sessionFile: requestedSessionFile }),
+		...(options.model === undefined ? {} : { model: options.model }),
 		onSpawn: processInfo => {
 			spawned = processInfo;
 		},
@@ -278,6 +280,98 @@ describe("OMP RPC worker", () => {
 			expect(argumentValue(startup.argv, "--resume")).toBe(join(harness.tempDir, "resume.jsonl"));
 			expect(commandTypes(entries)).not.toContain("new_session");
 		}, { sessionFile: "resume.jsonl" });
+	});
+
+	test("starts with the chat's model and reads the model catalog for /switch", async () => {
+		await withHarness(
+			"normal",
+			async harness => {
+				const catalog = await harness.worker.models();
+				expect(catalog.current).toBe("deepminer/tencent/glm-5.3");
+				expect(catalog.level).toBe("xhigh");
+				// Malformed entries are skipped; an empty name is not reported as one.
+				expect(catalog.available).toEqual([
+					{ provider: "fixture", id: "default", name: "Fixture Default" },
+					{ provider: "fixture", id: "fast" },
+					{ provider: "fixture", id: "nested/model", name: "Nested" },
+					{ provider: "other", id: "fast", name: "Other Fast" },
+				]);
+				const entries = await readLog(harness.logPath);
+				expect(argumentValue(startupEntry(entries).argv, "--model")).toBe("deepminer/tencent/glm-5.3");
+				expect(commandTypes(entries)).toContain("get_available_models");
+			},
+			{ model: "deepminer/tencent/glm-5.3" },
+		);
+	});
+
+	test("keeps --model together with --resume so a resumed turn keeps the chat's model", async () => {
+		await withHarness(
+			"normal",
+			async harness => {
+				const catalog = await harness.worker.models();
+				expect(catalog.current).toBe("fixture/fast");
+				const startup = startupEntry(await readLog(harness.logPath));
+				expect(argumentValue(startup.argv, "--resume")).toBe(join(harness.tempDir, "resumed.jsonl"));
+				expect(argumentValue(startup.argv, "--model")).toBe("fixture/fast");
+			},
+			{ sessionFile: "resumed.jsonl", model: "fixture/fast" },
+		);
+	});
+
+	test("reports an empty catalog when the deployment offers no models", async () => {
+		await withHarness("no-models", async harness => {
+			const catalog = await harness.worker.models();
+			expect(catalog.current).toBe("fixture/default");
+			expect(catalog.available).toEqual([]);
+		});
+	});
+
+	test("switchModel hands the selector to OMP's own /switch and reports the resolved model", async () => {
+		await withHarness("normal", async harness => {
+			// A model selector keeps the session's level when it names none.
+			await expect(harness.worker.switchModel("nested/model")).resolves.toEqual({
+				ok: true,
+				model: "fixture/nested/model",
+				level: "xhigh",
+			});
+			// A role alias resolves through OMP's own role mapping, level included.
+			await expect(harness.worker.switchModel("@fast")).resolves.toEqual({
+				ok: true,
+				model: "other/fast",
+				level: "max",
+			});
+			const catalog = await harness.worker.models();
+			expect(catalog.current).toBe("other/fast");
+			expect(catalog.level).toBe("max");
+			// A selector OMP cannot resolve leaves the session as it was.
+			await expect(harness.worker.switchModel("nope")).resolves.toEqual({ ok: false });
+			expect((await harness.worker.models()).current).toBe("other/fast");
+			const prompts = (await readLog(harness.logPath)).filter(entry => entry.kind === "prompt");
+			expect(prompts.map(entry => entry.message)).toEqual(["/switch nested/model", "/switch @fast", "/switch nope"]);
+		});
+	});
+
+	test("switchModel works while a turn is streaming and leaves that turn running", async () => {
+		await withHarness("steer", async harness => {
+			const events: WorkerEvent[] = [];
+			const prompt = harness.worker.prompt("start work", event => events.push(event));
+			await waitUntil(() => events.some(event => event.type === "text" && event.text === "fixture first turn"));
+
+			await expect(harness.worker.switchModel("@fast")).resolves.toEqual({
+				ok: true,
+				model: "other/fast",
+				level: "max",
+			});
+			expect((await harness.worker.models()).current).toBe("other/fast");
+
+			// The run itself is untouched: it still takes the steering frame and ends normally.
+			await harness.worker.steer("also check the logs");
+			await prompt;
+			const finals = events
+				.filter((event): event is Extract<WorkerEvent, { type: "text" }> => event.type === "text" && event.final)
+				.map(event => event.text);
+			expect(finals).toEqual(["fixture first turn", "fixture steered turn: also check the logs"]);
+		});
 	});
 
 	test("steer injects a message into the streaming turn until that run ends", async () => {

@@ -164,6 +164,37 @@ export function setChatMode(db: Database, botUid: string, target: ChatTarget, mo
   );
 }
 
+/**
+ * The chat's `provider/id` model, or null when it follows OMP's default. Like `chat_modes`, the
+ * row is a per-chat preference independent of the session binding, so replacing or losing a
+ * binding never changes the chat's model.
+ */
+export function getChatModel(db: Database, botUid: string, target: ChatTarget): string | null {
+  const row = query(db,
+    `SELECT model FROM chat_models WHERE bot_uid = ? AND ${targetWhere(target)}`,
+    [botUid, ...targetValues(target)],
+  )[0];
+  if (!row) return null;
+  const model = asString(row.model).trim();
+  return model.length > 0 ? model : null;
+}
+
+export function setChatModel(db: Database, botUid: string, target: ChatTarget, model: string): void {
+  run(db,
+    `INSERT INTO chat_models(bot_uid, channel_type, channel_id, model, updated_at)
+     VALUES(?, ?, ?, ?, ?)
+     ON CONFLICT(bot_uid, channel_type, channel_id) DO UPDATE SET model = excluded.model, updated_at = excluded.updated_at`,
+    [botUid, target.channelType, target.channelId, model, Date.now()],
+  );
+}
+
+export function clearChatModel(db: Database, botUid: string, target: ChatTarget): void {
+  run(db,
+    `DELETE FROM chat_models WHERE bot_uid = ? AND ${targetWhere(target)}`,
+    [botUid, ...targetValues(target)],
+  );
+}
+
 export function updateBindingSession(db: Database, botUid: string, target: ChatTarget, sessionId: string, sessionFile: string | null): void {
   run(db,
     `UPDATE chats SET session_id = ?, session_file = ?, updated_at = ? WHERE bot_uid = ? AND ${targetWhere(target)}`,

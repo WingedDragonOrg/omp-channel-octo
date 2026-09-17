@@ -250,6 +250,14 @@ export function applySchema(db: Database): void {
       updated_at INTEGER NOT NULL,
       PRIMARY KEY(bot_uid, channel_type, channel_id)
     );
+    CREATE TABLE IF NOT EXISTS chat_models (
+      bot_uid TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
+      channel_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(bot_uid, channel_type, channel_id)
+    );
     CREATE TABLE IF NOT EXISTS progress_cards (${PROGRESS_CARD_COLUMNS}
     );
     CREATE TABLE IF NOT EXISTS bot_event_cursor (
