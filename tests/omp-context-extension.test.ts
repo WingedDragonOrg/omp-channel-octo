@@ -150,7 +150,7 @@ async function readSidecar(sidecarPath: string): Promise<Sidecar & Record<string
   return JSON.parse(await readFile(sidecarPath, "utf8")) as Sidecar & Record<string, unknown>;
 }
 
-function captureHandlers(): { beforeAgentStart: Handler; sessionCompacting: Handler } {
+function captureHandlers(): { beforeAgentStart: Handler; sessionCompacting: Handler; modelContext?: Handler } {
   const handlers = new Map<string, Handler>();
   const api = {
     on(event: string, handler: Handler): void {
@@ -166,7 +166,8 @@ function captureHandlers(): { beforeAgentStart: Handler; sessionCompacting: Hand
   if (beforeAgentStart === undefined || sessionCompacting === undefined) {
     throw new Error("context extension did not register both lifecycle handlers");
   }
-  return { beforeAgentStart, sessionCompacting };
+  const modelContext = handlers.get("context");
+  return { beforeAgentStart, sessionCompacting, ...(modelContext ? { modelContext } : {}) };
 }
 
 function extensionContext(sessionId: string, abort: () => void): Record<string, unknown> {
@@ -203,6 +204,33 @@ function recordValue(value: unknown): Record<string, unknown> {
     ? (value as Record<string, unknown>)
     : {};
 }
+
+test("a native continuation injects pending shared context on every model call and prepares its receipt", async () => {
+  const sidecar = sidecarFor("version-change", {content: "Current retry instructions", present: true, version: 9}, "pending", "retry-attempt", 8);
+  await withSidecar(sidecar, async (_root, path) => {
+    const { modelContext } = captureHandlers();
+    const ctx = extensionContext(SESSION_ID, () => { throw new Error("unexpected abort"); });
+    const messages = [{role: "user", content: "original failed request", timestamp: 1}];
+    for (let call = 0; call < 2; call++) {
+      const result = recordValue(await modelContext?.({type: "context", messages}, ctx));
+      const received = result.messages as Array<Record<string, unknown>> | undefined;
+      expect(received?.slice(0, -1)).toEqual(messages);
+      expect(received?.at(-1)).toMatchObject({role: "developer", content: expect.stringContaining("Current retry instructions")});
+      expect(recordValue((await readSidecar(path)).prepared)).toMatchObject({attemptId: "retry-attempt", sessionId: SESSION_ID, version: 9});
+    }
+    expect(messages).toEqual([{role: "user", content: "original failed request", timestamp: 1}]);
+    expect(await modelContext?.({type: "context", messages}, extensionContext(SUBAGENT_SESSION_ID, () => {}))).toBeUndefined();
+  });
+});
+
+test("the model context hook does not duplicate a snapshot already injected by before_agent_start", async () => {
+  await withSidecar(sidecarFor("initial", {content: "Shared rules", present: true, version: 1}, "pending", "normal-attempt"), async () => {
+    const { beforeAgentStart, modelContext } = captureHandlers();
+    const ctx = extensionContext(SESSION_ID, () => {});
+    await beforeAgentStart({systemPrompt: ["base"]}, ctx);
+    expect(await modelContext?.({type: "context", messages: []}, ctx)).toBeUndefined();
+  });
+});
 
 test("injects initial and version-change snapshots at system level and records matching prepared receipts", async () => {
   const initialSnapshot: Snapshot = {

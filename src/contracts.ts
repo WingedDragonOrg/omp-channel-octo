@@ -369,11 +369,11 @@ export interface LocalCommandEvent {
 }
 
 /**
- * One upstream `notify` UI notification surfaced during a run (e.g. the /autoresearch
- * extension's local-only updates). `messageId` preserves the upstream frame id as validated
- * (nonempty, control-free, at most 200 UTF-16 code units); `text` is the sanitized,
- * bounded message. `level` follows the upstream severity, unknown or missing levels
- * falling back to `info`.
+ * One upstream UI notification or native command output surfaced during a run.
+ * For `notify`, `messageId` preserves the validated upstream frame id (nonempty,
+ * control-free, at most 200 UTF-16 code units); native command output gets a
+ * request-scoped generated id. `text` is sanitized and bounded. `level` follows
+ * upstream severity, with native command output and unknown levels using `info`.
  */
 export interface WorkerNoticeEvent {
   type: "notice";

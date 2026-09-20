@@ -122,6 +122,7 @@ class RpcWorker implements OmpWorker {
 	#stopping = false;
 	#stopPromise: Promise<boolean> | undefined;
 	#requestCounter = 0;
+	#commandOutputCounter = 0;
 	#pending = new Map<string, PendingResponse>();
 	#activePrompt: PromptRun | undefined;
 	/** True from prompt acknowledgement until the terminal `agent_end` settles the run. */
@@ -565,6 +566,18 @@ class RpcWorker implements OmpWorker {
 		}
 		if (frame.type === "config_update") {
 			this.#handleConfigUpdate(frame);
+			return;
+		}
+		if (frame.type === "command_output") {
+			const active = this.#activePrompt;
+			// Native builtins output before acknowledging their prompt. Frames have no request
+			// id, so only collect during this prompt's dispatch, not a mid-turn /switch probe.
+			if (active && this.#pending.has(active.requestId)) {
+				this.#handleNotice({
+					id: `command:${active.requestId}:${++this.#commandOutputCounter}`,
+					message: frame.text,
+				});
+			}
 			return;
 		}
 		const active = this.#activePrompt;

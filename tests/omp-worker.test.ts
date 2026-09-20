@@ -477,6 +477,7 @@ describe("OMP RPC worker", () => {
 				.filter((event): event is Extract<WorkerEvent, { type: "text" }> => event.type === "text" && event.final)
 				.map(event => event.text);
 			expect(finals).toEqual(["fixture first turn", "fixture steered turn: also check the logs"]);
+			expect(events.filter(event => event.type === "notice")).toEqual([]);
 		});
 	});
 
@@ -574,6 +575,28 @@ describe("OMP RPC worker", () => {
 			// completion replay on a settled run and must not open a second local command.
 			expect(events.filter(event => event.type === "local_command")).toEqual([{ type: "local_command" }]);
 			expect(events).toHaveLength(1);
+		});
+	});
+
+	test("/retry delivers its native receipt and waits for regenerated output, or completes locally when empty", async () => {
+		await withHarness("retry", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("/retry", event => events.push(event));
+			expect(events.filter(event => event.type === "notice")).toEqual([
+				{ type: "notice", messageId: expect.any(String), text: "Retrying the last failed turn.", level: "info" },
+			]);
+			expect(events.some(event => event.type === "text" && event.final && event.text === "fixture completed")).toBe(true);
+			expect(events.some(event => event.type === "local_command")).toBe(false);
+
+			const empty: WorkerEvent[] = [];
+			await harness.worker.prompt("/retry", event => empty.push(event));
+			expect(empty).toEqual([
+				{ type: "notice", messageId: expect.any(String), text: "Nothing to retry.", level: "info" },
+				{ type: "local_command" },
+			]);
+			const first = events.find(event => event.type === "notice")!;
+			const second = empty.find(event => event.type === "notice")!;
+			expect(first.messageId).not.toBe(second.messageId);
 		});
 	});
 

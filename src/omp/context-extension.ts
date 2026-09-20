@@ -25,7 +25,7 @@ type ExtensionContext = {
 };
 type ExtensionHandler = (event: ExtensionEvent, context: ExtensionContext) => unknown | Promise<unknown>;
 type ExtensionApi = {
-	on(event: "before_agent_start" | "session.compacting", handler: ExtensionHandler): void;
+	on(event: "before_agent_start" | "context" | "session.compacting", handler: ExtensionHandler): void;
 };
 
 type ExtensionScope = {
@@ -184,7 +184,11 @@ function formatCompactionContext(sidecar: ContextSidecar): string {
 	].join("\n");
 }
 
-async function beforeAgentStart(event: ExtensionEvent, context: ExtensionContext): Promise<{ systemPrompt: string[] } | undefined> {
+async function turnSidecar(event: ExtensionEvent, context: ExtensionContext): Promise<{
+	scope: ExtensionScope;
+	sessionId: string;
+	sidecar: ContextSidecar;
+} | undefined> {
 	let scope: ExtensionScope | undefined;
 	try {
 		scope = readScope();
@@ -203,19 +207,27 @@ async function beforeAgentStart(event: ExtensionEvent, context: ExtensionContext
 	const bound = await boundSessionFor(scope, context);
 	if (bound !== undefined && bound !== sessionId) return undefined;
 	const sidecar = validateSidecar(await sidecarForScope(scope, sessionId, context), scope, sessionId, context);
-	const originalSystemPrompt = systemPromptFromEvent(event, context);
-	if (sidecar.injectionDecision === "unchanged") return { systemPrompt: [...originalSystemPrompt] };
+	return { scope, sessionId, sidecar };
+}
 
+async function prepareSharedContext(scope: ExtensionScope, sidecar: ContextSidecar, context: ExtensionContext): Promise<string> {
 	// The receipt is the extension's acknowledgement that it validated and
 	// rendered this exact sidecar.  It is published before returning any body.
-	const path = contextSidecarPath(scope.root, sessionId);
+	const path = contextSidecarPath(scope.root, sidecar.sessionId);
 	try {
-		const receipt = preparedReceiptFor(sidecar);
-		await writePreparedReceipt(path, receipt);
+		if (!sidecar.prepared) await writePreparedReceipt(path, preparedReceiptFor(sidecar));
 	} catch (error) {
 		return abortAndThrow(context, error instanceof Error ? error.message : "prepared receipt could not be written");
 	}
-	const formatted = formatSharedContext(sidecar.snapshot, sidecar.injectionDecision, sidecar.previousVersion);
+	return formatSharedContext(sidecar.snapshot, sidecar.injectionDecision, sidecar.previousVersion);
+}
+
+async function beforeAgentStart(event: ExtensionEvent, context: ExtensionContext): Promise<{ systemPrompt: string[] } | undefined> {
+	const turn = await turnSidecar(event, context);
+	if (!turn) return undefined;
+	const originalSystemPrompt = systemPromptFromEvent(event, context);
+	if (turn.sidecar.injectionDecision === "unchanged") return { systemPrompt: [...originalSystemPrompt] };
+	const formatted = await prepareSharedContext(turn.scope, turn.sidecar, context);
 	return { systemPrompt: [...originalSystemPrompt, formatted] };
 }
 
@@ -254,6 +266,25 @@ async function sessionCompacting(event: ExtensionEvent, context: ExtensionContex
 }
 
 export default function contextExtension(api: ExtensionApi): void {
-	api.on("before_agent_start", beforeAgentStart);
+	let continuationAttempt: string | undefined;
+	api.on("before_agent_start", async (event, context) => {
+		const result = await beforeAgentStart(event, context);
+		if (result) continuationAttempt = undefined;
+		return result;
+	});
+	// Native retry continues the agent without before_agent_start. `context` runs before
+	// each model call, and its developer message is transient rather than a new user turn.
+	api.on("context", async (event, context) => {
+		const turn = await turnSidecar(event, context);
+		if (!turn || turn.sidecar.injectionDecision === "unchanged") return undefined;
+		const key = `${turn.sessionId}:${turn.sidecar.attemptId}`;
+		if (turn.sidecar.prepared && continuationAttempt !== key) return undefined;
+		if (!Array.isArray(event.messages)) return abortAndThrow(context, "context messages are invalid");
+		const content = await prepareSharedContext(turn.scope, turn.sidecar, context);
+		continuationAttempt = key;
+		return {
+			messages: [...event.messages, { role: "developer", content, timestamp: Date.now() }],
+		};
+	});
 	api.on("session.compacting", sessionCompacting);
 }

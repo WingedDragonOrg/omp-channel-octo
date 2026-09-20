@@ -14,6 +14,7 @@ type Frame = Record<string, unknown>;
 type Scenario =
 	| "normal"
 	| "local"
+	| "retry"
 	| "error"
 	| "same-chunk-error"
 	| "message-end"
@@ -275,6 +276,7 @@ let streaming = false;
  * `prompt_result` as a stale frame; consumed (and cleared) by the next "run goal" prompt.
  */
 let staleReplayId: string | undefined;
+let retryAvailable = true;
 /** Subagent subscription level the fixture last accepted; lifecycle frames follow it. */
 let subagentSubscription = "off";
 function persistSessionHeader(): void {
@@ -1376,6 +1378,15 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		emit({ type: "command_output", text: `Session-only model: ${currentModel.provider}/${currentModel.id}.` });
 		emit({ type: "config_update", model: { ...currentModel }, thinkingLevel: currentLevel });
 		response(id, "prompt", { agentInvoked: false });
+		return;
+	}
+	if (scenario === "retry" && message === "/retry") {
+		emit({ type: "command_output", text: retryAvailable ? "Retrying the last failed turn." : "Nothing to retry." });
+		response(id, "prompt", { agentInvoked: retryAvailable });
+		if (retryAvailable) {
+			retryAvailable = false;
+			promptTimer = setTimeout(() => emitAgentTurn(id), 60);
+		}
 		return;
 	}
 	if (scenario === "local") {

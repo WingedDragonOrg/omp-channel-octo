@@ -112,6 +112,7 @@ oco run --config ~/.oco/config/config.json
 | `/mode [steer\|queue]` | 查看或设置新消息的追加方式，默认 `steer`。 |
 | `/switch [模型]` | 查看当前模型与可用列表，或切换并保存本聊天模型。支持 `provider/id`、模型 ID/唯一子串、`@角色` 和 `:level` 后缀。 |
 | `/switch default` | 清除聊天模型设置，后续 worker 跟随 OMP 默认；不改变正在运行的会话模型。 |
+| `/retry` | 由 OMP 重试当前会话上次失败或中止的回合；忙时作为独立任务排队。没有可重试回合时返回 OMP 提示。 |
 | `/interrupt` | 中止当前回合，保留 worker 与后续排队消息。 |
 | `/cancel`、`/stop` | 取消当前任务并清除该聊天待执行消息；不会回滚已发生的副作用。 |
 | `/status` | 查看会话、目录、模型、追加模式及任务状态。 |
@@ -122,6 +123,8 @@ oco run --config ~/.oco/config/config.json
 目录参数接受绝对路径或当前账户的 `~/` 路径，可加一层引号；不展开环境变量、通配符或 shell 命令。省略目录通常沿用当前绑定，首次无绑定时使用 `~/tmp`。子区建立会话前可继承父群目录，建立后固定为自己的绑定；隔离工作区绑定优先。
 
 未注册的 `/xxx` 输入连同参数原样转交该聊天的 OMP 会话，由 OMP 分派命令或处理正文。权限与上表一致：私聊限 owner，群内成员不能执行 slash 命令。这类输入作为独立任务排队，不并入正在运行的回合。需要立刻停止当前工作时，先 `/cancel`（同时清除该聊天的排队消息），再发送目标命令。
+
+`/retry` 沿用当前绑定的 OMP 会话，由 OMP 决定可重试的回合与恢复方式。命令回执（如 `Retrying the last failed turn.`、`Nothing to retry.`）以 `OMP：` 通知独立投递，生成内容照常流式返回。若当前回合仍在运行，可先 `/interrupt`，再发送 `/retry`；执行时以 OMP 会话当时的状态为准。
 
 ### 原生 `/autoresearch`
 
