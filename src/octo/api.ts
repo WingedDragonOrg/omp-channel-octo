@@ -7,6 +7,7 @@ import type {
   GroupMentionPref,
   HistoryMessage,
   ThreadSummary,
+  UserInfo,
 } from "../contracts.ts";
 import { isJsonRecord, type JsonRecord } from "./type-guards.ts";
 import { OctoError } from "./error.ts";
@@ -167,6 +168,23 @@ export function mentionPrefFromResponse(value: unknown): GroupMentionPref {
     return { effective: noMention === 1 };
   }
   throw new OctoError("Octo group mention preference response has invalid schema");
+}
+
+/**
+ * `GET /v1/bot/user/info`: the server strips a space-prefixed uid (`s<digits>_<uid>`) before
+ * resolving and answers with the bare uid, so the response uid is what the caller asked for
+ * modulo that prefix. The display name is genuinely optional — an account may have none — and
+ * an unresolvable uid is an HTTP failure, never an empty object.
+ */
+export function userInfoFromResponse(value: unknown, label: string): UserInfo {
+  if (!isJsonRecord(value)) {
+    throw new OctoError(`Octo ${label} response has invalid schema`);
+  }
+  const name = value["name"];
+  return {
+    uid: requiredString(value["uid"], `${label} uid`),
+    name: typeof name === "string" ? name : "",
+  };
 }
 
 export function memberFromResponse(value: unknown, label: string): GroupMember {

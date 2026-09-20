@@ -1004,6 +1004,33 @@ describe("Octo group and thread management", () => {
     }
   });
 
+  test("resolves a user's display name by uid and surfaces the server failure", async () => {
+    const currentFixture = await createOctoProtocolFixture();
+    fixture = currentFixture;
+    transport = createOctoTransport({
+      apiUrl: currentFixture.apiUrl,
+      botToken: currentFixture.botToken,
+    });
+    await transport.initialize();
+    currentFixture.userNames.set(currentFixture.ownerUid, "董振兴");
+
+    await expect(transport.getUserInfo(currentFixture.ownerUid)).resolves.toEqual({
+      uid: currentFixture.ownerUid,
+      name: "董振兴",
+    });
+    // 线上「查无此人」是 HTTP 失败，不是空对象：渲染方据此回退成 uid。
+    await expect(transport.getUserInfo("nobody")).rejects.toThrow(/500|服务器/);
+    await expect(transport.getUserInfo("  ")).rejects.toThrow(/uid/i);
+
+    expect(currentFixture.managementRequests.map(({ method, path }) => `${method} ${path}`)).toEqual([
+      "GET /v1/bot/user/info",
+      "GET /v1/bot/user/info",
+    ]);
+    for (const request of currentFixture.managementRequests) {
+      expect(request.authorization).toBe(`Bearer ${currentFixture.botToken}`);
+    }
+  });
+
   test("surfaces the server message, HTTP status, and invalid schemas", async () => {
     const forbiddenGroup = "forbidden-group";
     const brokenGroup = "broken-group";

@@ -34,6 +34,7 @@ import {
   threadFromResponse,
   threadPath,
   threadsFromResponse,
+  userInfoFromResponse,
 } from "./api.ts";
 import {
   PresignedUpload,
@@ -114,6 +115,7 @@ import type {
   InboundQuote,
   SendReceipt,
   ThreadSummary,
+  UserInfo,
 } from "../contracts.ts";
 import { ATTACHMENT_DOWNLOAD_TIMEOUT_MS, AttachmentError } from "../attachments.ts";
 import { isJsonRecord, type JsonRecord } from "./type-guards.ts";
@@ -676,6 +678,25 @@ export class OctoTransport implements ChannelTransport {
         signal,
       ),
       "group members",
+    );
+  }
+
+  async getUserInfo(uid: string, signal?: AbortSignal): Promise<UserInfo> {
+    const wanted = uid.trim();
+    if (wanted.length === 0) {
+      throw new OctoError("Octo user info requires a uid", { permanent: true });
+    }
+    return userInfoFromResponse(
+      await botApiRequest(
+        this.apiBase,
+        this.botToken,
+        "user info",
+        `/v1/bot/user/info?uid=${encodeURIComponent(wanted)}`,
+        "GET",
+        undefined,
+        signal,
+      ),
+      "user info",
     );
   }
 

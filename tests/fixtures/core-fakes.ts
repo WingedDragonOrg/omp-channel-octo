@@ -34,6 +34,7 @@ import type {
   RestartPort,
   SendReceipt,
   ThreadSummary,
+  UserInfo,
   ThreadWorkspace,
   ThreadWorkspaceRequest,
   WorkerEvent,
@@ -171,6 +172,12 @@ export class FakeTransport implements ChannelTransport {
   readonly transcriptionByPath = new Map<string, string>();
   /** Groups whose 免@ decision was asked for, in call order. */
   readonly mentionPrefCalls: string[] = [];
+  /** uid → 显示名（署名解析的假实现）；未登记的 uid 与 `userInfoFailure` 走失败路径。 */
+  readonly userNames = new Map<string, string>();
+  readonly userInfoCalls: string[] = [];
+  userInfoFailure: Error | undefined;
+  /** When true, `getUserInfo` waits for its signal to abort instead of answering. */
+  userInfoHangs = false;
   /** When set, `downloadAttachment` throws this instead of consulting `attachmentBodies`. */
   attachmentFailure: AttachmentError | undefined;
   /** When set, `transcribeAudio` throws this instead of consulting `transcriptionByPath`. */
@@ -374,6 +381,26 @@ export class FakeTransport implements ChannelTransport {
   async getGroupMembers(groupId: string, signal?: AbortSignal): Promise<GroupMember[]> {
     this.recordManagement("group-members", groupId, null, signal);
     return this.groupMembers.get(groupId) ?? [];
+  }
+
+  async getUserInfo(uid: string, signal?: AbortSignal): Promise<UserInfo> {
+    this.userInfoCalls.push(uid);
+    if (this.userInfoHangs) {
+      await new Promise<void>((resolve) => {
+        if (signal?.aborted) resolve();
+        else signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+    }
+    if (signal?.aborted) throw new Error("fixture user info aborted");
+    if (this.userInfoFailure !== undefined) throw this.userInfoFailure;
+    const name = this.userNames.get(uid);
+    if (name === undefined) throw new Error(`fixture has no user ${uid}`);
+    return { uid, name };
+  }
+
+  /** Registers one uid's display name for `getUserInfo`; unregistered uids fail the lookup. */
+  setUserName(uid: string, name: string): void {
+    this.userNames.set(uid, name);
   }
 
   async updateGroupInfo(

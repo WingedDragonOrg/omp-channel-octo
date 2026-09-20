@@ -86,6 +86,14 @@ export interface AskCardFrame {
   profile: "octo/v2";
 }
 
+/**
+ * Display names of the uids an answered line attributes (uid → name), resolved by the caller.
+ * A uid the map does not carry — an unresolved lookup, a row written before attribution — renders
+ * as the uid itself, so a failed lookup degrades to the pre-name wording instead of hiding who
+ * answered. The uid stays the identity everywhere; this map only changes the spelling.
+ */
+export type AnswererNames = ReadonlyMap<string, string>;
+
 export type AskActionRef =
   | { kind: "option"; index: number; generation: number }
   | { kind: "submit"; generation: number };
@@ -163,11 +171,58 @@ export function askAnswerText(question: AskCardQuestion, answer: string): string
   return labels.join("；");
 }
 
-/** The sentence both frame kinds and their text fallback show for a recorded answer, attributed when the answerer is known. */
-export function askAnsweredText(question: AskCardQuestion, answer: string, answeredBy: string | null): string {
-  const body = askAnswerText(question, answer);
-  const who = answeredBy?.trim() ?? "";
-  return who.length === 0 ? `已回复：${body}` : `已由 ${who} 回复：${body}`;
+/** The answered sentence's parts: who answered (empty for a row written before attribution) and the answer body. */
+function answeredParts(
+  question: AskCardQuestion,
+  answer: string,
+  answeredBy: string | null,
+  names?: AnswererNames,
+): { answerer: string; body: string } {
+  const uid = answeredBy?.trim() ?? "";
+  const name = uid.length === 0 ? "" : names?.get(uid)?.trim() ?? "";
+  // 名字是署名，也是卡片文本里的一段数据：解析不到就回退成 uid，署名始终在，身份不变。
+  return { answerer: name.length > 0 ? name : uid, body: askAnswerText(question, answer) };
+}
+
+/**
+ * The sentence the text fallback (a frame's `plain`) shows for a recorded answer. A message body
+ * has no style of its own, so the name is Markdown-bold there — the real client renders it
+ * (measured 2026-09-19: the probe's rendered name came out bold with no stray asterisks).
+ */
+export function askAnsweredText(
+  question: AskCardQuestion,
+  answer: string,
+  answeredBy: string | null,
+  names?: AnswererNames,
+): string {
+  const { answerer, body } = answeredParts(question, answer, answeredBy, names);
+  return answerer.length === 0 ? `已回复：${body}` : `已由 **${answerer}** 回复：${body}`;
+}
+
+/**
+ * The answered row as the card paints it: the answerer is a `TextRun` carrying its own weight, so
+ * the name is bold by style rather than by Markdown syntax in the text (bold confirmed on the real
+ * client 2026-09-19). A row without attribution stays one plain text line.
+ */
+function answeredCardElement(
+  question: AskCardQuestion,
+  answer: string,
+  answeredBy: string | null,
+  names: AnswererNames | undefined,
+): Record<string, unknown> {
+  const { answerer, body } = answeredParts(question, answer, answeredBy, names);
+  if (answerer.length === 0) {
+    return { type: "TextBlock", text: cardText(`已回复：${body}`), wrap: true, spacing: "Medium" };
+  }
+  return {
+    type: "RichTextBlock",
+    spacing: "Medium",
+    inlines: [
+      { type: "TextRun", text: cardText("已由 ") },
+      { type: "TextRun", text: cardText(answerer), weight: "Bolder" },
+      { type: "TextRun", text: cardText(` 回复：${body}`) },
+    ],
+  };
 }
 
 /** Reads a comma-separated option selection; `null` when it does not name options of `question`. */
@@ -329,11 +384,14 @@ function pendingActions(
 /**
  * Builds the frame for one question; `plain` is the caller's text rendering of the same
  * question, so the card and the text-only path stay one message instead of two competing ones.
+ * `names` spells the answerer of an answered frame — its `plain` is built by the caller, so the
+ * caller must resolve the same names into it.
  */
 export function buildAskCard(
   question: AskCardQuestion,
   state: AskCardState,
   plain: string,
+  names?: AnswererNames,
 ): AskCardFrame {
   const card: Record<string, unknown> = {
     $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
@@ -350,9 +408,9 @@ export function buildAskCard(
     card.actions = pendingActions(question, state.generation);
   } else {
     const note = state.kind === "answered"
-      ? cardText(askAnsweredText(question, state.answer, state.answeredBy))
-      : state.note;
-    card.body = [...questionBody(question), { type: "TextBlock", text: note, wrap: true, spacing: "Medium" }];
+      ? answeredCardElement(question, state.answer, state.answeredBy, names)
+      : { type: "TextBlock", text: state.note, wrap: true, spacing: "Medium" };
+    card.body = [...questionBody(question), note];
   }
   return { card, plain, profile: ASK_CARD_PROFILE };
 }
@@ -362,6 +420,7 @@ function setQuestionBody(
   ordinal: number,
   total: number,
   open: boolean,
+  names?: AnswererNames,
 ): Record<string, unknown>[] {
   const { question } = entry;
   const body: Record<string, unknown>[] = [
@@ -375,12 +434,7 @@ function setQuestionBody(
     ...optionLines(question),
   ];
   if (entry.answer !== null) {
-    body.push({
-      type: "TextBlock",
-      text: cardText(askAnsweredText(question, entry.answer, entry.answeredBy)),
-      wrap: true,
-      spacing: "Medium",
-    });
+    body.push(answeredCardElement(question, entry.answer, entry.answeredBy, names));
     return body;
   }
   if (!open) return body;
@@ -399,6 +453,7 @@ export function buildAskCardSet(
   questions: readonly AskCardSetQuestion[],
   state: AskCardSetState,
   plain: string,
+  names?: AnswererNames,
 ): AskCardFrame {
   const total = questions.length;
   const open = state.kind === "open" && questions.some(({ answer }) => answer === null);
@@ -412,7 +467,7 @@ export function buildAskCardSet(
     });
   }
   questions.forEach((entry, position) => {
-    body.push(...setQuestionBody(entry, position + 1, total, open));
+    body.push(...setQuestionBody(entry, position + 1, total, open, names));
   });
   if (state.kind === "closed" && state.note !== null) {
     body.push({ type: "TextBlock", text: cardText(state.note), wrap: true, spacing: "Medium" });

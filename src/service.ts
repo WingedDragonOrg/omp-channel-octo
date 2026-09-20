@@ -92,6 +92,7 @@ import { ChannelStore, openChannelStore } from "./store.ts";
 import { boundedSelectorText, formatModelCatalog, modelWithLevel } from "./model-switch.ts";
 import type { BindingRecord, InboundClaim, OutboxRecord, ProgressCardRecord, TaskRecord } from "./store-records.ts";
 import { isGroupTarget, streamTargetKey, targetKey, taskTarget } from "./target.ts";
+import { createDisplayNameCache, type DisplayNameCache } from "./display-name.ts";
 import { createQuestionDesk, type QuestionDesk } from "./questions.ts";
 import { threadParentGroupId } from "./thread-target.ts";
 import { threadNotifyMessageId, threadOutcomeNotice } from "./thread-notify.ts";
@@ -451,6 +452,8 @@ class CoreService implements ChannelService {
   /** 出站投递：文字、流式编辑与文件共用的队列。 */
   private readonly outbox: Outbox;
   private readonly questions: QuestionDesk;
+  /** 回答署名的显示名缓存：uid → 人名，有界、失败即回退（署名渲染用，不参与身份判断）。 */
+  private readonly displayNames: DisplayNameCache;
   /** Bot 事件队列消费（卡片点击）。 */
   private readonly botEvents: BotEventLoop;
   private readonly commandHandlers: ReadonlyMap<string, ChannelCommandHandler>;
@@ -478,6 +481,9 @@ class CoreService implements ChannelService {
       botUid: () => this.bot?.uid,
       started: () => this.started,
     });
+    this.displayNames = createDisplayNameCache(
+      async (uid, signal) => (await this.options.transport.getUserInfo(uid, signal)).name,
+    );
     this.questions = createQuestionDesk({
       store: this.store,
       transport: this.options.transport,
@@ -487,6 +493,7 @@ class CoreService implements ChannelService {
       operationSet: (operation) => this.operationSet(operation),
       commandClaim: (message, name) => this.commandClaim(message, name),
       askTimeoutMs: () => this.options.config.ask?.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS,
+      displayNames: (uids) => this.displayNames.names(uids),
       stopTurnForQuestion: (taskId) => this.stopTurnForQuestion(taskId),
       wakeTurn: (target, text) => {
         void this.wakeTurn(target, text);

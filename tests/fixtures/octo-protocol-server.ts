@@ -120,6 +120,7 @@ type ManagementRoute =
   | { kind: "group-members"; groupId: string }
   | { kind: "group-info-update"; groupId: string }
   | { kind: "group-mention-pref"; groupId: string }
+  | { kind: "user-info"; uid: string }
   | { kind: "thread-list"; groupId: string }
   | { kind: "thread-create"; groupId: string }
   | { kind: "thread-info"; groupId: string; shortId: string }
@@ -557,6 +558,8 @@ export class OctoProtocolFixture {
   readonly groupContextRequests: FixtureGroupContextRequest[] = [];
   readonly groupContextUpdates: FixtureGroupContextUpdate[] = [];
   readonly managementRequests: FixtureManagementRequest[] = [];
+  /** uid → 显示名；未登记的 uid 与线上的「查无此人」一样返回 HTTP 500。 */
+  readonly userNames = new Map<string, string>();
   readonly presignRequests: FixturePresignRequest[] = [];
   readonly uploadRequests: FixtureUploadRequest[] = [];
   readonly transcriptionRequests: FixtureTranscriptionRequest[] = [];
@@ -738,7 +741,8 @@ export class OctoProtocolFixture {
     this.transcriptionStatus = status;
   }
 
-  private managementRouteFor(method: string, pathname: string): ManagementRoute | null {
+  private managementRouteFor(method: string, url: URL): ManagementRoute | null {
+    const pathname = url.pathname;
     const group = /^\/v1\/bot\/groups\/([^/]+)$/.exec(pathname);
     if (group?.[1] !== undefined && method === "GET") {
       return { kind: "group-info", groupId: decodeURIComponent(group[1]) };
@@ -754,6 +758,9 @@ export class OctoProtocolFixture {
     const pref = /^\/v1\/bot\/groups\/([^/]+)\/mention_pref$/.exec(pathname);
     if (pref?.[1] !== undefined && method === "GET") {
       return { kind: "group-mention-pref", groupId: decodeURIComponent(pref[1]) };
+    }
+    if (pathname === "/v1/bot/user/info" && method === "GET") {
+      return { kind: "user-info", uid: url.searchParams.get("uid") ?? "" };
     }
     const threads = /^\/v1\/bot\/groups\/([^/]+)\/threads$/.exec(pathname);
     if (threads?.[1] !== undefined) {
@@ -789,7 +796,7 @@ export class OctoProtocolFixture {
     body: Record<string, unknown>,
     response: ServerResponse,
   ): void {
-    const groupId = route.groupId;
+    const groupId = "groupId" in route ? route.groupId : "";
     const stored = this.managedGroupInfo.get(groupId);
     switch (route.kind) {
       case "group-info": {
@@ -813,6 +820,24 @@ export class OctoProtocolFixture {
       case "group-mention-pref": {
         // 默认与群开关允许、bot owner 尚未开启的线上默认一致：仍需 @Bot。
         writeJson(response, 200, { no_mention: 0, group_allow_no_mention: 1, effective: false });
+        return;
+      }
+      case "user-info": {
+        const name = this.userNames.get(route.uid);
+        if (name === undefined) {
+          // 线上查不到/查不了的用户是 HTTP 失败，不是空对象。
+          writeJson(response, 500, {
+            error: { code: "err.server.bot_api.query_failed", message: "服务器内部错误。" },
+            msg: "服务器内部错误。",
+            status: 500,
+          });
+          return;
+        }
+        writeJson(response, 200, {
+          uid: route.uid,
+          name,
+          avatar: `https://fixture.invalid/users/${route.uid}/avatar`,
+        });
         return;
       }
       case "group-info-update": {
@@ -1088,7 +1113,7 @@ export class OctoProtocolFixture {
       return;
     }
 
-    const managementRoute = this.managementRouteFor(request.method ?? "GET", url.pathname);
+    const managementRoute = this.managementRouteFor(request.method ?? "GET", url);
     if (managementRoute !== null) {
       this.managementRequests.push({
         method: request.method ?? "",

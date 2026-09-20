@@ -14,6 +14,7 @@ import {
   type AskCardSetQuestion,
   type AskCardSetState,
   type AskCardState,
+  type AnswererNames,
 } from "./ask-card.ts";
 import type { BotEventOutcome } from "./bot-events.ts";
 import type {
@@ -113,6 +114,11 @@ export interface QuestionDeskDeps {
   commandClaim(message: InboundMessage, name: string): InboundClaim;
   /** 提问等待的超时（毫秒），来自配置。 */
   askTimeoutMs(): number;
+  /**
+   * uid → 显示名的解析（有界缓存在服务侧）。署名把 uid 渲染成人名；查不到或失败时返回表里
+   * 没有该 uid，渲染回退成 uid 本身，绝不影响作答与卡片改写。
+   */
+  displayNames(uids: readonly string[]): Promise<ReadonlyMap<string, string>>;
   /** 等待超时：像取消 tool call 一样停住当前回合；问题行保持待答、卡片不改写。 */
   stopTurnForQuestion(taskId: string): void;
   /** 已无等待者的答案（停回合后 owner 才答复）：作为该聊天的新回合输入交付。 */
@@ -672,8 +678,34 @@ function wakeForAnswers(entries: readonly { question: QuestionRecord; answer: st
 }
 
 /**
+ * Resolves the answerers' display names a rewrite is about to render, then edits the card. The
+ * state being rendered is durable before any of this runs, so a failed lookup — like a failed
+ * edit — costs this render, never the state: the frame falls back to the uid.
+ */
+function editCardWithNames(
+  target: ChatTarget,
+  messageId: string,
+  uids: readonly (string | null)[],
+  build: (names: AnswererNames) => AskCardFrame,
+): void {
+  const wanted: string[] = [];
+  for (const raw of uids) {
+    const uid = raw?.trim() ?? "";
+    if (uid.length > 0 && !wanted.includes(uid)) wanted.push(uid);
+  }
+  const resolved: Promise<AnswererNames> = wanted.length === 0
+    ? Promise.resolve(new Map<string, string>())
+    : deps.displayNames(wanted).then((names) => names, () => new Map<string, string>());
+  const operation = resolved.then((names) => {
+    submitAskCardEdit(target, messageId, build(names));
+  });
+  deps.operationSet(operation);
+}
+
+/**
  * Rewrites one question card. Best-effort by contract: the state it renders is already durable
- * in the question row, so a failed edit changes nothing but the card's appearance.
+ * in the question row, so a failed lookup or a failed edit changes nothing but the card's
+ * appearance.
  */
 function rewriteAskCard(question: QuestionRecord, state: AskCardState, hint?: string): void {
   const messageId = question.cardMessageId;
@@ -681,14 +713,16 @@ function rewriteAskCard(question: QuestionRecord, state: AskCardState, hint?: st
   const payload = parseQuestionPayload(question);
   const ask = payload === null ? null : askQuestionFromPayload(payload);
   if (ask === null) return;
-  const note = state.kind === "answered"
-    ? askAnsweredText(ask, state.answer, state.answeredBy)
-    : state.kind === "inactive"
-      ? state.note
-      : hint;
   const base = formatQuestion(payload ?? {});
-  const frame = buildAskCard(ask, state, note === undefined ? base : `${base}\n${note}`);
-  submitAskCardEdit(question, messageId, frame);
+  const answerer = state.kind === "answered" ? state.answeredBy : null;
+  editCardWithNames(question, messageId, [answerer], (names) => {
+    const note = state.kind === "answered"
+      ? askAnsweredText(ask, state.answer, state.answeredBy, names)
+      : state.kind === "inactive"
+        ? state.note
+        : hint;
+    return buildAskCard(ask, state, note === undefined ? base : `${base}\n${note}`, names);
+  });
 }
 
 /**
@@ -719,8 +753,8 @@ function rewriteAskCardSet(
   }
   const base = formatQuestionSet(payloads);
   const note = hint ?? (state.kind === "closed" ? state.note : null);
-  const frame = buildAskCardSet(entries, state, note === null ? base : `${base}\n${note}`);
-  submitAskCardEdit(first, messageId, frame);
+  editCardWithNames(first, messageId, entries.map((entry) => entry.answeredBy), (names) =>
+    buildAskCardSet(entries, state, note === null ? base : `${base}\n${note}`, names));
 }
 
 /** Sends one card edit with the next sequence; failures are logged and never gate an answer. */

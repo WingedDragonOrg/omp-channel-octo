@@ -43,6 +43,36 @@ function bodyActionRows(card: { frame: { card: Record<string, unknown> } }): str
       .map((item) => String((item as Record<string, unknown>).id)));
 }
 
+/**
+ * The card's answered rows, in body order: the sentence the row renders plus the run that carries
+ * the answerer's name (`null` for a row that predates attribution and stays one text line).
+ */
+function answeredRows(
+  card: Record<string, unknown>,
+): Array<{ text: string; name: Record<string, unknown> | null }> {
+  const rows: Array<{ text: string; name: Record<string, unknown> | null }> = [];
+  for (const element of cardBody(card)) {
+    if (element.type === "RichTextBlock") {
+      const inlines = Array.isArray(element.inlines)
+        ? (element.inlines as Record<string, unknown>[])
+        : [];
+      rows.push({
+        text: inlines.map((run) => String(run.text ?? "")).join(""),
+        name: inlines[1] ?? null,
+      });
+      continue;
+    }
+    const text = element.text;
+    if (typeof text === "string" && text.startsWith("已回复：")) rows.push({ text, name: null });
+  }
+  return rows;
+}
+
+/** The rendered sentence of every answered row, in body order. */
+function answeredTexts(card: Record<string, unknown>): string[] {
+  return answeredRows(card).map((row) => row.text);
+}
+
 /** Ids of the inputs one frame renders, in body order. */
 function inputIds(card: { frame: { card: Record<string, unknown> } }): string[] {
   return cardBody(card.frame.card)
@@ -154,7 +184,182 @@ test("a card click answers the pending question and rewrites the card", async ()
     const edit = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
     expect(edit.cardSeq).toBe(2);
     expect(cardActions(edit)).toHaveLength(0);
-    expect(JSON.stringify(edit.frame.card)).toContain("已由 owner-1 回复：2. production");
+    expect(answeredTexts(edit.frame.card)).toContain("已由 owner-1 回复：2. production");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("an answered card spells the answerer's name and keeps the uid as identity", async () => {
+  const harness = await startAskHarness(
+    {
+      id: "deployment-target",
+      question: "Which deployment target?",
+      options: [{ label: "staging" }, { label: "production" }],
+    },
+    { setup: (transport) => transport.setUserName("owner-1", "董振兴") },
+  );
+  try {
+    const target: ChatTarget = { channelId: "dm-card-name", channelType: 1 };
+    await harness.service.handleInbound(
+      inbound({ messageId: "card-name-start", ...target, text: "needs an answer" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    const pending = await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.pendingQuestionIds.length === 1,
+    );
+    const questionId = onlyPendingQuestionId(pending);
+    const card = harness.transport.sentCards[0];
+    if (!card) {
+      throw new Error("ask card was not sent");
+    }
+
+    harness.transport.pushBotEvent(cardActionEvent(9, {
+      messageId: card.messageId,
+      channelType: 1,
+      channelId: target.channelId,
+      actionId: "ask_opt_2",
+      operatorUid: "owner-1",
+      inputs: {},
+    }));
+
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    // The uid stays the recorded identity; the name only changes how the line is spelled.
+    expect(await readAnswers(harness)).toEqual({
+      answers: [{ id: "deployment-target", questionId, answeredBy: "owner-1", answer: "2" }],
+    });
+    const edit = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
+    // 真机实测：署名是自带 weight 的 TextRun（加粗由样式而非 Markdown 文本承担）。
+    expect(answeredRows(edit.frame.card)).toEqual([
+      {
+        text: "已由 董振兴 回复：2. production",
+        name: { type: "TextRun", text: "董振兴", weight: "Bolder" },
+      },
+    ]);
+    // 文本回退（封套 plain）走消息正文：那里认 Markdown 加粗，同一个名字。
+    expect(edit.frame.plain).toContain("已由 **董振兴** 回复：2. production");
+    expect(harness.transport.userInfoCalls).toEqual(["owner-1"]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a failed name lookup still rewrites the card with the uid", async () => {
+  const harness = await startAskHarness(
+    {
+      id: "deployment-target",
+      question: "Which deployment target?",
+      options: [{ label: "staging" }, { label: "production" }],
+    },
+    { setup: (transport) => { transport.userInfoFailure = new Error("user info unavailable"); } },
+  );
+  try {
+    const target: ChatTarget = { channelId: "dm-card-name-failure", channelType: 1 };
+    await harness.service.handleInbound(
+      inbound({ messageId: "card-name-failure-start", ...target, text: "needs an answer" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    const pending = await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.pendingQuestionIds.length === 1,
+    );
+    const questionId = onlyPendingQuestionId(pending);
+    const card = harness.transport.sentCards[0];
+    if (!card) {
+      throw new Error("ask card was not sent");
+    }
+
+    harness.transport.pushBotEvent(cardActionEvent(10, {
+      messageId: card.messageId,
+      channelType: 1,
+      channelId: target.channelId,
+      actionId: "ask_opt_2",
+      operatorUid: "owner-1",
+      inputs: {},
+    }));
+
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(await readAnswers(harness)).toEqual({
+      answers: [{ id: "deployment-target", questionId, answeredBy: "owner-1", answer: "2" }],
+    });
+    const edit = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
+    expect(answeredTexts(edit.frame.card)).toContain("已由 owner-1 回复：2. production");
+    expect(harness.transport.userInfoCalls).toEqual(["owner-1"]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a set card resolves each answerer's name once, falling back per uid", async () => {
+  const harness = await startAskHarness(
+    [
+      { id: "target", question: "Which deployment target?", options: [{ label: "staging" }] },
+      { id: "window", question: "When do we ship?" },
+    ],
+    { setup: (transport) => transport.setUserName("owner-1", "董振兴") },
+  );
+  try {
+    const target: ChatTarget = { channelId: "group-allowed", channelType: 2 };
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "set-name-start",
+        ...target,
+        text: "needs answers",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 2);
+    const card = harness.transport.sentCards[0];
+    if (!card) {
+      throw new Error("ask card was not sent");
+    }
+
+    harness.transport.pushBotEvent(cardActionEvent(21, {
+      messageId: card.messageId,
+      channelType: 2,
+      channelId: target.channelId,
+      actionId: "ask_submit",
+      operatorUid: "owner-1",
+      inputs: { ask_choices_1: "1" },
+    }));
+    // 同一个名字只解析一次：第二次改写复用缓存，不再查询。
+    const first = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
+    expect(first.cardSeq).toBe(2);
+    expect(answeredTexts(first.frame.card)).toContain("已由 董振兴 回复：1. staging");
+
+    harness.transport.pushBotEvent(cardActionEvent(22, {
+      messageId: card.messageId,
+      channelType: 2,
+      channelId: target.channelId,
+      actionId: "ask_submit#2",
+      operatorUid: "member-9",
+      inputs: { ask_text_2: "tonight" },
+    }));
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    await harness.transport.waitForAck(22);
+    const closed = await harness.transport.waitForCardEdit(
+      (edit) => edit.messageId === card.messageId && edit.cardSeq === 3,
+    );
+    expect(answeredTexts(closed.frame.card)).toContain("已由 董振兴 回复：1. staging");
+    // 查不到名字的成员仍以 uid 署名，身份不隐藏；查询失败不影响这一帧的改写。
+    expect(answeredTexts(closed.frame.card)).toContain("已由 member-9 回复：tonight");
+    expect(harness.transport.userInfoCalls).toEqual(["owner-1", "member-9"]);
   } finally {
     await closeCoreHarness(harness);
   }
@@ -244,7 +449,7 @@ test("a single-choice card stacks every option as its own body row", async () =>
       ({ messageId }) => messageId === card.messageId,
     );
     expect(bodyActionRows(answered)).toEqual([]);
-    expect(JSON.stringify(answered.frame.card)).toContain(`已由 owner-1 回复：2. ${longLabel}`);
+    expect(answeredTexts(answered.frame.card)).toEqual([`已由 owner-1 回复：2. ${longLabel}`]);
   } finally {
     await closeCoreHarness(harness);
   }
@@ -284,7 +489,7 @@ test("a plain reply answers the card question and rewrites the same card", async
 
     const edit = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
     expect(cardActions(edit)).toHaveLength(0);
-    expect(JSON.stringify(edit.frame.card)).toContain("已由 owner-1 回复：1. staging");
+    expect(answeredTexts(edit.frame.card)).toContain("已由 owner-1 回复：1. staging");
   } finally {
     await closeCoreHarness(harness);
   }
@@ -506,7 +711,7 @@ test("a member's click in an enabled group answers the card and records the subm
     });
     const edit = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
     expect(cardActions(edit)).toHaveLength(0);
-    expect(JSON.stringify(edit.frame.card)).toContain("已由 member-9 回复：2. production");
+    expect(answeredTexts(edit.frame.card)).toContain("已由 member-9 回复：2. production");
   } finally {
     await closeCoreHarness(harness);
   }
@@ -820,11 +1025,10 @@ test("one submit answers every question of a multi-question card", async () => {
 
     const edit = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
     expect(cardActions(edit)).toHaveLength(0);
-    const rendered = JSON.stringify(edit.frame.card);
-    expect(rendered).toContain("已由 owner-1 回复：2. production");
-    expect(rendered).toContain("已由 owner-1 回复：tonight");
-    expect(rendered).toContain("已由 owner-1 回复：1. read；3. admin");
-    expect(rendered).toContain("已由 owner-1 回复：actually, use canary");
+    expect(answeredTexts(edit.frame.card)).toContain("已由 owner-1 回复：2. production");
+    expect(answeredTexts(edit.frame.card)).toContain("已由 owner-1 回复：tonight");
+    expect(answeredTexts(edit.frame.card)).toContain("已由 owner-1 回复：1. read；3. admin");
+    expect(answeredTexts(edit.frame.card)).toContain("已由 owner-1 回复：actually, use canary");
   } finally {
     await closeCoreHarness(harness);
   }
@@ -860,7 +1064,7 @@ test("a partial set submission answers what it filled and leaves the rest open",
     const rerendered = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
     expect(rerendered.cardSeq).toBe(2);
     expect(cardActions(rerendered)).toEqual(["ask_submit#2"]);
-    expect(JSON.stringify(rerendered.frame.card)).toContain("已由 owner-1 回复：1. staging");
+    expect(answeredTexts(rerendered.frame.card)).toContain("已由 owner-1 回复：1. staging");
     await expect(harness.service.status(target)).resolves.toMatchObject({
       pendingQuestionIds: [expect.any(String)],
     });
@@ -936,7 +1140,7 @@ test("a plain reply answers the whole set at once", async () => {
 
     const closed = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
     expect(cardActions(closed)).toHaveLength(0);
-    expect(JSON.stringify(closed.frame.card)).toContain("已由 owner-1 回复：1. staging");
+    expect(answeredTexts(closed.frame.card)).toContain("已由 owner-1 回复：1. staging");
     expect(JSON.stringify(closed.frame.card)).not.toContain("Input.Text");
   } finally {
     await closeCoreHarness(harness);
@@ -1157,7 +1361,7 @@ test("a timed-out question stops the turn and stays pending until the reply wake
     expect(await readText(join(harness.root, "tmp", "wake.log"))).toContain("答案（由 owner-1 回复）：1. staging");
     const edit = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
     expect(cardActions(edit)).toHaveLength(0);
-    expect(JSON.stringify(edit.frame.card)).toContain("已由 owner-1 回复：1. staging");
+    expect(answeredTexts(edit.frame.card)).toContain("已由 owner-1 回复：1. staging");
   } finally {
     await closeCoreHarness(harness);
   }

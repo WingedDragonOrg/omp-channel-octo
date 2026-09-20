@@ -183,6 +183,8 @@ export interface ChannelTransport {
   /** Group-level 免@ decision as the server computes it; rejects when the call fails. */
   getGroupMentionPref(groupId: string, signal?: AbortSignal): Promise<GroupMentionPref>;
   getGroupMembers(groupId: string, signal?: AbortSignal): Promise<GroupMember[]>;
+  /** Display identity of one user by uid; rejects when the server cannot resolve it. */
+  getUserInfo(uid: string, signal?: AbortSignal): Promise<UserInfo>;
   updateGroupInfo(
     groupId: string,
     patch: GroupInfoPatch,
@@ -297,6 +299,12 @@ export interface GroupMember {
   role: number;
   robot: boolean;
   joinedAt: string;
+}
+
+/** One user as `GET /v1/bot/user/info` reports it; `name` is empty when the account has none. */
+export interface UserInfo {
+  uid: string;
+  name: string;
 }
 
 export interface ThreadSummary {

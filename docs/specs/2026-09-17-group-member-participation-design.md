@@ -57,7 +57,7 @@
 | 提示节流 | 同一聊天 10 分钟至多一条（进程内，重启可再来一条） | 与本群未开通提示同一先例；重复命令不刷屏 |
 | 作答授权 | 问题所在聊天是已开通群/子区时任何成员可点击/提交；文本作答走同一门禁 | 与「成员可聊天」同一信任边界；私聊保持 owner |
 | 提交人记录 | 问题行新增 `answered_by`（uid）；随答案进入 ask 工具返回值、唤醒文本与卡片改写 | agent 必须知道谁答的；uid 是事件里唯一到达的身份，需要名字时 agent 可用 `octo_management` 的 `group-members` 查 |
-| 卡片文案 | 不提示可作答范围；答案改写显示「已由 <uid> 回复」 | 避免把权限细节发给全群；作答结果对群透明 |
+| 卡片文案 | 不提示可作答范围；答案改写显示「已由 <名字> 回复」，名字由 uid 解析而来（`GET /v1/bot/user/info`，有界缓存），查不到时回退 uid | 避免把权限细节发给全群；作答结果对群透明；署名给群成员看，uid 只作为身份与回退 |
 | 答案仲裁 | 沿用 compare-and-set：先落答案者胜，落败点击静默 ack | 不引入优先级；owner 与成员同一条路径 |
 
 ## 设计
@@ -100,13 +100,14 @@ owner 的命令路径（内建命令、注册 handler、未知 `/xxx` 透传任�
 - 写入：`answerQuestion`/`answerQuestions` 接收 `answeredBy`；文本路径取 `message.senderId.trim()`（owner 与成员同构），卡片路径取 `action.operatorUid.trim()`。
 - 等待者：`ask` 的等待以 `{ answer, answeredBy }` 结算；工具返回 `{"answers":[{"id","questionId","answer","answeredBy"}]}`。
 - 超时唤醒（`wakeForAnswers`）：`答案（由 <uid> 回复）：…`；旧行为无可读提交人时保持 `答案：…`。
-- 卡片改写：单题卡与整组卡的已回复行在 `answeredBy` 存在时渲染 `已由 <uid> 回复：<答案文本>`，否则保持 `已回复：…`（含 owner 作答——提交人对全群可见）。
+- 卡片改写：单题卡与整组卡的已回复行在 `answeredBy` 存在时渲染 `已由 <名字> 回复：<答案文本>`——名字在改写前由 `src/display-name.ts` 的有界缓存解析（30 分钟 TTL、最多 200 条、单次查询 3 秒预算，失败或查无此人回退 uid，且始终不参与身份判断、不影响答案落盘与卡片改写），卡片里以 `weight: "Bolder"` 的 `TextRun` 呈现；否则保持 `已回复：…`（含 owner 作答——提交人对全群可见）。
 
 ### 模块与接口
 
 - `src/service.ts`：`isAllowed` 成员分支、成员命令提示（常量、节流表、提示函数）、`memberAnswerAllowed` 注入。
 - `src/questions.ts`：`answerFromCard` 授权、答案携带 `answeredBy` 的整条链路、`wakeForAnswers` 与卡片文案。
-- `src/ask-card.ts`：`AskCardState.answered` 与 `AskCardSetQuestion` 增加 `answeredBy`，已回复行渲染提交人。
+- `src/ask-card.ts`：`AskCardState.answered` 与 `AskCardSetQuestion` 增加 `answeredBy`，已回复行渲染提交人（署名解析到的名字以 `weight: "Bolder"` 的 `TextRun` 呈现，查不到则回退 uid；`askAnsweredText` 仍是纯文本/文本回退那一句的来源）。
+- `src/display-name.ts`：uid → 显示名的有界缓存（TTL、条目上限、在途合并、单次查询预算、失败回退），服务经 `transport.getUserInfo` 注入问答子系统。
 - `src/store-schema.ts` / `src/store-records.ts` / `src/store-questions.ts` / `src/store.ts`：`answered_by` 列、记录字段与两个作答 API 的签名。
 
 ## 错误与边界情况
@@ -127,7 +128,7 @@ owner 的命令路径（内建命令、注册 handler、未知 `/xxx` 透传任�
 1. 已开通群内成员（带结构化 @Bot）的文本消息启动任务：任务正文、回执、失败分类、steering/排队、历史注入与 owner 同路径；成员可发送全部当前支持的内容类型（含附件与语音转写）。
 2. 成员不带 @Bot 的群消息、私聊非 owner、未开通群/子区的成员消息：全部无副作用（无任务、无 `inbound` 行、无待发消息、零 mention_pref 查询）。
 3. 成员发 `/` 开头消息（已注册与未知命令）：不执行、不建任务、不交给 agent；同一聊天 10 分钟内至多一条提示；owner 命令行为不回归（含未知 `/xxx` 照旧按任务透传）。
-4. 已开通群/子区中，非 owner 成员点击 ask 卡片按钮或提交自由输入：答案按既有校验记录、卡片改写为已回复并显示提交人、等待中的 ask 立即返回；ask 工具返回值中该答案带 `answeredBy=<成员 uid>`。
+4. 已开通群/子区中，非 owner 成员点击 ask 卡片按钮或提交自由输入：答案按既有校验记录、卡片改写为已回复并显示提交人（显示名为用户可读名字，取不到时回退 uid；`ask` 工具返回值中的身份始终是该成员的 uid）、等待中的 ask 立即返回；ask 工具返回值中该答案带 `answeredBy=<成员 uid>`。
 5. 私聊非 owner 点击与未开通聊天的点击：仍被忽略且无副作用（不落答案、不重绘、不唤醒）。
 6. 文本作答与点击并发只落一份答案；重复点击与重投静默；有 pending 问题时成员或 owner 的普通文本同样作答，提交人记录为发送者；等待超时后的答复唤醒文本包含「由 <uid> 回复」。
 7. owner 行为不回归：私聊/群消息、全部命令、免@、卡片作答与卡片改写（现在带提交人）全部正常。
