@@ -356,6 +356,7 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
           unknownNoticeSent = true;
           await sendUnknownNotice(target, item);
         }
+        let attempted = item;
         try {
           const delivery = await sendOutbox(item, target);
           if (item.streamMessageId) {
@@ -363,6 +364,7 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
               deps.store.bindTextOutbox(item.id, delivery.remoteMessageId);
               const bound = deps.store.getOutbox(item.id);
               if (bound?.remoteMessageId) {
+                attempted = bound;
                 const correction = await sendOutbox(bound, target);
                 deps.store.acknowledgeTextOutbox(
                   bound.id,
@@ -387,13 +389,18 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
             if (item.taskId) releaseTextAbortIfIdle(item.taskId);
           }
         } catch (error) {
+          // Content updates reset the budget; an older in-flight failure must not spend it.
+          if (attempted.streamMessageId) {
+            const latest = deps.store.getOutbox(attempted.id);
+            if (latest && latest.desiredVersion > attempted.desiredVersion) continue;
+          }
           const reason = failureText(error, "transport unavailable; delivery is unknown");
           if (item.streamMessageId) {
-            deps.store.failTextOutbox(item.id, item.desiredVersion, reason);
+            deps.store.failTextOutbox(item.id, attempted.desiredVersion, reason);
           } else {
             deps.store.markOutboxFailure(item.id, reason);
           }
-          const attempts = item.attempts + 1;
+          const attempts = attempted.attempts + 1;
           // 永久失败或重试预算耗尽：标记 dead 后继续排空队尾，不把后面的消息一起拖住。
           if (isPermanentOutboxError(error, item) || attempts >= MAX_OUTBOX_ATTEMPTS) {
             console.error(
