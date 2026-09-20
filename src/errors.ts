@@ -28,6 +28,19 @@ export function isTransientServerFailure(error: unknown): boolean {
 }
 
 /**
+ * Shutdown interrupted an inbound message before it was durably accepted. The handler rejects with
+ * it so the transport never ACKs a swallowed message; the same message is redelivered after restart.
+ * Defined here, once, because the permission gate (`chat-authorization`) and the attachment
+ * materializer both raise it and `service.ts` classifies it with `instanceof`.
+ */
+export class InboundShutdownError extends Error {
+  constructor() {
+    super("channel 正在停止，消息未接受");
+    this.name = "InboundShutdownError";
+  }
+}
+
+/**
  * 任务启动失败的有界原因文本：单行化、清除控制字符、截断到固定长度，供服务日志与 owner 侧
  * 任务行使用。它只放行本仓库构造的消息（原因码、HTTP 状态、路径），不携带错误对象本身、
  * 协议载荷或凭据；群消息里仍是各类别的固定文案。

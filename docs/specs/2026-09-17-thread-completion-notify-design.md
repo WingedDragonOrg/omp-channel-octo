@@ -107,7 +107,8 @@
 - `src/store-chats.ts` / `src/store.ts`：删除 `registerThreadNotify`/`getThreadNotify`/`clearThreadNotify` 与门面转发。
 - `src/thread-notify.ts`：`threadOutcomeNotice(task)` 从任务行渲染（模板、`bounded`、`stateLabel`、`outcomeLine`）。
 - `src/host-tools.ts`：`thread-dispatch` 的 `notify` 参数与登记、收据、工具描述；`create-thread` 去掉 `notify`；`thread-delete` 去掉清理；投递接口接收 `TaskRelayTarget | null`。
-- `src/service.ts`：`acceptTask` 接收 relay 目标；`notifyThreadOutcome` 读任务行；`threadIntentPrompt` 增加判断建议。
+- `src/service.ts`：`acceptTask` 接收 relay 目标；`notifyThreadOutcome` 读任务行。
+- `src/thread-commands.ts`：`threadIntentPrompt` 包含是否请求完成通知的判断建议。
 
 ## 错误与边界情况
 

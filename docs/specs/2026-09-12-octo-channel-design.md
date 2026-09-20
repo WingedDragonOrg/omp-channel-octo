@@ -46,6 +46,22 @@
 
 ## 设计
 
+### 服务编排边界
+
+`CoreService` 负责入站、任务与服务生命周期的编排，通过明确的类型化端口调用职责模块。`history-coordinator.ts` 独占每个聊天的历史覆盖 buffer，负责有界回填及 ledger prepare/commit；权限门之前的记录和 prompt 结束后的提交时点由服务保持。`model-controller.ts` 负责模型命令、聊天模型持久化及临时探测 worker 的完整生命周期，服务只提供活 worker、目录解析、出站投递和目录阻塞端口。模块不依赖 `CoreService` 实例，也不共享其可变状态集合。
+
+`chat-authorization.ts` 独占权限判定、免@查询缓存、运行时开通及节流通知；`inbound-materializer.ts` 负责唯一的正文资源组装入口，持有每次下载预算和本次新建文件清单，统一处理失败回滚。两者通过同一个服务 shutdown signal 取消在途 I/O，共用 `errors.ts` 的 `InboundShutdownError`；服务继续拥有入站操作登记和关停排空，权限门、待回答问题、typing、资源组装及 durable acceptance 的先后顺序保持不变。
+
+`progress-cards.ts` 统一拥有进度卡的持久恢复与每任务轮次状态。服务将已归一化的 `ExecutionEvent` 交给每任务的 `TaskProgress`；研究帧自身可以开卡，其最近快照在同一任务滚卡时结转，新任务独立开始。队列 tail 仍登记到服务关停排空集合，子区归档前读取并等待当前 tail。`session-lifecycle.ts` 负责会话身份/cwd 校验、目录回退、`/new` 和原生 `/move`；它通过 `TaskScheduler` 取得目录租约，blocked 集合继续由服务单点拥有，迁移始终同时持有源、目标目录租约。
+
+`thread-commands.ts` 负责 `/thread` 的任务交接和合并指令，复用正文组装、typing 及任务接纳端口；命令去重仍在服务入口完成。`thread-archive.ts` 独占待归档集合和停止唤醒信号，服务在授权新入站时取消排定、在回合输出之后运行归档；排定替换、出站排空、瞬时失败重试及停止放弃均由该模块维护。
+
+`task-scheduler.ts` 独占聊天串行链、排定任务、目录租约、等待回执标记及关停任务快照；运行中 worker 和 blocked 目录仍由服务管理，调度仅经明确端口查询。`command-routing.ts` 统一内建命令别名及注册校验，从别名表推导的 action 类型约束完整分派表；durable claim 保留用户输入的命令名，重启仍在 claim 完成后请求，未知命令照常走既有 handler 或 OMP 任务路径。
+
+`turn-context.ts` 负责每个群/子区任务的说明快照、注入 ledger 和 sidecar 事务：会话身份验证后发布，普通成功时校验当前 worker 会话的 prepared receipt 并 CAS 提交，取消、中断或失败时保留待重放状态。服务仅在群/子区创建该事务，私聊的完成状态与 outbox flush 保持同一同步结算段。`omp/events.ts` 统一折叠 RPC 消息、回合、工具及子代理帧；worker 保留消费方回调异常的捕获边界，只拒绝当前 prompt。
+
+`task-events.ts` 同步消费每任务的 worker 事件，维护按 messageId 聚合的输出及本地命令标记；通知、本地命令、ask 超时停止过滤、停止后工作、正文、steer 消费和进度事件的处理顺序固定。它只借用取消/停止状态的窄视图，通过同步端口交回研究完整报告供服务落盘，真正的执行事件交给 `TaskProgress`。`service-restart.ts` 独占已请求/待执行重启状态、命令资格、空闲触发和跨进程回执；命令 claim 完成后才请求宿主重启，启动回执先清持久行，再按十分钟窗口和聊天去重投递。
+
 ### 运行和配置
 
 使用 TypeScript/Bun 常驻服务，主动连接 Octo，启动并管理 OMP RPC worker。无需为 RPC 开放网络监听端口。macOS 使用 launchd 托管；机器休眠或离线期间不承诺可用。
@@ -304,7 +320,7 @@ Octo 断线不取消已经开始的 Agent；正文 outbox 与任务状态持久�
 ## 实施前提与未决事项
 既有实现已完成 `/new`/`/reset` 目录绑定、原生 `/move`、精确外部 session 恢复、正文 outbox、执行 tracker、卡片和生命周期边界；共享说明采用 session/version/OMP lifecycle context 设计；线程默认继承父群工作目录已实现：`src/thread-target.ts` 是线程目标父群解析的单一来源，传输层 `contextPath` 与服务的默认目录解析都经它取父群 ID。线程隔离工作区已按验收 25 落地（`src/worktree.ts` 的 worktree port + 绑定的 `cwd_pinned`），依赖部署解析出的 OMP 可执行文件提供 `worktree add`；OMP 未启用 `worktree.clone` 时新工作区不含被忽略文件。Worktrunk 生命周期已按验收 31 落地：`src/worktrunk.ts` 负责兼容探测（稳定 v0.76.x）、wt 命令参数与结果解析、单行错误边界，`src/worktree.ts` 在本机有兼容 wt 时用它创建、合并与清理，否则创建与清理回退现状；宿主调用不传 `-y`，命令审批按本机 Worktrunk 的项目配置进行。Agent 的 Octo 身份已按验收 27 落地：`src/octo-cli.ts` 维护每个 bot 一份 octo-cli 凭据目录，`workerEnv` 以 allowlist 把三个变量注入 OMP worker，其余 `OCTO_*` 继续被剥离；该路径要求部署环境存在 `octo-cli`，缺失时只降级为无 CLI 身份。模型切换已按验收 32 落地：`src/model-switch.ts` 负责选择器解析与有界列表渲染，`chat_models` 表按聊天目标持久化模型，任务路径与 `/new`、`/reset`、`/move` 组装 worker 时读取该值并传 `--model`，`/switch` 的探测复用既有 `WorkerFactory` 起一个 fresh、无 prompt 的一次性 worker 并清理其临时会话目录。原生扩展通知的聊天可见性已按验收 40 落地：`WorkerNoticeEvent` 进入 `WorkerEvent` 联合类型，worker 事件翻译层把上游 `notify` 帧净化转换为该事件，`src/service.ts` 在 `workAfterStop` 判定与进度追踪之前按级别标签投递，复用出站队列的持久化、分块与有界重试，同一上游帧 id 经既有 stream 去重不重复投递。本地命令的群说明提交豁免已按验收 41 落地：`LocalCommandEvent` 进入 `WorkerEvent` 联合类型（worker 仅在匹配的 no-agent 完成恰好发出一次），`src/service.ts` 在 `workAfterStop` 判定前置位 `localOnly`，该回合跳过 context commit、sidecar 照常移除、ledger 保持 pending 至下一真实生成回合。子区归档与合并后自动归档已按验收 42/43 落地：`ChannelTransport.archiveThread` 调 `POST /v1/bot/groups/{g}/threads/{s}/archive`，`octo_management` 的 `thread-archive` 与默认 pipeline 的 `thread-merge` 收尾都只经 `planThreadArchive` 排定，`CoreService` 在该聊天回合输出排空后执行一次归档，仅瞬时失败（5xx 或 `err.server.bot_api.store_failed`）按 5 秒间隔最多 5 次尝试、停止时放弃、最终失败只向发起聊天补一条有界说明。
 
-研究只读呈现与完整记录导出切片按验收 44/45 落线：`src/research-report.ts` 负责按 bot+真实聊天摘要键控的原子 latest 与导出不可变 spool（同聊天链式有序写入、stop 排水），`src/service.ts` 消费权威 `research_update`（运行时保留最新快照、研究帧开卡与轮次更新、报告落盘）并实现 owner-only 硬拦截 `/autoresearch-history`（入队 file outbox、messageId 级持久去重、入队失败自清 spool）。
+研究只读呈现与完整记录导出切片按验收 44/45 落线：`src/omp/events.ts` 通过每个 prompt 独立的 `ResearchTracker` 折叠权威工具帧，`src/task-events.ts` 将 `research_update` 的完整报告交回服务落盘，`src/progress-cards.ts` 拥有该任务最近快照、研究帧开卡与滚卡结转。`src/research-report.ts` 负责按 bot+真实聊天摘要键控的原子 latest 与导出不可变 spool（同聊天链式有序写入、stop 排水）；`src/service.ts` 接线报告存储并实现 owner-only 硬拦截 `/autoresearch-history`（入队 file outbox、messageId 级持久去重、入队失败自清 spool）。
 
 未决事项：无（子区归档的真机端到端验收待部署服务器升级到含 bot 归档端点的 octo-server 版本后补做，见验收 42/43 证据）。线程默认目录继承已按验收 3/4/22 落地并验证（见下）；真实 OMP compaction、删除 version、崩溃重放和凭证隔离验证仍按共享说明章节的验收补做。
 

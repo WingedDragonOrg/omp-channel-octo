@@ -43,23 +43,11 @@ import {
 	HostCall,
 	PendingResponse,
 	PromptRun,
-	asAssistantMessageKey,
 	describeUiFailure,
-	emitExecutionEvent,
-	ensureAssistantMessage,
-	eventTime,
+	emitWorkerEvent,
 	hostResult,
-	isUserSteerMessage,
-	messageText,
 	modelErrorFromFrame,
 	noticeEventFromFrame,
-	safeToolCallId,
-	safeToolName,
-	safeToolSummary,
-	subagentLifecycleEvent,
-	subagentProgressEvent,
-	todoDetailsFromResult,
-	turnIdValue,
 } from "./events.ts";
 
 const FIXED_CONTEXT_EXTENSION_PATH = resolve(import.meta.dir, "context-extension.ts");
@@ -697,130 +685,7 @@ class RpcWorker implements OmpWorker {
 
 	#emitWorkerEvent(active: PromptRun, frame: RpcFrame): void {
 		try {
-			if (frame.type === "message_start") {
-				const message = frame.message;
-				if (isUserSteerMessage(message)) {
-					active.onEvent({ type: "steer_consumed", text: messageText(message), atMs: eventTime(frame.timestamp) });
-					return;
-				}
-				if (isRecord(message) && message.role === "assistant") {
-					const key = asAssistantMessageKey(message);
-					if (!(key && active.completedAssistantMessageKeys.has(key))) ensureAssistantMessage(active, message);
-				}
-				return;
-			}
-			if (frame.type === "message_update") {
-				const message = frame.message;
-				if (!isRecord(message) || message.role !== "assistant") return;
-				const assistantMessageEvent = frame.assistantMessageEvent;
-				if (
-					!isRecord(assistantMessageEvent) ||
-					assistantMessageEvent.type !== "text_delta" ||
-					typeof assistantMessageEvent.delta !== "string"
-				) {
-					return;
-				}
-				const messageId = ensureAssistantMessage(active, message);
-				if (!messageId) return;
-				active.assistantMessageText += assistantMessageEvent.delta;
-				active.onEvent({
-					type: "text",
-					messageId,
-					text: active.assistantMessageText,
-					final: false,
-				});
-				return;
-			}
-			if (frame.type === "message_end") {
-				const message = frame.message;
-				if (!isRecord(message) || message.role !== "assistant") return;
-				const key = asAssistantMessageKey(message);
-				if (key && active.completedAssistantMessageKeys.has(key)) return;
-				if (active.assistantMessageEnded && (!key || active.assistantMessageKey === key)) return;
-				const messageId = ensureAssistantMessage(active, message);
-				if (!messageId || active.assistantMessageEnded || active.completedAssistantMessageIds.has(messageId)) return;
-				const text = messageText(message);
-				active.assistantMessageText = text;
-				active.assistantMessageEnded = true;
-				active.completedAssistantMessageIds.add(messageId);
-				if (key) active.completedAssistantMessageKeys.add(key);
-				active.onEvent({ type: "text", messageId, text, final: true });
-			}
-			if (frame.type === "turn_start") {
-				const upstreamTurnId = turnIdValue(frame.turnIndex);
-				const turnId = upstreamTurnId ?? active.nextTurnId++;
-				if (typeof turnId === "number") active.nextTurnId = Math.max(active.nextTurnId, Math.floor(turnId) + 1);
-				active.activeTurnId = turnId;
-				emitExecutionEvent(active, { type: "turn_start", turnId, atMs: eventTime(frame.timestamp) });
-				return;
-			}
-			if (frame.type === "turn_end") {
-				const turnId = turnIdValue(frame.turnIndex) ?? active.activeTurnId;
-				const atMs = eventTime(frame.timestamp);
-				if (turnId === undefined) emitExecutionEvent(active, { type: "turn_end", atMs });
-				else emitExecutionEvent(active, { type: "turn_end", turnId, atMs });
-				active.activeTurnId = undefined;
-				return;
-			}
-			if (frame.type === "subagent_lifecycle") {
-				if (!this.#subagentFrames) return;
-				const event = subagentLifecycleEvent(frame.payload, eventTime(frame.timestamp));
-				if (event) emitExecutionEvent(active, event);
-				return;
-			}
-			if (frame.type === "subagent_progress") {
-				if (!this.#subagentFrames) return;
-				const event = subagentProgressEvent(frame.payload, eventTime(frame.timestamp));
-				if (event) emitExecutionEvent(active, event);
-				return;
-			}
-			if (frame.type === "tool_execution_start") {
-				const toolCallId = safeToolCallId(frame.toolCallId);
-				const toolName = safeToolName(frame.toolName);
-				if (!toolCallId || !toolName) return;
-				const summary = safeToolSummary(toolName, frame.args);
-				if (summary) active.toolSummaries.set(toolCallId, summary);
-				if (summary === undefined) {
-					emitExecutionEvent(active, { type: "tool_start", toolCallId, toolName, atMs: Date.now() });
-				} else {
-					emitExecutionEvent(active, { type: "tool_start", toolCallId, toolName, atMs: Date.now(), summary });
-				}
-				const researchStart = active.research.startTool(toolName, toolCallId);
-				if (researchStart) emitExecutionEvent(active, researchStart);
-				return;
-			}
-			if (frame.type === "tool_execution_end") {
-				const toolCallId = safeToolCallId(frame.toolCallId);
-				const toolName = safeToolName(frame.toolName);
-				if (!toolCallId || !toolName) return;
-				const summary = active.toolSummaries.get(toolCallId);
-				active.toolSummaries.delete(toolCallId);
-				const failed = frame.isError === true;
-				const atMs = Date.now();
-				if (failed) {
-					if (summary === undefined) {
-						emitExecutionEvent(active, { type: "tool_end", toolCallId, atMs, status: "failed", errorCategory: "unknown" });
-					} else {
-						emitExecutionEvent(active, { type: "tool_end", toolCallId, atMs, status: "failed", errorCategory: "unknown", summary });
-					}
-				} else if (summary === undefined) {
-					emitExecutionEvent(active, { type: "tool_end", toolCallId, atMs, status: "succeeded" });
-				} else {
-					emitExecutionEvent(active, { type: "tool_end", toolCallId, atMs, status: "succeeded", summary });
-				}
-				if (!failed && toolName === "todo") {
-					const details = todoDetailsFromResult(frame.result);
-					if (details) {
-						const todoEvent =
-							details.op === undefined
-								? { type: "todo_update" as const, atMs, phases: details.phases }
-								: { type: "todo_update" as const, atMs, op: details.op, phases: details.phases };
-						emitExecutionEvent(active, todoEvent);
-					}
-				}
-				const researchEnd = active.research.endTool(toolName, toolCallId, frame.result, failed);
-				if (researchEnd) emitExecutionEvent(active, researchEnd);
-			}
+			emitWorkerEvent(active, frame, this.#subagentFrames);
 		} catch (error) {
 			this.#rejectPrompt(active, asError(error, "OMP event callback failed"));
 		}

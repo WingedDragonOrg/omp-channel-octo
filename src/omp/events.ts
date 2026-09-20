@@ -90,13 +90,13 @@ export function asTodoOperation(value: unknown): TodoOperation | undefined {
 	return typeof value === "string" && TODO_OPERATIONS.has(value as TodoOperation) ? (value as TodoOperation) : undefined;
 }
 
-export function asAssistantMessageKey(message: RpcFrame): string | undefined {
+function asAssistantMessageKey(message: RpcFrame): string | undefined {
 	const id = message.id;
 	return typeof id === "string" && id.length > 0 ? id : undefined;
 }
 
 /** Text blocks of one message frame; image and other blocks are skipped. */
-export function messageText(message: RpcFrame): string {
+function messageText(message: RpcFrame): string {
 	if (!Array.isArray(message.content)) return "";
 	return message.content
 		.filter(item => isRecord(item) && item.type === "text" && typeof item.text === "string")
@@ -108,11 +108,11 @@ export function messageText(message: RpcFrame): string {
  * A steering frame is a user-attributed message marked `steering: true`. The IRC bridge steers
  * its own user-role frames with `attribution: "agent"`, so those stay unreported.
  */
-export function isUserSteerMessage(value: unknown): value is RpcFrame {
+function isUserSteerMessage(value: unknown): value is RpcFrame {
 	return isRecord(value) && value.role === "user" && value.steering === true && value.attribution !== "agent";
 }
 
-export function emitExecutionEvent(active: PromptRun, event: ExecutionEvent): void {
+function emitExecutionEvent(active: PromptRun, event: ExecutionEvent): void {
 	active.onEvent(event);
 }
 
@@ -125,7 +125,7 @@ export function allocateAssistantMessage(active: PromptRun, key: string | undefi
 	return messageId;
 }
 
-export function ensureAssistantMessage(active: PromptRun, message: RpcFrame | undefined): string | undefined {
+function ensureAssistantMessage(active: PromptRun, message: RpcFrame | undefined): string | undefined {
 	const key = message ? asAssistantMessageKey(message) : undefined;
 	if (!active.assistantMessageId || active.assistantMessageEnded || (key && active.assistantMessageKey && key !== active.assistantMessageKey)) {
 		if (key && active.completedAssistantMessageKeys.has(key)) return undefined;
@@ -135,22 +135,22 @@ export function ensureAssistantMessage(active: PromptRun, message: RpcFrame | un
 	return active.assistantMessageId;
 }
 
-export function turnIdValue(value: unknown): string | number | undefined {
+function turnIdValue(value: unknown): string | number | undefined {
 	if (typeof value === "string" && value.length > 0) return value;
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-export function eventTime(value: unknown): number {
+function eventTime(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : Date.now();
 }
 
-export function safeToolName(value: unknown): string | undefined {
+function safeToolName(value: unknown): string | undefined {
 	if (typeof value !== "string") return undefined;
 	const name = value.trim();
 	return /^[A-Za-z0-9_.:-]{1,64}$/u.test(name) ? name : undefined;
 }
 
-export function safeToolCallId(value: unknown): string | undefined {
+function safeToolCallId(value: unknown): string | undefined {
 	if (typeof value !== "string") return undefined;
 	const id = value.trim();
 	return id.length > 0 ? id : undefined;
@@ -299,7 +299,7 @@ export function safeSpecialToolSummary(toolName: string, args: unknown): string 
 	}
 }
 
-export function safeToolSummary(toolName: string, args: unknown): string | undefined {
+function safeToolSummary(toolName: string, args: unknown): string | undefined {
 	const normalized = toolName.toLowerCase();
 	const special = safeSpecialToolSummary(normalized, args);
 	if (special !== undefined) return special;
@@ -317,7 +317,7 @@ export function safeToolSummary(toolName: string, args: unknown): string | undef
 	return SAFE_SUMMARY_COMPONENT.test(component) ? component : undefined;
 }
 
-export function todoDetailsFromResult(result: unknown): { phases: ExecutionTodoPhase[]; op: TodoOperation | undefined } | undefined {
+function todoDetailsFromResult(result: unknown): { phases: ExecutionTodoPhase[]; op: TodoOperation | undefined } | undefined {
 	if (!isRecord(result) || !isRecord(result.details) || !Array.isArray(result.details.phases)) return undefined;
 	const phases: ExecutionTodoPhase[] = [];
 	for (const rawPhase of result.details.phases) {
@@ -347,7 +347,7 @@ export function todoDetailsFromResult(result: unknown): { phases: ExecutionTodoP
 export type SubagentLifecycleEvent = Extract<ExecutionEvent, { type: "subagent_start" | "subagent_end" }>;
 export type SubagentProgressEvent = Extract<ExecutionEvent, { type: "subagent_update" }>;
 
-export function subagentLifecycleEvent(payload: unknown, atMs: number): SubagentLifecycleEvent | undefined {
+function subagentLifecycleEvent(payload: unknown, atMs: number): SubagentLifecycleEvent | undefined {
 	if (!isRecord(payload) || typeof payload.id !== "string" || payload.id.length === 0) return undefined;
 	const status = payload.status;
 	if (status !== "started" && status !== "completed" && status !== "failed" && status !== "aborted") return undefined;
@@ -378,7 +378,7 @@ export function subagentLifecycleEvent(payload: unknown, atMs: number): Subagent
  * recent tool arguments are dropped — the card shows a bounded state line, and raw arguments
  * belong to the child's own transcript.
  */
-export function subagentProgressEvent(payload: unknown, atMs: number): SubagentProgressEvent | undefined {
+function subagentProgressEvent(payload: unknown, atMs: number): SubagentProgressEvent | undefined {
 	if (!isRecord(payload) || !isRecord(payload.progress)) return undefined;
 	const progress = payload.progress;
 	if (typeof progress.id !== "string" || progress.id.length === 0) return undefined;
@@ -448,5 +448,139 @@ export function noticeEventFromFrame(frame: RpcFrame): WorkerNoticeEvent | undef
 
 export function describeUiFailure(method: string): Error {
 	return new Error(`OMP requested unsupported interactive UI (${method}); worker stopped safely`);
+}
+
+/**
+ * Fold one RPC frame into the run's `WorkerEvent`/`ExecutionEvent` stream: assistant message
+ * identity and text-delta/final dedup, turn numbering, the subagent subscription gate, and the
+ * tool/todo summaries. `subagentFrames` is the worker's subscription state, passed on every
+ * call rather than cached here. A failing consumer callback is deliberately not caught: the
+ * error propagates so the caller rejects that one prompt instead of turning the worker fatal.
+ */
+export function emitWorkerEvent(active: PromptRun, frame: RpcFrame, subagentFrames: boolean): void {
+	if (frame.type === "message_start") {
+		const message = frame.message;
+		if (isUserSteerMessage(message)) {
+			active.onEvent({ type: "steer_consumed", text: messageText(message), atMs: eventTime(frame.timestamp) });
+			return;
+		}
+		if (isRecord(message) && message.role === "assistant") {
+			const key = asAssistantMessageKey(message);
+			if (!(key && active.completedAssistantMessageKeys.has(key))) ensureAssistantMessage(active, message);
+		}
+		return;
+	}
+	if (frame.type === "message_update") {
+		const message = frame.message;
+		if (!isRecord(message) || message.role !== "assistant") return;
+		const assistantMessageEvent = frame.assistantMessageEvent;
+		if (
+			!isRecord(assistantMessageEvent) ||
+			assistantMessageEvent.type !== "text_delta" ||
+			typeof assistantMessageEvent.delta !== "string"
+		) {
+			return;
+		}
+		const messageId = ensureAssistantMessage(active, message);
+		if (!messageId) return;
+		active.assistantMessageText += assistantMessageEvent.delta;
+		active.onEvent({
+			type: "text",
+			messageId,
+			text: active.assistantMessageText,
+			final: false,
+		});
+		return;
+	}
+	if (frame.type === "message_end") {
+		const message = frame.message;
+		if (!isRecord(message) || message.role !== "assistant") return;
+		const key = asAssistantMessageKey(message);
+		if (key && active.completedAssistantMessageKeys.has(key)) return;
+		if (active.assistantMessageEnded && (!key || active.assistantMessageKey === key)) return;
+		const messageId = ensureAssistantMessage(active, message);
+		if (!messageId || active.assistantMessageEnded || active.completedAssistantMessageIds.has(messageId)) return;
+		const text = messageText(message);
+		active.assistantMessageText = text;
+		active.assistantMessageEnded = true;
+		active.completedAssistantMessageIds.add(messageId);
+		if (key) active.completedAssistantMessageKeys.add(key);
+		active.onEvent({ type: "text", messageId, text, final: true });
+	}
+	if (frame.type === "turn_start") {
+		const upstreamTurnId = turnIdValue(frame.turnIndex);
+		const turnId = upstreamTurnId ?? active.nextTurnId++;
+		if (typeof turnId === "number") active.nextTurnId = Math.max(active.nextTurnId, Math.floor(turnId) + 1);
+		active.activeTurnId = turnId;
+		emitExecutionEvent(active, { type: "turn_start", turnId, atMs: eventTime(frame.timestamp) });
+		return;
+	}
+	if (frame.type === "turn_end") {
+		const turnId = turnIdValue(frame.turnIndex) ?? active.activeTurnId;
+		const atMs = eventTime(frame.timestamp);
+		if (turnId === undefined) emitExecutionEvent(active, { type: "turn_end", atMs });
+		else emitExecutionEvent(active, { type: "turn_end", turnId, atMs });
+		active.activeTurnId = undefined;
+		return;
+	}
+	if (frame.type === "subagent_lifecycle") {
+		if (!subagentFrames) return;
+		const event = subagentLifecycleEvent(frame.payload, eventTime(frame.timestamp));
+		if (event) emitExecutionEvent(active, event);
+		return;
+	}
+	if (frame.type === "subagent_progress") {
+		if (!subagentFrames) return;
+		const event = subagentProgressEvent(frame.payload, eventTime(frame.timestamp));
+		if (event) emitExecutionEvent(active, event);
+		return;
+	}
+	if (frame.type === "tool_execution_start") {
+		const toolCallId = safeToolCallId(frame.toolCallId);
+		const toolName = safeToolName(frame.toolName);
+		if (!toolCallId || !toolName) return;
+		const summary = safeToolSummary(toolName, frame.args);
+		if (summary) active.toolSummaries.set(toolCallId, summary);
+		if (summary === undefined) {
+			emitExecutionEvent(active, { type: "tool_start", toolCallId, toolName, atMs: Date.now() });
+		} else {
+			emitExecutionEvent(active, { type: "tool_start", toolCallId, toolName, atMs: Date.now(), summary });
+		}
+		const researchStart = active.research.startTool(toolName, toolCallId);
+		if (researchStart) emitExecutionEvent(active, researchStart);
+		return;
+	}
+	if (frame.type === "tool_execution_end") {
+		const toolCallId = safeToolCallId(frame.toolCallId);
+		const toolName = safeToolName(frame.toolName);
+		if (!toolCallId || !toolName) return;
+		const summary = active.toolSummaries.get(toolCallId);
+		active.toolSummaries.delete(toolCallId);
+		const failed = frame.isError === true;
+		const atMs = Date.now();
+		if (failed) {
+			if (summary === undefined) {
+				emitExecutionEvent(active, { type: "tool_end", toolCallId, atMs, status: "failed", errorCategory: "unknown" });
+			} else {
+				emitExecutionEvent(active, { type: "tool_end", toolCallId, atMs, status: "failed", errorCategory: "unknown", summary });
+			}
+		} else if (summary === undefined) {
+			emitExecutionEvent(active, { type: "tool_end", toolCallId, atMs, status: "succeeded" });
+		} else {
+			emitExecutionEvent(active, { type: "tool_end", toolCallId, atMs, status: "succeeded", summary });
+		}
+		if (!failed && toolName === "todo") {
+			const details = todoDetailsFromResult(frame.result);
+			if (details) {
+				const todoEvent =
+					details.op === undefined
+						? { type: "todo_update" as const, atMs, phases: details.phases }
+						: { type: "todo_update" as const, atMs, op: details.op, phases: details.phases };
+				emitExecutionEvent(active, todoEvent);
+			}
+		}
+		const researchEnd = active.research.endTool(toolName, toolCallId, frame.result, failed);
+		if (researchEnd) emitExecutionEvent(active, researchEnd);
+	}
 }
 
