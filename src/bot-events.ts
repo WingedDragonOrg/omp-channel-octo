@@ -34,6 +34,7 @@ export interface BotEventLoop {
 
 /** Cancellable pause that resolves early when the caller's signal aborts. */
 function waitFor(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
   const { promise, resolve } = Promise.withResolvers<void>();
   const onAbort = (): void => {
     clearTimeout(timer);

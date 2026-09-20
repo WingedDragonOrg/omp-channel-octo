@@ -91,3 +91,42 @@ test("retryable event processing waits for recovery instead of exhausting its bu
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("stop during event processing does not wait on an already-aborted retry delay", async () => {
+  const root = await mkdtemp(join(tmpdir(), "oco-event-stop-"));
+  const store = await openChannelStore(root);
+  const transport = new RetryAckTransport({ bot: { uid: "stopping-bot", name: "Fixture" } });
+  const entered = Promise.withResolvers<void>();
+  const completion = Promise.withResolvers<"retry">();
+  transport.fetchBotEvents = async () => [{
+    eventId: 1, kind: "card_action",
+    action: { messageId: "card", channelType: 1, channelId: "owner", actionId: "ask_submit", operatorUid: "owner", inputs: {} },
+  }];
+  const loop = createBotEventLoop({
+    store, transport, botUid: () => transport.bot.uid, stopping: () => false,
+    onCardAction: () => {
+      entered.resolve();
+      return completion.promise;
+    },
+  });
+  let stopped = false;
+  vi.useFakeTimers();
+  try {
+    loop.start();
+    await entered.promise;
+    const stopping = loop.stop().then(() => { stopped = true; });
+    completion.resolve("retry");
+    await flush();
+    expect(stopped).toBe(true);
+    expect(transport.ackedEvents).toEqual([]);
+    expect(store.getBotEventCursor(transport.bot.uid)).toBe(0);
+    await stopping;
+  } finally {
+    completion.resolve("retry");
+    vi.advanceTimersByTime(5_000);
+    await loop.stop();
+    vi.useRealTimers();
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
