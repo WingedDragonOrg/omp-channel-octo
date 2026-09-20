@@ -86,6 +86,11 @@ export function createTypingLeaseManager(options: TypingLeaseOptions): TypingLea
   };
 
   const tick = (key: string, entry: LeaseEntry): void => {
+    if (options.stopping()) {
+      entries.delete(key);
+      stopEntry(entry);
+      return;
+    }
     // 兜底：terminal 或行缺失的任务租约在下一 tick 内回收（覆盖排队中取消等漏 release 路径）。
     for (const owner of [...entry.owners]) {
       if (!owner.startsWith(TASK_OWNER_PREFIX)) continue;

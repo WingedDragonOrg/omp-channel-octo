@@ -186,6 +186,8 @@ OMP extension 在 worker 启动时由固定路径自动加载；sidecar 根路�
 
 typing 由按聊天单例的租约环驱动：agent-attached 消息在权限门通过、判定交给 agent 后立即发出（普通消息在待回答问题判定之后、附件组装之前；未注册 `/xxx`、`/queue`、`/thread`、`/thread merge` 与 observing/intercepting 命令在各自交给 agent 前的同一点位），其后每 3 秒续期；同一聊天任一时刻至多一条续期环，owner 为 `msg:<messageId>` 与 `task:<id>` 租约——任务被持久接受时并入 task 租约、环不重启，同聊天排队与跨聊天同目录等待期间保持亮起，任务终态（完成/失败/取消/启动失败）释放，排队中 `/cancel` 等一切漏释放路径由每 tick 的任务行状态兜底回收，消息租约的释放由调用方 try/finally 硬保证（覆盖附件拒收、拒绝抛错、claim 去重早退等一切出口）；服务停止时切断新 acquire 并在 activity settle 后、store 关闭前释放全部租约；非 agent 命令、待回答问题答复、成员命令提示、不支持类型、权限拒绝与 Bot 回声一律不发送 typing。每个 typing/card 活动请求使用独立 2 秒 deadline，终态卡片使用独立短 signal。运行中卡片失败可按有界节流重试；终态 edit 失败只做一次 best-effort，随后 dispose 卡片活动，不无限重试，其遗留的持久记录由下一次启动补发。卡片正文被 Bot API 之前的部署边缘拒绝时——响应的状态码来自边缘本身、正文不是 Bot API 的错误信封，因而没有机器错误码——该轮改用不带工具与子代理步骤摘要的形态重试，并沿用至该轮的终态编辑：切换一次即成，状态、计数、任务清单与子代理行照旧，被拒事件与切换各记一条有界日志。卡片队列 promise 纳入服务生命周期并在停止时于任务结束后等待其有界收敛，不能拖延正文投递、取消 kill、目录解锁或正常业务。typing/card 失败不阻断正文或业务。
 
+typing 的已排定 tick 在服务进入 stopping 后直接回收该租约环，不再读取任务状态或发起续期请求，避免停机等待期间继续增加后台活动。
+
 ### 持久化、调度与恢复
 
 本地 SQLite 保存聊天绑定、动态允许集合（`allowed_chats`：运行中开通的聊天及其 `granted_by`/`granted_at`）、任务、入站去重键、问题、出站记录、进度卡记录和任务行上的派发回传登记（`tasks.relay_channel_type`/`relay_channel_id`/`relay_thread_name`：回传目标与子区名，空 = 不回传），OMP 自身保存对话。入站唯一键使用 Bot 身份、聊天类型、真实聊天 ID 和服务器消息 ID。没有可靠 ID 的任务拒绝执行。去重记录与接收状态事务写入成功后才确认接收；状态盘写入失败时不发送成功 ACK、不启动 Agent，并保留可重试的命令状态。每个聊天的追加模式（`steer`/`queue`）持久化在与绑定、任务同一套状态盘中，未写入行时按 `steer` 处理。作为 steering 消费的入站消息同样先 durable claim 再发送 RPC 帧：claim 成功而 OMP 拒绝该帧时释放 claim 并回退为普通排队任务，已 claim 未确认的消息在服务器重投时不会重复注入。
