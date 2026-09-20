@@ -263,7 +263,7 @@ test("a failed dispatch relays a bounded failure line", async () => {
     await noticeSeen.promise;
     expect(notices).toHaveLength(1);
     expect(notices[0]).toContain("状态：失败");
-    expect(notices[0]).toContain("失败原因：worker failed");
+    expect(notices[0]).toContain("fixture worker failed");
   } finally {
     await closeCoreHarness(harness);
   }
