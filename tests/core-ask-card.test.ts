@@ -1615,3 +1615,32 @@ test.each(["text", "cancel"] as const)("a partial set keeps earlier answers when
     await closeCoreHarness(harness);
   }
 });
+
+test("a declined card does not fall back to re-asking an answer recorded during send", async () => {
+  const sending = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const harness = await startAskHarness({ id: "fallback", question: "Pending fallback question?" }, {
+    setup: (transport) => {
+      transport.sendCard = async () => {
+        sending.resolve();
+        await release.promise;
+        return null;
+      };
+    },
+  });
+  try {
+    const target: ChatTarget = { channelType: 1, channelId: "late-declined-card" };
+    await harness.service.handleInbound(inbound({ ...target, text: "ask" }));
+    await sending.promise;
+    await harness.service.handleInbound(inbound({ ...target, text: "recorded-answer" }));
+    release.resolve();
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+    expect(harness.transport.sent).toHaveLength(0);
+    expect(await readAnswers(harness)).toMatchObject({
+      answers: [{ id: "fallback", answer: "recorded-answer", answeredBy: "owner-1" }],
+    });
+  } finally {
+    release.resolve();
+    await closeCoreHarness(harness);
+  }
+});

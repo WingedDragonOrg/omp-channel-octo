@@ -645,7 +645,9 @@ async function deliverQuestion(
       sendingQuestions.delete(questionId);
     }
   }
-  deps.enqueueText(target, formatQuestion(payload), taskId);
+  if (deps.store.getQuestion(questionId)?.state === "pending") {
+    deps.enqueueText(target, formatQuestion(payload), taskId);
+  }
 }
 
 /**

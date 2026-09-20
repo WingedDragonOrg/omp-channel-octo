@@ -166,6 +166,7 @@ OMP `session.compacting` 生命周期在压缩时把当前 turn sidecar 中的�
 卡片已发布但发送回执尚在途时，同聊天的有效 ask 点击保留为可重试事件，待远端 message ID 绑定到问题后再作答与 ACK；单题与整组卡都遵守该顺序。已结束发送且没有对应绑定的未知卡片仍按既有规则忽略，不能猜测绑定到另一道题。
 回执到达并绑定后重新读取问题的持久状态：在发送途中已经通过文字作答或关闭的问题，单题卡与整组卡都补写当前状态；卡片展示与已记录答案一致，发送完成不会重新打开已结束的问题。
 整组卡的成员由远端 message ID 绑定的全部问题决定，而非当前待答问题数量。部分作答后，剩余问题被文字回答或取消时仍重绘整张卡，保留先前答案与署名，并关闭剩余输入。
+单题卡发送失败或被部署拒绝时，纯文本回退只投递仍待答的问题；发送途中已记录答案或关闭的问题直接沿用持久状态。
 
 除 host tool 外，任务里的 Agent 还可以用本机 `octo-cli` 以本 bot 身份直接访问 Octo Bot API：宿主注册 Bot 后把该 bot 的 token 经 stdin 写入自己的 octo-cli 凭据目录（`~/.oco/octo-cli/<botUid>`，目录权限 0700，命令行与日志中不出现 token），并把 `OCTO_CONFIG_DIR`、`OCTO_API_BASE_URL`、`OCTO_BOT_ID` 注入 OMP worker 环境。一个 bot 一份目录，宿主服务多个 bot 时凭据互不共享。原始 token 不进入 worker 环境：OMP worker 继续按前缀剥离宿主继承的 `OCTO_*` 与 `OMP_CHANNEL_OCTO_*`，只有这三个名字允许进入子进程。凭据准备是 best-effort，octo-cli 缺失、登录失败或返回的 robot_id 与当前 bot 不一致时只记录一条有界日志并保持不注入，不影响启动与任务。因此 host tool "目标固定为当前聊天" 的承诺只约束 host tool 自身；经 octo-cli 的调用不受该绑定限制，其授权完全由服务端按本 bot 身份判定。`channel_control` 的说明同时告知 Agent 这条路径，并要求它先用 `octo-cli auth status` 自证身份，身份不是本 bot 时不使用。
 
