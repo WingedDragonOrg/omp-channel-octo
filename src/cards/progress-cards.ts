@@ -247,7 +247,9 @@ export class ProgressCards {
   /** 一轮 task 一个 owner；`runTask` 建，`finally` 里 `stop`。 */
   startTask(taskId: string, target: ChatTarget): TaskProgress {
     const recovered = this.recovered.get(taskId);
-    if (recovered === undefined) return new TaskProgress(this.deps, taskId, target);
+    if (recovered === undefined && !this.deps.store.isTaskResuming(taskId)) {
+      return new TaskProgress(this.deps, taskId, target);
+    }
     this.recovered.delete(taskId);
     return new TaskProgress(this.deps, taskId, target, {
       round: recovered ?? undefined,
@@ -436,6 +438,9 @@ export class TaskProgress {
       return;
     }
     // 上一进程已经建过这轮卡片：恢复不改身份、不改序号，只是接着编辑读者眼前那张卡。
+    // 研究带和 todo 一样属于任务而不是单轮，接管时先从快照里恢复任务级快照，否则恢复后
+    // 第一次 steer 滚出的新卡会静默丢掉上一进程已经报出来的研究带。
+    this.latestResearch = resumed.snapshot.research;
     this.round = {
       ...makeRound(taskId, 0, this.keyPrefix, resumed.tracker),
       started: true,

@@ -42,6 +42,13 @@ const textsFor = (harness: CoreHarness, target: ChatTarget): string[] =>
     .filter(({ target: sent }) => sent.channelId === target.channelId && sent.channelType === target.channelType)
     .map(({ text }) => text);
 
+/** 负向断言的观察窗：给异步唤醒一段明确的时间去犯错，而不是死睡。 */
+async function observationWindow(ms: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  await promise;
+}
+
 /**
  * A turn that stays in flight until its chat stops, then fails like the real RPC worker does when
  * `stop()` rejects the active prompt. That is the state a restart (graceful or crash) interrupts
@@ -58,6 +65,19 @@ const suspendedPrompt: FakePrompt = async ({ isStopped, onStop }) => {
 /** The prompt handler a restarted process uses: record the dispatched text, then settle. */
 const recordingPrompt: FakePrompt = async ({ text, append }) => {
   await append("effects.log", `${text}\n`);
+};
+
+/**
+ * An in-flight turn that ends as soon as `/interrupt` aborts it (the worker keeps running, so the
+ * chat is idle afterwards): the shape an explicit interrupt settles from.
+ */
+const abortablePrompt: FakePrompt = async ({ waitForAbort, onStop, isStopped }) => {
+  const stopped = Promise.withResolvers<void>();
+  onStop(stopped.resolve);
+  const aborted = Promise.withResolvers<void>();
+  void waitForAbort().then(aborted.resolve);
+  await Promise.race([stopped.promise, aborted.promise]);
+  if (isStopped()) throw new Error("OMP prompt cancelled");
 };
 
 async function withStore<T>(root: string, work: (store: ChannelStore) => T): Promise<T> {
@@ -609,6 +629,417 @@ test("an unconfirmed worker death keeps the task queued instead of failing it", 
     expect(rows.queued).toBe(2);
     expect(textsFor(restarted, blocked)).toEqual([]);
     expect(textsFor(restarted, later)).toEqual([]);
+  } finally {
+    await closeCoreHarness(restarted);
+  }
+});
+
+test("an interrupt acknowledged before the abrupt death is never resumed", async () => {
+  const inFlight: ChatTarget = { channelId: "dm-interrupt-killed", channelType: 1 };
+  const preDispatch: ChatTarget = { channelId: "dm-interrupt-killed-early", channelType: 1 };
+  const first = await createCoreHarness();
+  await closeCoreHarness(first, { remove: false });
+  const cwd = join(first.root, "tmp");
+  await withStore(first.root, (store) => {
+    // 已在途（1/1）：控制已被接受，但进程在回合收束前就死了。
+    seedQueuedTask(
+      store,
+      taskRow({ id: "interrupted-in-flight", botUid: first.bot.uid, ...inFlight, sessionId: "session-interrupted", cwd }),
+    );
+    store.markStarted("interrupted-in-flight");
+    store.markTaskPromptStarted("interrupted-in-flight", "session-interrupted");
+    store.markTaskPromptAccepted("interrupted-in-flight");
+    store.markTaskStopIntent("interrupted-in-flight", "interrupt");
+    store.createQuestion({
+      id: "interrupted-question",
+      botUid: first.bot.uid,
+      taskId: "interrupted-in-flight",
+      ...inFlight,
+      payload: JSON.stringify({ question: "还继续吗", toolCallId: "call-interrupted" }),
+    });
+    // 连派发都没走到（0/0）：同样是用户已经中断过的任务。
+    seedQueuedTask(store, taskRow({ id: "interrupted-pre-dispatch", botUid: first.bot.uid, ...preDispatch, cwd }));
+    store.markStarted("interrupted-pre-dispatch");
+    store.markTaskStopIntent("interrupted-pre-dispatch", "interrupt");
+  });
+
+  const restarted = await createCoreHarness({ root: first.root, bot: first.bot, prompt: recordingPrompt });
+  try {
+    await restarted.service.stop();
+    expect(restarted.workers.prompts).toHaveLength(0);
+    const rows = await withStore(restarted.root, (store) => ({
+      inFlight: store.getTask("interrupted-in-flight"),
+      preDispatch: store.getTask("interrupted-pre-dispatch"),
+    }));
+    expect(rows.inFlight?.state).toBe("interrupted");
+    expect(rows.inFlight?.errorText).toContain("用户中断");
+    expect(rows.preDispatch?.state).toBe("interrupted");
+    expect(rows.preDispatch?.errorText).toContain("用户中断");
+    // 用户中断是终局：它遗留的提问一并关闭（只关自己那条任务），迟到答复不再另起回合。
+    expect(await withStore(restarted.root, (store) => store.getQuestion("interrupted-question")?.state))
+      .toBe("cancelled");
+    // 用户中断是终局：不续接、不重放、也不再有额外说明（两个聊天都是）。
+    expect(textsFor(restarted, inFlight)).toEqual([]);
+    expect(textsFor(restarted, preDispatch)).toEqual([]);
+  } finally {
+    await closeCoreHarness(restarted);
+  }
+});
+
+test("an accepted interrupt leaves the turn running instead of cancelling the task", async () => {
+  const target: ChatTarget = { channelId: "dm-interrupt-durable", channelType: 1 };
+  const harness = await createCoreHarness({ prompt: suspendedPrompt });
+  try {
+    await harness.service.handleInbound(inbound({ messageId: "interrupt-durable-task", ...target, text: "hold" }));
+    await harness.workers.waitForPromptCount(1);
+    await harness.service.handleInbound(
+      inbound({ messageId: "interrupt-durable-command", ...target, text: "/interrupt" }),
+    );
+    await waitForStatus(harness.service, target, (status) => status.outbox === 0);
+    expect(textsFor(harness, target).join("\n")).toContain("已中断当前回合");
+    // 中断只停这一轮：任务行保持未结算（停止意图随行落盘，进程若在此刻被杀也不会被续接）。
+    const row = await withStore(harness.root, (store) => store.getLatestTask(harness.bot.uid, target));
+    expect(row?.state).toBe("running");
+    expect(textsFor(harness, target).join("\n")).not.toContain("当前任务已取消");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a question-timeout stop recovers as interrupted and keeps its question answerable", async () => {
+  const target: ChatTarget = { channelId: "dm-question-timeout", channelType: 1 };
+  const first = await createCoreHarness();
+  await closeCoreHarness(first, { remove: false });
+  await withStore(first.root, (store) => {
+    seedQueuedTask(
+      store,
+      taskRow({
+        id: "timeout-task",
+        botUid: first.bot.uid,
+        ...target,
+        sessionId: "session-timeout",
+        cwd: join(first.root, "tmp"),
+      }),
+    );
+    store.markStarted("timeout-task");
+    store.markTaskPromptStarted("timeout-task", "session-timeout");
+    store.markTaskPromptAccepted("timeout-task");
+    store.markTaskStopIntent("timeout-task", "question_timeout");
+    store.createQuestion({
+      id: "timeout-question",
+      botUid: first.bot.uid,
+      taskId: "timeout-task",
+      ...target,
+      payload: JSON.stringify({ question: "继续吗", toolCallId: "call-timeout" }),
+    });
+  });
+
+  const restarted = await createCoreHarness({ root: first.root, bot: first.bot, prompt: recordingPrompt });
+  try {
+    await restarted.service.stop();
+    expect(restarted.workers.prompts).toHaveLength(0);
+    const rows = await withStore(restarted.root, (store) => ({
+      task: store.getTask("timeout-task"),
+      question: store.getQuestion("timeout-question")?.state,
+    }));
+    expect(rows.task?.state).toBe("interrupted");
+    expect(rows.task?.errorText).toContain("等待回答超时");
+    // 提问超时只是停在这一轮：待答问题保留，迟到答复照在线路径唤醒新回合。
+    expect(rows.question).toBe("pending");
+  } finally {
+    await closeCoreHarness(restarted);
+  }
+});
+
+test("an answer to a recovered turn's question is not replayed as new work", async () => {
+  const target: ChatTarget = { channelId: "dm-recovery-answer", channelType: 1 };
+  const first = await createCoreHarness();
+  await closeCoreHarness(first, { remove: false });
+  // 这个目录被上个进程未确认的 worker 占着；默认工作目录（root/tmp）保持空闲，好让「答复被当成
+  // 新输入」这条路真的走得通——否则唤醒会失败，回归就失去判别力。
+  const cwd = join(first.root, "blocked-cwd");
+  await withStore(first.root, (store) => {
+    store.recordWorker({
+      id: "ledger-recovery-answer",
+      botUid: first.bot.uid,
+      sessionId: "session-recovery-answer",
+      sessionFile: join(cwd, "recovery-answer.jsonl"),
+      pid: 4243,
+      pgid: 4243,
+      identity: "fixture-recovery-answer",
+      cwd,
+      moveTargetCwd: null,
+      state: "running",
+    });
+    seedQueuedTask(
+      store,
+      taskRow({ id: "recovery-answer-task", botUid: first.bot.uid, ...target, sessionId: "session-recovery-answer", cwd }),
+    );
+    store.markStarted("recovery-answer-task");
+    store.markTaskPromptStarted("recovery-answer-task", "session-recovery-answer");
+    store.markTaskPromptAccepted("recovery-answer-task");
+    store.createQuestion({
+      id: "recovery-answer-question",
+      botUid: first.bot.uid,
+      taskId: "recovery-answer-task",
+      ...target,
+      payload: JSON.stringify({ question: "继续吗", toolCallId: "call-recovery-answer" }),
+    });
+  });
+
+  const restarted = await createCoreHarness({ root: first.root, bot: first.bot, prompt: recordingPrompt });
+  try {
+    await waitForStatus(restarted.service, target, (status) => status.queued === 1);
+    await restarted.service.handleInbound(
+      inbound({ messageId: "recovery-answer-reply", ...target, text: "继续" }),
+    );
+    // 答复是异步唤醒的：先给这条歧路一段明确的机会去犯错，再断言它没有多出任何任务。
+    const deadline = Date.now() + 200;
+    let latest: string | undefined = "recovery-answer-task";
+    while (Date.now() < deadline) {
+      latest = await withStore(restarted.root, (store) => store.getLatestTask(first.bot.uid, target)?.id);
+      if (latest !== "recovery-answer-task") break;
+      await observationWindow(10);
+    }
+    // 答复归它自己的那一轮提问：不会因为「此刻没有在跑的回合」多出一个任务，也不重复派发。
+    const after = await withStore(restarted.root, (store) => ({
+      state: store.getTask("recovery-answer-task")?.state,
+      question: store.getQuestion("recovery-answer-question")?.state,
+      queued: store.listQueuedTasks().length,
+    }));
+    expect(latest).toBe("recovery-answer-task");
+    expect(after.question).toBe("answered");
+    expect(after.state).toBe("queued");
+    expect(after.queued).toBe(1);
+    expect(restarted.workers.prompts).toHaveLength(0);
+  } finally {
+    await closeCoreHarness(restarted);
+  }
+});
+
+test("an explicit interrupt drops unclaimed recovery answers instead of waking a new turn", async () => {
+  const target: ChatTarget = { channelId: "dm-interrupt-snapshot", channelType: 1 };
+  const first = await createCoreHarness();
+  await closeCoreHarness(first, { remove: false });
+  const cwd = join(first.root, "tmp");
+  await mkdir(cwd, { recursive: true });
+  const sessionFile = join(first.root, "sessions", "interrupt-snapshot.jsonl");
+  await mkdir(dirname(sessionFile), { recursive: true });
+  await writeFile(
+    sessionFile,
+    `${JSON.stringify({ type: "session", version: 3, id: "session-interrupt-snapshot", cwd })}\n`,
+    "utf8",
+  );
+  await withStore(first.root, (store) => {
+    // 上一进程遗留：可续接任务 + 一条「已答复但从未被认领」的提问（属于恢复快照）。
+    store.ensureBinding({
+      botUid: first.bot.uid,
+      channelType: target.channelType,
+      channelId: target.channelId,
+      sessionId: "session-interrupt-snapshot",
+      cwd,
+      sessionFile,
+    });
+    seedQueuedTask(
+      store,
+      taskRow({
+        id: "interrupt-snapshot-task",
+        botUid: first.bot.uid,
+        ...target,
+        sessionId: "session-interrupt-snapshot",
+        cwd,
+      }),
+    );
+    store.markStarted("interrupt-snapshot-task");
+    store.markTaskPromptStarted("interrupt-snapshot-task", "session-interrupt-snapshot");
+    store.markTaskPromptAccepted("interrupt-snapshot-task");
+    store.createQuestion({
+      id: "unclaimed-answer",
+      botUid: first.bot.uid,
+      taskId: "interrupt-snapshot-task",
+      ...target,
+      payload: JSON.stringify({ question: "上一轮的问题", toolCallId: "call-unclaimed" }),
+    });
+    expect(store.answerQuestion("unclaimed-answer", first.bot.uid, target, "上一轮的答复", "owner-1")).toBe(true);
+  });
+
+  const restarted = await createCoreHarness({ root: first.root, bot: first.bot, prompt: abortablePrompt });
+  try {
+    // 续跑已派发且活跃，但这一轮还没来得及重新发起那轮 ask。
+    await restarted.workers.waitForPromptCount(1);
+    await restarted.service.handleInbound(
+      inbound({ messageId: "interrupt-snapshot-command", ...target, text: "/interrupt" }),
+    );
+    await waitForStatus(restarted.service, target, (status) => status.state === "interrupted");
+    await observationWindow(100);
+    const rows = await withStore(restarted.root, (store) => ({
+      latest: store.getLatestTask(first.bot.uid, target)?.id,
+      answer: store.getQuestion("unclaimed-answer")?.state,
+      queued: store.listQueuedTasks().length,
+    }));
+    // 显式中断后那条答复不再有认领方：不补投成新回合、不另起任务，行保持已答复。
+    expect(rows.latest).toBe("interrupt-snapshot-task");
+    expect(rows.answer).toBe("answered");
+    expect(rows.queued).toBe(0);
+    expect(restarted.workers.prompts).toHaveLength(1);
+  } finally {
+    await closeCoreHarness(restarted);
+  }
+});
+
+test("cancelling queued recovery work closes its open question card", async () => {
+  const target: ChatTarget = { channelId: "dm-cancel-queued-card", channelType: 1 };
+  const first = await createCoreHarness();
+  await closeCoreHarness(first, { remove: false });
+  // 恢复的续接任务等在仍被未确认 worker 占用的目录里：它是「排队中的恢复任务」。
+  const cwd = join(first.root, "blocked-cwd");
+  await withStore(first.root, (store) => {
+    store.recordWorker({
+      id: "ledger-cancel-queued",
+      botUid: first.bot.uid,
+      sessionId: "session-cancel-queued",
+      sessionFile: join(cwd, "cancel-queued.jsonl"),
+      pid: 4245,
+      pgid: 4245,
+      identity: "fixture-cancel-queued",
+      cwd,
+      moveTargetCwd: null,
+      state: "running",
+    });
+    seedQueuedTask(
+      store,
+      taskRow({
+        id: "queued-card-task",
+        botUid: first.bot.uid,
+        ...target,
+        sessionId: "session-cancel-queued",
+        cwd,
+      }),
+    );
+    store.markStarted("queued-card-task");
+    store.markTaskPromptStarted("queued-card-task", "session-cancel-queued");
+    store.markTaskPromptAccepted("queued-card-task");
+    store.createQuestion({
+      id: "queued-card-question",
+      botUid: first.bot.uid,
+      taskId: "queued-card-task",
+      ...target,
+      payload: JSON.stringify({ question: "继续吗", toolCallId: "call-queued-card" }),
+    });
+    store.setQuestionCard("queued-card-question", "card-queued-open");
+  });
+
+  const restarted = await createCoreHarness({ root: first.root, bot: first.bot });
+  try {
+    await waitForStatus(restarted.service, target, (status) => status.queued === 1);
+    await restarted.service.handleInbound(
+      inbound({ messageId: "cancel-queued-card-command", ...target, text: "/cancel" }),
+    );
+    // 存储域取消排队任务时已把提问行置 cancelled，聊天级清扫看不到它；卡片必须被逐任务收口，
+    // 否则它会一直留在「等你回答」的开放状态。
+    const edit = await Promise.race([
+      restarted.transport.waitForCardEdit(({ messageId }) => messageId === "card-queued-open"),
+      observationWindow(500).then(() => undefined),
+    ]);
+    expect(edit).toBeDefined();
+    const state = await withStore(restarted.root, (store) => store.getQuestion("queued-card-question")?.state);
+    expect(state).toBe("cancelled");
+  } finally {
+    await closeCoreHarness(restarted);
+  }
+});
+
+test("a question timeout closes unclaimed recovery rows in the same commit", async () => {
+  const target: ChatTarget = { channelId: "dm-timeout-window", channelType: 1 };
+  const first = await createCoreHarness();
+  await closeCoreHarness(first, { remove: false });
+  const cwd = join(first.root, "tmp");
+  await mkdir(cwd, { recursive: true });
+  const sessionFile = join(first.root, "sessions", "timeout-window.jsonl");
+  await mkdir(dirname(sessionFile), { recursive: true });
+  await writeFile(
+    sessionFile,
+    `${JSON.stringify({ type: "session", version: 3, id: "session-timeout-window", cwd })}\n`,
+    "utf8",
+  );
+  await withStore(first.root, (store) => {
+    // 上一进程遗留：可续接任务 + 一条从未被认领的待答老问题（A，在恢复快照里）。
+    store.ensureBinding({
+      botUid: first.bot.uid,
+      channelType: target.channelType,
+      channelId: target.channelId,
+      sessionId: "session-timeout-window",
+      cwd,
+      sessionFile,
+    });
+    seedQueuedTask(
+      store,
+      taskRow({
+        id: "timeout-window-task",
+        botUid: first.bot.uid,
+        ...target,
+        sessionId: "session-timeout-window",
+        cwd,
+      }),
+    );
+    store.markStarted("timeout-window-task");
+    store.markTaskPromptStarted("timeout-window-task", "session-timeout-window");
+    store.markTaskPromptAccepted("timeout-window-task");
+    store.createQuestion({
+      id: "leftover-question",
+      botUid: first.bot.uid,
+      taskId: "timeout-window-task",
+      ...target,
+      payload: JSON.stringify({ question: "上一轮的问题", toolCallId: "call-leftover" }),
+    });
+  });
+
+  // 续跑这一轮重新发起 ask（当前问题 B）：超时把停止意图写清，但回合本身留在「未收束」——杀在
+  // 这一刻正是要覆盖的窗口，所以测试必须能在收束之前看到库里的状态。
+  const askingPrompt: FakePrompt = async ({ promptContext, onStop, isStopped }) => {
+    const ask = promptContext?.tools?.find((tool) => tool.name === "ask");
+    const current = ask?.execute(
+      { questions: [{ question: "当前这一轮的问题" }] },
+      new AbortController().signal,
+      "call-current",
+    ) ?? Promise.resolve("");
+    await current.then(() => undefined, () => undefined);
+    const { promise, resolve } = Promise.withResolvers<void>();
+    onStop(resolve);
+    await promise;
+    if (isStopped()) throw new Error("OMP prompt cancelled");
+  };
+
+  const restarted = await createCoreHarness({
+    root: first.root,
+    bot: first.bot,
+    prompt: askingPrompt,
+    ask: { timeoutMs: 150 },
+  });
+  try {
+    // 本轮提问 B 的行先落地，再让 150ms 的超时到点——回合仍然挂着，不会替我们把状态抹平。
+    const deadline = Date.now() + 3_000;
+    let issued = 0;
+    while (Date.now() < deadline && issued === 0) {
+      issued = await withStore(restarted.root, (store) =>
+        store.listTaskQuestions("timeout-window-task").filter(({ id }) => id !== "leftover-question").length);
+      if (issued === 0) await observationWindow(20);
+    }
+    expect(issued).toBe(1);
+    await observationWindow(300);
+    const rows = await withStore(restarted.root, (store) => ({
+      task: store.getTask("timeout-window-task")?.state,
+      leftover: store.getQuestion("leftover-question")?.state,
+      current: store
+        .listTaskQuestions("timeout-window-task")
+        .filter(({ id }) => id !== "leftover-question")
+        .map(({ state }) => state),
+    }));
+    // 老问题 A 与停止意图同一事务写清（进程此刻被杀也已经取消）；当前问题 B 保持待答，迟到答复
+    // 照在线路径唤醒新回合；而回合本身还没收束——这就是被杀会命中的窗口。
+    expect(rows.task).toBe("running");
+    expect(rows.leftover).toBe("cancelled");
+    expect(rows.current).toEqual(["pending"]);
   } finally {
     await closeCoreHarness(restarted);
   }

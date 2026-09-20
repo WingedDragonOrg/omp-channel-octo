@@ -182,8 +182,12 @@ export interface QuestionDeskDeps {
    * 没有该 uid，渲染回退成 uid 本身，绝不影响作答与卡片改写。
    */
   displayNames(uids: readonly string[]): Promise<ReadonlyMap<string, string>>;
-  /** 等待超时：像取消 tool call 一样停住当前回合；问题行保持待答、卡片不改写。 */
-  stopTurnForQuestion(taskId: string): void;
+  /**
+   * 等待超时：停住当前回合，并把本任务恢复快照里**还没被认领**且仍待答的旧问题行交给服务；服务
+   * 把它们与停止意图（`question_timeout`）写进同一事务并取消——当前这轮超时的新问题不在名单里，
+   * 保持待答、迟到答复照旧唤醒；旧的那批不能再复活，否则进程再死一次时会被当成可答问题留给新回合。
+   */
+  stopTurnForQuestion(taskId: string, cancelQuestionIds: readonly string[]): void;
   /** 已无等待者的答案（停回合后 owner 才答复）：作为该聊天的新回合输入交付。 */
   wakeTurn(target: ChatTarget, text: string): void;
   /**
@@ -410,15 +414,18 @@ async function askQuestions(
   };
   const specs = questions.map((value, index) =>
     askSpec(task, value, questions.length > 1 ? index + 1 : null, questions.length, call));
-  claimRecoveredQuestions(task.id, specs, call.toolCallId);
+  claimRecoveredQuestions(task.id, specs, call);
   try {
     const answers = specs.length === 1
       ? [await askSingleQuestion(task, target, specs[0]!, signal)]
       : await askQuestionSet(task, target, specs, signal);
-    return JSON.stringify({ answers });
-  } finally {
-    // 停机挂起时不落定：那轮等待留给新进程按同一身份认领。
+    // 交付前的落定必须成功：没落定就没有「这一轮已经交付」的凭据，宁可让调用失败去重试。
     if (!deps.stopping()) settleQuestions(specs);
+    return JSON.stringify({ answers });
+  } catch (error) {
+    // 没能交付的收尾（超时、取消、失败）尽力落定，绝不掩盖原来的错误。
+    if (!deps.stopping()) settleQuietly(specs);
+    throw error;
   }
 }
 
@@ -428,8 +435,29 @@ async function askQuestions(
  * 书签，写失败最多让一次重复执行再去认领同一行，绝不吞掉已经记录下来的答案。
  */
 function settleQuestions(specs: readonly AskSpec[]): void {
+  deps.store.markQuestionsSettled(specs.map(({ id }) => id));
+}
+
+/**
+ * 等待到点要交出取消的旧问题：快照里还没被认领、且行仍是待答的那些。这次调用自己发的问题（没进
+ * 快照，或已被本次调用认领）不在名单里——它们保持待答，迟到答复照旧唤醒一个新回合。名单是精确行，
+ * 服务按行取消，不猜、不扫。
+ */
+function unclaimedPendingIds(taskId: string): string[] {
+  const ids: string[] = [];
+  for (const group of recoveryQuestions.get(taskId) ?? []) {
+    for (const entry of group.entries) {
+      if (entry.claimed) continue;
+      if (deps.store.getQuestion(entry.questionId)?.state === "pending") ids.push(entry.questionId);
+    }
+  }
+  return ids;
+}
+
+/** 失败路径的落定：呼叫方已经带着自己的错误往回走，这里再失败只记日志，不影响原始错误。 */
+function settleQuietly(specs: readonly AskSpec[]): void {
   try {
-    deps.store.markQuestionsSettled(specs.map(({ id }) => id));
+    settleQuestions(specs);
   } catch (error) {
     console.error(`[ask] 落定记录失败：${safeErrorMessage(error, "settle failed")}`);
   }
@@ -437,30 +465,77 @@ function settleQuestions(specs: readonly AskSpec[]): void {
 
 /**
  * 认领重启前遗留的问题行：快照里身份相同、仍未被认领的原行接管本轮提问。整组认领或整组不认领
- * ——多问卡是一次提交、一张卡，半认领会把新旧行混到两张卡片上。认领即消费，同一身份只可认领一次；
- * 唯一例外是同一次工具调用的重复执行（id 相同），它按幂等重放处理，可以再次拿到已交付的结果。
+ * ——多问卡是一次提交、一张卡，半认领会把新旧行混到两张卡片上。认领即消费（`takeOver` 在持久步骤
+ * 之后才落标记），同一身份只可认领一次；唯一例外是同一次工具调用的重复执行（id 相同），它按幂等
+ * 重放处理，可以再次拿到已交付的结果。
  */
-function claimRecoveredQuestions(taskId: string, specs: AskSpec[], toolCallId: string | null): void {
+function claimRecoveredQuestions(taskId: string, specs: AskSpec[], call: AskCall): void {
   const groups = recoveryQuestions.get(taskId);
   if (groups === undefined) return;
-  // 最近一轮优先：续跑的调用对应的是被中断的那一次，不是同一任务更早的提问。
-  for (const group of [...groups].reverse()) {
-    const replay = toolCallId !== null && group.toolCallId === toolCallId;
-    if (!replay && !group.recoverable) continue;
-    const claimed = matchGroup(group, specs, replay);
-    if (claimed === undefined) continue;
-    specs.forEach((spec, index) => {
-      spec.id = claimed[index]!.questionId;
-      spec.payload.id = spec.id;
-      spec.reused = true;
-    });
+  // 精确身份是权威：同一个工具调用 id 的组一定优先，且这一轮不再去语义认领别组的行——同一个调用
+  // 重执行的参数与首执行一致，对不上就说明这不是可复用的那一轮，重新提问比错认安全。
+  const exact = call.toolCallId === null
+    ? undefined
+    : groups.find((group) => group.toolCallId === call.toolCallId);
+  if (exact !== undefined) {
+    const claimed = matchGroup(exact, specs, true);
+    if (claimed === undefined) {
+      // 同一个工具调用的重执行参数与首执行一致；对不上说明这不是可复用的那一轮，明确失败，
+      // 绝不另起一张新题把旧行留在恢复里。
+      throw new Error("同一工具调用的重执行与原提问不一致：没有可复用的提问行");
+    }
+    takeOver(exact, claimed, specs, call, false);
     return;
+  }
+  // 语义认领：最近一轮优先——续跑的调用对应的是被中断的那一次，不是同一任务更早的提问。
+  for (const group of [...groups].reverse()) {
+    if (group === exact || !group.recoverable) continue;
+    const claimed = matchGroup(group, specs, false);
+    if (claimed !== undefined) {
+      takeOver(group, claimed, specs, call, true);
+      return;
+    }
   }
 }
 
 /**
+ * 把一组的遗留行交给本轮调用。语义认领先把本轮调用的身份写回每一行（Store 按行写、全成或全不成），
+ * 写不进去就整轮失败：既不消费恢复组、也不改指行 id，下一次重执行仍能把这些行原样认回来。
+ * 写盘完成后才动内存里的组与本轮 specs——顺序是这里唯一的安全边界，先标记再写会留下没凭据的认领。
+ */
+function takeOver(
+  group: RecoveredGroup,
+  claimed: readonly RecoveredQuestion[],
+  specs: readonly AskSpec[],
+  call: AskCall,
+  adopt: boolean,
+): void {
+  if (adopt) {
+    // 先把身份写进每一行：Store 按行写、全成或全不成；写不进去就整轮失败。
+    const updates = specs.map((spec, index) => {
+      const id = claimed[index]!.questionId;
+      const payload = JSON.stringify({ ...spec.payload, id });
+      return { id, payload };
+    });
+    const written = deps.store.updateQuestionPayloads(updates);
+    if (written !== updates.length) {
+      throw new Error(`调用身份写回不完整：${written}/${updates.length}`);
+    }
+    group.callKey = call.key;
+    group.toolCallId = call.toolCallId;
+  }
+  specs.forEach((spec, index) => {
+    spec.id = claimed[index]!.questionId;
+    spec.payload.id = spec.id;
+    spec.reused = true;
+  });
+  for (const entry of claimed) entry.claimed = true;
+}
+
+/**
  * 一组遗留行按身份接管本轮提问：每个 spec 各认一个身份相同、未被本轮占用的行。返回 `undefined`
- * 表示这一组接不下整轮提问。重复执行的同一调用（`replay`）不消耗认领——它本来就该能反复拿到结果。
+ * 表示这一组接不下整轮提问。纯匹配，不动任何状态——消费由 `takeOver` 在持久步骤之后执行，
+ * 认领失败时整组保持原样。重复执行的同一调用（`replay`）本就该反复拿到结果，不参与占用判断。
  */
 function matchGroup(
   group: RecoveredGroup,
@@ -477,7 +552,6 @@ function matchGroup(
     if (entry === undefined) return undefined;
     picked.push(entry);
   }
-  if (!replay) for (const entry of picked) entry.claimed = true;
   return picked;
 }
 
@@ -592,8 +666,8 @@ async function askSingleQuestion(
   const timer = setTimeout(() => {
     stopped = true;
     questionWaiters.delete(id);
-    // 先写 abort（同步入帧）再本地拒绝：模型不会先拿到 tool 错误再自行继续。
-    deps.stopTurnForQuestion(task.id);
+    // 先写 abort（同步入帧）再本地拒绝：模型不会先拿到 tool 错误再自行继续。旧问题随停止意图一并落库。
+    deps.stopTurnForQuestion(task.id, unclaimedPendingIds(task.id));
     completion.reject(new Error(ASK_STOPPED_MESSAGE));
   }, deps.askTimeoutMs());
   questionTimers.set(id, timer);
@@ -676,7 +750,7 @@ async function askQuestionSet(
         if (stopped) return;
         stopped = true;
         for (const open of specs) questionWaiters.delete(open.id);
-        deps.stopTurnForQuestion(task.id);
+        deps.stopTurnForQuestion(task.id, unclaimedPendingIds(task.id));
         for (const pending of completions) pending.reject(new Error(ASK_STOPPED_MESSAGE));
       }, deps.askTimeoutMs());
       questionTimers.set(spec.id, timer);
@@ -819,7 +893,8 @@ function closeUnclaimedRecovery(taskId: string): void {
   const open: QuestionRecord[] = [];
   for (const entry of unclaimedEntries(taskId)) {
     const question = deps.store.getQuestion(entry.questionId);
-    if (question?.state === "pending") open.push(question);
+    // 已被 Store 按终态/停止意图取消的行也要投影：取消是 CAS，重复无害，而卡片可能还开着。
+    if (question?.state === "pending" || question?.state === "cancelled") open.push(question);
   }
   for (const question of open) deps.store.cancelQuestion(question.id);
   closeQuestionCards(botUid, open, ENDED_NOTE);
@@ -841,6 +916,21 @@ function wakeUnclaimedAnswers(taskId: string): void {
   // 先丢掉快照：这批复述不再有认领方，投递不该再被认领窗口拦下。
   recoveryQuestions.delete(taskId);
   wakeForAnswers(orphaned, RESTART_WAKE_HEADLINE);
+}
+
+/**
+ * 显式取消一个聊天：该聊天里每个任务的恢复快照一律作废——包括只剩已答复行的组。取消之后那些答案
+ * 不该再被认领，也不该被 `wakeUnclaimedAnswers` 补投成新回合。
+ */
+function forgetRecoveredTarget(target: ChatTarget): void {
+  const key = targetKey(target);
+  for (const [taskId, groups] of recoveryQuestions) {
+    const hit = groups.some((group) => group.entries.some((entry) => {
+      const question = deps.store.getQuestion(entry.questionId);
+      return question !== null && targetKey(question) === key;
+    }));
+    if (hit) recoveryQuestions.delete(taskId);
+  }
 }
 
 /**
@@ -1284,7 +1374,7 @@ function answerSetCardClick(
     if (botUid === undefined) return;
     const openQuestions = deps.store.listPendingQuestions(botUid, target);
     deps.store.cancelQuestions(botUid, target);
-    for (const question of openQuestions) recoveryQuestions.delete(question.taskId);
+    forgetRecoveredTarget(target);
     closeQuestionCards(botUid, openQuestions, CANCELLED_NOTE);
   }
 
@@ -1296,8 +1386,11 @@ function answerSetCardClick(
     recoveryQuestions.delete(taskId);
     const botUid = deps.botUid();
     if (botUid === undefined) return;
-    const open = deps.store.listTaskQuestions(taskId).filter(({ state }) => state === "pending");
-    for (const question of open) deps.store.cancelQuestion(question.id);
+    // Store 的批量取消与任务终态同事务；这里再补一次幂等取消，随后按行关卡片——Store 先行取消、
+    // 进程随后被杀时，行是 cancelled 而卡片还挂着，所以已取消的行同样要收进来。
+    const open = deps.store.listTaskQuestions(taskId)
+      .filter(({ state }) => state === "pending" || state === "cancelled");
+    deps.store.cancelTaskQuestions(taskId);
     closeQuestionCards(botUid, open, INTERRUPTED_NOTE);
   }
 

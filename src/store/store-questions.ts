@@ -82,6 +82,18 @@ export function cancelQuestion(db: Database, id: string): boolean {
   ).changes === 1;
 }
 
+/**
+ * 关闭一个任务的全部待答提问并返回取消的行数。用户取消/中断这一回合时，它与任务终态在同一事务里
+ * 落盘：迟到的点击/答案因此无处可落，绝不能靠「下一条恢复通知」补救——进程在那之间死掉时，终态行
+ * 已不会再进恢复清单，漏掉的提问就成了唤醒新回合的入口。
+ */
+export function cancelTaskQuestions(db: Database, taskId: string): number {
+  return run(db,
+    "UPDATE questions SET state = 'cancelled', answered_at = ? WHERE task_id = ? AND state = 'pending'",
+    [Date.now(), taskId],
+  ).changes;
+}
+
 export function pendingQuestionIds(db: Database, botUid: string, target: ChatTarget): string[] {
   return listPendingQuestions(db, botUid, target).map(({ id }) => id);
 }
@@ -137,6 +149,32 @@ export function markQuestionsSettled(db: Database, ids: readonly string[]): void
     for (const id of ids) {
       run(db, "UPDATE questions SET settled_at = ? WHERE id = ? AND settled_at IS NULL", [settledAt, id]);
     }
+  });
+}
+
+/**
+ * 按行改写提问行的 payload（认领者身份写回：被重启中断的一轮被另一个工具调用身份语义认领时，把
+ * 认领者的 askGroup/toolCallId 写回这些行）。每行带自己的 payload——问题文本/选项/多选/cardIndex
+ * 都是这一行自己的内容，共用一份会把题目冲掉。只更新 payload 列，不碰
+ * state/answer/answered_by/settled_at/card_message_id/card_seq。
+ *
+ * All-or-none：行数对不上（行被并发删掉）就抛错并回滚整批，绝不留下「半组新身份」——调用方据此
+ * 放弃本次认领，而不是消费一个身份不一致的恢复组。空数组返回 0 且不开启事务。
+ */
+export function updateQuestionPayloads(
+  db: Database,
+  updates: ReadonlyArray<{ id: string; payload: string }>,
+): number {
+  if (updates.length === 0) return 0;
+  return transaction(db, () => {
+    let updated = 0;
+    for (const { id, payload } of updates) {
+      updated += run(db, "UPDATE questions SET payload = ? WHERE id = ?", [payload, id]).changes;
+    }
+    if (updated !== updates.length) {
+      throw new Error(`question payload update touched ${updated} of ${updates.length} rows`);
+    }
+    return updated;
   });
 }
 

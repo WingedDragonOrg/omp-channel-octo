@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -960,6 +960,189 @@ exec '${process.execPath}' "$@"
       await child.exited;
     }
     if (outputPromise) await outputPromise.catch(() => {});
+    if (fixture) await fixture.close();
+    if (root) await rm(root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+/** JSON lines the RPC fixture appended, torn tail lines skipped. */
+function rpcLogEntries(logPath: string): Array<Record<string, unknown>> {
+  if (!existsSync(logPath)) return [];
+  const entries: Array<Record<string, unknown>> = [];
+  for (const line of readFileSync(logPath, "utf8").split("\n")) {
+    if (line.trim().length === 0) continue;
+    try {
+      const entry: unknown = JSON.parse(line);
+      if (entry !== null && typeof entry === "object" && !Array.isArray(entry)) {
+        entries.push(entry as Record<string, unknown>);
+      }
+    } catch {
+      continue;
+    }
+  }
+  return entries;
+}
+
+/** The durable task row of one inbound message, read straight from the CLI's own store. */
+function readTaskRow(
+  dbPath: string,
+  messageId: string,
+): { state: string; errorText: string | null; promptAccepted: number } | undefined {
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    const row = db
+      .query("SELECT state, error_text, prompt_accepted FROM tasks WHERE message_id = ?")
+      .get(messageId) as { state?: unknown; error_text?: unknown; prompt_accepted?: unknown } | null;
+    if (row === null || row === undefined) return undefined;
+    return {
+      state: typeof row.state === "string" ? row.state : "",
+      errorText: typeof row.error_text === "string" ? row.error_text : null,
+      promptAccepted: row.prompt_accepted === 1 ? 1 : 0,
+    };
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * An interrupt that was already acknowledged may never be turned into a resumed turn by a restart:
+ * the process dies (SIGKILL) while the interrupted prompt is still in flight, and the replacement
+ * process must settle that task as interrupted instead of dispatching `/retry` or replaying the
+ * original input. The RPC fixture's `interrupt-hang` scenario keeps the turn open forever, so the
+ * kill lands exactly inside the acknowledged-but-unsettled window.
+ */
+test("real CLI killed after an accepted interrupt never resumes that turn", async () => {
+  let root: string | undefined;
+  let fixture: OctoProtocolFixture | undefined;
+  const children: Bun.Subprocess[] = [];
+  try {
+    const currentRoot = await mkdtemp(join(tmpdir(), "octo-cli-interrupt-kill-"));
+    root = currentRoot;
+    const currentFixture = await createOctoProtocolFixture();
+    fixture = currentFixture;
+    const stateDir = join(currentRoot, "state");
+    const rpcLogPath = join(currentRoot, "omp-rpc.log");
+    const configPath = join(currentRoot, "config.json");
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        apiUrl: currentFixture.apiUrl,
+        botToken: currentFixture.botToken,
+        ownerId: currentFixture.ownerUid,
+        allowedGroupIds: [],
+        stateDir,
+        ompCommand: process.execPath,
+        ompExtraArgs: [
+          resolve(import.meta.dir, "fixtures/omp-rpc-worker.ts"),
+          "--fixture-scenario",
+          "interrupt-hang",
+          "--fixture-log",
+          rpcLogPath,
+        ],
+        startupTimeoutMs: 5_000,
+        cancelTimeoutMs: 2_000,
+      }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+    const cliArgs = [
+      process.execPath,
+      resolve(import.meta.dir, "../src/cli.ts"),
+      "start",
+      "--config",
+      configPath,
+    ];
+    const cliEnv = cliEnvironment(currentRoot);
+    const chatId = `${currentFixture.ownerUid}@${currentFixture.botUid}`;
+    const taskMessageId = "9007199254748001";
+
+    const first = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe", env: cliEnv });
+    children.push(first);
+    const firstOutput = Promise.all([new Response(first.stdout).text(), new Response(first.stderr).text()]);
+    const firstConnection = await currentFixture.waitForConnection(1, 5_000);
+    await waitForFixture(
+      () => firstConnection.ready ? firstConnection : undefined,
+      5_000,
+      "first CLI did not authenticate its WebSocket connection",
+    );
+    currentFixture.sendInbound(firstConnection, {
+      fromUid: currentFixture.ownerUid,
+      channelId: chatId,
+      channelType: 1,
+      text: "挂住的回合",
+      messageId: taskMessageId,
+    });
+    // 派发已经进了会话（OMP 的接受回执已落账）而回合被 fixture 挂住：这就是「控制已回执、回合尚
+    // 未收束」的窗口。
+    await waitForFixture(
+      () => readTaskRow(join(stateDir, "channel.sqlite"), taskMessageId)?.promptAccepted === 1 ? true : undefined,
+      15_000,
+      "the hanging prompt was not accepted by OMP before the interrupt",
+    );
+    currentFixture.sendInbound(firstConnection, {
+      fromUid: currentFixture.ownerUid,
+      channelId: chatId,
+      channelType: 1,
+      text: "/interrupt",
+      messageId: "9007199254748002",
+    });
+    await waitForFixture(
+      () => currentFixture.sentMessages.find((message) => sentText(message).includes("已中断当前回合")),
+      8_000,
+      "the CLI did not acknowledge the interrupt",
+    );
+    // 中断已回执、prompt 仍未收束：此刻 SIGKILL，进程连一次关停清理都跑不到。
+    first.kill("SIGKILL");
+    await first.exited;
+    await firstOutput.catch(() => {});
+
+    const second = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe", env: cliEnv });
+    children.push(second);
+    const secondOutput = Promise.all([new Response(second.stdout).text(), new Response(second.stderr).text()]);
+    const secondConnection = await currentFixture.waitForConnection(2, 5_000);
+    await waitForFixture(
+      () => secondConnection.ready ? secondConnection : undefined,
+      5_000,
+      "restarted CLI did not authenticate its WebSocket connection",
+    );
+    const sentBefore = currentFixture.sentMessages.length;
+    currentFixture.sendInbound(secondConnection, {
+      fromUid: currentFixture.ownerUid,
+      channelId: chatId,
+      channelType: 1,
+      text: "/status",
+      messageId: "9007199254748003",
+    });
+    const statusReply = await waitForFixture(
+      () =>
+        currentFixture.sentMessages
+          .slice(sentBefore)
+          .find((message) => sentText(message).includes("session=")),
+      10_000,
+      "restarted CLI did not answer /status",
+    );
+    // 外部可见的结论：那一轮是终态的中断，而不是被续上的回合。
+    expect(sentText(statusReply)).toContain("state=interrupted");
+    const row = readTaskRow(join(stateDir, "channel.sqlite"), taskMessageId);
+    expect(row?.state).toBe("interrupted");
+    expect(row?.errorText).toBe("用户中断当前回合");
+    // 派发只有那一次：没有 /retry，也没有原文重放。
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const prompts = rpcLogEntries(rpcLogPath).filter((entry) => entry.kind === "prompt");
+    expect(prompts.map((entry) => entry.message)).toEqual(["挂住的回合"]);
+    const replayed = currentFixture.sentMessages.slice(sentBefore).map(sentText).join("\n");
+    expect(replayed).not.toContain("因重启中断");
+    expect(replayed).not.toContain("任务未自动恢复");
+
+    second.kill("SIGTERM");
+    expect(await waitForChildExit(second)).toBe(0);
+    await secondOutput.catch(() => {});
+  } finally {
+    for (const child of children) {
+      if (child.exitCode === null) {
+        child.kill("SIGKILL");
+        await child.exited;
+      }
+    }
     if (fixture) await fixture.close();
     if (root) await rm(root, { recursive: true, force: true });
   }

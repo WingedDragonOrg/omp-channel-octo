@@ -4,8 +4,9 @@
 
 import { Database } from "bun:sqlite";
 import type { ChatTarget } from "../contracts.ts";
-import type { InboundClaim, RestartNoticeRecord, TaskRecord, TaskRestartRecovery } from "./store-records.ts";
-import { asNumber, asString, query, run, targetValues, targetWhere, taskFromRow, transaction } from "./store-schema.ts";
+import type { InboundClaim, RestartNoticeRecord, StoppedTaskRecovery, TaskRecord, TaskRestartRecovery, TaskStopIntent } from "./store-records.ts";
+import { asNumber, asStopIntent, asString, query, run, targetValues, targetWhere, taskFromRow, transaction } from "./store-schema.ts";
+import { cancelTaskQuestions } from "./store-questions.ts";
 
 export function acceptTask(db: Database, claim: InboundClaim, task: TaskRecord): boolean {
   return transaction(db, () => {
@@ -163,48 +164,146 @@ export function markStarted(db: Database, taskId: string): boolean {
 }
 
 export function markCompleted(db: Database, taskId: string, resultText: string | null): void {
-  run(db,
-    "UPDATE tasks SET state = 'completed', finished_at = ?, result_text = ?, error_text = NULL WHERE id = ?",
-    [Date.now(), resultText, taskId],
-  );
+  transaction(db, () => {
+    const completed = run(db,
+      "UPDATE tasks SET state = 'completed', finished_at = ?, result_text = ?, error_text = NULL, stop_intent = NULL WHERE id = ?",
+      [Date.now(), resultText, taskId],
+    ).changes === 1;
+    // 终态与关闭本任务待答提问同事务提交：commit 与 finally 清题之间被杀，旧卡不能再唤醒新回合。
+    if (completed) cancelTaskQuestions(db, taskId);
+  });
 }
 
 export function markFailed(db: Database, taskId: string, errorText: string): void {
-  run(db,
-    "UPDATE tasks SET state = 'failed', finished_at = ?, error_text = ?, result_text = NULL WHERE id = ?",
-    [Date.now(), errorText, taskId],
-  );
+  transaction(db, () => {
+    const failed = run(db,
+      "UPDATE tasks SET state = 'failed', finished_at = ?, error_text = ?, result_text = NULL, stop_intent = NULL WHERE id = ?",
+      [Date.now(), errorText, taskId],
+    ).changes === 1;
+    if (failed) cancelTaskQuestions(db, taskId);
+  });
 }
 
 export function markCancelled(db: Database, taskId: string, errorText = "cancelled"): void {
-  run(db,
-    "UPDATE tasks SET state = 'cancelled', finished_at = ?, error_text = ? WHERE id = ? AND state IN ('queued', 'started')",
-    [Date.now(), errorText, taskId],
-  );
-}
-
-export function markInterrupted(db: Database, taskId: string, errorText: string): void {
-  run(db,
-    "UPDATE tasks SET state = 'interrupted', finished_at = ?, error_text = ? WHERE id = ? AND state IN ('queued', 'started')",
-    [Date.now(), errorText, taskId],
-  );
+  transaction(db, () => {
+    const cancelled = run(db,
+      "UPDATE tasks SET state = 'cancelled', finished_at = ?, error_text = ?, stop_intent = NULL WHERE id = ? AND state IN ('queued', 'started')",
+      [Date.now(), errorText, taskId],
+    ).changes === 1;
+    // 用户取消是终态：待答提问与任务终态同事务关闭，迟到的回答不再唤醒新回合。
+    if (cancelled) cancelTaskQuestions(db, taskId);
+  });
 }
 
 /**
- * 启动恢复入口：一次事务内规范化该 Bot 遗留的在途任务，并把结果分成两组。
- * - `queued`：重排回队列、按接受顺序（accepted_at, rowid 升序）待执行的任务。没有派发过的行
- *   （`prompt_started = 0`）重放原文；已有 OMP 接受回执的行（`prompt_started = 1 AND prompt_accepted = 1`）
- *   必须续接原会话，调用方用 {@link isTaskResuming} 分流。
+ * 停下这一回合。持久停止意图是 `interrupt` 时，任务终态与关闭待答提问在同一事务里完成——用户在
+ * 线中断后，遗留提问不能再被点开、迟到的回答不能再唤醒新回合；`question_timeout` 与无意图的
+ * 中断路径保持提问可答（迟到答复照在线路径唤醒新回合）。
+ */
+export function markInterrupted(db: Database, taskId: string, errorText: string): void {
+  transaction(db, () => {
+    const intent = asStopIntent(query(db, "SELECT stop_intent FROM tasks WHERE id = ?", [taskId])[0]?.stop_intent);
+    const interrupted = run(db,
+      "UPDATE tasks SET state = 'interrupted', finished_at = ?, error_text = ?, stop_intent = NULL WHERE id = ? AND state IN ('queued', 'started')",
+      [Date.now(), errorText, taskId],
+    ).changes === 1;
+    if (interrupted && intent === "interrupt") cancelTaskQuestions(db, taskId);
+  });
+}
+
+/**
+ * 用户已确认的停止意图，先落库再动手：进程被 SIGKILL 时，这一列是「这一回合是被叫停的」唯一证据，
+ * 重启恢复据此落终态而不是自动执行或续接。只写仍在途（queued/started）的行——行已终态说明无需再
+ * 叫停，静默 no-op 返回 false（命令处理器与 settle 之间存在竞态）；重复写是允许的（再次 /interrupt
+ * 重新武装）。
+ *
+ * `cancelQuestionIds` 只给 `question_timeout` 用（提问超时的恢复快照遗留题）：意图写入与这批行的取消
+ * 在同一事务里提交，本回合正在等的那批题仍保持可答。
+ */
+export function markTaskStopIntent(
+  db: Database,
+  taskId: string,
+  intent: TaskStopIntent,
+  cancelQuestionIds: readonly string[] = [],
+): boolean {
+  return transaction(db, () => {
+    const written = run(db,
+      "UPDATE tasks SET stop_intent = ? WHERE id = ? AND state IN ('queued', 'started')",
+      [intent, taskId],
+    ).changes === 1;
+    // 守卫失败（行已终态）时连题也不动：这次叫停本来就没生效。
+    if (!written) return false;
+    // 只有 `question_timeout` 用选择集：它按设计保留本回合正在等的提问（B），却必须原子关闭恢复快照里
+    // 没人接手的那批遗留题（A），否则被叫停的回合结束后 A 仍可点开、唤醒新回合。逐行校验归属与状态，
+    // 借用调用方传来的 id 不能越界取消别的任务或已收场的行。
+    if (intent === "question_timeout") {
+      for (const id of cancelQuestionIds) cancelOwnedPendingQuestion(db, taskId, id);
+    }
+    return true;
+  });
+}
+
+/** 只取消「id 指向、且确实属于该任务、且仍 pending」的那一行；其余情况静默 no-op。 */
+function cancelOwnedPendingQuestion(db: Database, taskId: string, id: string): boolean {
+  return run(db,
+    "UPDATE questions SET state = 'cancelled', answered_at = ? WHERE id = ? AND task_id = ? AND state = 'pending'",
+    [Date.now(), id, taskId],
+  ).changes === 1;
+}
+
+/** 停止意图被真实工作结果覆盖（interrupt 之后这一回合自己跑完了）时清除；无条件清 NULL。 */
+export function clearTaskStopIntent(db: Database, taskId: string): void {
+  run(db, "UPDATE tasks SET stop_intent = NULL WHERE id = ?", [taskId]);
+}
+
+/**
+ * 启动恢复入口：一次事务内规范化该 Bot 遗留的在途任务，并把结果分成三组。
+ * - `stopped`：先结算持久停止意图（`stop_intent`）——进程被 SIGKILL 时它是「这一回合是被叫停的」唯一
+ *   证据。`interrupt` 与 `question_timeout` 都落 `interrupted`，说明文案由调用方传入（必须与在线路径
+ *   同源，因为它会被回传通知当「原因」原样使用）；结算清列并把原意图随记录交回。intent 为 `interrupt`
+ *   的行连同其待答提问一起在本次事务里关闭（迟到答案不能再唤醒新回合）；`question_timeout` 的提问
+ *   保持可答，由服务按原因分流。
  * - `uncertain`：本次被 fail-closed 成 `interrupted` 的已派发行（`prompt_started = 1` 且
  *   `prompt_accepted = 0`，含升级时按「接受状态未知」记账的旧库 started 行）。prompt 已经落账却没有
- *   接受回执，无法判定它是否真的进过会话，因此既不重放原文也不错续到别的会话；这些行只报告本次
- *   结算的，后续启动不会重复上报。
+ *   接受回执，无法判定它是否真的进过会话，因此既不重放原文也不错续到别的会话；其待答提问与终态在
+ *   同一事务里关闭。
+ * - `queued`：重排回队列、按接受顺序待执行的任务。没有派发过的行（`prompt_started = 0`）重放原文；
+ *   已有 OMP 接受回执的行（`prompt_started = 1 AND prompt_accepted = 1`）必须续接原会话，调用方用
+ *   {@link isTaskResuming} 分流。
  *
- * `queued` 行原样保留，终态行不参与，等待中的提问不动，调度也不在这里发生。`session_id` 与 relay
- * 等元数据随行保留。
+ * `stopped` 与 `uncertain` 只含本次结算的行，后续启动不会重复上报；三组各自按 accepted_at, rowid
+ * 升序。`queued` 行原样保留，终态行不参与，等待中的提问不动，调度也不在这里发生；`session_id` 与
+ * relay 等元数据随行保留。
  */
-export function prepareTasksForRestart(db: Database, botUid: string): TaskRestartRecovery {
+export function prepareTasksForRestart(
+  db: Database,
+  botUid: string,
+  reasonTexts: Record<TaskStopIntent, string>,
+): TaskRestartRecovery {
   return transaction(db, () => {
+    // 1) 停止意图优先：用户确认过的叫停不该因为一次重启变成自动执行或自动续接。
+    const stopped: StoppedTaskRecovery[] = [];
+    for (const row of query(db,
+      `SELECT id, stop_intent FROM tasks
+       WHERE bot_uid = ? AND state IN ('queued', 'started') AND stop_intent IS NOT NULL
+       ORDER BY accepted_at ASC, rowid ASC`,
+      [botUid],
+    )) {
+      const stopIntent = asStopIntent(row.stop_intent);
+      if (stopIntent === null) continue;
+      const taskId = asString(row.id);
+      run(db,
+        `UPDATE tasks SET state = 'interrupted', finished_at = ?, error_text = ?, stop_intent = NULL
+         WHERE id = ?`,
+        [Date.now(), reasonTexts[stopIntent], taskId],
+      );
+      const settled = query(db, "SELECT * FROM tasks WHERE id = ?", [taskId])[0];
+      if (settled) stopped.push({ ...taskFromRow(settled), stopIntent });
+      // 中断的回合连同它的待答提问一起在本次事务里关闭：恢复过程本身再被 SIGKILL 也不会留下
+      // 可被点开、可唤醒新回合的旧卡；提问超时停下的行保持可答（迟到答复照在线路径唤醒）。
+      if (stopIntent === "interrupt") cancelTaskQuestions(db, taskId);
+    }
+    // 2) 已派发但没有接受回执的行：接受状态未知，fail-closed（不重放、不错续）。
     const uncertainIds = query(db,
       `SELECT id FROM tasks
        WHERE bot_uid = ? AND state = 'started' AND prompt_started = 1 AND prompt_accepted = 0`,
@@ -216,17 +315,21 @@ export function prepareTasksForRestart(db: Database, botUid: string): TaskRestar
        WHERE bot_uid = ? AND state = 'started' AND prompt_started = 1 AND prompt_accepted = 0`,
       [Date.now(), botUid],
     );
+    // 这些回合已经失败收场：它们的待答提问同样在本次事务里关闭，迟到答案不能唤醒新回合。
+    for (const taskId of uncertainIds) cancelTaskQuestions(db, taskId);
+    // 3) 其余在途行重排回队列，返回待执行集合。
     run(db, "UPDATE tasks SET state = 'queued' WHERE bot_uid = ? AND state = 'started'", [botUid]);
-    // 两组行一次性取回并按同一顺序排序，再按状态拆开：只有本次结算的 uncertain 行进入 IN 列表。
-    const uncertainRows = uncertainIds.length === 0 ? "" : ` OR id IN (${uncertainIds.map(() => "?").join(", ")})`;
-    const rows = query(db,
-      `SELECT * FROM tasks WHERE bot_uid = ? AND (state = 'queued'${uncertainRows})
-       ORDER BY accepted_at ASC, rowid ASC`,
-      [botUid, ...uncertainIds],
-    ).map((row) => taskFromRow(row));
     return {
-      queued: rows.filter((task) => task.state === "queued"),
-      uncertain: rows.filter((task) => task.state === "interrupted"),
+      queued: query(db,
+        "SELECT * FROM tasks WHERE bot_uid = ? AND state = 'queued' ORDER BY accepted_at ASC, rowid ASC",
+        [botUid],
+      ).map((row) => taskFromRow(row)),
+      uncertain: uncertainIds.length === 0 ? [] : query(db,
+        `SELECT * FROM tasks WHERE id IN (${uncertainIds.map(() => "?").join(", ")})
+         ORDER BY accepted_at ASC, rowid ASC`,
+        uncertainIds,
+      ).map((row) => taskFromRow(row)),
+      stopped,
     };
   });
 }
@@ -310,11 +413,16 @@ export function cancelQueued(db: Database, botUid: string, target: ChatTarget): 
       `SELECT id FROM tasks WHERE bot_uid = ? AND ${targetWhere(target)} AND state = 'queued'`,
       [botUid, ...targetValues(target)],
     );
+    const taskIds = rows.map((row) => asString(row.id));
+    // 与 markCancelled 同一收口：取消是终态，停止意图清掉、选中任务的待答提问在同一事务里关闭，
+    // 否则「cancelQueued → 通知/清理之间被杀」会留下可点开、可唤醒新回合的旧卡（恢复回来的 1/1
+    // 任务排队等前序时正是这个窗口）。
     run(db,
-      `UPDATE tasks SET state = 'cancelled', finished_at = ?, error_text = 'cancelled before start'
+      `UPDATE tasks SET state = 'cancelled', finished_at = ?, error_text = 'cancelled before start', stop_intent = NULL
        WHERE bot_uid = ? AND ${targetWhere(target)} AND state = 'queued'`,
       [Date.now(), botUid, ...targetValues(target)],
     );
-    return rows.map((row) => asString(row.id));
+    for (const taskId of taskIds) cancelTaskQuestions(db, taskId);
+    return taskIds;
   });
 }

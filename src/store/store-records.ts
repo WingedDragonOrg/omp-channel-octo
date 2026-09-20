@@ -26,6 +26,13 @@ export interface InboundClaim {
   kind: "task" | "command";
 }
 
+/**
+ * 用户/服务已下达的停止意图：`interrupt` 停止当前回合，`question_timeout` 是等待回答超时导致的停轮。
+ * 意图在动手之前先落库，进程被 SIGKILL 时它是「这一回合是被叫停的」唯一证据，重启恢复据此落终态而
+ * 不是自动续接。`/cancel` 不需要这一列——在线路径在 ACK 之前就已经把任务写成 cancelled。
+ */
+export type TaskStopIntent = "interrupt" | "question_timeout";
+
 export interface TaskRecord extends ChatTarget {
   id: string;
   botUid: string;
@@ -57,13 +64,25 @@ export interface RestartNoticeRecord extends ChatTarget {
 }
 
 /**
+ * 启动恢复结算的停止行：任务记录本身（已是 `interrupted` 终态）再加上结算前的持久意图。结算会清列，
+ * 所以原因必须随记录一起交回，供服务按原因分流（interrupt 与 question_timeout 对遗留提问的处理不同，
+ * 回传通知也用它说明原因）。只在这条恢复记录上带 `stopIntent`，`TaskRecord` 保持原样。
+ */
+export interface StoppedTaskRecovery extends TaskRecord {
+  stopIntent: TaskStopIntent;
+}
+
+/**
  * 启动恢复的一次规范化结果。`queued` 是按接受顺序待执行的任务：没有派发过的行重放原文，已有
  * OMP 接受回执的行续接原会话。`uncertain` 是本次被 fail-closed 的已派发行——prompt 已落账但收不到
  * 接受回执，无法判定它是否真的进过会话，既不重放也不错续，由服务按实际异常说明结算并关闭其问题。
+ * `stopped` 是本次按持久停止意图结算的行。三个数组各自按 accepted_at, rowid 升序；`uncertain` 与
+ * `stopped` 只含本次结算的行，后续启动不会重复上报。
  */
 export interface TaskRestartRecovery {
   queued: TaskRecord[];
   uncertain: TaskRecord[];
+  stopped: StoppedTaskRecovery[];
 }
 
 /**

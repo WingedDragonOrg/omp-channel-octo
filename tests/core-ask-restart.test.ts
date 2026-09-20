@@ -95,13 +95,18 @@ interface DeskRecord {
   readonly texts: Array<{ target: ChatTarget; text: string; taskId: string | null }>;
   readonly wakes: Array<{ target: ChatTarget; text: string }>;
   readonly stops: string[];
+  /** 每次停回合交出的待取消旧问题行：服务侧本应与停止意图写进同一事务。 */
+  readonly stopIntents: Array<{ taskId: string; ids: readonly string[] }>;
 }
 
 /** 第二段进程的问答子系统：真 store、真卡片构造，服务侧端口换成记录器。 */
-function resumeDesk(store: ChannelStore, options: { stopping?: boolean; timeoutMs?: number } = {}) {
-  const transport = new FakeTransport({ bot: { uid: BOT_UID, name: "Fixture Bot" } });
+function resumeDesk(
+  store: ChannelStore,
+  options: { stopping?: boolean; timeoutMs?: number; transport?: FakeTransport } = {},
+) {
+  const transport = options.transport ?? new FakeTransport({ bot: { uid: BOT_UID, name: "Fixture Bot" } });
   transport.cardSupported = true;
-  const record: DeskRecord = { texts: [], wakes: [], stops: [] };
+  const record: DeskRecord = { texts: [], wakes: [], stops: [], stopIntents: [] };
   const desk = createQuestionDesk({
     store,
     transport,
@@ -122,8 +127,9 @@ function resumeDesk(store: ChannelStore, options: { stopping?: boolean; timeoutM
     }),
     askTimeoutMs: () => options.timeoutMs ?? 600_000,
     displayNames: async (uids) => new Map(uids.map((uid) => [uid, uid])),
-    stopTurnForQuestion: (taskId) => {
+    stopTurnForQuestion: (taskId, cancelQuestionIds) => {
       record.stops.push(taskId);
+      record.stopIntents.push({ taskId, ids: cancelQuestionIds });
     },
     wakeTurn: (target, text) => {
       record.wakes.push({ target, text });
@@ -416,7 +422,7 @@ test("同一次工具调用的重复执行是幂等的，即使上次已经交�
     const task = latestTask(store);
     const rowId = interrupted.questionIds[0]!;
     // OMP 可能还没把这轮的结果落盘，同一个 toolCallId 的重执行必须拿回同一份答案。
-    const { desk, transport } = resumeDesk(store);
+    const { desk, transport, record } = resumeDesk(store);
     desk.beginRecovery(task.id);
     const call = desk.askQuestions(task, TARGET, args(SINGLE), new AbortController().signal, "call-replay");
     expect(answers(await call)).toEqual([
@@ -424,8 +430,254 @@ test("同一次工具调用的重复执行是幂等的，即使上次已经交�
     ]);
     expect(store.listTaskQuestions(task.id)).toHaveLength(1);
     expect(transport.sentCards).toHaveLength(0);
+
+    // 已经被这一次重放消费：另一个身份的同类提问不许再拿走这行。
+    const abandoned = new AbortController();
+    abandoned.abort();
+    await expect(
+      desk.askQuestions(task, TARGET, args(SINGLE), abandoned.signal, "call-other"),
+    ).rejects.toThrow();
+    expect(store.listTaskQuestions(task.id)).toHaveLength(2);
+    // 结果已经交付过，任务收束时不再补投同一个答复。
+    desk.rejectForTask(task.id, new Error("task finished"));
+    expect(record.wakes).toHaveLength(0);
   });
 });
+
+test("落定写不进库：答复不当作交付，本次 ask 明确失败", async () => {
+  const interrupted = await interruptAsk(SINGLE);
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    // 与停机前那段进程共用一条传输：卡片 id 才会接着编，新卡不撞旧卡的号。
+    const { desk, transport } = resumeDesk(store, { transport: interrupted.transport });
+    Object.assign(store, {
+      markQuestionsSettled: () => {
+        throw new Error("settle write failed");
+      },
+    });
+    const call = desk.askQuestions(task, TARGET, args(SINGLE), new AbortController().signal, "call-settle-fail");
+    const { messageId } = await transport.waitForCardSend(({ messageId: id }) => id !== interrupted.cardMessageId);
+    expect(await desk.answerFromCard(click(messageId, "ask_opt_2"))).toBe("handled");
+    await expect(call).rejects.toThrow("settle write failed");
+    // 答案本身已经记在行上，丢的只是「这次交付已落定」的凭据。
+    expect(store.listTaskQuestions(task.id).at(-1)!.state).toBe("answered");
+  });
+});
+
+test("超时路径的落定再失败也不掩盖原来的超时错误", async () => {
+  const interrupted = await interruptAsk(SINGLE);
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    const { desk } = resumeDesk(store, { timeoutMs: 20 });
+    Object.assign(store, {
+      markQuestionsSettled: () => {
+        throw new Error("settle write failed");
+      },
+    });
+    await expect(
+      desk.askQuestions(task, TARGET, args(SINGLE), new AbortController().signal, "call-timeout-settle-fail"),
+    ).rejects.toThrow("ask wait stopped: the turn was halted after the question timeout");
+  });
+});
+
+test("语义认领的身份写不进库：本次 ask 明确失败，行保持可重试且不发新卡", async () => {
+  const interrupted = await interruptAsk(SINGLE, { toolCallId: "call-adopt-fail" });
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    const rowId = interrupted.questionIds[0]!;
+    const { desk, transport, record } = resumeDesk(store);
+    desk.beginRecovery(task.id);
+    const cardsBefore = transport.sentCards.length;
+    // 故障注入：身份写回失败（事务因缺行回滚）。
+    const healthyWrite = store.updateQuestionPayloads.bind(store);
+    Object.assign(store, {
+      updateQuestionPayloads: () => {
+        throw new Error("question payload update touched 0 of 1 rows");
+      },
+    });
+    let failure: unknown;
+    try {
+      await desk.askQuestions(task, TARGET, args(SINGLE), new AbortController().signal, "call-adopt-fail-next");
+    } catch (error) {
+      failure = error;
+    }
+    expect(String(failure)).toContain("question payload update touched 0 of 1 rows");
+    // 没有消费恢复组：行仍是原样、仍待答，一个新行、一张新卡都没有。
+    const rows = store.listTaskQuestions(task.id);
+    expect(rows.map(({ id }) => id)).toEqual([rowId]);
+    expect(rows[0]!.state).toBe("pending");
+    expect(payloadOf(store, rowId)).toMatchObject({ toolCallId: "call-adopt-fail" });
+    expect(transport.sentCards).toHaveLength(cardsBefore);
+    expect(record.wakes).toHaveLength(0);
+    // 写回恢复后，同一个调用重执行仍能认回原行：没有新题、没有新卡。
+    Object.assign(store, { updateQuestionPayloads: healthyWrite });
+    const healthy = resumeDesk(store, { transport });
+    healthy.desk.beginRecovery(task.id);
+    const retry = healthy.desk.askQuestions(
+      task, TARGET, args(SINGLE), new AbortController().signal, "call-adopt-fail-next");
+    // 复用原行就是复用原卡：点击落在停机前那张卡上。
+    expect(await healthy.desk.answerFromCard(click(interrupted.cardMessageId, "ask_opt_2")))
+      .toBe("handled");
+    expect(answers(await retry)).toEqual([
+      { id: "deployment-target", questionId: rowId, answer: "2", answeredBy: OWNER },
+    ]);
+    expect(store.listTaskQuestions(task.id).map(({ id }) => id)).toEqual([rowId]);
+    expect(transport.sentCards).toHaveLength(cardsBefore);
+    expect(payloadOf(store, rowId)).toMatchObject({ toolCallId: "call-adopt-fail-next" });
+  });
+});
+
+test("同一个工具调用 id 重执行但参数不同：明确失败，不另起新题", async () => {
+  const interrupted = await interruptAsk(SINGLE, { toolCallId: "call-args-drift" });
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    const rowId = interrupted.questionIds[0]!;
+    const { desk, transport } = resumeDesk(store);
+    desk.beginRecovery(task.id);
+    const cardsBefore = transport.sentCards.length;
+    await expect(
+      desk.askQuestions(
+        task,
+        TARGET,
+        args([{ id: "deployment-target", question: "Another deployment target?", options: [{ label: "staging" }, { label: "production" }] }]),
+        new AbortController().signal,
+        "call-args-drift",
+      ),
+    ).rejects.toThrow("同一工具调用的重执行与原提问不一致");
+    expect(store.listTaskQuestions(task.id).map(({ id }) => id)).toEqual([rowId]);
+    expect(transport.sentCards).toHaveLength(cardsBefore);
+  });
+});
+
+test("重复执行认回窗口里的答复后，任务收束时不再补投", async () => {
+  const interrupted = await interruptAsk(SINGLE, { toolCallId: "call-window-replay" });
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    const rowId = interrupted.questionIds[0]!;
+    const { desk, record } = resumeDesk(store);
+    desk.beginRecovery(task.id);
+    // 答复在重挂之前落地：先不另起回合，留给这次执行认领。
+    await desk.answerPendingQuestion(inbound({ messageId: "restart-window-replay", ...TARGET, text: "2" }), "2");
+    expect(record.wakes).toHaveLength(0);
+    const call = desk.askQuestions(task, TARGET, args(SINGLE), new AbortController().signal, "call-window-replay");
+    expect(answers(await call)).toEqual([
+      { id: "deployment-target", questionId: rowId, answer: "2", answeredBy: OWNER },
+    ]);
+    // 答复已经交付给这次执行：任务收束时不能再补投一遍。
+    desk.rejectForTask(task.id, new Error("task finished"));
+    expect(record.wakes).toHaveLength(0);
+  });
+});
+
+test("重复执行的等待超时后，待答行不被收束关闭，迟到答复仍唤醒回合", async () => {
+  const interrupted = await interruptAsk(SINGLE, { toolCallId: "call-replay-timeout" });
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    const rowId = interrupted.questionIds[0]!;
+    const { desk, record } = resumeDesk(store, { timeoutMs: 20 });
+    desk.beginRecovery(task.id);
+    await expect(
+      desk.askQuestions(task, TARGET, args(SINGLE), new AbortController().signal, "call-replay-timeout"),
+    ).rejects.toThrow();
+    expect(record.stops).toEqual([task.id]);
+    expect(store.getQuestion(rowId)?.state).toBe("pending");
+    desk.rejectForTask(task.id, new Error("task finished"));
+    expect(store.getQuestion(rowId)?.state).toBe("pending");
+    await desk.answerPendingQuestion(inbound({ messageId: "restart-late-replay", ...TARGET, text: "2" }), "2");
+    expect(record.wakes).toHaveLength(1);
+  });
+});
+
+test("同形的两个被中断调用各自认回自己的行", async () => {
+  const interrupted = await interruptAsk(SINGLE);
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    // 旧的进程里有两个同形调用同时挂着（并行工具调用），各自带着自己的工具调用 id。
+    // 两张卡共用一个传输，卡片 id 因此在同一个命名空间里递增，不会互相顶替。
+    const first = resumeDesk(store, { transport: interrupted.transport });
+    const firstCall = first.desk.askQuestions(task, TARGET, args(SINGLE), new AbortController().signal, "call-a");
+    const rowA = store.listTaskQuestions(task.id).at(-1)!.id;
+    const cardA = await first.transport.waitForCardSend(({ messageId }) => messageId !== interrupted.cardMessageId)
+      .then(({ messageId }) => messageId);
+    const second = resumeDesk(store, { transport: first.transport });
+    const secondCall = second.desk.askQuestions(task, TARGET, args(SINGLE), new AbortController().signal, "call-b");
+    const rowB = store.listTaskQuestions(task.id).at(-1)!.id;
+    const cardB = await second.transport
+      .waitForCardSend(({ messageId }) => messageId !== cardA && messageId !== interrupted.cardMessageId)
+      .then(({ messageId }) => messageId);
+    expect(rowA).not.toBe(rowB);
+    expect(cardA).not.toBe(cardB);
+
+    const resumed = resumeDesk(store);
+    resumed.desk.beginRecovery(task.id);
+    const replayA = resumed.desk.askQuestions(task, TARGET, args(SINGLE), new AbortController().signal, "call-a");
+    expect(await resumed.desk.answerFromCard(click(cardA, "ask_opt_2"))).toBe("handled");
+    expect(answers(await replayA)).toEqual([
+      { id: "deployment-target", questionId: rowA, answer: "2", answeredBy: OWNER },
+    ]);
+    const replayB = resumed.desk.askQuestions(task, TARGET, args(SINGLE), new AbortController().signal, "call-b");
+    expect(await resumed.desk.answerFromCard(click(cardB, "ask_opt_2"))).toBe("handled");
+    expect(answers(await replayB)).toEqual([
+      { id: "deployment-target", questionId: rowB, answer: "2", answeredBy: OWNER },
+    ]);
+    expect(store.listTaskQuestions(task.id).map(({ id }) => id)).toEqual([...interrupted.questionIds, rowA, rowB]);
+    void firstCall;
+    void secondCall;
+  });
+});
+
+test("语义认领把新调用身份写回行：再次重启后同一个 id 仍认回原结果", async () => {
+  const interrupted = await interruptAsk(SINGLE, { toolCallId: "call-adopted-source" });
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    const rowId = interrupted.questionIds[0]!;
+    const adopted = resumeDesk(store);
+    adopted.desk.beginRecovery(task.id);
+    // 兜底续跑换了工具调用 id：语义认领 A 留下的行。
+    const call = adopted.desk.askQuestions(task, TARGET, args(SINGLE), new AbortController().signal, "call-adopted");
+    expect(await adopted.desk.answerFromCard(click(interrupted.cardMessageId, "ask_opt_2"))).toBe("handled");
+    expect(answers(await call)).toEqual([
+      { id: "deployment-target", questionId: rowId, answer: "2", answeredBy: OWNER },
+    ]);
+    // 认领者身份已经落盘。
+    expect(payloadOf(store, rowId).toolCallId).toBe("call-adopted");
+
+    // 再一次重启：同一个工具调用 id 的重执行仍然拿回同一份答案。
+    const later = resumeDesk(store);
+    later.desk.beginRecovery(task.id);
+    const replay = later.desk.askQuestions(task, TARGET, args(SINGLE), new AbortController().signal, "call-adopted");
+    expect(answers(await replay)).toEqual([
+      { id: "deployment-target", questionId: rowId, answer: "2", answeredBy: OWNER },
+    ]);
+    expect(store.listTaskQuestions(task.id)).toHaveLength(1);
+    expect(later.transport.sentCards).toHaveLength(0);
+  });
+});
+
+test("重启窗口里被答复后 /cancel：不再补投任何新回合", async () => {
+  const interrupted = await interruptAsk(SINGLE);
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    const rowId = interrupted.questionIds[0]!;
+    const { desk, record } = resumeDesk(store);
+    desk.beginRecovery(task.id);
+    // 答复在续跑 ask 重挂之前落地（先不另起回合）。
+    await desk.answerPendingQuestion(inbound({ messageId: "restart-cancel-window", ...TARGET, text: "2" }), "2");
+    expect(record.wakes).toHaveLength(0);
+    // 显式取消：该聊天的恢复快照全部作废，已答复的行也不该被补投。
+    desk.cancelForTarget(TARGET);
+    desk.rejectForTask(task.id, new Error("task cancelled"));
+    expect(record.wakes).toHaveLength(0);
+    expect(store.getQuestion(rowId)?.state).toBe("answered");
+  });
+});
+
+/** 一段提问行的 payload，按行读回。 */
+function payloadOf(store: ChannelStore, questionId: string): Record<string, unknown> {
+  const row = store.getQuestion(questionId);
+  if (row === null) throw new Error("question row missing");
+  return JSON.parse(row.payload) as Record<string, unknown>;
+}
 
 test("已交付的历史不被新的工具调用复用", async () => {
   const interrupted = await interruptAsk(SINGLE, {
@@ -474,6 +726,80 @@ test("任务不再恢复时 cancelForTask 关闭它遗留的问题与卡片", as
     expect(store.getQuestion(rowId)?.state).toBe("cancelled");
     const edit = await transport.waitForCardEdit(({ messageId }) => messageId === interrupted.cardMessageId);
     expect(JSON.stringify(edit.frame.card)).toContain("任务已中断");
+  });
+});
+
+test("提问超时把未认领的旧问题交给服务落库：再次恢复后 A 不可答、B 仍可答", async () => {
+  const interrupted = await interruptAsk(SINGLE, { toolCallId: "call-old-a" });
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    const rowA = interrupted.questionIds[0]!;
+    // 与停机前那段进程共用一条传输：新问题的卡片不会撞旧卡的号。
+    const { desk, transport, record } = resumeDesk(store, {
+      timeoutMs: 20,
+      transport: interrupted.transport,
+    });
+    desk.beginRecovery(task.id);
+    // 新的一轮提问是另一个问题：停机留下的 A 不会被这次调用认领。
+    const fresh = [{
+      id: "rollout-window",
+      question: "Which rollout window?",
+      options: [{ label: "tonight" }, { label: "tomorrow" }],
+    }];
+    await expect(
+      desk.askQuestions(task, TARGET, args(fresh), new AbortController().signal, "call-new-b"),
+    ).rejects.toThrow("ask wait stopped");
+    // 契约：停回合时交出的名单里只有未认领且仍待答的旧行 A；本轮超时的 B 不在其中（它要保持可答）。
+    expect(record.stops).toEqual([task.id]);
+    expect(record.stopIntents).toEqual([{ taskId: task.id, ids: [rowA] }]);
+    const rowB = store.listTaskQuestions(task.id).at(-1)!.id;
+    expect(rowB).not.toBe(rowA);
+    expect(store.getQuestion(rowB)?.state).toBe("pending");
+    // 服务侧：这份 id 与停止意图写进同一事务——真调用 store，不模拟。
+    expect(store.markTaskStopIntent(task.id, "question_timeout", record.stopIntents[0]!.ids)).toBe(true);
+    // 同一事务的效果：旧行 A 被取消，本轮超时的 B 仍可答。
+    expect(store.getQuestion(rowA)?.state).toBe("cancelled");
+    expect(store.getQuestion(rowB)?.state).toBe("pending");
+    // 再次恢复：A 是取消掉的历史，B 照旧等答复，迟到答复唤醒新回合。
+    const again = resumeDesk(store, { transport });
+    again.desk.beginRecovery(task.id);
+    const cardB = (await transport.waitForCardSend(({ messageId }) => messageId !== interrupted.cardMessageId))
+      .messageId;
+    expect(await again.desk.answerFromCard(click(interrupted.cardMessageId, "ask_opt_2"))).toBe("handled");
+    expect(store.getQuestion(rowA)?.state).toBe("cancelled");
+    expect(store.getQuestion(rowA)?.answer).toBeNull();
+    expect(again.record.texts.map(({ text }) => text)).toContain("该问题已失效，本次点击未作为答案。");
+    expect(await again.desk.answerFromCard(click(cardB, "ask_opt_1"))).toBe("handled");
+    expect(store.getQuestion(rowB)?.state).toBe("answered");
+    expect(again.record.wakes).toHaveLength(1);
+    // 收束投影：桌面在 A 还待答时建过快照、此刻行已被 Store 取消——它的卡片仍要补上关闭。
+    desk.rejectForTask(task.id, new Error("task finished"));
+    const closed = await transport.waitForCardEdit(({ messageId, frame }) =>
+      messageId === interrupted.cardMessageId && JSON.stringify(frame.card).includes("任务已结束"));
+    expect(closed.messageId).toBe(interrupted.cardMessageId);
+  });
+});
+
+test("Store 已按终态取消的提问，卡片仍要被收尾关闭", async () => {
+  const interrupted = await interruptAsk(SINGLE);
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    const rowId = interrupted.questionIds[0]!;
+    // 任务落终态的那段进程把行取消掉，随后被杀：卡片还挂在用户那里。
+    store.cancelQuestion(rowId);
+    expect(store.getQuestion(rowId)?.state).toBe("cancelled");
+    const { desk, transport } = resumeDesk(store);
+    desk.cancelForTask(task.id);
+    expect(store.getQuestion(rowId)?.state).toBe("cancelled");
+    const edit = await transport.waitForCardEdit(({ messageId }) => messageId === interrupted.cardMessageId);
+    expect(JSON.stringify(edit.frame.card)).toContain("任务已中断");
+    // 已取消的行不因任务收尾复活：迟到的答复照样无处可落。
+    const answered = await desk.answerPendingQuestion(
+      inbound({ messageId: "store-cancelled", ...TARGET, text: "2" }),
+      "2",
+    );
+    expect(answered).toBe(false);
+    expect(store.getQuestion(rowId)?.state).toBe("cancelled");
   });
 });
 

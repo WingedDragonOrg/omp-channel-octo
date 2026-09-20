@@ -34,7 +34,7 @@
 - 按 (bot, chat) 的 typing 租约：门后判定 agent-attached 、进入组装点之前亮起，每 3s 续期；同一聊天任一时刻至多一条续期环。
 - 租约接续：任务被持久接受时在同一条续期环上并入 `task:<id>` owner（先 acquire task 租约、调用方随后 release 消息租约，环不重启）；**任务排队等待（同聊天排队与跨聊天同目录等待）期间保持亮起**；任务终态（完成/失败/取消/启动失败/排队中取消）熄灭。
 - agent-attached 命令路径（`/queue <文本>`、`/thread <任务>`、`/thread merge`、observing 注册命令）在各自交给 agent 前的同一点位亮起。
-- `runTask` 入口的防御性幂等 acquire：任何未来把任务带进 `runTask` 的路径自动点亮（当前生产触达路径只有 `acceptTask` 的调度链；进程重启会把 queued 任务一并在 `markInterruptedOnStart` 转终态中断，不存在重启后重排 queued 任务的路径）。
+- `runTask` 入口幂等 acquire：普通接受路径与重启恢复的调度链都能在开始执行时点亮；恢复任务仍遵守旧 worker 退出及目录串行门禁。
 - 行为测试（相对时序与路径开/灭）、`bun run typecheck`、`bun test`，主规格、根 `AGENTS.md` 同步。
 
 ### 不包含
@@ -90,10 +90,10 @@
 - intercepting 命令的 `claimCommand` 去重早退（重投）→ release（finally 保证）。
 - `acceptTask` 返回 false（重投去重）或抛错 → release。
 - `appendToRunningTask` 命中 steer → release（运行任务的租约继续持有，环不断）。
-- `acceptTask` **成功时在自身内部** `acquire("task:"+taskId)`（先 acquire 后 schedule），调用方随后 release 消息租约；owner 集合从 `{msg}` 经 `{msg,task}` 到 `{task}`，环不重启。`acceptTask` 是**唯一**的 task 租约入口，因此不经 handleInbound 的任务（`deliverToChat`：host tool / `notify:` 合成消息 / 超时问题的答复唤醒）排队期间同样亮起。
+- `acceptTask` **成功时在自身内部** `acquire("task:"+taskId)`（先 acquire 后 schedule），调用方随后 release 消息租约；owner 集合从 `{msg}` 经 `{msg,task}` 到 `{task}`，环不重启。不经 handleInbound 的新任务（host tool、`notify:` 合成消息、问答唤醒）同样通过此处点亮；重启恢复的存量任务由 `runTask` 幂等取得租约。
 - intercepting 命令无任务归宿，`handler.handle` 结束后 release。
 
-**执行阶段**：`runTask` 不再自建 typing 环——在 `markStarted` 成功后幂等 `acquire("task:"+taskId)`（正常路径 owner 已在集合，no-op；这是防御点：当前生产触达 `runTask` 的路径只有 `acceptTask` 的调度链，重启后遗留 queued 任务被 `markInterruptedOnStart` 转终态、不会被重排，但任何未来新触达路径在此自动点亮，无需再改本设计）；任务走到任一终态（完成/失败/取消/启动失败）时 `release("task:"+taskId)`。原有每个请求 2s deadline、失败吞掉的语义保留到租约实现中。
+**执行阶段**：`runTask` 在 `markStarted` 成功后幂等 `acquire("task:"+taskId)`，普通路径复用已持有租约，重启恢复路径建立新租约。任务收束或服务停止时释放租约；停机后的客户端气泡按其自身 TTL 消退。每个请求仍有 2 秒 deadline，失败不阻断任务；本端恢复发送不代表绕过上游节流窗口。
 
 ## 错误与边界情况
 

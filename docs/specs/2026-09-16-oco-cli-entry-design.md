@@ -112,7 +112,7 @@ channel 的日常操作目前散落在四处：`bun run src/cli.ts serve --confi
 ### 配置与迁移
 
 - `config.example.json` 去掉 `restart` 块；`src/runtime/config.ts` 删除 `restartCommand`、`parseRestartCommand` 与 `restart` 键白名单项。
-- `CoreService` 的 restart 端口由 cli 层注入：探测成功时提供"派生守护进程重启"的 request，探测失败时不提供端口，服务回复"未检测到守护进程，无法重启 channel"；`channel_control.restart` 与聊天内 `/restart` 共用该端口，既有排定、持久化重启请求与重启后通报逻辑不变。
+- `CoreService` 的 restart 端口由 cli 层注入：探测成功时提供“派生守护进程重启”的 request，探测失败时明确拒绝。聊天内 `/restart` 与 `/restart now` 允许忙时重启；`channel_control.restart` 保持空闲后触发。新进程确认旧 worker 已退出后恢复持久任务与原 session，聊天内只发送请求回执；终端 `oco restart` 仍报告 PID 与健康状态。
 - 迁移步骤：创建 `~/.oco/{config,logs}`（`0700`）→ 复制现有配置到 `~/.oco/config/config.json` 并去掉 `restart` 块（`0600`）→ 更新 Super stack 的 `--config` 并 `super apply -f` → 用 `oco restart` 与 `oco logs` 验证 → 确认无引用后删除旧 `~/.config/omp-channel-octo/`。
 
 ## 错误与边界情况
@@ -134,7 +134,7 @@ channel 的日常操作目前散落在四处：`bun run src/cli.ts serve --confi
 1. `bun link` 后 `~/.bun/bin/oco` 存在且可执行；在任意 cwd 运行 `oco help` 列出全部命令；以 `omp-channel-octo` 调用时帮助显示该名。
 2. `oco status` 打印守护类型、程序名、状态、PID、运行时长、配置路径与当前日志文件；无守护进程时明确说明未检测到，并仍打印配置与日志路径。
 3. `oco restart` 在终端自动识别程序并重启：服务 PID 变化、状态 Healthy、输出重启前后 PID；多个候选时报错并列出候选；无守护进程时退出码非零。
-4. 未配置 `restart.command` 时，聊天内 `/restart` 与 `channel_control.restart` 仍能重启 channel 并通报新 PID；探测不到守护进程时明确拒绝且不猜测。
+4. 聊天内 `/restart` 与 `channel_control.restart` 使用自动检测的端口重启 channel；启动后 `/status` 可用，任务依主规格续接，恢复成功不追加聊天通报；探测不到守护进程时明确拒绝。
 5. `oco start`/`oco run` 运行期间 `~/.oco/logs/channel-YYYY-MM-DD.log` 出现带 `[YYYY-MM-DD HH:MM:SS]` 前缀的行，终端输出保持原样；14 天前的 `channel-*.log` 在启动时被删除。
 6. `oco logs --tail N` 打印最新日志文件末 N 行；`-f` 跟随新增行并在跨天后接上新文件。
 7. `oco test --card` 在未手动加载 `.envrc` 的 shell 中也能发出真实预览卡，退出码透传。

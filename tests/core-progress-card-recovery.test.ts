@@ -850,6 +850,57 @@ test("a card the recovery could not take over is created under a fresh key segme
   });
 });
 
+test("a resumable task with no surviving card row still opens under a fresh key segment", async () => {
+  await withResumeDomain("bot-resume-rowless", { cardSeq: 6, resumable: true }, async (seeded, store, domain) => {
+    // 上一轮的终态编辑已经清掉它的行，而新一轮还没产生开卡进度；恢复期一行卡片都读不到。
+    store.clearProgressCard("bot-resume-rowless", seeded.taskId, seeded.messageId);
+    expect(store.listProgressCards("bot-resume-rowless")).toHaveLength(0);
+    // 真实启动会在这里先把 started 归一化为 queued；`startTask` 之后直接问 `isTaskResuming`
+    // 决定这一轮是否换 key 段，所以恢复期有没有卡片行都不影响结论。
+    store.prepareTasksForRestart("bot-resume-rowless", {
+      interrupt: "用户中断当前回合",
+      question_timeout: "等待回答超时，回合已停止",
+    });
+    expect(store.isTaskResuming(seeded.taskId)).toBe(true);
+
+    await domain.cards.recover();
+    expect(domain.edits).toHaveLength(0);
+    const progress = domain.cards.startTask(seeded.taskId, RESUMED_TARGET);
+    progress.apply({ type: "tool_start", toolCallId: "call-live", toolName: "bash", atMs: 2_000 });
+    await progress.tail;
+    // 新卡照常开在原聊天，但 key 不能回到 `progress-<taskId>-0`：那是上一轮已经用过的 key，
+    // 服务端的去重窗口里它会寻址到那张已经收尾的旧卡，而不是开出一张新的。
+    expect(domain.sends).toHaveLength(1);
+    expect(domain.sends[0]!.clientMsgNo.startsWith(`progress-${seeded.taskId}-`)).toBe(true);
+    expect(domain.sends[0]!.clientMsgNo).not.toBe(`progress-${seeded.taskId}-0`);
+  });
+});
+
+test("a roll right after a resume keeps the task's research band and todos", async () => {
+  await withResumeDomain("bot-resume-research", { cardSeq: 4, resumable: true }, async (seeded, store, domain) => {
+    await domain.cards.recover();
+    const progress = domain.cards.startTask(seeded.taskId, RESUMED_TARGET);
+    // 恢复后没有新的 research_update 就 steer：研究带与 todo 都来自接管的快照，结转进新的一轮。
+    progress.roll();
+    await progress.tail;
+    expect(domain.edits.map((edit) => [edit.messageId, edit.progress.state])).toEqual([
+      [seeded.messageId, "completed"],
+    ]);
+
+    progress.apply({ type: "tool_start", toolCallId: "call-live", toolName: "bash", atMs: 2_000 });
+    await progress.tail;
+    expect(domain.sends).toHaveLength(1);
+    const carried = domain.sends[0]!.progress;
+    expect(carried.todos).toEqual(RESUMED_TODOS);
+    expect(carried.research).toMatchObject({ metricName: "p95_ms", completedRuns: 3, best: 940 });
+    expect(carried.tools.map((tool) => tool.toolCallId)).toEqual(["call-live"]);
+    // 旧行随被顶掉那一轮的终态编辑清掉，只剩新卡这一行。
+    expect(store.listProgressCards("bot-resume-research").map((card) => card.messageId)).toEqual([
+      "new-card-1",
+    ]);
+  });
+});
+
 test("a prompt the worker never accepted is closed instead of resumed", async () => {
   await withResumeDomain("bot-resume-refused", { cardSeq: 3, resumable: false }, async (seeded, store, domain) => {
     // 恢复期这条行会被 fail-closed（prompt 是否被接受未知）；卡片域不看行是否「活跃」，只看它
@@ -1003,6 +1054,80 @@ test("a suspended turn is resumed onto the same card and finishes on it", async 
     continueResume.resolve();
     await closeCoreHarness(restarted, { remove: false });
   }
+});
+
+test("a replayed tool call reopens the row recovery had settled", () => {
+  const tracker = createExecutionTracker({ runId: "replay", initialAtMs: 500 });
+  tracker.apply({ type: "tool_start", toolCallId: "done", toolName: "read", atMs: 600, summary: "第一次" });
+  tracker.apply({ type: "tool_end", toolCallId: "done", atMs: 700, status: "succeeded" });
+  tracker.apply({ type: "tool_start", toolCallId: "interrupted", toolName: "bash", atMs: 800, summary: "中断前" });
+  const encoded = encodeExecutionSnapshot(tracker.snapshot(900));
+
+  const resumed = restoreExecutionTracker(encoded, { state: "running", atMs: 900_000 })!;
+  expect(resumed.snapshot(900_000).tools.map((tool) => [tool.toolCallId, tool.state])).toEqual([
+    ["done", "succeeded"],
+    ["interrupted", "cancelled"],
+  ]);
+
+  // OMP 原生 /retry 复用同一个 toolCallId：真实重放把这一行重新打开，之后的状态与耗时都来自真实事件。
+  resumed.apply({ type: "tool_start", toolCallId: "interrupted", toolName: "bash", atMs: 1_000, summary: "重放" });
+  expect(
+    resumed.snapshot(1_050).tools.map((tool) => [tool.toolCallId, tool.state, tool.endedAtMs, tool.durationMs, tool.summary]),
+  ).toEqual([
+    ["done", "succeeded", 700, 100, "第一次"],
+    ["interrupted", "running", null, 50, "重放"],
+  ]);
+  resumed.apply({ type: "tool_end", toolCallId: "interrupted", atMs: 1_200, status: "succeeded" });
+  expect(resumed.snapshot(1_300).tools.map((tool) => [tool.toolCallId, tool.state, tool.endedAtMs])).toEqual([
+    ["done", "succeeded", 700],
+    ["interrupted", "succeeded", 1_200],
+  ]);
+
+  // 真实结束过的行不会被重开：那条同名 start 不是一次真的执行，行保留自己的结束时刻。
+  resumed.apply({ type: "tool_start", toolCallId: "done", toolName: "read", atMs: 1_400 });
+  expect(resumed.snapshot(1_500).tools.map((tool) => [tool.toolCallId, tool.state, tool.endedAtMs])).toEqual([
+    ["done", "succeeded", 700],
+    ["interrupted", "succeeded", 1_200],
+  ]);
+});
+
+test("a retried tool id keeps its reopening licence across two restarts", () => {
+  const first = createExecutionTracker({ runId: "twice", initialAtMs: 100 });
+  first.apply({ type: "tool_start", toolCallId: "call-1", toolName: "bash", atMs: 200, summary: "中断前" });
+  // 第一次恢复把上一进程遗留的运行中行收束成「推断结束」。
+  const firstResume = restoreExecutionTracker(encodeExecutionSnapshot(first.snapshot(300)), {
+    state: "running",
+    atMs: 900_000,
+  })!;
+  // 收束之后又来了别的真实事件，于是这一行以 cancelled 写进持久载荷——标记必须一起睡进快照，
+  // 否则它在第二次重启后就丢了重开资格。
+  firstResume.apply({ type: "tool_start", toolCallId: "call-2", toolName: "read", atMs: 400 });
+  const persisted = encodeExecutionSnapshot(firstResume.snapshot(500));
+
+  const secondResume = restoreExecutionTracker(persisted, { state: "running", atMs: 900_000 })!;
+  expect(secondResume.snapshot(900_000).tools.map((tool) => [tool.toolCallId, tool.state, tool.recoverySettled])).toEqual([
+    ["call-1", "cancelled", true],
+    ["call-2", "cancelled", true],
+  ]);
+  // 同一次真实重放（原生 /retry 复用同一个 toolCallId）仍然把这一行重开。
+  secondResume.apply({ type: "tool_start", toolCallId: "call-1", toolName: "bash", atMs: 1_000, summary: "重放" });
+  expect(secondResume.snapshot(1_050).tools.map((tool) => [tool.toolCallId, tool.state, tool.summary])).toEqual([
+    ["call-1", "running", "重放"],
+    ["call-2", "cancelled", undefined],
+  ]);
+  secondResume.apply({ type: "tool_end", toolCallId: "call-1", atMs: 1_100, status: "succeeded" });
+  expect(
+    secondResume.snapshot(1_200).tools.map((tool) => [tool.toolCallId, tool.state, tool.endedAtMs, tool.recoverySettled]),
+  ).toEqual([
+    ["call-1", "succeeded", 1_100, undefined],
+    ["call-2", "cancelled", 500, true],
+  ]);
+  // 真正结束过的行不再有资格：真实结果一旦落地，标记就消失了。
+  secondResume.apply({ type: "tool_start", toolCallId: "call-1", toolName: "bash", atMs: 1_300 });
+  expect(secondResume.snapshot(1_400).tools.map((tool) => [tool.toolCallId, tool.state, tool.endedAtMs])).toEqual([
+    ["call-1", "succeeded", 1_100],
+    ["call-2", "cancelled", 500],
+  ]);
 });
 
 test("the shared replay reopens a running round and still ends a terminal one", () => {

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatTarget } from "../src/contracts";
 import { type ChannelStore, openChannelStore } from "../src/store";
-import type { InboundClaim, TaskRecord } from "../src/store/store-records";
+import type { InboundClaim, TaskRecord, TaskStopIntent } from "../src/store/store-records";
 
 // 重启恢复的持久层契约：在途任务重排回 queued、prompt 标记决定「重放输入」还是「续接会话」、
 // 终态永不重跑、旧库的歧义 started 行开库只记账不改状态、由启动恢复结算为 interrupted。
@@ -57,6 +57,25 @@ function accept(store: ChannelStore, task: TaskRecord): void {
   expect(store.acceptTask(claimFor(task.messageId, task.text), task)).toBe(true);
 }
 
+/** 恢复结算停止行时的说明文案由调用方提供：这里用可辨识的英文串，证明 store 只负责原样落库。 */
+const stopReasons: Record<TaskStopIntent, string> = {
+  interrupt: "turn stopped by the user",
+  question_timeout: "turn stopped while waiting for an answer",
+};
+
+/** 直读 tasks.stop_intent：门面读出的 TaskRecord 不再暴露这一列。 */
+function readStopIntent(stateDir: string, taskId: string): string | null {
+  const db = new Database(join(stateDir, "channel.sqlite"));
+  try {
+    const row = db.query("SELECT stop_intent FROM tasks WHERE id = ?").get(taskId) as
+      | { stop_intent: string | null }
+      | null;
+    return row?.stop_intent ?? null;
+  } finally {
+    db.close();
+  }
+}
+
 test("重启准备把在途任务按接受顺序重排为 queued，并保留恢复身份与终态", () =>
   withStore((store) => {
     accept(store, taskFor("m1", "t1"));
@@ -83,7 +102,7 @@ test("重启准备把在途任务按接受顺序重排为 queued，并保留恢�
     accept(store, { ...taskFor("m8", "other-task"), botUid: "bot-other" });
     expect(store.markStarted("other-task")).toBe(true);
 
-    const recovered = store.prepareTasksForRestart(botUid);
+    const recovered = store.prepareTasksForRestart(botUid, stopReasons);
 
     expect(recovered.queued.map((task) => task.id)).toEqual(["t1", "t2", "t3"]);
     expect(recovered.queued.map((task) => task.state)).toEqual(["queued", "queued", "queued"]);
@@ -125,11 +144,11 @@ test("重复启动收敛：同一集合与顺序，恢复会话不被替换", ()
     store.markTaskPromptStarted("t2", "session-live-t2");
     store.markTaskPromptAccepted("t2");
 
-    const first = store.prepareTasksForRestart(botUid).queued.map((task) => task.id);
+    const first = store.prepareTasksForRestart(botUid, stopReasons).queued.map((task) => task.id);
     expect(first).toEqual(["t1", "t2"]);
     // 第二次重启：上一次已经把两行重新拉起，恢复必须得到同一集合与顺序。
     for (const id of first) expect(store.markStarted(id)).toBe(true);
-    const second = store.prepareTasksForRestart(botUid);
+    const second = store.prepareTasksForRestart(botUid, stopReasons);
     expect(second.queued.map((task) => task.id)).toEqual(["t1", "t2"]);
     expect(second.queued.map((task) => task.state)).toEqual(["queued", "queued"]);
     expect(store.isTaskResuming("t2")).toBe(true);
@@ -150,7 +169,7 @@ test("重启准备不动等待中的提问，也不释放 inbound 认领", () =>
     });
     expect(store.markStarted("t1")).toBe(true);
 
-    expect(store.prepareTasksForRestart(botUid).queued.map((row) => row.id)).toEqual(["t1"]);
+    expect(store.prepareTasksForRestart(botUid, stopReasons).queued.map((row) => row.id)).toEqual(["t1"]);
 
     expect(store.getQuestion("q-open")?.state).toBe("pending");
     // 认领仍在，重投的触发消息依旧是重复消息而不是新任务。
@@ -194,7 +213,7 @@ test("已发出 prompt 却缺少接受回执的任务在恢复时 fail-closed �
     expect(store.markStarted("unaccepted")).toBe(true);
     store.markTaskPromptStarted("unaccepted", "session-unaccepted");
 
-    const recovered = store.prepareTasksForRestart(botUid);
+    const recovered = store.prepareTasksForRestart(botUid, stopReasons);
 
     // 未发 prompt 的行重放原文，有回执的行续接；缺回执的行既不重放也不续接，走 uncertain 交回服务结算。
     expect(recovered.queued.map((task) => [task.id, task.state])).toEqual([
@@ -218,7 +237,7 @@ test("已发出 prompt 却缺少接受回执的任务在恢复时 fail-closed �
     expect(store.getTask("unaccepted")?.errorText).toContain("unknown");
     expect(store.isTaskResuming("unaccepted")).toBe(false);
     // 下一次重启不再重复上报已经结算的行，也不重复动它。
-    const next = store.prepareTasksForRestart(botUid);
+    const next = store.prepareTasksForRestart(botUid, stopReasons);
     expect(next.queued.map((task) => task.id)).toEqual(["no-prompt", "accepted"]);
     expect(next.uncertain).toEqual([]);
   }));
@@ -297,7 +316,7 @@ test("旧库升级只记账不改状态，启动恢复才结算歧义 started �
     expect(upgraded.getTask("legacy-done")?.state).toBe("completed");
 
     // 启动恢复（service 拿到 Bot 锁、回收旧 worker 之后）才把接受状态未知的行结算成 interrupted。
-    const legacyRecovery = upgraded.prepareTasksForRestart(botUid);
+    const legacyRecovery = upgraded.prepareTasksForRestart(botUid, stopReasons);
     expect(legacyRecovery.queued.map((task) => task.id)).toEqual(["legacy-queued"]);
     expect(legacyRecovery.uncertain.map((task) => task.id)).toEqual(["legacy-started"]);
     expect(upgraded.getTask("legacy-started")).toMatchObject({
@@ -318,7 +337,7 @@ test("旧库升级只记账不改状态，启动恢复才结算歧义 started �
       // 升级后的库支持完整的派发/接受两阶段标记，续接判定照常工作。
       reopened.markTaskPromptStarted("new-task", "session-new-task");
       reopened.markTaskPromptAccepted("new-task");
-      const recovered = reopened.prepareTasksForRestart(botUid);
+      const recovered = reopened.prepareTasksForRestart(botUid, stopReasons);
       expect(recovered.queued.map((task) => task.id)).toEqual(["legacy-queued", "new-task"]);
       expect(recovered.uncertain).toEqual([]);
       expect(reopened.isTaskResuming("new-task")).toBe(true);
@@ -509,6 +528,357 @@ test("旧库提问行的序号首次预留取高水位，之后持久单调且�
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("持久停止意图在恢复时落 interrupted 并交回原意图，提问保持原样", () =>
+  withStore((store, stateDir) => {
+    const start = (taskId: string, messageId: string, sessionId: string) => {
+      accept(store, taskFor(messageId, taskId));
+      expect(store.markStarted(taskId)).toBe(true);
+      store.markTaskPromptStarted(taskId, sessionId);
+      store.markTaskPromptAccepted(taskId);
+    };
+    start("interrupted-task", "m1", "session-interrupted");
+    expect(store.markTaskStopIntent("interrupted-task", "interrupt")).toBe(true);
+    start("timed-out-task", "m2", "session-timed-out");
+    expect(store.markTaskStopIntent("timed-out-task", "question_timeout")).toBe(true);
+    // 超时停轮遗留的提问必须保持 pending 可答：store 不碰提问行。
+    store.createQuestion({
+      id: "q-timeout",
+      taskId: "timed-out-task",
+      botUid,
+      channelType: target.channelType,
+      channelId: target.channelId,
+      payload: "{}",
+    });
+    start("resumed-task", "m3", "session-resumed");
+
+    const recovered = store.prepareTasksForRestart(botUid, stopReasons);
+
+    expect(recovered.stopped.map((entry) => [entry.id, entry.state, entry.stopIntent])).toEqual([
+      ["interrupted-task", "interrupted", "interrupt"],
+      ["timed-out-task", "interrupted", "question_timeout"],
+    ]);
+    // 文案由调用方提供，store 原样落库。
+    expect(store.getTask("interrupted-task")).toMatchObject({
+      state: "interrupted",
+      errorText: stopReasons.interrupt,
+    });
+    expect(store.getTask("timed-out-task")).toMatchObject({
+      state: "interrupted",
+      errorText: stopReasons.question_timeout,
+    });
+    expect(store.getQuestion("q-timeout")?.state).toBe("pending");
+    // 被叫停的行不再续接，也不进入待执行集合；其余 1/1 行照常续接。
+    expect(recovered.queued.map((task) => task.id)).toEqual(["resumed-task"]);
+    expect(recovered.uncertain).toEqual([]);
+    expect(store.isTaskResuming("interrupted-task")).toBe(false);
+    expect(store.isTaskResuming("resumed-task")).toBe(true);
+    // 意图随结算清列：下一次启动不重复上报。
+    expect(readStopIntent(stateDir, "interrupted-task")).toBeNull();
+    const next = store.prepareTasksForRestart(botUid, stopReasons);
+    expect(next.stopped).toEqual([]);
+    expect(next.queued.map((task) => task.id)).toEqual(["resumed-task"]);
+  }));
+
+test("markTaskStopIntent 只写在途行，clearTaskStopIntent 无条件清除", () =>
+  withStore((store, stateDir) => {
+    accept(store, taskFor("m1", "t1"));
+    expect(store.markTaskStopIntent("t1", "interrupt")).toBe(true);
+    expect(readStopIntent(stateDir, "t1")).toBe("interrupt");
+    // 再次叫停重新武装：重复写是允许的。
+    expect(store.markTaskStopIntent("t1", "question_timeout")).toBe(true);
+    expect(readStopIntent(stateDir, "t1")).toBe("question_timeout");
+    store.clearTaskStopIntent("t1");
+    expect(readStopIntent(stateDir, "t1")).toBeNull();
+
+    // 终态行静默 no-op：命令处理器与 settle 之间的竞态不抛错。
+    accept(store, taskFor("m2", "t2"));
+    expect(store.markTaskStopIntent("t2", "interrupt")).toBe(true);
+    store.markCompleted("t2", "已完成");
+    expect(store.markTaskStopIntent("t2", "interrupt")).toBe(false);
+    expect(readStopIntent(stateDir, "t2")).toBeNull();
+  }));
+
+test("completed/failed 终态同事务关闭本任务提问，已答行与邻任务不受影响", () =>
+  withStore((store) => {
+    const ask = (id: string, taskId: string) => store.createQuestion({
+      id,
+      taskId,
+      botUid,
+      channelType: target.channelType,
+      channelId: target.channelId,
+      payload: "{}",
+    });
+
+    accept(store, taskFor("m1", "done-task"));
+    expect(store.markStarted("done-task")).toBe(true);
+    ask("q-done", "done-task");
+    ask("q-answered", "done-task");
+    expect(store.answerQuestion("q-answered", botUid, target, "正常答案", "owner-1")).toBe(true);
+
+    accept(store, taskFor("m2", "failed-task"));
+    expect(store.markStarted("failed-task")).toBe(true);
+    ask("q-failed", "failed-task");
+
+    accept(store, taskFor("m3", "neighbour-task"));
+    expect(store.markStarted("neighbour-task")).toBe(true);
+    ask("q-neighbour", "neighbour-task");
+
+    store.markCompleted("done-task", "已完成");
+    expect(store.getQuestion("q-done")?.state).toBe("cancelled");
+    expect(store.answerQuestion("q-done", botUid, target, "迟到答案", "owner-1")).toBe(false);
+    // 已答行是业务结果，终态收口不碰它。
+    expect(store.getQuestion("q-answered")).toMatchObject({ state: "answered", answer: "正常答案" });
+
+    store.markFailed("failed-task", "模型调用失败");
+    expect(store.getQuestion("q-failed")?.state).toBe("cancelled");
+    expect(store.answerQuestion("q-failed", botUid, target, "迟到答案", "owner-1")).toBe(false);
+
+    expect(store.getQuestion("q-neighbour")?.state).toBe("pending");
+    expect(store.answerQuestion("q-neighbour", botUid, target, "正常答案", "owner-1")).toBe(true);
+  }));
+
+test("提问超时意图与选择集同事务：只关给定 id，越界/已答/未知 id 与当前提问都不动", () =>
+  withStore((store, stateDir) => {
+    const ask = (id: string, taskId: string) => store.createQuestion({
+      id,
+      taskId,
+      botUid,
+      channelType: target.channelType,
+      channelId: target.channelId,
+      payload: "{}",
+    });
+
+    accept(store, taskFor("m1", "timeout-task"));
+    expect(store.markStarted("timeout-task")).toBe(true);
+    ask("q-leftover", "timeout-task"); // A：恢复快照里没人接手的遗留题
+    ask("q-current", "timeout-task"); // B：本次超时正在等的那批
+    ask("q-answered", "timeout-task");
+    expect(store.answerQuestion("q-answered", botUid, target, "正常答案", "owner-1")).toBe(true);
+
+    accept(store, taskFor("m2", "neighbour-task"));
+    expect(store.markStarted("neighbour-task")).toBe(true);
+    ask("q-neighbour", "neighbour-task");
+
+    expect(store.markTaskStopIntent("timeout-task", "question_timeout", [
+      "q-leftover", // 该关的
+      "q-neighbour", // 越界：属于别的任务
+      "q-answered", // 已收场
+      "q-nonexistent", // 根本没这行
+    ])).toBe(true);
+    expect(readStopIntent(stateDir, "timeout-task")).toBe("question_timeout");
+    expect(store.getQuestion("q-leftover")?.state).toBe("cancelled");
+    expect(store.getQuestion("q-neighbour")?.state).toBe("pending");
+    expect(store.getQuestion("q-answered")?.state).toBe("answered");
+    expect(store.getQuestion("q-current")?.state).toBe("pending");
+    expect(store.answerQuestion("q-leftover", botUid, target, "迟到答案", "owner-1")).toBe(false);
+
+    // 再恢复：超时路线保留 B（迟到答复照样唤醒新回合），A 不复活。
+    const recovered = store.prepareTasksForRestart(botUid, stopReasons);
+    expect(recovered.stopped.map((entry) => [entry.id, entry.stopIntent])).toEqual([
+      ["timeout-task", "question_timeout"],
+    ]);
+    expect(store.getQuestion("q-current")?.state).toBe("pending");
+    expect(store.answerQuestion("q-current", botUid, target, "迟到但有效", "owner-1")).toBe(true);
+    expect(store.answerQuestion("q-leftover", botUid, target, "再迟到", "owner-1")).toBe(false);
+
+    // 守卫失败（行已终态）：意图与题一起不动。
+    accept(store, taskFor("m3", "already-done"));
+    expect(store.markStarted("already-done")).toBe(true);
+    ask("q-guarded", "already-done");
+    store.markInterrupted("already-done", "无意图中断");
+    expect(store.getQuestion("q-guarded")?.state).toBe("pending");
+    expect(store.markTaskStopIntent("already-done", "question_timeout", ["q-guarded"])).toBe(false);
+    expect(readStopIntent(stateDir, "already-done")).toBeNull();
+    expect(store.getQuestion("q-guarded")?.state).toBe("pending");
+  }));
+
+test("恢复结算中断与不确定行时同事务关闭提问，超时行保持可答", () =>
+  withStore((store) => {
+    const ask = (id: string, taskId: string) => store.createQuestion({
+      id,
+      taskId,
+      botUid,
+      channelType: target.channelType,
+      channelId: target.channelId,
+      payload: "{}",
+    });
+    accept(store, taskFor("m1", "interrupted-task"));
+    expect(store.markStarted("interrupted-task")).toBe(true);
+    store.markTaskStopIntent("interrupted-task", "interrupt");
+    ask("q-interrupt", "interrupted-task");
+
+    accept(store, taskFor("m2", "timed-out-task"));
+    expect(store.markStarted("timed-out-task")).toBe(true);
+    store.markTaskStopIntent("timed-out-task", "question_timeout");
+    ask("q-timeout", "timed-out-task");
+
+    // 1/0：prompt 已落标记、接受回执缺失 → uncertain。
+    accept(store, taskFor("m3", "uncertain-task"));
+    expect(store.markStarted("uncertain-task")).toBe(true);
+    store.markTaskPromptStarted("uncertain-task", "session-uncertain");
+    ask("q-uncertain", "uncertain-task");
+
+    const recovered = store.prepareTasksForRestart(botUid, stopReasons);
+    expect(recovered.stopped.map((entry) => [entry.id, entry.stopIntent])).toEqual([
+      ["interrupted-task", "interrupt"],
+      ["timed-out-task", "question_timeout"],
+    ]);
+    expect(recovered.uncertain.map((task) => task.id)).toEqual(["uncertain-task"]);
+    // 中断行与不确定行的提问随终态一起关闭；超时行保持可答。
+    expect(store.getQuestion("q-interrupt")?.state).toBe("cancelled");
+    expect(store.getQuestion("q-uncertain")?.state).toBe("cancelled");
+    expect(store.getQuestion("q-timeout")?.state).toBe("pending");
+    // 旧卡上的迟到答案无处可落（终态行不会再进恢复清单，靠它补救已经太迟）。
+    expect(store.answerQuestion("q-interrupt", botUid, target, "迟到答案", "owner-1")).toBe(false);
+    expect(store.answerQuestion("q-uncertain", botUid, target, "迟到答案", "owner-1")).toBe(false);
+    expect(store.answerQuestion("q-timeout", botUid, target, "迟到但有效", "owner-1")).toBe(true);
+
+    // 双恢复：第二次启动不重复上报，也不再改动已经关闭的行。
+    const second = store.prepareTasksForRestart(botUid, stopReasons);
+    expect(second.stopped).toEqual([]);
+    expect(second.uncertain).toEqual([]);
+    expect(store.getQuestion("q-interrupt")?.state).toBe("cancelled");
+    expect(store.answerQuestion("q-interrupt", botUid, target, "再迟到", "owner-1")).toBe(false);
+  }));
+
+test("中断/取消的终态写入同事务关闭本任务提问，超时中断与别的任务不受影响", () =>
+  withStore((store) => {
+    const ask = (id: string, taskId: string) => store.createQuestion({
+      id,
+      taskId,
+      botUid,
+      channelType: target.channelType,
+      channelId: target.channelId,
+      payload: "{}",
+    });
+    accept(store, taskFor("m0", "neighbour-task"));
+    expect(store.markStarted("neighbour-task")).toBe(true);
+    ask("q-neighbour", "neighbour-task");
+
+    accept(store, taskFor("m1", "interrupt-task"));
+    expect(store.markStarted("interrupt-task")).toBe(true);
+    ask("q-interrupt", "interrupt-task");
+    store.markTaskStopIntent("interrupt-task", "interrupt");
+    store.markInterrupted("interrupt-task", "用户中断当前回合");
+    expect(store.getQuestion("q-interrupt")?.state).toBe("cancelled");
+    expect(store.answerQuestion("q-interrupt", botUid, target, "迟到答案", "owner-1")).toBe(false);
+
+    // 提问超时停下的回合：提问保持可答，迟到答复仍能落库。
+    accept(store, taskFor("m2", "timeout-task"));
+    expect(store.markStarted("timeout-task")).toBe(true);
+    ask("q-timeout", "timeout-task");
+    store.markTaskStopIntent("timeout-task", "question_timeout");
+    store.markInterrupted("timeout-task", "等待回答超时，回合已停止");
+    expect(store.getQuestion("q-timeout")?.state).toBe("pending");
+    expect(store.answerQuestion("q-timeout", botUid, target, "迟到但有效", "owner-1")).toBe(true);
+
+    // 用户取消：终态与关闭提问一起落，且只动这一条任务的题。
+    accept(store, taskFor("m3", "cancel-task"));
+    expect(store.markStarted("cancel-task")).toBe(true);
+    ask("q-cancel", "cancel-task");
+    store.markCancelled("cancel-task");
+    expect(store.getQuestion("q-cancel")?.state).toBe("cancelled");
+    expect(store.answerQuestion("q-cancel", botUid, target, "迟到答案", "owner-1")).toBe(false);
+    expect(store.getQuestion("q-neighbour")?.state).toBe("pending");
+    expect(store.answerQuestion("q-neighbour", botUid, target, "正常答案", "owner-1")).toBe(true);
+  }));
+
+test("cancelQueued 同事务关闭选中任务的提问，恢复后排队等前序的 1/1 任务不留可唤醒旧卡", () =>
+  withStore((store, stateDir) => {
+    const otherTarget: ChatTarget = { channelId: "dm-restart-other", channelType: 1 };
+    const ask = (id: string, taskId: string, at: ChatTarget = target) => store.createQuestion({
+      id,
+      taskId,
+      botUid,
+      channelType: at.channelType,
+      channelId: at.channelId,
+      payload: "{}",
+    });
+
+    // 恢复回来的 1/1 任务排队等前序：此间的 /cancel 走 cancelQueued 而不是 markCancelled。
+    accept(store, taskFor("m1", "resumed-waiting"));
+    expect(store.markStarted("resumed-waiting")).toBe(true);
+    store.markTaskPromptStarted("resumed-waiting", "session-waiting");
+    store.markTaskPromptAccepted("resumed-waiting");
+    ask("q-waiting", "resumed-waiting");
+    expect(store.prepareTasksForRestart(botUid, stopReasons).queued.map((task) => task.id)).toEqual([
+      "resumed-waiting",
+    ]);
+    // 排队期间又落了停止意图，取消要把这一列一起清掉。
+    expect(store.markTaskStopIntent("resumed-waiting", "interrupt")).toBe(true);
+
+    // 邻聊天的排队任务与提问不该被这次取消波及。
+    const neighbour = taskFor("m2", "neighbour-queued", { channelId: otherTarget.channelId });
+    expect(store.acceptTask({ ...claimFor("m2", neighbour.text), target: otherTarget }, neighbour)).toBe(true);
+    ask("q-neighbour", "neighbour-queued", otherTarget);
+
+    expect(store.cancelQueued(botUid, target)).toEqual(["resumed-waiting"]);
+    expect(store.getTask("resumed-waiting")?.state).toBe("cancelled");
+    expect(readStopIntent(stateDir, "resumed-waiting")).toBeNull();
+    expect(store.getQuestion("q-waiting")?.state).toBe("cancelled");
+    expect(store.answerQuestion("q-waiting", botUid, target, "迟到答案", "owner-1")).toBe(false);
+    expect(store.getTask("neighbour-queued")?.state).toBe("queued");
+    expect(store.getQuestion("q-neighbour")?.state).toBe("pending");
+    expect(store.answerQuestion("q-neighbour", botUid, otherTarget, "正常答案", "owner-1")).toBe(true);
+
+    // 再恢复一次：取消掉的任务不会回到队列，提问也不会复活。
+    const second = store.prepareTasksForRestart(botUid, stopReasons);
+    expect(second.queued.map((task) => task.id)).toEqual(["neighbour-queued"]);
+    expect(second.stopped).toEqual([]);
+    expect(second.uncertain).toEqual([]);
+    expect(store.getQuestion("q-waiting")?.state).toBe("cancelled");
+    expect(store.answerQuestion("q-waiting", botUid, target, "再迟到", "owner-1")).toBe(false);
+  }));
+
+test("updateQuestionPayloads 按行 all-or-none 改写 payload，且不碰其它列", () =>
+  withStore((store) => {
+    accept(store, taskFor("m1", "t1"));
+    for (const id of ["q1", "q2"]) {
+      store.createQuestion({
+        id,
+        taskId: "t1",
+        botUid,
+        channelType: target.channelType,
+        channelId: target.channelId,
+        payload: `{"askGroup":"A","text":"${id}"}`,
+      });
+    }
+    store.setQuestionsCard(["q1", "q2"], "card-1");
+    store.answerQuestion("q1", botUid, target, "答案", "owner-1");
+    expect(store.reserveQuestionCardSeq(botUid, target, "card-1")).toBe(2);
+
+    // 缺行即整批不落（all-or-none）：先抛错、再确认两行都还保持原 payload。
+    expect(() => store.updateQuestionPayloads([
+      { id: "q1", payload: '{"askGroup":"B","text":"q1"}' },
+      { id: "q2", payload: '{"askGroup":"B","text":"q2"}' },
+      { id: "no-such-row", payload: "{}" },
+    ])).toThrow();
+    expect(store.getQuestion("q1")?.payload).toBe('{"askGroup":"A","text":"q1"}');
+    expect(store.getQuestion("q2")?.payload).toBe('{"askGroup":"A","text":"q2"}');
+
+    // 每行带着自己的问题内容，只有身份字段被改写。
+    expect(store.updateQuestionPayloads([
+      { id: "q1", payload: '{"askGroup":"B","text":"q1"}' },
+      { id: "q2", payload: '{"askGroup":"B","text":"q2"}' },
+    ])).toBe(2);
+
+    expect(store.getQuestion("q1")).toMatchObject({
+      payload: '{"askGroup":"B","text":"q1"}',
+      state: "answered",
+      answer: "答案",
+      answeredBy: "owner-1",
+      cardMessageId: "card-1",
+      settledAt: null,
+    });
+    expect(store.getQuestion("q2")).toMatchObject({
+      payload: '{"askGroup":"B","text":"q2"}',
+      state: "pending",
+    });
+    // 卡片身份与序号列原样：改写只落在 payload 上。
+    expect(store.reserveQuestionCardSeq(botUid, target, "card-1")).toBe(3);
+    expect(store.updateQuestionPayloads([])).toBe(0);
+  }));
 
 test("markQuestionsSettled 只给未收场的行落时间，幂等且空数组 no-op", () =>
   withStore((store, stateDir) => {

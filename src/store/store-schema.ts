@@ -5,7 +5,7 @@
 
 import { Database } from "bun:sqlite";
 import type { ChatExecutionState, ChatTarget } from "../contracts.ts";
-import type { ContextLedgerRecord, HistoryLedgerRecord, OutboxRecord, QuestionRecord, TaskRecord } from "./store-records.ts";
+import type { ContextLedgerRecord, HistoryLedgerRecord, OutboxRecord, QuestionRecord, TaskRecord, TaskStopIntent } from "./store-records.ts";
 
 export type SqlValue = string | number | null | Uint8Array;
 export type SqlRow = Record<string, unknown>;
@@ -71,9 +71,14 @@ export function asState(value: unknown): ChatExecutionState {
   value === "cancelled" ||
   value === "interrupted"
   ) {
-  return value === "started" ? "running" : value;
+    return value === "started" ? "running" : value;
   }
   return "failed";
+}
+
+/** 持久停止意图的读值；未知/空取值为 `null`（调用方按「没有叫停」处理）。 */
+export function asStopIntent(value: unknown): TaskStopIntent | null {
+  return value === "interrupt" || value === "question_timeout" ? value : null;
 }
 
 
@@ -153,6 +158,7 @@ export function applySchema(db: Database): void {
       history_eligible INTEGER NOT NULL DEFAULT 1,
       prompt_started INTEGER NOT NULL DEFAULT 0,
       prompt_accepted INTEGER NOT NULL DEFAULT 0,
+      stop_intent TEXT,
       relay_channel_type INTEGER,
       relay_channel_id TEXT,
       relay_thread_name TEXT
@@ -301,6 +307,7 @@ export function applySchema(db: Database): void {
     "ALTER TABLE worker_ledger ADD COLUMN move_target_cwd TEXT",
     "ALTER TABLE tasks ADD COLUMN message_seq INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN history_eligible INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE tasks ADD COLUMN stop_intent TEXT",
     "ALTER TABLE tasks ADD COLUMN relay_channel_type INTEGER",
     "ALTER TABLE tasks ADD COLUMN relay_channel_id TEXT",
     "ALTER TABLE tasks ADD COLUMN relay_thread_name TEXT",

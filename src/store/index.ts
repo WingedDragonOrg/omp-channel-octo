@@ -7,14 +7,14 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ChatAppendMode, ChatTarget } from "../contracts.ts";
-import type { BindingRecord, InboundClaim, TaskRecord, TaskRestartRecovery, RestartNoticeRecord, ProgressCardRecord, OutboxRecord, OutboxInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord } from "./store-records.ts";
+import type { BindingRecord, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, RestartNoticeRecord, ProgressCardRecord, OutboxRecord, OutboxInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord } from "./store-records.ts";
 import { applySchema } from "./store-schema.ts";
 import { claimOwnerEnrollment, clearChatModel, ensureBinding, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, grantAllowedChat, hasOwnerEnrollment, listAllowedChats, setBotUid, setChatMode, setChatModel, setOwnerId, updateBindingSession } from "./store-chats.ts";
-import { acceptTask, addRestartNotice, cancelQueued, claimCommand, clearRestartNotice, completeCommand, countQueuedTasks, failCommand, getActiveTask, getLatestTask, getTask, isTaskResuming, listQueuedTasks, listRestartNotices, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, prepareTasksForRestart, releaseClaim } from "./store-tasks.ts";
+import { acceptTask, addRestartNotice, cancelQueued, claimCommand, clearRestartNotice, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getLatestTask, getTask, isTaskResuming, listQueuedTasks, listRestartNotices, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim } from "./store-tasks.ts";
 import { clearProgressCard, listProgressCards, listWorkerLedger, markWorkerMoveTarget, markWorkerStopped, recordProgressCardAttempt, recordWorker, saveProgressCard } from "./store-cards.ts";
 import { advanceHistoryLedger, clearContextLedger, commitContextInjection, commitHistoryInjection, getContextLedger, getHistoryLedger, prepareContextInjection, prepareHistoryInjection, pruneHistoryLedger } from "./store-ledgers.ts";
 import { acknowledgeTextOutbox, beginTextCreate, bindTextOutbox, countPendingOutbox, countUnknownOutbox, enqueueOutbox, failTextOutbox, getBotEventCursor, getOutbox, listPendingOutbox, listPendingOutboxTargets, listTextStream, markOutboxDead, markOutboxFailure, markOutboxSent, setBotEventCursor, updateTextOutbox } from "./store-outbox.ts";
-import { answerQuestion, answerQuestions, cancelQuestion, cancelQuestions, createQuestion, getQuestion, listPendingQuestions, listQuestionsByCard, listTaskQuestions, markQuestionsSettled, pendingQuestionIds, reserveQuestionCardSeq, setQuestionCard, setQuestionsCard } from "./store-questions.ts";
+import { answerQuestion, answerQuestions, cancelQuestion, cancelQuestions, cancelTaskQuestions, createQuestion, getQuestion, listPendingQuestions, listQuestionsByCard, listTaskQuestions, markQuestionsSettled, pendingQuestionIds, reserveQuestionCardSeq, setQuestionCard, setQuestionsCard, updateQuestionPayloads } from "./store-questions.ts";
 
 export class ChannelStore {
   private readonly db: Database;
@@ -182,13 +182,31 @@ export class ChannelStore {
   }
 
   /**
-   * 启动恢复：一次事务内把该 Bot 遗留的在途任务规范化，返回 `queued`（按接受顺序待执行）与
-   * `uncertain`（本次 fail-closed 的已派发行）两组。只动状态，不调度、不取消提问；
-   * `session_id` 等元数据随行保留，`queued` 里用 {@link isTaskResuming} 决定重放原文还是续接会话。
+   * 启动恢复：一次事务内把该 Bot 遗留的在途任务规范化，返回 `stopped`（本次按持久停止意图结算的行，
+   * 附带原意图）、`uncertain`（本次 fail-closed 的已派发行）与 `queued`（按接受顺序待执行）三组。
+   * 只动状态，不调度、不取消提问；`session_id` 等元数据随行保留，`queued` 里用
+   * {@link isTaskResuming} 决定重放原文还是续接会话。停止行的说明文案由调用方传入，与在线路径同源。
    */
 
-  prepareTasksForRestart(botUid: string): TaskRestartRecovery {
-    return prepareTasksForRestart(this.db, botUid);
+  prepareTasksForRestart(botUid: string, reasonTexts: Record<TaskStopIntent, string>): TaskRestartRecovery {
+    return prepareTasksForRestart(this.db, botUid, reasonTexts);
+  }
+
+  /**
+   * 记下用户已确认的停止意图（先落库再动手）：`interrupt`/`question_timeout` 在进程被 SIGKILL 时
+   * 仍是重启恢复的依据。只对仍在途的行生效，终态行静默 no-op 返回 false（此时连题也不动）。
+   * `cancelQuestionIds` 只给 `question_timeout` 传（恢复快照里没人接手的遗留 pending 题）：与意图写入
+   * 同一事务取消，逐行校验归属与状态；本回合正在等的那批题不传进来、保持可答。
+   */
+
+  markTaskStopIntent(taskId: string, intent: TaskStopIntent, cancelQuestionIds?: readonly string[]): boolean {
+    return markTaskStopIntent(this.db, taskId, intent, cancelQuestionIds);
+  }
+
+  /** 停止意图被真实工作结果覆盖时清除（无条件清 NULL）；cancel 由在线路径直接落终态，不走这里。 */
+
+  clearTaskStopIntent(taskId: string): void {
+    clearTaskStopIntent(this.db, taskId);
   }
 
   /**
@@ -459,6 +477,16 @@ export class ChannelStore {
     return cancelQuestion(this.db, id);
   }
 
+  /**
+   * 取消一个任务的全部待答提问，返回取消的行数；只把 `pending` 行置 `cancelled`，不涉卡片 UI。
+   * 服务侧收尾（关卡片）需要「pending ∪ cancelled」这批行时，用这一条替掉逐行 CAS：单语句原子，
+   * 不会在中途崩溃时留下半批仍可答的旧卡。
+   */
+
+  cancelTaskQuestions(taskId: string): number {
+    return cancelTaskQuestions(this.db, taskId);
+  }
+
   pendingQuestionIds(botUid: string, target: ChatTarget): string[] {
     return pendingQuestionIds(this.db, botUid, target);
   }
@@ -491,6 +519,16 @@ export class ChannelStore {
 
   setQuestionsCard(ids: readonly string[], messageId: string): void {
     setQuestionsCard(this.db, ids, messageId);
+  }
+
+  /**
+   * 按行改写提问行的 payload（认领者身份写回）：每行带自己的 payload，一次事务内整批更新，只写
+   * payload 列。All-or-none：行数对不上（行被并发删掉）抛错并回滚整批，绝不留下半组新身份；返回
+   * 写成功的行数（等于入参行数）。
+   */
+
+  updateQuestionPayloads(updates: ReadonlyArray<{ id: string; payload: string }>): number {
+    return updateQuestionPayloads(this.db, updates);
   }
 
   /**

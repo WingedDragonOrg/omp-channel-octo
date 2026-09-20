@@ -536,6 +536,46 @@ describe("OMP RPC worker", () => {
 		});
 	});
 
+	test("an acknowledged interrupt leaves the hanging turn in flight until the worker dies", async () => {
+		await withHarness("interrupt-hang", async harness => {
+			const events: WorkerEvent[] = [];
+			let settled = false;
+			const prompt = harness.worker.prompt("run forever", event => events.push(event)).then(
+				() => {
+					settled = true;
+				},
+				() => {
+					settled = true;
+				},
+			);
+			await waitUntil(async () => (await readLog(harness.logPath)).some(entry => entry.kind === "prompt"));
+			// The live turn boundary arrives before any interrupt: only then can the service have
+			// durably recorded the task as accepted by OMP.
+			await waitUntil(() => events.some(event => event.type === "prompt_accepted"), 1_000);
+
+			await harness.worker.abortTurn();
+			await waitUntil(async () =>
+				(await readLog(harness.logPath)).some(entry => entry.kind === "command" && (entry.command as LogEntry)?.type === "abort"),
+			);
+			// The abort is acknowledged, but OMP keeps the turn open: nothing terminal arrives and
+			// the prompt must not settle while the worker is alive.
+			expect(settled).toBe(false);
+			expect(events.some(event => event.type === "text" && event.final)).toBe(false);
+			expect(events.filter(event => event.type === "local_command")).toEqual([]);
+			expect(processIsAlive(harness.spawned!.pid)).toBe(true);
+			// Exactly one dispatch: the hang is not a retry loop, and a restart regression can
+			// assert the original input is never replayed from here.
+			expect((await readLog(harness.logPath)).filter(entry => entry.kind === "prompt").map(entry => entry.message)).toEqual([
+				"run forever",
+			]);
+
+			// Only stopping the worker ends the hanging prompt.
+			await harness.worker.stop();
+			await prompt;
+			expect(settled).toBe(true);
+		});
+	});
+
 
 	test("does not treat the prompt acknowledgement as completion", async () => {
 		await withHarness("normal", async harness => {

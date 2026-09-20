@@ -36,6 +36,12 @@ export interface TaskEventsDeps {
    */
   persistResearchReport: (report: string) => void;
   steerConsumed: (event: Extract<WorkerEvent, { type: "steer_consumed" }>) => void;
+  /**
+   * 中断之后这一回合又跑出了真实工作（`workAfterStop` 翻真）时调用一次：把持久化的停止意图
+   * 作废，让随后的停机回到普通续接语义。停机挂起与提问超时两条路上不会触发（前者无事件、
+   * 后者在投影里直接返回）。
+   */
+  discardStopIntent: () => void;
 }
 
 /**
@@ -88,7 +94,11 @@ export class TaskEvents {
     }
     if (this.deps.control.stopCause === "question") return;
     if (this.deps.control.stopCause !== null && event.type !== "turn_end" && event.type !== "run_end") {
-      this.deps.control.workAfterStop = true;
+      if (!this.deps.control.workAfterStop) {
+        this.deps.control.workAfterStop = true;
+        // 停下的回合自己又接着干活了：本次停止不再是终局，撤回持久化的停止意图。
+        this.deps.discardStopIntent();
+      }
     }
     if (event.type === "text") {
       // 空 messageId 一律丢弃；空 final 文本仍更新聚合与出站（收尾帧照常落编辑）。

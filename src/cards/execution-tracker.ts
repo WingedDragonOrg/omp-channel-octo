@@ -58,6 +58,13 @@ export type ExecutionEvent =
       readonly status: Exclude<ExecutionToolState, "running">;
       readonly summary?: string;
       readonly errorCategory?: ExecutionErrorCategory;
+      /**
+       * Set only by the restart recovery, when it settles a row the process that owned it left
+       * running: nobody observed this end, it is inferred from that process being gone. Native
+       * `/retry` replays the same call under the same `toolCallId`, so a real `tool_start` may
+       * legitimately reopen such a row — an observed end never may.
+       */
+      readonly recoverySettled?: true;
     }
   | {
       readonly type: "todo_update";
@@ -111,6 +118,14 @@ export interface ExecutionToolSnapshot {
   readonly durationMs: number | null;
   readonly summary?: string;
   readonly errorCategory?: ExecutionErrorCategory;
+  /**
+   * Internal recovery marker: this end was inferred because the process that owned the row is
+   * gone, nobody observed it. It is persisted with the snapshot so the licence to reopen the row
+   * survives any number of restarts — native `/retry` replays the same call under the same
+   * `toolCallId`, and only that real `tool_start` clears it. The card never renders it, and a row
+   * that really ended never carries it.
+   */
+  readonly recoverySettled?: true;
 }
 
 /**
@@ -170,12 +185,14 @@ interface MutablePhase {
 
 interface MutableTool {
   readonly toolCallId: string;
-  readonly toolName: string;
-  readonly startedAtMs: number;
+  toolName: string;
+  startedAtMs: number;
   state: ExecutionToolState;
   endedAtMs: number | null;
   summary: string | undefined;
   errorCategory: ExecutionErrorCategory | undefined;
+  /** 恢复期推断出的结束：真实重放同一个 `toolCallId` 时可以重开这一行。 */
+  recoverySettled: boolean;
 }
 
 interface MutableSubagent {
@@ -364,6 +381,7 @@ class ExecutionTrackerState implements ExecutionTracker {
         durationMs,
         ...(tool.summary === undefined ? {} : { summary: tool.summary }),
         ...(tool.errorCategory === undefined ? {} : { errorCategory: tool.errorCategory }),
+        ...(tool.recoverySettled ? { recoverySettled: true as const } : {}),
       };
       return [snapshot];
     });
@@ -412,7 +430,21 @@ class ExecutionTrackerState implements ExecutionTracker {
   #startTool(event: Extract<ExecutionEvent, { type: "tool_start" }>, atMs: number): void {
     if (this.#state !== "running") return;
     this.#ensureStarted(atMs);
-    if (this.#tools.has(event.toolCallId)) return;
+    const existing = this.#tools.get(event.toolCallId);
+    if (existing !== undefined) {
+      // 上一进程遗留、由恢复推断结束的那一步被真的重放了(原生 /retry 复用同一个 toolCallId):
+      // 重开这一行,而不是让它永远停在「已取消」。已经真实结束过的行不受影响——那种重放不是事实。
+      if (!existing.recoverySettled) return;
+      existing.recoverySettled = false;
+      existing.toolName = safeToolName(event.toolName);
+      existing.startedAtMs = atMs;
+      existing.state = "running";
+      existing.endedAtMs = null;
+      existing.errorCategory = undefined;
+      const replayedSummary = safeDisplayText(event.summary);
+      if (replayedSummary !== undefined) existing.summary = replayedSummary;
+      return;
+    }
     const tool: MutableTool = {
       toolCallId: safeDisplayText(event.toolCallId, 96) ?? `tool-${this.#toolOrder.length + 1}`,
       toolName: safeToolName(event.toolName),
@@ -421,6 +453,7 @@ class ExecutionTrackerState implements ExecutionTracker {
       endedAtMs: null,
       summary: safeDisplayText(event.summary),
       errorCategory: undefined,
+      recoverySettled: false,
     };
     this.#tools.set(event.toolCallId, tool);
     this.#toolOrder.push(event.toolCallId);
@@ -431,6 +464,7 @@ class ExecutionTrackerState implements ExecutionTracker {
     if (!tool || tool.endedAtMs !== null) return;
     tool.state = event.status;
     tool.endedAtMs = Math.max(tool.startedAtMs, atMs);
+    tool.recoverySettled = event.recoverySettled === true;
     const summary = safeDisplayText(event.summary);
     if (summary !== undefined) tool.summary = summary;
     if (event.status === "failed" || event.status === "cancelled") {
@@ -564,6 +598,7 @@ export function stripCardSummaries(snapshot: ExecutionSnapshot): ExecutionSnapsh
       endedAtMs: tool.endedAtMs,
       durationMs: tool.durationMs,
       ...(tool.errorCategory === undefined ? {} : { errorCategory: tool.errorCategory }),
+      ...(tool.recoverySettled === true ? { recoverySettled: true as const } : {}),
     })),
     subagents: snapshot.subagents.map((subagent) => ({
       subagentId: subagent.subagentId,
@@ -685,9 +720,16 @@ export function restoreExecutionTracker(
     const endedAtMs = typeof tool.endedAtMs === "number" ? finiteTime(tool.endedAtMs) : null;
     if (state === null || endedAtMs === null) {
       // A row the stored snapshot itself reports as running: the process that owned it is gone, so
-      // the resumed card settles it as cancelled at the last moment that process saw it.
+      // the resumed card settles it as cancelled at the last moment that process saw it. Marked as
+      // inferred, because a native `/retry` replays the same call and may reopen the row for real.
       if (resume) {
-        tracker.apply({ type: "tool_end", toolCallId, atMs: observedAtMs, status: "cancelled" });
+        tracker.apply({
+          type: "tool_end",
+          toolCallId,
+          atMs: observedAtMs,
+          status: "cancelled",
+          recoverySettled: true,
+        });
       }
       continue;
     }
@@ -700,6 +742,8 @@ export function restoreExecutionTracker(
       ...(state === "failed" || state === "cancelled"
         ? { errorCategory: safeErrorCategory(tool.errorCategory, state === "cancelled" ? "cancelled" : "unknown") }
         : {}),
+      // 上一次恢复推断出的结束：这个标记随快照睡过一觉，再一次重启也不能让它丢掉重开资格。
+      ...(tool.recoverySettled === true ? { recoverySettled: true as const } : {}),
     });
   }
   if (record.todos.length > 0) {

@@ -90,6 +90,12 @@ const MAX_PENDING_STEERS = 32;
 /** Characters of the triggering message shown in a start/consumption receipt. */
 const RECEIPT_EXCERPT_CHARS = 20;
 const DEFAULT_CANCELLED_TEXT = "当前任务已取消；不回滚已发生的副作用。";
+/**
+ * 中断原因文案：在线结算与重启恢复共用同一份（恢复由存储域按停止意图落终态），`thread-notify`
+ * 会把它原样当「原因」回传给派工方，两处措辞漂移会直接改变对外说法。
+ */
+const INTERRUPT_REASON_TEXT = "用户中断当前回合";
+const QUESTION_TIMEOUT_REASON_TEXT = "等待回答超时，回合已停止";
 /** 1/0 行的实际恢复失败说明:prompt 标记已落、OMP 是否接受未知，不放行也不重放。 */
 const UNCERTAIN_RECOVERY_NOTICE =
   "任务未自动恢复：无法确认 OMP 是否已接受该输入，请核对会话后继续。";
@@ -294,7 +300,7 @@ class CoreService implements ChannelService {
       commandClaim: (message, name) => this.commandClaim(message, name),
       askTimeoutMs: () => this.options.config.ask?.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS,
       displayNames: (uids) => this.displayNames.names(uids),
-      stopTurnForQuestion: (taskId) => this.stopTurnForQuestion(taskId),
+      stopTurnForQuestion: (taskId, cancelQuestionIds) => this.stopTurnForQuestion(taskId, cancelQuestionIds),
       wakeTurn: (target, text) => {
         void this.wakeTurn(target, text);
       },
@@ -398,11 +404,28 @@ class CoreService implements ChannelService {
       this.serviceRestart.consumeStartupNotices(identity.uid);
       // started→queued（prompt 标记随行保留）由存储域一次性完成；先补发遗留卡片终态，恢复
       // 回合随后接上同一条卡片记录，不与卡片恢复竞争。
-      const recovery = this.store.prepareTasksForRestart(identity.uid);
+      const recovery = this.store.prepareTasksForRestart(identity.uid, {
+        interrupt: INTERRUPT_REASON_TEXT,
+        question_timeout: QUESTION_TIMEOUT_REASON_TEXT,
+      });
       await this.progressCards.recover();
+      // 续接任务重挂提问的快照必须在开放入站之前一次性建好：此后到达的答复由快照认领、交给
+      // 续跑的原 ask 消费，不会因「此刻没有在跑的回合」被当成新输入再唤醒一个任务。恢复任务
+      // 的实际执行在启动门之后，快照与 `worker.resume` 的先后因此由这里固定；续跑路径不再重复
+      // 初始化——重复快照会把已经认领过的行重新交出去。
+      for (const task of recovery.queued) {
+        if (this.store.isTaskResuming(task.id)) this.questions.beginRecovery(task.id);
+      }
       // 恢复任务先占住聊天链与目录序，再让 transport 开始接新入站：任何新消息（含下面的
       // 恢复失败回执与子区回传）都排在它们后面，而真正执行要等启动门放行。
       for (const task of recovery.queued) this.scheduler.scheduleTask(task.id);
+      // 上一进程已经回执过的停止控制：意图随行落盘、存储域已按它落终态，这里只做收尾。中断要
+      // 收掉该任务自己的遗留提问（只动自己那条 task 的题，不误伤同聊天其他任务）；提问超时停下的
+      // 行必须保留提问——迟到答复照在线路径唤醒新回合。子区派工的回传照常说清楚。
+      for (const task of recovery.stopped) {
+        if (task.stopIntent !== "question_timeout") this.questions.cancelForTask(task.id);
+        await this.notifyThreadOutcome(task.id);
+      }
       // 1/0 行（prompt 已落标记、接受状态未知）既不重放也不续接：按实际恢复失败通报、关闭
       // 该任务遗留的提问，子区派工的回传照常说清楚，不把一次失败的恢复留成静默。
       for (const task of recovery.uncertain) {
@@ -872,10 +895,14 @@ class CoreService implements ChannelService {
     }
     runtime.stopCause = "interrupt";
     runtime.workAfterStop = false;
+    // 停止意图先落盘再回执：此后任何 abrupt 死亡都不能把用户已经中断的回合当成「可续接」重启
+    // （回合随后又跑出真实工作时，由 task-events 撤回这条意图）。
+    this.store.markTaskStopIntent(runtime.taskId, "interrupt");
     try {
       await runtime.worker.abortTurn();
     } catch {
       runtime.stopCause = null;
+      this.store.clearTaskStopIntent(runtime.taskId);
       await this.outbox.enqueueText(target, DEFAULT_INTERRUPT_REJECTED_TEXT, null);
       return;
     }
@@ -883,15 +910,19 @@ class CoreService implements ChannelService {
   }
 
   /**
-   * Stops the turn at the configured ask deadline. Abort is bounded by the worker RPC budget;
-   * regardless of its acknowledgement, stop then reaps the owned process group. Questions stay
-   * pending and later answers queue behind cleanup before resuming the same session.
+   * 提问超时：像取消 tool call 一样停住当前回合（abort 受 RPC 预算约束，随后照常收拢进程组），
+   * 并把停止意图与「这次超时后再也不会被认领的旧问题」写进同一事务。
+   *
+   * `cancelQuestionIds` 是恢复快照里未认领且仍待答的精确行：进程若死在这次落库与回合收束之间，
+   * 它们必须已经取消——否则重启后会被当成可答问题复活、唤醒一个早已结束的回合。当前这一轮超时的
+   * 问题不在此列，保持可迟答（迟到答复照旧唤醒新回合）。
    */
-  private stopTurnForQuestion(taskId: string): void {
+  private stopTurnForQuestion(taskId: string, cancelQuestionIds: readonly string[] = []): void {
     const runtime = this.runtimes.get(taskId);
     if (!runtime?.worker || !runtime.promptInFlight) return;
     runtime.stopCause = "question";
     runtime.workAfterStop = false;
+    this.store.markTaskStopIntent(taskId, "question_timeout", cancelQuestionIds);
     const worker = runtime.worker;
     void worker.abortTurn().catch(() => {}).finally(() => worker.stop().catch(() => false));
   }
@@ -1035,6 +1066,9 @@ class CoreService implements ChannelService {
   private async handleCancel(target: ChatTarget): Promise<void> {
     const queued = this.store.cancelQueued(this.bot!.uid, target);
     for (const taskId of queued) this.scheduler.takeWaitingReceipt(taskId);
+    // 存储域在取消这些排队任务时已顺手把它们的待答问题置为 cancelled：这些行不再是 pending，
+    // 聊天级清扫看不到它们，卡片会留在开放状态。逐任务按「待答∪已取消」收口，卡片才会关。
+    for (const taskId of queued) this.questions.cancelForTask(taskId);
     for (const taskId of queued) await this.notifyThreadOutcome(taskId);
     this.questions.cancelForTarget(target);
     let active = false;
@@ -1310,6 +1344,7 @@ class CoreService implements ChannelService {
       progress,
       persistResearchReport: report => this.persistResearchReport(target, report),
       steerConsumed: (event) => this.noteSteerConsumed(runtime, event),
+      discardStopIntent: () => this.store.clearTaskStopIntent(taskId),
     });
     let snapshot: GroupContext | null = null;
     let contextInjection: ContextInjection | undefined;
@@ -1429,8 +1464,8 @@ class CoreService implements ChannelService {
       };
       try {
         if (resuming) {
-          // 先重挂该任务遗留的待答问题：续跑里重新发起的同一轮 ask 会认领原行，不会多发一题。
-          this.questions.beginRecovery(taskId);
+          // 提问快照已在启动时（开放入站之前）建好，这里不再重复初始化：续跑里重新发起的同一轮
+          // ask 会认领原行，不会多发一题，也不会吞掉已经按快照交付的答复。
           await worker.resume(consumeEvent, promptContext);
         } else {
           await worker.prompt(historyTurn?.text ?? task.text, consumeEvent, promptContext);
@@ -1444,12 +1479,15 @@ class CoreService implements ChannelService {
         progress.finish("cancelled");
         await this.sendCancelledIfNeeded(runtime);
       } else if (runtime.stopCause !== null && !runtime.workAfterStop) {
+        const questionTimeout = runtime.stopCause === "question";
         this.store.markInterrupted(
           taskId,
-          runtime.stopCause === "question"
-            ? "等待回答超时，回合已停止"
-            : "用户中断当前回合",
+          questionTimeout ? QUESTION_TIMEOUT_REASON_TEXT : INTERRUPT_REASON_TEXT,
         );
+        // 显式 /interrupt 到此确定不再续接：先丢掉该任务的恢复快照与遗留提问，否则快照里
+        // 「已答复但还没被认领」的行会在随后的 rejectForTask 里被补投成一个新回合。
+        // 提问超时不清快照：那一轮停下后迟到的答复要继续这次工作，唤醒正是它该走的路。
+        if (!questionTimeout) this.questions.cancelForTask(taskId);
         progress.finish("cancelled");
       } else if (!runtime.suspended) {
         if (turnContext) await turnContext.complete(worker.sessionId, events.localOnly);
@@ -1466,12 +1504,13 @@ class CoreService implements ChannelService {
         // 显式 /interrupt 或 ask 超时已经把这个回合停在这里：即使紧接着进程停机，也按终态结算，
         // 不让一次重启把用户的中断续上（与成功分支同一判据）。停下后又有真实工作的回合照常
         // 落到下面的停机挂起，由新进程续跑。
+        const questionTimeout = runtime.stopCause === "question";
         this.store.markInterrupted(
           taskId,
-          runtime.stopCause === "question"
-            ? "等待回答超时，回合已停止"
-            : "用户中断当前回合",
+          questionTimeout ? QUESTION_TIMEOUT_REASON_TEXT : INTERRUPT_REASON_TEXT,
         );
+        // 与成功分支同一判据：显式 /interrupt 的终态不保留恢复快照（提问超时相反）。
+        if (!questionTimeout) this.questions.cancelForTask(taskId);
         progress.finish("cancelled");
       } else if (runtime.suspended) {
         // 停机挂起：不是失败，也不是取消。行保持 started 与 prompt 标记，遗留提问保持 pending，

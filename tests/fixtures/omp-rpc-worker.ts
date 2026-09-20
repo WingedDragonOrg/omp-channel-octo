@@ -20,6 +20,7 @@ type Scenario =
 	| "retry-resume-failure"
 	| "retry-resume-model-error"
 	| "retry-resume-late-completion"
+	| "interrupt-hang"
 	| "error"
 	| "same-chunk-error"
 	| "message-end"
@@ -1466,6 +1467,16 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		response(id, "prompt", { agentInvoked: true });
 		streaming = true;
 		promptTimer = setTimeout(() => emitModelErrorScenario(id), 30);
+		return;
+	}
+	if (scenario === "interrupt-hang") {
+		// A turn that never finishes: the acknowledgement starts it, `agent_start` reports the
+		// live boundary, and nothing else follows — no timer, no `agent_end`. An abort is
+		// acknowledged without ending the turn, so a host that kills the process mid-flight can
+		// only recover from its own records.
+		response(id, "prompt", { agentInvoked: true });
+		streaming = true;
+		emit({ type: "agent_start" });
 		return;
 	}
 	if (scenario === "local") {
