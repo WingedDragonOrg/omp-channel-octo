@@ -486,9 +486,9 @@ test("concurrent stop calls wait for the worker and reject new work while stoppi
     });
     await workers.stopCalled.promise;
 
-    await harness.service.handleInbound(
+    await expect(harness.service.handleInbound(
       inbound({ messageId: "stop-during-shutdown", ...target, text: "must not spawn" }),
-    );
+    )).rejects.toThrow();
     expect(workers.workers).toHaveLength(1);
     expect(workers.prompts).toHaveLength(1);
     expect(transport.stopStarted).toBe(false);

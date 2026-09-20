@@ -444,6 +444,17 @@ class SwitchDirectoryError extends Error {
   }
 }
 
+/**
+ * Shutdown interrupted an inbound message before it was durably accepted. The handler rejects with
+ * it so the transport never ACKs a swallowed message; the same message is redelivered after restart.
+ */
+class InboundShutdownError extends Error {
+  constructor() {
+    super("channel 正在停止，消息未接受");
+    this.name = "InboundShutdownError";
+  }
+}
+
 function parseCommand(text: string): { name: string; argument: string } | null {
   const match = /^\/([^\s]+)(?:\s+([\s\S]*))?$/.exec(text.trim());
   if (!match) return null;
@@ -473,6 +484,10 @@ function contextSidecarRoot(
 
 class CoreService implements ChannelService {
   private readonly taskOperations = new Set<Promise<void>>();
+  /** In-flight inbound handlers: stop aborts their I/O and awaits their cleanup before closing the store. */
+  private readonly inboundOperations = new Set<Promise<void>>();
+  /** Shutdown cancellation source for inbound I/O (downloads, transcription, mention-pref lookups). */
+  private readonly shutdownController = new AbortController();
   private readonly chatTails = new Map<string, Promise<void>>();
   private readonly scheduledTasks = new Map<string, Promise<void>>();
   /**
@@ -651,6 +666,9 @@ class CoreService implements ChannelService {
     if (this.stopping) return;
     this.stopping = true;
     this.started = false;
+    // Abort inbound I/O first so in-flight downloads/transcriptions/lookups unwind while the rest
+    // of shutdown runs; their cleanup (claim rollback, temp-file removal) is awaited below.
+    this.shutdownController.abort();
     const runtimes = [...this.runtimes.values()];
     for (const runtime of runtimes) {
       runtime.cancelRequested = true;
@@ -676,6 +694,9 @@ class CoreService implements ChannelService {
     this.outbox.abortAll();
     await Promise.allSettled([...this.taskOperations]);
     await Promise.allSettled([...this.activityOperations]);
+    // Inbound handlers aborted above finish their bounded cleanup here, while the store is still
+    // open: interrupted assembly rolls its command claim back so a redelivery is not swallowed.
+    await Promise.allSettled([...this.inboundOperations]);
     this.typingLeases.releaseAll();
     await this.botEvents.stop();
     this.questions.stop();
@@ -705,8 +726,31 @@ class CoreService implements ChannelService {
     }
   }
 
+  /**
+   * Single shutdown gate for inbound continuations: any path that has not yet durably accepted the
+   * message (task row, completed claim, delivered reply) rejects instead of silently resolving,
+   * because the transport ACKs a resolved handler.
+   */
+  private throwIfStopping(): void {
+    if (this.stopping) throw new InboundShutdownError();
+  }
+
   async handleInbound(message: InboundMessage): Promise<void> {
-    if (!this.started || !this.bot || this.stopping) return;
+    // Tracked so `stop` can await the interrupted handler's cleanup before closing the store.
+    const operation = this.processInbound(message);
+    this.inboundOperations.add(operation);
+    const cleanup = () => {
+      this.inboundOperations.delete(operation);
+    };
+    void operation.then(cleanup, cleanup);
+    await operation;
+  }
+
+  private async processInbound(message: InboundMessage): Promise<void> {
+    // A message that arrives during shutdown is never accepted: reject so the transport does not
+    // ACK it; the same message is redelivered after restart.
+    this.throwIfStopping();
+    if (!this.started || !this.bot) return;
     if (message.messageId.trim().length === 0 || message.senderId.trim().length === 0) return;
     this.recordHistoryMessage(message);
     const text = message.text.trim();
@@ -751,6 +795,7 @@ class CoreService implements ChannelService {
       ownerId = this.store.getOwnerId(this.bot.uid)?.trim() || null;
     }
     const allowed = await this.isAllowed(message, ownerId);
+    this.throwIfStopping();
     if (!allowed) {
       await this.handleUnlistedOwnerContact(message, ownerId);
       return;
@@ -792,6 +837,7 @@ class CoreService implements ChannelService {
       await this.withMessageTyping(message, async () => {
         const slashPrompt = await this.materializeInbound(message);
         if (slashPrompt === null) return;
+        this.throwIfStopping();
         await this.acceptTask(message, slashPrompt);
       });
       return;
@@ -800,6 +846,7 @@ class CoreService implements ChannelService {
     await this.withMessageTyping(message, async() => {
       const promptText = await this.materializeInbound(message);
       if (promptText === null) return;
+      this.throwIfStopping();
       if (await this.appendToRunningTask(message, promptText)) return;
       await this.acceptTask(message, promptText);
     });
@@ -864,6 +911,7 @@ class CoreService implements ChannelService {
   }
 
   private async materializeInbound(message: InboundMessage, text = message.text): Promise<string | null> {
+    this.throwIfStopping();
     const quotedText = message.quoted?.text.trim() ?? "";
     const association = this.associatedAttachments(message);
     // 歧义时不取回任何文件：说明写进正文，任务照常接受；引用块（若有）照常组装。
@@ -910,6 +958,7 @@ class CoreService implements ChannelService {
     try {
       // 附件目录由服务创建（0700，与传输层的写入互为幂等），失败清理才有一个确定的所有者。
       await mkdir(directory, { recursive: true, mode: 0o700 });
+      this.throwIfStopping();
       const files: SavedAttachment[] = [];
       for (const [index, attachment] of requested.entries()) {
         // 客户端声明的大小先做超限预检，不发起无谓的请求。
@@ -920,8 +969,10 @@ class CoreService implements ChannelService {
         const signal = AbortSignal.any([
           AbortSignal.timeout(ATTACHMENT_DOWNLOAD_TIMEOUT_MS),
           budget.signal,
+          this.shutdownController.signal,
         ]);
         let bytes = await existingFileSize(path);
+        this.throwIfStopping();
         if (bytes === null) {
           try {
             bytes = await this.options.transport.downloadAttachment({
@@ -932,6 +983,8 @@ class CoreService implements ChannelService {
             });
           } catch (error) {
             if (error instanceof AttachmentError && error.reason === "oversize") throw error;
+            // 停机中止先于预算/超时判定：被中断的取回不是附件失败，不发拒绝文案。
+            if (this.shutdownController.signal.aborted) throw new InboundShutdownError();
             // 单条 60 秒超时与整条 120 秒预算都会中止同一条 signal；只有预算耗尽按「超限」回复。
             if (budget.signal.aborted) throw new AttachmentError("budget", "attachment budget exhausted");
             if (signal.aborted) throw new AttachmentError("timeout", "attachment download timed out");
@@ -950,6 +1003,7 @@ class CoreService implements ChannelService {
             attachment.kind === "audio" ? await this.transcribeInboundAudio(path, budget.signal) : null,
         });
       }
+      this.throwIfStopping();
       const promptText = composePromptText(
         associated ? withSystemNote(text, association.note) : text,
         files,
@@ -968,6 +1022,12 @@ class CoreService implements ChannelService {
         }
       } catch {
         // 目录未落盘或不可读时无需清理。
+      }
+      if (this.stopping) {
+        // 停机中断时任务未接受：不发「附件拒绝」回复、不建任务；命令 claim 随中断回滚，
+        // 同一消息重启后可重新接收；取消错误上抛，传输层不会 ACK。
+        this.store.releaseClaim(claim);
+        throw error instanceof InboundShutdownError ? error : new InboundShutdownError();
       }
       const reason: AttachmentFailureReason = error instanceof AttachmentError ? error.reason : "failed";
       if (associated) {
@@ -991,11 +1051,17 @@ class CoreService implements ChannelService {
    * 只有整条消息的下载预算被耗尽才按超限失败处理。
    */
   private async transcribeInboundAudio(path: string, budgetSignal: AbortSignal): Promise<string | null> {
-    const signal = AbortSignal.any([AbortSignal.timeout(ATTACHMENT_DOWNLOAD_TIMEOUT_MS), budgetSignal]);
+    const signal = AbortSignal.any([
+      AbortSignal.timeout(ATTACHMENT_DOWNLOAD_TIMEOUT_MS),
+      budgetSignal,
+      this.shutdownController.signal,
+    ]);
     try {
       const transcription = await this.options.transport.transcribeAudio(path, signal);
       return transcription !== null && transcription.trim().length > 0 ? transcription : null;
     } catch {
+      // 停机中止不能降级成「无转写」后继续组装：被中断的入站以有界取消上抛。
+      if (this.shutdownController.signal.aborted) throw new InboundShutdownError();
       if (budgetSignal.aborted) {
         throw new AttachmentError("budget", "attachment budget exhausted during transcription");
       }
@@ -1226,11 +1292,16 @@ class CoreService implements ChannelService {
       try {
         const pref = await this.options.transport.getGroupMentionPref(
           groupId,
-          AbortSignal.timeout(MENTION_PREF_TIMEOUT_MS),
+          AbortSignal.any([
+            AbortSignal.timeout(MENTION_PREF_TIMEOUT_MS),
+            this.shutdownController.signal,
+          ]),
         );
         effective = pref.effective;
         ttl = MENTION_PREF_TTL_MS;
       } catch {
+        // 停机中止查询不是「需要 @」的结论：未接受的入站以有界取消拒绝，重投后重新判定。
+        if (this.shutdownController.signal.aborted) throw new InboundShutdownError();
         // 保留「需要 @」的既有行为，只做短暂负缓存，避免查询失败时长挂入站处理。
       }
       this.mentionPrefs.set(groupId, { effective, expiresAt: Date.now() + ttl });
@@ -1646,6 +1717,7 @@ class CoreService implements ChannelService {
    * Returns true when the message was consumed as a steering message.
    */
   private async appendToRunningTask(message: InboundMessage, text: string): Promise<boolean> {
+    this.throwIfStopping();
     if (this.store.getChatMode(this.bot!.uid, message) !== "steer") return false;
     const runtime = this.runningRuntime(message);
     if (!runtime) return false;
@@ -1681,6 +1753,7 @@ class CoreService implements ChannelService {
     await this.withMessageTyping(message, async () => {
       const body = await this.materializeInbound(message);
       if (body === null) return;
+      this.throwIfStopping();
       const claim = this.commandClaim(message, command.name);
       if (!this.store.claimCommand(claim)) return;
       try {
@@ -2583,6 +2656,7 @@ class CoreService implements ChannelService {
     historyEligible = true,
     relay: TaskRelayTarget | null = null,
   ): Promise<boolean> {
+    this.throwIfStopping();
     let binding = await this.reconcileExternalBinding(
       message,
       this.store.getBinding(this.bot!.uid, message),
@@ -2620,6 +2694,9 @@ class CoreService implements ChannelService {
         }
       }
     }
+    // Shutdown can land during the binding probes above; never persist an acceptance from a
+    // redeliverable message.
+    this.throwIfStopping();
     const task: TaskRecord = {
       id: randomUUID(),
       botUid: this.bot!.uid,

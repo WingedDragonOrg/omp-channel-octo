@@ -160,6 +160,8 @@ export function createQuestionDesk(deps: QuestionDeskDeps): QuestionDesk {
   const askCardSeq = new Map<string, number>();
   /** 每张卡片的 action-id 代次：必须保持可回答的帧据此换新 id。 */
   const askCardGeneration = new Map<string, number>();
+  /** Published cards can receive clicks before their HTTP receipt supplies the message id. */
+  const sendingQuestions = new Set<string>();
 
   function currentBotUid(): string {
     const uid = deps.botUid();
@@ -255,15 +257,15 @@ function answerQuestionSetFromText(
       speaking.push({ question, answer, answeredBy });
     }
   }
-  for (const [messageId, rows] of questionsByCard(pending)) {
+  for (const messageId of questionsByCard(pending).keys()) {
+    const rows = deps.store.listQuestionsByCard(botUid, message, messageId);
     forgetAskGeneration(messageId);
     const first = rows[0];
     if (first === undefined) continue;
     if (rows.length === 1) {
       rewriteAskCard(first, { kind: "answered", answer: byId.get(first.id) ?? text, answeredBy });
     } else {
-      const fresh = deps.store.listQuestionsByCard(botUid, message, messageId);
-      rewriteAskCardSet(fresh, { kind: "closed", note: null }, null);
+      rewriteAskCardSet(rows, { kind: "closed", note: null }, null);
     }
   }
   wakeForAnswers(speaking);
@@ -431,44 +433,43 @@ async function askQuestionSet(
   const cleanups: Array<() => void> = [];
   /** 整组共用一次停回合：任一题到点即整组停止等待，全部行保持 pending、卡片不改写。 */
   let stopped = false;
-  specs.forEach((spec, index) => {
-    deps.store.createQuestion({
-      id: spec.id,
-      taskId: task.id,
-      botUid: currentBotUid(),
-      ...target,
-      payload: JSON.stringify(spec.payload),
-    });
-    const completion = completions[index]!;
-    void completion.promise.catch(() => {});
-    questionWaiters.set(spec.id, {
-      taskId: task.id,
-      resolve: completion.resolve,
-      reject: completion.reject,
-    });
-    const abort = () => {
-      if (stopped) return;
-      deps.store.cancelQuestion(spec.id);
-      questionWaiters.delete(spec.id);
-      completion.reject(new Error("question cancelled"));
-    };
-    signal.addEventListener("abort", abort, { once: true });
-    cleanups.push(() => signal.removeEventListener("abort", abort));
-    const timer = setTimeout(() => {
-      if (stopped) return;
-      stopped = true;
-      for (const open of specs) questionWaiters.delete(open.id);
-      deps.stopTurnForQuestion(task.id);
-      for (const pending of completions) pending.reject(new Error(ASK_STOPPED_MESSAGE));
-    }, deps.askTimeoutMs());
-    questionTimers.set(spec.id, timer);
-  });
   try {
+    specs.forEach((spec, index) => {
+      deps.store.createQuestion({
+        id: spec.id,
+        taskId: task.id,
+        botUid: currentBotUid(),
+        ...target,
+        payload: JSON.stringify(spec.payload),
+      });
+      const completion = completions[index]!;
+      void completion.promise.catch(() => {});
+      questionWaiters.set(spec.id, {
+        taskId: task.id,
+        resolve: completion.resolve,
+        reject: completion.reject,
+      });
+      const abort = () => {
+        if (stopped) return;
+        deps.store.cancelQuestion(spec.id);
+        questionWaiters.delete(spec.id);
+        completion.reject(new Error("question cancelled"));
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      cleanups.push(() => signal.removeEventListener("abort", abort));
+      const timer = setTimeout(() => {
+        if (stopped) return;
+        stopped = true;
+        for (const open of specs) questionWaiters.delete(open.id);
+        deps.stopTurnForQuestion(task.id);
+        for (const pending of completions) pending.reject(new Error(ASK_STOPPED_MESSAGE));
+      }, deps.askTimeoutMs());
+      questionTimers.set(spec.id, timer);
+    });
     throwIfAborted(signal);
     const messageId = await deliverQuestionSet(specs, target, signal);
     throwIfAborted(signal);
     if (messageId !== null) {
-      deps.store.setQuestionsCard(specs.map(({ id }) => id), messageId);
       const settled = await Promise.all(completions.map(({ promise }) => promise));
       return specs.map(({ id, sourceId }, index) => {
         const answer = settled[index] ?? { answer: "", answeredBy: null };
@@ -520,6 +521,7 @@ async function deliverQuestionSet(
     payloads.push(spec.payload);
   }
   const frame = buildAskCardSet(entries, { kind: "open", generation: 1 }, formatQuestionSet(payloads));
+  for (const spec of specs) sendingQuestions.add(spec.id);
   try {
     const receipt = await deps.transport.sendCard(
       target,
@@ -527,6 +529,18 @@ async function deliverQuestionSet(
       randomUUID(),
       AbortSignal.any([signal, AbortSignal.timeout(ASK_CARD_SEND_TIMEOUT_MS)]),
     );
+    if (receipt?.messageId !== undefined) {
+      deps.store.setQuestionsCard(specs.map(({ id }) => id), receipt.messageId);
+      const rows = deps.store.listQuestionsByCard(currentBotUid(), target, receipt.messageId);
+      if (rows.some(({ state }) => state !== "pending")) {
+        rewriteAskCardSet(rows, rows.some(({ state }) => state === "pending")
+          ? { kind: "open", generation: 1 }
+          : {
+            kind: "closed",
+            note: rows.some(({ state }) => state !== "answered") ? "任务已取消：该问题不再接受回答。" : null,
+          }, null);
+      }
+    }
     return receipt?.messageId ?? null;
   } catch (error) {
     if (signal.aborted) throw error;
@@ -534,6 +548,8 @@ async function deliverQuestionSet(
       `[ask-card] set send failed target=${targetKey(target)}：${safeErrorMessage(error, "send failed")}`,
     );
     return null;
+  } finally {
+    for (const spec of specs) sendingQuestions.delete(spec.id);
   }
 }
 
@@ -602,6 +618,7 @@ async function deliverQuestion(
 ): Promise<void> {
   const ask = askQuestionFromPayload(payload);
   if (ask !== null) {
+    sendingQuestions.add(questionId);
     try {
       const receipt = await deps.transport.sendCard(
         target,
@@ -611,14 +628,26 @@ async function deliverQuestion(
       );
       if (receipt?.messageId !== undefined) {
         deps.store.setQuestionCard(questionId, receipt.messageId);
+        const question = deps.store.getQuestion(questionId);
+        if (question?.state === "answered") {
+          rewriteAskCard(question, {
+            kind: "answered", answer: question.answer ?? "", answeredBy: question.answeredBy,
+          });
+        } else if (question && question.state !== "pending") {
+          rewriteAskCard(question, { kind: "inactive", note: "任务已取消：该问题不再接受回答。" });
+        }
         return;
       }
     } catch (error) {
       if (signal.aborted) throw error;
       console.error(`[ask-card] send failed target=${targetKey(target)}：${safeErrorMessage(error, "send failed")}`);
+    } finally {
+      sendingQuestions.delete(questionId);
     }
   }
-  deps.enqueueText(target, formatQuestion(payload), taskId);
+  if (deps.store.getQuestion(questionId)?.state === "pending") {
+    deps.enqueueText(target, formatQuestion(payload), taskId);
+  }
 }
 
 /**
@@ -632,7 +661,14 @@ function applyQuestionAnswer(question: QuestionRecord, answer: string, answeredB
   if (!deps.store.answerQuestion(question.id, botUid, question, answer, answeredBy)) return false;
   const waiting = releaseQuestion(question.id, { answer, answeredBy });
   forgetAskGeneration(question.cardMessageId);
-  rewriteAskCard(question, { kind: "answered", answer, answeredBy });
+  const rows = question.cardMessageId === null
+    ? []
+    : deps.store.listQuestionsByCard(botUid, question, question.cardMessageId);
+  if (rows.length > 1) {
+    rewriteAskCardSet(rows, { kind: "closed", note: null }, null);
+  } else {
+    rewriteAskCard(question, { kind: "answered", answer, answeredBy });
+  }
   if (!waiting) wakeForAnswers([{ question, answer, answeredBy }]);
   return true;
 }
@@ -832,7 +868,12 @@ async function answerFromCard(action: BotCardAction): Promise<BotEventOutcome> {
     return "retry";
   }
   const first = rows[0];
-  if (first === undefined) return "ignored";
+  if (first === undefined) {
+    if (parseAskActionId(action.actionId) === null) return "ignored";
+    const awaitingReceipt = deps.store.listPendingQuestions(botUid, target)
+      .some((question) => sendingQuestions.has(question.id));
+    return awaitingReceipt ? "retry" : "ignored";
+  }
   if (rows.length === 1) return answerSingleCardClick(first, action, operator);
   return answerSetCardClick(target, rows, action, operator);
 }
@@ -942,7 +983,8 @@ function answerSetCardClick(
     if (botUid === undefined) return;
     const openQuestions = deps.store.listPendingQuestions(botUid, target);
     deps.store.cancelQuestions(botUid, target);
-    for (const [messageId, rows] of questionsByCard(openQuestions)) {
+    for (const messageId of questionsByCard(openQuestions).keys()) {
+      const rows = deps.store.listQuestionsByCard(botUid, target, messageId);
       forgetAskGeneration(messageId);
       const first = rows[0];
       if (first === undefined) continue;

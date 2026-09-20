@@ -71,10 +71,14 @@ test("shares one in-flight lookup per uid and never rejects", async () => {
   await expect(second).resolves.toEqual(new Map([["owner-1", "董振兴"]]));
   expect(calls).toEqual(["owner-1"]);
 
+  let available = false;
   const hostile = createDisplayNameCache(() => {
-    throw new Error("sync failure");
+    if (!available) throw new Error("sync failure");
+    return Promise.resolve("Recovered");
   });
   await expect(hostile.names(["owner-1"])).resolves.toEqual(new Map());
+  available = true;
+  await expect(hostile.names(["owner-1"])).resolves.toEqual(new Map([["owner-1", "Recovered"]]));
 });
 
 test("settles within the lookup budget even when the lookup ignores cancellation", async () => {

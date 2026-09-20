@@ -123,26 +123,41 @@ async function runSuperCommand(
   argv: readonly string[],
   timeoutMs: number,
 ): Promise<SupervisorRunResult> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const detached = process.platform !== "win32";
+  const child = Bun.spawn([command, ...argv], {
+    stdout: "pipe",
+    stderr: "pipe",
+    stdin: "ignore",
+    detached,
+  });
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    // Descendants may retain the CLI's pipes; terminate the group this invocation owns.
+    if (detached) {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        // The group may already have exited; the direct child is still owned below.
+      }
+    }
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Already exited.
+    }
+  }, timeoutMs);
   const timeoutMessage = `${command} ${argv.join(" ")} 超时（${timeoutMs}ms）`;
   try {
-    const child = Bun.spawn([command, ...argv], {
-      stdout: "pipe",
-      stderr: "pipe",
-      stdin: "ignore",
-      signal: controller.signal,
-    });
     const [code, stdout, stderr] = await Promise.all([
       child.exited,
       new Response(child.stdout).text(),
       new Response(child.stderr).text(),
     ]);
-    // Aborting kills the child, which reports a signal exit code instead of an error.
-    if (controller.signal.aborted) throw new Error(timeoutMessage);
+    if (timedOut) throw new Error(timeoutMessage);
     return { code, stdout, stderr };
   } catch (error) {
-    if (controller.signal.aborted) throw new Error(timeoutMessage);
+    if (timedOut) throw new Error(timeoutMessage);
     throw error;
   } finally {
     clearTimeout(timer);
