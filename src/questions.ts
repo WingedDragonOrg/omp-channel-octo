@@ -531,6 +531,15 @@ async function deliverQuestionSet(
     );
     if (receipt?.messageId !== undefined) {
       deps.store.setQuestionsCard(specs.map(({ id }) => id), receipt.messageId);
+      const rows = deps.store.listQuestionsByCard(currentBotUid(), target, receipt.messageId);
+      if (rows.some(({ state }) => state !== "pending")) {
+        rewriteAskCardSet(rows, rows.some(({ state }) => state === "pending")
+          ? { kind: "open", generation: 1 }
+          : {
+            kind: "closed",
+            note: rows.some(({ state }) => state !== "answered") ? "任务已取消：该问题不再接受回答。" : null,
+          }, null);
+      }
     }
     return receipt?.messageId ?? null;
   } catch (error) {
@@ -619,6 +628,14 @@ async function deliverQuestion(
       );
       if (receipt?.messageId !== undefined) {
         deps.store.setQuestionCard(questionId, receipt.messageId);
+        const question = deps.store.getQuestion(questionId);
+        if (question?.state === "answered") {
+          rewriteAskCard(question, {
+            kind: "answered", answer: question.answer ?? "", answeredBy: question.answeredBy,
+          });
+        } else if (question && question.state !== "pending") {
+          rewriteAskCard(question, { kind: "inactive", note: "任务已取消：该问题不再接受回答。" });
+        }
         return;
       }
     } catch (error) {

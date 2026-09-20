@@ -1544,3 +1544,39 @@ test("a timed-out question set stops the turn once and keeps every row answerabl
     await closeCoreHarness(harness);
   }
 });
+
+test.each(["single", "set"] as const)("text answers before the %s card receipt are rendered when it binds", async (kind) => {
+  const published = Promise.withResolvers<void>();
+  const receiptGate = Promise.withResolvers<void>();
+  const questions = kind === "single"
+    ? [{ id: "first", question: "First question?" }]
+    : [{ id: "first", question: "First question?" }, { id: "second", question: "Second question?" }];
+  const harness = await startAskHarness(questions, {
+    setup: (transport) => {
+      const send = transport.sendCard.bind(transport);
+      transport.sendCard = async (...args) => {
+        const receipt = await send(...args);
+        published.resolve();
+        await receiptGate.promise;
+        return receipt;
+      };
+    },
+  });
+  try {
+    const target: ChatTarget = { channelType: 1, channelId: `late-text-${kind}` };
+    await harness.service.handleInbound(inbound({ ...target, text: "ask" }));
+    await published.promise;
+    await harness.service.handleInbound(inbound({ ...target, text: "receipt-answer" }));
+    receiptGate.resolve();
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+    const edit = harness.transport.cardEdits.at(-1);
+    expect(edit).toBeDefined();
+    const replies = answeredTexts(edit!.frame.card);
+    expect(replies).toHaveLength(questions.length);
+    for (const reply of replies) expect(reply).toContain("receipt-answer");
+    expect(cardActions(edit!)).toEqual([]);
+  } finally {
+    receiptGate.resolve();
+    await closeCoreHarness(harness);
+  }
+});
