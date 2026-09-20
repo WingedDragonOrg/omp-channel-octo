@@ -150,7 +150,7 @@ export interface Outbox {
   forgetTask(taskId: string): void;
   /** 任务不再有排队内容时释放其取消句柄。 */
   releaseIfIdle(taskId: string): void;
-  /** 停机第一步：中止所有在途文本尝试。 */
+  /** 停机第一步：中止所有在途投递尝试（文字、文件与送达状态提示）。 */
   abortAll(): void;
   /** 停机第二步：清掉重试与流式计时器。 */
   stopTimers(): void;
@@ -165,7 +165,7 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
   const streamTimers = new Map<string, NodeJS.Timeout>();
   const streamNotBefore = new Map<string, number>();
   const textAbortControllers = new Map<string, AbortController>();
-  const textAttempts = new Set<AbortController>();
+  const deliveryAttempts = new Set<AbortController>();
 
   function currentBotUid(): string {
     const uid = deps.botUid();
@@ -355,6 +355,8 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
         ) {
           unknownNoticeSent = true;
           await sendUnknownNotice(target, item);
+          // Shutdown can land while the notice is in flight: do not start a real send after it.
+          if (!deps.started()) return;
         }
         let attempted = item;
         try {
@@ -445,17 +447,20 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
 
   async function sendUnknownNotice(target: ChatTarget, item: OutboxRecord): Promise<void> {
     try {
-      await deps.transport.sendText(
-        target,
-        "上一条消息送达状态未知，正在重试。",
-        `delivery-unknown-${item.id}`,
+      await withDeliveryAttempt(null, (signal) =>
+        deps.transport.sendText(
+          target,
+          "上一条消息送达状态未知，正在重试。",
+          `delivery-unknown-${item.id}`,
+          signal,
+        ),
       );
     } catch {
       // The notice is intentionally best effort and never creates another outbox item.
     }
   }
 
-  async function withTextAttempt<T>(
+  async function withDeliveryAttempt<T>(
     taskId: string | null,
     work: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
@@ -464,11 +469,11 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
     const abort = () => attempt.abort();
     if (parent?.signal.aborted) attempt.abort();
     else parent?.signal.addEventListener("abort", abort, { once: true });
-    textAttempts.add(attempt);
+    deliveryAttempts.add(attempt);
     try {
       return await work(attempt.signal);
     } finally {
-      textAttempts.delete(attempt);
+      deliveryAttempts.delete(attempt);
       parent?.signal.removeEventListener("abort", abort);
     }
   }
@@ -479,24 +484,30 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
   ): Promise<{ remoteMessageId: string | null; reconcile: boolean; attemptedVersion: number }> {
     if (item.kind === "file") {
       if (!item.path || !item.fileKind) throw new Error("invalid file outbox item");
-      try {
-        await stat(item.path);
-      } catch (error) {
-        if (asAppError(error).code === "ENOENT") {
-          const missing = new Error("outbox file spool is missing") as AppError & { permanent?: boolean };
-          missing.code = "ENOENT";
-          missing.permanent = true;
-          throw missing;
+      const path = item.path;
+      const fileKind = item.fileKind;
+      await withDeliveryAttempt(null, async (signal) => {
+        try {
+          await stat(path);
+        } catch (error) {
+          if (asAppError(error).code === "ENOENT") {
+            const missing = new Error("outbox file spool is missing") as AppError & { permanent?: boolean };
+            missing.code = "ENOENT";
+            missing.permanent = true;
+            throw missing;
+          }
+          throw error;
         }
-        throw error;
-      }
-      await deps.transport.sendFile(target, item.path, item.fileKind, item.clientMsgNo);
+        // Shutdown can land while the stat is in flight: never start a fresh send after it.
+        if (signal.aborted) throw new Error("outbox delivery aborted");
+        await deps.transport.sendFile(target, path, fileKind, item.clientMsgNo, signal);
+      });
       return { remoteMessageId: null, reconcile: false, attemptedVersion: 0 };
     }
     if (item.streamMessageId) {
       if (item.remoteMessageId) {
         markStreamEditStarted(item, target);
-        await withTextAttempt(item.taskId, (signal) =>
+        await withDeliveryAttempt(item.taskId, (signal) =>
           deps.transport.editText(target, item.remoteMessageId!, item.text ?? "", signal),
         );
         return {
@@ -508,13 +519,15 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
       const reconcile = item.state === "unknown";
       if (!reconcile) deps.store.beginTextCreate(item.id);
       markStreamEditStarted(item, target);
-      const receipt = await withTextAttempt(item.taskId, (signal) =>
+      const receipt = await withDeliveryAttempt(item.taskId, (signal) =>
         deps.transport.sendText(target, item.text ?? "", item.clientMsgNo, signal),
       );
       if (!receipt?.messageId) throw new Error("stream text send did not return a remote message id");
       return { remoteMessageId: receipt.messageId, reconcile, attemptedVersion: item.desiredVersion };
     }
-    await deps.transport.sendText(target, item.text ?? "", item.clientMsgNo);
+    await withDeliveryAttempt(null, (signal) =>
+      deps.transport.sendText(target, item.text ?? "", item.clientMsgNo, signal),
+    );
     return { remoteMessageId: null, reconcile: false, attemptedVersion: 0 };
   }
 
@@ -533,7 +546,7 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
 
   function abortAll(): void {
     for (const controller of textAbortControllers.values()) controller.abort();
-    for (const controller of textAttempts) controller.abort();
+    for (const controller of deliveryAttempts) controller.abort();
   }
 
   function stopTimers(): void {
