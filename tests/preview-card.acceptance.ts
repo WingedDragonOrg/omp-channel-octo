@@ -92,7 +92,7 @@ function visibleTodoTaskLabels(card: JsonRecord): string[] {
   for (const row of cardNodes(todoDetail)) {
     if (row.type !== "ColumnSet" || row.isVisible === false) continue;
     const columns = row.columns as JsonRecord[] | undefined;
-    if (columns?.[0]?.width !== "80px") continue;
+    if (!columns || !/\[[✓•×-]\]/u.test(cardText(columns[0] ?? {}))) continue;
     const body = (columns[1]?.items as JsonRecord[] | undefined)?.[0];
     const text = typeof body?.text === "string" ? body.text : cardText(body ?? {});
     labels.push(text);

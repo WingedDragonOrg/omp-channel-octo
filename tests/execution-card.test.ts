@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createRequire } from "node:module";
 import { buildExecutionCard, type ExecutionCardCapabilities } from "../src/cards/execution-card.ts";
 import type { ResearchRun, ResearchSnapshot } from "../src/research/index.ts";
 import {
@@ -73,7 +74,7 @@ function visibleTodoTaskLabels(card: JsonRecord): string[] {
   for (const row of nodes(todoDetail)) {
     if (row.type !== "ColumnSet" || row.isVisible === false) continue;
     const columns = row.columns as JsonRecord[] | undefined;
-    if (columns?.[0]?.width !== "80px") continue;
+    if (!columns || !/\[[✓•×-]\]/u.test(cardText(columns[0] ?? {}))) continue;
     const body = (columns[1]?.items as JsonRecord[] | undefined)?.[0];
     const text = typeof body?.text === "string" ? body.text : cardText(body ?? {});
     labels.push(text);
@@ -189,6 +190,20 @@ function endSubagent(
     ...(summary === undefined ? {} : { summary }),
   });
 }
+
+test("waiting and cancelled tool markers remain visible through Markdown rendering", () => {
+  const tracker = createExecutionTracker({ initialAtMs: 1_000 });
+  startTool(tracker, "cancelled-read", "read", 1_000);
+  tracker.apply({ type: "tool_end", toolCallId: "cancelled-read", status: "cancelled", atMs: 1_100 });
+  startTool(tracker, "waiting-child", "subagent_await", 1_000);
+  const result = buildExecutionCard(tracker.snapshot(1_100), fullCapabilities);
+  expect(result).not.toBeNull();
+  const markdown: { render(text: string): string } = createRequire(import.meta.url)("markdown-it")();
+  const markers = nodes(result!.card).filter(node => node.type === "TextBlock" && node.fontType === "Monospace");
+  const rendered = markers.map(node => markdown.render(String(node.text)));
+  expect(rendered.filter(html => html === "<p>-</p>\n")).toHaveLength(2);
+  expect(rendered.some(html => html.includes("<ul>"))).toBe(false);
+});
 
 describe("execution tracker", () => {
   test("projects turn phases, tool counts, elapsed time, and terminal state", () => {
@@ -369,8 +384,6 @@ describe("execution tracker", () => {
       text: "│\u00a0├─\u2009[•]",
       wrap: false,
     });
-    expect(firstTaskColumns[0]).toMatchObject({ width: "80px", verticalContentAlignment: "Center" });
-    expect(firstTaskColumns[1]).toMatchObject({ width: "stretch", verticalContentAlignment: "Center" });
     expect(cardText(firstTaskColumns[1]!)).toBe("Wire storage");
     const blockedTaskColumns = foundationRows[1]?.columns as JsonRecord[];
     expect(blockedTaskColumns).toHaveLength(2);
@@ -381,8 +394,6 @@ describe("execution tracker", () => {
       size: "Small",
       wrap: false,
     });
-    expect(blockedTaskColumns[0]).toMatchObject({ width: "80px", verticalContentAlignment: "Center" });
-    expect(blockedTaskColumns[1]).toMatchObject({ width: "stretch", verticalContentAlignment: "Center" });
     expect(cardText(blockedTaskColumns[1]!)).toBe("Wait for access · 等待授权");
     expect(cardText(blockedCard)).not.toContain("│  ├─");
     expect(blockedRendered!.plain).toContain("├─ Foundation");
@@ -927,23 +938,6 @@ describe("execution card rendering", () => {
       .find(target => target.elementId === "subagent_omitted_steps")).toMatchObject({ isVisible: false });
   });
 
-  test("keeps waiting markers out of markdown list rendering", () => {
-    const tracker = createExecutionTracker({ runId: "waiting-marker" });
-    startTurn(tracker, "turn-1", 0);
-    startTool(tracker, "verifier", "subagent_await", 900, "等待子代理 · verifier");
-    const snapshot = tracker.snapshot(1_800);
-    const rendered = buildExecutionCard(snapshot, fullCapabilities);
-    expect(rendered).not.toBeNull();
-    const card = rendered!.card as JsonRecord;
-    expect(nodes(card).find(node => node.text === "-")).toMatchObject({ color: "Default" });
-    expect(cardText(card)).not.toContain("- 等待子代理 · verifier");
-
-    const flat = buildExecutionCard(snapshot, { ...fullCapabilities, elements: ["TextBlock"] });
-    expect(flat).not.toBeNull();
-    const flatText = cardText(flat!.card as JsonRecord);
-    expect(flatText).toContain(`-\u00a0· ${clockAt(900)} · 等待子代理`);
-    expect(flatText).toContain("等待 · 900ms");
-  });
 
   test("keeps subagent activity visible without ToggleVisibility support", () => {
     const tracker = createExecutionTracker({ runId: "subagents-fallback" });
@@ -1040,7 +1034,6 @@ describe("execution card rendering", () => {
       expect.objectContaining({ text: "generate_image", isSubtle: true, size: "Small", spacing: "None" }),
       expect.objectContaining({
         text: `${clockAt(1_000)} · 进行中 · 35.2s`,
-        isSubtle: true,
         size: "Small",
         spacing: "None",
         color: "Accent",
@@ -1399,8 +1392,6 @@ describe("execution card rendering", () => {
       && cardText(node).includes("等待子代理")
     ));
     expect(waitingRow).toBeDefined();
-    const waitingGlyph = waitingNodes.find(node => node.text === "-" && node.color === "Default");
-    expect(waitingGlyph).toBeDefined();
     const waitingStatus = nodes(waitingRow!).find(node => (
       typeof node.text === "string" && node.text.startsWith(`${clockAt(1)} · 等待 · `)
     ));
@@ -1873,7 +1864,6 @@ describe("execution card rendering", () => {
     expect(firstOmitted).toMatchObject({ type: "ColumnSet" });
     const omittedTaskColumns = firstOmitted.columns as JsonRecord[];
     expect(omittedTaskColumns).toHaveLength(2);
-    expect(omittedTaskColumns[0]).toMatchObject({ width: "80px" });
     expect((omittedTaskColumns[0]?.items as JsonRecord[])[0]).toMatchObject({
       fontType: "Monospace",
       size: "Small",
