@@ -51,3 +51,43 @@ test("a failed acknowledgement retries from the held cursor and keeps later even
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("retryable event processing waits for recovery instead of exhausting its budget immediately", async () => {
+  const root = await mkdtemp(join(tmpdir(), "oco-event-processing-"));
+  const store = await openChannelStore(root);
+  const transport = new RetryAckTransport({ bot: { uid: "processing-bot", name: "Fixture" } });
+  transport.failures = 0;
+  transport.fetchBotEvents = async ({ afterEventId }) => afterEventId >= 1 ? null : [{
+    eventId: 1,
+    kind: "card_action",
+    action: { messageId: "card", channelType: 1, channelId: "owner", actionId: "ask_submit", operatorUid: "owner", inputs: {} },
+  }];
+  let available = false;
+  let applied = 0;
+  const loop = createBotEventLoop({
+    store, transport, botUid: () => transport.bot.uid, stopping: () => false,
+    onCardAction: async () => {
+      if (!available) return "retry";
+      applied++;
+      return "handled";
+    },
+  });
+  vi.useFakeTimers();
+  try {
+    loop.start();
+    await flush();
+    expect(transport.ackedEvents).toEqual([]);
+    expect(store.getBotEventCursor(transport.bot.uid)).toBe(0);
+    available = true;
+    vi.advanceTimersByTime(5_000);
+    await flush();
+    expect(applied).toBe(1);
+    expect(transport.ackedEvents).toEqual([1]);
+    expect(store.getBotEventCursor(transport.bot.uid)).toBe(1);
+  } finally {
+    await loop.stop();
+    vi.useRealTimers();
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

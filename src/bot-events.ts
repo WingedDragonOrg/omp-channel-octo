@@ -87,7 +87,10 @@ export function createBotEventLoop(deps: BotEventLoopDeps): BotEventLoop {
           const attempts = (eventAttempts.get(event.eventId) ?? 0) + 1;
           eventAttempts.set(event.eventId, attempts);
           // Keep the cursor: the next round re-reads this event from the same place.
-          if (attempts < BOT_EVENT_MAX_ATTEMPTS) break;
+          if (attempts < BOT_EVENT_MAX_ATTEMPTS) {
+            await waitFor(BOT_EVENT_POLL_BACKOFF_MS, signal);
+            break;
+          }
           console.error(`[bot-events] dropped event ${event.eventId} after ${attempts} attempts`);
         }
         try {
