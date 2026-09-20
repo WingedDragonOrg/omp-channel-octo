@@ -83,7 +83,7 @@ import {
 import { createBotEventLoop, type BotEventLoop } from "./bot-events.ts";
 import { createOutboxDelivery, type Outbox } from "./outbox.ts";
 import { createHostTools, type HostToolHost } from "./host-tools.ts";
-import { safeErrorMessage } from "./errors.ts";
+import { failureText, isTransientServerFailure, safeErrorMessage } from "./errors.ts";
 import { classifyStartupFailure, classifyTaskFailure, GENERIC_TASK_FAILURE_NOTICE, type TaskStartupPhase } from "./task-failure.ts";
 import {
   findMovedSession,
@@ -183,6 +183,12 @@ const THREAD_MERGE_NO_WORKSPACE_TEXT =
   "当前子区未绑定隔离工作区，/thread merge 不可用。";
 const THREAD_MERGE_UNCONFIGURED_TEXT =
   "本部署未配置隔离工作区能力，/thread merge 不可用。";
+/** 排定的子区归档：仅瞬时失败重试（最多 5 次尝试、每次间隔 5 秒），永久失败即刻结束。 */
+const THREAD_ARCHIVE_ATTEMPTS = 5;
+const THREAD_ARCHIVE_RETRY_MS = 5_000;
+/** 归档前等该聊天出站队列排空的有界轮询（100ms 一次，最多 10 秒）。 */
+const THREAD_ARCHIVE_DRAIN_MS = 10_000;
+const THREAD_ARCHIVE_DRAIN_POLL_MS = 100;
 
 /** 系统说明行与正文之间保持空行分隔；正文为空时说明行本身就是正文。 */
 function withSystemNote(text: string, note: string): string {
@@ -398,8 +404,10 @@ function readThreadMergeNote(argument: string): string | undefined {
  * sub-thread's cwd with it as a known result that must not be repeated as a caveat or used as a
  * reason to keep the workspace. A trailing note after the `merge` keyword is the owner's own
  * supplement and is carried along verbatim. The merge itself is executed by the host through
- * `octo_management`'s `thread-merge`. Every outcome, including a conflict that must be resolved
- * before retrying, is reported to the owner.
+ * `octo_management`'s `thread-merge`, and a default-pipeline merge also schedules the sub-thread's
+ * archive after the turn's own reply is delivered — so the body tells the assistant not to archive
+ * by itself and to report that disposition. Every outcome, including a conflict that must be
+ * resolved before retrying, is reported to the owner.
  */
 function threadMergePrompt(workspacePath: string, note: string): string {
   return [
@@ -409,6 +417,7 @@ function threadMergePrompt(workspacePath: string, note: string): string {
     "要保留工作区时必须说明必要理由，并显式传 remove:false；目标分支等其他参数确有需要时同样显式传入并说明理由。",
     "工作区被删除后本子区 cwd 随之失效，这是该命令的既定结果、owner 已知：不要在汇报里反复说明这一点，也不要把 cwd 失效当作保留工作区的理由——保留工作区的必要理由应是尚未收尾的具体工作（例如部署、验收）。",
     "合并由宿主执行：调用 octo_management 的 thread-merge 动作，不要自己运行 wt。",
+    "合并成功后宿主会按默认 pipeline 自动排定归档本子区（在本回合最后一条回复送达后执行），不要自己再调 thread-archive；显式保留工作区时不会归档。向 owner 汇报时说明这一处置即可。",
     "成功后向 owner 汇报目标分支与结果细节；失败时（例如 rebase 冲突或 pre-merge 检查失败）先在本子区处置再重试，并把最终结果告诉 owner。",
     ...(note.length === 0 ? [] : ["", "owner 补充说明：", note]),
     "",
@@ -460,6 +469,17 @@ class SwitchDirectoryError extends Error {
   }
 }
 
+/**
+ * Shutdown interrupted an inbound message before it was durably accepted. The handler rejects with
+ * it so the transport never ACKs a swallowed message; the same message is redelivered after restart.
+ */
+class InboundShutdownError extends Error {
+  constructor() {
+    super("channel 正在停止，消息未接受");
+    this.name = "InboundShutdownError";
+  }
+}
+
 function parseCommand(text: string): { name: string; argument: string } | null {
   const match = /^\/([^\s]+)(?:\s+([\s\S]*))?$/.exec(text.trim());
   if (!match) return null;
@@ -487,8 +507,24 @@ function contextSidecarRoot(
   return join(config.stateDir, "context-sidecars", scopeDigest);
 }
 
+/**
+ * 一次排定到聊天回合末执行的子区归档：`thread-archive` 与默认 pipeline 的 `thread-merge`
+ * 收尾都只排定，真正的调用发生在该聊天回合输出（正文与进度卡终态编辑）排空之后——任何发进
+ * 子区的消息都会把归档子区解档。
+ */
+interface PendingThreadArchive {
+  /** 发起排定的聊天；归档失败说明回这个聊天。 */
+  readonly target: ChatTarget;
+  readonly groupId: string;
+  readonly shortId: string;
+}
+
 class CoreService implements ChannelService {
   private readonly taskOperations = new Set<Promise<void>>();
+  /** In-flight inbound handlers: stop aborts their I/O and awaits their cleanup before closing the store. */
+  private readonly inboundOperations = new Set<Promise<void>>();
+  /** Shutdown cancellation source for inbound I/O (downloads, transcription, mention-pref lookups). */
+  private readonly shutdownController = new AbortController();
   private readonly chatTails = new Map<string, Promise<void>>();
   private readonly scheduledTasks = new Map<string, Promise<void>>();
   /**
@@ -531,6 +567,13 @@ class CoreService implements ChannelService {
    * asked for it still delivers its reply.
    */
   private pendingRestart: ChatTarget | null = null;
+  /**
+   * 排定到回合末的子区归档（键为该聊天）。进程内一次性状态：执行或放弃即清除，该聊天过
+   * 权限门禁的新入站也清除——用户回来了就不归档。
+   */
+  private readonly pendingThreadArchives = new Map<string, PendingThreadArchive>();
+  /** `stopInternal` 的到达信号：归档重试的等待据此提前结束，关停不为一轮重试等满一次间隔。 */
+  private readonly stopped = Promise.withResolvers<void>();
   private stopPromise: Promise<void> | undefined;
   constructor(
     private readonly options: ChannelServiceOptions,
@@ -672,7 +715,11 @@ class CoreService implements ChannelService {
   private async stopInternal(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    this.stopped.resolve();
     this.started = false;
+    // Abort inbound I/O first so in-flight downloads/transcriptions/lookups unwind while the rest
+    // of shutdown runs; their cleanup (claim rollback, temp-file removal) is awaited below.
+    this.shutdownController.abort();
     const runtimes = [...this.runtimes.values()];
     for (const runtime of runtimes) {
       runtime.cancelRequested = true;
@@ -698,6 +745,9 @@ class CoreService implements ChannelService {
     this.outbox.abortAll();
     await Promise.allSettled([...this.taskOperations]);
     await Promise.allSettled([...this.activityOperations]);
+    // Inbound handlers aborted above finish their bounded cleanup here, while the store is still
+    // open: interrupted assembly rolls its command claim back so a redelivery is not swallowed.
+    await Promise.allSettled([...this.inboundOperations]);
     await this.researchReports.drain();
     this.typingLeases.releaseAll();
     await this.botEvents.stop();
@@ -728,8 +778,31 @@ class CoreService implements ChannelService {
     }
   }
 
+  /**
+   * Single shutdown gate for inbound continuations: any path that has not yet durably accepted the
+   * message (task row, completed claim, delivered reply) rejects instead of silently resolving,
+   * because the transport ACKs a resolved handler.
+   */
+  private throwIfStopping(): void {
+    if (this.stopping) throw new InboundShutdownError();
+  }
+
   async handleInbound(message: InboundMessage): Promise<void> {
-    if (!this.started || !this.bot || this.stopping) return;
+    // Tracked so `stop` can await the interrupted handler's cleanup before closing the store.
+    const operation = this.processInbound(message);
+    this.inboundOperations.add(operation);
+    const cleanup = () => {
+      this.inboundOperations.delete(operation);
+    };
+    void operation.then(cleanup, cleanup);
+    await operation;
+  }
+
+  private async processInbound(message: InboundMessage): Promise<void> {
+    // A message that arrives during shutdown is never accepted: reject so the transport does not
+    // ACK it; the same message is redelivered after restart.
+    this.throwIfStopping();
+    if (!this.started || !this.bot) return;
     if (message.messageId.trim().length === 0 || message.senderId.trim().length === 0) return;
     this.recordHistoryMessage(message);
     const text = message.text.trim();
@@ -774,10 +847,13 @@ class CoreService implements ChannelService {
       ownerId = this.store.getOwnerId(this.bot.uid)?.trim() || null;
     }
     const allowed = await this.isAllowed(message, ownerId);
+    this.throwIfStopping();
     if (!allowed) {
       await this.handleUnlistedOwnerContact(message, ownerId);
       return;
     }
+    // 已授权的新入站说明这个聊天仍在继续：排定中的归档随之取消（用户回来了就不归档）。
+    this.pendingThreadArchives.delete(targetKey(message));
     if (!message.supported) {
       const claim = this.commandClaim(message, "unsupported");
       if (!this.store.claimCommand(claim)) return;
@@ -815,6 +891,7 @@ class CoreService implements ChannelService {
       await this.withMessageTyping(message, async () => {
         const slashPrompt = await this.materializeInbound(message);
         if (slashPrompt === null) return;
+        this.throwIfStopping();
         await this.acceptTask(message, slashPrompt);
       });
       return;
@@ -823,6 +900,7 @@ class CoreService implements ChannelService {
     await this.withMessageTyping(message, async() => {
       const promptText = await this.materializeInbound(message);
       if (promptText === null) return;
+      this.throwIfStopping();
       if (await this.appendToRunningTask(message, promptText)) return;
       await this.acceptTask(message, promptText);
     });
@@ -887,6 +965,7 @@ class CoreService implements ChannelService {
   }
 
   private async materializeInbound(message: InboundMessage, text = message.text): Promise<string | null> {
+    this.throwIfStopping();
     const quotedText = message.quoted?.text.trim() ?? "";
     const association = this.associatedAttachments(message);
     // 歧义时不取回任何文件：说明写进正文，任务照常接受；引用块（若有）照常组装。
@@ -933,6 +1012,7 @@ class CoreService implements ChannelService {
     try {
       // 附件目录由服务创建（0700，与传输层的写入互为幂等），失败清理才有一个确定的所有者。
       await mkdir(directory, { recursive: true, mode: 0o700 });
+      this.throwIfStopping();
       const files: SavedAttachment[] = [];
       for (const [index, attachment] of requested.entries()) {
         // 客户端声明的大小先做超限预检，不发起无谓的请求。
@@ -943,8 +1023,10 @@ class CoreService implements ChannelService {
         const signal = AbortSignal.any([
           AbortSignal.timeout(ATTACHMENT_DOWNLOAD_TIMEOUT_MS),
           budget.signal,
+          this.shutdownController.signal,
         ]);
         let bytes = await existingFileSize(path);
+        this.throwIfStopping();
         if (bytes === null) {
           try {
             bytes = await this.options.transport.downloadAttachment({
@@ -955,6 +1037,8 @@ class CoreService implements ChannelService {
             });
           } catch (error) {
             if (error instanceof AttachmentError && error.reason === "oversize") throw error;
+            // 停机中止先于预算/超时判定：被中断的取回不是附件失败，不发拒绝文案。
+            if (this.shutdownController.signal.aborted) throw new InboundShutdownError();
             // 单条 60 秒超时与整条 120 秒预算都会中止同一条 signal；只有预算耗尽按「超限」回复。
             if (budget.signal.aborted) throw new AttachmentError("budget", "attachment budget exhausted");
             if (signal.aborted) throw new AttachmentError("timeout", "attachment download timed out");
@@ -973,6 +1057,7 @@ class CoreService implements ChannelService {
             attachment.kind === "audio" ? await this.transcribeInboundAudio(path, budget.signal) : null,
         });
       }
+      this.throwIfStopping();
       const promptText = composePromptText(
         associated ? withSystemNote(text, association.note) : text,
         files,
@@ -991,6 +1076,12 @@ class CoreService implements ChannelService {
         }
       } catch {
         // 目录未落盘或不可读时无需清理。
+      }
+      if (this.stopping) {
+        // 停机中断时任务未接受：不发「附件拒绝」回复、不建任务；命令 claim 随中断回滚，
+        // 同一消息重启后可重新接收；取消错误上抛，传输层不会 ACK。
+        this.store.releaseClaim(claim);
+        throw error instanceof InboundShutdownError ? error : new InboundShutdownError();
       }
       const reason: AttachmentFailureReason = error instanceof AttachmentError ? error.reason : "failed";
       if (associated) {
@@ -1014,11 +1105,17 @@ class CoreService implements ChannelService {
    * 只有整条消息的下载预算被耗尽才按超限失败处理。
    */
   private async transcribeInboundAudio(path: string, budgetSignal: AbortSignal): Promise<string | null> {
-    const signal = AbortSignal.any([AbortSignal.timeout(ATTACHMENT_DOWNLOAD_TIMEOUT_MS), budgetSignal]);
+    const signal = AbortSignal.any([
+      AbortSignal.timeout(ATTACHMENT_DOWNLOAD_TIMEOUT_MS),
+      budgetSignal,
+      this.shutdownController.signal,
+    ]);
     try {
       const transcription = await this.options.transport.transcribeAudio(path, signal);
       return transcription !== null && transcription.trim().length > 0 ? transcription : null;
     } catch {
+      // 停机中止不能降级成「无转写」后继续组装：被中断的入站以有界取消上抛。
+      if (this.shutdownController.signal.aborted) throw new InboundShutdownError();
       if (budgetSignal.aborted) {
         throw new AttachmentError("budget", "attachment budget exhausted during transcription");
       }
@@ -1249,11 +1346,16 @@ class CoreService implements ChannelService {
       try {
         const pref = await this.options.transport.getGroupMentionPref(
           groupId,
-          AbortSignal.timeout(MENTION_PREF_TIMEOUT_MS),
+          AbortSignal.any([
+            AbortSignal.timeout(MENTION_PREF_TIMEOUT_MS),
+            this.shutdownController.signal,
+          ]),
         );
         effective = pref.effective;
         ttl = MENTION_PREF_TTL_MS;
       } catch {
+        // 停机中止查询不是「需要 @」的结论：未接受的入站以有界取消拒绝，重投后重新判定。
+        if (this.shutdownController.signal.aborted) throw new InboundShutdownError();
         // 保留「需要 @」的既有行为，只做短暂负缓存，避免查询失败时长挂入站处理。
       }
       this.mentionPrefs.set(groupId, { effective, expiresAt: Date.now() + ttl });
@@ -1669,6 +1771,7 @@ class CoreService implements ChannelService {
    * Returns true when the message was consumed as a steering message.
    */
   private async appendToRunningTask(message: InboundMessage, text: string): Promise<boolean> {
+    this.throwIfStopping();
     if (this.store.getChatMode(this.bot!.uid, message) !== "steer") return false;
     const runtime = this.runningRuntime(message);
     if (!runtime) return false;
@@ -1704,6 +1807,7 @@ class CoreService implements ChannelService {
     await this.withMessageTyping(message, async () => {
       const body = await this.materializeInbound(message);
       if (body === null) return;
+      this.throwIfStopping();
       const claim = this.commandClaim(message, command.name);
       if (!this.store.claimCommand(claim)) return;
       try {
@@ -2608,6 +2712,7 @@ class CoreService implements ChannelService {
     historyEligible = true,
     relay: TaskRelayTarget | null = null,
   ): Promise<boolean> {
+    this.throwIfStopping();
     let binding = await this.reconcileExternalBinding(
       message,
       this.store.getBinding(this.bot!.uid, message),
@@ -2645,6 +2750,9 @@ class CoreService implements ChannelService {
         }
       }
     }
+    // Shutdown can land during the binding probes above; never persist an acceptance from a
+    // redeliverable message.
+    this.throwIfStopping();
     const task: TaskRecord = {
       id: randomUUID(),
       botUid: this.bot!.uid,
@@ -2880,6 +2988,9 @@ class CoreService implements ChannelService {
       botUid,
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
       flushTarget: (target) => this.outbox.flush(target),
+      planThreadArchive: (target, groupId, shortId) => {
+        this.pendingThreadArchives.set(targetKey(target), { target: { ...target }, groupId, shortId });
+      },
       deliverToChat: async (message, relay) => {
         if (await this.appendToRunningTask(message, message.text)) return "steered";
         await this.acceptTask(message, message.text, true, relay ?? null);
@@ -3506,6 +3617,7 @@ class CoreService implements ChannelService {
       // the relay as work that queued behind this run.
       this.runtimes.delete(taskId);
       await this.notifyThreadOutcome(taskId);
+      await this.runScheduledArchive(target, progressTail);
       this.maybeRunDeferredRestart();
     }
   }
@@ -3520,6 +3632,78 @@ class CoreService implements ChannelService {
     );
   }
 
+
+  /**
+   * 排定的子区归档收尾：先等本回合的进度卡终态编辑与出站投递排空——回复先送达、归档后执行，
+   * 因为任何发进子区的消息都会把归档子区解档——再按重试策略调用 `archiveThread`。成功留一条
+   * 日志；失败只给发起聊天一条 ≤200 字符的单行说明，不改变已经发生的合并；停止时放弃。
+   */
+  private async runScheduledArchive(target: ChatTarget, progressTail: Promise<void>): Promise<void> {
+    const key = targetKey(target);
+    const pending = this.pendingThreadArchives.get(key);
+    if (!pending || this.stopping) return;
+    await progressTail.catch(() => {});
+    await this.drainChatOutbox(target);
+    try {
+      const outcome = await this.archivePendingThread(key, pending);
+      if (outcome === "archived") {
+        console.error(`[thread-archive] 已归档子区 ${pending.shortId} target=${key}`);
+      }
+    } catch (error) {
+      const reason = failureText(error, "归档失败");
+      console.error(`[thread-archive] 归档失败 target=${key} short=${pending.shortId}：${reason}`);
+      this.outbox.enqueueText(target, `归档失败：${reason}`, null);
+    } finally {
+      if (this.pendingThreadArchives.get(key) === pending) this.pendingThreadArchives.delete(key);
+    }
+  }
+
+  /**
+   * 一次排定归档的调用：第 1 次立即执行，瞬时失败（5xx 或 bot API 的 `store_failed`）每间隔
+   * 5 秒重试一次、总共至多 5 次尝试；永久失败即刻抛出。每次尝试前确认排定仍在（该聊天的新
+   * 入站会取消它）且服务未在停止。
+   */
+  private async archivePendingThread(
+    key: string,
+    pending: PendingThreadArchive,
+  ): Promise<"archived" | "cancelled"> {
+    let attempt = 1;
+    for (;;) {
+      if (this.stopping || this.pendingThreadArchives.get(key) !== pending) return "cancelled";
+      try {
+        await this.options.transport.archiveThread(pending.groupId, pending.shortId);
+        return "archived";
+      } catch (error) {
+        if (attempt >= THREAD_ARCHIVE_ATTEMPTS || !isTransientServerFailure(error)) throw error;
+        attempt += 1;
+        // 停止信号一到就提前结束，关停不为一轮重试等满一次间隔。
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, THREAD_ARCHIVE_RETRY_MS);
+          void this.stopped.promise.then(() => {
+            clearTimeout(timer);
+            resolve();
+          });
+        });
+      }
+    }
+  }
+
+  /**
+   * 等该聊天的出站队列排空（有界轮询）：回复与文件先送达，归档才排得上。超时照常归档——残余
+   * 消息可能稍后把子区解档为 active，可重复调用补做。
+   */
+  private async drainChatOutbox(target: ChatTarget): Promise<void> {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) return;
+    for (let waited = 0; waited < THREAD_ARCHIVE_DRAIN_MS; waited += THREAD_ARCHIVE_DRAIN_POLL_MS) {
+      await this.outbox.flush(target).catch(() => {});
+      if (this.stopping) return;
+      if (this.store.countPendingOutbox(botUid, target) === 0) return;
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, THREAD_ARCHIVE_DRAIN_POLL_MS);
+      });
+    }
+  }
 
   /**
    * Runs a restart the agent asked for once it cannot cost work: every chat idle and no queued

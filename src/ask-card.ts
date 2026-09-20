@@ -22,20 +22,10 @@ export const ASK_CHOICES_INPUT_ID = "ask_choices";
 
 const OPTION_ACTION_PREFIX = "ask_opt_";
 const SUBMIT_ACTION_PREFIX = "ask_submit";
-/**
- * Button titles must fit the narrowest card: the client lays each action out at its intrinsic
- * width on one line, so a title wider than the card overflows the edge instead of wrapping.
- * The budget is in half-width columns (about 20 full-width glyphs); the full label and its
- * description stay in the numbered body lines above.
- */
-const MAX_ACTION_TITLE_COLUMNS = 40;
-/** Full-width code points (CJK, kana, hangul, full-width forms, emoji) cost two columns. */
-const WIDE_GLYPH =
-  /[\u1100-\u115F\u2E80-\u303F\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7A3\uF900-\uFAFF\uFF00-\uFF60\uFFE0-\uFFE6]/u;
 const OPTION_ACTION_ID = new RegExp(`^${OPTION_ACTION_PREFIX}(\\d+)(?:#(\\d+))?$`, "u");
 const SUBMIT_ACTION_ID = new RegExp(`^${SUBMIT_ACTION_PREFIX}(?:#(\\d+))?$`, "u");
-/** One set runs one submit; its title says the click answers every question at once. */
-const SET_SUBMIT_TITLE = "提交全部答案";
+/** A set submission records the filled answers and leaves the other questions open. */
+const SET_SUBMIT_TITLE = "提交已填答案";
 const OTHER_INPUT_LABEL = "其他（选填，填写后以它为准）";
 const OTHER_INPUT_PLACEHOLDER = "自定义答案";
 const ANSWER_INPUT_LABEL = "自填答案";
@@ -103,31 +93,6 @@ export type AskAnswer = { kind: "answer"; answer: string } | { kind: "invalid" }
 /** Escapes the Markdown openers a TextBlock would otherwise interpret as links. */
 function cardText(text: string): string {
   return text.replace(/\\/gu, "\\\\").replace(/\[/gu, "\\[");
-}
-
-/** Display columns of one code point, matching the client's half/full-width glyph split. */
-function glyphColumns(char: string): number {
-  if ((char.codePointAt(0) ?? 0) >= 0x1F000) return 2;
-  return WIDE_GLYPH.test(char) ? 2 : 1;
-}
-
-/** Truncates to the column budget, appending an ellipsis only when something was dropped. */
-function truncateToColumns(text: string, budget: number): string {
-  let kept = "";
-  let columns = 0;
-  for (const char of text) {
-    const width = glyphColumns(char);
-    if (columns + width > budget) return `${kept}…`;
-    kept += char;
-    columns += width;
-  }
-  return kept;
-}
-
-function actionTitle(index: number, label: string): string {
-  const prefix = `${index}. `;
-  // One column is reserved for the ellipsis so a truncated title never exceeds the budget.
-  return `${prefix}${truncateToColumns(label.trim(), MAX_ACTION_TITLE_COLUMNS - prefix.length - 1)}`;
 }
 
 function optionActionId(index: number, generation: number): string {
@@ -212,15 +177,15 @@ function answeredCardElement(
 ): Record<string, unknown> {
   const { answerer, body } = answeredParts(question, answer, answeredBy, names);
   if (answerer.length === 0) {
-    return { type: "TextBlock", text: cardText(`已回复：${body}`), wrap: true, spacing: "Medium" };
+    return { type: "TextBlock", text: cardText(`已回复：${body}`), wrap: true, spacing: "Small", color: "Good" };
   }
   return {
     type: "RichTextBlock",
-    spacing: "Medium",
+    spacing: "Small",
     inlines: [
-      { type: "TextRun", text: cardText("已由 ") },
-      { type: "TextRun", text: cardText(answerer), weight: "Bolder" },
-      { type: "TextRun", text: cardText(` 回复：${body}`) },
+      { type: "TextRun", text: cardText("已由 "), color: "Good" },
+      { type: "TextRun", text: cardText(answerer), weight: "Bolder", color: "Good" },
+      { type: "TextRun", text: cardText(` 回复：${body}`), color: "Good" },
     ],
   };
 }
@@ -279,33 +244,61 @@ export function resolveAskSetAnswer(
   return selectionAnswer(question, inputs[`${ASK_CHOICES_INPUT_ID}_${ordinal}`] ?? "");
 }
 
-/** The numbered option list every frame renders: full labels plus optional descriptions. */
-function optionLines(question: AskCardQuestion): Record<string, unknown>[] {
+/** Full option labels and descriptions, with single-choice actions kept beside their option. */
+function optionLines(question: AskCardQuestion, generation?: number): Record<string, unknown>[] {
   const body: Record<string, unknown>[] = [];
   question.options.forEach((option, index) => {
-    body.push({
+    const items: Record<string, unknown>[] = [{
       type: "TextBlock",
       text: `**${index + 1}.** ${cardText(option.label.trim())}`,
       wrap: true,
       spacing: "Small",
-    });
+      weight: generation === undefined ? "Default" : "Bolder",
+      isSubtle: generation === undefined,
+    }];
     const description = option.description?.trim() ?? "";
     if (description.length > 0) {
-      body.push({ type: "TextBlock", text: cardText(description), wrap: true, spacing: "None" });
+      items.push({ type: "TextBlock", text: cardText(description), wrap: true, spacing: "None", isSubtle: true });
+    }
+    if (generation !== undefined && !question.multi) {
+      body.push({
+        type: "ColumnSet",
+        spacing: "Default",
+        separator: index > 0,
+        columns: [
+          { type: "Column", width: "stretch", items },
+          {
+            type: "Column",
+            width: "auto",
+            spacing: "Small",
+            items: [{
+              type: "ActionSet",
+              actions: [{
+                type: "Action.Submit",
+                id: optionActionId(index + 1, generation),
+                title: `${index + 1}. 选择`,
+              }],
+            }],
+          },
+        ],
+      });
+    } else {
+      body.push(...items);
     }
   });
   return body;
 }
 
-function questionBody(question: AskCardQuestion): Record<string, unknown>[] {
+function questionBody(question: AskCardQuestion, generation?: number): Record<string, unknown>[] {
   return [
     {
       type: "TextBlock",
-      text: `问题：${cardText(question.question)}`,
+      text: cardText(question.question),
       wrap: true,
       weight: "Bolder",
+      size: "Medium",
     },
-    ...optionLines(question),
+    ...(generation !== undefined && question.multi ? [] : optionLines(question, generation)),
   ];
 }
 
@@ -315,8 +308,10 @@ function choiceSetInput(question: AskCardQuestion, id: string): Record<string, u
     id,
     label: question.multi ? "可多选" : "单选",
     isMultiSelect: question.multi,
+    style: "expanded",
+    wrap: true,
     choices: question.options.map((option, index) => ({
-      title: `${index + 1}. ${option.label.trim()}`,
+      title: `**${index + 1}. ${cardText(option.label.trim())}**${option.description?.trim() ? `  \n${cardText(option.description.trim())}` : ""}`,
       value: String(index + 1),
     })),
   };
@@ -328,6 +323,7 @@ function answerInput(id: string, hasOptions: boolean): Record<string, unknown> {
     id,
     label: hasOptions ? OTHER_INPUT_LABEL : ANSWER_INPUT_LABEL,
     placeholder: hasOptions ? OTHER_INPUT_PLACEHOLDER : ANSWER_INPUT_PLACEHOLDER,
+    isMultiline: !hasOptions,
   };
 }
 
@@ -342,31 +338,8 @@ function pendingInputs(question: AskCardQuestion): Record<string, unknown>[] {
 }
 
 /**
- * The option buttons of a single choice, one body `ActionSet` per option. Body actionsets stack
- * vertically, so every button owns a row and a long label is never clipped at the card edge the
- * way a shared horizontal action row clips it. Full labels (and descriptions) stay in the
- * numbered body lines above; the button title keeps its own bound.
- */
-function optionActionSets(
-  question: AskCardQuestion,
-  generation: number,
-): Record<string, unknown>[] {
-  if (question.options.length === 0 || question.multi) return [];
-  return question.options.map((option, index) => ({
-    type: "ActionSet",
-    spacing: "Small",
-    actions: [{
-      type: "Action.Submit",
-      id: optionActionId(index + 1, generation),
-      title: actionTitle(index + 1, option.label),
-    }],
-  }));
-}
-
-/**
- * The card-level action area, which holds only the submit: the option buttons are body
- * `ActionSet` rows (`optionActionSets`), because this area renders every action in one
- * horizontal row and clips the overflow.
+ * The card-level action area holds only the submit; option actions live beside their
+ * explanations in body ActionSets so the client stacks them instead of clipping a shared row.
  */
 function pendingActions(
   question: AskCardQuestion,
@@ -393,24 +366,21 @@ export function buildAskCard(
   plain: string,
   names?: AnswererNames,
 ): AskCardFrame {
+  const body = questionBody(question, state.kind === "pending" ? state.generation : undefined);
   const card: Record<string, unknown> = {
     $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
     type: "AdaptiveCard",
     version: "1.5",
-    body: questionBody(question),
+    body,
   };
   if (state.kind === "pending") {
-    card.body = [
-      ...questionBody(question),
-      ...pendingInputs(question),
-      ...optionActionSets(question, state.generation),
-    ];
+    body.push(...pendingInputs(question));
     card.actions = pendingActions(question, state.generation);
   } else {
     const note = state.kind === "answered"
       ? answeredCardElement(question, state.answer, state.answeredBy, names)
       : { type: "TextBlock", text: state.note, wrap: true, spacing: "Medium" };
-    card.body = [...questionBody(question), note];
+    body.splice(1, 0, note);
   }
   return { card, plain, profile: ASK_CARD_PROFILE };
 }
@@ -426,15 +396,17 @@ function setQuestionBody(
   const body: Record<string, unknown>[] = [
     {
       type: "TextBlock",
-      text: `问题 ${ordinal}/${total}：${cardText(question.question)}`,
+      text: `${ordinal} / ${total}  ${cardText(question.question)}`,
       wrap: true,
       weight: "Bolder",
-      spacing: ordinal === 1 ? "None" : "Medium",
+      size: "Medium",
+      separator: ordinal > 1,
+      spacing: ordinal === 1 ? "Small" : "Medium",
     },
-    ...optionLines(question),
+    ...(open && entry.answer === null ? [] : optionLines(question)),
   ];
   if (entry.answer !== null) {
-    body.push(answeredCardElement(question, entry.answer, entry.answeredBy, names));
+    body.splice(1, 0, answeredCardElement(question, entry.answer, entry.answeredBy, names));
     return body;
   }
   if (!open) return body;
@@ -456,14 +428,16 @@ export function buildAskCardSet(
   names?: AnswererNames,
 ): AskCardFrame {
   const total = questions.length;
-  const open = state.kind === "open" && questions.some(({ answer }) => answer === null);
+  const remaining = questions.reduce((count, { answer }) => count + Number(answer === null), 0);
+  const open = state.kind === "open" && remaining > 0;
   const body: Record<string, unknown>[] = [];
   if (open) {
     body.push({
       type: "TextBlock",
-      text: `共 ${total} 题：填写后一次提交；也可以直接回复本消息作答。`,
+      text: `待回答 ${remaining} / ${total} · 填写后提交，也可直接回复消息作答。`,
       wrap: true,
       spacing: "None",
+      isSubtle: true,
     });
   }
   questions.forEach((entry, position) => {

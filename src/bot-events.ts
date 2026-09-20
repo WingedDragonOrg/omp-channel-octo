@@ -34,6 +34,7 @@ export interface BotEventLoop {
 
 /** Cancellable pause that resolves early when the caller's signal aborts. */
 function waitFor(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
   const { promise, resolve } = Promise.withResolvers<void>();
   const onAbort = (): void => {
     clearTimeout(timer);
@@ -87,7 +88,10 @@ export function createBotEventLoop(deps: BotEventLoopDeps): BotEventLoop {
           const attempts = (eventAttempts.get(event.eventId) ?? 0) + 1;
           eventAttempts.set(event.eventId, attempts);
           // Keep the cursor: the next round re-reads this event from the same place.
-          if (attempts < BOT_EVENT_MAX_ATTEMPTS) break;
+          if (attempts < BOT_EVENT_MAX_ATTEMPTS) {
+            await waitFor(BOT_EVENT_POLL_BACKOFF_MS, signal);
+            break;
+          }
           console.error(`[bot-events] dropped event ${event.eventId} after ${attempts} attempts`);
         }
         try {
@@ -95,7 +99,8 @@ export function createBotEventLoop(deps: BotEventLoopDeps): BotEventLoop {
         } catch (error) {
           if (signal.aborted || deps.stopping()) return;
           console.error(`[bot-events] ack failed：${safeErrorMessage(error, "ack failed")}`);
-          return;
+          await waitFor(BOT_EVENT_POLL_BACKOFF_MS, signal);
+          break;
         }
         eventAttempts.delete(event.eventId);
         cursor = Math.max(cursor, event.eventId);

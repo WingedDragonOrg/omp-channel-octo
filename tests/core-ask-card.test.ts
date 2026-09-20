@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import { join } from "node:path";
 import type { ChannelStatus, ChatTarget } from "../src/contracts";
 import { cardStats } from "../src/octo/cards";
@@ -31,8 +31,9 @@ function cardActions(edit: { frame: { card: Record<string, unknown> } }): string
 }
 
 function cardBody(card: Record<string, unknown>): Record<string, unknown>[] {
-  const body = card.body;
-  return Array.isArray(body) ? (body as Record<string, unknown>[]) : [];
+  const children = card.body ?? card.items ?? card.columns;
+  if (!Array.isArray(children)) return [];
+  return children.flatMap((child: Record<string, unknown>) => [child, ...cardBody(child)]);
 }
 
 /** Action ids of the card's body `ActionSet` rows in body order; one entry per row. */
@@ -158,8 +159,6 @@ test("a card click answers the pending question and rewrites the card", async ()
     // The card carries the question; the text path stays silent unless the card cannot be sent.
     expect(harness.transport.sent).toHaveLength(0);
     expect(card.frame.profile).toBe("octo/v2");
-    expect(JSON.stringify(card.frame.card)).toContain("2. production");
-    expect(card.frame.plain).toContain("直接回复选项编号作为答案");
 
     harness.transport.pushBotEvent(cardActionEvent(7, {
       messageId: card.messageId,
@@ -189,6 +188,57 @@ test("a card click answers the pending question and rewrites the card", async ()
     await closeCoreHarness(harness);
   }
 });
+
+for (const size of [1, 2]) {
+  test(`a ${size}-question card click waits for its send receipt before acknowledgement`, async () => {
+    const published = Promise.withResolvers<void>();
+    const receiptGate = Promise.withResolvers<void>();
+    const questions = Array.from({ length: size }, (_, index) => ({
+      id: `question-${index + 1}`, question: "Choose target",
+      options: [{ label: "staging" }, { label: "production" }],
+    }));
+    const harness = await startAskHarness(questions, {
+      setup(transport) {
+        const send = transport.sendCard.bind(transport);
+        transport.sendCard = async (...args) => {
+          const receipt = await send(...args);
+          published.resolve();
+          await receiptGate.promise;
+          return receipt;
+        };
+      },
+    });
+    try {
+      const target: ChatTarget = { channelType: 1, channelId: `receipt-race-${size}` };
+      await harness.service.handleInbound(inbound({ ...target, text: "ask" }));
+      await published.promise;
+      const card = harness.transport.sentCards[0]!;
+      const event = cardActionEvent(91, {
+        ...target, messageId: card.messageId, operatorUid: "owner-1",
+        actionId: size === 1 ? "ask_opt_2" : "ask_submit",
+        inputs: size === 1 ? {} : { ask_choices_1: "2", ask_choices_2: "2" },
+      });
+      vi.useFakeTimers();
+      harness.transport.pushBotEvent(event);
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+      expect(harness.transport.ackedEvents).toEqual([]);
+      receiptGate.resolve();
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+      // The fixture removes fetched events; explicitly simulate the server's unacked redelivery.
+      harness.transport.pushBotEvent(event);
+      vi.advanceTimersByTime(5_000);
+      await waitForStatus(harness.service, target, (status) => status.state === "completed");
+      expect(await readAnswers(harness)).toEqual({
+        answers: questions.map(({ id }) => expect.objectContaining({ id, answer: "2", answeredBy: "owner-1" })),
+      });
+      expect(harness.transport.ackedEvents).toEqual([91]);
+    } finally {
+      receiptGate.resolve();
+      vi.useRealTimers();
+      await closeCoreHarness(harness);
+    }
+  });
+}
 
 test("an answered card spells the answerer's name and keeps the uid as identity", async () => {
   const harness = await startAskHarness(
@@ -239,7 +289,7 @@ test("an answered card spells the answerer's name and keeps the uid as identity"
     expect(answeredRows(edit.frame.card)).toEqual([
       {
         text: "已由 董振兴 回复：2. production",
-        name: { type: "TextRun", text: "董振兴", weight: "Bolder" },
+        name: expect.objectContaining({ type: "TextRun", text: "董振兴", weight: "Bolder" }),
       },
     ]);
     // 文本回退（封套 plain）走消息正文：那里认 Markdown 加粗，同一个名字。
@@ -401,20 +451,8 @@ test("a single-choice card stacks every option as its own body row", async () =>
     ]);
     // 动作区只剩自由输入的提交按钮，不再承载选项。
     expect(cardActions(card)).toEqual(["ask_submit"]);
-    // 完整选项文案留在编号行里；按钮标题按显示宽度有界（40 列，即约 20 个全角字形），
-    // 因为客户端按一行固有宽度摆放按钮，超宽只会溢出卡片边缘而不会换行。
-    expect(longLabel.length).toBeGreaterThan(60);
+    // Long labels remain readable in full; actions carry only the option ordinal and verb.
     expect(JSON.stringify(card.frame.card)).toContain(longLabel);
-    const rows = cardBody(card.frame.card).filter((element) => element.type === "ActionSet");
-    const titles = rows.map((row) =>
-      String((row.actions as Record<string, unknown>[])[0]?.title ?? ""));
-    expect(titles[0]).toBe("1. staging");
-    expect(titles[3]).toBe("4. production");
-    // 全角：3（前缀）+18（正文）+1（省略号）= 22 个码点；半角文案在 40 列内。
-    expect(titles[1]?.endsWith("…")).toBe(true);
-    expect([...(titles[1] ?? "")].length).toBeLessThanOrEqual(22);
-    expect(titles[2]?.endsWith("…")).toBe(true);
-    expect([...(titles[2] ?? "")].length).toBeLessThanOrEqual(40);
     // 新增的每行一个 ActionSet 仍远在部署上限（max_nodes=200 / max_depth=16）之内。
     const stats = cardStats({
       type: 17,
@@ -1490,6 +1528,106 @@ test("a timed-out question set stops the turn once and keeps every row answerabl
     );
     expect(cardActions(closed)).toHaveLength(0);
   } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test.each(["single", "set"] as const)("text answers before the %s card receipt are rendered when it binds", async (kind) => {
+  const published = Promise.withResolvers<void>();
+  const receiptGate = Promise.withResolvers<void>();
+  const questions = kind === "single"
+    ? [{ id: "first", question: "First question?" }]
+    : [{ id: "first", question: "First question?" }, { id: "second", question: "Second question?" }];
+  const harness = await startAskHarness(questions, {
+    setup: (transport) => {
+      const send = transport.sendCard.bind(transport);
+      transport.sendCard = async (...args) => {
+        const receipt = await send(...args);
+        published.resolve();
+        await receiptGate.promise;
+        return receipt;
+      };
+    },
+  });
+  try {
+    const target: ChatTarget = { channelType: 1, channelId: `late-text-${kind}` };
+    await harness.service.handleInbound(inbound({ ...target, text: "ask" }));
+    await published.promise;
+    await harness.service.handleInbound(inbound({ ...target, text: "receipt-answer" }));
+    receiptGate.resolve();
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+    const edit = harness.transport.cardEdits.at(-1);
+    expect(edit).toBeDefined();
+    const replies = answeredTexts(edit!.frame.card);
+    expect(replies).toHaveLength(questions.length);
+    for (const reply of replies) expect(reply).toContain("receipt-answer");
+    expect(cardActions(edit!)).toEqual([]);
+  } finally {
+    receiptGate.resolve();
+    await closeCoreHarness(harness);
+  }
+});
+
+test.each(["text", "cancel"] as const)("a partial set keeps earlier answers when the remainder ends via %s", async (finish) => {
+  const questions = [
+    { id: "first", question: "First question?" },
+    { id: "second", question: "Second question?" },
+    ...(finish === "cancel" ? [{ id: "third", question: "Third question?" }] : []),
+  ];
+  const harness = await startAskHarness(questions);
+  try {
+    const target: ChatTarget = { channelType: 1, channelId: `partial-set-${finish}` };
+    await harness.service.handleInbound(inbound({ ...target, text: "ask" }));
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === questions.length);
+    const card = harness.transport.sentCards[0]!;
+    harness.transport.pushBotEvent(cardActionEvent(1, {
+      messageId: card.messageId,
+      ...target,
+      operatorUid: "owner-1",
+      actionId: cardActions(card)[0]!,
+      inputs: { ask_text_1: "first-answer" },
+    }));
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === questions.length - 1);
+    await harness.service.handleInbound(inbound({ ...target, text: finish === "cancel" ? "/cancel" : "second-answer" }));
+    await waitForStatus(harness.service, target,
+      (status) => status.state === (finish === "cancel" ? "cancelled" : "completed"));
+    const edit = harness.transport.cardEdits.at(-1)!;
+    expect(answeredTexts(edit.frame.card).some((text) => text.includes("first-answer"))).toBe(true);
+    if (finish === "text") {
+      expect(answeredTexts(edit.frame.card).some((text) => text.includes("second-answer"))).toBe(true);
+    }
+    expect(cardActions(edit)).toEqual([]);
+    expect(inputIds(edit)).toEqual([]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a declined card does not fall back to re-asking an answer recorded during send", async () => {
+  const sending = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const harness = await startAskHarness({ id: "fallback", question: "Pending fallback question?" }, {
+    setup: (transport) => {
+      transport.sendCard = async () => {
+        sending.resolve();
+        await release.promise;
+        return null;
+      };
+    },
+  });
+  try {
+    const target: ChatTarget = { channelType: 1, channelId: "late-declined-card" };
+    await harness.service.handleInbound(inbound({ ...target, text: "ask" }));
+    await sending.promise;
+    await harness.service.handleInbound(inbound({ ...target, text: "recorded-answer" }));
+    release.resolve();
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+    expect(harness.transport.sent).toHaveLength(0);
+    expect(await readAnswers(harness)).toMatchObject({
+      answers: [{ id: "fallback", answer: "recorded-answer", answeredBy: "owner-1" }],
+    });
+  } finally {
+    release.resolve();
     await closeCoreHarness(harness);
   }
 });

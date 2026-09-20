@@ -14,6 +14,7 @@ import type {
   ThreadSummary,
   WorktreeMergeRequest,
 } from "./contracts.ts";
+import { isTransientServerFailure } from "./errors.ts";
 import type { ChannelStore } from "./store.ts";
 import type { TaskRecord } from "./store-records.ts";
 import { taskTarget } from "./target.ts";
@@ -31,6 +32,11 @@ export interface HostToolHost {
   readonly botUid: string;
   enqueueText(target: ChatTarget, text: string, taskId: string | null): void;
   flushTarget(target: ChatTarget): Promise<void>;
+  /**
+   * `thread-archive`（以及默认 pipeline 的 `thread-merge` 收尾）：把一次子区归档排定到该聊天
+   * 本回合输出排空之后执行——任何发进子区的消息都会把归档子区解档，所以工具内不即时归档。
+   */
+  planThreadArchive(target: ChatTarget, groupId: string, shortId: string): void;
   /** 把一条合成消息交付到它的聊天（thread-dispatch 用）：按该聊天的追加模式并入运行中回合，否则接受为该聊天自己的任务；relay 只在任务真正落盘时随任务持久化。 */
   deliverToChat(message: InboundMessage, relay?: TaskRelayTarget | null): Promise<"steered" | "queued">;
   /** `ask`：提问并等待答案。 */
@@ -65,6 +71,7 @@ const MANAGEMENT_BASE_ACTIONS = [
   "thread-leave",
   "thread-delete",
   "thread-merge",
+  "thread-archive",
 ] as const;
 const MANAGEMENT_DISPATCH_ACTION = "thread-dispatch";
 /** Synthetic inbound id prefix: a dispatched task must not dispatch further. */
@@ -85,19 +92,6 @@ function truncateForTool(value: string, maxChars: number): string {
 function boundedManagementError(error: unknown, fallback: string): string {
   const detail = (error instanceof Error ? error.message : String(error)).replace(/\s+/gu, " ").trim();
   return (detail.length > 0 ? detail : fallback).slice(0, MAX_MANAGEMENT_ERROR_CHARS);
-}
-
-/**
- * Transient server failures a retry can clear: any 5xx, plus the internal `store_failed`
- * error the bot API reports as HTTP 400 while the body itself declares an internal 500.
- * The fields are read structurally, like `isPermanentOutboxError`, so the fake transport
- * can reproduce the shape without the real transport module.
- */
-function isTransientManagementError(error: unknown): boolean {
-  if (!error || typeof error !== "object") return false;
-  const candidate = error as { code?: unknown; status?: unknown };
-  if (typeof candidate.status === "number" && candidate.status >= 500) return true;
-  return candidate.code === "err.server.bot_api.store_failed";
 }
 
 function managementMembers(members: readonly GroupMember[]): {
@@ -251,7 +245,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord, _snapshot:
   const managementTool: HostTool = {
     name: "octo_management",
     description:
-      "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；create-thread 可带 worktree_name 为线程建立独立 git worktree 并把线程目录绑定到它（本机有兼容 Worktrunk 时经 wt 创建，否则经 OMP）；thread-delete 默认清理干净的工作区，force=true 时连同未提交改动一起强制清理（本机无兼容 wt 时回退 git）；thread-merge 把当前子区隔离工作区的分支经本机 Worktrunk（wt）的 merge pipeline 合并回目标分支，仅绑定隔离工作区的子区可用，省略参数即 wt 默认 pipeline；thread-dispatch 把一条任务派发给本群的某个 thread，结果按该子区的追加模式处置——steer 且该子区有可接收 steering 的运行中回合时并入该回合（delivery=steered），否则在该子区作为独立任务执行（delivery=queued），两种情况本群都收到一条回执；可选 notify=true 让这条派发任务在结束（完成/失败/取消/中断）时向本聊天回传一条有界结果通知（默认 false，自行判断是否需要）；派发出去的任务不能再派发。目标固定为当前聊天，不能指向其他群。",
+      "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；create-thread 可带 worktree_name 为线程建立独立 git worktree 并把线程目录绑定到它（本机有兼容 Worktrunk 时经 wt 创建，否则经 OMP）；thread-delete 默认清理干净的工作区，force=true 时连同未提交改动一起强制清理（本机无兼容 wt 时回退 git）；thread-merge 把当前子区隔离工作区的分支经本机 Worktrunk（wt）的 merge pipeline 合并回目标分支，仅绑定隔离工作区的子区可用，省略参数即 wt 默认 pipeline（合并成功且工作区已被删除时自动排定本子区归档）；thread-archive 归档一个子区（幂等，short_id 省略即当前子区），与合并收尾一样排定在本回合最后一条回复送达后执行——任何发进子区的消息都会把归档子区解档，所以工具内不即时归档；thread-dispatch 把一条任务派发给本群的某个 thread，结果按该子区的追加模式处置——steer 且该子区有可接收 steering 的运行中回合时并入该回合（delivery=steered），否则在该子区作为独立任务执行（delivery=queued），两种情况本群都收到一条回执；可选 notify=true 让这条派发任务在结束（完成/失败/取消/中断）时向本聊天回传一条有界结果通知（默认 false，自行判断是否需要）；派发出去的任务不能再派发。目标固定为当前聊天，不能指向其他群。",
     parameters: {
       type: "object",
       properties: {
@@ -524,10 +518,21 @@ async function runManagementTool(
       if (!worktrees) throw new Error("本部署未配置隔离工作区能力");
       try {
         const summary = await worktrees.merge(mergeRequest(workspace.cwd), signal);
-        return JSON.stringify({ merged: true, ...summary });
+        // 默认 pipeline 删掉工作区（合并完成即收尾）时排定归档：本子区在回合输出排空后归档。
+        let archive: "scheduled" | null = null;
+        if (summary.removed === true) {
+          host.planThreadArchive(target, groupId, currentShortId);
+          archive = "scheduled";
+        }
+        return JSON.stringify({ merged: true, ...summary, ...(archive === null ? {} : { archive }) });
       } catch (error) {
         throw new Error(boundedManagementError(error, "合并隔离工作区失败"));
       }
+    }
+    case "thread-archive": {
+      const shortId = threadId();
+      host.planThreadArchive(target, groupId, shortId);
+      return `已排定归档子区 ${shortId}：本回合最后一条回复送达后执行`;
     }
     case "thread-dispatch": {
       if (task.messageId.startsWith(DISPATCH_MESSAGE_PREFIX)) {
@@ -561,7 +566,7 @@ async function deleteThread(
     await transport.deleteThread(groupId, shortId, signal);
     return;
   } catch (error) {
-    if (signal?.aborted === true || !isTransientManagementError(error)) {
+    if (signal?.aborted === true || !isTransientServerFailure(error)) {
       throw new Error(boundedManagementError(error, "删除线程失败"));
     }
   }

@@ -74,7 +74,8 @@ export function createDisplayNameCache(
     if (hit !== undefined && hit.expiresAt > Date.now()) return Promise.resolve(hit.name);
     const pending = inFlight.get(uid);
     if (pending !== undefined) return pending;
-    const request = (async () => {
+    // Publish the in-flight entry before a synchronously throwing lookup can finish cleanup.
+    const request = Promise.resolve().then(async () => {
       try {
         const name = (await withinBudget(lookup(uid, signal), lookupTimeoutMs)).trim();
         if (name.length > 0) remember(uid, name);
@@ -84,7 +85,7 @@ export function createDisplayNameCache(
       } finally {
         inFlight.delete(uid);
       }
-    })();
+    });
     inFlight.set(uid, request);
     return request;
   }
