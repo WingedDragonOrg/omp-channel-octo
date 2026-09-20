@@ -1017,6 +1017,7 @@ class FixtureWorker implements OmpWorker {
     sessionId: string,
     private readonly catalog: () => WorkerModelCatalog,
     private readonly resolveModel: (selector: string) => { model: string; level: string | null } | null,
+    private readonly modelsFailure: () => Error | undefined,
   ) {
     this.sessionFile = options.sessionFile ?? join(options.sessionDir, `${sessionId}.session`);
     let persistedSessionId: string | undefined;
@@ -1065,6 +1066,8 @@ class FixtureWorker implements OmpWorker {
 
   /** Mirrors OMP: a worker started with `--model` reports that model, and `/switch` moves it. */
   async models(): Promise<WorkerModelCatalog> {
+    const failure = this.modelsFailure();
+    if (failure !== undefined) throw failure;
     const catalog = this.catalog();
     return {
       current: this.switchedModel?.model ?? this.options.model ?? catalog.current,
@@ -1260,6 +1263,8 @@ export class FakeWorkerFactory implements WorkerFactory {
   };
   /** When set, `create` rejects with this error instead of materializing a worker. */
   createFailure: Error | undefined;
+  /** When set, every worker's `models()` rejects with this error, mirroring a dead RPC worker. */
+  modelsFailure: Error | undefined;
 
   private nextSessionId = 1;
   private readonly promptWaiters: Array<{
@@ -1276,6 +1281,11 @@ export class FakeWorkerFactory implements WorkerFactory {
   /** Passing `undefined` clears the failure so later creates succeed again. */
   failCreateWith(error?: Error): void {
     this.createFailure = error;
+  }
+
+  /** Passing `undefined` clears the failure so `models()` reports the catalog again. */
+  failModelsWith(error?: Error): void {
+    this.modelsFailure = error;
   }
 
   async create(options: WorkerOptions): Promise<OmpWorker> {
@@ -1295,6 +1305,7 @@ export class FakeWorkerFactory implements WorkerFactory {
       String(this.nextSessionId++),
       () => this.catalog,
       selector => resolveFixtureModel(selector, this.roles, this.catalog),
+      () => this.modelsFailure,
     );
     this.workers.push(worker);
     return worker;

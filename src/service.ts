@@ -1771,6 +1771,7 @@ class CoreService implements ChannelService {
           sessionFile: null,
         };
         const fresh = await verifyFreshSession(previousForFresh, freshState, cwd);
+        const model = await this.createdSessionModel(candidate);
         stopped = await candidate.stop();
         if (!stopped) {
           this.blockedDirectories.add(cwd);
@@ -1792,7 +1793,11 @@ class CoreService implements ChannelService {
           throw new Error("本地状态盘写入失败，会话未切换。");
         }
         this.store.clearContextLedger(this.bot!.uid, target);
-        await this.outbox.enqueueText(target, `已创建会话 ${binding.sessionId}，cwd=${binding.cwd}`, null);
+        await this.outbox.enqueueText(
+          target,
+          `已创建会话 ${binding.sessionId}，cwd=${binding.cwd}${model === null ? "" : `，模型=${model}`}`,
+          null,
+        );
       } catch {
         if (candidate && !stopped) {
           const verified = await candidate.stop().catch(() => false);
@@ -2110,6 +2115,19 @@ class CoreService implements ChannelService {
         : "追加模式已设为 queue：运行中的新消息会排到当前回合之后。",
       null,
     );
+  }
+
+  /**
+   * The model the freshly created `/new`/`/reset` session actually came up with, asked of its own
+   * candidate worker through the same `worker.models()` state query `/switch` and `/status` use: the stored
+   * chat model when `--model` carried one, OMP's own default otherwise — it can never report
+   * `default` as a model. A failed or empty answer degrades the creation receipt to its model-less
+   * form instead of failing `/new` or inventing a value.
+   */
+  private async createdSessionModel(worker: OmpWorker): Promise<string | null> {
+    const catalog = await worker.models().catch(() => null);
+    if (catalog === null || catalog.current === null) return null;
+    return modelWithLevel(catalog.current, catalog.level);
   }
 
   /**

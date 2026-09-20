@@ -122,3 +122,93 @@ test("/new is rejected while the current chat has a running task", async () => {
     await closeCoreHarness(harness);
   }
 });
+
+test("/new reports the fresh session's actual model next to the session id and cwd", async () => {
+  const harness = await createCoreHarness();
+  try {
+    const target = { channelId: "dm-owner", channelType: 1 as const };
+    await harness.service.handleInbound(
+      inbound({ messageId: "new-model-default", ...target, text: "/new" }),
+    );
+    const status = await harness.service.status(target);
+    // No chat override: the worker starts without `--model`, so the receipt carries OMP's default.
+    expect(harness.transport.sent.at(-1)?.text).toBe(
+      `已创建会话 ${status.sessionId}，cwd=${status.cwd}，模型=fixture/default`,
+    );
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("/new after /switch reports the chat model with its thinking level, matching the worker", async () => {
+  const harness = await createCoreHarness();
+  try {
+    const target = { channelId: "dm-owner", channelType: 1 as const };
+    await harness.service.handleInbound(
+      inbound({ messageId: "new-switch-first", ...target, text: "/switch fixture/fast:high" }),
+    );
+    await harness.service.handleInbound(
+      inbound({ messageId: "new-model-switched", ...target, text: "/new" }),
+    );
+    const status = await harness.service.status(target);
+    expect(harness.transport.sent.at(-1)?.text).toBe(
+      `已创建会话 ${status.sessionId}，cwd=${status.cwd}，模型=fixture/fast:high`,
+    );
+    // The receipt reports what the session's worker was actually started with.
+    expect(harness.workers.creations.at(-1)?.model).toBe("fixture/fast:high");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("/reset shares the creation receipt and reports the model too", async () => {
+  const harness = await createCoreHarness();
+  try {
+    const target = { channelId: "dm-owner", channelType: 1 as const };
+    await harness.service.handleInbound(
+      inbound({ messageId: "reset-model", ...target, text: "/reset" }),
+    );
+    const status = await harness.service.status(target);
+    expect(harness.transport.sent.at(-1)?.text).toBe(
+      `已创建会话 ${status.sessionId}，cwd=${status.cwd}，模型=fixture/default`,
+    );
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("/new keeps its receipt model-free rather than inventing one when OMP cannot answer", async () => {
+  const harness = await createCoreHarness();
+  try {
+    const target = { channelId: "dm-owner", channelType: 1 as const };
+    harness.workers.failModelsWith(new Error("rpc gone"));
+    await harness.service.handleInbound(
+      inbound({ messageId: "new-model-unreachable", ...target, text: "/new" }),
+    );
+    const status = await harness.service.status(target);
+    // The session was created; only the model display degrades, to the original receipt.
+    expect(status.state).toBe("idle");
+    expect(harness.transport.sent.at(-1)?.text).toBe(
+      `已创建会话 ${status.sessionId}，cwd=${status.cwd}`,
+    );
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("/new keeps its receipt model-free when OMP reports no current model", async () => {
+  const harness = await createCoreHarness();
+  try {
+    const target = { channelId: "dm-owner", channelType: 1 as const };
+    harness.workers.catalog = { current: null, level: null, available: [] };
+    await harness.service.handleInbound(
+      inbound({ messageId: "new-model-unknown", ...target, text: "/new" }),
+    );
+    const status = await harness.service.status(target);
+    expect(harness.transport.sent.at(-1)?.text).toBe(
+      `已创建会话 ${status.sessionId}，cwd=${status.cwd}`,
+    );
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
