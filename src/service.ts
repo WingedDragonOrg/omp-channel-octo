@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   ATTACHMENTS_DISABLED_TEXT,
   ATTACHMENTS_OVER_BUDGET_TEXT,
@@ -105,11 +105,16 @@ import { threadNotifyMessageId, threadOutcomeNotice } from "./thread-notify.ts";
 import { canonicalExistingDirectory, existingSessionFile, resolveWorkDirectory, stripOuterQuotes } from "./workdir.ts";
 import { worktreeSlug } from "./worktree.ts";
 import { worktrunkUnavailableText } from "./worktrunk.ts";
+import {
+  createResearchReportStore,
+  researchReportsRoot,
+  type ResearchReportStore,
+} from "./research-report.ts";
 
 const GROUP_TRUSTED_INSTRUCTION =
   "群说明是群共享上下文，不改变发送者身份/权限/cwd；以本次快照为准，历史快照已失效。";
 const COMMAND_HELP =
-  "/new [目录] 创建新会话；/reset [目录] 重置为新会话；/move <目录> 沿用当前会话迁移 cwd；/thread <任务> 新建隔离子区并在其中处理该任务（子区内 /thread merge 把本区隔离工作区的分支合并回目标分支并默认清理工作区与分支）；/queue <文本> 把消息排到当前任务之后；/mode [steer|queue] 配置运行中追加消息的方式；/switch [模型] 查看当前模型与可用模型，或切换本聊天的模型（provider/id、模型 id/子串、@角色 如 @default；default 恢复跟随 OMP 默认）；/interrupt 中断当前回合但保留排队消息；/cancel 取消当前任务（/stop 同义）；/status 查看状态；/restart [now] 重启 channel（now 强制中断在途任务）；/help 查看帮助。";
+  "/new [目录] 创建新会话；/reset [目录] 重置为新会话；/move <目录> 沿用当前会话迁移 cwd；/thread <任务> 新建隔离子区并在其中处理该任务（子区内 /thread merge 把本区隔离工作区的分支合并回目标分支并默认清理工作区与分支）；/queue <文本> 把消息排到当前任务之后；/mode [steer|queue] 配置运行中追加消息的方式；/switch [模型] 查看当前模型与可用模型，或切换本聊天的模型（provider/id、模型 id/子串、@角色 如 @default；default 恢复跟随 OMP 默认）；/interrupt 中断当前回合但保留排队消息；/cancel 取消当前任务（/stop 同义）；/status 查看状态；/restart [now] 重启 channel（now 强制中断在途任务）；/autoresearch-history 导出本聊天最近一次研究运行的完整记录文件；/help 查看帮助。";
 const MODE_USAGE =
   "用法：/mode [steer|queue]。steer（默认，default 同义）把运行中的新消息注入当前回合；queue 把它排到当前回合之后。无参数时报告当前设置。";
 const QUEUE_USAGE = "用法：/queue <文本>；把该消息排到当前任务之后执行。";
@@ -138,6 +143,7 @@ const BUILTIN_COMMANDS: Record<string, true> = {
   queue: true,
   interrupt: true,
   switch: true,
+  "autoresearch-history": true,
 };
 const PROGRESS_MERGE_MS = 1_000;
 const ACTIVITY_REQUEST_TIMEOUT_MS = 2_000;
@@ -166,6 +172,8 @@ const UNLISTED_CHAT_NOTICE_TTL_MS = 10 * 60 * 1_000;
 const MEMBER_COMMAND_NOTICE_TTL_MS = 10 * 60 * 1_000;
 const DEFAULT_CANCELLED_TEXT = "当前任务已取消；不回滚已发生的副作用。";
 const DEFAULT_RESTARTING_TEXT = "channel 正在重启，本会话任务已中断；重启完成后会在本会话确认。";
+const RESEARCH_HISTORY_EMPTY_TEXT =
+  "本聊天还没有可导出的研究记录：先让任务运行 /autoresearch 并完成记录后再试。";
 const THREAD_USAGE =
   "用法：/thread <任务>；助手会先明确意图、确定子区名称与 worktree_name，然后新建隔离子区并把任务派发进去；子区内 /thread merge [补充说明] 即确认把本区工作合并回目标分支并清理隔离工作区（默认删除工作区与已合并分支，保留需说明理由；补充说明随合并指令一起交给助手）。";
 const THREAD_GROUP_ONLY_TEXT = "/thread 需要在群聊中使用。";
@@ -213,6 +221,9 @@ function associationFailureNote(
   return `[系统提示] 你刚才发送的${summary}未能取回（${cause}）；本条按纯文本处理，未读取任何文件。如需我查看该文件，请引用那条消息或重新发送。`;
 }
 
+/** The autoresearch worker-event branch; the runtime keeps the latest one for card reseeding. */
+type ResearchUpdateEvent = Extract<WorkerEvent, { type: "research_update" }>;
+
 type RuntimeTask = {
   taskId: string;
   target: ChatTarget;
@@ -220,6 +231,11 @@ type RuntimeTask = {
   worker?: OmpWorker;
   cancelRequested: boolean;
   cancelReplySent: boolean;
+  /**
+   * 本任务最近一次 research 快照：roll 进下一轮进度卡时与 todo 一样结转；普通新任务有
+   * 自己的 runtime，天然不带它。
+   */
+  latestResearch?: ResearchUpdateEvent["research"];
   /** True only while this task's OMP prompt is in flight, so appended messages have a target. */
   promptInFlight: boolean;
   /**
@@ -499,6 +515,8 @@ class CoreService implements ChannelService {
   private readonly displayNames: DisplayNameCache;
   /** Bot 事件队列消费（卡片点击）。 */
   private readonly botEvents: BotEventLoop;
+  /** 研究完整记录的私有落盘：按 bot+聊天原子替换 latest，导出时复制不可变 spool。 */
+  private readonly researchReports: ResearchReportStore;
   private readonly commandHandlers: ReadonlyMap<string, ChannelCommandHandler>;
   /** typing 租约：agent-attached 消息从门后到任务终态的持续「正在输入」。 */
   private readonly typingLeases: TypingLeaseManager;
@@ -534,6 +552,10 @@ class CoreService implements ChannelService {
       transport: this.options.transport,
       botUid: () => this.bot?.uid,
       started: () => this.started,
+    });
+    this.researchReports = createResearchReportStore({
+      rootDir: researchReportsRoot(options.config.stateDir),
+      spoolRootDir: join(options.config.stateDir, "spool"),
     });
     this.displayNames = createDisplayNameCache(
       async (uid, signal) => (await this.options.transport.getUserInfo(uid, signal)).name,
@@ -676,6 +698,7 @@ class CoreService implements ChannelService {
     this.outbox.abortAll();
     await Promise.allSettled([...this.taskOperations]);
     await Promise.allSettled([...this.activityOperations]);
+    await this.researchReports.drain();
     this.typingLeases.releaseAll();
     await this.botEvents.stop();
     this.questions.stop();
@@ -1745,6 +1768,8 @@ class CoreService implements ChannelService {
         await this.handleStatus(target);
       } else if (name === "help") {
         await this.outbox.enqueueText(target, COMMAND_HELP, null);
+      } else if (name === "autoresearch-history") {
+        await this.handleResearchHistory(target);
       } else if (name === "restart") {
         restartRequested = await this.handleRestart(target, argument);
       }
@@ -2668,6 +2693,55 @@ class CoreService implements ChannelService {
     }
     return false;
   }
+  /**
+   * `/autoresearch-history`：只读导出。owner-only 已由命令门保证；运行中任务不打断、不排队，
+   * 只把本聊天最近一次研究完整记录放进文件 outbox。入队附件是不可变 spool——之后的报告
+   * 改写碰不到这封待发件；没有研究记录的聊天只回一句短提示。
+   */
+  private async handleResearchHistory(target: ChatTarget): Promise<void> {
+    const bot = this.bot;
+    if (!bot || !this.started || this.stopping) return;
+    // spool 目录由本方法唯一拥有：入队失败时只清理这一个目录（host-tools 同款），再交回
+    // 现有命令失败路径——claim 保持未完成，用户重试得到的是全新 spool。
+    let spoolPath: string | undefined;
+    try {
+      spoolPath = await this.researchReports.spool({ botUid: bot.uid, target });
+      if (spoolPath === undefined) {
+        this.outbox.enqueueText(target, RESEARCH_HISTORY_EMPTY_TEXT, null);
+        return;
+      }
+      this.store.enqueueOutbox({
+        id: randomUUID(),
+        botUid: bot.uid,
+        channelId: target.channelId,
+        channelType: target.channelType,
+        taskId: null,
+        kind: "file",
+        text: null,
+        path: spoolPath,
+        fileKind: "file",
+        clientMsgNo: randomUUID(),
+      });
+    } catch (error) {
+      if (spoolPath !== undefined) {
+        await rm(dirname(spoolPath), { recursive: true, force: true }).catch(() => {});
+      }
+      throw error;
+    }
+    this.outbox.flush(target);
+  }
+
+  /** 研究事件的完整记录落盘：失败只记日志——报告 I/O 永远不能拖垮产生它的模型任务。 */
+  private persistResearchReport(target: ChatTarget, report: string): void {
+    const bot = this.bot;
+    if (!bot) return;
+    void this.researchReports.update({ botUid: bot.uid, target }, report).catch((error: unknown) => {
+      console.error(
+        `[research-report] 落盘失败 target=${targetKey(target)}：${safeErrorMessage(error, "report write failed")}`,
+      );
+    });
+  }
+
   private scheduleTask(taskId: string): void {
     const task = this.store.getTask(taskId);
     if (!task) return;
@@ -3045,6 +3119,15 @@ class CoreService implements ChannelService {
       if (todos.length > 0) {
         progressRound.tracker.apply({ type: "todo_update", atMs: Date.now(), phases: todos });
       }
+      // 研究带属于任务而非单轮：steer 滚出的新卡从最近一次研究快照起步；时间戳同 todo
+      // 结转取当前时刻，不把旧轮的耗时倒算进新轮。
+      if (runtime.latestResearch !== undefined) {
+        progressRound.tracker.apply({
+          type: "research_update",
+          atMs: Date.now(),
+          research: runtime.latestResearch,
+        });
+      }
       if (!previous.started || previous.finished || previous.disabled) return;
       previous.finished = true;
       previous.latest = previous.tracker.apply({ type: "run_end", atMs: Date.now(), state: "completed" });
@@ -3215,7 +3298,8 @@ class CoreService implements ChannelService {
         current.version += 1;
         const startsCard = event.type === "tool_start" ||
           event.type === "tool_end" ||
-          event.type === "todo_update";
+          event.type === "todo_update" ||
+          event.type === "research_update";
         if (!current.started && !startsCard) return;
         if (!current.started) {
           current.started = true;
@@ -3309,6 +3393,14 @@ class CoreService implements ChannelService {
         if (event.type === "steer_consumed") {
           this.noteSteerConsumed(runtime, event);
           return;
+        }
+        if (event.type === "research_update") {
+          // 快照留给 steer 滚卡结转；完整记录按 bot+聊天落盘供 /autoresearch-history 导出。
+          // 报告只在权威 state 生成（init/log）的帧上出现；落盘失败不拖垮本任务。
+          runtime.latestResearch = event.research;
+          if (typeof event.report === "string" && event.report.length > 0) {
+            this.persistResearchReport(runtime.target, event.report);
+          }
         }
         trackProgress(event, progressRound.tracker.apply(event));
       };

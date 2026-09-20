@@ -38,6 +38,7 @@ import {
 	stripEnforcedArgs,
 	workerEnv,
 } from "./profile.ts";
+import { ResearchTracker } from "../research.ts";
 import {
 	HostCall,
 	PendingResponse,
@@ -334,6 +335,7 @@ class RpcWorker implements OmpWorker {
 			toolSummaries: new Map(),
 			nextTurnId: 0,
 			activeTurnId: undefined,
+			research: new ResearchTracker(),
 		};
 		this.#activePrompt = run;
 		try {
@@ -770,6 +772,8 @@ class RpcWorker implements OmpWorker {
 				} else {
 					emitExecutionEvent(active, { type: "tool_start", toolCallId, toolName, atMs: Date.now(), summary });
 				}
+				const researchStart = active.research.startTool(toolName, toolCallId);
+				if (researchStart) emitExecutionEvent(active, researchStart);
 				return;
 			}
 			if (frame.type === "tool_execution_end") {
@@ -801,6 +805,8 @@ class RpcWorker implements OmpWorker {
 						emitExecutionEvent(active, todoEvent);
 					}
 				}
+				const researchEnd = active.research.endTool(toolName, toolCallId, frame.result, failed);
+				if (researchEnd) emitExecutionEvent(active, researchEnd);
 			}
 		} catch (error) {
 			this.#rejectPrompt(active, asError(error, "OMP event callback failed"));

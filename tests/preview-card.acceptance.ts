@@ -8,6 +8,7 @@ import {
   type ExecutionTracker,
 } from "../src/execution-tracker.ts";
 import { createOctoTransport } from "../src/octo/index.ts";
+import type { ResearchRun, ResearchSnapshot } from "../src/research.ts";
 
 function firstNonEmpty(...values: readonly (string | undefined)[]): string | undefined {
   for (const value of values) {
@@ -421,6 +422,129 @@ function terminalPreviewSnapshot() {
   return tracker.snapshot(PREVIEW_STARTED_AT + 200);
 }
 
+// ——— autoresearch 迭代卡预览夹具 ———
+// 与 tests/execution-card.test.ts 相同的共享研究类型；经真实 tracker.apply 投递
+// research_update 帧生成本地预览快照。
+
+function previewResearchRun(overrides: Partial<ResearchRun> & { readonly runNumber: number | null }): ResearchRun {
+  return {
+    segment: 1,
+    metric: 800,
+    status: "keep",
+    description: typeof overrides.runNumber === "number" ? `实验 ${overrides.runNumber}` : "旧版本记录",
+    flagged: false,
+    ...overrides,
+  };
+}
+
+/**
+ * Nine recorded runs in one segment with honest aggregates: baseline is the first unflagged
+ * keep, best the directional extreme of the unflagged keeps, and the flagged run (#8) is what
+ * keeps best at 640 despite its lower metric. Improvement over the baseline is exactly 20%.
+ * The leading legacy row predates run numbering and keeps its null run number.
+ */
+function makePreviewResearch(overrides: Partial<ResearchSnapshot> = {}): ResearchSnapshot {
+  const recent: ResearchRun[] = [
+    // The legacy row leads: old records predate run numbering and keep their null number.
+    previewResearchRun({ runNumber: null, metric: 835, status: "discard", description: "旧版本丢弃记录" }),
+    previewResearchRun({ runNumber: 1, metric: 800, description: "建立基线测量" }),
+    previewResearchRun({ runNumber: 2, metric: 780, description: "减少序列化拷贝" }),
+    previewResearchRun({ runNumber: 3, metric: 910, status: "discard", description: "验证激进缓存" }),
+    previewResearchRun({ runNumber: 4, metric: 0, status: "crash", description: "基准进程崩溃退出" }),
+    previewResearchRun({ runNumber: 5, metric: 700, description: "增加索引" }),
+    previewResearchRun({ runNumber: 6, metric: 640, description: "复用连接池" }),
+    previewResearchRun({ runNumber: 7, metric: 645, status: "checks_failed", description: "通过基准但检查失败" }),
+    previewResearchRun({ runNumber: 8, metric: 620, description: "复测连接池配置", flagged: true }),
+  ];
+  return {
+    sessionId: 7,
+    name: "p95-latency",
+    goal: "把 API P95 延迟降到 400ms 以下",
+    segment: 1,
+    metricName: "p95",
+    metricUnit: "ms",
+    direction: "lower",
+    baseline: 800,
+    best: 640,
+    completedRuns: 9,
+    maxExperiments: 50,
+    phase: "running",
+    activeRun: 10,
+    latestMetric: 620,
+    recent,
+    totalRuns: 9,
+    ...overrides,
+  };
+}
+
+/** The worker's research frame, delivered to the tracker as an ExecutionEvent by the RPC bridge. */
+function applyResearchUpdate(tracker: ExecutionTracker, research: unknown, atMs: number): void {
+  // 预览夹具始终喂合法载荷;断言跨过 unknown,真正的运行时校验由 tracker 内的 sanitize 执行。
+  tracker.apply({
+    type: "research_update",
+    atMs,
+    research: research as ResearchSnapshot,
+  });
+}
+
+/** Status glyph leading every compact run row; free of any locale wording. */
+const RESEARCH_ROW_TEXT = /^[✓×-] · /u;
+
+function researchBandItems(card: JsonRecord): JsonRecord[] {
+  const band = cardNodes(card).find(node => node.id === "research_recent_runs");
+  if (!band) return [];
+  return (band.items as JsonRecord[] | undefined) ?? [];
+}
+
+/** Rows of the recent-run window, identified by their status glyph rather than any wording. */
+function researchRunRows(card: JsonRecord): JsonRecord[] {
+  return researchBandItems(card).filter(item => (
+    item.type === "TextBlock" && typeof item.text === "string" && RESEARCH_ROW_TEXT.test(item.text)
+  ));
+}
+
+/** The omitted-count figure, read as a bare number wherever the card carries it. */
+function omittedResearchCount(card: JsonRecord): number | null {
+  const band = cardNodes(card).find(node => node.id === "research_recent_runs");
+  if (band) {
+    const [first] = researchBandItems(card);
+    if (!first || (typeof first.text === "string" && RESEARCH_ROW_TEXT.test(first.text))) return 0;
+    const match = typeof first.text === "string" ? first.text.match(/\d+/u) : null;
+    return match === null ? null : Number(match[0]);
+  }
+  const line = cardNodes(card).find(node => node.id === "research_recent_summary");
+  if (!line) return null;
+  const text = typeof line.text === "string" ? line.text : cardText(line);
+  const match = text.match(/\d+/u);
+  return match === null ? null : Number(match[0]);
+}
+
+/**
+ * A live research loop mid-run: the baseline benchmark finished, round 10 is executing, and nine
+ * recorded runs wait behind the recent-run toggle. The oldest kept record has no run number
+ * (legacy row), the newest window shows six rows, and three are omitted.
+ */
+function researchPreviewSnapshot() {
+  const tracker = createExecutionTracker({ runId: "preview-card-research", initialAtMs: PREVIEW_STARTED_AT });
+  tracker.apply({ type: "turn_start", turnId: "preview-turn", atMs: PREVIEW_STARTED_AT });
+  addPreviewTool(tracker, {
+    toolCallId: "research-baseline",
+    toolName: "bash",
+    atMs: 100,
+    endAtMs: 420,
+    status: "succeeded",
+    summary: "autoresearch 基线基准",
+  });
+  addPreviewTool(tracker, {
+    toolCallId: "research-experiment",
+    toolName: "bash",
+    atMs: 500,
+    summary: "运行实验基准 · 第 10 轮",
+  });
+  applyResearchUpdate(tracker, makePreviewResearch(), 600);
+  return tracker.snapshot(PREVIEW_STARTED_AT + 700);
+}
+
 /** Wall clock for the long-run fixture: the reported card had run for 14m 35s. */
 const LONG_RUN_STARTED_AT = Date.now() - 14 * 60_000 - 35_000;
 
@@ -637,6 +761,46 @@ test("preview long run keeps the todo handoff and compresses the trace", () => {
   expect(richRows.map(row => cardText(row)).join("\n")).toMatch(/\d{2}:\d{2}:\d{2} · 已完成/u);
 });
 
+test("preview research card keeps the summary visible and folds recent runs independently", () => {
+  const built = buildExecutionCard(researchPreviewSnapshot(), previewCapabilities);
+  expect(built).not.toBeNull();
+  const card = built!.card as JsonRecord;
+  const summary = nodeById(card, "research_summary");
+  expect(summary.isVisible).not.toBe(false);
+  const text = cardText(summary);
+  expect(text).toContain("把 API P95 延迟降到 400ms 以下");
+  expect(text).toContain("p95");
+  expect(text).toMatch(/\b800\b/u);
+  expect(text).toMatch(/\b640\b/u);
+  expect(text).toMatch(/20(?:\.0*)?%/u);
+  expect(text).toMatch(/\b9\s*\/\s*50\b/u);
+  expect(text).toContain("/autoresearch-history");
+
+  // Nine recorded runs: the newest six stay behind the research fold; the folded line and the
+  // omitted count are read as bare numbers, whatever the wording around them.
+  const foldedDigits = cardText(nodeById(card, "research_recent_summary")).match(/\d+/u);
+  expect(foldedDigits).not.toBeNull();
+  expect(Number(foldedDigits![0])).toBe(6);
+  const band = nodeById(card, "research_recent_runs");
+  expect(band.isVisible).toBe(false);
+  const bandText = cardText(band);
+  expect(researchRunRows(card)).toHaveLength(6);
+  expect(omittedResearchCount(card)).toBe(3);
+  expect(bandText).toMatch(/\b640\b/u);
+  expect(bandText).toContain("复用连接池");
+  expect(bandText).toContain("复测连接池配置");
+  expect(bandText).toMatch(/标|flagged/iu);
+  // The window is the newest six: the baseline pair and the legacy row stay out of it.
+  expect(bandText).not.toContain("建立基线测量");
+  expect(bandText).not.toContain("旧版本丢弃记录");
+
+  // The research fold is its own control: the running card shows both, each with its own ids.
+  expect(nodeById(card, "btn_collapse_progress")).toMatchObject({ isVisible: true });
+  expect(nodeById(card, "btn_expand_research")).toMatchObject({ isVisible: true });
+  expect(nodeById(card, "timeline_section").isVisible).not.toBe(false);
+  expect(cardText(nodeById(card, "timeline_detail"))).toContain("autoresearch 基线基准");
+});
+
 const botToken = firstNonEmpty(process.env.BOT_TOKEN, process.env.OCTO_BOT_TOKEN);
 const runPreviewTest = botToken === undefined ? test.skip : test;
 
@@ -647,8 +811,9 @@ async function sendLivePreviewCard(snapshot: ExecutionSnapshot, label: string): 
     botToken: botToken!,
   });
   try {
-    const identity = await transport.initialize();
-    const targetId = configuredTargetId ?? identity.ownerUid;
+    // 常驻服务在场时注册会踢掉它的 WS 连接；目标已配置（或经 OCTO_OWNER_ID 已知）就直接发卡。
+    // sendProgressCard 自取卡片能力，不依赖 initialize。仅在目标未知时才注册换取 owner UID。
+    const targetId = configuredTargetId ?? (await transport.initialize()).ownerUid;
     if (!targetId) {
       throw new Error("注册响应未提供 owner UID；请设置 OCTO_PREVIEW_TARGET_UID（或 OCTO_OWNER_ID）");
     }
@@ -733,6 +898,31 @@ runPreviewTest(
     await sendLivePreviewCard(
       preview,
       "长任务预览卡片（96 个阶段、116 次工具调用、截图中的任务清单；轨迹行带 HH:mm:ss）",
+    );
+  },
+  { timeout: 30_000 },
+);
+
+runPreviewTest(
+  "sends the autoresearch progress card with summary and folded recent runs",
+  async () => {
+    const preview = researchPreviewSnapshot();
+    expect(preview.toolCount).toBe(2);
+    // 断言先行：研究卡面缺失时在发送前即失败，未完成实现不会发出半截卡片。
+    const built = buildExecutionCard(preview, previewCapabilities);
+    expect(built).not.toBeNull();
+    const card = built!.card as JsonRecord;
+    const summary = cardText(nodeById(card, "research_summary"));
+    expect(summary).toContain("把 API P95 延迟降到 400ms 以下");
+    expect(summary).toMatch(/\b640\b/u);
+    expect(summary).toContain("/autoresearch-history");
+    const band = nodeById(card, "research_recent_runs");
+    expect(band.isVisible).toBe(false);
+    expect(cardText(band)).toContain("复用连接池");
+    expect(omittedResearchCount(card)).toBe(3);
+    await sendLivePreviewCard(
+      preview,
+      "研究进度预览卡片（目标与指标摘要、基线 800 最佳 640 改善 20%、运行中第 10 轮、最近 6 条折叠省略 3 条、完整记录入口 /autoresearch-history）",
     );
   },
   { timeout: 30_000 },

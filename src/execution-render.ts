@@ -726,7 +726,7 @@ export function makeTimelineItems(
     }));
   }
   if (tools.length === 0) {
-    if (!hasHistoryRows) {
+    if (!hasHistoryRows && hiddenCount === 0) {
       items.push(makeTextBlock(emptyText, { isSubtle: true, spacing: "Small" }));
     }
   } else if (richLayout) {

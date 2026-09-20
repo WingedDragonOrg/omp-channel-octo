@@ -5,6 +5,7 @@
 
 import type { WorkerEvent, WorkerNoticeEvent } from "../contracts.ts";
 import type { ExecutionEvent, ExecutionTodoPhase, TodoOperation, TodoStatus } from "../execution-tracker.ts";
+import type { ResearchTracker } from "../research.ts";
 import { isRecord, type RpcFrame } from "./rpc.ts";
 
 export type PendingResponse = {
@@ -35,6 +36,8 @@ export type PromptRun = {
 	toolSummaries: Map<string, string>;
 	nextTurnId: number;
 	activeTurnId: string | number | undefined;
+	/** The prompt-scoped research stream: per-prompt cache, never shared across runs. */
+	research: ResearchTracker;
 };
 
 export function hostResult(text: string): RpcFrame {

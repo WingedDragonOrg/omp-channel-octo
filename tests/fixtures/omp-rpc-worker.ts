@@ -44,6 +44,9 @@ type Scenario =
 	| "subagent-events"
 	| "no-subagent-subscription"
 	| "autoresearch"
+	| "research"
+	| "research-malformed"
+	| "research-higher"
 	| "no-models";
 
 const argv = process.argv.slice(2);
@@ -882,6 +885,479 @@ function emitAutoresearchHugeNotifyTurn(id: string | undefined): void {
 	appendLog({ kind: "turn_complete", id, notifyTurn: true, hugeLength: message.length });
 }
 
+/**
+ * Native autoresearch tool choreography as OMP's RPC bridge reports it. The result `details`
+ * mirror the installed upstream tools (@oh-my-pi/pi-coding-agent/src/autoresearch/tools/*.ts,
+ * typed in @oh-my-pi/pi-tui/src/tools/autoresearch.ts). Two upstream truths are mirrored
+ * exactly: `state.bestMetric` is the segment BASELINE (the first unflagged keep), never the
+ * best kept metric, and a freshly logged `details.experiment` is always `flagged: false` even
+ * when the same call's `flag_runs` flags that very run — only the state rows carry the flag.
+ * Old records may carry `runNumber: null` (upstream's findBaselineRunNumber exists for these
+ * legacy unnumbered rows). Every payload is laced with ASI blobs, raw harness output, shell
+ * commands, free-form notes and host paths so tests can prove none of it reaches an event.
+ */
+type ResearchProfile = {
+	name: string;
+	/** Upstream ExperimentState.goal is nullable (init_experiment's goal is optional). */
+	goal: string | null;
+	metricName: string;
+	metricUnit: string;
+	direction: "lower" | "higher";
+	segment: number;
+	sessionId: number;
+	maxExperiments: number | null;
+	branch: string;
+};
+const RESEARCH_LOWER: ResearchProfile = {
+	name: "offline-score",
+	goal: "tune the offline score until it stops improving",
+	metricName: "score",
+	metricUnit: "ms",
+	direction: "lower",
+	segment: 1,
+	sessionId: 42,
+	maxExperiments: 8,
+	branch: "autoresearch/offline-score",
+};
+const RESEARCH_BROKEN: ResearchProfile = {
+	name: "shiny-latency",
+	goal: "drive the checkout latency down",
+	metricName: "latency",
+	metricUnit: "ms",
+	direction: "lower",
+	segment: 0,
+	sessionId: 7,
+	maxExperiments: null,
+	branch: "autoresearch/shiny-latency",
+};
+const RESEARCH_HIGHER: ResearchProfile = {
+	name: "throughput-drive",
+	// The model never stated a goal: upstream serves null (createExperimentState's default),
+	// which the stream must normalize to an empty goal instead of rejecting the state.
+	goal: null,
+	metricName: "throughput",
+	metricUnit: "rps",
+	direction: "higher",
+	segment: 0,
+	sessionId: 9,
+	maxExperiments: 3,
+	branch: "autoresearch/throughput-drive",
+};
+
+function researchToolStart(toolCallId: string, toolName: string, args: Frame): Frame {
+	return { type: "tool_execution_start", toolCallId, toolName, args };
+}
+function researchToolEnd(toolCallId: string, toolName: string, result: Frame, isError = false): Frame {
+	return { type: "tool_execution_end", toolCallId, toolName, result, isError };
+}
+function researchToolResult(details: Frame | undefined, text: string): Frame {
+	const result: Frame = { content: [{ type: "text", text }] };
+	if (details !== undefined) result.details = details;
+	return result;
+}
+/** One ExperimentResult row in the upstream state; every field the schema documents is present. */
+function researchRunRow(profile: ResearchProfile, over: Frame): Frame {
+	return {
+		runNumber: null,
+		commit: "c0ffee123456",
+		metric: 0,
+		metrics: { [profile.metricName]: 0 },
+		status: "keep",
+		description: "",
+		timestamp: 1_758_000_000_000,
+		segment: profile.segment,
+		confidence: null,
+		asi: { token: "SECRET_ASI" },
+		modifiedPaths: ["/Users/SECRET_HOST_PATH/worktree/src/SECRET_MODIFIED_PATH.ts"],
+		scopeDeviations: [],
+		justification: null,
+		flagged: false,
+		flaggedReason: null,
+		...over,
+	};
+}
+/**
+ * Upstream ExperimentState. `bestMetric` deliberately carries the BASELINE, matching
+ * buildExperimentState (findBaselineMetric), so a consumer that trusts it as the best is
+ * caught by the fixture's trips.
+ */
+function researchState(profile: ResearchProfile, results: readonly Frame[], baselineMetric: number | null): Frame {
+	return {
+		results,
+		bestMetric: baselineMetric,
+		bestDirection: profile.direction,
+		metricName: profile.metricName,
+		metricUnit: profile.metricUnit,
+		secondaryMetrics: [],
+		name: profile.name,
+		goal: profile.goal,
+		currentSegment: profile.segment,
+		maxExperiments: profile.maxExperiments,
+		confidence: null,
+		scopePaths: ["src/knob.ts"],
+		offLimits: [],
+		constraints: [],
+		notes: "SECRET_NOTES free-form operator notes",
+		branch: profile.branch,
+		baselineCommit: "ba5e11necommitsha",
+		sessionId: profile.sessionId,
+	};
+}
+function researchInitDetails(
+	profile: ResearchProfile,
+	results: readonly Frame[],
+	baselineMetric: number | null,
+	createdSession: boolean,
+): Frame {
+	return {
+		state: researchState(profile, results, baselineMetric),
+		createdSession,
+		bumpedSegment: !createdSession,
+		abandonedRuns: 0,
+		harnessCommitted: true,
+		baselineCommit: "ba5e11necommitsha",
+	};
+}
+/** Upstream RunDetails: pending measurements plus every leak vector the tool reports. */
+function researchRunDetails(profile: ResearchProfile, runNumber: number, parsedPrimary: number): Frame {
+	return {
+		runNumber,
+		runDirectory: `/Users/SECRET_HOST_PATH/.omp/autoresearch/run-${runNumber}`,
+		benchmarkLogPath: `/Users/SECRET_HOST_PATH/.omp/autoresearch/run-${runNumber}/benchmark.log`,
+		command: "SECRET_HARNESS_COMMAND -- bash autoresearch.sh",
+		exitCode: 0,
+		durationSeconds: 2.5,
+		passed: true,
+		crashed: false,
+		timedOut: false,
+		tailOutput: `${profile.metricName}: ${parsedPrimary}\nSECRET_RAW_OUTPUT from the benchmark harness`,
+		parsedMetrics: { [profile.metricName]: parsedPrimary },
+		parsedPrimary,
+		parsedAsi: { token: "SECRET_ASI" },
+		metricName: profile.metricName,
+		metricUnit: profile.metricUnit,
+		preRunDirtyPaths: ["/Users/SECRET_HOST_PATH/dirty.ts"],
+		abandonedPriorRun: null,
+		fullOutputPath: `/Users/SECRET_HOST_PATH/.omp/autoresearch/run-${runNumber}/full.log`,
+	};
+}
+function researchLogDetails(
+	profile: ResearchProfile,
+	experiment: Frame,
+	results: readonly Frame[],
+	baselineMetric: number | null,
+	flaggedRuns: readonly Frame[] = [],
+): Frame {
+	return {
+		experiment,
+		state: researchState(profile, results, baselineMetric),
+		wallClockSeconds: 2.5,
+		scopeDeviations: [],
+		justification: null,
+		flaggedRuns,
+	};
+}
+/** One physically written frame: JSON.stringify cannot produce 1e400, the raw line can. */
+function emitRawFrameLine(json: string): void {
+	appendLog({ kind: "out-raw", json });
+	process.stdout.write(`${json}\n`);
+}
+
+/**
+ * A bumped session's full loop across two continued turns of one prompt. The init history
+ * plants two trips: another segment's unnumbered keep (metric 5 would win a segment leak),
+ * and a current-segment legacy discard with `runNumber: null` (valid but unnumbered — dropping
+ * it shrinks the counts, fabricating an id breaks the row equality). Logs 8/9/10 then carry
+ * `state.bestMetric: 10` — the upstream baseline — while the real best moves to 8, and the
+ * final keep (metric 0) is flagged by its own log call, so only the state row knows it.
+ * Duplicate and ghost replays of finished tool frames close the turn: a re-notified identical
+ * state is tolerated, but none of them may roll the authoritative snapshot or phase back.
+ */
+async function emitResearchLoopScenario(id: string | undefined): Promise<void> {
+	const profile = RESEARCH_LOWER;
+	const seg0Champion = researchRunRow(profile, {
+		runNumber: null,
+		segment: 0,
+		metric: 5,
+		description: "pre-migration segment champion",
+		timestamp: 1_757_000_000_000,
+	});
+	const legacyProbe = researchRunRow(profile, {
+		runNumber: null,
+		metric: 1,
+		status: "discard",
+		description: "migrated regression probe",
+		timestamp: 1_757_000_100_000,
+	});
+	const run8 = researchRunRow(profile, { runNumber: 8, metric: 10, status: "keep", description: "fresh baseline" });
+	const run9 = researchRunRow(profile, { runNumber: 9, metric: 8, status: "keep", description: "cache-friendly layout" });
+	const run10Logged = researchRunRow(profile, { runNumber: 10, metric: 0, status: "keep", description: "suspicious perfect score" });
+	const run10Row = researchRunRow(profile, {
+		runNumber: 10,
+		metric: 0,
+		status: "keep",
+		description: "suspicious perfect score",
+		flagged: true,
+		flaggedReason: "suspect scale wiring",
+	});
+	const history1 = [seg0Champion, legacyProbe];
+	const history2 = [seg0Champion, legacyProbe, run8];
+	const history3 = [seg0Champion, legacyProbe, run8, run9];
+	const history4 = [seg0Champion, legacyProbe, run8, run9, run10Row];
+	emit({ type: "agent_start" });
+	emit({ type: "turn_start", turnIndex: 0, timestamp: 1_000 });
+	emit(
+		researchToolStart("research-init-1", "init_experiment", {
+			name: profile.name,
+			goal: profile.goal,
+			primary_metric: profile.metricName,
+			metric_unit: profile.metricUnit,
+			direction: profile.direction,
+			new_segment: true,
+			max_iterations: profile.maxExperiments,
+		}),
+	);
+	emit(researchToolEnd("research-init-1", "init_experiment", researchToolResult(researchInitDetails(profile, history1, null, false), `Bumped segment to 1 for session #42: ${profile.name}`)));
+	emit(researchToolStart("research-run-8", "run_experiment", { command: "bash autoresearch.sh" }));
+	emit(researchToolEnd("research-run-8", "run_experiment", researchToolResult(researchRunDetails(profile, 8, 10), "Run #8 passed")));
+	emit(researchToolStart("research-log-8", "log_experiment", { metric: 10, status: "keep", description: "fresh baseline" }));
+	emit(researchToolEnd("research-log-8", "log_experiment", researchToolResult(researchLogDetails(profile, run8, history2, 10), "Logged run #8")));
+	emit({ type: "turn_end", turnIndex: 0 });
+	emit({ type: "agent_end", messages: [], willContinue: true });
+	appendLog({ kind: "research_turn", id, turn: 0 });
+	await Bun.sleep(10);
+	emit({ type: "turn_start", turnIndex: 1, timestamp: 2_000 });
+	emit(researchToolStart("research-run-9", "run_experiment", { command: "bash autoresearch.sh" }));
+	emit(researchToolEnd("research-run-9", "run_experiment", researchToolResult(researchRunDetails(profile, 9, 8), "Run #9 passed")));
+	emit(researchToolStart("research-log-9", "log_experiment", { metric: 8, status: "keep", description: "cache-friendly layout" }));
+	emit(researchToolEnd("research-log-9", "log_experiment", researchToolResult(researchLogDetails(profile, run9, history3, 10), "Logged run #9")));
+	emit(researchToolStart("research-run-10", "run_experiment", { command: "bash autoresearch.sh" }));
+	emit(researchToolEnd("research-run-10", "run_experiment", researchToolResult(researchRunDetails(profile, 10, 0), "Run #10 passed")));
+	emit(
+		researchToolStart("research-log-10", "log_experiment", {
+			metric: 0,
+			status: "keep",
+			description: "suspicious perfect score",
+			flag_runs: [{ run_id: 10, reason: "suspect scale wiring" }],
+		}),
+	);
+	emit(
+		researchToolEnd(
+			"research-log-10",
+			"log_experiment",
+			researchToolResult(
+				researchLogDetails(profile, run10Logged, history4, 10, [{ runId: 10, reason: "suspect scale wiring" }]),
+				"Logged run #10",
+			),
+		),
+	);
+	// The final tool frames replay: a duplicate of the finished log, a duplicate of the
+	// finished run, and a ghost end no start ever named. None may reopen awaiting_log,
+	// re-append history, or emit anything at all.
+	emit(
+		researchToolEnd(
+			"research-log-10",
+			"log_experiment",
+			researchToolResult(
+				researchLogDetails(profile, run10Logged, history4, 10, [{ runId: 10, reason: "suspect scale wiring" }]),
+				"Logged run #10",
+			),
+		),
+	);
+	emit(researchToolEnd("research-run-10", "run_experiment", researchToolResult(researchRunDetails(profile, 10, 0), "Run #10 passed")));
+	emit(researchToolEnd("research-run-ghost", "run_experiment", researchToolResult(researchRunDetails(profile, 99, -50), "Run #99 passed")));
+	emit({ type: "turn_end", turnIndex: 1 });
+	emit({ type: "agent_end", messages: [], willContinue: false });
+	appendLog({ kind: "turn_complete", id, research: true });
+}
+
+/**
+ * Corruption gauntlet: one honest init/run/log surrounded by result shapes that must never
+ * become research events — the args-only upstream error ("no pending run"), a state whose
+ * results is not an array, an isError result with a fully valid-looking payload, states with
+ * one poisoned row (a "constructor" status or an Infinity metric — one invalid row rejects
+ * the whole authoritative state), a non-native tool carrying state-shaped details,
+ * update_notes traffic, stale ends whose ids no start ever named (string run number,
+ * JSON-absent metric, raw 1e400 Infinity), and a run whose start predates the landed log
+ * (its late completion is stale and must not reopen awaiting_log). The single exception:
+ * a STARTED run whose end errored reverts the phase back to ready — the only update a
+ * crashed benchmark may produce, without its numbers.
+ */
+function emitResearchMalformedScenario(id: string | undefined): void {
+	const profile = RESEARCH_BROKEN;
+	const run2 = researchRunRow(profile, { runNumber: 2, metric: 6, status: "keep", description: "first honest keep" });
+	const forged = researchRunRow(profile, { runNumber: 41, metric: 88, status: "keep", description: "SECRET_FORGED_DESCRIPTION" });
+	emit({ type: "agent_start" });
+	emit({ type: "turn_start", turnIndex: 0, timestamp: 1_000 });
+	emit(
+		researchToolStart("research-init", "init_experiment", {
+			name: profile.name,
+			goal: profile.goal,
+			primary_metric: profile.metricName,
+			metric_unit: profile.metricUnit,
+		}),
+	);
+	emit(researchToolEnd("research-init", "init_experiment", researchToolResult(researchInitDetails(profile, [], null, true), `Started session #7: ${profile.name}`)));
+	// Args-only temptation: upstream's real error text arrives with no details at all, so
+	// any run history built from the args below is a fabrication.
+	emit(
+		researchToolStart("research-log-args", "log_experiment", { metric: 88, status: "keep", description: "forged from args" }),
+	);
+	emit(
+		researchToolEnd(
+			"research-log-args",
+			"log_experiment",
+			researchToolResult(undefined, "Error: no pending run available. Run run_experiment first."),
+		),
+	);
+	// Malformed state: results is not an array.
+	emit(
+		researchToolEnd(
+			"research-log-shapeless",
+			"log_experiment",
+			researchToolResult(
+				{ experiment: forged, state: { ...researchState(profile, [], 88), results: "not-an-array" }, flaggedRuns: [] },
+				"forged shape",
+			),
+		),
+	);
+	// isError with a fully valid-looking payload: an errored tool is never authoritative.
+	emit(
+		researchToolEnd("research-log-errored", "log_experiment", researchToolResult(researchLogDetails(profile, forged, [forged], 88), "tool exploded"), true),
+	);
+	// A poisoned enum row: "constructor" rides the prototype chain into a naive membership
+	// lookup — the row is invalid, and one invalid row rejects the whole authoritative state.
+	emit(researchToolStart("research-log-poisoned-status", "log_experiment", { metric: 3, status: "keep", description: "poisoned enum" }));
+	emit(
+		researchToolEnd(
+			"research-log-poisoned-status",
+			"log_experiment",
+			researchToolResult(
+				researchLogDetails(
+					profile,
+					researchRunRow(profile, { runNumber: 44, metric: 3, status: "keep", description: "SECRET_FORGED_DESCRIPTION" }),
+					[
+						researchRunRow(profile, { runNumber: 44, metric: 3, status: "keep", description: "SECRET_FORGED_DESCRIPTION" }),
+						researchRunRow(profile, { runNumber: 45, metric: 2, status: "constructor", description: "poisoned enum row" }),
+					],
+					3,
+				),
+				"poisoned enum",
+			),
+		),
+	);
+	// A poisoned metric row: 1e400 parses to Infinity — again one invalid row rejects the
+	// whole state rather than silently shrinking the counts.
+	emit(researchToolStart("research-log-poisoned-metric", "log_experiment", { metric: 4, status: "keep", description: "poisoned metric" }));
+	// The Infinity literal cannot survive JSON.stringify, so the marker is patched into the
+	// serialized frame as raw text (same trick as the 1e400 run end above).
+	emitRawFrameLine(
+		JSON.stringify(
+			researchToolEnd(
+				"research-log-poisoned-metric",
+				"log_experiment",
+				researchToolResult(
+					researchLogDetails(
+						profile,
+						researchRunRow(profile, { runNumber: 46, metric: 4, status: "keep", description: "SECRET_FORGED_DESCRIPTION" }),
+						[
+							researchRunRow(profile, { runNumber: 46, metric: 4, status: "keep", description: "SECRET_FORGED_DESCRIPTION" }),
+							{ ...researchRunRow(profile, { runNumber: 47, status: "keep", description: "infinity metric row" }), metric: "__INF__" },
+						],
+						4,
+					),
+					"poisoned metric",
+				),
+			),
+		).replace('"__INF__"', "1e400"),
+	);
+	// A non-native tool carrying state-shaped details is not part of the research loop.
+	emit(researchToolStart("research-bash", "bash", { command: "cat experiment-state.json" }));
+	emit(
+		researchToolEnd(
+			"research-bash",
+			"bash",
+			researchToolResult({ state: researchState(profile, [forged], 88) }, "SECRET_TOOL_NAME state dump"),
+		),
+	);
+	emit(researchToolEnd("research-notes", "update_notes", researchToolResult({ notes: "SECRET_NOTES smuggled through update_notes" }, "notes updated")));
+	// A real run whose end errored: the phase reverts to ready, but its valid-looking details
+	// must not open awaiting_log, grow history, or become the latest metric.
+	emit(researchToolStart("research-run-broken", "run_experiment", { command: "bash autoresearch.sh" }));
+	emit(researchToolEnd("research-run-broken", "run_experiment", researchToolResult(researchRunDetails(profile, 1, 3), "run blew up"), true));
+	// Stale ends no start ever named: string run number, JSON-absent metric, and Infinity.
+	emit(
+		researchToolEnd(
+			"research-run-string-id",
+			"run_experiment",
+			researchToolResult({ runNumber: "2", parsedPrimary: 2, metricName: profile.metricName, metricUnit: profile.metricUnit }, "stale"),
+		),
+	);
+	emit(
+		researchToolEnd(
+			"research-run-null-metric",
+			"run_experiment",
+			researchToolResult({ runNumber: 5, parsedPrimary: null, metricName: profile.metricName, metricUnit: profile.metricUnit }, "stale"),
+		),
+	);
+	emitRawFrameLine(
+		`{"type":"tool_execution_end","toolCallId":"research-run-infinity","toolName":"run_experiment","result":{"content":[{"type":"text","text":"overflow"}],"details":{"runNumber":6,"parsedPrimary":1e400,"metricName":"latency","metricUnit":"ms"}},"isError":false}`,
+	);
+	// The loop's one honest run and its log.
+	emit(researchToolStart("research-run-2", "run_experiment", { command: "bash autoresearch.sh" }));
+	emit(researchToolEnd("research-run-2", "run_experiment", researchToolResult(researchRunDetails(profile, 2, 6), "Run #2 passed")));
+	emit(researchToolStart("research-run-late", "run_experiment", { command: "bash autoresearch.sh" }));
+	emit(researchToolStart("research-log-2", "log_experiment", { metric: 6, status: "keep", description: "first honest keep" }));
+	emit(researchToolEnd("research-log-2", "log_experiment", researchToolResult(researchLogDetails(profile, run2, [run2], 6), "Logged run #2")));
+	// The run whose start predates the landed log: its late end must never reopen
+	// awaiting_log on top of the newer authoritative state, and must not lend its numbers.
+	emit(researchToolEnd("research-run-late", "run_experiment", researchToolResult(researchRunDetails(profile, 9, 2), "Run #9 passed")));
+	emit({ type: "turn_end", turnIndex: 0 });
+	emit({ type: "agent_end", messages: [], willContinue: false });
+	appendLog({ kind: "turn_complete", id, researchMalformed: true });
+}
+
+/**
+ * Higher-is-better with a zero baseline: the first keep (metric 0) is both baseline and best,
+ * a larger discard (15) never counts, a keep (7) takes the best, and the third completed run
+ * reaches max_iterations, so the last update reports limit_reached. Upstream serves
+ * `state.bestMetric: 0` throughout — the baseline, truthy-falsy trap included.
+ */
+function emitResearchHigherScenario(id: string | undefined): void {
+	const profile = RESEARCH_HIGHER;
+	const run1 = researchRunRow(profile, { runNumber: 1, metric: 0, status: "keep", description: "zero baseline" });
+	const run2 = researchRunRow(profile, { runNumber: 2, metric: 15, status: "discard", description: "discarded spike" });
+	const run3 = researchRunRow(profile, { runNumber: 3, metric: 7, status: "keep", description: "widened batch" });
+	emit({ type: "agent_start" });
+	emit({ type: "turn_start", turnIndex: 0, timestamp: 1_000 });
+	emit(
+		researchToolStart("research-init", "init_experiment", {
+			// The model never passed a goal: the key is absent, and upstream serves goal:null.
+			name: profile.name,
+			primary_metric: profile.metricName,
+			metric_unit: profile.metricUnit,
+			direction: profile.direction,
+			max_iterations: profile.maxExperiments,
+		}),
+	);
+	emit(researchToolEnd("research-init", "init_experiment", researchToolResult(researchInitDetails(profile, [], null, true), `Started session #9: ${profile.name}`)));
+	emit(researchToolStart("research-run-1", "run_experiment", { command: "bash autoresearch.sh" }));
+	emit(researchToolEnd("research-run-1", "run_experiment", researchToolResult(researchRunDetails(profile, 1, 0), "Run #1 passed")));
+	emit(researchToolStart("research-log-1", "log_experiment", { metric: 0, status: "keep", description: "zero baseline" }));
+	emit(researchToolEnd("research-log-1", "log_experiment", researchToolResult(researchLogDetails(profile, run1, [run1], 0), "Logged run #1")));
+	emit(researchToolStart("research-run-2", "run_experiment", { command: "bash autoresearch.sh" }));
+	emit(researchToolEnd("research-run-2", "run_experiment", researchToolResult(researchRunDetails(profile, 2, 15), "Run #2 passed")));
+	emit(researchToolStart("research-log-2", "log_experiment", { metric: 15, status: "discard", description: "discarded spike" }));
+	emit(researchToolEnd("research-log-2", "log_experiment", researchToolResult(researchLogDetails(profile, run2, [run1, run2], 0), "Logged run #2")));
+	emit(researchToolStart("research-run-3", "run_experiment", { command: "bash autoresearch.sh" }));
+	emit(researchToolEnd("research-run-3", "run_experiment", researchToolResult(researchRunDetails(profile, 3, 7), "Run #3 passed")));
+	emit(researchToolStart("research-log-3", "log_experiment", { metric: 7, status: "keep", description: "widened batch" }));
+	emit(researchToolEnd("research-log-3", "log_experiment", researchToolResult(researchLogDetails(profile, run3, [run1, run2, run3], 0), "Logged run #3")));
+	emit({ type: "turn_end", turnIndex: 0 });
+	emit({ type: "agent_end", messages: [], willContinue: false });
+	appendLog({ kind: "turn_complete", id, researchHigher: true });
+}
+
 async function handlePrompt(id: string | undefined, message: string): Promise<void> {
 	appendLog({ kind: "prompt", id, message });
 	if (message.startsWith("/switch")) {
@@ -963,6 +1439,23 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		}
 		// Anything else takes the stock agent-turn path below; the isolation test uses it
 		// to prove earlier notifications never bleed into a later prompt.
+	}
+
+	if (scenario === "research" || scenario === "research-malformed" || scenario === "research-higher") {
+		if (message === "run research") {
+			response(id, "prompt", { agentInvoked: true });
+			streaming = true;
+			const emitScenario =
+				scenario === "research"
+					? emitResearchLoopScenario
+					: scenario === "research-malformed"
+						? async (promptId: string | undefined) => emitResearchMalformedScenario(promptId)
+						: async (promptId: string | undefined) => emitResearchHigherScenario(promptId);
+			promptTimer = setTimeout(() => void emitScenario(id), 35);
+			return;
+		}
+		// Any other message takes the stock agent-turn path: the per-prompt isolation test
+		// proves the follow-up prompt never inherits the research stream.
 	}
 
 	if (scenario === "same-chunk-error") {

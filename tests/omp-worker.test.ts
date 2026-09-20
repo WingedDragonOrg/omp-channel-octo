@@ -215,6 +215,98 @@ function hasLoneSurrogate(text: string): boolean {
 	return false;
 }
 
+/**
+ * Read-only views of the worker's `research_update` ExecutionEvent branch. The production
+ * types are still being built (RED phase), so the tests pin the observable wire shape with
+ * local views instead of importing a module that does not exist yet; the tag comparison
+ * widens through a plain string constant, the boundary cast is named and local.
+ */
+type ResearchRunView = {
+	runNumber: number | null;
+	segment: number;
+	metric: number;
+	status: "keep" | "discard" | "crash" | "checks_failed";
+	description: string;
+	flagged: boolean;
+};
+
+type ResearchSnapshotView = {
+	sessionId: number | null;
+	name: string;
+	goal: string;
+	segment: number;
+	metricName: string;
+	metricUnit: string;
+	direction: "lower" | "higher";
+	baseline: number | null;
+	best: number | null;
+	completedRuns: number;
+	maxExperiments: number | null;
+	phase: "ready" | "running" | "awaiting_log" | "limit_reached";
+	activeRun: number | null;
+	latestMetric: number | null;
+	recent: readonly ResearchRunView[];
+	totalRuns: number;
+};
+
+type ResearchEventView = { type: string; atMs: number; research: ResearchSnapshotView; report?: string };
+
+/**
+ * RED-phase widening: the production WorkerEvent union does not name the research branch
+ * yet, so the tag is a plain string and the comparison never fabricates a shape.
+ */
+const RESEARCH_UPDATE_TAG: string = "research_update";
+
+function researchUpdates(events: readonly WorkerEvent[]): ResearchEventView[] {
+	const updates: ResearchEventView[] = [];
+	for (const event of events) {
+		if (event.type !== RESEARCH_UPDATE_TAG) continue;
+		// Same object, literal widening only; the test bodies assert every field of this
+		// locally pinned wire view against hand-derived expectations.
+		const viewed = event as unknown as ResearchEventView;
+		updates.push(viewed);
+	}
+	return updates;
+}
+
+/**
+ * The effective phase transitions, collapsing consecutive repeats: how often an identical
+ * phase is re-notified is an implementation detail; the order of the real transitions is not.
+ */
+function researchPhases(events: readonly ResearchEventView[]): ResearchSnapshotView["phase"][] {
+	const phases: ResearchSnapshotView["phase"][] = [];
+	for (const event of events) {
+		if (phases[phases.length - 1] !== event.research.phase) phases.push(event.research.phase);
+	}
+	return phases;
+}
+
+/** Rows of the lower-is-better loop exactly as they must surface in `recent`. */
+const legacyProbeView: ResearchRunView = {
+	runNumber: null,
+	segment: 1,
+	metric: 1,
+	status: "discard",
+	description: "migrated regression probe",
+	flagged: false,
+};
+const run8View: ResearchRunView = { runNumber: 8, segment: 1, metric: 10, status: "keep", description: "fresh baseline", flagged: false };
+const run9View: ResearchRunView = { runNumber: 9, segment: 1, metric: 8, status: "keep", description: "cache-friendly layout", flagged: false };
+const run10View: ResearchRunView = {
+	runNumber: 10,
+	segment: 1,
+	metric: 0,
+	status: "keep",
+	description: "suspicious perfect score",
+	flagged: true,
+};
+
+const run2BrokenView: ResearchRunView = { runNumber: 2, segment: 0, metric: 6, status: "keep", description: "first honest keep", flagged: false };
+
+const run1HigherView: ResearchRunView = { runNumber: 1, segment: 0, metric: 0, status: "keep", description: "zero baseline", flagged: false };
+const run2HigherView: ResearchRunView = { runNumber: 2, segment: 0, metric: 15, status: "discard", description: "discarded spike", flagged: false };
+const run3HigherView: ResearchRunView = { runNumber: 3, segment: 0, metric: 7, status: "keep", description: "widened batch", flagged: false };
+
 describe("OMP RPC worker", () => {
 	test("starts a real child with enforced RPC/yolo/cwd flags and reads state after ready", async () => {
 		await withHarness("normal", async harness => {
@@ -617,6 +709,322 @@ describe("OMP RPC worker", () => {
 			await harness.worker.prompt("/autoresearch legacy", event => events.push(event));
 			expect(events.filter(event => event.type === "local_command")).toEqual([{ type: "local_command" }]);
 			expect(events).toHaveLength(1);
+		});
+	});
+
+	test("derives the authoritative research snapshot from native init/run/log details across continued turns", async () => {
+		await withHarness("research", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("run research", event => events.push(event));
+			const research = researchUpdates(events);
+
+			// Effective phase transitions only: how often a phase is re-notified is an
+			// implementation detail; the order of the real transitions is the contract.
+			expect(researchPhases(research)).toEqual([
+				"ready",
+				"running",
+				"awaiting_log",
+				"ready",
+				"running",
+				"awaiting_log",
+				"ready",
+				"running",
+				"awaiting_log",
+				"ready",
+			]);
+
+			// Init boundary: another segment's keep 5 must not leak into baseline/best/recent,
+			// and the legacy unnumbered discard stays a valid (null run number) row.
+			expect(research[0]?.research).toMatchObject({
+				sessionId: 42,
+				name: "offline-score",
+				goal: "tune the offline score until it stops improving",
+				segment: 1,
+				metricName: "score",
+				metricUnit: "ms",
+				direction: "lower",
+				maxExperiments: 8,
+				baseline: null,
+				best: null,
+				completedRuns: 1,
+				totalRuns: 2,
+				phase: "ready",
+				activeRun: null,
+				latestMetric: null,
+				recent: [legacyProbeView],
+			});
+
+			// Pending runs never append history: awaiting run 9 the counts are still 2 of 3.
+			const pendingRun9 = research.find(event => event.research.phase === "awaiting_log" && event.research.activeRun === 9);
+			expect(pendingRun9?.research).toMatchObject({
+				latestMetric: 8,
+				baseline: 10,
+				best: 10,
+				completedRuns: 2,
+				totalRuns: 3,
+				recent: [legacyProbeView, run8View],
+			});
+
+			// Final authoritative state: baseline stays the first unflagged keep (10) even
+			// though every log served state.bestMetric 10 — the upstream baseline — while the
+			// real best moved to 8; the flagged keep 0 counts but changes neither; the
+			// unnumbered discard keeps its null id.
+			expect(research.at(-1)?.research).toEqual({
+				sessionId: 42,
+				name: "offline-score",
+				goal: "tune the offline score until it stops improving",
+				segment: 1,
+				metricName: "score",
+				metricUnit: "ms",
+				direction: "lower",
+				baseline: 10,
+				best: 8,
+				completedRuns: 4,
+				maxExperiments: 8,
+				phase: "ready",
+				activeRun: null,
+				latestMetric: 0,
+				recent: [legacyProbeView, run8View, run9View, run10View],
+				totalRuns: 5,
+			});
+
+			// Duplicate and ghost replays after the last log must never roll the state back.
+			const finalIndex = research.findIndex(event => event.research.completedRuns === 4);
+			expect(finalIndex).toBeGreaterThan(0);
+			for (const event of research.slice(finalIndex)) {
+				expect(event.research.phase).toBe("ready");
+				expect(event.research).toMatchObject({ baseline: 10, best: 8, completedRuns: 4, totalRuns: 5, activeRun: null });
+			}
+
+			// Only init/log updates carry the sanitized full-history report; pending never does.
+			for (const event of research) {
+				if (event.research.phase === "running" || event.research.phase === "awaiting_log") {
+					expect(event.report).toBeUndefined();
+				} else {
+					expect(typeof event.report).toBe("string");
+				}
+			}
+			expect(Number.isFinite(research.at(-1)?.atMs)).toBe(true);
+
+			// No leak vector in the native payloads (ASI blobs, raw harness output, the
+			// harness command line, notes, host paths) may reach an event or the report.
+			const serialized = JSON.stringify(research);
+			for (const marker of [
+				"SECRET_ASI",
+				"SECRET_RAW_OUTPUT",
+				"SECRET_HARNESS_COMMAND",
+				"SECRET_NOTES",
+				"SECRET_HOST_PATH",
+				"SECRET_MODIFIED_PATH",
+			]) {
+				expect(serialized).not.toContain(marker);
+			}
+
+			// The report is the sanitized full record: every recorded run across all
+			// segments (the /autoresearch-history payload), their safe fields, nothing else.
+			const finalReport = research.at(-1)?.report ?? "";
+			for (const description of [
+				"fresh baseline",
+				"cache-friendly layout",
+				"suspicious perfect score",
+				"migrated regression probe",
+				"pre-migration segment champion",
+			]) {
+				expect(finalReport).toContain(description);
+			}
+			expect(finalReport).not.toContain("SECRET");
+			expect(Buffer.byteLength(finalReport, "utf8")).toBeLessThanOrEqual(1024 * 1024);
+
+			// The research cache is per-prompt: a follow-up task never inherits this stream.
+			const followUps: WorkerEvent[] = [];
+			await harness.worker.prompt("run normally", event => followUps.push(event));
+			expect(researchUpdates(followUps)).toEqual([]);
+		});
+	});
+
+	test("never fabricates research events from missing, malformed, errored or stale tool results", async () => {
+		await withHarness("research-malformed", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("run research", event => events.push(event));
+			const research = researchUpdates(events);
+
+			// The errored run end reverts the phase instead of leaving the loop running
+			// forever; the run started before the log completes reports running with the
+			// pre-log history; every other junk shape is invisible to the stream.
+			expect(researchPhases(research)).toEqual(["ready", "running", "ready", "running", "awaiting_log", "running", "ready"]);
+
+			// The matched isError end reverts to ready with the numbers it had before the
+			// crash: no history, no pending run, and the exploded run's details are not
+			// fabricated into a metric, a report, or a run id.
+			const reverted = research.find((event, index) => index > 0 && event.research.phase === "ready");
+			expect(reverted?.research).toMatchObject({
+				sessionId: 7,
+				segment: 0,
+				phase: "ready",
+				activeRun: null,
+				latestMetric: null,
+				baseline: null,
+				best: null,
+				completedRuns: 0,
+				totalRuns: 0,
+				recent: [],
+			});
+			expect(reverted?.report).toBeUndefined();
+
+			// The honest run is the only pending run the stream ever sees: the args-only
+			// keep (metric 88), the shapeless state, the isError'd log payload, the poisoned
+			// enum/Infinity rows (one bad row rejects the whole state), the bash state
+			// dump, the string/null/Infinity metrics — none opened an awaiting_log.
+			const pending = research.find(event => event.research.phase === "awaiting_log");
+			expect(pending?.research).toMatchObject({
+				activeRun: 2,
+				latestMetric: 6,
+				baseline: null,
+				best: null,
+				completedRuns: 0,
+				totalRuns: 0,
+				recent: [],
+			});
+
+			// The run started before the log completes and reports running against the
+			// pre-log history; its late completion must never reopen awaiting_log on top
+			// of the landed log nor lend the stream its run number or metric.
+			const lateRunning = research.filter(event => event.research.phase === "running").at(-1);
+			expect(lateRunning?.research).toMatchObject({ activeRun: null, latestMetric: 6, completedRuns: 0, totalRuns: 0, recent: [] });
+
+			expect(research.at(-1)?.research).toEqual({
+				sessionId: 7,
+				name: "shiny-latency",
+				goal: "drive the checkout latency down",
+				segment: 0,
+				metricName: "latency",
+				metricUnit: "ms",
+				direction: "lower",
+				baseline: 6,
+				best: 6,
+				completedRuns: 1,
+				maxExperiments: null,
+				phase: "ready",
+				activeRun: null,
+				latestMetric: 6,
+				recent: [run2BrokenView],
+				totalRuns: 1,
+			});
+
+			// Reports ride only on authoritative updates: the init and the final log.
+			expect(typeof research[0]?.report).toBe("string");
+			expect(typeof research.at(-1)?.report).toBe("string");
+			for (const event of research) {
+				if (event === reverted || event.research.phase !== "ready") expect(event.report).toBeUndefined();
+			}
+
+			// Nothing in the gauntlet may leak: not the forged description, not the notes,
+			// not the raw output or harness command smuggled inside the errored payloads.
+			const serialized = JSON.stringify(research);
+			for (const marker of [
+				"SECRET_FORGED_DESCRIPTION",
+				"SECRET_TOOL_NAME",
+				"SECRET_NOTES",
+				"SECRET_ASI",
+				"SECRET_RAW_OUTPUT",
+				"SECRET_HOST_PATH",
+				"SECRET_MODIFIED_PATH",
+				"SECRET_HARNESS_COMMAND",
+			]) {
+				expect(serialized).not.toContain(marker);
+			}
+		});
+	});
+
+	test("keeps a zero baseline, tracks best upward for higher-is-better, and reports limit_reached at the cap", async () => {
+		await withHarness("research-higher", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("run research", event => events.push(event));
+			const research = researchUpdates(events);
+
+			expect(researchPhases(research)).toEqual([
+				"ready",
+				"running",
+				"awaiting_log",
+				"ready",
+				"running",
+				"awaiting_log",
+				"ready",
+				"running",
+				"awaiting_log",
+				"limit_reached",
+			]);
+
+			// The model never stated a goal: upstream serves goal:null, which normalizes to an
+			// empty goal instead of rejecting the whole state.
+			expect(research[0]?.research).toMatchObject({
+				sessionId: 9,
+				name: "throughput-drive",
+				goal: "",
+				segment: 0,
+				metricName: "throughput",
+				metricUnit: "rps",
+				direction: "higher",
+				maxExperiments: 3,
+				baseline: null,
+				best: null,
+				completedRuns: 0,
+				totalRuns: 0,
+				phase: "ready",
+				activeRun: null,
+				latestMetric: null,
+				recent: [],
+			});
+
+			// A zero pending metric is a real measurement, never "missing".
+			const firstPending = research.find(event => event.research.phase === "awaiting_log");
+			expect(firstPending?.research).toMatchObject({ activeRun: 1, completedRuns: 0, totalRuns: 0, recent: [] });
+			expect(firstPending?.research.latestMetric).toBe(0);
+
+			// The zero-metric first keep is both baseline and best — zero, not null.
+			const firstLog = research.find(event => event.research.completedRuns === 1);
+			expect(firstLog?.research.baseline).toBe(0);
+			expect(firstLog?.research.best).toBe(0);
+			expect(firstLog?.research).toMatchObject({ completedRuns: 1, totalRuns: 1, latestMetric: 0, phase: "ready", recent: [run1HigherView] });
+
+			// The larger discard counts toward progress, never toward the best.
+			const discardLog = research.find(event => event.research.completedRuns === 2);
+			expect(discardLog?.research).toMatchObject({
+				baseline: 0,
+				best: 0,
+				totalRuns: 2,
+				latestMetric: 15,
+				recent: [run1HigherView, run2HigherView],
+			});
+
+			// The third completed run hits max_iterations: limit_reached, zero baseline kept,
+			// the keep 7 (not the discard 15) is the best.
+			expect(research.at(-1)?.research).toEqual({
+				sessionId: 9,
+				name: "throughput-drive",
+				goal: "",
+				segment: 0,
+				metricName: "throughput",
+				metricUnit: "rps",
+				direction: "higher",
+				baseline: 0,
+				best: 7,
+				completedRuns: 3,
+				maxExperiments: 3,
+				phase: "limit_reached",
+				activeRun: null,
+				latestMetric: 7,
+				recent: [run1HigherView, run2HigherView, run3HigherView],
+				totalRuns: 3,
+			});
+
+			for (const event of research) {
+				if (event.research.phase === "running" || event.research.phase === "awaiting_log") {
+					expect(event.report).toBeUndefined();
+				} else {
+					expect(typeof event.report).toBe("string");
+				}
+			}
 		});
 	});
 

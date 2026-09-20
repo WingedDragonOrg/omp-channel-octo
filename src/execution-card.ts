@@ -40,6 +40,7 @@ import {
 import type {
   JsonNode,
 } from "./execution-render.ts";
+import { makeResearchCardItems, makeResearchFlatLines, RESEARCH_ROW_LADDER } from "./research-render.ts";
 
 export interface ExecutionCardLimits {
   readonly maxNodes?: number;
@@ -96,6 +97,7 @@ function buildCandidate(
   omittedTodos: readonly ExecutionTodoPhase[],
   totalTodoTasks: number,
   hiddenRowLimit: number,
+  researchRowLimit: number,
 ): ExecutionCardResult {
   const todoRowLimit = Math.min(hiddenRowLimit, MAX_EXPANDED_TODO_TASKS);
   const hasContainer = supportsElement(capabilities, "Container");
@@ -154,7 +156,7 @@ function buildCandidate(
     visibleTraceTools,
     hiddenTraceTools,
     richLayout,
-    visibleSubagents.length > 0 ? "暂无其他工具活动" : "正在准备",
+    visibleSubagents.length > 0 ? "暂无其他工具活动" : snapshot.state === "running" ? "正在准备" : "暂无工具活动",
     traceHistoryTools.length > 0,
   );
   const hasRenderedSubagentActivity = visibleSubagents.length > 0
@@ -216,6 +218,10 @@ function buildCandidate(
       makeStatusContainer(snapshot, metrics, richLayout),
     );
     if (notice) body.push(makeNotice(notice));
+    // 研究摘要常显:在 notice 与 todo 之间作为顶层区块渲染,不进任何总折叠目标。
+    if (snapshot.research) {
+      body.push(...makeResearchCardItems(snapshot.research, { canToggle, executionState: snapshot.state, rowLimit: researchRowLimit }));
+    }
     if (todoContainer) {
       body.push(overallDetailsVisible ? todoContainer : { ...todoContainer, isVisible: false });
     }
@@ -276,6 +282,12 @@ function buildCandidate(
         spacing: "Medium",
       }));
     }
+    // 纯文本降级路径同样常显研究摘要与最近记录,只是没有折叠控件;窗口行数随预算搜索降级。
+    if (snapshot.research) {
+      for (const line of makeResearchFlatLines(snapshot.research, researchRowLimit, snapshot.state)) {
+        body.push(makeTextBlock(line, { spacing: "Small" }));
+      }
+    }
     if (visibleTodoTasks > 0) {
       body.push(...todoLines(visibleTodos, hiddenTodoTasks, totalTodoTasks).map(line => makeTextBlock(line, { spacing: "Small" })));
     }
@@ -294,6 +306,7 @@ function buildCandidate(
     `处理进度 · ${executionStateLabel(snapshot.state)} · ${metrics}`,
     "OMP 自动执行",
     ...(notice ? [notice.text] : []),
+    ...(snapshot.research ? makeResearchFlatLines(snapshot.research, researchRowLimit, snapshot.state) : []),
     ...visibleTools.map(tool => markdownSafeToolLine(tool)),
     ...(hiddenTools > 0 ? [`已隐藏前 ${hiddenTools} 个步骤，共 ${snapshot.tools.length} 个步骤`] : []),
     ...subagents.map(subagent => subagentLine(subagent, true)),
@@ -302,7 +315,7 @@ function buildCandidate(
   ];
   // The rich card keeps finished subagents behind the section toggle; the plain rendering has no
   // toggle, so it lists every subagent the session reported.
-  if (visibleTools.length === 0 && visibleTodoTasks === 0 && subagents.length === 0) plainLines.push("正在准备");
+  if (!snapshot.research && snapshot.state === "running" && totalTraceTools === 0 && visibleTodoTasks === 0 && subagents.length === 0) plainLines.push("正在准备");
   return { card, plain: plainLines.join("\n") };
 }
 
@@ -392,6 +405,7 @@ export function buildExecutionCard(
   const attempt = (
     visibleTodoCount: number,
     visibleToolCounts: readonly number[],
+    researchRowLimit: number,
   ): ExecutionCardResult | null => {
     const trimmedTodos = trimTodos(snapshot.todos, visibleTodoCount);
     for (const visibleToolCount of visibleToolCounts) {
@@ -407,6 +421,7 @@ export function buildExecutionCard(
           trimmedTodos.omitted,
           totalTodoTasks,
           hiddenRowLimit,
+          researchRowLimit,
         );
         if (cardWithinLimits(candidate.card, candidate.plain, limits)) return candidate;
       }
@@ -422,15 +437,28 @@ export function buildExecutionCard(
   for (let count = Math.min(totalTools, MAX_RENDERED_TOOLS); count >= 0; count -= 1) {
     toolCounts.push(count);
   }
-  const wholeList = attempt(maximumVisibleTodos, toolCounts);
+  const wholeList = attempt(maximumVisibleTodos, toolCounts, RESEARCH_ROW_LADDER[0]);
   if (wholeList) return wholeList;
 
-  // Largest readable band first, keeping room for the newest steps while they still fit.
   const floorToolCounts = [...new Set([Math.min(totalTools, MAX_VISIBLE_TOOLS), 0])];
-  for (const band of TODO_BAND_LADDER) {
-    if (band >= maximumVisibleTodos) continue;
-    const candidate = attempt(band, floorToolCounts);
+  // With the trace at its floor the research window is the next donor: the summary never gives
+  // way, only the number of rendered recent runs steps down, and the omitted count stays honest.
+  // Only rungs that actually shrink the rendered window are candidates: without research, or once
+  // every recorded run already fits, the step would rebuild the identical card again.
+  const research = snapshot.research;
+  const researchRowRungs = research === undefined
+    ? []
+    : RESEARCH_ROW_LADDER.slice(1).filter(limit => limit < research.recent.length);
+  for (const researchRowLimit of researchRowRungs) {
+    const candidate = attempt(maximumVisibleTodos, floorToolCounts, researchRowLimit);
     if (candidate) return candidate;
   }
-  return attempt(0, floorToolCounts);
+
+  // Largest readable band first, keeping room for the newest steps while they still fit.
+  for (const band of TODO_BAND_LADDER) {
+    if (band >= maximumVisibleTodos) continue;
+    const candidate = attempt(band, floorToolCounts, 0);
+    if (candidate) return candidate;
+  }
+  return attempt(0, floorToolCounts, 0);
 }

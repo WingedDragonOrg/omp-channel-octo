@@ -4,6 +4,9 @@
  * (长度、阈值、脱敏),卡片如何呈现由 `./execution-render.ts` 与 `./execution-card.ts` 决定。
  */
 
+import { safeDisplayText } from "./execution-text.ts";
+import { sanitizeResearchSnapshot, type ResearchSnapshot, type ResearchUpdateEvent } from "./research.ts";
+
 export type ExecutionState = "running" | "completed" | "failed" | "cancelled";
 export type ExecutionToolState = "running" | "succeeded" | "failed" | "cancelled";
 export type ExecutionErrorCategory =
@@ -96,7 +99,8 @@ export type ExecutionEvent =
       readonly state: Extract<ExecutionSubagentState, "completed" | "failed" | "cancelled">;
       readonly atMs: number;
       readonly summary?: string;
-    };
+    }
+  | ResearchUpdateEvent;
 
 export interface ExecutionToolSnapshot {
   readonly toolCallId: string;
@@ -135,6 +139,11 @@ export interface ExecutionSnapshot {
   readonly tools: readonly ExecutionToolSnapshot[];
   readonly subagents: readonly ExecutionSubagentSnapshot[];
   readonly todos: readonly ExecutionTodoPhase[];
+  /**
+   * 最近一次 research_update 注入的研究状态;任务未携带研究时不出现此键。事件上的 report
+   * 只供投递层落盘,从不进入快照——重启复原不能复活上 MiB 的全记录载荷。
+   */
+  readonly research?: ResearchSnapshot;
 }
 
 export interface ExecutionTracker {
@@ -172,7 +181,6 @@ interface MutableSubagent {
   toolCount: number | undefined;
 }
 
-const MAX_LOCAL_VISIBLE_TEXT_CHARS = 240;
 const MAX_LOCAL_PHASES = 64;
 const MAX_LOCAL_TASKS = 128;
 const ALLOWED_ERROR_CATEGORIES: Record<ExecutionErrorCategory, true> = {
@@ -202,43 +210,6 @@ function eventTime(value: number): number {
 
 function nonNegativeDuration(startedAtMs: number, endedAtMs: number): number {
   return Math.max(0, endedAtMs - startedAtMs);
-}
-
-function truncateDisplayText(value: string, maximum = MAX_LOCAL_VISIBLE_TEXT_CHARS): string {
-  let codePointCount = 0;
-  let codeUnitOffset = 0;
-  for (const character of value) {
-    if (codePointCount >= maximum) return `${value.slice(0, codeUnitOffset)}…`;
-    codePointCount += 1;
-    codeUnitOffset += character.length;
-  }
-  return value;
-}
-
-function redactSensitiveText(value: string): string {
-  let redacted = value;
-  redacted = redacted.replace(
-    /((?:authorization|api[-_.]?key|client[-_.]?secret|cookie|credentials?|pass(?:word|wd)|secret|session[-_.]?token|sig(?:nature)?|token)\s*[:=]\s*)(?:bearer\s+)?[^\s,;&]+/giu,
-    "$1[redacted]",
-  );
-  redacted = redacted.replace(/(\b(?:bearer|basic|digest|token)\s+)[^\s,;&]+/giu, "$1[redacted]");
-  redacted = redacted.replace(
-    /([?&](?:access[-_.]?(?:key|token)|api[-_.]?key|authorization|password|passwd|secret|sig(?:nature)?|token|x[-_.]?api[-_.]?key)\s*=)[^&#\s]*/giu,
-    "$1[redacted]",
-  );
-  redacted = redacted.replace(/\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{6,}\b/gu, "[redacted]");
-  redacted = redacted.replace(/\bAKIA[0-9A-Z]{16}\b/gu, "[redacted]");
-  return redacted;
-}
-
-function safeDisplayText(value: unknown, maximum = MAX_LOCAL_VISIBLE_TEXT_CHARS): string | undefined {
-  if (typeof value !== "string" || value.length === 0) return undefined;
-  const normalized = redactSensitiveText(value)
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, " ")
-    .replace(/\s+/gu, " ")
-    .trim();
-  if (normalized.length === 0) return undefined;
-  return truncateDisplayText(normalized, maximum);
 }
 
 function safeToolName(value: unknown): string {
@@ -306,6 +277,7 @@ class ExecutionTrackerState implements ExecutionTracker {
   readonly #subagents = new Map<string, MutableSubagent>();
   readonly #subagentOrder: string[] = [];
   #todos: ExecutionTodoPhase[] = [];
+  #research: ResearchSnapshot | undefined;
   #startedAtMs: number | null;
   #endedAtMs: number | null = null;
   #state: ExecutionState = "running";
@@ -348,6 +320,9 @@ class ExecutionTrackerState implements ExecutionTracker {
         break;
       case "run_end":
         this.#endRun(event, atMs);
+        break;
+      case "research_update":
+        this.#updateResearch(event);
         break;
     }
     return this.snapshot(this.#lastAtMs);
@@ -400,6 +375,7 @@ class ExecutionTrackerState implements ExecutionTracker {
         }];
       }),
       todos: copySnapshotTodos(this.#todos),
+      ...(this.#research === undefined ? {} : { research: this.#research }),
     };
   }
 
@@ -450,6 +426,16 @@ class ExecutionTrackerState implements ExecutionTracker {
   #updateTodos(event: Extract<ExecutionEvent, { type: "todo_update" }>): void {
     if (this.#state !== "running") return;
     this.#todos = copyTodoPhases(event.phases);
+  }
+
+  /**
+   * 最新一帧 research_update 整体替换研究投影:同一版本重放得到相同结果(可重入),之后到达
+   * 的无关帧不再触碰它(sticky),而内容非法的帧得到与缺失相同的 undefined——与工具行被
+   * 丢弃同理,卡面只渲染能净化的状态。事件携带的 report 从不进快照。
+   */
+  #updateResearch(event: Extract<ExecutionEvent, { type: "research_update" }>): void {
+    if (this.#state !== "running") return;
+    this.#research = sanitizeResearchSnapshot(event.research);
   }
 
   #startSubagent(event: Extract<ExecutionEvent, { type: "subagent_start" }>, atMs: number): void {
@@ -549,6 +535,8 @@ export function createExecutionTracker(options: ExecutionTrackerOptions = {}): E
  * deployment's edge inspects every card body and refuses one whose text matches its injection
  * rules, and a bounded command line can do that on its own, so a card refused that way is retried
  * in this shape: run state, counts, todos and subagent rows stay, and the command text does not.
+ * Research entries follow the same rule: name, goal, and per-run descriptions empty out while
+ * baselines, bests, statuses, round numbers, and the aggregate counts stay.
  */
 export function stripCardSummaries(snapshot: ExecutionSnapshot): ExecutionSnapshot {
   return {
@@ -569,6 +557,14 @@ export function stripCardSummaries(snapshot: ExecutionSnapshot): ExecutionSnapsh
       ...(subagent.currentTool === undefined ? {} : { currentTool: subagent.currentTool }),
       ...(subagent.toolCount === undefined ? {} : { toolCount: subagent.toolCount }),
     })),
+    ...(snapshot.research === undefined ? {} : {
+      research: {
+        ...snapshot.research,
+        name: "",
+        goal: "",
+        recent: snapshot.research.recent.map(run => ({ ...run, description: "" })),
+      },
+    }),
   };
 }
 
@@ -603,6 +599,7 @@ export function restoreExecutionSnapshot(
     tools?: unknown;
     subagents?: unknown;
     todos?: unknown;
+    research?: unknown;
   };
   if (!Array.isArray(record.tools) || !Array.isArray(record.todos)) return null;
   const startedAtMs = typeof record.startedAtMs === "number" ? finiteTime(record.startedAtMs) : null;
@@ -686,6 +683,16 @@ export function restoreExecutionSnapshot(
         ...(toolCount === undefined ? {} : { toolCount }),
       });
     }
+  }
+  // 研究状态随同一净化边界重放:持久载荷可能写于编码期尚无保证的年代,恢复与实时帧走同一
+  // 套 research_update 规则;没有 research 键的旧快照自然落到 undefined。值一传入即由
+  // apply 内的 sanitize 校验,这里的断言只是跨过 unknown。
+  if (record.research !== undefined) {
+    tracker.apply({
+      type: "research_update",
+      atMs: options.atMs,
+      research: record.research as ResearchSnapshot,
+    });
   }
   return tracker.apply({ type: "run_end", atMs: options.atMs, state: options.state });
 }
