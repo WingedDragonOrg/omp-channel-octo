@@ -101,14 +101,14 @@
 ### 模块与接口
 
 - `src/contracts.ts`：`TaskRelayTarget`（`channelType: 2 | 5`、`channelId`、`threadName`）。
-- `src/store-records.ts`：`TaskRecord` 新增 `relayChannelType`/`relayChannelId`/`relayThreadName`；`ThreadNotifyRecord` 删除。
-- `src/store-schema.ts`：`tasks` 三个新列、`thread_notify` 建表移除并在初始化时 `DROP TABLE IF EXISTS`；`taskFromRow` 解码新列。
-- `src/store-tasks.ts`：`acceptTask` 写入 relay 列。
-- `src/store-chats.ts` / `src/store.ts`：删除 `registerThreadNotify`/`getThreadNotify`/`clearThreadNotify` 与门面转发。
-- `src/thread-notify.ts`：`threadOutcomeNotice(task)` 从任务行渲染（模板、`bounded`、`stateLabel`、`outcomeLine`）。
+- `src/store/store-records.ts`：`TaskRecord` 新增 `relayChannelType`/`relayChannelId`/`relayThreadName`；`ThreadNotifyRecord` 删除。
+- `src/store/store-schema.ts`：`tasks` 三个新列、`thread_notify` 建表移除并在初始化时 `DROP TABLE IF EXISTS`；`taskFromRow` 解码新列。
+- `src/store/store-tasks.ts`：`acceptTask` 写入 relay 列。
+- `src/store/store-chats.ts` / `src/store/index.ts`：删除 `registerThreadNotify`/`getThreadNotify`/`clearThreadNotify` 与门面转发。
+- `src/threads/thread-notify.ts`：`threadOutcomeNotice(task)` 从任务行渲染（模板、`bounded`、`stateLabel`、`outcomeLine`）。
 - `src/host-tools.ts`：`thread-dispatch` 的 `notify` 参数与登记、收据、工具描述；`create-thread` 去掉 `notify`；`thread-delete` 去掉清理；投递接口接收 `TaskRelayTarget | null`。
 - `src/service.ts`：`acceptTask` 接收 relay 目标；`notifyThreadOutcome` 读任务行。
-- `src/thread-commands.ts`：`threadIntentPrompt` 包含是否请求完成通知的判断建议。
+- `src/commands/thread-commands.ts`：`threadIntentPrompt` 包含是否请求完成通知的判断建议。
 
 ## 错误与边界情况
 

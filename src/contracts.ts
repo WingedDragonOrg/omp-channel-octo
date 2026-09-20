@@ -1,5 +1,5 @@
-import type { ExecutionEvent, ExecutionSnapshot } from "./execution-tracker.ts";
-import type { ProjectSessionState } from "./project-session.ts";
+import type { ExecutionEvent, ExecutionSnapshot } from "./cards/execution-tracker.ts";
+import type { ProjectSessionState } from "./session/project-session.ts";
 
 export interface ChatTarget {
   channelId: string;

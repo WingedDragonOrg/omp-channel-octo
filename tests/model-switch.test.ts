@@ -5,7 +5,7 @@ import {
   boundedSelectorText,
   formatModelCatalog,
   modelWithLevel,
-} from "../src/model-switch";
+} from "../src/commands/model-switch";
 
 const MODELS: WorkerModelInfo[] = [
   { provider: "deepminer", id: "claude-opus-5", name: "Claude Opus 5" },

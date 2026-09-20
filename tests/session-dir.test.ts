@@ -7,7 +7,7 @@ import {
   projectSessionDir,
   projectSessionKey,
   sessionsRoot,
-} from "../src/session-dir";
+} from "../src/session/session-dir";
 import { closeCoreHarness, createCoreHarness, inbound } from "./fixtures/core-fakes";
 
 test("项目目录名对同一个 cwd 稳定，同名目录互不混淆", () => {

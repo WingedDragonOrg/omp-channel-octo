@@ -7,8 +7,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import type { WorkerContextScope } from "../contracts.ts";
-import { OCTO_CLI_ENV_ALLOWLIST } from "../octo-cli.ts";
-import { loadValidatedSessionState, type ProjectSessionState } from "../project-session.ts";
+import { OCTO_CLI_ENV_ALLOWLIST } from "../runtime/octo-cli.ts";
+import { loadValidatedSessionState, type ProjectSessionState } from "../session/project-session.ts";
 
 export const VALUE_FLAGS_TO_STRIP = new Set([
 	"--mode",

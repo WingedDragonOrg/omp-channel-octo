@@ -1,4 +1,4 @@
-import { buildAskCard, buildAskCardSet, type AskCardQuestion } from "../../src/ask-card.ts";
+import { buildAskCard, buildAskCardSet, type AskCardQuestion } from "../../src/cards/ask-card.ts";
 
 // Fixed synthetic content. Keep this workload unchanged across UI experiments.
 const single: AskCardQuestion = {

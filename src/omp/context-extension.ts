@@ -7,9 +7,9 @@ import {
 	readContextSidecar,
 	writePreparedReceipt,
 	type ContextSidecar,
-} from "../context-sidecar.ts";
+} from "../session/context-sidecar.ts";
 
-export { contextSidecarFileName } from "../context-sidecar.ts";
+export { contextSidecarFileName } from "../session/context-sidecar.ts";
 
 /**
  * The extension is loaded inside OMP, not inside the channel host.  Keep the

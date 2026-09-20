@@ -63,7 +63,7 @@
 - `InboundMessage` 增加 `messageSeq: number`（WS RECV 已解码的 `messageSeq`，`0` 表示解不出；DM 同样携带，群历史只用群/线程）与 `messageTimestamp: number`（服务端发送时间，epoch 毫秒，`0` 表示未知）。
 - `ChannelTransport` 增加 `fetchGroupMessages(target, { sinceSeq, untilSeq, limit, signal }): Promise<HistoryMessage[]>`，`HistoryMessage = { seq, senderId, text, timestamp, attachments? }`（`timestamp` 为 epoch 毫秒；`attachments` 为 `{ kind, name, size, url }[]`，只带绝对 http(s) 下载 URL，无附件消息不带该键）；`OctoTransport` 用 `POST /v1/bot/messages/sync` 实现（`start_message_seq = sinceSeq`、`end_message_seq = untilSeq`、`pull_mode = 1`；`untilSeq` 为 0 时表示"取最新窗口"），解码 base64 `payload` 后保留带文本或附件的消息，忽略 Bot 自己的消息。调用失败抛错，由调用方决定降级（见"水位线与窗口"）。
 - tasks 表增加 `message_seq INTEGER NOT NULL DEFAULT 0` 与 `history_eligible INTEGER NOT NULL DEFAULT 1`，`TaskRecord` 相应携带 `messageSeq`/`historyEligible`：前者是本轮任务的 `S`（跨重启/排队保持），后者区分普通任务（可注入历史）与经 `acceptTask` 进入的观察型命令（不注入历史）。
-- `CoreServiceConfig` 增加 `groupHistory?: { enabled: boolean; maxMessages: number }`；`config.ts` 严格校验：`enabled` 必须是布尔，`maxMessages` 必须是 `1..200` 的整数，`groupHistory` 内部未知字段拒绝。字段缺省即"开启、maxMessages 50"；只写 `maxMessages` 时 `enabled` 仍取默认 `true`，只写 `enabled: false` 时窗口保留默认 `50`（关闭即整块不生效）。
+- `CoreServiceConfig` 增加 `groupHistory?: { enabled: boolean; maxMessages: number }`；`src/runtime/config.ts` 严格校验：`enabled` 必须是布尔，`maxMessages` 必须是 `1..200` 的整数，`groupHistory` 内部未知字段拒绝。字段缺省即"开启、maxMessages 50"；只写 `maxMessages` 时 `enabled` 仍取默认 `true`，只写 `enabled: false` 时窗口保留默认 `50`（关闭即整块不生效）。
 
 ### 实时缓冲
 

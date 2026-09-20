@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createOutboxDelivery } from "../src/outbox.ts";
-import { openChannelStore } from "../src/store.ts";
+import { openChannelStore } from "../src/store/index.ts";
 import { FakeTransport } from "./fixtures/core-fakes.ts";
 
 test("a late failure of old content cannot exhaust the newer snapshot's retry budget", async () => {

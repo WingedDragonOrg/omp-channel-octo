@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import type { TaskRecord } from "../src/store-records";
-import { threadNotifyMessageId, threadOutcomeNotice } from "../src/thread-notify";
+import type { TaskRecord } from "../src/store/store-records";
+import { threadNotifyMessageId, threadOutcomeNotice } from "../src/threads/thread-notify";
 
 function task(overrides: Partial<TaskRecord> = {}): TaskRecord {
   return {

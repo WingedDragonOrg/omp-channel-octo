@@ -4,8 +4,8 @@
  */
 
 import type { WorkerEvent, WorkerNoticeEvent } from "../contracts.ts";
-import type { ExecutionEvent, ExecutionTodoPhase, TodoOperation, TodoStatus } from "../execution-tracker.ts";
-import type { ResearchTracker } from "../research.ts";
+import type { ExecutionEvent, ExecutionTodoPhase, TodoOperation, TodoStatus } from "../cards/execution-tracker.ts";
+import type { ResearchTracker } from "../research/index.ts";
 import { isRecord, type RpcFrame } from "./rpc.ts";
 
 export type PendingResponse = {

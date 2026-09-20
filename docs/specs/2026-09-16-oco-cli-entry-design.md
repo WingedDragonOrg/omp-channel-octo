@@ -42,7 +42,7 @@ channel 的日常操作目前散落在四处：`bun run src/cli.ts serve --confi
 | 决策 | 选择 | 理由 |
 | --- | --- | --- |
 | `oco` 归属 | `package.json` 的 `bin` 增加 `"oco": "src/cli.ts"`，安装用 `bun link` | 一个程序两个名字，零分叉；`~/.bun/bin` 已在 PATH；软链跟随工作树，与 Super 启动的是同一份代码 |
-| 守护进程识别 | 新增 `src/supervisor.ts`，`SupervisorTarget` 抽象 + 本期 `kind: "super"`；自动探测，不接受服务名参数、不读 channel 配置 | 部署姿势属于机器环境，不是 channel 配置；写进配置会让同一份代码换机器就要改配置 |
+| 守护进程识别 | 新增 `src/runtime/supervisor.ts`，`SupervisorTarget` 抽象 + 本期 `kind: "super"`；自动探测，不接受服务名参数、不读 channel 配置 | 部署姿势属于机器环境，不是 channel 配置；写进配置会让同一份代码换机器就要改配置 |
 | 启动动词 | `start` 是唯一的服务进程入口（原 `serve`），`run` 是不参与守护进程的调试入口 | 两个前台动词语义靠"是否参与守护进程"区分；守护进程 Stack 与 launchd 运行 `start`，调试用 `run` |
 | 重复启动 | 注册 Bot 之前检查 Bot 独占锁，被存活进程持有时报错退出 | 第二个实例的重新注册会切断在线实例的 WebSocket；用一个既有判据（锁）在动手之前拦住，而不是打完广告再失败 |
 | 日志归属 | 服务自持：`start`/`run` 把 `console` 输出同时写终端与 `~/.oco/logs/channel-YYYY-MM-DD.log` | 不依赖守护进程的日志实现；前台运行也有文件；14 天窗口与附件清理一致 |
@@ -92,7 +92,7 @@ channel 的日常操作目前散落在四处：`bun run src/cli.ts serve --confi
 
 ### 守护进程探测
 
-`src/supervisor.ts` 提供探测与执行两层，纯逻辑与进程调用分离，便于测试注入：
+`src/runtime/supervisor.ts` 提供探测与执行两层，纯逻辑与进程调用分离，便于测试注入：
 
 - 候选来源：`super export --format json` 的程序列表（`name`、`command`、`args`、`cwd`）。
 - 自进程模式（服务内触发重启）：调用方传入自己的 PID，对命令行走本 checkout CLI 的候选逐个读 `super info <program>`，PID 完全相等者即目标；无匹配即"未检测到"。
@@ -111,7 +111,7 @@ channel 的日常操作目前散落在四处：`bun run src/cli.ts serve --confi
 
 ### 配置与迁移
 
-- `config.example.json` 去掉 `restart` 块；`src/config.ts` 删除 `restartCommand`、`parseRestartCommand` 与 `restart` 键白名单项。
+- `config.example.json` 去掉 `restart` 块；`src/runtime/config.ts` 删除 `restartCommand`、`parseRestartCommand` 与 `restart` 键白名单项。
 - `CoreService` 的 restart 端口由 cli 层注入：探测成功时提供"派生守护进程重启"的 request，探测失败时不提供端口，服务回复"未检测到守护进程，无法重启 channel"；`channel_control.restart` 与聊天内 `/restart` 共用该端口，既有排定、持久化重启请求与重启后通报逻辑不变。
 - 迁移步骤：创建 `~/.oco/{config,logs}`（`0700`）→ 复制现有配置到 `~/.oco/config/config.json` 并去掉 `restart` 块（`0600`）→ 更新 Super stack 的 `--config` 并 `super apply -f` → 用 `oco restart` 与 `oco logs` 验证 → 确认无引用后删除旧 `~/.config/omp-channel-octo/`。
 

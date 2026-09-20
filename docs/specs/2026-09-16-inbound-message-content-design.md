@@ -84,7 +84,7 @@
 - `ChannelTransport` 增加：
   - `downloadAttachment({ url, path, maxBytes, signal }): Promise<number>`：落盘并返回字节数。
   - `transcribeAudio(path, signal): Promise<string | null>`：`null` 表示无转写可用。
-- `CoreServiceConfig` 增加 `attachments: { enabled: boolean; maxBytes: number }`；`config.ts` 严格校验（内部未知字段拒绝；`maxBytes` 为 1 KiB..1 GiB 的整数；缺省 `{ enabled: true, maxBytes: 26214400 }`；`enabled: false` 时 `maxBytes` 仍按默认解析）。
+- `CoreServiceConfig` 增加 `attachments: { enabled: boolean; maxBytes: number }`；`src/runtime/config.ts` 严格校验（内部未知字段拒绝；`maxBytes` 为 1 KiB..1 GiB 的整数；缺省 `{ enabled: true, maxBytes: 26214400 }`；`enabled: false` 时 `maxBytes` 仍按默认解析）。
 - 群/线程历史的实时缓冲与 sync 补洞必须使用**同一个**类型提取函数，只取其中的文本部分；否则同一张图在两条来源里的口径会不一致。回填路径（`POST /v1/bot/messages/sync`）不产出附件、不做 URL 判定，只按该函数取文本；mention 处理沿用各路径现状，本设计不改。
 - **唯一组装点**：`handleInbound` 在权限门、命令解析、待回答问题判定之后，在 steering 与任务派发之前执行一次「下载 + 转写 + 组装」，产出组装正文。该正文显式传给两个出口：`appendToRunningTask`（成功则为 steering，不建任务，但注入的就是这份正文）与 `acceptTask`（成为 `tasks.text`）。除这两个出口外没有其它消费方：
   - 命令是否取资源取决于它是否消费正文：`/thread <任务>` 与 `/queue <文本>` 的正文是命令参数，注册 handler 的正文是整条消息——这些路径先把命令 claim 释放（或本来就还没有 claim），再把各自的正文交给同一条组装点，附件（图片/文件/语音/视频）与引用块照常进入组装正文；组装失败（附件被拒）时不接受任务、不调用 handler。拦截型 handler 拿到的是组装后的正文（`message.text` 即组装文本），观察型 handler 接受的任务正文与它看到的正文是同一份。

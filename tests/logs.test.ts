@@ -10,7 +10,7 @@ import {
   newestLogFile,
   pruneLogFiles,
   readLogTail,
-} from "../src/logs.ts";
+} from "../src/runtime/logs.ts";
 
 async function tempDir(prefix: string): Promise<string> {
   return await mkdtemp(join(tmpdir(), prefix));

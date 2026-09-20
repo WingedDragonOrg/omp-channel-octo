@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import contextExtension, { contextSidecarFileName } from "../src/omp/context-extension.ts";
-import { boundSessionPath } from "../src/context-sidecar.ts";
+import { boundSessionPath } from "../src/session/context-sidecar.ts";
 
 type Target = {
   channelType: number;

@@ -11,7 +11,7 @@ import {
   verifyMovedSession,
   type ProjectSessionBinding,
   type ProjectSessionState,
-} from "../src/project-session";
+} from "../src/session/project-session";
 import { openChannelStore } from "../src/store";
 import {
   closeCoreHarness,

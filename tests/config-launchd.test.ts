@@ -1,14 +1,14 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import { generateLaunchdPlist } from "../src/launchd.ts";
+import { generateLaunchdPlist } from "../src/runtime/launchd.ts";
 import {
   DEFAULT_CONFIG_PATH,
   ocoConfigDir,
   ocoLogsDir,
   parseConfig,
   toCoreConfig,
-} from "../src/config.ts";
+} from "../src/runtime/config.ts";
 
 function configDocument(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {

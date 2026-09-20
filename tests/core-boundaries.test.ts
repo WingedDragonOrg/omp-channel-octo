@@ -17,7 +17,7 @@ import type {
   WorkerOptions,
   WorkerProcess,
 } from "../src/contracts";
-import type { ProjectSessionState } from "../src/project-session";
+import type { ProjectSessionState } from "../src/session/project-session";
 import { createChannelService } from "../src/service";
 import {
   closeCoreHarness,

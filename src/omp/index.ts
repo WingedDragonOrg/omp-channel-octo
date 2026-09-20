@@ -13,7 +13,7 @@ import type {
 	WorkerProcess,
 } from "../contracts.ts";
 import { TaskStartupError, taskStartupError } from "../contracts.ts";
-import { loadValidatedSessionState, type ProjectSessionState } from "../project-session.ts";
+import { loadValidatedSessionState, type ProjectSessionState } from "../session/project-session.ts";
 import {
 	RpcCommand,
 	RpcFrame,
@@ -38,7 +38,7 @@ import {
 	stripEnforcedArgs,
 	workerEnv,
 } from "./profile.ts";
-import { ResearchTracker } from "../research.ts";
+import { ResearchTracker } from "../research/index.ts";
 import {
 	HostCall,
 	PendingResponse,

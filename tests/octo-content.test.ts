@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import { mkdtemp, open as openFile, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AttachmentError } from "../src/attachments.ts";
+import { AttachmentError } from "../src/inbound/attachments.ts";
 import type { ChannelTransport, InboundMessage } from "../src/contracts.ts";
 import { createOctoTransport } from "../src/octo/index.ts";
 import {

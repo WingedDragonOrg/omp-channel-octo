@@ -13,7 +13,7 @@ import {
   sweepAttachments,
   type AttachmentFailureReason,
   type SavedAttachment,
-} from "../src/attachments.ts";
+} from "../src/inbound/attachments.ts";
 import type { ChatTarget } from "../src/contracts.ts";
 
 const ATTACHMENT_HEADER = "附件（已保存到本机；需要时用 read 打开）：";

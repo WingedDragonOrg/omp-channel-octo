@@ -117,11 +117,11 @@ import type {
   ThreadSummary,
   UserInfo,
 } from "../contracts.ts";
-import { ATTACHMENT_DOWNLOAD_TIMEOUT_MS, AttachmentError } from "../attachments.ts";
+import { ATTACHMENT_DOWNLOAD_TIMEOUT_MS, AttachmentError } from "../inbound/attachments.ts";
 import { isJsonRecord, type JsonRecord } from "./type-guards.ts";
-import { buildExecutionCard, type ExecutionCardCapabilities } from "../execution-card.ts";
-import type { ExecutionSnapshot } from "../execution-tracker.ts";
-import { threadParentGroupId } from "../thread-target.ts";
+import { buildExecutionCard, type ExecutionCardCapabilities } from "../cards/execution-card.ts";
+import type { ExecutionSnapshot } from "../cards/execution-tracker.ts";
+import { threadParentGroupId } from "../threads/thread-target.ts";
 
 type Logger = (message: string) => void;
 

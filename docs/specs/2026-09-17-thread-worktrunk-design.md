@@ -32,7 +32,7 @@
 
 | 决策 | 选择 | 理由 |
 | --- | --- | --- |
-| 接入层 | 宿主侧执行 wt（`src/worktrunk.ts` + worktree 端口），agent 只经 `octo_management` 触发 | 与现有 create-thread 的 worktree 路径同构；审批、超时与错误边界集中在宿主 |
+| 接入层 | 宿主侧执行 wt（`src/workspace/worktrunk.ts` + worktree 端口），agent 只经 `octo_management` 触发 | 与现有 create-thread 的 worktree 路径同构；审批、超时与错误边界集中在宿主 |
 | 创建回退 | `wt` 不可用回退 `omp worktree add` | 不回归现状 |
 | merge 形态 | `/thread merge` 只注入合并指令 prompt；命令即 owner 的合并 + 清理确认——除非有明确必要理由（并说明）按默认参数执行，保留工作区须说明理由并显式 `remove:false` | owner 定稿：命令发出即默认收尾，执行与参数仍由 agent 决定 |
 | merge 默认行为 | 沿用 `wt merge` 默认 pipeline（squash、rebase、fast-forward、合并后删除工作区与分支） | owner 定稿：wt 默认删除 |
@@ -82,9 +82,9 @@
 ### 模块与接口
 
 - `src/contracts.ts`：`WorktreePort` 增加 `worktrunk()`/`merge()`/`remove()`；新增 `WorktrunkProbe`、`WorktreeMergeRequest`、`WorktreeMergeSummary`、`WorktreeRemovalRequest`、`WorktreeRemovalOutcome`。
-- `src/worktrunk.ts`（新）：候选探测、wt switch/merge/remove 的 argv 与 JSON 解析、git worktree 删除回退、linked worktree 校验、共享的受限命令执行与单行错误文本。
-- `src/worktree.ts`：保留 slug/候选命名与端口组装；工厂更名 `createWorktreePort`（创建优先 wt，不可用回退现状）。
-- `src/thread-target.ts`：新增 `threadChannelId(groupId, shortId)`——线程目标 ID 组装与解析同源。
+- `src/workspace/worktrunk.ts`（新）：候选探测、wt switch/merge/remove 的 argv 与 JSON 解析、git worktree 删除回退、linked worktree 校验、共享的受限命令执行与单行错误文本。
+- `src/workspace/worktree.ts`：保留 slug/候选命名与端口组装；工厂更名 `createWorktreePort`（创建优先 wt，不可用回退现状）。
+- `src/threads/thread-target.ts`：新增 `threadChannelId(groupId, shortId)`——线程目标 ID 组装与解析同源。
 - `src/service.ts`：`/thread merge` 分支、合并指令 prompt、提示文案、`/help` 与 `/thread` 用法更新。
 - `src/host-tools.ts`：`thread-merge` 动作、`thread-delete` 的 `force` 与清理回执、工具描述更新。
 

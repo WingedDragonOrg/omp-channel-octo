@@ -2,8 +2,8 @@ import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { expect, test } from "bun:test";
-import { ensureStateDirectory, loadConfig, parseConfig } from "../src/config.ts";
-import { generateLaunchdPlist, installLaunchdPlist } from "../src/launchd.ts";
+import { ensureStateDirectory, loadConfig, parseConfig } from "../src/runtime/config.ts";
+import { generateLaunchdPlist, installLaunchdPlist } from "../src/runtime/launchd.ts";
 
 function configDocument(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {

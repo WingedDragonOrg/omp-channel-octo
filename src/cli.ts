@@ -4,7 +4,7 @@ import { access, mkdtemp, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { createOctoTransport } from "./octo/index.ts";
-import { createOctoCliCredentialProvisioner } from "./octo-cli.ts";
+import { createOctoCliCredentialProvisioner } from "./runtime/octo-cli.ts";
 import { createWorkerFactory } from "./omp/index.ts";
 import {
   DEFAULT_CONFIG_PATH,
@@ -13,14 +13,14 @@ import {
   ocoLogsDir,
   resolveConfigPath,
   toCoreConfig,
-} from "./config.ts";
-import { createAllowlistWriteback } from "./config-writeback.ts";
+} from "./runtime/config.ts";
+import { createAllowlistWriteback } from "./runtime/config-writeback.ts";
 import {
   DEFAULT_LAUNCHD_LABEL,
   DEFAULT_LAUNCHD_PLIST_PATH,
   installLaunchdPlist,
   uninstallLaunchdPlist,
-} from "./launchd.ts";
+} from "./runtime/launchd.ts";
 import {
   DEFAULT_LOG_TAIL_LINES,
   ensureLogsDirectory,
@@ -30,10 +30,10 @@ import {
   pruneLogFiles,
   readLogTail,
   type LogTee,
-} from "./logs.ts";
-import { createSupervisorClient, type SupervisorClient, type SupervisorTarget } from "./supervisor.ts";
+} from "./runtime/logs.ts";
+import { createSupervisorClient, type SupervisorClient, type SupervisorTarget } from "./runtime/supervisor.ts";
 import { createChannelService } from "./service.ts";
-import { createWorktreePort } from "./worktree.ts";
+import { createWorktreePort } from "./workspace/worktree.ts";
 import type { ChannelService, OmpWorker } from "./contracts.ts";
 
 /** The checkout this CLI runs from; supervisor detection is scoped to it. */

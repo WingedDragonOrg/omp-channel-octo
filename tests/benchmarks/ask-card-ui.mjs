@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { chromium } from "playwright";
 import { askCardCases } from "./ask-card-cases.ts";
 import { cardStats } from "../../src/octo/cards.ts";
-import { parseAskActionId, resolveAskAnswer, resolveAskSetAnswer } from "../../src/ask-card.ts";
+import { parseAskActionId, resolveAskAnswer, resolveAskSetAnswer } from "../../src/cards/ask-card.ts";
 
 // Pinned local renderer and Chromium; no HTTP requests, credentials, model or clock inputs.
 // A geometry proxy, NOT an aesthetic rating. A keep also requires main-agent screenshot review.

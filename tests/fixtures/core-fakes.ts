@@ -51,14 +51,14 @@ import type {
   WorktreeRemovalRequest,
   WorktrunkProbe,
 } from "../../src/contracts";
-import { AttachmentError } from "../../src/attachments";
+import { AttachmentError } from "../../src/inbound/attachments";
 import {
   contextSidecarPath,
   normalizeGroupContext,
   readBoundSession,
   writePreparedReceipt,
-} from "../../src/context-sidecar";
-import type { ProjectSessionState } from "../../src/project-session";
+} from "../../src/session/context-sidecar";
+import type { ProjectSessionState } from "../../src/session/project-session";
 import { createChannelService } from "../../src/service";
 
 type GroupContextInput = Omit<GroupContext, "present"> & Partial<Pick<GroupContext, "present">>;

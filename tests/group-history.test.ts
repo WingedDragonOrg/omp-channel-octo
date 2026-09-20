@@ -10,7 +10,7 @@ import {
   renderHistoryBlock,
   selectHistoryWindow,
   type HistoryEntry,
-} from "../src/group-history";
+} from "../src/inbound/group-history";
 import type { HistoryMessageAttachment } from "../src/contracts";
 
 function mediaFile(name: string, size = 1): HistoryMessageAttachment {
