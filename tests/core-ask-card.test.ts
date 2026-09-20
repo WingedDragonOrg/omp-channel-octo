@@ -1580,3 +1580,38 @@ test.each(["single", "set"] as const)("text answers before the %s card receipt a
     await closeCoreHarness(harness);
   }
 });
+
+test.each(["text", "cancel"] as const)("a partial set keeps earlier answers when the remainder ends via %s", async (finish) => {
+  const questions = [
+    { id: "first", question: "First question?" },
+    { id: "second", question: "Second question?" },
+    ...(finish === "cancel" ? [{ id: "third", question: "Third question?" }] : []),
+  ];
+  const harness = await startAskHarness(questions);
+  try {
+    const target: ChatTarget = { channelType: 1, channelId: `partial-set-${finish}` };
+    await harness.service.handleInbound(inbound({ ...target, text: "ask" }));
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === questions.length);
+    const card = harness.transport.sentCards[0]!;
+    harness.transport.pushBotEvent(cardActionEvent(1, {
+      messageId: card.messageId,
+      ...target,
+      operatorUid: "owner-1",
+      actionId: cardActions(card)[0]!,
+      inputs: { ask_text_1: "first-answer" },
+    }));
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === questions.length - 1);
+    await harness.service.handleInbound(inbound({ ...target, text: finish === "cancel" ? "/cancel" : "second-answer" }));
+    await waitForStatus(harness.service, target,
+      (status) => status.state === (finish === "cancel" ? "cancelled" : "completed"));
+    const edit = harness.transport.cardEdits.at(-1)!;
+    expect(answeredTexts(edit.frame.card).some((text) => text.includes("first-answer"))).toBe(true);
+    if (finish === "text") {
+      expect(answeredTexts(edit.frame.card).some((text) => text.includes("second-answer"))).toBe(true);
+    }
+    expect(cardActions(edit)).toEqual([]);
+    expect(inputIds(edit)).toEqual([]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});

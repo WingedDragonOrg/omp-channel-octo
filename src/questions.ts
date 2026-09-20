@@ -257,15 +257,15 @@ function answerQuestionSetFromText(
       speaking.push({ question, answer, answeredBy });
     }
   }
-  for (const [messageId, rows] of questionsByCard(pending)) {
+  for (const messageId of questionsByCard(pending).keys()) {
+    const rows = deps.store.listQuestionsByCard(botUid, message, messageId);
     forgetAskGeneration(messageId);
     const first = rows[0];
     if (first === undefined) continue;
     if (rows.length === 1) {
       rewriteAskCard(first, { kind: "answered", answer: byId.get(first.id) ?? text, answeredBy });
     } else {
-      const fresh = deps.store.listQuestionsByCard(botUid, message, messageId);
-      rewriteAskCardSet(fresh, { kind: "closed", note: null }, null);
+      rewriteAskCardSet(rows, { kind: "closed", note: null }, null);
     }
   }
   wakeForAnswers(speaking);
@@ -659,7 +659,14 @@ function applyQuestionAnswer(question: QuestionRecord, answer: string, answeredB
   if (!deps.store.answerQuestion(question.id, botUid, question, answer, answeredBy)) return false;
   const waiting = releaseQuestion(question.id, { answer, answeredBy });
   forgetAskGeneration(question.cardMessageId);
-  rewriteAskCard(question, { kind: "answered", answer, answeredBy });
+  const rows = question.cardMessageId === null
+    ? []
+    : deps.store.listQuestionsByCard(botUid, question, question.cardMessageId);
+  if (rows.length > 1) {
+    rewriteAskCardSet(rows, { kind: "closed", note: null }, null);
+  } else {
+    rewriteAskCard(question, { kind: "answered", answer, answeredBy });
+  }
   if (!waiting) wakeForAnswers([{ question, answer, answeredBy }]);
   return true;
 }
@@ -974,7 +981,8 @@ function answerSetCardClick(
     if (botUid === undefined) return;
     const openQuestions = deps.store.listPendingQuestions(botUid, target);
     deps.store.cancelQuestions(botUid, target);
-    for (const [messageId, rows] of questionsByCard(openQuestions)) {
+    for (const messageId of questionsByCard(openQuestions).keys()) {
+      const rows = deps.store.listQuestionsByCard(botUid, target, messageId);
       forgetAskGeneration(messageId);
       const first = rows[0];
       if (first === undefined) continue;
