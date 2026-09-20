@@ -57,8 +57,8 @@ export interface HostToolHost {
     queued_tasks: number;
     blocked_cwds: number;
   };
-  /** `channel_control` 的 restart：没有配置重启命令时返回不可用文案。 */
-  scheduleRestart(target: ChatTarget): string;
+  /** `channel_control` 的空闲重启；宿主重启端口不可用时返回说明。 */
+  scheduleRestart(): string;
 }
 
 const MANAGEMENT_BASE_ACTIONS = [
@@ -231,7 +231,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord, _snapshot:
     },
     execute: async (args, signal, toolCallId) => host.askQuestions(task, target, args, signal, toolCallId),
   };
-  const channelTool = createChannelTool(host, target);
+  const channelTool = createChannelTool(host);
   const parentGroupId =
     target.channelType === 2
       ? target.channelId
@@ -309,7 +309,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord, _snapshot:
  * Channel-level control for the agent. Available in every chat, because the restart it can
  * request is a property of the channel, not of a group.
  */
-function createChannelTool(host: HostToolHost, target: ChatTarget): HostTool {
+function createChannelTool(host: HostToolHost): HostTool {
   return {
     name: "channel_control",
     description:
@@ -322,18 +322,17 @@ function createChannelTool(host: HostToolHost, target: ChatTarget): HostTool {
       required: ["action"],
       additionalProperties: false,
     },
-    execute: async (args) => runChannelTool(host, target, args),
+    execute: async (args) => runChannelTool(host, args),
   };
 }
 
 async function runChannelTool(
   host: HostToolHost,
-  target: ChatTarget,
   args: Record<string, unknown>,
 ): Promise<string> {
   const action = args.action;
   if (action === "status") return JSON.stringify(host.channelStatus());
-  if (action === "restart") return host.scheduleRestart(target);
+  if (action === "restart") return host.scheduleRestart();
   throw new Error(`unknown action: ${typeof action === "string" ? action : String(action)}`);
 }
 

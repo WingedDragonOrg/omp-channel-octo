@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
@@ -309,20 +310,32 @@ test("legacy restart-notice rows are consumed silently", async () => {
   const botUid = first.bot.uid;
   await closeCoreHarness(first, { remove: false });
   await withStore(first.root, (store) => {
-    store.addRestartNotice({
-      id: "legacy-notice",
-      botUid,
-      channelType: target.channelType,
-      channelId: target.channelId,
-      requestedAt: Date.now(),
-    });
+    const db = new Database(store.path);
+    try {
+      const insert = db.query(
+        "INSERT INTO restart_notices(id, bot_uid, channel_type, channel_id, requested_at) VALUES (?, ?, ?, ?, ?)",
+      );
+      insert.run("legacy-notice", botUid, target.channelType, target.channelId, Date.now());
+      insert.run("legacy-other", `${botUid}-other`, 1, "other-chat", Date.now());
+    } finally {
+      db.close();
+    }
   });
 
   const restarted = await createCoreHarness({ root: first.root, bot: first.bot });
   try {
     await restarted.service.stop();
     expect(textsFor(restarted, target)).toEqual([]);
-    expect(await withStore(restarted.root, (store) => store.listRestartNotices(botUid))).toEqual([]);
+    await withStore(restarted.root, (store) => {
+      const db = new Database(store.path, { readonly: true });
+      try {
+        expect(db.query("SELECT bot_uid FROM restart_notices").all()).toEqual([
+          { bot_uid: `${botUid}-other` },
+        ]);
+      } finally {
+        db.close();
+      }
+    });
   } finally {
     await closeCoreHarness(restarted);
   }

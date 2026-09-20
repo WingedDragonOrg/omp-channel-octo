@@ -1270,7 +1270,7 @@ class CoreService implements ChannelService {
         queued_tasks: this.store.listQueuedTasks().length,
         blocked_cwds: this.blockedDirectories.size,
       }),
-      scheduleRestart: (target) => this.serviceRestart.schedule(target),
+      scheduleRestart: () => this.serviceRestart.schedule(),
     };
   }
 

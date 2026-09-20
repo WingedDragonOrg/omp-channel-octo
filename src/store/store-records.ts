@@ -57,11 +57,6 @@ export interface TaskRecord extends ChatTarget {
   /** Thread display name captured at dispatch time for the notice; only set with a relay target. */
   relayThreadName: string | null;
 }
-export interface RestartNoticeRecord extends ChatTarget {
-  id: string;
-  botUid: string;
-  requestedAt: number;
-}
 
 /**
  * 启动恢复结算的停止行：任务记录本身（已是 `interrupted` 终态）再加上结算前的持久意图。结算会清列，

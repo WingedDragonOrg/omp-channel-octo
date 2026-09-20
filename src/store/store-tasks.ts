@@ -4,7 +4,7 @@
 
 import { Database } from "bun:sqlite";
 import type { ChatTarget } from "../contracts.ts";
-import type { InboundClaim, RestartNoticeRecord, StoppedTaskRecovery, TaskRecord, TaskRestartRecovery, TaskStopIntent } from "./store-records.ts";
+import type { InboundClaim, StoppedTaskRecovery, TaskRecord, TaskRestartRecovery, TaskStopIntent } from "./store-records.ts";
 import { asNumber, asStopIntent, asString, query, run, targetValues, targetWhere, taskFromRow, transaction } from "./store-schema.ts";
 import { cancelTaskQuestions } from "./store-questions.ts";
 
@@ -382,29 +382,8 @@ export function isTaskResuming(db: Database, taskId: string): boolean {
   return row !== undefined;
 }
 
-export function addRestartNotice(db: Database, record: RestartNoticeRecord): void {
-  run(db,
-    `INSERT INTO restart_notices(id, bot_uid, channel_type, channel_id, requested_at)
-     VALUES(?, ?, ?, ?, ?)`,
-    [record.id, record.botUid, record.channelType, record.channelId, record.requestedAt],
-  );
-}
-
-export function listRestartNotices(db: Database, botUid: string): RestartNoticeRecord[] {
-  return query(db,
-    "SELECT * FROM restart_notices WHERE bot_uid = ? ORDER BY requested_at ASC, rowid ASC",
-    [botUid],
-  ).map((row) => ({
-    id: asString(row.id),
-    botUid: asString(row.bot_uid),
-    channelType: asNumber(row.channel_type) as 1 | 2 | 5,
-    channelId: asString(row.channel_id),
-    requestedAt: asNumber(row.requested_at),
-  }));
-}
-
-export function clearRestartNotice(db: Database, id: string): void {
-  run(db, "DELETE FROM restart_notices WHERE id = ?", [id]);
+export function clearRestartNotices(db: Database, botUid: string): void {
+  run(db, "DELETE FROM restart_notices WHERE bot_uid = ?", [botUid]);
 }
 
 export function cancelQueued(db: Database, botUid: string, target: ChatTarget): string[] {

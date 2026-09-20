@@ -1,14 +1,7 @@
 /**
- * channel 重启的所有者：`/restart` 的校验、`channel_control` 的延期重启排定、延期重启在
- * channel idle 时的实际请求，以及旧版重启通报行的静默清理都在这里。
- *
- * 重启不再以中断任务为代价：在途回合由新进程按任务行的 prompt 标记续接，因此命令不再因忙碌
- * 被拒，也不再写「已重启完成 / 因重启中断」这类成功或中断通报——只留一条短回执。`pending`
- * 只读暴露给 host tools 的 channel 快照。
- *
- * 模块不依赖 `service.ts`：出站说明（`enqueueText`）、旧通知行的两个窄方法、在途任务视图
- * （`hasRunning`），以及宿主检测到的重启端口（`restart`，缺席即未检测到守护进程）都由
- * `CoreService` 以端口注入；端口缺席时命令只回一条说明，不猜重启机制。
+ * `/restart` 的资格检查、`channel_control` 的空闲重启，以及旧版通报行的静默清理。
+ * 在途任务由服务根据持久 prompt 标记续接；这里仅保存延期重启意图。
+ * CoreService 注入出站说明、状态盘、活动视图与检测出的宿主重启端口。
  */
 
 import type { ChatTarget, RestartPort } from "../contracts.ts";
@@ -26,7 +19,7 @@ const CHANNEL_RESTART_SCHEDULED_TEXT =
  * idle 判定），以及宿主注入的重启端口。
  */
 export interface ServiceRestartDeps {
-  readonly store: Pick<ChannelStore, "listQueuedTasks" | "listRestartNotices" | "clearRestartNotice">;
+  readonly store: Pick<ChannelStore, "listQueuedTasks" | "clearRestartNotices">;
   readonly stopping: () => boolean;
   /** 在途任务视图：`CoreService` 的 `hasRunning` 判定。 */
   readonly hasRunning: () => boolean;
@@ -40,19 +33,18 @@ export class ServiceRestart {
    * A restart requested through `channel_control`, kept until every chat is idle so the turn that
    * asked for it still delivers its reply.
    */
-  private pendingRestart: ChatTarget | null = null;
+  private pendingRestart = false;
 
   constructor(private readonly deps: ServiceRestartDeps) {}
 
   /** `channel_control` 是否排定了一次延期重启。 */
   get pending(): boolean {
-    return this.pendingRestart !== null;
+    return this.pendingRestart;
   }
 
   /**
-   * `/restart` 的校验与执行：参数只接受空或 `now`；有在途任务时同样接受——重启会由新进程
-   * 续接它们，不再有「先 /cancel 或 /restart now」的限制。通过校验回一条短回执，然后要求
-   * 服务向守护进程请求重启。返回 true 表示服务应请求重启。端口缺席时报未检测到守护进程。
+   * 参数接受空或 `now`；忙时也可请求重启。通过资格检查后回复一次，并返回 true 让服务
+   * 在命令 claim 完成后调用宿主重启端口。端口缺席时明确拒绝。
    */
   async handleCommand(target: ChatTarget, argument: string): Promise<boolean> {
     const restart = this.deps.restart;
@@ -75,9 +67,9 @@ export class ServiceRestart {
   }
 
   /** `channel_control` 的 restart：只排定，等 channel 空闲后由 `maybeRunDeferred` 真正请求。 */
-  schedule(target: ChatTarget): string {
+  schedule(): string {
     if (!this.deps.restart) return RESTART_UNAVAILABLE_TEXT;
-    this.pendingRestart = { channelType: target.channelType, channelId: target.channelId };
+    this.pendingRestart = true;
     return CHANNEL_RESTART_SCHEDULED_TEXT;
   }
 
@@ -86,9 +78,9 @@ export class ServiceRestart {
    * task. The request is fire-and-forget, because the supervisor stops this process.
    */
   maybeRunDeferred(): void {
-    if (this.pendingRestart === null || this.deps.stopping()) return;
+    if (!this.pendingRestart || this.deps.stopping()) return;
     if (this.deps.hasRunning() || this.deps.store.listQueuedTasks().length > 0) return;
-    this.pendingRestart = null;
+    this.pendingRestart = false;
     const restart = this.deps.restart;
     if (!restart) return;
     void restart.request().catch((error: unknown) => {
@@ -103,8 +95,6 @@ export class ServiceRestart {
    * `prompt_accepted` 标记与 `prepareTasksForRestart` 保证，通报行没有剩余含义。
    */
   consumeStartupNotices(botUid: string): void {
-    for (const notice of this.deps.store.listRestartNotices(botUid)) {
-      this.deps.store.clearRestartNotice(notice.id);
-    }
+    this.deps.store.clearRestartNotices(botUid);
   }
 }
