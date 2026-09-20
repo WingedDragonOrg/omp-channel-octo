@@ -95,7 +95,8 @@ export function createBotEventLoop(deps: BotEventLoopDeps): BotEventLoop {
         } catch (error) {
           if (signal.aborted || deps.stopping()) return;
           console.error(`[bot-events] ack failed：${safeErrorMessage(error, "ack failed")}`);
-          return;
+          await waitFor(BOT_EVENT_POLL_BACKOFF_MS, signal);
+          break;
         }
         eventAttempts.delete(event.eventId);
         cursor = Math.max(cursor, event.eventId);
