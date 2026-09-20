@@ -131,10 +131,10 @@ oco run --config ~/.oco/config/config.json
 | `/autoresearch` | 开启研究模式；已开启时再次发送则关闭。 |
 | `/autoresearch <目标>` | 开启或恢复研究，并把目标交给助手执行。 |
 | `/autoresearch off` | 关闭研究模式；运行中的任务会先结束，再执行这条排队命令。 |
-| `/autoresearch clear --keep-tree` | 关闭并清空研究状态，保留工作树。 |
+| `/autoresearch clear --keep-tree` | 关闭并清空研究状态，跳过 Git 重置；仍删除 `autoresearch.sh` 等遗留研究产物。 |
 | `/autoresearch clear` | 关闭并清空研究状态；在 `autoresearch/*` 分支上默认硬重置到基线并清理未跟踪文件。没有基线时通知跳过重置。 |
 
-**`clear` 会丢弃工作树改动。** `clear --reset-tree` 还会在其他分支强制执行重置；channel 不增加确认或撤销机制。
+**`clear` 会删除研究产物，并可能丢弃工作树改动。** OMP v18.2.6 的 `clear`（包括 `--keep-tree`）会删除 `autoresearch.sh` 及旧版研究文件；`clear --reset-tree` 还会在其他分支强制执行 Git 重置。channel 不增加确认或撤销机制。
 
 开启、关闭和错误通知通过持久出站队列发到原聊天，带 `OMP：`、`OMP 警告：` 或 `OMP 错误：` 标签；它们与助手正文分开，不记入任务结果。研究续回合的正文和工具进度沿用现有流式消息与进度卡。
 
