@@ -21,7 +21,7 @@ import {
   requestWithTimeout,
   requiredString,
 } from "./http.ts";
-import { threadParentGroupId } from "../thread-target.ts";
+import { threadParentGroupId } from "../threads/thread-target.ts";
 
 /** 群共享说明（GROUP.md / THREAD.md）的服务端上限。 */
 export const MAX_GROUP_CONTEXT_BYTES = 64 * 1024;

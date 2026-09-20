@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createWorktreePort, worktreeCandidates, worktreeSlug } from "../src/worktree";
+import { createWorktreePort, worktreeCandidates, worktreeSlug } from "../src/workspace/worktree";
 
 /**
  * The port shells out to the OMP executable and to Worktrunk, so these tests use executable stubs

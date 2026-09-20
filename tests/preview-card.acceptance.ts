@@ -1,14 +1,14 @@
 import { expect, test } from "bun:test";
-import { DEFAULT_API_URL } from "../src/config.ts";
+import { DEFAULT_API_URL } from "../src/runtime/config.ts";
 import type { ChatTarget } from "../src/contracts.ts";
-import { buildExecutionCard, type ExecutionCardCapabilities } from "../src/execution-card.ts";
+import { buildExecutionCard, type ExecutionCardCapabilities } from "../src/cards/execution-card.ts";
 import {
   createExecutionTracker,
   type ExecutionSnapshot,
   type ExecutionTracker,
-} from "../src/execution-tracker.ts";
+} from "../src/cards/execution-tracker.ts";
 import { createOctoTransport } from "../src/octo/index.ts";
-import type { ResearchRun, ResearchSnapshot } from "../src/research.ts";
+import type { ResearchRun, ResearchSnapshot } from "../src/research/index.ts";
 
 function firstNonEmpty(...values: readonly (string | undefined)[]): string | undefined {
   for (const value of values) {

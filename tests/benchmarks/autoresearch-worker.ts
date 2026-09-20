@@ -19,7 +19,7 @@ import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { OmpWorker, WorkerEvent, WorkerProcess } from "../../src/contracts.ts";
-import type { ExecutionEvent } from "../../src/execution-tracker.ts";
+import type { ExecutionEvent } from "../../src/cards/execution-tracker.ts";
 import { createWorkerFactory } from "../../src/omp/index.ts";
 import { check, type CheckResult } from "./autoresearch-types.ts";
 

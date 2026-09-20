@@ -4,9 +4,9 @@ import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { BotIdentity, ChatTarget, ProgressCard, SendReceipt } from "../src/contracts";
-import { createExecutionTracker, encodeExecutionSnapshot } from "../src/execution-tracker";
+import { createExecutionTracker, encodeExecutionSnapshot } from "../src/cards/execution-tracker";
 import { ChannelStore } from "../src/store";
-import type { InboundClaim, ProgressCardRecord, TaskRecord } from "../src/store-records";
+import type { InboundClaim, ProgressCardRecord, TaskRecord } from "../src/store/store-records";
 import {
   assistantText,
   closeCoreHarness,

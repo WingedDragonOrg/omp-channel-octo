@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { InboundMessage } from "../src/contracts.ts";
 import { createQuestionDesk, type QuestionDeskDeps } from "../src/questions.ts";
-import { openChannelStore } from "../src/store.ts";
-import type { InboundClaim, TaskRecord } from "../src/store-records.ts";
+import { openChannelStore } from "../src/store/index.ts";
+import type { InboundClaim, TaskRecord } from "../src/store/store-records.ts";
 import { FakeTransport, inbound } from "./fixtures/core-fakes.ts";
 
 const ASK_TIMEOUT_MS = 1_000;

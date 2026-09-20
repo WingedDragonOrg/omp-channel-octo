@@ -35,7 +35,7 @@
 | --- | --- | --- |
 | 归档时机 | 工具内不即时归档，只「排定」；在该聊天任务回合末、回合输出与进度卡终态编辑排空后执行 | 任何消息都会把归档子区解档；即时归档会被紧随其后的回复解档 |
 | 自动归档条件 | `thread-merge` 成功且默认 pipeline（工作区已删除，`summary.removed === true`）时排定 | 「合并完成即归档」对应默认路径；显式保留工作区通常意味着还要继续用这个子区 |
-| 排定载体 | `ThreadArchiveScheduler`（`src/thread-archive.ts`）进程内 `Map<string, PendingThreadArchive>`（键为 `targetKey`），一次性（执行或放弃后清除） | 与 `pendingRestart` 同风格；不为一次性收尾新增持久化 |
+| 排定载体 | `ThreadArchiveScheduler`（`src/threads/thread-archive.ts`）进程内 `Map<string, PendingThreadArchive>`（键为 `targetKey`），一次性（执行或放弃后清除） | 与 `pendingRestart` 同风格；不为一次性收尾新增持久化 |
 | 新消息 | 该聊天的新入站（过权限门禁后）清除该聊天的待归档 | 用户回来了就不归档；避免归档↔解档抖动 |
 | 重试 | 仅瞬时失败（HTTP 5xx，或 bot API 把内部 500 包裹成 400 的 `err.server.bot_api.store_failed`）重试：最多 5 次尝试、尝试间隔 5s；永久 4xx 立即失败；停止时放弃 | 与既有 `deleteThread` 的瞬发失败认知一致（`src/errors.ts` 的 `isTransientServerFailure` 是两处共用的判定）；计时走 `setTimeout`，测试用假定时器推进，不真等 5s 壁钟 |
 | 结果可见性 | 合并结果进工具结果与回复；归档成功只留服务日志（子区状态即证据）；归档失败向发起聊天回一条 ≤200 字符单行说明 | 归档成功后再向子区发消息会把它解档；失败说明只影响收尾，不改变 merge 结果 |
@@ -56,7 +56,7 @@
 - `thread-merge` 成功且 `summary.removed === true` 时同样排定；工具结果 JSON 在合并结果旁给出 `archive: "scheduled"`（与合并结果分别可见）。
 - `octo_management` 的工具描述与 `action` 枚举同步（含「归档排定到回合末执行」的说明）。
 
-### 归档调度（`src/thread-archive.ts`）与服务接线
+### 归档调度（`src/threads/thread-archive.ts`）与服务接线
 
 - `ThreadArchiveScheduler` 独占 `pendingThreadArchives: Map<string, PendingThreadArchive>`（键为 `targetKey`，值为聊天目标 + `groupId`/`shortId`）及停止信号。
 - `HostToolHost.planThreadArchive(target, groupId, shortId)` 接线到 `schedule`（写入或覆盖）。

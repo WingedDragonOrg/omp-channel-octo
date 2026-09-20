@@ -169,7 +169,7 @@ channel 另补两块只读呈现，均由权威实验状态驱动，不从工具
 | `attachments` | 默认启用，附件大小上限 25 MiB；启动时清理超过 14 天的附件。 |
 | `ask.timeoutMs` | 默认 6 小时，可配置为 30 分钟到 7 天的整数毫秒。 |
 
-状态、会话、附件和日志可能包含私有内容，应按敏感数据保存和备份。配置字段及校验以 [src/config.ts](src/config.ts) 为准。
+状态、会话、附件和日志可能包含私有内容，应按敏感数据保存和备份。配置字段及校验以 [src/runtime/config.ts](src/runtime/config.ts) 为准。
 
 ## 日常运维
 
@@ -219,17 +219,33 @@ oco test --card
 
 ### 代码结构
 
+仓库是单一 private Bun package（`package.json` 无 `workspaces`，无拆包），运行时代码全在 `src/` 下，按领域目录组织：
+
 ```text
 src/cli.ts                  CLI 与服务生命周期
 src/service.ts              权限、命令、调度和任务协调
+src/contracts.ts            传输、入站、worker、服务与命令契约
+src/host-tools.ts           worker 暴露的宿主工具及其绑定目标
+src/questions.ts            持久化问答与答案交付
+src/outbox.ts               正文分块、串行编辑与有界重试投递
+src/display-name.ts         uid → 显示名解析（问答归属）
+src/typing-lease.ts         每聊天 typing 租约与续期
+src/bot-events.ts           Bot 事件队列长轮询（卡片点击）
+src/target.ts               聊天与流目标键
+src/errors.ts               共享错误面与瞬时失败判定
+src/abort.ts                取消信号转失败路径
 src/octo/                   Octo HTTP、WebSocket、消息及卡片传输
 src/omp/                    OMP 子进程、RPC、事件与进程清理
-src/store*.ts               SQLite 持久化与迁移
-src/execution-*.ts          执行进度跟踪与卡片渲染
-src/questions.ts            持久化问答与答案交付
-src/ask-card.ts             交互问答卡片
-src/worktree.ts             隔离工作区生命周期
-src/worktrunk.ts            Worktrunk 命令适配
+src/store/                  SQLite 持久化与迁移（index.ts 门面 + store-*.ts 分域读写）
+src/cards/                  执行进度跟踪、卡片渲染与交互问答卡片
+src/session/                会话身份、目录布局与回合上下文
+src/inbound/                入站权限、正文组装、附件与群历史
+src/commands/               命令解析、模型切换与 /thread 指令
+src/tasks/                  任务串行链、目录租约与失败分类
+src/threads/                子区目标解析、归档与完成通知
+src/workspace/              工作目录解析、隔离工作区与 Worktrunk 适配
+src/runtime/                配置、守护进程识别、日志、launchd 与重启
+src/research/               研究呈现与报告导出
 tests/                      行为测试、协议和子进程夹具
 ```
 

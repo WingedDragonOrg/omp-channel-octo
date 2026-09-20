@@ -106,9 +106,9 @@ owner 的命令路径（内建命令、注册 handler、未知 `/xxx` 透传任�
 
 - `src/service.ts`：`isAllowed` 成员分支、成员命令提示（常量、节流表、提示函数）、`memberAnswerAllowed` 注入。
 - `src/questions.ts`：`answerFromCard` 授权、答案携带 `answeredBy` 的整条链路、`wakeForAnswers` 与卡片文案。
-- `src/ask-card.ts`：`AskCardState.answered` 与 `AskCardSetQuestion` 增加 `answeredBy`，已回复行渲染提交人（署名解析到的名字以 `weight: "Bolder"` 的 `TextRun` 呈现，查不到则回退 uid；`askAnsweredText` 仍是纯文本/文本回退那一句的来源）。
+- `src/cards/ask-card.ts`：`AskCardState.answered` 与 `AskCardSetQuestion` 增加 `answeredBy`，已回复行渲染提交人（署名解析到的名字以 `weight: "Bolder"` 的 `TextRun` 呈现，查不到则回退 uid；`askAnsweredText` 仍是纯文本/文本回退那一句的来源）。
 - `src/display-name.ts`：uid → 显示名的有界缓存（TTL、条目上限、在途合并、单次查询预算、失败回退），服务经 `transport.getUserInfo` 注入问答子系统。
-- `src/store-schema.ts` / `src/store-records.ts` / `src/store-questions.ts` / `src/store.ts`：`answered_by` 列、记录字段与两个作答 API 的签名。
+- `src/store/store-schema.ts` / `src/store/store-records.ts` / `src/store/store-questions.ts` / `src/store/index.ts`：`answered_by` 列、记录字段与两个作答 API 的签名。
 
 ## 错误与边界情况
 

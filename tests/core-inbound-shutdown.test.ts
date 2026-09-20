@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { attachmentDirectory } from "../src/attachments.ts";
+import { attachmentDirectory } from "../src/inbound/attachments.ts";
 import type { AttachmentDownload } from "../src/contracts.ts";
 import {
   closeCoreHarness,

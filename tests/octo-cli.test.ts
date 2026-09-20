@@ -2,8 +2,8 @@ import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, test } from "bun:test";
-import { OCTO_CLI_ENV_ALLOWLIST, createOctoCliCredentialProvisioner } from "../src/octo-cli.ts";
-import { octoCliConfigDir } from "../src/config.ts";
+import { OCTO_CLI_ENV_ALLOWLIST, createOctoCliCredentialProvisioner } from "../src/runtime/octo-cli.ts";
+import { octoCliConfigDir } from "../src/runtime/config.ts";
 
 /**
  * The provisioner exists so OMP tasks can run `octo-cli` as this channel's bot without the raw

@@ -1,9 +1,9 @@
-import type { ExecutionCardCapabilities } from "../execution-card.ts";
-import type { ExecutionSnapshot } from "../execution-tracker.ts";
+import type { ExecutionCardCapabilities } from "../cards/execution-card.ts";
+import type { ExecutionSnapshot } from "../cards/execution-tracker.ts";
 import type { BotCardAction, CardFrame, CardProfile } from "../contracts.ts";
 import { isJsonRecord, type JsonRecord } from "./type-guards.ts";
 import { OctoError } from "./error.ts";
-import { buildExecutionCard } from "../execution-card.ts";
+import { buildExecutionCard } from "../cards/execution-card.ts";
 import { INTERACTIVE_CARD_MESSAGE_TYPE } from "./content.ts";
 import {
   MAX_HTTP_BODY_BYTES,

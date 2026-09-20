@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { buildExecutionCard, type ExecutionCardCapabilities } from "../src/execution-card.ts";
-import type { ResearchRun, ResearchSnapshot } from "../src/research.ts";
+import { buildExecutionCard, type ExecutionCardCapabilities } from "../src/cards/execution-card.ts";
+import type { ResearchRun, ResearchSnapshot } from "../src/research/index.ts";
 import {
   createExecutionTracker,
   encodeExecutionSnapshot,
@@ -10,7 +10,7 @@ import {
   type ExecutionSnapshot,
   type ExecutionState,
   type ExecutionTracker,
-} from "../src/execution-tracker.ts";
+} from "../src/cards/execution-tracker.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -1908,7 +1908,7 @@ describe("execution card rendering", () => {
 });
 
 // ——— autoresearch 迭代卡 ———
-// 共享类型来自 src/research.ts；夹具按合同诚实地自洽聚合，经既有 tracker.apply 投递
+// 共享类型来自 src/research/index.ts；夹具按合同诚实地自洽聚合，经既有 tracker.apply 投递
 // research_update 帧，只断言消费者可观察的快照与卡面。
 
 function researchRun(overrides: Partial<ResearchRun> & { readonly runNumber: number | null }): ResearchRun {

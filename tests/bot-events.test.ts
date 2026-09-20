@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BotEvent, BotEventFetch } from "../src/contracts.ts";
 import { createBotEventLoop } from "../src/bot-events.ts";
-import { openChannelStore } from "../src/store.ts";
+import { openChannelStore } from "../src/store/index.ts";
 import { FakeTransport } from "./fixtures/core-fakes.ts";
 
 class RetryAckTransport extends FakeTransport {

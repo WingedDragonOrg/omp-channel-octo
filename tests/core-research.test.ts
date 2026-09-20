@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
 import type { ChatTarget, ProgressCard, SendReceipt, WorkerEvent } from "../src/contracts.ts";
-import { researchReportsRoot } from "../src/research-report.ts";
-import type { ResearchSnapshot } from "../src/research.ts";
+import { researchReportsRoot } from "../src/research/research-report.ts";
+import type { ResearchSnapshot } from "../src/research/index.ts";
 import {
   assistantText,
   closeCoreHarness,

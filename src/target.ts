@@ -1,5 +1,5 @@
 import type { ChatTarget } from "./contracts.ts";
-import type { TaskRecord } from "./store-records.ts";
+import type { TaskRecord } from "./store/store-records.ts";
 
 /** 聊天目标的稳定键：真实 channelType + channelId，不用昵称。 */
 export function targetKey(target: ChatTarget): string {

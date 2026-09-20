@@ -15,7 +15,7 @@ import {
   type AskCardSetState,
   type AskCardState,
   type AnswererNames,
-} from "./ask-card.ts";
+} from "./cards/ask-card.ts";
 import type { BotEventOutcome } from "./bot-events.ts";
 import type {
   BotCardAction,
@@ -24,8 +24,8 @@ import type {
   InboundMessage,
 } from "./contracts.ts";
 import { safeErrorMessage } from "./errors.ts";
-import type { ChannelStore } from "./store.ts";
-import type { InboundClaim, QuestionRecord, TaskRecord } from "./store-records.ts";
+import type { ChannelStore } from "./store/index.ts";
+import type { InboundClaim, QuestionRecord, TaskRecord } from "./store/store-records.ts";
 import { targetKey } from "./target.ts";
 
 /**

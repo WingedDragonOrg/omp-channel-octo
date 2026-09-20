@@ -1,6 +1,6 @@
 import type { BotCardAction, BotEvent, ChannelTransport } from "./contracts.ts";
 import { safeErrorMessage } from "./errors.ts";
-import type { ChannelStore } from "./store.ts";
+import type { ChannelStore } from "./store/index.ts";
 
 /** Long-poll hold and the pause between rounds that returned immediately or failed. */
 const BOT_EVENT_POLL_WAIT_SECONDS = 20;

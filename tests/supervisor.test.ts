@@ -9,7 +9,7 @@ import {
   type SupervisorClient,
   type SupervisorRun,
   type SupervisorRunResult,
-} from "../src/supervisor.ts";
+} from "../src/runtime/supervisor.ts";
 
 const CHECKOUT = "/repo/omp-channel-octo";
 

@@ -4,7 +4,7 @@ import {
   contextSidecarPath,
   readContextSidecar,
   writeContextSidecarFile,
-} from "../src/context-sidecar";
+} from "../src/session/context-sidecar";
 import {
   assistantText,
   closeCoreHarness,

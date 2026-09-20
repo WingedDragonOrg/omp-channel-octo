@@ -9,7 +9,7 @@ import {
   AttachmentError,
   attachmentDirectory,
   safeAttachmentName,
-} from "../src/attachments.ts";
+} from "../src/inbound/attachments.ts";
 import type {
   AttachmentConfig,
   BotIdentity,

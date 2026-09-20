@@ -81,7 +81,7 @@ export class TaskStartupError extends Error {
 
 `src/omp/index.ts` 的 `create()` 与 `initialize()` 在各失败点抛出带码的错误（消息文本保持现有措辞，便于既有断言与运维检索）：`cwd-missing`、`session-dir-missing`、`spawn-failed`、`identity-unverified`、`watchdog-unavailable`、`not-ready`、`exited`、`handshake-failed`、`session-invalid`（`refreshState` 的会话状态校验）。宿主在 `existingSessionFile(binding.sessionFile)` 为空时抛 `session-invalid`。
 
-### 分类与呈现（`src/task-failure.ts`）
+### 分类与呈现（`src/tasks/task-failure.ts`）
 
 ```ts
 export type TaskStartupPhase = "context" | "startup";

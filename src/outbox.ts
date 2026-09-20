@@ -2,8 +2,8 @@ import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
 import type { ChannelTransport, ChatTarget, TextEvent } from "./contracts.ts";
 import { asAppError, failureText, type AppError } from "./errors.ts";
-import type { ChannelStore } from "./store.ts";
-import type { OutboxRecord } from "./store-records.ts";
+import type { ChannelStore } from "./store/index.ts";
+import type { OutboxRecord } from "./store/store-records.ts";
 import { streamTargetKey, targetKey } from "./target.ts";
 
 const MAX_TEXT_BYTES = 3_000;

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendAllowedGroupId, createAllowlistWriteback } from "../src/config-writeback";
+import { appendAllowedGroupId, createAllowlistWriteback } from "../src/runtime/config-writeback";
 
 async function writeConfig(directory: string, document: unknown, mode = 0o600): Promise<string> {
   const path = join(directory, "config.json");

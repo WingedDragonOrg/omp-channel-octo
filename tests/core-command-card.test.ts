@@ -3,10 +3,10 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createConfigMenuDesk, CONFIG_MENU_MAX_SESSIONS, CONFIG_MENU_TTL_MS } from "../src/command-cards.ts";
-import type { CommandCardView } from "../src/command-card.ts";
+import { createConfigMenuDesk, CONFIG_MENU_MAX_SESSIONS, CONFIG_MENU_TTL_MS } from "../src/commands/command-cards.ts";
+import type { CommandCardView } from "../src/cards/command-card.ts";
 import type { BotCardAction, BotIdentity, CardFrame, ChatTarget, SendReceipt } from "../src/contracts.ts";
-import { openChannelStore } from "../src/store.ts";
+import { openChannelStore } from "../src/store/index.ts";
 import { cardActionEvent, closeCoreHarness, createCoreHarness, FakeTransport, inbound, waitForStatus } from "./fixtures/core-fakes.ts";
 import type { SentCard } from "./fixtures/core-fakes.ts";
 

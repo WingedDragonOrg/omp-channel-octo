@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
 import { throwIfAborted } from "./abort.ts";
-import { normalizeGroupContext } from "./context-sidecar.ts";
+import { normalizeGroupContext } from "./session/context-sidecar.ts";
 import type {
   ChannelServiceOptions,
   ChatTarget,
@@ -15,11 +15,11 @@ import type {
   WorktreeMergeRequest,
 } from "./contracts.ts";
 import { isTransientServerFailure } from "./errors.ts";
-import type { ChannelStore } from "./store.ts";
-import type { TaskRecord } from "./store-records.ts";
+import type { ChannelStore } from "./store/index.ts";
+import type { TaskRecord } from "./store/store-records.ts";
 import { taskTarget } from "./target.ts";
-import { threadChannelId, threadParentGroupId, threadShortId } from "./thread-target.ts";
-import { worktreeSlug } from "./worktree.ts";
+import { threadChannelId, threadParentGroupId, threadShortId } from "./threads/thread-target.ts";
+import { worktreeSlug } from "./workspace/worktree.ts";
 
 /**
  * Host tools 需要的那部分 channel 状态。工具由服务在任务内组装，依赖以接口传入：工具模块

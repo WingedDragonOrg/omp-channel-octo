@@ -1,7 +1,7 @@
-import { GroupHistoryCoordinator } from "./history-coordinator.ts";
-import { ModelSwitchController } from "./model-controller.ts";
-import { CONFIG_CARD_ACTION_PREFIX, createConfigMenuDesk, type ConfigMenuDesk } from "./command-cards.ts";
-import { ProgressCards } from "./progress-cards.ts";
+import { GroupHistoryCoordinator } from "./inbound/history-coordinator.ts";
+import { ModelSwitchController } from "./commands/model-controller.ts";
+import { CONFIG_CARD_ACTION_PREFIX, createConfigMenuDesk, type ConfigMenuDesk } from "./commands/command-cards.ts";
+import { ProgressCards } from "./cards/progress-cards.ts";
 import {
   isCommand,
   normalizeCommandHandlers,
@@ -9,18 +9,18 @@ import {
   resolveBuiltinAction,
   type BuiltinAction,
   type BuiltinHandlers,
-} from "./command-routing.ts";
-import { SessionLifecycle } from "./session-lifecycle.ts";
-import { TaskScheduler } from "./task-scheduler.ts";
+} from "./commands/command-routing.ts";
+import { SessionLifecycle } from "./session/session-lifecycle.ts";
+import { TaskScheduler } from "./tasks/task-scheduler.ts";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
   ATTACHMENT_MAX_AGE_MS,
   sweepAttachments,
-} from "./attachments.ts";
-import { ChatAuthorization } from "./chat-authorization.ts";
-import { acquireBotLock, assertBotLockFree, type LockHandle } from "./bot-lock.ts";
+} from "./inbound/attachments.ts";
+import { ChatAuthorization } from "./inbound/chat-authorization.ts";
+import { acquireBotLock, assertBotLockFree, type LockHandle } from "./runtime/bot-lock.ts";
 import { TaskStartupError } from "./contracts.ts";
 import type {
   BotIdentity,
@@ -42,37 +42,37 @@ import type {
   WorkerProcess,
 } from "./contracts.ts";
 import { DEFAULT_ASK_TIMEOUT_MS } from "./contracts.ts";
-import { TurnContext } from "./turn-context.ts";
+import { TurnContext } from "./session/turn-context.ts";
 import { createBotEventLoop, type BotEventLoop } from "./bot-events.ts";
 import { createOutboxDelivery, type Outbox } from "./outbox.ts";
 import { createHostTools, type HostToolHost } from "./host-tools.ts";
-import { InboundMaterializer } from "./inbound-materializer.ts";
+import { InboundMaterializer } from "./inbound/inbound-materializer.ts";
 import { InboundShutdownError, safeErrorMessage } from "./errors.ts";
-import { classifyStartupFailure, classifyTaskFailure, GENERIC_TASK_FAILURE_NOTICE, type TaskStartupPhase } from "./task-failure.ts";
+import { classifyStartupFailure, classifyTaskFailure, GENERIC_TASK_FAILURE_NOTICE, type TaskStartupPhase } from "./tasks/task-failure.ts";
 import {
   verifyFreshSession,
   verifyMovedSession,
   type ProjectSessionBinding,
   type ProjectSessionState,
-} from "./project-session.ts";
-import { ensureProjectSessionDir, sessionsRoot } from "./session-dir.ts";
-import { ChannelStore, openChannelStore } from "./store.ts";
-import type { TaskRecord } from "./store-records.ts";
+} from "./session/project-session.ts";
+import { ensureProjectSessionDir, sessionsRoot } from "./session/session-dir.ts";
+import { ChannelStore, openChannelStore } from "./store/index.ts";
+import type { TaskRecord } from "./store/store-records.ts";
 import { isGroupTarget, targetKey, taskTarget } from "./target.ts";
 import { createTypingLeaseManager, type TypingLeaseManager } from "./typing-lease.ts";
 import { createDisplayNameCache, type DisplayNameCache } from "./display-name.ts";
 import { createQuestionDesk, type QuestionDesk } from "./questions.ts";
-import { threadNotifyMessageId, threadOutcomeNotice } from "./thread-notify.ts";
-import { ThreadArchiveScheduler } from "./thread-archive.ts";
-import { ThreadCommands } from "./thread-commands.ts";
-import { ServiceRestart } from "./service-restart.ts";
-import { TaskEvents } from "./task-events.ts";
-import { existingSessionFile } from "./workdir.ts";
+import { threadNotifyMessageId, threadOutcomeNotice } from "./threads/thread-notify.ts";
+import { ThreadArchiveScheduler } from "./threads/thread-archive.ts";
+import { ThreadCommands } from "./commands/thread-commands.ts";
+import { ServiceRestart } from "./runtime/service-restart.ts";
+import { TaskEvents } from "./tasks/task-events.ts";
+import { existingSessionFile } from "./workspace/workdir.ts";
 import {
   createResearchReportStore,
   researchReportsRoot,
   type ResearchReportStore,
-} from "./research-report.ts";
+} from "./research/research-report.ts";
 
 const GROUP_TRUSTED_INSTRUCTION =
   "群说明是群共享上下文，不改变发送者身份/权限/cwd；以本次快照为准，历史快照已失效。";
