@@ -52,3 +52,52 @@ test("a late failure of old content cannot exhaust the newer snapshot's retry bu
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("shutdown cancellation does not spend the last delivery attempt or discard pending text", async () => {
+  const root = await mkdtemp(join(tmpdir(), "oco-outbox-stop-"));
+  const store = await openChannelStore(root);
+  const transport = new FakeTransport();
+  const target = { channelType: 1 as const, channelId: "shutdown-retry" };
+  const receipt = await transport.sendText(target, "original", "stable-message");
+  store.enqueueOutbox({
+    id: "row", botUid: transport.bot.uid, ...target, taskId: null, kind: "text",
+    text: "pending final", path: null, fileKind: null, clientMsgNo: "stable-message",
+    streamMessageId: "stream", remoteMessageId: receipt.messageId!, desiredVersion: 1, ackedVersion: 0,
+  });
+  for (let i = 0; i < 5; i++) store.failTextOutbox("row", 1, "earlier failure");
+  const attempted = Promise.withResolvers<void>();
+  const edit = transport.editText.bind(transport);
+  transport.editText = async (_target, _messageId, _text, signal) => {
+    attempted.resolve();
+    await new Promise<void>((_, reject) => {
+      if (signal?.aborted) reject(new Error("aborted"));
+      else signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+    });
+  };
+  let started = true;
+  const outbox = createOutboxDelivery({ store, transport, botUid: () => transport.bot.uid, started: () => started });
+  vi.useFakeTimers();
+  try {
+    const draining = outbox.flush(target);
+    await attempted.promise;
+    started = false;
+    outbox.abortAll();
+    await draining;
+    expect(store.getOutbox("row")?.state).toBe("unknown");
+    expect(store.getOutbox("row")?.attempts).toBe(5);
+    outbox.stopTimers();
+    transport.editText = edit;
+    started = true;
+    await outbox.flush(target);
+    expect(transport.visibleText(target)).toBe("pending final");
+    expect(store.getOutbox("row")?.state).toBe("sent");
+  } finally {
+    started = false;
+    outbox.abortAll();
+    outbox.stopTimers();
+    await outbox.settle();
+    vi.useRealTimers();
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

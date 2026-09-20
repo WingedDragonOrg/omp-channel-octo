@@ -389,6 +389,8 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
             if (item.taskId) releaseTextAbortIfIdle(item.taskId);
           }
         } catch (error) {
+          // Shutdown aborts are not delivery failures; preserve the durable row for recovery.
+          if (!deps.started()) return;
           // Content updates reset the budget; an older in-flight failure must not spend it.
           if (attempted.streamMessageId) {
             const latest = deps.store.getOutbox(attempted.id);
