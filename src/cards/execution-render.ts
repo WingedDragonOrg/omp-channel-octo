@@ -61,7 +61,7 @@ const WAITING_GLYPH = "-";
 const FAILURE_GLYPH = "×";
 const RUNNING_GLYPH = "•";
 // A fixed pixel slot prevents mobile glyph metrics from moving task content.
-const TODO_MARKER_COLUMN_WIDTH = "80px";
+const TODO_MARKER_COLUMN_WIDTH = "64px";
 // A fixed pixel slot keeps every tool row's marker on one column.
 const TOOL_MARKER_COLUMN_WIDTH = "24px";
 const WAITING_TOOL_NAMES: Record<string, true> = {
@@ -418,7 +418,6 @@ function makeTodoTaskRow(
       {
         type: "Column",
         width: TODO_MARKER_COLUMN_WIDTH,
-        verticalContentAlignment: "Center",
         items: [makeTextBlock(`${continuation}\u00a0${branch}\u2009[${todoStatusGlyph(task.status)}]`, {
           color: tone,
           fontType: "Monospace",
@@ -430,7 +429,6 @@ function makeTodoTaskRow(
       {
         type: "Column",
         width: "stretch",
-        verticalContentAlignment: "Center",
         items: [makeTodoTaskBody(task, richTextSupported)],
       },
     ],
@@ -615,6 +613,11 @@ export function makeTextBlock(text: string, options: JsonNode = {}): JsonNode {
     ...options,
   };
 }
+/** Status markers are literal glyphs, never Markdown list openers. */
+function makeGlyph(glyph: string, options: JsonNode): JsonNode {
+  return makeTextBlock(glyph.replace(/[-*+]/gu, "\\$&"), options);
+}
+
 
 function makeToolRow(
   tool: ExecutionToolSnapshot,
@@ -659,7 +662,7 @@ function makeToolRow(
                     type: "Column",
                     width: TOOL_MARKER_COLUMN_WIDTH,
                     verticalContentAlignment: "Center",
-                    items: [makeTextBlock(glyph, {
+                    items: [makeGlyph(glyph, {
                       spacing: "None",
                       color: tone,
                       fontType: "Monospace",
@@ -673,7 +676,6 @@ function makeToolRow(
                     items: [
                       ...mainItems,
                       makeTextBlock(statusParts.join(" · "), {
-                        isSubtle: true,
                         size: "Small",
                         spacing: "None",
                         color: tone,
@@ -806,7 +808,7 @@ function makeSubagentRow(
                     type: "Column",
                     width: TOOL_MARKER_COLUMN_WIDTH,
                     verticalContentAlignment: "Center",
-                    items: [makeTextBlock(executionStateGlyph(subagent.state), {
+                    items: [makeGlyph(executionStateGlyph(subagent.state), {
                       spacing: "None",
                       color: tone,
                       fontType: "Monospace",
@@ -827,7 +829,6 @@ function makeSubagentRow(
                         ...(subagent.currentTool === undefined ? [] : [subagent.currentTool]),
                         ...(subagent.toolCount === undefined ? [] : [`${subagent.toolCount} 次调用`]),
                       ].join(" · "), {
-                        isSubtle: true,
                         size: "Small",
                         spacing: "None",
                         color: tone,
@@ -1156,7 +1157,7 @@ export function cardWithinLimits(card: AdaptiveCard, plain: string, limits: Reso
 }
 
 export function makeHeader(richLayout: boolean, actionSets: readonly JsonNode[] = []): JsonNode[] {
-  const title = makeTextBlock("处理进度", { weight: "Bolder", size: "Large", spacing: "None" });
+  const title = makeTextBlock("处理进度", { weight: "Bolder", size: "Medium", spacing: "None" });
   const subtitle = makeTextBlock("OMP 执行", { isSubtle: true, size: "Small", spacing: "Small" });
   if (richLayout) {
     return [
@@ -1169,20 +1170,12 @@ export function makeHeader(richLayout: boolean, actionSets: readonly JsonNode[] 
             width: "stretch",
             items: [title, subtitle],
           },
-          {
+          ...(actionSets.length === 0 ? [] : [{
             type: "Column",
             width: "auto",
             verticalContentAlignment: "Center",
-            items: [
-              makeTextBlock("✦", {
-                color: "Accent",
-                size: "ExtraLarge",
-                horizontalAlignment: "Right",
-                spacing: "None",
-              }),
-              ...actionSets,
-            ],
-          },
+            items: actionSets,
+          }]),
         ],
       },
     ];
@@ -1238,7 +1231,7 @@ export function makeStatusContainer(
               type: "Column",
               width: "auto",
               verticalContentAlignment: "Center",
-              items: [makeTextBlock(glyph, { color: tone, size: "Medium", spacing: "None" })],
+              items: [makeGlyph(glyph, { color: tone, size: "Medium", spacing: "None" })],
             },
             {
               type: "Column",
@@ -1246,19 +1239,6 @@ export function makeStatusContainer(
               items: [
                 makeTextBlock(status, { color: tone, weight: "Bolder", spacing: "None" }),
                 makeTextBlock(metrics, { isSubtle: true, size: "Small", spacing: "Small" }),
-              ],
-            },
-            {
-              type: "Column",
-              width: "auto",
-              verticalContentAlignment: "Center",
-              items: [
-                makeTextBlock(formatDuration(snapshot.elapsedMs), {
-                  color: tone,
-                  weight: "Bolder",
-                  horizontalAlignment: "Right",
-                  spacing: "None",
-                }),
               ],
             },
           ],
