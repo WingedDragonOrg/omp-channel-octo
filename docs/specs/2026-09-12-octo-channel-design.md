@@ -52,6 +52,8 @@
 
 本机入口为 `oco`（`omp-channel-octo` 的别名，`bun link` 安装）：`start` 是守护进程托管的服务进程入口，`run` 是不探测守护进程的调试入口，`restart`/`status`/`logs` 通过自动识别出的守护进程程序操作常驻实例，`test --card` 发送真实预览卡。配置在 `~/.oco/config/config.json`，服务日志由服务自持在 `~/.oco/logs/`，状态目录仍在 `~/.local/state/omp-channel-octo`（数据库、附件、sidecar、spool），OMP 会话默认落在 `~/.oco/sessions/`（每个项目一个子目录，见下）；守护进程与程序名不写进配置。详见 `2026-09-16-oco-cli-entry-design.md`。
 
+每次 Super CLI 查询有独立期限（默认 10 秒），覆盖进程退出及 stdout/stderr 读取。在 POSIX 上该调用使用独立进程组，期限到达时终止该组及直接子进程，即使子进程忽略 SIGTERM 或后代仍持有管道，也以超时错误结束调用。
+
 配置包含 Octo API 地址（缺省为 `https://im.deepminer.com.cn/`）、Bot token、可选 owner 用户 ID、允许群 ID、OMP 可执行文件、本地状态目录与会话目录（`sessionsDir`，缺省 `~/.oco/sessions`，每个项目一个子目录）；WebSocket 地址可按现有发现机制取得或显式配置；`ask` 块可配置问答等待超时 `timeoutMs`（默认 6 小时，允许 30 分钟到 7 天的整数毫秒，越界或非法值启动即拒绝）。未配置 owner 时，服务仅在该 Bot 尚无持久 owner 的条件下接受首次有效私聊绑定。凭证只来自本地配置或环境，不通过聊天设置，不写入日志。使用环境凭证时环境变量名默认 `OCTO_BOT_TOKEN`，显式名称仅允许 `OCTO_` 或 `OMP_CHANNEL_OCTO_` 前缀；所有这两类前缀的变量都会从 worker/watchdog 环境中剔除，以免子进程继承凭证。启动时校验配置、账户能力和状态目录可写性。同一 Bot 只允许一个 channel 实例，使用本机独占锁；不支持跨机器复制运行同一账户。
 发卡前必须通过同一能力门禁：profile `enabled=true`（兼容服务端返回 `1`），`profiles` 包含 `octo/v1`，`card_version=1.5`，且 `config.card_enabled=true`、`config.display_enabled=true`、`config.reasoning_enabled=true`；`TextBlock` 是唯一硬依赖，`Container` 等可选元素缺失时使用 fallback；若响应提供 `elements` 或 `limits`，则遵守所需元素和各项限额（包括 payload、node、depth 限额）。能力响应明确不满足必需条件时按未启用处理；HTTP 失败属于请求失败，不等同未启用，不通过发送试探能力。
 `launchd install` 只负责生成并写入权限为 `0600` 的 plist，不调用 `launchctl`；需要实际加载服务时由运维显式执行：

@@ -137,7 +137,7 @@ test("a hung super client fails on the deadline instead of blocking the CLI", as
   const root = await mkdtemp(join(tmpdir(), "oco-super-timeout-"));
   try {
     const script = join(root, "super");
-    await writeFile(script, "#!/bin/sh\nsleep 30\n", "utf8");
+    await writeFile(script, "#!/bin/sh\ntrap '' TERM\nsleep 30\n", "utf8");
     await chmod(script, 0o755);
     const client = createSupervisorClient({ command: script, timeoutMs: 150 });
     await expect(client.listPrograms()).rejects.toThrow(/超时/);
