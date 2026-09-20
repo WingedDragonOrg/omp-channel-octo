@@ -46,7 +46,7 @@ import { createBotEventLoop, type BotEventLoop } from "./bot-events.ts";
 import { createOutboxDelivery, type Outbox } from "./outbox.ts";
 import { createHostTools, type HostToolHost } from "./host-tools.ts";
 import { InboundMaterializer } from "./inbound-materializer.ts";
-import { InboundShutdownError, failureText, isTransientServerFailure, safeErrorMessage } from "./errors.ts";
+import { InboundShutdownError, safeErrorMessage } from "./errors.ts";
 import { classifyStartupFailure, classifyTaskFailure, GENERIC_TASK_FAILURE_NOTICE, type TaskStartupPhase } from "./task-failure.ts";
 import {
   verifyFreshSession,
@@ -62,8 +62,9 @@ import { createTypingLeaseManager, type TypingLeaseManager } from "./typing-leas
 import { createDisplayNameCache, type DisplayNameCache } from "./display-name.ts";
 import { createQuestionDesk, type QuestionDesk } from "./questions.ts";
 import { threadNotifyMessageId, threadOutcomeNotice } from "./thread-notify.ts";
+import { ThreadArchiveScheduler } from "./thread-archive.ts";
+import { ThreadCommands } from "./thread-commands.ts";
 import { existingSessionFile } from "./workdir.ts";
-import { worktrunkUnavailableText } from "./worktrunk.ts";
 
 const GROUP_TRUSTED_INSTRUCTION =
   "群说明是群共享上下文，不改变发送者身份/权限/cwd；以本次快照为准，历史快照已失效。";
@@ -102,22 +103,6 @@ const MAX_PENDING_STEERS = 32;
 const RECEIPT_EXCERPT_CHARS = 20;
 const DEFAULT_CANCELLED_TEXT = "当前任务已取消；不回滚已发生的副作用。";
 const DEFAULT_RESTARTING_TEXT = "channel 正在重启，本会话任务已中断；重启完成后会在本会话确认。";
-const THREAD_USAGE =
-  "用法：/thread <任务>；助手会先明确意图、确定子区名称与 worktree_name，然后新建隔离子区并把任务派发进去；子区内 /thread merge [补充说明] 即确认把本区工作合并回目标分支并清理隔离工作区（默认删除工作区与已合并分支，保留需说明理由；补充说明随合并指令一起交给助手）。";
-const THREAD_GROUP_ONLY_TEXT = "/thread 需要在群聊中使用。";
-const THREAD_NESTED_TEXT = "当前会话已是子区，不能再建子区。";
-const THREAD_MERGE_THREAD_ONLY_TEXT = "/thread merge 只在子区中使用。";
-const THREAD_MERGE_NO_WORKSPACE_TEXT =
-  "当前子区未绑定隔离工作区，/thread merge 不可用。";
-const THREAD_MERGE_UNCONFIGURED_TEXT =
-  "本部署未配置隔离工作区能力，/thread merge 不可用。";
-/** 排定的子区归档：仅瞬时失败重试（最多 5 次尝试、每次间隔 5 秒），永久失败即刻结束。 */
-const THREAD_ARCHIVE_ATTEMPTS = 5;
-const THREAD_ARCHIVE_RETRY_MS = 5_000;
-/** 归档前等该聊天出站队列排空的有界轮询（100ms 一次，最多 10 秒）。 */
-const THREAD_ARCHIVE_DRAIN_MS = 10_000;
-const THREAD_ARCHIVE_DRAIN_POLL_MS = 100;
-
 type RuntimeTask = {
   taskId: string;
   target: ChatTarget;
@@ -150,85 +135,6 @@ function receiptText(prefix: string, text: string): string {
     ? `${excerpt.slice(0, RECEIPT_EXCERPT_CHARS)}…`
     : excerpt;
   return `${prefix} ▸ ${bounded}`;
-}
-
-/**
- * Instruction block for a `/thread` message: the command hands the intent over instead of
- * creating anything, and the assistant names the sub-thread and its workspace itself, then drives
- * `octo_management`. The dispatch body always follows SDD shape (goal, scope, constraints,
- * acceptance): a requirement clear enough to generate the SDD from is dispatched without a
- * clarification round, so the thread generates the SDD and starts at once; anything else is
- * dispatched after at most the few SDD-shaped answers it takes to hand it over, with the remaining
- * clarification left to the thread (guided by a clarification skill when the environment has one).
- * Detailed clarification never happens in the originating chat. The dispatch's `notify` flag stays
- * the assistant's own judgment: it asks for a completion relay only for hand-offs it will not keep
- * watching.
- */
-function threadIntentPrompt(intent: string): string {
-  return [
-    "用户希望把下面这件事放进一个新的隔离子区处理，而不是在当前会话直接执行。",
-    "先理解意图，并据此确定子区名称（简洁、能说明这件事）与 worktree_name（ASCII 小写连字符，如 fix-login-flow）。",
-    "需求简单或非常明确时不要在这里澄清；其余情况先按 SDD 的要素（目标、范围、约束与验收标准）向 owner 问最少必要的问题（够派发即可，不要在当前会话展开细节），再派发。",
-    "然后调用 octo_management：create-thread（name=子区名称，worktree_name=你定的名字）创建隔离子区，",
-    "再用 thread-dispatch（short_id=该子区）把任务派发进去；派发的任务正文按 SDD 格式写（目标、范围、约束与验收标准），需求明确程度决定子区能否直接生成 SDD：",
-    "- 简单或非常明确（目标与验收标准能直接写清、足以直接生成 SDD、没有需要 owner 决策的歧义或取舍）：直接按 SDD 格式写清要做什么（可整理原始意图，但不要丢信息），让子区直接生成 SDD 并立刻开工；",
-    "- 否则：按 SDD 格式写明已知的目标、范围、约束与验收标准，并要求子区先按 SDD 格式把尚不明确的需求澄清成 SDD（可实施的设计）再动手，需要 owner 拍板的问题在子区内用 ask 提出；环境里有 spec-design 等需求澄清或设计技能时，引导子区用该技能完成澄清。",
-    "派发时自行判断是否要回执：只有你派发后不会再盯着这份活、又需要在它结束（完成/失败/取消/中断）时知道结果，才给 thread-dispatch 传 notify=true；你会在子区里持续交互、或结果不需要回报时不要开（默认 false，不开就不回报）。",
-    "详细的需求澄清在子区内进行：不要在当前会话执行这件事，也不要在当前会话做过于详细的需求澄清。",
-    "完成后简要汇报子区名称、short_id 与工作区路径。",
-    "",
-    "原始意图：",
-    intent,
-  ].join("\n");
-}
-
-/**
- * `/thread` 参数按首词识别合并意图：首词是 `merge`（其后为行尾或非字母数字、下划线、连字符
- * 的分隔符——`merge-fix` 这类名字不算）时返回去掉分隔符并单行化后的补充说明（可为空串），
- * 其余情况返回 `undefined`。
- */
-function readThreadMergeNote(argument: string): string | undefined {
-  const trimmed = argument.trim();
-  if (!/^merge(?:$|[^\p{L}\p{N}_-])/iu.test(trimmed)) return undefined;
-  const note = trimmed
-    .slice("merge".length)
-    .replace(/^[\s,，、:：]+/u, "")
-    .replace(/[\p{Cc}\p{Cf}]+/gu, " ")
-    .replace(/\s+/gu, " ")
-    .trim();
-  return note.length > 200 ? `${note.slice(0, 199)}…` : note;
-}
-
-/**
- * Instruction block for a `/thread merge` message: like the creation prompt it hands the intent
- * to the assistant instead of acting itself. The command is the owner's confirmation to merge and
- * clean up, so the body names the default pipeline (stages and commits the workspace changes,
- * squashes, rebases onto the target branch, fast-forwards it, then removes the worktree and its
- * merged branch) as the expected behaviour and asks for a stated reason plus an explicit
- * `remove:false` whenever the workspace must be kept; it also states that the removal takes the
- * sub-thread's cwd with it as a known result that must not be repeated as a caveat or used as a
- * reason to keep the workspace. A trailing note after the `merge` keyword is the owner's own
- * supplement and is carried along verbatim. The merge itself is executed by the host through
- * `octo_management`'s `thread-merge`, and a default-pipeline merge also schedules the sub-thread's
- * archive after the turn's own reply is delivered — so the body tells the assistant not to archive
- * by itself and to report that disposition. Every outcome, including a conflict that must be
- * resolved before retrying, is reported to the owner.
- */
-function threadMergePrompt(workspacePath: string, note: string): string {
-  return [
-    "用户要求把本子区（隔离工作区）已完成的工作合并回目标分支，走本机 Worktrunk（wt）的 merge pipeline。",
-    "这条命令即代表 owner 确认合并并清理：除非有明确必要理由并向 owner 说明，直接按默认参数执行。",
-    "默认 pipeline 会暂存并提交工作区改动、squash、rebase 到目标分支、fast-forward，合并成功后删除工作区与已合并分支；执行前先确认本子区的工作已收尾。",
-    "要保留工作区时必须说明必要理由，并显式传 remove:false；目标分支等其他参数确有需要时同样显式传入并说明理由。",
-    "工作区被删除后本子区 cwd 随之失效，这是该命令的既定结果、owner 已知：不要在汇报里反复说明这一点，也不要把 cwd 失效当作保留工作区的理由——保留工作区的必要理由应是尚未收尾的具体工作（例如部署、验收）。",
-    "合并由宿主执行：调用 octo_management 的 thread-merge 动作，不要自己运行 wt。",
-    "合并成功后宿主会按默认 pipeline 自动排定归档本子区（在本回合最后一条回复送达后执行），不要自己再调 thread-archive；显式保留工作区时不会归档。向 owner 汇报时说明这一处置即可。",
-    "成功后向 owner 汇报目标分支与结果细节；失败时（例如 rebase 冲突或 pre-merge 检查失败）先在本子区处置再重试，并把最终结果告诉 owner。",
-    ...(note.length === 0 ? [] : ["", "owner 补充说明：", note]),
-    "",
-    "隔离工作区：",
-    workspacePath,
-  ].join("\n");
 }
 
 function normalizeCommandHandlers(
@@ -288,18 +194,6 @@ function contextSidecarRoot(
   return join(config.stateDir, "context-sidecars", scopeDigest);
 }
 
-/**
- * 一次排定到聊天回合末执行的子区归档：`thread-archive` 与默认 pipeline 的 `thread-merge`
- * 收尾都只排定，真正的调用发生在该聊天回合输出（正文与进度卡终态编辑）排空之后——任何发进
- * 子区的消息都会把归档子区解档。
- */
-interface PendingThreadArchive {
-  /** 发起排定的聊天；归档失败说明回这个聊天。 */
-  readonly target: ChatTarget;
-  readonly groupId: string;
-  readonly shortId: string;
-}
-
 class CoreService implements ChannelService {
   private readonly history: GroupHistoryCoordinator;
   private readonly models: ModelSwitchController;
@@ -345,13 +239,10 @@ class CoreService implements ChannelService {
    * asked for it still delivers its reply.
    */
   private pendingRestart: ChatTarget | null = null;
-  /**
-   * 排定到回合末的子区归档（键为该聊天）。进程内一次性状态：执行或放弃即清除，该聊天过
-   * 权限门禁的新入站也清除——用户回来了就不归档。
-   */
-  private readonly pendingThreadArchives = new Map<string, PendingThreadArchive>();
-  /** `stopInternal` 的到达信号：归档重试的等待据此提前结束，关停不为一轮重试等满一次间隔。 */
-  private readonly stopped = Promise.withResolvers<void>();
+  /** `/thread` 家族命令的所有者：意图交接、合并交接与资格文案都不再留在服务里。 */
+  private readonly threadCommands: ThreadCommands;
+  /** 子区归档排定的所有者：排定 map 与停止信号都在它内部，服务只负责接线与调用。 */
+  private readonly threadArchives: ThreadArchiveScheduler;
   private stopPromise: Promise<void> | undefined;
   constructor(
     private readonly options: ChannelServiceOptions,
@@ -450,6 +341,24 @@ class CoreService implements ChannelService {
       stopping: () => this.stopping,
       onCardAction: (action) => this.questions.answerFromCard(action),
     });
+    this.threadArchives = new ThreadArchiveScheduler({
+      store: this.store,
+      transport: this.options.transport,
+      outbox: this.outbox,
+      botUid: () => this.bot?.uid,
+      stopping: () => this.stopping,
+    });
+    this.threadCommands = new ThreadCommands({
+      store: this.store,
+      botUid: () => this.bot?.uid,
+      ...(options.worktrees === undefined ? {} : { worktrees: options.worktrees }),
+      materialize: (message, text) => this.materializer.materialize(message, text),
+      commandClaim: (message, name) => this.commandClaim(message, name),
+      withMessageTyping: (message, work) => this.withMessageTyping(message, work),
+      appendToRunningTask: (message, text) => this.appendToRunningTask(message, text),
+      acceptTask: (message, text) => this.acceptTask(message, text),
+      enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
+    });
   }
 
   async start(): Promise<void> {
@@ -539,7 +448,7 @@ class CoreService implements ChannelService {
   private async stopInternal(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
-    this.stopped.resolve();
+    this.threadArchives.stop();
     this.started = false;
     // Abort inbound I/O first so in-flight downloads/transcriptions/lookups unwind while the rest
     // of shutdown runs; their cleanup (claim rollback, temp-file removal) is awaited below.
@@ -676,7 +585,7 @@ class CoreService implements ChannelService {
       return;
     }
     // 已授权的新入站说明这个聊天仍在继续：排定中的归档随之取消（用户回来了就不归档）。
-    this.pendingThreadArchives.delete(targetKey(message));
+    this.threadArchives.cancel(message);
     if (!message.supported) {
       const claim = this.commandClaim(message, "unsupported");
       if (!this.store.claimCommand(claim)) return;
@@ -939,7 +848,7 @@ class CoreService implements ChannelService {
       if (name === "new" || name === "reset") {
         await this.sessions.handleNew(target, argument);
       } else if (name === "thread") {
-        await this.handleThreadCommand(message, argument);
+        await this.threadCommands.handle(message, argument);
       } else if (name === "move") {
         await this.sessions.handleMove(target, argument);
       } else if (name === "cancel" || name === "stop") {
@@ -968,89 +877,6 @@ class CoreService implements ChannelService {
       this.store.failCommand(claim);
       throw new Error("命令未能持久完成，请重试。");
     }
-  }
-
-  /**
-   * `/thread <任务>`: hand the intent to the assistant instead of creating a sub-thread here. The
-   * message carries an instruction block, so the agent reads the intent, names the sub-thread and
-   * its workspace itself, and drives `octo_management`: a simple or unambiguous intent is
-   * dispatched as the work itself so the thread starts at once, an underspecified one after at
-   * most the few answers it takes to hand it over, with the detailed, SDD-shaped clarification
-   * left to the thread. The body follows the chat's append mode like any other message the
-   * assistant has to read: a running turn that accepts steering gets the instruction inside that
-   * turn, otherwise it becomes a durable task (`queue` mode included) that waits behind the run.
-   * Only groups grow threads, so DMs and threads themselves are refused.
-   */
-  private async handleThreadCommand(message: InboundMessage, argument: string): Promise<void> {
-    const mergeNote = readThreadMergeNote(argument);
-    if (mergeNote !== undefined) {
-      await this.handleThreadMergeCommand(message, mergeNote);
-      return;
-    }
-    if (message.channelType === 5) {
-      await this.outbox.enqueueText(message, THREAD_NESTED_TEXT, null);
-      return;
-    }
-    if (message.channelType !== 2) {
-      await this.outbox.enqueueText(message, THREAD_GROUP_ONLY_TEXT, null);
-      return;
-    }
-    const intent = argument.trim();
-    if (intent.length === 0) {
-      await this.outbox.enqueueText(message, THREAD_USAGE, null);
-      return;
-    }
-    // 这条命令的正文就是交给助手的任务正文：先释放命令 claim，再走与普通任务同一条组装点
-    // （claim + 下载 + 转写 + 附件块），否则随消息发来的图片只剩 `[图片]` 占位。
-    this.store.releaseClaim(this.commandClaim(message, "thread"));
-    await this.withMessageTyping(message, async () => {
-      const request = await this.materializer.materialize(message, intent);
-      if (request === null) return;
-      const body = threadIntentPrompt(request);
-      if (await this.appendToRunningTask(message, body)) return;
-      await this.acceptTask(message, body);
-    });
-  }
-
-  /**
-   * `/thread merge`: a sub-thread that is bound to an isolated workspace can hand the merge
-   * instruction to the assistant; a compatible local Worktrunk must exist, because merging has no
-   * fallback. Every other caller — the main group, DMs, a thread without a bound workspace, a
-   * deployment without the capability, a missing or incompatible wt — gets one prompt and no
-   * task. The command runs nothing itself: the prompt is delivered like any other message the
-   * assistant has to read (steering when the running turn accepts it, otherwise a durable task),
-   * and the assistant drives `octo_management`'s `thread-merge`.
-   */
-  private async handleThreadMergeCommand(message: InboundMessage, mergeNote: string): Promise<void> {
-    if (message.channelType !== 5) {
-      await this.outbox.enqueueText(message, THREAD_MERGE_THREAD_ONLY_TEXT, null);
-      return;
-    }
-    const worktrees = this.options.worktrees;
-    if (!worktrees) {
-      await this.outbox.enqueueText(message, THREAD_MERGE_UNCONFIGURED_TEXT, null);
-      return;
-    }
-    const binding = this.store.getBinding(this.bot!.uid, message);
-    if (!binding || binding.cwdPinned !== true) {
-      await this.outbox.enqueueText(message, THREAD_MERGE_NO_WORKSPACE_TEXT, null);
-      return;
-    }
-    const available = await worktrees.worktrunk();
-    if (!available.available) {
-      await this.outbox.enqueueText(
-        message,
-        `${worktrunkUnavailableText(available)}，/thread merge 不可用。`,
-        null,
-      );
-      return;
-    }
-    this.store.releaseClaim(this.commandClaim(message, "thread"));
-    await this.withMessageTyping(message, async () => {
-      const body = threadMergePrompt(binding.cwd, mergeNote);
-      if (await this.appendToRunningTask(message, body)) return;
-      await this.acceptTask(message, body);
-    });
   }
 
   /**
@@ -1556,9 +1382,8 @@ class CoreService implements ChannelService {
       botUid,
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
       flushTarget: (target) => this.outbox.flush(target),
-      planThreadArchive: (target, groupId, shortId) => {
-        this.pendingThreadArchives.set(targetKey(target), { target: { ...target }, groupId, shortId });
-      },
+      planThreadArchive: (target, groupId, shortId) =>
+        this.threadArchives.schedule(target, groupId, shortId),
       deliverToChat: async (message, relay) => {
         if (await this.appendToRunningTask(message, message.text)) return "steered";
         await this.acceptTask(message, message.text, true, relay ?? null);
@@ -1930,7 +1755,7 @@ class CoreService implements ChannelService {
       // the relay as work that queued behind this run.
       this.runtimes.delete(taskId);
       await this.notifyThreadOutcome(taskId);
-      await this.runScheduledArchive(target, progress.tail);
+      await this.threadArchives.run(target, progress.tail);
       this.maybeRunDeferredRestart();
     }
   }
@@ -1945,78 +1770,6 @@ class CoreService implements ChannelService {
     );
   }
 
-
-  /**
-   * 排定的子区归档收尾：先等本回合的进度卡终态编辑与出站投递排空——回复先送达、归档后执行，
-   * 因为任何发进子区的消息都会把归档子区解档——再按重试策略调用 `archiveThread`。成功留一条
-   * 日志；失败只给发起聊天一条 ≤200 字符的单行说明，不改变已经发生的合并；停止时放弃。
-   */
-  private async runScheduledArchive(target: ChatTarget, progressTail: Promise<void>): Promise<void> {
-    const key = targetKey(target);
-    const pending = this.pendingThreadArchives.get(key);
-    if (!pending || this.stopping) return;
-    await progressTail.catch(() => {});
-    await this.drainChatOutbox(target);
-    try {
-      const outcome = await this.archivePendingThread(key, pending);
-      if (outcome === "archived") {
-        console.error(`[thread-archive] 已归档子区 ${pending.shortId} target=${key}`);
-      }
-    } catch (error) {
-      const reason = failureText(error, "归档失败");
-      console.error(`[thread-archive] 归档失败 target=${key} short=${pending.shortId}：${reason}`);
-      this.outbox.enqueueText(target, `归档失败：${reason}`, null);
-    } finally {
-      if (this.pendingThreadArchives.get(key) === pending) this.pendingThreadArchives.delete(key);
-    }
-  }
-
-  /**
-   * 一次排定归档的调用：第 1 次立即执行，瞬时失败（5xx 或 bot API 的 `store_failed`）每间隔
-   * 5 秒重试一次、总共至多 5 次尝试；永久失败即刻抛出。每次尝试前确认排定仍在（该聊天的新
-   * 入站会取消它）且服务未在停止。
-   */
-  private async archivePendingThread(
-    key: string,
-    pending: PendingThreadArchive,
-  ): Promise<"archived" | "cancelled"> {
-    let attempt = 1;
-    for (;;) {
-      if (this.stopping || this.pendingThreadArchives.get(key) !== pending) return "cancelled";
-      try {
-        await this.options.transport.archiveThread(pending.groupId, pending.shortId);
-        return "archived";
-      } catch (error) {
-        if (attempt >= THREAD_ARCHIVE_ATTEMPTS || !isTransientServerFailure(error)) throw error;
-        attempt += 1;
-        // 停止信号一到就提前结束，关停不为一轮重试等满一次间隔。
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, THREAD_ARCHIVE_RETRY_MS);
-          void this.stopped.promise.then(() => {
-            clearTimeout(timer);
-            resolve();
-          });
-        });
-      }
-    }
-  }
-
-  /**
-   * 等该聊天的出站队列排空（有界轮询）：回复与文件先送达，归档才排得上。超时照常归档——残余
-   * 消息可能稍后把子区解档为 active，可重复调用补做。
-   */
-  private async drainChatOutbox(target: ChatTarget): Promise<void> {
-    const botUid = this.bot?.uid;
-    if (botUid === undefined) return;
-    for (let waited = 0; waited < THREAD_ARCHIVE_DRAIN_MS; waited += THREAD_ARCHIVE_DRAIN_POLL_MS) {
-      await this.outbox.flush(target).catch(() => {});
-      if (this.stopping) return;
-      if (this.store.countPendingOutbox(botUid, target) === 0) return;
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, THREAD_ARCHIVE_DRAIN_POLL_MS);
-      });
-    }
-  }
 
   /**
    * Runs a restart the agent asked for once it cannot cost work: every chat idle and no queued

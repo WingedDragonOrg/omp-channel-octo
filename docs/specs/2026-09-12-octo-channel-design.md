@@ -54,6 +54,8 @@
 
 `progress-cards.ts` 统一拥有进度卡的持久恢复与每任务轮次状态。服务将已归一化的 `ExecutionEvent` 交给每任务的 `TaskProgress`，其队列 tail 仍登记到服务关停排空集合，子区归档前读取并等待当前 tail。`session-lifecycle.ts` 负责会话身份/cwd 校验、目录回退、`/new` 和原生 `/move`；目录仲裁及 blocked 集合继续由服务单点拥有，通过租约和阻塞端口协作，迁移始终同时持有源、目标目录租约。
 
+`thread-commands.ts` 负责 `/thread` 的任务交接和合并指令，复用正文组装、typing 及任务接纳端口；命令去重仍在服务入口完成。`thread-archive.ts` 独占待归档集合和停止唤醒信号，服务在授权新入站时取消排定、在回合输出之后运行归档；排定替换、出站排空、瞬时失败重试及停止放弃均由该模块维护。
+
 ### 运行和配置
 
 使用 TypeScript/Bun 常驻服务，主动连接 Octo，启动并管理 OMP RPC worker。无需为 RPC 开放网络监听端口。macOS 使用 launchd 托管；机器休眠或离线期间不承诺可用。
