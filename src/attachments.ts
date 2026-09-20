@@ -105,10 +105,11 @@ export function composePromptText(
   // 没有附件也没有引用时保持逐字返回：普通文本任务的正文与今天完全一致。
   if (files.length === 0 && quoteText.length === 0) return text;
   const sections = [text.trim()];
-  if (quoteText.length > 0) {
-    const senderName = quote?.senderName.trim() ?? "";
+  // 被引用的正文可能为空（例如引用的是一份文件）：此时标题本身就是「附件来自这条引用」的上下文。
+  if (quote !== null && (quoteText.length > 0 || files.length > 0)) {
+    const senderName = quote.senderName.trim();
     const heading = senderName.length > 0 ? `[引用 ${senderName}]` : "[引用]";
-    sections.push(`${heading}\n${quoteText}`);
+    sections.push(quoteText.length > 0 ? `${heading}\n${quoteText}` : heading);
   }
   for (const file of files) {
     const transcription = file.transcription?.trim() ?? "";

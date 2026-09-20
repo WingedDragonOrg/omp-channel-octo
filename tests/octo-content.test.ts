@@ -446,6 +446,79 @@ describe("Octo inbound message content", () => {
     ]);
   });
 
+  test("reads a quoted file message through the real client payload shape", async () => {
+    // 线上取证的真实形状（2026-09-20 群聊文件事故）：type 1 正文 + reply.payload 内联完整
+    // type 8 文件块（name/extension/size/绝对 CDN 直链）；type 9 别名同表；相对路径引用来
+    // 自客户端降级形态，整条引用不可用。
+    const inbox: InboundMessage[] = [];
+    const { current, connection } = await startFixtureTransport(async (message) => {
+      inbox.push(message);
+    });
+    const quotedFile = `${current.apiUrl}/fixture-download/quoted-file.xlsx`;
+    const aliasedFile = `${current.apiUrl}/fixture-download/aliased.xlsx`;
+
+    const messages = await deliverInbound(current, connection, inbox, [
+      {
+        type: 1,
+        content: "有这个附件你看一眼呗？ ",
+        reply: {
+          from_name: "赵奕",
+          from_uid: "zhaoyi",
+          message_id: "quoted-file-message",
+          message_seq: 360,
+          payload: {
+            type: 8,
+            name: "【新标准有sample版】20260818 Output Form_Zhi 修改版本_副本.xlsx",
+            extension: "xlsx",
+            size: 426681,
+            url: quotedFile,
+          },
+        },
+      },
+      {
+        type: 1,
+        content: "",
+        reply: {
+          from_name: "赵奕",
+          payload: { type: 9, name: "plain-report", extension: "xlsx", size: 10, url: aliasedFile },
+        },
+      },
+      {
+        type: 1,
+        content: "这条文件引用不可用",
+        reply: { from_name: "赵奕", payload: { type: 8, name: "rel.xlsx", url: "file/preview/rel.xlsx" } },
+      },
+    ]);
+
+    expect(
+      messages.map((message) => ({
+        text: message.text,
+        supported: message.supported,
+        quoted: message.quoted,
+        attachments: message.attachments,
+      })),
+    ).toEqual([
+      {
+        text: "有这个附件你看一眼呗？ ",
+        supported: true,
+        quoted: { senderName: "赵奕", text: "" },
+        attachments: [
+          attachment(quotedFile, "file", {
+            name: "【新标准有sample版】20260818 Output Form_Zhi 修改版本_副本.xlsx",
+            size: 426681,
+          }),
+        ],
+      },
+      {
+        text: "",
+        supported: true,
+        quoted: { senderName: "赵奕", text: "" },
+        attachments: [attachment(aliasedFile, "file", { name: "plain-report.xlsx", size: 10 })],
+      },
+      { text: "这条文件引用不可用", supported: true, quoted: null, attachments: [] },
+    ]);
+  });
+
   test("strips the bot mention from extracted text", async () => {
     const inbox: InboundMessage[] = [];
     const { current, connection } = await startFixtureTransport(async (message) => {
@@ -704,7 +777,7 @@ describe("Octo inbound attachment download", () => {
 });
 
 describe("Octo group history backfill", () => {
-  test("keeps only extractable text and never downloads", async () => {
+  test("keeps text plus absolute attachment references and never downloads", async () => {
     const { current, channel } = await startRegisteredFixture();
     const asset = (key: string): string => `${current.apiUrl}/fixture-download/${key}`;
     const encoded = (payload: Record<string, unknown>): string =>
@@ -743,6 +816,20 @@ describe("Octo group history backfill", () => {
           timestamp: 1_757_656_003,
           payload: encoded({ type: 12, url: asset("sticker.png") }),
         },
+        {
+          // 无 caption 的文件消息以前从历史里整条消失；现在它带元数据存活为一条历史。
+          message_seq: 15,
+          from_uid: "member-e",
+          timestamp: 1_757_656_004,
+          payload: encoded({ type: 8, name: "报告.xlsx", size: 426_681, url: asset("report.xlsx") }),
+        },
+        {
+          // 相对预览路径不可用：与 live 路径一致地丢弃，整条消息不进入历史。
+          message_seq: 16,
+          from_uid: "member-f",
+          timestamp: 1_757_656_005,
+          payload: encoded({ type: 8, name: "preview.xlsx", url: "file/preview/preview.xlsx" }),
+        },
       ],
     });
 
@@ -752,9 +839,28 @@ describe("Octo group history backfill", () => {
     );
 
     expect(history).toEqual([
-      { seq: 11, senderId: "member-a", text: "历史图片说明", timestamp: 1_757_656_000_000 },
+      {
+        seq: 11,
+        senderId: "member-a",
+        text: "历史图片说明",
+        timestamp: 1_757_656_000_000,
+        attachments: [{ kind: "image", name: "", size: 0, url: asset("history.png") }],
+      },
       { seq: 12, senderId: "member-b", text: "[合并转发]\n阿甲: 转发内容", timestamp: 1_757_656_001_000 },
-      { seq: 13, senderId: "member-c", text: "富文本正文", timestamp: 1_757_656_002_000 },
+      {
+        seq: 13,
+        senderId: "member-c",
+        text: "富文本正文",
+        timestamp: 1_757_656_002_000,
+        attachments: [{ kind: "image", name: "", size: 0, url: asset("history-inline.png") }],
+      },
+      {
+        seq: 15,
+        senderId: "member-e",
+        text: "",
+        timestamp: 1_757_656_004_000,
+        attachments: [{ kind: "file", name: "报告.xlsx", size: 426_681, url: asset("report.xlsx") }],
+      },
     ]);
     expect(current.downloadRequests).toHaveLength(0);
   });

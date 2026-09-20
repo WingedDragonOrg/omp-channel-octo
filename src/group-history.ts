@@ -4,11 +4,28 @@
  * renderer. Nothing here touches I/O so every rule stays unit-testable.
  */
 
+import { formatBytes } from "./attachments.ts";
+import type { HistoryMessageAttachment } from "./contracts.ts";
+
 export const GROUP_HISTORY_DEFAULT_MAX_MESSAGES = 50;
 /** Server page ceiling for one `POST /v1/bot/messages/sync` call. */
 export const GROUP_HISTORY_FETCH_LIMIT = 200;
 export const GROUP_HISTORY_MAX_ENTRY_CODEPOINTS = 1000;
 export const GROUP_HISTORY_MAX_BLOCK_BYTES = 32 * 1024;
+/**
+ * 「这个」场景的关联窗口：同一发送者在该时长内恰好一条带附件消息时才可视为所指。
+ * 10 分钟覆盖「发文件 → 紧接着 @bot」的正常节奏，又能挡住中午发的文件被傍晚的
+ * 「这个」误关联。
+ */
+export const GROUP_ATTACHMENT_ASSOCIATION_WINDOW_MS = 10 * 60 * 1000;
+
+/** History lines and system notes share one vocabulary for attachment kinds. */
+export const ATTACHMENT_KIND_LABELS: Readonly<Record<string, string>> = {
+  file: "文件",
+  image: "图片",
+  audio: "语音",
+  video: "视频",
+};
 
 const ENTRY_CAP_FLOOR = GROUP_HISTORY_FETCH_LIMIT;
 const COVERED_SEQ_SLACK = 256;
@@ -21,6 +38,12 @@ export interface HistoryEntry {
   senderId: string;
   text: string;
   timestamp: number;
+  /**
+   * Absolute download references for media the message carries. Present since 2026-09-20;
+   * absent means none/unknown. A message with attachments but empty text is a full entry:
+   * "a recent message" includes the recent *file*, not just the recent text.
+   */
+  attachments?: HistoryMessageAttachment[];
 }
 
 export interface HistoryRecord {
@@ -31,10 +54,15 @@ export interface HistoryRecord {
   text: string;
   timestamp: number;
   fromBot: boolean;
+  /** Absolute-URL attachments the message carries (live path already filters unusable URLs). */
+  attachments?: HistoryMessageAttachment[];
 }
 
 export interface HistoryBuffer {
-  /** Records coverage for every group/thread message; only text from others becomes an entry. */
+  /**
+   * Records coverage for every group/thread message; text-bearing or media-bearing messages
+   * from others become renderable entries (media keeps its download reference).
+   */
   record(message: HistoryRecord): void;
   /** A reconnect makes the covered range unknown again while collected entries survive. */
   resetCoverage(): void;
@@ -42,6 +70,12 @@ export interface HistoryBuffer {
   covers(fromSeq: number, toSeq: number): boolean;
   entriesInRange(fromSeq: number, toSeq: number): HistoryEntry[];
   recentEntries(limit: number): HistoryEntry[];
+  /**
+   * Live-observed media-bearing entries from `senderId`, older than `beforeSeq` and at most
+   * `GROUP_ATTACHMENT_ASSOCIATION_WINDOW_MS` older than `referenceTimestamp` — the association
+   * candidates for an authorized message that itself carries no attachment.
+   */
+  attachmentCandidates(senderId: string, beforeSeq: number, referenceTimestamp: number): HistoryEntry[];
 }
 
 export interface PlannedHistoryFetch {
@@ -96,13 +130,17 @@ export function createHistoryBuffer(maxMessages: number): HistoryBuffer {
         }
       }
       if (!message.supported || message.fromBot) return;
-      if (message.text.trim().length === 0) return;
-      insertEntry({
+      const attachments = message.attachments ?? [];
+      if (message.text.trim().length === 0 && attachments.length === 0) return;
+      const entry: HistoryEntry = {
         seq: message.seq,
         senderId: message.senderId,
         text: message.text,
         timestamp: message.timestamp,
-      });
+      };
+      // 无附件的消息不带这个键：形状与引入元数据之前完全一致。
+      if (attachments.length > 0) entry.attachments = attachments;
+      insertEntry(entry);
     },
     resetCoverage(): void {
       liveFrom = null;
@@ -118,10 +156,32 @@ export function createHistoryBuffer(maxMessages: number): HistoryBuffer {
     entriesInRange(fromSeq: number, toSeq: number): HistoryEntry[] {
       return entries
         .filter((entry) => entry.seq > fromSeq && entry.seq < toSeq)
-        .map((entry) => ({ ...entry }));
+        .map((entry) => {
+          const copy: HistoryEntry = { ...entry };
+          if (entry.attachments !== undefined) copy.attachments = entry.attachments.map((item) => ({ ...item }));
+          return copy;
+        });
     },
     recentEntries(limit: number): HistoryEntry[] {
-      return entries.slice(Math.max(0, entries.length - limit)).map((entry) => ({ ...entry }));
+      return entries.slice(Math.max(0, entries.length - limit)).map((entry) => {
+        const copy: HistoryEntry = { ...entry };
+        if (entry.attachments !== undefined) copy.attachments = entry.attachments.map((item) => ({ ...item }));
+        return copy;
+      });
+    },
+    attachmentCandidates(senderId: string, beforeSeq: number, referenceTimestamp: number): HistoryEntry[] {
+      const since = referenceTimestamp - GROUP_ATTACHMENT_ASSOCIATION_WINDOW_MS;
+      return entries
+        .filter((entry) =>
+          (entry.attachments?.length ?? 0) > 0
+          && entry.senderId === senderId
+          && entry.seq < beforeSeq
+          && entry.timestamp >= since
+          && entry.timestamp <= referenceTimestamp)
+        .map((entry) => ({
+          ...entry,
+          attachments: (entry.attachments ?? []).map((item) => ({ ...item })),
+        }));
     },
   };
 }
@@ -159,7 +219,7 @@ export function selectHistoryWindow(input: {
   const bySeq = new Map<number, HistoryEntry>();
   for (const entry of input.entries) {
     if (!Number.isInteger(entry.seq) || entry.seq <= 0) continue;
-    if (entry.text.trim().length === 0) continue;
+    if (entry.text.trim().length === 0 && (entry.attachments?.length ?? 0) === 0) continue;
     if (!bySeq.has(entry.seq)) bySeq.set(entry.seq, entry);
   }
   const merged = [...bySeq.values()].sort((left, right) => left.seq - right.seq);
@@ -176,8 +236,25 @@ function historyHeader(count: number, skipped: number, truncatedEarlier: boolean
   return `[群聊历史，${size}]`;
 }
 
+/**
+ * Compact marker for a message's media, e.g. `[文件 报告.xlsx (416.7 KB)]` or
+ * `[图片 a.png，视频 b.mp4 等 3 个]`；纯附件消息的行正文就是这个标记本身。
+ */
+function historyAttachmentSummary(attachments: readonly HistoryMessageAttachment[]): string {
+  const rendered = attachments.slice(0, 2).map((attachment) => {
+    const label = ATTACHMENT_KIND_LABELS[attachment.kind] ?? "附件";
+    const name = attachment.name.trim();
+    const size = attachment.size > 0 ? ` (${formatBytes(attachment.size)})` : "";
+    return name.length > 0 ? `${label} ${name}${size}` : label;
+  });
+  const suffix = attachments.length > 2 ? ` 等 ${attachments.length} 个` : "";
+  return `[${rendered.join("，")}${suffix}]`;
+}
+
 function historyEntryLine(entry: HistoryEntry): string {
-  const body = entry.text.trim();
+  const attachments = entry.attachments ?? [];
+  const summary = attachments.length > 0 ? historyAttachmentSummary(attachments) : "";
+  const body = [entry.text.trim(), summary].filter((part) => part.length > 0).join(" ");
   const truncated = body.length > GROUP_HISTORY_MAX_ENTRY_CODEPOINTS
     ? Array.from(body).slice(0, GROUP_HISTORY_MAX_ENTRY_CODEPOINTS).join("")
     : body;

@@ -211,6 +211,26 @@ test("keeps an attachment-only reply's quote without an empty text section", () 
     .toBe("[引用]\n被引用的正文");
 });
 
+test("renders the quote heading alone when the quoted message is a file without text", () => {
+  const files = [
+    saved({
+      path: "/state/attachments/2-group-1/m-363/0-report.xlsx",
+      name: "report.xlsx",
+      kind: "file",
+    }),
+  ];
+  expect(composePromptText("有这个附件你看一眼呗？", files, { senderName: "赵奕", text: "  " })).toBe([
+    "有这个附件你看一眼呗？",
+    "[引用 赵奕]",
+    [ATTACHMENT_HEADER, "1. file report.xlsx 0 B → /state/attachments/2-group-1/m-363/0-report.xlsx"].join("\n"),
+  ].join("\n\n"));
+  // 引用与正文都为空、只带附件时不渲染引用标题。
+  expect(composePromptText("  ", files, { senderName: "赵奕", text: "" })).toBe([
+    "[引用 赵奕]",
+    [ATTACHMENT_HEADER, "1. file report.xlsx 0 B → /state/attachments/2-group-1/m-363/0-report.xlsx"].join("\n"),
+  ].join("\n\n"));
+});
+
 test("renders a video attachment line with its declared duration", () => {
   const files = [
     saved({

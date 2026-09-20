@@ -866,7 +866,7 @@ test("accounts a steered message so the next turn never sends it back", async ()
   }
 });
 
-test("a live image message contributes only its caption to history and downloads nothing", async () => {
+test("a live image message contributes its caption and attachment marker to history, and downloads nothing for another sender", async () => {
   const harness = await createCoreHarness({
     groupHistory: { enabled: true, maxMessages: 5 },
     allowedGroupIds: GROUP_IDS,
@@ -880,7 +880,7 @@ test("a live image message contributes only its caption to history and downloads
   });
   try {
     await deliverGroupMessages(harness, 1, 2);
-    // 实时缓冲走同一张类型表：带 caption 的图片按 caption 渲染。
+    // 实时缓冲走同一张类型表：带 caption 的图片按 caption + 附件标记渲染。
     await harness.service.handleInbound(inbound({
       ...GROUP,
       senderId: "member-2",
@@ -889,7 +889,7 @@ test("a live image message contributes only its caption to history and downloads
       messageSeq: 3,
       messageTimestamp: T0 + 3 * 60_000,
     }));
-    // 无 caption 的图片没有可渲染文本，只贡献覆盖。
+    // 无 caption 的图片曾是「只贡献覆盖」；如今「最近的消息」也包括它，按附件标记渲染。
     await harness.service.handleInbound(inbound({
       ...GROUP,
       senderId: "member-2",
@@ -906,11 +906,12 @@ test("a live image message contributes only its caption to history and downloads
     expect(historyLinesOf(prompt)).toEqual([
       expectedLine(1, "群消息 1"),
       expectedLine(2, "群消息 2"),
-      expectedLine(3, "这是设计稿", "member-2"),
+      expectedLine(3, "这是设计稿 [图片 design.png (12 B)]", "member-2"),
+      expectedLine(4, "[图片 bare.png (12 B)]", "member-2"),
     ]);
-    expect(prompt).not.toContain("bare.png");
-    // 非 owner 的历史消息永不触发下载。
+    // 「这个」的关联只认同一发送者：owner 的触发不取回 member-2 的任何东西。
     expect(harness.transport.downloadRequests).toHaveLength(0);
+    expect(prompt).not.toContain("未携带附件或显式引用");
   } finally {
     await closeCoreHarness(harness);
   }

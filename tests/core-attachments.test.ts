@@ -34,6 +34,31 @@ import {
 const MAX_BYTES = 1024 * 1024;
 /** 12 字节的假 PNG 头：落盘字节数必须与 fixture 注册的远端字节完全一致。 */
 const IMAGE_BYTES = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 1, 2, 3]);
+
+/**
+ * 最小合法 ZIP 容器（xlsx 的本体）：一条空的 `xl/workbook.xml` 存储条目。落盘字节可被任意
+ * zip 读取器列出，证明文件原样可选中、可打开，而不是只比对字符串路径。
+ */
+function buildXlsxBytes(): Uint8Array {
+  const name = Buffer.from("xl/workbook.xml", "utf8");
+  const local = Buffer.alloc(30);
+  local.writeUInt32LE(0x04034b50, 0); // local file header
+  local.writeUInt16LE(20, 4); // version needed
+  local.writeUInt16LE(name.length, 26); // name length（内容为空，CRC 与长度字段保持 0）
+  const central = Buffer.alloc(46);
+  central.writeUInt32LE(0x02014b50, 0); // central directory header
+  central.writeUInt16LE(20, 4);
+  central.writeUInt16LE(20, 6);
+  central.writeUInt16LE(name.length, 28);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0); // end of central directory
+  eocd.writeUInt16LE(1, 8);
+  eocd.writeUInt16LE(1, 10);
+  eocd.writeUInt32LE(46 + name.length, 12);
+  eocd.writeUInt32LE(30 + name.length, 16);
+  return new Uint8Array(Buffer.concat([local, name, central, name, eocd]));
+}
+const XLSX_BYTES = buildXlsxBytes();
 const AUDIO_BYTES = new Uint8Array([35, 33, 65, 77, 82, 10, 1, 2]);
 const KEPT_BYTES = new Uint8Array([1, 2, 3, 4, 5]);
 
@@ -57,6 +82,8 @@ interface AttachmentHarness {
 interface AttachmentHarnessOptions {
   /** `null` 表示 config 里完全不写 `attachments`（未配置）；默认开启且上限 1 MiB。 */
   attachments?: AttachmentConfig | null;
+  /** 不传表示不写 `groupHistory`（关联取回随之关闭）。 */
+  groupHistory?: { enabled: boolean; maxMessages: number };
   /** `null` 表示不写 ownerId，改由第一条非空文本私聊完成认领。 */
   ownerId?: string | null;
   prompt?: FakePrompt;
@@ -87,6 +114,7 @@ async function createAttachmentHarness(
     ...(options.attachments === null
       ? {}
       : { attachments: options.attachments ?? { enabled: true, maxBytes: MAX_BYTES } }),
+    ...(options.groupHistory === undefined ? {} : { groupHistory: options.groupHistory }),
   };
   if (options.beforeStart) await options.beforeStart(stateDir);
   const service = await createChannelService({
@@ -485,6 +513,296 @@ test("文件附件在提示词里渲染为 file 行并原样落盘", async () =>
     expect(attachmentPathsFromPrompt(prompt)).toEqual([path]);
     expect(prompt).toContain(`1. file quarterly.pdf ${bytes.byteLength} B → ${path}`);
     await expectSameBytes(path, bytes);
+  } finally {
+    await closeAttachmentHarness(harness);
+  }
+});
+
+test("回复引用一份 xlsx 文件：恰好一次下载，引用标题与绝对路径进正文，落盘字节可开卷", async () => {
+  // 复刻线上取证形状：成员那句「有这个附件你看一眼呗？」引用了自己的 type 8 文件消息。
+  const harness = await createAttachmentHarness();
+  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+  const name = "【新标准有sample版】20260818 Output Form_Zhi 修改版本_副本.xlsx";
+  const url = "https://cdn.example.test/quoted-file.xlsx";
+  harness.transport.attachmentBodies.set(url, XLSX_BYTES);
+  const message = inbound({
+    messageId: "attach-quoted-xlsx",
+    ...target,
+    text: "有这个附件你看一眼呗？",
+    quoted: { senderName: "赵奕", text: "" },
+    attachments: [attachment(url, "file", name, { size: XLSX_BYTES.byteLength })],
+  });
+  try {
+    await harness.service.handleInbound(message);
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+
+    expect(harness.transport.downloadRequests).toHaveLength(1);
+    expect(harness.workers.prompts).toHaveLength(1);
+    const prompt = harness.workers.prompts[0]!.text;
+    expect(prompt).toContain("[引用 赵奕]");
+    const path = savedPath(harness, target, message.messageId, 0, name, "file", url);
+    expect(attachmentPathsFromPrompt(prompt)).toEqual([path]);
+    await expectSameBytes(path, XLSX_BYTES);
+    // xlsx 即 zip：开卷列出 workbook 条目，证明文件本体可读而不只是字符串落盘。
+    const bytes = await readFile(path);
+    expect(bytes.includes(Buffer.from("xl/workbook.xml"))).toBe(true);
+    expect(bytes.readUInt32LE(0)).toBe(0x04034b50);
+  } finally {
+    await closeAttachmentHarness(harness);
+  }
+});
+
+test("群成员 @Bot 发文件：过权限门、恰好一次下载并进入同一条任务正文", async () => {
+  const harness = await createAttachmentHarness();
+  const target: ChatTarget = { channelId: "group-allowed", channelType: 2 };
+  const url = "https://cdn.example.test/member-upload.xlsx";
+  harness.transport.attachmentBodies.set(url, XLSX_BYTES);
+  const message = inbound({
+    messageId: "group-member-xlsx",
+    ...target,
+    senderId: "member-zhaoyi",
+    mentionedUserIds: [harness.bot.uid],
+    text: "看下这个表",
+    attachments: [attachment(url, "file", "member-upload.xlsx", { size: XLSX_BYTES.byteLength })],
+  });
+  try {
+    await harness.service.handleInbound(message);
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+
+    expect(harness.transport.downloadRequests).toHaveLength(1);
+    expect(harness.workers.prompts).toHaveLength(1);
+    const path = savedPath(harness, target, message.messageId, 0, "member-upload.xlsx", "file", url);
+    expect(attachmentPathsFromPrompt(harness.workers.prompts[0]!.text)).toEqual([path]);
+    await expectSameBytes(path, XLSX_BYTES);
+  } finally {
+    await closeAttachmentHarness(harness);
+  }
+});
+
+test("「这个」：同一发送者 10 分钟内唯一文件被关联取回，提示词注明来源且字节一致", async () => {
+  // 复刻线上事故：成员先发文件（未 @bot，权限门放弃任务），紧接着 @bot 说「这个」。
+  const harness = await createAttachmentHarness({ groupHistory: { enabled: true, maxMessages: 50 } });
+  const target: ChatTarget = { channelId: "group-allowed", channelType: 2 };
+  const url = "https://cdn.example.test/zhaoyi-report.xlsx";
+  harness.transport.attachmentBodies.set(url, XLSX_BYTES);
+  const now = Date.now();
+  const name = "【新标准有sample版】20260818 Output Form_Zhi 修改版本_副本.xlsx";
+  try {
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "zhaoyi-file",
+        ...target,
+        senderId: "member-zhaoyi",
+        text: "",
+        messageSeq: 360,
+        messageTimestamp: now - 60_000,
+        attachments: [attachment(url, "file", name, { size: XLSX_BYTES.byteLength })],
+      }),
+    );
+    // 未 @bot 的文件消息不建任务、不提前下载，但已作为历史元数据保留。
+    expect(harness.transport.downloadRequests).toHaveLength(0);
+    expect(harness.workers.prompts).toHaveLength(0);
+
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "zhaoyi-this",
+        ...target,
+        senderId: "member-zhaoyi",
+        mentionedUserIds: [harness.bot.uid],
+        text: "这个",
+        messageSeq: 362,
+        messageTimestamp: now,
+      }),
+    );
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+
+    expect(harness.transport.downloadRequests).toHaveLength(1);
+    expect(harness.workers.prompts).toHaveLength(1);
+    const prompt = harness.workers.prompts[0]!.text;
+    // 群历史行不再丢掉这份文件：名字与大小原样渲染。
+    expect(prompt).toContain(`[文件 ${name} (${XLSX_BYTES.byteLength} B)]`);
+    // 关联说明诚实标注来源，绝不虚构「发送者显式提交」。
+    expect(prompt).toContain("未携带附件或显式引用");
+    expect(prompt).toContain(`《${name}》`);
+    const paths = attachmentPathsFromPrompt(prompt);
+    expect(paths).toHaveLength(1);
+    expect(paths[0]).toContain(join("attachments", "2-group-allowed", "zhaoyi-this"));
+    await expectSameBytes(paths[0]!, XLSX_BYTES);
+  } finally {
+    await closeAttachmentHarness(harness);
+  }
+});
+
+test("「这个」歧义：10 分钟内发了两份文件时一个也不取，提示词要求引用具体那份", async () => {
+  const harness = await createAttachmentHarness({ groupHistory: { enabled: true, maxMessages: 50 } });
+  const target: ChatTarget = { channelId: "group-allowed", channelType: 2 };
+  const firstUrl = "https://cdn.example.test/first.xlsx";
+  const secondUrl = "https://cdn.example.test/second.xlsx";
+  harness.transport.attachmentBodies.set(firstUrl, XLSX_BYTES);
+  harness.transport.attachmentBodies.set(secondUrl, XLSX_BYTES);
+  const now = Date.now();
+  try {
+    for (const [index, [url, name]] of ([
+      [firstUrl, "first.xlsx"],
+      [secondUrl, "second.xlsx"],
+    ] as const).entries()) {
+      await harness.service.handleInbound(
+        inbound({
+          messageId: `ambiguous-file-${index}`,
+          ...target,
+          senderId: "member-zhaoyi",
+          text: "",
+          messageSeq: 360 + index,
+          messageTimestamp: now - 180_000 + index * 60_000,
+          attachments: [attachment(url, "file", name, { size: XLSX_BYTES.byteLength })],
+        }),
+      );
+    }
+
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "ambiguous-this",
+        ...target,
+        senderId: "member-zhaoyi",
+        mentionedUserIds: [harness.bot.uid],
+        text: "这个",
+        messageSeq: 362,
+        messageTimestamp: now,
+      }),
+    );
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+
+    expect(harness.transport.downloadRequests).toHaveLength(0);
+    expect(harness.workers.prompts).toHaveLength(1);
+    const prompt = harness.workers.prompts[0]!.text;
+    expect(prompt).toContain("无法确定");
+    expect(prompt).toContain("《first.xlsx》");
+    expect(prompt).toContain("《second.xlsx》");
+    expect(attachmentPathsFromPrompt(prompt)).toHaveLength(0);
+  } finally {
+    await closeAttachmentHarness(harness);
+  }
+});
+
+test("「这个」不猜别人的文件：文件与请求来自不同发送者时正文逐字、零下载", async () => {
+  const harness = await createAttachmentHarness({ groupHistory: { enabled: true, maxMessages: 50 } });
+  const target: ChatTarget = { channelId: "group-allowed", channelType: 2 };
+  const url = "https://cdn.example.test/someone-else.xlsx";
+  harness.transport.attachmentBodies.set(url, XLSX_BYTES);
+  const now = Date.now();
+  try {
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "other-member-file",
+        ...target,
+        senderId: "member-a",
+        text: "",
+        messageSeq: 360,
+        messageTimestamp: now - 60_000,
+        attachments: [attachment(url, "file", "someone-else.xlsx", { size: XLSX_BYTES.byteLength })],
+      }),
+    );
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "member-b-this",
+        ...target,
+        senderId: "member-b",
+        mentionedUserIds: [harness.bot.uid],
+        text: "这个",
+        messageSeq: 362,
+        messageTimestamp: now,
+      }),
+    );
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+
+    expect(harness.transport.downloadRequests).toHaveLength(0);
+    expect(harness.workers.prompts).toHaveLength(1);
+    const prompt = harness.workers.prompts[0]!.text;
+    // 别人的文件只渲染进群历史行，绝不被关联取回；任务正文仍是逐字的「这个」。
+    expect(prompt).toContain("[文件 someone-else.xlsx");
+    expect(prompt).not.toContain("未携带附件或显式引用");
+    expect(prompt.endsWith("这个")).toBe(true);
+    expect(attachmentPathsFromPrompt(prompt)).toHaveLength(0);
+  } finally {
+    await closeAttachmentHarness(harness);
+  }
+});
+
+test("「这个」窗口过期：11 分钟前发的文件不参与关联", async () => {
+  const harness = await createAttachmentHarness({ groupHistory: { enabled: true, maxMessages: 50 } });
+  const target: ChatTarget = { channelId: "group-allowed", channelType: 2 };
+  const url = "https://cdn.example.test/stale.xlsx";
+  harness.transport.attachmentBodies.set(url, XLSX_BYTES);
+  const now = Date.now();
+  try {
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "stale-file",
+        ...target,
+        senderId: "member-zhaoyi",
+        text: "",
+        messageSeq: 360,
+        messageTimestamp: now - 11 * 60_000,
+        attachments: [attachment(url, "file", "stale.xlsx", { size: XLSX_BYTES.byteLength })],
+      }),
+    );
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "stale-this",
+        ...target,
+        senderId: "member-zhaoyi",
+        mentionedUserIds: [harness.bot.uid],
+        text: "这个",
+        messageSeq: 362,
+        messageTimestamp: now,
+      }),
+    );
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+
+    expect(harness.transport.downloadRequests).toHaveLength(0);
+    const prompt = harness.workers.prompts[0]!.text;
+    expect(prompt).toContain("[文件 stale.xlsx");
+    expect(prompt).not.toContain("未携带附件或显式引用");
+    expect(prompt.endsWith("这个")).toBe(true);
+    expect(attachmentPathsFromPrompt(prompt)).toHaveLength(0);
+  } finally {
+    await closeAttachmentHarness(harness);
+  }
+});
+
+test("「这个」群历史关闭：即使唯一文件也不关联，正文逐字", async () => {
+  const harness = await createAttachmentHarness();
+  const target: ChatTarget = { channelId: "group-allowed", channelType: 2 };
+  const url = "https://cdn.example.test/no-history.xlsx";
+  harness.transport.attachmentBodies.set(url, XLSX_BYTES);
+  const now = Date.now();
+  try {
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "no-history-file",
+        ...target,
+        senderId: "member-zhaoyi",
+        text: "",
+        messageSeq: 360,
+        messageTimestamp: now - 60_000,
+        attachments: [attachment(url, "file", "no-history.xlsx", { size: XLSX_BYTES.byteLength })],
+      }),
+    );
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "no-history-this",
+        ...target,
+        senderId: "member-zhaoyi",
+        mentionedUserIds: [harness.bot.uid],
+        text: "这个",
+        messageSeq: 362,
+        messageTimestamp: now,
+      }),
+    );
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+
+    expect(harness.transport.downloadRequests).toHaveLength(0);
+    expect(harness.workers.prompts[0]!.text).toBe("这个");
   } finally {
     await closeAttachmentHarness(harness);
   }

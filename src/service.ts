@@ -14,6 +14,7 @@ import {
   attachmentRefusalText,
   composePromptText,
   existingFileSize,
+  formatBytes,
   safeAttachmentName,
   sweepAttachments,
   type AttachmentFailureReason,
@@ -34,7 +35,9 @@ import type {
   CoreServiceConfig,
   GroupContext,
   HistoryMessage,
+  HistoryMessageAttachment,
   PromptContext,
+  InboundAttachment,
   InboundMessage,
   OmpWorker,
   WorkerEvent,
@@ -58,12 +61,14 @@ import {
   type ExecutionTracker,
 } from "./execution-tracker.ts";
 import {
+  ATTACHMENT_KIND_LABELS,
   GROUP_HISTORY_DEFAULT_MAX_MESSAGES,
   createHistoryBuffer,
   planHistoryFetch,
   renderHistoryBlock,
   selectHistoryWindow,
   type HistoryBuffer,
+  type HistoryEntry,
   type PlannedHistoryFetch,
 } from "./group-history.ts";
 import {
@@ -170,6 +175,44 @@ const THREAD_MERGE_NO_WORKSPACE_TEXT =
   "当前子区未绑定隔离工作区，/thread merge 不可用。";
 const THREAD_MERGE_UNCONFIGURED_TEXT =
   "本部署未配置隔离工作区能力，/thread merge 不可用。";
+
+/** 系统说明行与正文之间保持空行分隔；正文为空时说明行本身就是正文。 */
+function withSystemNote(text: string, note: string): string {
+  const body = text.trim();
+  return body.length === 0 ? note : `${body}\n\n${note}`;
+}
+
+/** 「《name》(416.7 KB)」/「《name》(416.7 KB) 等 2 项」；无名时退化为类型词，超长名截断。 */
+function describeHistoryAttachments(attachments: readonly HistoryMessageAttachment[]): string {
+  const first = attachments[0];
+  if (first === undefined) return "附件消息";
+  const label = ATTACHMENT_KIND_LABELS[first.kind] ?? "附件";
+  const name = first.name.trim();
+  const short = Array.from(name).length > 60 ? `${Array.from(name).slice(0, 60).join("")}…` : name;
+  const size = first.size > 0 ? `（${formatBytes(first.size)}）` : "";
+  const head = short.length > 0 ? `《${short}》${size}` : `${label}${size}`;
+  return attachments.length > 1 ? `${head} 等 ${attachments.length} 项` : head;
+}
+
+/**
+ * 关联取回失败时的诚实降级说明：绝不虚构「已收到」，而是让 Agent 据此请发送者引用或重传。
+ * 与拒收文案不同，这里任务本身继续——关联是尽力协助，不是发送者的显式动作。
+ */
+function associationFailureNote(
+  reason: AttachmentFailureReason,
+  maxBytes: number,
+  summary: string,
+): string {
+  let cause = "下载失败";
+  if (reason === "oversize") {
+    const megabytes = maxBytes / (1024 * 1024);
+    cause = `超过 ${Number.isInteger(megabytes) ? megabytes : megabytes.toFixed(1)} MB 上限`;
+  } else if (reason === "budget" || reason === "timeout") {
+    cause = "下载超时";
+  }
+  return `[系统提示] 你刚才发送的${summary}未能取回（${cause}）；本条按纯文本处理，未读取任何文件。如需我查看该文件，请引用那条消息或重新发送。`;
+}
+
 type RuntimeTask = {
   taskId: string;
   target: ChatTarget;
@@ -741,14 +784,69 @@ class CoreService implements ChannelService {
    * （图片/文件/语音/视频）与引用块因此不会被命令吃掉。不消费正文的控制命令（`/status`、
    * `/cancel`、`/mode` 等）与待回答问题的答案不经过这里。
    */
+  /**
+   * 「这个」场景的附件关联：受权消息本身无附件时，把同一发送者在最近
+   * `GROUP_ATTACHMENT_ASSOCIATION_WINDOW_MS` 内、本进程实际观察到的带附件消息作为候选——
+   * 恰好一条才视同所指并走与自带附件完全相同的下载/限额流程；多条只让 Agent 请其引用，
+   * 零条则完全不改变行为（返回 null）。候选全部来自群历史 buffer（live 观察；服务重启
+   * 期间的消息只经历史回填渲染、不参与取回），因此依赖群历史与附件接收同时开启；
+   * 私聊没有历史 buffer，天然不参与。权限未扩大：候选消息本就在 bot 可读的群里，
+   * 且请求者与发件人必须是同一人——绝不把别的成员的文件猜成「这个」。
+   */
+  private associatedAttachments(
+    message: InboundMessage,
+  ): { kind: "matched"; attachments: InboundAttachment[]; summary: string; note: string }
+    | { kind: "ambiguous"; note: string }
+    | null {
+    if (message.attachments.length > 0) return null;
+    if (this.options.config.groupHistory?.enabled !== true) return null;
+    if (this.options.config.attachments?.enabled !== true) return null;
+    if (message.channelType !== 2 && message.channelType !== 5) return null;
+    if (!Number.isInteger(message.messageSeq) || message.messageSeq <= 0) return null;
+    if (message.messageTimestamp <= 0) return null;
+    const senderId = message.senderId.trim();
+    if (senderId.length === 0) return null;
+    const buffer = this.groupHistoryBuffers.get(targetKey(message));
+    const candidates = buffer?.attachmentCandidates(senderId, message.messageSeq, message.messageTimestamp) ?? [];
+    if (candidates.length === 0) return null;
+    if (candidates.length === 1) {
+      const candidate = candidates[0]!;
+      const attachments = (candidate.attachments ?? [])
+        .map((attachment) => ({ ...attachment, durationSeconds: 0 }));
+      const summary = describeHistoryAttachments(candidate.attachments ?? []);
+      return {
+        kind: "matched",
+        attachments,
+        summary,
+        note: `[系统提示] 本条消息未携带附件或显式引用；已按「同一发送者、最近 10 分钟内唯一一条附件消息」的规则取回你发送的${summary}，下方附件块即该文件。若它不是你所指的，请说明并引用对应消息。`,
+      };
+    }
+    const listed = candidates.slice(-3)
+      .map((candidate) => describeHistoryAttachments(candidate.attachments ?? []))
+      .join("，");
+    const more = candidates.length > 3 ? ` 等 ${candidates.length} 条` : "";
+    return {
+      kind: "ambiguous",
+      note: `[系统提示] 本条消息未携带附件或显式引用；你最近 10 分钟内发送过 ${candidates.length} 条附件消息（${listed}${more}），无法确定「这个」指哪一份。请引用对应文件消息或重新上传；在那之前不要读取其中任何一份。`,
+    };
+  }
+
   private async materializeInbound(message: InboundMessage, text = message.text): Promise<string | null> {
     const quotedText = message.quoted?.text.trim() ?? "";
+    const association = this.associatedAttachments(message);
+    // 歧义时不取回任何文件：说明写进正文，任务照常接受；引用块（若有）照常组装。
+    if (association?.kind === "ambiguous") {
+      return composePromptText(withSystemNote(text, association.note), [], message.quoted);
+    }
     // 只带引用、不带附件时也要把引用块交给 Agent；普通文本任务的正文保持逐字不变。
-    if (message.attachments.length === 0) {
+    if (message.attachments.length === 0 && association === null) {
       return quotedText.length === 0 ? text : composePromptText(text, [], message.quoted);
     }
+    const associated = association !== null;
+    const requested: InboundAttachment[] = associated ? association.attachments : message.attachments;
     const attachmentConfig = this.options.config.attachments;
     if (attachmentConfig?.enabled !== true) {
+      // 关联要求附件接收开启，走到这里的一定是消息自带的附件。
       if (text.trim().length > 0 || quotedText.length > 0) {
         return composePromptText(text, [], message.quoted);
       }
@@ -759,7 +857,16 @@ class CoreService implements ChannelService {
     }
     const claim = this.commandClaim(message, "attachment");
     if (!this.store.claimCommand(claim)) return null;
-    if (message.attachments.length > MAX_MESSAGE_ATTACHMENTS) {
+    if (requested.length > MAX_MESSAGE_ATTACHMENTS) {
+      if (associated) {
+        // 尽力协助失败一律诚实降级，不整条拒收。
+        this.store.releaseClaim(claim);
+        return composePromptText(
+          withSystemNote(text, associationFailureNote("budget", attachmentConfig.maxBytes, association.summary)),
+          [],
+          message.quoted,
+        );
+      }
       await this.refuseAttachments(message, claim, ATTACHMENTS_OVER_BUDGET_TEXT);
       return null;
     }
@@ -772,7 +879,7 @@ class CoreService implements ChannelService {
       // 附件目录由服务创建（0700，与传输层的写入互为幂等），失败清理才有一个确定的所有者。
       await mkdir(directory, { recursive: true, mode: 0o700 });
       const files: SavedAttachment[] = [];
-      for (const [index, attachment] of message.attachments.entries()) {
+      for (const [index, attachment] of requested.entries()) {
         // 客户端声明的大小先做超限预检，不发起无谓的请求。
         if (attachment.size > attachmentConfig.maxBytes) {
           throw new AttachmentError("oversize", `attachment ${index} exceeds ${attachmentConfig.maxBytes} bytes`);
@@ -811,7 +918,11 @@ class CoreService implements ChannelService {
             attachment.kind === "audio" ? await this.transcribeInboundAudio(path, budget.signal) : null,
         });
       }
-      const promptText = composePromptText(text, files, message.quoted);
+      const promptText = composePromptText(
+        associated ? withSystemNote(text, association.note) : text,
+        files,
+        message.quoted,
+      );
       this.store.releaseClaim(claim);
       return promptText;
     } catch (error) {
@@ -827,6 +938,15 @@ class CoreService implements ChannelService {
         // 目录未落盘或不可读时无需清理。
       }
       const reason: AttachmentFailureReason = error instanceof AttachmentError ? error.reason : "failed";
+      if (associated) {
+        // 关联尽力协助失败：诚实降级为纯文本说明，而不是整条拒收——用户并未显式提交附件。
+        this.store.releaseClaim(claim);
+        return composePromptText(
+          withSystemNote(text, associationFailureNote(reason, attachmentConfig.maxBytes, association.summary)),
+          [],
+          message.quoted,
+        );
+      }
       await this.refuseAttachments(message, claim, attachmentRefusalText(reason, attachmentConfig.maxBytes));
       return null;
     } finally {
@@ -1187,6 +1307,8 @@ class CoreService implements ChannelService {
       text: message.text,
       timestamp: message.messageTimestamp,
       fromBot: senderId.length > 0 && senderId === this.bot?.uid,
+      // Live 归一化已滤掉不可用的相对 URL，这里保留的都是绝对直链。
+      attachments: message.attachments.map(({ kind, name, size, url }) => ({ kind, name, size, url })),
     });
   }
 
@@ -1265,12 +1387,14 @@ class CoreService implements ChannelService {
       truncatedEarlier = plan.truncatedEarlier;
       for (const message of page) {
         if (!Number.isInteger(message.seq) || message.seq <= 0 || message.seq >= currentSeq) continue;
-        candidates.push({
+        const entry: HistoryEntry = {
           seq: message.seq,
           senderId: message.senderId,
           text: message.text,
           timestamp: message.timestamp,
-        });
+        };
+        if (message.attachments !== undefined) entry.attachments = message.attachments;
+        candidates.push(entry);
       }
     }
     const { kept, skipped } = selectHistoryWindow({

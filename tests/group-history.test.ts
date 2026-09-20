@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+  GROUP_ATTACHMENT_ASSOCIATION_WINDOW_MS,
   GROUP_HISTORY_DEFAULT_MAX_MESSAGES,
   GROUP_HISTORY_FETCH_LIMIT,
   GROUP_HISTORY_MAX_BLOCK_BYTES,
@@ -10,6 +11,11 @@ import {
   selectHistoryWindow,
   type HistoryEntry,
 } from "../src/group-history";
+import type { HistoryMessageAttachment } from "../src/contracts";
+
+function mediaFile(name: string, size = 1): HistoryMessageAttachment {
+  return { kind: "file", name, size, url: `https://cdn.example.test/${name}` };
+}
 
 function entry(
   seq: number,
@@ -170,6 +176,72 @@ test("only renders text from other senders while every message contributes cover
   expect(buffer.covers(0, 4)).toBe(true);
   expect(buffer.entriesInRange(0, 4)).toEqual([entry(3, "hello", "member-2", 3)]);
   expect(buffer.recentEntries(10).map((item) => item.seq)).toEqual([3]);
+});
+
+test("keeps a media-only message as a full history entry and renders its attachment marker", () => {
+  const timestamp = Date.UTC(2026, 8, 20, 7, 58);
+  const buffer = createHistoryBuffer(20);
+  buffer.record({
+    seq: 360,
+    supported: true,
+    senderId: "member-zhao",
+    text: "",
+    timestamp,
+    fromBot: false,
+    attachments: [{ kind: "file", name: "报告.xlsx", size: 426_681, url: "https://cdn.example.test/report.xlsx" }],
+  });
+
+  const recorded = buffer.entriesInRange(0, 400);
+  expect(recorded).toEqual([{
+    seq: 360,
+    senderId: "member-zhao",
+    text: "",
+    timestamp,
+    attachments: [{ kind: "file", name: "报告.xlsx", size: 426_681, url: "https://cdn.example.test/report.xlsx" }],
+  }]);
+
+  const { kept } = selectHistoryWindow({ entries: recorded, maxMessages: 50 });
+  expect(kept).toHaveLength(1);
+  const block = renderHistoryBlock(kept, { skipped: 0, truncatedEarlier: false }) ?? "";
+  expect(entryLines(block)).toEqual(["- 2026-09-20T07:58Z <member-zhao>: [文件 报告.xlsx (416.7 KB)]"]);
+});
+
+test("appends the attachment marker to a captioned message's text", () => {
+  const block = renderHistoryBlock(
+    [{
+      seq: 5,
+      senderId: "m",
+      text: "看下这个表",
+      timestamp: Date.UTC(2026, 8, 20, 7, 58),
+      attachments: [mediaFile("a.xlsx", 0)],
+    }],
+    { skipped: 0, truncatedEarlier: false },
+  ) ?? "";
+  expect(lineText(entryLines(block)[0] ?? "")).toBe("看下这个表 [文件 a.xlsx]");
+});
+
+test("attachmentCandidates matches only the same sender inside the sequence and time window", () => {
+  const base = Date.UTC(2026, 8, 20, 8, 0);
+  const buffer = createHistoryBuffer(20);
+  const media = (seq: number, senderId: string, timestamp: number, name: string): void => {
+    buffer.record({ seq, supported: true, senderId, text: "", timestamp, fromBot: false, attachments: [mediaFile(name)] });
+  };
+  media(100, "member-a", base - 60_000, "recent.xlsx");
+  media(101, "member-a", base - 1_000, "earlier-in-window.xlsx");
+  media(102, "member-b", base, "other-sender.xlsx");
+  media(103, "member-a", base - GROUP_ATTACHMENT_ASSOCIATION_WINDOW_MS - 1, "stale.xlsx");
+  media(104, "member-a", base + 1_000, "future.xlsx");
+  buffer.record({ seq: 105, supported: true, senderId: "member-a", text: "no media", timestamp: base, fromBot: false });
+
+  const candidates = buffer.attachmentCandidates("member-a", 110, base);
+  expect(candidates.map((candidate) => candidate.attachments?.[0]?.name)).toEqual([
+    "recent.xlsx",
+    "earlier-in-window.xlsx",
+  ]);
+
+  // 返回的是深拷贝：调用方改动不会回流进 buffer。
+  candidates[0]!.attachments![0]!.name = "mutated.xlsx";
+  expect(buffer.recentEntries(10).map((item) => item.attachments?.[0]?.name)).not.toContain("mutated.xlsx");
 });
 
 test("keeps buffered entries ordered and scoped to the requested range", () => {

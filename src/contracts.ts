@@ -136,12 +136,25 @@ export interface BotEventFetch {
   signal?: AbortSignal;
 }
 
-/** One text message of a group/thread channel history window. */
+/** Attachment descriptor of one history message; `url` is always an absolute http(s) link. */
+export interface HistoryMessageAttachment {
+  kind: InboundAttachmentKind;
+  name: string;
+  size: number;
+  url: string;
+}
+
+/**
+ * One message of a group/thread channel history window. `attachments` carries the absolute
+ * download references of media-bearing messages (added 2026-09-20); absent means none/unknown.
+ * An attachment-bearing message with empty text is a full history entry in its own right.
+ */
 export interface HistoryMessage {
   seq: number;
   senderId: string;
   text: string;
   timestamp: number;
+  attachments?: HistoryMessageAttachment[];
 }
 
 /**

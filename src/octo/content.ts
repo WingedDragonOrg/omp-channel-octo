@@ -541,16 +541,31 @@ function historyMessage(value: unknown, botUid: string): HistoryMessage | undefi
   if (typeof payload !== "string") return undefined;
   const envelope = decodedHistoryPayload(payload);
   if (!isJsonRecord(envelope)) return undefined;
-  // Same type table as the live path, text only: history never downloads attachments and
-  // never checks URLs, so a stale or relative reference cannot trigger network work.
-  const text = messageContent(envelope)?.text ?? "";
-  if (text.trim().length === 0) return undefined;
-  return {
+  // Same type table as the live path. History itself never downloads anything, but an
+  // attachment-bearing message keeps its absolute download reference so it survives as a
+  // real history entry — otherwise a file that carries no caption vanishes from "recent
+  // messages" altogether, and a later 「这个」 has nothing to associate with. Relative or
+  // otherwise unusable URLs are dropped here, exactly like the live path drops them.
+  const content = messageContent(envelope);
+  const text = content?.text ?? "";
+  const attachments = (content?.attachments ?? [])
+    .filter((attachment) => absoluteHttpUrl(attachment.url) !== undefined)
+    .map((attachment) => ({
+      kind: attachment.kind,
+      name: attachment.name,
+      size: attachment.size,
+      url: attachment.url,
+    }));
+  if (text.trim().length === 0 && attachments.length === 0) return undefined;
+  const entry: HistoryMessage = {
     seq: seq as number,
     senderId,
     text,
     timestamp: (timestamp as number) * 1000,
   };
+  // 无附件的消息不带这个键：形状与引入元数据之前完全一致。
+  if (attachments.length > 0) entry.attachments = attachments;
+  return entry;
 }
 
 function decodedHistoryPayload(payload: string): unknown {
