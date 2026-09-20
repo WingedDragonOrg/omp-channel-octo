@@ -433,39 +433,39 @@ async function askQuestionSet(
   const cleanups: Array<() => void> = [];
   /** 整组共用一次停回合：任一题到点即整组停止等待，全部行保持 pending、卡片不改写。 */
   let stopped = false;
-  specs.forEach((spec, index) => {
-    deps.store.createQuestion({
-      id: spec.id,
-      taskId: task.id,
-      botUid: currentBotUid(),
-      ...target,
-      payload: JSON.stringify(spec.payload),
-    });
-    const completion = completions[index]!;
-    void completion.promise.catch(() => {});
-    questionWaiters.set(spec.id, {
-      taskId: task.id,
-      resolve: completion.resolve,
-      reject: completion.reject,
-    });
-    const abort = () => {
-      if (stopped) return;
-      deps.store.cancelQuestion(spec.id);
-      questionWaiters.delete(spec.id);
-      completion.reject(new Error("question cancelled"));
-    };
-    signal.addEventListener("abort", abort, { once: true });
-    cleanups.push(() => signal.removeEventListener("abort", abort));
-    const timer = setTimeout(() => {
-      if (stopped) return;
-      stopped = true;
-      for (const open of specs) questionWaiters.delete(open.id);
-      deps.stopTurnForQuestion(task.id);
-      for (const pending of completions) pending.reject(new Error(ASK_STOPPED_MESSAGE));
-    }, deps.askTimeoutMs());
-    questionTimers.set(spec.id, timer);
-  });
   try {
+    specs.forEach((spec, index) => {
+      deps.store.createQuestion({
+        id: spec.id,
+        taskId: task.id,
+        botUid: currentBotUid(),
+        ...target,
+        payload: JSON.stringify(spec.payload),
+      });
+      const completion = completions[index]!;
+      void completion.promise.catch(() => {});
+      questionWaiters.set(spec.id, {
+        taskId: task.id,
+        resolve: completion.resolve,
+        reject: completion.reject,
+      });
+      const abort = () => {
+        if (stopped) return;
+        deps.store.cancelQuestion(spec.id);
+        questionWaiters.delete(spec.id);
+        completion.reject(new Error("question cancelled"));
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      cleanups.push(() => signal.removeEventListener("abort", abort));
+      const timer = setTimeout(() => {
+        if (stopped) return;
+        stopped = true;
+        for (const open of specs) questionWaiters.delete(open.id);
+        deps.stopTurnForQuestion(task.id);
+        for (const pending of completions) pending.reject(new Error(ASK_STOPPED_MESSAGE));
+      }, deps.askTimeoutMs());
+      questionTimers.set(spec.id, timer);
+    });
     throwIfAborted(signal);
     const messageId = await deliverQuestionSet(specs, target, signal);
     throwIfAborted(signal);
