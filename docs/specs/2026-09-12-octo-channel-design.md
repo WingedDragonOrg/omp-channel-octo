@@ -58,6 +58,8 @@
 
 `task-scheduler.ts` 独占聊天串行链、排定任务、目录租约、等待回执标记及关停任务快照；运行中 worker 和 blocked 目录仍由服务管理，调度仅经明确端口查询。`command-routing.ts` 统一内建命令别名及注册校验，从别名表推导的 action 类型约束完整分派表；durable claim 保留用户输入的命令名，重启仍在 claim 完成后请求，未知命令照常走既有 handler 或 OMP 任务路径。
 
+`turn-context.ts` 负责每个群/子区任务的说明快照、注入 ledger 和 sidecar 事务：会话身份验证后发布，普通成功时校验当前 worker 会话的 prepared receipt 并 CAS 提交，取消、中断或失败时保留待重放状态。服务仅在群/子区创建该事务，私聊的完成状态与 outbox flush 保持同一同步结算段。`omp/events.ts` 统一折叠 RPC 消息、回合、工具及子代理帧；worker 保留消费方回调异常的捕获边界，只拒绝当前 prompt。
+
 ### 运行和配置
 
 使用 TypeScript/Bun 常驻服务，主动连接 Octo，启动并管理 OMP RPC worker。无需为 RPC 开放网络监听端口。macOS 使用 launchd 托管；机器休眠或离线期间不承诺可用。

@@ -11,7 +11,7 @@ import {
 } from "./command-routing.ts";
 import { SessionLifecycle } from "./session-lifecycle.ts";
 import { TaskScheduler } from "./task-scheduler.ts";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
   ATTACHMENT_MAX_AGE_MS,
@@ -30,7 +30,6 @@ import type {
   ChatExecutionState,
   ChatTarget,
   ContextInjection,
-  CoreServiceConfig,
   GroupContext,
   PromptContext,
   InboundMessage,
@@ -42,15 +41,7 @@ import type {
   WorkerProcess,
 } from "./contracts.ts";
 import { DEFAULT_ASK_TIMEOUT_MS } from "./contracts.ts";
-import {
-  normalizeGroupContext,
-  preparedReceiptMatches,
-  readContextSidecar,
-  removeContextSidecar,
-  writeBoundSession,
-  writeContextSidecar,
-  type ContextSidecar,
-} from "./context-sidecar.ts";
+import { TurnContext } from "./turn-context.ts";
 import { createBotEventLoop, type BotEventLoop } from "./bot-events.ts";
 import { createOutboxDelivery, type Outbox } from "./outbox.ts";
 import { createHostTools, type HostToolHost } from "./host-tools.ts";
@@ -138,17 +129,6 @@ function statusState(task: TaskRecord | null, hasBinding: boolean): ChatExecutio
 
 function createSessionId(): string {
   return randomUUID();
-}
-
-function contextSidecarRoot(
-  config: CoreServiceConfig,
-  botUid: string,
-  target: ChatTarget,
-): string {
-  const scopeDigest = createHash("sha256")
-    .update(`${botUid}\u0000${target.channelType}\u0000${target.channelId}`, "utf8")
-    .digest("hex");
-  return join(config.stateDir, "context-sidecars", scopeDigest);
 }
 
 class CoreService implements ChannelService {
@@ -1280,12 +1260,18 @@ class CoreService implements ChannelService {
     let spawned: WorkerProcess | undefined;
     const textDelivery = this.outbox.registerTask(taskId);
     const target = taskTarget(task);
+    /** 本回合的群说明事务：快照、ledger 决策与本回合 sidecar 都归它，服务只按序调用。 */
+    const turnContext = isGroupTarget(target) ? new TurnContext({
+      store: this.store,
+      transport: this.options.transport,
+      stateDir: this.options.config.stateDir,
+      botUid: this.bot!.uid,
+      target,
+    }) : null;
     const progress = this.progressCards.startTask(taskId, target);
     const assistantTexts = new Map<string, string>();
     let snapshot: GroupContext | null = null;
     let contextInjection: ContextInjection | undefined;
-    let currentContextSidecarPath: string | undefined;
-    let contextNeedsCommit = false;
     /**
      * 本地命令回合（如 `/autoresearch` 的开关/清理）：无 agent 生成，OMP 不会写群说明
      * prepared receipt。置位后本回合跳过 context commit，但 sidecar 照常清理、ledger 保持
@@ -1299,10 +1285,7 @@ class CoreService implements ChannelService {
     runtime.rollProgressCard = () => progress.roll();
 
     try {
-      const groupTask = isGroupTarget(target);
-      snapshot = groupTask
-        ? normalizeGroupContext(await this.options.transport.getGroupContext(target))
-        : null;
+      snapshot = turnContext ? await turnContext.load() : null;
       if (runtime.cancelRequested) {
         this.store.markCancelled(taskId);
         return;
@@ -1311,19 +1294,11 @@ class CoreService implements ChannelService {
       // read problem, so the classification must not keep reporting one.
       startupPhase = "startup";
       const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.options.config), task.cwd);
-      const sidecarRoot = contextSidecarRoot(this.options.config, this.bot!.uid, target);
       const binding = bindingAtStart ?? this.store.getBinding(this.bot!.uid, target);
       const chatModel = this.store.getChatModel(this.bot!.uid, target);
+      const contextScope = turnContext?.workerScope;
       const workerOptions: WorkerOptions = {
-        ...(groupTask
-          ? {
-              contextScope: {
-                sidecarRoot,
-                botUid: this.bot!.uid,
-                target: { ...target },
-              },
-            }
-          : {}),
+        ...(contextScope === undefined ? {} : { contextScope }),
         cwd: task.cwd,
         sessionDir,
         ...(chatModel === null ? {} : { model: chatModel }),
@@ -1376,69 +1351,7 @@ class CoreService implements ChannelService {
         verified.sessionId,
         verified.sessionFile,
       );
-      if (groupTask) {
-        const immutableSnapshot = snapshot;
-        if (!immutableSnapshot) throw new Error("群说明快照缺失");
-        const existingLedger = this.store.getContextLedger(this.bot!.uid, target, verified.sessionId);
-        if (existingLedger && existingLedger.version > immutableSnapshot.version) {
-          throw new Error("群说明版本回退，未启动任务");
-        }
-        let ledger = existingLedger;
-        if (!ledger || ledger.version < immutableSnapshot.version) {
-          ledger = this.store.prepareContextInjection(
-            this.bot!.uid,
-            target,
-            verified.sessionId,
-            immutableSnapshot.version,
-          );
-        }
-        const previousVersion = ledger.previousVersion;
-        const injectionDecision: ContextInjection["injectionDecision"] = ledger.phase === "committed"
-          && ledger.version === immutableSnapshot.version
-          ? "unchanged"
-          : previousVersion === null
-            ? "initial"
-            : "version-change";
-        const explanation = injectionDecision === "version-change" && previousVersion !== null
-          ? `群说明版本从 ${previousVersion} 更新为 ${immutableSnapshot.version}，注入最新完整快照。`
-          : injectionDecision === "initial"
-            ? "首次注入当前群/线程共享说明完整快照。"
-            : `群说明版本 ${immutableSnapshot.version} 未变化，本轮不重复注入正文。`;
-        contextInjection = {
-          snapshot: { ...immutableSnapshot },
-          injectionDecision,
-          attemptId: ledger.attemptId,
-          explanation,
-        };
-        contextNeedsCommit = injectionDecision !== "unchanged";
-        const sidecar: ContextSidecar = {
-          schemaVersion: 1,
-          botUid: this.bot!.uid,
-          target: { ...target },
-          sessionId: verified.sessionId,
-          snapshot: { ...immutableSnapshot },
-          injectionDecision,
-          attemptId: ledger.attemptId,
-          marker: {
-            phase: ledger.phase,
-            botUid: this.bot!.uid,
-            target: { ...target },
-            sessionId: verified.sessionId,
-            version: immutableSnapshot.version,
-            attemptId: ledger.attemptId,
-          },
-          ...(previousVersion === null ? {} : { previousVersion }),
-        };
-        // The scope publishes the session this turn belongs to; it stays as the
-        // scope's current session so sub-sessions OMP opens in the same worker
-        // are never mistaken for a channel turn.
-        await writeBoundSession(sidecarRoot, {
-          botUid: this.bot!.uid,
-          target: { ...target },
-          sessionId: verified.sessionId,
-        });
-        currentContextSidecarPath = await writeContextSidecar(sidecarRoot, sidecar);
-      }
+      contextInjection = turnContext ? await turnContext.prepare(verified.sessionId) : undefined;
       const onEvent = (event: WorkerEvent): void => {
         if (runtime.cancelRequested || this.stopping) return;
         if (event.type === "notice") {
@@ -1505,40 +1418,7 @@ class CoreService implements ChannelService {
         );
         progress.finish("cancelled");
       } else {
-        if (contextNeedsCommit && !localOnly) {
-          const sidecarPath = currentContextSidecarPath;
-          const injection = contextInjection;
-          if (!sidecarPath || !injection) {
-            throw new Error("群说明注入状态缺失，未提交");
-          }
-          const sidecar = await readContextSidecar(sidecarPath);
-          if (
-            sidecar.marker.phase !== "pending"
-            || sidecar.botUid !== this.bot!.uid
-            || sidecar.sessionId !== worker.sessionId
-            || sidecar.target.channelType !== target.channelType
-            || sidecar.target.channelId !== target.channelId
-            || sidecar.snapshot.version !== injection.snapshot.version
-            || sidecar.attemptId !== injection.attemptId
-            || !sidecar.prepared
-            || !preparedReceiptMatches(sidecar, sidecar.prepared)
-          ) {
-            throw new Error("群说明注入未获得匹配的 prepared receipt，未提交");
-          }
-          if (!this.store.commitContextInjection(
-            this.bot!.uid,
-            target,
-            worker.sessionId,
-            injection.snapshot.version,
-            injection.attemptId,
-          )) {
-            throw new Error("群说明 marker CAS 提交失败，保留待重放状态");
-          }
-        }
-        if (currentContextSidecarPath) {
-          await removeContextSidecar(currentContextSidecarPath).catch(() => {});
-          currentContextSidecarPath = undefined;
-        }
+        if (turnContext) await turnContext.complete(worker.sessionId, localOnly);
         const resultText = assistantTexts.size > 0 ? [...assistantTexts.values()].join("\n\n") : null;
         this.store.markCompleted(taskId, resultText);
         progress.finish("completed");
