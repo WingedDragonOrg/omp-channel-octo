@@ -1,26 +1,12 @@
 import { GroupHistoryCoordinator } from "./history-coordinator.ts";
 import { ModelSwitchController } from "./model-controller.ts";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, rm } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import {
-  ATTACHMENTS_DISABLED_TEXT,
-  ATTACHMENTS_OVER_BUDGET_TEXT,
-  ATTACHMENT_DOWNLOAD_BUDGET_MS,
-  ATTACHMENT_DOWNLOAD_TIMEOUT_MS,
   ATTACHMENT_MAX_AGE_MS,
-  AttachmentError,
-  MAX_MESSAGE_ATTACHMENTS,
-  attachmentDirectory,
-  attachmentRefusalText,
-  composePromptText,
-  existingFileSize,
-  formatBytes,
-  safeAttachmentName,
   sweepAttachments,
-  type AttachmentFailureReason,
-  type SavedAttachment,
 } from "./attachments.ts";
+import { ChatAuthorization } from "./chat-authorization.ts";
 import { acquireBotLock, assertBotLockFree, type LockHandle } from "./bot-lock.ts";
 import { TaskStartupError } from "./contracts.ts";
 import type {
@@ -35,9 +21,7 @@ import type {
   ContextInjection,
   CoreServiceConfig,
   GroupContext,
-  HistoryMessageAttachment,
   PromptContext,
-  InboundAttachment,
   InboundMessage,
   OmpWorker,
   WorkerEvent,
@@ -58,9 +42,6 @@ import {
   type ExecutionTracker,
 } from "./execution-tracker.ts";
 import {
-  ATTACHMENT_KIND_LABELS,
-} from "./group-history.ts";
-import {
   normalizeGroupContext,
   preparedReceiptMatches,
   readContextSidecar,
@@ -72,7 +53,8 @@ import {
 import { createBotEventLoop, type BotEventLoop } from "./bot-events.ts";
 import { createOutboxDelivery, type Outbox } from "./outbox.ts";
 import { createHostTools, type HostToolHost } from "./host-tools.ts";
-import { failureText, isTransientServerFailure, safeErrorMessage } from "./errors.ts";
+import { InboundMaterializer } from "./inbound-materializer.ts";
+import { InboundShutdownError, failureText, isTransientServerFailure, safeErrorMessage } from "./errors.ts";
 import { classifyStartupFailure, classifyTaskFailure, GENERIC_TASK_FAILURE_NOTICE, type TaskStartupPhase } from "./task-failure.ts";
 import {
   findMovedSession,
@@ -84,7 +66,7 @@ import {
 import { ensureProjectSessionDir, projectSessionDir, sessionsRoot } from "./session-dir.ts";
 import { ChannelStore, openChannelStore } from "./store.ts";
 import { modelWithLevel } from "./model-switch.ts";
-import type { BindingRecord, InboundClaim, ProgressCardRecord, TaskRecord } from "./store-records.ts";
+import type { BindingRecord, ProgressCardRecord, TaskRecord } from "./store-records.ts";
 import { isGroupTarget, targetKey, taskTarget } from "./target.ts";
 import { createTypingLeaseManager, type TypingLeaseManager } from "./typing-lease.ts";
 import { createDisplayNameCache, type DisplayNameCache } from "./display-name.ts";
@@ -133,22 +115,6 @@ const PROGRESS_CARD_RECOVERY_ATTEMPTS = 3;
 const MAX_PENDING_STEERS = 32;
 /** Characters of the triggering message shown in a start/consumption receipt. */
 const RECEIPT_EXCERPT_CHARS = 20;
-/** How long one 免@ decision is reused before the group switch is consulted again. */
-const MENTION_PREF_TTL_MS = 60_000;
-/** A failed lookup keeps the stricter "must be @mentioned" answer only briefly. */
-const MENTION_PREF_FAILURE_TTL_MS = 10_000;
-/** Bounds the 免@ lookup on the inbound path: the handler, and RECVACK, wait for it. */
-const MENTION_PREF_TIMEOUT_MS = 5_000;
-/**
- * The one exception that lets an allowlist rejection speak: an owner's @Bot mention in an unlisted
- * group or thread gets a short notice carrying this exact reply text (compared after Bot-mention
- * stripping and outer whitespace trimming), and that reply enables the chat durably.
- */
-const UNLISTED_CHAT_PASSPHRASE = "开通本群";
-/** One notice per unlisted chat per window, so a burst of messages cannot become a burst of replies. */
-const UNLISTED_CHAT_NOTICE_TTL_MS = 10 * 60 * 1_000;
-/** Same window for the members-cannot-command notice: the first command of a chat is explained once. */
-const MEMBER_COMMAND_NOTICE_TTL_MS = 10 * 60 * 1_000;
 const DEFAULT_CANCELLED_TEXT = "当前任务已取消；不回滚已发生的副作用。";
 const DEFAULT_RESTARTING_TEXT = "channel 正在重启，本会话任务已中断；重启完成后会在本会话确认。";
 const THREAD_USAGE =
@@ -166,43 +132,6 @@ const THREAD_ARCHIVE_RETRY_MS = 5_000;
 /** 归档前等该聊天出站队列排空的有界轮询（100ms 一次，最多 10 秒）。 */
 const THREAD_ARCHIVE_DRAIN_MS = 10_000;
 const THREAD_ARCHIVE_DRAIN_POLL_MS = 100;
-
-/** 系统说明行与正文之间保持空行分隔；正文为空时说明行本身就是正文。 */
-function withSystemNote(text: string, note: string): string {
-  const body = text.trim();
-  return body.length === 0 ? note : `${body}\n\n${note}`;
-}
-
-/** 「《name》(416.7 KB)」/「《name》(416.7 KB) 等 2 项」；无名时退化为类型词，超长名截断。 */
-function describeHistoryAttachments(attachments: readonly HistoryMessageAttachment[]): string {
-  const first = attachments[0];
-  if (first === undefined) return "附件消息";
-  const label = ATTACHMENT_KIND_LABELS[first.kind] ?? "附件";
-  const name = first.name.trim();
-  const short = Array.from(name).length > 60 ? `${Array.from(name).slice(0, 60).join("")}…` : name;
-  const size = first.size > 0 ? `（${formatBytes(first.size)}）` : "";
-  const head = short.length > 0 ? `《${short}》${size}` : `${label}${size}`;
-  return attachments.length > 1 ? `${head} 等 ${attachments.length} 项` : head;
-}
-
-/**
- * 关联取回失败时的诚实降级说明：绝不虚构「已收到」，而是让 Agent 据此请发送者引用或重传。
- * 与拒收文案不同，这里任务本身继续——关联是尽力协助，不是发送者的显式动作。
- */
-function associationFailureNote(
-  reason: AttachmentFailureReason,
-  maxBytes: number,
-  summary: string,
-): string {
-  let cause = "下载失败";
-  if (reason === "oversize") {
-    const megabytes = maxBytes / (1024 * 1024);
-    cause = `超过 ${Number.isInteger(megabytes) ? megabytes : megabytes.toFixed(1)} MB 上限`;
-  } else if (reason === "budget" || reason === "timeout") {
-    cause = "下载超时";
-  }
-  return `[系统提示] 你刚才发送的${summary}未能取回（${cause}）；本条按纯文本处理，未读取任何文件。如需我查看该文件，请引用那条消息或重新发送。`;
-}
 
 type RuntimeTask = {
   taskId: string;
@@ -279,20 +208,6 @@ function isEdgeRefusal(error: unknown): boolean {
     && candidate.status >= 400
     && candidate.status < 500
     && candidate.code === undefined;
-}
-
-/**
- * A thread (channelType=5) inherits its parent group's allowlist entry, so a freshly
- * created thread needs no extra configuration; an explicit full channel ID still wins.
- */
-function isAllowlistedChat(
-  allowedGroupIds: readonly string[],
-  message: Pick<InboundMessage, "channelId" | "channelType">,
-): boolean {
-  if (allowedGroupIds.includes(message.channelId)) return true;
-  if (message.channelType !== 5) return false;
-  const parentGroupId = threadParentGroupId(message.channelId);
-  return parentGroupId !== null && allowedGroupIds.includes(parentGroupId);
 }
 
 /** Single-line, bounded excerpt of the triggering message for a start/consumption receipt. */
@@ -414,17 +329,6 @@ function isCommand(text: string): boolean {
   return /^\/\S+/.test(text.trim());
 }
 
-/**
- * Shutdown interrupted an inbound message before it was durably accepted. The handler rejects with
- * it so the transport never ACKs a swallowed message; the same message is redelivered after restart.
- */
-class InboundShutdownError extends Error {
-  constructor() {
-    super("channel 正在停止，消息未接受");
-    this.name = "InboundShutdownError";
-  }
-}
-
 function parseCommand(text: string): { name: string; argument: string } | null {
   const match = /^\/([^\s]+)(?:\s+([\s\S]*))?$/.exec(text.trim());
   if (!match) return null;
@@ -467,6 +371,8 @@ interface PendingThreadArchive {
 class CoreService implements ChannelService {
   private readonly history: GroupHistoryCoordinator;
   private readonly models: ModelSwitchController;
+  private readonly authorization: ChatAuthorization;
+  private readonly materializer: InboundMaterializer;
   private readonly taskOperations = new Set<Promise<void>>();
   /** In-flight inbound handlers: stop aborts their I/O and awaits their cleanup before closing the store. */
   private readonly inboundOperations = new Set<Promise<void>>();
@@ -483,12 +389,6 @@ class CoreService implements ChannelService {
   private readonly directoryTails = new Map<string, Promise<void>>();
   private readonly runtimes = new Map<string, RuntimeTask>();
   private readonly blockedDirectories = new Set<string>();
-  private readonly mentionPrefs = new Map<string, { effective: boolean; expiresAt: number }>();
-  private readonly mentionPrefRequests = new Map<string, Promise<boolean>>();
-  /** Last unlisted-chat notice per chat; process-local, so a restart may re-notify once. */
-  private readonly unlistedChatNotices = new Map<string, number>();
-  /** Last members-cannot-command notice per chat; same process-local window pattern. */
-  private readonly memberCommandNotices = new Map<string, number>();
   /** 问题与问答卡：等待者、卡片代次与问题行的所有者。 */
   /** 出站投递：文字、流式编辑与文件共用的队列。 */
   private readonly outbox: Outbox;
@@ -551,6 +451,27 @@ class CoreService implements ChannelService {
       botUid: () => this.bot?.uid,
       started: () => this.started,
     });
+    this.authorization = new ChatAuthorization({
+      bot: () => this.bot,
+      allowedGroupIds: options.config.allowedGroupIds,
+      allowlistWriteback: options.allowlistWriteback,
+      store: this.store,
+      transport: options.transport,
+      shutdownSignal: this.shutdownController.signal,
+      commandClaim: (message, name) => this.commandClaim(message, name),
+      enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
+    });
+    this.materializer = new InboundMaterializer({
+      config: this.options.config,
+      store: this.store,
+      transport: this.options.transport,
+      history: this.history,
+      shutdownSignal: this.shutdownController.signal,
+      stopping: () => this.stopping,
+      throwIfStopping: () => this.throwIfStopping(),
+      commandClaim: (message, name) => this.commandClaim(message, name),
+      enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
+    });
     this.displayNames = createDisplayNameCache(
       async (uid, signal) => (await this.options.transport.getUserInfo(uid, signal)).name,
     );
@@ -568,7 +489,7 @@ class CoreService implements ChannelService {
       wakeTurn: (target, text) => {
         void this.wakeTurn(target, text);
       },
-      memberAnswerAllowed: (target) => target.channelType !== 1 && this.isPermittedChat(target),
+      memberAnswerAllowed: (target) => target.channelType !== 1 && this.authorization.isPermittedChat(target),
     });
     this.botEvents = createBotEventLoop({
       store: this.store,
@@ -796,10 +717,10 @@ class CoreService implements ChannelService {
       }
       ownerId = this.store.getOwnerId(this.bot.uid)?.trim() || null;
     }
-    const allowed = await this.isAllowed(message, ownerId);
+    const allowed = await this.authorization.isAllowed(message, ownerId);
     this.throwIfStopping();
     if (!allowed) {
-      await this.handleUnlistedOwnerContact(message, ownerId);
+      await this.authorization.handleUnlistedOwnerContact(message, ownerId);
       return;
     }
     // 已授权的新入站说明这个聊天仍在继续：排定中的归档随之取消（用户回来了就不归档）。
@@ -819,7 +740,7 @@ class CoreService implements ChannelService {
     // Members never run commands: the slash text would otherwise be passed to OMP, whose own
     // builtin dispatch consumes it, so it only earns one throttled notice instead.
     if (isCommand(text) && message.senderId.trim() !== ownerId) {
-      await this.noticeMemberCommand(message);
+      await this.authorization.noticeMemberCommand(message);
       return;
     }
     const command = isCommand(text) ? parseCommand(text) : null;
@@ -839,7 +760,7 @@ class CoreService implements ChannelService {
       }
       // 未注册的 /xxx 不是命令，仍按普通任务走唯一组装点，附件照常取回。
       await this.withMessageTyping(message, async () => {
-        const slashPrompt = await this.materializeInbound(message);
+        const slashPrompt = await this.materializer.materialize(message);
         if (slashPrompt === null) return;
         this.throwIfStopping();
         await this.acceptTask(message, slashPrompt);
@@ -848,239 +769,12 @@ class CoreService implements ChannelService {
     }
     if (await this.questions.answerPendingQuestion(message, text)) return;
     await this.withMessageTyping(message, async() => {
-      const promptText = await this.materializeInbound(message);
+      const promptText = await this.materializer.materialize(message);
       if (promptText === null) return;
       this.throwIfStopping();
       if (await this.appendToRunningTask(message, promptText)) return;
       await this.acceptTask(message, promptText);
     });
-  }
-
-  /**
-   * 唯一组装点：在权限门、命令解析与待回答问题判定之后，把消息组装成任务正文
-   * （用户文本 + 语音转写 + 附件清单）。附件在这里下载到本机、语音在这里转写。
-   * 失败时经命令 claim + outbox 只回复一次并返回 `null`，不建任务、不进入 steering；
-   * `null` 也表示该消息已被更早的处理路径（含重投去重）消费。
-   *
-   * `text` 默认是整条消息正文。命令路径传入自己的正文：`/thread <任务>` 与 `/queue <文本>` 传
-   * 命令参数，注册 handler 传整条消息——凡是把正文交给 Agent 的命令路径都经这里组装，附件
-   * （图片/文件/语音/视频）与引用块因此不会被命令吃掉。不消费正文的控制命令（`/status`、
-   * `/cancel`、`/mode` 等）与待回答问题的答案不经过这里。
-   */
-  /**
-   * 「这个」场景的附件关联：受权消息本身无附件时，把同一发送者在最近
-   * `GROUP_ATTACHMENT_ASSOCIATION_WINDOW_MS` 内、本进程实际观察到的带附件消息作为候选——
-   * 恰好一条才视同所指并走与自带附件完全相同的下载/限额流程；多条只让 Agent 请其引用，
-   * 零条则完全不改变行为（返回 null）。候选全部来自群历史 buffer（live 观察；服务重启
-   * 期间的消息只经历史回填渲染、不参与取回），因此依赖群历史与附件接收同时开启；
-   * 私聊没有历史 buffer，天然不参与。权限未扩大：候选消息本就在 bot 可读的群里，
-   * 且请求者与发件人必须是同一人——绝不把别的成员的文件猜成「这个」。
-   */
-  private associatedAttachments(
-    message: InboundMessage,
-  ): { kind: "matched"; attachments: InboundAttachment[]; summary: string; note: string }
-    | { kind: "ambiguous"; note: string }
-    | null {
-    if (message.attachments.length > 0) return null;
-    if (this.options.config.groupHistory?.enabled !== true) return null;
-    if (this.options.config.attachments?.enabled !== true) return null;
-    if (message.channelType !== 2 && message.channelType !== 5) return null;
-    if (!Number.isInteger(message.messageSeq) || message.messageSeq <= 0) return null;
-    if (message.messageTimestamp <= 0) return null;
-    const senderId = message.senderId.trim();
-    if (senderId.length === 0) return null;
-    const candidates = this.history.attachmentCandidates(message);
-    if (candidates.length === 0) return null;
-    if (candidates.length === 1) {
-      const candidate = candidates[0]!;
-      const attachments = (candidate.attachments ?? [])
-        .map((attachment) => ({ ...attachment, durationSeconds: 0 }));
-      const summary = describeHistoryAttachments(candidate.attachments ?? []);
-      return {
-        kind: "matched",
-        attachments,
-        summary,
-        note: `[系统提示] 本条消息未携带附件或显式引用；已按「同一发送者、最近 10 分钟内唯一一条附件消息」的规则取回你发送的${summary}，下方附件块即该文件。若它不是你所指的，请说明并引用对应消息。`,
-      };
-    }
-    const listed = candidates.slice(-3)
-      .map((candidate) => describeHistoryAttachments(candidate.attachments ?? []))
-      .join("，");
-    const more = candidates.length > 3 ? ` 等 ${candidates.length} 条` : "";
-    return {
-      kind: "ambiguous",
-      note: `[系统提示] 本条消息未携带附件或显式引用；你最近 10 分钟内发送过 ${candidates.length} 条附件消息（${listed}${more}），无法确定「这个」指哪一份。请引用对应文件消息或重新上传；在那之前不要读取其中任何一份。`,
-    };
-  }
-
-  private async materializeInbound(message: InboundMessage, text = message.text): Promise<string | null> {
-    this.throwIfStopping();
-    const quotedText = message.quoted?.text.trim() ?? "";
-    const association = this.associatedAttachments(message);
-    // 歧义时不取回任何文件：说明写进正文，任务照常接受；引用块（若有）照常组装。
-    if (association?.kind === "ambiguous") {
-      return composePromptText(withSystemNote(text, association.note), [], message.quoted);
-    }
-    // 只带引用、不带附件时也要把引用块交给 Agent；普通文本任务的正文保持逐字不变。
-    if (message.attachments.length === 0 && association === null) {
-      return quotedText.length === 0 ? text : composePromptText(text, [], message.quoted);
-    }
-    const associated = association !== null;
-    const requested: InboundAttachment[] = associated ? association.attachments : message.attachments;
-    const attachmentConfig = this.options.config.attachments;
-    if (attachmentConfig?.enabled !== true) {
-      // 关联要求附件接收开启，走到这里的一定是消息自带的附件。
-      if (text.trim().length > 0 || quotedText.length > 0) {
-        return composePromptText(text, [], message.quoted);
-      }
-      const claim = this.commandClaim(message, "attachment");
-      if (!this.store.claimCommand(claim)) return null;
-      await this.refuseAttachments(message, claim, ATTACHMENTS_DISABLED_TEXT);
-      return null;
-    }
-    const claim = this.commandClaim(message, "attachment");
-    if (!this.store.claimCommand(claim)) return null;
-    if (requested.length > MAX_MESSAGE_ATTACHMENTS) {
-      if (associated) {
-        // 尽力协助失败一律诚实降级，不整条拒收。
-        this.store.releaseClaim(claim);
-        return composePromptText(
-          withSystemNote(text, associationFailureNote("budget", attachmentConfig.maxBytes, association.summary)),
-          [],
-          message.quoted,
-        );
-      }
-      await this.refuseAttachments(message, claim, ATTACHMENTS_OVER_BUDGET_TEXT);
-      return null;
-    }
-    const directory = attachmentDirectory(this.options.config.stateDir, message, message.messageId);
-    const created: string[] = [];
-    const budget = new AbortController();
-    // 整条消息的下载预算（含转写）：超时就中止在途下载，按超限失败处理。
-    const budgetTimer = setTimeout(() => budget.abort(), ATTACHMENT_DOWNLOAD_BUDGET_MS);
-    try {
-      // 附件目录由服务创建（0700，与传输层的写入互为幂等），失败清理才有一个确定的所有者。
-      await mkdir(directory, { recursive: true, mode: 0o700 });
-      this.throwIfStopping();
-      const files: SavedAttachment[] = [];
-      for (const [index, attachment] of requested.entries()) {
-        // 客户端声明的大小先做超限预检，不发起无谓的请求。
-        if (attachment.size > attachmentConfig.maxBytes) {
-          throw new AttachmentError("oversize", `attachment ${index} exceeds ${attachmentConfig.maxBytes} bytes`);
-        }
-        const path = join(directory, safeAttachmentName(attachment.name, index, attachment.kind, attachment.url));
-        const signal = AbortSignal.any([
-          AbortSignal.timeout(ATTACHMENT_DOWNLOAD_TIMEOUT_MS),
-          budget.signal,
-          this.shutdownController.signal,
-        ]);
-        let bytes = await existingFileSize(path);
-        this.throwIfStopping();
-        if (bytes === null) {
-          try {
-            bytes = await this.options.transport.downloadAttachment({
-              url: attachment.url,
-              path,
-              maxBytes: attachmentConfig.maxBytes,
-              signal,
-            });
-          } catch (error) {
-            if (error instanceof AttachmentError && error.reason === "oversize") throw error;
-            // 停机中止先于预算/超时判定：被中断的取回不是附件失败，不发拒绝文案。
-            if (this.shutdownController.signal.aborted) throw new InboundShutdownError();
-            // 单条 60 秒超时与整条 120 秒预算都会中止同一条 signal；只有预算耗尽按「超限」回复。
-            if (budget.signal.aborted) throw new AttachmentError("budget", "attachment budget exhausted");
-            if (signal.aborted) throw new AttachmentError("timeout", "attachment download timed out");
-            if (error instanceof AttachmentError) throw error;
-            throw new AttachmentError("failed", "attachment download failed");
-          }
-          created.push(path);
-        }
-        files.push({
-          path,
-          kind: attachment.kind,
-          name: attachment.name.trim().length > 0 ? attachment.name.trim() : basename(path),
-          bytes,
-          durationSeconds: attachment.durationSeconds,
-          transcription:
-            attachment.kind === "audio" ? await this.transcribeInboundAudio(path, budget.signal) : null,
-        });
-      }
-      this.throwIfStopping();
-      const promptText = composePromptText(
-        associated ? withSystemNote(text, association.note) : text,
-        files,
-        message.quoted,
-      );
-      this.store.releaseClaim(claim);
-      return promptText;
-    } catch (error) {
-      // 失败清理：只删除本次新建的文件，已存在（可能被既有任务引用）的文件保留；目录空了才移除。
-      for (const path of created) {
-        await rm(path, { force: true }).catch(() => {});
-      }
-      try {
-        if ((await readdir(directory)).length === 0) {
-          await rm(directory, { recursive: true, force: true });
-        }
-      } catch {
-        // 目录未落盘或不可读时无需清理。
-      }
-      if (this.stopping) {
-        // 停机中断时任务未接受：不发「附件拒绝」回复、不建任务；命令 claim 随中断回滚，
-        // 同一消息重启后可重新接收；取消错误上抛，传输层不会 ACK。
-        this.store.releaseClaim(claim);
-        throw error instanceof InboundShutdownError ? error : new InboundShutdownError();
-      }
-      const reason: AttachmentFailureReason = error instanceof AttachmentError ? error.reason : "failed";
-      if (associated) {
-        // 关联尽力协助失败：诚实降级为纯文本说明，而不是整条拒收——用户并未显式提交附件。
-        this.store.releaseClaim(claim);
-        return composePromptText(
-          withSystemNote(text, associationFailureNote(reason, attachmentConfig.maxBytes, association.summary)),
-          [],
-          message.quoted,
-        );
-      }
-      await this.refuseAttachments(message, claim, attachmentRefusalText(reason, attachmentConfig.maxBytes));
-      return null;
-    } finally {
-      clearTimeout(budgetTimer);
-    }
-  }
-
-  /**
-   * 语音转写是 best-effort：普通失败、空文本甚至单条转写超时都降级为无转写，任务照常接受；
-   * 只有整条消息的下载预算被耗尽才按超限失败处理。
-   */
-  private async transcribeInboundAudio(path: string, budgetSignal: AbortSignal): Promise<string | null> {
-    const signal = AbortSignal.any([
-      AbortSignal.timeout(ATTACHMENT_DOWNLOAD_TIMEOUT_MS),
-      budgetSignal,
-      this.shutdownController.signal,
-    ]);
-    try {
-      const transcription = await this.options.transport.transcribeAudio(path, signal);
-      return transcription !== null && transcription.trim().length > 0 ? transcription : null;
-    } catch {
-      // 停机中止不能降级成「无转写」后继续组装：被中断的入站以有界取消上抛。
-      if (this.shutdownController.signal.aborted) throw new InboundShutdownError();
-      if (budgetSignal.aborted) {
-        throw new AttachmentError("budget", "attachment budget exhausted during transcription");
-      }
-      return null;
-    }
-  }
-
-  /** 附件拒绝：走既有命令 claim + outbox 通道，只回复一次、不写 task 行。 */
-  private async refuseAttachments(message: InboundMessage, claim: InboundClaim, text: string): Promise<void> {
-    try {
-      await this.outbox.enqueueText(message, text, null);
-      this.store.completeCommand(claim);
-    } catch {
-      this.store.failCommand(claim);
-      throw new Error("本地状态盘写入失败，未能记录附件消息。");
-    }
   }
 
   async status(target: ChatTarget): Promise<ChannelStatus> {
@@ -1138,184 +832,6 @@ class CoreService implements ChannelService {
       supported: message.supported,
       kind: "task" as const,
     };
-  }
-
-  /**
-   * The allowlist is the config's `allowedGroupIds` plus the chats the owner enabled at runtime
-   * (durable in the state store). Threads keep the same inheritance rule over both sets: a thread
-   * is permitted by its own id or by its parent group's.
-   */
-  private isPermittedChat(message: Pick<InboundMessage, "channelId" | "channelType">): boolean {
-    if (isAllowlistedChat(this.options.config.allowedGroupIds, message)) return true;
-    if (!this.bot) return false;
-    const granted = this.store.listAllowedChats(this.bot.uid);
-    return granted.length > 0 && isAllowlistedChat(granted.map((chat) => chat.channelId), message);
-  }
-
-  private async isAllowed(message: InboundMessage, ownerId: string | null): Promise<boolean> {
-    if (!this.bot || !ownerId || message.messageId.trim().length === 0 || message.senderId.trim().length === 0) {
-      return false;
-    }
-    const senderId = message.senderId.trim();
-    if (senderId === this.bot.uid) return false;
-    if (message.channelType === 1) {
-      return senderId === ownerId;
-    }
-    if (!this.isPermittedChat(message)) return false;
-    if (message.mentionedUserIds.includes(this.bot.uid)) return true;
-    // The 免@ exemption belongs to the owner: a member's unmentioned message never runs — and
-    // never triggers the upstream lookup either, so a rejected member costs no request.
-    if (senderId !== ownerId) return false;
-    return await this.groupAllowsNoMention(message);
-  }
-
-  /**
-   * The single exception to "an allowlist rejection is silent": an owner's @Bot mention in an
-   * unlisted group or thread gets one short, throttled notice with the passphrase, and the exact
-   * passphrase enables that chat durably. Every other rejection path is unchanged - a non-owner,
-   * an unmentioned message, a bot echo, and every DM stay reply-less, task-less and unlogged, and
-   * a chat the owner already enabled never reaches here.
-   */
-  private async handleUnlistedOwnerContact(message: InboundMessage, ownerId: string | null): Promise<void> {
-    const bot = this.bot;
-    if (!bot || !ownerId) return;
-    const senderId = message.senderId.trim();
-    if (senderId !== ownerId || senderId === bot.uid) return;
-    if (message.channelType !== 2 && message.channelType !== 5) return;
-    if (!message.mentionedUserIds.includes(bot.uid)) return;
-    if (this.isPermittedChat(message)) return;
-    if (message.text.trim() === UNLISTED_CHAT_PASSPHRASE) {
-      await this.grantUnlistedChat(message);
-      return;
-    }
-    this.noticeUnlistedChat(message, bot.name.trim().length > 0 ? bot.name.trim() : bot.uid);
-  }
-
-  /** 本群 vs 本子区: the notice, the confirmation and the grant row all name the same scope. */
-  private noticeUnlistedChat(message: InboundMessage, botName: string): void {
-    const key = targetKey(message);
-    const lastNoticedAt = this.unlistedChatNotices.get(key);
-    if (lastNoticedAt !== undefined && Date.now() - lastNoticedAt < UNLISTED_CHAT_NOTICE_TTL_MS) return;
-    const scope = message.channelType === 5 ? "本子区" : "本群";
-    this.outbox.enqueueText(message, `${scope}未开通。回复「@${botName} ${UNLISTED_CHAT_PASSPHRASE}」即可开通${scope}。`, null);
-    // Only a queued notice opens the window: a failed enqueue still leaves the next message free to try again.
-    this.unlistedChatNotices.set(key, Date.now());
-  }
-
-  /**
-   * The only visible effect of a member's `/` message: the command is not executed and never
-   * reaches the agent. One durable claim per message id keeps a redelivery silent, and one
-   * notice per chat per window keeps a stream of attempts from becoming a stream of replies.
-   */
-  private async noticeMemberCommand(message: InboundMessage): Promise<void> {
-    const bot = this.bot;
-    if (!bot) return;
-    const claim = this.commandClaim(message, "member-command");
-    if (!this.store.claimCommand(claim)) return;
-    const key = targetKey(message);
-    const lastNoticedAt = this.memberCommandNotices.get(key);
-    if (lastNoticedAt !== undefined && Date.now() - lastNoticedAt < MEMBER_COMMAND_NOTICE_TTL_MS) {
-      this.store.completeCommand(claim);
-      return;
-    }
-    const botName = bot.name.trim().length > 0 ? bot.name.trim() : bot.uid;
-    try {
-      await this.outbox.enqueueText(message, `命令仅 owner 可用；需要助手做事请直接 @${botName} 说明。`, null);
-      this.memberCommandNotices.set(key, Date.now());
-      this.store.completeCommand(claim);
-    } catch {
-      this.store.failCommand(claim);
-      throw new Error("本地状态盘写入失败，未能记录成员命令提示。");
-    }
-  }
-
-  /**
-   * Enables the chat the owner answered the passphrase in. The grant row is the durable permission
-   * (the next message needs no restart and no config reload); the config file is then updated as
-   * the operator-visible mirror, and a mirror failure is reported without taking the grant back.
-   */
-  private async grantUnlistedChat(message: InboundMessage): Promise<void> {
-    const botUid = this.bot!.uid;
-    // The passphrase is a control action, not a task: one durable claim per message id, so a
-    // redelivery after the grant cannot fall through to a task that prompts the model with it.
-    const claim = this.commandClaim(message, "allow-chat");
-    if (!this.store.claimCommand(claim)) return;
-    const scope = message.channelType === 5 ? "本子区" : "本群";
-    let mirrorFailed = false;
-    try {
-      this.store.grantAllowedChat({
-        botUid,
-        channelType: message.channelType === 5 ? 5 : 2,
-        channelId: message.channelId,
-        grantedBy: message.senderId.trim(),
-      });
-      if (this.options.allowlistWriteback) {
-        try {
-          await this.options.allowlistWriteback.append(message.channelId);
-        } catch {
-          mirrorFailed = true;
-        }
-      }
-      console.error(
-        `[allow] 已开通${scope} ${targetKey(message)}（owner ${message.senderId.trim()}）${
-          mirrorFailed ? "；配置文件写回失败，仅状态盘生效" : ""
-        }`,
-      );
-      await this.outbox.enqueueText(
-        message,
-        mirrorFailed
-          ? `已开通${scope}；配置文件写回失败，本次开通仅在状态盘生效。`
-          : `已开通${scope}，后续 @${this.bot!.name} 即可正常使用。`,
-        null,
-      );
-      this.store.completeCommand(claim);
-    } catch {
-      this.store.failCommand(claim);
-      throw new Error("本地状态盘写入失败，未记录开通结果。");
-    }
-  }
-
-  /**
-   * 群级免@：服务器把 bot owner 的意图与群级开关 AND 后给出 `effective`，为真时群里不必 @Bot。
-   * 结果按群缓存，查询失败一律保持「需要 @」，不因错误内容放宽权限。
-   */
-  private async groupAllowsNoMention(message: InboundMessage): Promise<boolean> {
-    // 线程的免@开关属于父群；线程自身没有独立设置。
-    const groupId =
-      message.channelType === 5 ? threadParentGroupId(message.channelId) : message.channelId.trim();
-    if (groupId === null || groupId.length === 0) return false;
-    const cached = this.mentionPrefs.get(groupId);
-    if (cached !== undefined && cached.expiresAt > Date.now()) return cached.effective;
-    const inflight = this.mentionPrefRequests.get(groupId);
-    if (inflight !== undefined) return await inflight;
-    // 并发入站只发一次查询；同一个 promise 同时充当在途去重与结果缓存。
-    const request = (async (): Promise<boolean> => {
-      let effective = false;
-      let ttl = MENTION_PREF_FAILURE_TTL_MS;
-      try {
-        const pref = await this.options.transport.getGroupMentionPref(
-          groupId,
-          AbortSignal.any([
-            AbortSignal.timeout(MENTION_PREF_TIMEOUT_MS),
-            this.shutdownController.signal,
-          ]),
-        );
-        effective = pref.effective;
-        ttl = MENTION_PREF_TTL_MS;
-      } catch {
-        // 停机中止查询不是「需要 @」的结论：未接受的入站以有界取消拒绝，重投后重新判定。
-        if (this.shutdownController.signal.aborted) throw new InboundShutdownError();
-        // 保留「需要 @」的既有行为，只做短暂负缓存，避免查询失败时长挂入站处理。
-      }
-      this.mentionPrefs.set(groupId, { effective, expiresAt: Date.now() + ttl });
-      return effective;
-    })();
-    this.mentionPrefRequests.set(groupId, request);
-    try {
-      return await request;
-    } finally {
-      this.mentionPrefRequests.delete(groupId);
-    }
   }
 
   private async sessionRootsFor(cwd: string): Promise<readonly string[]> {
@@ -1591,7 +1107,7 @@ class CoreService implements ChannelService {
   ): Promise<void> {
     // handler 拿到的是这条消息的正文，因此正文先经唯一组装点：注册命令同样不吃掉附件。
     await this.withMessageTyping(message, async () => {
-      const body = await this.materializeInbound(message);
+      const body = await this.materializer.materialize(message);
       if (body === null) return;
       this.throwIfStopping();
       const claim = this.commandClaim(message, command.name);
@@ -1616,7 +1132,7 @@ class CoreService implements ChannelService {
     handler: ChannelCommandHandler,
   ): Promise<void> {
     const body = await this.withMessageTyping(message, async () => {
-      const materialized = await this.materializeInbound(message);
+      const materialized = await this.materializer.materialize(message);
       if (materialized === null) return null;
       return (await this.acceptTask(message, materialized, false)) ? materialized : null;
     });
@@ -1706,7 +1222,7 @@ class CoreService implements ChannelService {
     // （claim + 下载 + 转写 + 附件块），否则随消息发来的图片只剩 `[图片]` 占位。
     this.store.releaseClaim(this.commandClaim(message, "thread"));
     await this.withMessageTyping(message, async () => {
-      const request = await this.materializeInbound(message, intent);
+      const request = await this.materializer.materialize(message, intent);
       if (request === null) return;
       const body = threadIntentPrompt(request);
       if (await this.appendToRunningTask(message, body)) return;
@@ -2160,7 +1676,7 @@ class CoreService implements ChannelService {
     // 附件（任意类型）与引用块随正文进入排队任务。
     this.store.releaseClaim(this.commandClaim(message, "queue"));
     await this.withMessageTyping(message, async () => {
-      const body = await this.materializeInbound(message, text);
+      const body = await this.materializer.materialize(message, text);
       if (body === null) return;
       await this.acceptTask(message, body);
     });
