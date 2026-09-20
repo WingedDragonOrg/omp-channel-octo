@@ -1,11 +1,13 @@
-import { expect, test } from "bun:test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { expect, test, vi } from "bun:test";
+import { mkdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ThreadSummary } from "../src/contracts";
 import { ChannelStore } from "../src/store";
 import {
+  assistantText,
   closeCoreHarness,
   createCoreHarness,
+  FakeTransport,
   inbound,
   readText,
   waitForStatus,
@@ -29,6 +31,39 @@ function threadRecord(shortId: string): ThreadSummary {
     createdAt: "2026-09-12T00:00:00.000Z",
     updatedAt: "2026-09-12T00:00:00.000Z",
   };
+}
+
+/** 记录归档时刻该聊天已收到的正文：回复必须先于归档送达，否则迟到的回复会把归档解档。 */
+class ArchiveTracingTransport extends FakeTransport {
+  readonly archiveOrder: Array<{ shortId: string; sentBefore: string[] }> = [];
+
+  override async archiveThread(
+    groupId: string,
+    shortId: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    this.archiveOrder.push({ shortId, sentBefore: this.sent.map(({ text }) => text) });
+    return super.archiveThread(groupId, shortId, signal);
+  }
+}
+
+/** 服务端瞬时失败的两种线缆形状：纯 5xx，与内部 500 被包成 400 的 `store_failed`。 */
+const TRANSIENT_ARCHIVE_FAILURES: Error[] = [
+  Object.assign(new Error("Octo thread archive failed with HTTP 500: 服务器内部错误。"), { status: 500 }),
+  Object.assign(new Error("Octo thread archive failed with HTTP 400: 服务器内部错误。"), {
+    status: 400,
+    code: "err.server.bot_api.store_failed",
+  }),
+  Object.assign(new Error("Octo thread archive failed with HTTP 503"), { status: 503 }),
+  Object.assign(new Error("Octo thread archive failed with HTTP 500: 服务器内部错误。"), { status: 500 }),
+  Object.assign(new Error("Octo thread archive failed with HTTP 500: 服务器内部错误。"), { status: 500 }),
+];
+
+/** 假定时器只接管计时：用真实 I/O 让出事件循环，fs 步骤与微任务照常推进。 */
+async function yieldRealIo(root: string): Promise<void> {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    await stat(root);
+  }
 }
 
 test("group dispatch freezes scoped management/file tools to the current target and cwd", async () => {
@@ -1353,6 +1388,373 @@ test("thread-delete keeps a dirty workspace unless force discards it", async () 
     expect(log.join("\n")).toContain("已删除线程 thread-2；隔离工作区已清理（分支已删除）");
   } finally {
     await closeCoreHarness(harness);
+  }
+});
+
+test("thread-archive schedules one archive that runs after the turn's reply is delivered", async () => {
+  const transport = new ArchiveTracingTransport();
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ append, emit, promptContext, text }) => {
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("management tool missing");
+      if (text !== "archive the current thread twice") return;
+      const signal = new AbortController().signal;
+      const first = await management.execute({ action: "thread-archive" }, signal);
+      const second = await management.execute({ action: "thread-archive" }, signal);
+      emit(assistantText("archive-reply", "归档前的回复", true));
+      await append("thread-archive.log", `${first}\n${second}\n`);
+    },
+  });
+  try {
+    const cwd = join(harness.root, "archive cwd");
+    await mkdir(cwd, { recursive: true });
+    harness.transport.setThreads("group-tools", [threadRecord("topic-7")]);
+    await harness.service.handleInbound(
+      inbound({ messageId: "archive-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "archive-run",
+        ...THREAD_TOOLS,
+        text: "archive the current thread twice",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await harness.transport.waitForManagementCalls((call) => call.action === "thread-archive");
+    await waitForStatus(harness.service, THREAD_TOOLS, (status) => status.state === "completed");
+
+    // 子区里省略 short_id 即当前线程；两次调用只排定一次，归档在本回合回复送达之后执行。
+    expect(harness.transport.managementCalls.filter((call) => call.action === "thread-archive")).toEqual([
+      { action: "thread-archive", groupId: "group-tools", shortId: "topic-7" },
+    ]);
+    expect(transport.archiveOrder).toHaveLength(1);
+    expect(transport.archiveOrder[0]?.sentBefore).toContain("归档前的回复");
+    expect(await readText(join(cwd, "thread-archive.log"))).toBe(
+      "已排定归档子区 topic-7：本回合最后一条回复送达后执行\n"
+      + "已排定归档子区 topic-7：本回合最后一条回复送达后执行\n",
+    );
+    await expect(harness.transport.listThreads("group-tools")).resolves.toMatchObject([
+      { shortId: "topic-7", status: 2 },
+    ]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a default-pipeline merge schedules the thread's archive beside the merge result", async () => {
+  const transport = new ArchiveTracingTransport();
+  const log: string[] = [];
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ emit, promptContext, text }) => {
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("management tool missing");
+      const signal = new AbortController().signal;
+      if (text === "create the merge thread") {
+        const created = JSON.parse(
+          await management.execute(
+            { action: "create-thread", name: "合并线程", worktree_name: "archive-workspace" },
+            signal,
+          ),
+        ) as { short_id: string };
+        log.push(`created:${created.short_id}\n`);
+        return;
+      }
+      if (text === "merge and archive") {
+        const result = await management.execute({ action: "thread-merge" }, signal);
+        log.push(`${result}\n`);
+        emit(assistantText("merge-archive-reply", "合并完成，本子区随后归档", true));
+      }
+    },
+  });
+  try {
+    const worktrees = harness.worktrees;
+    if (!worktrees) throw new Error("expected a worktree port in the harness");
+    const cwd = join(harness.root, "merge archive cwd");
+    await mkdir(cwd, { recursive: true });
+    await harness.service.handleInbound(
+      inbound({ messageId: "merge-archive-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "merge-archive-create",
+        ...GROUP_TOOLS,
+        text: "create the merge thread",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+
+    const thread = { channelId: "group-tools____thread-1", channelType: 5 as const };
+    const workspace = join(harness.root, "worktrees", "thread-1");
+    await waitForStatus(harness.service, thread, (status) => status.cwd === workspace);
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "merge-archive-run",
+        ...thread,
+        text: "merge and archive",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(2);
+    await harness.transport.waitForManagementCalls((call) => call.action === "thread-archive");
+    await waitForStatus(harness.service, thread, (status) => status.state === "completed");
+
+    // 合并结果与归档排定分别可见；归档在回复之后、以发起排定的子区为目标执行。
+    expect(log.join("\n")).toContain('"archive":"scheduled"');
+    expect(worktrees.merges).toEqual([{ cwd: workspace }]);
+    expect(harness.transport.managementCalls.filter((call) => call.action === "thread-archive")).toEqual([
+      { action: "thread-archive", groupId: "group-tools", shortId: "thread-1" },
+    ]);
+    expect(transport.archiveOrder[0]?.sentBefore).toContain("合并完成，本子区随后归档");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a transient archive failure retries five times five seconds apart and ends as one bounded notice", async () => {
+  vi.useFakeTimers();
+  try {
+    const transport = new ArchiveTracingTransport();
+    const harness = await createCoreHarness({
+      transport,
+      prompt: async ({ emit, promptContext, text }) => {
+        const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+        if (!management) throw new Error("management tool missing");
+        if (text !== "archive the current thread") return;
+        await management.execute({ action: "thread-archive" }, new AbortController().signal);
+        emit(assistantText("archive-retry-reply", "归档前的回复", true));
+      },
+    });
+    try {
+      const archiveCalls = (): number =>
+        harness.transport.managementCalls.filter((call) => call.action === "thread-archive").length;
+      const cwd = join(harness.root, "archive retry cwd");
+      await mkdir(cwd, { recursive: true });
+      harness.transport.setThreads("group-tools", [threadRecord("topic-7")]);
+      harness.transport.failArchiveTimes(TRANSIENT_ARCHIVE_FAILURES);
+      await harness.service.handleInbound(
+        inbound({ messageId: "archive-retry-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
+      );
+      await harness.service.handleInbound(
+        inbound({
+          messageId: "archive-retry-run",
+          ...THREAD_TOOLS,
+          text: "archive the current thread",
+          mentionedUserIds: [harness.bot.uid],
+        }),
+      );
+      await harness.workers.waitForPromptCount(1);
+      // 第一次尝试不等待计时器：排空与调用走微任务跑完。
+      for (let step = 0; step < 200 && archiveCalls() < 1; step += 1) {
+        await yieldRealIo(harness.stateDir);
+        if (archiveCalls() >= 1) break;
+        vi.advanceTimersByTime(150);
+      }
+      expect(archiveCalls()).toBe(1);
+      // 间隔 5 秒：4 秒未到不重试，过 5 秒重试一次。
+      vi.advanceTimersByTime(4_000);
+      await yieldRealIo(harness.stateDir);
+      expect(archiveCalls()).toBe(1);
+      vi.advanceTimersByTime(1_500);
+      await yieldRealIo(harness.stateDir);
+      expect(archiveCalls()).toBe(2);
+      // 其余尝试按同一间隔推进：总计至多 5 次，之后不再尝试。
+      for (let step = 0; step < 100 && archiveCalls() < 5; step += 1) {
+        vi.advanceTimersByTime(1_000);
+        await yieldRealIo(harness.stateDir);
+      }
+      await yieldRealIo(harness.stateDir);
+      expect(archiveCalls()).toBe(5);
+      vi.advanceTimersByTime(30_000);
+      await yieldRealIo(harness.stateDir);
+      expect(archiveCalls()).toBe(5);
+
+      const notices = harness.transport.sent.filter(({ text: body }) => body.startsWith("归档失败："));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.text).not.toContain("\n");
+      expect(notices[0]!.text.length).toBeLessThanOrEqual(210);
+      expect(notices[0]!.text).toContain("HTTP 500");
+    } finally {
+      await closeCoreHarness(harness);
+    }
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("thread-archive does not retry a permanent failure and reports one bounded line", async () => {
+  vi.useFakeTimers();
+  try {
+    const harness = await createCoreHarness({
+      transport: new ArchiveTracingTransport(),
+      prompt: async ({ emit, promptContext, text }) => {
+        const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+        if (!management) throw new Error("management tool missing");
+        if (text !== "archive topic nine") return;
+        await management.execute(
+          { action: "thread-archive", short_id: "topic-9" },
+          new AbortController().signal,
+        );
+        emit(assistantText("archive-permanent-reply", "归档前的回复", true));
+      },
+    });
+    try {
+      const archiveCalls = (): number =>
+        harness.transport.managementCalls.filter((call) => call.action === "thread-archive").length;
+      const cwd = join(harness.root, "archive permanent cwd");
+      await mkdir(cwd, { recursive: true });
+      harness.transport.setThreads("group-tools", [threadRecord("topic-9")]);
+      harness.transport.failArchiveTimes([
+        Object.assign(new Error("Octo thread archive failed with HTTP 403: 无归档权限。"), { status: 403 }),
+      ]);
+      await harness.service.handleInbound(
+        inbound({ messageId: "archive-permanent-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
+      );
+      await harness.service.handleInbound(
+        inbound({
+          messageId: "archive-permanent-run",
+          ...GROUP_TOOLS,
+          text: "archive topic nine",
+          mentionedUserIds: [harness.bot.uid],
+        }),
+      );
+      await harness.workers.waitForPromptCount(1);
+      for (let step = 0; step < 200 && archiveCalls() < 1; step += 1) {
+        await yieldRealIo(harness.stateDir);
+        if (archiveCalls() >= 1) break;
+        vi.advanceTimersByTime(150);
+      }
+      await yieldRealIo(harness.stateDir);
+      expect(archiveCalls()).toBe(1);
+      // 永久失败不重试：推进一分钟也不会有第二次尝试。
+      vi.advanceTimersByTime(60_000);
+      await yieldRealIo(harness.stateDir);
+      expect(archiveCalls()).toBe(1);
+      expect(harness.transport.managementCalls).toEqual([
+        { action: "thread-archive", groupId: "group-tools", shortId: "topic-9" },
+      ]);
+      const notices = harness.transport.sent.filter(({ text: body }) => body.startsWith("归档失败："));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.text).toContain("HTTP 403");
+      expect(notices[0]!.text.length).toBeLessThanOrEqual(210);
+    } finally {
+      await closeCoreHarness(harness);
+    }
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("a new message in the same chat cancels the scheduled archive", async () => {
+  const transport = new ArchiveTracingTransport();
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ promptContext, text, waitForAppend }) => {
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("management tool missing");
+      if (text !== "archive then wait") return;
+      await management.execute({ action: "thread-archive" }, new AbortController().signal);
+      await waitForAppend();
+    },
+  });
+  try {
+    const cwd = join(harness.root, "archive cancel cwd");
+    await mkdir(cwd, { recursive: true });
+    await harness.service.handleInbound(
+      inbound({ messageId: "archive-cancel-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
+    );
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "archive-cancel-run",
+        ...THREAD_TOOLS,
+        text: "archive then wait",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    // 回合仍在运行：owner 的新消息（过权限门禁后）清除排定。
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "archive-cancel-msg",
+        ...THREAD_TOOLS,
+        text: "还有一件事",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    // 第二个任务在 chatTails 上串行执行：它开始即证明第一个回合的收尾（含归档检查）已经跑完。
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "archive-cancel-after",
+        ...THREAD_TOOLS,
+        text: "second task",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(2);
+    expect(transport.archiveOrder).toEqual([]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a pending archive is dropped when the channel stops before it runs", async () => {
+  vi.useFakeTimers();
+  try {
+    const harness = await createCoreHarness({
+      transport: new ArchiveTracingTransport(),
+      prompt: async ({ emit, promptContext, text }) => {
+        const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+        if (!management) throw new Error("management tool missing");
+        if (text !== "archive the current thread") return;
+        await management.execute({ action: "thread-archive" }, new AbortController().signal);
+        emit(assistantText("archive-stop-reply", "归档前的回复", true));
+      },
+    });
+    const archiveCalls = (): number =>
+      harness.transport.managementCalls.filter((call) => call.action === "thread-archive").length;
+    try {
+      const cwd = join(harness.root, "archive stop cwd");
+      await mkdir(cwd, { recursive: true });
+      harness.transport.setThreads("group-tools", [threadRecord("topic-7")]);
+      harness.transport.failArchiveTimes([
+        Object.assign(new Error("Octo thread archive failed with HTTP 500"), { status: 500 }),
+        Object.assign(new Error("Octo thread archive failed with HTTP 500"), { status: 500 }),
+      ]);
+      await harness.service.handleInbound(
+        inbound({ messageId: "archive-stop-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
+      );
+      await harness.service.handleInbound(
+        inbound({
+          messageId: "archive-stop-run",
+          ...THREAD_TOOLS,
+          text: "archive the current thread",
+          mentionedUserIds: [harness.bot.uid],
+        }),
+      );
+      await harness.workers.waitForPromptCount(1);
+      for (let step = 0; step < 200 && archiveCalls() < 1; step += 1) {
+        await yieldRealIo(harness.stateDir);
+        if (archiveCalls() >= 1) break;
+        vi.advanceTimersByTime(150);
+      }
+      expect(archiveCalls()).toBe(1);
+      // 停在重试等待中：关停立即结束等待并放弃归档，也不再发失败说明。
+      await harness.service.stop();
+      vi.advanceTimersByTime(60_000);
+      await yieldRealIo(harness.stateDir);
+      expect(archiveCalls()).toBe(1);
+      expect(
+        harness.transport.sent.filter(({ text: body }) => body.startsWith("归档失败：")),
+      ).toEqual([]);
+    } finally {
+      await closeCoreHarness(harness);
+    }
+  } finally {
+    vi.useRealTimers();
   }
 });
 

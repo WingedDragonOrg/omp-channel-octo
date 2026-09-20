@@ -136,6 +136,18 @@ export interface FakeTransportOptions {
   startOnline?: boolean;
 }
 
+/** One management call the transport recorded; `freshConnection` marks a retry on its own connection. */
+export interface ManagementCall {
+  action: string;
+  groupId: string;
+  shortId: string | null;
+  /** Present when the caller asked for a connection of its own (a retry). */
+  freshConnection?: boolean;
+}
+
+/** 服务端的子区状态取值：1 活跃、2 已归档。 */
+const THREAD_STATUS_ARCHIVED = 2;
+
 export class FakeTransport implements ChannelTransport {
   readonly attempts: TransportAttempt[] = [];
   readonly sent: SentMessage[] = [];
@@ -159,13 +171,7 @@ export class FakeTransport implements ChannelTransport {
   readonly textRequests: TextRequest[] = [];
   readonly remoteTextMessages = new Map<string, RemoteTextMessage>();
   readonly groupContextCalls: ChatTarget[] = [];
-  readonly managementCalls: Array<{
-    action: string;
-    groupId: string;
-    shortId: string | null;
-    /** Present when the caller asked for a connection of its own (a retry). */
-    freshConnection?: boolean;
-  }> = [];
+  readonly managementCalls: ManagementCall[] = [];
   readonly historyCalls: Array<{ target: ChatTarget } & HistoryFetch> = [];
   readonly attachmentBodies = new Map<string, Uint8Array>();
   readonly downloadRequests: Array<{ url: string; path: string; maxBytes: number }> = [];
@@ -214,6 +220,11 @@ export class FakeTransport implements ChannelTransport {
     resolve: (card: SentCard) => void;
   }> = [];
   private readonly ackWaiters: Array<{ eventId: number; resolve: (eventId: number) => void }> = [];
+  private readonly managementWaiters: Array<{
+    predicate: (call: ManagementCall) => boolean;
+    count: number;
+    resolve: () => void;
+  }> = [];
   private readonly eventWaiters: Array<() => void> = [];
   private readonly editGates: Array<Promise<void>> = [];
   private readonly remoteTextByClientMsgNo = new Map<string, string>();
@@ -230,6 +241,8 @@ export class FakeTransport implements ChannelTransport {
   private readonly threadMembers = new Map<string, GroupMember[]>();
   private managementFailure: Error | undefined;
   private managementFailures: Error[] = [];
+  /** 排定归档的失败注入：按调用顺序消费一个错误，随后恢复成功。 */
+  private archiveFailures: Error[] = [];
   private nextThreadId = 1;
   constructor(options: FakeTransportOptions = {}) {
     this.bot = options.bot ?? { uid: "bot-fixture", name: "Fixture Bot" };
@@ -336,9 +349,31 @@ export class FakeTransport implements ChannelTransport {
       shortId,
       ...(options?.freshConnection === true ? { freshConnection: true } : {}),
     });
+    this.settleManagementWaiters();
     const queued = this.managementFailures.shift();
     if (queued) throw queued;
     if (this.managementFailure) throw this.managementFailure;
+  }
+
+  /** 每次记录后结算到达条件的等待者：失败的调用同样算数（重试测试要看到失败尝试）。 */
+  private settleManagementWaiters(): void {
+    for (let index = this.managementWaiters.length - 1; index >= 0; index -= 1) {
+      const waiter = this.managementWaiters[index]!;
+      if (this.managementCalls.filter(waiter.predicate).length < waiter.count) continue;
+      this.managementWaiters.splice(index, 1);
+      waiter.resolve();
+    }
+  }
+
+  /** Resolves once `count` recorded management calls match `predicate` (past calls included). */
+  waitForManagementCalls(
+    predicate: (call: ManagementCall) => boolean,
+    count = 1,
+  ): Promise<void> {
+    if (this.managementCalls.filter(predicate).length >= count) return Promise.resolve();
+    const wait = Promise.withResolvers<void>();
+    this.managementWaiters.push({ predicate, count, resolve: () => wait.resolve() });
+    return wait.promise;
   }
 
   private groupInfoFor(groupId: string): GroupInfo {
@@ -478,6 +513,19 @@ export class FakeTransport implements ChannelTransport {
       groupId,
       (this.threads.get(groupId) ?? []).filter((entry) => entry.shortId !== shortId),
     );
+  }
+
+  async archiveThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void> {
+    this.recordManagement("thread-archive", groupId, shortId, signal);
+    const queued = this.archiveFailures.shift();
+    if (queued) throw queued;
+    const thread = (this.threads.get(groupId) ?? []).find((entry) => entry.shortId === shortId);
+    if (thread) thread.status = THREAD_STATUS_ARCHIVED;
+  }
+
+  /** Fails the next archive calls, one queued error per call, then lets them succeed again. */
+  failArchiveTimes(errors: readonly Error[]): void {
+    this.archiveFailures = [...errors];
   }
 
   setGroupInfo(groupId: string, info: GroupInfo): void {

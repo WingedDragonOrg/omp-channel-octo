@@ -83,7 +83,7 @@ import {
 import { createBotEventLoop, type BotEventLoop } from "./bot-events.ts";
 import { createOutboxDelivery, type Outbox } from "./outbox.ts";
 import { createHostTools, type HostToolHost } from "./host-tools.ts";
-import { safeErrorMessage } from "./errors.ts";
+import { failureText, isTransientServerFailure, safeErrorMessage } from "./errors.ts";
 import { classifyStartupFailure, classifyTaskFailure, GENERIC_TASK_FAILURE_NOTICE, type TaskStartupPhase } from "./task-failure.ts";
 import {
   findMovedSession,
@@ -175,6 +175,12 @@ const THREAD_MERGE_NO_WORKSPACE_TEXT =
   "当前子区未绑定隔离工作区，/thread merge 不可用。";
 const THREAD_MERGE_UNCONFIGURED_TEXT =
   "本部署未配置隔离工作区能力，/thread merge 不可用。";
+/** 排定的子区归档：仅瞬时失败重试（最多 5 次尝试、每次间隔 5 秒），永久失败即刻结束。 */
+const THREAD_ARCHIVE_ATTEMPTS = 5;
+const THREAD_ARCHIVE_RETRY_MS = 5_000;
+/** 归档前等该聊天出站队列排空的有界轮询（100ms 一次，最多 10 秒）。 */
+const THREAD_ARCHIVE_DRAIN_MS = 10_000;
+const THREAD_ARCHIVE_DRAIN_POLL_MS = 100;
 
 /** 系统说明行与正文之间保持空行分隔；正文为空时说明行本身就是正文。 */
 function withSystemNote(text: string, note: string): string {
@@ -382,8 +388,10 @@ function readThreadMergeNote(argument: string): string | undefined {
  * sub-thread's cwd with it as a known result that must not be repeated as a caveat or used as a
  * reason to keep the workspace. A trailing note after the `merge` keyword is the owner's own
  * supplement and is carried along verbatim. The merge itself is executed by the host through
- * `octo_management`'s `thread-merge`. Every outcome, including a conflict that must be resolved
- * before retrying, is reported to the owner.
+ * `octo_management`'s `thread-merge`, and a default-pipeline merge also schedules the sub-thread's
+ * archive after the turn's own reply is delivered — so the body tells the assistant not to archive
+ * by itself and to report that disposition. Every outcome, including a conflict that must be
+ * resolved before retrying, is reported to the owner.
  */
 function threadMergePrompt(workspacePath: string, note: string): string {
   return [
@@ -393,6 +401,7 @@ function threadMergePrompt(workspacePath: string, note: string): string {
     "要保留工作区时必须说明必要理由，并显式传 remove:false；目标分支等其他参数确有需要时同样显式传入并说明理由。",
     "工作区被删除后本子区 cwd 随之失效，这是该命令的既定结果、owner 已知：不要在汇报里反复说明这一点，也不要把 cwd 失效当作保留工作区的理由——保留工作区的必要理由应是尚未收尾的具体工作（例如部署、验收）。",
     "合并由宿主执行：调用 octo_management 的 thread-merge 动作，不要自己运行 wt。",
+    "合并成功后宿主会按默认 pipeline 自动排定归档本子区（在本回合最后一条回复送达后执行），不要自己再调 thread-archive；显式保留工作区时不会归档。向 owner 汇报时说明这一处置即可。",
     "成功后向 owner 汇报目标分支与结果细节；失败时（例如 rebase 冲突或 pre-merge 检查失败）先在本子区处置再重试，并把最终结果告诉 owner。",
     ...(note.length === 0 ? [] : ["", "owner 补充说明：", note]),
     "",
@@ -482,6 +491,18 @@ function contextSidecarRoot(
   return join(config.stateDir, "context-sidecars", scopeDigest);
 }
 
+/**
+ * 一次排定到聊天回合末执行的子区归档：`thread-archive` 与默认 pipeline 的 `thread-merge`
+ * 收尾都只排定，真正的调用发生在该聊天回合输出（正文与进度卡终态编辑）排空之后——任何发进
+ * 子区的消息都会把归档子区解档。
+ */
+interface PendingThreadArchive {
+  /** 发起排定的聊天；归档失败说明回这个聊天。 */
+  readonly target: ChatTarget;
+  readonly groupId: string;
+  readonly shortId: string;
+}
+
 class CoreService implements ChannelService {
   private readonly taskOperations = new Set<Promise<void>>();
   /** In-flight inbound handlers: stop aborts their I/O and awaits their cleanup before closing the store. */
@@ -528,6 +549,13 @@ class CoreService implements ChannelService {
    * asked for it still delivers its reply.
    */
   private pendingRestart: ChatTarget | null = null;
+  /**
+   * 排定到回合末的子区归档（键为该聊天）。进程内一次性状态：执行或放弃即清除，该聊天过
+   * 权限门禁的新入站也清除——用户回来了就不归档。
+   */
+  private readonly pendingThreadArchives = new Map<string, PendingThreadArchive>();
+  /** `stopInternal` 的到达信号：归档重试的等待据此提前结束，关停不为一轮重试等满一次间隔。 */
+  private readonly stopped = Promise.withResolvers<void>();
   private stopPromise: Promise<void> | undefined;
   constructor(
     private readonly options: ChannelServiceOptions,
@@ -665,6 +693,7 @@ class CoreService implements ChannelService {
   private async stopInternal(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    this.stopped.resolve();
     this.started = false;
     // Abort inbound I/O first so in-flight downloads/transcriptions/lookups unwind while the rest
     // of shutdown runs; their cleanup (claim rollback, temp-file removal) is awaited below.
@@ -800,6 +829,8 @@ class CoreService implements ChannelService {
       await this.handleUnlistedOwnerContact(message, ownerId);
       return;
     }
+    // 已授权的新入站说明这个聊天仍在继续：排定中的归档随之取消（用户回来了就不归档）。
+    this.pendingThreadArchives.delete(targetKey(message));
     if (!message.supported) {
       const claim = this.commandClaim(message, "unsupported");
       if (!this.store.claimCommand(claim)) return;
@@ -2883,6 +2914,9 @@ class CoreService implements ChannelService {
       botUid,
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
       flushTarget: (target) => this.outbox.flush(target),
+      planThreadArchive: (target, groupId, shortId) => {
+        this.pendingThreadArchives.set(targetKey(target), { target: { ...target }, groupId, shortId });
+      },
       deliverToChat: async (message, relay) => {
         if (await this.appendToRunningTask(message, message.text)) return "steered";
         await this.acceptTask(message, message.text, true, relay ?? null);
@@ -3491,6 +3525,7 @@ class CoreService implements ChannelService {
       // the relay as work that queued behind this run.
       this.runtimes.delete(taskId);
       await this.notifyThreadOutcome(taskId);
+      await this.runScheduledArchive(target, progressTail);
       this.maybeRunDeferredRestart();
     }
   }
@@ -3505,6 +3540,78 @@ class CoreService implements ChannelService {
     );
   }
 
+
+  /**
+   * 排定的子区归档收尾：先等本回合的进度卡终态编辑与出站投递排空——回复先送达、归档后执行，
+   * 因为任何发进子区的消息都会把归档子区解档——再按重试策略调用 `archiveThread`。成功留一条
+   * 日志；失败只给发起聊天一条 ≤200 字符的单行说明，不改变已经发生的合并；停止时放弃。
+   */
+  private async runScheduledArchive(target: ChatTarget, progressTail: Promise<void>): Promise<void> {
+    const key = targetKey(target);
+    const pending = this.pendingThreadArchives.get(key);
+    if (!pending || this.stopping) return;
+    await progressTail.catch(() => {});
+    await this.drainChatOutbox(target);
+    try {
+      const outcome = await this.archivePendingThread(key, pending);
+      if (outcome === "archived") {
+        console.error(`[thread-archive] 已归档子区 ${pending.shortId} target=${key}`);
+      }
+    } catch (error) {
+      const reason = failureText(error, "归档失败");
+      console.error(`[thread-archive] 归档失败 target=${key} short=${pending.shortId}：${reason}`);
+      this.outbox.enqueueText(target, `归档失败：${reason}`, null);
+    } finally {
+      if (this.pendingThreadArchives.get(key) === pending) this.pendingThreadArchives.delete(key);
+    }
+  }
+
+  /**
+   * 一次排定归档的调用：第 1 次立即执行，瞬时失败（5xx 或 bot API 的 `store_failed`）每间隔
+   * 5 秒重试一次、总共至多 5 次尝试；永久失败即刻抛出。每次尝试前确认排定仍在（该聊天的新
+   * 入站会取消它）且服务未在停止。
+   */
+  private async archivePendingThread(
+    key: string,
+    pending: PendingThreadArchive,
+  ): Promise<"archived" | "cancelled"> {
+    let attempt = 1;
+    for (;;) {
+      if (this.stopping || this.pendingThreadArchives.get(key) !== pending) return "cancelled";
+      try {
+        await this.options.transport.archiveThread(pending.groupId, pending.shortId);
+        return "archived";
+      } catch (error) {
+        if (attempt >= THREAD_ARCHIVE_ATTEMPTS || !isTransientServerFailure(error)) throw error;
+        attempt += 1;
+        // 停止信号一到就提前结束，关停不为一轮重试等满一次间隔。
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, THREAD_ARCHIVE_RETRY_MS);
+          void this.stopped.promise.then(() => {
+            clearTimeout(timer);
+            resolve();
+          });
+        });
+      }
+    }
+  }
+
+  /**
+   * 等该聊天的出站队列排空（有界轮询）：回复与文件先送达，归档才排得上。超时照常归档——残余
+   * 消息可能稍后把子区解档为 active，可重复调用补做。
+   */
+  private async drainChatOutbox(target: ChatTarget): Promise<void> {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) return;
+    for (let waited = 0; waited < THREAD_ARCHIVE_DRAIN_MS; waited += THREAD_ARCHIVE_DRAIN_POLL_MS) {
+      await this.outbox.flush(target).catch(() => {});
+      if (this.stopping) return;
+      if (this.store.countPendingOutbox(botUid, target) === 0) return;
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, THREAD_ARCHIVE_DRAIN_POLL_MS);
+      });
+    }
+  }
 
   /**
    * Runs a restart the agent asked for once it cannot cost work: every chat idle and no queued

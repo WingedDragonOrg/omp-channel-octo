@@ -821,6 +821,18 @@ export class OctoTransport implements ChannelTransport {
     );
   }
 
+  async archiveThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void> {
+    await botApiRequest(
+      this.apiBase,
+      this.botToken,
+      "thread archive",
+      `${threadPath(groupId, shortId)}/archive`,
+      "POST",
+      undefined,
+      signal,
+    );
+  }
+
   async sendFile(
     target: ChatTarget,
     path: string,

@@ -220,6 +220,12 @@ export interface ChannelTransport {
     signal?: AbortSignal,
     options?: DeleteThreadOptions,
   ): Promise<void>;
+  /**
+   * Archives one thread. The server call is idempotent — archiving an already-archived thread
+   * answers success — and any message sent into the thread afterwards reactivates it, so callers
+   * archive only after the chat's own output has been delivered.
+   */
+  archiveThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void>;
   sendFile(
     target: ChatTarget,
     path: string,

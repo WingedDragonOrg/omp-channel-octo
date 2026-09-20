@@ -17,6 +17,17 @@ export function safeErrorMessage(_error: unknown, fallback: string): string {
 }
 
 /**
+ * 服务端瞬时失败：任何 5xx，或内部 500 被 bot API 包在线缆 400 上的 `store_failed`。
+ * 与 `isPermanentOutboxError` 同口径：字段结构化读取，夹具可以脱离传输模块复现同样的形状。
+ */
+export function isTransientServerFailure(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { code?: unknown; status?: unknown };
+  if (typeof candidate.status === "number" && candidate.status >= 500) return true;
+  return candidate.code === "err.server.bot_api.store_failed";
+}
+
+/**
  * 任务启动失败的有界原因文本：单行化、清除控制字符、截断到固定长度，供服务日志与 owner 侧
  * 任务行使用。它只放行本仓库构造的消息（原因码、HTTP 状态、路径），不携带错误对象本身、
  * 协议载荷或凭据；群消息里仍是各类别的固定文案。
