@@ -52,6 +52,8 @@
 
 `chat-authorization.ts` 独占权限判定、免@查询缓存、运行时开通及节流通知；`inbound-materializer.ts` 负责唯一的正文资源组装入口，持有每次下载预算和本次新建文件清单，统一处理失败回滚。两者通过同一个服务 shutdown signal 取消在途 I/O，共用 `errors.ts` 的 `InboundShutdownError`；服务继续拥有入站操作登记和关停排空，权限门、待回答问题、typing、资源组装及 durable acceptance 的先后顺序保持不变。
 
+`progress-cards.ts` 统一拥有进度卡的持久恢复与每任务轮次状态。服务将已归一化的 `ExecutionEvent` 交给每任务的 `TaskProgress`，其队列 tail 仍登记到服务关停排空集合，子区归档前读取并等待当前 tail。`session-lifecycle.ts` 负责会话身份/cwd 校验、目录回退、`/new` 和原生 `/move`；目录仲裁及 blocked 集合继续由服务单点拥有，通过租约和阻塞端口协作，迁移始终同时持有源、目标目录租约。
+
 ### 运行和配置
 
 使用 TypeScript/Bun 常驻服务，主动连接 Octo，启动并管理 OMP RPC worker。无需为 RPC 开放网络监听端口。macOS 使用 launchd 托管；机器休眠或离线期间不承诺可用。

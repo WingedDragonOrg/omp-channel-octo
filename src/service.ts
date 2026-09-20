@@ -1,5 +1,7 @@
 import { GroupHistoryCoordinator } from "./history-coordinator.ts";
 import { ModelSwitchController } from "./model-controller.ts";
+import { ProgressCards } from "./progress-cards.ts";
+import { SessionLifecycle, type DirectoryLease } from "./session-lifecycle.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
@@ -26,21 +28,11 @@ import type {
   OmpWorker,
   WorkerEvent,
   SteerConsumedEvent,
-  ProgressCard,
   TaskRelayTarget,
   WorkerOptions,
   WorkerProcess,
 } from "./contracts.ts";
 import { DEFAULT_ASK_TIMEOUT_MS } from "./contracts.ts";
-import {
-  createExecutionTracker,
-  encodeExecutionSnapshot,
-  restoreExecutionSnapshot,
-  stripCardSummaries,
-  type ExecutionSnapshot,
-  type ExecutionState,
-  type ExecutionTracker,
-} from "./execution-tracker.ts";
 import {
   normalizeGroupContext,
   preparedReceiptMatches,
@@ -57,23 +49,20 @@ import { InboundMaterializer } from "./inbound-materializer.ts";
 import { InboundShutdownError, failureText, isTransientServerFailure, safeErrorMessage } from "./errors.ts";
 import { classifyStartupFailure, classifyTaskFailure, GENERIC_TASK_FAILURE_NOTICE, type TaskStartupPhase } from "./task-failure.ts";
 import {
-  findMovedSession,
   verifyFreshSession,
   verifyMovedSession,
   type ProjectSessionBinding,
   type ProjectSessionState,
 } from "./project-session.ts";
-import { ensureProjectSessionDir, projectSessionDir, sessionsRoot } from "./session-dir.ts";
+import { ensureProjectSessionDir, sessionsRoot } from "./session-dir.ts";
 import { ChannelStore, openChannelStore } from "./store.ts";
-import { modelWithLevel } from "./model-switch.ts";
-import type { BindingRecord, ProgressCardRecord, TaskRecord } from "./store-records.ts";
+import type { TaskRecord } from "./store-records.ts";
 import { isGroupTarget, targetKey, taskTarget } from "./target.ts";
 import { createTypingLeaseManager, type TypingLeaseManager } from "./typing-lease.ts";
 import { createDisplayNameCache, type DisplayNameCache } from "./display-name.ts";
 import { createQuestionDesk, type QuestionDesk } from "./questions.ts";
-import { threadParentGroupId } from "./thread-target.ts";
 import { threadNotifyMessageId, threadOutcomeNotice } from "./thread-notify.ts";
-import { canonicalExistingDirectory, existingSessionFile, resolveWorkDirectory, stripOuterQuotes } from "./workdir.ts";
+import { existingSessionFile } from "./workdir.ts";
 import { worktrunkUnavailableText } from "./worktrunk.ts";
 
 const GROUP_TRUSTED_INSTRUCTION =
@@ -107,10 +96,6 @@ const BUILTIN_COMMANDS: Record<string, true> = {
   interrupt: true,
   switch: true,
 };
-const PROGRESS_MERGE_MS = 1_000;
-const ACTIVITY_REQUEST_TIMEOUT_MS = 2_000;
-/** Recovery attempts for a card left by a previous process before the row is dropped. */
-const PROGRESS_CARD_RECOVERY_ATTEMPTS = 3;
 /** Steered messages tracked for the consumption receipt; older entries fall out of observation. */
 const MAX_PENDING_STEERS = 32;
 /** Characters of the triggering message shown in a start/consumption receipt. */
@@ -156,59 +141,6 @@ type RuntimeTask = {
   /** Closes the progress card of the round that just ended; a steered message starts a new round. */
   rollProgressCard?: () => void;
 };
-
-/**
- * One user round's progress card inside a run. A run serves every message of its chat, and each
- * appended message is answered in the card that appears right below it, so a round owns its own
- * card, idempotency key, and sequence.
- */
-type ProgressRound = {
-  /** Server idempotency key: stable across creation retries, distinct between rounds. */
-  readonly clientMsgNo: string;
-  readonly tracker: ExecutionTracker;
-  /** True once creation of this round's card has been queued. */
-  started: boolean;
-  /** True once a terminal edit for this card has been queued. */
-  finished: boolean;
-  /** True once a later round took over; only this card's terminal edit may still run. */
-  retired: boolean;
-  disabled: boolean;
-  /** Set after this card's first running-edit failure so a repeating error logs once. */
-  failureLogged: boolean;
-  /**
-   * True once the deployment's edge refused a card body and the retry dropped the free-text step
-   * summaries. The rest of the round keeps that shape — including the terminal edit — so the card
-   * keeps updating instead of freezing on the refusal.
-   */
-  degraded: boolean;
-  messageId: string | undefined;
-  seq: number;
-  latest: ProgressCard | undefined;
-  version: number;
-  sentVersion: number;
-  nextEditAt: number;
-};
-
-type DirectoryLease = {
-  ready: Promise<void>;
-  complete(): void;
-};
-
-/**
- * The edge in front of the bot API refuses a request body it dislikes with its own 4xx and page,
- * while every bot API error — transient or not — arrives as a JSON envelope carrying `error.code`.
- * So a 4xx with no code is a refusal of the body rather than a verdict on the request's meaning,
- * and the same call can go out again in a different shape. Read structurally, like
- * `isPermanentOutboxError`, so a fake transport can reproduce the shape without the real module.
- */
-function isEdgeRefusal(error: unknown): boolean {
-  if (!error || typeof error !== "object") return false;
-  const candidate = error as { code?: unknown; status?: unknown };
-  return typeof candidate.status === "number"
-    && candidate.status >= 400
-    && candidate.status < 500
-    && candidate.code === undefined;
-}
 
 /** Single-line, bounded excerpt of the triggering message for a start/consumption receipt. */
 function receiptText(prefix: string, text: string): string {
@@ -373,6 +305,8 @@ class CoreService implements ChannelService {
   private readonly models: ModelSwitchController;
   private readonly authorization: ChatAuthorization;
   private readonly materializer: InboundMaterializer;
+  private readonly progressCards: ProgressCards;
+  private readonly sessions: SessionLifecycle;
   private readonly taskOperations = new Set<Promise<void>>();
   /** In-flight inbound handlers: stop aborts their I/O and awaits their cleanup before closing the store. */
   private readonly inboundOperations = new Set<Promise<void>>();
@@ -432,8 +366,26 @@ class CoreService implements ChannelService {
     this.models = new ModelSwitchController({
       store, workerFactory: options.workerFactory, botUid: () => this.bot!.uid,
       liveWorker: target => this.liveWorker(target),
-      probeDirectory: target => this.probeDirectory(target),
+      probeDirectory: target => this.sessions.probeDirectory(target),
       blockDirectory: cwd => { this.blockedDirectories.add(cwd); },
+      enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
+    });
+    this.progressCards = new ProgressCards({
+      store: this.store,
+      transport: options.transport,
+      botUid: () => this.bot?.uid,
+      stopping: () => this.stopping,
+      trackOperation: (operation) => this.operationSet(operation),
+    });
+    this.sessions = new SessionLifecycle({
+      store: this.store,
+      workerFactory: options.workerFactory,
+      config: options.config,
+      bot: () => this.bot,
+      hasRuntime: target => this.hasRuntime(target),
+      isDirectoryBlocked: cwd => this.blockedDirectories.has(cwd),
+      blockDirectory: cwd => { this.blockedDirectories.add(cwd); },
+      tryAcquireCommandDirectories: cwds => this.tryAcquireCommandDirectories(cwds),
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
     });
     this.typingLeases = createTypingLeaseManager({
@@ -566,7 +518,7 @@ class CoreService implements ChannelService {
       if (this.stopping) throw new Error("channel 正在停止");
       this.outbox.flushAll();
       this.botEvents.start();
-      await this.recoverProgressCards();
+      await this.progressCards.recover();
     } catch (error) {
       this.started = false;
       await this.botEvents.stop();
@@ -795,7 +747,7 @@ class CoreService implements ChannelService {
     const active = this.store.getActiveTask(this.bot.uid, target);
     const binding = active
       ? this.store.getBinding(this.bot.uid, target)
-      : await this.reconcileExternalBinding(target);
+      : await this.sessions.reconcileExternalBinding(target);
     const display = active ?? latest;
     return {
       sessionId: binding?.sessionId ?? null,
@@ -834,48 +786,6 @@ class CoreService implements ChannelService {
     };
   }
 
-  private async sessionRootsFor(cwd: string): Promise<readonly string[]> {
-    // 项目目录在前，改动前的扁平根留在候选里，旧会话仍能被找回。
-    const roots = [
-      projectSessionDir(sessionsRoot(this.options.config), cwd),
-      join(this.options.config.stateDir, "sessions"),
-    ];
-    if (!this.options.workerFactory.sessionRootsFor) return roots;
-    try {
-      return [...roots, ...(await this.options.workerFactory.sessionRootsFor(cwd))];
-    } catch {
-      return roots;
-    }
-  }
-
-  private async reconcileExternalBinding(
-    target: ChatTarget,
-    binding: BindingRecord | null = this.bot ? this.store.getBinding(this.bot.uid, target) : null,
-  ): Promise<BindingRecord | null> {
-    if (!binding || !binding.sessionFile) return binding;
-    if (this.blockedDirectories.has(binding.cwd)) return binding;
-    const moved = await findMovedSession(binding, { roots: await this.sessionRootsFor(binding.cwd) });
-    if (
-      !moved ||
-      (moved.sessionId === binding.sessionId &&
-        moved.cwd === binding.cwd &&
-        moved.sessionFile === binding.sessionFile)
-    ) {
-      return binding;
-    }
-    const rebound: BindingRecord = {
-      ...binding,
-      sessionId: moved.sessionId,
-      cwd: moved.cwd,
-      sessionFile: moved.sessionFile,
-    };
-    try {
-      this.store.ensureBinding(rebound);
-    } catch {
-      return binding;
-    }
-    return rebound;
-  }
   private hasRuntime(target: ChatTarget): boolean {
     const key = targetKey(target);
     for (const runtime of this.runtimes.values()) {
@@ -900,134 +810,6 @@ class CoreService implements ChannelService {
       if (targetKey(runtime.target) === key && runtime.worker) return runtime.worker;
     }
     return undefined;
-  }
-
-  /**
-   * Persists the card frame the server accepted. A process that did not observe the run cannot
-   * address the card, so this row is what lets a later process close it. Storage failures are
-   * logged instead of being treated as card failures.
-   */
-  private rememberProgressCard(
-    taskId: string,
-    target: ChatTarget,
-    messageId: string,
-    lastSeq: number,
-    snapshot: ExecutionSnapshot,
-  ): void {
-    const botUid = this.bot?.uid;
-    if (botUid === undefined) return;
-    try {
-      this.store.saveProgressCard({
-        botUid,
-        taskId,
-        channelType: target.channelType,
-        channelId: target.channelId,
-        messageId,
-        lastSeq,
-        snapshot: encodeExecutionSnapshot(snapshot),
-      });
-    } catch (error) {
-      console.error(
-        `[progress-card] 无法记录卡片状态 task=${taskId}：`
-        + `${error instanceof Error ? error.message : "unknown error"}`,
-      );
-    }
-  }
-
-  /** Drops the persisted card row. Bookkeeping failures are logged, never fatal. */
-  private forgetProgressCard(taskId: string, messageId: string): void {
-    const botUid = this.bot?.uid;
-    if (botUid === undefined) return;
-    try {
-      this.store.clearProgressCard(botUid, taskId, messageId);
-    } catch (error) {
-      console.error(
-        `[progress-card] 无法清除卡片记录 task=${taskId}：`
-        + `${error instanceof Error ? error.message : "unknown error"}`,
-      );
-    }
-  }
-
-  /**
-   * Counts a recovery attempt, whose row also advances the stored sequence: an attempt whose
-   * response was lost may already be accepted, so the next one has to stay strictly above it. A
-   * failing state disk must not keep the channel from starting, so that failure is logged and
-   * reported as the last attempt.
-   */
-  private recordProgressCardAttempt(taskId: string, messageId: string): number {
-    const botUid = this.bot?.uid;
-    if (botUid === undefined) return PROGRESS_CARD_RECOVERY_ATTEMPTS;
-    try {
-      return this.store.recordProgressCardAttempt(botUid, taskId, messageId);
-    } catch (error) {
-      console.error(
-        `[progress-card] 无法记录补发尝试 task=${taskId}：`
-        + `${error instanceof Error ? error.message : "unknown error"}`,
-      );
-      return PROGRESS_CARD_RECOVERY_ATTEMPTS;
-    }
-  }
-
-  /**
-   * Closes cards left open by an earlier process — a restart that interrupted the turn, or a
-   * terminal edit that never landed. Without this the client keeps showing the last running state
-   * forever, because the card's message id and sequence only existed in that process.
-   */
-  private async recoverProgressCards(): Promise<void> {
-    const botUid = this.bot?.uid;
-    if (botUid === undefined) return;
-    for (const card of this.store.listProgressCards(botUid)) {
-      const target: ChatTarget = { channelType: card.channelType, channelId: card.channelId };
-      const task = this.store.getTask(card.taskId);
-      const state: Exclude<ExecutionState, "running"> = task?.state === "completed"
-        ? "completed"
-        : task?.state === "failed"
-          ? "failed"
-          : "cancelled";
-      const snapshot = restoreExecutionSnapshot(card.snapshot, { state, atMs: Date.now() });
-      if (snapshot === null) {
-        this.forgetProgressCard(card.taskId, card.messageId);
-        console.error(`[progress-card] 丢弃无法解析的卡片记录 task=${card.taskId}`);
-        continue;
-      }
-      try {
-        await this.submitRecoveredCard(target, card, snapshot);
-        this.forgetProgressCard(card.taskId, card.messageId);
-        console.error(
-          `[progress-card] 已补发终态卡片 task=${card.taskId} target=${targetKey(target)} state=${state}`,
-        );
-      } catch (error) {
-        const attempts = this.recordProgressCardAttempt(card.taskId, card.messageId);
-        console.error(
-          `[progress-card] 补发终态失败 task=${card.taskId} attempt=${attempts}：`
-          + `${error instanceof Error ? error.message : "unknown error"}`,
-        );
-        if (attempts >= PROGRESS_CARD_RECOVERY_ATTEMPTS) {
-          this.forgetProgressCard(card.taskId, card.messageId);
-        }
-      }
-    }
-  }
-
-  /** One recovery edit, under the same bounded deadline as a live card edit. */
-  private async submitRecoveredCard(
-    target: ChatTarget,
-    card: ProgressCardRecord,
-    snapshot: ExecutionSnapshot,
-  ): Promise<void> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), ACTIVITY_REQUEST_TIMEOUT_MS);
-    try {
-      await this.options.transport.editProgressCard(
-        target,
-        card.messageId,
-        snapshot,
-        card.lastSeq + 1,
-        controller.signal,
-      );
-    } finally {
-      clearTimeout(timer);
-    }
   }
 
   private async deliverSteer(target: ChatTarget, text: string): Promise<boolean> {
@@ -1155,11 +937,11 @@ class CoreService implements ChannelService {
     try {
       let restartRequested = false;
       if (name === "new" || name === "reset") {
-        await this.handleNew(target, argument);
+        await this.sessions.handleNew(target, argument);
       } else if (name === "thread") {
         await this.handleThreadCommand(message, argument);
       } else if (name === "move") {
-        await this.handleMove(target, argument);
+        await this.sessions.handleMove(target, argument);
       } else if (name === "cancel" || name === "stop") {
         await this.handleCancel(target);
       } else if (name === "interrupt") {
@@ -1269,272 +1051,6 @@ class CoreService implements ChannelService {
       if (await this.appendToRunningTask(message, body)) return;
       await this.acceptTask(message, body);
     });
-  }
-
-  private async defaultWorkDirectory(target: ChatTarget): Promise<string> {
-    const botUid = this.bot?.uid;
-    const binding = botUid === undefined ? null : this.store.getBinding(botUid, target);
-    if (binding?.sessionFile) return canonicalExistingDirectory(binding.cwd);
-    if (binding?.cwdPinned === true) {
-      try {
-        return await canonicalExistingDirectory(binding.cwd);
-      } catch {
-        // An isolated workspace that no longer exists falls back to the ordinary order below.
-      }
-    }
-    if (target.channelType === 5) {
-      const parentId = threadParentGroupId(target.channelId);
-      const parent = parentId === null || botUid === undefined
-        ? null
-        : this.store.getBinding(botUid, { channelId: parentId, channelType: 2 });
-      if (parent) {
-        try {
-          return await canonicalExistingDirectory(parent.cwd);
-        } catch {
-          // The parent cwd is unusable: fall back to the default work directory.
-        }
-      }
-    }
-    return resolveWorkDirectory("", this.options.config);
-  }
-
-  private async handleNew(target: ChatTarget, argument: string): Promise<void> {
-    if (this.bot && (this.store.getActiveTask(this.bot.uid, target) || this.hasRuntime(target))) {
-      await this.outbox.enqueueText(target, "当前聊天有运行中或排队任务，请先 /cancel。", null);
-      return;
-    }
-    const previous = await this.reconcileExternalBinding(target);
-    let cwd: string;
-    try {
-      const trimmed = argument.trim();
-      if (
-        (trimmed.length > 0 && stripOuterQuotes(argument).length === 0) ||
-        (trimmed.length === 0 && argument.length > 0)
-      ) {
-        throw new Error("空引号不是有效目录");
-      }
-      cwd = trimmed.length > 0
-        ? await resolveWorkDirectory(argument, this.options.config)
-        : await this.defaultWorkDirectory(target);
-    } catch (error) {
-      await this.outbox.enqueueText(target, `目录无效：${safeErrorMessage(error, "无法访问该目录")}`, null);
-      return;
-    }
-    const commandLease = this.tryAcquireCommandDirectories([cwd]);
-    if (!commandLease) {
-      await this.outbox.enqueueText(target, "目标目录当前被任务或未确认会话占用，请稍后重试。", null);
-      return;
-    }
-    try {
-      await commandLease.ready;
-      const sessionId = createSessionId();
-      const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.options.config), cwd);
-      const ledgerId = `new-${sessionId}`;
-      const ledgerSessionFile = join(sessionDir, `${sessionId}.jsonl`);
-      let spawned: WorkerProcess | undefined;
-      let candidate: OmpWorker | undefined;
-      let stopped = false;
-      let persistenceFailed = false;
-      try {
-        const chatModel = this.store.getChatModel(this.bot!.uid, target);
-        candidate = await this.options.workerFactory.create({
-          cwd,
-          sessionDir,
-          ...(chatModel === null ? {} : { model: chatModel }),
-          onSpawn: (processInfo) => {
-            spawned = processInfo;
-            this.store.recordWorker({
-              id: ledgerId,
-              botUid: this.bot!.uid,
-              sessionId,
-              sessionFile: ledgerSessionFile,
-              pid: processInfo.pid,
-              pgid: processInfo.pgid,
-              identity: processInfo.identity,
-              cwd: processInfo.cwd,
-              moveTargetCwd: null,
-              state: "running",
-            });
-          },
-        });
-        const freshState: ProjectSessionState = await candidate.refreshState();
-        const previousForFresh: ProjectSessionBinding = previous ?? {
-          sessionId: "",
-          cwd,
-          sessionFile: null,
-        };
-        const fresh = await verifyFreshSession(previousForFresh, freshState, cwd);
-        const model = await this.createdSessionModel(candidate);
-        stopped = await candidate.stop();
-        if (!stopped) {
-          this.blockedDirectories.add(cwd);
-          throw new Error("worker did not stop");
-        }
-        this.store.markWorkerStopped(ledgerId);
-        const binding: BindingRecord = {
-          botUid: this.bot!.uid,
-          channelId: target.channelId,
-          channelType: target.channelType,
-          sessionId: fresh.sessionId,
-          cwd: fresh.cwd,
-          sessionFile: fresh.sessionFile,
-        };
-        try {
-          this.store.ensureBinding(binding);
-        } catch {
-          persistenceFailed = true;
-          throw new Error("本地状态盘写入失败，会话未切换。");
-        }
-        this.store.clearContextLedger(this.bot!.uid, target);
-        await this.outbox.enqueueText(
-          target,
-          `已创建会话 ${binding.sessionId}，cwd=${binding.cwd}${model === null ? "" : `，模型=${model}`}`,
-          null,
-        );
-      } catch {
-        if (candidate && !stopped) {
-          const verified = await candidate.stop().catch(() => false);
-          if (verified) {
-            this.store.markWorkerStopped(ledgerId);
-          } else {
-            this.blockedDirectories.add(cwd);
-          }
-        } else if (spawned && !stopped) {
-          const verified = await this.options.workerFactory.recover(spawned).catch(() => false);
-          if (verified) {
-            this.store.markWorkerStopped(ledgerId);
-          } else {
-            this.blockedDirectories.add(cwd);
-          }
-        }
-        if (persistenceFailed) throw new Error("本地状态盘写入失败，会话未切换。");
-        await this.outbox.enqueueText(target, "无法创建可恢复的 OMP 会话，当前绑定未改变。", null);
-      }
-    } finally {
-      commandLease.complete();
-    }
-  }
-
-  private async handleMove(target: ChatTarget, argument: string): Promise<void> {
-    if (this.bot && (this.store.getActiveTask(this.bot.uid, target) || this.hasRuntime(target))) {
-      await this.outbox.enqueueText(target, "当前聊天有运行中或排队任务，请先 /cancel。", null);
-      return;
-    }
-    const previous = await this.reconcileExternalBinding(target);
-    if (!previous) {
-      await this.outbox.enqueueText(target, "当前聊天没有可迁移的会话，请先 /new。", null);
-      return;
-    }
-    let cwd: string;
-    try {
-      const trimmed = argument.trim();
-      if (
-        trimmed.length === 0 ||
-        stripOuterQuotes(argument).length === 0 ||
-        (trimmed.length > 0 && stripOuterQuotes(argument).length === 0)
-      ) {
-        throw new Error("必须指定目标目录");
-      }
-      cwd = await resolveWorkDirectory(argument, this.options.config);
-    } catch (error) {
-      await this.outbox.enqueueText(target, `目录无效：${safeErrorMessage(error, "无法访问该目录")}`, null);
-      return;
-    }
-    if (!previous.sessionFile) {
-      await this.outbox.enqueueText(target, "当前绑定没有可恢复的精确会话文件，未迁移。", null);
-      return;
-    }
-    const sessionFile = await existingSessionFile(previous.sessionFile);
-    if (!sessionFile) {
-      await this.outbox.enqueueText(target, "绑定的 OMP 会话文件不存在，未迁移。", null);
-      return;
-    }
-    const commandLease = this.tryAcquireCommandDirectories([previous.cwd, cwd]);
-    if (!commandLease) {
-      await this.outbox.enqueueText(target, "源目录或目标目录当前被任务或未确认会话占用，请稍后重试。", null);
-      return;
-    }
-    try {
-      await commandLease.ready;
-      const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.options.config), cwd);
-      const ledgerId = `move-${randomUUID()}`;
-      let spawned: WorkerProcess | undefined;
-      let candidate: OmpWorker | undefined;
-      let stopped = false;
-      let persistenceFailed = false;
-      try {
-        const chatModel = this.store.getChatModel(this.bot!.uid, target);
-        candidate = await this.options.workerFactory.create({
-          cwd: previous.cwd,
-          sessionDir,
-          sessionFile,
-          ...(chatModel === null ? {} : { model: chatModel }),
-          onSpawn: (processInfo) => {
-            spawned = processInfo;
-            this.store.recordWorker({
-              id: ledgerId,
-              botUid: this.bot!.uid,
-              sessionId: previous.sessionId,
-              sessionFile,
-              pid: processInfo.pid,
-              pgid: processInfo.pgid,
-              identity: processInfo.identity,
-              cwd: processInfo.cwd,
-              moveTargetCwd: null,
-              state: "running",
-            });
-          },
-        });
-        this.store.markWorkerMoveTarget(ledgerId, cwd);
-        await candidate.prompt(`/move ${cwd}`, () => {});
-        const movedState: ProjectSessionState = await candidate.refreshState();
-        const moved = await verifyMovedSession(previous, movedState, cwd);
-        stopped = await candidate.stop();
-        if (!stopped) {
-          this.blockedDirectories.add(previous.cwd);
-          this.blockedDirectories.add(cwd);
-          throw new Error("worker did not stop");
-        }
-        this.store.markWorkerStopped(ledgerId);
-        const binding: BindingRecord = {
-          ...previous,
-          sessionId: moved.sessionId,
-          cwd: moved.cwd,
-          sessionFile: moved.sessionFile,
-          // An explicit /move leaves an isolated thread workspace behind.
-          cwdPinned: false,
-        };
-        try {
-          this.store.ensureBinding(binding);
-        } catch {
-          persistenceFailed = true;
-          throw new Error("本地状态盘写入失败，会话未迁移。");
-        }
-        await this.outbox.enqueueText(target, `已迁移会话 ${binding.sessionId}，cwd=${binding.cwd}`, null);
-      } catch {
-        if (candidate && !stopped) {
-          const verified = await candidate.stop().catch(() => false);
-          if (verified) {
-            this.store.markWorkerStopped(ledgerId);
-          } else {
-            this.blockedDirectories.add(previous.cwd);
-            this.blockedDirectories.add(cwd);
-          }
-        } else if (spawned && !stopped) {
-          const verified = await this.options.workerFactory.recover(spawned).catch(() => false);
-          if (verified) {
-            this.store.markWorkerStopped(ledgerId);
-          } else {
-            this.blockedDirectories.add(previous.cwd);
-            this.blockedDirectories.add(cwd);
-          }
-        }
-        if (persistenceFailed) throw new Error("本地状态盘写入失败，会话未迁移。");
-        await this.outbox.enqueueText(target, "无法验证 OMP 原生 /move，当前绑定未改变。", null);
-      }
-    } finally {
-      commandLease.complete();
-    }
   }
 
   /**
@@ -1712,33 +1228,6 @@ class CoreService implements ChannelService {
     );
   }
 
-  /**
-   * The model the freshly created `/new`/`/reset` session actually came up with, asked of its own
-   * candidate worker through the same `worker.models()` state query `/switch` and `/status` use: the stored
-   * chat model when `--model` carried one, OMP's own default otherwise — it can never report
-   * `default` as a model. A failed or empty answer degrades the creation receipt to its model-less
-   * form instead of failing `/new` or inventing a value.
-   */
-  private async createdSessionModel(worker: OmpWorker): Promise<string | null> {
-    const catalog = await worker.models().catch(() => null);
-    if (catalog === null || catalog.current === null) return null;
-    return modelWithLevel(catalog.current, catalog.level);
-  }
-
-  /**
-   * The cwd a probe worker runs in: the chat's own directory — the same one its turns use — or
-   * `null` when nothing usable resolves.
-   */
-  private async probeDirectory(target: ChatTarget): Promise<string | null> {
-    try {
-      return await this.defaultWorkDirectory(target).catch(() =>
-        resolveWorkDirectory("", this.options.config),
-      );
-    } catch {
-      return null;
-    }
-  }
-
   private async handleCancel(target: ChatTarget): Promise<void> {
     const queued = this.store.cancelQueued(this.bot!.uid, target);
     for (const taskId of queued) this.queuedBehind.delete(taskId);
@@ -1841,14 +1330,14 @@ class CoreService implements ChannelService {
     relay: TaskRelayTarget | null = null,
   ): Promise<boolean> {
     this.throwIfStopping();
-    let binding = await this.reconcileExternalBinding(
+    let binding = await this.sessions.reconcileExternalBinding(
       message,
       this.store.getBinding(this.bot!.uid, message),
     );
     if (!binding) {
       let cwd: string;
       try {
-        cwd = await this.defaultWorkDirectory(message);
+        cwd = await this.sessions.defaultWorkDirectory(message);
       } catch {
         await this.outbox.enqueueText(message, "无法创建默认会话目录，未接收任务。", null);
         return false;
@@ -1868,7 +1357,7 @@ class CoreService implements ChannelService {
       }
     } else if (!binding.sessionFile) {
       const current = binding;
-      const cwd = await this.defaultWorkDirectory(message).catch(() => current.cwd);
+      const cwd = await this.sessions.defaultWorkDirectory(message).catch(() => current.cwd);
       if (cwd !== current.cwd) {
         binding = { ...current, cwd };
         try {
@@ -1990,7 +1479,7 @@ class CoreService implements ChannelService {
     for (let index = 0; index < currentIndex; index += 1) {
       const earlier = queued[index];
       if (!earlier) continue;
-      const binding = await this.reconcileExternalBinding(
+      const binding = await this.sessions.reconcileExternalBinding(
         taskTarget(earlier),
         this.store.getBinding(this.bot!.uid, taskTarget(earlier)),
       );
@@ -2007,7 +1496,7 @@ class CoreService implements ChannelService {
       for (let attempt = 0; attempt < 4; attempt += 1) {
         const current = this.store.getTask(taskId);
         if (this.stopping || !current || current.state !== "queued") return;
-        const binding = await this.reconcileExternalBinding(
+        const binding = await this.sessions.reconcileExternalBinding(
           taskTarget(current),
           this.store.getBinding(this.bot!.uid, taskTarget(current)),
         );
@@ -2021,7 +1510,7 @@ class CoreService implements ChannelService {
         if (this.stopping || !beforeLease || beforeLease.state !== "queued") return;
         lease = await this.acquireDirectoryLease(cwd);
 
-        const refreshed = await this.reconcileExternalBinding(
+        const refreshed = await this.sessions.reconcileExternalBinding(
           taskTarget(beforeLease),
           this.store.getBinding(this.bot!.uid, taskTarget(beforeLease)),
         );
@@ -2095,7 +1584,7 @@ class CoreService implements ChannelService {
   private async runTask(taskId: string, lockedCwd?: string): Promise<void> {
     const persistedTask = this.store.getTask(taskId);
     if (!persistedTask || persistedTask.state !== "queued") return;
-    const bindingAtStart = await this.reconcileExternalBinding(
+    const bindingAtStart = await this.sessions.reconcileExternalBinding(
       taskTarget(persistedTask),
       this.store.getBinding(this.bot!.uid, taskTarget(persistedTask)),
     );
@@ -2137,29 +1626,9 @@ class CoreService implements ChannelService {
     let worker: OmpWorker | undefined;
     let workerLedgerId: string | undefined;
     let spawned: WorkerProcess | undefined;
-    let progressTimer: NodeJS.Timeout | undefined;
-    let progressTail: Promise<void> = Promise.resolve();
-    const progressAbort = new AbortController();
     const textDelivery = this.outbox.registerTask(taskId);
     const target = taskTarget(task);
-    let roundIndex = 0;
-    const createRound = (): ProgressRound => ({
-      clientMsgNo: `progress-${taskId}-${roundIndex}`,
-      tracker: createExecutionTracker({ runId: taskId }),
-      started: false,
-      finished: false,
-      retired: false,
-      disabled: false,
-      failureLogged: false,
-      degraded: false,
-      messageId: undefined,
-      seq: 0,
-      latest: undefined,
-      version: 0,
-      sentVersion: 0,
-      nextEditAt: 0,
-    });
-    let progressRound = createRound();
+    const progress = this.progressCards.startTask(taskId, target);
     const assistantTexts = new Map<string, string>();
     let snapshot: GroupContext | null = null;
     let contextInjection: ContextInjection | undefined;
@@ -2173,158 +1642,9 @@ class CoreService implements ChannelService {
     let localOnly = false;
     let startupPhase: TaskStartupPhase = "context";
 
-    const trackActivity = (operation: Promise<void>): void => {
-      const settled = operation.catch(() => {});
-      this.activityOperations.add(settled);
-      void settled.finally(() => {
-        this.activityOperations.delete(settled);
-      });
-    };
-    const runActivityRequest = async <T>(
-      work: (signal: AbortSignal) => Promise<T>,
-      parentSignal?: AbortSignal,
-    ): Promise<T> => {
-      const controller = new AbortController();
-      const abort = () => controller.abort();
-      if (parentSignal?.aborted) {
-        controller.abort();
-      } else {
-        parentSignal?.addEventListener("abort", abort, { once: true });
-      }
-      const timer = setTimeout(() => controller.abort(), ACTIVITY_REQUEST_TIMEOUT_MS);
-      try {
-        return await work(controller.signal);
-      } finally {
-        clearTimeout(timer);
-        parentSignal?.removeEventListener("abort", abort);
-      }
-    };
-    const queueProgress = (work: () => Promise<void>): void => {
-      progressTail = progressTail.then(work, work).catch(() => {});
-      trackActivity(progressTail);
-    };
-    const scheduleProgressEdit = (): void => {
-      const current = progressRound;
-      if (this.stopping || current.retired || !current.started || current.disabled || progressTimer) return;
-      if (current.version <= current.sentVersion) return;
-      progressTimer = setTimeout(() => {
-        progressTimer = undefined;
-        const pending = progressRound;
-        if (!pending.retired && pending.version > pending.sentVersion) {
-          queueProgress(() => editProgress(pending));
-        }
-      }, Math.max(0, current.nextEditAt - Date.now()));
-    };
-    const editProgress = async (round: ProgressRound): Promise<void> => {
-      const messageId = round.messageId;
-      const progress = round.latest;
-      if (round.disabled || !messageId || !progress) return;
-      if (round.version <= round.sentVersion) {
-        if (!round.retired) scheduleProgressEdit();
-        return;
-      }
-      const running = progress.state === "running";
-      // A superseded card only still receives the terminal edit that closes it.
-      if (running && round.retired) return;
-      if (running && Date.now() < round.nextEditAt) {
-        scheduleProgressEdit();
-        return;
-      }
-      const version = round.version;
-      const cardSeq = ++round.seq;
-      const snapshot = round.degraded ? stripCardSummaries(progress) : progress;
-      if (running) round.nextEditAt = Date.now() + PROGRESS_MERGE_MS;
-      const parentSignal = running ? progressAbort.signal : undefined;
-      try {
-        await runActivityRequest(
-          (signal) => this.options.transport.editProgressCard(target, messageId, snapshot, cardSeq, signal),
-          parentSignal,
-        );
-        if (round.version === version) round.sentVersion = version;
-        if (running) {
-          this.rememberProgressCard(taskId, target, messageId, cardSeq, snapshot);
-        } else {
-          this.forgetProgressCard(taskId, messageId);
-        }
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : "unknown error";
-        if (!running) {
-          round.disabled = true;
-          if (!round.retired) {
-            clearTimeout(progressTimer);
-            progressTimer = undefined;
-          }
-          console.error(
-            `[progress-card] 终态编辑失败 target=${targetKey(target)} state=${progress.state}`
-            + ` seq=${cardSeq}：${reason}`,
-          );
-        } else {
-          if (!round.failureLogged) {
-            round.failureLogged = true;
-            console.error(`[progress-card] 运行中编辑失败 target=${targetKey(target)} seq=${cardSeq}：${reason}`);
-          }
-          // The edge refused the body rather than the request: the same card goes out once without
-          // the free-text step summaries, and the round keeps that shape from here on.
-          if (!round.degraded && isEdgeRefusal(error)) {
-            round.degraded = true;
-            console.error(
-              `[progress-card] 卡片正文被网关拒绝，改用不带步骤摘要的形态重试`
-              + ` target=${targetKey(target)} seq=${cardSeq}`,
-            );
-          }
-        }
-      } finally {
-        if (!round.retired) scheduleProgressEdit();
-      }
-    };
-    const finishProgress = (state: Exclude<ProgressCard["state"], "running">): void => {
-      const current = progressRound;
-      if (!current.started || current.finished) return;
-      current.finished = true;
-      clearTimeout(progressTimer);
-      progressTimer = undefined;
-      current.latest = current.tracker.apply({
-        type: "run_end",
-        atMs: Date.now(),
-        state,
-      });
-      current.version += 1;
-      queueProgress(() => editProgress(current));
-    };
-    /**
-     * A steered message opens the next user round. The card the reader is looking at must sit
-     * below that message instead of staying where the first tool call of the run happened, so the
-     * round in progress is closed and the next real tool progress opens a card of its own.
-     */
-    const rollProgressCard = (): void => {
-      const previous = progressRound;
-      if (previous.retired) return;
-      previous.retired = true;
-      clearTimeout(progressTimer);
-      progressTimer = undefined;
-      roundIndex += 1;
-      progressRound = createRound();
-      // The todo list belongs to the task rather than to one round, so the new card keeps it.
-      const todos = previous.latest?.todos ?? [];
-      if (todos.length > 0) {
-        progressRound.tracker.apply({ type: "todo_update", atMs: Date.now(), phases: todos });
-      }
-      if (!previous.started || previous.finished || previous.disabled) return;
-      previous.finished = true;
-      previous.latest = previous.tracker.apply({ type: "run_end", atMs: Date.now(), state: "completed" });
-      previous.version += 1;
-      queueProgress(() => editProgress(previous));
-    };
-    const stopActivity = (abortProgress = true): void => {
-      if (!progressRound.finished || abortProgress) {
-        clearTimeout(progressTimer);
-        progressTimer = undefined;
-      }
-      if (abortProgress) progressAbort.abort();
-    };
-    runtime.stopActivity = stopActivity;
+    runtime.stopActivity = (abortProgress) => progress.stop(abortProgress);
     runtime.stopText = () => textDelivery.stop();
-    runtime.rollProgressCard = rollProgressCard;
+    runtime.rollProgressCard = () => progress.roll();
 
     try {
       const groupTask = isGroupTarget(target);
@@ -2467,74 +1787,6 @@ class CoreService implements ChannelService {
         });
         currentContextSidecarPath = await writeContextSidecar(sidecarRoot, sidecar);
       }
-      /**
-       * Feeds one real execution event into the current round's card. The card is created lazily
-       * on the round's first real tool/todo progress, so a round without tool work shows no card.
-       */
-      const trackProgress = (event: WorkerEvent, progress: ProgressCard): void => {
-        const current = progressRound;
-        current.latest = progress;
-        if (current.retired) return;
-        if (current.finished && progress.state !== "running") return;
-        current.version += 1;
-        const startsCard = event.type === "tool_start" ||
-          event.type === "tool_end" ||
-          event.type === "todo_update";
-        if (!current.started && !startsCard) return;
-        if (!current.started) {
-          current.started = true;
-          const initial = progress;
-          const initialVersion = current.version;
-          if (progress.state !== "running") {
-            current.finished = true;
-          }
-          queueProgress(async () => {
-            try {
-              const receipt = await runActivityRequest(
-                (signal) => this.options.transport.sendProgressCard(
-                  target,
-                  initial,
-                  current.clientMsgNo,
-                  signal,
-                ),
-                progressAbort.signal,
-              );
-              if (!receipt?.messageId) {
-                current.disabled = true;
-                console.error(
-                  `[progress-card] 未创建进度卡 target=${targetKey(target)}：卡片能力不可用或内容超出限制`,
-                );
-                return;
-              }
-              current.messageId = receipt.messageId;
-              current.seq = 1;
-              current.sentVersion = initialVersion;
-              this.rememberProgressCard(taskId, target, current.messageId, 1, initial);
-              if (current.version > current.sentVersion) {
-                if (current.finished) queueProgress(() => editProgress(current));
-                else scheduleProgressEdit();
-              } else if (!current.finished) {
-                scheduleProgressEdit();
-              }
-            } catch (error) {
-              current.started = false;
-              console.error(
-                `[progress-card] 创建失败 target=${targetKey(target)}：`
-                + `${error instanceof Error ? error.message : "unknown error"}`,
-              );
-            }
-          });
-          return;
-        }
-        if (progress.state !== "running") {
-          current.finished = true;
-          clearTimeout(progressTimer);
-          progressTimer = undefined;
-          queueProgress(() => editProgress(current));
-        } else {
-          scheduleProgressEdit();
-        }
-      };
       const onEvent = (event: WorkerEvent): void => {
         if (runtime.cancelRequested || this.stopping) return;
         if (event.type === "notice") {
@@ -2574,7 +1826,7 @@ class CoreService implements ChannelService {
           this.noteSteerConsumed(runtime, event);
           return;
         }
-        trackProgress(event, progressRound.tracker.apply(event));
+        progress.apply(event);
       };
       const historyTurn = await this.history.prepareTurn(task, target, verified.sessionId);
       const promptContext: PromptContext = {
@@ -2590,7 +1842,7 @@ class CoreService implements ChannelService {
       }
       if (runtime.cancelRequested) {
         this.store.markCancelled(taskId);
-        finishProgress("cancelled");
+        progress.finish("cancelled");
         await this.sendCancelledIfNeeded(runtime);
       } else if (runtime.stopCause !== null && !runtime.workAfterStop) {
         this.store.markInterrupted(
@@ -2599,7 +1851,7 @@ class CoreService implements ChannelService {
             ? "等待回答超时，回合已停止"
             : "用户中断当前回合",
         );
-        finishProgress("cancelled");
+        progress.finish("cancelled");
       } else {
         if (contextNeedsCommit && !localOnly) {
           const sidecarPath = currentContextSidecarPath;
@@ -2637,13 +1889,13 @@ class CoreService implements ChannelService {
         }
         const resultText = assistantTexts.size > 0 ? [...assistantTexts.values()].join("\n\n") : null;
         this.store.markCompleted(taskId, resultText);
-        finishProgress("completed");
+        progress.finish("completed");
         this.outbox.flush(target);
       }
     } catch (error) {
       if (runtime.cancelRequested) {
         this.store.markCancelled(taskId);
-        finishProgress("cancelled");
+        progress.finish("cancelled");
         await this.sendCancelledIfNeeded(runtime);
       } else {
         const failure = worker
@@ -2654,11 +1906,11 @@ class CoreService implements ChannelService {
           + ` kind=${failure.kind} code=${failure.code} phase=${startupPhase} detail=${failure.detail}`,
         );
         this.store.markFailed(taskId, failure.row);
-        finishProgress("failed");
+        progress.finish("failed");
         await this.outbox.enqueueText(runtime.target, failure.notice, taskId);
       }
     } finally {
-      runtime.stopActivity?.(!progressRound.finished);
+      progress.stop(!progress.finished);
       this.typingLeases.release(runtime.target, `task:${taskId}`);
       this.questions.rejectForTask(taskId, new Error("task finished"));
       if (worker) {
@@ -2678,7 +1930,7 @@ class CoreService implements ChannelService {
       // the relay as work that queued behind this run.
       this.runtimes.delete(taskId);
       await this.notifyThreadOutcome(taskId);
-      await this.runScheduledArchive(target, progressTail);
+      await this.runScheduledArchive(target, progress.tail);
       this.maybeRunDeferredRestart();
     }
   }
