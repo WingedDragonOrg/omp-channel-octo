@@ -1774,7 +1774,7 @@ class CoreService implements ChannelService {
     this.throwIfStopping();
     if (this.store.getChatMode(this.bot!.uid, message) !== "steer") return false;
     const runtime = this.runningRuntime(message);
-    if (!runtime) return false;
+    if (!runtime || runtime.stopCause === "question") return false;
     const claim = this.commandClaim(message, "steer");
     if (!this.store.claimCommand(claim)) return true;
     if (await this.deliverSteer(message, text)) {
@@ -2260,20 +2260,17 @@ class CoreService implements ChannelService {
   }
 
   /**
-   * Stops the turn whose `ask` wait timed out, the way a cancelled tool call stops it: the abort
-   * frame goes out first, so the model cannot use a tool error to keep going. The questions stay
-   * pending and their cards stay submittable; the run settles as interrupted unless the turn
-   * really produced work after the stop. Nothing is delivered to the chat (the owner is silent
-   * by contract); their later answer wakes the agent through `wakeTurn`.
+   * Stops the turn at the configured ask deadline. Abort is bounded by the worker RPC budget;
+   * regardless of its acknowledgement, stop then reaps the owned process group. Questions stay
+   * pending and later answers queue behind cleanup before resuming the same session.
    */
   private stopTurnForQuestion(taskId: string): void {
     const runtime = this.runtimes.get(taskId);
     if (!runtime?.worker || !runtime.promptInFlight) return;
     runtime.stopCause = "question";
     runtime.workAfterStop = false;
-    void runtime.worker.abortTurn().catch(() => {
-      if (runtime.stopCause === "question") runtime.stopCause = null;
-    });
+    const worker = runtime.worker;
+    void worker.abortTurn().catch(() => {}).finally(() => worker.stop().catch(() => false));
   }
 
   /**
@@ -3492,6 +3489,7 @@ class CoreService implements ChannelService {
           localOnly = true;
           return;
         }
+        if (runtime.stopCause === "question") return;
         if (runtime.stopCause !== null && event.type !== "turn_end" && event.type !== "run_end") {
           runtime.workAfterStop = true;
         }
@@ -3584,6 +3582,9 @@ class CoreService implements ChannelService {
         this.store.markCancelled(taskId);
         finishProgress("cancelled");
         await this.sendCancelledIfNeeded(runtime);
+      } else if (runtime.stopCause === "question") {
+        this.store.markInterrupted(taskId, "等待回答超时，回合已停止");
+        finishProgress("cancelled");
       } else {
         const failure = worker
           ? classifyTaskFailure(error)
