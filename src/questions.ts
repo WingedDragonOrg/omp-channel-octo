@@ -160,6 +160,8 @@ export function createQuestionDesk(deps: QuestionDeskDeps): QuestionDesk {
   const askCardSeq = new Map<string, number>();
   /** 每张卡片的 action-id 代次：必须保持可回答的帧据此换新 id。 */
   const askCardGeneration = new Map<string, number>();
+  /** Published cards can receive clicks before their HTTP receipt supplies the message id. */
+  const sendingQuestions = new Set<string>();
 
   function currentBotUid(): string {
     const uid = deps.botUid();
@@ -468,7 +470,6 @@ async function askQuestionSet(
     const messageId = await deliverQuestionSet(specs, target, signal);
     throwIfAborted(signal);
     if (messageId !== null) {
-      deps.store.setQuestionsCard(specs.map(({ id }) => id), messageId);
       const settled = await Promise.all(completions.map(({ promise }) => promise));
       return specs.map(({ id, sourceId }, index) => {
         const answer = settled[index] ?? { answer: "", answeredBy: null };
@@ -520,6 +521,7 @@ async function deliverQuestionSet(
     payloads.push(spec.payload);
   }
   const frame = buildAskCardSet(entries, { kind: "open", generation: 1 }, formatQuestionSet(payloads));
+  for (const spec of specs) sendingQuestions.add(spec.id);
   try {
     const receipt = await deps.transport.sendCard(
       target,
@@ -527,6 +529,9 @@ async function deliverQuestionSet(
       randomUUID(),
       AbortSignal.any([signal, AbortSignal.timeout(ASK_CARD_SEND_TIMEOUT_MS)]),
     );
+    if (receipt?.messageId !== undefined) {
+      deps.store.setQuestionsCard(specs.map(({ id }) => id), receipt.messageId);
+    }
     return receipt?.messageId ?? null;
   } catch (error) {
     if (signal.aborted) throw error;
@@ -534,6 +539,8 @@ async function deliverQuestionSet(
       `[ask-card] set send failed target=${targetKey(target)}：${safeErrorMessage(error, "send failed")}`,
     );
     return null;
+  } finally {
+    for (const spec of specs) sendingQuestions.delete(spec.id);
   }
 }
 
@@ -602,6 +609,7 @@ async function deliverQuestion(
 ): Promise<void> {
   const ask = askQuestionFromPayload(payload);
   if (ask !== null) {
+    sendingQuestions.add(questionId);
     try {
       const receipt = await deps.transport.sendCard(
         target,
@@ -616,6 +624,8 @@ async function deliverQuestion(
     } catch (error) {
       if (signal.aborted) throw error;
       console.error(`[ask-card] send failed target=${targetKey(target)}：${safeErrorMessage(error, "send failed")}`);
+    } finally {
+      sendingQuestions.delete(questionId);
     }
   }
   deps.enqueueText(target, formatQuestion(payload), taskId);
@@ -832,7 +842,12 @@ async function answerFromCard(action: BotCardAction): Promise<BotEventOutcome> {
     return "retry";
   }
   const first = rows[0];
-  if (first === undefined) return "ignored";
+  if (first === undefined) {
+    if (parseAskActionId(action.actionId) === null) return "ignored";
+    const awaitingReceipt = deps.store.listPendingQuestions(botUid, target)
+      .some((question) => sendingQuestions.has(question.id));
+    return awaitingReceipt ? "retry" : "ignored";
+  }
   if (rows.length === 1) return answerSingleCardClick(first, action, operator);
   return answerSetCardClick(target, rows, action, operator);
 }

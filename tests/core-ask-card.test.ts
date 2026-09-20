@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import { join } from "node:path";
 import type { ChannelStatus, ChatTarget } from "../src/contracts";
 import { cardStats } from "../src/octo/cards";
@@ -189,6 +189,57 @@ test("a card click answers the pending question and rewrites the card", async ()
     await closeCoreHarness(harness);
   }
 });
+
+for (const size of [1, 2]) {
+  test(`a ${size}-question card click waits for its send receipt before acknowledgement`, async () => {
+    const published = Promise.withResolvers<void>();
+    const receiptGate = Promise.withResolvers<void>();
+    const questions = Array.from({ length: size }, (_, index) => ({
+      id: `question-${index + 1}`, question: "Choose target",
+      options: [{ label: "staging" }, { label: "production" }],
+    }));
+    const harness = await startAskHarness(questions, {
+      setup(transport) {
+        const send = transport.sendCard.bind(transport);
+        transport.sendCard = async (...args) => {
+          const receipt = await send(...args);
+          published.resolve();
+          await receiptGate.promise;
+          return receipt;
+        };
+      },
+    });
+    try {
+      const target: ChatTarget = { channelType: 1, channelId: `receipt-race-${size}` };
+      await harness.service.handleInbound(inbound({ ...target, text: "ask" }));
+      await published.promise;
+      const card = harness.transport.sentCards[0]!;
+      const event = cardActionEvent(91, {
+        ...target, messageId: card.messageId, operatorUid: "owner-1",
+        actionId: size === 1 ? "ask_opt_2" : "ask_submit",
+        inputs: size === 1 ? {} : { ask_choices_1: "2", ask_choices_2: "2" },
+      });
+      vi.useFakeTimers();
+      harness.transport.pushBotEvent(event);
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+      expect(harness.transport.ackedEvents).toEqual([]);
+      receiptGate.resolve();
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+      // The fixture removes fetched events; explicitly simulate the server's unacked redelivery.
+      harness.transport.pushBotEvent(event);
+      vi.advanceTimersByTime(5_000);
+      await waitForStatus(harness.service, target, (status) => status.state === "completed");
+      expect(await readAnswers(harness)).toEqual({
+        answers: questions.map(({ id }) => expect.objectContaining({ id, answer: "2", answeredBy: "owner-1" })),
+      });
+      expect(harness.transport.ackedEvents).toEqual([91]);
+    } finally {
+      receiptGate.resolve();
+      vi.useRealTimers();
+      await closeCoreHarness(harness);
+    }
+  });
+}
 
 test("an answered card spells the answerer's name and keeps the uid as identity", async () => {
   const harness = await startAskHarness(

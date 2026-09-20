@@ -161,6 +161,7 @@ OMP `session.compacting` 生命周期在压缩时把当前 turn sidecar 中的�
 交互卡片的上行由 channel 主动消费 Bot 事件队列：`POST /v1/bot/events` 长轮询读取（`wait` 上限低于客户端请求超时并留余量），游标按 `botUid` 持久化且单调递增，事件处理完成后才 `POST /v1/bot/events/{event_id}/ack`，ack 失败或处理可重试时保留游标让同一事件下轮重读。投递是至少一次：重复投递的点击按已记录答案处理，不再作答也不重复改写。该队列只有本 channel 一个消费者；非 `card_action` 的事件（含无 `event_type` 的旧式消息事件）ack 后略过，不参与聊天路由。部署没有该端点时事件轮询自行停止，问答退回纯文本路径。
 
 事件 ACK 暂时失败时保留当前游标，按轮询失败相同的 5 秒退避继续读取和确认；不终止消费者，也不越过尚未确认的事件处理同批后续事件。事件处理返回可重试结果时同样间隔 5 秒再尝试，连续 5 次仍无法处理才确认并丢弃该事件，避免即时重投在故障恢复前耗尽预算。
+卡片已发布但发送回执尚在途时，同聊天的有效 ask 点击保留为可重试事件，待远端 message ID 绑定到问题后再作答与 ACK；单题与整组卡都遵守该顺序。已结束发送且没有对应绑定的未知卡片仍按既有规则忽略，不能猜测绑定到另一道题。
 
 除 host tool 外，任务里的 Agent 还可以用本机 `octo-cli` 以本 bot 身份直接访问 Octo Bot API：宿主注册 Bot 后把该 bot 的 token 经 stdin 写入自己的 octo-cli 凭据目录（`~/.oco/octo-cli/<botUid>`，目录权限 0700，命令行与日志中不出现 token），并把 `OCTO_CONFIG_DIR`、`OCTO_API_BASE_URL`、`OCTO_BOT_ID` 注入 OMP worker 环境。一个 bot 一份目录，宿主服务多个 bot 时凭据互不共享。原始 token 不进入 worker 环境：OMP worker 继续按前缀剥离宿主继承的 `OCTO_*` 与 `OMP_CHANNEL_OCTO_*`，只有这三个名字允许进入子进程。凭据准备是 best-effort，octo-cli 缺失、登录失败或返回的 robot_id 与当前 bot 不一致时只记录一条有界日志并保持不注入，不影响启动与任务。因此 host tool "目标固定为当前聊天" 的承诺只约束 host tool 自身；经 octo-cli 的调用不受该绑定限制，其授权完全由服务端按本 bot 身份判定。`channel_control` 的说明同时告知 Agent 这条路径，并要求它先用 `octo-cli auth status` 自证身份，身份不是本 bot 时不使用。
 
