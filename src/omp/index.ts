@@ -51,6 +51,7 @@ import {
 	isUserSteerMessage,
 	messageText,
 	modelErrorFromFrame,
+	noticeEventFromFrame,
 	safeToolCallId,
 	safeToolName,
 	safeToolSummary,
@@ -88,7 +89,13 @@ type WorkerFactoryOptions = {
 const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 const DEFAULT_CANCEL_TIMEOUT_MS = 10_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
-const PASSIVE_UI_METHODS = new Set(["notify", "setStatus", "setWidget", "setTitle", "set_editor_text", "open_url"]);
+const PASSIVE_UI_METHODS: Record<string, true> = {
+	setStatus: true,
+	setWidget: true,
+	setTitle: true,
+	set_editor_text: true,
+	open_url: true,
+};
 
 /** The thinking level a `get_state` or `config_update` frame reports, or null when it carries none. */
 function modelLevel(frame: unknown): string | null {
@@ -342,7 +349,7 @@ class RpcWorker implements OmpWorker {
 			if (response.id !== run.requestId) throw new Error("OMP prompt acknowledgement did not contain the expected request ID");
 			this.#streaming = true;
 			const data = response.data;
-			if (isRecord(data) && data.agentInvoked === false) this.#settlePrompt(run);
+			if (isRecord(data) && data.agentInvoked === false) this.#completeLocalCommand(run);
 			await run.completion;
 		} catch (error) {
 			this.#rejectPrompt(run, asError(error, "OMP prompt failed"));
@@ -570,7 +577,11 @@ class RpcWorker implements OmpWorker {
 			return;
 		}
 		if (frame.type === "prompt_result" && frame.agentInvoked === false) {
-			this.#settlePrompt(active);
+			// A late or replayed `prompt_result` belongs to the run it names: only an absent id
+			// is the legacy shape that may settle any active run; any carried id — string
+			// mismatch or non-string junk like null/number — is not this run's completion.
+			if (frame.id !== undefined && frame.id !== active.requestId) return;
+			this.#completeLocalCommand(active);
 			return;
 		}
 		this.#emitWorkerEvent(active, frame);
@@ -596,7 +607,11 @@ class RpcWorker implements OmpWorker {
 
 	#handleUiRequest(frame: RpcFrame): void {
 		const method = typeof frame.method === "string" ? frame.method : "unknown";
-		if (PASSIVE_UI_METHODS.has(method)) return;
+		if (method === "notify") {
+			this.#handleNotice(frame);
+			return;
+		}
+		if (PASSIVE_UI_METHODS[method] === true) return;
 		try {
 			if (typeof frame.id === "string" && !this.#closed) this.#writeFrame({ type: "extension_ui_response", id: frame.id, cancelled: true });
 		} catch {
@@ -605,6 +620,24 @@ class RpcWorker implements OmpWorker {
 		const active = this.#activePrompt;
 		if (active) this.#rejectPrompt(active, describeUiFailure(method));
 		void this.stop();
+	}
+
+	/**
+	 * Upstream `notify` requests surface as notice events on the run they arrived in. Only an
+	 * active, unsettled prompt receives them: startup and post-settlement broadcasts are
+	 * ignored, while the HUD's duplicate re-broadcasts ride through for the service stream to
+	 * dedup by message id. A callback failure rejects the prompt exactly as in
+	 * #emitWorkerEvent — the error must never escape into the stdout handler.
+	 */
+	#handleNotice(frame: RpcFrame): void {
+		const active = this.#activePrompt;
+		if (!active || active.settled) return;
+		try {
+			const event = noticeEventFromFrame(frame);
+			if (event) active.onEvent(event);
+		} catch (error) {
+			this.#rejectPrompt(active, asError(error, "OMP event callback failed"));
+		}
 	}
 
 	#handleHostToolCall(frame: RpcFrame): void {
@@ -778,6 +811,23 @@ class RpcWorker implements OmpWorker {
 		run.settled = true;
 		this.#streaming = false;
 		run.resolve();
+	}
+
+	/**
+	 * A run that finished without generation (agentInvoked:false) announces its local
+	 * completion once, immediately before settling; a replayed completion on a settled run
+	 * emits nothing. The callback failure path matches #emitWorkerEvent: reject the prompt
+	 * instead of letting the error escape into the stdout handler.
+	 */
+	#completeLocalCommand(run: PromptRun): void {
+		if (run.settled) return;
+		try {
+			run.onEvent({ type: "local_command" });
+		} catch (error) {
+			this.#rejectPrompt(run, asError(error, "OMP event callback failed"));
+			return;
+		}
+		this.#settlePrompt(run);
 	}
 
 	#rejectPrompt(run: PromptRun, error: Error): void {

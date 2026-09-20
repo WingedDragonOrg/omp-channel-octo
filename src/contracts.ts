@@ -353,7 +353,30 @@ export interface SteerConsumedEvent {
   atMs: number;
 }
 
-export type WorkerEvent = TextEvent | ExecutionEvent | SteerConsumedEvent;
+/**
+ * The run completed without generation: OMP answered a prompt locally (the prompt ack or a
+ * `prompt_result` carries `agentInvoked: false`), so no assistant turn ever existed. Emitted
+ * once, immediately before the run settles; a completion replay after settlement is ignored.
+ */
+export interface LocalCommandEvent {
+  type: "local_command";
+}
+
+/**
+ * One upstream `notify` UI notification surfaced during a run (e.g. the /autoresearch
+ * extension's local-only updates). `messageId` preserves the upstream frame id as validated
+ * (nonempty, control-free, at most 200 UTF-16 code units); `text` is the sanitized,
+ * bounded message. `level` follows the upstream severity, unknown or missing levels
+ * falling back to `info`.
+ */
+export interface WorkerNoticeEvent {
+  type: "notice";
+  messageId: string;
+  text: string;
+  level: "info" | "warning" | "error";
+}
+
+export type WorkerEvent = TextEvent | ExecutionEvent | SteerConsumedEvent | WorkerNoticeEvent | LocalCommandEvent;
 
 export interface WorkerProcess {
   pid: number;

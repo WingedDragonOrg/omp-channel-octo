@@ -1,6 +1,17 @@
 import { expect, test, vi } from "bun:test";
-import type { ChatTarget, OmpWorker, ProgressCard, SendReceipt, WorkerOptions } from "../src/contracts";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type {
+  ChatTarget,
+  OmpWorker,
+  ProgressCard,
+  SendReceipt,
+  WorkerNoticeEvent,
+  WorkerOptions,
+} from "../src/contracts";
 import { OctoError } from "../src/octo/error";
+import { openChannelStore } from "../src/store";
 import {
   assistantText,
   closeCoreHarness,
@@ -15,6 +26,16 @@ import {
 const flushMicrotasks = async (): Promise<void> => {
   for (let step = 0; step < 8; step += 1) await Promise.resolve();
 };
+
+/**
+ * One extension notice frame as `WorkerNoticeEvent` carries it (e.g. `/autoresearch` enable /
+ * off / dirty-worktree refusal): the chat renders these, but they are not turn output.
+ */
+const noticeEvent = (
+  messageId: string,
+  text: string,
+  level: "info" | "warning" | "error",
+): WorkerNoticeEvent => ({ type: "notice", messageId, text, level });
 
 type TypingCall = {
   target: ChatTarget;
@@ -1075,6 +1096,216 @@ test("an aborted running card edit still submits the terminal card state", async
   } finally {
     releaseWorker();
     vi.useRealTimers();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a notice-only command outcome is delivered to the chat without assistant output or a progress card", async () => {
+  const transport = new PresentationTransport();
+  const noticeText =
+    "Worktree is dirty (src/index.ts). Commit or stash these changes before starting autoresearch — a fresh autoresearch/* branch needs a clean baseline.";
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ emit }) => {
+      // Mirrors `/autoresearch` on a dirty worktree: the extension notifies and settles
+      // with agentInvoked:false — no turn frames, no assistant text.
+      emit(noticeEvent("autoresearch-notify-dirty", noticeText, "error"));
+    },
+  });
+  const task = inbound({
+    messageId: "notice-only-dirty",
+    channelId: "dm-notice-only-dirty",
+    text: "/autoresearch",
+  });
+  try {
+    try {
+      await harness.service.handleInbound(task);
+      await waitForStatus(
+        harness.service,
+        task,
+        (status) => status.state === "completed" && status.outbox === 0,
+      );
+
+      const delivered = transport.listRemoteText(task);
+      expect(delivered).toHaveLength(1);
+      const noticeMessage = delivered[0]!;
+      expect(noticeMessage.text).toContain(noticeText);
+      // An error notice must be visibly more than its bare body: the severity rides along.
+      expect(noticeMessage.text).not.toBe(noticeText);
+      // Nothing ran: a notice-only outcome may not open a progress card.
+      expect(transport.progressCardSends).toHaveLength(0);
+    } finally {
+      await closeCoreHarness(harness, { remove: false });
+    }
+
+    const store = await openChannelStore(join(harness.root, "state"));
+    try {
+      const record = store.getLatestTask(harness.bot.uid, task);
+      expect(record?.state).toBe("completed");
+      // A notice is presentation, not turn output: the task result stays empty.
+      expect(record?.resultText).toBeNull();
+    } finally {
+      store.close();
+    }
+  } finally {
+    await rm(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("assistant text and repeated notices stay separate messages and a replayed notice id is not duplicated", async () => {
+  const transport = new PresentationTransport();
+  const firstBody = "first assistant segment\nsecond assistant segment";
+  const secondBody = "second assistant message closes the turn";
+  const noticeText = "Autoresearch enabled—describe what to optimize in your next message.";
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ emit }) => {
+      emit({ type: "turn_start", turnId: "notice-mixed-turn", atMs: 1 });
+      emit(assistantText("assistant-first", "first assistant segment", false));
+      emit(noticeEvent("autoresearch-notify-enabled", noticeText, "info"));
+      emit(assistantText("assistant-first", firstBody, true));
+      // The stream may replay the same notify frame id; the chat still shows one message.
+      emit(noticeEvent("autoresearch-notify-enabled", noticeText, "info"));
+      emit(assistantText("assistant-second", secondBody, true));
+      emit({ type: "turn_end", turnId: "notice-mixed-turn", atMs: 2 });
+    },
+  });
+  const task = inbound({
+    messageId: "notice-interleaved",
+    channelId: "dm-notice-interleaved",
+    text: "/autoresearch tune autoresearch.sh",
+  });
+  try {
+    try {
+      await harness.service.handleInbound(task);
+      await waitForStatus(
+        harness.service,
+        task,
+        (status) => status.state === "completed" && status.outbox === 0,
+      );
+
+      const delivered = transport.listRemoteText(task);
+      expect(delivered).toHaveLength(3);
+      const noticeMessages = delivered.filter(({ text }) => text.includes(noticeText));
+      expect(noticeMessages).toHaveLength(1);
+      const noticeMessage = noticeMessages[0]!;
+      expect(noticeMessage.text.indexOf(noticeText)).toBe(noticeMessage.text.lastIndexOf(noticeText));
+      expect(delivered.some(({ text }) => text === firstBody)).toBe(true);
+      expect(delivered.some(({ text }) => text === secondBody)).toBe(true);
+    } finally {
+      await closeCoreHarness(harness, { remove: false });
+    }
+
+    const store = await openChannelStore(join(harness.root, "state"));
+    try {
+      const record = store.getLatestTask(harness.bot.uid, task);
+      // Notices stay out of the assistant result even when interleaved with real output.
+      expect(record?.resultText).toBe(`${firstBody}\n\n${secondBody}`);
+    } finally {
+      store.close();
+    }
+  } finally {
+    await rm(harness.root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("a notice pending in the outbox survives a service restart without rerunning the task", async () => {
+  const bot = { uid: "bot-notice-restart", name: "Notice Bot" };
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-notice-restart-")));
+  const noticeText = "Autoresearch mode disabled";
+  const message = inbound({
+    messageId: "notice-restart",
+    channelId: "dm-notice-restart",
+    text: "/autoresearch off",
+  });
+  try {
+    const offline = new FakeTransport({ bot, online: false, startOnline: false });
+    const first = await createCoreHarness({
+      root,
+      bot,
+      transport: offline,
+      prompt: async ({ emit }) => {
+        // `/autoresearch off` is local-only: one notify frame, no agent turn.
+        emit(noticeEvent("autoresearch-notify-disabled", noticeText, "info"));
+      },
+    });
+    try {
+      await first.service.handleInbound(message);
+      await first.workers.waitForPromptCount(1);
+      const stalled = await waitForStatus(
+        first.service,
+        message,
+        (status) => status.state === "completed",
+      );
+      // The offline transport keeps the notice parked in the durable outbox.
+      expect(stalled.outbox).toBeGreaterThan(0);
+    } finally {
+      await closeCoreHarness(first, { remove: false });
+    }
+
+    const online = new FakeTransport({ bot });
+    const second = await createCoreHarness({ root, bot, transport: online });
+    try {
+      await waitForStatus(second.service, message, (status) => status.outbox === 0);
+      expect(
+        online.listRemoteText(message).filter(({ text }) => text.includes(noticeText)),
+      ).toHaveLength(1);
+      // Recovery replays the outbox row it found; it never respawns the settled run.
+      expect(second.workers.prompts).toHaveLength(0);
+    } finally {
+      await closeCoreHarness(second);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a notice arriving after /interrupt is delivered without flipping the turn to completed", async () => {
+  const transport = new PresentationTransport();
+  const noticeText = "Autoresearch mode disabled";
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ emit, waitForAbort }) => {
+      emit({ type: "turn_start", turnId: "notice-abort-turn", atMs: 1 });
+      await waitForAbort();
+      // A notify frame that lands while the turn winds down is information, not work.
+      emit(noticeEvent("autoresearch-notify-abort", noticeText, "info"));
+      emit({ type: "turn_end", turnId: "notice-abort-turn", atMs: 2 });
+    },
+  });
+  const task = inbound({
+    messageId: "notice-abort-task",
+    channelId: "dm-notice-abort",
+    text: "hold the turn",
+  });
+  try {
+    await harness.service.handleInbound(task);
+    await harness.workers.waitForPromptCount(1);
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "notice-abort-command",
+        channelId: task.channelId,
+        channelType: task.channelType,
+        text: "/interrupt",
+      }),
+    );
+    const settled = await waitForStatus(
+      harness.service,
+      task,
+      (status) => status.state === "interrupted" || status.state === "completed",
+    );
+    expect(settled.state).toBe("interrupted");
+    // Informational UI still reaches the chat as its own message.
+    await transport.waitForRemoteText(
+      (message) =>
+        message.target.channelType === task.channelType
+        && message.target.channelId === task.channelId
+        && message.text.includes(noticeText),
+    );
+    expect(
+      transport.listRemoteText(task).filter(({ text }) => text.includes(noticeText)),
+    ).toHaveLength(1);
+  } finally {
     await closeCoreHarness(harness);
   }
 });

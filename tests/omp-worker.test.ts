@@ -203,6 +203,18 @@ function resultTextFromCommand(command: unknown): string {
 		: String(result);
 }
 
+function hasLoneSurrogate(text: string): boolean {
+	for (let index = 0; index < text.length; index++) {
+		const code = text.charCodeAt(index);
+		if (code >= 0xd800 && code <= 0xdbff) {
+			const next = text.charCodeAt(index + 1);
+			if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+			index++;
+		} else if (code >= 0xdc00 && code <= 0xdfff) return true;
+	}
+	return false;
+}
+
 describe("OMP RPC worker", () => {
 	test("starts a real child with enforced RPC/yolo/cwd flags and reads state after ready", async () => {
 		await withHarness("normal", async harness => {
@@ -462,11 +474,149 @@ describe("OMP RPC worker", () => {
 		});
 	});
 
-	test("completes a local-only prompt from agentInvoked false without agent events", async () => {
+	test("completes a local-only prompt from the ack's agentInvoked false with one local command event", async () => {
 		await withHarness("local", async harness => {
 			const events: WorkerEvent[] = [];
 			await harness.worker.prompt("/help", event => events.push(event));
-			expect(events).toEqual([]);
+			// The ack settles the run; the fixture's same-id prompt_result replay 1ms later is a
+			// completion replay on a settled run and must not open a second local command.
+			expect(events.filter(event => event.type === "local_command")).toEqual([{ type: "local_command" }]);
+			expect(events).toHaveLength(1);
+		});
+	});
+
+	test("surfaces /autoresearch notify frames as levelled worker notice events with preserved ids", async () => {
+		await withHarness("autoresearch", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("/autoresearch", event => events.push(event));
+			const enabledText = "Autoresearch enabled—describe what to optimize in your next message.";
+			expect(events.filter(event => event.type === "notice")).toEqual([
+				{ type: "notice", messageId: "fixture-autoresearch-notify-enabled", text: enabledText, level: "info" },
+				{
+					type: "notice",
+					messageId: "fixture-autoresearch-notify-warn-1",
+					text: "Autoresearch worktree is dirty — commit or stash these changes first.",
+					level: "warning",
+				},
+				{
+					type: "notice",
+					messageId: "fixture-autoresearch-notify-error-1",
+					text: "Autoresearch run failed — offline score regressed, baseline kept.",
+					level: "error",
+				},
+				{ type: "notice", messageId: "fixture-autoresearch-notify-plain", text: "Autoresearch heartbeat is still running.", level: "info" },
+				{
+					type: "notice",
+					messageId: "fixture-autoresearch-notify-odd-level",
+					text: "Autoresearch level tokens are advisory only.",
+					level: "info",
+				},
+				{
+					type: "notice",
+					messageId: "fixture-autoresearch-notify-padded",
+					text: "Autoresearch pads this notice with whitespace.",
+					level: "info",
+				},
+				{
+					type: "notice",
+					messageId: "fixture-autoresearch-notify-multiline",
+					text: "Autoresearch step one done.\nStep two pending.\tQueued at 09:00.",
+					level: "info",
+				},
+				{
+					type: "notice",
+					messageId: "n".repeat(200),
+					text: "the 200-unit id boundary stays usable",
+					level: "info",
+				},
+				// The HUD re-broadcast surfaces again with the same id; the service stream
+				// dedup, not the worker, collapses the duplicate downstream.
+				{ type: "notice", messageId: "fixture-autoresearch-notify-enabled", text: enabledText, level: "info" },
+			]);
+			// A local-only command produces notices only: no assistant text joins the stream.
+			expect(events.filter(event => event.type === "text")).toEqual([]);
+			// The id-carrying prompt_result is the second real local completion path; it counts
+			// the run once exactly.
+			expect(events.filter(event => event.type === "local_command")).toEqual([{ type: "local_command" }]);
+			expect(events).toHaveLength(10);
+		});
+	});
+
+	test("ignores startup and post-settlement notifications and keeps them out of the next prompt", async () => {
+		await withHarness("autoresearch", async harness => {
+			const firstEvents: WorkerEvent[] = [];
+			await harness.worker.prompt("/autoresearch", event => firstEvents.push(event));
+			// Wait until the fixture's post-settlement re-broadcast has been offered to the host.
+			await waitUntil(async () =>
+				(await readLog(harness.logPath)).some(entry => entry.kind === "turn_complete" && entry.notifyTurn === true),
+			);
+			const firstNotices = firstEvents.filter(event => event.type === "notice");
+			expect(firstNotices.length).toBeGreaterThan(0);
+			expect(firstNotices.some(notice => notice.messageId === "fixture-autoresearch-notify-startup-1")).toBe(false);
+			expect(firstNotices.some(notice => notice.messageId === "fixture-autoresearch-notify-late-1")).toBe(false);
+			expect(firstEvents.filter(event => event.type === "local_command")).toHaveLength(1);
+
+			const secondEvents: WorkerEvent[] = [];
+			await harness.worker.prompt("run normally", event => secondEvents.push(event));
+			expect(secondEvents.filter(event => event.type === "notice")).toEqual([]);
+			// A real generation turn is not a local command and must not inherit one.
+			expect(secondEvents.filter(event => event.type === "local_command")).toEqual([]);
+			expect(secondEvents.filter(event => event.type === "text").map(event => ({ text: event.text, final: event.final }))).toEqual([
+				{ text: "fixture completed", final: false },
+				{ text: "fixture completed", final: true },
+			]);
+			// Re-broadcasts after settlement never reopen the settled run either.
+			expect(firstEvents.filter(event => event.type === "notice")).toEqual(firstNotices);
+		});
+	});
+
+	test("bounds an oversized unicode notification without split surrogates or control characters", async () => {
+		await withHarness("autoresearch", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("/autoresearch huge", event => events.push(event));
+			const notices = events.filter(event => event.type === "notice");
+			expect(notices).toHaveLength(1);
+			const notice = notices[0]!;
+			expect(notice.messageId).toBe("fixture-autoresearch-notify-huge-1");
+			expect(notice.level).toBe("warning");
+			// The bounded contract: at most 4,000 UTF-16 code units of sanitized text.
+			expect(notice.text.length).toBeLessThanOrEqual(4_000);
+			expect(hasLoneSurrogate(notice.text)).toBe(false);
+			// C0 controls other than \n \r \t, and DEL, are stripped before delivery.
+			expect(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(notice.text)).toBe(false);
+			expect(notice.text.startsWith("alphabravocharliedelta")).toBe(true);
+			expect(notice.text.includes("字")).toBe(true);
+			// The only other event on this local-only run is its local completion.
+			expect(events.filter(event => event.type === "local_command")).toEqual([{ type: "local_command" }]);
+			expect(events).toHaveLength(2);
+		});
+	});
+
+	test("a stale prompt_result replay cannot terminate the next goal prompt", async () => {
+		await withHarness("autoresearch", async harness => {
+			const quietEvents: WorkerEvent[] = [];
+			await harness.worker.prompt("/autoresearch quiet", event => quietEvents.push(event));
+
+			const goalEvents: WorkerEvent[] = [];
+			await harness.worker.prompt("run goal", event => goalEvents.push(event));
+			// The finished local run's prompt_result replayed mid-goal is stale: it must not
+			// settle the new prompt, whose own agent turn still completes it.
+			expect(goalEvents.filter(event => event.type === "text").map(event => ({ text: event.text, final: event.final }))).toEqual([
+				{ text: "fixture completed", final: false },
+				{ text: "fixture completed", final: true },
+			]);
+			// A generation turn carries no notification and no local completion of its own.
+			expect(goalEvents.filter(event => event.type === "notice")).toEqual([]);
+			expect(goalEvents.filter(event => event.type === "local_command")).toEqual([]);
+		});
+	});
+
+	test("accepts a legacy prompt_result without a request id as the local completion", async () => {
+		await withHarness("autoresearch", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("/autoresearch legacy", event => events.push(event));
+			expect(events.filter(event => event.type === "local_command")).toEqual([{ type: "local_command" }]);
+			expect(events).toHaveLength(1);
 		});
 	});
 

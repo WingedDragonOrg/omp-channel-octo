@@ -1,7 +1,15 @@
 import { expect, test } from "bun:test";
+import type { LocalCommandEvent } from "../src/contracts";
 import {
+  contextSidecarPath,
+  readContextSidecar,
+  writeContextSidecarFile,
+} from "../src/context-sidecar";
+import {
+  assistantText,
   closeCoreHarness,
   createCoreHarness,
+  FakeWorkerFactory,
   inbound,
   waitForStatus,
   type CoreHarness,
@@ -22,6 +30,26 @@ function contextInjection(
 ): ContextInjection | undefined {
   return (prompt?.promptContext as { contextInjection?: ContextInjection } | undefined)
     ?.contextInjection;
+}
+
+/**
+ * One no-agent local command completion as `LocalCommandEvent` carries it: the command
+ * (e.g. `/autoresearch` enable/off/clear) ran inside OMP without an agent turn, so this
+ * prompt produces no group-context prepared receipt.
+ */
+const localCommandEvent = (): LocalCommandEvent => ({ type: "local_command" });
+
+/**
+ * Simulates a worker whose prompted turn never honored the shared-context injection: the
+ * fixture worker writes the prepared receipt for every injected prompt, so the test removes
+ * exactly the receipt from the sidecar through the same sidecar API the service uses — no
+ * production toggle.
+ */
+async function scrubPreparedReceipt(sidecarRoot: string, sessionId: string): Promise<void> {
+  const path = contextSidecarPath(sidecarRoot, sessionId);
+  const sidecar = await readContextSidecar(path);
+  const { prepared: _prepared, ...stripped } = sidecar;
+  await writeContextSidecarFile(path, stripped);
 }
 
 test("injects the complete group snapshot only on the first and changed-version turns", async () => {
@@ -267,6 +295,112 @@ test("a group-context read failure fails the task before any worker prompt", asy
     expect(status.state).toBe("failed");
     expect(harness.workers.prompts).toHaveLength(0);
     expect(harness.transport.sent.some(({ text }) => /失败|说明|读取/.test(text))).toBe(true);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a local-only command completes without a prepared receipt and leaves the context ledger for the next model turn", async () => {
+  const workers = new FakeWorkerFactory(async ({ emit, sessionId, text }) => {
+    const scopeRoot = workers.prompts.at(-1)?.sidecarRoot;
+    if (text === "/autoresearch") {
+      // Upstream no-agent completion (`prompt_result agentInvoked:false`): the local command
+      // never drove an agent turn, so no prepared receipt exists for this prompt.
+      emit(localCommandEvent());
+      if (scopeRoot) await scrubPreparedReceipt(scopeRoot, sessionId);
+      return;
+    }
+    emit({ type: "turn_start", turnId: "model-turn", atMs: 1 });
+    emit(assistantText("assistant-model-turn", "model body", true));
+    emit({ type: "turn_end", turnId: "model-turn", atMs: 2 });
+  });
+  const harness = await createCoreHarness({ workers });
+  try {
+    const group = { channelId: "group-a", channelType: 2 as const };
+    harness.transport.setGroupContext(group, {
+      content: "shared group instructions",
+      version: 2,
+      updatedAt: "2026-09-20T00:00:00.000Z",
+      updatedBy: "admin",
+    });
+
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "local-only-autoresearch",
+        ...group,
+        text: "/autoresearch",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await workers.waitForPromptCount(1);
+    const localStatus = await waitForStatus(
+      harness.service,
+      group,
+      (status) => status.state === "completed" || status.state === "failed",
+    );
+    expect(localStatus.state).toBe("completed");
+    expect(contextInjection(workers.prompts[0])?.injectionDecision).toBe("initial");
+
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "after-local-only",
+        ...group,
+        text: "model turn after local command",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await workers.waitForPromptCount(2);
+    const modelStatus = await waitForStatus(
+      harness.service,
+      group,
+      (status) => status.state === "completed" || status.state === "failed",
+    );
+    expect(modelStatus.state).toBe("completed");
+
+    // The local-only prompt must not commit the ledger: the next generation still sees the
+    // first injection of this version and commits it with its own real receipt.
+    expect(contextInjection(workers.prompts[1])?.injectionDecision).toBe("initial");
+    expect(contextInjection(workers.prompts[1])?.snapshot?.version).toBe(2);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a model turn that produced real events still requires its own prepared receipt", async () => {
+  const workers = new FakeWorkerFactory(async ({ emit, sessionId }) => {
+    const scopeRoot = workers.prompts.at(-1)?.sidecarRoot;
+    // A genuine agent turn must own the receipt; scrubbing means this worker never honored it.
+    if (scopeRoot) await scrubPreparedReceipt(scopeRoot, sessionId);
+    emit({ type: "turn_start", turnId: "receipt-required-turn", atMs: 1 });
+    emit(assistantText("assistant-receipt-required", "model body", true));
+    emit({ type: "turn_end", turnId: "receipt-required-turn", atMs: 2 });
+  });
+  const harness = await createCoreHarness({ workers });
+  try {
+    const group = { channelId: "group-b", channelType: 2 as const };
+    harness.transport.setGroupContext(group, {
+      content: "shared instructions",
+      version: 4,
+      updatedAt: "2026-09-20T00:00:00.000Z",
+      updatedBy: "admin",
+    });
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "receipt-required-model-turn",
+        ...group,
+        text: "model turn with ignored receipt",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await workers.waitForPromptCount(1);
+    const status = await waitForStatus(
+      harness.service,
+      group,
+      (next) => next.state === "completed" || next.state === "failed",
+    );
+    expect(status.state).toBe("failed");
+    // The failure is the receipt guard, not an injection-less prompt.
+    expect(contextInjection(workers.prompts[0])?.injectionDecision).toBe("initial");
   } finally {
     await closeCoreHarness(harness);
   }

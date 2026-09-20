@@ -3,7 +3,7 @@
  * 运行里的 assistant 消息身份、工具摘要与 todo 明细。这里不写协议,也不做卡片布局。
  */
 
-import type { WorkerEvent } from "../contracts.ts";
+import type { WorkerEvent, WorkerNoticeEvent } from "../contracts.ts";
 import type { ExecutionEvent, ExecutionTodoPhase, TodoOperation, TodoStatus } from "../execution-tracker.ts";
 import { isRecord, type RpcFrame } from "./rpc.ts";
 
@@ -397,6 +397,50 @@ export function subagentProgressEvent(payload: unknown, atMs: number): SubagentP
 		...(currentTool === undefined ? {} : { currentTool }),
 		...(toolCount === undefined ? {} : { toolCount }),
 	};
+}
+
+/**
+ * Upstream `extension_ui_request` notifications (method `notify`, e.g. the /autoresearch
+ * extension's updates) translated to the bounded WorkerNoticeEvent contract. The upstream
+ * frame id is untrusted input: nonempty, control-free and at most NOTICE_ID_CHARS UTF-16
+ * code units — anything wider is dropped, never truncated, because an id is a dedup key
+ * downstream, and mutating it would merge distinct notifications.
+ */
+export const NOTICE_ID_CHARS = 200;
+/**
+ * Bounded message budget: at most 4,000 UTF-16 code units after sanitizing, ellipsis
+ * included. The service outbox chunks this further for delivery; the worker bound is what
+ * keeps one hostile notification from growing a run's event log without limit.
+ */
+export const NOTICE_TEXT_CHARS = 4_000;
+
+/** Controls a notification id must never carry: C0 plus DEL. */
+const NOTICE_FORBIDDEN_ID_CHARS = /[\x00-\x1F\x7F]/u;
+
+/** Controls stripped from the message body: C0 other than \n \r \t, plus DEL. */
+const NOTICE_STRIPPED_TEXT_CHARS = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/gu;
+
+/** Sanitized-body bound with a one-unit ellipsis, cut back to a surrogate-pair boundary. */
+function truncateNoticeText(text: string): string {
+	if (text.length <= NOTICE_TEXT_CHARS) return text;
+	const end = NOTICE_TEXT_CHARS - 1;
+	const last = text.charCodeAt(end - 1);
+	const boundary = last >= 0xd800 && last <= 0xdbff ? end - 1 : end;
+	return `${text.slice(0, boundary)}…`;
+}
+
+/**
+ * One notify frame as a WorkerNoticeEvent, or undefined when the id is invalid or the
+ * message is missing, non-string or blank. An unknown or absent `notifyType` is `info`.
+ */
+export function noticeEventFromFrame(frame: RpcFrame): WorkerNoticeEvent | undefined {
+	if (typeof frame.id !== "string" || frame.id.length === 0 || frame.id.length > NOTICE_ID_CHARS) return undefined;
+	if (NOTICE_FORBIDDEN_ID_CHARS.test(frame.id)) return undefined;
+	if (typeof frame.message !== "string") return undefined;
+	const text = frame.message.replace(NOTICE_STRIPPED_TEXT_CHARS, "").trim();
+	if (text.length === 0) return undefined;
+	const level = frame.notifyType === "warning" || frame.notifyType === "error" ? frame.notifyType : "info";
+	return { type: "notice", messageId: frame.id, text: truncateNoticeText(text), level };
 }
 
 export function describeUiFailure(method: string): Error {

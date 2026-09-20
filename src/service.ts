@@ -2901,6 +2901,12 @@ class CoreService implements ChannelService {
     let contextInjection: ContextInjection | undefined;
     let currentContextSidecarPath: string | undefined;
     let contextNeedsCommit = false;
+    /**
+     * 本地命令回合（如 `/autoresearch` 的开关/清理）：无 agent 生成，OMP 不会写群说明
+     * prepared receipt。置位后本回合跳过 context commit，但 sidecar 照常清理、ledger 保持
+     * pending，下一个真实生成回合仍以 initial 注入并用真实 receipt 提交。
+     */
+    let localOnly = false;
     let startupPhase: TaskStartupPhase = "context";
 
     const trackActivity = (operation: Promise<void>): void => {
@@ -3267,6 +3273,30 @@ class CoreService implements ChannelService {
       };
       const onEvent = (event: WorkerEvent): void => {
         if (runtime.cancelRequested || this.stopping) return;
+        if (event.type === "notice") {
+          // 扩展的通知帧（如 /autoresearch 的 enable/off/拒绝原因）是信息性 UI：原样投递到
+          // 对应会话、带上级别标签，但它不是回合产出——不进 assistantTexts/resultText、不开
+          // 进度卡，也绝不能改 workAfterStop，让 /interrupt 的归因保持诚实。
+          if (event.messageId.trim().length === 0 || event.text.length === 0) return;
+          const label = event.level === "error"
+            ? "OMP 错误："
+            : event.level === "warning"
+              ? "OMP 警告："
+              : "OMP：";
+          this.outbox.enqueueStreamText(target, task.id, {
+            type: "text",
+            messageId: `notice:${event.messageId}`,
+            text: `${label}${event.text}`,
+            final: true,
+          });
+          return;
+        }
+        if (event.type === "local_command") {
+          // no-agent 完成帧：标记本回合不产生 prepared receipt，commit 门限据此豁免；同样
+          // 在 workAfterStop 之前返回，既不算工作产出也不触发进度。
+          localOnly = true;
+          return;
+        }
         if (runtime.stopCause !== null && event.type !== "turn_end" && event.type !== "run_end") {
           runtime.workAfterStop = true;
         }
@@ -3307,7 +3337,7 @@ class CoreService implements ChannelService {
         );
         finishProgress("cancelled");
       } else {
-        if (contextNeedsCommit) {
+        if (contextNeedsCommit && !localOnly) {
           const sidecarPath = currentContextSidecarPath;
           const injection = contextInjection;
           if (!sidecarPath || !injection) {

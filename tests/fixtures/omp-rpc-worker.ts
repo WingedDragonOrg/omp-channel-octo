@@ -43,6 +43,7 @@ type Scenario =
 	| "host-stop"
 	| "subagent-events"
 	| "no-subagent-subscription"
+	| "autoresearch"
 	| "no-models";
 
 const argv = process.argv.slice(2);
@@ -266,6 +267,11 @@ type HostToolRegistration = {
 const hostTools = new Map<string, HostToolRegistration>();
 let pendingHostToolRequestId: string | undefined;
 let streaming = false;
+/**
+ * Id of the last completed local-only run, remembered so a later prompt can replay its
+ * `prompt_result` as a stale frame; consumed (and cleared) by the next "run goal" prompt.
+ */
+let staleReplayId: string | undefined;
 /** Subagent subscription level the fixture last accepted; lifecycle frames follow it. */
 let subagentSubscription = "off";
 function persistSessionHeader(): void {
@@ -304,6 +310,18 @@ emit({
 	maxFrameBytes: 1024 * 1024,
 	maxReassembledFrameBytes: 64 * 1024 * 1024,
 });
+
+if (scenario === "autoresearch") {
+	// An extension re-attaching during startup can broadcast before any prompt exists;
+	// with no active run, these frames must never surface as worker events.
+	emit({
+		type: "extension_ui_request",
+		id: "fixture-autoresearch-notify-startup-1",
+		method: "notify",
+		message: "Autoresearch re-attached during startup.",
+		notifyType: "info",
+	});
+}
 
 async function spawnDescendantIfRequested(): Promise<void> {
 	if (!marker || descendantPid !== undefined) return;
@@ -778,6 +796,92 @@ function completeHostToolTurn(command: Frame): void {
 	emit({ type: "agent_end", messages: [message], willContinue: false });
 }
 
+/**
+ * Mirrors the upstream autoresearch extension's `ctx.ui.notify` calls: `extension_ui_request`
+ * frames with method `notify` carrying `message` and `notifyType` (same shape as the frozen
+ * capability fixture in tests/fixtures/autoresearch-rpc-worker.ts, which cannot grow new
+ * rows). The batch deliberately mixes every level, an unlabeled and an unknown level so they
+ * default, a whitespace-padded and a control-laden multiline message so sanitizing is visible,
+ * and malformed ids/messages plus passive widgets that must all be ignored.
+ */
+function autoresearchNotifyFrames(): Frame[] {
+	const enabled = "Autoresearch enabled—describe what to optimize in your next message.";
+	return [
+		{ type: "extension_ui_request", id: "fixture-autoresearch-notify-enabled", method: "notify", message: enabled, notifyType: "info" },
+		{ type: "extension_ui_request", id: "fixture-autoresearch-notify-warn-1", method: "notify", message: "Autoresearch worktree is dirty — commit or stash these changes first.", notifyType: "warning" },
+		{ type: "extension_ui_request", id: "fixture-autoresearch-notify-error-1", method: "notify", message: "Autoresearch run failed — offline score regressed, baseline kept.", notifyType: "error" },
+		{ type: "extension_ui_request", id: "fixture-autoresearch-notify-plain", method: "notify", message: "Autoresearch heartbeat is still running." },
+		{ type: "extension_ui_request", id: "fixture-autoresearch-notify-odd-level", method: "notify", message: "Autoresearch level tokens are advisory only.", notifyType: "shouting" },
+		{ type: "extension_ui_request", id: "fixture-autoresearch-notify-padded", method: "notify", message: "  Autoresearch pads this notice with whitespace.  ", notifyType: "info" },
+		{
+			type: "extension_ui_request",
+			id: "fixture-autoresearch-notify-multiline",
+			method: "notify",
+			message: "Autoresearch step one done.\nStep two pending.\tQueued at 09:00. \u001B",
+			notifyType: "info",
+		},
+		// A 201-unit id exceeds the bounded id contract and is dropped; its 200-unit
+		// neighbour stays valid.
+		{ type: "extension_ui_request", id: "n".repeat(201), method: "notify", message: "overlong ids are dropped", notifyType: "info" },
+		{ type: "extension_ui_request", id: "n".repeat(200), method: "notify", message: "the 200-unit id boundary stays usable", notifyType: "info" },
+		{ type: "extension_ui_request", id: "", method: "notify", message: "an empty id is dropped", notifyType: "info" },
+		{ type: "extension_ui_request", id: "fixture-autoresearch-\u0007-bell", method: "notify", message: "an id with control characters is dropped", notifyType: "info" },
+		{ type: "extension_ui_request", id: "fixture-autoresearch-notify-missing-message", method: "notify", notifyType: "info" },
+		{ type: "extension_ui_request", id: "fixture-autoresearch-notify-numeric-message", method: "notify", message: 42, notifyType: "info" },
+		{ type: "extension_ui_request", id: "fixture-autoresearch-notify-blank-message", method: "notify", message: " \n\t ", notifyType: "info" },
+		// Upstream re-broadcasts the same notification id when its HUD re-attaches; the
+		// worker forwards both occurrences and the service stream dedups by message id.
+		{ type: "extension_ui_request", id: "fixture-autoresearch-notify-enabled", method: "notify", message: enabled, notifyType: "info" },
+		// Widgets and status lines share the delivery channel but stay passive.
+		{ type: "extension_ui_request", id: "fixture-autoresearch-widget-1", method: "setWidget", widget: "autoresearch", content: "autoresearch running" },
+		{ type: "extension_ui_request", id: "fixture-autoresearch-status-1", method: "setStatus", text: "autoresearch running" },
+	];
+}
+
+function emitAutoresearchNotifyTurn(id: string | undefined): void {
+	writeFrames(autoresearchNotifyFrames());
+	emit({ type: "prompt_result", id, agentInvoked: false });
+	// A re-broadcast after settlement must not reopen the settled run or bleed into the
+	// next prompt; the log marker lets tests wait until it has been offered.
+	setTimeout(() => {
+		writeFrames([
+			{
+				type: "extension_ui_request",
+				id: "fixture-autoresearch-notify-late-1",
+				method: "notify",
+				message: "Autoresearch re-broadcast after settlement.",
+				notifyType: "info",
+			},
+		]);
+		appendLog({ kind: "turn_complete", id, notifyTurn: true });
+	}, 15);
+}
+
+/**
+ * Oversized control-laden Unicode notification. The bounded contract is 4,000 UTF-16 code
+ * units of sanitized text, so the surrogate pair straddling the naive cut position is the
+ * tripwire for implementations that slice code units blindly.
+ */
+function emitAutoresearchHugeNotifyTurn(id: string | undefined): void {
+	// NUL/ESC/DEL must be stripped, leaving 22 visible units: "alphabravocharliedelta".
+	const head = "alpha\u0000bravo\u001Bcharlie\u007Fdelta";
+	// After sanitizing, the pair occupies code units 3,998–3,999: a naive `slice(0, 3999)`
+	// would end on a lone high surrogate.
+	const filler = "字".repeat(3_998 - 22);
+	const message = ` \t${head}${filler}😀${"z".repeat(600)}`;
+	writeFrames([
+		{
+			type: "extension_ui_request",
+			id: "fixture-autoresearch-notify-huge-1",
+			method: "notify",
+			message,
+			notifyType: "warning",
+		},
+	]);
+	emit({ type: "prompt_result", id, agentInvoked: false });
+	appendLog({ kind: "turn_complete", id, notifyTurn: true, hugeLength: message.length });
+}
+
 async function handlePrompt(id: string | undefined, message: string): Promise<void> {
 	appendLog({ kind: "prompt", id, message });
 	if (message.startsWith("/switch")) {
@@ -802,6 +906,63 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		response(id, "prompt", { agentInvoked: false });
 		setTimeout(() => emit({ type: "prompt_result", id, agentInvoked: false }), 1);
 		return;
+	}
+
+	if (scenario === "autoresearch") {
+		// The extension's local-only commands: the ack goes out first, its notify frames
+		// stream afterwards, and `prompt_result agentInvoked:false` settles the run.
+		if (message === "/autoresearch") {
+			response(id, "prompt");
+			setTimeout(() => emitAutoresearchNotifyTurn(id), 15);
+			return;
+		}
+		if (message === "/autoresearch huge") {
+			response(id, "prompt");
+			setTimeout(() => emitAutoresearchHugeNotifyTurn(id), 15);
+			return;
+		}
+		if (message === "/autoresearch legacy") {
+			// Legacy OMP emits the local-only settle frame without a request id; it must still
+			// count as the run's local completion.
+			response(id, "prompt");
+			setTimeout(() => {
+				emit({ type: "prompt_result", agentInvoked: false });
+				appendLog({ kind: "turn_complete", id, legacySettle: true });
+			}, 15);
+			return;
+		}
+		if (message === "/autoresearch quiet") {
+			// A local-only completion without any notify traffic: its prompt_result carries the
+			// request id, which the next goal replays as the stale late frame.
+			staleReplayId = id;
+			response(id, "prompt");
+			setTimeout(() => {
+				emit({ type: "prompt_result", id, agentInvoked: false });
+				appendLog({ kind: "turn_complete", id, quietSettle: true });
+			}, 15);
+			return;
+		}
+		if (message === "run goal") {
+			const replayId = staleReplayId;
+			staleReplayId = undefined;
+			response(id, "prompt", { agentInvoked: true });
+			streaming = true;
+			if (replayId !== undefined) {
+				// The finished local run's `prompt_result` arrives late, mid-goal, together
+				// with junk-id variants; none names this prompt, so none may settle it.
+				setTimeout(() =>
+					emitFrames([
+						{ type: "prompt_result", id: replayId, agentInvoked: false },
+						{ type: "prompt_result", id: 42, agentInvoked: false },
+						{ type: "prompt_result", id: null, agentInvoked: false },
+					]),
+				10);
+			}
+			promptTimer = setTimeout(() => emitAgentTurn(id), 60);
+			return;
+		}
+		// Anything else takes the stock agent-turn path below; the isolation test uses it
+		// to prove earlier notifications never bleed into a later prompt.
 	}
 
 	if (scenario === "same-chunk-error") {
