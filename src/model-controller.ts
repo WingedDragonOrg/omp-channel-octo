@@ -12,6 +12,8 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { CommandCardView } from "./command-card.ts";
+import type { ConfigMenuPort } from "./command-cards.ts";
 import type {
   ChatTarget,
   InboundMessage,
@@ -21,7 +23,7 @@ import type {
   WorkerModelSwitch,
   WorkerProcess,
 } from "./contracts.ts";
-import { boundedSelectorText, formatModelCatalog, modelWithLevel } from "./model-switch.ts";
+import { boundedSelectorText, formatModelCatalog, modelCatalogCurrent, modelWithLevel, switchCardChoices } from "./model-switch.ts";
 import type { ChannelStore } from "./store.ts";
 
 const SWITCH_PROBE_FAILED_TEXT = "无法从 OMP 读取模型信息，请稍后重试。";
@@ -30,6 +32,11 @@ const SWITCH_CWD_UNAVAILABLE_TEXT = "无法解析该聊天的工作目录，/swi
 /** One bounded line for a selector OMP could not resolve. */
 function notFoundModelText(selector: string): string {
   return `未找到模型 "${boundedSelectorText(selector)}"；发送 /switch 查看可用模型列表。`;
+}
+
+/** A `/switch` failure as one bounded line: no working directory, or no usable OMP answer. */
+function switchFailureText(error: unknown): string {
+  return error instanceof SwitchDirectoryError ? SWITCH_CWD_UNAVAILABLE_TEXT : SWITCH_PROBE_FAILED_TEXT;
 }
 
 /** A `/switch` probe whose chat directory cannot be resolved; reported apart from worker failures. */
@@ -62,6 +69,11 @@ export interface ModelSwitchControllerDeps {
   readonly blockDirectory: (cwd: string) => void;
   /** Queues one text message for the chat; the command path awaits it as it always has. */
   readonly enqueueText: (target: ChatTarget, text: string, taskId: string | null) => void;
+  /**
+   * 配置卡片菜单：无参数命令把回执渲染成一张可选卡片，卡片不可用时按同一段文本回退；非空
+   * 命令让旧卡片失效并按到达顺序落地。生命周期在 `./command-cards.ts`，这里只调用窄面。
+   */
+  readonly menu: ConfigMenuPort;
 }
 
 export class ModelSwitchController {
@@ -77,65 +89,92 @@ export class ModelSwitchController {
    * command locally instead of starting an agent turn.
    */
   async handleSwitch(message: InboundMessage, argument: string): Promise<void> {
-    const botUid = this.deps.botUid();
     const requested = argument.trim();
-    const live = this.deps.liveWorker(message);
     if (requested.length === 0) {
-      let catalog: WorkerModelCatalog;
+      // 先拿到代次票据再查询：这次探测期间被更新的同类命令会让它作废，迟到的目录不得发布新卡。
+      const ticket = this.deps.menu.begin(message, "switch");
       try {
-        catalog = live
-          ? await live.models()
-          : await this.withProbeWorker(message, worker => worker.models());
-      } catch (error) {
-        await this.replySwitchFailure(message, error);
-        return;
+        const live = this.deps.liveWorker(message);
+        let catalog: WorkerModelCatalog;
+        try {
+          catalog = live
+            ? await live.models()
+            : await this.withProbeWorker(message, worker => worker.models());
+        } catch (error) {
+          if (ticket.current()) await this.deps.enqueueText(message, switchFailureText(error), null);
+          return;
+        }
+        await this.deps.menu.open(message, this.switchMenuView(message, live !== undefined, catalog), ticket);
+      } finally {
+        ticket.release();
       }
-      await this.deps.enqueueText(message, this.describeChatModel(message, live !== undefined, catalog), null);
       return;
     }
+    // 非空命令先让本聊天旧的模型卡片失效，再按到达顺序应用：卡片点击走同一段应用逻辑，
+    // 因此更慢的旧探测不会覆盖更新的选择。
+    this.deps.menu.invalidate(message, "switch");
+    const receipt = await this.deps.menu.serialize("switch", message, () => this.applySwitch(message, requested));
+    await this.deps.enqueueText(message, receipt, null);
+  }
+
+  /**
+   * Apply one `/switch` request — a selector, or `default` — and return the receipt verbatim. The
+   * text command and a card click share this path: both go through OMP's own resolution and persist
+   * the same resolved value. Every failure converges on the existing single-line Chinese text and
+   * changes no state, so a card click can never claim a switch OMP refused.
+   */
+  async applySwitch(target: ChatTarget, requested: string): Promise<string> {
+    const live = this.deps.liveWorker(target);
     if (requested.toLowerCase() === "default" && !requested.includes("/")) {
-      await this.resetChatModel(message);
-      return;
+      return await this.resetChatModel(target, live);
     }
     // A selector is a single token; catching a stray one here keeps a typo from starting a worker.
-    if (/\s/u.test(requested)) {
-      await this.deps.enqueueText(message, notFoundModelText(requested), null);
-      return;
-    }
+    if (/\s/u.test(requested)) return notFoundModelText(requested);
     let outcome: WorkerModelSwitch;
     try {
       outcome = live
         ? await live.switchModel(requested)
-        : await this.withProbeWorker(message, worker => worker.switchModel(requested));
+        : await this.withProbeWorker(target, worker => worker.switchModel(requested));
     } catch (error) {
-      await this.replySwitchFailure(message, error);
-      return;
+      return switchFailureText(error);
     }
-    if (!outcome.ok) {
-      await this.deps.enqueueText(message, notFoundModelText(requested), null);
-      return;
-    }
+    if (!outcome.ok) return notFoundModelText(requested);
     const model = modelWithLevel(outcome.model, outcome.level);
-    this.deps.store.setChatModel(botUid, message, model);
-    await this.deps.enqueueText(
-      message,
-      live === undefined
-        ? `已切换本聊天模型为 ${model}，从下一回合开始生效。`
-        : `已切换本聊天模型为 ${model}（运行中会话已同步切换）。`,
-      null,
-    );
+    this.deps.store.setChatModel(this.deps.botUid(), target, model);
+    return live === undefined
+      ? `已切换本聊天模型为 ${model}，从下一回合开始生效。`
+      : `已切换本聊天模型为 ${model}（运行中会话已同步切换）。`;
   }
 
   /**
-   * The empty `/switch` answer: the live session's model while a turn runs (that is the model in
-   * use), otherwise this chat's stored model, otherwise the model OMP would start a fresh session
-   * with — followed by every model OMP currently offers.
+   * The empty `/switch` card: the current model and the catalog exactly as the text receipt renders
+   * them — `plain` is that same text, so a deployment that cannot carry cards (or declines this
+   * frame) answers byte-for-byte as before. Choices are `default` plus the catalog's selectors.
    */
-  private describeChatModel(target: ChatTarget, running: boolean, catalog: WorkerModelCatalog): string {
+  private switchMenuView(target: ChatTarget, running: boolean, catalog: WorkerModelCatalog): CommandCardView {
+    const { current, label } = this.chatModel(target, running, catalog);
+    return {
+      kind: "switch",
+      current: modelCatalogCurrent(current, label),
+      choices: switchCardChoices(catalog.available),
+      plain: formatModelCatalog({ current, label, models: catalog.available }),
+    };
+  }
+
+  /**
+   * The model this chat is on, plus where the value comes from: the live session's model while a
+   * turn runs (that is the model in use), otherwise this chat's stored model, otherwise the model
+   * OMP would start a fresh session with.
+   */
+  private chatModel(
+    target: ChatTarget,
+    running: boolean,
+    catalog: WorkerModelCatalog,
+  ): { current: string | null; label: string } {
     const stored = this.deps.store.getChatModel(this.deps.botUid(), target);
     const live = catalog.current === null ? null : modelWithLevel(catalog.current, catalog.level);
     if (running && live !== null) {
-      return formatModelCatalog({
+      return {
         current: live,
         label:
           stored === null
@@ -143,13 +182,10 @@ export class ModelSwitchController {
             : stored === live
               ? "本聊天指定"
               : `运行中会话；本聊天模型 ${stored}`,
-        models: catalog.available,
-      });
+      };
     }
-    if (stored !== null) {
-      return formatModelCatalog({ current: stored, label: "本聊天指定", models: catalog.available });
-    }
-    return formatModelCatalog({ current: live, label: "OMP 默认", models: catalog.available });
+    if (stored !== null) return { current: stored, label: "本聊天指定" };
+    return { current: live, label: "OMP 默认" };
   }
 
   /**
@@ -157,23 +193,16 @@ export class ModelSwitchController {
    * OMP's own default selection. A running session is left alone — `/switch @default` is the
    * native way to move it.
    */
-  private async resetChatModel(target: ChatTarget): Promise<void> {
+  private async resetChatModel(target: ChatTarget, live: OmpWorker | undefined): Promise<string> {
     const previous = this.deps.store.getChatModel(this.deps.botUid(), target);
-    if (previous === null) {
-      await this.deps.enqueueText(target, "本聊天未指定模型，继续跟随 OMP 默认。", null);
-      return;
-    }
+    if (previous === null) return "本聊天未指定模型，继续跟随 OMP 默认。";
     this.deps.store.clearChatModel(this.deps.botUid(), target);
     let current: string | null = null;
-    if (this.deps.liveWorker(target) === undefined) {
+    if (live === undefined) {
       const catalog = await this.withProbeWorker(target, worker => worker.models()).catch(() => null);
       if (catalog !== null && catalog.current !== null) current = modelWithLevel(catalog.current, catalog.level);
     }
-    await this.deps.enqueueText(
-      target,
-      `已恢复跟随 OMP 默认模型${current === null ? "" : `（当前为 ${current}）`}。`,
-      null,
-    );
+    return `已恢复跟随 OMP 默认模型${current === null ? "" : `（当前为 ${current}）`}。`;
   }
 
   /**
@@ -228,14 +257,5 @@ export class ModelSwitchController {
     } finally {
       await rm(sessionDir, { recursive: true, force: true }).catch(() => {});
     }
-  }
-
-  /** A probe failure as one bounded line: no working directory, or no usable OMP answer. */
-  private async replySwitchFailure(target: ChatTarget, error: unknown): Promise<void> {
-    await this.deps.enqueueText(
-      target,
-      error instanceof SwitchDirectoryError ? SWITCH_CWD_UNAVAILABLE_TEXT : SWITCH_PROBE_FAILED_TEXT,
-      null,
-    );
   }
 }

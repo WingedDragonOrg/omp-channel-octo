@@ -4,7 +4,9 @@ import {
   MODEL_CATALOG_MAX_MODELS,
   boundedSelectorText,
   formatModelCatalog,
+  modelCatalogCurrent,
   modelWithLevel,
+  switchCardChoices,
 } from "../src/model-switch";
 
 const MODELS: WorkerModelInfo[] = [
@@ -56,4 +58,30 @@ test("a report without a current model, an empty catalog, and an oversized catal
   const renderedIds = lines.filter(line => line.startsWith("fixture：")).flatMap(line => line.slice("fixture：".length).split("、"));
   expect(renderedIds.length).toBe(MODEL_CATALOG_MAX_MODELS);
   expect(lines.at(-1)).toBe(`…（共 ${many.length} 个）`);
+});
+
+test("the card offers only selectors the text command would accept", () => {
+  const values = switchCardChoices([
+    { provider: "fixture", id: "fast" },
+    { provider: "fixture", id: "fast" },
+    { provider: "", id: "orphan" },
+    { provider: "fixture", id: "two words" },
+    { provider: "deepminer", id: "tencent/glm-5.3" },
+  ]).map(choice => choice.value);
+  expect(values).toEqual(["default", "fixture/fast", "deepminer/tencent/glm-5.3"]);
+  const many: WorkerModelInfo[] = Array.from({ length: MODEL_CATALOG_MAX_MODELS + 5 }, (_, index) => ({
+    provider: "fixture",
+    id: `m${index}`,
+  }));
+  expect(switchCardChoices(many)).toHaveLength(MODEL_CATALOG_MAX_MODELS + 1);
+});
+
+test("the card's current value is the text fallback's first line", () => {
+  const current = modelCatalogCurrent("fixture/default:max", "本聊天指定");
+  expect(formatModelCatalog({
+    current: "fixture/default:max",
+    label: "本聊天指定",
+    models: MODELS,
+  }).split("\n")[0]).toBe(`当前模型：${current}`);
+  expect(modelCatalogCurrent(null, "OMP 默认")).toBe("未知（OMP 未报告）");
 });

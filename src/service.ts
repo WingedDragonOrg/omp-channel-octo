@@ -1,5 +1,6 @@
 import { GroupHistoryCoordinator } from "./history-coordinator.ts";
 import { ModelSwitchController } from "./model-controller.ts";
+import { CONFIG_CARD_ACTION_PREFIX, createConfigMenuDesk, type ConfigMenuDesk } from "./command-cards.ts";
 import { ProgressCards } from "./progress-cards.ts";
 import {
   isCommand,
@@ -79,6 +80,11 @@ const COMMAND_HELP =
   "/new [目录] 创建新会话；/reset [目录] 重置为新会话；/move <目录> 沿用当前会话迁移 cwd；/thread <任务> 新建隔离子区并在其中处理该任务（子区内 /thread merge 把本区隔离工作区的分支合并回目标分支并默认清理工作区与分支）；/queue <文本> 把消息排到当前任务之后；/mode [steer|queue] 配置运行中追加消息的方式；/switch [模型] 查看当前模型与可用模型，或切换本聊天的模型（provider/id、模型 id/子串、@角色 如 @default；default 恢复跟随 OMP 默认）；/retry 由 OMP 重试当前会话上次失败或中止的回合（忙时排队）；/interrupt 中断当前回合但保留排队消息；/cancel 取消当前任务（/stop 同义）；/status 查看状态；/restart [now] 重启 channel（now 强制中断在途任务）；/autoresearch-history 导出本聊天最近一次研究运行的完整记录文件；/help 查看帮助。";
 const MODE_USAGE =
   "用法：/mode [steer|queue]。steer（默认，default 同义）把运行中的新消息注入当前回合；queue 把它排到当前回合之后。无参数时报告当前设置。";
+/** `/mode` 卡片的两个取值：与文本命令接受的写法同义，取值原样进 store。 */
+const MODE_CARD_CHOICES: readonly { title: string; value: string }[] = [
+  { title: "steer：运行中的新消息注入当前回合", value: "steer" },
+  { title: "queue：运行中的新消息排到当前回合之后", value: "queue" },
+];
 const QUEUE_USAGE = "用法：/queue <文本>；把该消息排到当前任务之后执行。";
 const DEFAULT_INTERRUPTED_TEXT = "已中断当前回合；已排队的消息会继续执行。";
 const DEFAULT_INTERRUPT_REJECTED_TEXT = "中断请求未被 OMP 接受，当前回合仍在运行。";
@@ -138,6 +144,8 @@ function createSessionId(): string {
 class CoreService implements ChannelService {
   private readonly history: GroupHistoryCoordinator;
   private readonly models: ModelSwitchController;
+  /** `/switch`、`/mode` 配置卡片的进程内会话：绑定、owner 校验、应用串行与有界回收都在它内部。 */
+  private readonly configMenus: ConfigMenuDesk;
   private readonly authorization: ChatAuthorization;
   private readonly materializer: InboundMaterializer;
   private readonly progressCards: ProgressCards;
@@ -193,6 +201,27 @@ class CoreService implements ChannelService {
       probeDirectory: target => this.sessions.probeDirectory(target),
       blockDirectory: cwd => { this.blockedDirectories.add(cwd); },
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
+      // 窄面在调用时解引用 `this.configMenus`：卡片菜单对象在紧随其后构造，箭头函数此时不解引用。
+      menu: {
+        begin: (target, kind) => this.configMenus.begin(target, kind),
+        open: (target, view, ticket) => this.configMenus.open(target, view, ticket),
+        invalidate: (target, kind) => this.configMenus.invalidate(target, kind),
+        serialize: (kind, target, work) => this.configMenus.serialize(kind, target, work),
+      },
+    });
+    this.configMenus = createConfigMenuDesk({
+      store: this.store,
+      transport: options.transport,
+      botUid: () => this.bot?.uid,
+      stopping: () => this.stopping,
+      // 点击时刻重新校验聊天：私聊沿用消息门的 owner 判定（点击者非 owner 时更早被拒），群/子区
+      // 仍须命中允许清单——被移出允许清单的聊天不能让旧卡片继续改配置。
+      chatAllowed: target => target.channelType === 1 || this.authorization.isPermittedChat(target),
+      shutdownSignal: this.shutdownController.signal,
+      enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
+      applyChoice: (kind, target, value) => kind === "switch"
+        ? this.models.applySwitch(target, value)
+        : Promise.resolve(this.applyModeChoice(target, value)),
     });
     this.progressCards = new ProgressCards({
       store: this.store,
@@ -291,7 +320,11 @@ class CoreService implements ChannelService {
       transport: this.options.transport,
       botUid: () => this.bot?.uid,
       stopping: () => this.stopping,
-      onCardAction: (action) => this.questions.answerFromCard(action),
+      // 配置卡片的点击只进配置会话（绑定校验、owner 判定与应用都在那里），其余 action 一律
+      // 交给问答卡；两条路径互不创建对方的行或任务。
+      onCardAction: (action) => action.actionId.startsWith(CONFIG_CARD_ACTION_PREFIX)
+        ? this.configMenus.handleAction(action)
+        : this.questions.answerFromCard(action),
     });
     this.threadArchives = new ThreadArchiveScheduler({
       store: this.store,
@@ -961,33 +994,50 @@ class CoreService implements ChannelService {
   }
 
   private async handleMode(target: ChatTarget, argument: string): Promise<void> {
-    const requested = argument.trim().toLowerCase();
+    const requested = argument.trim();
     if (requested.length === 0) {
-      await this.outbox.enqueueText(
-        target,
-        `当前追加模式：${this.store.getChatMode(this.bot!.uid, target)}。${MODE_USAGE}`,
-        null,
-      );
+      const ticket = this.configMenus.begin(target, "mode");
+      try {
+        const mode = this.store.getChatMode(this.bot!.uid, target);
+        await this.configMenus.open(target, {
+          kind: "mode",
+          current: mode,
+          choices: MODE_CARD_CHOICES,
+          plain: `当前追加模式：${mode}。${MODE_USAGE}`,
+        }, ticket);
+      } finally {
+        ticket.release();
+      }
       return;
     }
+    // 文本命令与卡片点击共用同一段应用逻辑；先让旧的模式卡片失效，再按到达顺序落地。
+    this.configMenus.invalidate(target, "mode");
+    const receipt = await this.configMenus.serialize(
+      "mode",
+      target,
+      () => this.applyModeChoice(target, requested),
+    );
+    await this.outbox.enqueueText(target, receipt, null);
+  }
+
+  /**
+   * Apply one append-mode request and return the receipt verbatim. The text command and a card
+   * click share this: `default` stays a synonym of `steer`, anything else is the usage line, and
+   * only a valid value reaches the store.
+   */
+  private applyModeChoice(target: ChatTarget, value: string): string {
+    const requested = value.trim().toLowerCase();
     const mode: ChatAppendMode | null =
       requested === "steer" || requested === "default"
         ? "steer"
         : requested === "queue"
           ? "queue"
           : null;
-    if (!mode) {
-      await this.outbox.enqueueText(target, MODE_USAGE, null);
-      return;
-    }
+    if (!mode) return MODE_USAGE;
     this.store.setChatMode(this.bot!.uid, target, mode);
-    await this.outbox.enqueueText(
-      target,
-      mode === "steer"
-        ? "追加模式已设为 steer：运行中的新消息会注入当前回合。"
-        : "追加模式已设为 queue：运行中的新消息会排到当前回合之后。",
-      null,
-    );
+    return mode === "steer"
+      ? "追加模式已设为 steer：运行中的新消息会注入当前回合。"
+      : "追加模式已设为 queue：运行中的新消息会排到当前回合之后。";
   }
 
   private async handleCancel(target: ChatTarget): Promise<void> {
