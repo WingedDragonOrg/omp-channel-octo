@@ -263,7 +263,10 @@ test("a failed dispatch relays a bounded failure line", async () => {
     await noticeSeen.promise;
     expect(notices).toHaveLength(1);
     expect(notices[0]).toContain("状态：失败");
-    expect(notices[0]).toContain("fixture worker failed");
+    // The relay carries the task's recorded failure reason, bounded to one line.
+    const reasonLine = notices[0]?.split("\n").find(line => line.startsWith("失败原因：")) ?? "";
+    expect(reasonLine).toContain("fixture worker failed");
+    expect(reasonLine.length).toBeLessThanOrEqual(210);
   } finally {
     await closeCoreHarness(harness);
   }

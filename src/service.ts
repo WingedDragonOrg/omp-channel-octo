@@ -97,6 +97,7 @@ import { ChannelStore, openChannelStore } from "./store.ts";
 import { boundedSelectorText, formatModelCatalog, modelWithLevel } from "./model-switch.ts";
 import type { BindingRecord, InboundClaim, OutboxRecord, ProgressCardRecord, TaskRecord } from "./store-records.ts";
 import { isGroupTarget, streamTargetKey, targetKey, taskTarget } from "./target.ts";
+import { createTypingLeaseManager, type TypingLeaseManager } from "./typing-lease.ts";
 import { createDisplayNameCache, type DisplayNameCache } from "./display-name.ts";
 import { createQuestionDesk, type QuestionDesk } from "./questions.ts";
 import { threadParentGroupId } from "./thread-target.ts";
@@ -139,7 +140,6 @@ const BUILTIN_COMMANDS: Record<string, true> = {
   switch: true,
 };
 const PROGRESS_MERGE_MS = 1_000;
-const TYPING_RENEW_MS = 3_000;
 const ACTIVITY_REQUEST_TIMEOUT_MS = 2_000;
 /** Recovery attempts for a card left by a previous process before the row is dropped. */
 const PROGRESS_CARD_RECOVERY_ATTEMPTS = 3;
@@ -500,6 +500,8 @@ class CoreService implements ChannelService {
   /** Bot 事件队列消费（卡片点击）。 */
   private readonly botEvents: BotEventLoop;
   private readonly commandHandlers: ReadonlyMap<string, ChannelCommandHandler>;
+  /** typing 租约：agent-attached 消息从门后到任务终态的持续「正在输入」。 */
+  private readonly typingLeases: TypingLeaseManager;
   private bot: BotIdentity | undefined;
   private readonly activityOperations = new Set<Promise<void>>();
   private lock: LockHandle | undefined;
@@ -518,6 +520,15 @@ class CoreService implements ChannelService {
     commandHandlers: ReadonlyMap<string, ChannelCommandHandler>,
   ) {
     this.commandHandlers = commandHandlers;
+    this.typingLeases = createTypingLeaseManager({
+      sendTyping: (target, signal) => this.options.transport.sendTyping(target, signal),
+      trackOperation: (operation) => this.operationSet(operation),
+      taskState: (taskId) => {
+        const state = store.getTask(taskId)?.state;
+        return state === "queued" || state === "running" ? "active" : "terminal";
+      },
+      stopping: () => this.stopping,
+    });
     this.outbox = createOutboxDelivery({
       store: this.store,
       transport: this.options.transport,
@@ -665,6 +676,7 @@ class CoreService implements ChannelService {
     this.outbox.abortAll();
     await Promise.allSettled([...this.taskOperations]);
     await Promise.allSettled([...this.activityOperations]);
+    this.typingLeases.releaseAll();
     await this.botEvents.stop();
     this.questions.stop();
     this.outbox.stopTimers();
@@ -675,6 +687,22 @@ class CoreService implements ChannelService {
       this.lock = undefined;
     }
     this.store.close();
+  }
+
+  /**
+   * typing 的「门后即亮」段：agent-attached 消息在权限校验通过、进入附件组装/转写与接受之前
+   * 亮起；其后的任何出口（组装失败、附件拒绝、重投去重、steer 命中、任务接受、抛错）都被
+   * finally 覆盖，租赁不会因规格未枚举的出口泄漏。任务被持久接受时 `acceptTask` 把 task 租约
+   * 并入同一条续期环，本段退出仅释放消息租约，环不重启。
+   */
+  private async withMessageTyping<T>(message: InboundMessage, work: () => Promise<T>): Promise<T> {
+    const owner = `msg:${message.messageId}`;
+    this.typingLeases.acquire(message, owner);
+    try {
+      return await work();
+    } finally {
+      this.typingLeases.release(message, owner);
+    }
   }
 
   async handleInbound(message: InboundMessage): Promise<void> {
@@ -761,16 +789,20 @@ class CoreService implements ChannelService {
         return;
       }
       // 未注册的 /xxx 不是命令，仍按普通任务走唯一组装点，附件照常取回。
-      const slashPrompt = await this.materializeInbound(message);
-      if (slashPrompt === null) return;
-      await this.acceptTask(message, slashPrompt);
+      await this.withMessageTyping(message, async () => {
+        const slashPrompt = await this.materializeInbound(message);
+        if (slashPrompt === null) return;
+        await this.acceptTask(message, slashPrompt);
+      });
       return;
     }
     if (await this.questions.answerPendingQuestion(message, text)) return;
-    const promptText = await this.materializeInbound(message);
-    if (promptText === null) return;
-    if (await this.appendToRunningTask(message, promptText)) return;
-    await this.acceptTask(message, promptText);
+    await this.withMessageTyping(message, async() => {
+      const promptText = await this.materializeInbound(message);
+      if (promptText === null) return;
+      if (await this.appendToRunningTask(message, promptText)) return;
+      await this.acceptTask(message, promptText);
+    });
   }
 
   /**
@@ -1646,21 +1678,23 @@ class CoreService implements ChannelService {
     handler: ChannelCommandHandler,
   ): Promise<void> {
     // handler 拿到的是这条消息的正文，因此正文先经唯一组装点：注册命令同样不吃掉附件。
-    const body = await this.materializeInbound(message);
-    if (body === null) return;
-    const claim = this.commandClaim(message, command.name);
-    if (!this.store.claimCommand(claim)) return;
-    try {
-      await handler.handle({
-        message: { ...message, text: body },
-        name: command.name,
-        argument: command.argument,
-      });
-      this.store.completeCommand(claim);
-    } catch {
-      this.store.failCommand(claim);
-      throw new Error("命令未能持久完成，请重试。");
-    }
+    await this.withMessageTyping(message, async () => {
+      const body = await this.materializeInbound(message);
+      if (body === null) return;
+      const claim = this.commandClaim(message, command.name);
+      if (!this.store.claimCommand(claim)) return;
+      try {
+        await handler.handle({
+          message: { ...message, text: body },
+          name: command.name,
+          argument: command.argument,
+        });
+        this.store.completeCommand(claim);
+      } catch {
+        this.store.failCommand(claim);
+        throw new Error("命令未能持久完成，请重试。");
+      }
+    });
   }
 
   private async handleObservingCommand(
@@ -1668,10 +1702,12 @@ class CoreService implements ChannelService {
     command: { name: string; argument: string },
     handler: ChannelCommandHandler,
   ): Promise<void> {
-    const body = await this.materializeInbound(message);
+    const body = await this.withMessageTyping(message, async () => {
+      const materialized = await this.materializeInbound(message);
+      if (materialized === null) return null;
+      return (await this.acceptTask(message, materialized, false)) ? materialized : null;
+    });
     if (body === null) return;
-    const accepted = await this.acceptTask(message, body, false);
-    if (!accepted) return;
     try {
       await handler.handle({
         message: { ...message, text: body },
@@ -1756,11 +1792,13 @@ class CoreService implements ChannelService {
     // 这条命令的正文就是交给助手的任务正文：先释放命令 claim，再走与普通任务同一条组装点
     // （claim + 下载 + 转写 + 附件块），否则随消息发来的图片只剩 `[图片]` 占位。
     this.store.releaseClaim(this.commandClaim(message, "thread"));
-    const request = await this.materializeInbound(message, intent);
-    if (request === null) return;
-    const body = threadIntentPrompt(request);
-    if (await this.appendToRunningTask(message, body)) return;
-    await this.acceptTask(message, body);
+    await this.withMessageTyping(message, async () => {
+      const request = await this.materializeInbound(message, intent);
+      if (request === null) return;
+      const body = threadIntentPrompt(request);
+      if (await this.appendToRunningTask(message, body)) return;
+      await this.acceptTask(message, body);
+    });
   }
 
   /**
@@ -1797,9 +1835,11 @@ class CoreService implements ChannelService {
       return;
     }
     this.store.releaseClaim(this.commandClaim(message, "thread"));
-    const body = threadMergePrompt(binding.cwd, mergeNote);
-    if (await this.appendToRunningTask(message, body)) return;
-    await this.acceptTask(message, body);
+    await this.withMessageTyping(message, async () => {
+      const body = threadMergePrompt(binding.cwd, mergeNote);
+      if (await this.appendToRunningTask(message, body)) return;
+      await this.acceptTask(message, body);
+    });
   }
 
   private async defaultWorkDirectory(target: ChatTarget): Promise<string> {
@@ -2206,9 +2246,11 @@ class CoreService implements ChannelService {
     // 排队任务的正文就是这条命令的参数：和 `/thread` 一样先释放命令 claim，再走唯一组装点，
     // 附件（任意类型）与引用块随正文进入排队任务。
     this.store.releaseClaim(this.commandClaim(message, "queue"));
-    const body = await this.materializeInbound(message, text);
-    if (body === null) return;
-    await this.acceptTask(message, body);
+    await this.withMessageTyping(message, async () => {
+      const body = await this.materializeInbound(message, text);
+      if (body === null) return;
+      await this.acceptTask(message, body);
+    });
   }
 
   private async handleMode(target: ChatTarget, argument: string): Promise<void> {
@@ -2609,6 +2651,8 @@ class CoreService implements ChannelService {
       throw new Error("本地状态盘写入失败，任务未接收。");
     }
     if (!accepted) return false;
+    // 持久接受即点亮 task 租约：排队等待（同聊天或跨聊天同目录）到终态都保持「正在输入」。
+    this.typingLeases.acquire(message, `task:${task.id}`);
     if (startsBehind) this.queuedBehind.add(task.id);
     this.scheduleTask(task.id);
     this.outbox.flush(message);
@@ -2809,6 +2853,8 @@ class CoreService implements ChannelService {
       return;
     }
     if (!this.store.markStarted(taskId)) return;
+    // 防御性幂等点亮：正常路径在接受时已持有 task 租约（此处 no-op）；任何未来触达路径自动点亮。
+    this.typingLeases.acquire(taskTarget(task), `task:${taskId}`);
     if (this.queuedBehind.delete(taskId)) {
       this.outbox.enqueueText(taskTarget(task), receiptText("开始执行排队消息", task.text), null);
     }
@@ -2828,11 +2874,9 @@ class CoreService implements ChannelService {
     let workerLedgerId: string | undefined;
     let spawned: WorkerProcess | undefined;
     let progressTimer: NodeJS.Timeout | undefined;
-    let typingTimer: NodeJS.Timeout | undefined;
     let progressTail: Promise<void> = Promise.resolve();
     const progressAbort = new AbortController();
     const textDelivery = this.outbox.registerTask(taskId);
-    let typingAbort: AbortController | undefined;
     const target = taskTarget(task);
     let roundIndex = 0;
     const createRound = (): ProgressRound => ({
@@ -3006,30 +3050,11 @@ class CoreService implements ChannelService {
         clearTimeout(progressTimer);
         progressTimer = undefined;
       }
-      clearTimeout(typingTimer);
-      typingTimer = undefined;
       if (abortProgress) progressAbort.abort();
-      typingAbort?.abort();
-    };
-    const startTyping = (): void => {
-      typingAbort = new AbortController();
-      const renew = (): void => {
-        const parentSignal = typingAbort?.signal;
-        if (!parentSignal || parentSignal.aborted) return;
-        trackActivity(
-          runActivityRequest(
-            (signal) => this.options.transport.sendTyping(target, signal),
-            parentSignal,
-          ),
-        );
-        typingTimer = setTimeout(renew, TYPING_RENEW_MS);
-      };
-      renew();
     };
     runtime.stopActivity = stopActivity;
     runtime.stopText = () => textDelivery.stop();
     runtime.rollProgressCard = rollProgressCard;
-    startTyping();
 
     try {
       const groupTask = isGroupTarget(target);
@@ -3340,6 +3365,7 @@ class CoreService implements ChannelService {
       }
     } finally {
       runtime.stopActivity?.(!progressRound.finished);
+      this.typingLeases.release(runtime.target, `task:${taskId}`);
       this.questions.rejectForTask(taskId, new Error("task finished"));
       if (worker) {
         const stopped = await worker.stop().catch(() => false);

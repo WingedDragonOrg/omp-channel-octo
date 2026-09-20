@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import type {
   AllowlistWriteback,
   AskConfig,
+  AttachmentConfig,
   AttachmentDownload,
   BotCardAction,
   BotEvent,
@@ -599,8 +600,12 @@ export class FakeTransport implements ChannelTransport {
       this.finishTextRequest(request);
     }
   }
-  async sendTyping(_target: ChatTarget, signal?: AbortSignal): Promise<void> {
+  /** Every `sendTyping` call in order, for early-typing and renewal cadence assertions. */
+  readonly typingCalls: { target: ChatTarget }[] = [];
+
+  async sendTyping(target: ChatTarget, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) throw new Error("fixture typing aborted");
+    this.typingCalls.push({ target: { ...target } });
   }
 
   async sendProgressCard(
@@ -1401,6 +1406,8 @@ export interface CoreHarnessOptions {
   ownerId?: string | null;
   /** Overrides the allowlist when a test drives chat targets outside the defaults. */
   allowedGroupIds?: string[];
+  /** Inbound attachment configuration; absent means the deployment has no attachment pipeline. */
+  attachments?: AttachmentConfig;
   /** Group history configuration; absent means the service default (disabled). */
   groupHistory?: GroupHistoryConfig;
   /** `ask` wait configuration; absent means the service default (6-hour timeout). */
@@ -1444,6 +1451,7 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
     ],
     stateDir,
     homeDir: root,
+    ...(options.attachments === undefined ? {} : { attachments: options.attachments }),
     ...(options.groupHistory === undefined ? {} : { groupHistory: options.groupHistory }),
     ...(options.ask === undefined ? {} : { ask: options.ask }),
   } as CoreServiceConfig;
