@@ -34,7 +34,6 @@ import type {
   PromptContext,
   InboundMessage,
   OmpWorker,
-  WorkerEvent,
   SteerConsumedEvent,
   TaskRelayTarget,
   WorkerOptions,
@@ -64,6 +63,8 @@ import { createQuestionDesk, type QuestionDesk } from "./questions.ts";
 import { threadNotifyMessageId, threadOutcomeNotice } from "./thread-notify.ts";
 import { ThreadArchiveScheduler } from "./thread-archive.ts";
 import { ThreadCommands } from "./thread-commands.ts";
+import { ServiceRestart } from "./service-restart.ts";
+import { TaskEvents } from "./task-events.ts";
 import { existingSessionFile } from "./workdir.ts";
 
 const GROUP_TRUSTED_INSTRUCTION =
@@ -77,11 +78,6 @@ const DEFAULT_INTERRUPTED_TEXT = "已中断当前回合；已排队的消息会�
 const DEFAULT_INTERRUPT_REJECTED_TEXT = "中断请求未被 OMP 接受，当前回合仍在运行。";
 const DEFAULT_INTERRUPT_IDLE_TEXT =
   "当前没有正在运行的回合可中断；任务尚未进入执行阶段时可用 /cancel 取消。";
-const RESTART_USAGE = "用法：/restart [now]；now 表示强制重启并中断在途任务。";
-const RESTART_UNAVAILABLE_TEXT = "未检测到守护进程，无法重启 channel。";
-const CHANNEL_RESTART_SCHEDULED_TEXT =
-  "已排定重启：本回合结束后、channel 没有运行中或排队任务时执行守护进程的重启；重启完成后会在本会话通报 PID。";
-const RESTART_NOTICE_TTL_MS = 10 * 60 * 1_000;
 /** Steered messages tracked for the consumption receipt; older entries fall out of observation. */
 const MAX_PENDING_STEERS = 32;
 /** Characters of the triggering message shown in a start/consumption receipt. */
@@ -164,12 +160,8 @@ class CoreService implements ChannelService {
   private lock: LockHandle | undefined;
   private started = false;
   private stopping = false;
-  private restartRequested = false;
-  /**
-   * A restart requested through `channel_control`, kept until every chat is idle so the turn that
-   * asked for it still delivers its reply.
-   */
-  private pendingRestart: ChatTarget | null = null;
+  /** channel 重启的所有者：/restart 校验、延期重启排定与跨进程重启通报都不再留在服务里。 */
+  private readonly serviceRestart: ServiceRestart;
   /** `/thread` 家族命令的所有者：意图交接、合并交接与资格文案都不再留在服务里。 */
   private readonly threadCommands: ThreadCommands;
   /** 子区归档排定的所有者：排定 map 与停止信号都在它内部，服务只负责接线与调用。 */
@@ -305,6 +297,16 @@ class CoreService implements ChannelService {
       acceptTask: (message, text) => this.acceptTask(message, text),
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
     });
+    this.serviceRestart = new ServiceRestart({
+      store: this.store,
+      botUid: () => this.bot?.uid,
+      stopping: () => this.stopping,
+      // 在途任务视图直接借用 runtimes 本身：idle 判定与忙碌目标枚举看到同一份集合。
+      runningRuntimes: () => this.runtimes.values(),
+      hasRunning: () => this.runtimes.size > 0,
+      restart: options.restart,
+      enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
+    });
     // 内建命令的 canonical handler 表：每个 action 一个函数，直接返回原 handler 的 Promise
     // （不再包一层 async），`handleCommand` 里的 await 因此仍是原来的微任务边界；只有
     // `restart` 的返回值参与重启判定。
@@ -319,7 +321,7 @@ class CoreService implements ChannelService {
       switch: (message, argument) => this.models.handleSwitch(message, argument),
       status: message => this.handleStatus(message),
       help: message => this.outbox.enqueueText(message, COMMAND_HELP, null),
-      restart: (message, argument) => this.handleRestart(message, argument),
+      restart: (message, argument) => this.serviceRestart.handleCommand(message, argument),
     };
   }
 
@@ -354,20 +356,7 @@ class CoreService implements ChannelService {
       for (const task of interrupted) {
         await this.outbox.enqueueText(taskTarget(task), `服务已重启完成；任务 ${task.id} 因重启中断，请重新发送。`, null);
       }
-      const restartedAt = Date.now();
-      const notifiedTargets = new Set<string>();
-      for (const notice of this.store.listRestartNotices(identity.uid)) {
-        this.store.clearRestartNotice(notice.id);
-        if (restartedAt - notice.requestedAt > RESTART_NOTICE_TTL_MS) continue;
-        const key = targetKey(notice);
-        if (notifiedTargets.has(key)) continue;
-        notifiedTargets.add(key);
-        await this.outbox.enqueueText(
-          notice,
-          `channel 已重启完成：PID ${process.pid}，启动于 ${new Date(restartedAt).toISOString()}。`,
-          null,
-        );
-      }
+      await this.serviceRestart.announceStartup(identity.uid);
       for (const ledger of this.store.listWorkerLedger(identity.uid)) {
         const stopped = await this.options.workerFactory.recover(ledger);
         if (stopped) {
@@ -422,15 +411,7 @@ class CoreService implements ChannelService {
       runtime.stopActivity?.();
       if (this.bot) {
         this.store.cancelQuestions(this.bot.uid, runtime.target);
-        if (this.restartRequested) {
-          this.store.addRestartNotice({
-            id: randomUUID(),
-            botUid: this.bot.uid,
-            channelType: runtime.target.channelType,
-            channelId: runtime.target.channelId,
-            requestedAt: Date.now(),
-          });
-        }
+        this.serviceRestart.rememberInterrupted(runtime.target);
       }
       this.questions.rejectForTask(runtime.taskId, new Error("channel stopping"));
       if (runtime.worker) {
@@ -811,8 +792,7 @@ class CoreService implements ChannelService {
       const restartRequested = await this.builtinHandlers[action](message, argument);
       this.store.completeCommand(claim);
       if (restartRequested === true) {
-        this.restartRequested = true;
-        await this.options.restart?.request();
+        await this.serviceRestart.request();
       }
     } catch {
       this.store.failCommand(claim);
@@ -1022,61 +1002,6 @@ class CoreService implements ChannelService {
     );
   }
 
-  private busyTargets(): ChatTarget[] {
-    const seen = new Set<string>();
-    const targets: ChatTarget[] = [];
-    const add = (target: ChatTarget): void => {
-      const key = targetKey(target);
-      if (seen.has(key)) return;
-      seen.add(key);
-      targets.push(target);
-    };
-    for (const runtime of this.runtimes.values()) add(runtime.target);
-    const botUid = this.bot?.uid;
-    for (const task of this.store.listQueuedTasks()) {
-      if (botUid === undefined || task.botUid === botUid) add(task);
-    }
-    return targets;
-  }
-
-  /** Returns true when the host should ask the detected supervisor to restart this process. */
-  private async handleRestart(target: ChatTarget, argument: string): Promise<boolean> {
-    const restart = this.options.restart;
-    if (!restart) {
-      await this.outbox.enqueueText(target, RESTART_UNAVAILABLE_TEXT, null);
-      return false;
-    }
-    const mode = argument.trim();
-    if (mode.length > 0 && mode !== "now") {
-      await this.outbox.enqueueText(target, RESTART_USAGE, null);
-      return false;
-    }
-    const busy = this.busyTargets();
-    if (busy.length > 0 && mode !== "now") {
-      await this.outbox.enqueueText(
-        target,
-        `当前有 ${busy.length} 个会话在运行或排队任务，重启会中断它们：先 /cancel，或发送 /restart now 强制重启。`,
-        null,
-      );
-      return false;
-    }
-    this.store.addRestartNotice({
-      id: randomUUID(),
-      botUid: this.bot!.uid,
-      channelType: target.channelType,
-      channelId: target.channelId,
-      requestedAt: Date.now(),
-    });
-    await this.outbox.enqueueText(
-      target,
-      busy.length > 0
-        ? `正在重启 channel；${busy.length} 个会话的在途任务会中断，重启完成后会在本会话确认。`
-        : "正在重启 channel；重启完成后会在本会话确认。",
-      null,
-    );
-    return true;
-  }
-
   private async handleStatus(target: ChatTarget): Promise<void> {
     const current = await this.status(target);
     const taskState = current.state;
@@ -1177,7 +1102,8 @@ class CoreService implements ChannelService {
   }
 
   /**
-   * Host tools 的宿主适配：工具模块只看到它真正需要的状态，重启排定与 channel 快照留在
+   * Host tools 的宿主适配：工具模块只看到它真正需要的状态。重启排定已委托给独立的
+   * `ServiceRestart` 所有者（工具只拿到它的 `schedule` 与 `pending`），channel 快照仍留在
    * 服务里，工具因此不能绕过运行时的调度与生命周期。
    */
   private hostToolHost(): HostToolHost {
@@ -1199,16 +1125,12 @@ class CoreService implements ChannelService {
       askQuestions: (task, target, args, signal) => this.questions.askQuestions(task, target, args, signal),
       channelStatus: () => ({
         pid: process.pid,
-        restart_pending: this.pendingRestart !== null,
+        restart_pending: this.serviceRestart.pending,
         running_targets: [...this.runtimes.values()].map((runtime) => targetKey(runtime.target)),
         queued_tasks: this.store.listQueuedTasks().length,
         blocked_cwds: this.blockedDirectories.size,
       }),
-      scheduleRestart: (target) => {
-        if (!this.options.restart) return RESTART_UNAVAILABLE_TEXT;
-        this.pendingRestart = { channelType: target.channelType, channelId: target.channelId };
-        return CHANNEL_RESTART_SCHEDULED_TEXT;
-      },
+      scheduleRestart: (target) => this.serviceRestart.schedule(target),
     };
   }
 
@@ -1269,15 +1191,18 @@ class CoreService implements ChannelService {
       target,
     }) : null;
     const progress = this.progressCards.startTask(taskId, target);
-    const assistantTexts = new Map<string, string>();
+    /** 本回合的 worker 事件归集：通知帧、本地命令标记、assistant 文本与 steer 消费都归它。 */
+    const events = new TaskEvents({
+      target,
+      taskId,
+      control: runtime,
+      stopping: () => this.stopping,
+      outbox: this.outbox,
+      progress,
+      steerConsumed: (event) => this.noteSteerConsumed(runtime, event),
+    });
     let snapshot: GroupContext | null = null;
     let contextInjection: ContextInjection | undefined;
-    /**
-     * 本地命令回合（如 `/autoresearch` 的开关/清理）：无 agent 生成，OMP 不会写群说明
-     * prepared receipt。置位后本回合跳过 context commit，但 sidecar 照常清理、ledger 保持
-     * pending，下一个真实生成回合仍以 initial 注入并用真实 receipt 提交。
-     */
-    let localOnly = false;
     let startupPhase: TaskStartupPhase = "context";
 
     runtime.stopActivity = (abortProgress) => progress.stop(abortProgress);
@@ -1352,47 +1277,6 @@ class CoreService implements ChannelService {
         verified.sessionFile,
       );
       contextInjection = turnContext ? await turnContext.prepare(verified.sessionId) : undefined;
-      const onEvent = (event: WorkerEvent): void => {
-        if (runtime.cancelRequested || this.stopping) return;
-        if (event.type === "notice") {
-          // 扩展的通知帧（如 /autoresearch 的 enable/off/拒绝原因）是信息性 UI：原样投递到
-          // 对应会话、带上级别标签，但它不是回合产出——不进 assistantTexts/resultText、不开
-          // 进度卡，也绝不能改 workAfterStop，让 /interrupt 的归因保持诚实。
-          if (event.messageId.trim().length === 0 || event.text.length === 0) return;
-          const label = event.level === "error"
-            ? "OMP 错误："
-            : event.level === "warning"
-              ? "OMP 警告："
-              : "OMP：";
-          this.outbox.enqueueStreamText(target, task.id, {
-            type: "text",
-            messageId: `notice:${event.messageId}`,
-            text: `${label}${event.text}`,
-            final: true,
-          });
-          return;
-        }
-        if (event.type === "local_command") {
-          // no-agent 完成帧：标记本回合不产生 prepared receipt，commit 门限据此豁免；同样
-          // 在 workAfterStop 之前返回，既不算工作产出也不触发进度。
-          localOnly = true;
-          return;
-        }
-        if (runtime.stopCause !== null && event.type !== "turn_end" && event.type !== "run_end") {
-          runtime.workAfterStop = true;
-        }
-        if (event.type === "text") {
-          if (event.messageId.trim().length === 0 || (event.text.length === 0 && !event.final)) return;
-          assistantTexts.set(event.messageId, event.text);
-          this.outbox.enqueueStreamText(target, task.id, event);
-          return;
-        }
-        if (event.type === "steer_consumed") {
-          this.noteSteerConsumed(runtime, event);
-          return;
-        }
-        progress.apply(event);
-      };
       const historyTurn = await this.history.prepareTurn(task, target, verified.sessionId);
       const promptContext: PromptContext = {
         tools: createHostTools(this.hostToolHost(), task, snapshot),
@@ -1400,7 +1284,7 @@ class CoreService implements ChannelService {
       };
       runtime.promptInFlight = true;
       try {
-        await worker.prompt(historyTurn?.text ?? task.text, onEvent, promptContext);
+        await worker.prompt(historyTurn?.text ?? task.text, events.onEvent, promptContext);
       } finally {
         runtime.promptInFlight = false;
         if (historyTurn) this.history.commitTurn(target, verified.sessionId, historyTurn);
@@ -1418,9 +1302,8 @@ class CoreService implements ChannelService {
         );
         progress.finish("cancelled");
       } else {
-        if (turnContext) await turnContext.complete(worker.sessionId, localOnly);
-        const resultText = assistantTexts.size > 0 ? [...assistantTexts.values()].join("\n\n") : null;
-        this.store.markCompleted(taskId, resultText);
+        if (turnContext) await turnContext.complete(worker.sessionId, events.localOnly);
+        this.store.markCompleted(taskId, events.resultText);
         progress.finish("completed");
         this.outbox.flush(target);
       }
@@ -1463,7 +1346,7 @@ class CoreService implements ChannelService {
       this.runtimes.delete(taskId);
       await this.notifyThreadOutcome(taskId);
       await this.threadArchives.run(target, progress.tail);
-      this.maybeRunDeferredRestart();
+      this.serviceRestart.maybeRunDeferred();
     }
   }
 
@@ -1472,39 +1355,10 @@ class CoreService implements ChannelService {
     runtime.cancelReplySent = true;
     await this.outbox.enqueueText(
       runtime.target,
-      this.restartRequested ? DEFAULT_RESTARTING_TEXT : DEFAULT_CANCELLED_TEXT,
+      this.serviceRestart.requested ? DEFAULT_RESTARTING_TEXT : DEFAULT_CANCELLED_TEXT,
       runtime.taskId,
     );
   }
-
-
-  /**
-   * Runs a restart the agent asked for once it cannot cost work: every chat idle and no queued
-   * task. The request is fire-and-forget, because the supervisor stops this process.
-   */
-  private maybeRunDeferredRestart(): void {
-    const target = this.pendingRestart;
-    if (!target || this.stopping) return;
-    if (this.runtimes.size > 0 || this.store.listQueuedTasks().length > 0) return;
-    this.pendingRestart = null;
-    this.restartRequested = true;
-    this.store.addRestartNotice({
-      id: randomUUID(),
-      botUid: this.bot!.uid,
-      channelType: target.channelType,
-      channelId: target.channelId,
-      requestedAt: Date.now(),
-    });
-    const restart = this.options.restart;
-    if (!restart) return;
-    void restart.request().catch((error: unknown) => {
-      console.error(
-        `[restart] 重启命令执行失败：${error instanceof Error ? error.message : "unknown error"}`,
-      );
-    });
-  }
-
-
 
   /** Tracks a background operation so shutdown waits for it without blocking a caller. */
   private operationSet(operation: Promise<void>): void {

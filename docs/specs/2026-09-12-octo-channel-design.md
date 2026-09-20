@@ -60,6 +60,8 @@
 
 `turn-context.ts` 负责每个群/子区任务的说明快照、注入 ledger 和 sidecar 事务：会话身份验证后发布，普通成功时校验当前 worker 会话的 prepared receipt 并 CAS 提交，取消、中断或失败时保留待重放状态。服务仅在群/子区创建该事务，私聊的完成状态与 outbox flush 保持同一同步结算段。`omp/events.ts` 统一折叠 RPC 消息、回合、工具及子代理帧；worker 保留消费方回调异常的捕获边界，只拒绝当前 prompt。
 
+`task-events.ts` 同步消费每任务的 worker 事件，维护按 messageId 聚合的输出及本地命令标记；通知、本地命令、停止后工作、正文、steer 消费和进度事件的处理顺序固定。它只借用取消/停止状态的窄视图，真正的执行事件交给 `TaskProgress`。`service-restart.ts` 独占已请求/待执行重启状态、命令资格、空闲触发和跨进程回执；命令 claim 完成后才请求宿主重启，启动回执先清持久行，再按十分钟窗口和聊天去重投递。
+
 ### 运行和配置
 
 使用 TypeScript/Bun 常驻服务，主动连接 Octo，启动并管理 OMP RPC worker。无需为 RPC 开放网络监听端口。macOS 使用 launchd 托管；机器休眠或离线期间不承诺可用。
