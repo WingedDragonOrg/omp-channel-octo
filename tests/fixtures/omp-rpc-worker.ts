@@ -73,6 +73,21 @@ function appendLog(value: Frame): void {
 }
 
 /**
+ * Optional pid report (`--fixture-pid-out <path>`): written before any RPC handshake so tests that
+ * stop the child during startup can still find its pid and assert it was reaped.
+ */
+{
+	const path = flag("--fixture-pid-out");
+	if (path) {
+		try {
+			writeFileSync(path, `${process.pid}\n`, "utf8");
+		} catch {
+			// Diagnostic only.
+		}
+	}
+}
+
+/**
  * Optional environment report (`--env-out <path>`): lets tests assert exactly which
  * environment the host hands to OMP children, including the names it must strip.
  */

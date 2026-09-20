@@ -72,6 +72,11 @@ type WorkerFactoryOptions = {
 	 * startup reaches later workers. Only `OCTO_CLI_ENV_NAMES` pass through; see `workerEnv`.
 	 */
 	cliEnv?: () => Record<string, string> | undefined;
+	/**
+	 * Test seam: replace the watchdog child spawn. Production never passes this; a task must only
+	 * ever run behind the real spawn discipline (same executable, same detached group).
+	 */
+	spawnWatchdog?: () => RpcChild;
 };
 
 /**
@@ -879,11 +884,23 @@ class OmpWorkerFactory implements WorkerFactory {
 			}
 			throw new TaskStartupError("identity-unverified", "Could not verify the OMP worker process identity");
 		}
-		const watchdog = await createWatchdog(child.pid, snapshot.pgid, parentSnapshot?.identity ?? "");
-		if (process.platform !== "win32" && !watchdog) {
+		const watchdogStart = await createWatchdog(
+			child.pid,
+			snapshot.pgid,
+			parentSnapshot?.identity ?? "",
+			this.#startupTimeoutMs,
+			this.#options.spawnWatchdog,
+		);
+		if (process.platform !== "win32" && !watchdogStart.ok) {
 			await terminateOwnedProcess(child, snapshot.pgid, this.#cancelTimeoutMs);
-			throw new TaskStartupError("watchdog-unavailable", "Could not start the OMP parent-death watchdog");
+			throw new TaskStartupError(
+				"watchdog-unavailable",
+				watchdogStart.detail.length > 0
+					? `Could not start the OMP parent-death watchdog: ${watchdogStart.detail}`
+					: "Could not start the OMP parent-death watchdog",
+			);
 		}
+		const watchdog = watchdogStart.ok ? watchdogStart.watchdog : undefined;
 		const processInfo: WorkerProcess = { pid: child.pid, pgid: snapshot.pgid, identity: snapshot.identity, cwd };
 		try {
 			options.onSpawn(processInfo);

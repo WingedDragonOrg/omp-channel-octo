@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createWorkerFactory } from "../src/omp/index.ts";
+import { TaskStartupError } from "../src/contracts.ts";
 import type { HostTool, OmpWorker, PromptContext, WorkerEvent, WorkerOptions, WorkerProcess } from "../src/contracts.ts";
+import type { RpcChild } from "../src/omp/process.ts";
 
 const fixturePath = resolve(import.meta.dir, "fixtures/omp-rpc-worker.ts");
 const watchdogParentFixturePath = resolve(import.meta.dir, "fixtures/omp-watchdog-parent.ts");
@@ -1139,6 +1141,57 @@ describe("OMP RPC worker", () => {
 			await rm(tempDir, { recursive: true, force: true });
 		}
 	}, 10_000);
+
+	test("a watchdog that never becomes ready stops the OMP child and fails with bounded detail", async () => {
+		// Real clock by design: the worker factory must stop a real OMP child it just spawned once
+		// the real watchdog handshake budget expires; fake timers cannot drive a real child.
+		const tempDir = await realpath(await mkdtemp(join(tmpdir(), "omp-watchdog-fail-")));
+		const logPath = join(tempDir, "fixture.log");
+		const pidPath = join(tempDir, "child.pid");
+		try {
+			let watchdogPid = 0;
+			const factory = createWorkerFactory({
+				ompCommand: process.execPath,
+				extraArgs: [fixturePath, "--fixture-scenario", "normal", "--fixture-log", logPath, "--fixture-pid-out", pidPath],
+				startupTimeoutMs: 400,
+				cancelTimeoutMs: 500,
+				spawnWatchdog: () => {
+					const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1_000);"], {
+						stdin: "ignore",
+						stdout: "pipe",
+						stderr: "pipe",
+						detached: true,
+					}) as unknown as RpcChild;
+					watchdogPid = child.pid;
+					return child;
+				},
+			});
+			let failure: unknown;
+			try {
+				await factory.create({ cwd: tempDir, sessionDir: tempDir, onSpawn: () => {} });
+			} catch (error) {
+				failure = error;
+			}
+			expect(failure).toBeInstanceOf(TaskStartupError);
+			const startup = failure as TaskStartupError;
+			expect(startup.code).toBe("watchdog-unavailable");
+			expect(startup.message).toContain("Could not start the OMP parent-death watchdog");
+			expect(startup.message).toContain("no ready marker within 400ms");
+			// The just-spawned OMP child and the failed watchdog are both reaped.
+			await waitUntil(() => existsSync(pidPath), 5_000);
+			const workerPid = Number(readFileSync(pidPath, "utf8").trim());
+			expect(workerPid).toBeGreaterThan(0);
+			await waitForProcessExit(workerPid, 5_000);
+			expect(processIsAlive(workerPid)).toBe(false);
+			expect(watchdogPid).toBeGreaterThan(0);
+			await waitForProcessExit(watchdogPid, 3_000);
+			expect(processIsAlive(watchdogPid)).toBe(false);
+			const entries = await readLog(logPath);
+			expect(entries.some(entry => entry.kind === "prompt")).toBe(false);
+		} finally {
+			await rm(tempDir, { recursive: true, force: true });
+		}
+	}, 15_000);
 
 	test("kills a child when durable onSpawn persistence fails and never prompts it", async () => {
 		const tempDir = await mkdtemp(join(tmpdir(), "omp-rpc-spawn-failure-"));

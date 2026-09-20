@@ -4,6 +4,7 @@
  */
 
 import { workerEnv } from "./profile.ts";
+import { failureText } from "../errors.ts";
 
 export type RpcChild = {
 	readonly pid: number;
@@ -226,62 +227,145 @@ export async function terminateOwnedProcess(child: RpcChild, pgid: number, cance
 	return groupStopped;
 }
 
-export async function createWatchdog(childPid: number, workerPgid: number, parentIdentity: string): Promise<RpcChild | undefined> {
-	if (process.platform === "win32") return undefined;
+/** Line the watchdog writes once it is running; the parent waits for it after spawn. */
+export const WATCHDOG_READY_MARKER = "__omp_watchdog_ready__";
+/**
+ * How long the watchdog may take to write its ready marker. The factory passes the worker
+ * startup budget through, so a loaded host that slows a cold Bun start gets the same allowance
+ * for the watchdog as for the OMP child; the wait is still bounded and a real timeout fails.
+ */
+export const DEFAULT_WATCHDOG_READY_TIMEOUT_MS = 30_000;
+/** Head of stderr kept for a failed watchdog start; the drain keeps reading so the pipe never backpressures. */
+const WATCHDOG_STDERR_CAPTURE_CHARS = 1_024;
+/** Rolling stdout window; the marker is short, so a doubled window cannot cut a split marker. */
+const READY_TAIL_CHARS = WATCHDOG_READY_MARKER.length * 2;
+/** Bounded wait for a killed watchdog to actually exit, so a failure leaves no child behind. */
+const WATCHDOG_SHUTDOWN_GRACE_MS = 1_000;
+/** After the watchdog's stdout closes, its exit status almost always settles immediately. */
+const WATCHDOG_EXIT_SETTLE_MS = 500;
+
+export type WatchdogFailureReason = "unsupported-platform" | "spawn-failed" | "exited" | "read-failed" | "timeout";
+
+export type WatchdogStartResult =
+	| { readonly ok: true; readonly watchdog: RpcChild }
+	| { readonly ok: false; readonly reason: WatchdogFailureReason; readonly detail: string };
+
+function spawnWatchdogProcess(childPid: number, workerPgid: number, parentIdentity: string): RpcChild {
+	return Bun.spawn(
+		[
+			process.execPath,
+			"-e",
+			WATCHDOG_SCRIPT,
+			String(process.pid),
+			String(childPid),
+			String(workerPgid),
+			parentIdentity,
+		],
+		{
+			stdin: "ignore",
+			env: workerEnv(),
+			stdout: "pipe",
+			stderr: "pipe",
+			detached: true,
+		},
+	) as unknown as RpcChild;
+}
+
+/**
+ * Drains a child stream to EOF keeping at most `maxChars` head characters. The stream is read
+ * to completion regardless, so a chatty failing child can never wedge on a full pipe.
+ */
+async function drainBounded(stream: ReadableStream<Uint8Array>, maxChars: number): Promise<string> {
+	const reader = stream.getReader();
+	const decoder = new TextDecoder();
+	let text = "";
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (value && text.length < maxChars) {
+				text = (text + decoder.decode(value, { stream: true })).slice(0, maxChars);
+			}
+		}
+	} catch {
+		// Diagnostic capture is best effort; whatever was collected before the error is used.
+	}
+	return text;
+}
+
+export async function createWatchdog(
+	childPid: number,
+	workerPgid: number,
+	parentIdentity: string,
+	readyTimeoutMs: number = DEFAULT_WATCHDOG_READY_TIMEOUT_MS,
+	spawnWatchdog: () => RpcChild = () => spawnWatchdogProcess(childPid, workerPgid, parentIdentity),
+): Promise<WatchdogStartResult> {
+	if (process.platform === "win32") {
+		return { ok: false, reason: "unsupported-platform", detail: "parent-death watchdog is not available on this platform" };
+	}
 	let watchdog: RpcChild;
 	try {
-		watchdog = Bun.spawn(
-			[
-				process.execPath,
-				"-e",
-				WATCHDOG_SCRIPT,
-				String(process.pid),
-				String(childPid),
-				String(workerPgid),
-				parentIdentity,
-			],
-			{
-				stdin: "ignore",
-				env: workerEnv(),
-				stdout: "pipe",
-				stderr: "ignore",
-				detached: true,
-			},
-		) as unknown as RpcChild;
-	} catch {
-		return undefined;
+		watchdog = spawnWatchdog();
+	} catch (error) {
+		return { ok: false, reason: "spawn-failed", detail: `spawn failed: ${failureText(error, "unknown spawn error")}` };
 	}
-	const reader = watchdog.stdout.getReader();
-	const decoder = new TextDecoder();
-	const ready = (async () => {
-		let output = "";
-		try {
-			for (;;) {
-				const result = await reader.read();
-				if (result.done) return false;
-				output += decoder.decode(result.value, { stream: true });
-				if (output.includes("__omp_watchdog_ready__")) return true;
-			}
-		} catch {
-			return false;
-		}
-	})();
-	let timer: NodeJS.Timeout;
-	const timeout = new Promise<boolean>(resolve => {
-		timer = setTimeout(() => resolve(false), 1_000);
-	});
-	const isReady = await Promise.race([ready, timeout]);
-	clearTimeout(timer!);
-	if (!isReady) {
+	const stderrDrain = drainBounded(watchdog.stderr, WATCHDOG_STDERR_CAPTURE_CHARS);
+	const fail = async (reason: WatchdogFailureReason, detail: string): Promise<WatchdogStartResult> => {
 		try {
 			watchdog.kill("SIGKILL");
 		} catch {
-			// The watchdog may have exited after a syntax or startup failure.
+			// The watchdog may have exited between the observation and this cleanup.
 		}
-		return undefined;
+		await waitForExit(watchdog, WATCHDOG_SHUTDOWN_GRACE_MS);
+		const stderr = failureText(await Promise.race([stderrDrain, Bun.sleep(150).then(() => "")]), "");
+		return { ok: false, reason, detail: stderr.length > 0 ? `${detail}; stderr: ${stderr}` : detail };
+	};
+	const stdoutReader = watchdog.stdout.getReader();
+	const decoder = new TextDecoder();
+	let tail = "";
+	const readyLoop = (async (): Promise<"ready" | "ended" | "read-failed"> => {
+		try {
+			for (;;) {
+				const { done, value } = await stdoutReader.read();
+				if (done) return "ended";
+				if (value && value.byteLength > 0) {
+					tail = (tail + decoder.decode(value, { stream: true })).slice(-READY_TAIL_CHARS);
+					if (tail.includes(WATCHDOG_READY_MARKER)) return "ready";
+				}
+			}
+		} catch {
+			return "read-failed";
+		}
+	})();
+	const readyObservation = readyLoop.then(kind => ({ kind }));
+	const exitObservation = watchdog.exited.then(
+		code => ({ kind: "exited" as const, code }),
+		() => ({ kind: "exited" as const, code: -1 }),
+	);
+	let timer: NodeJS.Timeout | undefined;
+	const timeoutObservation = new Promise<{ kind: "timeout" }>(resolve => {
+		timer = setTimeout(() => resolve({ kind: "timeout" }), Math.max(1, readyTimeoutMs));
+	});
+	const observation = await Promise.race([readyObservation, exitObservation, timeoutObservation]);
+	clearTimeout(timer);
+	switch (observation.kind) {
+		case "ready":
+			await stdoutReader.cancel().catch(() => {});
+			return { ok: true, watchdog };
+		case "exited":
+			return fail("exited", `exited with code ${observation.code} before ready`);
+		case "ended": {
+			if (await waitForExit(watchdog, WATCHDOG_EXIT_SETTLE_MS)) {
+				const code = await watchdog.exited.catch(() => -1);
+				return fail("exited", `stdout closed before ready (exit code ${code})`);
+			}
+			return fail("exited", "stdout closed before ready");
+		}
+		case "read-failed":
+			return fail("read-failed", "stdout read failed");
+		case "timeout":
+			return fail("timeout", `no ready marker within ${Math.max(1, readyTimeoutMs)}ms`);
 	}
-	await reader.cancel().catch(() => {});
-	return watchdog;
 }
 export function stopWatchdog(watchdog: RpcChild | undefined): void {
 	if (!watchdog) return;

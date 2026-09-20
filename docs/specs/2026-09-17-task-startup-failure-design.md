@@ -55,6 +55,7 @@
 | 类前缀 | 任务行前缀沿用既有词汇（`群说明读取失败`、`任务执行失败`）并新增 `绑定不可用`、`worker 启动失败` | 历史行与 grep 习惯不被打断 |
 | 群说明读取失败 | 保持现状：任务失败且不启动 worker | owner 拍板 2026-09-17；主规格第 129 行与验收第 204 条已确认该承诺，群说明承载群内规则，静默降级会让回复脱离群约定 |
 | 启动失败重试 | 不加：把默认启动预算从 10 秒提高到 30 秒（`startupTimeoutMs` 仍可覆盖） | owner 拍板 2026-09-17；实测失败来自环境瞬时变慢，给慢启动更多时间比多跑一次握手更省 |
+| 看门狗就绪窗口 | 与 worker 启动预算共用同一 `startupTimeoutMs`（默认 30 秒），不设独立配置；超时仍判 `watchdog-unavailable` 并在有界时间内回收 | 2026-09-20 现场：typing 子区任务 `cda0b274` 在主机负载 31+ 时以 `watchdog-unavailable` 失败，固定 1 秒就绪窗口把慢启动误判为坏启动（就绪耗时、stderr、退出码现场均无留存，未能确证）；预算与 worker 对齐避免第二套阈值 |
 | 工作区被移除 | 保持绑定不变，只报 `绑定不可用（cwd-missing）` | owner 拍板 2026-09-17；绑定由 owner 显式控制，回落父群目录会静默改变隔离语义 |
 
 ## 设计
@@ -126,7 +127,8 @@ export function classifyStartupFailure(error: unknown, phase: TaskStartupPhase):
 | 绑定会话文件缺失 | `binding` 类：`session-invalid` |
 | worker ready 超时 | `worker` 类：`not-ready`；子进程已被 `create` 的失败清理路径停止 |
 | 子进程提前退出/输出中断 | `worker` 类：`exited` |
-| spawn、身份、看门狗失败 | `worker` 类：对应码 |
+| spawn、身份失败 | `worker` 类：对应码 |
+| 看门狗启动失败 | `worker` 类：`watchdog-unavailable`；有界 detail 区分 spawn 异常、提前退出（退出码 + ≤1024 字符 stderr 头部摘要、单行化）、stdout 读取失败、就绪超时（含预算毫秒数）；任一失败都 SIGKILL 回收该看门狗子进程，随后由工厂停止已启动的 OMP 进程组，安全门禁不变（watchdog 未就绪不创建 worker） |
 | 私聊任务（无群说明读取） | 不产生 `context` 类：读说明阶段被跳过 |
 | worker 已创建后的失败 | `generic` 类：文案不变，行与日志带真实原因 |
 | 任务被取消 | 不变：仍走 `markCancelled` 与取消回执 |
