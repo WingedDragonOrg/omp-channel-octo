@@ -1,6 +1,7 @@
+import { GroupHistoryCoordinator } from "./history-coordinator.ts";
+import { ModelSwitchController } from "./model-controller.ts";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readdir, rm } from "node:fs/promises";
 import { basename, join } from "node:path";
 import {
   ATTACHMENTS_DISABLED_TEXT,
@@ -34,15 +35,12 @@ import type {
   ContextInjection,
   CoreServiceConfig,
   GroupContext,
-  HistoryMessage,
   HistoryMessageAttachment,
   PromptContext,
   InboundAttachment,
   InboundMessage,
   OmpWorker,
   WorkerEvent,
-  WorkerModelCatalog,
-  WorkerModelSwitch,
   SteerConsumedEvent,
   ProgressCard,
   TaskRelayTarget,
@@ -55,21 +53,12 @@ import {
   encodeExecutionSnapshot,
   restoreExecutionSnapshot,
   stripCardSummaries,
-  type ExecutionEvent,
   type ExecutionSnapshot,
   type ExecutionState,
   type ExecutionTracker,
 } from "./execution-tracker.ts";
 import {
   ATTACHMENT_KIND_LABELS,
-  GROUP_HISTORY_DEFAULT_MAX_MESSAGES,
-  createHistoryBuffer,
-  planHistoryFetch,
-  renderHistoryBlock,
-  selectHistoryWindow,
-  type HistoryBuffer,
-  type HistoryEntry,
-  type PlannedHistoryFetch,
 } from "./group-history.ts";
 import {
   normalizeGroupContext,
@@ -94,16 +83,15 @@ import {
 } from "./project-session.ts";
 import { ensureProjectSessionDir, projectSessionDir, sessionsRoot } from "./session-dir.ts";
 import { ChannelStore, openChannelStore } from "./store.ts";
-import { boundedSelectorText, formatModelCatalog, modelWithLevel } from "./model-switch.ts";
-import type { BindingRecord, InboundClaim, OutboxRecord, ProgressCardRecord, TaskRecord } from "./store-records.ts";
-import { isGroupTarget, streamTargetKey, targetKey, taskTarget } from "./target.ts";
+import { modelWithLevel } from "./model-switch.ts";
+import type { BindingRecord, InboundClaim, ProgressCardRecord, TaskRecord } from "./store-records.ts";
+import { isGroupTarget, targetKey, taskTarget } from "./target.ts";
 import { createTypingLeaseManager, type TypingLeaseManager } from "./typing-lease.ts";
 import { createDisplayNameCache, type DisplayNameCache } from "./display-name.ts";
 import { createQuestionDesk, type QuestionDesk } from "./questions.ts";
 import { threadParentGroupId } from "./thread-target.ts";
 import { threadNotifyMessageId, threadOutcomeNotice } from "./thread-notify.ts";
 import { canonicalExistingDirectory, existingSessionFile, resolveWorkDirectory, stripOuterQuotes } from "./workdir.ts";
-import { worktreeSlug } from "./worktree.ts";
 import { worktrunkUnavailableText } from "./worktrunk.ts";
 
 const GROUP_TRUSTED_INSTRUCTION =
@@ -113,8 +101,6 @@ const COMMAND_HELP =
 const MODE_USAGE =
   "用法：/mode [steer|queue]。steer（默认，default 同义）把运行中的新消息注入当前回合；queue 把它排到当前回合之后。无参数时报告当前设置。";
 const QUEUE_USAGE = "用法：/queue <文本>；把该消息排到当前任务之后执行。";
-const SWITCH_PROBE_FAILED_TEXT = "无法从 OMP 读取模型信息，请稍后重试。";
-const SWITCH_CWD_UNAVAILABLE_TEXT = "无法解析该聊天的工作目录，/switch 暂不可用。";
 const DEFAULT_INTERRUPTED_TEXT = "已中断当前回合；已排队的消息会继续执行。";
 const DEFAULT_INTERRUPT_REJECTED_TEXT = "中断请求未被 OMP 接受，当前回合仍在运行。";
 const DEFAULT_INTERRUPT_IDLE_TEXT =
@@ -147,7 +133,6 @@ const PROGRESS_CARD_RECOVERY_ATTEMPTS = 3;
 const MAX_PENDING_STEERS = 32;
 /** Characters of the triggering message shown in a start/consumption receipt. */
 const RECEIPT_EXCERPT_CHARS = 20;
-const GROUP_HISTORY_FETCH_TIMEOUT_MS = 10_000;
 /** How long one 免@ decision is reused before the group switch is consulted again. */
 const MENTION_PREF_TTL_MS = 60_000;
 /** A failed lookup keeps the stricter "must be @mentioned" answer only briefly. */
@@ -273,17 +258,6 @@ type ProgressRound = {
   version: number;
   sentVersion: number;
   nextEditAt: number;
-};
-
-
-/**
- * Group history injected into one task turn together with the ledger attempt it
- * claims; the attempt is committed once the prompt returns, cancellation included.
- */
-type HistoryTurn = {
-  text: string;
-  lastSeq: number;
-  attemptId: string;
 };
 
 type DirectoryLease = {
@@ -440,19 +414,6 @@ function isCommand(text: string): boolean {
   return /^\/\S+/.test(text.trim());
 }
 
-/** One bounded line for a selector OMP could not resolve. */
-function notFoundModelText(selector: string): string {
-  return `未找到模型 "${boundedSelectorText(selector)}"；发送 /switch 查看可用模型列表。`;
-}
-
-/** A `/switch` probe whose chat directory cannot be resolved; reported apart from worker failures. */
-class SwitchDirectoryError extends Error {
-  constructor() {
-    super("switch probe directory unavailable");
-    this.name = "SwitchDirectoryError";
-  }
-}
-
 /**
  * Shutdown interrupted an inbound message before it was durably accepted. The handler rejects with
  * it so the transport never ACKs a swallowed message; the same message is redelivered after restart.
@@ -504,6 +465,8 @@ interface PendingThreadArchive {
 }
 
 class CoreService implements ChannelService {
+  private readonly history: GroupHistoryCoordinator;
+  private readonly models: ModelSwitchController;
   private readonly taskOperations = new Set<Promise<void>>();
   /** In-flight inbound handlers: stop aborts their I/O and awaits their cleanup before closing the store. */
   private readonly inboundOperations = new Set<Promise<void>>();
@@ -520,7 +483,6 @@ class CoreService implements ChannelService {
   private readonly directoryTails = new Map<string, Promise<void>>();
   private readonly runtimes = new Map<string, RuntimeTask>();
   private readonly blockedDirectories = new Set<string>();
-  private readonly groupHistoryBuffers = new Map<string, HistoryBuffer>();
   private readonly mentionPrefs = new Map<string, { effective: boolean; expiresAt: number }>();
   private readonly mentionPrefRequests = new Map<string, Promise<boolean>>();
   /** Last unlisted-chat notice per chat; process-local, so a restart may re-notify once. */
@@ -563,6 +525,17 @@ class CoreService implements ChannelService {
     commandHandlers: ReadonlyMap<string, ChannelCommandHandler>,
   ) {
     this.commandHandlers = commandHandlers;
+    this.history = new GroupHistoryCoordinator({
+      store, transport: options.transport, config: options.config.groupHistory,
+      botUid: () => this.bot?.uid,
+    });
+    this.models = new ModelSwitchController({
+      store, workerFactory: options.workerFactory, botUid: () => this.bot!.uid,
+      liveWorker: target => this.liveWorker(target),
+      probeDirectory: target => this.probeDirectory(target),
+      blockDirectory: cwd => { this.blockedDirectories.add(cwd); },
+      enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
+    });
     this.typingLeases = createTypingLeaseManager({
       sendTyping: (target, signal) => this.options.transport.sendTyping(target, signal),
       trackOperation: (operation) => this.operationSet(operation),
@@ -665,7 +638,7 @@ class CoreService implements ChannelService {
       await this.options.transport.start(
         (message) => this.handleInbound(message),
         () => {
-          this.resetHistoryCoverage();
+          this.history.resetCoverage();
           this.outbox.flushAll();
         },
       );
@@ -781,7 +754,7 @@ class CoreService implements ChannelService {
     this.throwIfStopping();
     if (!this.started || !this.bot) return;
     if (message.messageId.trim().length === 0 || message.senderId.trim().length === 0) return;
-    this.recordHistoryMessage(message);
+    this.history.record(message);
     const text = message.text.trim();
     if (this.store.hasOwnerEnrollment(this.bot.uid, message, message.messageId)) return;
     let ownerId = this.store.getOwnerId(this.bot.uid)?.trim() || null;
@@ -916,8 +889,7 @@ class CoreService implements ChannelService {
     if (message.messageTimestamp <= 0) return null;
     const senderId = message.senderId.trim();
     if (senderId.length === 0) return null;
-    const buffer = this.groupHistoryBuffers.get(targetKey(message));
-    const candidates = buffer?.attachmentCandidates(senderId, message.messageSeq, message.messageTimestamp) ?? [];
+    const candidates = this.history.attachmentCandidates(message);
     if (candidates.length === 0) return null;
     if (candidates.length === 1) {
       const candidate = candidates[0]!;
@@ -1414,161 +1386,6 @@ class CoreService implements ChannelService {
     return undefined;
   }
 
-  /** Live per-chat coverage buffer; chats without one simply have no coverage history. */
-  private historyBufferFor(target: ChatTarget): HistoryBuffer {
-    const key = targetKey(target);
-    const existing = this.groupHistoryBuffers.get(key);
-    if (existing) return existing;
-    const created = createHistoryBuffer(
-      this.options.config.groupHistory?.maxMessages ?? GROUP_HISTORY_DEFAULT_MAX_MESSAGES,
-    );
-    this.groupHistoryBuffers.set(key, created);
-    return created;
-  }
-
-  /**
-   * Every group/thread message proves coverage before any permission gate; only text
-   * from other senders becomes a renderable entry.
-   */
-  private recordHistoryMessage(message: InboundMessage): void {
-    if (this.options.config.groupHistory?.enabled !== true) return;
-    if (message.channelType !== 2 && message.channelType !== 5) return;
-    const senderId = message.senderId.trim();
-    this.historyBufferFor(message).record({
-      seq: message.messageSeq,
-      supported: message.supported,
-      senderId,
-      text: message.text,
-      timestamp: message.messageTimestamp,
-      fromBot: senderId.length > 0 && senderId === this.bot?.uid,
-      // Live 归一化已滤掉不可用的相对 URL，这里保留的都是绝对直链。
-      attachments: message.attachments.map(({ kind, name, size, url }) => ({ kind, name, size, url })),
-    });
-  }
-
-  /** A websocket connect/reconnect makes the covered seq range unknown again. */
-  private resetHistoryCoverage(): void {
-    for (const buffer of this.groupHistoryBuffers.values()) {
-      buffer.resetCoverage();
-    }
-  }
-
-  /** One bounded sync page; `null` marks a degraded turn that must not advance the watermark. */
-  private async fetchHistoryPage(
-    target: ChatTarget,
-    plan: PlannedHistoryFetch,
-  ): Promise<HistoryMessage[] | null> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), GROUP_HISTORY_FETCH_TIMEOUT_MS);
-    try {
-      return await this.options.transport.fetchGroupMessages(target, {
-        sinceSeq: plan.sinceSeq,
-        untilSeq: plan.untilSeq,
-        limit: plan.limit,
-        signal: controller.signal,
-      });
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : "fetch failed";
-      console.error(
-        `[group-history] sync failed target=${targetKey(target)} since=${plan.sinceSeq}`
-        + ` until=${plan.untilSeq}: ${reason}`,
-      );
-      return null;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  /**
-   * Builds the history block for one group/thread turn and claims the ledger attempt that
-   * the post-prompt commit closes.  A range the live buffer cannot prove covered is taken
-   * from sync; when that sync fails the turn keeps its plain text and the watermark stays
-   * put, so the next turn replays the same range instead of silently losing it.
-   */
-  private async historyTurnFor(
-    task: TaskRecord,
-    target: ChatTarget,
-    sessionId: string,
-  ): Promise<HistoryTurn | null> {
-    const config = this.options.config.groupHistory;
-    if (config?.enabled !== true) return null;
-    if (task.channelType !== 2 && task.channelType !== 5) return null;
-    if (!task.historyEligible || !Number.isInteger(task.messageSeq) || task.messageSeq <= 0) return null;
-    const botUid = this.bot!.uid;
-    const currentSeq = task.messageSeq;
-    // Session identity may have moved (`/new`, external rebinding); drop orphan rows first.
-    this.store.pruneHistoryLedger(botUid, target, sessionId);
-    const ledger = this.store.getHistoryLedger(botUid, target, sessionId);
-    // A committed row's lastSeq is the accounted-through watermark; a pending row still
-    // owes the range its previous attempt started from.
-    const watermark = ledger === null
-      ? null
-      : ledger.phase === "pending"
-        ? ledger.previousSeq
-        : ledger.lastSeq;
-    if (watermark !== null && watermark >= currentSeq) return null;
-    const buffer = this.historyBufferFor(target);
-    const candidates = buffer.entriesInRange(watermark ?? 0, currentSeq);
-    let truncatedEarlier = false;
-    if (!buffer.covers(watermark ?? 0, currentSeq)) {
-      const plan = planHistoryFetch({
-        previousSeq: watermark,
-        currentSeq,
-        maxMessages: config.maxMessages,
-      });
-      const page = await this.fetchHistoryPage(target, plan);
-      if (page === null) return null;
-      truncatedEarlier = plan.truncatedEarlier;
-      for (const message of page) {
-        if (!Number.isInteger(message.seq) || message.seq <= 0 || message.seq >= currentSeq) continue;
-        const entry: HistoryEntry = {
-          seq: message.seq,
-          senderId: message.senderId,
-          text: message.text,
-          timestamp: message.timestamp,
-        };
-        if (message.attachments !== undefined) entry.attachments = message.attachments;
-        candidates.push(entry);
-      }
-    }
-    const { kept, skipped } = selectHistoryWindow({
-      entries: candidates,
-      maxMessages: config.maxMessages,
-    });
-    const block = renderHistoryBlock(kept, { skipped, truncatedEarlier });
-    const prepared = this.store.prepareHistoryInjection(botUid, target, sessionId, currentSeq);
-    console.error(
-      `[group-history] target=${targetKey(target)} seq=${currentSeq}`
-      + ` injected=${kept.length} skipped=${skipped}${truncatedEarlier ? " truncated" : ""}`,
-    );
-    return {
-      text: block === null ? task.text : `${block}\n${task.text}`,
-      lastSeq: prepared.lastSeq,
-      attemptId: prepared.attemptId,
-    };
-  }
-
-  /**
-   * Closes the claimed attempt once the prompt returned.  A steer that landed mid-turn
-   * raised the row's lastSeq under the same attempt, so the commit follows it instead of
-   * reporting a CAS failure that would replay the steered message on the next turn.
-   */
-  private commitHistoryTurn(target: ChatTarget, sessionId: string, turn: HistoryTurn): void {
-    const botUid = this.bot?.uid;
-    if (botUid === undefined) return;
-    try {
-      const current = this.store.getHistoryLedger(botUid, target, sessionId);
-      const lastSeq = current === null ? turn.lastSeq : Math.max(turn.lastSeq, current.lastSeq);
-      if (this.store.commitHistoryInjection(botUid, target, sessionId, lastSeq, turn.attemptId)) return;
-      console.error(`[group-history] commit rejected target=${targetKey(target)} seq=${lastSeq}`);
-    } catch (error) {
-      console.error(
-        `[group-history] commit failed target=${targetKey(target)}:`
-        + ` ${error instanceof Error ? error.message : "unknown error"}`,
-      );
-    }
-  }
-
   /**
    * Persists the card frame the server accepted. A process that did not observe the run cannot
    * address the card, so this row is what lets a later process close it. Storage failures are
@@ -1697,14 +1514,6 @@ class CoreService implements ChannelService {
     }
   }
 
-  /** A steered message is already inside the running turn, so it is accounted for directly. */
-  private recordSteeredHistory(message: InboundMessage, runtime: RuntimeTask): void {
-    if (this.options.config.groupHistory?.enabled !== true) return;
-    const sessionId = runtime.worker?.sessionId ?? "";
-    if (sessionId.length === 0) return;
-    this.store.advanceHistoryLedger(this.bot!.uid, message, sessionId, message.messageSeq);
-  }
-
   private async deliverSteer(target: ChatTarget, text: string): Promise<boolean> {
     const runtime = this.runningRuntime(target);
     if (!runtime?.worker) return false;
@@ -1756,7 +1565,7 @@ class CoreService implements ChannelService {
     if (!this.store.claimCommand(claim)) return true;
     if (await this.deliverSteer(message, text)) {
       this.store.completeCommand(claim);
-      this.recordSteeredHistory(message, runtime);
+      this.history.recordSteered(message, runtime.worker?.sessionId ?? "");
       return true;
     }
     this.store.releaseClaim(claim);
@@ -1844,7 +1653,7 @@ class CoreService implements ChannelService {
       } else if (name === "mode") {
         await this.handleMode(target, argument);
       } else if (name === "switch") {
-        await this.handleSwitch(message, argument);
+        await this.models.handleSwitch(message, argument);
       } else if (name === "status") {
         await this.handleStatus(target);
       } else if (name === "help") {
@@ -2401,169 +2210,6 @@ class CoreService implements ChannelService {
   }
 
   /**
-   * `/switch [选择器]`: no argument reports the model this chat is on plus every model OMP offers;
-   * `default` drops the chat's model; anything else is handed to OMP's own `/switch`, which
-   * resolves `provider/id`, a model id or substring, `@role`, and an optional `:level` suffix
-   * against its live catalog. The resolved `provider/id:level` is stored for the chat, so workers
-   * started later (tasks, `/new`, `/reset`, `/move`) get it as `--model` — and when a turn is
-   * already running, the same dispatch switches that session in place, because OMP consumes the
-   * command locally instead of starting an agent turn.
-   */
-  private async handleSwitch(message: InboundMessage, argument: string): Promise<void> {
-    const botUid = this.bot!.uid;
-    const requested = argument.trim();
-    const live = this.liveWorker(message);
-    if (requested.length === 0) {
-      let catalog: WorkerModelCatalog;
-      try {
-        catalog = live
-          ? await live.models()
-          : await this.withProbeWorker(message, worker => worker.models());
-      } catch (error) {
-        await this.replySwitchFailure(message, error);
-        return;
-      }
-      await this.outbox.enqueueText(message, this.describeChatModel(message, live !== undefined, catalog), null);
-      return;
-    }
-    if (requested.toLowerCase() === "default" && !requested.includes("/")) {
-      await this.resetChatModel(message);
-      return;
-    }
-    // A selector is a single token; catching a stray one here keeps a typo from starting a worker.
-    if (/\s/u.test(requested)) {
-      await this.outbox.enqueueText(message, notFoundModelText(requested), null);
-      return;
-    }
-    let outcome: WorkerModelSwitch;
-    try {
-      outcome = live
-        ? await live.switchModel(requested)
-        : await this.withProbeWorker(message, worker => worker.switchModel(requested));
-    } catch (error) {
-      await this.replySwitchFailure(message, error);
-      return;
-    }
-    if (!outcome.ok) {
-      await this.outbox.enqueueText(message, notFoundModelText(requested), null);
-      return;
-    }
-    const model = modelWithLevel(outcome.model, outcome.level);
-    this.store.setChatModel(botUid, message, model);
-    await this.outbox.enqueueText(
-      message,
-      live === undefined
-        ? `已切换本聊天模型为 ${model}，从下一回合开始生效。`
-        : `已切换本聊天模型为 ${model}（运行中会话已同步切换）。`,
-      null,
-    );
-  }
-
-  /**
-   * The empty `/switch` answer: the live session's model while a turn runs (that is the model in
-   * use), otherwise this chat's stored model, otherwise the model OMP would start a fresh session
-   * with — followed by every model OMP currently offers.
-   */
-  private describeChatModel(target: ChatTarget, running: boolean, catalog: WorkerModelCatalog): string {
-    const stored = this.store.getChatModel(this.bot!.uid, target);
-    const live = catalog.current === null ? null : modelWithLevel(catalog.current, catalog.level);
-    if (running && live !== null) {
-      return formatModelCatalog({
-        current: live,
-        label:
-          stored === null
-            ? "运行中会话"
-            : stored === live
-              ? "本聊天指定"
-              : `运行中会话；本聊天模型 ${stored}`,
-        models: catalog.available,
-      });
-    }
-    if (stored !== null) {
-      return formatModelCatalog({ current: stored, label: "本聊天指定", models: catalog.available });
-    }
-    return formatModelCatalog({ current: live, label: "OMP 默认", models: catalog.available });
-  }
-
-  /**
-   * `/switch default`: drop this chat's model so later workers start without `--model` and follow
-   * OMP's own default selection. A running session is left alone — `/switch @default` is the
-   * native way to move it.
-   */
-  private async resetChatModel(target: ChatTarget): Promise<void> {
-    const previous = this.store.getChatModel(this.bot!.uid, target);
-    if (previous === null) {
-      await this.outbox.enqueueText(target, "本聊天未指定模型，继续跟随 OMP 默认。", null);
-      return;
-    }
-    this.store.clearChatModel(this.bot!.uid, target);
-    let current: string | null = null;
-    if (this.liveWorker(target) === undefined) {
-      const catalog = await this.withProbeWorker(target, worker => worker.models()).catch(() => null);
-      if (catalog !== null && catalog.current !== null) current = modelWithLevel(catalog.current, catalog.level);
-    }
-    await this.outbox.enqueueText(
-      target,
-      `已恢复跟随 OMP 默认模型${current === null ? "" : `（当前为 ${current}）`}。`,
-      null,
-    );
-  }
-
-  /**
-   * One throwaway worker serves a `/switch` probe: fresh (no `--resume`), no prompt of our own
-   * beyond the switch dispatch, and a `mkdtemp` session directory it never shares with a chat
-   * session, so it neither reads nor writes a running turn's transcript. It runs in the chat's own
-   * directory — same OMP profile, config, and credentials as that chat's turns — is recorded in
-   * the worker ledger like `/new`'s candidate worker, and is removed afterwards.
-   */
-  private async withProbeWorker<T>(target: ChatTarget, run: (worker: OmpWorker) => Promise<T>): Promise<T> {
-    const cwd = await this.probeDirectory(target);
-    if (cwd === null) throw new SwitchDirectoryError();
-    const sessionDir = await mkdtemp(join(tmpdir(), "omp-channel-octo-switch-"));
-    const sessionId = createSessionId();
-    const ledgerId = `switch-${sessionId}`;
-    let spawned: WorkerProcess | undefined;
-    let stopped = false;
-    try {
-      const candidate = await this.options.workerFactory.create({
-        cwd,
-        sessionDir,
-        onSpawn: (processInfo) => {
-          spawned = processInfo;
-          this.store.recordWorker({
-            id: ledgerId,
-            botUid: this.bot!.uid,
-            sessionId,
-            sessionFile: join(sessionDir, `${sessionId}.jsonl`),
-            pid: processInfo.pid,
-            pgid: processInfo.pgid,
-            identity: processInfo.identity,
-            cwd: processInfo.cwd,
-            moveTargetCwd: null,
-            state: "running",
-          });
-        },
-      });
-      try {
-        return await run(candidate);
-      } finally {
-        stopped = await candidate.stop().catch(() => false);
-        if (stopped) this.store.markWorkerStopped(ledgerId);
-        else this.blockedDirectories.add(cwd);
-      }
-    } catch (error) {
-      if (!stopped && spawned) {
-        const verified = await this.options.workerFactory.recover(spawned).catch(() => false);
-        if (verified) this.store.markWorkerStopped(ledgerId);
-        else this.blockedDirectories.add(cwd);
-      }
-      throw error;
-    } finally {
-      await rm(sessionDir, { recursive: true, force: true }).catch(() => {});
-    }
-  }
-
-  /**
    * The cwd a probe worker runs in: the chat's own directory — the same one its turns use — or
    * `null` when nothing usable resolves.
    */
@@ -2575,15 +2221,6 @@ class CoreService implements ChannelService {
     } catch {
       return null;
     }
-  }
-
-  /** A probe failure as one bounded line: no working directory, or no usable OMP answer. */
-  private async replySwitchFailure(target: ChatTarget, error: unknown): Promise<void> {
-    await this.outbox.enqueueText(
-      target,
-      error instanceof SwitchDirectoryError ? SWITCH_CWD_UNAVAILABLE_TEXT : SWITCH_PROBE_FAILED_TEXT,
-      null,
-    );
   }
 
   private async handleCancel(target: ChatTarget): Promise<void> {
@@ -3423,7 +3060,7 @@ class CoreService implements ChannelService {
         }
         trackProgress(event, progressRound.tracker.apply(event));
       };
-      const historyTurn = await this.historyTurnFor(task, target, verified.sessionId);
+      const historyTurn = await this.history.prepareTurn(task, target, verified.sessionId);
       const promptContext: PromptContext = {
         tools: createHostTools(this.hostToolHost(), task, snapshot),
         ...(contextInjection === undefined ? {} : { contextInjection }),
@@ -3433,7 +3070,7 @@ class CoreService implements ChannelService {
         await worker.prompt(historyTurn?.text ?? task.text, onEvent, promptContext);
       } finally {
         runtime.promptInFlight = false;
-        if (historyTurn) this.commitHistoryTurn(target, verified.sessionId, historyTurn);
+        if (historyTurn) this.history.commitTurn(target, verified.sessionId, historyTurn);
       }
       if (runtime.cancelRequested) {
         this.store.markCancelled(taskId);

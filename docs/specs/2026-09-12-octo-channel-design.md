@@ -46,6 +46,10 @@
 
 ## 设计
 
+### 服务编排边界
+
+`CoreService` 负责入站、任务与服务生命周期的编排，通过明确的类型化端口调用职责模块。`history-coordinator.ts` 独占每个聊天的历史覆盖 buffer，负责有界回填及 ledger prepare/commit；权限门之前的记录和 prompt 结束后的提交时点由服务保持。`model-controller.ts` 负责模型命令、聊天模型持久化及临时探测 worker 的完整生命周期，服务只提供活 worker、目录解析、出站投递和目录阻塞端口。模块不依赖 `CoreService` 实例，也不共享其可变状态集合。
+
 ### 运行和配置
 
 使用 TypeScript/Bun 常驻服务，主动连接 Octo，启动并管理 OMP RPC worker。无需为 RPC 开放网络监听端口。macOS 使用 launchd 托管；机器休眠或离线期间不承诺可用。
