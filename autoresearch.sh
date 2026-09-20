@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run only local fixtures; no Octo credentials, installed OMP, or model calls.
+# Offline ask-card geometry, screenshots, and real-renderer answer interactions.
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 export TZ=UTC
 export LC_ALL=C
-exec bun run tests/benchmarks/autoresearch.ts
+exec bun run tests/benchmarks/ask-card-ui.mjs
