@@ -154,8 +154,8 @@ class RpcWorker implements OmpWorker {
 		this.#newSessionOnStart = newSessionOnStart;
 		const ready = Promise.withResolvers<void>();
 		this.#readyPromise = ready.promise;
-		this.#readyResolve = () => ready.resolve();
-		this.#readyReject = error => ready.reject(error);
+		this.#readyResolve = ready.resolve;
+		this.#readyReject = ready.reject;
 		void this.#readStdout();
 		void this.#readStderr();
 		void this.#child.exited.then(
@@ -862,9 +862,7 @@ class RpcWorker implements OmpWorker {
 		this.#rejectPending(error);
 		this.#abortHostCalls(error);
 		if (this.#activePrompt) this.#rejectPrompt(this.#activePrompt, error);
-		void terminateOwnedProcess(this.#child, this.#pgid, this.#cancelTimeoutMs).then(stopped => {
-			if (stopped) stopWatchdog(this.#watchdog);
-		});
+		void this.stop();
 	}
 }
 
