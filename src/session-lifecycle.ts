@@ -3,9 +3,9 @@
  * 两条命令各自的候选 worker 台账、状态验证与回执时序。
  *
  * 模块不依赖 `service.ts`：持久层（绑定行、worker 台账、聊天模型）、worker 工厂与配置按原样注入。
- * 按 cwd 的租约、运行中任务与 blocked 集合仍是 `CoreService` 的进程内状态，分别经
- * `tryAcquireCommandDirectories`、`hasRuntime`、`isDirectoryBlocked`/`blockDirectory` 端口跨越；
- * 模块内不保存副本，所以被 block 的目录在绑定探测与任务调度两侧保持同一个语义。
+ * 按 cwd 的租约本体由 `TaskScheduler` 持有，运行中任务与 blocked 集合仍是 `CoreService` 的进程内
+ * 状态，分别经 `tryAcquireCommandDirectories`、`hasRuntime`、`isDirectoryBlocked`/`blockDirectory`
+ * 端口跨越；模块内不保存副本，所以被 block 的目录在绑定探测与任务调度两侧保持同一个语义。
  */
 
 import { randomUUID } from "node:crypto";
@@ -31,6 +31,7 @@ import {
 import { ensureProjectSessionDir, projectSessionDir, sessionsRoot } from "./session-dir.ts";
 import type { ChannelStore } from "./store.ts";
 import type { BindingRecord } from "./store-records.ts";
+import type { DirectoryLease } from "./task-scheduler.ts";
 import { threadParentGroupId } from "./thread-target.ts";
 import {
   canonicalExistingDirectory,
@@ -38,15 +39,6 @@ import {
   resolveWorkDirectory,
   stripOuterQuotes,
 } from "./workdir.ts";
-
-/**
- * 按目录的租约：`/new`、`/move` 在命令体内占据一个或多个 cwd，`ready` 在它们都空闲后兑现，
- * `complete` 恰好释放一次。租约本体（按 cwd 的 Promise 链）仍由 `CoreService` 持有。
- */
-export type DirectoryLease = {
-  ready: Promise<void>;
-  complete(): void;
-};
 
 /**
  * 生命周期可以触及的自有状态之外的一切：持久化的绑定行/worker 台账/聊天模型、命令启动候选
@@ -76,8 +68,8 @@ export interface SessionLifecycleDeps {
   /** 把该 cwd 标为不可用（worker 无法确认停止时）。 */
   readonly blockDirectory: (cwd: string) => void;
   /**
-   * 为一次目录级命令租下全部给定 cwd，任一忙碌时返回 `undefined`（由 `CoreService` 的
-   * directoryTails、运行中任务与 blocked 集合共同判定）。租约在命令的 finally 里释放。
+   * 为一次目录级命令租下全部给定 cwd，任一忙碌时返回 `undefined`（由 `TaskScheduler` 的目录
+   * 租约链、运行中任务与 blocked 集合共同判定）。租约在命令的 finally 里释放。
    */
   readonly tryAcquireCommandDirectories: (cwds: readonly string[]) => DirectoryLease | undefined;
   /** 为该聊天排一条回执文本，与其他命令路径一致。 */

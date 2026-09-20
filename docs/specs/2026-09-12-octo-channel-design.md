@@ -52,9 +52,11 @@
 
 `chat-authorization.ts` 独占权限判定、免@查询缓存、运行时开通及节流通知；`inbound-materializer.ts` 负责唯一的正文资源组装入口，持有每次下载预算和本次新建文件清单，统一处理失败回滚。两者通过同一个服务 shutdown signal 取消在途 I/O，共用 `errors.ts` 的 `InboundShutdownError`；服务继续拥有入站操作登记和关停排空，权限门、待回答问题、typing、资源组装及 durable acceptance 的先后顺序保持不变。
 
-`progress-cards.ts` 统一拥有进度卡的持久恢复与每任务轮次状态。服务将已归一化的 `ExecutionEvent` 交给每任务的 `TaskProgress`，其队列 tail 仍登记到服务关停排空集合，子区归档前读取并等待当前 tail。`session-lifecycle.ts` 负责会话身份/cwd 校验、目录回退、`/new` 和原生 `/move`；目录仲裁及 blocked 集合继续由服务单点拥有，通过租约和阻塞端口协作，迁移始终同时持有源、目标目录租约。
+`progress-cards.ts` 统一拥有进度卡的持久恢复与每任务轮次状态。服务将已归一化的 `ExecutionEvent` 交给每任务的 `TaskProgress`，其队列 tail 仍登记到服务关停排空集合，子区归档前读取并等待当前 tail。`session-lifecycle.ts` 负责会话身份/cwd 校验、目录回退、`/new` 和原生 `/move`；它通过 `TaskScheduler` 取得目录租约，blocked 集合继续由服务单点拥有，迁移始终同时持有源、目标目录租约。
 
 `thread-commands.ts` 负责 `/thread` 的任务交接和合并指令，复用正文组装、typing 及任务接纳端口；命令去重仍在服务入口完成。`thread-archive.ts` 独占待归档集合和停止唤醒信号，服务在授权新入站时取消排定、在回合输出之后运行归档；排定替换、出站排空、瞬时失败重试及停止放弃均由该模块维护。
+
+`task-scheduler.ts` 独占聊天串行链、排定任务、目录租约、等待回执标记及关停任务快照；运行中 worker 和 blocked 目录仍由服务管理，调度仅经明确端口查询。`command-routing.ts` 统一内建命令别名及注册校验，从别名表推导的 action 类型约束完整分派表；durable claim 保留用户输入的命令名，重启仍在 claim 完成后请求，未知命令照常走既有 handler 或 OMP 任务路径。
 
 ### 运行和配置
 

@@ -1,7 +1,16 @@
 import { GroupHistoryCoordinator } from "./history-coordinator.ts";
 import { ModelSwitchController } from "./model-controller.ts";
 import { ProgressCards } from "./progress-cards.ts";
-import { SessionLifecycle, type DirectoryLease } from "./session-lifecycle.ts";
+import {
+  isCommand,
+  normalizeCommandHandlers,
+  parseCommand,
+  resolveBuiltinAction,
+  type BuiltinAction,
+  type BuiltinHandlers,
+} from "./command-routing.ts";
+import { SessionLifecycle } from "./session-lifecycle.ts";
+import { TaskScheduler } from "./task-scheduler.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
@@ -82,21 +91,6 @@ const RESTART_UNAVAILABLE_TEXT = "未检测到守护进程，无法重启 channe
 const CHANNEL_RESTART_SCHEDULED_TEXT =
   "已排定重启：本回合结束后、channel 没有运行中或排队任务时执行守护进程的重启；重启完成后会在本会话通报 PID。";
 const RESTART_NOTICE_TTL_MS = 10 * 60 * 1_000;
-const BUILTIN_COMMANDS: Record<string, true> = {
-  new: true,
-  reset: true,
-  move: true,
-  thread: true,
-  cancel: true,
-  stop: true,
-  status: true,
-  help: true,
-  restart: true,
-  mode: true,
-  queue: true,
-  interrupt: true,
-  switch: true,
-};
 /** Steered messages tracked for the consumption receipt; older entries fall out of observation. */
 const MAX_PENDING_STEERS = 32;
 /** Characters of the triggering message shown in a start/consumption receipt. */
@@ -137,43 +131,6 @@ function receiptText(prefix: string, text: string): string {
   return `${prefix} ▸ ${bounded}`;
 }
 
-function normalizeCommandHandlers(
-  handlers: readonly ChannelCommandHandler[] | undefined,
-): ReadonlyMap<string, ChannelCommandHandler> {
-  const normalized = new Map<string, ChannelCommandHandler>();
-  for (const handler of handlers ?? []) {
-    if (
-      typeof handler !== "object" ||
-      handler === null ||
-      typeof handler.name !== "string" ||
-      typeof handler.intercept !== "boolean" ||
-      typeof handler.handle !== "function"
-    ) {
-      throw new Error("命令 handler 注册无效");
-    }
-    const name = handler.name.trim().toLowerCase();
-    if (name.length === 0 || name.startsWith("/") || /\s/u.test(name)) {
-      throw new Error("命令 handler 名称无效");
-    }
-    if (normalized.has(name)) {
-      throw new Error(`命令 handler 重复注册：${name}`);
-    }
-    normalized.set(name, handler);
-  }
-  return normalized;
-}
-
-function isCommand(text: string): boolean {
-  return /^\/\S+/.test(text.trim());
-}
-
-function parseCommand(text: string): { name: string; argument: string } | null {
-  const match = /^\/([^\s]+)(?:\s+([\s\S]*))?$/.exec(text.trim());
-  if (!match) return null;
-  return { name: match[1]!.toLowerCase(), argument: match[2] ?? "" };
-}
-
-
 function statusState(task: TaskRecord | null, hasBinding: boolean): ChatExecutionState {
   if (!task) return hasBinding ? "idle" : "none";
   return task.state;
@@ -201,20 +158,12 @@ class CoreService implements ChannelService {
   private readonly materializer: InboundMaterializer;
   private readonly progressCards: ProgressCards;
   private readonly sessions: SessionLifecycle;
-  private readonly taskOperations = new Set<Promise<void>>();
+  /** 任务排定与按 cwd 的租约：队列、等待回执与目录链都由它独占。 */
+  private readonly scheduler: TaskScheduler;
   /** In-flight inbound handlers: stop aborts their I/O and awaits their cleanup before closing the store. */
   private readonly inboundOperations = new Set<Promise<void>>();
   /** Shutdown cancellation source for inbound I/O (downloads, transcription, mention-pref lookups). */
   private readonly shutdownController = new AbortController();
-  private readonly chatTails = new Map<string, Promise<void>>();
-  private readonly scheduledTasks = new Map<string, Promise<void>>();
-  /**
-   * Tasks accepted while their chat or directory was already busy. They get one start receipt
-   * when they finally begin, so a message that waited is distinguishable from one that started
-   * right away. In-memory only: a restart interrupts such tasks instead of starting them.
-   */
-  private readonly queuedBehind = new Set<string>();
-  private readonly directoryTails = new Map<string, Promise<void>>();
   private readonly runtimes = new Map<string, RuntimeTask>();
   private readonly blockedDirectories = new Set<string>();
   /** 问题与问答卡：等待者、卡片代次与问题行的所有者。 */
@@ -226,6 +175,8 @@ class CoreService implements ChannelService {
   /** Bot 事件队列消费（卡片点击）。 */
   private readonly botEvents: BotEventLoop;
   private readonly commandHandlers: ReadonlyMap<string, ChannelCommandHandler>;
+  /** 内建命令的 canonical handler 表：识别（alias 表）与分派共用同一份 canonical action。 */
+  private readonly builtinHandlers: BuiltinHandlers;
   /** typing 租约：agent-attached 消息从门后到任务终态的持续「正在输入」。 */
   private readonly typingLeases: TypingLeaseManager;
   private bot: BotIdentity | undefined;
@@ -268,6 +219,21 @@ class CoreService implements ChannelService {
       stopping: () => this.stopping,
       trackOperation: (operation) => this.operationSet(operation),
     });
+    // 排定与租约的所有者先于 SessionLifecycle 构造：会话侧的命令租约经端口落到这里。它的
+    // reconcileBinding/runTask 回调只在任务真正执行时解引用 `this.sessions`（构造时不解引用，
+    // 因此这里先构造不会碰到尚未赋值的字段）。
+    this.scheduler = new TaskScheduler({
+      store: this.store,
+      botUid: () => this.bot?.uid,
+      stopping: () => this.stopping,
+      hasRuntimeInDirectory: cwd => this.hasRuntimeInDirectory(cwd),
+      isDirectoryBlocked: cwd => this.blockedDirectories.has(cwd),
+      reconcileBinding: (target, binding) =>
+        this.sessions.reconcileExternalBinding(target, binding),
+      runTask: (taskId, cwd) => this.runTask(taskId, cwd),
+      enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
+      notifyThreadOutcome: taskId => this.notifyThreadOutcome(taskId),
+    });
     this.sessions = new SessionLifecycle({
       store: this.store,
       workerFactory: options.workerFactory,
@@ -276,7 +242,7 @@ class CoreService implements ChannelService {
       hasRuntime: target => this.hasRuntime(target),
       isDirectoryBlocked: cwd => this.blockedDirectories.has(cwd),
       blockDirectory: cwd => { this.blockedDirectories.add(cwd); },
-      tryAcquireCommandDirectories: cwds => this.tryAcquireCommandDirectories(cwds),
+      tryAcquireCommandDirectories: cwds => this.scheduler.tryAcquireCommandDirectories(cwds),
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
     });
     this.typingLeases = createTypingLeaseManager({
@@ -359,6 +325,22 @@ class CoreService implements ChannelService {
       acceptTask: (message, text) => this.acceptTask(message, text),
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
     });
+    // 内建命令的 canonical handler 表：每个 action 一个函数，直接返回原 handler 的 Promise
+    // （不再包一层 async），`handleCommand` 里的 await 因此仍是原来的微任务边界；只有
+    // `restart` 的返回值参与重启判定。
+    this.builtinHandlers = {
+      new: (message, argument) => this.sessions.handleNew(message, argument),
+      move: (message, argument) => this.sessions.handleMove(message, argument),
+      thread: (message, argument) => this.threadCommands.handle(message, argument),
+      cancel: message => this.handleCancel(message),
+      interrupt: message => this.handleInterrupt(message),
+      queue: (message, argument) => this.handleQueue(message, argument),
+      mode: (message, argument) => this.handleMode(message, argument),
+      switch: (message, argument) => this.models.handleSwitch(message, argument),
+      status: message => this.handleStatus(message),
+      help: message => this.outbox.enqueueText(message, COMMAND_HELP, null),
+      restart: (message, argument) => this.handleRestart(message, argument),
+    };
   }
 
   async start(): Promise<void> {
@@ -476,7 +458,7 @@ class CoreService implements ChannelService {
       }
     }
     this.outbox.abortAll();
-    await Promise.allSettled([...this.taskOperations]);
+    await this.scheduler.settle();
     await Promise.allSettled([...this.activityOperations]);
     // Inbound handlers aborted above finish their bounded cleanup here, while the store is still
     // open: interrupted assembly rolls its command claim back so a redelivery is not swallowed.
@@ -606,8 +588,9 @@ class CoreService implements ChannelService {
     }
     const command = isCommand(text) ? parseCommand(text) : null;
     if (command) {
-      if (BUILTIN_COMMANDS[command.name] === true) {
-        await this.handleCommand(message, command.name, command.argument);
+      const action = resolveBuiltinAction(command.name);
+      if (action !== undefined) {
+        await this.handleCommand(message, command.name, command.argument, action);
         return;
       }
       const handler = this.commandHandlers.get(command.name);
@@ -703,6 +686,14 @@ class CoreService implements ChannelService {
     return false;
   }
 
+  /** 该 cwd 是否有进程内运行任务：调度侧的目录判定遍历同一份 runtimes。 */
+  private hasRuntimeInDirectory(cwd: string): boolean {
+    for (const runtime of this.runtimes.values()) {
+      if (runtime.cwd === cwd) return true;
+    }
+    return false;
+  }
+
   /** The chat's task whose OMP prompt is currently in flight, if any. */
   private runningRuntime(target: ChatTarget): RuntimeTask | undefined {
     const key = targetKey(target);
@@ -779,18 +770,6 @@ class CoreService implements ChannelService {
     return false;
   }
 
-  private directoryUnavailable(cwd: string): boolean {
-    if (this.blockedDirectories.has(cwd) || this.directoryTails.has(cwd)) return true;
-    for (const runtime of this.runtimes.values()) {
-      if (runtime.cwd === cwd) return true;
-    }
-    for (const task of this.store.listQueuedTasks()) {
-      if (task.cwd === cwd) return true;
-    }
-    return false;
-  }
-
-
   private async handleInterceptingCommand(
     message: InboundMessage,
     command: { name: string; argument: string },
@@ -839,37 +818,19 @@ class CoreService implements ChannelService {
     }
   }
 
-  private async handleCommand(message: InboundMessage, name: string, argument: string): Promise<void> {
+  private async handleCommand(
+    message: InboundMessage,
+    name: string,
+    argument: string,
+    action: BuiltinAction,
+  ): Promise<void> {
+    // 认领仍按键原始命令名（别名在 claim 之后只影响走哪个 handler），认领失败即丢弃。
     const claim = this.commandClaim(message, name);
     if (!this.store.claimCommand(claim)) return;
-    const target: ChatTarget = message;
     try {
-      let restartRequested = false;
-      if (name === "new" || name === "reset") {
-        await this.sessions.handleNew(target, argument);
-      } else if (name === "thread") {
-        await this.threadCommands.handle(message, argument);
-      } else if (name === "move") {
-        await this.sessions.handleMove(target, argument);
-      } else if (name === "cancel" || name === "stop") {
-        await this.handleCancel(target);
-      } else if (name === "interrupt") {
-        await this.handleInterrupt(target);
-      } else if (name === "queue") {
-        await this.handleQueue(message, argument);
-      } else if (name === "mode") {
-        await this.handleMode(target, argument);
-      } else if (name === "switch") {
-        await this.models.handleSwitch(message, argument);
-      } else if (name === "status") {
-        await this.handleStatus(target);
-      } else if (name === "help") {
-        await this.outbox.enqueueText(target, COMMAND_HELP, null);
-      } else if (name === "restart") {
-        restartRequested = await this.handleRestart(target, argument);
-      }
+      const restartRequested = await this.builtinHandlers[action](message, argument);
       this.store.completeCommand(claim);
-      if (restartRequested) {
+      if (restartRequested === true) {
         this.restartRequested = true;
         await this.options.restart?.request();
       }
@@ -1056,7 +1017,7 @@ class CoreService implements ChannelService {
 
   private async handleCancel(target: ChatTarget): Promise<void> {
     const queued = this.store.cancelQueued(this.bot!.uid, target);
-    for (const taskId of queued) this.queuedBehind.delete(taskId);
+    for (const taskId of queued) this.scheduler.takeWaitingReceipt(taskId);
     for (const taskId of queued) await this.notifyThreadOutcome(taskId);
     this.questions.cancelForTarget(target);
     let active = false;
@@ -1220,7 +1181,7 @@ class CoreService implements ChannelService {
     };
     let accepted: boolean;
     // Measured before acceptance so the new task's own row cannot count itself as the work it waits for.
-    const startsBehind = this.hasBlockingWork(message, task.cwd);
+    const startsBehind = this.scheduler.hasBlockingWork(message, task.cwd);
     try {
       accepted = this.store.acceptTask(this.taskClaim(message), task);
     } catch {
@@ -1229,144 +1190,10 @@ class CoreService implements ChannelService {
     if (!accepted) return false;
     // 持久接受即点亮 task 租约：排队等待（同聊天或跨聊天同目录）到终态都保持「正在输入」。
     this.typingLeases.acquire(message, `task:${task.id}`);
-    if (startsBehind) this.queuedBehind.add(task.id);
-    this.scheduleTask(task.id);
+    if (startsBehind) this.scheduler.markWaiting(task.id);
+    this.scheduler.scheduleTask(task.id);
     this.outbox.flush(message);
     return true;
-  }
-
-  /** True when a new task on this chat cannot start at once: the chat or its directory is busy. */
-  private hasBlockingWork(target: ChatTarget, cwd: string): boolean {
-    if (this.chatTails.has(targetKey(target))) return true;
-    if (this.store.listQueuedTasks().some((queued) => queued.cwd === cwd)) return true;
-    for (const runtime of this.runtimes.values()) {
-      if (runtime.cwd === cwd) return true;
-    }
-    return false;
-  }
-  private scheduleTask(taskId: string): void {
-    const task = this.store.getTask(taskId);
-    if (!task) return;
-    const target = taskTarget(task);
-    const chatKey = targetKey(target);
-    const previousChat = this.chatTails.get(chatKey) ?? Promise.resolve();
-    const next = previousChat.catch(() => {}).then(() => this.runScheduledTask(taskId));
-    this.chatTails.set(chatKey, next);
-    this.scheduledTasks.set(taskId, next);
-    this.taskOperations.add(next);
-    const cleanup = () => {
-      if (this.chatTails.get(chatKey) === next) this.chatTails.delete(chatKey);
-      if (this.scheduledTasks.get(taskId) === next) this.scheduledTasks.delete(taskId);
-      this.taskOperations.delete(next);
-    };
-    void next.then(cleanup, cleanup);
-  }
-
-  private createDirectoryLease(cwd: string): DirectoryLease {
-    const previous = this.directoryTails.get(cwd);
-    const completion = Promise.withResolvers<void>();
-    const lease = completion.promise;
-    this.directoryTails.set(cwd, lease);
-    let complete = false;
-    return {
-      ready: previous?.catch(() => {}) ?? Promise.resolve(),
-      complete: () => {
-        if (complete) return;
-        complete = true;
-        if (this.directoryTails.get(cwd) === lease) this.directoryTails.delete(cwd);
-        completion.resolve();
-      },
-    };
-  }
-
-  private tryAcquireCommandDirectories(cwds: readonly string[]): DirectoryLease | undefined {
-    const unique = [...new Set(cwds)];
-    if (unique.some(cwd => this.directoryUnavailable(cwd))) return undefined;
-    const leases = unique.map(cwd => this.createDirectoryLease(cwd));
-    return {
-      ready: Promise.all(leases.map(lease => lease.ready)).then(() => {}),
-      complete: () => {
-        for (const lease of leases) lease.complete();
-      },
-    };
-  }
-
-  private async acquireDirectoryLease(cwd: string): Promise<DirectoryLease> {
-    const lease = this.createDirectoryLease(cwd);
-    await lease.ready;
-    return lease;
-  }
-
-  private async earlierDirectoryOperations(task: TaskRecord, cwd: string): Promise<Promise<void>[]> {
-    const queued = this.store.listQueuedTasks();
-    const currentIndex = queued.findIndex(candidate => candidate.id === task.id);
-    if (currentIndex < 0) return [];
-    const operations: Promise<void>[] = [];
-    for (let index = 0; index < currentIndex; index += 1) {
-      const earlier = queued[index];
-      if (!earlier) continue;
-      const binding = await this.sessions.reconcileExternalBinding(
-        taskTarget(earlier),
-        this.store.getBinding(this.bot!.uid, taskTarget(earlier)),
-      );
-      if ((binding?.cwd ?? earlier.cwd) !== cwd) continue;
-      const operation = this.scheduledTasks.get(earlier.id);
-      if (operation) operations.push(operation);
-    }
-    return operations;
-  }
-
-  private async runScheduledTask(taskId: string): Promise<void> {
-    let lease: DirectoryLease | undefined;
-    try {
-      for (let attempt = 0; attempt < 4; attempt += 1) {
-        const current = this.store.getTask(taskId);
-        if (this.stopping || !current || current.state !== "queued") return;
-        const binding = await this.sessions.reconcileExternalBinding(
-          taskTarget(current),
-          this.store.getBinding(this.bot!.uid, taskTarget(current)),
-        );
-        const reconciledCurrent = this.store.getTask(taskId);
-        if (this.stopping || !reconciledCurrent || reconciledCurrent.state !== "queued") return;
-        const cwd = binding?.cwd ?? reconciledCurrent.cwd;
-        const earlier = await this.earlierDirectoryOperations(reconciledCurrent, cwd);
-        await Promise.all(earlier.map(operation => operation.catch(() => {})));
-
-        const beforeLease = this.store.getTask(taskId);
-        if (this.stopping || !beforeLease || beforeLease.state !== "queued") return;
-        lease = await this.acquireDirectoryLease(cwd);
-
-        const refreshed = await this.sessions.reconcileExternalBinding(
-          taskTarget(beforeLease),
-          this.store.getBinding(this.bot!.uid, taskTarget(beforeLease)),
-        );
-        const latest = this.store.getTask(taskId);
-        if (this.stopping || !latest || latest.state !== "queued") return;
-        const currentCwd = refreshed?.cwd ?? latest.cwd;
-        if (currentCwd !== cwd) {
-          lease.complete();
-          lease = undefined;
-          continue;
-        }
-        const newlyEarlier = await this.earlierDirectoryOperations(latest, currentCwd);
-        if (newlyEarlier.length > 0) {
-          lease.complete();
-          lease = undefined;
-          await Promise.all(newlyEarlier.map(operation => operation.catch(() => {})));
-          continue;
-        }
-        await this.runTask(taskId, cwd);
-        return;
-      }
-      const task = this.store.getTask(taskId);
-      if (!task || task.state !== "queued") return;
-      this.queuedBehind.delete(taskId);
-      this.store.markFailed(taskId, "绑定目录在启动前持续变更，任务未启动。");
-      await this.outbox.enqueueText(taskTarget(task), GENERIC_TASK_FAILURE_NOTICE, taskId);
-      await this.notifyThreadOutcome(taskId);
-    } finally {
-      lease?.complete();
-    }
   }
 
   /**
@@ -1417,14 +1244,14 @@ class CoreService implements ChannelService {
       ? { ...persistedTask, cwd: bindingAtStart.cwd, sessionId: bindingAtStart.sessionId }
       : persistedTask;
     if (lockedCwd !== undefined && task.cwd !== lockedCwd) {
-      this.queuedBehind.delete(taskId);
+      this.scheduler.takeWaitingReceipt(taskId);
       this.store.markFailed(taskId, "绑定目录在启动前再次变更，任务未启动。");
       await this.outbox.enqueueText(taskTarget(task), GENERIC_TASK_FAILURE_NOTICE, taskId);
       await this.notifyThreadOutcome(taskId);
       return;
     }
     if (this.blockedDirectories.has(task.cwd)) {
-      this.queuedBehind.delete(taskId);
+      this.scheduler.takeWaitingReceipt(taskId);
       this.store.markFailed(taskId, "directory remains blocked by an unconfirmed worker");
       await this.outbox.enqueueText(taskTarget(task), GENERIC_TASK_FAILURE_NOTICE, taskId);
       await this.notifyThreadOutcome(taskId);
@@ -1433,7 +1260,7 @@ class CoreService implements ChannelService {
     if (!this.store.markStarted(taskId)) return;
     // 防御性幂等点亮：正常路径在接受时已持有 task 租约（此处 no-op）；任何未来触达路径自动点亮。
     this.typingLeases.acquire(taskTarget(task), `task:${taskId}`);
-    if (this.queuedBehind.delete(taskId)) {
+    if (this.scheduler.takeWaitingReceipt(taskId)) {
       this.outbox.enqueueText(taskTarget(task), receiptText("开始执行排队消息", task.text), null);
     }
     const runtime: RuntimeTask = {
