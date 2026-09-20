@@ -39,12 +39,16 @@ export interface HostToolHost {
   planThreadArchive(target: ChatTarget, groupId: string, shortId: string): void;
   /** 把一条合成消息交付到它的聊天（thread-dispatch 用）：按该聊天的追加模式并入运行中回合，否则接受为该聊天自己的任务；relay 只在任务真正落盘时随任务持久化。 */
   deliverToChat(message: InboundMessage, relay?: TaskRelayTarget | null): Promise<"steered" | "queued">;
-  /** `ask`：提问并等待答案。 */
+  /**
+   * `ask`：提问并等待答案。`toolCallId` 是 OMP 给这次工具调用的身份（retry 重执行同一个调用时
+   * 复用），提问行据此在跨重启恢复时认回原问题。
+   */
   askQuestions(
     task: TaskRecord,
     target: ChatTarget,
     args: Record<string, unknown>,
     signal: AbortSignal,
+    toolCallId?: string,
   ): Promise<string>;
   channelStatus(): {
     pid: number;
@@ -225,7 +229,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord, _snapshot:
       required: ["questions"],
       additionalProperties: false,
     },
-    execute: async (args, signal) => host.askQuestions(task, target, args, signal),
+    execute: async (args, signal, toolCallId) => host.askQuestions(task, target, args, signal, toolCallId),
   };
   const channelTool = createChannelTool(host, target);
   const parentGroupId =
@@ -309,7 +313,7 @@ function createChannelTool(host: HostToolHost, target: ChatTarget): HostTool {
   return {
     name: "channel_control",
     description:
-      "控制当前 channel（omp-channel-octo）自身：restart 排定一次重启，在本回合结束后、channel 没有运行中或排队任务时执行部署配置的重启命令，重启完成后会在本会话通报 PID；status 返回 channel 的进程 PID、运行中的会话、排队任务数、被阻塞目录数与是否已排定重启。本机装有 octo-cli 时，宿主已为本 bot 注入凭据（OCTO_CONFIG_DIR/OCTO_API_BASE_URL/OCTO_BOT_ID），可直接用 octo-cli 调用未被工具包装的 Octo API；先用 octo-cli auth status 确认身份是本 bot，不符或报错就不要使用。",
+      "控制当前 channel（omp-channel-octo）自身：restart 排定一次重启，在本回合结束后、channel 没有运行中或排队任务时执行部署配置的重启命令；status 返回 channel 的进程 PID、运行中的会话、排队任务数、被阻塞目录数与是否已排定重启。本机装有 octo-cli 时，宿主已为本 bot 注入凭据（OCTO_CONFIG_DIR/OCTO_API_BASE_URL/OCTO_BOT_ID），可直接用 octo-cli 调用未被工具包装的 Octo API；先用 octo-cli auth status 确认身份是本 bot，不符或报错就不要使用。",
     parameters: {
       type: "object",
       properties: {

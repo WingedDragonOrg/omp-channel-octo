@@ -154,6 +154,12 @@ export interface ExecutionTracker {
 export interface ExecutionTrackerOptions {
   readonly runId?: string;
   readonly initialAtMs?: number;
+  /**
+   * Turns this tracker did not observe itself, carried in from the payload that reopens a resumed
+   * round. The card's stage metric counts the run rather than one process, so a resumed card keeps
+   * counting from where the process that died had reached instead of dropping back to zero.
+   */
+  readonly initialPhaseCount?: number;
 }
 
 interface MutablePhase {
@@ -183,6 +189,8 @@ interface MutableSubagent {
 
 const MAX_LOCAL_PHASES = 64;
 const MAX_LOCAL_TASKS = 128;
+/** Ceiling for turns carried in from a stored payload: a corrupt row must not dictate the metric. */
+const MAX_RESTORED_PHASES = 100_000;
 const ALLOWED_ERROR_CATEGORIES: Record<ExecutionErrorCategory, true> = {
   timeout: true,
   permission: true,
@@ -269,6 +277,11 @@ function currentTime(lastAtMs: number, nowMs: number | undefined): number {
   return Math.max(lastAtMs, finiteTime(nowMs) ?? lastAtMs);
 }
 
+function safePhaseCount(value: unknown): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return 0;
+  return Math.min(value, MAX_RESTORED_PHASES);
+}
+
 class ExecutionTrackerState implements ExecutionTracker {
   readonly #runId: string;
   readonly #phases: MutablePhase[] = [];
@@ -278,6 +291,7 @@ class ExecutionTrackerState implements ExecutionTracker {
   readonly #subagentOrder: string[] = [];
   #todos: ExecutionTodoPhase[] = [];
   #research: ResearchSnapshot | undefined;
+  readonly #phaseCountBase: number;
   #startedAtMs: number | null;
   #endedAtMs: number | null = null;
   #state: ExecutionState = "running";
@@ -287,6 +301,7 @@ class ExecutionTrackerState implements ExecutionTracker {
     this.#runId = safeDisplayText(options.runId, 96) ?? "octo-progress";
     this.#startedAtMs = options.initialAtMs === undefined ? null : finiteTime(options.initialAtMs);
     this.#lastAtMs = this.#startedAtMs ?? 0;
+    this.#phaseCountBase = safePhaseCount(options.initialPhaseCount);
   }
 
   apply(event: ExecutionEvent): ExecutionSnapshot {
@@ -358,7 +373,7 @@ class ExecutionTrackerState implements ExecutionTracker {
       startedAtMs: this.#startedAtMs,
       endedAtMs: this.#endedAtMs,
       elapsedMs,
-      phaseCount: this.#phases.length,
+      phaseCount: this.#phaseCountBase + this.#phases.length,
       toolCount: this.#toolOrder.length,
       subagentCount: this.#subagentOrder.length,
       tools,
@@ -586,6 +601,38 @@ export function restoreExecutionSnapshot(
   encoded: string,
   options: { readonly state: Exclude<ExecutionState, "running">; readonly atMs: number },
 ): ExecutionSnapshot | null {
+  const tracker = restoreExecutionTracker(encoded, options);
+  if (tracker === null) return null;
+  return tracker.snapshot(options.atMs);
+}
+
+/** The state the restored run is left in, and the moment the restoring process observes it. */
+export interface RestoreTrackerOptions {
+  /**
+   * `"running"` reopens a round the same task is about to resume; every other state is the
+   * terminal frame that closes a card whose run is over.
+   */
+  readonly state: ExecutionState;
+  readonly atMs: number;
+}
+
+/**
+ * Replays a stored payload through a fresh tracker — the one entry point both recovery paths use,
+ * so a resumed round and a closed card are rebuilt by the same sanitizing, capping, and lifecycle
+ * rules. Identity, todos, tool trajectory, subagent rows, and the research projection come back as
+ * the card last showed them. Returns null when the payload is not a usable snapshot; callers drop
+ * such rows rather than guess.
+ *
+ * `state: "running"` is the resume path: the payload reopens the round it was written for, and its
+ * own live rows — a tool or child still running when that process died — can never receive their
+ * end frame from anyone, so they are settled here instead of staying active on the resumed card.
+ * Every other state is the terminal path and is written as the run's own end frame, which settles
+ * those rows through the normal cancelled/failed/completed rules.
+ */
+export function restoreExecutionTracker(
+  encoded: string,
+  options: RestoreTrackerOptions,
+): ExecutionTracker | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(encoded);
@@ -596,6 +643,8 @@ export function restoreExecutionSnapshot(
   const record = parsed as {
     runId?: unknown;
     startedAtMs?: unknown;
+    elapsedMs?: unknown;
+    phaseCount?: unknown;
     tools?: unknown;
     subagents?: unknown;
     todos?: unknown;
@@ -603,9 +652,17 @@ export function restoreExecutionSnapshot(
   };
   if (!Array.isArray(record.tools) || !Array.isArray(record.todos)) return null;
   const startedAtMs = typeof record.startedAtMs === "number" ? finiteTime(record.startedAtMs) : null;
+  const resume = options.state === "running";
+  // 上一进程最后被看见的时刻:running 快照的 elapsedMs 正是相对 startedAtMs 走到那一刻的差。
+  // 收束它遗留的运行中步骤时用它,而不是恢复时刻——否则停机期间等待会被算进这一步的耗时。
+  const observedAtMs = startedAtMs !== null && typeof record.elapsedMs === "number"
+    ? Math.min(startedAtMs + (finiteTime(record.elapsedMs) ?? 0), options.atMs)
+    : options.atMs;
   const tracker = createExecutionTracker({
     runId: typeof record.runId === "string" ? record.runId : "octo-progress",
     ...(startedAtMs === null ? {} : { initialAtMs: startedAtMs }),
+    // 终态恢复沿用旧行为(阶段计数归零);续接的一轮属于同一次运行,接着上一进程数到的阶段数走。
+    ...(resume ? { initialPhaseCount: safePhaseCount(record.phaseCount) } : {}),
   });
   const entries = record.tools;
   for (let index = 0; index < entries.length; index += 1) {
@@ -626,7 +683,14 @@ export function restoreExecutionSnapshot(
     });
     const state = savedToolState(tool.state);
     const endedAtMs = typeof tool.endedAtMs === "number" ? finiteTime(tool.endedAtMs) : null;
-    if (state === null || endedAtMs === null) continue;
+    if (state === null || endedAtMs === null) {
+      // A row the stored snapshot itself reports as running: the process that owned it is gone, so
+      // the resumed card settles it as cancelled at the last moment that process saw it.
+      if (resume) {
+        tracker.apply({ type: "tool_end", toolCallId, atMs: observedAtMs, status: "cancelled" });
+      }
+      continue;
+    }
     tracker.apply({
       type: "tool_end",
       toolCallId,
@@ -673,6 +737,17 @@ export function restoreExecutionSnapshot(
       });
       continue;
     }
+    // Same rule as a live tool row: a child the dead process left open cannot be reported on by
+    // the resumed one, so the resumed card ends it as cancelled instead of showing it forever.
+    if (resume) {
+      tracker.apply({
+        type: "subagent_end",
+        subagentId: subagent.subagentId,
+        state: "cancelled",
+        atMs: options.atMs,
+      });
+      continue;
+    }
     if (currentTool !== undefined || toolCount !== undefined) {
       tracker.apply({
         type: "subagent_update",
@@ -694,7 +769,9 @@ export function restoreExecutionSnapshot(
       research: record.research as ResearchSnapshot,
     });
   }
-  return tracker.apply({ type: "run_end", atMs: options.atMs, state: options.state });
+  if (resume) return tracker;
+  tracker.apply({ type: "run_end", atMs: options.atMs, state: options.state });
+  return tracker;
 }
 
 function savedToolState(value: unknown): Exclude<ExecutionToolState, "running"> | null {

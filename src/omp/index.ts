@@ -12,7 +12,7 @@ import type {
 	WorkerOptions,
 	WorkerProcess,
 } from "../contracts.ts";
-import { TaskStartupError, taskStartupError } from "../contracts.ts";
+import { RESUME_CONTINUATION_PROMPT, TaskStartupError, taskStartupError } from "../contracts.ts";
 import { loadValidatedSessionState, type ProjectSessionState } from "../session/project-session.ts";
 import {
 	RpcCommand,
@@ -111,6 +111,11 @@ class RpcWorker implements OmpWorker {
 	#stopPromise: Promise<boolean> | undefined;
 	#requestCounter = 0;
 	#commandOutputCounter = 0;
+	/**
+	 * True while the internal `/retry` dispatch of `resume` runs: its native command-output
+	 * receipt is control traffic and never becomes a worker notice.
+	 */
+	#suppressCommandOutput = false;
 	#pending = new Map<string, PendingResponse>();
 	#activePrompt: PromptRun | undefined;
 	/** True from prompt acknowledgement until the terminal `agent_end` settles the run. */
@@ -303,10 +308,52 @@ class RpcWorker implements OmpWorker {
 	}
 
 	async prompt(text: string, onEvent: (event: WorkerEvent) => void, context?: PromptContext): Promise<void> {
+		await this.#dispatchPrompt(text, onEvent, context, false);
+	}
+
+	/**
+	 * Resume the bound session's interrupted turn after a worker restart by dispatching OMP's own
+	 * `/retry`, which continues from the recorded transcript instead of replaying the original
+	 * request. The dispatch's native command-output receipt and a local-only completion are
+	 * control traffic, never assistant output. When OMP answers `/retry` locally — there is no
+	 * resumable failed turn — one same-session continuation instruction continues the recorded
+	 * work. A real failure rejects and nothing is sent after it.
+	 */
+	async resume(onEvent: (event: WorkerEvent) => void, context?: PromptContext): Promise<void> {
+		let localOnly = false;
+		await this.#dispatchPrompt(
+			"/retry",
+			event => {
+				// The retry dispatch's local completion belongs to the internal control flow: it
+				// must neither mark the resumed task local-only nor surface as an assistant event.
+				if (event.type === "local_command") {
+					localOnly = true;
+					return;
+				}
+				onEvent(event);
+			},
+			context,
+			true,
+		);
+		if (!localOnly) return;
+		await this.#dispatchPrompt(RESUME_CONTINUATION_PROMPT, onEvent, context, false);
+	}
+
+	async #dispatchPrompt(
+		text: string,
+		onEvent: (event: WorkerEvent) => void,
+		context: PromptContext | undefined,
+		internalCommandOutput: boolean,
+	): Promise<void> {
 		if (this.#closed) throw new Error("OMP worker is not running");
 		if (this.#activePrompt) throw new Error("OMP worker already has a prompt in progress");
 		if (typeof text !== "string") throw new Error("OMP prompt text must be a string");
 		const completion = Promise.withResolvers<void>();
+		// The dispatch promise carries every run rejection to its caller; this handler only keeps
+		// the internal settle signal from surfacing as a duplicate unhandled rejection when the
+		// acknowledgement path throws before `run.completion` is awaited (an ack that fails with
+		// `success:false` rejects through the dispatch, never through this promise alone).
+		void completion.promise.catch(() => {});
 		const run: PromptRun = {
 			requestId: "",
 			onEvent,
@@ -314,6 +361,8 @@ class RpcWorker implements OmpWorker {
 			reject: error => completion.reject(error),
 			completion: completion.promise,
 			settled: false,
+			agentInvoked: false,
+			accepted: false,
 			assistantMessageEnded: false,
 			assistantMessageId: undefined,
 			assistantMessageKey: undefined,
@@ -327,6 +376,7 @@ class RpcWorker implements OmpWorker {
 			research: new ResearchTracker(),
 		};
 		this.#activePrompt = run;
+		this.#suppressCommandOutput = internalCommandOutput;
 		try {
 			await this.#installHostTools(context?.tools ?? []);
 			const response = await this.#request(
@@ -339,8 +389,9 @@ class RpcWorker implements OmpWorker {
 			this.#assertSuccess(response, "prompt");
 			if (response.id !== run.requestId) throw new Error("OMP prompt acknowledgement did not contain the expected request ID");
 			this.#streaming = true;
-			const data = response.data;
-			if (isRecord(data) && data.agentInvoked === false) this.#completeLocalCommand(run);
+			// The acknowledgement's agent-turn verdict was recorded in line with its frame
+			// (`#notePromptAck`); only an explicit local-only completion settles here.
+			if (isRecord(response.data) && response.data.agentInvoked === false) this.#completeLocalCommand(run);
 			await run.completion;
 		} catch (error) {
 			this.#rejectPrompt(run, asError(error, "OMP prompt failed"));
@@ -350,6 +401,7 @@ class RpcWorker implements OmpWorker {
 			await this.#clearHostTools();
 			if (this.#activePrompt === run) this.#activePrompt = undefined;
 			this.#streaming = false;
+			this.#suppressCommandOutput = false;
 		}
 	}
 
@@ -560,7 +612,9 @@ class RpcWorker implements OmpWorker {
 			const active = this.#activePrompt;
 			// Native builtins output before acknowledging their prompt. Frames have no request
 			// id, so only collect during this prompt's dispatch, not a mid-turn /switch probe.
-			if (active && this.#pending.has(active.requestId)) {
+			// `resume`'s internal `/retry` dispatch suppresses the receipt: it is control
+			// traffic, and the chat must not receive a restart disruption notice.
+			if (active && this.#pending.has(active.requestId) && !this.#suppressCommandOutput) {
 				this.#handleNotice({
 					id: `command:${active.requestId}:${++this.#commandOutputCounter}`,
 					message: frame.text,
@@ -584,9 +638,14 @@ class RpcWorker implements OmpWorker {
 			// is the legacy shape that may settle any active run; any carried id — string
 			// mismatch or non-string junk like null/number — is not this run's completion.
 			if (frame.id !== undefined && frame.id !== active.requestId) return;
+			// A run OMP acknowledged as an agent turn completes only at its terminal `agent_end`:
+			// a replayed local completion must neither settle it early nor make `resume` read a
+			// regenerating turn as local-only.
+			if (active.agentInvoked) return;
 			this.#completeLocalCommand(active);
 			return;
 		}
+		if (frame.type === "agent_start" && !this.#acceptPrompt(active)) return;
 		this.#emitWorkerEvent(active, frame);
 	}
 
@@ -597,6 +656,9 @@ class RpcWorker implements OmpWorker {
 			if (pending) {
 				this.#pending.delete(id);
 				clearTimeout(pending.timer);
+				// The acknowledgement's verdict is recorded while its frame is on the wire: the
+				// frames that follow it in the same stdout read must already see it.
+				if (frame.success === true) this.#notePromptAck(frame, id);
 				pending.resolve(frame);
 				return;
 			}
@@ -606,6 +668,21 @@ class RpcWorker implements OmpWorker {
 				return;
 			}
 		}
+	}
+
+	/**
+	 * The acknowledgement's verdict, recorded in line with the frame instead of in the awaiting
+	 * dispatch: the frames that follow it in the same stdout read must already see whether this
+	 * run is an agent turn, so a replayed local completion can never settle a regenerating turn.
+	 * Only an explicit `agentInvoked: true` is recorded here; an explicit local-only completion is
+	 * settled by the dispatch that owns the request, and an acknowledgement without data leaves
+	 * the run waiting for its real completion.
+	 */
+	#notePromptAck(frame: RpcFrame, id: string): void {
+		const active = this.#activePrompt;
+		if (!active || active.settled || active.requestId !== id) return;
+		const data = frame.data;
+		if (isRecord(data) && data.agentInvoked === true) active.agentInvoked = true;
 	}
 
 	#handleUiRequest(frame: RpcFrame): void {
@@ -656,8 +733,11 @@ class RpcWorker implements OmpWorker {
 		const call: HostCall = { requestId, controller };
 		this.#hostCalls.set(requestId, call);
 		const args = isRecord(frame.arguments) ? frame.arguments : {};
+		// OMP's own call id, independent of the RPC request id and reused by a retry that
+		// re-executes the call; a frame without one leaves it undefined.
+		const toolCallId = typeof frame.toolCallId === "string" && frame.toolCallId.length > 0 ? frame.toolCallId : undefined;
 		void Promise.resolve()
-			.then(() => tool.execute(args, controller.signal))
+			.then(() => tool.execute(args, controller.signal, toolCallId))
 			.then(
 				text => this.#sendHostToolResult(requestId, false, typeof text === "string" ? text : String(text)),
 				error => this.#sendHostToolResult(requestId, true, asError(error, "Host tool failed").message),
@@ -688,6 +768,25 @@ class RpcWorker implements OmpWorker {
 			emitWorkerEvent(active, frame, this.#subagentFrames);
 		} catch (error) {
 			this.#rejectPrompt(active, asError(error, "OMP event callback failed"));
+		}
+	}
+
+	/**
+	 * The run's live turn boundary: OMP started generating (`agent_start`), so this prompt is a
+	 * real turn rather than the early acknowledgement of a local-only command. Reported once,
+	 * before any output of the turn, so the service can record the acceptance durably; a failing
+	 * callback rejects the run exactly like a failing output callback and reports false, stopping
+	 * further frames of the settled run.
+	 */
+	#acceptPrompt(run: PromptRun): boolean {
+		if (run.accepted) return true;
+		run.accepted = true;
+		try {
+			run.onEvent({ type: "prompt_accepted" });
+			return true;
+		} catch (error) {
+			this.#rejectPrompt(run, asError(error, "OMP event callback failed"));
+			return false;
 		}
 	}
 	#settlePrompt(run: PromptRun): void {

@@ -1,10 +1,11 @@
 import { Database } from "bun:sqlite";
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import type { BotIdentity, ChatTarget, ProgressCard, SendReceipt } from "../src/contracts";
-import { createExecutionTracker, encodeExecutionSnapshot } from "../src/cards/execution-tracker";
+import type { BotIdentity, ChatTarget, ChannelTransport, ProgressCard, SendReceipt } from "../src/contracts";
+import { createExecutionTracker, encodeExecutionSnapshot, restoreExecutionSnapshot, restoreExecutionTracker } from "../src/cards/execution-tracker";
+import { ProgressCards, type TaskProgress } from "../src/cards/progress-cards";
 import { ChannelStore } from "../src/store";
 import type { InboundClaim, ProgressCardRecord, TaskRecord } from "../src/store/store-records";
 import {
@@ -33,6 +34,11 @@ class RecoveryTransport extends FakeTransport {
     messageId: string;
   }> = [];
   failProgressCardEdits = false;
+  private readonly sendWaiters: Array<() => void> = [];
+  private readonly editWaiters: Array<{
+    predicate: (edit: RecordedCardEdit) => boolean;
+    resolve: (edit: RecordedCardEdit) => void;
+  }> = [];
   override async sendProgressCard(
     target: ChatTarget,
     progress: ProgressCard,
@@ -40,6 +46,7 @@ class RecoveryTransport extends FakeTransport {
   ): Promise<SendReceipt | null> {
     const messageId = `card-${this.progressCardSends.length + 1}`;
     this.progressCardSends.push({ target, progress: { ...progress }, clientMsgNo, messageId });
+    for (const resolve of this.sendWaiters.splice(0)) resolve();
     return { messageId };
   }
   override async editProgressCard(
@@ -48,8 +55,29 @@ class RecoveryTransport extends FakeTransport {
     progress: ProgressCard,
     cardSeq: number,
   ): Promise<void> {
-    this.progressCardEdits.push({ target, messageId, progress: { ...progress }, cardSeq });
+    const edit = { target, messageId, progress: { ...progress }, cardSeq };
+    this.progressCardEdits.push(edit);
+    for (const waiter of this.editWaiters.splice(0)) {
+      if (waiter.predicate(edit)) waiter.resolve(edit);
+      else this.editWaiters.push(waiter);
+    }
     if (this.failProgressCardEdits) throw new Error("fixture recovery edit unavailable");
+  }
+  /** Awaits the first created card. The caller resumes on the frame the service recorded. */
+  waitForProgressSend(): Promise<void> {
+    if (this.progressCardSends.length > 0) return Promise.resolve();
+    const { promise, resolve } = Promise.withResolvers<void>();
+    this.sendWaiters.push(() => resolve());
+    return promise;
+  }
+
+  /** Awaits the next edit matching `predicate`; an already recorded one counts. */
+  waitForProgressEdit(predicate: (edit: RecordedCardEdit) => boolean): Promise<RecordedCardEdit> {
+    const recorded = this.progressCardEdits.find(predicate);
+    if (recorded) return Promise.resolve(recorded);
+    const { promise, resolve } = Promise.withResolvers<RecordedCardEdit>();
+    this.editWaiters.push({ predicate, resolve });
+    return promise;
   }
 }
 
@@ -472,4 +500,536 @@ test("a database written before per-round cards keeps its rows and gains card id
       schema.close();
     }
   });
+});
+
+/**
+ * 续接契约：一个会被本进程续接的任务，其遗留卡片不被收尾，而是由续接的一轮接着编辑——同一张卡、
+ * 同一个递增序号、上一进程的 todo/工具/子代理/研究原样保留。这些用例直接喂 `ProgressCards`，
+ * 不经过服务与 worker 夹层：判定与去留都在卡片域自己的边界上。
+ */
+
+type CardEdit = {
+  target: ChatTarget;
+  messageId: string;
+  progress: ProgressCard;
+  cardSeq: number;
+};
+
+/** 一次卡片创建请求：恢复与续接都不该产生它。 */
+type CardSend = { progress: ProgressCard; clientMsgNo: string };
+
+/** 上一进程留下的那一轮：任务、卡片身份、它当时数到的阶段，以及那一行的载荷。 */
+type SeededRound = {
+  taskId: string;
+  messageId: string;
+  lastSeq: number;
+  phaseCount: number;
+  snapshot: string;
+};
+
+/** 一次续接用例的现场：卡片域本身，加上它发出的创建请求与被编辑的卡片帧。 */
+type ResumeDomain = {
+  cards: ProgressCards;
+  sends: CardSend[];
+  edits: CardEdit[];
+};
+
+/**
+ * 卡片域的窄端口：`ProgressCardsDeps` 只要求这两条投递能力。`refuseFirstEdit` 复现网关对正文的
+ * 那次拒绝（4xx 且没有 bot API 的 `error.code`），卡片必须改用不带步骤摘要的形态继续编辑。
+ */
+function cardTransport(options: { refuseFirstEdit?: boolean } = {}): {
+  transport: Pick<ChannelTransport, "sendProgressCard" | "editProgressCard">;
+  sends: CardSend[];
+  edits: CardEdit[];
+} {
+  const sends: CardSend[] = [];
+  const edits: CardEdit[] = [];
+  const transport: Pick<ChannelTransport, "sendProgressCard" | "editProgressCard"> = {
+    async sendProgressCard(_target, progress, clientMsgNo) {
+      sends.push({ progress, clientMsgNo });
+      return { messageId: `new-card-${sends.length}` };
+    },
+    async editProgressCard(target, messageId, progress, cardSeq) {
+      const edit = { target, messageId, progress: { ...progress }, cardSeq };
+      edits.push(edit);
+      if (options.refuseFirstEdit && edits.length === 1) {
+        throw Object.assign(new Error("gateway refused the card body"), { status: 400 });
+      }
+    },
+  };
+  return { transport, sends, edits };
+}
+
+/** 运行中的编辑由合并定时器驱动：推进假时钟让这一刻的编辑排上，再等出站链排空。 */
+async function flushCardEdits(progress: TaskProgress, edits: CardEdit[], count: number): Promise<void> {
+  vi.advanceTimersByTime(2_000);
+  await progress.tail;
+  expect(edits).toHaveLength(count);
+}
+
+const RESUMED_TARGET: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+const RESUMED_TODOS = [
+  {
+    name: "复现",
+    tasks: [
+      { content: "复现中断现场", status: "completed" as const },
+      { content: "接管进度卡", status: "in_progress" as const },
+    ],
+  },
+];
+const RESUMED_RESEARCH = {
+  sessionId: 7,
+  name: "搜索加速",
+  goal: "把 P95 压到 1 秒",
+  segment: 2,
+  metricName: "p95_ms",
+  metricUnit: "ms",
+  direction: "lower" as const,
+  baseline: 1_800,
+  best: 940,
+  completedRuns: 3,
+  maxExperiments: 20,
+  phase: "running" as const,
+  activeRun: 4,
+  latestMetric: 940,
+  recent: [],
+  totalRuns: 3,
+};
+
+/**
+ * 上一进程被 kill 时的现场：一个 `started` 任务、一行它正在编辑的卡片，以及一份仍带着运行中步骤、
+ * 运行中子代理、todo 与研究带的快照。`resumable` 只差第二阶段标记：写下它的行在恢复时会被续接，
+ * 只发出 prompt 却不知道有没有被接受的行不会。
+ */
+async function seedResumableRound(
+  root: string,
+  botUid: string,
+  options: { cardSeq: number; resumable: boolean },
+): Promise<SeededRound> {
+  const store = await ChannelStore.open(join(root, "state", "channel.sqlite"));
+  try {
+    store.setBotUid(botUid);
+    store.setOwnerId(botUid, "owner-1");
+    const taskId = `resuming-${options.cardSeq}-${options.resumable ? "accepted" : "pending"}`;
+    const claim: InboundClaim = {
+      botUid,
+      target: RESUMED_TARGET,
+      messageId: `message-${taskId}`,
+      senderId: "owner-1",
+      text: "fixture work",
+      supported: true,
+      kind: "task",
+    };
+    store.ensureBinding({
+      botUid,
+      channelType: RESUMED_TARGET.channelType,
+      channelId: RESUMED_TARGET.channelId,
+      sessionId: "session-1",
+      cwd: root,
+      sessionFile: null,
+    });
+    const task: TaskRecord = {
+      id: taskId,
+      botUid,
+      channelType: RESUMED_TARGET.channelType,
+      channelId: RESUMED_TARGET.channelId,
+      messageId: claim.messageId,
+      senderId: "owner-1",
+      text: claim.text,
+      sessionId: "session-1",
+      cwd: root,
+      state: "queued",
+      resultText: null,
+      errorText: null,
+      messageSeq: 0,
+      historyEligible: true,
+      relayChannelType: null,
+      relayChannelId: null,
+      relayThreadName: null,
+    };
+    expect(store.acceptTask(claim, task)).toBe(true);
+    expect(store.markStarted(taskId)).toBe(true);
+    store.markTaskPromptStarted(taskId, "session-1");
+    if (options.resumable) store.markTaskPromptAccepted(taskId);
+
+    const tracker = createExecutionTracker({ runId: taskId, initialAtMs: 1_000 });
+    tracker.apply({ type: "turn_start", turnId: 1, atMs: 1_000 });
+    tracker.apply({ type: "todo_update", atMs: 1_100, phases: RESUMED_TODOS });
+    for (let index = 0; index < 2; index += 1) {
+      tracker.apply({ type: "tool_start", toolCallId: `call-${index}`, toolName: "bash", atMs: 1_200 + index });
+      tracker.apply({ type: "tool_end", toolCallId: `call-${index}`, atMs: 1_250 + index, status: "succeeded" });
+    }
+    // 进程死时仍在运行的行：它们不可能再从任何进程收到结束帧。
+    tracker.apply({ type: "tool_start", toolCallId: "call-stale", toolName: "bash", atMs: 1_500 });
+    tracker.apply({
+      type: "subagent_start",
+      subagentId: "child-stale",
+      agent: "scout",
+      state: "running",
+      atMs: 1_600,
+      summary: "中断前的子代理",
+    });
+    tracker.apply({ type: "research_update", atMs: 1_700, research: RESUMED_RESEARCH });
+    const payload = tracker.snapshot(1_800);
+    const messageId = `card-${taskId}`;
+    const snapshot = encodeExecutionSnapshot(payload);
+    store.saveProgressCard({
+      botUid,
+      taskId,
+      channelType: RESUMED_TARGET.channelType,
+      channelId: RESUMED_TARGET.channelId,
+      messageId,
+      lastSeq: options.cardSeq,
+      snapshot,
+    });
+    return { taskId, messageId, lastSeq: options.cardSeq, phaseCount: payload.phaseCount, snapshot };
+  } finally {
+    store.close();
+  }
+}
+
+/**
+ * 卡片出站由合并定时器驱动：用例里用假时钟推进它，出站链仍然按原来的顺序排空。时钟只接管定时器
+ * （`Date.now()` 仍走真实时间），所以快照里那两个毫秒时间戳（`startedAtMs` + `elapsedMs`）仍然是
+ * 判定「上一进程最后被看见的一刻」的唯一依据。
+ */
+async function withResumeDomain(
+  botUid: string,
+  scenario: { cardSeq: number; resumable: boolean; refuseFirstEdit?: boolean },
+  run: (seeded: SeededRound, store: ChannelStore, domain: ResumeDomain) => Promise<void>,
+): Promise<void> {
+  await withRoot(async (root) => {
+    const seeded = await seedResumableRound(root, botUid, scenario);
+    const store = await ChannelStore.open(join(root, "state", "channel.sqlite"));
+    try {
+      const { transport, sends, edits } = cardTransport(scenario);
+      vi.useFakeTimers();
+      await run(seeded, store, { cards: resumeDomain(store, botUid, transport), sends, edits });
+    } finally {
+      vi.useRealTimers();
+      store.close();
+    }
+  });
+}
+
+function resumeDomain(
+  store: ChannelStore,
+  botUid: string,
+  transport: Pick<ChannelTransport, "sendProgressCard" | "editProgressCard">,
+): ProgressCards {
+  return new ProgressCards({
+    store,
+    transport,
+    botUid: () => botUid,
+    stopping: () => false,
+    trackOperation: () => {},
+  });
+}
+
+test("a resumable turn keeps its card and the resumed run edits it in place", async () => {
+  await withResumeDomain("bot-resume-cards", { cardSeq: 7, resumable: true }, async (seeded, store, domain) => {
+    await domain.cards.recover();
+    // 没有终态补发：读者眼前那张卡原地不动，行也还在（续接的一轮还要用它）。
+    expect(domain.edits).toHaveLength(0);
+    expect(domain.sends).toHaveLength(0);
+    const held = store.listProgressCards("bot-resume-cards");
+    expect(held).toHaveLength(1);
+    expect(held[0]!.messageId).toBe(seeded.messageId);
+    expect(held[0]!.lastSeq).toBe(7);
+
+    const progress = domain.cards.startTask(seeded.taskId, RESUMED_TARGET);
+    progress.apply({
+      type: "tool_start",
+      toolCallId: "call-live",
+      toolName: "bash",
+      atMs: 2_000,
+      summary: "续接后的第一步",
+    });
+    await flushCardEdits(progress, domain.edits, 1);
+    const resumed = domain.edits[0]!;
+    // 同一张卡、同一个序号序列：不重发创建，也不从 1 重新计数。
+    expect(resumed.messageId).toBe(seeded.messageId);
+    expect(domain.sends).toHaveLength(0);
+    expect(resumed.cardSeq).toBe(8);
+    expect(resumed.progress.state).toBe("running");
+    expect(resumed.progress.phaseCount).toBe(seeded.phaseCount);
+    expect(resumed.progress.todos).toEqual(RESUMED_TODOS);
+    expect(resumed.progress.tools.map((tool) => [tool.toolCallId, tool.state])).toEqual([
+      ["call-0", "succeeded"],
+      ["call-1", "succeeded"],
+      ["call-stale", "cancelled"],
+      ["call-live", "running"],
+    ]);
+    // 遗留的运行中步骤按上一进程最后看见它的那一刻收束：停机时间不算进这一步的耗时。
+    expect(resumed.progress.tools[2]!.durationMs).toBe(300);
+    expect(resumed.progress.subagents.map((child) => [child.subagentId, child.state])).toEqual([
+      ["child-stale", "cancelled"],
+    ]);
+    expect(resumed.progress.research).toMatchObject({ metricName: "p95_ms", completedRuns: 3 });
+    // 落盘的行跟着走：下一次恢复会从 9 继续，而不是回到 8。
+    expect(store.listProgressCards("bot-resume-cards")[0]!.lastSeq).toBe(8);
+
+    progress.finish("completed");
+    await flushCardEdits(progress, domain.edits, 2);
+    const closed = domain.edits[1]!;
+    expect(closed.messageId).toBe(seeded.messageId);
+    expect(closed.cardSeq).toBe(9);
+    expect(closed.progress.state).toBe("completed");
+    expect(closed.progress.tools.every((tool) => tool.state !== "running")).toBe(true);
+    expect(closed.progress.subagents.every((child) => child.state !== "running")).toBe(true);
+    expect(store.listProgressCards("bot-resume-cards")).toHaveLength(0);
+  });
+});
+
+test("a resumed round the gateway refuses keeps editing the same card in the degraded shape", async () => {
+  await withResumeDomain(
+    "bot-resume-degraded",
+    { cardSeq: 5, resumable: true, refuseFirstEdit: true },
+    async (seeded, store, domain) => {
+      await domain.cards.recover();
+      expect(domain.edits).toHaveLength(0);
+      const progress = domain.cards.startTask(seeded.taskId, RESUMED_TARGET);
+      progress.apply({
+        type: "tool_start",
+        toolCallId: "call-live",
+        toolName: "bash",
+        atMs: 2_000,
+        summary: "被拒正文里的一步",
+      });
+      await flushCardEdits(progress, domain.edits, 1);
+      // 第一次编辑被网关拒绝（4xx 且没有 code）：同一张卡改用不带步骤摘要的形态重试，序号继续往上走。
+      expect(domain.edits[0]!.progress.tools.some((tool) => tool.summary === "被拒正文里的一步")).toBe(true);
+      expect(domain.sends).toHaveLength(0);
+      await flushCardEdits(progress, domain.edits, 2);
+      expect(domain.edits.map((edit) => [edit.messageId, edit.cardSeq])).toEqual([
+        [seeded.messageId, 6],
+        [seeded.messageId, 7],
+      ]);
+      expect(domain.edits[1]!.progress.tools.every((tool) => tool.summary === undefined)).toBe(true);
+      expect(store.listProgressCards("bot-resume-degraded")[0]!.lastSeq).toBe(7);
+    },
+  );
+});
+
+test("a card the recovery could not take over is created under a fresh key segment", async () => {
+  await withResumeDomain("bot-resume-malformed", { cardSeq: 5, resumable: true }, async (seeded, store, domain) => {
+    // 最后一行载荷已经不可用：接管无从谈起，行被丢弃，剩下的只有「这批 key 已经用过」这一事实。
+    store.saveProgressCard({
+      botUid: "bot-resume-malformed",
+      taskId: seeded.taskId,
+      channelType: RESUMED_TARGET.channelType,
+      channelId: RESUMED_TARGET.channelId,
+      messageId: seeded.messageId,
+      lastSeq: seeded.lastSeq,
+      snapshot: "{\"not\":\"a snapshot\"}",
+    });
+
+    await domain.cards.recover();
+    expect(domain.edits).toHaveLength(0);
+    expect(store.listProgressCards("bot-resume-malformed")).toHaveLength(0);
+
+    const progress = domain.cards.startTask(seeded.taskId, RESUMED_TARGET);
+    progress.apply({ type: "tool_start", toolCallId: "call-live", toolName: "bash", atMs: 2_000 });
+    await progress.tail;
+    // 新卡照常在原聊天开出来，但 idempotency key 不再从上一进程用过的 `progress-<taskId>-0` 数起：
+    // 服务端的去重窗口里那是一个已经接受过的 key，复用会让这次创建被当成重试。
+    expect(domain.sends).toHaveLength(1);
+    expect(domain.sends[0]!.clientMsgNo.startsWith(`progress-${seeded.taskId}-`)).toBe(true);
+    expect(domain.sends[0]!.clientMsgNo).not.toBe(`progress-${seeded.taskId}-0`);
+    expect(domain.edits).toHaveLength(0);
+
+    // 第二个事件才产生这一轮的第一次增量编辑：新卡的序号从它自己的 1 往后走，与上一进程无关。
+    progress.apply({ type: "tool_end", toolCallId: "call-live", atMs: 2_100, status: "succeeded" });
+    await flushCardEdits(progress, domain.edits, 1);
+    expect(domain.edits[0]!.messageId).toBe("new-card-1");
+    expect(domain.edits[0]!.cardSeq).toBe(2);
+    progress.finish("completed");
+    await flushCardEdits(progress, domain.edits, 2);
+    expect(store.listProgressCards("bot-resume-malformed")).toHaveLength(0);
+  });
+});
+
+test("a prompt the worker never accepted is closed instead of resumed", async () => {
+  await withResumeDomain("bot-resume-refused", { cardSeq: 3, resumable: false }, async (seeded, store, domain) => {
+    // 恢复期这条行会被 fail-closed（prompt 是否被接受未知）；卡片域不看行是否「活跃」，只看它
+    // 会不会被续接，所以它同样不该接管这张卡。
+    expect(store.isTaskResuming(seeded.taskId)).toBe(false);
+
+    await domain.cards.recover();
+    expect(domain.sends).toHaveLength(0);
+    expect(domain.edits).toHaveLength(1);
+    expect(domain.edits[0]!.messageId).toBe(seeded.messageId);
+    expect(domain.edits[0]!.cardSeq).toBe(4);
+    expect(domain.edits[0]!.progress.state).toBe("cancelled");
+    expect(store.listProgressCards("bot-resume-refused")).toHaveLength(0);
+  });
+});
+
+test("the newest open round resumes while a rolled-away round is closed", async () => {
+  await withResumeDomain("bot-resume-rounds", { cardSeq: 7, resumable: true }, async (seeded, store, domain) => {
+    // 进程死在 steer 之后、被滚掉那一轮的终态编辑落地之前：同一任务两行都还开着。
+    const currentMessageId = `${seeded.messageId}-round-2`;
+    store.saveProgressCard({
+      botUid: "bot-resume-rounds",
+      taskId: seeded.taskId,
+      channelType: RESUMED_TARGET.channelType,
+      channelId: RESUMED_TARGET.channelId,
+      messageId: currentMessageId,
+      lastSeq: 4,
+      snapshot: encodeExecutionSnapshot(
+        createExecutionTracker({ runId: seeded.taskId, initialAtMs: 1_000 }).snapshot(1_800),
+      ),
+    });
+    // 旧轮的迟到重写（终态编辑落地、或补发失败把 attempts 与序号推上去）落在新轮之后：
+    // 行的新旧只看创建序（rowid），旧轮不能因为写得晚就变成「当前那一轮」。
+    store.saveProgressCard({
+      botUid: "bot-resume-rounds",
+      taskId: seeded.taskId,
+      channelType: RESUMED_TARGET.channelType,
+      channelId: RESUMED_TARGET.channelId,
+      messageId: seeded.messageId,
+      lastSeq: seeded.lastSeq,
+      snapshot: seeded.snapshot,
+    });
+
+    await domain.cards.recover();
+    // 被滚掉的那轮已经由后一轮回答过：按 `roll` 给的结局收尾；当前那轮原地保留。
+    expect(domain.sends).toHaveLength(0);
+    expect(domain.edits.map((edit) => [edit.messageId, edit.cardSeq, edit.progress.state])).toEqual([
+      [seeded.messageId, 8, "completed"],
+    ]);
+    expect(store.listProgressCards("bot-resume-rounds").map((card) => card.messageId)).toEqual([
+      currentMessageId,
+    ]);
+
+    const progress = domain.cards.startTask(seeded.taskId, RESUMED_TARGET);
+    progress.apply({ type: "tool_start", toolCallId: "call-live", toolName: "bash", atMs: 2_000 });
+    await flushCardEdits(progress, domain.edits, 2);
+    expect(domain.edits[1]!.messageId).toBe(currentMessageId);
+    expect(domain.edits[1]!.cardSeq).toBe(5);
+    progress.finish("completed");
+    await flushCardEdits(progress, domain.edits, 3);
+    expect(domain.edits[2]!.messageId).toBe(currentMessageId);
+    expect(domain.edits[2]!.cardSeq).toBe(6);
+    expect(store.listProgressCards("bot-resume-rounds")).toHaveLength(0);
+  });
+});
+
+test("a suspended turn is resumed onto the same card and finishes on it", async () => {
+  const bot: BotIdentity = { uid: "bot-suspend-card", name: "Fixture Bot" };
+  const target: ChatTarget = { channelId: "dm-suspend-card", channelType: 1 };
+  const continueResume = Promise.withResolvers<void>();
+  const firstTransport = new RecoveryTransport({ bot });
+  // 第一进程：开卡后一直挂着的回合。停机把它挂起（不是取消），卡片行留在盘上。
+  const first = await createCoreHarness({
+    bot,
+    transport: firstTransport,
+    prompt: async ({ emit, isStopped, onStop }) => {
+      emit({
+        type: "tool_start",
+        toolCallId: "before-restart",
+        toolName: "bash",
+        atMs: Date.now(),
+        summary: "重启前的一步",
+      });
+      await new Promise<void>((resolve) => {
+        onStop(resolve);
+        if (isStopped()) resolve();
+      });
+      if (isStopped()) throw new Error("OMP prompt cancelled");
+    },
+  });
+  try {
+    await first.service.handleInbound(inbound({ messageId: "suspend-card", ...target, text: "开卡后挂起" }));
+    await first.workers.waitForPromptCount(1);
+    // 让服务端已经接受的这一帧真的落进状态盘，再停机：挂起的回合留给下一进程的是这张卡。
+    await firstTransport.waitForProgressSend();
+  } finally {
+    await closeCoreHarness(first, { remove: false });
+  }
+  const rows = await openCards(first.root, bot.uid);
+  expect(rows).toHaveLength(1);
+  const seeded = { messageId: rows[0]!.messageId, lastSeq: rows[0]!.lastSeq };
+
+  const transport = new RecoveryTransport({ bot });
+  const restarted = await createCoreHarness({
+    root: first.root,
+    bot,
+    transport,
+    prompt: async ({ text, emit }) => {
+      // 续接不重放原文：新进程派发的是 OMP 自己的 /retry。
+      if (text !== "/retry") return;
+      emit({ type: "tool_start", toolCallId: "after-restart", toolName: "bash", atMs: Date.now() });
+      // 停到运行中的编辑真的发出来，再让回合收尾，于是两次编辑的序号都能被断言。
+      await continueResume.promise;
+      emit({
+        type: "tool_end",
+        toolCallId: "after-restart",
+        atMs: Date.now(),
+        status: "succeeded",
+        summary: "续接后的一步",
+      });
+      emit(assistantText("resumed-card-body", "done", true));
+    },
+  });
+  try {
+    const running = await transport.waitForProgressEdit((edit) => (
+      edit.progress.tools.some((tool) => tool.toolCallId === "after-restart")
+    ));
+    // 同一张卡、序号严格接在存储值之后，而且重启前那一步的历史仍在卡上（它的结束帧再也不会来）。
+    expect(running.messageId).toBe(seeded.messageId);
+    expect(running.cardSeq).toBe(seeded.lastSeq + 1);
+    expect(running.progress.tools.map((tool) => [tool.toolCallId, tool.state])).toEqual([
+      ["before-restart", "cancelled"],
+      ["after-restart", "running"],
+    ]);
+    continueResume.resolve();
+    await waitForStatus(restarted.service, target, (status) => status.state === "completed" && status.outbox === 0);
+
+    // 全程没有第二张卡、没有任何一次取消：终态编辑落在同一张卡上，随后清掉那一行。
+    expect(transport.progressCardSends).toHaveLength(0);
+    const edits = transport.progressCardEdits;
+    expect(edits.map((edit) => edit.cardSeq)).toEqual(edits.map((_, index) => seeded.lastSeq + 1 + index));
+    expect(edits.every((edit) => edit.messageId === seeded.messageId)).toBe(true);
+    expect(edits.every((edit) => edit.progress.state !== "cancelled")).toBe(true);
+    expect(edits.at(-1)!.progress.state).toBe("completed");
+    expect(edits.at(-1)!.progress.tools.map((tool) => [tool.toolCallId, tool.state])).toEqual([
+      ["before-restart", "cancelled"],
+      ["after-restart", "succeeded"],
+    ]);
+    expect(await openCards(first.root, bot.uid)).toHaveLength(0);
+  } finally {
+    continueResume.resolve();
+    await closeCoreHarness(restarted, { remove: false });
+  }
+});
+
+test("the shared replay reopens a running round and still ends a terminal one", () => {
+  const tracker = createExecutionTracker({ runId: "seam", initialAtMs: 100 });
+  tracker.apply({ type: "turn_start", turnId: 1, atMs: 100 });
+  tracker.apply({ type: "tool_start", toolCallId: "done", toolName: "read", atMs: 110 });
+  tracker.apply({ type: "tool_end", toolCallId: "done", atMs: 120, status: "succeeded" });
+  tracker.apply({ type: "tool_start", toolCallId: "live", toolName: "bash", atMs: 130 });
+  const encoded = encodeExecutionSnapshot(tracker.snapshot(200));
+
+  const resumed = restoreExecutionTracker(encoded, { state: "running", atMs: 900_000 });
+  expect(resumed).not.toBeNull();
+  const running = resumed!.snapshot(900_000);
+  expect(running.state).toBe("running");
+  expect(running.endedAtMs).toBeNull();
+  expect(running.phaseCount).toBe(1);
+  expect(running.tools.map((tool) => [tool.toolCallId, tool.state, tool.endedAtMs])).toEqual([
+    ["done", "succeeded", 120],
+    ["live", "cancelled", 200],
+  ]);
+
+  const closed = restoreExecutionSnapshot(encoded, { state: "failed", atMs: 900_000 });
+  expect(closed!.state).toBe("failed");
+  expect(closed!.endedAtMs).toBe(900_000);
+  expect(closed!.phaseCount).toBe(0);
+  expect(closed!.tools.map((tool) => [tool.toolCallId, tool.state])).toEqual([
+    ["done", "succeeded"],
+    ["live", "failed"],
+  ]);
 });

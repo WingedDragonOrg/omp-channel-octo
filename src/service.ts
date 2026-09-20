@@ -37,6 +37,7 @@ import type {
   OmpWorker,
   SteerConsumedEvent,
   TaskRelayTarget,
+  WorkerEvent,
   WorkerOptions,
   WorkerProcess,
 } from "./contracts.ts";
@@ -56,7 +57,7 @@ import {
 } from "./session/project-session.ts";
 import { ensureProjectSessionDir, sessionsRoot } from "./session/session-dir.ts";
 import { ChannelStore, openChannelStore } from "./store/index.ts";
-import type { TaskRecord } from "./store/store-records.ts";
+import type { BindingRecord, TaskRecord } from "./store/store-records.ts";
 import { isGroupTarget, targetKey, taskTarget } from "./target.ts";
 import { createTypingLeaseManager, type TypingLeaseManager } from "./typing-lease.ts";
 import { createDisplayNameCache, type DisplayNameCache } from "./display-name.ts";
@@ -89,7 +90,9 @@ const MAX_PENDING_STEERS = 32;
 /** Characters of the triggering message shown in a start/consumption receipt. */
 const RECEIPT_EXCERPT_CHARS = 20;
 const DEFAULT_CANCELLED_TEXT = "当前任务已取消；不回滚已发生的副作用。";
-const DEFAULT_RESTARTING_TEXT = "channel 正在重启，本会话任务已中断；重启完成后会在本会话确认。";
+/** 1/0 行的实际恢复失败说明:prompt 标记已落、OMP 是否接受未知，不放行也不重放。 */
+const UNCERTAIN_RECOVERY_NOTICE =
+  "任务未自动恢复：无法确认 OMP 是否已接受该输入，请核对会话后继续。";
 const RESEARCH_HISTORY_EMPTY_TEXT =
   "本聊天还没有可导出的研究记录：先让任务运行 /autoresearch 并完成记录后再试。";
 type RuntimeTask = {
@@ -99,6 +102,11 @@ type RuntimeTask = {
   worker?: OmpWorker;
   cancelRequested: boolean;
   cancelReplySent: boolean;
+  /**
+   * 停机挂起：关停时置位，`runTask` 据此不把中断当成任务失败/取消——行保留 prompt 标记，
+   * 由下一个进程续接。只由 `stopInternal` 写。
+   */
+  suspended: boolean;
   /** True only while this task's OMP prompt is in flight, so appended messages have a target. */
   promptInFlight: boolean;
   /**
@@ -167,6 +175,11 @@ class CoreService implements ChannelService {
   private readonly typingLeases: TypingLeaseManager;
   private bot: BotIdentity | undefined;
   private readonly activityOperations = new Set<Promise<void>>();
+  /**
+   * 恢复任务先占调度序、后执行所等的启动门：`start()` 接线全部成功才放行，失败即拒绝，
+   * 已排定的恢复任务随之放弃（行留在 queued，下一次进程再试）。
+   */
+  private startupGate = Promise.withResolvers<void>();
   private lock: LockHandle | undefined;
   private started = false;
   private stopping = false;
@@ -210,9 +223,10 @@ class CoreService implements ChannelService {
       stopping: () => this.stopping,
       hasRuntimeInDirectory: cwd => this.hasRuntimeInDirectory(cwd),
       isDirectoryBlocked: cwd => this.blockedDirectories.has(cwd),
-      reconcileBinding: (target, binding) =>
-        this.sessions.reconcileExternalBinding(target, binding),
+      reconcileBinding: (taskId, target, binding) =>
+        this.reconcileTaskBinding(taskId, target, binding),
       runTask: (taskId, cwd) => this.runTask(taskId, cwd),
+      awaitStartReady: () => this.startupGate.promise,
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
       notifyThreadOutcome: taskId => this.notifyThreadOutcome(taskId),
     });
@@ -313,10 +327,8 @@ class CoreService implements ChannelService {
     });
     this.serviceRestart = new ServiceRestart({
       store: this.store,
-      botUid: () => this.bot?.uid,
       stopping: () => this.stopping,
-      // 在途任务视图直接借用 runtimes 本身：idle 判定与忙碌目标枚举看到同一份集合。
-      runningRuntimes: () => this.runtimes.values(),
+      // 在途任务视图直接借用 runtimes 本身：idle 判定与延期重启看到同一份集合。
       hasRunning: () => this.runtimes.size > 0,
       restart: options.restart,
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
@@ -343,6 +355,10 @@ class CoreService implements ChannelService {
   async start(): Promise<void> {
     if (this.started) return;
     if (this.stopping) throw new Error("channel 正在停止");
+    // 每次启动一条新门：这一批排定任务要么等到接线成功，要么随失败一起被放弃。
+    this.startupGate = Promise.withResolvers<void>();
+    // 没有恢复任务等待时也不产生未处理拒绝（门只在 start 失败时拒绝）。
+    void this.startupGate.promise.catch(() => {});
     // Checked before `initialize`, because registering is what interrupts a running instance.
     const knownBotUid = this.store.getBotUid();
     if (knownBotUid !== null) await assertBotLockFree(knownBotUid);
@@ -367,11 +383,8 @@ class CoreService implements ChannelService {
       if (configuredOwner) {
         this.store.setOwnerId(identity.uid, configuredOwner);
       }
-      const interrupted = this.store.markInterruptedOnStart(identity.uid);
-      for (const task of interrupted) {
-        await this.outbox.enqueueText(taskTarget(task), `服务已重启完成；任务 ${task.id} 因重启中断，请重新发送。`, null);
-      }
-      await this.serviceRestart.announceStartup(identity.uid);
+      // 重启不丢工作：先把每个遗留 worker 的进程组收干净，再动任何任务状态。无法确认死亡的
+      // 目录保持 block——它的任务留在队列继续挡住同目录的新写者（runTask 原样放过）。
       for (const ledger of this.store.listWorkerLedger(identity.uid)) {
         const stopped = await this.options.workerFactory.recover(ledger);
         if (stopped) {
@@ -380,6 +393,22 @@ class CoreService implements ChannelService {
           this.blockedDirectories.add(ledger.cwd);
           if (ledger.moveTargetCwd) this.blockedDirectories.add(ledger.moveTargetCwd);
         }
+      }
+      // 旧版重启通报已随续接机制移除：遗留行静默清理，绝不再投递。
+      this.serviceRestart.consumeStartupNotices(identity.uid);
+      // started→queued（prompt 标记随行保留）由存储域一次性完成；先补发遗留卡片终态，恢复
+      // 回合随后接上同一条卡片记录，不与卡片恢复竞争。
+      const recovery = this.store.prepareTasksForRestart(identity.uid);
+      await this.progressCards.recover();
+      // 恢复任务先占住聊天链与目录序，再让 transport 开始接新入站：任何新消息（含下面的
+      // 恢复失败回执与子区回传）都排在它们后面，而真正执行要等启动门放行。
+      for (const task of recovery.queued) this.scheduler.scheduleTask(task.id);
+      // 1/0 行（prompt 已落标记、接受状态未知）既不重放也不续接：按实际恢复失败通报、关闭
+      // 该任务遗留的提问，子区派工的回传照常说清楚，不把一次失败的恢复留成静默。
+      for (const task of recovery.uncertain) {
+        this.questions.cancelForTask(task.id);
+        await this.outbox.enqueueText(taskTarget(task), UNCERTAIN_RECOVERY_NOTICE, null);
+        await this.notifyThreadOutcome(task.id);
       }
       if (this.stopping) throw new Error("channel 正在停止");
       this.started = true;
@@ -393,9 +422,10 @@ class CoreService implements ChannelService {
       if (this.stopping) throw new Error("channel 正在停止");
       this.outbox.flushAll();
       this.botEvents.start();
-      await this.progressCards.recover();
+      this.startupGate.resolve();
     } catch (error) {
       this.started = false;
+      this.startupGate.reject(error instanceof Error ? error : new Error("channel 启动失败"));
       await this.botEvents.stop();
       await this.options.transport.stop().catch(() => {});
       await lock.release().catch(() => {});
@@ -421,13 +451,11 @@ class CoreService implements ChannelService {
     this.shutdownController.abort();
     const runtimes = [...this.runtimes.values()];
     for (const runtime of runtimes) {
-      runtime.cancelRequested = true;
+      // 停机不是用户的 /cancel：只挂起。任务行保留 prompt 标记，由新进程按续接语义恢复；
+      // 遗留提问保持 pending（beginRecovery 重挂），因此这里不再 durably 取消它们。
+      runtime.suspended = true;
       runtime.stopText?.();
       runtime.stopActivity?.();
-      if (this.bot) {
-        this.store.cancelQuestions(this.bot.uid, runtime.target);
-        this.serviceRestart.rememberInterrupted(runtime.target);
-      }
       this.questions.rejectForTask(runtime.taskId, new Error("channel stopping"));
       if (runtime.worker) {
         await runtime.worker.stop().catch(() => false);
@@ -653,6 +681,20 @@ class CoreService implements ChannelService {
       supported: message.supported,
       kind: "task" as const,
     };
+  }
+
+  /**
+   * 绑定核对的服务侧入口（调度与 `runTask` 共用）：恢复中的任务只读原绑定——核对会在会话
+   * 搬移时改写绑定行，而恢复必须以崩溃前记录的会话身份与文件为准；缺失或身份不符由
+   * `runTask` fail-closed，绝不静默换绑或新建会话。普通任务照常走可写核对与找回。
+   */
+  private async reconcileTaskBinding(
+    taskId: string,
+    target: ChatTarget,
+    binding: BindingRecord | null,
+  ): Promise<BindingRecord | null> {
+    if (binding !== null && this.store.isTaskResuming(taskId)) return binding;
+    return this.sessions.reconcileExternalBinding(target, binding);
   }
 
   private hasRuntime(target: ChatTarget): boolean {
@@ -1185,7 +1227,8 @@ class CoreService implements ChannelService {
         await this.acceptTask(message, message.text, true, relay ?? null);
         return "queued";
       },
-      askQuestions: (task, target, args, signal) => this.questions.askQuestions(task, target, args, signal),
+      askQuestions: (task, target, args, signal, toolCallId) =>
+        this.questions.askQuestions(task, target, args, signal, toolCallId),
       channelStatus: () => ({
         pid: process.pid,
         restart_pending: this.serviceRestart.pending,
@@ -1201,7 +1244,8 @@ class CoreService implements ChannelService {
   private async runTask(taskId: string, lockedCwd?: string): Promise<void> {
     const persistedTask = this.store.getTask(taskId);
     if (!persistedTask || persistedTask.state !== "queued") return;
-    const bindingAtStart = await this.sessions.reconcileExternalBinding(
+    const bindingAtStart = await this.reconcileTaskBinding(
+      taskId,
       taskTarget(persistedTask),
       this.store.getBinding(this.bot!.uid, taskTarget(persistedTask)),
     );
@@ -1216,13 +1260,14 @@ class CoreService implements ChannelService {
       return;
     }
     if (this.blockedDirectories.has(task.cwd)) {
-      this.scheduler.takeWaitingReceipt(taskId);
-      this.store.markFailed(taskId, "directory remains blocked by an unconfirmed worker");
-      await this.outbox.enqueueText(taskTarget(task), GENERIC_TASK_FAILURE_NOTICE, taskId);
-      await this.notifyThreadOutcome(taskId);
+      // 旧 worker 的死亡未确认：任务保持排队、继续占住该目录的队列位，绝不启动第二个写者，
+      // 也不把它当作失败丢掉；下一个进程再试。失败收尾只留给确定无法恢复的情形。
+      console.error(`[task] 目录仍被未确认的 worker 占用，任务保持排队 task=${taskId}`);
       return;
     }
     if (!this.store.markStarted(taskId)) return;
+    // 恢复分流：prompt 已被 OMP 接受的遗留任务必须续接原会话，其余任务重放原文。
+    const resuming = this.store.isTaskResuming(taskId);
     // 防御性幂等点亮：正常路径在接受时已持有 task 租约（此处 no-op）；任何未来触达路径自动点亮。
     this.typingLeases.acquire(taskTarget(task), `task:${taskId}`);
     if (this.scheduler.takeWaitingReceipt(taskId)) {
@@ -1234,6 +1279,7 @@ class CoreService implements ChannelService {
       cwd: task.cwd,
       cancelRequested: false,
       cancelReplySent: false,
+      suspended: false,
       promptInFlight: false,
       stopCause: null,
       workAfterStop: false,
@@ -1284,6 +1330,17 @@ class CoreService implements ChannelService {
       startupPhase = "startup";
       const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.options.config), task.cwd);
       const binding = bindingAtStart ?? this.store.getBinding(this.bot!.uid, target);
+      // 续接只认原会话：绑定缺失、文件丢失或身份不一致都 fail-closed，不新建也不重绑。
+      if (
+        resuming
+        && (
+          bindingAtStart === null
+          || bindingAtStart.sessionFile === null
+          || bindingAtStart.sessionId !== persistedTask.sessionId
+        )
+      ) {
+        throw new TaskStartupError("session-invalid", "恢复所需的会话绑定缺失或身份不匹配");
+      }
       const chatModel = this.store.getChatModel(this.bot!.uid, target);
       const contextScope = turnContext?.workerScope;
       const workerOptions: WorkerOptions = {
@@ -1340,15 +1397,44 @@ class CoreService implements ChannelService {
         verified.sessionId,
         verified.sessionFile,
       );
+      // 续接不重放原文、也不重灌历史快照：原回合的上下文与会话消息都在会话里；群/子区说明
+      // 的注入事务照常发布——会话侧车正是为「原生续跑回合」准备的（`context` 钩子补灌），
+      // 上一进程未结算的 pending 事务在这里被接手，成功的续跑回合照常提交。
       contextInjection = turnContext ? await turnContext.prepare(verified.sessionId) : undefined;
-      const historyTurn = await this.history.prepareTurn(task, target, verified.sessionId);
+      const historyTurn = resuming ? null : await this.history.prepareTurn(task, target, verified.sessionId);
       const promptContext: PromptContext = {
         tools: createHostTools(this.hostToolHost(), task, snapshot),
         ...(contextInjection === undefined ? {} : { contextInjection }),
       };
+      if (!resuming) {
+        // 普通派发在 prompt 发出前的最后一刻落标记：死在这一步之后、OMP 接受之前，恢复只会
+        // 看到「已派发、未接受」，按 fail-closed 结算而不是重放。
+        this.store.markTaskPromptStarted(taskId, verified.sessionId);
+      }
       runtime.promptInFlight = true;
+      // Worker-local message counters restart at one; resumed output needs its own durable stream.
+      const resumeStreamPrefix = resuming ? `resume:${randomUUID()}:` : "";
+      /**
+       * 事件入口：接受回执先同步落标记，再交给 TaskEvents——恢复判定因此严格基于「OMP 已
+       * 接受该 prompt」的持久事实，而不是事件到达顺序。
+       */
+      const consumeEvent = (event: WorkerEvent): void => {
+        if (event.type === "prompt_accepted") {
+          this.store.markTaskPromptAccepted(taskId);
+          return;
+        }
+        events.onEvent(resumeStreamPrefix && (event.type === "text" || event.type === "notice")
+          ? { ...event, messageId: `${resumeStreamPrefix}${event.messageId}` }
+          : event);
+      };
       try {
-        await worker.prompt(historyTurn?.text ?? task.text, events.onEvent, promptContext);
+        if (resuming) {
+          // 先重挂该任务遗留的待答问题：续跑里重新发起的同一轮 ask 会认领原行，不会多发一题。
+          this.questions.beginRecovery(taskId);
+          await worker.resume(consumeEvent, promptContext);
+        } else {
+          await worker.prompt(historyTurn?.text ?? task.text, consumeEvent, promptContext);
+        }
       } finally {
         runtime.promptInFlight = false;
         if (historyTurn) this.history.commitTurn(target, verified.sessionId, historyTurn);
@@ -1365,7 +1451,7 @@ class CoreService implements ChannelService {
             : "用户中断当前回合",
         );
         progress.finish("cancelled");
-      } else {
+      } else if (!runtime.suspended) {
         if (turnContext) await turnContext.complete(worker.sessionId, events.localOnly);
         this.store.markCompleted(taskId, events.resultText);
         progress.finish("completed");
@@ -1376,9 +1462,21 @@ class CoreService implements ChannelService {
         this.store.markCancelled(taskId);
         progress.finish("cancelled");
         await this.sendCancelledIfNeeded(runtime);
-      } else if (runtime.stopCause === "question") {
-        this.store.markInterrupted(taskId, "等待回答超时，回合已停止");
+      } else if (runtime.stopCause !== null && !runtime.workAfterStop) {
+        // 显式 /interrupt 或 ask 超时已经把这个回合停在这里：即使紧接着进程停机，也按终态结算，
+        // 不让一次重启把用户的中断续上（与成功分支同一判据）。停下后又有真实工作的回合照常
+        // 落到下面的停机挂起，由新进程续跑。
+        this.store.markInterrupted(
+          taskId,
+          runtime.stopCause === "question"
+            ? "等待回答超时，回合已停止"
+            : "用户中断当前回合",
+        );
         progress.finish("cancelled");
+      } else if (runtime.suspended) {
+        // 停机挂起：不是失败，也不是取消。行保持 started 与 prompt 标记，遗留提问保持 pending，
+        // 由新进程按续接语义恢复；这里既不结算也不发任何通知。
+        console.error(`[task] 停机挂起，任务保持未结算 task=${taskId}`);
       } else {
         const failure = worker
           ? classifyTaskFailure(error)
@@ -1389,6 +1487,8 @@ class CoreService implements ChannelService {
         );
         this.store.markFailed(taskId, failure.row);
         progress.finish("failed");
+        // 续接失败即该任务确定不再恢复：它自己的待答问题与卡片一并收尾（不波及同聊天其他任务）。
+        if (resuming) this.questions.cancelForTask(taskId);
         await this.outbox.enqueueText(runtime.target, failure.notice, taskId);
       }
     } finally {
@@ -1420,11 +1520,7 @@ class CoreService implements ChannelService {
   private async sendCancelledIfNeeded(runtime: RuntimeTask): Promise<void> {
     if (runtime.cancelReplySent) return;
     runtime.cancelReplySent = true;
-    await this.outbox.enqueueText(
-      runtime.target,
-      this.serviceRestart.requested ? DEFAULT_RESTARTING_TEXT : DEFAULT_CANCELLED_TEXT,
-      runtime.taskId,
-    );
+    await this.outbox.enqueueText(runtime.target, DEFAULT_CANCELLED_TEXT, runtime.taskId);
   }
 
   /** Tracks a background operation so shutdown waits for it without blocking a caller. */

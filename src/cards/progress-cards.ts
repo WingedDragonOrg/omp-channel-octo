@@ -1,7 +1,9 @@
 /**
  * 进度卡的完整生命周期：一轮 user round 一张卡（懒建卡、按版本合并的运行中编辑、终态编辑、
- * 被 steer 顶掉后的滚动），以及进程重启后替上一进程补发终态卡片的持久恢复。两者只共享卡片
- * 行与卡片投递两条边界，身份分别是运行中的 round 与 `progress_cards` 行。
+ * 被 steer 顶掉后的滚动），以及进程重启后对上一进程遗留卡片的两种处置：任务已经结束的按存
+ * 储的终态补发一次终态编辑，任务即将续接的直接接管——不改卡片身份、不改序号，接着编辑读者
+ * 眼前那张卡。两者只共享卡片行与卡片投递两条边界，身份分别是运行中的 round 与
+ * `progress_cards` 行。
  *
  * 模块不依赖 `service.ts`：卡片行（`saveProgressCard` / `listProgressCards` /
  * `recordProgressCardAttempt` / `clearProgressCard` / `getTask`）、卡片投递
@@ -11,10 +13,12 @@
  * `finally` 里 `stop`，归档前 `await tail`。
  */
 
+import { randomUUID } from "node:crypto";
 import {
   createExecutionTracker,
   encodeExecutionSnapshot,
   restoreExecutionSnapshot,
+  restoreExecutionTracker,
   stripCardSummaries,
   type ExecutionSnapshot,
   type ExecutionState,
@@ -43,7 +47,11 @@ type LatestResearch = Extract<ExecutionEvent, { type: "research_update" }>["rese
  * card, idempotency key, and sequence.
  */
 type ProgressRound = {
-  /** Server idempotency key: stable across creation retries, distinct between rounds. */
+  /**
+   * Server idempotency key: stable across creation retries, distinct between rounds. A round of a
+   * task that came through recovery carries a recovery-only segment instead of the plain counter,
+   * because the counter the previous process reached is not durable and its keys must never repeat.
+   */
   readonly clientMsgNo: string;
   readonly tracker: ExecutionTracker;
   /** True once creation of this round's card has been queued. */
@@ -69,11 +77,19 @@ type ProgressRound = {
   nextEditAt: number;
 };
 
-/** A fresh round: `roundIndex` is the run's own counter, so the idempotency key never repeats. */
-function makeRound(taskId: string, roundIndex: number): ProgressRound {
+/**
+ * A fresh round: `roundIndex` is the run's own counter, so the idempotency key never repeats.
+ * A resumed round arrives with the tracker replayed from the stored payload instead of a new one.
+ */
+function makeRound(
+  taskId: string,
+  roundIndex: number,
+  keyPrefix: string,
+  tracker?: ExecutionTracker,
+): ProgressRound {
   return {
-    clientMsgNo: `progress-${taskId}-${roundIndex}`,
-    tracker: createExecutionTracker({ runId: taskId }),
+    clientMsgNo: `progress-${taskId}-${keyPrefix}${roundIndex}`,
+    tracker: tracker ?? createExecutionTracker({ runId: taskId }),
     started: false,
     finished: false,
     retired: false,
@@ -88,6 +104,19 @@ function makeRound(taskId: string, roundIndex: number): ProgressRound {
     nextEditAt: 0,
   };
 }
+
+/**
+ * 上一进程遗留、即将由本进程续接的一轮：卡片已经存在服务端，所以身份与序号都取自那行，而不是
+ * 再发一次创建。`snapshot` 是那行里的最后一帧重放出来的样子——续接的一轮从读者眼前的状态继续，
+ * todo、工具轨迹、子代理与研究都还在。
+ */
+type ResumedRound = {
+  readonly messageId: string;
+  /** The last sequence the server accepted for this card; the next edit stays strictly above it. */
+  readonly lastSeq: number;
+  readonly tracker: ExecutionTracker;
+  readonly snapshot: ExecutionSnapshot;
+};
 
 /**
  * The edge in front of the bot API refuses a request body it dislikes with its own 4xx and page,
@@ -180,7 +209,13 @@ function recordCardAttempt(deps: ProgressCardsDeps, taskId: string, messageId: s
 export interface ProgressCardsDeps {
   readonly store: Pick<
     ChannelStore,
-    "saveProgressCard" | "listProgressCards" | "recordProgressCardAttempt" | "clearProgressCard" | "getTask"
+    | "saveProgressCard"
+    | "listProgressCards"
+    | "recordProgressCardAttempt"
+    | "clearProgressCard"
+    | "getTask"
+    /** 该 task 是否会被本进程续接：决定遗留卡片是接管还是补发终态。 */
+    | "isTaskResuming"
   >;
   readonly transport: Pick<ChannelTransport, "sendProgressCard" | "editProgressCard">;
   /** 卡片行以 bot 身份为键；未就绪（未 start）即整个域 no-op。 */
@@ -190,54 +225,134 @@ export interface ProgressCardsDeps {
   readonly trackOperation: (operation: Promise<void>) => void;
 }
 
+/** 恢复留给本轮的两件事：接管的那张卡（可能没有），以及新开卡必须换用的 idempotency key 段。 */
+type RecoveryHandoff = {
+  readonly round: ResumedRound | undefined;
+  readonly keyPrefix: string;
+};
+
 /** 全服务共用的持久恢复：卡片身份只存在于观察过该回合的进程里。 */
 export class ProgressCards {
+  /**
+   * 恢复期对某个任务的决定，按 task id 存放；`startTask` 取走即消费，所以同一任务只会取一次。
+   * 值 `null` 表示这次恢复没有卡片可接管——最后一行不可用，或它已经按终态补发过——对新的一轮
+   * 而言只剩「开卡必须换 key 段」这一件事。
+   */
+  private readonly recovered = new Map<string, ResumedRound | null>();
+  /** A fresh recovery segment keeps new rounds distinct from every previously issued card key. */
+  private readonly recoveryKeyPrefix = `r${randomUUID()}-`;
+
   constructor(private readonly deps: ProgressCardsDeps) {}
 
   /** 一轮 task 一个 owner；`runTask` 建，`finally` 里 `stop`。 */
   startTask(taskId: string, target: ChatTarget): TaskProgress {
-    return new TaskProgress(this.deps, taskId, target);
+    const recovered = this.recovered.get(taskId);
+    if (recovered === undefined) return new TaskProgress(this.deps, taskId, target);
+    this.recovered.delete(taskId);
+    return new TaskProgress(this.deps, taskId, target, {
+      round: recovered ?? undefined,
+      keyPrefix: this.recoveryKeyPrefix,
+    });
   }
 
   /**
-   * Closes cards left open by an earlier process — a restart that interrupted the turn, or a
+   * Settles the cards left open by an earlier process — a restart that interrupted the turn, or a
    * terminal edit that never landed. Without this the client keeps showing the last running state
    * forever, because the card's message id and sequence only existed in that process.
+   *
+   * A task this process is about to resume is the exception: its newest card is taken over instead
+   * of closed, so the resumed turn keeps editing the card the reader is looking at rather than
+   * flashing a cancelled one and opening a second below the same message. Rounds the run had
+   * already rolled away are still closed, in the state the roll gave them.
    */
   async recover(): Promise<void> {
     const botUid = this.deps.botUid();
     if (botUid === undefined) return;
+    // 同一任务的行按创建顺序读（rowid）：最后一行是上一进程死前正在编辑的那一轮，前面的是它已经
+    // 滚掉的轮。带上时间戳的那些行不能当作新旧的依据——旧轮的迟到重写与重试都会落在新轮之后。
+    const toResume = new Map<string, ProgressCardRecord[]>();
+    const withRows = new Set<string>();
     for (const card of this.deps.store.listProgressCards(botUid)) {
-      const target: ChatTarget = { channelType: card.channelType, channelId: card.channelId };
-      const task = this.deps.store.getTask(card.taskId);
-      const state: Exclude<ExecutionState, "running"> = task?.state === "completed"
-        ? "completed"
-        : task?.state === "failed"
-          ? "failed"
-          : "cancelled";
-      const snapshot = restoreExecutionSnapshot(card.snapshot, { state, atMs: Date.now() });
-      if (snapshot === null) {
-        forgetCard(this.deps, card.taskId, card.messageId);
-        console.error(`[progress-card] 丢弃无法解析的卡片记录 task=${card.taskId}`);
+      withRows.add(card.taskId);
+      if (this.deps.store.isTaskResuming(card.taskId)) {
+        const rounds = toResume.get(card.taskId);
+        if (rounds === undefined) toResume.set(card.taskId, [card]);
+        else rounds.push(card);
         continue;
       }
-      try {
-        await this.submitRecoveredCard(target, card, snapshot);
-        forgetCard(this.deps, card.taskId, card.messageId);
-        console.error(
-          `[progress-card] 已补发终态卡片 task=${card.taskId} target=${targetKey(target)} state=${state}`,
+      const snapshot = this.restoreStoredCard(card);
+      if (snapshot !== null) {
+        await this.closeStoredCard(
+          { channelType: card.channelType, channelId: card.channelId },
+          card,
+          snapshot,
         );
-      } catch (error) {
-        const attempts = recordCardAttempt(this.deps, card.taskId, card.messageId);
-        console.error(
-          `[progress-card] 补发终态失败 task=${card.taskId} attempt=${attempts}：`
-          + `${error instanceof Error ? error.message : "unknown error"}`,
-        );
-        if (attempts >= PROGRESS_CARD_RECOVERY_ATTEMPTS) {
-          forgetCard(this.deps, card.taskId, card.messageId);
-        }
       }
     }
+    for (const [taskId, rounds] of toResume) {
+      const current = rounds[rounds.length - 1]!;
+      const atMs = Date.now();
+      const tracker = restoreExecutionTracker(current.snapshot, { state: "running", atMs });
+      if (tracker === null) {
+        forgetCard(this.deps, taskId, current.messageId);
+        console.error(`[progress-card] 丢弃无法解析的卡片记录 task=${taskId}`);
+        this.recovered.set(taskId, null);
+      } else {
+        this.recovered.set(taskId, {
+          messageId: current.messageId,
+          lastSeq: current.lastSeq,
+          tracker,
+          snapshot: tracker.snapshot(atMs),
+        });
+      }
+      // 被 steer 滚掉的轮不再有读者，但卡片还开着：按 `roll` 当时给出的结局收尾（新消息已经由
+      // 后一轮回答），而不是让它们停在运行中的样子。
+      for (const retired of rounds.slice(0, -1)) {
+        const snapshot = this.restoreStoredCard(retired, "completed");
+        if (snapshot === null) continue;
+        await this.closeStoredCard(
+          { channelType: retired.channelType, channelId: retired.channelId },
+          retired,
+          snapshot,
+        );
+      }
+    }
+    // 其余恢复时还有卡片行、又可能再跑一次的任务（典型是刚补发完终态、即将重放原文的排队行）同样
+    // 不能再从 `progress-<taskId>-0` 数 key：上一进程已经用掉过那批 key。终态任务不会再跑，不留意图。
+    for (const taskId of withRows) {
+      if (this.recovered.has(taskId)) continue;
+      const task = this.deps.store.getTask(taskId);
+      const active = task !== null
+        && task.state !== "completed"
+        && task.state !== "failed"
+        && task.state !== "cancelled"
+        && task.state !== "interrupted";
+      if (active) this.recovered.set(taskId, null);
+    }
+  }
+
+  /**
+   * The stored frame replayed into a terminal card body, or null when the row cannot be used — and
+   * then dropped, because no later process could address that card either. A card whose own task
+   * row is missing gets the cancelled verdict the old recovery always gave it: nothing can revive
+   * a run no task record describes.
+   */
+  private restoreStoredCard(
+    card: ProgressCardRecord,
+    state?: Exclude<ExecutionState, "running">,
+  ): ExecutionSnapshot | null {
+    const task = this.deps.store.getTask(card.taskId);
+    const verdict = state ?? (task?.state === "completed"
+      ? "completed"
+      : task?.state === "failed"
+        ? "failed"
+        : "cancelled");
+    const snapshot = restoreExecutionSnapshot(card.snapshot, { state: verdict, atMs: Date.now() });
+    if (snapshot === null) {
+      forgetCard(this.deps, card.taskId, card.messageId);
+      console.error(`[progress-card] 丢弃无法解析的卡片记录 task=${card.taskId}`);
+    }
+    return snapshot;
   }
 
   /** One recovery edit, under the same bounded deadline as a live card edit. */
@@ -260,6 +375,34 @@ export class ProgressCards {
       clearTimeout(timer);
     }
   }
+
+  /**
+   * Submits one terminal edit for a card nobody will edit again and drops the row. A failed edit
+   * spends a bounded attempt and keeps the row — a lost response may already have been accepted, so
+   * the next process retries above it — until the attempts run out.
+   */
+  private async closeStoredCard(
+    target: ChatTarget,
+    card: ProgressCardRecord,
+    snapshot: ExecutionSnapshot,
+  ): Promise<void> {
+    try {
+      await this.submitRecoveredCard(target, card, snapshot);
+      forgetCard(this.deps, card.taskId, card.messageId);
+      console.error(
+        `[progress-card] 已补发终态卡片 task=${card.taskId} target=${targetKey(target)} state=${snapshot.state}`,
+      );
+    } catch (error) {
+      const attempts = recordCardAttempt(this.deps, card.taskId, card.messageId);
+      console.error(
+        `[progress-card] 补发终态失败 task=${card.taskId} attempt=${attempts}：`
+        + `${error instanceof Error ? error.message : "unknown error"}`,
+      );
+      if (attempts >= PROGRESS_CARD_RECOVERY_ATTEMPTS) {
+        forgetCard(this.deps, card.taskId, card.messageId);
+      }
+    }
+  }
 }
 
 /**
@@ -274,13 +417,35 @@ export class TaskProgress {
   private round: ProgressRound;
   /** 本任务最近一次研究快照：随 `apply` 更新，`roll` 时结转进新轮。 */
   private latestResearch: LatestResearch | undefined;
+  /**
+   * 本任务后续轮的 idempotency key 前缀。新任务为空（`progress-<taskId>-<n>` 从未用过）；
+   * 恢复过的任务换成恢复期的新段，保证同一任务里新卡永远不会复用上一进程用过的 key。
+   */
+  private keyPrefix = "";
 
   constructor(
     private readonly deps: ProgressCardsDeps,
     private readonly taskId: string,
     private readonly target: ChatTarget,
+    handoff?: RecoveryHandoff,
   ) {
-    this.round = makeRound(taskId, 0);
+    this.keyPrefix = handoff?.keyPrefix ?? "";
+    const resumed = handoff?.round;
+    if (resumed === undefined) {
+      this.round = makeRound(taskId, 0, this.keyPrefix);
+      return;
+    }
+    // 上一进程已经建过这轮卡片：恢复不改身份、不改序号，只是接着编辑读者眼前那张卡。
+    this.round = {
+      ...makeRound(taskId, 0, this.keyPrefix, resumed.tracker),
+      started: true,
+      messageId: resumed.messageId,
+      seq: resumed.lastSeq,
+      latest: resumed.snapshot,
+      // 存储里的那一帧就是客户端正在看的一版；第一次真实变化是下一版，由它发出增量编辑。
+      version: 1,
+      sentVersion: 0,
+    };
   }
 
   /** 当前轮已进入终态（终态编辑已入队）：`stop` 据此决定是否 abort 在途编辑。 */
@@ -336,7 +501,7 @@ export class TaskProgress {
     clearTimeout(this.timer);
     this.timer = undefined;
     this.roundIndex += 1;
-    this.round = makeRound(this.taskId, this.roundIndex);
+    this.round = makeRound(this.taskId, this.roundIndex, this.keyPrefix);
     // The todo list belongs to the task rather than to one round, so the new card keeps it.
     const todos = previous.latest?.todos ?? [];
     if (todos.length > 0) {

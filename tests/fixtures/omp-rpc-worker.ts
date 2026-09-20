@@ -15,6 +15,11 @@ type Scenario =
 	| "normal"
 	| "local"
 	| "retry"
+	| "retry-resume"
+	| "retry-resume-empty"
+	| "retry-resume-failure"
+	| "retry-resume-model-error"
+	| "retry-resume-late-completion"
 	| "error"
 	| "same-chunk-error"
 	| "message-end"
@@ -754,10 +759,12 @@ function emitHostToolCall(): void {
 		toolArguments = parsed as Frame;
 	}
 	emit({ type: "agent_start" });
+	// `toolCallId` is OMP's own identity for the call (independent of the RPC request id, reused
+	// when a retry re-executes the call). `--host-tool-no-call-id` models a legacy/absent field.
 	emit({
 		type: "host_tool_call",
 		id: pendingHostToolRequestId,
-		toolCallId: "fixture-tool-call-1",
+		...(flag("--host-tool-no-call-id") === undefined ? { toolCallId: "fixture-tool-call-1" } : {}),
 		toolName,
 		arguments: toolArguments,
 	});
@@ -1387,6 +1394,78 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 			retryAvailable = false;
 			promptTimer = setTimeout(() => emitAgentTurn(id), 60);
 		}
+		return;
+	}
+	if (scenario === "retry-resume" && message === "/retry") {
+		// Native `/retry` continues the interrupted turn from the recorded transcript: the receipt
+		// is a command-output line, and the regenerated turn streams afterwards as its own run.
+		emit({ type: "command_output", text: "Retrying the last failed turn." });
+		response(id, "prompt", { agentInvoked: true });
+		streaming = true;
+		promptTimer = setTimeout(() => {
+			emit({ type: "agent_start" });
+			emitAssistantMessage("fixture resumed work", 0);
+			emit({ type: "agent_end", messages: [], willContinue: false });
+			streaming = false;
+			appendLog({ kind: "turn_complete", id, retryResume: true });
+		}, 40);
+		return;
+	}
+	if (scenario === "retry-resume-late-completion" && message === "/retry") {
+		// The acknowledgement and a replayed local completion naming this very request arrive in
+		// ONE stdout write: every frame following the acknowledgement must already see that this
+		// run is an agent turn, so the replay can neither settle it nor count as its completion.
+		emitFrames([
+			{ type: "command_output", text: "Retrying the last failed turn." },
+			{ type: "response", id, command: "prompt", success: true, data: { agentInvoked: true } },
+			{ type: "prompt_result", id, agentInvoked: false },
+		]);
+		streaming = true;
+		promptTimer = setTimeout(() => {
+			emit({ type: "agent_start" });
+			emitAssistantMessage("fixture resumed work", 0);
+			emit({ type: "agent_end", messages: [], willContinue: false });
+			streaming = false;
+			appendLog({ kind: "turn_complete", id, retryResumeLate: true });
+		}, 40);
+		return;
+	}
+	if (scenario === "retry-resume-empty" && message === "/retry") {
+		// A healthy transcript tail: OMP answers `/retry` locally with `agentInvoked:false`, and
+		// the id-carrying local completion follows in the same write. Both belong to the internal
+		// retry dispatch and must never surface to the caller.
+		emitFrames([
+			{ type: "command_output", text: "Nothing to retry." },
+			{ type: "response", id, command: "prompt", success: true, data: { agentInvoked: false } },
+			{ type: "prompt_result", id, agentInvoked: false },
+		]);
+		return;
+	}
+	if (scenario === "retry-resume-empty") {
+		// The same-session continuation instruction: one genuine agent turn that continues the
+		// recorded work instead of replaying the original request.
+		response(id, "prompt", { agentInvoked: true });
+		streaming = true;
+		promptTimer = setTimeout(() => {
+			emit({ type: "agent_start" });
+			emitAssistantMessage("fixture continued recorded work", 0);
+			emit({ type: "agent_end", messages: [], willContinue: false });
+			streaming = false;
+			appendLog({ kind: "turn_complete", id, continuation: true });
+		}, 40);
+		return;
+	}
+	if (scenario === "retry-resume-failure" && message === "/retry") {
+		// The native dispatch itself fails: no turn starts, so nothing may be resent.
+		promptTimer = setTimeout(() => {
+			failure(id, "prompt", "fixture retry failed natively", "fixture_retry_error");
+		}, 20);
+		return;
+	}
+	if (scenario === "retry-resume-model-error" && message === "/retry") {
+		response(id, "prompt", { agentInvoked: true });
+		streaming = true;
+		promptTimer = setTimeout(() => emitModelErrorScenario(id), 30);
 		return;
 	}
 	if (scenario === "local") {

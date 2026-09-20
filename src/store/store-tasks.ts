@@ -4,7 +4,7 @@
 
 import { Database } from "bun:sqlite";
 import type { ChatTarget } from "../contracts.ts";
-import type { InboundClaim, RestartNoticeRecord, TaskRecord } from "./store-records.ts";
+import type { InboundClaim, RestartNoticeRecord, TaskRecord, TaskRestartRecovery } from "./store-records.ts";
 import { asNumber, asString, query, run, targetValues, targetWhere, taskFromRow, transaction } from "./store-schema.ts";
 
 export function acceptTask(db: Database, claim: InboundClaim, task: TaskRecord): boolean {
@@ -190,22 +190,93 @@ export function markInterrupted(db: Database, taskId: string, errorText: string)
   );
 }
 
-export function markInterruptedOnStart(db: Database, botUid: string): TaskRecord[] {
+/**
+ * 启动恢复入口：一次事务内规范化该 Bot 遗留的在途任务，并把结果分成两组。
+ * - `queued`：重排回队列、按接受顺序（accepted_at, rowid 升序）待执行的任务。没有派发过的行
+ *   （`prompt_started = 0`）重放原文；已有 OMP 接受回执的行（`prompt_started = 1 AND prompt_accepted = 1`）
+ *   必须续接原会话，调用方用 {@link isTaskResuming} 分流。
+ * - `uncertain`：本次被 fail-closed 成 `interrupted` 的已派发行（`prompt_started = 1` 且
+ *   `prompt_accepted = 0`，含升级时按「接受状态未知」记账的旧库 started 行）。prompt 已经落账却没有
+ *   接受回执，无法判定它是否真的进过会话，因此既不重放原文也不错续到别的会话；这些行只报告本次
+ *   结算的，后续启动不会重复上报。
+ *
+ * `queued` 行原样保留，终态行不参与，等待中的提问不动，调度也不在这里发生。`session_id` 与 relay
+ * 等元数据随行保留。
+ */
+export function prepareTasksForRestart(db: Database, botUid: string): TaskRestartRecovery {
   return transaction(db, () => {
-    const rows = query(db,
-      "SELECT * FROM tasks WHERE bot_uid = ? AND state IN ('queued', 'started')",
+    const uncertainIds = query(db,
+      `SELECT id FROM tasks
+       WHERE bot_uid = ? AND state = 'started' AND prompt_started = 1 AND prompt_accepted = 0`,
       [botUid],
-    );
+    ).map((row) => asString(row.id));
     run(db,
-      "UPDATE tasks SET state = 'interrupted', finished_at = ?, error_text = 'service restarted before task completion' WHERE bot_uid = ? AND state IN ('queued', 'started')",
+      `UPDATE tasks SET state = 'interrupted', finished_at = ?,
+         error_text = 'prompt acceptance unknown at restart (dispatch recorded, worker receipt missing)'
+       WHERE bot_uid = ? AND state = 'started' AND prompt_started = 1 AND prompt_accepted = 0`,
       [Date.now(), botUid],
     );
-    run(db,
-      "UPDATE questions SET state = 'cancelled', answered_at = ? WHERE bot_uid = ? AND state = 'pending'",
-      [Date.now(), botUid],
-    );
-    return rows.map((row) => taskFromRow(row));
+    run(db, "UPDATE tasks SET state = 'queued' WHERE bot_uid = ? AND state = 'started'", [botUid]);
+    // 两组行一次性取回并按同一顺序排序，再按状态拆开：只有本次结算的 uncertain 行进入 IN 列表。
+    const uncertainRows = uncertainIds.length === 0 ? "" : ` OR id IN (${uncertainIds.map(() => "?").join(", ")})`;
+    const rows = query(db,
+      `SELECT * FROM tasks WHERE bot_uid = ? AND (state = 'queued'${uncertainRows})
+       ORDER BY accepted_at ASC, rowid ASC`,
+      [botUid, ...uncertainIds],
+    ).map((row) => taskFromRow(row));
+    return {
+      queued: rows.filter((task) => task.state === "queued"),
+      uncertain: rows.filter((task) => task.state === "interrupted"),
+    };
   });
+}
+
+/**
+ * 发出 prompt 之前的一次性落账：置 `prompt_started` 并记录真实会话身份，同时清掉接受回执——
+ * 新一次派发默认还没有被 OMP 接受。只有仍在 `started`、且尚未标记过的任务写得进去：其他状态
+ * 说明调用方拿错了行，重复标记则是在重放原输入并覆盖恢复所需的会话身份，两者都直接抛错而不是
+ * 静默改写。
+ */
+export function markTaskPromptStarted(db: Database, taskId: string, sessionId: string): void {
+  const marked = run(db,
+    "UPDATE tasks SET prompt_started = 1, prompt_accepted = 0, session_id = ? WHERE id = ? AND state = 'started' AND prompt_started = 0",
+    [sessionId, taskId],
+  ).changes === 1;
+  if (marked) return;
+  const row = query(db, "SELECT state, prompt_started FROM tasks WHERE id = ?", [taskId])[0];
+  if (!row) throw new Error(`task ${taskId} does not exist`);
+  if (asString(row.state) !== "started") {
+    throw new Error(`task ${taskId} is ${asString(row.state)}, not started; the prompt marker follows markStarted`);
+  }
+  throw new Error(`task ${taskId} already recorded a prompt; resume its session instead of replaying the input`);
+}
+
+/**
+ * OMP 接受 prompt 的回执（worker 的 `prompt_accepted` 事件）：确认这次派发真的进了会话，重启时才
+ * 能安全续接。只要求派发标记已经落账，不校验状态——回执与后续状态迁移在同一事件流里，晚到或重复
+ * 到达都是幂等的，写终态行也无害；缺派发标记说明调用方没按「先标记再处理后续事件」的顺序接线。
+ */
+export function markTaskPromptAccepted(db: Database, taskId: string): void {
+  const accepted = run(db,
+    "UPDATE tasks SET prompt_accepted = 1 WHERE id = ? AND prompt_started = 1",
+    [taskId],
+  ).changes === 1;
+  if (!accepted) {
+    throw new Error(`task ${taskId} has no dispatched prompt; markTaskPromptStarted comes first`);
+  }
+}
+
+/**
+ * 在途任务是否必须续接既有会话：非终态，且 prompt 已落账并收到 OMP 接受回执。缺回执的行在恢复时
+ * 会被 fail-closed 成 interrupted，因此恢复流程看到的可续接任务一定满足这里。
+ */
+export function isTaskResuming(db: Database, taskId: string): boolean {
+  const row = query(db,
+    `SELECT 1 FROM tasks
+     WHERE id = ? AND state IN ('queued', 'started') AND prompt_started = 1 AND prompt_accepted = 1`,
+    [taskId],
+  )[0];
+  return row !== undefined;
 }
 
 export function addRestartNotice(db: Database, record: RestartNoticeRecord): void {

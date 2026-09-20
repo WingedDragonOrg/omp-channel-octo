@@ -530,13 +530,13 @@ test("a graceful stop never relays its in-flight dispatched tasks", async () => 
     );
     await harness.workers.waitForPromptCount(2);
 
-    // A graceful stop cancels the in-flight task; that lifecycle outcome is never relayed.
+    // A graceful stop suspends the task; only its eventual completion is relayed.
     await harness.service.stop();
     const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
     try {
       expect(
         store.getLatestTask(harness.bot.uid, { channelId: created.channelId, channelType: 5 })?.state,
-      ).toBe("cancelled");
+      ).toBe("running");
       expect(store.getLatestTask(harness.bot.uid, GROUP)?.messageId.startsWith("notify:")).toBe(false);
     } finally {
       store.close();
@@ -547,7 +547,7 @@ test("a graceful stop never relays its in-flight dispatched tasks", async () => 
   }
 });
 
-test("relays survive a restart, never repeat, and restart interruptions never relay", async () => {
+test("queued dispatches resume after restart and relay once alongside new work", async () => {
   const root = await mkdtemp(join(tmpdir(), "omp-channel-octo-relay-restart-"));
   const firstNotices: string[] = [];
   const firstSeen = Promise.withResolvers<void>();
@@ -584,13 +584,14 @@ test("relays survive a restart, never repeat, and restart interruptions never re
       }),
     );
     await firstSeen.promise;
+    await waitForStatus(first.service, GROUP, (status) => status.state === "completed");
     expect(firstNotices).toHaveLength(1);
     expect(firstNotices[0]).toContain("第一件结果");
   } finally {
     await closeCoreHarness(first, { remove: false });
   }
 
-  // A dispatch accepted before the restart still carries its relay, but the restart interrupts it.
+  // A dispatch accepted before the restart retains both execution and relay eligibility.
   const store = await ChannelStore.open(join(first.stateDir, "channel.sqlite"));
   try {
     const persisted = store.getLatestTask(first.bot.uid, {
@@ -644,13 +645,17 @@ test("relays survive a restart, never repeat, and restart interruptions never re
         await dispatchViaTool(promptContext, { short_id: thread.short_id, text: "第二件事", notify: true });
         return;
       }
+      if (text === "重启前的排队任务") {
+        emit(assistantText("recovered-result", "恢复排队任务的结果", true));
+        return;
+      }
       if (text === "第二件事") {
         emit(assistantText("second-result", "第二件结果", true));
         return;
       }
       if (text.startsWith("[子区任务回传]")) {
         secondNotices.push(text);
-        secondSeen.resolve();
+        if (text.includes("第二件结果")) secondSeen.resolve();
         return;
       }
       throw new Error(`unexpected second-session prompt: ${text}`);
@@ -667,14 +672,14 @@ test("relays survive a restart, never repeat, and restart interruptions never re
     );
     await secondSeen.promise;
 
-    expect(secondNotices).toHaveLength(1);
-    expect(secondNotices[0]).toContain("第二件结果");
-    expect(secondNotices[0]).not.toContain("第一件结果");
-    expect(secondNotices[0]).not.toContain("重启前的排队任务");
+    expect(secondNotices).toHaveLength(2);
+    expect(secondNotices.some(notice => notice.includes("第二件结果"))).toBe(true);
+    expect(secondNotices.some(notice => notice.includes("恢复排队任务的结果"))).toBe(true);
+    expect(secondNotices.some(notice => notice.includes("第一件结果"))).toBe(false);
 
     const reopened = await ChannelStore.open(join(second.stateDir, "channel.sqlite"));
     try {
-      expect(reopened.getTask("queued-relay-task")?.state).toBe("interrupted");
+      expect(reopened.getTask("queued-relay-task")?.state).toBe("completed");
     } finally {
       reopened.close();
     }

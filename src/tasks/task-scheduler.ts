@@ -48,13 +48,22 @@ export interface TaskSchedulerDeps {
   readonly hasRuntimeInDirectory: (cwd: string) => boolean;
   /** 该 cwd 是否因 worker 无法确认停止而被 block。 */
   readonly isDirectoryBlocked: (cwd: string) => boolean;
-  /** 绑定行与磁盘会话文件的核对：任务启动前确认它的 cwd。 */
+  /**
+   * 绑定行与磁盘会话文件的核对：任务启动前确认它的 cwd。恢复中的任务由服务侧实现只读核对
+   * （绑定行不能被改写），任务身份因此必须传进来。
+   */
   readonly reconcileBinding: (
+    taskId: string,
     target: ChatTarget,
     binding: BindingRecord | null,
   ) => Promise<BindingRecord | null>;
   /** 启动一个已排定任务；`cwd` 是调度已租下的目录。 */
   readonly runTask: (taskId: string, cwd?: string) => Promise<void>;
+  /**
+   * 启动门：恢复任务先占住调度序，但要等服务接线成功才真正执行。`start()` 失败时该 Promise
+   * 拒绝，排定任务直接放弃，不留一个已起 worker 的残局。
+   */
+  readonly awaitStartReady: () => Promise<void>;
   /** 为该聊天排一条回执文本，与其他路径一致。 */
   readonly enqueueText: Outbox["enqueueText"];
   /** 任务终态的 relay 通知（子区回传）。 */
@@ -181,6 +190,7 @@ export class TaskScheduler {
       const earlier = queued[index];
       if (!earlier) continue;
       const binding = await this.deps.reconcileBinding(
+        earlier.id,
         taskTarget(earlier),
         this.deps.store.getBinding(this.deps.botUid()!, taskTarget(earlier)),
       );
@@ -192,12 +202,19 @@ export class TaskScheduler {
   }
 
   private async runScheduledTask(taskId: string): Promise<void> {
+    try {
+      await this.deps.awaitStartReady();
+    } catch {
+      // 启动失败：这条排定任务不执行，行仍以 queued 留给下一次进程。
+      return;
+    }
     let lease: DirectoryLease | undefined;
     try {
       for (let attempt = 0; attempt < 4; attempt += 1) {
         const current = this.deps.store.getTask(taskId);
         if (this.deps.stopping() || !current || current.state !== "queued") return;
         const binding = await this.deps.reconcileBinding(
+          taskId,
           taskTarget(current),
           this.deps.store.getBinding(this.deps.botUid()!, taskTarget(current)),
         );
@@ -212,6 +229,7 @@ export class TaskScheduler {
         lease = await this.acquireDirectoryLease(cwd);
 
         const refreshed = await this.deps.reconcileBinding(
+          taskId,
           taskTarget(beforeLease),
           this.deps.store.getBinding(this.deps.botUid()!, taskTarget(beforeLease)),
         );

@@ -4,9 +4,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createWorkerFactory } from "../src/omp/index.ts";
-import { TaskStartupError } from "../src/contracts.ts";
+import { RESUME_CONTINUATION_PROMPT, TaskStartupError } from "../src/contracts.ts";
 import type { HostTool, OmpWorker, PromptContext, WorkerEvent, WorkerOptions, WorkerProcess } from "../src/contracts.ts";
 import type { RpcChild } from "../src/omp/process.ts";
+import { FakeWorkerFactory } from "./fixtures/core-fakes";
 
 const fixturePath = resolve(import.meta.dir, "fixtures/omp-rpc-worker.ts");
 const watchdogParentFixturePath = resolve(import.meta.dir, "fixtures/omp-watchdog-parent.ts");
@@ -79,6 +80,8 @@ async function withHarness<T>(
 		envReport?: boolean;
 		cliEnv?: () => Record<string, string> | undefined;
 		model?: string;
+		/** Leaves the native tool-call identity off the frame, like a legacy host_tool_call. */
+		hostToolNoCallId?: boolean;
 	} = {},
 ): Promise<T> {
 	const tempDir = await realpath(await mkdtemp(join(tmpdir(), "omp-rpc-worker-")));
@@ -106,6 +109,7 @@ async function withHarness<T>(
 		"--fixture-descendant-delay",
 		String(options.descendantDelayMs ?? 0),
 		...(options.envReport === true ? ["--env-out", envPath] : []),
+		...(options.hostToolNoCallId === true ? ["--host-tool-no-call-id"] : []),
 	];
 	const requestedSessionFile =
 		options.sessionFile && !options.sessionFile.startsWith("/") ? join(tempDir, options.sessionFile) : options.sessionFile;
@@ -597,6 +601,129 @@ describe("OMP RPC worker", () => {
 			const first = events.find(event => event.type === "notice")!;
 			const second = empty.find(event => event.type === "notice")!;
 			expect(first.messageId).not.toBe(second.messageId);
+		});
+	});
+
+	test("resume continues the interrupted session through OMP's own /retry without replaying the request", async () => {
+		await withHarness("retry-resume", async harness => {
+			const events: WorkerEvent[] = [];
+			const tool: HostTool = {
+				name: "fixture_resume_tool",
+				description: "fixture resume tool",
+				parameters: { type: "object", properties: {} },
+				execute: async () => "ok",
+			};
+			await harness.worker.resume(event => events.push(event), { tools: [tool] });
+			// The resume context reaches the child before its retry dispatch, exactly like a
+			// first prompt's host tools.
+			const logs = await readLog(harness.logPath);
+			const registrationIndex = logs.findIndex(entry => {
+				if (entry.kind !== "command") return false;
+				const command = entry.command as LogEntry | undefined;
+				if (command?.type !== "set_host_tools" || !Array.isArray(command.tools)) return false;
+				return command.tools.some(value => (value as LogEntry | undefined)?.name === "fixture_resume_tool");
+			});
+			const retryIndex = logs.findIndex(entry => entry.kind === "prompt" && entry.message === "/retry");
+			expect(registrationIndex).toBeGreaterThanOrEqual(0);
+			expect(retryIndex).toBeGreaterThan(registrationIndex);
+			// The regenerated turn's live boundary is reported first: the resumed task is
+			// durably accepted before any of its output reaches the caller.
+			expect(events[0]).toEqual({ type: "prompt_accepted" });
+			expect(events.filter(event => event.type === "text").map(event => ({ text: event.text, final: event.final }))).toEqual([
+				{ text: "fixture resumed work", final: false },
+				{ text: "fixture resumed work", final: true },
+			]);
+			// The native retry receipt is control traffic: no disruption notice may reach the
+			// chat, and the resumed run never counts as a local-only completion.
+			expect(events.filter(event => event.type === "notice")).toEqual([]);
+			expect(events.filter(event => event.type === "local_command")).toEqual([]);
+
+			expect(logs.filter(entry => entry.kind === "prompt").map(entry => entry.message)).toEqual(["/retry"]);
+			expect(logs.some(entry => entry.kind === "turn_complete" && entry.retryResume === true)).toBe(true);
+
+			// Resume keeps the same live worker and session: the next ordinary turn still works.
+			const followUp: WorkerEvent[] = [];
+			await harness.worker.prompt("follow up", event => followUp.push(event));
+			expect(followUp.some(event => event.type === "text" && event.text === "fixture completed" && event.final)).toBe(true);
+		});
+	});
+
+	test("resume sends one same-session continuation when OMP reports nothing to retry", async () => {
+		await withHarness("retry-resume-empty", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.resume(event => events.push(event));
+			// The local-only retry dispatch reports no acceptance of its own; the continuation
+			// turn's live boundary is the one the caller sees, ahead of its output.
+			expect(events[0]).toEqual({ type: "prompt_accepted" });
+			expect(events.filter(event => event.type === "text").map(event => ({ text: event.text, final: event.final }))).toEqual([
+				{ text: "fixture continued recorded work", final: false },
+				{ text: "fixture continued recorded work", final: true },
+			]);
+			// Neither the "Nothing to retry." receipt nor the retry dispatch's internal local
+			// completion may surface, and the stale local completion replay must not settle the
+			// continuation before its own turn ends.
+			expect(events.filter(event => event.type === "notice")).toEqual([]);
+			expect(events.filter(event => event.type === "local_command")).toEqual([]);
+
+			const prompts = (await readLog(harness.logPath)).filter(entry => entry.kind === "prompt");
+			expect(prompts.map(entry => entry.message)).toEqual(["/retry", RESUME_CONTINUATION_PROMPT]);
+			// The fallback continues the recorded work instead of replaying the original request,
+			// and it warns about uncertain tool outcomes before anything is repeated.
+			expect(RESUME_CONTINUATION_PROMPT).not.toBe("/retry");
+			expect(RESUME_CONTINUATION_PROMPT).toMatch(/continue/i);
+			expect(RESUME_CONTINUATION_PROMPT).toMatch(/uncertain/i);
+		});
+	});
+
+	test("resume rejects a native retry failure without sending any fallback", async () => {
+		await withHarness("retry-resume-failure", async harness => {
+			await expect(harness.worker.resume(() => {})).rejects.toThrow("fixture retry failed natively");
+			const logs = await readLog(harness.logPath);
+			expect(logs.filter(entry => entry.kind === "prompt").map(entry => entry.message)).toEqual(["/retry"]);
+			// The rejected resume leaves no half-open run behind: the next turn still works.
+			const followUp: WorkerEvent[] = [];
+			await harness.worker.prompt("follow up", event => followUp.push(event));
+			expect(followUp.some(event => event.type === "text" && event.final)).toBe(true);
+		});
+	});
+
+	test("resume rejects a model error raised by the retried turn without falling back", async () => {
+		await withHarness("retry-resume-model-error", async harness => {
+			await expect(harness.worker.resume(() => {})).rejects.toThrow(/OMP model reported an error: fixture model failure/);
+			const logs = await readLog(harness.logPath);
+			expect(logs.filter(entry => entry.kind === "prompt").map(entry => entry.message)).toEqual(["/retry"]);
+		});
+	});
+
+	test("a late local completion replay cannot settle a retried turn or trigger a fallback", async () => {
+		await withHarness("retry-resume-late-completion", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.resume(event => events.push(event));
+			// The replayed `prompt_result agentInvoked:false` arrives while the regenerated turn
+			// streams: the turn's real output must still be delivered in full.
+			expect(events.filter(event => event.type === "text").map(event => ({ text: event.text, final: event.final }))).toEqual([
+				{ text: "fixture resumed work", final: false },
+				{ text: "fixture resumed work", final: true },
+			]);
+			expect(events.filter(event => event.type === "local_command")).toEqual([]);
+			const logs = await readLog(harness.logPath);
+			expect(logs.filter(entry => entry.kind === "prompt").map(entry => entry.message)).toEqual(["/retry"]);
+		});
+	});
+
+	test("reports prompt_accepted once at the live turn boundary and never for a local-only completion", async () => {
+		await withHarness("normal", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("run", event => events.push(event));
+			expect(events.filter(event => event.type === "prompt_accepted")).toEqual([{ type: "prompt_accepted" }]);
+			// The acceptance is the turn's first event: it is reported before any output.
+			expect(events[0]).toEqual({ type: "prompt_accepted" });
+		});
+		await withHarness("local", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("/help", event => events.push(event));
+			// A local-only command never opens a generating turn, so nothing is marked accepted.
+			expect(events.filter(event => event.type === "prompt_accepted")).toEqual([]);
 		});
 	});
 
@@ -1115,7 +1242,9 @@ describe("OMP RPC worker", () => {
 			});
 			await waitUntil(async () => (await readLog(harness.logPath)).some(entry => entry.kind === "continue_pending"));
 			expect(settled).toBe(false);
-			expect(events).toEqual([]);
+			// Nothing of the unfinished round leaks before its terminal agent_end; only the live
+			// turn boundary may have been reported by then.
+			expect(events.filter(event => event.type !== "prompt_accepted")).toEqual([]);
 			await prompt;
 			const textEvents = events.filter(event => event.type === "text");
 			expect(textEvents.map(event => ({ text: event.text, final: event.final }))).toEqual([
@@ -1140,7 +1269,7 @@ describe("OMP RPC worker", () => {
 			expect(textEvents[0]?.messageId).toBe(textEvents[1]?.messageId);
 			expect(textEvents[2]?.messageId).toBe(textEvents[3]?.messageId);
 			expect(textEvents[0]?.messageId).not.toBe(textEvents[2]?.messageId);
-			expect(events.every(event => event.type === "text")).toBe(true);
+			expect(events.filter(event => event.type !== "prompt_accepted").every(event => event.type === "text")).toBe(true);
 		});
 	});
 
@@ -1158,7 +1287,7 @@ describe("OMP RPC worker", () => {
 			expect(textEvents[0]?.messageId).toBe(textEvents[1]?.messageId);
 			expect(textEvents[2]?.messageId).toBe(textEvents[3]?.messageId);
 			expect(textEvents[0]?.messageId).not.toBe(textEvents[2]?.messageId);
-			expect(events.every(event => event.type === "text")).toBe(true);
+			expect(events.filter(event => event.type !== "prompt_accepted").every(event => event.type === "text")).toBe(true);
 		});
 	});
 
@@ -1199,7 +1328,7 @@ describe("OMP RPC worker", () => {
 		await withHarness("tool-progress", async harness => {
 			const events: WorkerEvent[] = [];
 			await harness.worker.prompt("show tool progress", event => events.push(event));
-			const executionEvents = events.filter(event => event.type !== "text");
+			const executionEvents = events.filter(event => event.type !== "text" && event.type !== "prompt_accepted");
 			expect(executionEvents.map(event => event.type)).toEqual(["turn_start", "tool_start", "tool_end", "turn_end"]);
 			expect(executionEvents[0]).toMatchObject({ type: "turn_start", turnId: 0, atMs: 2_000 });
 			expect(executionEvents[1]).toMatchObject({
@@ -1507,12 +1636,14 @@ describe("OMP RPC worker", () => {
 	test("registers host tools as essential before prompting and returns textual results", async () => {
 		await withHarness("host-tool", async harness => {
 			let receivedArgs: Record<string, unknown> | undefined;
+			let receivedToolCallId: string | undefined;
 			const tool: HostTool = {
 				name: "fixture_echo",
 				description: "Echo a fixture value",
 				parameters: { type: "object", properties: { message: { type: "string" } } },
-				execute: async args => {
+				execute: async (args, _signal, toolCallId) => {
 					receivedArgs = args;
+					receivedToolCallId = toolCallId;
 					return `host result: ${String(args.message)}`;
 				},
 			};
@@ -1533,7 +1664,33 @@ describe("OMP RPC worker", () => {
 			expect(hostResult).toBeDefined();
 			expect((hostResult!.command as LogEntry).isError).toBe(false);
 			expect(resultTextFromCommand(hostResult!.command)).toContain("host result: hello from fixture");
+			// OMP's own call identity rides the frame next to the RPC request id, so a consumer
+			// that must survive a restart can key durable state on it.
+			expect(receivedToolCallId).toBe("fixture-tool-call-1");
 		});
+	});
+
+	test("runs a host tool without a call identity when the native frame carries none", async () => {
+		await withHarness(
+			"host-tool",
+			async harness => {
+				let receivedToolCallId: string | undefined | "unset" = "unset";
+				const tool: HostTool = {
+					name: "fixture_echo",
+					description: "Echo a fixture value",
+					parameters: { type: "object", properties: { message: { type: "string" } } },
+					execute: async (_args, _signal, toolCallId) => {
+						receivedToolCallId = toolCallId;
+						return "host result: legacy";
+					},
+				};
+				const events: WorkerEvent[] = [];
+				await harness.worker.prompt("use host tool", event => events.push(event), { tools: [tool] });
+				expect(events.some(event => event.type === "text" && event.text.includes("host result: legacy"))).toBe(true);
+				expect(receivedToolCallId).toBeUndefined();
+			},
+			{ hostToolNoCallId: true },
+		);
 	});
 
 	test("fails an unknown host tool through an error result instead of hanging", async () => {
@@ -1829,5 +1986,57 @@ describe("OMP RPC worker", () => {
 			await waitForProcessExit(harness.spawned!.pid);
 			expect(processIsAlive(harness.spawned!.pid)).toBe(false);
 		});
+	});
+});
+
+describe("fixture worker resume", () => {
+	test("retries through the existing prompt callback and forwards the continued turn", async () => {
+		const workers = new FakeWorkerFactory(async ({ emit, text }) => {
+			if (text !== "/retry") return;
+			emit({ type: "text", messageId: "fixture-resumed", text: "fixture fake resumed", final: true });
+		});
+		const worker = await workers.create({ cwd: tmpdir(), sessionDir: tmpdir(), onSpawn: () => {} });
+		const events: WorkerEvent[] = [];
+		await worker.resume(event => events.push(event));
+		expect(workers.prompts.map(record => record.text)).toEqual(["/retry"]);
+		expect(events).toEqual([
+			{ type: "prompt_accepted" },
+			{ type: "text", messageId: "fixture-resumed", text: "fixture fake resumed", final: true },
+		]);
+	});
+
+	test("sends one same-session continuation when the fake retry completes locally", async () => {
+		const workers = new FakeWorkerFactory(async ({ emit, text }) => {
+			if (text === "/retry") {
+				emit({ type: "local_command" });
+				return;
+			}
+			emit({ type: "text", messageId: "fixture-continuation", text: "fixture fake continued", final: true });
+		});
+		const worker = await workers.create({ cwd: tmpdir(), sessionDir: tmpdir(), onSpawn: () => {} });
+		const events: WorkerEvent[] = [];
+		await worker.resume(event => events.push(event));
+		expect(workers.prompts.map(record => record.text)).toEqual(["/retry", RESUME_CONTINUATION_PROMPT]);
+		// The retry dispatch's internal local completion stays internal; only the continuation
+		// turn reports its own acceptance and output.
+		expect(events).toEqual([
+			{ type: "prompt_accepted" },
+			{ type: "prompt_accepted" },
+			{ type: "text", messageId: "fixture-continuation", text: "fixture fake continued", final: true },
+		]);
+	});
+
+	test("works with the default handler that never scripts /retry", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "fixture-worker-resume-"));
+		try {
+			const workers = new FakeWorkerFactory();
+			const worker = await workers.create({ cwd, sessionDir: cwd, onSpawn: () => {} });
+			const events: WorkerEvent[] = [];
+			await worker.resume(event => events.push(event));
+			expect(workers.prompts.map(record => record.text)).toEqual(["/retry"]);
+			expect(events).toEqual([{ type: "prompt_accepted" }]);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
 	});
 });

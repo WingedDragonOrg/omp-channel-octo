@@ -26,6 +26,19 @@ export type PromptRun = {
 	reject: (error: Error) => void;
 	completion: Promise<void>;
 	settled: boolean;
+	/**
+	 * True once OMP acknowledged this dispatch as an agent turn (`agentInvoked: true`), recorded
+	 * in line with the acknowledgement frame: such a run completes only at its terminal
+	 * `agent_end`, so a replayed `prompt_result agentInvoked:false` — even one sharing the
+	 * acknowledgement's stdout read — can neither settle it early nor make it look like a
+	 * local-only completion.
+	 */
+	agentInvoked: boolean;
+	/**
+	 * True once the `agent_start` boundary was reported as `prompt_accepted`. The acceptance is
+	 * reported once per run, ahead of any output, and never for a local-only completion.
+	 */
+	accepted: boolean;
 	assistantMessageEnded: boolean;
 	assistantMessageId: string | undefined;
 	assistantMessageKey: string | undefined;

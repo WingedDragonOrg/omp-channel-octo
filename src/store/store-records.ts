@@ -57,6 +57,16 @@ export interface RestartNoticeRecord extends ChatTarget {
 }
 
 /**
+ * 启动恢复的一次规范化结果。`queued` 是按接受顺序待执行的任务：没有派发过的行重放原文，已有
+ * OMP 接受回执的行续接原会话。`uncertain` 是本次被 fail-closed 的已派发行——prompt 已落账但收不到
+ * 接受回执，无法判定它是否真的进过会话，既不重放也不错续，由服务按实际异常说明结算并关闭其问题。
+ */
+export interface TaskRestartRecovery {
+  queued: TaskRecord[];
+  uncertain: TaskRecord[];
+}
+
+/**
  * The last progress-card frame the server accepted for a task. Card identity only exists in the
  * process that observed the run, so this row lets the next process submit one terminal edit
  * instead of leaving the client on the last running state.
@@ -113,6 +123,11 @@ export interface QuestionRecord extends ChatTarget {
   answeredBy: string | null;
   /** Remote id of the interactive card carrying this question; `null` for text-only questions. */
   cardMessageId: string | null;
+  /**
+   * 本轮 ask 的收场时间（结果已交付给模型，或等待超时/本地取消），`null` 表示既没交付也没收场——
+   * 只可能是被重启中断的那一轮，启动恢复据此只认领这些行。
+   */
+  settledAt: number | null;
 }
 
 export interface WorkerLedgerRecord extends WorkerProcess {

@@ -360,7 +360,7 @@ test("real CLI runs the owner's group command with the bot mention placed before
   }
 });
 
-test("real CLI restarts through the detected supervisor program and confirms it after coming back", async () => {
+test("real CLI restarts through the detected supervisor program and the replacement process serves afterwards", async () => {
   let root: string | undefined;
   let fixture: OctoProtocolFixture | undefined;
   const children: Bun.Subprocess[] = [];
@@ -460,15 +460,28 @@ exit 2
       5_000,
       "restarted CLI did not authenticate its WebSocket connection",
     );
-    const confirmation = await waitForFixture(
+    // The restart no longer announces itself: the replacement process proves it is serving by
+    // answering a status command in the same chat.
+    currentFixture.sendInbound(secondConnection, {
+      fromUid: currentFixture.ownerUid,
+      channelId: `${currentFixture.ownerUid}@${currentFixture.botUid}`,
+      channelType: 1,
+      text: "/status",
+      messageId: "9007199254742002",
+    });
+    const statusReply = await waitForFixture(
       () =>
         currentFixture.sentMessages
           .slice(beforeRestart)
-          .find((message) => sentText(message).includes("channel 已重启完成")),
+          .find((message) => sentText(message).includes("session=")),
       8_000,
-      "restarted CLI did not confirm the restart in the requesting chat",
+      "restarted CLI did not answer /status",
     );
-    expect(sentText(confirmation)).toContain("channel 已重启完成");
+    expect(sentText(statusReply)).toContain("state=");
+    // The removed restart success/interruption notices never come back.
+    const afterRestart = currentFixture.sentMessages.slice(beforeRestart).map(sentText).join("\n");
+    expect(afterRestart).not.toContain("已重启完成");
+    expect(afterRestart).not.toContain("因重启中断");
 
     second.kill("SIGTERM");
     expect(await waitForChildExit(second)).toBe(0);

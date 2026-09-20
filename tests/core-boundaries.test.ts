@@ -61,6 +61,12 @@ class WorkerProxy implements OmpWorker {
       : this.inner.prompt(text, onEvent, context);
   }
 
+  resume(onEvent: (event: WorkerEvent) => void, context?: PromptContext): Promise<void> {
+    return context === undefined
+      ? this.inner.resume(onEvent)
+      : this.inner.resume(onEvent, context);
+  }
+
   steer(text: string): Promise<void> {
     return this.inner.steer(text);
   }

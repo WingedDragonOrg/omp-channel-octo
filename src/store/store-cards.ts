@@ -32,9 +32,14 @@ export function saveProgressCard(db: Database, record: Omit<ProgressCardRecord, 
   );
 }
 
+/**
+ * 该 Bot 的全部进度卡，按 rowid 升序——rowid 是首次插入顺序（UPSERT 只改行内容、不改 rowid），
+ * 也就是轮次创建顺序：同一任务最后一行必定是最新一轮。不能用 updated_at 排序——旧轮的重试/迟到
+ * 重写会把它的行推到新轮之后，让「最后一条」指向过期的轮次。
+ */
 export function listProgressCards(db: Database, botUid: string): ProgressCardRecord[] {
   return query(db,
-    "SELECT * FROM progress_cards WHERE bot_uid = ? ORDER BY updated_at ASC, task_id ASC",
+    "SELECT * FROM progress_cards WHERE bot_uid = ? ORDER BY rowid ASC",
     [botUid],
   ).map((row) => ({
     botUid: asString(row.bot_uid),

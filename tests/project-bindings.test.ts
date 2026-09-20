@@ -91,6 +91,12 @@ class DelayedStopWorker implements OmpWorker {
       : this.inner.prompt(text, onEvent, context);
   }
 
+  resume(onEvent: (event: WorkerEvent) => void, context?: PromptContext): Promise<void> {
+    return context === undefined
+      ? this.inner.resume(onEvent)
+      : this.inner.resume(onEvent, context);
+  }
+
   steer(text: string): Promise<void> {
     return this.inner.steer(text);
   }
@@ -160,6 +166,12 @@ class StopFalseWorker implements OmpWorker {
       : this.inner.prompt(text, onEvent, context);
   }
 
+  resume(onEvent: (event: WorkerEvent) => void, context?: PromptContext): Promise<void> {
+    return context === undefined
+      ? this.inner.resume(onEvent)
+      : this.inner.resume(onEvent, context);
+  }
+
   steer(text: string): Promise<void> {
     return this.inner.steer(text);
   }
@@ -226,6 +238,14 @@ class CommandLeaseWorker implements OmpWorker {
       await this.inner.prompt(text, onEvent);
     } else {
       await this.inner.prompt(text, onEvent, context);
+    }
+  }
+
+  async resume(onEvent: (event: WorkerEvent) => void, context?: PromptContext): Promise<void> {
+    if (context === undefined) {
+      await this.inner.resume(onEvent);
+    } else {
+      await this.inner.resume(onEvent, context);
     }
   }
 
@@ -829,8 +849,16 @@ test("move stop uncertainty blocks both source and destination across restart", 
     await restarted.service.handleInbound(
       inbound({ messageId: "move-stop-after-restart", ...target, text: "must not run" }),
     );
-    await waitForStatus(restarted.service, target, next => next.state === "failed");
+    // An unconfirmed worker keeps both directories blocked: the queued task stays queued and
+    // never runs — it is neither failed nor silently dropped while the process is unverified.
+    await restarted.service.stop();
     expect(restarted.workers.prompts).toEqual([]);
+    const store = await openChannelStore(restarted.stateDir);
+    try {
+      expect(store.getLatestTask(restarted.bot.uid, target)?.state).toBe("queued");
+    } finally {
+      store.close();
+    }
   } finally {
     if (first && !firstClosed) await closeCoreHarness(first, { remove: false });
     if (restarted) {

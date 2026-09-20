@@ -8,7 +8,7 @@
  * 事件路径全程同步，只做入队与记账，不引入新的异步边界。
  */
 
-import type { ChatTarget, WorkerEvent } from "../contracts.ts";
+import type { ChatTarget, PromptAcceptedEvent, WorkerEvent } from "../contracts.ts";
 import type { Outbox } from "../outbox.ts";
 import type { TaskProgress } from "../cards/progress-cards.ts";
 
@@ -39,6 +39,13 @@ export interface TaskEventsDeps {
 }
 
 /**
+ * 投影事件：`TaskEvents` 见过的一切 worker 事件。OMP 的接受回执（`prompt_accepted`）不在其中
+ * ——它在服务的事件入口就同步落账并返回，类型上排除它正是这条契约的强制表达：接受回执没落账
+ * 之前不得进入投影，投影也无从「顺手」把它当成执行事件吞掉。
+ */
+export type TaskProjectionEvent = Exclude<WorkerEvent, PromptAcceptedEvent>;
+
+/**
  * 一个 task 的事件所有者：`onEvent` 是实例箭头属性，可直接交给 worker 的 prompt；
  * `localOnly` 与 `resultText` 供回合结算（context commit 门限与结果落库）读取。
  */
@@ -53,7 +60,7 @@ export class TaskEvents {
 
   constructor(private readonly deps: TaskEventsDeps) {}
 
-  readonly onEvent = (event: WorkerEvent): void => {
+  readonly onEvent = (event: TaskProjectionEvent): void => {
     if (this.deps.control.cancelRequested || this.deps.stopping()) return;
     if (event.type === "notice") {
       // 扩展的通知帧（如 /autoresearch 的 enable/off/拒绝原因）是信息性 UI：原样投递到

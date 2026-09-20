@@ -151,6 +151,8 @@ export function applySchema(db: Database): void {
       error_text TEXT,
       message_seq INTEGER NOT NULL DEFAULT 0,
       history_eligible INTEGER NOT NULL DEFAULT 1,
+      prompt_started INTEGER NOT NULL DEFAULT 0,
+      prompt_accepted INTEGER NOT NULL DEFAULT 0,
       relay_channel_type INTEGER,
       relay_channel_id TEXT,
       relay_thread_name TEXT
@@ -194,7 +196,10 @@ export function applySchema(db: Database): void {
       answer TEXT,
       answered_by TEXT,
       created_at INTEGER NOT NULL,
-      answered_at INTEGER
+      answered_at INTEGER,
+      card_message_id TEXT,
+      card_seq INTEGER,
+      settled_at INTEGER
     );
     CREATE INDEX IF NOT EXISTS questions_chat_pending
       ON questions(bot_uid, channel_type, channel_id, state);
@@ -270,6 +275,23 @@ export function applySchema(db: Database): void {
       updated_at INTEGER NOT NULL
     );
   `);
+  // 两个 prompt 标记列同一次引入。补列与旧行收尾必须在同一事务里：中途崩溃要么都回滚（下次
+  // 打开重来），要么都生效——否则会留下「列已补上、旧 started 行没被标记」的中间态，把旧行的
+  // prompt 歧义退化成自动重放。
+  const taskColumns = query(db, "PRAGMA table_info(tasks)");
+  const promptStartedWasMissing = !taskColumns.some((row) => asString(row.name) === "prompt_started");
+  const promptAcceptedWasMissing = !taskColumns.some((row) => asString(row.name) === "prompt_accepted");
+  if (promptStartedWasMissing || promptAcceptedWasMissing) {
+    transaction(db, () => {
+      if (promptStartedWasMissing) {
+        db.exec("ALTER TABLE tasks ADD COLUMN prompt_started INTEGER NOT NULL DEFAULT 0");
+      }
+      if (promptAcceptedWasMissing) {
+        db.exec("ALTER TABLE tasks ADD COLUMN prompt_accepted INTEGER NOT NULL DEFAULT 0");
+      }
+      if (promptStartedWasMissing) markLegacyStartedUnconfirmed(db);
+    });
+  }
   for (const statement of [
     "ALTER TABLE outbox ADD COLUMN remote_message_id TEXT",
     "ALTER TABLE outbox ADD COLUMN stream_message_id TEXT",
@@ -292,6 +314,22 @@ export function applySchema(db: Database): void {
       if (!String(error).includes("duplicate column")) throw error;
     }
   }
+  const questionColumns = query(db, "PRAGMA table_info(questions)");
+  const cardSeqWasMissing = !questionColumns.some((row) => asString(row.name) === "card_seq");
+  const settledAtWasMissing = !questionColumns.some((row) => asString(row.name) === "settled_at");
+  if (cardSeqWasMissing || settledAtWasMissing) {
+    transaction(db, () => {
+      // `card_seq` 保持可空：NULL = 这一行没有持久序号（补列之前就落盘的旧行），未知与「已知的某个值」
+      // 必须分得开。旧线上版本用的是内存序号加时间戳起点，序号可能已经到过 1.7e12 量级，这里绝不能
+      // 预设一个小数字；旧行的高水位由首次预留时一次性 bootstrap（见 reserveQuestionCardSeq）。
+      if (cardSeqWasMissing) {
+        db.exec("ALTER TABLE questions ADD COLUMN card_seq INTEGER");
+      }
+      if (settledAtWasMissing) {
+        db.exec("ALTER TABLE questions ADD COLUMN settled_at INTEGER");
+      }
+    });
+  }
   // 回传登记已由任务行的 relay 字段承载，旧的子区级登记表没有读者。
   db.exec("DROP TABLE IF EXISTS thread_notify");
   db.exec(
@@ -301,6 +339,18 @@ export function applySchema(db: Database): void {
     "CREATE INDEX IF NOT EXISTS questions_card ON questions(bot_uid, channel_type, channel_id, card_message_id)",
   );
   migrateProgressCards(db);
+}
+
+/**
+ * 补列那一次的收尾：`prompt_started` 之前落盘的 `started` 行无法区分「prompt 已发出、会话里还在跑」
+ * 与「刚 markStarted 还没发 prompt」，因此统一按「已派发但接受状态未知」记账。这里只写标记、绝不动
+ * 任务状态与终态字段：开库可能由 CLI/status 触发，旧进程也许还在跑这些任务，开库本身不得打断它们。
+ * 真正的结算发生在启动恢复（prepareTasksForRestart，service 拿到 Bot 锁并回收旧 worker 之后）：
+ * 这类行会 fail-closed 成 interrupted 并作为 uncertain 交回服务说明原因。queued 行语义无歧义，
+ * 仍按启动恢复流程重排执行。
+ */
+function markLegacyStartedUnconfirmed(db: Database): void {
+  run(db, "UPDATE tasks SET prompt_started = 1, prompt_accepted = 0 WHERE state = 'started'");
 }
 
 export function migrateProgressCards(db: Database): void {
@@ -450,5 +500,6 @@ export function questionFromRow(row: SqlRow): QuestionRecord {
     answer: asNullableString(row.answer),
     answeredBy: asNullableString(row.answered_by),
     cardMessageId: asNullableString(row.card_message_id),
+    settledAt: row.settled_at === null || row.settled_at === undefined ? null : asNumber(row.settled_at),
   };
 }

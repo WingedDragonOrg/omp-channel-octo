@@ -1842,16 +1842,6 @@ test("channel_control schedules a restart that runs once every chat is idle", as
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
     expect(requests).toHaveLength(1);
-
-    const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
-    try {
-      const notices = store.listRestartNotices(harness.bot.uid);
-      expect(notices).toHaveLength(1);
-      expect(notices[0]?.channelId).toBe(first.channelId);
-      expect(notices[0]?.channelType).toBe(first.channelType);
-    } finally {
-      store.close();
-    }
   } finally {
     releaseFirst.resolve();
     releaseSecond.resolve();
@@ -1873,12 +1863,6 @@ test("channel_control without a detected supervisor reports it and schedules not
     await harness.service.handleInbound(task);
     await waitForStatus(harness.service, task, (status) => status.state === "completed");
     expect(restartResult).toContain("未检测到守护进程");
-    const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
-    try {
-      expect(store.listRestartNotices(harness.bot.uid)).toHaveLength(0);
-    } finally {
-      store.close();
-    }
   } finally {
     await closeCoreHarness(harness);
   }

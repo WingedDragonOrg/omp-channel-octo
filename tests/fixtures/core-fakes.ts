@@ -51,6 +51,7 @@ import type {
   WorktreeRemovalRequest,
   WorktrunkProbe,
 } from "../../src/contracts";
+import { RESUME_CONTINUATION_PROMPT } from "../../src/contracts";
 import { AttachmentError } from "../../src/inbound/attachments";
 import {
   contextSidecarPath,
@@ -1210,6 +1211,9 @@ class FixtureWorker implements OmpWorker {
     }
     this.promptInFlight = true;
     try {
+      // Mirrors the live turn boundary the real worker reports at `agent_start`: the fixture's
+      // prompt callback stands for the agent turn, so the acceptance is reported before it runs.
+      onEvent({ type: "prompt_accepted" });
       await this.promptHandler({
         text,
         cwd,
@@ -1234,6 +1238,27 @@ class FixtureWorker implements OmpWorker {
     } finally {
       this.promptInFlight = false;
     }
+  }
+
+  /**
+   * Mirrors `RpcWorker.resume`: dispatch OMP's own `/retry` in this session and, when the retry
+   * completes locally (nothing to retry), send one same-session continuation instruction. The
+   * retry dispatch's local completion is internal and never reaches the caller's event stream.
+   */
+  async resume(onEvent: (event: WorkerEvent) => void, promptContext?: PromptContext): Promise<void> {
+    let localOnly = false;
+    await this.prompt(
+      "/retry",
+      event => {
+        if (event.type === "local_command") {
+          localOnly = true;
+          return;
+        }
+        onEvent(event);
+      },
+      promptContext,
+    );
+    if (localOnly) await this.prompt(RESUME_CONTINUATION_PROMPT, onEvent, promptContext);
   }
 
   async steer(text: string): Promise<void> {
@@ -1318,6 +1343,12 @@ export class FakeWorkerFactory implements WorkerFactory {
   createFailure: Error | undefined;
   /** When set, every worker's `models()` rejects with this error, mirroring a dead RPC worker. */
   modelsFailure: Error | undefined;
+  /**
+   * What `recover` reports for a persisted worker process: `true` means the old process is
+   * confirmed stopped, so its directory is free again. The default `false` keeps the directory
+   * blocked as unverified, which is what fail-closed recovery tests need.
+   */
+  recovered = false;
 
   private nextSessionId = 1;
   private readonly promptWaiters: Array<{
@@ -1365,7 +1396,7 @@ export class FakeWorkerFactory implements WorkerFactory {
   }
 
   async recover(_process: WorkerProcess): Promise<boolean> {
-    return false;
+    return this.recovered;
   }
 
   waitForPromptCount(count: number): Promise<void> {

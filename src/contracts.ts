@@ -382,7 +382,24 @@ export interface WorkerNoticeEvent {
   level: "info" | "warning" | "error";
 }
 
-export type WorkerEvent = TextEvent | ExecutionEvent | SteerConsumedEvent | WorkerNoticeEvent | LocalCommandEvent;
+/**
+ * OMP started generating for this prompt: the run opened its live turn boundary (`agent_start`),
+ * so the prompt is a real turn and not just an early acknowledgement of a local-only command.
+ * Reported once per run, before any of its output, and never for a prompt OMP answers locally
+ * (`agentInvoked: false`). The service records the acceptance durably, so a task whose worker dies
+ * after this point is resumed instead of replayed from its original input.
+ */
+export interface PromptAcceptedEvent {
+  type: "prompt_accepted";
+}
+
+export type WorkerEvent =
+  | TextEvent
+  | ExecutionEvent
+  | SteerConsumedEvent
+  | WorkerNoticeEvent
+  | LocalCommandEvent
+  | PromptAcceptedEvent;
 
 export interface WorkerProcess {
   pid: number;
@@ -438,7 +455,14 @@ export interface HostTool {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
-  execute(args: Record<string, unknown>, signal: AbortSignal): Promise<string>;
+  /**
+   * Runs one native tool call. `toolCallId` is OMP's own identity for the call — independent of
+   * the RPC request id and reused when a retry re-executes the same call — when the frame carried
+   * one; legacy frames pass `undefined`. A consumer whose state must outlive the process (for
+   * example a question whose answer may arrive after a restart) keys durable state on it instead
+   * of the RPC request id.
+   */
+  execute(args: Record<string, unknown>, signal: AbortSignal, toolCallId?: string): Promise<string>;
 }
 
 export interface ContextInjection {
@@ -453,6 +477,15 @@ export interface PromptContext {
   contextInjection?: ContextInjection;
 }
 
+/**
+ * The bounded instruction `OmpWorker.resume` sends when OMP's own `/retry` reports there is no
+ * resumable failed turn — a healthy or missing transcript tail. It continues the interrupted work
+ * from the recorded history instead of replaying the original request, and it makes the agent
+ * verify the outcome of any uncertain previous tool call before repeating that call.
+ */
+export const RESUME_CONTINUATION_PROMPT =
+  "Continue the unfinished work in this session from the recorded history. Do not restart the original request: first verify the outcome of any previous tool call whose result is uncertain before repeating that call, then finish the remaining steps and report the result.";
+
 export interface OmpWorker {
   readonly sessionFile: string;
   readonly sessionId: string;
@@ -461,6 +494,18 @@ export interface OmpWorker {
     onEvent: (event: WorkerEvent) => void,
     context?: PromptContext,
   ): Promise<void>;
+  /**
+   * Resume the bound session's interrupted turn after a worker restart, without replaying the
+   * original request: `/retry` is dispatched in the already-selected session, and OMP continues
+   * from the recorded transcript. A fully failed tool batch may re-execute its tools, so a
+   * committed side effect of the interrupted turn is not guaranteed exactly-once. The native
+   * command-output receipt and a local-only completion are control traffic: they are never
+   * reported as worker events. When OMP answers `/retry` locally — there is no resumable failed
+   * turn — one same-session continuation instruction (`RESUME_CONTINUATION_PROMPT`) is sent
+   * instead. A real failure (RPC error, model error, timeout, dead worker) rejects, and nothing
+   * is sent after it.
+   */
+  resume(onEvent: (event: WorkerEvent) => void, context?: PromptContext): Promise<void>;
   /** Injects a message into the running OMP turn; fails once no turn is streaming. */
   steer(text: string): Promise<void>;
   /** Aborts the current OMP turn without clearing its queued messages or killing the worker. */

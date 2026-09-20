@@ -37,6 +37,8 @@ class RefusingSteerFactory extends FakeWorkerFactory {
       },
       prompt: (text: string, onEvent: (event: WorkerEvent) => void, context?: PromptContext) =>
         context === undefined ? worker.prompt(text, onEvent) : worker.prompt(text, onEvent, context),
+      resume: (onEvent: (event: WorkerEvent) => void, context?: PromptContext) =>
+        context === undefined ? worker.resume(onEvent) : worker.resume(onEvent, context),
       steer: async () => {
         throw new Error("OMP worker is not streaming a turn");
       },
