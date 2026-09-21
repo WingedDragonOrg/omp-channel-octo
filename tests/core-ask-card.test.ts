@@ -415,7 +415,7 @@ test("a set card resolves each answerer's name once, falling back per uid", asyn
   }
 });
 
-test("a single-choice card stacks every option as its own body row", async () => {
+test("a single-choice selection is recorded only through the card submit", async () => {
   const longLabel =
     "确认，直接按现有设计调整：先测量现有字号与布局，提出统一调整方案，再由赵奕在桌面端与窄屏各确认一次视觉方案后实施，实施前同步更新文档。";
   const longAscii = "deploy to the staging cluster with the canary flag and wait for owner approval";
@@ -441,19 +441,12 @@ test("a single-choice card stacks every option as its own body row", async () =>
       throw new Error("ask card was not sent");
     }
 
-    // 每个选项各占一个 ActionSet 行：客户端把 body 的 actionset 纵向堆叠，没有按钮与别的
-    // 按钮共用一行，因此不会被卡片边缘裁掉；action id 与选项顺序不变。
-    expect(bodyActionRows(card)).toEqual([
-      ["ask_opt_1"],
-      ["ask_opt_2"],
-      ["ask_opt_3"],
-      ["ask_opt_4"],
-    ]);
-    // 动作区只剩自由输入的提交按钮，不再承载选项。
+    const selection = cardBody(card.frame.card).find((element) => element.type === "Input.ChoiceSet");
+    expect(selection).toBeDefined();
+    expect(selection?.isMultiSelect).toBe(false);
+    expect(bodyActionRows(card)).toEqual([]);
     expect(cardActions(card)).toEqual(["ask_submit"]);
-    // Long labels remain readable in full; actions carry only the option ordinal and verb.
-    expect(JSON.stringify(card.frame.card)).toContain(longLabel);
-    // 新增的每行一个 ActionSet 仍远在部署上限（max_nodes=200 / max_depth=16）之内。
+    expect(JSON.stringify(selection)).toContain(longLabel);
     const stats = cardStats({
       type: 17,
       profile: card.frame.profile,
@@ -464,14 +457,13 @@ test("a single-choice card stacks every option as its own body row", async () =>
     expect(stats.nodes).toBeLessThanOrEqual(200);
     expect(stats.maxDepth).toBeLessThanOrEqual(16);
 
-    // 布局不改变答案语义：点击第二个选项照旧记录为答案 "2" 并改写同一张卡。
     harness.transport.pushBotEvent(cardActionEvent(61, {
       messageId: card.messageId,
       channelType: 1,
       channelId: target.channelId,
-      actionId: "ask_opt_2",
+      actionId: "ask_submit",
       operatorUid: "owner-1",
-      inputs: {},
+      inputs: { ask_choices: "2" },
     }));
     await waitForStatus(
       harness.service,
@@ -1263,8 +1255,8 @@ test("a set frame the deployment refuses falls back to one card per question", a
     await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 2);
 
     const first = await harness.transport.waitForCardSend(({ messageId }) => messageId === "card-1");
-    expect(inputIds(first)).toEqual(["ask_text"]);
-    expect(bodyActionRows(first)).toEqual([["ask_opt_1"], ["ask_opt_2"]]);
+    expect(inputIds(first)).toEqual(["ask_choices", "ask_text"]);
+    expect(bodyActionRows(first)).toEqual([]);
     expect(cardActions(first)).toEqual(["ask_submit"]);
     expect(first.frame.plain).toContain("问题 1/2：Which deployment target?");
 
@@ -1272,9 +1264,9 @@ test("a set frame the deployment refuses falls back to one card per question", a
       messageId: first.messageId,
       channelType: 1,
       channelId: target.channelId,
-      actionId: "ask_opt_2",
+      actionId: "ask_submit",
       operatorUid: "owner-1",
-      inputs: {},
+      inputs: { ask_choices: "2" },
     }));
     const second = await harness.transport.waitForCardSend(({ messageId }) => messageId !== first.messageId);
     expect(inputIds(second)).toEqual(["ask_text"]);

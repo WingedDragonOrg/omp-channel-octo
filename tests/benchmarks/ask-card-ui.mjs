@@ -139,8 +139,10 @@ try {
       }
     }
     // Real renderer clicks -> emitted action/input payload -> production decoder.
-    const option = page.locator('#single button').filter({hasText:'2.'}).first();
-    await option.click();
+    const beforeSelection = await page.evaluate(() => window.submissions.length);
+    await page.locator('#single input[type=radio]').nth(1).check();
+    assert.equal(await page.evaluate(() => window.submissions.length), beforeSelection);
+    await page.locator('#single button').click();
     let event = await page.evaluate(() => window.submissions.at(-1));
     let ref = parseAskActionId(event.id);
     assert(ref);

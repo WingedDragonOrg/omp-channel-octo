@@ -95,10 +95,6 @@ function cardText(text: string): string {
   return text.replace(/\\/gu, "\\\\").replace(/\[/gu, "\\[");
 }
 
-function optionActionId(index: number, generation: number): string {
-  const base = `${OPTION_ACTION_PREFIX}${index}`;
-  return generation > 1 ? `${base}#${generation}` : base;
-}
 
 function submitActionId(generation: number): string {
   return generation > 1 ? `${SUBMIT_ACTION_PREFIX}#${generation}` : SUBMIT_ACTION_PREFIX;
@@ -223,7 +219,6 @@ export function resolveAskAnswer(
     return text.length === 0 ? { kind: "invalid" } : { kind: "answer", answer: text };
   }
   if (text.length > 0) return { kind: "answer", answer: text };
-  if (!question.multi) return { kind: "invalid" };
   const selected = selectionAnswer(question, inputs[ASK_CHOICES_INPUT_ID] ?? "");
   return selected === null ? { kind: "invalid" } : { kind: "answer", answer: selected };
 }
@@ -244,8 +239,8 @@ export function resolveAskSetAnswer(
   return selectionAnswer(question, inputs[`${ASK_CHOICES_INPUT_ID}_${ordinal}`] ?? "");
 }
 
-/** Full option labels and descriptions, with single-choice actions kept beside their option. */
-function optionLines(question: AskCardQuestion, generation?: number): Record<string, unknown>[] {
+/** Full option labels and descriptions for answered or inactive questions. */
+function optionLines(question: AskCardQuestion): Record<string, unknown>[] {
   const body: Record<string, unknown>[] = [];
   question.options.forEach((option, index) => {
     const items: Record<string, unknown>[] = [{
@@ -253,43 +248,19 @@ function optionLines(question: AskCardQuestion, generation?: number): Record<str
       text: `**${index + 1}.** ${cardText(option.label.trim())}`,
       wrap: true,
       spacing: "Small",
-      weight: generation === undefined ? "Default" : "Bolder",
-      isSubtle: generation === undefined,
+      weight: "Default",
+      isSubtle: true,
     }];
     const description = option.description?.trim() ?? "";
     if (description.length > 0) {
       items.push({ type: "TextBlock", text: cardText(description), wrap: true, spacing: "None", isSubtle: true });
     }
-    if (generation !== undefined && !question.multi) {
-      body.push({
-        type: "ColumnSet",
-        spacing: "Default",
-        separator: index > 0,
-        columns: [
-          { type: "Column", width: "stretch", items },
-          {
-            type: "Column",
-            width: "auto",
-            spacing: "Small",
-            items: [{
-              type: "ActionSet",
-              actions: [{
-                type: "Action.Submit",
-                id: optionActionId(index + 1, generation),
-                title: `${index + 1}. 选择`,
-              }],
-            }],
-          },
-        ],
-      });
-    } else {
-      body.push(...items);
-    }
+    body.push(...items);
   });
   return body;
 }
 
-function questionBody(question: AskCardQuestion, generation?: number): Record<string, unknown>[] {
+function questionBody(question: AskCardQuestion, pending: boolean): Record<string, unknown>[] {
   return [
     {
       type: "TextBlock",
@@ -298,7 +269,7 @@ function questionBody(question: AskCardQuestion, generation?: number): Record<st
       weight: "Bolder",
       size: "Medium",
     },
-    ...(generation !== undefined && question.multi ? [] : optionLines(question, generation)),
+    ...(pending ? [] : optionLines(question)),
   ];
 }
 
@@ -331,25 +302,15 @@ function pendingInputs(question: AskCardQuestion): Record<string, unknown>[] {
   if (question.options.length === 0) {
     return [answerInput(ASK_TEXT_INPUT_ID, false)];
   }
-  if (question.multi) {
-    return [choiceSetInput(question, ASK_CHOICES_INPUT_ID), answerInput(ASK_TEXT_INPUT_ID, true)];
-  }
-  return [answerInput(ASK_TEXT_INPUT_ID, true)];
+  return [choiceSetInput(question, ASK_CHOICES_INPUT_ID), answerInput(ASK_TEXT_INPUT_ID, true)];
 }
 
-/**
- * The card-level action area holds only the submit; option actions live beside their
- * explanations in body ActionSets so the client stacks them instead of clipping a shared row.
- */
-function pendingActions(
-  question: AskCardQuestion,
-  generation: number,
-): Record<string, unknown>[] {
-  const freeFormOnly = question.options.length === 0 || question.multi;
+/** A single submit commits the selected option(s) or free-form answer. */
+function pendingActions(generation: number): Record<string, unknown>[] {
   return [{
     type: "Action.Submit",
     id: submitActionId(generation),
-    title: freeFormOnly ? "提交" : "提交其他答案",
+    title: "提交",
     style: "positive",
   }];
 }
@@ -366,7 +327,7 @@ export function buildAskCard(
   plain: string,
   names?: AnswererNames,
 ): AskCardFrame {
-  const body = questionBody(question, state.kind === "pending" ? state.generation : undefined);
+  const body = questionBody(question, state.kind === "pending");
   const card: Record<string, unknown> = {
     $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
     type: "AdaptiveCard",
@@ -375,7 +336,7 @@ export function buildAskCard(
   };
   if (state.kind === "pending") {
     body.push(...pendingInputs(question));
-    card.actions = pendingActions(question, state.generation);
+    card.actions = pendingActions(state.generation);
   } else {
     const note = state.kind === "answered"
       ? answeredCardElement(question, state.answer, state.answeredBy, names)
