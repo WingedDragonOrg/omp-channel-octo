@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdir, stat } from "node:fs/promises";
 import { join } from "node:path";
+import { openChannelStore } from "../src/store";
 import {
   closeCoreHarness,
   createCoreHarness,
@@ -28,6 +29,38 @@ test("/new without a path initially uses ~/tmp, then reuses that cwd with a fres
     const refreshedStatus = await harness.service.status(target);
     expect(refreshedStatus.sessionId).not.toBe(status.sessionId);
     expect(refreshedStatus.cwd).toBe(status.cwd);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("/new records the session switch on the binding, and later session writes keep it", async () => {
+  const harness = await createCoreHarness();
+  try {
+    const target = { channelId: "dm-owner", channelType: 1 as const };
+    await harness.service.handleInbound(
+      inbound({ messageId: "switch-before-new", ...target, text: "hello" }),
+    );
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+    const store = await openChannelStore(harness.stateDir);
+    try {
+      // 首次绑定没有这段历史：问题不属于任何一次主动换会话。
+      expect(store.getBinding(harness.bot.uid, target)?.sessionSwitchedAt ?? null).toBeNull();
+      const before = Date.now();
+      await harness.service.handleInbound(inbound({ messageId: "switch-new", ...target, text: "/new" }));
+      const switched = store.getBinding(harness.bot.uid, target)?.sessionSwitchedAt ?? null;
+      expect(switched).not.toBeNull();
+      expect(switched!).toBeGreaterThanOrEqual(before);
+
+      // 之后普通任务重写绑定（同一会话）不得抹掉它。
+      await harness.service.handleInbound(
+        inbound({ messageId: "switch-after-new", ...target, text: "run this" }),
+      );
+      await waitForStatus(harness.service, target, (status) => status.state === "completed");
+      expect(store.getBinding(harness.bot.uid, target)?.sessionSwitchedAt).toBe(switched);
+    } finally {
+      store.close();
+    }
   } finally {
     await closeCoreHarness(harness);
   }

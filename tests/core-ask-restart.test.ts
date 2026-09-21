@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { rm } from "node:fs/promises";
+import { join } from "node:path";
 import type { BotCardAction, ChatTarget } from "../src/contracts";
 import { createQuestionDesk } from "../src/questions";
 import { openChannelStore, type ChannelStore } from "../src/store";
@@ -144,6 +146,15 @@ function latestTask(store: ChannelStore): TaskRecord {
   const task = store.getLatestTask(BOT_UID, TARGET);
   if (task === null) throw new Error("task row missing");
   return task;
+}
+
+/** 一张卡片里的已回复行，按其 runs 拼回整句（回复者名字是独立的 run）。 */
+function answeredLines(card: Record<string, unknown>): string[] {
+  const body = Array.isArray(card.body) ? (card.body as Record<string, unknown>[]) : [];
+  return body.flatMap((element) => {
+    if (element.type !== "RichTextBlock" || !Array.isArray(element.inlines)) return [];
+    return [(element.inlines as Record<string, unknown>[]).map((run) => String(run.text ?? "")).join("")];
+  });
 }
 
 /** 一次卡片点击，按 Bot 事件队列交付的形状。 */
@@ -714,22 +725,36 @@ function interruptedCardMessageId(harness: CoreHarness): string {
   return card.messageId;
 }
 
-test("任务不再恢复时 cancelForTask 关闭它遗留的问题与卡片", async () => {
+test("任务不再恢复时 cancelForTask 关闭它遗留的问题与卡片，说明随关闭原因", async () => {
   const interrupted = await interruptAsk(SINGLE);
   await withStore(interrupted, async (store) => {
     const task = latestTask(store);
     const rowId = interrupted.questionIds[0]!;
     const { desk, transport } = resumeDesk(store);
     desk.beginRecovery(task.id);
-    desk.cancelForTask(task.id);
-    desk.cancelForTask(task.id);
+    desk.cancelForTask(task.id, "interrupted");
+    desk.cancelForTask(task.id, "interrupted");
     expect(store.getQuestion(rowId)?.state).toBe("cancelled");
+    expect(store.getQuestion(rowId)?.closedReason).toBe("interrupted");
     const edit = await transport.waitForCardEdit(({ messageId }) => messageId === interrupted.cardMessageId);
     expect(JSON.stringify(edit.frame.card)).toContain("任务已中断");
   });
 });
 
-test("提问超时把未认领的旧问题交给服务落库：再次恢复后 A 不可答、B 仍可答", async () => {
+test("生命周期收尾关闭的行说明「仍可提交」，并在行上留下关闭原因", async () => {
+  const interrupted = await interruptAsk(SINGLE);
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    const rowId = interrupted.questionIds[0]!;
+    const { desk, transport } = resumeDesk(store);
+    desk.cancelForTask(task.id, "ended");
+    expect(store.getQuestion(rowId)?.closedReason).toBe("ended");
+    const edit = await transport.waitForCardEdit(({ messageId }) => messageId === interrupted.cardMessageId);
+    expect(JSON.stringify(edit.frame.card)).toContain("之后在这里提交会作为新消息交给助手");
+  });
+});
+
+test("提问超时把未认领的旧问题交给服务落库：A 按迟到提交接受，B 照旧等答复", async () => {
   const interrupted = await interruptAsk(SINGLE, { toolCallId: "call-old-a" });
   await withStore(interrupted, async (store) => {
     const task = latestTask(store);
@@ -765,18 +790,167 @@ test("提问超时把未认领的旧问题交给服务落库：再次恢复后 A
     again.desk.beginRecovery(task.id);
     const cardB = (await transport.waitForCardSend(({ messageId }) => messageId !== interrupted.cardMessageId))
       .messageId;
+    // A 是超时清扫关闭的旧行（`ended`）：提交按迟到答复记录，并作为该聊天的新输入投递一次。
     expect(await again.desk.answerFromCard(click(interrupted.cardMessageId, "ask_opt_2"))).toBe("handled");
-    expect(store.getQuestion(rowA)?.state).toBe("cancelled");
-    expect(store.getQuestion(rowA)?.answer).toBeNull();
-    expect(again.record.texts.map(({ text }) => text)).toContain("该问题已失效，本次点击未作为答案。");
+    expect(store.getQuestion(rowA)?.state).toBe("answered");
+    expect(store.getQuestion(rowA)?.answer).toBe("2");
+    expect(store.getQuestion(rowA)?.answeredBy).toBe(OWNER);
+    expect(store.getQuestion(rowA)?.closedReason).toBe("ended");
+    expect(again.record.texts).toEqual([]);
+    expect(again.record.wakes).toHaveLength(1);
+    expect(again.record.wakes[0]?.text).toContain("原等待已结束");
+    expect(again.record.wakes[0]?.text).toContain("Which deployment target?");
+    expect(again.record.wakes[0]?.text).toContain("答案（由 owner-1 回复）：2. production");
+    // 同一提交重投：行已是 answered，静默、不重记也不重投。
+    expect(await again.desk.answerFromCard(click(interrupted.cardMessageId, "ask_opt_2"))).toBe("handled");
+    expect(again.record.wakes).toHaveLength(1);
+    expect(again.record.texts).toEqual([]);
+    // 迟到答复落盘后卡片随即改写成已回复行。
+    const lateEdit = await again.transport.waitForCardEdit(({ messageId, frame }) =>
+      messageId === interrupted.cardMessageId && JSON.stringify(frame.card).includes("已由"));
+    expect(answeredLines(lateEdit.frame.card as Record<string, unknown>)).toEqual([
+      "已由 owner-1 回复：2. production",
+    ]);
     expect(await again.desk.answerFromCard(click(cardB, "ask_opt_1"))).toBe("handled");
     expect(store.getQuestion(rowB)?.state).toBe("answered");
-    expect(again.record.wakes).toHaveLength(1);
-    // 收束投影：桌面在 A 还待答时建过快照、此刻行已被 Store 取消——它的卡片仍要补上关闭。
+    expect(again.record.wakes).toHaveLength(2);
+    expect(again.record.wakes[1]?.text).toContain("先前询问的等待已超时停住");
+    // 收束投影：A 的行已按迟到答复落定，任务收尾不再把它的卡片改回关闭。
+    const editsBefore = transport.cardEdits.length;
     desk.rejectForTask(task.id, new Error("task finished"));
-    const closed = await transport.waitForCardEdit(({ messageId, frame }) =>
-      messageId === interrupted.cardMessageId && JSON.stringify(frame.card).includes("任务已结束"));
-    expect(closed.messageId).toBe(interrupted.cardMessageId);
+    const aEdits = transport.cardEdits
+      .slice(editsBefore)
+      .filter(({ messageId }) => messageId === interrupted.cardMessageId);
+    expect(aEdits).toEqual([]);
+  });
+});
+
+test("用户停止或中断关闭的行：点击得到失效说明，不落答案也不投递", async () => {
+  for (const reason of ["cancelled", "interrupted"] as const) {
+    const interrupted = await interruptAsk(SINGLE, { toolCallId: `call-${reason}` });
+    await withStore(interrupted, async (store) => {
+      const task = latestTask(store);
+      const rowId = interrupted.questionIds[0]!;
+      const { desk, transport, record } = resumeDesk(store);
+      desk.cancelForTask(task.id, reason);
+      expect(store.getQuestion(rowId)?.closedReason).toBe(reason);
+      await transport.waitForCardEdit(({ messageId }) => messageId === interrupted.cardMessageId);
+      expect(await desk.answerFromCard(click(interrupted.cardMessageId, "ask_opt_2"))).toBe("handled");
+      expect(record.texts.map(({ text }) => text)).toEqual(["该问题已失效，本次点击未作为答案。"]);
+      expect(record.wakes).toEqual([]);
+      expect(store.getQuestion(rowId)?.state).toBe("cancelled");
+      expect(store.getQuestion(rowId)?.answer).toBeNull();
+      // 同一失效点击重投：行不动，说明照旧（这条提示本来就是「什么也没发生」的回执）。
+      expect(await desk.answerFromCard(click(interrupted.cardMessageId, "ask_opt_2"))).toBe("handled");
+      expect(record.texts).toHaveLength(2);
+      expect(record.wakes).toEqual([]);
+      expect(store.getQuestion(rowId)?.state).toBe("cancelled");
+      expect(store.getQuestion(rowId)?.answer).toBeNull();
+    });
+  }
+});
+
+test("已答行的点击：维持已落定的答案、静默，改答走普通消息", async () => {
+  const interrupted = await interruptAsk(SINGLE);
+  await withStore(interrupted, async (store) => {
+    const rowId = interrupted.questionIds[0]!;
+    const { desk, record } = resumeDesk(store);
+    expect(store.answerQuestion(rowId, BOT_UID, TARGET, "1", OWNER)).toBe(true);
+    expect(await desk.answerFromCard(click(interrupted.cardMessageId, "ask_opt_2"))).toBe("handled");
+    expect(store.getQuestion(rowId)?.answer).toBe("1");
+    expect(record.wakes).toEqual([]);
+    expect(record.texts).toEqual([]);
+  });
+});
+
+test("换过会话之后（/new、/reset），换会话前提出的关闭行不再接受迟到提交", async () => {
+  const interrupted = await interruptAsk(SINGLE);
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    const rowId = interrupted.questionIds[0]!;
+    // 关掉的旧行本来接受迟交（`ended`），但本聊天此后换过会话：它属于上一段对话。
+    store.cancelQuestion(rowId, "ended");
+    const binding = store.getBinding(BOT_UID, TARGET);
+    if (binding === null) throw new Error("binding missing");
+    store.ensureBinding({ ...binding, sessionSwitchedAt: Date.now() });
+    const { desk, record } = resumeDesk(store);
+    desk.cancelForTask(task.id, "ended");
+    expect(await desk.answerFromCard(click(interrupted.cardMessageId, "ask_opt_2"))).toBe("handled");
+    expect(store.getQuestion(rowId)?.state).toBe("cancelled");
+    expect(store.getQuestion(rowId)?.answer).toBeNull();
+    expect(record.wakes).toEqual([]);
+    expect(record.texts.map(({ text }) => text)).toEqual(["该问题已失效，本次点击未作为答案。"]);
+  });
+});
+
+test("整组卡片关闭后的提交：每行按自己的规则记录，一次投递带全部答案", async () => {
+  const interrupted = await interruptAsk(SET);
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    const { desk, transport, record } = resumeDesk(store);
+    desk.cancelForTask(task.id, "ended");
+    await transport.waitForCardEdit(({ messageId }) => messageId === interrupted.cardMessageId);
+    const submit = click(interrupted.cardMessageId, "ask_submit", {
+      ask_choices_1: "2",
+      ask_text_2: "tomorrow",
+    });
+    expect(await desk.answerFromCard(submit)).toBe("handled");
+    const rows = store.listTaskQuestions(task.id);
+    expect(rows.map(({ state }) => state)).toEqual(["answered", "answered"]);
+    expect(rows.map(({ answer }) => answer)).toEqual(["2", "tomorrow"]);
+    expect(record.wakes).toHaveLength(1);
+    expect(record.wakes[0]?.text).toContain("Which deployment target?");
+    expect(record.wakes[0]?.text).toContain("When do we ship?");
+    expect(record.texts).toEqual([]);
+    // 同一提交重投：两行都已落定，静默且不重复投递。
+    expect(await desk.answerFromCard(submit)).toBe("handled");
+    expect(record.wakes).toHaveLength(1);
+  });
+});
+
+test("关闭行上的空提交与越界选择只回失效说明，未知 action 不回应", async () => {
+  const interrupted = await interruptAsk(SINGLE);
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    const rowId = interrupted.questionIds[0]!;
+    const { desk, record } = resumeDesk(store);
+    desk.cancelForTask(task.id, "ended");
+    // 空提交、越界编号：解不出答案，也不凭猜测补一个。
+    expect(await desk.answerFromCard(click(interrupted.cardMessageId, "ask_submit", {}))).toBe("handled");
+    expect(await desk.answerFromCard(click(interrupted.cardMessageId, "ask_opt_9"))).toBe("handled");
+    expect(store.getQuestion(rowId)?.state).toBe("cancelled");
+    expect(store.getQuestion(rowId)?.answer).toBeNull();
+    expect(record.wakes).toEqual([]);
+    expect(record.texts.map(({ text }) => text)).toEqual([
+      "该问题已失效，本次点击未作为答案。",
+      "该问题已失效，本次点击未作为答案。",
+    ]);
+    // 不是本卡发放的形状：完全静默，连说明也不回。
+    expect(await desk.answerFromCard(click(interrupted.cardMessageId, "cfg:mode:not-a-session"))).toBe("handled");
+    expect(record.texts).toHaveLength(2);
+  });
+});
+
+test("迁移前的旧行（没有 closed_reason）按 ended 读，提交照样接受", async () => {
+  const interrupted = await interruptAsk(SINGLE);
+  await withStore(interrupted, async (store) => {
+    const rowId = interrupted.questionIds[0]!;
+    // 旧版本落下的关闭行：只有 state/answered_at，没有关闭原因。
+    const raw = new Database(join(interrupted.stateDir, "channel.sqlite"));
+    try {
+      raw
+        .query("UPDATE questions SET state = 'cancelled', closed_reason = NULL, answered_at = ? WHERE id = ?")
+        .run(Date.now(), rowId);
+    } finally {
+      raw.close();
+    }
+    const { desk, record } = resumeDesk(store);
+    expect(store.getQuestion(rowId)?.closedReason).toBeNull();
+    expect(await desk.answerFromCard(click(interrupted.cardMessageId, "ask_opt_2"))).toBe("handled");
+    expect(store.getQuestion(rowId)?.state).toBe("answered");
+    expect(store.getQuestion(rowId)?.answer).toBe("2");
+    expect(record.wakes).toHaveLength(1);
+    expect(record.wakes[0]?.text).toContain("原等待已结束");
   });
 });
 
@@ -785,15 +959,16 @@ test("Store 已按终态取消的提问，卡片仍要被收尾关闭", async ()
   await withStore(interrupted, async (store) => {
     const task = latestTask(store);
     const rowId = interrupted.questionIds[0]!;
-    // 任务落终态的那段进程把行取消掉，随后被杀：卡片还挂在用户那里。
-    store.cancelQuestion(rowId);
-    expect(store.getQuestion(rowId)?.state).toBe("cancelled");
+    // 桌面在行还待答时建过快照，任务落终态的那段进程把行取消掉，随后被杀：卡片还挂在用户那里。
     const { desk, transport } = resumeDesk(store);
-    desk.cancelForTask(task.id);
+    desk.beginRecovery(task.id);
+    store.cancelQuestion(rowId, "ended");
+    expect(store.getQuestion(rowId)?.state).toBe("cancelled");
+    desk.cancelForTask(task.id, "ended");
     expect(store.getQuestion(rowId)?.state).toBe("cancelled");
     const edit = await transport.waitForCardEdit(({ messageId }) => messageId === interrupted.cardMessageId);
-    expect(JSON.stringify(edit.frame.card)).toContain("任务已中断");
-    // 已取消的行不因任务收尾复活：迟到的答复照样无处可落。
+    expect(JSON.stringify(edit.frame.card)).toContain("任务已结束");
+    // 已取消的行不因任务收尾复活：文字回复不会把自己当成它的答案（卡片提交按迟答复分流）。
     const answered = await desk.answerPendingQuestion(
       inbound({ messageId: "store-cancelled", ...TARGET, text: "2" }),
       "2",

@@ -7,14 +7,14 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ChatAppendMode, ChatTarget } from "../contracts.ts";
-import type { BindingRecord, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord } from "./store-records.ts";
+import type { BindingRecord, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord } from "./store-records.ts";
 import { applySchema } from "./store-schema.ts";
 import { claimOwnerEnrollment, clearChatModel, ensureBinding, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, grantAllowedChat, hasOwnerEnrollment, listAllowedChats, setBotUid, setChatMode, setChatModel, setOwnerId, updateBindingSession } from "./store-chats.ts";
 import { acceptTask, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getLatestTask, getTask, isTaskResuming, listQueuedTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim } from "./store-tasks.ts";
 import { clearProgressCard, listProgressCards, listWorkerLedger, markWorkerMoveTarget, markWorkerStopped, recordProgressCardAttempt, recordWorker, saveProgressCard } from "./store-cards.ts";
 import { advanceHistoryLedger, clearContextLedger, commitContextInjection, commitHistoryInjection, getContextLedger, getHistoryLedger, prepareContextInjection, prepareHistoryInjection, pruneHistoryLedger } from "./store-ledgers.ts";
 import { acknowledgeTextOutbox, beginTextCreate, bindTextOutbox, countPendingOutbox, countUnknownOutbox, enqueueOutbox, failTextOutbox, getBotEventCursor, getOutbox, listPendingOutbox, listPendingOutboxTargets, listTextStream, markOutboxDead, markOutboxFailure, markOutboxSent, setBotEventCursor, updateTextOutbox } from "./store-outbox.ts";
-import { answerQuestion, answerQuestions, cancelQuestion, cancelQuestions, cancelTaskQuestions, createQuestion, getQuestion, listPendingQuestions, listQuestionsByCard, listTaskQuestions, markQuestionsSettled, pendingQuestionIds, reserveQuestionCardSeq, setQuestionCard, setQuestionsCard, updateQuestionPayloads } from "./store-questions.ts";
+import { answerClosedQuestion, answerQuestion, answerQuestions, cancelQuestion, cancelQuestions, cancelTaskQuestions, createQuestion, getQuestion, listPendingQuestions, listQuestionsByCard, listTaskQuestions, markQuestionsSettled, pendingQuestionIds, reserveQuestionCardSeq, setQuestionCard, setQuestionsCard, updateQuestionPayloads } from "./store-questions.ts";
 
 export class ChannelStore {
   private readonly db: Database;
@@ -431,7 +431,7 @@ export class ChannelStore {
     markOutboxDead(this.db, id, errorText);
   }
 
-  createQuestion(record: Omit<QuestionRecord, "state" | "answer" | "answeredBy" | "cardMessageId" | "settledAt">): void {
+  createQuestion(record: QuestionInsert): void {
     createQuestion(this.db, record);
   }
 
@@ -461,22 +461,31 @@ export class ChannelStore {
     return answerQuestions(this.db, botUid, target, answers);
   }
 
-  cancelQuestions(botUid: string, target: ChatTarget): void {
-    cancelQuestions(this.db, botUid, target);
+  /**
+   * 一条关闭后到达的答案：把 `cancelled`/`expired` 行 CAS 成 `answered`（记提交人与关闭原因）。
+   * 这是迟到答复的唯一仲裁点——同一提交重投与重启重放都只有一个赢家，其余读到 `answered` 后静默。
+   */
+
+  answerClosedQuestion(id: string, botUid: string, target: ChatTarget, answer: string, answeredBy: string | null): boolean {
+    return answerClosedQuestion(this.db, id, botUid, target, answer, answeredBy);
   }
 
-  cancelQuestion(id: string): boolean {
-    return cancelQuestion(this.db, id);
+  cancelQuestions(botUid: string, target: ChatTarget, reason: QuestionCloseReason): void {
+    cancelQuestions(this.db, botUid, target, reason);
+  }
+
+  cancelQuestion(id: string, reason: QuestionCloseReason): boolean {
+    return cancelQuestion(this.db, id, reason);
   }
 
   /**
-   * 取消一个任务的全部待答提问，返回取消的行数；只把 `pending` 行置 `cancelled`，不涉卡片 UI。
-   * 服务侧收尾（关卡片）需要「pending ∪ cancelled」这批行时，用这一条替掉逐行 CAS：单语句原子，
-   * 不会在中途崩溃时留下半批仍可答的旧卡。
+   * 取消一个任务的全部待答提问并记下关闭原因，返回取消的行数；只把 `pending` 行置 `cancelled`，
+   * 不涉卡片 UI。服务侧收尾（关卡片）需要「pending ∪ cancelled」这批行时，用这一条替掉逐行 CAS：
+   * 单语句原子，不会在中途崩溃时留下半批仍可答的旧卡。
    */
 
-  cancelTaskQuestions(taskId: string): number {
-    return cancelTaskQuestions(this.db, taskId);
+  cancelTaskQuestions(taskId: string, reason: QuestionCloseReason): number {
+    return cancelTaskQuestions(this.db, taskId, reason);
   }
 
   pendingQuestionIds(botUid: string, target: ChatTarget): string[] {

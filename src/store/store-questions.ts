@@ -5,10 +5,10 @@
 
 import { Database } from "bun:sqlite";
 import type { ChatTarget } from "../contracts.ts";
-import type { QuestionRecord } from "./store-records.ts";
+import type { QuestionCloseReason, QuestionInsert, QuestionRecord } from "./store-records.ts";
 import { asNumber, query, questionFromRow, run, type SqlValue, targetValues, targetWhere, transaction } from "./store-schema.ts";
 
-export function createQuestion(db: Database, record: Omit<QuestionRecord, "state" | "answer" | "answeredBy" | "cardMessageId" | "settledAt">): void {
+export function createQuestion(db: Database, record: QuestionInsert): void {
   run(db,
     `INSERT INTO questions(id, task_id, bot_uid, channel_type, channel_id, payload, state, created_at)
      VALUES(?, ?, ?, ?, ?, ?, 'pending', ?)`,
@@ -67,31 +67,52 @@ export function answerQuestions(db: Database, botUid: string,
   });
 }
 
-export function cancelQuestions(db: Database, botUid: string, target: ChatTarget): void {
+export function cancelQuestions(db: Database, botUid: string, target: ChatTarget, reason: QuestionCloseReason): void {
   run(db,
-    `UPDATE questions SET state = 'cancelled', answered_at = ?
+    `UPDATE questions SET state = 'cancelled', answered_at = ?, closed_reason = ?
      WHERE bot_uid = ? AND ${targetWhere(target)} AND state = 'pending'`,
-    [Date.now(), botUid, ...targetValues(target)],
+    [Date.now(), reason, botUid, ...targetValues(target)],
   );
 }
 
-export function cancelQuestion(db: Database, id: string): boolean {
+export function cancelQuestion(db: Database, id: string, reason: QuestionCloseReason): boolean {
   return run(db,
-    "UPDATE questions SET state = 'cancelled', answered_at = ? WHERE id = ? AND state = 'pending'",
-    [Date.now(), id],
+    "UPDATE questions SET state = 'cancelled', answered_at = ?, closed_reason = ? WHERE id = ? AND state = 'pending'",
+    [Date.now(), reason, id],
   ).changes === 1;
 }
 
 /**
  * 关闭一个任务的全部待答提问并返回取消的行数。用户取消/中断这一回合时，它与任务终态在同一事务里
  * 落盘：迟到的点击/答案因此无处可落，绝不能靠「下一条恢复通知」补救——进程在那之间死掉时，终态行
- * 已不会再进恢复清单，漏掉的提问就成了唤醒新回合的入口。
+ * 已不会再进恢复清单，漏掉的提问就成了唤醒新回合的入口。关闭原因随行落库，迟到提交按其分流。
  */
-export function cancelTaskQuestions(db: Database, taskId: string): number {
+export function cancelTaskQuestions(db: Database, taskId: string, reason: QuestionCloseReason): number {
   return run(db,
-    "UPDATE questions SET state = 'cancelled', answered_at = ? WHERE task_id = ? AND state = 'pending'",
-    [Date.now(), taskId],
+    "UPDATE questions SET state = 'cancelled', answered_at = ?, closed_reason = ? WHERE task_id = ? AND state = 'pending'",
+    [Date.now(), reason, taskId],
   ).changes;
+}
+
+/**
+ * 一条关闭后到达的答案：把 `cancelled`/`expired` 行 compare-and-set 成 `answered` 并记答复人与
+ * 答案。CAS 是唯一仲裁点——同一提交的事件重投、重复点击与重启重放都只会有一个赢家，其余读到
+ * `answered` 后按静默处理，迟到答复因此恰好投递一次。`closed_reason` 保留关闭原因，作为「这条
+ * 答复晚于哪种关闭到达」的证据。
+ */
+export function answerClosedQuestion(
+  db: Database,
+  id: string,
+  botUid: string,
+  target: ChatTarget,
+  answer: string,
+  answeredBy: string | null,
+): boolean {
+  return run(db,
+    `UPDATE questions SET state = 'answered', answer = ?, answered_by = ?, answered_at = ?
+     WHERE id = ? AND bot_uid = ? AND ${targetWhere(target)} AND state IN ('cancelled', 'expired')`,
+    [answer, answeredBy, Date.now(), id, botUid, ...targetValues(target)],
+  ).changes === 1;
 }
 
 export function pendingQuestionIds(db: Database, botUid: string, target: ChatTarget): string[] {

@@ -121,6 +121,7 @@ export function applySchema(db: Database): void {
       cwd TEXT NOT NULL,
       session_file TEXT,
       cwd_pinned INTEGER NOT NULL DEFAULT 0,
+      session_switched_at INTEGER,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       PRIMARY KEY(bot_uid, channel_type, channel_id)
@@ -201,6 +202,7 @@ export function applySchema(db: Database): void {
       state TEXT NOT NULL CHECK(state IN ('pending', 'answered', 'cancelled', 'expired')),
       answer TEXT,
       answered_by TEXT,
+      closed_reason TEXT,
       created_at INTEGER NOT NULL,
       answered_at INTEGER,
       card_message_id TEXT,
@@ -312,8 +314,10 @@ export function applySchema(db: Database): void {
     "ALTER TABLE tasks ADD COLUMN relay_channel_id TEXT",
     "ALTER TABLE tasks ADD COLUMN relay_thread_name TEXT",
     "ALTER TABLE chats ADD COLUMN cwd_pinned INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE chats ADD COLUMN session_switched_at INTEGER",
     "ALTER TABLE questions ADD COLUMN card_message_id TEXT",
     "ALTER TABLE questions ADD COLUMN answered_by TEXT",
+    "ALTER TABLE questions ADD COLUMN closed_reason TEXT",
   ]) {
     try {
       db.exec(statement);
@@ -507,6 +511,11 @@ export function questionFromRow(row: SqlRow): QuestionRecord {
     answer: asNullableString(row.answer),
     answeredBy: asNullableString(row.answered_by),
     cardMessageId: asNullableString(row.card_message_id),
+    createdAt: asNumber(row.created_at),
+    // 关闭原因按白名单读取；NULL、未知取值与旧库里的其它文本一律按 null（调用方按 ended 处理）。
+    closedReason: row.closed_reason === "cancelled" || row.closed_reason === "interrupted" || row.closed_reason === "ended"
+      ? row.closed_reason
+      : null,
     settledAt: row.settled_at === null || row.settled_at === undefined ? null : asNumber(row.settled_at),
   };
 }

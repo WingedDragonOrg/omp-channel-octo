@@ -1453,6 +1453,149 @@ test("a card submission after the timeout answers once and wakes the agent", asy
   }
 });
 
+/**
+ * 任务失败留下的关闭问题（生命周期收尾）：卡片上的提交不再是「已失效」，而是该聊天的一条新输入
+ * ——空闲聊天里它成为一个新任务，正文带着原问题与答案；重复提交不再执行第二次。
+ */
+test("a submission on a card the task failure closed becomes the chat's new input", async () => {
+  const transport = new FakeTransport();
+  transport.cardSupported = true;
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ append, promptContext, text }) => {
+      if (text.startsWith("[ask 答复]")) {
+        await append("wake.log", text);
+        return;
+      }
+      const ask = promptContext?.tools?.find(({ name }) => name === "ask");
+      if (!ask) throw new Error("ask host tool missing");
+      const published = transport.waitForCardSend(() => true);
+      // 这次回合在提问期间失败：问题行随任务终态关闭（`ended`），卡片仍留在用户手里。
+      void ask
+        .execute(
+          { questions: [{ id: "release-window", question: "When do we ship?" }] },
+          new AbortController().signal,
+        )
+        .catch(() => {});
+      await published;
+      throw new Error("worker exploded");
+    },
+  });
+  try {
+    const target: ChatTarget = { channelId: "dm-ask-closed", channelType: 1 };
+    await harness.service.handleInbound(
+      inbound({ messageId: "ask-closed-start", ...target, text: "needs an answer" }),
+    );
+    await waitForStatus(harness.service, target, (status) => status.state === "failed");
+    const card = harness.transport.sentCards[0];
+    if (!card) {
+      throw new Error("ask card was not sent");
+    }
+
+    const click = {
+      messageId: card.messageId,
+      channelType: 1 as const,
+      channelId: target.channelId,
+      actionId: "ask_submit",
+      operatorUid: "owner-1",
+      inputs: { ask_text: "ship it tonight" },
+    };
+    harness.transport.pushBotEvent(cardActionEvent(51, click));
+    await harness.workers.waitForPromptCount(2);
+    await harness.transport.waitForAck(51);
+    const wake = harness.workers.prompts[1]?.text ?? "";
+    expect(wake).toContain("原等待已结束");
+    expect(wake).toContain("When do we ship?");
+    expect(wake).toContain("答案（由 owner-1 回复）：ship it tonight");
+    expect(harness.transport.sent.map(({ text }) => text)).not.toContain(
+      "该问题已失效，本次点击未作为答案。",
+    );
+    const edit = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
+    expect(JSON.stringify(edit.frame.card)).toContain("ship it tonight");
+
+    // 同一提交重投：不回答第二次，也不再来一个任务。
+    const promptsAfter = harness.workers.prompts.length;
+    harness.transport.pushBotEvent(cardActionEvent(52, click));
+    await harness.transport.waitForAck(52);
+    expect(harness.workers.prompts).toHaveLength(promptsAfter);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+/**
+ * 忙碌聊天里的迟到提交遵循既有 append mode：steer 模式下并入正在跑的回合，不另起任务。
+ */
+test("a late submission joins the running turn in steer mode", async () => {
+  const transport = new FakeTransport();
+  transport.cardSupported = true;
+  const running = Promise.withResolvers<void>();
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ append, promptContext, text, waitForAppend }) => {
+      if (text.startsWith("[ask 答复]")) {
+        await append("wake.log", text);
+        return;
+      }
+      const ask = promptContext?.tools?.find(({ name }) => name === "ask");
+      if (!ask) throw new Error("ask host tool missing");
+      if (text === "close a question") {
+        const published = transport.waitForCardSend(() => true);
+        // 这次回合在提问期间失败：问题按生命周期收尾关闭，卡片留在用户手里。
+        void ask
+          .execute(
+            { questions: [{ id: "release-window", question: "When do we ship?" }] },
+            new AbortController().signal,
+          )
+          .catch(() => {});
+        await published;
+        throw new Error("worker exploded");
+      }
+      await append("steer.log", `start:${text}\n`);
+      running.resolve();
+      const appended = await waitForAppend();
+      await append("steer.log", `steered:${appended.text}\n`);
+      await append("steer.log", `end:${text}\n`);
+    },
+  });
+  try {
+    const target: ChatTarget = { channelId: "dm-ask-closed-steer", channelType: 1 };
+    await harness.service.handleInbound(
+      inbound({ messageId: "ask-closed-steer-first", ...target, text: "close a question" }),
+    );
+    await waitForStatus(harness.service, target, (status) => status.state === "failed");
+    const card = harness.transport.sentCards[0];
+    if (!card) {
+      throw new Error("ask card was not sent");
+    }
+
+    const holding = harness.service.handleInbound(
+      inbound({ messageId: "ask-closed-steer-second", ...target, text: "long task" }),
+    );
+    await running.promise;
+    harness.transport.pushBotEvent(cardActionEvent(61, {
+      messageId: card.messageId,
+      channelType: 1,
+      channelId: target.channelId,
+      actionId: "ask_submit",
+      operatorUid: "owner-1",
+      inputs: { ask_text: "ship it tonight" },
+    }));
+    await harness.transport.waitForAck(61);
+    await holding;
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+
+    expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["close a question", "long task"]);
+    const log = await readText(join(harness.root, "tmp", "steer.log"));
+    expect(log).toContain("steered:[ask 答复]");
+    expect(log).toContain("When do we ship?");
+    expect(log).toContain("答案（由 owner-1 回复）：ship it tonight");
+    expect(log).toContain("end:long task");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
 test("a timed-out question set stops the turn once and keeps every row answerable", async () => {
   const harness = await startAskTimeoutHarness([
     {

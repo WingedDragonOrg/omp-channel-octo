@@ -244,6 +244,9 @@ export class SessionLifecycle {
           sessionId: fresh.sessionId,
           cwd: fresh.cwd,
           sessionFile: fresh.sessionFile,
+          // 主动换会话的唯一痕迹：问答卡据此拒绝切换前提出的旧问题的迟到提交（`/move` 保持会话
+          // 身份，因此不写这里）。切换失败走下面的 catch，绑定与这个时间都不落。
+          sessionSwitchedAt: Date.now(),
         };
         try {
           this.deps.store.ensureBinding(binding);

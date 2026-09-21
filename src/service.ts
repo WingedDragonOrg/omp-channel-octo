@@ -456,13 +456,15 @@ class CoreService implements ChannelService {
       // 收掉该任务自己的遗留提问（只动自己那条 task 的题，不误伤同聊天其他任务）；提问超时停下的
       // 行必须保留提问——迟到答复照在线路径唤醒新回合。子区派工的回传照常说清楚。
       for (const task of recovery.stopped) {
-        if (task.stopIntent !== "question_timeout") this.questions.cancelForTask(task.id);
+        // 用户中断的遗留提问记 `interrupted`（迟到提交不可接受）；提问超时停下的行保持可答。
+        if (task.stopIntent !== "question_timeout") this.questions.cancelForTask(task.id, "interrupted");
         await this.notifyThreadOutcome(task.id);
       }
       // 1/0 行（prompt 已落标记、接受状态未知）既不重放也不续接：按实际恢复失败通报、关闭
       // 该任务遗留的提问，子区派工的回传照常说清楚，不把一次失败的恢复留成静默。
       for (const task of recovery.uncertain) {
-        this.questions.cancelForTask(task.id);
+        // 接受状态未知不是用户叫停：关闭行记 `ended`，迟到提交仍作为该聊天的新输入接受。
+        this.questions.cancelForTask(task.id, "ended");
         await this.outbox.enqueueText(taskTarget(task), UNCERTAIN_RECOVERY_NOTICE, null);
         await this.notifyThreadOutcome(task.id);
       }
@@ -1118,7 +1120,7 @@ class CoreService implements ChannelService {
     for (const taskId of queued) this.scheduler.takeWaitingReceipt(taskId);
     // 存储域在取消这些排队任务时已顺手把它们的待答问题置为 cancelled：这些行不再是 pending，
     // 聊天级清扫看不到它们，卡片会留在开放状态。逐任务按「待答∪已取消」收口，卡片才会关。
-    for (const taskId of queued) this.questions.cancelForTask(taskId);
+    for (const taskId of queued) this.questions.cancelForTask(taskId, "cancelled");
     for (const taskId of queued) await this.notifyThreadOutcome(taskId);
     this.questions.cancelForTarget(target);
     let active = false;
@@ -1537,7 +1539,7 @@ class CoreService implements ChannelService {
         // 显式 /interrupt 到此确定不再续接：先丢掉该任务的恢复快照与遗留提问，否则快照里
         // 「已答复但还没被认领」的行会在随后的 rejectForTask 里被补投成一个新回合。
         // 提问超时不清快照：那一轮停下后迟到的答复要继续这次工作，唤醒正是它该走的路。
-        if (!questionTimeout) this.questions.cancelForTask(taskId);
+        if (!questionTimeout) this.questions.cancelForTask(taskId, "interrupted");
         progress.finish("cancelled");
       } else if (!runtime.suspended) {
         if (turnContext) await turnContext.complete(worker.sessionId, events.localOnly);
@@ -1560,7 +1562,7 @@ class CoreService implements ChannelService {
           questionTimeout ? QUESTION_TIMEOUT_REASON_TEXT : INTERRUPT_REASON_TEXT,
         );
         // 与成功分支同一判据：显式 /interrupt 的终态不保留恢复快照（提问超时相反）。
-        if (!questionTimeout) this.questions.cancelForTask(taskId);
+        if (!questionTimeout) this.questions.cancelForTask(taskId, "interrupted");
         progress.finish("cancelled");
       } else if (runtime.suspended) {
         // 停机挂起：不是失败，也不是取消。行保持 started 与 prompt 标记，遗留提问保持 pending，
@@ -1577,7 +1579,8 @@ class CoreService implements ChannelService {
         this.store.markFailed(taskId, failure.row);
         progress.finish("failed");
         // 续接失败即该任务确定不再恢复：它自己的待答问题与卡片一并收尾（不波及同聊天其他任务）。
-        if (resuming) this.questions.cancelForTask(taskId);
+        // 这不是用户叫停，关闭记 `ended`——迟到提交按该聊天的新输入接受。
+        if (resuming) this.questions.cancelForTask(taskId, "ended");
         await this.outbox.enqueueText(runtime.target, failure.notice, taskId);
       }
     } finally {

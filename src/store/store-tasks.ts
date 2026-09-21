@@ -170,7 +170,8 @@ export function markCompleted(db: Database, taskId: string, resultText: string |
       [Date.now(), resultText, taskId],
     ).changes === 1;
     // 终态与关闭本任务待答提问同事务提交：commit 与 finally 清题之间被杀，旧卡不能再唤醒新回合。
-    if (completed) cancelTaskQuestions(db, taskId);
+    // 任务自行结束记 `ended`——它没有用户明确停止，迟到提交按新输入接受。
+    if (completed) cancelTaskQuestions(db, taskId, "ended");
   });
 }
 
@@ -180,7 +181,7 @@ export function markFailed(db: Database, taskId: string, errorText: string): voi
       "UPDATE tasks SET state = 'failed', finished_at = ?, error_text = ?, result_text = NULL, stop_intent = NULL WHERE id = ?",
       [Date.now(), errorText, taskId],
     ).changes === 1;
-    if (failed) cancelTaskQuestions(db, taskId);
+    if (failed) cancelTaskQuestions(db, taskId, "ended");
   });
 }
 
@@ -191,7 +192,7 @@ export function markCancelled(db: Database, taskId: string, errorText = "cancell
       [Date.now(), errorText, taskId],
     ).changes === 1;
     // 用户取消是终态：待答提问与任务终态同事务关闭，迟到的回答不再唤醒新回合。
-    if (cancelled) cancelTaskQuestions(db, taskId);
+    if (cancelled) cancelTaskQuestions(db, taskId, "cancelled");
   });
 }
 
@@ -207,7 +208,7 @@ export function markInterrupted(db: Database, taskId: string, errorText: string)
       "UPDATE tasks SET state = 'interrupted', finished_at = ?, error_text = ?, stop_intent = NULL WHERE id = ? AND state IN ('queued', 'started')",
       [Date.now(), errorText, taskId],
     ).changes === 1;
-    if (interrupted && intent === "interrupt") cancelTaskQuestions(db, taskId);
+    if (interrupted && intent === "interrupt") cancelTaskQuestions(db, taskId, "interrupted");
   });
 }
 
@@ -217,8 +218,11 @@ export function markInterrupted(db: Database, taskId: string, errorText: string)
  * 叫停，静默 no-op 返回 false（命令处理器与 settle 之间存在竞态）；重复写是允许的（再次 /interrupt
  * 重新武装）。
  *
+ * `interrupt` 的意图与「关闭本任务待答提问（记 `interrupted`）」在同一事务里提交：这些行对迟到提交
+ * 不可接受，而在线中断与重启结算必须给出同一个分流答案。
+ *
  * `cancelQuestionIds` 只给 `question_timeout` 用（提问超时的恢复快照遗留题）：意图写入与这批行的取消
- * 在同一事务里提交，本回合正在等的那批题仍保持可答。
+ * （记 `ended`）在同一事务里提交，本回合正在等的那批题仍保持可答。
  */
 export function markTaskStopIntent(
   db: Database,
@@ -233,6 +237,7 @@ export function markTaskStopIntent(
     ).changes === 1;
     // 守卫失败（行已终态）时连题也不动：这次叫停本来就没生效。
     if (!written) return false;
+    if (intent === "interrupt") cancelTaskQuestions(db, taskId, "interrupted");
     // 只有 `question_timeout` 用选择集：它按设计保留本回合正在等的提问（B），却必须原子关闭恢复快照里
     // 没人接手的那批遗留题（A），否则被叫停的回合结束后 A 仍可点开、唤醒新回合。逐行校验归属与状态，
     // 借用调用方传来的 id 不能越界取消别的任务或已收场的行。
@@ -243,10 +248,10 @@ export function markTaskStopIntent(
   });
 }
 
-/** 只取消「id 指向、且确实属于该任务、且仍 pending」的那一行；其余情况静默 no-op。 */
+/** 只取消「id 指向、且确实属于该任务、且仍 pending」的那一行（记 `ended`）；其余情况静默 no-op。 */
 function cancelOwnedPendingQuestion(db: Database, taskId: string, id: string): boolean {
   return run(db,
-    "UPDATE questions SET state = 'cancelled', answered_at = ? WHERE id = ? AND task_id = ? AND state = 'pending'",
+    "UPDATE questions SET state = 'cancelled', answered_at = ?, closed_reason = 'ended' WHERE id = ? AND task_id = ? AND state = 'pending'",
     [Date.now(), id, taskId],
   ).changes === 1;
 }
@@ -299,9 +304,9 @@ export function prepareTasksForRestart(
       );
       const settled = query(db, "SELECT * FROM tasks WHERE id = ?", [taskId])[0];
       if (settled) stopped.push({ ...taskFromRow(settled), stopIntent });
-      // 中断的回合连同它的待答提问一起在本次事务里关闭：恢复过程本身再被 SIGKILL 也不会留下
-      // 可被点开、可唤醒新回合的旧卡；提问超时停下的行保持可答（迟到答复照在线路径唤醒）。
-      if (stopIntent === "interrupt") cancelTaskQuestions(db, taskId);
+      // 中断的回合连同它的待答提问一起在本次事务里关闭（记 `interrupted`）：恢复过程本身再被 SIGKILL
+      // 也不会留下可被点开、可唤醒新回合的旧卡；提问超时停下的行保持可答（迟到答复照在线路径唤醒）。
+      if (stopIntent === "interrupt") cancelTaskQuestions(db, taskId, "interrupted");
     }
     // 2) 已派发但没有接受回执的行：接受状态未知，fail-closed（不重放、不错续）。
     const uncertainIds = query(db,
@@ -315,8 +320,9 @@ export function prepareTasksForRestart(
        WHERE bot_uid = ? AND state = 'started' AND prompt_started = 1 AND prompt_accepted = 0`,
       [Date.now(), botUid],
     );
-    // 这些回合已经失败收场：它们的待答提问同样在本次事务里关闭，迟到答案不能唤醒新回合。
-    for (const taskId of uncertainIds) cancelTaskQuestions(db, taskId);
+    // 这些回合已经失败收场：它们的待答提问同样在本次事务里关闭（记 `ended`——不是用户叫停，迟到提交
+    // 按新输入接受）。
+    for (const taskId of uncertainIds) cancelTaskQuestions(db, taskId, "ended");
     // 3) 其余在途行重排回队列，返回待执行集合。
     run(db, "UPDATE tasks SET state = 'queued' WHERE bot_uid = ? AND state = 'started'", [botUid]);
     return {
@@ -401,7 +407,7 @@ export function cancelQueued(db: Database, botUid: string, target: ChatTarget): 
        WHERE bot_uid = ? AND ${targetWhere(target)} AND state = 'queued'`,
       [Date.now(), botUid, ...targetValues(target)],
     );
-    for (const taskId of taskIds) cancelTaskQuestions(db, taskId);
+    for (const taskId of taskIds) cancelTaskQuestions(db, taskId, "cancelled");
     return taskIds;
   });
 }

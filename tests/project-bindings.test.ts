@@ -430,13 +430,24 @@ test("/move keeps the session identity while changing the bound directory", asyn
     );
     const before = await harness.service.status(target);
 
-    await harness.service.handleInbound(
-      inbound({ messageId: "bindings-move-destination", ...target, text: `/move ${destination}` }),
-    );
-    const after = await harness.service.status(target);
+    const bindings = await openChannelStore(harness.stateDir);
+    try {
+      // `/new` 记下这次主动换会话：迟到提交据此判断问题是否属于上一段对话。
+      const switched = bindings.getBinding(harness.bot.uid, target)?.sessionSwitchedAt ?? null;
+      expect(switched).not.toBeNull();
 
-    expect(after.cwd).toBe(destination);
-    expect(after.sessionId).toBe(before.sessionId);
+      await harness.service.handleInbound(
+        inbound({ messageId: "bindings-move-destination", ...target, text: `/move ${destination}` }),
+      );
+      const after = await harness.service.status(target);
+
+      expect(after.cwd).toBe(destination);
+      expect(after.sessionId).toBe(before.sessionId);
+      // `/move` 沿用会话身份，不覆盖这次主动换会话的时间。
+      expect(bindings.getBinding(harness.bot.uid, target)?.sessionSwitchedAt).toBe(switched);
+    } finally {
+      bindings.close();
+    }
   } finally {
     await closeCoreHarness(harness);
   }

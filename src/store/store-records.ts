@@ -14,6 +14,11 @@ export interface BindingRecord extends ChatTarget {
    * default work directory order must keep it even when the binding has no verified session yet.
    */
   cwdPinned?: boolean;
+  /**
+   * 本聊天最近一次主动换会话（`/new`/`/reset` 成功）的时间；`null`/缺省表示从未主动切换。
+   * 问答卡据此判断关闭问题的迟到提交是否属于切换前的旧会话。`/move` 保持会话身份，不写这里。
+   */
+  sessionSwitchedAt?: number | null;
 }
 
 export interface InboundClaim {
@@ -126,6 +131,9 @@ export type OutboxInsert = Omit<
   ackedVersion?: number;
 };
 
+/** 关闭原因：`cancelled`＝用户 `/cancel`，`interrupted`＝用户 `/interrupt`，`ended`＝生命周期收尾。 */
+export type QuestionCloseReason = "cancelled" | "interrupted" | "ended";
+
 export interface QuestionRecord extends ChatTarget {
   id: string;
   botUid: string;
@@ -137,12 +145,25 @@ export interface QuestionRecord extends ChatTarget {
   answeredBy: string | null;
   /** Remote id of the interactive card carrying this question; `null` for text-only questions. */
   cardMessageId: string | null;
+  /** 建立时间：按时序判断提问是否属于某次主动会话切换之前的旧会话。 */
+  createdAt: number;
+  /**
+   * 行被关闭时记下的原因（`cancelled`/`interrupted`/`ended`）；`null` 只出现在开启迟到提交分流
+   * 之前落库的旧行，读取方按 `ended` 处理。
+   */
+  closedReason: QuestionCloseReason | null;
   /**
    * 本轮 ask 的收场时间（结果已交付给模型，或等待超时/本地取消），`null` 表示既没交付也没收场——
    * 只可能是被重启中断的那一轮，启动恢复据此只认领这些行。
    */
   settledAt: number | null;
 }
+
+/** 新建提问行的输入：状态、答案、卡片绑定与各时间戳都由存储层补。 */
+export type QuestionInsert = Omit<
+  QuestionRecord,
+  "state" | "answer" | "answeredBy" | "cardMessageId" | "createdAt" | "closedReason" | "settledAt"
+>;
 
 export interface WorkerLedgerRecord extends WorkerProcess {
   id: string;

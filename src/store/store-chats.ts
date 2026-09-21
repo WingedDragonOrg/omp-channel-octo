@@ -106,13 +106,15 @@ export function ensureBinding(db: Database, binding: BindingRecord): void {
   const now = Date.now();
   transaction(db, () => {
     run(db,
-      `INSERT INTO chats(bot_uid, channel_type, channel_id, session_id, cwd, session_file, cwd_pinned, created_at, updated_at)
-       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO chats(bot_uid, channel_type, channel_id, session_id, cwd, session_file, cwd_pinned,
+                          session_switched_at, created_at, updated_at)
+       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(bot_uid, channel_type, channel_id) DO UPDATE SET
          session_id = excluded.session_id,
          cwd = excluded.cwd,
          session_file = excluded.session_file,
          cwd_pinned = excluded.cwd_pinned,
+         session_switched_at = COALESCE(excluded.session_switched_at, chats.session_switched_at),
          updated_at = excluded.updated_at`,
       [
         binding.botUid,
@@ -122,6 +124,8 @@ export function ensureBinding(db: Database, binding: BindingRecord): void {
         binding.cwd,
         binding.sessionFile,
         binding.cwdPinned === true ? 1 : 0,
+        // 只有真正的主动换会话（`/new`/`/reset`）带这个时间；其余 upsert 传 null，COALESCE 保留旧值。
+        binding.sessionSwitchedAt ?? null,
         now,
         now,
       ],
@@ -131,7 +135,7 @@ export function ensureBinding(db: Database, binding: BindingRecord): void {
 
 export function getBinding(db: Database, botUid: string, target: ChatTarget): BindingRecord | null {
   const row = query(db,
-    `SELECT bot_uid, channel_type, channel_id, session_id, cwd, session_file, cwd_pinned
+    `SELECT bot_uid, channel_type, channel_id, session_id, cwd, session_file, cwd_pinned, session_switched_at
      FROM chats WHERE bot_uid = ? AND ${targetWhere(target)}`,
     [botUid, ...targetValues(target)],
   )[0];
@@ -144,6 +148,9 @@ export function getBinding(db: Database, botUid: string, target: ChatTarget): Bi
     cwd: asString(row.cwd),
     sessionFile: asNullableString(row.session_file),
     ...(asNumber(row.cwd_pinned) === 1 ? { cwdPinned: true } : {}),
+    sessionSwitchedAt: row.session_switched_at === null || row.session_switched_at === undefined
+      ? null
+      : asNumber(row.session_switched_at),
   };
 }
 

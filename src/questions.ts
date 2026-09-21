@@ -25,7 +25,7 @@ import type {
 } from "./contracts.ts";
 import { safeErrorMessage } from "./errors.ts";
 import type { ChannelStore } from "./store/index.ts";
-import type { InboundClaim, QuestionRecord, TaskRecord } from "./store/store-records.ts";
+import type { InboundClaim, QuestionCloseReason, QuestionRecord, TaskRecord } from "./store/store-records.ts";
 import { targetKey } from "./target.ts";
 
 /**
@@ -39,10 +39,12 @@ const ASK_CARD_SEND_TIMEOUT_MS = 10_000;
 /** 显式 `/cancel`、任务不再恢复、恢复后没认领到等待三种终态在卡片上的说明；行本身都已是 cancelled。 */
 const CANCELLED_NOTE = "任务已取消：该问题不再接受回答。";
 const INTERRUPTED_NOTE = "任务已中断：该问题不再接受回答。";
-const ENDED_NOTE = "任务已结束：该问题不再接受回答。";
-/** 没有等待者时的答复投递文案：等待停住的两种原因各一条。 */
+/** 生命周期收尾（非用户叫停）：行已关闭，但这里仍提交得进来——作为该聊天的新消息交给助手。 */
+const ENDED_NOTE = "任务已结束：该问题不再有等待中的回合；之后在这里提交会作为新消息交给助手。";
+/** 没有等待者时的答复投递文案：等待停住的两种原因各一条，关闭行上的迟到提交第三条。 */
 const TIMEOUT_WAKE_HEADLINE = "[ask 答复] 先前询问的等待已超时停住，现已收到回复；请据此继续：";
 const RESTART_WAKE_HEADLINE = "[ask 答复] 先前询问的等待随重启中断，现已收到回复；请据此继续：";
+const LATE_WAKE_HEADLINE = "[ask 答复] 该问题的原等待已结束，收到关闭后的提交；请作为该聊天的新输入处理：";
 /** Long-poll hold and the pause between rounds that returned immediately or failed. */
 
 /** One recorded answer plus who gave it; `answeredBy` is `null` only for rows written before attribution. */
@@ -235,10 +237,12 @@ export interface QuestionDesk {
    */
   beginRecovery(taskId: string): void;
   /**
-   * 任务确定不再恢复（重启后判为中断、恢复失败）：durably 取消它遗留的待答问题并封闭对应卡片。
-   * 与 `/cancel` 的差别只是范围——这里只波及该任务自己的提问。
+   * 任务确定不再恢复（重启后判为中断、恢复失败）或终止：durably 取消它遗留的待答问题并封闭对应
+   * 卡片，`reason` 记录这次关闭的性质（`cancelled`＝用户取消、`interrupted`＝用户中断、`ended`＝
+   * 生命周期收尾）——迟到提交按它分流，卡片说明与之一致。与 `/cancel` 的差别是范围：这里只波及
+   * 该任务自己的提问。
    */
-  cancelForTask(taskId: string): void;
+  cancelForTask(taskId: string, reason: QuestionCloseReason): void;
   /** 取消一个聊天的问题并封闭其卡片（`/cancel`）。 */
   cancelForTarget(target: ChatTarget): void;
   /** 服务停机：清掉问题计时器。 */
@@ -301,6 +305,15 @@ async function answerPendingQuestion(message: InboundMessage, text: string): Pro
     deps.store.failCommand(claim);
     throw new Error("本地状态盘写入失败，未能记录答案。");
   }
+}
+
+/** 关闭原因对应的卡片说明：用户叫停的两条照旧，生命周期收尾说明「仍可提交」。 */
+function closeNote(reason: QuestionCloseReason): string {
+  return reason === "cancelled"
+    ? CANCELLED_NOTE
+    : reason === "interrupted"
+      ? INTERRUPTED_NOTE
+      : ENDED_NOTE;
 }
 
 /** Groups question rows by the card that carried them; a row without a card carries none. */
@@ -658,7 +671,8 @@ async function askSingleQuestion(
   const abort = () => {
     if (stopped) return;
     // 停机中的中止是暂停：行保持待答，续跑认领后继续等同一个答案。
-    if (!deps.stopping()) deps.store.cancelQuestion(id);
+    // 非用户叫停的拆除（失败、重启回收……）记 `ended`：这条行上的迟到提交仍作为新输入投递。
+    if (!deps.stopping()) deps.store.cancelQuestion(id, "ended");
     questionWaiters.delete(id);
     completion.reject(new Error("question cancelled"));
   };
@@ -687,7 +701,7 @@ async function askSingleQuestion(
     questionWaiters.delete(id);
     if (!stopped && !deps.stopping()) {
       forgetAskGeneration(deps.store.getQuestion(id)?.cardMessageId ?? null);
-      deps.store.cancelQuestion(id);
+      deps.store.cancelQuestion(id, "ended");
     }
   }
 }
@@ -740,7 +754,7 @@ async function askQuestionSet(
       const abort = () => {
         if (stopped) return;
         // 停机中的中止是暂停：整组行保持待答，续跑认领后继续等同一个答案。
-        if (!deps.stopping()) deps.store.cancelQuestion(spec.id);
+        if (!deps.stopping()) deps.store.cancelQuestion(spec.id, "ended");
         questionWaiters.delete(spec.id);
         completion.reject(new Error("question cancelled"));
       };
@@ -784,7 +798,7 @@ async function askQuestionSet(
       questionWaiters.delete(spec.id);
       if (!stopped && !deps.stopping()) {
         forgetAskGeneration(deps.store.getQuestion(spec.id)?.cardMessageId ?? null);
-        deps.store.cancelQuestion(spec.id);
+        deps.store.cancelQuestion(spec.id, "ended");
       }
     }
     for (const cleanup of cleanups) cleanup();
@@ -896,7 +910,7 @@ function closeUnclaimedRecovery(taskId: string): void {
     // 已被 Store 按终态/停止意图取消的行也要投影：取消是 CAS，重复无害，而卡片可能还开着。
     if (question?.state === "pending" || question?.state === "cancelled") open.push(question);
   }
-  for (const question of open) deps.store.cancelQuestion(question.id);
+  for (const question of open) deps.store.cancelQuestion(question.id, "ended");
   closeQuestionCards(botUid, open, ENDED_NOTE);
 }
 
@@ -1270,15 +1284,89 @@ async function answerFromCard(action: BotCardAction): Promise<BotEventOutcome> {
 }
 
 /**
- * Applies one click on a single-question card. An answered question can only be reached by a
- * replay of the click that answered it (the rewrite removed its buttons), so it stays silent; a
- * question that never got an answer is worth telling the operator about.
+ * 关闭行上的提交是否按迟到答复接受：只有生命周期关闭（任务自行结束、恢复收尾、重启相关收尾、
+ * 超时清扫与迁移前的旧行）接受；用户明确停止（`/cancel`、`/interrupt`）留下的关闭、以及提问早于
+ * 本聊天最近一次主动换会话（`/new`/`/reset`，`chats.session_switched_at`）的旧行都不接受，只回
+ * 一次失效提示。切换判断只在关闭行上生效：仍待答（等待超时停住）的问题照旧记录答案并唤醒。
+ */
+function lateAccepted(question: QuestionRecord, target: ChatTarget): boolean {
+  if (question.closedReason === "cancelled" || question.closedReason === "interrupted") return false;
+  const switchedAt = deps.store.getBinding(currentBotUid(), target)?.sessionSwitchedAt ?? null;
+  return switchedAt === null || question.createdAt >= switchedAt;
+}
+
+/**
+ * 一组关闭行上的迟到答复：逐行 compare-and-set 成 `answered`（每行一个赢家，事件重投与重启重放
+ * 都只会读到 `answered` 后静默），返回真正落行的那些行。调用方负责卡片改写与一次性唤醒。
+ */
+function landLateAnswers(
+  entries: ReadonlyArray<{ question: QuestionRecord; answer: string; answeredBy: string }>,
+): Array<{ question: QuestionRecord; answer: string; answeredBy: string }> {
+  const landed: Array<{ question: QuestionRecord; answer: string; answeredBy: string }> = [];
+  for (const entry of entries) {
+    if (deps.store.answerClosedQuestion(entry.question.id, currentBotUid(), entry.question, entry.answer, entry.answeredBy)) {
+      landed.push(entry);
+    }
+  }
+  return landed;
+}
+
+/**
+ * 关闭行上一次点击解出的答案：动作 id、问题载荷与答案内容三者都成立才有值，任何一步不成（未知
+ * action、空提交、越界选择）都是 `null`——绝不为猜不到的提交补一个答案。
+ */
+function closedClickAnswer(question: QuestionRecord, action: BotCardAction): string | null {
+  const ref = parseAskActionId(action.actionId);
+  const payload = parseQuestionPayload(question);
+  const ask = payload === null ? null : askQuestionFromPayload(payload);
+  if (ref === null || ask === null) return null;
+  const resolved = resolveAskAnswer(ask, ref, action.inputs);
+  if (resolved.kind !== "answer") return null;
+  try {
+    return normalizeAnswer(question, resolved.answer);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 关闭行上的一次提交：接受就落行、改写卡片并把整组作为该聊天的一条新输入投递；不接受（用户
+ * 明确停掉、切换前的旧会话，或解不出答案）只回一次失效提示。重复提交与重投落不进行，因此静默。
+ */
+function submitClosedAnswer(question: QuestionRecord, answer: string, answeredBy: string): BotEventOutcome {
+  let landed: Array<{ question: QuestionRecord; answer: string; answeredBy: string }>;
+  try {
+    landed = landLateAnswers([{ question, answer, answeredBy }]);
+  } catch {
+    return "retry";
+  }
+  if (landed.length === 0) return "handled";
+  rewriteAskCard(question, { kind: "answered", answer, answeredBy });
+  forgetAskGeneration(question.cardMessageId);
+  wakeForAnswers(landed, LATE_WAKE_HEADLINE);
+  return "handled";
+}
+
+/**
+ * Applies one click on a single-question card. A visible question answers as it always did. An
+ * answered question is reached by a replay of the click that answered it (or by a deliberate new
+ * selection) and stays silent either way: the answer already reached its ask, and a change of mind
+ * arrives as an ordinary message. A closed question is decided by `lateAccepted` — the lifecycle
+ * closed it without anyone stopping it, so a submission still becomes input for this chat; a
+ * question the operator stopped, or one asked before the current session, only gets the notice.
  */
 function answerSingleCardClick(question: QuestionRecord, action: BotCardAction, answeredBy: string): BotEventOutcome {
-  if (question.state === "answered") return "handled";
   if (question.state !== "pending") {
-    deps.enqueueText(question, "该问题已失效，本次点击未作为答案。", null);
-    return "handled";
+    if (question.state === "answered") return "handled";
+    // 不是本卡发放的形状（别的卡片或伪造的 action id）不回应；本卡上的提交按下面的规则分流。
+    if (parseAskActionId(action.actionId) === null) return "handled";
+    const target: ChatTarget = { channelType: question.channelType, channelId: question.channelId };
+    const answer = lateAccepted(question, target) ? closedClickAnswer(question, action) : null;
+    if (answer === null) {
+      deps.enqueueText(question, "该问题已失效，本次点击未作为答案。", null);
+      return "handled";
+    }
+    return submitClosedAnswer(question, answer, answeredBy);
   }
   const ref = parseAskActionId(action.actionId);
   const payload = parseQuestionPayload(question);
@@ -1309,6 +1397,11 @@ function answerSingleCardClick(question: QuestionRecord, action: BotCardAction, 
  * compare-and-set in a single transaction, the questions it left empty stay open, and the card
  * is rewritten once — closed when nothing waits anymore, otherwise re-rendered behind fresh
  * action ids. A replay of an already consumed submission changes nothing.
+ *
+ * Closed questions on the same card follow `lateAccepted`: the ones the lifecycle closed are
+ * recorded and delivered once as new input for this chat (they join no waiter), the ones the
+ * operator stopped — or older than the current session — are left alone; the notice fires only
+ * when the whole submission produced nothing at all.
  */
 function answerSetCardClick(
   target: ChatTarget,
@@ -1317,12 +1410,8 @@ function answerSetCardClick(
   answeredBy: string,
 ): BotEventOutcome {
   const pending = rows.filter(({ state }) => state === "pending");
-  if (pending.length === 0) {
-    if (!rows.every(({ state }) => state === "answered")) {
-      deps.enqueueText(target, "该问题已失效，本次点击未作为答案。", null);
-    }
-    return "handled";
-  }
+  const closed = rows.filter(({ state }) => state !== "pending" && state !== "answered");
+  if (pending.length === 0 && closed.length === 0) return "handled";
   const ref = parseAskActionId(action.actionId);
   if (ref === null || ref.kind !== "submit") return "handled";
   const filled: Array<{ id: string; answer: string; answeredBy: string }> = [];
@@ -1334,15 +1423,31 @@ function answerSetCardClick(
     const answer = resolveAskSetAnswer(ask, position.index, action.inputs);
     if (answer !== null) filled.push({ id: question.id, answer, answeredBy });
   }
-  if (filled.length === 0) {
+  const late: Array<{ question: QuestionRecord; answer: string; answeredBy: string }> = [];
+  for (const question of closed) {
+    if (!lateAccepted(question, target)) continue;
+    const payload = parseQuestionPayload(question);
+    const ask = payload === null ? null : askQuestionFromPayload(payload);
+    const position = payload === null ? null : questionPosition(payload);
+    if (ask === null || position === null) continue;
+    const answer = resolveAskSetAnswer(ask, position.index, action.inputs);
+    if (answer !== null) late.push({ question, answer, answeredBy });
+  }
+  if (filled.length === 0 && late.length === 0) {
+    if (pending.length === 0) {
+      deps.enqueueText(target, "该问题已失效，本次点击未作为答案。", null);
+      return "handled";
+    }
     retryAskCardSet(rows, ref.generation, "未收到内容：请至少填写一题后重新提交，或直接回复本消息作答。");
     return "handled";
   }
-  let landed: string[];
-  try {
-    landed = deps.store.answerQuestions(currentBotUid(), target, filled);
-  } catch {
-    return "retry";
+  let landed: string[] = [];
+  if (filled.length > 0) {
+    try {
+      landed = deps.store.answerQuestions(currentBotUid(), target, filled);
+    } catch {
+      return "retry";
+    }
   }
   const byId = new Map(filled.map(({ id, answer }) => [id, answer]));
   const byQuestion = new Map(pending.map((question) => [question.id, question]));
@@ -1352,6 +1457,14 @@ function answerSetCardClick(
     const question = byQuestion.get(id);
     if (!releaseQuestion(id, { answer, answeredBy }) && question !== undefined) {
       speaking.push({ question, answer, answeredBy });
+    }
+  }
+  let lateLanded: Array<{ question: QuestionRecord; answer: string; answeredBy: string }> = [];
+  if (late.length > 0) {
+    try {
+      lateLanded = landLateAnswers(late);
+    } catch {
+      return "retry";
     }
   }
   const fresh = deps.store.listQuestionsByCard(currentBotUid(), target, action.messageId);
@@ -1366,6 +1479,7 @@ function answerSetCardClick(
     rewriteAskCardSet(fresh, { kind: "closed", note: null }, null);
   }
   wakeForAnswers(speaking, TIMEOUT_WAKE_HEADLINE);
+  wakeForAnswers(lateLanded, LATE_WAKE_HEADLINE);
   return "handled";
 }
 
@@ -1373,16 +1487,17 @@ function answerSetCardClick(
     const botUid = deps.botUid();
     if (botUid === undefined) return;
     const openQuestions = deps.store.listPendingQuestions(botUid, target);
-    deps.store.cancelQuestions(botUid, target);
+    deps.store.cancelQuestions(botUid, target, "cancelled");
     forgetRecoveredTarget(target);
     closeQuestionCards(botUid, openQuestions, CANCELLED_NOTE);
   }
 
   /**
    * 任务确定不再恢复：取消它遗留的待答问题、封闭卡片，并丢掉还没被认领的快照。范围只到该任务自己的
-   * 提问——同一聊天里别的任务的问题不受影响。
+   * 提问——同一聊天里别的任务的问题不受影响。关闭原因由调用方给出（用户取消、用户中断、生命周期
+   * 收尾），它决定迟到提交是被接受为新输入还是只回一次失效提示，卡片说明与之一致。
    */
-  function cancelForTask(taskId: string): void {
+  function cancelForTask(taskId: string, reason: QuestionCloseReason): void {
     recoveryQuestions.delete(taskId);
     const botUid = deps.botUid();
     if (botUid === undefined) return;
@@ -1390,8 +1505,8 @@ function answerSetCardClick(
     // 进程随后被杀时，行是 cancelled 而卡片还挂着，所以已取消的行同样要收进来。
     const open = deps.store.listTaskQuestions(taskId)
       .filter(({ state }) => state === "pending" || state === "cancelled");
-    deps.store.cancelTaskQuestions(taskId);
-    closeQuestionCards(botUid, open, INTERRUPTED_NOTE);
+    deps.store.cancelTaskQuestions(taskId, reason);
+    closeQuestionCards(botUid, open, closeNote(reason));
   }
 
   /**
