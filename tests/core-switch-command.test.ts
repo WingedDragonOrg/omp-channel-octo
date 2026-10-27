@@ -255,6 +255,40 @@ test("a failed probe reports a bounded error and changes nothing", async () => {
   }
 });
 
+test("a failed model probe recovers its worker when stop cannot confirm termination", async () => {
+  class RecoverableProbeFactory extends FakeWorkerFactory {
+    private terminate: (() => Promise<boolean>) | undefined;
+
+    override async create(options: WorkerOptions): Promise<OmpWorker> {
+      const worker = await super.create(options);
+      this.terminate = worker.stop.bind(worker);
+      worker.stop = async () => false;
+      return worker;
+    }
+
+    override async recover(): Promise<boolean> {
+      return this.terminate!();
+    }
+  }
+
+  const workers = new RecoverableProbeFactory();
+  workers.failModelsWith(new Error("model query failed"));
+  const harness = await createCoreHarness({ workers });
+  try {
+    await harness.service.handleInbound(inbound({ ...DM, messageId: "switch-recover", text: "/switch" }));
+    expect(await sentText(harness)).toBe("无法从 OMP 读取模型信息，请稍后重试。");
+    expect(workers.workers[0]?.stopped).toBe(true);
+    const store = await openChannelStore(harness.stateDir);
+    try {
+      expect(store.listWorkerLedger(harness.bot.uid)).toEqual([]);
+    } finally {
+      store.close();
+    }
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
 test("a deployment without any available model says so", async () => {
   const harness = await createCoreHarness();
   try {

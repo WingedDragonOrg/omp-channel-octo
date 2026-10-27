@@ -233,10 +233,13 @@ export class ModelSwitchController {
         blockDirectories: [cwd],
         blockDirectory: this.deps.blockDirectory,
       });
+      let failed = true;
       try {
-        return await run(lease.worker);
+        const result = await run(lease.worker);
+        failed = false;
+        return result;
       } finally {
-        await lease.close();
+        await lease.close(failed);
       }
     } finally {
       await rm(sessionDir, { recursive: true, force: true }).catch(() => {});

@@ -10,7 +10,7 @@ import type { WorkerLedgerRecord } from "../store/store-records.ts";
 export interface TrackedWorker {
   readonly worker: OmpWorker;
   markMoveTarget(cwd: string): void;
-  close(): Promise<boolean>;
+  close(recoverOnFailure?: boolean): Promise<boolean>;
 }
 
 export interface OpenTrackedWorkerOptions {
@@ -71,12 +71,19 @@ export async function openTrackedWorker(options: OpenTrackedWorkerOptions): Prom
   return {
     worker,
     markMoveTarget: (cwd) => options.store.markWorkerMoveTarget(options.ledger.id, cwd),
-    close: async () => {
+    close: async (recoverOnFailure = false) => {
       let stopped = false;
       try {
         stopped = await worker.stop();
       } catch {
         // A rejected stop is not confirmation that the process group has exited.
+      }
+      if (!stopped && recoverOnFailure && spawned) {
+        try {
+          stopped = await options.workerFactory.recover(spawned);
+        } catch {
+          // An unconfirmed process remains blocked below.
+        }
       }
       if (stopped) options.store.markWorkerStopped(options.ledger.id);
       else blockDirectories(options);
