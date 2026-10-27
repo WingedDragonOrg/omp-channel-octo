@@ -16,7 +16,6 @@ import type {
   CoreServiceConfig,
   OmpWorker,
   WorkerFactory,
-  WorkerProcess,
 } from "../contracts.ts";
 import { safeErrorMessage } from "../errors.ts";
 import { modelWithLevel } from "../commands/model-switch.ts";
@@ -29,6 +28,7 @@ import {
   type ProjectSessionState,
 } from "./project-session.ts";
 import { ensureProjectSessionDir, projectSessionDir, sessionsRoot } from "./session-dir.ts";
+import { openTrackedWorker, type TrackedWorker } from "../runtime/worker-lease.ts";
 import type { ChannelStore } from "../store/index.ts";
 import type { BindingRecord } from "../store/store-records.ts";
 import type { DirectoryLease } from "../tasks/task-scheduler.ts";
@@ -197,46 +197,42 @@ export class SessionLifecycle {
       const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.deps.config), cwd);
       const ledgerId = `new-${sessionId}`;
       const ledgerSessionFile = join(sessionDir, `${sessionId}.jsonl`);
-      let spawned: WorkerProcess | undefined;
-      let candidate: OmpWorker | undefined;
-      let stopped = false;
+      let candidate: TrackedWorker | undefined;
+      let closeAttempted = false;
       let persistenceFailed = false;
       try {
         const chatModel = this.deps.store.getChatModel(this.deps.bot()!.uid, target);
-        candidate = await this.deps.workerFactory.create({
-          cwd,
-          sessionDir,
-          ...(chatModel === null ? {} : { model: chatModel }),
-          onSpawn: (processInfo) => {
-            spawned = processInfo;
-            this.deps.store.recordWorker({
-              id: ledgerId,
-              botUid: this.deps.bot()!.uid,
-              sessionId,
-              sessionFile: ledgerSessionFile,
-              pid: processInfo.pid,
-              pgid: processInfo.pgid,
-              identity: processInfo.identity,
-              cwd: processInfo.cwd,
-              moveTargetCwd: null,
-              state: "running",
-            });
+        candidate = await openTrackedWorker({
+          workerFactory: this.deps.workerFactory,
+          store: this.deps.store,
+          worker: {
+            cwd,
+            sessionDir,
+            ...(chatModel === null ? {} : { model: chatModel }),
           },
+          ledger: {
+            id: ledgerId,
+            botUid: this.deps.bot()!.uid,
+            sessionId,
+            sessionFile: ledgerSessionFile,
+            moveTargetCwd: null,
+          },
+          blockDirectories: [cwd],
+          blockDirectory: this.deps.blockDirectory,
         });
-        const freshState: ProjectSessionState = await candidate.refreshState();
+        const freshState: ProjectSessionState = await candidate.worker.refreshState();
         const previousForFresh: ProjectSessionBinding = previous ?? {
           sessionId: "",
           cwd,
           sessionFile: null,
         };
         const fresh = await verifyFreshSession(previousForFresh, freshState, cwd);
-        const model = await this.createdSessionModel(candidate);
-        stopped = await candidate.stop();
-        if (!stopped) {
-          this.deps.blockDirectory(cwd);
+        const model = await this.createdSessionModel(candidate.worker);
+        closeAttempted = true;
+        if (!await candidate.close()) {
+          closeAttempted = false;
           throw new Error("worker did not stop");
         }
-        this.deps.store.markWorkerStopped(ledgerId);
         const binding: BindingRecord = {
           botUid: this.deps.bot()!.uid,
           channelId: target.channelId,
@@ -261,20 +257,9 @@ export class SessionLifecycle {
           null,
         );
       } catch {
-        if (candidate && !stopped) {
-          const verified = await candidate.stop().catch(() => false);
-          if (verified) {
-            this.deps.store.markWorkerStopped(ledgerId);
-          } else {
-            this.deps.blockDirectory(cwd);
-          }
-        } else if (spawned && !stopped) {
-          const verified = await this.deps.workerFactory.recover(spawned).catch(() => false);
-          if (verified) {
-            this.deps.store.markWorkerStopped(ledgerId);
-          } else {
-            this.deps.blockDirectory(cwd);
-          }
+        if (candidate && !closeAttempted) {
+          closeAttempted = true;
+          await candidate.close();
         }
         if (persistenceFailed) throw new Error("本地状态盘写入失败，会话未切换。");
         await this.deps.enqueueText(target, "无法创建可恢复的 OMP 会话，当前绑定未改变。", null);
@@ -333,44 +318,39 @@ export class SessionLifecycle {
       await commandLease.ready;
       const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.deps.config), cwd);
       const ledgerId = `move-${randomUUID()}`;
-      let spawned: WorkerProcess | undefined;
-      let candidate: OmpWorker | undefined;
-      let stopped = false;
+      let candidate: TrackedWorker | undefined;
+      let closeAttempted = false;
       let persistenceFailed = false;
       try {
         const chatModel = this.deps.store.getChatModel(this.deps.bot()!.uid, target);
-        candidate = await this.deps.workerFactory.create({
-          cwd: previous.cwd,
-          sessionDir,
-          sessionFile,
-          ...(chatModel === null ? {} : { model: chatModel }),
-          onSpawn: (processInfo) => {
-            spawned = processInfo;
-            this.deps.store.recordWorker({
-              id: ledgerId,
-              botUid: this.deps.bot()!.uid,
-              sessionId: previous.sessionId,
-              sessionFile,
-              pid: processInfo.pid,
-              pgid: processInfo.pgid,
-              identity: processInfo.identity,
-              cwd: processInfo.cwd,
-              moveTargetCwd: null,
-              state: "running",
-            });
+        candidate = await openTrackedWorker({
+          workerFactory: this.deps.workerFactory,
+          store: this.deps.store,
+          worker: {
+            cwd: previous.cwd,
+            sessionDir,
+            sessionFile,
+            ...(chatModel === null ? {} : { model: chatModel }),
           },
+          ledger: {
+            id: ledgerId,
+            botUid: this.deps.bot()!.uid,
+            sessionId: previous.sessionId,
+            sessionFile,
+            moveTargetCwd: null,
+          },
+          blockDirectories: [previous.cwd, cwd],
+          blockDirectory: this.deps.blockDirectory,
         });
-        this.deps.store.markWorkerMoveTarget(ledgerId, cwd);
-        await candidate.prompt(`/move ${cwd}`, () => {});
-        const movedState: ProjectSessionState = await candidate.refreshState();
+        candidate.markMoveTarget(cwd);
+        await candidate.worker.prompt(`/move ${cwd}`, () => {});
+        const movedState: ProjectSessionState = await candidate.worker.refreshState();
         const moved = await verifyMovedSession(previous, movedState, cwd);
-        stopped = await candidate.stop();
-        if (!stopped) {
-          this.deps.blockDirectory(previous.cwd);
-          this.deps.blockDirectory(cwd);
+        closeAttempted = true;
+        if (!await candidate.close()) {
+          closeAttempted = false;
           throw new Error("worker did not stop");
         }
-        this.deps.store.markWorkerStopped(ledgerId);
         const binding: BindingRecord = {
           ...previous,
           sessionId: moved.sessionId,
@@ -387,22 +367,9 @@ export class SessionLifecycle {
         }
         await this.deps.enqueueText(target, `已迁移会话 ${binding.sessionId}，cwd=${binding.cwd}`, null);
       } catch {
-        if (candidate && !stopped) {
-          const verified = await candidate.stop().catch(() => false);
-          if (verified) {
-            this.deps.store.markWorkerStopped(ledgerId);
-          } else {
-            this.deps.blockDirectory(previous.cwd);
-            this.deps.blockDirectory(cwd);
-          }
-        } else if (spawned && !stopped) {
-          const verified = await this.deps.workerFactory.recover(spawned).catch(() => false);
-          if (verified) {
-            this.deps.store.markWorkerStopped(ledgerId);
-          } else {
-            this.deps.blockDirectory(previous.cwd);
-            this.deps.blockDirectory(cwd);
-          }
+        if (candidate && !closeAttempted) {
+          closeAttempted = true;
+          await candidate.close();
         }
         if (persistenceFailed) throw new Error("本地状态盘写入失败，会话未迁移。");
         await this.deps.enqueueText(target, "无法验证 OMP 原生 /move，当前绑定未改变。", null);

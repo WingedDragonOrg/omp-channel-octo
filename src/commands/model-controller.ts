@@ -21,10 +21,10 @@ import type {
   WorkerFactory,
   WorkerModelCatalog,
   WorkerModelSwitch,
-  WorkerProcess,
 } from "../contracts.ts";
 import { boundedSelectorText, formatModelCatalog, modelCatalogCurrent, modelWithLevel, switchCardChoices } from "./model-switch.ts";
 import type { ChannelStore } from "../store/index.ts";
+import { openTrackedWorker } from "../runtime/worker-lease.ts";
 
 const SWITCH_PROBE_FAILED_TEXT = "无法从 OMP 读取模型信息，请稍后重试。";
 const SWITCH_CWD_UNAVAILABLE_TEXT = "无法解析该聊天的工作目录，/switch 暂不可用。";
@@ -218,42 +218,26 @@ export class ModelSwitchController {
     const sessionDir = await mkdtemp(join(tmpdir(), "omp-channel-octo-switch-"));
     const sessionId = randomUUID();
     const ledgerId = `switch-${sessionId}`;
-    let spawned: WorkerProcess | undefined;
-    let stopped = false;
     try {
-      const candidate = await this.deps.workerFactory.create({
-        cwd,
-        sessionDir,
-        onSpawn: (processInfo) => {
-          spawned = processInfo;
-          this.deps.store.recordWorker({
-            id: ledgerId,
-            botUid: this.deps.botUid(),
-            sessionId,
-            sessionFile: join(sessionDir, `${sessionId}.jsonl`),
-            pid: processInfo.pid,
-            pgid: processInfo.pgid,
-            identity: processInfo.identity,
-            cwd: processInfo.cwd,
-            moveTargetCwd: null,
-            state: "running",
-          });
+      const lease = await openTrackedWorker({
+        workerFactory: this.deps.workerFactory,
+        store: this.deps.store,
+        worker: { cwd, sessionDir },
+        ledger: {
+          id: ledgerId,
+          botUid: this.deps.botUid(),
+          sessionId,
+          sessionFile: join(sessionDir, `${sessionId}.jsonl`),
+          moveTargetCwd: null,
         },
+        blockDirectories: [cwd],
+        blockDirectory: this.deps.blockDirectory,
       });
       try {
-        return await run(candidate);
+        return await run(lease.worker);
       } finally {
-        stopped = await candidate.stop().catch(() => false);
-        if (stopped) this.deps.store.markWorkerStopped(ledgerId);
-        else this.deps.blockDirectory(cwd);
+        await lease.close();
       }
-    } catch (error) {
-      if (!stopped && spawned) {
-        const verified = await this.deps.workerFactory.recover(spawned).catch(() => false);
-        if (verified) this.deps.store.markWorkerStopped(ledgerId);
-        else this.deps.blockDirectory(cwd);
-      }
-      throw error;
     } finally {
       await rm(sessionDir, { recursive: true, force: true }).catch(() => {});
     }

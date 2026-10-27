@@ -4,15 +4,15 @@ import { basename, isAbsolute, join } from "node:path";
 import { throwIfAborted } from "./abort.ts";
 import { normalizeGroupContext } from "./session/context-sidecar.ts";
 import type {
-  ChannelServiceOptions,
+  ChannelTransport,
   ChatTarget,
-  GroupContext,
   GroupMember,
   HostTool,
   InboundMessage,
   TaskRelayTarget,
   ThreadSummary,
   WorktreeMergeRequest,
+  WorktreePort,
 } from "./contracts.ts";
 import { isTransientServerFailure } from "./errors.ts";
 import type { ChannelStore } from "./store/index.ts";
@@ -20,14 +20,29 @@ import type { TaskRecord } from "./store/store-records.ts";
 import { taskTarget } from "./target.ts";
 import { threadChannelId, threadParentGroupId, threadShortId } from "./threads/thread-target.ts";
 import { worktreeSlug } from "./workspace/worktree.ts";
-
 /**
- * Host tools 需要的那部分 channel 状态。工具由服务在任务内组装，依赖以接口传入：工具模块
- * 因此不持有服务实例，也不需要知道任务调度、会话迁移或出站投递是怎么实现的。
+ * Host tools need only the channel capabilities they actually use. The service passes this port
+ * while keeping task scheduling, session migration and outbound delivery internals private.
  */
 export interface HostToolHost {
-  readonly options: ChannelServiceOptions;
-  readonly store: ChannelStore;
+  readonly stateDir: string;
+  readonly transport: Pick<
+    ChannelTransport,
+    | "getGroupContext"
+    | "updateGroupContext"
+    | "getGroupInfo"
+    | "getGroupMembers"
+    | "updateGroupInfo"
+    | "listThreads"
+    | "createThread"
+    | "getThread"
+    | "getThreadMembers"
+    | "joinThread"
+    | "leaveThread"
+    | "deleteThread"
+  >;
+  readonly worktrees: WorktreePort | undefined;
+  readonly store: Pick<ChannelStore, "enqueueOutbox" | "getBinding" | "ensureBinding" | "getOwnerId">;
   /** 任务必然属于已注册的 Bot，构造工具时身份一定存在。 */
   readonly botUid: string;
   enqueueText(target: ChatTarget, text: string, taskId: string | null): void;
@@ -142,11 +157,11 @@ function managementThread(thread: ThreadSummary): {
   };
 }
 
-export function createHostTools(host: HostToolHost, task: TaskRecord, _snapshot: GroupContext | null): HostTool[] {
+export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[] {
   const target = taskTarget(task);
   const fileTool: HostTool = {
     name: "octo_send_file",
-    description: "发送当前 cwd 下的图片或文件；目标由当前聊天绑定。",
+    description: "发送文件：相对路径按当前 cwd 解析，绝对路径可引用本地其他文件；目标由当前聊天绑定。",
     parameters: {
       type: "object",
       properties: {
@@ -165,7 +180,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord, _snapshot:
       const canonical = await realpath(requested);
       const details = await stat(canonical);
       if (!details.isFile()) throw new Error("file path is not a regular file");
-      const spoolDirectory = join(host.options.config.stateDir, "spool", randomUUID());
+      const spoolDirectory = join(host.stateDir, "spool", randomUUID());
       await mkdir(spoolDirectory, { recursive: true });
       const spoolPath = join(spoolDirectory, basename(canonical));
       try {
@@ -415,7 +430,7 @@ async function runManagementTool(
     }
     return resolved;
   };
-  const transport = host.options.transport;
+  const transport = host.transport;
   throwIfAborted(signal);
   switch (action) {
     case "description-read": {
@@ -517,7 +532,7 @@ async function runManagementTool(
       if (!workspace || workspace.cwdPinned !== true) {
         throw new Error("当前子区未绑定隔离工作区，无法合并");
       }
-      const worktrees = host.options.worktrees;
+      const worktrees = host.worktrees;
       if (!worktrees) throw new Error("本部署未配置隔离工作区能力");
       try {
         const summary = await worktrees.merge(mergeRequest(workspace.cwd), signal);
@@ -564,7 +579,7 @@ async function deleteThread(
   shortId: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  const transport = host.options.transport;
+  const transport = host.transport;
   try {
     await transport.deleteThread(groupId, shortId, signal);
     return;
@@ -594,7 +609,7 @@ async function cleanupThreadWorkspace(
   force: boolean,
   signal?: AbortSignal,
 ): Promise<string | null> {
-  const worktrees = host.options.worktrees;
+  const worktrees = host.worktrees;
   if (!worktrees) return null;
   const binding = host.store.getBinding(host.botUid, {
     channelId: threadChannelId(groupId, shortId),
@@ -632,7 +647,7 @@ async function createThreadWorkspace(
   workspaceName: string,
   signal?: AbortSignal,
 ): Promise<{ worktree: { path: string; branch: string } } | { worktree_error: string }> {
-  const worktrees = host.options.worktrees;
+  const worktrees = host.worktrees;
   if (!worktrees) return { worktree_error: "本部署未配置隔离工作区能力" };
   try {
     const workspace = await worktrees.create(
@@ -708,7 +723,7 @@ async function dispatchThreadTask(
   notify: boolean,
   signal: AbortSignal,
 ): Promise<string> {
-  const thread = await host.options.transport.getThread(groupId, shortId, signal);
+  const thread = await host.transport.getThread(groupId, shortId, signal);
   if (thread.groupId.length > 0 && thread.groupId !== groupId) {
     throw new Error(`thread ${shortId} does not belong to the current group`);
   }

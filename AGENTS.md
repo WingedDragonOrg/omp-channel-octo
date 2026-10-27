@@ -117,6 +117,7 @@ The resident service on this host is managed by Super: the stack at `~/.super/co
 ## Code Conventions & Common Patterns
 
 - Use strict TypeScript contracts from `src/contracts.ts` and explicit dependency injection through `createChannelService`, `createOctoTransport`, `createWorkerFactory`, and option interfaces. Keep transport, persistence, worker, and presentation seams independently testable.
+- For non-trivial changes, identify the single owner of each new piece of knowledge, what callers must know, and who guarantees cross-module state or ordering invariants; if any cannot be localized, adjust the boundary before implementation.
 - Keep explicit `.ts` import extensions and follow the ESM/Bundler configuration in `tsconfig.json`.
 - Validate untrusted config, protocol frames, message metadata, paths, and tool results at their boundaries. Use type guards and bounded body/frame sizes instead of assuming external shapes.
 - Use `AbortSignal` and bounded deadlines for network activity, typing/card operations, worker cancellation, and shutdown. Pair resource ownership with `try`/`finally`; preserve the original error when rolling back a store transaction.

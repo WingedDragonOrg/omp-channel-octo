@@ -61,8 +61,9 @@ export class GroupHistoryCoordinator {
   constructor(private readonly deps: GroupHistoryDeps) {}
 
   /**
-   * Every group/thread message proves coverage before any permission gate; only text
-   * from other senders becomes a renderable entry.
+   * Group/thread messages are recorded for coverage before permission gates. Supported, non-Bot
+   * messages with text or attachment metadata can become renderable history entries, including
+   * messages from other senders.
    */
   record(message: InboundMessage): void {
     if (this.deps.config?.enabled !== true) return;

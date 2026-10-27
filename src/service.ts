@@ -21,6 +21,7 @@ import {
 } from "./inbound/attachments.ts";
 import { ChatAuthorization } from "./inbound/chat-authorization.ts";
 import { acquireBotLock, assertBotLockFree, type LockHandle } from "./runtime/bot-lock.ts";
+import { openTrackedWorker, type TrackedWorker } from "./runtime/worker-lease.ts";
 import { TaskStartupError } from "./contracts.ts";
 import type {
   BotIdentity,
@@ -32,7 +33,6 @@ import type {
   ChatExecutionState,
   ChatTarget,
   ContextInjection,
-  GroupContext,
   PromptContext,
   InboundMessage,
   OmpWorker,
@@ -40,7 +40,6 @@ import type {
   TaskRelayTarget,
   WorkerEvent,
   WorkerOptions,
-  WorkerProcess,
 } from "./contracts.ts";
 import { DEFAULT_ASK_TIMEOUT_MS } from "./contracts.ts";
 import { TurnContext } from "./session/turn-context.ts";
@@ -1301,7 +1300,9 @@ class CoreService implements ChannelService {
     const botUid = this.bot?.uid;
     if (botUid === undefined) throw new Error("Bot 身份未注册，无法构造 host tools");
     return {
-      options: this.options,
+      stateDir: this.options.config.stateDir,
+      transport: this.options.transport,
+      worktrees: this.options.worktrees,
       store: this.store,
       botUid,
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
@@ -1373,8 +1374,7 @@ class CoreService implements ChannelService {
     };
     this.runtimes.set(taskId, runtime);
     let worker: OmpWorker | undefined;
-    let workerLedgerId: string | undefined;
-    let spawned: WorkerProcess | undefined;
+    let workerLease: TrackedWorker | undefined;
     const textDelivery = this.outbox.registerTask(taskId);
     const target = taskTarget(task);
     /** 本回合的群说明事务：快照、ledger 决策与本回合 sidecar 都归它，服务只按序调用。 */
@@ -1398,7 +1398,6 @@ class CoreService implements ChannelService {
       steerConsumed: (event) => this.noteSteerConsumed(runtime, event),
       discardStopIntent: () => this.store.clearTaskStopIntent(taskId),
     });
-    let snapshot: GroupContext | null = null;
     let contextInjection: ContextInjection | undefined;
     let startupPhase: TaskStartupPhase = "context";
 
@@ -1407,7 +1406,7 @@ class CoreService implements ChannelService {
     runtime.rollProgressCard = () => progress.roll();
 
     try {
-      snapshot = turnContext ? await turnContext.load() : null;
+      if (turnContext) await turnContext.load();
       if (runtime.cancelRequested) {
         this.store.markCancelled(taskId);
         return;
@@ -1430,42 +1429,35 @@ class CoreService implements ChannelService {
       }
       const chatModel = this.store.getChatModel(this.bot!.uid, target);
       const contextScope = turnContext?.workerScope;
-      const workerOptions: WorkerOptions = {
+      const workerOptions: Omit<WorkerOptions, "onSpawn"> = {
         ...(contextScope === undefined ? {} : { contextScope }),
         cwd: task.cwd,
         sessionDir,
         ...(chatModel === null ? {} : { model: chatModel }),
-        onSpawn: (processInfo) => {
-          spawned = processInfo;
-          workerLedgerId = task.id;
-          this.store.recordWorker({
-            id: task.id,
-            botUid: this.bot!.uid,
-            sessionId: task.sessionId,
-            sessionFile: binding?.sessionFile ?? join(sessionDir, `${task.sessionId}.jsonl`),
-            pid: processInfo.pid,
-            pgid: processInfo.pgid,
-            identity: processInfo.identity,
-            cwd: processInfo.cwd,
-            moveTargetCwd: null,
-            state: "running",
-          });
-        },
       };
       if (binding?.sessionFile) {
         const sessionFile = await existingSessionFile(binding.sessionFile);
         if (!sessionFile) throw new TaskStartupError("session-invalid", "绑定的 OMP 会话文件不存在");
         workerOptions.sessionFile = sessionFile;
       }
-      worker = await this.options.workerFactory.create(workerOptions);
+      workerLease = await openTrackedWorker({
+        workerFactory: this.options.workerFactory,
+        store: this.store,
+        worker: workerOptions,
+        ledger: {
+          id: task.id,
+          botUid: this.bot!.uid,
+          sessionId: task.sessionId,
+          sessionFile: binding?.sessionFile ?? join(sessionDir, `${task.sessionId}.jsonl`),
+          moveTargetCwd: null,
+        },
+        blockDirectories: [task.cwd],
+        blockDirectory: (cwd) => this.blockedDirectories.add(cwd),
+      });
+      worker = workerLease.worker;
       runtime.worker = worker;
       if (runtime.cancelRequested || this.stopping) {
-        const stopped = await worker.stop().catch(() => false);
-        if (workerLedgerId) {
-          if (stopped) this.store.markWorkerStopped(workerLedgerId);
-          else this.blockedDirectories.add(task.cwd);
-        }
-        if (!stopped) this.blockedDirectories.add(task.cwd);
+        await workerLease.close();
         if (runtime.cancelRequested) this.store.markCancelled(taskId);
         return;
       }
@@ -1490,7 +1482,7 @@ class CoreService implements ChannelService {
       contextInjection = turnContext ? await turnContext.prepare(verified.sessionId) : undefined;
       const historyTurn = resuming ? null : await this.history.prepareTurn(task, target, verified.sessionId);
       const promptContext: PromptContext = {
-        tools: createHostTools(this.hostToolHost(), task, snapshot),
+        tools: createHostTools(this.hostToolHost(), task),
         ...(contextInjection === undefined ? {} : { contextInjection }),
       };
       if (!resuming) {
@@ -1587,18 +1579,7 @@ class CoreService implements ChannelService {
       progress.stop(!progress.finished);
       this.typingLeases.release(runtime.target, `task:${taskId}`);
       this.questions.rejectForTask(taskId, new Error("task finished"));
-      if (worker) {
-        const stopped = await worker.stop().catch(() => false);
-        if (workerLedgerId) {
-          if (stopped) this.store.markWorkerStopped(workerLedgerId);
-          else this.blockedDirectories.add(task.cwd);
-        }
-        if (!stopped) this.blockedDirectories.add(task.cwd);
-      } else if (workerLedgerId && spawned) {
-        const stopped = await this.options.workerFactory.recover(spawned).catch(() => false);
-        if (stopped) this.store.markWorkerStopped(workerLedgerId);
-        else this.blockedDirectories.add(task.cwd);
-      }
+      if (workerLease) await workerLease.close();
       this.outbox.releaseIfIdle(taskId);
       // Deregistered before the relay so a creator chat that shares this directory does not read
       // the relay as work that queued behind this run.

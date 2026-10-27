@@ -252,6 +252,10 @@ export interface ChannelTransport {
     clientMsgNo: string,
     signal?: AbortSignal,
   ): Promise<SendReceipt | null>;
+  /**
+   * Edits one remote progress card. For the same remote card, `cardSeq` MUST increase strictly
+   * with every edit and continue increasing across process restarts.
+   */
   editProgressCard(
     target: ChatTarget,
     messageId: string,
@@ -266,7 +270,11 @@ export interface ChannelTransport {
     clientMsgNo: string,
     signal?: AbortSignal,
   ): Promise<SendReceipt | null>;
-  /** Edits a card this Bot sent; rejects when the frame cannot be carried. */
+  /**
+   * Edits a card this Bot sent; rejects when the frame cannot be carried. For the same remote
+   * card, `cardSeq` MUST increase strictly with every edit and continue increasing across process
+   * restarts.
+   */
   editCard(
     target: ChatTarget,
     messageId: string,
@@ -424,6 +432,10 @@ export interface WorkerOptions {
    */
   model?: string;
   contextScope?: WorkerContextScope;
+  /**
+   * Called immediately after spawn. The caller MUST durably record the running process before
+   * worker initialization can fail.
+   */
   onSpawn: (process: WorkerProcess) => void;
 }
 
@@ -519,12 +531,20 @@ export interface OmpWorker {
    * this session. Works mid-turn: the dispatch is not an agent prompt.
    */
   switchModel(selector: string): Promise<WorkerModelSwitch>;
+  /**
+   * Stops the worker. Resolves `false` when termination cannot be confirmed; callers MUST keep
+   * the worker's `cwd` blocked from reuse in that case.
+   */
   stop(): Promise<boolean>;
 }
 
 export interface WorkerFactory {
   sessionRootsFor?(cwd: string): Promise<readonly string[]>;
   create(options: WorkerOptions): Promise<OmpWorker>;
+  /**
+   * Recovers a worker process. Resolves `false` when termination cannot be confirmed; callers
+   * MUST keep `process.cwd` blocked from reuse in that case.
+   */
   recover(process: WorkerProcess): Promise<boolean>;
 }
 
@@ -668,7 +688,8 @@ export interface ChannelServiceOptions {
   restart?: RestartPort;
   /**
    * Isolated thread workspaces, present when the host can materialize git worktrees.
-   * `octo_management` reaches it through `create-thread`'s `isolate` argument.
+   * `octo_management` reaches it through `create-thread`'s `worktree_name` argument, which names
+   * the independent worktree created for the thread.
    */
   worktrees?: WorktreePort;
   /**
