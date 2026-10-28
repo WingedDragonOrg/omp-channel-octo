@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -12,7 +13,7 @@ import {
   type ProjectSessionBinding,
   type ProjectSessionState,
 } from "../src/session/project-session";
-import { openChannelStore } from "../src/store";
+import { openChannelStore, type ChannelStore } from "../src/store";
 import {
   closeCoreHarness,
   createCoreHarness,
@@ -500,6 +501,47 @@ test("a rejected move leaves the prior binding untouched", async () => {
     await closeCoreHarness(harness);
   }
 });
+
+test("/move does not replace the binding when worker-ledger finalization fails", async () => {
+  const harness = await createCoreHarness();
+  const target = { channelId: "dm-project-move-ledger-finalization", channelType: 1 as const };
+  const source = await realpath(await mkdtemp(join(harness.root, "source-")));
+  const destination = await realpath(await mkdtemp(join(harness.root, "destination-")));
+  let store: ChannelStore | undefined;
+  let failureDb: Database | undefined;
+  try {
+    await harness.service.handleInbound(
+      inbound({ messageId: "move-ledger-source", ...target, text: `/new ${source}` }),
+    );
+    store = await openChannelStore(harness.stateDir);
+    const before = store.getBinding(harness.bot.uid, target);
+    expect(before).not.toBeNull();
+
+    failureDb = new Database(join(harness.stateDir, "channel.sqlite"));
+    failureDb.query(`
+      CREATE TRIGGER fail_worker_stop
+      BEFORE UPDATE OF state ON worker_ledger
+      WHEN NEW.state = 'stopped'
+      BEGIN
+        SELECT RAISE(FAIL, 'fixture worker-ledger finalization failed');
+      END
+    `).run();
+    await harness.service.handleInbound(
+      inbound({ messageId: "move-ledger-failure", ...target, text: `/move ${destination}` }),
+    );
+
+    expect(store.getBinding(harness.bot.uid, target)).toEqual(before);
+    expect(harness.transport.sent.at(-1)?.text).toMatch(/无法|未能|失败/);
+    expect(harness.transport.sent.at(-1)?.text).not.toContain("已迁移会话");
+  } finally {
+    if (failureDb !== undefined) {
+      failureDb.query("DROP TRIGGER fail_worker_stop").run();
+      failureDb.close();
+    }
+    store?.close();
+    await closeCoreHarness(harness);
+  }
+});
 test("directory execution preserves durable acceptance order across chats", async () => {
   const holdStarted = createGate();
   const releaseHold = createGate();
@@ -846,14 +888,23 @@ test("move stop uncertainty blocks both source and destination across restart", 
   let first: Awaited<ReturnType<typeof createCoreHarness>> | undefined;
   let restarted: Awaited<ReturnType<typeof createCoreHarness>> | undefined;
   let firstClosed = false;
+  let bindingStore: ChannelStore | undefined;
   try {
     first = await createCoreHarness({ root, bot, workers });
     await first.service.handleInbound(
       inbound({ messageId: "move-stop-bind", ...target, text: `/new ${source}` }),
     );
+    bindingStore = await openChannelStore(first.stateDir);
+    const before = bindingStore.getBinding(bot.uid, target);
+    expect(before).not.toBeNull();
     await first.service.handleInbound(
       inbound({ messageId: "move-stop-command", ...target, text: `/move ${destination}` }),
     );
+    expect(bindingStore.getBinding(bot.uid, target)).toEqual(before);
+    expect(first.transport.sent.at(-1)?.text).toMatch(/无法|未能|失败/);
+    expect(first.transport.sent.at(-1)?.text).not.toContain("已迁移会话");
+    bindingStore.close();
+    bindingStore = undefined;
     await closeCoreHarness(first, { remove: false });
     firstClosed = true;
     restarted = await createCoreHarness({ root, bot });
@@ -871,6 +922,7 @@ test("move stop uncertainty blocks both source and destination across restart", 
       store.close();
     }
   } finally {
+    bindingStore?.close();
     if (first && !firstClosed) await closeCoreHarness(first, { remove: false });
     if (restarted) {
       await closeCoreHarness(restarted);

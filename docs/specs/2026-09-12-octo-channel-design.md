@@ -54,6 +54,10 @@
 
 `cards/progress-cards.ts` 统一拥有进度卡的持久恢复与每任务轮次状态。服务将已归一化的 `ExecutionEvent` 交给每任务的 `TaskProgress`；研究帧自身可以开卡，其最近快照在同一任务滚卡时结转，新任务独立开始。队列 tail 仍登记到服务关停排空集合，子区归档前读取并等待当前 tail。`session/session-lifecycle.ts` 负责会话身份/cwd 校验、目录回退、`/new` 和原生 `/move`；它通过 `TaskScheduler` 取得目录租约，blocked 集合继续由服务单点拥有，迁移始终同时持有源、目标目录租约。
 
+`runtime/worker-lease.ts` 独占运行期 worker 的终止、恢复回收和台账收尾；业务侧只取得不含 `stop` 的 `WorkerSession`，服务的停机、取消、问答超时及任务收尾共用同一 lease。首次 `close` 的策略和完整 Promise（包含台账写入失败）由 lease 保存，并发与后续关闭复用同一结果。停止或恢复未确认时，按 spawn 的真实 cwd 与预先声明的迁移目标阻塞目录；迁移目标随 spawn 台账一次写入，初始化失败和重启恢复也使用这份记录。
+
+`/new`、`/move` 的候选 worker 通过 `withStoppedWorker` 运行：scope 验证会话、确认进程停止并完成台账更新后才交付结果，调用方随后持久化绑定并发送回执。停止未确认或台账更新失败不会交付成功结果；操作失败仍执行关闭，关闭中的台账错误优先返回，否则保留原操作错误。目录租约覆盖整个 scope 和绑定提交。
+
 `commands/thread-commands.ts` 负责 `/thread` 的任务交接和合并指令，复用正文组装、typing 及任务接纳端口；命令去重仍在服务入口完成。`threads/thread-archive.ts` 独占待归档集合和停止唤醒信号，服务在授权新入站时取消排定、在回合输出之后运行归档；排定替换、出站排空、瞬时失败重试及停止放弃均由该模块维护。
 
 `tasks/task-scheduler.ts` 独占聊天串行链、排定任务、目录租约、等待回执标记及关停任务快照；运行中 worker 和 blocked 目录仍由服务管理，调度仅经明确端口查询。`commands/command-routing.ts` 统一内建命令别名及注册校验，从别名表推导的 action 类型约束完整分派表；durable claim 保留用户输入的命令名，重启仍在 claim 完成后请求，未知命令照常走既有 handler 或 OMP 任务路径。

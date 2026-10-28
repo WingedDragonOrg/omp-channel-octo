@@ -21,7 +21,7 @@ import {
 } from "./inbound/attachments.ts";
 import { ChatAuthorization } from "./inbound/chat-authorization.ts";
 import { acquireBotLock, assertBotLockFree, type LockHandle } from "./runtime/bot-lock.ts";
-import { openTrackedWorker, type TrackedWorker } from "./runtime/worker-lease.ts";
+import { openTrackedWorker, type TrackedWorker, type WorkerSession } from "./runtime/worker-lease.ts";
 import { TaskStartupError } from "./contracts.ts";
 import type {
   BotIdentity,
@@ -35,7 +35,6 @@ import type {
   ContextInjection,
   PromptContext,
   InboundMessage,
-  OmpWorker,
   SteerConsumedEvent,
   TaskRelayTarget,
   WorkerEvent,
@@ -110,7 +109,7 @@ type RuntimeTask = {
   taskId: string;
   target: ChatTarget;
   cwd: string;
-  worker?: OmpWorker;
+  lease?: TrackedWorker;
   cancelRequested: boolean;
   cancelReplySent: boolean;
   /**
@@ -514,8 +513,8 @@ class CoreService implements ChannelService {
       runtime.stopText?.();
       runtime.stopActivity?.();
       this.questions.rejectForTask(runtime.taskId, new Error("channel stopping"));
-      if (runtime.worker) {
-        await runtime.worker.stop().catch(() => false);
+      if (runtime.lease) {
+        await runtime.lease.close().catch(() => false);
       }
     }
     this.outbox.abortAll();
@@ -780,24 +779,24 @@ class CoreService implements ChannelService {
   }
 
   /** The worker of the chat's live run, while its OMP session is still up. */
-  private liveWorker(target: ChatTarget): OmpWorker | undefined {
+  private liveWorker(target: ChatTarget): WorkerSession | undefined {
     const key = targetKey(target);
     for (const runtime of this.runtimes.values()) {
-      if (targetKey(runtime.target) === key && runtime.worker) return runtime.worker;
+      if (targetKey(runtime.target) === key && runtime.lease) return runtime.lease.worker;
     }
     return undefined;
   }
 
   private async deliverSteer(target: ChatTarget, text: string): Promise<boolean> {
     const runtime = this.runningRuntime(target);
-    if (!runtime?.worker) return false;
+    if (!runtime?.lease) return false;
     // Recorded before the request so the delivery order matches the RPC command order even when
     // two appends race; a refused frame removes its own entry.
     const delivery = { text };
     runtime.steerDeliveries.push(delivery);
     if (runtime.steerDeliveries.length > MAX_PENDING_STEERS) runtime.steerDeliveries.shift();
     try {
-      await runtime.worker.steer(text);
+      await runtime.lease.worker.steer(text);
       // The message starts a new round: its progress belongs below the message, not above it.
       runtime.rollProgressCard?.();
       return true;
@@ -841,7 +840,7 @@ class CoreService implements ChannelService {
     if (!this.store.claimCommand(claim)) return true;
     if (await this.deliverSteer(message, text)) {
       this.store.completeCommand(claim);
-      this.history.recordSteered(message, runtime.worker?.sessionId ?? "");
+      this.history.recordSteered(message, runtime.lease?.worker.sessionId ?? "");
       return true;
     }
     this.store.releaseClaim(claim);
@@ -923,7 +922,7 @@ class CoreService implements ChannelService {
    */
   private async handleInterrupt(target: ChatTarget): Promise<void> {
     const runtime = this.runningRuntime(target);
-    if (!runtime?.worker) {
+    if (!runtime?.lease) {
       await this.outbox.enqueueText(target, DEFAULT_INTERRUPT_IDLE_TEXT, null);
       return;
     }
@@ -933,7 +932,7 @@ class CoreService implements ChannelService {
     // （回合随后又跑出真实工作时，由 task-events 撤回这条意图）。
     this.store.markTaskStopIntent(runtime.taskId, "interrupt");
     try {
-      await runtime.worker.abortTurn();
+      await runtime.lease.worker.abortTurn();
     } catch {
       runtime.stopCause = null;
       this.store.clearTaskStopIntent(runtime.taskId);
@@ -953,12 +952,12 @@ class CoreService implements ChannelService {
    */
   private stopTurnForQuestion(taskId: string, cancelQuestionIds: readonly string[] = []): void {
     const runtime = this.runtimes.get(taskId);
-    if (!runtime?.worker || !runtime.promptInFlight) return;
+    if (!runtime?.lease || !runtime.promptInFlight) return;
     runtime.stopCause = "question";
     runtime.workAfterStop = false;
     this.store.markTaskStopIntent(taskId, "question_timeout", cancelQuestionIds);
-    const worker = runtime.worker;
-    void worker.abortTurn().catch(() => {}).finally(() => worker.stop().catch(() => false));
+    const lease = runtime.lease;
+    void lease.worker.abortTurn().catch(() => {}).finally(() => lease.close().catch(() => false));
   }
 
   /**
@@ -1131,8 +1130,8 @@ class CoreService implements ChannelService {
       this.outbox.forgetTask(runtime.taskId);
       runtime.stopActivity?.();
       runtime.cancelReplySent = true;
-      if (runtime.worker) {
-        void runtime.worker.stop().catch(() => false);
+      if (runtime.lease) {
+        void runtime.lease.close().catch(() => false);
       }
       this.questions.rejectForTask(runtime.taskId, new Error("task cancelled"));
       this.store.markCancelled(runtime.taskId);
@@ -1373,8 +1372,6 @@ class CoreService implements ChannelService {
       steerDeliveries: [],
     };
     this.runtimes.set(taskId, runtime);
-    let worker: OmpWorker | undefined;
-    let workerLease: TrackedWorker | undefined;
     const textDelivery = this.outbox.registerTask(taskId);
     const target = taskTarget(task);
     /** 本回合的群说明事务：快照、ledger 决策与本回合 sidecar 都归它，服务只按序调用。 */
@@ -1440,7 +1437,7 @@ class CoreService implements ChannelService {
         if (!sessionFile) throw new TaskStartupError("session-invalid", "绑定的 OMP 会话文件不存在");
         workerOptions.sessionFile = sessionFile;
       }
-      workerLease = await openTrackedWorker({
+      runtime.lease = await openTrackedWorker({
         workerFactory: this.options.workerFactory,
         store: this.store,
         worker: workerOptions,
@@ -1449,15 +1446,12 @@ class CoreService implements ChannelService {
           botUid: this.bot!.uid,
           sessionId: task.sessionId,
           sessionFile: binding?.sessionFile ?? join(sessionDir, `${task.sessionId}.jsonl`),
-          moveTargetCwd: null,
         },
-        blockDirectories: [task.cwd],
         blockDirectory: (cwd) => this.blockedDirectories.add(cwd),
       });
-      worker = workerLease.worker;
-      runtime.worker = worker;
+      const worker = runtime.lease.worker;
       if (runtime.cancelRequested || this.stopping) {
-        await workerLease.close();
+        await runtime.lease.close();
         if (runtime.cancelRequested) this.store.markCancelled(taskId);
         return;
       }
@@ -1561,11 +1555,11 @@ class CoreService implements ChannelService {
         // 由新进程按续接语义恢复；这里既不结算也不发任何通知。
         console.error(`[task] 停机挂起，任务保持未结算 task=${taskId}`);
       } else {
-        const failure = worker
+        const failure = runtime.lease
           ? classifyTaskFailure(error)
           : classifyStartupFailure(error, startupPhase);
         console.error(
-          `[task] ${worker ? "执行失败" : "启动失败"} task=${taskId} target=${targetKey(runtime.target)}`
+          `[task] ${runtime.lease ? "执行失败" : "启动失败"} task=${taskId} target=${targetKey(runtime.target)}`
           + ` kind=${failure.kind} code=${failure.code} phase=${startupPhase} detail=${failure.detail}`,
         );
         this.store.markFailed(taskId, failure.row);
@@ -1579,7 +1573,7 @@ class CoreService implements ChannelService {
       progress.stop(!progress.finished);
       this.typingLeases.release(runtime.target, `task:${taskId}`);
       this.questions.rejectForTask(taskId, new Error("task finished"));
-      if (workerLease) await workerLease.close();
+      if (runtime.lease) await runtime.lease.close();
       this.outbox.releaseIfIdle(taskId);
       // Deregistered before the relay so a creator chat that shares this directory does not read
       // the relay as work that queued behind this run.

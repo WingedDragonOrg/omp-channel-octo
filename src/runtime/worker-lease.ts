@@ -7,29 +7,32 @@ import type {
 import type { ChannelStore } from "../store/index.ts";
 import type { WorkerLedgerRecord } from "../store/store-records.ts";
 
+export type WorkerSession = Omit<OmpWorker, "stop">;
+
 export interface TrackedWorker {
-  readonly worker: OmpWorker;
-  markMoveTarget(cwd: string): void;
+  readonly worker: WorkerSession;
+  /**
+   * The first call selects recovery. All calls share the stop and ledger-finalization promise,
+   * including a rejected finalization.
+   */
   close(recoverOnFailure?: boolean): Promise<boolean>;
 }
 
 export interface OpenTrackedWorkerOptions {
   readonly workerFactory: WorkerFactory;
-  readonly store: Pick<ChannelStore, "recordWorker" | "markWorkerMoveTarget" | "markWorkerStopped">;
+  readonly store: Pick<ChannelStore, "recordWorker" | "markWorkerStopped">;
   readonly worker: Omit<WorkerOptions, "onSpawn">;
-  readonly ledger: Omit<WorkerLedgerRecord, keyof WorkerProcess | "state">;
-  readonly blockDirectories: readonly string[];
+  readonly ledger: Omit<WorkerLedgerRecord, keyof WorkerProcess | "state" | "moveTargetCwd">;
+  readonly moveTargetCwd?: string;
   readonly blockDirectory: (cwd: string) => void;
 }
 
-function blockDirectories(options: OpenTrackedWorkerOptions): void {
-  for (const cwd of options.blockDirectories) {
-    try {
-      options.blockDirectory(cwd);
-    } catch {
-      // Best-effort cleanup must not replace the worker lifecycle result.
-    }
-  }
+function blockUnconfirmedWorker(
+  options: OpenTrackedWorkerOptions,
+  spawned: WorkerProcess | undefined,
+): void {
+  if (spawned) options.blockDirectory(spawned.cwd);
+  if (options.moveTargetCwd !== undefined) options.blockDirectory(options.moveTargetCwd);
 }
 
 export async function openTrackedWorker(options: OpenTrackedWorkerOptions): Promise<TrackedWorker> {
@@ -43,6 +46,7 @@ export async function openTrackedWorker(options: OpenTrackedWorkerOptions): Prom
         options.store.recordWorker({
           ...options.ledger,
           ...processInfo,
+          moveTargetCwd: options.moveTargetCwd ?? null,
           state: "running",
         });
       },
@@ -62,32 +66,53 @@ export async function openTrackedWorker(options: OpenTrackedWorkerOptions): Prom
           // Preserve the original create failure.
         }
       } else {
-        blockDirectories(options);
+        blockUnconfirmedWorker(options, spawned);
       }
     }
     throw error;
   }
 
-  return {
-    worker,
-    markMoveTarget: (cwd) => options.store.markWorkerMoveTarget(options.ledger.id, cwd),
-    close: async (recoverOnFailure = false) => {
-      let stopped = false;
-      try {
-        stopped = await worker.stop();
-      } catch {
-        // A rejected stop is not confirmation that the process group has exited.
-      }
-      if (!stopped && recoverOnFailure && spawned) {
+  let closePromise: Promise<boolean> | undefined;
+  const close = (recoverOnFailure = false): Promise<boolean> => {
+    if (!closePromise) {
+      closePromise = (async () => {
+        let stopped = false;
         try {
-          stopped = await options.workerFactory.recover(spawned);
+          stopped = await worker.stop();
         } catch {
-          // An unconfirmed process remains blocked below.
+          // A rejected stop is not confirmation that the process group has exited.
         }
-      }
-      if (stopped) options.store.markWorkerStopped(options.ledger.id);
-      else blockDirectories(options);
-      return stopped;
-    },
+        if (!stopped && recoverOnFailure && spawned) {
+          try {
+            stopped = await options.workerFactory.recover(spawned);
+          } catch {
+            // An unconfirmed process remains blocked below.
+          }
+        }
+        if (stopped) options.store.markWorkerStopped(options.ledger.id);
+        else blockUnconfirmedWorker(options, spawned);
+        return stopped;
+      })();
+    }
+    return closePromise;
   };
+
+  return { worker, close };
+}
+
+/** Returns the candidate result only after the worker stops and its ledger is finalized. */
+export async function withStoppedWorker<T>(
+  options: OpenTrackedWorkerOptions,
+  run: (worker: WorkerSession) => Promise<T>,
+): Promise<T> {
+  const lease = await openTrackedWorker(options);
+  let result: T;
+  try {
+    result = await run(lease.worker);
+  } catch (error) {
+    await lease.close();
+    throw error;
+  }
+  if (!(await lease.close())) throw new Error("worker did not stop");
+  return result;
 }

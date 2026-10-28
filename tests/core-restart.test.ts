@@ -1007,9 +1007,14 @@ test("a question timeout closes unclaimed recovery rows in the same commit", asy
     });
   });
 
+  const stopStarted = Promise.withResolvers<void>();
+  const releaseStop = Promise.withResolvers<void>();
+
   // 续跑这一轮重新发起 ask（当前问题 B）：超时把停止意图写清，但回合本身留在「未收束」——杀在
   // 这一刻正是要覆盖的窗口，所以测试必须能在收束之前看到库里的状态。
   const askingPrompt: FakePrompt = async ({ promptContext, onStop, isStopped }) => {
+    const stopped = Promise.withResolvers<void>();
+    onStop(stopped.resolve);
     const ask = promptContext?.tools?.find((tool) => tool.name === "ask");
     const current = ask?.execute(
       { questions: [{ question: "当前这一轮的问题" }] },
@@ -1017,20 +1022,31 @@ test("a question timeout closes unclaimed recovery rows in the same commit", asy
       "call-current",
     ) ?? Promise.resolve("");
     await current.then(() => undefined, () => undefined);
-    const { promise, resolve } = Promise.withResolvers<void>();
-    onStop(resolve);
-    await promise;
+    await stopped.promise;
     if (isStopped()) throw new Error("OMP prompt cancelled");
+  };
+
+  const workers = new FakeWorkerFactory(askingPrompt);
+  const createWorker = workers.create.bind(workers);
+  workers.create = async options => {
+    const worker = await createWorker(options);
+    const stop = worker.stop.bind(worker);
+    worker.stop = async () => {
+      stopStarted.resolve();
+      await releaseStop.promise;
+      return stop();
+    };
+    return worker;
   };
 
   const restarted = await createCoreHarness({
     root: first.root,
     bot: first.bot,
-    prompt: askingPrompt,
+    workers,
     ask: { timeoutMs: 150 },
   });
   try {
-    // 本轮提问 B 的行先落地，再让 150ms 的超时到点——回合仍然挂着，不会替我们把状态抹平。
+    // 本轮提问 B 先落地；停止请求到达后，确认退出仍受 releaseStop 控制。
     const deadline = Date.now() + 3_000;
     let issued = 0;
     while (Date.now() < deadline && issued === 0) {
@@ -1039,7 +1055,7 @@ test("a question timeout closes unclaimed recovery rows in the same commit", asy
       if (issued === 0) await observationWindow(20);
     }
     expect(issued).toBe(1);
-    await observationWindow(300);
+    await stopStarted.promise;
     const rows = await withStore(restarted.root, (store) => ({
       task: store.getTask("timeout-window-task")?.state,
       leftover: store.getQuestion("leftover-question")?.state,
@@ -1054,6 +1070,7 @@ test("a question timeout closes unclaimed recovery rows in the same commit", asy
     expect(rows.leftover).toBe("cancelled");
     expect(rows.current).toEqual(["pending"]);
   } finally {
+    releaseStop.resolve();
     await closeCoreHarness(restarted);
   }
 });

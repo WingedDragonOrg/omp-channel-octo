@@ -14,7 +14,6 @@ import type {
   BotIdentity,
   ChatTarget,
   CoreServiceConfig,
-  OmpWorker,
   WorkerFactory,
 } from "../contracts.ts";
 import { safeErrorMessage } from "../errors.ts";
@@ -28,7 +27,7 @@ import {
   type ProjectSessionState,
 } from "./project-session.ts";
 import { ensureProjectSessionDir, projectSessionDir, sessionsRoot } from "./session-dir.ts";
-import { openTrackedWorker, type TrackedWorker } from "../runtime/worker-lease.ts";
+import { withStoppedWorker, type WorkerSession } from "../runtime/worker-lease.ts";
 import type { ChannelStore } from "../store/index.ts";
 import type { BindingRecord } from "../store/store-records.ts";
 import type { DirectoryLease } from "../tasks/task-scheduler.ts";
@@ -54,7 +53,6 @@ export interface SessionLifecycleDeps {
     | "getChatModel"
     | "clearContextLedger"
     | "recordWorker"
-    | "markWorkerMoveTarget"
     | "markWorkerStopped"
   >;
   readonly workerFactory: WorkerFactory;
@@ -197,71 +195,66 @@ export class SessionLifecycle {
       const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.deps.config), cwd);
       const ledgerId = `new-${sessionId}`;
       const ledgerSessionFile = join(sessionDir, `${sessionId}.jsonl`);
-      let candidate: TrackedWorker | undefined;
-      let closeAttempted = false;
-      let persistenceFailed = false;
+      let created: { fresh: ProjectSessionBinding; model: string | null };
       try {
         const chatModel = this.deps.store.getChatModel(this.deps.bot()!.uid, target);
-        candidate = await openTrackedWorker({
-          workerFactory: this.deps.workerFactory,
-          store: this.deps.store,
-          worker: {
-            cwd,
-            sessionDir,
-            ...(chatModel === null ? {} : { model: chatModel }),
+        created = await withStoppedWorker(
+          {
+            workerFactory: this.deps.workerFactory,
+            store: this.deps.store,
+            worker: {
+              cwd,
+              sessionDir,
+              ...(chatModel === null ? {} : { model: chatModel }),
+            },
+            ledger: {
+              id: ledgerId,
+              botUid: this.deps.bot()!.uid,
+              sessionId,
+              sessionFile: ledgerSessionFile,
+            },
+            blockDirectory: this.deps.blockDirectory,
           },
-          ledger: {
-            id: ledgerId,
-            botUid: this.deps.bot()!.uid,
-            sessionId,
-            sessionFile: ledgerSessionFile,
-            moveTargetCwd: null,
+          async worker => {
+            const freshState: ProjectSessionState = await worker.refreshState();
+            const previousForFresh: ProjectSessionBinding = previous ?? {
+              sessionId: "",
+              cwd,
+              sessionFile: null,
+            };
+            const fresh = await verifyFreshSession(previousForFresh, freshState, cwd);
+            const model = await this.createdSessionModel(worker);
+            return { fresh, model };
           },
-          blockDirectories: [cwd],
-          blockDirectory: this.deps.blockDirectory,
-        });
-        const freshState: ProjectSessionState = await candidate.worker.refreshState();
-        const previousForFresh: ProjectSessionBinding = previous ?? {
-          sessionId: "",
-          cwd,
-          sessionFile: null,
-        };
-        const fresh = await verifyFreshSession(previousForFresh, freshState, cwd);
-        const model = await this.createdSessionModel(candidate.worker);
-        closeAttempted = true;
-        if (!await candidate.close()) {
-          closeAttempted = false;
-          throw new Error("worker did not stop");
-        }
-        const binding: BindingRecord = {
-          botUid: this.deps.bot()!.uid,
-          channelId: target.channelId,
-          channelType: target.channelType,
-          sessionId: fresh.sessionId,
-          cwd: fresh.cwd,
-          sessionFile: fresh.sessionFile,
-          // 主动换会话的唯一痕迹：问答卡据此拒绝切换前提出的旧问题的迟到提交（`/move` 保持会话
-          // 身份，因此不写这里）。切换失败走下面的 catch，绑定与这个时间都不落。
-          sessionSwitchedAt: Date.now(),
-        };
-        try {
-          this.deps.store.ensureBinding(binding);
-        } catch {
-          persistenceFailed = true;
-          throw new Error("本地状态盘写入失败，会话未切换。");
-        }
+        );
+      } catch {
+        await this.deps.enqueueText(target, "无法创建可恢复的 OMP 会话，当前绑定未改变。", null);
+        return;
+      }
+      const binding: BindingRecord = {
+        botUid: this.deps.bot()!.uid,
+        channelId: target.channelId,
+        channelType: target.channelType,
+        sessionId: created.fresh.sessionId,
+        cwd: created.fresh.cwd,
+        sessionFile: created.fresh.sessionFile,
+        // 主动换会话的唯一痕迹：问答卡据此拒绝切换前提出的旧问题的迟到提交（`/move` 保持会话
+        // 身份，因此不写这里）。切换失败走下面的 catch，绑定与这个时间都不落。
+        sessionSwitchedAt: Date.now(),
+      };
+      try {
+        this.deps.store.ensureBinding(binding);
+      } catch {
+        throw new Error("本地状态盘写入失败，会话未切换。");
+      }
+      try {
         this.deps.store.clearContextLedger(this.deps.bot()!.uid, target);
         await this.deps.enqueueText(
           target,
-          `已创建会话 ${binding.sessionId}，cwd=${binding.cwd}${model === null ? "" : `，模型=${model}`}`,
+          `已创建会话 ${binding.sessionId}，cwd=${binding.cwd}${created.model === null ? "" : `，模型=${created.model}`}`,
           null,
         );
       } catch {
-        if (candidate && !closeAttempted) {
-          closeAttempted = true;
-          await candidate.close();
-        }
-        if (persistenceFailed) throw new Error("本地状态盘写入失败，会话未切换。");
         await this.deps.enqueueText(target, "无法创建可恢复的 OMP 会话，当前绑定未改变。", null);
       }
     } finally {
@@ -270,9 +263,8 @@ export class SessionLifecycle {
   }
 
   /**
-   * `/move <目录>`：让候选 worker 用 OMP 原生 `/move` 把当前会话迁到新 cwd——迁移台账先落
-   * `moveTargetCwd` 再发 prompt，崩溃恢复才能同时避开源与目标目录——验证会话 id 与目标 cwd 后
-   * 停掉 worker，绑定换成迁移结果并清掉隔离工作区的 pin。失败时两处 cwd 都要确认停止。
+   * `/move <目录>`：在 worker 出生时将目标 cwd 持久化到台账，用 OMP 原生 `/move` 迁移并验证后，
+   * 由 worker scope 确认退出和台账更新，再把迁移结果提交为绑定。失败时源与目标 cwd 都要确认停止。
    */
   async handleMove(target: ChatTarget, argument: string): Promise<void> {
     const bot = this.deps.bot();
@@ -318,60 +310,54 @@ export class SessionLifecycle {
       await commandLease.ready;
       const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.deps.config), cwd);
       const ledgerId = `move-${randomUUID()}`;
-      let candidate: TrackedWorker | undefined;
-      let closeAttempted = false;
-      let persistenceFailed = false;
+      let moved: ProjectSessionBinding;
       try {
         const chatModel = this.deps.store.getChatModel(this.deps.bot()!.uid, target);
-        candidate = await openTrackedWorker({
-          workerFactory: this.deps.workerFactory,
-          store: this.deps.store,
-          worker: {
-            cwd: previous.cwd,
-            sessionDir,
-            sessionFile,
-            ...(chatModel === null ? {} : { model: chatModel }),
+        moved = await withStoppedWorker(
+          {
+            workerFactory: this.deps.workerFactory,
+            store: this.deps.store,
+            worker: {
+              cwd: previous.cwd,
+              sessionDir,
+              sessionFile,
+              ...(chatModel === null ? {} : { model: chatModel }),
+            },
+            ledger: {
+              id: ledgerId,
+              botUid: this.deps.bot()!.uid,
+              sessionId: previous.sessionId,
+              sessionFile,
+            },
+            moveTargetCwd: cwd,
+            blockDirectory: this.deps.blockDirectory,
           },
-          ledger: {
-            id: ledgerId,
-            botUid: this.deps.bot()!.uid,
-            sessionId: previous.sessionId,
-            sessionFile,
-            moveTargetCwd: null,
+          async worker => {
+            await worker.prompt(`/move ${cwd}`, () => {});
+            const movedState: ProjectSessionState = await worker.refreshState();
+            return verifyMovedSession(previous, movedState, cwd);
           },
-          blockDirectories: [previous.cwd, cwd],
-          blockDirectory: this.deps.blockDirectory,
-        });
-        candidate.markMoveTarget(cwd);
-        await candidate.worker.prompt(`/move ${cwd}`, () => {});
-        const movedState: ProjectSessionState = await candidate.worker.refreshState();
-        const moved = await verifyMovedSession(previous, movedState, cwd);
-        closeAttempted = true;
-        if (!await candidate.close()) {
-          closeAttempted = false;
-          throw new Error("worker did not stop");
-        }
-        const binding: BindingRecord = {
-          ...previous,
-          sessionId: moved.sessionId,
-          cwd: moved.cwd,
-          sessionFile: moved.sessionFile,
-          // An explicit /move leaves an isolated thread workspace behind.
-          cwdPinned: false,
-        };
-        try {
-          this.deps.store.ensureBinding(binding);
-        } catch {
-          persistenceFailed = true;
-          throw new Error("本地状态盘写入失败，会话未迁移。");
-        }
+        );
+      } catch {
+        await this.deps.enqueueText(target, "无法验证 OMP 原生 /move，当前绑定未改变。", null);
+        return;
+      }
+      const binding: BindingRecord = {
+        ...previous,
+        sessionId: moved.sessionId,
+        cwd: moved.cwd,
+        sessionFile: moved.sessionFile,
+        // An explicit /move leaves an isolated thread workspace behind.
+        cwdPinned: false,
+      };
+      try {
+        this.deps.store.ensureBinding(binding);
+      } catch {
+        throw new Error("本地状态盘写入失败，会话未迁移。");
+      }
+      try {
         await this.deps.enqueueText(target, `已迁移会话 ${binding.sessionId}，cwd=${binding.cwd}`, null);
       } catch {
-        if (candidate && !closeAttempted) {
-          closeAttempted = true;
-          await candidate.close();
-        }
-        if (persistenceFailed) throw new Error("本地状态盘写入失败，会话未迁移。");
         await this.deps.enqueueText(target, "无法验证 OMP 原生 /move，当前绑定未改变。", null);
       }
     } finally {
@@ -401,7 +387,7 @@ export class SessionLifecycle {
    * `default` as a model. A failed or empty answer degrades the creation receipt to its model-less
    * form instead of failing `/new` or inventing a value.
    */
-  private async createdSessionModel(worker: OmpWorker): Promise<string | null> {
+  private async createdSessionModel(worker: WorkerSession): Promise<string | null> {
     const catalog = await worker.models().catch(() => null);
     if (catalog === null || catalog.current === null) return null;
     return modelWithLevel(catalog.current, catalog.level);

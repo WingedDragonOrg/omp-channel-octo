@@ -289,6 +289,37 @@ test("a failed model probe recovers its worker when stop cannot confirm terminat
   }
 });
 
+test("a successful model probe keeps its catalog when stop cannot confirm termination", async () => {
+  class UnconfirmedStopProbeFactory extends FakeWorkerFactory {
+    override async create(options: WorkerOptions): Promise<OmpWorker> {
+      const worker = await super.create(options);
+      worker.stop = async () => false;
+      return worker;
+    }
+  }
+
+  const harness = await createCoreHarness({ workers: new UnconfirmedStopProbeFactory() });
+  try {
+    await harness.service.handleInbound(inbound({ ...DM, messageId: "switch-stop-unconfirmed", text: "/switch" }));
+    const catalog = await sentText(harness);
+    expect(catalog).toContain("fixture/default");
+    expect(catalog).toContain("fast");
+    const store = await openChannelStore(harness.stateDir);
+    try {
+      expect(store.listWorkerLedger(harness.bot.uid)).toMatchObject([{ state: "running" }]);
+      await harness.service.handleInbound(
+        inbound({ ...DM, messageId: "switch-stop-blocked-task", text: "wait for confirmed cleanup" }),
+      );
+      await waitForStatus(harness.service, DM, status => status.state === "queued");
+      expect(harness.workers.prompts).toEqual([]);
+    } finally {
+      store.close();
+    }
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
 test("a deployment without any available model says so", async () => {
   const harness = await createCoreHarness();
   try {

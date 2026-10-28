@@ -17,13 +17,13 @@ import type { ConfigMenuPort } from "./command-cards.ts";
 import type {
   ChatTarget,
   InboundMessage,
-  OmpWorker,
   WorkerFactory,
   WorkerModelCatalog,
   WorkerModelSwitch,
 } from "../contracts.ts";
 import { boundedSelectorText, formatModelCatalog, modelCatalogCurrent, modelWithLevel, switchCardChoices } from "./model-switch.ts";
 import type { ChannelStore } from "../store/index.ts";
+import type { WorkerSession } from "../runtime/worker-lease.ts";
 import { openTrackedWorker } from "../runtime/worker-lease.ts";
 
 const SWITCH_PROBE_FAILED_TEXT = "无法从 OMP 读取模型信息，请稍后重试。";
@@ -58,7 +58,7 @@ export interface ModelSwitchControllerDeps {
   /** The bot identity chat settings are keyed by; a getter because it is learned after start. */
   readonly botUid: () => string;
   /** The worker of the chat's live run, while its OMP session is still up. */
-  readonly liveWorker: (target: ChatTarget) => OmpWorker | undefined;
+  readonly liveWorker: (target: ChatTarget) => WorkerSession | undefined;
   /**
    * The cwd a probe worker runs in — the chat's own directory — or `null` when nothing usable
    * resolves. Resolution (bindings, isolated workspaces, the configured default) stays in
@@ -193,7 +193,7 @@ export class ModelSwitchController {
    * OMP's own default selection. A running session is left alone — `/switch @default` is the
    * native way to move it.
    */
-  private async resetChatModel(target: ChatTarget, live: OmpWorker | undefined): Promise<string> {
+  private async resetChatModel(target: ChatTarget, live: WorkerSession | undefined): Promise<string> {
     const previous = this.deps.store.getChatModel(this.deps.botUid(), target);
     if (previous === null) return "本聊天未指定模型，继续跟随 OMP 默认。";
     this.deps.store.clearChatModel(this.deps.botUid(), target);
@@ -212,7 +212,10 @@ export class ModelSwitchController {
    * directory — same OMP profile, config, and credentials as that chat's turns — is recorded in
    * the worker ledger like `/new`'s candidate worker, and is removed afterwards.
    */
-  private async withProbeWorker<T>(target: ChatTarget, run: (worker: OmpWorker) => Promise<T>): Promise<T> {
+  private async withProbeWorker<T>(
+    target: ChatTarget,
+    run: (worker: WorkerSession) => Promise<T>,
+  ): Promise<T> {
     const cwd = await this.deps.probeDirectory(target);
     if (cwd === null) throw new SwitchDirectoryError();
     const sessionDir = await mkdtemp(join(tmpdir(), "omp-channel-octo-switch-"));
@@ -228,19 +231,18 @@ export class ModelSwitchController {
           botUid: this.deps.botUid(),
           sessionId,
           sessionFile: join(sessionDir, `${sessionId}.jsonl`),
-          moveTargetCwd: null,
         },
-        blockDirectories: [cwd],
         blockDirectory: this.deps.blockDirectory,
       });
-      let failed = true;
+      let result: T;
       try {
-        const result = await run(lease.worker);
-        failed = false;
-        return result;
-      } finally {
-        await lease.close(failed);
+        result = await run(lease.worker);
+      } catch (error) {
+        await lease.close(true);
+        throw error;
       }
+      await lease.close();
+      return result;
     } finally {
       await rm(sessionDir, { recursive: true, force: true }).catch(() => {});
     }

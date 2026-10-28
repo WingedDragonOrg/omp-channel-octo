@@ -1,7 +1,8 @@
+import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { mkdir, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { openChannelStore } from "../src/store";
+import { openChannelStore, type ChannelStore } from "../src/store";
 import {
   closeCoreHarness,
   createCoreHarness,
@@ -206,6 +207,49 @@ test("/reset shares the creation receipt and reports the model too", async () =>
       `已创建会话 ${status.sessionId}，cwd=${status.cwd}，模型=fixture/default`,
     );
   } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("/new does not replace the binding when worker-ledger finalization fails", async () => {
+  const harness = await createCoreHarness();
+  const target = { channelId: "dm-new-ledger-finalization", channelType: 1 as const };
+  const source = join(harness.root, "source");
+  const destination = join(harness.root, "destination");
+  let store: ChannelStore | undefined;
+  let failureDb: Database | undefined;
+  try {
+    await mkdir(source);
+    await mkdir(destination);
+    await harness.service.handleInbound(
+      inbound({ messageId: "new-ledger-source", ...target, text: `/new ${source}` }),
+    );
+    store = await openChannelStore(harness.stateDir);
+    const before = store.getBinding(harness.bot.uid, target);
+    expect(before).not.toBeNull();
+
+    failureDb = new Database(join(harness.stateDir, "channel.sqlite"));
+    failureDb.query(`
+      CREATE TRIGGER fail_worker_stop
+      BEFORE UPDATE OF state ON worker_ledger
+      WHEN NEW.state = 'stopped'
+      BEGIN
+        SELECT RAISE(FAIL, 'fixture worker-ledger finalization failed');
+      END
+    `).run();
+    await harness.service.handleInbound(
+      inbound({ messageId: "new-ledger-failure", ...target, text: `/new ${destination}` }),
+    );
+
+    expect(store.getBinding(harness.bot.uid, target)).toEqual(before);
+    expect(harness.transport.sent.at(-1)?.text).toMatch(/无法|未能|失败/);
+    expect(harness.transport.sent.at(-1)?.text).not.toContain("已创建会话");
+  } finally {
+    if (failureDb !== undefined) {
+      failureDb.query("DROP TRIGGER fail_worker_stop").run();
+      failureDb.close();
+    }
+    store?.close();
     await closeCoreHarness(harness);
   }
 });

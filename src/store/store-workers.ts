@@ -31,13 +31,6 @@ export function recordWorker(db: Database, worker: WorkerLedgerRecord): void {
   );
 }
 
-export function markWorkerMoveTarget(db: Database, id: string, cwd: string): void {
-  run(db,
-    "UPDATE worker_ledger SET move_target_cwd = ?, updated_at = ? WHERE id = ?",
-    [cwd, Date.now(), id],
-  );
-}
-
 export function listWorkerLedger(db: Database, botUid: string): WorkerLedgerRecord[] {
   return query(db, "SELECT * FROM worker_ledger WHERE bot_uid = ? AND state != 'stopped'", [botUid]).map(
     (row) => ({
