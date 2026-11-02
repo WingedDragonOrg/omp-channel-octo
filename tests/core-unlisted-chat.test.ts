@@ -70,6 +70,24 @@ function ownerGroupMessage(overrides: Partial<InboundMessage>): InboundMessage {
   });
 }
 
+test("an owner mention offers an interactive grant without starting a task", async () => {
+  const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
+  harness.transport.cardSupported = true;
+  try {
+    await harness.service.handleInbound(ownerGroupMessage({
+      messageId: "unlisted-card",
+      text: "请处理这项任务",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    expect(harness.transport.sentCards).toHaveLength(1);
+    expect(harness.transport.sentCards[0]!.frame.profile).toBe("octo/v2");
+    expect(queryRows(harness, "SELECT 1 FROM allowed_chats")).toHaveLength(0);
+    expect(harness.workers.prompts).toHaveLength(0);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
 test("an owner mention in an unlisted group gets one throttled notice and never a task", async () => {
   const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
   try {
