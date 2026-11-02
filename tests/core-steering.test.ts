@@ -4,6 +4,8 @@ import type {
   OmpWorker,
   PromptContext,
   WorkerEvent,
+  WorkerGoalResult,
+  WorkerGoalRun,
   WorkerOptions,
 } from "../src/contracts";
 import {
@@ -39,6 +41,15 @@ class RefusingSteerFactory extends FakeWorkerFactory {
         context === undefined ? worker.prompt(text, onEvent) : worker.prompt(text, onEvent, context),
       resume: (onEvent: (event: WorkerEvent) => void, context?: PromptContext) =>
         context === undefined ? worker.resume(onEvent) : worker.resume(onEvent, context),
+      goal: (op: "get" | "pause" | "drop"): Promise<WorkerGoalResult> => worker.goal(op),
+      runGoal: (
+        request: WorkerGoalRun,
+        onEvent: (event: WorkerEvent) => void,
+        context?: PromptContext,
+      ): Promise<WorkerGoalResult> =>
+        context === undefined
+          ? worker.runGoal(request, onEvent)
+          : worker.runGoal(request, onEvent, context),
       steer: async () => {
         throw new Error("OMP worker is not streaming a turn");
       },

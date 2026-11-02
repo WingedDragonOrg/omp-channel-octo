@@ -408,13 +408,25 @@ export interface PromptAcceptedEvent {
   type: "prompt_accepted";
 }
 
+export interface WorkerGoalUpdatedEvent {
+  type: "goal_updated";
+  goal: WorkerGoal | null;
+}
+
+export interface WorkerGoalAcceptedEvent {
+  type: "goal_accepted";
+  goalId: string;
+}
+
 export type WorkerEvent =
   | TextEvent
   | ExecutionEvent
   | SteerConsumedEvent
   | WorkerNoticeEvent
   | LocalCommandEvent
-  | PromptAcceptedEvent;
+  | PromptAcceptedEvent
+  | WorkerGoalUpdatedEvent
+  | WorkerGoalAcceptedEvent;
 
 export interface WorkerProcess {
   pid: number;
@@ -439,6 +451,11 @@ export interface WorkerOptions {
    */
   model?: string;
   contextScope?: WorkerContextScope;
+  /**
+   * Enables OMP RPC goal continuation only for this process. Does not enable goal mode when the
+   * active OMP profile has `goal.enabled: false`.
+   */
+  goalContinuation?: boolean;
   /**
    * Called immediately after spawn. The caller MUST durably record the running process before
    * worker initialization can fail.
@@ -496,6 +513,57 @@ export interface PromptContext {
   contextInjection?: ContextInjection;
 }
 
+export type WorkerGoalStatus = "active" | "paused" | "budget-limited" | "complete" | "dropped";
+
+/** Normalized native goal progress returned by OMP's structured goal RPC. */
+export interface WorkerGoal {
+  id: string;
+  objective: string;
+  status: WorkerGoalStatus;
+  tokenBudget?: number;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+}
+
+/** Native goal mode state; null when OMP has no journaled goal state. */
+export interface WorkerGoalModeState {
+  enabled: boolean;
+  mode: "active" | "exiting";
+  goal: WorkerGoal;
+}
+
+export interface WorkerGoalResult {
+  goal: WorkerGoal | null;
+  state: WorkerGoalModeState | null;
+}
+
+export type WorkerGoalRun =
+  | { op: "create"; objective: string; tokenBudget?: number }
+  | { op: "resume" }
+  | { op: "recover"; goalId: string };
+
+export type WorkerGoalErrorCode =
+  | "unsupported"
+  | "disabled"
+  | "already-exists"
+  | "already-active"
+  | "identity-mismatch"
+  | "invalid-request"
+  | "invalid-response"
+  | "continuation-disabled"
+  | "native-error";
+
+/** Stable, bounded worker error for goal RPC failures; never includes native payload text. */
+export class WorkerGoalError extends Error {
+  readonly code: WorkerGoalErrorCode;
+
+  constructor(code: WorkerGoalErrorCode, message: string) {
+    super(message);
+    this.name = "WorkerGoalError";
+    this.code = code;
+  }
+}
+
 /**
  * The bounded instruction `OmpWorker.resume` sends when OMP's own `/retry` reports there is no
  * resumable failed turn — a healthy or missing transcript tail. It continues the interrupted work
@@ -525,6 +593,18 @@ export interface OmpWorker {
    * is sent after it.
    */
   resume(onEvent: (event: WorkerEvent) => void, context?: PromptContext): Promise<void>;
+  /** Reads, pauses, or drops the native goal; pause/drop remain callable during a goal run. */
+  goal(op: "get" | "pause" | "drop"): Promise<WorkerGoalResult>;
+  /**
+   * Starts a native goal run without a generic prompt. It resolves only at session_settled and
+   * reports native goal state. Recovery verifies the exact goal ID, retries the interrupted native
+   * turn without a generic continuation prompt, then resumes the same goal when it remains valid.
+   */
+  runGoal(
+    request: WorkerGoalRun,
+    onEvent: (event: WorkerEvent) => void,
+    context?: PromptContext,
+  ): Promise<WorkerGoalResult>;
   /** Injects a message into the running OMP turn; fails once no turn is streaming. */
   steer(text: string): Promise<void>;
   /** Aborts the current OMP turn without clearing its queued messages or killing the worker. */

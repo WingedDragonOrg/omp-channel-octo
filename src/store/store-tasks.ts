@@ -4,7 +4,8 @@
 
 import { Database } from "bun:sqlite";
 import type { ChatTarget } from "../contracts.ts";
-import type { CommandClaimState, InboundClaim, StoppedTaskRecovery, TaskRecord, TaskRestartRecovery, TaskStopIntent } from "./store-records.ts";
+import type { CommandClaimState, GoalStoppedRecovery, GoalStopIntent, GoalTaskRequest, InboundClaim, StoppedTaskRecovery, TaskRecord, TaskRestartRecovery, TaskStopIntent } from "./store-records.ts";
+import { getGoalSession, getGoalTask, hasActiveGoalTask, insertGoalTask, revokedGoalTaskIds, stopGoalContinuation, stopGoalContinuationForTask, undispatchedGoalAcceptanceIds } from "./store-goals.ts";
 import { asNumber, asStopIntent, asString, query, run, targetValues, targetWhere, taskFromRow, transaction } from "./store-schema.ts";
 import { cancelTaskQuestions } from "./store-questions.ts";
 
@@ -25,8 +26,9 @@ export function getCommandClaimState(
   return state === "pending" || state === "completed" || state === "failed" ? state : null;
 }
 
-export function acceptTask(db: Database, claim: InboundClaim, task: TaskRecord): boolean {
+export function acceptTask(db: Database, claim: InboundClaim, task: TaskRecord, goalRequest?: GoalTaskRequest): boolean {
   return transaction(db, () => {
+    if (goalRequest && hasActiveGoalTask(db, task.botUid, task, task.sessionId)) return false;
     const existing = query(db,
       `SELECT 1 FROM inbound WHERE bot_uid = ? AND channel_type = ? AND channel_id = ? AND message_id = ?`,
       [claim.botUid, claim.target.channelType, claim.target.channelId, claim.messageId],
@@ -73,6 +75,7 @@ export function acceptTask(db: Database, claim: InboundClaim, task: TaskRecord):
         task.relayThreadName,
       ],
     );
+    if (goalRequest) insertGoalTask(db, task, goalRequest);
     return true;
   });
 }
@@ -209,7 +212,10 @@ export function markCancelled(db: Database, taskId: string, errorText = "cancell
       [Date.now(), errorText, taskId],
     ).changes === 1;
     // 用户取消是终态：待答提问与任务终态同事务关闭，迟到的回答不再唤醒新回合。
-    if (cancelled) cancelTaskQuestions(db, taskId, "cancelled");
+    if (cancelled) {
+      cancelTaskQuestions(db, taskId, "cancelled");
+      stopGoalContinuationForTask(db, taskId, "cancel");
+    }
   });
 }
 
@@ -254,6 +260,8 @@ export function markTaskStopIntent(
     ).changes === 1;
     // 守卫失败（行已终态）时连题也不动：这次叫停本来就没生效。
     if (!written) return false;
+    // Goal continuation has an independent durable authorization and must be revoked before abort.
+    stopGoalContinuationForTask(db, taskId, intent);
     if (intent === "interrupt") cancelTaskQuestions(db, taskId, "interrupted");
     // 只有 `question_timeout` 用选择集：它按设计保留本回合正在等的提问（B），却必须原子关闭恢复快照里
     // 没人接手的那批遗留题（A），否则被叫停的回合结束后 A 仍可点开、唤醒新回合。逐行校验归属与状态，
@@ -303,7 +311,6 @@ export function prepareTasksForRestart(
   reasonTexts: Record<TaskStopIntent, string>,
 ): TaskRestartRecovery {
   return transaction(db, () => {
-    // 1) 停止意图优先：用户确认过的叫停不该因为一次重启变成自动执行或自动续接。
     const stopped: StoppedTaskRecovery[] = [];
     for (const row of query(db,
       `SELECT id, stop_intent FROM tasks
@@ -314,6 +321,7 @@ export function prepareTasksForRestart(
       const stopIntent = asStopIntent(row.stop_intent);
       if (stopIntent === null) continue;
       const taskId = asString(row.id);
+      stopGoalContinuationForTask(db, taskId, stopIntent);
       run(db,
         `UPDATE tasks SET state = 'interrupted', finished_at = ?, error_text = ?, stop_intent = NULL
          WHERE id = ?`,
@@ -321,26 +329,59 @@ export function prepareTasksForRestart(
       );
       const settled = query(db, "SELECT * FROM tasks WHERE id = ?", [taskId])[0];
       if (settled) stopped.push({ ...taskFromRow(settled), stopIntent });
-      // 中断的回合连同它的待答提问一起在本次事务里关闭（记 `interrupted`）：恢复过程本身再被 SIGKILL
-      // 也不会留下可被点开、可唤醒新回合的旧卡；提问超时停下的行保持可答（迟到答复照在线路径唤醒）。
       if (stopIntent === "interrupt") cancelTaskQuestions(db, taskId, "interrupted");
     }
-    // 2) 已派发但没有接受回执的行：接受状态未知，fail-closed（不重放、不错续）。
-    const uncertainIds = query(db,
-      `SELECT id FROM tasks
-       WHERE bot_uid = ? AND state = 'started' AND prompt_started = 1 AND prompt_accepted = 0`,
-      [botUid],
-    ).map((row) => asString(row.id));
-    run(db,
-      `UPDATE tasks SET state = 'interrupted', finished_at = ?,
-         error_text = 'prompt acceptance unknown at restart (dispatch recorded, worker receipt missing)'
-       WHERE bot_uid = ? AND state = 'started' AND prompt_started = 1 AND prompt_accepted = 0`,
-      [Date.now(), botUid],
-    );
-    // 这些回合已经失败收场：它们的待答提问同样在本次事务里关闭（记 `ended`——不是用户叫停，迟到提交
-    // 按新输入接受）。
-    for (const taskId of uncertainIds) cancelTaskQuestions(db, taskId, "ended");
-    // 3) 其余在途行重排回队列，返回待执行集合。
+
+    const uncertainIdsSet = new Set([
+      ...query(db,
+        `SELECT id FROM tasks
+         WHERE bot_uid = ? AND state = 'started' AND prompt_started = 1 AND prompt_accepted = 0`,
+        [botUid],
+      ).map((row) => asString(row.id)),
+      ...undispatchedGoalAcceptanceIds(db, botUid),
+    ]);
+    const uncertainIds = uncertainIdsSet.size === 0
+      ? []
+      : query(db,
+        `SELECT id FROM tasks WHERE bot_uid = ? AND state = 'started'
+         AND id IN (${[...uncertainIdsSet].map(() => "?").join(", ")})
+         ORDER BY accepted_at ASC, rowid ASC`,
+        [botUid, ...uncertainIdsSet],
+      ).map((row) => asString(row.id));
+    for (const taskId of uncertainIds) {
+      if (getGoalTask(db, taskId)) stopGoalContinuationForTask(db, taskId, "pause");
+      run(db,
+        `UPDATE tasks SET state = 'interrupted', finished_at = ?,
+           error_text = 'goal or prompt dispatch was recorded without a native acceptance receipt'
+         WHERE id = ? AND state = 'started'`,
+        [Date.now(), taskId],
+      );
+      cancelTaskQuestions(db, taskId, "ended");
+    }
+
+    const goalStopped: GoalStoppedRecovery[] = [];
+    for (const taskId of revokedGoalTaskIds(db, botUid)) {
+      const request = getGoalTask(db, taskId);
+      const session = request
+        ? getGoalSession(db, request.botUid, request, request.sessionId)
+        : null;
+      run(db,
+        `UPDATE tasks SET state = 'interrupted', finished_at = ?,
+           error_text = 'native goal continuation was revoked before restart'
+         WHERE id = ? AND state = 'started'`,
+        [Date.now(), taskId],
+      );
+      cancelTaskQuestions(db, taskId, "ended");
+      const settled = query(db, "SELECT * FROM tasks WHERE id = ?", [taskId])[0];
+      if (settled) {
+        goalStopped.push({
+          ...taskFromRow(settled),
+          goalStopIntent: session?.stopIntent ?? "pause",
+          goalStatus: session?.status ?? null,
+        });
+      }
+    }
+
     run(db, "UPDATE tasks SET state = 'queued' WHERE bot_uid = ? AND state = 'started'", [botUid]);
     return {
       queued: query(db,
@@ -353,6 +394,7 @@ export function prepareTasksForRestart(
         uncertainIds,
       ).map((row) => taskFromRow(row)),
       stopped,
+      goalStopped,
     };
   });
 }
@@ -411,14 +453,13 @@ export function clearRestartNotices(db: Database, botUid: string): void {
 
 export function cancelQueued(db: Database, botUid: string, target: ChatTarget): string[] {
   return transaction(db, () => {
+    const goalTaskIds = stopGoalContinuation(db, botUid, target, null, "cancel", false);
     const rows = query(db,
       `SELECT id FROM tasks WHERE bot_uid = ? AND ${targetWhere(target)} AND state = 'queued'`,
       [botUid, ...targetValues(target)],
     );
-    const taskIds = rows.map((row) => asString(row.id));
-    // 与 markCancelled 同一收口：取消是终态，停止意图清掉、选中任务的待答提问在同一事务里关闭，
-    // 否则「cancelQueued → 通知/清理之间被杀」会留下可点开、可唤醒新回合的旧卡（恢复回来的 1/1
-    // 任务排队等前序时正是这个窗口）。
+    const taskIds = [...new Set([...goalTaskIds, ...rows.map((row) => asString(row.id))])];
+    // Cancel queued tasks and their unresolved questions in this same transaction.
     run(db,
       `UPDATE tasks SET state = 'cancelled', finished_at = ?, error_text = 'cancelled before start', stop_intent = NULL
        WHERE bot_uid = ? AND ${targetWhere(target)} AND state = 'queued'`,

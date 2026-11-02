@@ -39,6 +39,9 @@ import type {
   ThreadWorkspace,
   ThreadWorkspaceRequest,
   WorkerEvent,
+  WorkerGoal,
+  WorkerGoalResult,
+  WorkerGoalRun,
   WorkerFactory,
   WorkerModelCatalog,
   WorkerModelSwitch,
@@ -1014,6 +1017,43 @@ export interface PromptRecord {
   /** Session the host published as bound in that scope when this prompt started. */
   boundSessionId?: string;
 }
+export interface FakeGoalRunContext {
+  readonly request: WorkerGoalRun;
+  readonly sessionId: string;
+  readonly promptContext: PromptContext | undefined;
+  readonly current: WorkerGoalResult;
+  readonly emit: (event: WorkerEvent) => void;
+  readonly appended: () => readonly FakeAppendRecord[];
+  readonly waitForAppend: () => Promise<FakeAppendRecord>;
+  readonly waitForAbort: () => Promise<void>;
+}
+
+export type FakeGoalHandler = (
+  context: FakeGoalRunContext,
+) => Promise<WorkerGoalResult> | WorkerGoalResult;
+
+export interface FakeGoalRunRecord {
+  request: WorkerGoalRun;
+  sessionId: string;
+  promptContext: PromptContext | undefined;
+}
+
+interface FixtureGoalState {
+  value: WorkerGoalResult;
+}
+
+function fakeGoalResult(goal: WorkerGoal | null): WorkerGoalResult {
+  return goal === null
+    ? { goal: null, state: null }
+    : {
+        goal,
+        state: {
+          enabled: true,
+          mode: goal.status === "active" ? "active" : "exiting",
+          goal,
+        },
+      };
+}
 
 /**
  * Stand-in for OMP's `/switch` resolution: `@role` through the fixture's role map, then an exact
@@ -1053,11 +1093,15 @@ class FixtureWorker implements OmpWorker {
   abortCalls = 0;
   /** Selectors this session was asked to switch to, in order — the native `/switch` dispatches. */
   readonly switchDispatches: string[] = [];
+  /** Native goal RPC controls requested in this session. */
+  readonly goalOperations: Array<"get" | "pause" | "drop"> = [];
 
+  private readonly goalState: FixtureGoalState;
   private currentCwd: string;
   private switchedModel: { model: string; level: string | null } | undefined;
   private readonly stopCallbacks = new Set<() => void>();
   private promptInFlight = false;
+  private goalRunInFlight = false;
   private abortSignaled = false;
   private appendCursor = 0;
   private readonly appendedMessages: FakeAppendRecord[] = [];
@@ -1072,6 +1116,10 @@ class FixtureWorker implements OmpWorker {
     private readonly catalog: () => WorkerModelCatalog,
     private readonly resolveModel: (selector: string) => { model: string; level: string | null } | null,
     private readonly modelsFailure: () => Error | undefined,
+    private readonly goalStateFor: (sessionId: string) => FixtureGoalState,
+    private readonly goalHandler: FakeGoalHandler,
+    private readonly recordGoalRun: (record: FakeGoalRunRecord) => void,
+    private readonly waitBeforeStop: (sessionId: string) => Promise<void>,
   ) {
     this.sessionFile = options.sessionFile ?? join(options.sessionDir, `${sessionId}.session`);
     let persistedSessionId: string | undefined;
@@ -1085,6 +1133,7 @@ class FixtureWorker implements OmpWorker {
       }
     }
     this.sessionId = persistedSessionId ?? sessionId;
+    this.goalState = this.goalStateFor(this.sessionId);
     this.currentCwd = options.cwd;
     options.onSpawn({
       pid: 30000 + Number(this.sessionId.replace(/\D/g, "")),
@@ -1137,6 +1186,60 @@ class FixtureWorker implements OmpWorker {
     if (resolved === null) return { ok: false };
     this.switchedModel = resolved;
     return { ok: true, model: resolved.model, level: resolved.level };
+  }
+  async goal(op: "get" | "pause" | "drop"): Promise<WorkerGoalResult> {
+    this.goalOperations.push(op);
+    const current = this.goalState.value;
+    if (op === "get" || current.goal === null) return current;
+    const goal: WorkerGoal = {
+      ...current.goal,
+      status: op === "pause" ? "paused" : "dropped",
+    };
+    this.goalState.value = fakeGoalResult(goal);
+    return this.goalState.value;
+  }
+
+  async runGoal(
+    request: WorkerGoalRun,
+    onEvent: (event: WorkerEvent) => void,
+    context?: PromptContext,
+  ): Promise<WorkerGoalResult> {
+    this.recordGoalRun({
+      request: { ...request },
+      sessionId: this.sessionId,
+      promptContext: context,
+    });
+    this.goalRunInFlight = true;
+    try {
+      const result = await this.goalHandler({
+        request,
+        sessionId: this.sessionId,
+        promptContext: context,
+        current: this.goalState.value,
+        emit: event => {
+          if (event.type === "goal_updated") {
+            this.goalState.value = fakeGoalResult(event.goal);
+          }
+          onEvent(event);
+        },
+        appended: () => [...this.appendedMessages],
+        waitForAppend: () => this.takeAppend(),
+        waitForAbort: () => this.takeAbort(),
+      });
+      const latestGoal = this.goalState.value.goal;
+      if (
+        result.goal !== null
+        && latestGoal?.id === result.goal.id
+        && (latestGoal.status === "paused" || latestGoal.status === "dropped")
+        && result.goal.status === "active"
+      ) {
+        return result;
+      }
+      this.goalState.value = result;
+      return result;
+    } finally {
+      this.goalRunInFlight = false;
+    }
   }
 
   private async writeSessionHeader(previousSessionFiles: readonly string[] = []): Promise<void> {
@@ -1262,7 +1365,9 @@ class FixtureWorker implements OmpWorker {
   }
 
   async steer(text: string): Promise<void> {
-    if (!this.promptInFlight) throw new Error("fixture worker is not streaming a turn");
+    if (!this.promptInFlight && !this.goalRunInFlight) {
+      throw new Error("fixture worker is not streaming a turn");
+    }
     this.appendedMessages.push({
       text,
       sessionId: this.sessionId,
@@ -1276,7 +1381,9 @@ class FixtureWorker implements OmpWorker {
   }
 
   async abortTurn(): Promise<void> {
-    if (!this.promptInFlight) throw new Error("fixture worker has no prompt in progress");
+    if (!this.promptInFlight && !this.goalRunInFlight) {
+      throw new Error("fixture worker has no prompt or goal run in progress");
+    }
     this.abortCalls += 1;
     this.abortSignaled = true;
     for (const callback of this.abortWaiters.splice(0)) callback();
@@ -1301,6 +1408,7 @@ class FixtureWorker implements OmpWorker {
   }
 
   async stop(): Promise<boolean> {
+    await this.waitBeforeStop(this.sessionId);
     this.stopped = true;
     for (const callback of this.stopCallbacks) {
       callback();
@@ -1318,6 +1426,45 @@ export class FakeWorkerFactory implements WorkerFactory {
   readonly prompts: PromptRecord[] = [];
   /** Options every creation was asked for, in call order, for model and target assertions. */
   readonly creations: WorkerOptions[] = [];
+  readonly goalRuns: FakeGoalRunRecord[] = [];
+  /** A narrow shutdown seam for tests that need to hold the lease cleanup window open. */
+  stopHandler: ((sessionId: string) => void | Promise<void>) | undefined = undefined;
+  /** The native structured-goal behavior a test asks this fixture to perform. */
+  goalHandler: FakeGoalHandler = async ({ request, current, emit, sessionId }) => {
+    if (request.op === "create") {
+      if (current.goal !== null) return current;
+      const goal: WorkerGoal = {
+        id: `fixture-goal-${sessionId}`,
+        objective: request.objective,
+        status: "active",
+        tokensUsed: 0,
+        timeUsedSeconds: 0,
+        ...(request.tokenBudget === undefined ? {} : { tokenBudget: request.tokenBudget }),
+      };
+      emit({ type: "goal_accepted", goalId: goal.id });
+      emit({ type: "goal_updated", goal });
+      emit({ type: "prompt_accepted" });
+      return fakeGoalResult(goal);
+    }
+    if (
+      current.goal === null
+      || (request.op === "recover" && current.goal.id !== request.goalId)
+    ) {
+      return current;
+    }
+    const goal = request.op === "resume"
+      ? { ...current.goal, status: "active" as const }
+      : current.goal;
+    emit({ type: "goal_accepted", goalId: goal.id });
+    emit({ type: "goal_updated", goal });
+    emit({ type: "prompt_accepted" });
+    return fakeGoalResult(goal);
+  };
+  private readonly goalRunWaiters: Array<{
+    count: number;
+    resolve: () => void;
+  }> = [];
+  private readonly goalStates = new Map<string, FixtureGoalState>();
 
   /**
    * Catalog fixture workers report for `/switch`. A worker created with `WorkerOptions.model`
@@ -1390,15 +1537,48 @@ export class FakeWorkerFactory implements WorkerFactory {
       () => this.catalog,
       selector => resolveFixtureModel(selector, this.roles, this.catalog),
       () => this.modelsFailure,
+      (sessionId) => this.goalStateFor(sessionId),
+      (context) => this.goalHandler(context),
+      (record) => this.recordGoalRun(record),
+      async sessionId => {
+        await this.stopHandler?.(sessionId);
+      },
     );
     this.workers.push(worker);
     return worker;
-  }
 
+  }
   async recover(_process: WorkerProcess): Promise<boolean> {
     return this.recovered;
   }
 
+  /** Simulates native goal state that has not yet reached the channel's progress projection. */
+  setNativeGoal(sessionId: string, goal: WorkerGoal | null): void {
+    this.goalStateFor(sessionId).value = fakeGoalResult(goal);
+  }
+
+  private goalStateFor(sessionId: string): FixtureGoalState {
+    let state = this.goalStates.get(sessionId);
+    if (state === undefined) {
+      state = { value: { goal: null, state: null } };
+      this.goalStates.set(sessionId, state);
+    }
+    return state;
+  }
+
+  private recordGoalRun(record: FakeGoalRunRecord): void {
+    this.goalRuns.push(record);
+    for (const waiter of this.goalRunWaiters) {
+      if (this.goalRuns.length >= waiter.count) waiter.resolve();
+    }
+  }
+
+  waitForGoalRunCount(count: number): Promise<void> {
+    if (this.goalRuns.length >= count) return Promise.resolve();
+    const { promise, resolve } = Promise.withResolvers<void>();
+    this.goalRunWaiters.push({ count, resolve });
+    return promise;
+  }
   waitForPromptCount(count: number): Promise<void> {
     if (this.prompts.length >= count) {
       return Promise.resolve();

@@ -6,13 +6,18 @@ import type {
 	PromptContext,
 	WorkerEvent,
 	WorkerFactory,
+	WorkerGoal,
+	WorkerGoalErrorCode,
+	WorkerGoalResult,
+	WorkerGoalRun,
+	WorkerGoalStatus,
 	WorkerModelCatalog,
 	WorkerModelInfo,
 	WorkerModelSwitch,
 	WorkerOptions,
 	WorkerProcess,
 } from "../contracts.ts";
-import { RESUME_CONTINUATION_PROMPT, TaskStartupError, taskStartupError } from "../contracts.ts";
+import { RESUME_CONTINUATION_PROMPT, TaskStartupError, WorkerGoalError, taskStartupError } from "../contracts.ts";
 import { loadValidatedSessionState, type ProjectSessionState } from "../session/project-session.ts";
 import {
 	RpcCommand,
@@ -51,6 +56,107 @@ import {
 } from "./events.ts";
 
 const FIXED_CONTEXT_EXTENSION_PATH = resolve(import.meta.dir, "context-extension.ts");
+const FIXED_GOAL_RPC_CONFIG_PATH = resolve(import.meta.dir, "goal-rpc.yml");
+
+const GOAL_ERROR_MESSAGES: Record<WorkerGoalErrorCode, string> = {
+	unsupported: "当前 OMP 不支持原生目标 RPC",
+	disabled: "OMP 原生目标功能未启用",
+	"already-exists": "当前会话已有原生目标，请先删除",
+	"already-active": "当前原生目标正在执行，拒绝重复恢复",
+	"identity-mismatch": "原生目标 ID 与已接受目标不一致，已停止恢复",
+	"invalid-request": "原生目标请求无效",
+	"invalid-response": "OMP 原生目标 RPC 返回了无效结果",
+	"continuation-disabled": "当前 worker 未启用原生目标自动续跑",
+	"native-error": "OMP 原生目标操作失败",
+};
+
+function workerGoalError(code: WorkerGoalErrorCode, message?: string): WorkerGoalError {
+	return new WorkerGoalError(code, message ?? GOAL_ERROR_MESSAGES[code]);
+}
+
+function asGoalRpcError(error: unknown): WorkerGoalError {
+	if (error instanceof WorkerGoalError) return error;
+	const message = asError(error, "native goal RPC failed").message.toLowerCase();
+	if (/unknown (?:rpc )?command|unsupported.*goal|goal.*unsupported/u.test(message)) {
+		return workerGoalError("unsupported");
+	}
+	if (/disabled|not enabled|goal\.enabled/u.test(message)) return workerGoalError("disabled");
+	if (/already.*goal|goal.*already|active or paused/u.test(message)) {
+		return workerGoalError("already-exists");
+	}
+	return workerGoalError("native-error");
+}
+
+const WORKER_GOAL_STATUSES: Record<WorkerGoalStatus, true> = {
+	active: true,
+	paused: true,
+	"budget-limited": true,
+	complete: true,
+	dropped: true,
+};
+
+function parseWorkerGoal(value: unknown, source: string): WorkerGoal | null {
+	if (value === null) return null;
+	if (
+		!isRecord(value) ||
+		typeof value.id !== "string" ||
+		value.id.length === 0 ||
+		typeof value.objective !== "string" ||
+		typeof value.status !== "string" ||
+		WORKER_GOAL_STATUSES[value.status as WorkerGoalStatus] !== true ||
+		typeof value.tokensUsed !== "number" ||
+		!Number.isSafeInteger(value.tokensUsed) ||
+		value.tokensUsed < 0 ||
+		typeof value.timeUsedSeconds !== "number" ||
+		!Number.isFinite(value.timeUsedSeconds) ||
+		value.timeUsedSeconds < 0 ||
+		typeof value.createdAt !== "number" ||
+		!Number.isFinite(value.createdAt) ||
+		typeof value.updatedAt !== "number" ||
+		!Number.isFinite(value.updatedAt) ||
+		(value.tokenBudget !== undefined &&
+			(typeof value.tokenBudget !== "number" || !Number.isSafeInteger(value.tokenBudget) || value.tokenBudget <= 0))
+	) {
+		throw workerGoalError("invalid-response", `${source} returned an invalid native goal`);
+	}
+	const goal: WorkerGoal = {
+		id: value.id,
+		objective: value.objective,
+		status: value.status as WorkerGoalStatus,
+		tokensUsed: value.tokensUsed,
+		timeUsedSeconds: value.timeUsedSeconds,
+	};
+	if (typeof value.tokenBudget === "number") goal.tokenBudget = value.tokenBudget;
+	return goal;
+}
+
+function parseWorkerGoalResult(value: unknown, source: string): WorkerGoalResult {
+	if (!isRecord(value) || !("goal" in value) || !("state" in value)) {
+		throw workerGoalError("invalid-response", `${source} returned an invalid native goal response`);
+	}
+	const goal = parseWorkerGoal(value.goal, source);
+	if (value.state === null) {
+		if (goal !== null) throw workerGoalError("invalid-response", `${source} returned a goal without native goal state`);
+		return { goal: null, state: null };
+	}
+	const state = value.state;
+	if (
+		!isRecord(state) ||
+		typeof state.enabled !== "boolean" ||
+		(state.mode !== "active" && state.mode !== "exiting") ||
+		!("goal" in state)
+	) {
+		throw workerGoalError("invalid-response", `${source} returned an invalid native goal state`);
+	}
+	const stateGoal = parseWorkerGoal(state.goal, source);
+	if (goal === null || stateGoal === null || goal.id !== stateGoal.id) {
+		throw workerGoalError("invalid-response", `${source} returned inconsistent native goal state`);
+	}
+	return {
+		goal,
+		state: { enabled: state.enabled, mode: state.mode, goal: stateGoal },
+	};
+}
 
 type WorkerFactoryOptions = {
 	ompCommand: string;
@@ -100,6 +206,9 @@ class RpcWorker implements OmpWorker {
 	#startupTimeoutMs: number;
 	#cancelTimeoutMs: number;
 	#newSessionOnStart: boolean;
+	#goalContinuation: boolean;
+	/** Invalidates goal starts that have not crossed their structured RPC dispatch boundary. */
+	#goalControlGeneration = 0;
 	#decoder = new RpcFrameDecoder();
 	#protocolV2 = false;
 	#ready = false;
@@ -118,7 +227,7 @@ class RpcWorker implements OmpWorker {
 	#suppressCommandOutput = false;
 	#pending = new Map<string, PendingResponse>();
 	#activePrompt: PromptRun | undefined;
-	/** True from prompt acknowledgement until the terminal `agent_end` settles the run. */
+	/** True after prompt acceptance or during an agent turn; false between turns and at settlement. */
 	#streaming = false;
 	#activeTools = new Map<string, HostTool>();
 	#hostCalls = new Map<string, HostCall>();
@@ -140,6 +249,7 @@ class RpcWorker implements OmpWorker {
 		startupTimeoutMs: number,
 		cancelTimeoutMs: number,
 		newSessionOnStart: boolean,
+		goalContinuation: boolean,
 	) {
 		this.#child = child;
 		this.#watchdog = watchdog;
@@ -147,6 +257,7 @@ class RpcWorker implements OmpWorker {
 		this.#startupTimeoutMs = startupTimeoutMs;
 		this.#cancelTimeoutMs = cancelTimeoutMs;
 		this.#newSessionOnStart = newSessionOnStart;
+		this.#goalContinuation = goalContinuation;
 		const ready = Promise.withResolvers<void>();
 		this.#readyPromise = ready.promise;
 		this.#readyResolve = ready.resolve;
@@ -339,28 +450,269 @@ class RpcWorker implements OmpWorker {
 		await this.#dispatchPrompt(RESUME_CONTINUATION_PROMPT, onEvent, context, false);
 	}
 
-	async #dispatchPrompt(
-		text: string,
+
+	async goal(op: "get" | "pause" | "drop"): Promise<WorkerGoalResult> {
+		if (op !== "get") this.#goalControlGeneration++;
+		if (this.#closed) throw new Error("OMP worker is not running");
+		try {
+			const response = await this.#request({ type: "goal", op }, DEFAULT_REQUEST_TIMEOUT_MS);
+			this.#assertSuccess(response, `goal ${op}`);
+			return parseWorkerGoalResult(response.data, `OMP goal ${op}`);
+		} catch (error) {
+			throw asGoalRpcError(error);
+		}
+	}
+
+	async runGoal(
+		request: WorkerGoalRun,
+		onEvent: (event: WorkerEvent) => void,
+		context?: PromptContext,
+	): Promise<WorkerGoalResult> {
+		if (this.#closed) throw new Error("OMP worker is not running");
+		if (!this.#goalContinuation) throw workerGoalError("continuation-disabled");
+		if (this.#activePrompt) throw new Error("OMP worker already has a run in progress");
+		if (!request || typeof request !== "object") throw workerGoalError("invalid-request");
+		const controlGeneration = this.#goalControlGeneration;
+
+		if (request.op === "create") {
+			if (typeof request.objective !== "string" || request.objective.trim().length === 0) {
+				throw workerGoalError("invalid-request");
+			}
+			if (
+				request.tokenBudget !== undefined &&
+				(!Number.isSafeInteger(request.tokenBudget) || request.tokenBudget <= 0)
+			) {
+				throw workerGoalError("invalid-request");
+			}
+			const current = await this.goal("get");
+			if (controlGeneration !== this.#goalControlGeneration) return this.#goalAfterControl();
+			if (current.goal) throw workerGoalError("already-exists");
+			return this.#startNativeGoal("create", onEvent, context, request, undefined, controlGeneration);
+		}
+
+		if (request.op === "resume") {
+			const current = await this.goal("get");
+			if (controlGeneration !== this.#goalControlGeneration) return this.#goalAfterControl();
+			if (
+				!current.goal ||
+				current.goal.status === "complete" ||
+				current.goal.status === "dropped" ||
+				current.goal.status === "budget-limited"
+			) {
+				return current;
+			}
+			if (current.goal.status !== "paused") throw workerGoalError("already-active");
+			return this.#startNativeGoal("resume", onEvent, context, undefined, current.goal.id, controlGeneration);
+		}
+
+		if (request.op === "recover") return this.#recoverGoal(request.goalId, onEvent, context, controlGeneration);
+		throw workerGoalError("invalid-request");
+	}
+
+	async #goalAfterControl(expectedGoalId?: string): Promise<WorkerGoalResult> {
+		while (true) {
+			const generation = this.#goalControlGeneration;
+			const current = await this.goal("get");
+			if (expectedGoalId !== undefined && current.goal && current.goal.id !== expectedGoalId) {
+				throw workerGoalError("identity-mismatch");
+			}
+			if (generation === this.#goalControlGeneration) return current;
+		}
+	}
+
+	async #recoverGoal(
+		goalId: string,
 		onEvent: (event: WorkerEvent) => void,
 		context: PromptContext | undefined,
-		internalCommandOutput: boolean,
-	): Promise<void> {
+		controlGeneration: number,
+	): Promise<WorkerGoalResult> {
+		if (typeof goalId !== "string" || goalId.length === 0) throw workerGoalError("invalid-request");
+		let current = await this.goal("get");
+		if (current.goal && current.goal.id !== goalId) throw workerGoalError("identity-mismatch");
+		if (controlGeneration !== this.#goalControlGeneration) return this.#goalAfterControl(goalId);
+		if (
+			!current.goal ||
+			current.goal.status === "complete" ||
+			current.goal.status === "dropped" ||
+			current.goal.status === "budget-limited"
+		) {
+			return current;
+		}
+
+		// Retry only the failed native turn. Unlike ordinary resume, an empty retry never sends a
+		// generic continuation prompt; the structured goal resume below is the only continuation.
+		await this.#dispatchPrompt(
+			"/retry",
+			event => {
+				if (event.type === "prompt_accepted" || event.type === "local_command") return;
+				onEvent(event);
+			},
+			context,
+			true,
+		);
+
+		current = await this.goal("get");
+		if (current.goal && current.goal.id !== goalId) throw workerGoalError("identity-mismatch");
+		if (controlGeneration !== this.#goalControlGeneration) return this.#goalAfterControl(goalId);
+		if (
+			!current.goal ||
+			current.goal.status === "complete" ||
+			current.goal.status === "dropped" ||
+			current.goal.status === "budget-limited"
+		) {
+			return current;
+		}
+		return this.#startNativeGoal("resume", onEvent, context, undefined, goalId, controlGeneration);
+	}
+
+
+	async #startNativeGoal(
+		op: "create" | "resume",
+		onEvent: (event: WorkerEvent) => void,
+		context: PromptContext | undefined,
+		createRequest: Extract<WorkerGoalRun, { op: "create" }> | undefined,
+		expectedGoalId: string | undefined,
+		controlGeneration: number,
+	): Promise<WorkerGoalResult> {
 		if (this.#closed) throw new Error("OMP worker is not running");
-		if (this.#activePrompt) throw new Error("OMP worker already has a prompt in progress");
-		if (typeof text !== "string") throw new Error("OMP prompt text must be a string");
+		if (this.#activePrompt) throw new Error("OMP worker already has a run in progress");
+		const run = this.#createPromptRun(onEvent, true);
+		this.#activePrompt = run;
+		this.#suppressCommandOutput = false;
+		let acceptedGoalId: string | undefined;
+		try {
+			await this.#installHostTools(context?.tools ?? []);
+			if (controlGeneration !== this.#goalControlGeneration) {
+				this.#settlePrompt(run);
+				return await this.#goalAfterControl(expectedGoalId);
+			}
+			const command: RpcCommand =
+				op === "create"
+					? {
+							type: "goal",
+							op,
+							objective: createRequest!.objective,
+							...(createRequest!.tokenBudget === undefined ? {} : { token_budget: createRequest!.tokenBudget }),
+						}
+					: { type: "goal", op };
+			run.goalDispatchIssued = true;
+			const response = await this.#request(command, DEFAULT_REQUEST_TIMEOUT_MS, requestId => {
+				run.requestId = requestId;
+			});
+			try {
+				this.#assertSuccess(response, `goal ${op}`);
+			} catch (error) {
+				throw asGoalRpcError(error);
+			}
+			run.goalRpcSucceeded = true;
+			const result = parseWorkerGoalResult(response.data, `OMP goal ${op}`);
+			run.goalResponseReceived = true;
+			if (op === "create" && !result.goal) {
+				throw workerGoalError("invalid-response", "OMP goal create succeeded without creating a native goal");
+			}
+			if (!result.goal) {
+				this.#settlePrompt(run);
+				return result;
+			}
+			if (expectedGoalId !== undefined && result.goal.id !== expectedGoalId) {
+				throw workerGoalError("identity-mismatch");
+			}
+			acceptedGoalId = result.goal.id;
+			try {
+				onEvent({ type: "goal_accepted", goalId: acceptedGoalId });
+			} catch (error) {
+				throw asError(error, "OMP goal acceptance callback failed");
+			}
+			if (run.settled) await run.completion;
+			if (!run.settled && (run.sessionSettledSeen || !run.agentStarted) && (await this.#sessionIsSettled())) {
+				this.#settlePrompt(run);
+			}
+			await run.completion;
+
+			let final = await this.goal("get");
+			if (final.goal && final.goal.id !== acceptedGoalId) throw workerGoalError("identity-mismatch");
+			if (final.goal?.status === "active") {
+				const paused = await this.goal("pause");
+				if (paused.goal && paused.goal.id !== acceptedGoalId) throw workerGoalError("identity-mismatch");
+				final = await this.goal("get");
+				if (final.goal && final.goal.id !== acceptedGoalId) throw workerGoalError("identity-mismatch");
+				if (final.goal?.status === "active") {
+					throw workerGoalError("native-error", "OMP 未完成目标仍处于 active，native pause 未生效");
+				}
+			}
+			return final;
+		} catch (error) {
+			const failure = asError(error, `OMP goal ${op} failed`);
+			this.#rejectPrompt(run, failure);
+			const goalToPause = acceptedGoalId ?? (op === "resume" ? expectedGoalId : run.goalUpdatedId);
+			if (goalToPause !== undefined) {
+				await this.#pauseCurrentGoal(goalToPause);
+			} else if (op === "create" && run.goalRpcSucceeded) {
+				await this.#pauseCurrentGoal();
+			}
+			throw failure;
+		} finally {
+			this.#abortHostCalls(new Error("goal run finished"));
+			await this.#clearHostTools();
+			if (this.#activePrompt === run) this.#activePrompt = undefined;
+			this.#streaming = false;
+			this.#suppressCommandOutput = false;
+		}
+	}
+
+	async #sessionIsSettled(): Promise<boolean> {
+		const response = await this.#request({ type: "get_state" }, this.#startupTimeoutMs);
+		this.#assertSuccess(response, "get_state");
+		if (!isRecord(response.data) || typeof response.data.isSettled !== "boolean") {
+			throw workerGoalError("invalid-response", "OMP RPC get_state did not report session settlement");
+		}
+		return response.data.isSettled;
+	}
+	async #confirmGoalSettlement(run: PromptRun): Promise<void> {
+		try {
+			if (await this.#sessionIsSettled() && this.#activePrompt === run && !run.settled) {
+				this.#settlePrompt(run);
+			}
+		} catch (error) {
+			if (this.#activePrompt === run && !run.settled) {
+				this.#rejectPrompt(run, asError(error, "OMP goal session settlement could not be confirmed"));
+			}
+		}
+	}
+
+	async #pauseCurrentGoal(expectedGoalId?: string): Promise<void> {
+		try {
+			const current = await this.goal("get");
+			if (
+				current.goal?.status === "active" &&
+				(expectedGoalId === undefined || current.goal.id === expectedGoalId)
+			) {
+				await this.goal("pause");
+			}
+		} catch {
+			// The caller already has the operation failure; this best-effort pause only prevents an
+			// unaccepted or failed run from silently scheduling more native work.
+		}
+	}
+
+	#createPromptRun(onEvent: (event: WorkerEvent) => void, goalRun: boolean): PromptRun {
 		const completion = Promise.withResolvers<void>();
-		// The dispatch promise carries every run rejection to its caller; this handler only keeps
-		// the internal settle signal from surfacing as a duplicate unhandled rejection when the
-		// acknowledgement path throws before `run.completion` is awaited (an ack that fails with
-		// `success:false` rejects through the dispatch, never through this promise alone).
 		void completion.promise.catch(() => {});
-		const run: PromptRun = {
+		return {
 			requestId: "",
 			onEvent,
 			resolve: () => completion.resolve(),
 			reject: error => completion.reject(error),
 			completion: completion.promise,
 			settled: false,
+			goalRun,
+			waitForSessionSettled: goalRun,
+			goalDispatchIssued: false,
+			goalRpcSucceeded: false,
+			goalResponseReceived: false,
+			sessionSettledSeen: false,
+			goalUpdatedId: undefined,
+			agentStarted: false,
 			agentInvoked: false,
 			accepted: false,
 			assistantMessageEnded: false,
@@ -375,6 +727,17 @@ class RpcWorker implements OmpWorker {
 			activeTurnId: undefined,
 			research: new ResearchTracker(),
 		};
+	}
+	async #dispatchPrompt(
+		text: string,
+		onEvent: (event: WorkerEvent) => void,
+		context: PromptContext | undefined,
+		internalCommandOutput: boolean,
+	): Promise<void> {
+		if (this.#closed) throw new Error("OMP worker is not running");
+		if (this.#activePrompt) throw new Error("OMP worker already has a prompt in progress");
+		if (typeof text !== "string") throw new Error("OMP prompt text must be a string");
+		const run = this.#createPromptRun(onEvent, false);
 		this.#activePrompt = run;
 		this.#suppressCommandOutput = internalCommandOutput;
 		try {
@@ -406,8 +769,8 @@ class RpcWorker implements OmpWorker {
 	}
 
 	/**
-	 * Steering is only meaningful while a turn streams: once the terminal `agent_end` arrived OMP
-	 * would park the message in a queue no later turn drains, so the host must fall back to a task.
+	 * Steering is only meaningful while a turn streams. A modern terminal `agent_end` can leave the
+	 * session unsettled for background or goal work; keep that run open but close the turn gate.
 	 */
 	async steer(text: string): Promise<void> {
 		if (this.#closed) throw new Error("OMP worker is not running");
@@ -422,6 +785,7 @@ class RpcWorker implements OmpWorker {
 	}
 
 	async abortTurn(): Promise<void> {
+		this.#goalControlGeneration++;
 		if (this.#closed) throw new Error("OMP worker is not running");
 		const response = await this.#request({ type: "abort" }, Math.min(1_000, this.#cancelTimeoutMs));
 		this.#assertSuccess(response, "abort");
@@ -429,6 +793,7 @@ class RpcWorker implements OmpWorker {
 
 	async stop(): Promise<boolean> {
 		if (this.#stopPromise) return this.#stopPromise;
+		this.#goalControlGeneration++;
 		this.#stopPromise = this.#stopInternal();
 		return this.#stopPromise;
 	}
@@ -623,30 +988,72 @@ class RpcWorker implements OmpWorker {
 			return;
 		}
 		const active = this.#activePrompt;
-		if (!active) return;
+		if (frame.type === "goal_updated") {
+			if (active && !active.settled) this.#handleGoalUpdated(active, frame);
+			return;
+		}
+		if (!active || active.settled) return;
+		if (frame.type === "session_settled") {
+			if (!active.waitForSessionSettled) return;
+			if (!active.goalRun) {
+				this.#settlePrompt(active);
+				return;
+			}
+			if (!active.goalDispatchIssued) return;
+			if (!active.goalResponseReceived) {
+				active.sessionSettledSeen = true;
+				return;
+			}
+			void this.#confirmGoalSettlement(active);
+			return;
+		}
 		const modelError = modelErrorFromFrame(frame);
 		if (modelError) {
 			this.#rejectPrompt(active, modelError);
 			return;
 		}
 		if (frame.type === "agent_end") {
-			if (frame.willContinue !== true) this.#settlePrompt(active);
+			if (typeof frame.isTerminal === "boolean" || typeof frame.yielded === "boolean") {
+				active.waitForSessionSettled = true;
+			}
+			this.#streaming = false;
+			if (!active.goalRun && !active.waitForSessionSettled && frame.willContinue !== true) {
+				this.#settlePrompt(active);
+			}
 			return;
 		}
-		if (frame.type === "prompt_result" && frame.agentInvoked === false) {
-			// A late or replayed `prompt_result` belongs to the run it names: only an absent id
-			// is the legacy shape that may settle any active run; any carried id — string
-			// mismatch or non-string junk like null/number — is not this run's completion.
+		if (frame.type === "prompt_result") {
+			if (active.goalRun) return;
 			if (frame.id !== undefined && frame.id !== active.requestId) return;
-			// A run OMP acknowledged as an agent turn completes only at its terminal `agent_end`:
-			// a replayed local completion must neither settle it early nor make `resume` read a
-			// regenerating turn as local-only.
-			if (active.agentInvoked) return;
-			this.#completeLocalCommand(active);
+			if (frame.agentInvoked === true) {
+				if (frame.id !== active.requestId) return;
+				active.waitForSessionSettled = true;
+				if (frame.sessionSettled === true) this.#settlePrompt(active);
+				return;
+			}
+			if (frame.agentInvoked === false) {
+				// A run OMP acknowledged as an agent turn ignores stale local completion frames.
+				if (!active.agentInvoked) this.#completeLocalCommand(active);
+			}
 			return;
 		}
-		if (frame.type === "agent_start" && !this.#acceptPrompt(active)) return;
+		if (frame.type === "agent_start") {
+			active.agentStarted = true;
+			this.#streaming = true;
+			if (!this.#acceptPrompt(active)) return;
+		}
 		this.#emitWorkerEvent(active, frame);
+	}
+
+	#handleGoalUpdated(active: PromptRun, frame: RpcFrame): void {
+		try {
+			if (!("goal" in frame)) throw workerGoalError("invalid-response", "OMP goal_updated omitted its goal field");
+			const goal = parseWorkerGoal(frame.goal, "OMP goal_updated");
+			active.goalUpdatedId = goal?.id;
+			active.onEvent({ type: "goal_updated", goal });
+		} catch (error) {
+			this.#rejectPrompt(active, asError(error, "OMP goal_updated event was invalid"));
+		}
 	}
 
 	#handleResponse(frame: RpcFrame): void {
@@ -891,6 +1298,7 @@ class OmpWorkerFactory implements WorkerFactory {
 		];
 		if (options.model) command.push("--model", options.model);
 		if (options.sessionFile) command.push("--resume", resolve(options.sessionFile));
+		if (options.goalContinuation === true) command.push("--config", FIXED_GOAL_RPC_CONFIG_PATH);
 		let child: RpcChild;
 		try {
 			child = Bun.spawn(command, {
@@ -940,7 +1348,15 @@ class OmpWorkerFactory implements WorkerFactory {
 			if (stopped) stopWatchdog(watchdog);
 			throw error;
 		}
-		const worker = new RpcWorker(child, watchdog, snapshot.pgid, this.#startupTimeoutMs, this.#cancelTimeoutMs, !options.sessionFile);
+		const worker = new RpcWorker(
+			child,
+			watchdog,
+			snapshot.pgid,
+			this.#startupTimeoutMs,
+			this.#cancelTimeoutMs,
+			!options.sessionFile,
+			options.goalContinuation === true,
+		);
 		try {
 			await worker.initialize();
 			return worker;

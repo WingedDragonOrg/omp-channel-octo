@@ -189,6 +189,41 @@ export function applySchema(db: Database): void {
       relay_channel_id TEXT,
       relay_thread_name TEXT
     );
+    CREATE TABLE IF NOT EXISTS goal_sessions (
+      bot_uid TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
+      channel_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      goal_id TEXT,
+      objective TEXT NOT NULL,
+      status TEXT CHECK(status IS NULL OR status IN ('active', 'paused', 'budget-limited', 'complete', 'dropped')),
+      tokens_used INTEGER NOT NULL DEFAULT 0 CHECK(tokens_used >= 0),
+      time_used_seconds INTEGER NOT NULL DEFAULT 0 CHECK(time_used_seconds >= 0),
+      token_budget INTEGER CHECK(token_budget IS NULL OR token_budget > 0),
+      continuation_authorized INTEGER NOT NULL DEFAULT 0 CHECK(continuation_authorized IN (0, 1)),
+      stop_intent TEXT CHECK(stop_intent IS NULL OR stop_intent IN ('pause', 'drop', 'interrupt', 'question_timeout', 'cancel')),
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(bot_uid, channel_type, channel_id, session_id)
+    );
+    CREATE TABLE IF NOT EXISTS goal_tasks (
+      task_id TEXT PRIMARY KEY NOT NULL,
+      bot_uid TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
+      channel_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      request_op TEXT NOT NULL CHECK(request_op IN ('create', 'resume')),
+      dispatch_op TEXT CHECK(dispatch_op IS NULL OR dispatch_op IN ('create', 'resume', 'recover')),
+      objective TEXT NOT NULL DEFAULT '',
+      token_budget INTEGER CHECK(token_budget IS NULL OR token_budget > 0),
+      dispatched INTEGER NOT NULL DEFAULT 0 CHECK(dispatched IN (0, 1)),
+      accepted INTEGER NOT NULL DEFAULT 0 CHECK(accepted IN (0, 1)),
+      agent_accepted INTEGER NOT NULL DEFAULT 0 CHECK(agent_accepted IN (0, 1)),
+      accepted_goal_id TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS goal_tasks_target
+      ON goal_tasks(bot_uid, channel_type, channel_id, session_id, created_at, task_id);
     CREATE INDEX IF NOT EXISTS tasks_chat_order
       ON tasks(bot_uid, channel_type, channel_id, accepted_at, id);
     CREATE INDEX IF NOT EXISTS tasks_active

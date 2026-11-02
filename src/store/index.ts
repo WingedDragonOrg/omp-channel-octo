@@ -6,11 +6,12 @@
 import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { ChatAppendMode, ChatTarget } from "../contracts.ts";
-import type { BindingRecord, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput } from "./store-records.ts";
+import type { ChatAppendMode, ChatTarget, WorkerGoal } from "../contracts.ts";
+import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput } from "./store-records.ts";
 import { applySchema } from "./store-schema.ts";
 import { claimOwnerEnrollment, clearChatModel, ensureBinding, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, grantAllowedChat, hasOwnerEnrollment, listAllowedChats, setBotUid, setChatMode, setChatModel, setOwnerId, updateBindingSession } from "./store-chats.ts";
 import { acceptTask, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, isTaskResuming, listQueuedTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim } from "./store-tasks.ts";
+import { bindGoalTaskSession, clearGoalSession, finishGoalTaskProgress, getGoalSession, getGoalTask, isGoalTaskResuming, markGoalTaskAccepted, markGoalTaskAgentAccepted, markGoalTaskDispatched, saveGoalSessionProgress, stopGoalContinuation, updateGoalTaskProgress } from "./store-goals.ts";
 import { clearProgressCard, listProgressCards, recordProgressCardAttempt, saveProgressCard } from "./store-cards.ts";
 import { listWorkerLedger, markWorkerStopped, recordWorker } from "./store-workers.ts";
 import { advanceHistoryLedger, clearContextLedger, commitContextInjection, commitHistoryInjection, getContextLedger, getHistoryLedger, prepareContextInjection, prepareHistoryInjection, pruneHistoryLedger } from "./store-ledgers.ts";
@@ -175,8 +176,59 @@ export class ChannelStore {
     return workspaceDirectories(this.db, cwd);
   }
 
-  acceptTask(claim: InboundClaim, task: TaskRecord): boolean {
-    return acceptTask(this.db, claim, task);
+  acceptTask(claim: InboundClaim, task: TaskRecord, goalRequest?: GoalTaskRequest): boolean {
+    return acceptTask(this.db, claim, task, goalRequest);
+  }
+
+  getGoalTask(taskId: string): GoalTaskRecord | null {
+    return getGoalTask(this.db, taskId);
+  }
+
+  getGoalSession(botUid: string, target: ChatTarget, sessionId: string): GoalSessionRecord | null {
+    return getGoalSession(this.db, botUid, target, sessionId);
+  }
+  bindGoalTaskSession(taskId: string, expectedSessionId: string, sessionId: string, sessionFile: string): void {
+    bindGoalTaskSession(this.db, taskId, expectedSessionId, sessionId, sessionFile);
+  }
+
+  clearGoalSession(botUid: string, target: ChatTarget, sessionId: string): void {
+    clearGoalSession(this.db, botUid, target, sessionId);
+  }
+
+  markGoalTaskDispatched(taskId: string, sessionId: string, dispatchOp?: "create" | "resume" | "recover"): void {
+    markGoalTaskDispatched(this.db, taskId, sessionId, dispatchOp);
+  }
+
+  markGoalTaskAccepted(taskId: string, goalId: string): void {
+    markGoalTaskAccepted(this.db, taskId, goalId);
+  }
+  markGoalTaskAgentAccepted(taskId: string): void {
+    markGoalTaskAgentAccepted(this.db, taskId);
+  }
+
+  updateGoalTaskProgress(taskId: string, goal: WorkerGoal | null): void {
+    updateGoalTaskProgress(this.db, taskId, goal);
+  }
+
+  finishGoalTaskProgress(taskId: string, goal: WorkerGoal): void {
+    finishGoalTaskProgress(this.db, taskId, goal);
+  }
+
+  saveGoalSessionProgress(botUid: string, target: ChatTarget, sessionId: string, goal: WorkerGoal): void {
+    saveGoalSessionProgress(this.db, botUid, target, sessionId, goal);
+  }
+
+  isGoalTaskResuming(taskId: string): boolean {
+    return isGoalTaskResuming(this.db, taskId);
+  }
+
+  stopGoalContinuation(
+    botUid: string,
+    target: ChatTarget,
+    sessionId: string | null,
+    intent: GoalStopIntent,
+  ): string[] {
+    return stopGoalContinuation(this.db, botUid, target, sessionId, intent);
   }
 
   getCommandClaimState(botUid: string, target: ChatTarget, messageId: string): CommandClaimState | null {

@@ -4,7 +4,16 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createWorkerFactory } from "../src/omp/index";
-import type { OmpWorker, PromptContext, WorkerEvent, WorkerModelCatalog, WorkerModelSwitch, WorkerOptions } from "../src/contracts";
+import type {
+  OmpWorker,
+  PromptContext,
+  WorkerEvent,
+  WorkerGoalResult,
+  WorkerGoalRun,
+  WorkerModelCatalog,
+  WorkerModelSwitch,
+  WorkerOptions,
+} from "../src/contracts";
 import {
   findMovedSession,
   loadValidatedSessionState,
@@ -97,6 +106,19 @@ class DelayedStopWorker implements OmpWorker {
       ? this.inner.resume(onEvent)
       : this.inner.resume(onEvent, context);
   }
+  goal(op: "get" | "pause" | "drop"): Promise<WorkerGoalResult> {
+    return this.inner.goal(op);
+  }
+
+  runGoal(
+    request: WorkerGoalRun,
+    onEvent: (event: WorkerEvent) => void,
+    context?: PromptContext,
+  ): Promise<WorkerGoalResult> {
+    return context === undefined
+      ? this.inner.runGoal(request, onEvent)
+      : this.inner.runGoal(request, onEvent, context);
+  }
 
   steer(text: string): Promise<void> {
     return this.inner.steer(text);
@@ -171,6 +193,19 @@ class StopFalseWorker implements OmpWorker {
     return context === undefined
       ? this.inner.resume(onEvent)
       : this.inner.resume(onEvent, context);
+  }
+  goal(op: "get" | "pause" | "drop"): Promise<WorkerGoalResult> {
+    return this.inner.goal(op);
+  }
+
+  runGoal(
+    request: WorkerGoalRun,
+    onEvent: (event: WorkerEvent) => void,
+    context?: PromptContext,
+  ): Promise<WorkerGoalResult> {
+    return context === undefined
+      ? this.inner.runGoal(request, onEvent)
+      : this.inner.runGoal(request, onEvent, context);
   }
 
   steer(text: string): Promise<void> {
@@ -248,6 +283,19 @@ class CommandSessionWorker implements OmpWorker {
     } else {
       await this.inner.resume(onEvent, context);
     }
+  }
+  goal(op: "get" | "pause" | "drop"): Promise<WorkerGoalResult> {
+    return this.inner.goal(op);
+  }
+
+  runGoal(
+    request: WorkerGoalRun,
+    onEvent: (event: WorkerEvent) => void,
+    context?: PromptContext,
+  ): Promise<WorkerGoalResult> {
+    return context === undefined
+      ? this.inner.runGoal(request, onEvent)
+      : this.inner.runGoal(request, onEvent, context);
   }
 
   async steer(text: string): Promise<void> {

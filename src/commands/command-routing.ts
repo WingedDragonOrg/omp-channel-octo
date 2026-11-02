@@ -67,6 +67,7 @@ const BUILTIN_ALIASES = {
   stop: "cancel",
   status: "status",
   help: "help",
+  goal: "goal",
   restart: "restart",
   mode: "mode",
   queue: "queue",

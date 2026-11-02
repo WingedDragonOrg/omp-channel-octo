@@ -13,8 +13,31 @@ type Frame = Record<string, unknown>;
 
 type Scenario =
 	| "normal"
+	| "session-settled"
+	| "goal-run"
+	| "goal-no-generation"
+	| "goal-no-progress"
+	| "goal-pause-during-run"
+	| "goal-drop-during-run"
+	| "goal-disabled"
+	| "goal-unsupported"
+	| "goal-invalid-response"
+	| "goal-create-empty-response"
+	| "goal-invalid-event"
+	| "goal-already-exists"
+	| "goal-already-active"
+	| "goal-budget-limited"
+	| "goal-recover-local"
+	| "goal-recover-mismatch"
+	| "goal-recover-complete"
+	| "goal-recover-gated"
+	| "goal-preflight-create"
+	| "goal-preflight-resume"
+	| "goal-create-tools-gated"
+	| "goal-resume-tools-gated"
 	| "local"
 	| "retry"
+	| "goal-control"
 	| "retry-resume"
 	| "retry-resume-empty"
 	| "retry-resume-failure"
@@ -285,6 +308,61 @@ let staleReplayId: string | undefined;
 let retryAvailable = true;
 /** Subagent subscription level the fixture last accepted; lifecycle frames follow it. */
 let subagentSubscription = "off";
+type FixtureGoalStatus = "active" | "paused" | "budget-limited" | "complete" | "dropped";
+type FixtureGoal = {
+	id: string;
+	objective: string;
+	status: FixtureGoalStatus;
+	tokenBudget?: number;
+	tokensUsed: number;
+	timeUsedSeconds: number;
+	createdAt: number;
+	updatedAt: number;
+};
+function makeFixtureGoal(
+	status: FixtureGoalStatus,
+	id = "fixture-goal-1",
+	objective = "fixture objective",
+	tokenBudget?: number,
+): FixtureGoal {
+	const now = Date.now();
+	return {
+		id,
+		objective,
+		status,
+		...(tokenBudget === undefined ? {} : { tokenBudget }),
+		tokensUsed: status === "budget-limited" ? tokenBudget ?? 1 : 0,
+		timeUsedSeconds: 1,
+		createdAt: now,
+		updatedAt: now,
+	};
+}
+const initialGoalStatus =
+	scenario === "goal-already-exists" || scenario === "goal-already-active" || scenario === "goal-control"
+		? "active"
+		: scenario === "goal-budget-limited"
+			? "budget-limited"
+			: scenario === "goal-recover-local" ||
+					scenario === "goal-recover-mismatch" ||
+					scenario === "goal-recover-gated" ||
+					scenario === "goal-preflight-resume" ||
+					scenario === "goal-resume-tools-gated"
+				? "paused"
+				: scenario === "goal-recover-complete"
+					? "complete"
+					: undefined;
+let nativeGoal: FixtureGoal | null =
+	initialGoalStatus === undefined
+		? null
+		: makeFixtureGoal(
+				initialGoalStatus,
+				scenario === "goal-recover-mismatch" ? "different-goal" : "fixture-goal-1",
+				"fixture objective",
+				scenario === "goal-budget-limited" ? 4 : undefined,
+			);
+let sessionIsSettled = true;
+let goalPreflightGateUsed = false;
+let goalToolsGateUsed = false;
 function persistSessionHeader(): void {
 	writeFileSync(
 		sessionFile,
@@ -356,6 +434,21 @@ function emitAgentTurn(id: string | undefined): void {
 	emitAssistantMessage("fixture completed", 0);
 	emit({ type: "agent_end", messages: [], willContinue: false });
 	appendLog({ kind: "turn_complete", id });
+}
+async function holdFixtureGate(path: string): Promise<void> {
+	writeFileSync(path, "waiting", "utf8");
+	while (existsSync(path)) await Bun.sleep(5);
+}
+
+async function emitSessionSettledScenario(id: string | undefined): Promise<void> {
+	emit({ type: "agent_start" });
+	emitAssistantMessage("fixture first objective step", 0);
+	emit({ type: "agent_end", messages: [], isTerminal: true });
+	const markerPath = flag("--fixture-marker");
+	if (!markerPath) throw new Error("session-settled fixture needs a marker path");
+	await holdFixtureGate(markerPath);
+	emitHostToolCall();
+	appendLog({ kind: "second_turn_started", id });
 }
 async function emitMessageEndScenario(id: string | undefined): Promise<void> {
 	const messageId = "fixture-message-end-1";
@@ -806,6 +899,26 @@ function completeHostToolTurn(command: Frame): void {
 		message,
 	});
 	emit({ type: "message_end", message });
+	if (scenario === "session-settled") {
+		emit({ type: "agent_end", messages: [message], isTerminal: true });
+		const logPath = flag("--fixture-log");
+		if (!logPath) throw new Error("session-settled fixture needs a log path");
+		void holdFixtureGate(`${logPath}.settled`).then(() => {
+			emit({ type: "session_settled" });
+			appendLog({ kind: "session_settled", id: "fixture-host-1" });
+		});
+		return;
+	}
+	if (scenario === "goal-run") {
+		emit({ type: "agent_end", messages: [message], isTerminal: true });
+		if (nativeGoal) {
+			nativeGoal.status = "complete";
+			nativeGoal.updatedAt = Date.now();
+			emitGoalUpdated();
+		}
+		void settleGoalSession("fixture-host-1", true);
+		return;
+	}
 	emit({ type: "agent_end", messages: [message], willContinue: false });
 }
 
@@ -1388,6 +1501,23 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		response(id, "prompt", { agentInvoked: false });
 		return;
 	}
+	if (scenario === "goal-recover-gated" && message === "/retry") {
+		appendLog({ kind: "goal_retry_gate", id });
+		const logPath = flag("--fixture-log");
+		if (!logPath) throw new Error("goal recovery fixture needs a log path");
+		await holdFixtureGate(`${logPath}.retry`);
+		emit({ type: "command_output", text: "Nothing to retry." });
+		response(id, "prompt", { agentInvoked: false });
+		setTimeout(() => emit({ type: "prompt_result", id, agentInvoked: false, sessionSettled: true }), 1);
+		return;
+	}
+	if (scenario === "goal-recover-local" && message === "/retry") {
+		appendLog({ kind: "goal_retry_local", id });
+		emit({ type: "command_output", text: "Nothing to retry." });
+		response(id, "prompt", { agentInvoked: false });
+		setTimeout(() => emit({ type: "prompt_result", id, agentInvoked: false, sessionSettled: true }), 1);
+		return;
+	}
 	if (scenario === "retry" && message === "/retry") {
 		emit({ type: "command_output", text: retryAvailable ? "Retrying the last failed turn." : "Nothing to retry." });
 		response(id, "prompt", { agentInvoked: retryAvailable });
@@ -1575,6 +1705,10 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 	}
 	response(id, "prompt", { agentInvoked: true });
 	streaming = true;
+	if (scenario === "session-settled") {
+		promptTimer = setTimeout(() => void emitSessionSettledScenario(id), 35);
+		return;
+	}
 	if (scenario === "late-message-start") {
 		const message = { role: "assistant", content: [] };
 		emit({ type: "agent_start" });
@@ -1779,6 +1913,164 @@ async function emitSubagentScenario(id: string | undefined): Promise<void> {
 	appendLog({ kind: "turn_complete", id, subagentFrames: 2 });
 }
 
+function goalResult(): Frame {
+	if (!nativeGoal) return { goal: null, state: null };
+	const goal = { ...nativeGoal };
+	return {
+		goal,
+		state: {
+			enabled: goal.status === "active",
+			mode: goal.status === "complete" || goal.status === "dropped" ? "exiting" : "active",
+			goal: { ...goal },
+		},
+	};
+}
+
+function emitGoalUpdated(): void {
+	const result = goalResult();
+	emit({ type: "goal_updated", goal: result.goal, state: result.state });
+}
+
+async function settleGoalSession(id: string | undefined, waitForGate: boolean): Promise<void> {
+	if (waitForGate) {
+		const logPath = flag("--fixture-log");
+		if (!logPath) throw new Error("goal fixture needs a log path");
+		await holdFixtureGate(`${logPath}.settled`);
+	}
+	streaming = false;
+	sessionIsSettled = true;
+	emit({ type: "session_settled" });
+	appendLog({ kind: "goal_session_settled", id });
+}
+
+async function emitGoalRun(id: string | undefined): Promise<void> {
+	streaming = true;
+	emit({ type: "agent_start" });
+	emitAssistantMessage("fixture native goal step", 0);
+	emit({ type: "agent_end", messages: [], isTerminal: true });
+	appendLog({ kind: "goal_turn_yielded", id });
+
+	if (scenario === "goal-no-progress") {
+		await settleGoalSession(id, false);
+		return;
+	}
+	if (scenario === "goal-preflight-create" || scenario === "goal-preflight-resume") {
+		await settleGoalSession(id, false);
+		return;
+	}
+	if (scenario === "goal-recover-local") {
+		if (nativeGoal) {
+			nativeGoal.status = "complete";
+			nativeGoal.updatedAt = Date.now();
+			emitGoalUpdated();
+		}
+		await settleGoalSession(id, false);
+		return;
+	}
+
+	const markerPath = flag("--fixture-marker");
+	if (!markerPath) throw new Error("goal fixture needs a marker path");
+	await holdFixtureGate(markerPath);
+	if (scenario === "goal-run" && nativeGoal?.status === "active") {
+		emitHostToolCall();
+		return;
+	}
+	await settleGoalSession(id, false);
+}
+
+function handleGoalCommand(id: string | undefined, command: Frame): void {
+	const op = typeof command.op === "string" ? command.op : "";
+	if (scenario === "goal-unsupported") {
+		failure(id, "goal", "Unknown RPC command: goal", "unknown_command");
+		return;
+	}
+	if (scenario === "goal-invalid-response" && op === "get") {
+		response(id, "goal", { goal: { id: "malformed-goal" }, state: null });
+		return;
+	}
+	if (op === "get") {
+		if (
+			(scenario === "goal-preflight-create" || scenario === "goal-preflight-resume") &&
+			!goalPreflightGateUsed
+		) {
+			goalPreflightGateUsed = true;
+			const logPath = flag("--fixture-log");
+			if (!logPath) throw new Error("goal preflight fixture needs a log path");
+			void holdFixtureGate(`${logPath}.preflight`).then(() => response(id, "goal", goalResult()));
+			return;
+		}
+		response(id, "goal", goalResult());
+		return;
+	}
+	if (op === "create") {
+		if (scenario === "goal-disabled") {
+			failure(id, "goal", "Goal mode is disabled", "goal_disabled");
+			return;
+		}
+		if (nativeGoal?.status === "active" || nativeGoal?.status === "paused") {
+			failure(id, "goal", "A goal is already active or paused", "goal_already_exists");
+			return;
+		}
+		if (typeof command.objective !== "string" || command.objective.trim().length === 0) {
+			failure(id, "goal", "Goal objective is required", "invalid_goal");
+			return;
+		}
+		if (scenario === "goal-create-tools-gated") {
+			nativeGoal = makeFixtureGoal("active", "fixture-goal-1", command.objective);
+			emitGoalUpdated();
+			sessionIsSettled = true;
+			response(id, "goal", goalResult());
+			return;
+		}
+		if (scenario === "goal-create-empty-response") {
+			nativeGoal = makeFixtureGoal("active", "fixture-goal-1", command.objective);
+			sessionIsSettled = true;
+			response(id, "goal", { goal: null, state: null });
+			return;
+		}
+		const tokenBudget = typeof command.token_budget === "number" ? command.token_budget : undefined;
+		nativeGoal = makeFixtureGoal("active", "fixture-goal-1", command.objective, tokenBudget);
+		if (scenario === "goal-invalid-event") {
+			emit({ type: "goal_updated", goal: { id: "malformed-goal" } });
+		} else {
+			emitGoalUpdated();
+		}
+		sessionIsSettled = scenario === "goal-no-generation";
+		response(id, "goal", goalResult());
+		if (!sessionIsSettled) setTimeout(() => void emitGoalRun(id), 5);
+		return;
+	}
+	if (op === "resume") {
+		if (nativeGoal?.status !== "paused") {
+			failure(id, "goal", "Goal is not paused", "goal_not_paused");
+			return;
+		}
+		nativeGoal.status = "active";
+		nativeGoal.updatedAt = Date.now();
+		emitGoalUpdated();
+		sessionIsSettled = scenario === "goal-resume-tools-gated" || scenario === "goal-recover-gated";
+		response(id, "goal", goalResult());
+		if (!sessionIsSettled) setTimeout(() => void emitGoalRun(id), 5);
+		return;
+	}
+	if (op === "pause") {
+		if (nativeGoal?.status === "active") {
+			nativeGoal.status = "paused";
+			nativeGoal.updatedAt = Date.now();
+			emitGoalUpdated();
+		}
+		response(id, "goal", goalResult());
+		return;
+	}
+	if (op === "drop") {
+		nativeGoal = null;
+		emitGoalUpdated();
+		response(id, "goal", goalResult());
+		return;
+	}
+	failure(id, "goal", "Invalid goal operation", "invalid_goal_operation");
+}
+
 function handleCommand(command: Frame): void {
 	appendLog({ kind: "command", command });
 	const id = typeof command.id === "string" ? command.id : undefined;
@@ -1798,12 +2090,16 @@ function handleCommand(command: Frame): void {
 		response(id, type, { cancelled: false });
 		return;
 	}
+	if (type === "goal") {
+		handleGoalCommand(id, command);
+		return;
+	}
 	if (type === "get_state") {
 		response(id, type, {
 			model: { ...currentModel, name: currentModel.id },
 			thinkingLevel: currentLevel ?? "off",
-			isStreaming: false,
-			isCompacting: false,
+			isStreaming: streaming,
+			isSettled: sessionIsSettled,
 			steeringMode: "one-at-a-time",
 			followUpMode: "one-at-a-time",
 			interruptMode: "immediate",
@@ -1844,6 +2140,17 @@ function handleCommand(command: Frame): void {
 			const tool = value as Frame;
 			if (typeof tool.name !== "string") continue;
 			hostTools.set(tool.name, { name: tool.name, parameters: tool.parameters });
+		}
+		if (
+			(scenario === "goal-create-tools-gated" || scenario === "goal-resume-tools-gated") &&
+			!goalToolsGateUsed &&
+			hostTools.size > 0
+		) {
+			goalToolsGateUsed = true;
+			const logPath = flag("--fixture-log");
+			if (!logPath) throw new Error("goal tool fixture needs a log path");
+			void holdFixtureGate(`${logPath}.tools`).then(() => response(id, type, { toolNames: [...hostTools.keys()] }));
+			return;
 		}
 		response(id, type, { toolNames: [...hostTools.keys()] });
 		return;

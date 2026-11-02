@@ -26,6 +26,21 @@ export type PromptRun = {
 	reject: (error: Error) => void;
 	completion: Promise<void>;
 	settled: boolean;
+	/** Structured goal RPC runs lack a prompt ticket but are accepted at their first agent_start. */
+	goalRun: boolean;
+	/** Modern OMP runs stay alive through all turns until session_settled. */
+	waitForSessionSettled: boolean;
+	agentStarted: boolean;
+	/** A goal RPC was sent; a later global session_settled belongs to this run. */
+	goalDispatchIssued: boolean;
+	/** The native start/resume command returned success, even if its payload was malformed. */
+	goalRpcSucceeded: boolean;
+	/** The structured start/resume response has been parsed for this run. */
+	goalResponseReceived: boolean;
+	/** A global session_settled frame arrived before the structured response. */
+	sessionSettledSeen: boolean;
+	/** Last native goal ID observed during this run, for identity-scoped failure cleanup. */
+	goalUpdatedId: string | undefined;
 	/**
 	 * True once OMP acknowledged this dispatch as an agent turn (`agentInvoked: true`), recorded
 	 * in line with the acknowledgement frame: such a run completes only at its terminal
@@ -35,8 +50,8 @@ export type PromptRun = {
 	 */
 	agentInvoked: boolean;
 	/**
-	 * True once the `agent_start` boundary was reported as `prompt_accepted`. The acceptance is
-	 * reported once per run, ahead of any output, and never for a local-only completion.
+	 * True once the `agent_start` boundary was reported as `prompt_accepted`. Acceptance is
+	 * reported once per ordinary or goal run, ahead of any output, never for local-only completion.
 	 */
 	accepted: boolean;
 	assistantMessageEnded: boolean;

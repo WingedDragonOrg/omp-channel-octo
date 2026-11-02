@@ -51,7 +51,10 @@ export interface TaskEventsDeps {
  * ——它在服务的事件入口就同步落账并返回，类型上排除它正是这条契约的强制表达：接受回执没落账
  * 之前不得进入投影，投影也无从「顺手」把它当成执行事件吞掉。
  */
-export type TaskProjectionEvent = Exclude<WorkerEvent, PromptAcceptedEvent>;
+export type TaskProjectionEvent = Exclude<
+  WorkerEvent,
+  PromptAcceptedEvent | Extract<WorkerEvent, { type: "goal_accepted" | "goal_updated" }>
+>;
 
 /**
  * 一个 task 的事件所有者：`onEvent` 是实例箭头属性，可直接交给 worker 的 prompt；

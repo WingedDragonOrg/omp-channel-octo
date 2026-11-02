@@ -2,7 +2,7 @@
  * 持久层的记录类型：每张表在 TypeScript 侧的形状，被 store 门面与各领域模块共用。
  */
 
-import type { ChatAppendMode, ChatExecutionState, ChatTarget, TextMention, WorkerProcess } from "../contracts.ts";
+import type { ChatAppendMode, ChatExecutionState, ChatTarget, TextMention, WorkerGoal, WorkerGoalRun, WorkerProcess } from "../contracts.ts";
 
 export interface BindingRecord extends ChatTarget {
   botUid: string;
@@ -65,6 +65,36 @@ export interface TaskRecord extends ChatTarget {
   relayThreadName: string | null;
 }
 
+/** Persisted form of an accepted structured goal task; task.text is never its execution payload. */
+export type GoalTaskRequest = Extract<WorkerGoalRun, { op: "create" | "resume" }>;
+
+export interface GoalTaskRecord extends ChatTarget {
+  botUid: string;
+  taskId: string;
+  sessionId: string;
+  dispatchOp: WorkerGoalRun["op"] | null;
+  request: GoalTaskRequest;
+  dispatched: boolean;
+  accepted: boolean;
+  agentAccepted: boolean;
+  acceptedGoalId: string | null;
+}
+
+export type GoalStopIntent = "pause" | "drop" | "interrupt" | "question_timeout" | "cancel";
+
+export interface GoalSessionRecord extends ChatTarget {
+  botUid: string;
+  sessionId: string;
+  goalId: string | null;
+  objective: string;
+  status: WorkerGoal["status"] | null;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  tokenBudget: number | null;
+  continuationAuthorized: boolean;
+  stopIntent: GoalStopIntent | null;
+}
+
 /**
  * 启动恢复结算的停止行：任务记录本身（已是 `interrupted` 终态）再加上结算前的持久意图。结算会清列，
  * 所以原因必须随记录一起交回，供服务按原因分流（interrupt 与 question_timeout 对遗留提问的处理不同，
@@ -72,6 +102,11 @@ export interface TaskRecord extends ChatTarget {
  */
 export interface StoppedTaskRecovery extends TaskRecord {
   stopIntent: TaskStopIntent;
+}
+
+export interface GoalStoppedRecovery extends TaskRecord {
+  goalStopIntent: GoalStopIntent;
+  goalStatus: WorkerGoal["status"] | null;
 }
 
 /**
@@ -85,6 +120,7 @@ export interface TaskRestartRecovery {
   queued: TaskRecord[];
   uncertain: TaskRecord[];
   stopped: StoppedTaskRecovery[];
+  goalStopped: GoalStoppedRecovery[];
 }
 
 /**

@@ -16,12 +16,15 @@
 
 包含服务侧获取的每轮群/线程成员上下文、system/developer 中的 mention 使用规则与 Octo CLI 能力入口，以及普通助手回复中的结构化 mention。正文和完整 mention 随流式输出持续更新同一消息；具体边界见「每轮成员与操作上下文」及「普通回复中的 mention」。
 
+包含 owner-only 原生持续目标管理 `/goal`：创建时 token 预算、状态查询、暂停、恢复、删除、跨回合执行与在途目标跨服务重启续接，详细契约见 `docs/specs/2026-11-02-goal-command-design.md`。
+
 不包含终端会话接管、多用户服务、通用网络 Agent gateway、文档评论任务、服务端通用 bot_task、群历史归档与检索、出站附件之外的通用文件托管和交互 callback 系统。channel 仅提供由 OMP host tool 明确发起的出站图片/文件发送，以及由能力 profile 明确启用的 Octo raw type17 `octo/v1` AdaptiveCard 1.5 进度展示和 `octo/v2` 交互问答卡片；交互卡片的上行只使用该 Bot 自己的事件队列（`/v1/bot/events` 轮询与 ack），不注册回调地址、不实现通用 callback 或审批流。收到的入站消息按已确认的类型表提取内容，贴纸、系统与 CMD 等没有内容的类型明确告知，不作为成功执行。范围以个人 IM 交互为准，不继承参考适配器的其他任务入口。
 
 ## 已知约束与资料
 
 - 本机当前 OMP v18.1.21 提供 `--mode rpc`、`--cwd`、`--resume`、`--approval-mode yolo`、`--extension` 及 `session.compacting` 生命周期能力；本地兼容解码器按 v18.1.18 保持 RPC 兼容。RPC 提供 prompt、steer、abort、状态和会话事件；启动 ready 不代表模型调用可用。模型选择走启动参数、内建命令与 RPC 只读目录（v18.2.3 实测）：OMP 自带 `/switch` 内建命令（ACP 可见），选择器接受 `provider/id`、模型 id/唯一子串、`@角色`（`settings.modelRoles`）与 `:level` 后缀，命中后只改本会话（`setModelTemporary`），分发发生在 RPC 的 prompt 路径、agent 回合之前（响应 `agentInvoked:false`），因此回合运行中同样可用；成功时先发 `command_output` 与带解析后模型与级别的 `config_update`，再回响应，无法解析时只发 `command_output`（`Unknown model: …`）。`--model <provider>/<id>[:level]` 用同一解析器（`@smol` 这类角色别名同样接受），启动时生效并覆盖 `--resume` 会话里记录的模型；传无法解析的值使 worker 启动失败（`Model "x/y" not found`），所以落盘前必须由 OMP 自己校验过。`get_state` 返回当前模型与思考级别，`get_available_models` 返回当前已配置凭据的可用模型。线程隔离工作区在本机存在可执行 Worktrunk（命令兼容性由 wt 自身判定）时由宿主调用 wt 完成创建、合并与清理（v0.76.0 实测；合并没有回退），否则创建回退 `omp worktree add`（v18.2.1 实测，clone-first 由 `worktree.clone` 设置决定）、清理回退 `git worktree remove`。子代理可观测性走 OMP 自身的 subagent 通道（v18.2.1 实测）：`set_subagent_subscription` 选择级别（`off`/`progress`/`events`，默认 `off`），订阅后 RPC 侧推送 `subagent_lifecycle`（`id`、`agent`、`agentSource`、`status: started|completed|failed|aborted`、可选 `description`、`index`、`parentToolCallId`、`detached`）、`subagent_progress`（`progress.status`、`lastIntent`、`currentTool`、`toolCount`、`recentTools` 等）与 `subagent_event`（原始子事件），`get_subagents` 另有存活子代理快照。channel 只订阅 `progress` 级别。
 - OMP SDK 可嵌入，但本设计选择 RPC，保持进程边界。
+- 持续目标按 OMP 18.15.0 的结构化 `{type:"goal", op:"get|create|pause|resume|drop"}` 接入，不依赖 TUI slash 注册。目标执行 worker 只覆盖 `goal.continuationModes: [rpc]`，不覆盖 `goal.enabled`。create/resume 自发启动的回合没有 prompt ticket；单轮 `agent_end` 即使 `isTerminal:true` 也不代表目标执行已静止，应等待 `session_settled`。已有目标替换及创建后预算变更当前未由原生 RPC 开放，明确反馈。
 - Octo 运行参考：[openclaw-channel-octo](https://github.com/Mininglamp-OSS/openclaw-channel-octo)。其 README 确认 REST 注册、WebSocket 实时收发和自动重连。
 - 账户参考：[create-openclaw-octo](https://github.com/Mininglamp-OSS/octo-adapters/tree/main/create-openclaw-octo)。使用 BotFather 创建的 User Bot；`app_` App Bot 仅支持私聊，不能满足群聊验收。
 - octo-adapters 当前源码树主要提供安装 CLI；协议运行时代码在独立 channel 仓库。实施时以运行时代码核实报文、消息 ID、mention 元数据和发送接口，不凭顶层 README 猜测端点。
@@ -126,6 +129,10 @@ channel 支持下列命令，`/help` 展示用法；`/retry` 经 OMP 原生命�
 | `/queue <文本>` | 把该文本作为排队任务追加在当前任务之后，不受当前追加模式影响；正文经与普通任务相同的组装点，随消息发来的附件以本机绝对路径进入排队任务的正文 |
 | `/mode [steer\|queue]` | 设置/报告该聊天的追加模式：`steer`（默认，`default` 同义）把运行中的新消息注入当前回合，`queue` 把它变成排队任务；无参数时报告当前设置，部署声明 `octo/v2` 时改发 owner-only 配置卡片（一行选择 + 一次提交；卡片不可用时回退为同一段文本） |
 | `/switch [模型]` | 无参数时报告本聊天当前模型与可用模型列表（运行中的回合用其活会话读 `get_state`/`get_available_models`，否则由 fresh 一次性 worker 读取）；带参数时把选择器交给 OMP 自己的 `/switch` 解析并应用（`provider/id`、模型 id/子串、`@角色`、`:level`）——有运行中的回合时切该会话，空闲时解析后按聊天持久化、之后启动的 worker 带 `--model`；`default` 恢复跟随 OMP 默认；无参数时在 `octo/v2` 可用的部署改发 owner-only 配置卡片（`default` 加目录选择器），卡片不可用时回退为同一段文本列表 |
+| `/goal`、`/goal show` | 查询本聊天绑定的原生目标，显示 goal ID、目标、状态、用量和预算 |
+| `/goal set [--budget N] <目标>` | durable 接纳后结构化创建并持续执行；预算为正整数 token；已有目标时拒绝替换 |
+| `/goal pause`、`/goal resume`、`/goal drop` | 暂停后续续跑、恢复或删除目标；控制请求不排在持续目标后面，启动/恢复遵循任务和目录串行 |
+| `/goal budget [N\|off]` | 无参数查看预算；创建后修改/清除明确反馈原生 RPC 不支持 |
 | `/retry` | 在当前绑定的 OMP 会话中重试上次失败或中止的回合，由 OMP 原生实现判定与恢复；与其他原生 slash 输入相同，忙时按独立任务排队，执行时以会话当时的状态为准 |
 | `/interrupt` | 中止当前聊天的运行中回合，保留已排队消息与它后面的排队任务；不终止 worker |
 | `/cancel`（`/stop` 同义） | 取消当前聊天正在执行的任务，并清除该聊天待执行消息 |
@@ -154,9 +161,13 @@ channel 支持下列命令，`/help` 展示用法；`/retry` 经 OMP 原生命�
 
 群中使用 `@Bot /new <目录>`、`@Bot /reset <目录>` 或 `@Bot /move <目录>` 等相同命令；剥离已验证的 Bot mention 后解析。命令与 mention 的先后顺序不固定：客户端可能发送 `@Bot /command <参数>` 或 `/command <参数> @Bot`，解析前剥离全部已验证的 Bot mention，无论它位于命令前、命令后还是参数中间，并清理剥离处残留的空白。结构化 span 与文本对不上或缺失时，退回按 mention uid 列表匹配独立出现的 `@BotName` 或 `@BotUid` 词元（两侧为空白或文本边界，允许尾随冒号）；未指向当前 Bot 的文本型 `@` 不剥离，用户正文中的其他 `@` 保持原样。命令只允许 owner 发起：成员发来的 `/` 开头消息一律不执行、也不交给 Agent（OMP 会在 RPC prompt 路径对内建命令做分发，透传等于把命令面暴露给成员），同一聊天 10 分钟窗口内至多回一条提示「命令仅 owner 可用；需要助手做事请直接 @<BotName> 说明。」，并按既有命令 claim 去重、重投不重复提示。channel 内置 `/new`、`/reset`、`/move`、`/thread`、`/queue`、`/mode`、`/switch`、`/interrupt`、`/cancel`、`/stop`、`/status`、`/help`、`/restart`、`/autoresearch-history` 始终硬拦截，不发送给模型；若存在同名观察器也不能改变这一安全语义。其他 slash 输入按原始 `message.text` 作为普通 OMP task 透传，未知命令不再返回“不支持的命令”。
 
+`/goal` 同属 owner-only 内置硬拦截命令；命令参数转为持久结构化请求，不进入普通模型 prompt。控制接受（原生响应及 exact goal ID）与实际 `agent_start` 生成接受分别记账；RPC 前先持久化派发意图，缺少控制接受的已派发请求不重放。暂停、删除、中断、取消及 ask 超时先撤销持续授权，取消该聊天尚未执行的目标启动/恢复请求；普通排队消息沿用各停止命令既有规则。目标恢复按原会话及 exact goal ID，停止意图优先，不通过普通续接正文替代原生目标。
+
 `/retry` 保持 OMP 原生语义（v18.2.6）：会话末尾可重试的失败或中止回合由 OMP 恢复，成功时回执为 `Retrying the last failed turn.`，没有可重试回合时为 `Nothing to retry.`。channel 沿用绑定会话与既有 slash 任务路径，不从任务表复制上一条 prompt；owner/允许列表/mention、持久去重、会话串行与群历史首行保护保持不变。运行中的消息不会把 `/retry` 当成 steering；需要先中止当前回合时可使用 `/interrupt`。worker 把当前 prompt 分派期间、响应确认之前的 `command_output.text` 转为 info 通知，通过既有有界通知 outbox 单独投递；帧无上游 id，使用请求 id 与输出序号生成唯一消息 id。确认后的旁路命令输出（如回合运行中的 `/switch`）不归入该回合。无生成的 `agentInvoked:false` 正常本地完成；成功重试的 `agentInvoked:true` 等待真实 `agent_end`，助手正文与进度照常交付。
 
 OMP 原生 `/autoresearch` 经上述 slash 任务路径执行：无参数开启会话内研究模式，已开启时再次发送则关闭；`off` 关闭；`<goal>` 经扩展的 `api.sendUserMessage` 启动或恢复研究。`clear` 关闭并清空研究状态，在 `autoresearch/*` 分支默认硬重置回基线并清理未跟踪文件（没有基线则通知跳过 Git 重置）；`--reset-tree` 在其他分支强制执行同一重置，`--keep-tree` 跳过 Git 重置。OMP v18.2.6 的所有 `clear` 变体仍会删除 `autoresearch.sh` 等遗留研究文件与 `.autoresearch` 目录，channel 不增加确认或撤销。`agent_end.willContinue:true` 的后续回合继续在同一任务中流式投递。`extension_ui_request.notify` 转为带级别的独立通知，使用持久 outbox，重复帧复用稳定消息 ID，不混入助手正文、任务结果或中断归因；活动回合外的通知忽略。无模型生成的本地命令由明确的 `local_command` 事件识别，完成时保留待提交群说明，直到下一次真实生成获得 prepared receipt 后提交（验收 40/41）。研究状态、实验工具和 Git 操作由 OMP 管理；Octo 展示通知、助手正文与工具进度卡，OMP TUI 自定义仪表盘不通过 RPC 提供。
+
+对提供现代结算字段的 OMP，所有生成任务在 `session_settled` 或对应 `prompt_result.sessionSettled:true` 后才清 host tools、结算任务并释放目录；不能仅凭 `isTerminal` 或 `yielded` 提前收尾。原生目标即使静止仍可能未达成：保留预算受限状态，将仍 active 的未完成目标原生暂停并如实反馈。原生确认完成/删除后的当前状态投影清除，历史任务审计保留，同一会话可继续创建新目标。重启恢复在途目标先原生 `/retry`，仍有授权的原目标才 resume；不存在可重试回合时不发送通用 continuation prompt。
 
 channel 在工具进度之上补两块由权威实验状态驱动的只读呈现，不从工具参数或文本猜测来推测实验结果：其一，权威 `research_update` 事件参与该轮进度卡——研究帧自身即可开卡，轮次更新沿同一张卡推进，卡面研究带常显摘要（目标/指标/基线/最佳/改善/轮次上限与研究 phase + 任务终态），最近 6 轮记录可折叠展开（与工具轨迹、终态折叠相互独立），卡片节点预算不足时展开行按 6→3→1→0 回收并以省略数明示，研究摘要永不牺牲；研究快照的 recent 窗口最多 32 条当前段记录，旧记录 runNumber 为 null 时保留为未编号行、既不丢弃也不伪造轮次号。任务终态摘要以执行状态覆盖可能过期的研究 phase，不展示与当前状态矛盾的阶段文案；纯文本（无卡片能力的部署）回退同样携带研究摘要与最近行。steer 滚出的新卡与 todo 结转同理，从该任务最近一次研究快照在滚卡时刻起步，而新普通任务的卡不带旧研究。其二，权威 init/log 帧上的脱敏完整记录（跨全部段，不含 ASI、notes、命令、原始输出与本机路径）按 bot+真实聊天私有落盘（仅状态盘 `research-reports/`，原子替换 latest，同聊天写入严格有序，stop 等待已排队写入，写失败只记日志、不拖垮产生它的任务，绝不读 OMP 原始数据库）；报告不超 1 MiB，超限时按整行保留最新记录、标注省略条数（不切半行半字符、不保留最旧段），跨段记录的数值列用中性「指标值」而非当前段指标名，上游 results 超过 10000 行直接拒绝，不伪造聚合。`/autoresearch-history` 是 owner-only 内置只读命令，经既有命令门与 messageId 级持久 claim 去重，运行中也立即执行，不启动模型、不回答待答问题，把该聊天最近一份完整记录以不可变 spool 附件放入既有文件 outbox——入队字节固定，之后的报告重写碰不到待发附件；入队失败只清理自己这一个 spool 目录后走既有命令失败路径；重启后仍可导出，其他聊天与其他成员的请求只得到无泄漏的拒绝或提示。
 
@@ -566,3 +577,11 @@ outbox 有界失败与队列放行的验收证据（验收 9）：`tests/core-ou
 同次离线真实进程烟测 `bun tests/benchmarks/restart.ts` 的优雅重启、SIGKILL 两种场景均通过：2 个原任务续接、2 个排队任务继续，会话重叠、重复副作用及任务打断通报均为 0。此次通知实现不改变任务恢复和持久 outbox 语义。
 
 当前 Super 部署已经通过 `oco restart` 加载实现，随后完成一次新版本到新版本的正常重启验收（PID 30637 → 30740）。在已登录的 Octo Web「O-小爱」owner 私聊中实际观察到：`2026-11-02T15:43:24+08:00` 的旧进程正在停止通知，随后是同秒的新进程已启动通知；两条正文的 PID 与 Super 实际进程一致。新进程持续 Healthy，并保持已建立的 HTTPS 连接。真实私聊 `/status` 返回原会话、`queued=0`、`outbox=0`；随后同一聊天的文件操作经实际 OMP 完成，31 字节内容及末尾换行精确核对，助手完成回复在客户端可见，任务行记为 completed，验收临时文件已删除。
+
+## 原生持续目标验收（2026-11-02）
+
+`/goal` 的结构化请求、精确会话/目标归属、控制接受和生成接受、持续授权及停止意图已接通。目标运行保持 worker、host tools、ask、输出与目录 lease，直到原生 `session_settled`；完成或删除后清除当前投影，保留任务审计。显式恢复核对原生状态，不把过期缓存当作目标事实；控制 worker 与执行 worker 都应用本聊天的模型设置。完整契约及实现细节见 `docs/specs/2026-11-02-goal-command-design.md`。
+
+最终 `bun run typecheck` 与 `bun test` 通过：909 项、68 个文件、5,169 个断言。`bun tests/benchmarks/goal.ts` 经真实 OMP 18.15.0、真实 CLI、隔离 profile/session、有限 localhost 模型及本地 Octo fixture 完成 23 次模型请求，覆盖两轮续跑、状态、暂停恢复、删除、无进展、预算限制、禁用配置、切换模型后原 provider 不可用，以及 graceful/SIGKILL 后同会话同目标恢复，重复创建为 0。既有真实进程重启基准两种场景也通过，原任务和队列均恢复，会话重叠与重复副作用为 0。
+
+真实状态库只读一致性副本连续迁移两次，原有 17 张表、5,282 行逐表旧列哈希一致，新增两张目标表；私有副本与探针脚本已移除。本次目标实现仅在隔离工作区验收，未部署、未重启常驻服务、未合并；本地模型替身验证协议与执行路径，不证明真实模型质量。

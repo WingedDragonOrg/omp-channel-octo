@@ -234,7 +234,6 @@ test("已发出 prompt 却缺少接受回执的任务在恢复时 fail-closed �
       text: "unaccepted 原始输入",
       sessionId: "session-unaccepted",
     });
-    expect(store.getTask("unaccepted")?.errorText).toContain("unknown");
     expect(store.isTaskResuming("unaccepted")).toBe(false);
     // 下一次重启不再重复上报已经结算的行，也不重复动它。
     const next = store.prepareTasksForRestart(botUid, stopReasons);

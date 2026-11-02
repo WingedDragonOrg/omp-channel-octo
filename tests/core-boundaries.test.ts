@@ -11,6 +11,8 @@ import type {
   OmpWorker,
   PromptContext,
   WorkerEvent,
+  WorkerGoalResult,
+  WorkerGoalRun,
   WorkerFactory,
   WorkerModelCatalog,
   WorkerModelSwitch,
@@ -65,6 +67,19 @@ class WorkerProxy implements OmpWorker {
     return context === undefined
       ? this.inner.resume(onEvent)
       : this.inner.resume(onEvent, context);
+  }
+  goal(op: "get" | "pause" | "drop"): Promise<WorkerGoalResult> {
+    return this.inner.goal(op);
+  }
+
+  runGoal(
+    request: WorkerGoalRun,
+    onEvent: (event: WorkerEvent) => void,
+    context?: PromptContext,
+  ): Promise<WorkerGoalResult> {
+    return context === undefined
+      ? this.inner.runGoal(request, onEvent)
+      : this.inner.runGoal(request, onEvent, context);
   }
 
   steer(text: string): Promise<void> {

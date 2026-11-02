@@ -2,7 +2,14 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import type { OmpWorker, WorkerFactory, WorkerOptions, WorkerProcess } from "../src/contracts.ts";
+import type {
+  OmpWorker,
+  WorkerFactory,
+  WorkerGoalResult,
+  WorkerGoalRun,
+  WorkerOptions,
+  WorkerProcess,
+} from "../src/contracts.ts";
 import { openTrackedWorker, withStoppedWorker } from "../src/runtime/worker-lease.ts";
 import { ChannelStore } from "../src/store/index.ts";
 import type { WorkerLedgerRecord } from "../src/store/store-records.ts";
@@ -79,6 +86,8 @@ async function withHarness<T>(
     sessionId,
     prompt: async () => {},
     resume: async () => {},
+    goal: async (): Promise<WorkerGoalResult> => ({ goal: null, state: null }),
+    runGoal: async (_request: WorkerGoalRun): Promise<WorkerGoalResult> => ({ goal: null, state: null }),
     steer: async () => {},
     abortTurn: async () => {},
     refreshState: async () => ({ sessionId, sessionFile, cwd }),

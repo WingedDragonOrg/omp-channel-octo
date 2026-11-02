@@ -1,5 +1,6 @@
 import { GroupHistoryCoordinator } from "./inbound/history-coordinator.ts";
 import { ModelSwitchController } from "./commands/model-controller.ts";
+import { formatGoalSession, goalErrorText, GOAL_USAGE, parseGoalCommand } from "./commands/goal-command.ts";
 import { CONFIG_CARD_ACTION_PREFIX, createConfigMenuDesk, type ConfigMenuDesk } from "./commands/command-cards.ts";
 import { ProgressCards } from "./cards/progress-cards.ts";
 import { CHAT_GRANT_ACTION_PREFIX } from "./cards/chat-grant-card.ts";
@@ -24,7 +25,7 @@ import { ChatAuthorization } from "./inbound/chat-authorization.ts";
 import { createChatGrantDesk, type ChatGrantDesk } from "./inbound/chat-grants.ts";
 import { acquireBotLock, assertBotLockFree, type LockHandle } from "./runtime/bot-lock.ts";
 import { openTrackedWorker, type TrackedWorker, type WorkerSession } from "./runtime/worker-lease.ts";
-import { TaskStartupError } from "./contracts.ts";
+import { TaskStartupError, WorkerGoalError } from "./contracts.ts";
 import type {
   BotIdentity,
   ChannelCommandHandler,
@@ -40,8 +41,12 @@ import type {
   SteerConsumedEvent,
   TaskRelayTarget,
   WorkerEvent,
+  WorkerGoal,
+  WorkerGoalResult,
+  WorkerGoalRun,
   WorkerOptions,
 } from "./contracts.ts";
+import type { GoalTaskRecord, GoalTaskRequest } from "./store/store-records.ts";
 import { DEFAULT_ASK_TIMEOUT_MS } from "./contracts.ts";
 import { TurnContext } from "./session/turn-context.ts";
 import { memberSnapshotFor, normalizeAgentMembers, type AgentContext, type AgentMemberSnapshot } from "./session/agent-context.ts";
@@ -92,6 +97,7 @@ const COMMAND_HELP = [
   "任务",
   "/queue <文本> · 将消息排到当前任务之后",
   "/mode [steer|queue] · 查看或设置新消息的追加方式",
+  "/goal [show|set [--budget N] <目标>|pause|resume|drop|budget [N|off]] · 管理本会话的原生目标",
   "/retry · 重试当前会话上次失败或中止的回合，忙时排队",
   "/interrupt · 中断当前回合，保留排队消息",
   "/cancel（/stop） · 取消当前任务并清除排队消息",
@@ -153,6 +159,7 @@ const MEMBER_LOOKUP_TIMEOUT_MS = 5_000;
 const MEMBER_LOOKUP_FAILURE_STEER_NOTICE = "成员信息读取失败，本条消息未并入当前回合。";
 type RuntimeTask = {
   taskId: string;
+  isGoalTask: boolean;
   target: ChatTarget;
   cwd: string;
   lease?: TrackedWorker;
@@ -184,6 +191,13 @@ type RuntimeTask = {
   /** Closes the progress card of the round that just ended; a steered message starts a new round. */
   rollProgressCard?: () => void;
 };
+
+class GoalDirectoryBusyError extends Error {
+  constructor() {
+    super("原生目标控制命令遇到忙目录");
+    this.name = "GoalDirectoryBusyError";
+  }
+}
 
 /** Single-line, bounded excerpt of the triggering message for a start/consumption receipt. */
 function receiptText(prefix: string, text: string): string {
@@ -225,6 +239,8 @@ class CoreService implements ChannelService {
   /** Shutdown cancellation source for inbound I/O (downloads, transcription, mention-pref lookups). */
   private readonly shutdownController = new AbortController();
   private readonly runtimes = new Map<string, RuntimeTask>();
+  /** In-flight native-state reads invalidated by a later explicit goal stop. */
+  private readonly goalResumeChecks = new Map<string, { generation: number; active: number }>();
   private readonly blockedDirectories = new Set<string>();
   /** 问题与问答卡：等待者、卡片代次与问题行的所有者。 */
   /** 出站投递：文字、流式编辑与文件共用的队列。 */
@@ -460,6 +476,7 @@ class CoreService implements ChannelService {
       mode: (message, argument) => this.handleMode(message, argument),
       switch: (message, argument) => this.models.handleSwitch(message, argument),
       status: message => this.handleStatus(message),
+      goal: (message, argument) => this.handleGoal(message, argument),
       help: message => this.outbox.enqueueText(message, COMMAND_HELP, null),
       "autoresearch-history": message => this.handleResearchHistory(message),
       restart: (message, argument) => this.serviceRestart.handleCommand(message, argument),
@@ -548,7 +565,7 @@ class CoreService implements ChannelService {
       // 的实际执行在启动门之后，快照与 `worker.resume` 的先后因此由这里固定；续跑路径不再重复
       // 初始化——重复快照会把已经认领过的行重新交出去。
       for (const task of recovery.queued) {
-        if (this.store.isTaskResuming(task.id)) this.questions.beginRecovery(task.id);
+        if (this.store.isTaskResuming(task.id) || this.store.isGoalTaskResuming(task.id)) this.questions.beginRecovery(task.id);
       }
       // 恢复任务先占住聊天链与目录序，再让 transport 开始接新入站：任何新消息（含下面的
       // 恢复失败回执与子区回传）都排在它们后面，而真正执行要等启动门放行。
@@ -567,6 +584,15 @@ class CoreService implements ChannelService {
         // 接受状态未知不是用户叫停：关闭行记 `ended`，迟到提交仍作为该聊天的新输入接受。
         this.questions.cancelForTask(task.id, "ended");
         await this.outbox.enqueueText(taskTarget(task), UNCERTAIN_RECOVERY_NOTICE, null);
+        await this.notifyThreadOutcome(task.id);
+      }
+      for (const task of recovery.goalStopped) {
+        this.questions.cancelForTask(task.id, task.goalStopIntent === "interrupt" ? "interrupted" : "ended");
+        await this.outbox.enqueueText(
+          taskTarget(task),
+          `原生目标当前状态为 ${task.goalStatus ?? "unknown"}；续跑授权已撤销，不会自动恢复。请使用 /goal show 核对。`,
+          null,
+        );
         await this.notifyThreadOutcome(task.id);
       }
       if (this.stopping) throw new Error("channel 正在停止");
@@ -907,7 +933,10 @@ class CoreService implements ChannelService {
     binding: BindingRecord | null,
   ): Promise<BindingRecord | null> {
     if (await this.threadWorkspaceIncomplete(target)) return binding;
-    if (binding !== null && this.store.isTaskResuming(taskId)) return binding;
+    if (
+      binding !== null
+      && (this.store.isTaskResuming(taskId) || this.store.getGoalTask(taskId) !== null)
+    ) return binding;
     return this.sessions.reconcileExternalBinding(target, binding);
   }
 
@@ -1277,6 +1306,8 @@ class CoreService implements ChannelService {
       await this.outbox.enqueueText(target, DEFAULT_INTERRUPT_IDLE_TEXT, null);
       return;
     }
+    const binding = this.store.getBinding(this.bot!.uid, target);
+    if (binding) this.invalidateGoalResumeChecks(target, binding.sessionId);
     runtime.stopCause = "interrupt";
     runtime.workAfterStop = false;
     // 停止意图先落盘再回执：此后任何 abrupt 死亡都不能把用户已经中断的回合当成「可续接」重启
@@ -1304,6 +1335,8 @@ class CoreService implements ChannelService {
   private stopTurnForQuestion(taskId: string, cancelQuestionIds: readonly string[] = []): void {
     const runtime = this.runtimes.get(taskId);
     if (!runtime?.lease || !runtime.promptInFlight) return;
+    const binding = this.store.getBinding(this.bot!.uid, runtime.target);
+    if (binding) this.invalidateGoalResumeChecks(runtime.target, binding.sessionId);
     runtime.stopCause = "question";
     runtime.workAfterStop = false;
     this.store.markTaskStopIntent(taskId, "question_timeout", cancelQuestionIds);
@@ -1397,6 +1430,470 @@ class CoreService implements ChannelService {
     }
   }
 
+  private activeGoalTask(target: ChatTarget, sessionId: string | null): GoalTaskRecord | null {
+    for (const runtime of this.runtimes.values()) {
+      if (!runtime.isGoalTask || targetKey(runtime.target) !== targetKey(target)) continue;
+      const task = this.store.getTask(runtime.taskId);
+      if (task?.state !== "running" && task?.state !== "queued") continue;
+      const goalTask = this.store.getGoalTask(runtime.taskId);
+      if (goalTask && (sessionId === null || goalTask.sessionId === sessionId)) return goalTask;
+    }
+    for (const task of this.store.listQueuedTasks()) {
+      if (targetKey(taskTarget(task)) !== targetKey(target) || (sessionId !== null && task.sessionId !== sessionId)) continue;
+      const goalTask = this.store.getGoalTask(task.id);
+      if (goalTask) return goalTask;
+    }
+    return null;
+  }
+  private goalResumeCheckKey(target: ChatTarget, sessionId: string): string {
+    return JSON.stringify([target.channelType, target.channelId, sessionId]);
+  }
+
+  private beginGoalResumeCheck(
+    target: ChatTarget,
+    sessionId: string,
+  ): { isCurrent: () => boolean; release: () => void } {
+    const key = this.goalResumeCheckKey(target, sessionId);
+    const existing = this.goalResumeChecks.get(key);
+    const state = existing ?? { generation: 0, active: 0 };
+    if (!existing) this.goalResumeChecks.set(key, state);
+    state.active += 1;
+    const generation = state.generation;
+    let released = false;
+    return {
+      isCurrent: () => !released && state.generation === generation,
+      release: () => {
+        if (released) return;
+        released = true;
+        state!.active -= 1;
+        if (state!.active === 0 && this.goalResumeChecks.get(key) === state) {
+          this.goalResumeChecks.delete(key);
+        }
+      },
+    };
+  }
+
+  private invalidateGoalResumeChecks(target: ChatTarget, sessionId: string): void {
+    const state = this.goalResumeChecks.get(this.goalResumeCheckKey(target, sessionId));
+    if (state) state.generation += 1;
+  }
+
+  private async cleanupCancelledGoalTasks(target: ChatTarget, taskIds: readonly string[]): Promise<void> {
+    for (const taskId of taskIds) {
+      this.scheduler.takeWaitingReceipt(taskId);
+      this.typingLeases.release(target, `task:${taskId}`);
+      this.questions.cancelForTask(taskId, "cancelled");
+      await this.notifyThreadOutcome(taskId);
+    }
+  }
+
+  private async withGoalWorker<T>(
+    target: ChatTarget,
+    operation: (worker: WorkerSession, binding: BindingRecord) => Promise<T>,
+  ): Promise<T> {
+    const botUid = this.bot?.uid;
+    if (!botUid) throw new Error("Bot identity unavailable");
+    const binding = this.store.getBinding(botUid, target);
+    if (!binding) throw new Error("当前聊天没有已绑定的 OMP 会话。");
+    const live = this.liveWorker(target);
+    if (live && !this.runningRuntime(target)) throw new GoalDirectoryBusyError();
+    if (live) {
+      if (live.sessionId !== binding.sessionId) {
+        throw new WorkerGoalError("identity-mismatch", "当前绑定会话与运行中的会话不一致");
+      }
+      return operation(live, binding);
+    }
+
+    const sessionLease = this.scheduler.tryAcquireCommandSession(target, [binding.cwd]);
+    if (!sessionLease) throw new GoalDirectoryBusyError();
+    let tracked: TrackedWorker | undefined;
+    try {
+      await sessionLease.ready;
+      const current = this.store.getBinding(botUid, target);
+      if (
+        !current
+        || current.sessionId !== binding.sessionId
+        || current.sessionFile !== binding.sessionFile
+      ) {
+        throw new WorkerGoalError("identity-mismatch", "控制期间会话绑定已发生变化");
+      }
+      if (!binding.sessionFile) throw new Error("当前绑定尚无可控制的 OMP 会话文件。");
+      const sessionFile = await existingSessionFile(binding.sessionFile);
+      if (!sessionFile) throw new WorkerGoalError("identity-mismatch", "绑定的原生目标会话文件不存在");
+      const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.options.config), binding.cwd);
+      const model = this.store.getChatModel(botUid, target);
+      tracked = await openTrackedWorker({
+        workerFactory: this.options.workerFactory,
+        store: this.store,
+        worker: { cwd: binding.cwd, sessionDir, sessionFile, ...(model === null ? {} : { model }) },
+        ledger: {
+          id: randomUUID(),
+          botUid,
+          sessionId: binding.sessionId,
+          sessionFile,
+        },
+        blockDirectory: cwd => this.blockedDirectories.add(cwd),
+      });
+      const state = await tracked.worker.refreshState();
+      const verified = await verifyMovedSession(binding, state, binding.cwd);
+      if (verified.sessionId !== binding.sessionId || verified.sessionFile !== sessionFile) {
+        throw new WorkerGoalError("identity-mismatch", "打开的 OMP 会话与绑定身份不一致");
+      }
+      return await operation(tracked.worker, binding);
+    } finally {
+      try {
+        if (tracked && !(await tracked.close())) {
+          throw new Error("原生目标控制 worker 未能确认退出");
+        }
+      } finally {
+        sessionLease.complete();
+      }
+    }
+  }
+
+  private async handleGoal(message: InboundMessage, argument: string): Promise<void> {
+    const parsed = parseGoalCommand(argument);
+    if ("error" in parsed) {
+      await this.outbox.enqueueText(message, parsed.error, null);
+      return;
+    }
+    const command = parsed.command;
+    switch (command.op) {
+      case "show":
+      case "budget-show":
+        await this.handleGoalShow(message);
+        return;
+      case "set":
+        await this.handleGoalSet(message, command.objective, command.tokenBudget);
+        return;
+      case "resume":
+        await this.handleGoalResume(message);
+        return;
+      case "pause":
+      case "drop":
+        await this.handleGoalControl(message, command.op);
+        return;
+      case "budget-set":
+        await this.outbox.enqueueText(
+          message,
+          `原生目标预算创建后不能修改；请在创建时使用 /goal set --budget N <目标>。${GOAL_USAGE}`,
+          null,
+        );
+        return;
+    }
+  }
+
+  private async handleGoalShow(target: ChatTarget): Promise<void> {
+    const botUid = this.bot?.uid;
+    if (!botUid) return;
+    const binding = this.store.getBinding(botUid, target);
+    if (!binding) {
+      await this.outbox.enqueueText(target, formatGoalSession(null), null);
+      return;
+    }
+    const stored = this.store.getGoalSession(botUid, target, binding.sessionId);
+    if (!binding.sessionFile && !this.liveWorker(target)) {
+      await this.outbox.enqueueText(target, formatGoalSession(stored), null);
+      return;
+    }
+    try {
+      const pending = this.activeGoalTask(target, binding.sessionId);
+      const result = await this.withGoalWorker(target, worker => worker.goal("get"));
+      if (result.goal) {
+        if (result.goal.status === "complete" || result.goal.status === "dropped") {
+          if (pending) this.store.saveGoalSessionProgress(botUid, target, binding.sessionId, result.goal);
+          else this.store.clearGoalSession(botUid, target, binding.sessionId);
+          await this.outbox.enqueueText(target, `原生目标 ${result.goal.id} 已结算，状态 ${result.goal.status}。`, null);
+          return;
+        }
+        this.store.saveGoalSessionProgress(botUid, target, binding.sessionId, result.goal);
+      } else if (pending) {
+        await this.outbox.enqueueText(
+          target,
+          `原生 RPC 当前未返回目标；目标请求仍在执行或排队，${formatGoalSession(stored)}。`,
+          null,
+        );
+        return;
+      } else {
+        this.store.clearGoalSession(botUid, target, binding.sessionId);
+      }
+      await this.outbox.enqueueText(
+        target,
+        result.goal ? formatGoalSession(this.store.getGoalSession(botUid, target, binding.sessionId)) : formatGoalSession(null),
+        null,
+      );
+    } catch (error) {
+      const text = error instanceof GoalDirectoryBusyError
+        ? "原生目标控制目录正忙；任务结束后再试 /goal show。"
+        : goalErrorText(error) ?? (stored ? formatGoalSession(stored) : "无法安全读取当前会话的原生目标状态。");
+      await this.outbox.enqueueText(target, text, null);
+    }
+  }
+
+  private async handleGoalSet(message: InboundMessage, objective: string, tokenBudget?: number): Promise<void> {
+    const botUid = this.bot?.uid;
+    if (!botUid) return;
+    const binding = this.store.getBinding(botUid, message);
+    if (binding) {
+      if (this.store.getGoalSession(botUid, message, binding.sessionId)) {
+        await this.outbox.enqueueText(
+          message,
+          "当前绑定会话已有原生目标或目标请求，不能替换；请使用 /goal show、/goal pause 或 /goal drop。",
+          null,
+        );
+        return;
+      }
+      if (this.activeGoalTask(message, binding.sessionId)) {
+        await this.outbox.enqueueText(message, "当前会话已有目标任务在排队或运行；未重复启动。", null);
+        return;
+      }
+    }
+    const request: GoalTaskRequest = {
+      op: "create",
+      objective,
+      ...(tokenBudget === undefined ? {} : { tokenBudget }),
+    };
+    this.store.releaseClaim(this.commandClaim(message, "goal"));
+    const accepted = await this.acceptTask(message, `目标：${objective}`, false, null, request);
+    if (!accepted) {
+      await this.outbox.enqueueText(message, "目标任务未能持久接收；没有发送普通模型 prompt。", null);
+    }
+  }
+
+  private async handleGoalResume(message: InboundMessage): Promise<void> {
+    const botUid = this.bot?.uid;
+    if (!botUid) return;
+    const binding = this.store.getBinding(botUid, message);
+    if (!binding) {
+      await this.outbox.enqueueText(message, "当前会话没有可恢复的原生目标。", null);
+      return;
+    }
+    const reportExistingTask = async (): Promise<boolean> => {
+      const active = this.activeGoalTask(message, binding.sessionId);
+      if (!active) return false;
+      const task = this.store.getTask(active.taskId);
+      await this.outbox.enqueueText(
+        message,
+        task?.state === "queued"
+          ? "原生目标恢复请求已排队；没有重复排队。"
+          : "原生目标任务正在运行；没有重复启动。",
+        null,
+      );
+      return true;
+    };
+    if (await reportExistingTask()) return;
+
+    const resumeCheck = this.beginGoalResumeCheck(message, binding.sessionId);
+    const bindingIsExact = (): boolean => {
+      const current = this.store.getBinding(botUid, message);
+      return current?.sessionId === binding.sessionId && current.sessionFile === binding.sessionFile;
+    };
+    const reportStopped = async (): Promise<void> => {
+      await this.outbox.enqueueText(message, "目标恢复期间收到新的停止意图；未执行恢复。", null);
+    };
+    try {
+      const enqueueResume = async (goalId: string): Promise<void> => {
+        if (await reportExistingTask()) return;
+        if (!resumeCheck.isCurrent()) {
+          await reportStopped();
+          return;
+        }
+        if (!bindingIsExact()) {
+          await this.outbox.enqueueText(message, "绑定会话已变化；未在新会话恢复原生目标。", null);
+          return;
+        }
+        if (!binding.sessionFile) {
+          await this.outbox.enqueueText(message, "无法恢复原生目标：精确绑定会话文件不存在。", null);
+          return;
+        }
+        const currentGoal = this.store.getGoalSession(botUid, message, binding.sessionId);
+        if (!currentGoal || currentGoal.goalId !== goalId || currentGoal.status !== "paused") {
+          await this.outbox.enqueueText(message, "原生目标状态已变化；未排队恢复，请重新检查目标状态。", null);
+          return;
+        }
+        this.store.releaseClaim(this.commandClaim(message, "goal"));
+        const accepted = await this.acceptTask(
+          message,
+          `恢复原生目标 ${goalId}`,
+          false,
+          null,
+          { op: "resume" },
+          binding.sessionId,
+          resumeCheck.isCurrent,
+        );
+        if (!accepted) {
+          await this.outbox.enqueueText(
+            message,
+            resumeCheck.isCurrent()
+              ? "原生目标恢复请求未能在原绑定会话持久接收；没有发送普通模型 prompt。"
+              : "目标恢复期间收到新的停止意图；未执行恢复。",
+            null,
+          );
+        }
+      };
+
+      const stored = this.store.getGoalSession(botUid, message, binding.sessionId);
+      if (!binding.sessionFile && !this.liveWorker(message)) {
+        await this.outbox.enqueueText(
+          message,
+          stored?.goalId
+            ? "无法安全读取原生目标状态：精确绑定会话文件不存在。"
+            : "当前会话没有已接受且可恢复的原生目标。",
+          null,
+        );
+        return;
+      }
+
+      let nativeGoal: WorkerGoal | null;
+      try {
+        nativeGoal = await this.withGoalWorker(message, async worker => {
+          const result = await worker.goal("get");
+          const current = this.store.getGoalSession(botUid, message, binding.sessionId);
+          if (!result.goal) {
+            this.store.clearGoalSession(botUid, message, binding.sessionId);
+            return null;
+          }
+          if (current?.goalId && current.goalId !== result.goal.id) {
+            throw new WorkerGoalError("identity-mismatch", "原生目标 ID 与精确绑定会话记录不一致");
+          }
+          if (result.goal.status === "complete" || result.goal.status === "dropped") {
+            this.store.clearGoalSession(botUid, message, binding.sessionId);
+          } else {
+            this.store.saveGoalSessionProgress(botUid, message, binding.sessionId, result.goal);
+          }
+          return result.goal;
+        });
+      } catch (error) {
+        if (!resumeCheck.isCurrent()) {
+          await reportStopped();
+          return;
+        }
+        if (error instanceof GoalDirectoryBusyError) {
+          const cached = this.store.getGoalSession(botUid, message, binding.sessionId);
+          if (cached?.status === "paused" && cached.goalId && binding.sessionFile) {
+            await enqueueResume(cached.goalId);
+            return;
+          }
+        }
+        const text = error instanceof GoalDirectoryBusyError
+          ? "原生目标恢复目录正忙；无法安全核实目标状态，未启动恢复。"
+          : goalErrorText(error) ?? "读取精确绑定会话的原生目标状态失败；未启动恢复。";
+        await this.outbox.enqueueText(message, text, null);
+        return;
+      }
+      if (!resumeCheck.isCurrent()) {
+        await reportStopped();
+        return;
+      }
+      if (!bindingIsExact()) {
+        await this.outbox.enqueueText(message, "绑定会话已变化；未在新会话恢复原生目标。", null);
+        return;
+      }
+      if (!nativeGoal) {
+        await this.outbox.enqueueText(message, formatGoalSession(null), null);
+        return;
+      }
+      if (nativeGoal.status === "complete" || nativeGoal.status === "dropped") {
+        await this.outbox.enqueueText(
+          message,
+          `原生目标 ${nativeGoal.id} 已结算，状态 ${nativeGoal.status}。`,
+          null,
+        );
+        return;
+      }
+      if (nativeGoal.status === "budget-limited") {
+        await this.outbox.enqueueText(message, "原生目标已达到预算限制；预算不能事后修改，也不会自动恢复。", null);
+        return;
+      }
+      if (nativeGoal.status !== "paused") {
+        await this.outbox.enqueueText(
+          message,
+          nativeGoal.status === "active"
+            ? "原生目标仍处于 active；不会重复恢复，可使用 /goal pause。"
+            : `原生目标状态为 ${nativeGoal.status}，不能恢复。`,
+          null,
+        );
+        return;
+      }
+      await enqueueResume(nativeGoal.id);
+    } finally {
+      resumeCheck.release();
+    }
+  }
+
+  private async handleGoalControl(target: ChatTarget, operation: "pause" | "drop"): Promise<void> {
+    const botUid = this.bot?.uid;
+    if (!botUid) return;
+    const binding = this.store.getBinding(botUid, target);
+    if (!binding) {
+      const cancelled = this.store.stopGoalContinuation(botUid, target, null, operation);
+      await this.cleanupCancelledGoalTasks(target, cancelled);
+      await this.outbox.enqueueText(target, "当前聊天没有已绑定的原生目标会话。", null);
+      return;
+    }
+    this.invalidateGoalResumeChecks(target, binding.sessionId);
+    try {
+      const cancelled = this.store.stopGoalContinuation(botUid, target, binding.sessionId, operation);
+      await this.cleanupCancelledGoalTasks(target, cancelled);
+      const result = await this.withGoalWorker(target, async worker => {
+        const pending = this.activeGoalTask(target, binding.sessionId) !== null;
+        const prior = this.store.getGoalSession(botUid, target, binding.sessionId);
+        const before = await worker.goal("get");
+        if (before.goal) {
+          if (prior?.goalId && prior.goalId !== before.goal.id) {
+            throw new WorkerGoalError("identity-mismatch", "控制会话的原生目标 ID 与持久记录不一致");
+          }
+          this.store.saveGoalSessionProgress(botUid, target, binding.sessionId, before.goal);
+        } else if (!pending) {
+          this.store.clearGoalSession(botUid, target, binding.sessionId);
+        }
+        const outcome = await worker.goal(operation);
+        if (outcome.goal) {
+          if (before.goal && outcome.goal.id !== before.goal.id) {
+            throw new WorkerGoalError("identity-mismatch", "原生目标控制返回了不同的 goal ID");
+          }
+          if (operation === "pause" && outcome.goal.status === "active") {
+            throw new WorkerGoalError("native-error", "原生目标仍处于 active，pause 未生效；自动续跑授权已撤销。");
+          }
+          if (operation === "drop" && outcome.goal.status !== "dropped" && outcome.goal.status !== "complete") {
+            throw new WorkerGoalError("native-error", "原生目标 drop 未确认；自动续跑授权已撤销。");
+          }
+          if ((outcome.goal.status === "complete" || outcome.goal.status === "dropped") && !pending) {
+            this.store.clearGoalSession(botUid, target, binding.sessionId);
+          } else {
+            this.store.saveGoalSessionProgress(botUid, target, binding.sessionId, outcome.goal);
+          }
+        } else if (!pending) {
+          this.store.clearGoalSession(botUid, target, binding.sessionId);
+        }
+        return { before, outcome, pending };
+      });
+      if (!result.outcome.goal) {
+        const text = result.pending
+          ? "已撤销目标续跑授权；原生 RPC 尚无目标，目标任务仍在收尾。"
+          : "已撤销目标续跑授权；原生会话当前没有目标。";
+        await this.outbox.enqueueText(target, text, null);
+      } else if (result.outcome.goal.status === "complete" || result.outcome.goal.status === "dropped") {
+        await this.outbox.enqueueText(
+          target,
+          `原生目标 ${result.outcome.goal.id} 已结算，状态 ${result.outcome.goal.status}。`,
+          null,
+        );
+      } else {
+        const session = this.store.getGoalSession(botUid, target, binding.sessionId);
+        const message = operation === "pause" && result.outcome.goal.status === "paused"
+          ? `原生目标已暂停；${formatGoalSession(session)}`
+          : `原生目标当前状态为 ${result.outcome.goal.status}；${formatGoalSession(session)}`;
+        await this.outbox.enqueueText(target, message, null);
+      }
+    } catch (error) {
+      const text = error instanceof GoalDirectoryBusyError
+        ? "原生目标控制目录正忙；当前操作未能打开精确绑定会话。"
+        : goalErrorText(error) ?? `原生目标 ${operation === "pause" ? "暂停" : "删除"}失败；自动续跑授权已撤销。`;
+      await this.outbox.enqueueText(target, text, null);
+    }
+  }
+
   /**
    * `/queue` is the explicit way to append behind the running task regardless of the chat's mode,
    * so it always takes the durable task path minus the command prefix.
@@ -1466,6 +1963,8 @@ class CoreService implements ChannelService {
   }
 
   private async handleCancel(target: ChatTarget): Promise<void> {
+    const binding = this.store.getBinding(this.bot!.uid, target);
+    if (binding) this.invalidateGoalResumeChecks(target, binding.sessionId);
     const queued = this.store.cancelQueued(this.bot!.uid, target);
     for (const taskId of queued) this.scheduler.takeWaitingReceipt(taskId);
     // 存储域在取消这些排队任务时已顺手把它们的待答问题置为 cancelled：这些行不再是 pending，
@@ -1500,9 +1999,12 @@ class CoreService implements ChannelService {
     const taskState = current.state;
     const session = current.sessionId ?? "无";
     const cwd = current.cwd ?? "无";
+    const goal = current.sessionId
+      ? this.store.getGoalSession(this.bot!.uid, target, current.sessionId)
+      : null;
     await this.outbox.enqueueText(
       target,
-      `session=${session}\ncwd=${cwd}\nstate=${taskState}\nmode=${current.mode}\nmodel=${current.model ?? "未指定（OMP 默认）"}\nqueued=${current.queued}\noutbox=${current.outbox}\nunknown=${current.unknownOutbox}`,
+      `session=${session}\ncwd=${cwd}\nstate=${taskState}\ngoal=${goal?.status ?? "none"}\nmode=${current.mode}\nmodel=${current.model ?? "未指定（OMP 默认）"}\nqueued=${current.queued}\noutbox=${current.outbox}\nunknown=${current.unknownOutbox}`,
       null,
     );
   }
@@ -1561,13 +2063,20 @@ class CoreService implements ChannelService {
     text: string,
     historyEligible = true,
     relay: TaskRelayTarget | null = null,
+    goalRequest?: GoalTaskRequest,
+    expectedSessionId?: string,
+    acceptGuard?: () => boolean,
   ): Promise<boolean> {
     if (await this.refuseIncompleteThreadWorkspace(message)) return false;
     this.throwIfStopping();
-    let binding = await this.sessions.reconcileExternalBinding(
-      message,
-      this.store.getBinding(this.bot!.uid, message),
-    );
+    let binding = expectedSessionId === undefined
+      ? await this.sessions.reconcileExternalBinding(
+        message,
+        this.store.getBinding(this.bot!.uid, message),
+      )
+      : this.store.getBinding(this.bot!.uid, message);
+    if (acceptGuard && !acceptGuard()) return false;
+    if (expectedSessionId !== undefined && binding?.sessionId !== expectedSessionId) return false;
     if (!binding) {
       let cwd: string;
       try {
@@ -1601,6 +2110,13 @@ class CoreService implements ChannelService {
         }
       }
     }
+    if (
+      (expectedSessionId !== undefined
+        && this.store.getBinding(this.bot!.uid, message)?.sessionId !== expectedSessionId)
+      || (acceptGuard && !acceptGuard())
+    ) {
+      return false;
+    }
     // Shutdown can land during the binding probes above; never persist an acceptance from a
     // redeliverable message.
     this.throwIfStopping();
@@ -1618,10 +2134,9 @@ class CoreService implements ChannelService {
       resultText: null,
       errorText: null,
       messageSeq: message.messageSeq,
-      // 以 `/` 开头的任务正文是 OMP 自己的输入语言：内置命令（`/move`）与插件命令（`/wtm`）
-      // 由 OMP 从 prompt 首行分派，历史块前缀会把这一行变回普通模型输入，因此不带历史块、
-      // 不发起 sync，水位线也不因这轮推进。
-      historyEligible: historyEligible && !isCommand(text),
+      // Slash prompts never enter ordinary history. Structured goals are a separate RPC payload and
+      // stay in their persisted goal request instead of ever being parsed back out of task.text.
+      historyEligible: goalRequest === undefined && historyEligible && !isCommand(text),
       relayChannelType: relay?.channelType ?? null,
       relayChannelId: relay?.channelId ?? null,
       relayThreadName: relay?.threadName ?? null,
@@ -1630,7 +2145,7 @@ class CoreService implements ChannelService {
     // Measured before acceptance so the new task's own row cannot count itself as the work it waits for.
     const startsBehind = this.scheduler.hasBlockingWork(message, task.cwd);
     try {
-      accepted = this.store.acceptTask(this.taskClaim(message), task);
+      accepted = this.store.acceptTask(this.taskClaim(message), task, goalRequest);
     } catch {
       throw new Error("本地状态盘写入失败，任务未接收。");
     }
@@ -1688,28 +2203,50 @@ class CoreService implements ChannelService {
   private async runTask(taskId: string, expectedCwd?: string): Promise<void> {
     const persistedTask = this.store.getTask(taskId);
     if (!persistedTask || persistedTask.state !== "queued") return;
-    const targetAtStart = taskTarget(persistedTask);
-    if (await this.threadWorkspaceIncomplete(targetAtStart, true)) {
+    const target = taskTarget(persistedTask);
+    const goalTask = this.store.getGoalTask(taskId);
+    if (await this.threadWorkspaceIncomplete(target, true)) {
+      if (goalTask) {
+        const cancelled = this.store.stopGoalContinuation(this.bot!.uid, target, goalTask.sessionId, "pause");
+        await this.cleanupCancelledGoalTasks(target, cancelled);
+      }
       this.scheduler.takeWaitingReceipt(taskId);
       this.store.markFailed(taskId, THREAD_WORKSPACE_UNAVAILABLE_TEXT);
       this.questions.cancelForTask(taskId, "ended");
       this.questions.rejectForTask(taskId, new Error("task finished"));
-      await this.outbox.enqueueText(targetAtStart, THREAD_WORKSPACE_UNAVAILABLE_TEXT, taskId);
+      await this.outbox.enqueueText(target, THREAD_WORKSPACE_UNAVAILABLE_TEXT, taskId);
       await this.notifyThreadOutcome(taskId);
       return;
     }
-    const bindingAtStart = await this.reconcileTaskBinding(
-      taskId,
-      targetAtStart,
-      this.store.getBinding(this.bot!.uid, targetAtStart),
-    );
+    let goalSessionId = goalTask?.sessionId ?? persistedTask.sessionId;
+    const bindingAtStart = goalTask
+      ? this.store.getBinding(this.bot!.uid, target)
+      : await this.reconcileTaskBinding(taskId, target, this.store.getBinding(this.bot!.uid, target));
+    if (goalTask && (
+      !bindingAtStart
+      || bindingAtStart.sessionId !== goalTask.sessionId
+      || persistedTask.sessionId !== goalTask.sessionId
+    )) {
+      const cancelled = this.store.stopGoalContinuation(this.bot!.uid, target, goalTask.sessionId, "pause");
+      await this.cleanupCancelledGoalTasks(target, cancelled);
+      this.scheduler.takeWaitingReceipt(taskId);
+      this.store.markFailed(taskId, "原生目标绑定会话身份已变化，拒绝切换会话或重放请求。");
+      this.typingLeases.release(target, `task:${taskId}`);
+      await this.outbox.enqueueText(target, "原生目标绑定会话已变化；为避免在其他会话执行，本次操作已拒绝。", taskId);
+      await this.notifyThreadOutcome(taskId);
+      return;
+    }
     const task = bindingAtStart
       ? { ...persistedTask, cwd: bindingAtStart.cwd, sessionId: bindingAtStart.sessionId }
       : persistedTask;
     if (expectedCwd !== undefined && task.cwd !== expectedCwd) {
       this.scheduler.takeWaitingReceipt(taskId);
+      if (goalTask) {
+        const cancelled = this.store.stopGoalContinuation(this.bot!.uid, target, goalTask.sessionId, "pause");
+        await this.cleanupCancelledGoalTasks(target, cancelled);
+      }
       this.store.markFailed(taskId, "绑定目录在启动前再次变更，任务未启动。");
-      await this.outbox.enqueueText(taskTarget(task), GENERIC_TASK_FAILURE_NOTICE, taskId);
+      await this.outbox.enqueueText(target, goalTask ? "原生目标绑定目录已变化；为避免在其他会话执行，本次操作已拒绝。" : GENERIC_TASK_FAILURE_NOTICE, taskId);
       await this.notifyThreadOutcome(taskId);
       return;
     }
@@ -1720,14 +2257,13 @@ class CoreService implements ChannelService {
       return;
     }
     if (!this.store.markStarted(taskId)) return;
-    // 恢复分流：prompt 已被 OMP 接受的遗留任务必须续接原会话，其余任务重放原文。
-    const resuming = this.store.isTaskResuming(taskId);
-    // 防御性幂等点亮：正常路径在接受时已持有 task 租约（此处 no-op）；任何未来触达路径自动点亮。
+    // Goal recovery requires its own native goal receipt; ordinary prompts retain prompt receipts.
+    const goalResuming = this.store.isGoalTaskResuming(taskId);
+    const resuming = this.store.isTaskResuming(taskId) || goalResuming;
     this.typingLeases.acquire(taskTarget(task), `task:${taskId}`);
     if (this.scheduler.takeWaitingReceipt(taskId)) {
       this.outbox.enqueueText(taskTarget(task), receiptText("开始执行排队消息", task.text), null);
     }
-    const target = taskTarget(task);
     const turnContext = new TurnContext({
       store: this.store,
       transport: this.options.transport,
@@ -1737,6 +2273,7 @@ class CoreService implements ChannelService {
     });
     const runtime: RuntimeTask = {
       taskId,
+      isGoalTask: goalTask !== null,
       target,
       cwd: task.cwd,
       cancelRequested: false,
@@ -1818,6 +2355,7 @@ class CoreService implements ChannelService {
         cwd: task.cwd,
         sessionDir,
         ...(chatModel === null ? {} : { model: chatModel }),
+        ...(goalTask === null ? {} : { goalContinuation: true }),
       };
       if (binding?.sessionFile) {
         const sessionFile = await existingSessionFile(binding.sessionFile);
@@ -1851,48 +2389,127 @@ class CoreService implements ChannelService {
       const verified = binding?.sessionFile
         ? await verifyMovedSession(previousForWorker, authoritativeState, task.cwd)
         : await verifyFreshSession(previousForWorker, authoritativeState, task.cwd);
-      this.store.updateBindingSession(
-        this.bot!.uid,
-        target,
-        verified.sessionId,
-        verified.sessionFile,
-      );
+      if (goalTask && bindingAtStart?.sessionFile === null) {
+        if (!verified.sessionFile) {
+          throw new WorkerGoalError("invalid-response", "Fresh goal session did not expose its exact session file");
+        }
+        this.store.bindGoalTaskSession(taskId, goalSessionId, verified.sessionId, verified.sessionFile);
+        goalSessionId = verified.sessionId;
+      } else if (goalTask && verified.sessionId !== goalSessionId) {
+        throw new WorkerGoalError("identity-mismatch", "Worker session changed before goal dispatch");
+      } else if (!goalTask) {
+        this.store.updateBindingSession(
+          this.bot!.uid,
+          target,
+          verified.sessionId,
+          verified.sessionFile,
+        );
+      }
       // 续接不重放原文、也不重灌历史快照：原回合的上下文与会话消息都在会话里；群/子区说明
       // 的注入事务照常发布——会话侧车正是为「原生续跑回合」准备的（`context` 钩子补灌），
       // 上一进程未结算的 pending 事务在这里被接手，成功的续跑回合照常提交。
       contextInjection = await turnContext.prepare(verified.sessionId, agentContext);
-      const historyTurn = resuming ? null : await this.history.prepareTurn(task, target, verified.sessionId);
+      const historyTurn = goalTask || resuming ? null : await this.history.prepareTurn(task, target, verified.sessionId);
       const promptContext: PromptContext = {
         tools: createHostTools(this.hostToolHost(), task),
         ...(contextInjection === undefined ? {} : { contextInjection }),
       };
-      if (!resuming) {
-        // 普通派发在 prompt 发出前的最后一刻落标记：死在这一步之后、OMP 接受之前，恢复只会
-        // 看到「已派发、未接受」，按 fail-closed 结算而不是重放。
-        this.store.markTaskPromptStarted(taskId, verified.sessionId);
-      }
-      runtime.promptInFlight = true;
-      // Worker-local message counters restart at one; resumed output needs its own durable stream.
       const resumeStreamPrefix = resuming ? `resume:${randomUUID()}:` : "";
-      /**
-       * 事件入口：接受回执先同步落标记，再交给 TaskEvents——恢复判定因此严格基于「OMP 已
-       * 接受该 prompt」的持久事实，而不是事件到达顺序。
-       */
+      const pendingGoalUpdates: WorkerGoal[] = [];
+      const latestGoalProgress: { value: WorkerGoal | null } = { value: null };
+      const persistGoalProgress = (goal: WorkerGoal): void => {
+        this.store.updateGoalTaskProgress(taskId, goal);
+        latestGoalProgress.value = goal;
+      };
       const consumeEvent = (event: WorkerEvent): void => {
         if (event.type === "prompt_accepted") {
-          this.store.markTaskPromptAccepted(taskId);
+          if (goalTask) this.store.markGoalTaskAgentAccepted(taskId);
+          else this.store.markTaskPromptAccepted(taskId);
+          return;
+        }
+        if (event.type === "goal_accepted") {
+          if (!goalTask) throw new WorkerGoalError("invalid-response", "goal_accepted arrived for an ordinary task");
+          const current = this.store.getGoalTask(taskId);
+          if (current?.dispatchOp === "recover") {
+            if (current.acceptedGoalId !== event.goalId) {
+              throw new WorkerGoalError("identity-mismatch", "recovery acceptance did not match the persisted native goal id");
+            }
+          } else {
+            this.store.markGoalTaskAccepted(taskId, event.goalId);
+          }
+          for (const goal of pendingGoalUpdates.splice(0)) persistGoalProgress(goal);
+          return;
+        }
+        if (event.type === "goal_updated") {
+          if (!goalTask) throw new WorkerGoalError("invalid-response", "goal_updated arrived for an ordinary task");
+          if (event.goal === null) return;
+          const current = this.store.getGoalTask(taskId);
+          if (current?.accepted && current.acceptedGoalId !== null) {
+            persistGoalProgress(event.goal);
+          } else {
+            pendingGoalUpdates.push(event.goal);
+          }
           return;
         }
         events.onEvent(resumeStreamPrefix && (event.type === "text" || event.type === "notice")
           ? { ...event, messageId: `${resumeStreamPrefix}${event.messageId}` }
           : event);
       };
+      let goalResult: WorkerGoalResult | null = null;
+      let settledGoal: WorkerGoal | null = null;
+      let goalAbsent = false;
       try {
-        if (resuming) {
-          // 提问快照已在启动时（开放入站之前）建好，这里不再重复初始化：续跑里重新发起的同一轮
-          // ask 会认领原行，不会多发一题，也不会吞掉已经按快照交付的答复。
+        if (goalTask) {
+          const latest = this.store.getGoalTask(taskId);
+          if (!latest) throw new WorkerGoalError("invalid-response", "persisted goal request disappeared");
+          let request: WorkerGoalRun;
+          if (goalResuming) {
+            if (!latest.accepted || latest.acceptedGoalId === null) {
+              throw new WorkerGoalError("invalid-response", "no accepted goal receipt for recovery");
+            }
+            request = { op: "recover", goalId: latest.acceptedGoalId };
+          } else {
+            request = latest.request;
+          }
+          this.store.markGoalTaskDispatched(taskId, verified.sessionId, request.op);
+          runtime.promptInFlight = true;
+          goalResult = await worker.runGoal(request, consumeEvent, promptContext);
+          const accepted = this.store.getGoalTask(taskId);
+          if (!accepted?.accepted || !accepted.acceptedGoalId) {
+            throw new WorkerGoalError("invalid-response", "native goal dispatch returned without a durable goal acceptance");
+          }
+          const expectedGoalId = request.op === "recover" ? request.goalId : accepted.acceptedGoalId;
+          if (accepted.acceptedGoalId !== expectedGoalId) {
+            throw new WorkerGoalError("identity-mismatch", "recovery goal id did not match its persisted acceptance");
+          }
+          if (goalResult.goal) {
+            if (goalResult.goal.id !== expectedGoalId) {
+              throw new WorkerGoalError("identity-mismatch", "native goal result id did not match accepted goal id");
+            }
+            this.store.finishGoalTaskProgress(taskId, goalResult.goal);
+            settledGoal = goalResult.goal;
+            if (settledGoal.status === "complete" || settledGoal.status === "dropped") {
+              this.store.clearGoalSession(this.bot!.uid, target, goalSessionId);
+              goalAbsent = true;
+            }
+          } else if (
+            request.op === "recover"
+            || latestGoalProgress.value?.status === "complete"
+            || latestGoalProgress.value?.status === "dropped"
+          ) {
+            if (latestGoalProgress.value) this.store.finishGoalTaskProgress(taskId, latestGoalProgress.value);
+            this.store.clearGoalSession(this.bot!.uid, target, goalSessionId);
+            settledGoal = latestGoalProgress.value;
+            goalAbsent = true;
+          } else {
+            throw new WorkerGoalError("invalid-response", "native goal start returned no goal and no terminal progress");
+          }
+        } else if (resuming) {
+          runtime.promptInFlight = true;
           await worker.resume(consumeEvent, promptContext);
         } else {
+          this.store.markTaskPromptStarted(taskId, verified.sessionId);
+          runtime.promptInFlight = true;
           await worker.prompt(historyTurn?.text ?? task.text, consumeEvent, promptContext);
         }
       } finally {
@@ -1916,10 +2533,58 @@ class CoreService implements ChannelService {
         progress.finish("cancelled");
       } else if (!runtime.suspended) {
         await runtime.steerSerial;
-        await turnContext.complete(worker.sessionId, events.localOnly);
-        this.store.markCompleted(taskId, events.resultText);
-        progress.finish("completed");
-        this.outbox.flush(target);
+        if (goalTask) {
+          let goal = settledGoal;
+          let pauseFailure: unknown = null;
+          const priorStop = this.store.getGoalSession(this.bot!.uid, target, goalSessionId)?.stopIntent;
+          if (goal?.status === "active" && !goalAbsent) {
+            const cancelled = this.store.stopGoalContinuation(this.bot!.uid, target, goalSessionId, "pause");
+            await this.cleanupCancelledGoalTasks(target, cancelled);
+            if (priorStop === "drop") {
+              pauseFailure = new WorkerGoalError("native-error", "原生目标仍为 active，drop 未确认；自动续跑授权已撤销。");
+            } else {
+              let paused: WorkerGoalResult | null = null;
+              try {
+                paused = await worker.goal("pause");
+              } catch (error) {
+                pauseFailure = error;
+              }
+              if (paused?.goal) {
+                if (paused.goal.id !== goal.id) {
+                  throw new WorkerGoalError("identity-mismatch", "native goal pause returned a different goal id");
+                }
+                goal = paused.goal;
+              } else if (paused && !paused.goal) {
+                goal = null;
+                goalAbsent = true;
+                this.store.clearGoalSession(this.bot!.uid, target, goalSessionId);
+              }
+              if (goal?.status === "active" && pauseFailure === null) {
+                pauseFailure = new WorkerGoalError("native-error", "原生目标仍为 active，pause 未确认；自动续跑授权已撤销。");
+              }
+            }
+          }
+          if (goal && !goalAbsent) this.store.saveGoalSessionProgress(this.bot!.uid, target, goalSessionId, goal);
+          await turnContext.complete(worker.sessionId, events.localOnly);
+          this.store.markCompleted(taskId, events.resultText);
+          progress.finish("completed");
+          const current = this.store.getGoalSession(this.bot!.uid, target, goalSessionId);
+          const settled = goalAbsent
+            ? goal
+              ? `原生目标 ${goal.id} 已结算，状态 ${goal.status}。`
+              : "原生目标已完成或已不存在。"
+            : `原生目标执行已结算；${formatGoalSession(current)}`;
+          const suffix = pauseFailure === null
+            ? ""
+            : ` 原生${priorStop === "drop" ? "drop" : "pause"}未确认：${goalErrorText(pauseFailure) ?? "请使用 /goal show 核对原生状态"}。`;
+          await this.outbox.enqueueText(target, `${settled}${suffix}`, taskId);
+          this.outbox.flush(target);
+        } else {
+          await turnContext.complete(worker.sessionId, events.localOnly);
+          this.store.markCompleted(taskId, events.resultText);
+          progress.finish("completed");
+          this.outbox.flush(target);
+        }
       }
     } catch (error) {
       if (runtime.cancelRequested) {
@@ -1941,6 +2606,15 @@ class CoreService implements ChannelService {
       } else if (runtime.suspended || this.stopping) {
         // Stop aborts startup I/O before its per-runtime suspend loop; `stopping` closes that race.
         console.error(`[task] 停机挂起，任务保持未结算 task=${taskId}`);
+      } else if (goalTask) {
+        const cancelled = this.store.stopGoalContinuation(this.bot!.uid, target, goalSessionId, "pause");
+        await this.cleanupCancelledGoalTasks(target, cancelled);
+        const notice = goalErrorText(error)
+          ?? "原生目标执行未能可靠完成；自动续跑授权已撤销，请使用 /goal show 核对状态。";
+        this.store.markFailed(taskId, notice);
+        progress.finish("failed");
+        if (resuming) this.questions.cancelForTask(taskId, "ended");
+        await this.outbox.enqueueText(target, notice, taskId);
       } else {
         const failure = runtime.lease
           ? classifyTaskFailure(error)
@@ -1951,8 +2625,6 @@ class CoreService implements ChannelService {
         );
         this.store.markFailed(taskId, failure.row);
         progress.finish("failed");
-        // 续接失败即该任务确定不再恢复：它自己的待答问题与卡片一并收尾（不波及同聊天其他任务）。
-        // 这不是用户叫停，关闭记 `ended`——迟到提交按该聊天的新输入接受。
         if (resuming) this.questions.cancelForTask(taskId, "ended");
         await this.outbox.enqueueText(runtime.target, failure.notice, taskId);
       }

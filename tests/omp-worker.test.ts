@@ -1,16 +1,26 @@
-import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createWorkerFactory } from "../src/omp/index.ts";
-import { RESUME_CONTINUATION_PROMPT, TaskStartupError } from "../src/contracts.ts";
-import type { HostTool, OmpWorker, PromptContext, WorkerEvent, WorkerOptions, WorkerProcess } from "../src/contracts.ts";
+import { RESUME_CONTINUATION_PROMPT, TaskStartupError, WorkerGoalError } from "../src/contracts.ts";
+import type {
+	HostTool,
+	OmpWorker,
+	PromptContext,
+	WorkerEvent,
+	WorkerGoalResult,
+	WorkerGoalRun,
+	WorkerOptions,
+	WorkerProcess,
+} from "../src/contracts.ts";
 import type { RpcChild } from "../src/omp/process.ts";
 import { FakeWorkerFactory } from "./fixtures/core-fakes";
 
 const fixturePath = resolve(import.meta.dir, "fixtures/omp-rpc-worker.ts");
 const watchdogParentFixturePath = resolve(import.meta.dir, "fixtures/omp-watchdog-parent.ts");
+const goalRpcConfigPath = resolve(import.meta.dir, "../src/omp/goal-rpc.yml");
 
 type LogEntry = Record<string, unknown>;
 
@@ -30,7 +40,6 @@ const harnesses = new Set<Harness>();
 afterEach(async () => {
 	for (const harness of [...harnesses]) {
 		await harness.cleanup();
-		harnesses.delete(harness);
 	}
 });
 
@@ -81,6 +90,8 @@ async function withHarness<T>(
 		envReport?: boolean;
 		cliEnv?: () => Record<string, string> | undefined;
 		model?: string;
+		goalContinuation?: boolean;
+		userConfig?: string;
 		/** Leaves the native tool-call identity off the frame, like a legacy host_tool_call. */
 		hostToolNoCallId?: boolean;
 	} = {},
@@ -91,8 +102,11 @@ async function withHarness<T>(
 	const envPath = join(tempDir, "child-env.json");
 	const conflictingCwd = join(tempDir, "wrong-cwd");
 	const conflictingSessionDir = join(tempDir, "wrong-session-dir");
+	const userConfigPath = join(tempDir, "user-config.yml");
+	if (options.userConfig !== undefined) await writeFile(userConfigPath, options.userConfig, "utf8");
 	const extraArgs = [
 		fixturePath,
+		...(options.userConfig === undefined ? [] : ["--config", userConfigPath]),
 		"--mode",
 		"interactive",
 		"--approval-mode",
@@ -128,6 +142,7 @@ async function withHarness<T>(
 		...(requestedSessionFile === undefined ? {} : { sessionFile: requestedSessionFile }),
 		...(options.contextScope === undefined ? {} : { contextScope: options.contextScope }),
 		...(options.model === undefined ? {} : { model: options.model }),
+		...(options.goalContinuation === true ? { goalContinuation: true } : {}),
 		onSpawn: processInfo => {
 			spawned = processInfo;
 		},
@@ -177,6 +192,28 @@ function commandTypes(entries: LogEntry[]): string[] {
 				? command.type
 				: "<invalid>";
 		});
+}
+function rpcCommands(entries: LogEntry[], type: string): LogEntry[] {
+	return entries.flatMap(entry => {
+		const command = entry.command;
+		return entry.kind === "command" && command && typeof command === "object" && !Array.isArray(command)
+			&& (command as LogEntry).type === type
+			? [command as LogEntry]
+			: [];
+	});
+}
+
+function goalOps(entries: LogEntry[]): unknown[] {
+	return rpcCommands(entries, "goal").map(command => command.op);
+}
+
+async function expectGoalError(promise: Promise<unknown>, code: string): Promise<void> {
+	const error = await promise.then(
+		() => null,
+		value => value,
+	);
+	expect(error).toBeInstanceOf(WorkerGoalError);
+	expect(error).toMatchObject({ code });
 }
 
 function startupEntry(entries: LogEntry[]): LogEntry {
@@ -332,6 +369,7 @@ describe("OMP RPC worker", () => {
 			expect(argumentValue(startup.argv, "--approval-mode")).toBe("yolo");
 			expect(argumentValue(startup.argv, "--cwd")).toBe(harness.tempDir);
 			expect(argumentValue(startup.argv, "--session-dir")).toBe(harness.tempDir);
+			expect(argumentValue(startup.argv, "--config")).toBeUndefined();
 		});
 	});
 	test("forwards direct-message context scope to the real OMP child environment", async () => {
@@ -347,6 +385,24 @@ describe("OMP RPC worker", () => {
 			expect(childEnv["OMP_CHANNEL_OCTO_CONTEXT_CHANNEL_TYPE"]).toBe("1");
 			expect(childEnv["OMP_CHANNEL_OCTO_CONTEXT_CHANNEL_ID"]).toBe("owner-direct-message");
 		}, { envReport: true, contextScope });
+	});
+	test("layers an RPC-only continuation overlay after the user profile without setting goal.enabled", async () => {
+		await withHarness(
+			"normal",
+			async harness => {
+				const startup = startupEntry(await readLog(harness.logPath));
+				const argv = startup.argv;
+				if (!Array.isArray(argv)) throw new Error("fixture startup argv was missing");
+				const configs = argv.flatMap((value, index) =>
+					value === "--config" && typeof argv[index + 1] === "string" ? [argv[index + 1]] : [],
+				);
+				expect(configs).toEqual([join(harness.tempDir, "user-config.yml"), goalRpcConfigPath]);
+				const overlay = readFileSync(goalRpcConfigPath, "utf8");
+				expect(overlay.trimEnd()).toBe("goal:\n  continuationModes:\n    - rpc");
+				expect(overlay).not.toContain("enabled");
+			},
+			{ goalContinuation: true, userConfig: "goal:\n  enabled: false\n" },
+		);
 	});
 	test("carries the CLI credential names into the child and strips every other OCTO_ variable", async () => {
 		const hostToken = Bun.env["OCTO_BOT_TOKEN"];
@@ -625,6 +681,437 @@ describe("OMP RPC worker", () => {
 			expect(textEvents[0]?.messageId).toEqual(expect.any(String));
 			expect(textEvents[0]?.messageId).toBe(textEvents[1]?.messageId);
 		});
+	});
+
+	test("keeps a prompt open across terminal agent_end frames until session_settled", async () => {
+		await withHarness("session-settled", async harness => {
+			const events: WorkerEvent[] = [];
+			let settled = false;
+			let toolExecutions = 0;
+			const tool: HostTool = {
+				name: "fixture_echo",
+				description: "Echo a fixture value",
+				parameters: { type: "object", properties: {} },
+				execute: async () => {
+					toolExecutions += 1;
+					return "goal host tool ran";
+				},
+			};
+			const prompt = harness.worker.prompt("run the objective", event => events.push(event), { tools: [tool] }).then(
+				() => {
+					settled = true;
+				},
+				(error: unknown) => {
+					settled = true;
+					throw error;
+				},
+			);
+
+			await waitUntil(() => existsSync(harness.markerPath));
+			// Round-trip through the live RPC process after its first terminal agent_end. The
+			// modern session is still running: its second turn must retain the installed tool.
+			await harness.worker.models();
+			expect(settled).toBe(false);
+			await rm(harness.markerPath, { force: true });
+
+			const finalGatePath = `${harness.logPath}.settled`;
+			await waitUntil(() => existsSync(finalGatePath));
+			// The second terminal agent_end is not the session boundary either.
+			await harness.worker.models();
+			expect(settled).toBe(false);
+			expect(toolExecutions).toBe(1);
+			await rm(finalGatePath, { force: true });
+
+			await prompt;
+			expect(
+				events.some(event => event.type === "text" && event.text === "fixture first objective step"),
+			).toBe(true);
+			expect(
+				events.some(event => event.type === "text" && event.text === "fixture tool returned: goal host tool ran"),
+			).toBe(true);
+		});
+	});
+	test("structured goal creation owns host tools until the native session settles", async () => {
+		await withHarness(
+			"goal-run",
+			async harness => {
+				const events: WorkerEvent[] = [];
+				let toolCalls = 0;
+				let settled = false;
+				const tool: HostTool = {
+					name: "fixture_echo",
+					description: "Echo a fixture value",
+					parameters: { type: "object", properties: {} },
+					execute: async () => {
+						toolCalls += 1;
+						return "goal host tool ran";
+					},
+				};
+				const request: WorkerGoalRun = { op: "create", objective: "finish the fixture objective", tokenBudget: 40 };
+				const running: Promise<WorkerGoalResult> = harness.worker
+					.runGoal(request, event => events.push(event), { tools: [tool] })
+					.then(result => {
+						settled = true;
+						return result;
+					});
+				void running.catch(() => undefined);
+
+				const settledGate = `${harness.logPath}.settled`;
+				try {
+					await waitUntil(() => existsSync(harness.markerPath));
+					await harness.worker.models();
+					expect(settled).toBe(false);
+					expect(events.some(event => event.type === "goal_updated" && event.goal?.status === "active")).toBe(true);
+					const acceptedIndex = events.findIndex(
+						event => event.type === "goal_accepted" && event.goalId === "fixture-goal-1",
+					);
+					const generationAcceptedIndex = events.findIndex(event => event.type === "prompt_accepted");
+					const firstTextIndex = events.findIndex(event => event.type === "text");
+					expect(acceptedIndex).toBeGreaterThanOrEqual(0);
+					expect(generationAcceptedIndex).toBeGreaterThan(acceptedIndex);
+					expect(generationAcceptedIndex).toBeLessThan(firstTextIndex);
+					expect(events.filter(event => event.type === "prompt_accepted")).toHaveLength(1);
+					await rm(harness.markerPath, { force: true });
+
+					await waitUntil(() => existsSync(settledGate));
+					await harness.worker.models();
+					expect(settled).toBe(false);
+					expect(toolCalls).toBe(1);
+					await rm(settledGate, { force: true });
+
+					const result = await running;
+					expect(result.goal).toMatchObject({
+						id: "fixture-goal-1",
+						objective: "finish the fixture objective",
+						status: "complete",
+						tokenBudget: 40,
+					});
+					expect(result.state?.enabled).toBe(false);
+					const entries = await readLog(harness.logPath);
+					const commands = entries.filter(entry => entry.kind === "command");
+					const toolsIndex = commands.findIndex(
+						entry => (entry.command as LogEntry | undefined)?.type === "set_host_tools",
+					);
+					const createIndex = commands.findIndex(entry => {
+						const command = entry.command as LogEntry | undefined;
+						return command?.type === "goal" && command.op === "create";
+					});
+					expect(toolsIndex).toBeGreaterThanOrEqual(0);
+					expect(toolsIndex).toBeLessThan(createIndex);
+					expect(goalOps(entries)).toContain("create");
+					expect(rpcCommands(entries, "prompt")).toEqual([]);
+					expect(
+						events.some(event => event.type === "text" && event.text === "fixture tool returned: goal host tool ran"),
+					).toBe(true);
+				} finally {
+					await rm(harness.markerPath, { force: true });
+					if (!settled) {
+						await waitUntil(() => existsSync(settledGate) || settled, 1_500).catch(() => {});
+						await rm(settledGate, { force: true });
+						await waitUntil(() => settled, 1_500).catch(() => {});
+						if (!settled) await harness.worker.stop().catch(() => false);
+					}
+					await running.catch(() => undefined);
+				}
+			},
+			{ goalContinuation: true },
+		);
+	});
+
+	test("a goal control during preflight or host-tool installation prevents a later structured create/resume", async () => {
+		const tool: HostTool = {
+			name: "fixture_echo",
+			description: "Echo a fixture value",
+			parameters: { type: "object", properties: {} },
+			execute: async () => "unused fixture tool",
+		};
+		const cases: Array<{
+			scenario: string;
+			request: WorkerGoalRun;
+			gate: "preflight" | "tools";
+			operation: "create" | "resume";
+			expectedStatus: "paused" | null;
+		}> = [
+			{
+				scenario: "goal-preflight-create",
+				request: { op: "create", objective: "fixture objective" },
+				gate: "preflight",
+				operation: "create",
+				expectedStatus: null,
+			},
+			{
+				scenario: "goal-preflight-resume",
+				request: { op: "resume" },
+				gate: "preflight",
+				operation: "resume",
+				expectedStatus: "paused",
+			},
+			{
+				scenario: "goal-create-tools-gated",
+				request: { op: "create", objective: "fixture objective" },
+				gate: "tools",
+				operation: "create",
+				expectedStatus: null,
+			},
+			{
+				scenario: "goal-resume-tools-gated",
+				request: { op: "resume" },
+				gate: "tools",
+				operation: "resume",
+				expectedStatus: "paused",
+			},
+		];
+		for (const scenario of cases) {
+			await withHarness(
+				scenario.scenario,
+				async harness => {
+					const context = scenario.gate === "tools" ? { tools: [tool] } : undefined;
+					const running = harness.worker.runGoal(scenario.request, () => {}, context);
+					const gatePath = `${harness.logPath}.${scenario.gate}`;
+					await waitUntil(() => existsSync(gatePath));
+
+					const control = await harness.worker.goal("pause");
+					expect(control.goal?.status ?? null).toBe(scenario.expectedStatus);
+					await rm(gatePath, { force: true });
+
+					const result = await running;
+					expect(result.goal?.status ?? null).toBe(scenario.expectedStatus);
+					expect(goalOps(await readLog(harness.logPath))).not.toContain(scenario.operation);
+				},
+				{ goalContinuation: true },
+			);
+		}
+	});
+
+	test("settled goal creation without a generated turn returns and pauses instead of hanging", async () => {
+		await withHarness(
+			"goal-no-generation",
+			async harness => {
+				const result = await harness.worker.runGoal({ op: "create", objective: "fixture objective" }, () => {});
+				expect(result.goal?.status).toBe("paused");
+				const entries = await readLog(harness.logPath);
+				expect(goalOps(entries)).toContain("pause");
+				expect(rpcCommands(entries, "prompt")).toEqual([]);
+				expect(
+					entries.some(entry => entry.kind === "out" && (entry.frame as LogEntry | undefined)?.type === "agent_start"),
+				).toBe(false);
+			},
+			{ goalContinuation: true },
+		);
+	});
+
+	test("a no-progress native goal settles truthfully and pauses while remaining incomplete", async () => {
+		await withHarness(
+			"goal-no-progress",
+			async harness => {
+				const events: WorkerEvent[] = [];
+				const result = await harness.worker.runGoal(
+					{ op: "create", objective: "fixture objective" },
+					event => events.push(event),
+				);
+				expect(result.goal?.status).toBe("paused");
+				expect(result.goal?.status).not.toBe("complete");
+				expect(events.some(event => event.type === "goal_accepted")).toBe(true);
+				expect(events.some(event => event.type === "text" && event.text === "fixture native goal step")).toBe(true);
+				expect(rpcCommands(await readLog(harness.logPath), "prompt")).toEqual([]);
+			},
+			{ goalContinuation: true },
+		);
+	});
+
+	test("goal get, pause, and drop remain available without enabling continuation", async () => {
+		await withHarness("goal-control", async harness => {
+			const current = await harness.worker.goal("get");
+			expect(current.goal?.status).toBe("active");
+			expect((await harness.worker.goal("pause")).goal?.status).toBe("paused");
+			expect(await harness.worker.goal("drop")).toEqual({ goal: null, state: null });
+			expect(argumentValue(startupEntry(await readLog(harness.logPath)).argv, "--config")).toBeUndefined();
+		});
+	});
+
+	test("pause or drop can control an active goal run without waiting for it to settle", async () => {
+		for (const scenario of ["goal-pause-during-run", "goal-drop-during-run"] as const) {
+			await withHarness(
+				scenario,
+				async harness => {
+					let settled = false;
+					const running = harness.worker
+						.runGoal({ op: "create", objective: "fixture objective" }, () => {})
+						.then(result => {
+							settled = true;
+							return result;
+						});
+					await waitUntil(() => existsSync(harness.markerPath));
+					const control = scenario === "goal-pause-during-run"
+						? await harness.worker.goal("pause")
+						: await harness.worker.goal("drop");
+					expect(settled).toBe(false);
+					if (scenario === "goal-pause-during-run") {
+						expect(control.goal?.status).toBe("paused");
+					} else {
+						expect(control).toEqual({ goal: null, state: null });
+					}
+					await rm(harness.markerPath, { force: true });
+					const result = await running;
+					if (scenario === "goal-pause-during-run") {
+						expect(result.goal?.status).toBe("paused");
+					} else {
+						expect(result).toEqual({ goal: null, state: null });
+					}
+					const entries = await readLog(harness.logPath);
+					expect(
+						entries.some(
+							entry => entry.kind === "out" && (entry.frame as LogEntry | undefined)?.type === "host_tool_call",
+						),
+					).toBe(false);
+				},
+				{ goalContinuation: true },
+			);
+		}
+	});
+
+	test("native goal protocol errors are classified and malformed updates fail closed", async () => {
+		const cases: Array<{ scenario: string; request: WorkerGoalRun; code: string }> = [
+			{ scenario: "goal-disabled", request: { op: "create", objective: "fixture objective" }, code: "disabled" },
+			{ scenario: "goal-unsupported", request: { op: "create", objective: "fixture objective" }, code: "unsupported" },
+			{ scenario: "goal-invalid-response", request: { op: "create", objective: "fixture objective" }, code: "invalid-response" },
+			{ scenario: "goal-create-empty-response", request: { op: "create", objective: "fixture objective" }, code: "invalid-response" },
+			{ scenario: "goal-invalid-event", request: { op: "create", objective: "fixture objective" }, code: "invalid-response" },
+			{ scenario: "goal-already-exists", request: { op: "create", objective: "fixture objective" }, code: "already-exists" },
+			{ scenario: "goal-already-active", request: { op: "resume" }, code: "already-active" },
+		];
+		for (const { scenario, request, code } of cases) {
+			await withHarness(
+				scenario,
+				async harness => {
+					await expectGoalError(harness.worker.runGoal(request, () => {}), code);
+					if (scenario === "goal-invalid-event" || scenario === "goal-create-empty-response") {
+						expect(goalOps(await readLog(harness.logPath))).toContain("pause");
+					}
+					if (scenario === "goal-already-exists" || scenario === "goal-already-active") {
+						expect(goalOps(await readLog(harness.logPath))).not.toContain(
+							scenario === "goal-already-exists" ? "create" : "resume",
+						);
+					}
+				},
+				{ goalContinuation: true },
+			);
+		}
+	});
+
+	test("invalid goal requests are rejected before any native RPC is dispatched", async () => {
+		await withHarness(
+			"goal-control",
+			async harness => {
+				await expectGoalError(harness.worker.runGoal({ op: "create", objective: "  " }, () => {}), "invalid-request");
+				await expectGoalError(
+					harness.worker.runGoal({ op: "create", objective: "fixture objective", tokenBudget: 0 }, () => {}),
+					"invalid-request",
+				);
+				expect(goalOps(await readLog(harness.logPath))).toEqual([]);
+			},
+			{ goalContinuation: true },
+		);
+	});
+	test("structured goal execution requires an opted-in continuation worker", async () => {
+		await withHarness("goal-control", async harness => {
+			await expectGoalError(
+				harness.worker.runGoal({ op: "create", objective: "fixture objective" }, () => {}),
+				"continuation-disabled",
+			);
+			expect(goalOps(await readLog(harness.logPath))).toEqual([]);
+		});
+	});
+
+	test("budget-limited goals are returned without sending a native resume", async () => {
+		await withHarness(
+			"goal-budget-limited",
+			async harness => {
+				const result = await harness.worker.runGoal({ op: "resume" }, () => {});
+				expect(result.goal?.status).toBe("budget-limited");
+				expect(goalOps(await readLog(harness.logPath))).toEqual(["get"]);
+				expect(rpcCommands(await readLog(harness.logPath), "prompt")).toEqual([]);
+			},
+			{ goalContinuation: true },
+		);
+	});
+
+	test("goal recovery checks exact identity before retrying and returns terminal goals untouched", async () => {
+		await withHarness(
+			"goal-recover-mismatch",
+			async harness => {
+				await expectGoalError(
+					harness.worker.runGoal({ op: "recover", goalId: "fixture-goal-1" }, () => {}),
+					"identity-mismatch",
+				);
+				const entries = await readLog(harness.logPath);
+				expect(rpcCommands(entries, "prompt")).toEqual([]);
+				expect(goalOps(entries)).toEqual(["get"]);
+			},
+			{ goalContinuation: true },
+		);
+		await withHarness(
+			"goal-recover-complete",
+			async harness => {
+				const result = await harness.worker.runGoal(
+					{ op: "recover", goalId: "fixture-goal-1" },
+					() => {},
+				);
+				expect(result.goal?.status).toBe("complete");
+				const entries = await readLog(harness.logPath);
+				expect(rpcCommands(entries, "prompt")).toEqual([]);
+				expect(goalOps(entries)).toEqual(["get"]);
+			},
+			{ goalContinuation: true },
+		);
+	});
+
+	test("pause or interrupt during local retry recovery cannot reactivate the goal", async () => {
+		for (const control of ["pause", "interrupt"] as const) {
+			await withHarness(
+				"goal-recover-gated",
+				async harness => {
+					const running = harness.worker.runGoal({ op: "recover", goalId: "fixture-goal-1" }, () => {});
+					const retryGate = `${harness.logPath}.retry`;
+					await waitUntil(() => existsSync(retryGate));
+
+					if (control === "pause") {
+						expect((await harness.worker.goal("pause")).goal?.status).toBe("paused");
+					} else {
+						await harness.worker.abortTurn();
+					}
+					await rm(retryGate, { force: true });
+
+					const result = await running;
+					expect(result.goal?.status).toBe("paused");
+					expect(goalOps(await readLog(harness.logPath))).not.toContain("resume");
+				},
+				{ goalContinuation: true },
+			);
+		}
+	});
+
+	test("local retry recovery resumes the same native goal without a generic continuation prompt", async () => {
+		await withHarness(
+			"goal-recover-local",
+			async harness => {
+				const events: WorkerEvent[] = [];
+				const result = await harness.worker.runGoal(
+					{ op: "recover", goalId: "fixture-goal-1" },
+					event => events.push(event),
+				);
+				expect(result.goal?.id).toBe("fixture-goal-1");
+				expect(result.goal?.status).toBe("complete");
+				const entries = await readLog(harness.logPath);
+				expect(rpcCommands(entries, "prompt").map(command => command.message)).toEqual(["/retry"]);
+				expect(goalOps(entries)).toContain("resume");
+				expect(events.filter(event => event.type === "prompt_accepted")).toHaveLength(1);
+				expect(events.filter(event => event.type === "local_command")).toEqual([]);
+				expect(events.some(event => event.type === "goal_accepted" && event.goalId === "fixture-goal-1")).toBe(true);
+				expect(rpcCommands(entries, "prompt").map(command => command.message)).not.toContain(RESUME_CONTINUATION_PROMPT);
+			},
+			{ goalContinuation: true },
+		);
 	});
 
 	test("completes a local-only prompt from the ack's agentInvoked false with one local command event", async () => {

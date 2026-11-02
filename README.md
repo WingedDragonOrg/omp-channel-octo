@@ -11,6 +11,7 @@
 - **消息与文件**：流式编辑助手回复，接收入站附件和引用内容，支持语音转写及出站文件。
 - **执行反馈**：展示工具、待办和子代理进度；支持交互问答卡片，也可直接用文字作答。卡片能力取决于 Octo 部署，卡片失败不阻断正文。
 - **原生命令与通知**：未注册的 OMP slash 命令（如 `/autoresearch`）按独立任务原样转交 OMP 会话；扩展通知按级别标签独立投递，离线排队且跨服务重启可达。
+- **持续目标**：`/goal` 通过原生结构化 RPC 管理目标；支持创建时 token 预算、跨回合续跑、暂停恢复及在途目标的重启续接。
 - **群组上下文**：注入群与子区说明、增量聊天历史，按会话记录已读取的位置。
 - **成员与点名**：每条新任务和 steering 获取当前群或子区成员信息；普通回复可生成结构化 @成员提醒。
 - **隔离子区**：为子区创建 git worktree，派发任务，并通过 Worktrunk 合并和清理工作区。
@@ -113,6 +114,10 @@ oco run --config ~/.oco/config/config.json
 | `/mode [steer\|queue]` | 查看或设置新消息的追加方式，默认 `steer`。 |
 | `/switch [模型]` | 查看当前模型与可用列表，或切换并保存本聊天模型。支持 `provider/id`、模型 ID/唯一子串、`@角色` 和 `:level` 后缀。 |
 | `/switch default` | 清除聊天模型设置，后续 worker 跟随 OMP 默认；不改变正在运行的会话模型。 |
+| `/goal`、`/goal show` | 查看当前会话的原生目标、状态、用量及预算。 |
+| `/goal set [--budget N] <目标>` | 创建目标并持续执行；`N` 为正整数 token 预算。 |
+| `/goal pause`、`/goal resume`、`/goal drop` | 暂停后续续跑、恢复或删除目标。 |
+| `/goal budget` | 查看预算；当前原生 RPC 仅支持创建时设置预算。 |
 | `/retry` | 由 OMP 重试当前会话上次失败或中止的回合；忙时作为独立任务排队。没有可重试回合时返回 OMP 提示。 |
 | `/interrupt` | 中止当前回合，保留 worker 与后续排队消息。 |
 | `/cancel`、`/stop` | 取消当前任务并清除该聊天待执行消息；不会回滚已发生的副作用。 |
@@ -163,6 +168,24 @@ oco run --config ~/.oco/config/config.json
 远端创建结果未知时，持久创建意图会阻止同组尚无绑定的新子区自动执行，已有绑定不受影响；owner 可显式 `/new <目录>` 建立确定绑定。shared 要求状态目录和入口祖先位于 Git worktree 之外，否则创建前即拒绝，避免把用户仓库误当入口。
 
 shared 不支持 `/thread merge` 或工具 `thread-merge`。`thread-delete` 按持久资源归属清理，默认保留脏工作树和占用中的资源；`force: true` 才丢弃未提交改动。显式 `/new <目录>` 或 `/move <目录>` 改变当前绑定，但保留原工作区归属以便删除时清理；`/new` 无目录沿用工作区。
+
+### 持续目标 `/goal`
+
+需要支持 goal RPC 和 `session_settled` 的 OMP，已按 18.15.0 验证。owner 的 `set` / `resume` 授权当前会话持续执行；channel 只对目标执行 worker 加载 `src/omp/goal-rpc.yml`，开启 RPC 续跑，不修改全局设置。OMP 的 `goal.enabled: false` 仍会拒绝启动。
+
+```text
+/goal set --budget 120000 完成导入器实现并运行验收
+/goal show
+/goal pause
+/goal resume
+/goal drop
+```
+
+目标状态与单次任务结束分开：多轮续跑共用原任务，原生静止后才收尾。无进展时暂停未完成目标；达到预算时显示 `budget-limited`，不是宣布目标达成。预算按原生累计 input、cacheWrite、output，排除 cacheRead，不是硬 token 上限。已有目标时 `set` 明确拒绝；预算修改/清除需等待原生 RPC 提供相应能力，当前命令不会删除重建目标。
+
+普通任务正忙时，目标启动/恢复请求排队；`show` / `pause` / `drop` 直接控制本聊天的活会话。暂停或删除不强行中止当前回合，需要立即中断用 `/interrupt`，取消并清队列用 `/cancel`。显式停止与 ask 超时撤销目标续跑授权，普通消息和迟到答案不会恢复目标。
+
+服务重启会自动续接仍有授权的在途目标：先确认旧进程退出，再核对原会话和原生 goal ID，使用原生 `/retry` / goal resume；接受状态不明时停止恢复，不重新发送目标正文。详细边界见[持续目标设计](docs/specs/2026-11-02-goal-command-design.md)。
 
 ### 原生 `/autoresearch`
 
@@ -251,6 +274,14 @@ bun test
 
 测试覆盖权限、持久化、流式投递、重启恢复、工作区和 RPC 生命周期；HTTP/WebSocket 与真实子进程夹具不调用模型。
 
+目标生命周期另有显式真实 OMP 验收，使用隔离的配置/会话、localhost 模型替身和本地 Octo fixture，不需要模型凭据，也不连接常驻 Bot：
+
+```sh
+bun tests/benchmarks/goal.ts
+# 或 OMP_REAL_COMMAND=/绝对路径/omp bun tests/benchmarks/goal.ts
+bun tests/benchmarks/restart.ts
+```
+
 涉及执行卡片布局的改动还需运行真实预览，并在 Octo 客户端检查：
 
 ```sh
@@ -282,7 +313,7 @@ src/store/                  SQLite 持久化与迁移（index.ts 门面 + store-
 src/cards/                  执行进度跟踪、卡片渲染与交互问答卡片
 src/session/                会话身份、目录布局与回合上下文
 src/inbound/                入站权限、正文组装、附件与群历史
-src/commands/               命令解析、模型切换与 /thread 指令
+src/commands/               命令解析、模型切换、持续目标与 /thread 指令
 src/tasks/                  任务串行链、会话租约与失败分类
 src/threads/                子区目标解析、归档与完成通知
 src/workspace/              工作目录解析、隔离工作区与 Worktrunk 适配
