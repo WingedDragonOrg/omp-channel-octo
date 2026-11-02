@@ -14,6 +14,8 @@
 
 包含发给当前 owner 私聊的服务启动就绪与正常停机通知：覆盖 Super、`oco` 和聊天命令最终触发的同一服务生命周期，按事件做有界发送，不承担异常离线监控。
 
+包含服务侧获取的每轮群/线程成员上下文、system/developer 中的 mention 使用规则与 Octo CLI 能力入口，以及普通助手回复中的结构化 mention。正文保持 mention 前文流式、含 mention 后半段在该条助手消息结束后以新消息投递；具体边界见「每轮成员与操作上下文」及「普通回复中的 mention」。
+
 不包含终端会话接管、多用户服务、通用网络 Agent gateway、文档评论任务、服务端通用 bot_task、群历史归档与检索、出站附件之外的通用文件托管和交互 callback 系统。channel 仅提供由 OMP host tool 明确发起的出站图片/文件发送，以及由能力 profile 明确启用的 Octo raw type17 `octo/v1` AdaptiveCard 1.5 进度展示和 `octo/v2` 交互问答卡片；交互卡片的上行只使用该 Bot 自己的事件队列（`/v1/bot/events` 轮询与 ack），不注册回调地址、不实现通用 callback 或审批流。收到的入站消息按已确认的类型表提取内容，贴纸、系统与 CMD 等没有内容的类型明确告知，不作为成功执行。范围以个人 IM 交互为准，不继承参考适配器的其他任务入口。
 
 ## 已知约束与资料
@@ -43,6 +45,9 @@
 | 调度 | 同会话串行，同规范化目录串行；迁移同时持有真实源、目标目录 lease | 避免 channel 内任务同时修改同一目录 |
 | 故障 | 确认旧进程退出后，已进入生成的任务沿原 session 续接，未派发任务按序执行；接受状态不明则停止自动恢复 | 续接不重放原始 prompt，不把未知工具副作用当作尚未发生 |
 | 共享说明 | 按持久 OMP session 与聊天目标绑定 version；首次或 version 变化时注入，普通未变化 turn 不注入 | 降低重复输入并保持群/线程隔离；压缩生命周期单独负责恢复 |
+| 成员上下文 | 新任务执行及 steering 追加输入时由服务直接请求当前聊天成员 API；小名单给名称和 UID，大名单给人数与查询入口 | 模型无需自行发现成员能力；快照随新输入刷新，数据不承担授权作用 |
+| Mention 投递 | 助手以 `@[uid:显示名]` 表达点名，宿主生成结构化 mention；前文流式、后半段 final 后新发 | 首次发送含完整 mention 数据，保留前文可见性与新消息提醒语义 |
+| CLI 能力入口 | 每轮 system/developer 提供业务能力摘要、当前 bot/聊天身份与 skills/schema 发现路径 | Loop、Docs、Drive 等能力可发现，完整操作手册仍按需读取 |
 | 入站内容 | 按已确认类型表提取文本；媒体附件下载到状态目录后以本机绝对路径交给 Agent；回复消息按同一张表读取客户端内联的被引用 payload（文本进引用块、媒体并入本条附件——被引用的是无正文媒体时以 `[引用 <发送者>]` 标题注明来源）；群/线程中受权消息本身无附件、无可用引用时，按「同一发送者、10 分钟窗口、唯一一条带附件消息」做「这个」关联取回（歧义/跨发送者/超窗一律不关联，详见 `2026-09-16-group-history-context-design.md`）；贴纸、系统与 CMD 等仍明确告知不支持 | 让常见消息真正可驱动 Agent，同时保持权限门、单一体积上限和可解释的拒绝行为 |
 | 群自助开通 | 允许列表 = 配置 `allowedGroupIds` ∪ 状态盘 `allowed_chats`；owner 在未开通群/子区 @Bot 时收到一条节流短通知，回复固定口令 `开通本群` 即开通该聊天（状态盘持久，配置文件同步追加） | owner 现场把 bot 拉进新群后无需改配置或重启；非 owner 与非 @Bot 消息保持静默拒绝，开通动作只归 owner |
 
@@ -179,6 +184,24 @@ channel 在工具进度之上补两块由权威实验状态驱动的只读呈现
 
 OMP `session.compacting` 生命周期在压缩时把当前 turn sidecar 中的完整共享说明和 version 边界加入压缩上下文，即使 version 未变化；这是为保证压缩后仍保留 group/thread 语义的恢复性注入例外，不推进普通 turn 的 committed marker。当前 turn 的 sidecar 在 `octo_management` 的 `description-write` 后保持 immutable，compaction 使用本 turn 已建立的快照；写入成功的新 version 只在下一 turn 重新读取并发布。恢复后的下一次普通 turn继续依据 committed marker 判断，不因 compaction 再次重复注入。GROUP.md/THREAD.md 中的内容是共享上下文，不改变发送者身份、权限或 cwd。
 
+#### 每轮成员与操作上下文
+
+成员快照的获取由 channel 服务负责，使用既有 transport API，不通过 agent 工具或 CLI 获取：群聊调用 `GET /v1/bot/groups/{group}/members`，CommunityTopic 调用 `GET /v1/bot/groups/{parent}/threads/{short}/members`。线程快照只描述当前线程，并标明父群 ID；私聊不读取群或线程成员。快照包含明确的聊天目标、API 返回的总人数，以及小名单的名称和 UID：人数不超过 10 时列出全部 `{name, uid}`，超过 10 时只给人数和当前 `octo_management` 成员查询动作，需点名时由助手查询具体成员。人数为 API 返回列表的数量，不能把工具展示截断后的条数当作总人数；空列表是有效的 0 人结果。名称作为 JSON 字符串数据编码，UID 按 API 原值使用，不从名称推导，也不套用某一种 UID 长度或字符集。
+
+快照跟随 channel 的新输入刷新：已授权、去重后的新任务在开始执行时请求一次，排队期间不预取；steering 输入在并入前请求一次，在下一次模型调用前发布新快照。工具调用和同一回合的后续模型请求复用该快照，不发起周期刷新或跨轮缓存。重启后尚未执行的排队任务仍按新任务获取；OMP 原生 `/retry` 及通过原生重试续跑的在途任务沿用 OMP 会话上下文，不请求成员 API，也不新增成员块。服务的控制命令、单纯记录 ask 答案的路径及被拒绝、重复的输入不触发成员获取；ask 答案若另行唤醒新任务或成为 steering，则在该新输入的交付边界获取。
+
+同一聊天的成员获取、当前 session 复核、快照发布与 steering 交付按已受理输入顺序串行，控制命令不进入这条等待链。每次发布带本次输入的单调代次，迟到结果不得覆盖较新输入或另一个 session 的快照；多条 steering 在同一次模型调用前完成时使用最新一次已发布快照。原回合已经退出时不向其残留作用域发布，输入交回普通任务路径，在真正执行时获取自己的快照。
+
+成员获取是本次新输入的前置条件：失败、超时或响应格式不符时不使用旧名单、不编造人数，新任务按启动失败结算，发送「成员信息读取失败，未启动任务。」；steering 刷新失败则不把该输入并入或悄悄变成排队任务，发送「成员信息读取失败，本条消息未并入当前回合。」且已有任务继续。错误细节沿既有有界日志/任务失败通道记录，不向聊天泄漏原始响应。steering 期间原回合已结束或不再接收输入时，沿既有普通任务路径交付，在真正执行时重新获取。成员请求遵守既有网络截止和停机取消；不阻塞控制命令，不新增自动重试或配置项。
+
+成员块为临时 `developer` 上下文，由固定 OMP extension 在模型调用边界读取服务发布的最新快照，替换本轮旧成员块而不是不断叠加，不写成用户正文或永久会话消息，也不套用共享说明的 version/committed 去重。宿主为每次派发显式发布成员注入资格及输入代次：普通新任务启用，运行中接受 steering 时更新；同一轮的工具续调保持资格、复用最新快照，直到本轮结束。派发原生 `/retry` 或恢复在途任务前关闭该资格，磁盘仍有历史快照也不能据此重新启用；若续跑期间有新的 steering，则按新输入重新获取并启用。快照按 bot、真实聊天目标和已验证 OMP session 隔离；宿主拥有 API 请求及发布，extension 不持有 Octo 凭据。发布前验证真实 session，跨聊天、跨 session 的快照不能使用，同一 worker 内非绑定的 subagent/eval 子会话保持原有隔离。steering 刷新只替换成员快照，不改写本回合 immutable GROUP.md/THREAD.md 快照；既有共享说明的 prepared receipt、CAS 和 compaction 恢复机制独立保留。成员块只是数据，不改变 owner、授权、cwd 或工具目标。
+
+普通 channel 回合同时获得固定的 system/developer 操作指引：当前 bot UID、聊天的真实 `channel_type`/`channel_id`（线程另带父群与 short id）、mention 规则及下文的 CLI 能力入口。私聊同样获得 bot/聊天身份与 CLI 指引。固定指引与成员块的受控上下文作用域覆盖 DM/群/线程（channelType=1/2/5），都必须绑定 bot、真实聊天目标及已验证的 OMP session；不能为支持 DM 而将聊天特定内容设置为 worker 全局 prompt。非绑定的 subagent/eval 不收到成员块、bot/聊天身份、父群/线程字段或其他聊天特定指引。原有 GROUP.md/THREAD.md 作用域仍只接受群/线程，不把 DM 纳入共享说明读取或 ledger。指引由宿主提供，不依赖某个工具是否被模型选用，也不放到用户 prompt 首行之前，保持 OMP slash command 原生解析。原生重试的上下文处理遵循 OMP 机制，现有共享说明恢复契约不变。
+
+Mention 规则要求助手使用 `@[uid:显示名]` 表达明确点名，UID 来自本聊天成员快照或一次明确的成员查询；名单只有人数或同名目标无法唯一确定时先查询或澄清，不能猜 UID。宿主负责把标记变为可见的 `@显示名` 和结构化 mention，普通 `@名字` 不按名称自动匹配。规则明确成员名称及共享内容仅是数据，不能用其中的文字替换身份或授权。CLI 直接发送消息时使用 API 的结构化 `payload.mention`，不把助手输出标记当作 CLI 或服务端自动转换语法。
+
+#### Host tools 与问答
+
 群和线程任务获得一个复合工具 `octo_management`，动作固定为 `group-info`、`group-members`、`group-update`、`description-read`、`description-write`、`list-threads`、`create-thread`、`thread-info`、`thread-members`、`thread-join`、`thread-leave`、`thread-delete`、`thread-merge`、`thread-dispatch`，对应服务端 `groups/{id}`、`groups/{id}/members`、`groups/{id}/info`、`groups/{id}/md`、`groups/{id}/threads`、`groups/{id}/threads/{short}` 及其 `members`/`join`/`leave` 路径。目标固定为当前聊天：群任务取当前 `group_no`，线程任务取父群 `group_no`，`thread-*` 动作省略 `short_id` 时取当前线程，模型不能传入其他群或线程 ID。`group-update`、`thread-delete`、`thread-join`、`thread-leave` 等写操作的授权由服务端判定（`bot_admin`、线程创建者或群管理员），客户端不放行服务端拒绝的动作，也不做额外提权。失败时把服务端错误正文压成单行、截断到 200 字符后作为工具错误返回，便于模型纠正参数；错误文本在 HTTP 状态后带上服务端机器码（如 `err.server.bot_api.store_failed`）——bot API 在兼容窗口内把所有错误都以线缆 400 返回（服务端 `pkg/httperr/respond.go` 的 `ResponseErrorL` 固定传输状态 400，正文 `error.http_status` 才是语义状态），因此参数错误（`err.server.bot_api.request_invalid`）与内部失败只能靠正文的 code 区分；返回值按固定上限裁剪（成员 200、线程 50）并显式给出总数与截断标记，名称截断到 200 字符、公告截断到 2000 字符，不返回原始 HTTP 响应或凭据。`thread-delete` 对服务端瞬时存储失败做有界重试：响应为任意 5xx，或响应体 `error.code` 为 `err.server.bot_api.store_failed`（该内部失败在兼容窗口内同样以线缆 400 到达）时，换一条新连接（Bun fetch 显式 `keepalive: false`，不复用连接池的 keep-alive 连接）重试一次；服务端删除本身幂等，重试不会重复删除。重试成功后同样返回「已删除线程 `<short_id>`」；两次都失败时仍返回单行、≤200 字符的服务端错误，不把失败折叠成成功；4xx 参数与权限拒绝不重试。`thread-delete` 另有可选布尔参数 `force`（默认 false）：服务端删除成功后，被删子区存在 `cwd_pinned` 绑定时联动清理该工作区——本机有兼容 wt 时 `wt remove --foreground`（分支已合并即删除、未合并保留），否则回退 `git -C <path> worktree remove`；有未提交改动且未传 `force` 时保留工作区并在回执说明「可传 force=true 强制删除」，`force=true` 时丢弃未提交改动；工作区已不存在时回执说明；清理失败只进入回执、不影响已生效的删除；部署未提供隔离能力或绑定非 `cwd_pinned` 时不清理、回执维持原文。
 
 `thread-dispatch` 让当前群/线程会话把一条任务派发给本群的某个 thread：先按服务端读取该 thread 的真实 `channel_id`（必须属于当前群），在该 thread 里投递一条可见的派发说明，再把内容按该 thread 自己的追加模式交付——入站消息 ID 使用 `dispatch:` 前缀的唯一值、发送者为持久 owner、目标为该 thread；`steer` 模式的子区有可接收 steering 的运行中回合时内容并入该回合（工具结果 `delivery` 为 `steered`），否则按与真实入站相同的 durable 路径成为该子区自己的任务（`delivery` 为 `queued`）。工具结果带回 `delivery`，发起群的回执如实描述这次交付（并入运行中回合，或在该子区作为独立任务执行）；派发不等待该任务完成。被派发的任务在目标 thread 的绑定与 session 中执行，cwd 按线程默认目录规则解析（未建会话时继承父群绑定 cwd，因此与父群任务按目录串行），结果投递到该 thread 而不是发起聊天。派发是显式交接而不是 owner 的回复，因此从不作为该 thread 待回答问题的答案；被派发任务自身仍照常排队、在自己回合里接收 steering 与问答。派发的深度固定为 1：任务记录的消息 ID 带 `dispatch:` 前缀时，该任务的 `octo_management` 不提供 `thread-dispatch` 动作，客户端也拒绝该动作。
@@ -219,8 +242,15 @@ OMP `session.compacting` 生命周期在压缩时把当前 turn sidecar 中的�
 整组卡的成员由远端 message ID 绑定的全部问题决定，而非当前待答问题数量。部分作答后，剩余问题被文字回答或取消时仍重绘整张卡，保留先前答案与署名，并关闭剩余输入。
 单题卡发送失败或被部署拒绝时，纯文本回退只投递仍待答的问题；发送途中已记录答案或关闭的问题直接沿用持久状态。
 
-除 host tool 外，任务里的 Agent 还可以用本机 `octo-cli` 以本 bot 身份直接访问 Octo Bot API：宿主注册 Bot 后把该 bot 的 token 经 stdin 写入自己的 octo-cli 凭据目录（`~/.oco/octo-cli/<botUid>`，目录权限 0700，命令行与日志中不出现 token），并把 `OCTO_CONFIG_DIR`、`OCTO_API_BASE_URL`、`OCTO_BOT_ID` 注入 OMP worker 环境。一个 bot 一份目录，宿主服务多个 bot 时凭据互不共享。原始 token 不进入 worker 环境：OMP worker 继续按前缀剥离宿主继承的 `OCTO_*` 与 `OMP_CHANNEL_OCTO_*`，只有这三个名字允许进入子进程。凭据准备是 best-effort，octo-cli 缺失、登录失败或返回的 robot_id 与当前 bot 不一致时只记录一条有界日志并保持不注入，不影响启动与任务。因此 host tool "目标固定为当前聊天" 的承诺只约束 host tool 自身；经 octo-cli 的调用不受该绑定限制，其授权完全由服务端按本 bot 身份判定。`channel_control` 的说明同时告知 Agent 这条路径，并要求它先用 `octo-cli auth status` 自证身份，身份不是本 bot 时不使用。
+除 host tool 外，任务里的 Agent 还可以用本机 `octo-cli` 以本 bot 身份直接访问 Octo Bot API：宿主注册 Bot 后把该 bot 的 token 经 stdin 写入自己的 octo-cli 凭据目录（`~/.oco/octo-cli/<botUid>`，目录权限 0700，命令行与日志中不出现 token），并把 `OCTO_CONFIG_DIR`、`OCTO_API_BASE_URL`、`OCTO_BOT_ID` 注入 OMP worker 环境。一个 bot 一份目录，宿主服务多个 bot 时凭据互不共享。原始 token 不进入 worker 环境：OMP worker 继续按前缀剥离宿主继承的 `OCTO_*` 与 `OMP_CHANNEL_OCTO_*`，只有这三个名字允许进入子进程。凭据准备是 best-effort，octo-cli 缺失、登录失败或返回的 robot_id 与当前 bot 不一致时只记录一条有界日志并保持不注入，不影响启动与任务。因此 host tool "目标固定为当前聊天" 的承诺只约束 host tool 自身；经 octo-cli 的调用不受该绑定限制，其授权完全由服务端按本 bot 身份判定。Agent 的能力发现及身份核对要求由下文固定操作指引统一提供。
 
+#### Octo CLI 能力入口
+
+每轮固定操作指引把 `octo-cli` 描述为当前 bot 访问 Octo 业务的入口，而不只描述为 host tool 的 API 补充。摘要覆盖 Loop（任务、派发、专家/专家团、工作区与执行进度）、Docs（文档、表格、白板、PPT、评论与版本）、Drive（空间、目录、上传下载、分享与挂载）、HTML（交互 HTML 文档、发布与版本）、Messaging/Files（消息、群、线程、历史搜索与附件）、Mail（邮件）及 Marketplace（插件、技能与专家资源）。摘要不承诺当前 bot 具有所有资源的访问或写权限，也不把安装 CLI 等同于凭据配置成功。
+
+指引提供固定的发现顺序：先以 `octo-cli auth status` 确认当前身份与宿主配置的 bot 一致；用 `octo-cli skills` 发现本机指南，`octo-cli skills octo-shared` 和 `octo-cli skills <相关技能名>` 按需读取，参数不明确时查 `octo-cli schema <操作>` 或 `<命令> --help`。不在每轮内联各域完整手册，不要求每轮执行能力探测命令；业务摘要与实际受支持命令保持同步，具体操作以当前安装版本的指南和 schema 为准。
+
+宿主提供的 CLI 身份就绪状态必须真实：凭据配置成功时沿用上述三项环境变量；CLI 缺失或凭据准备失败时说明本轮没有已就绪的 CLI 身份，继续使用可用 host tools，不能宣称已经配置成功。Agent 不切换其他 profile、凭据或 API 路由绕过权限失败；CLI 自身的授权及操作限制由相应指南与服务端执行。`channel_control` 保持自身 restart/status 职责，CLI 入口说明由固定操作指引统一拥有，避免两处独立维护同一份业务提示。此项不新增 host tools、凭据类型或业务权限。
 
 ### RPC 与输出
 
@@ -229,11 +259,29 @@ worker ready 后协商协议版本；本地实现保持 OMP v18.1.18 兼容的 R
 按需启动 worker；同一持久会话只能被一个 worker 写入。新会话只通过 fresh RPC `new_session` 创建并立即落盘；对已有绑定，恢复前先按 session ID 与 `previousSessionFiles` breadcrumb 在 native roots 中寻找并验证唯一外移候选，找到后持久化重绑；扫描或验证失败则保留原绑定并报告失败，不能用“最近会话”替代精确身份。恢复 worker 时仅传入已经确认存在且准确的 session 文件和保存的目录。正常退出释放 worker。
 OMP extension 在 worker 启动时由固定路径自动加载；sidecar 根路径通过宿主显式 allowlist 的非秘密 worker 输入传给 extension，sidecar 在真实 session ID 确认后、第一次 `prompt` 前原子发布，extension 在生命周期回调中按该 ID 精确读取并写入 `prepared` receipt。绑定 session 指针在该 turn 的第一次 `prompt` 前发布，并作为该作用域的当前 session 保留；worker 进程内由 OMP 打开的 subagent 或 eval 子会话因此不会被当作 channel turn，extension 不按 cwd、全局路径或模糊 session 猜测身份。宿主必须能观察 matching receipt 和 prompt acceptance，并以 attempt ID 做单调 CAS；worker 停止、重启、恢复和 compaction 不得绕过 `pending`/`committed` 判定。宿主不向 extension 暴露 Octo 认证凭证，extension 不得按 cwd、全局路径或模糊 session 查找 sidecar。
 
-`WorkerEvent` 的正文事件为稳定的本地 `messageId`、累计正文快照和 `final` 标记；上游没有原生 ID 时由 adapter 生成。每个 assistant message 独立维护 stream，首次非空快照立即创建一条正文消息，后续累计快照只编辑同一个远端 message ID；不同 assistant message 不合并。`final=true` 是该消息的权威结束快照，允许比此前更短或为空；已有远端消息必须编辑到最终空文本，尚未创建且从未有非空正文的空最终事件不发送空白新消息。
+`WorkerEvent` 的正文事件为稳定的本地 `messageId`、累计正文快照和 `final` 标记；上游没有原生 ID 时由 adapter 生成。每个 assistant message 独立维护 stream，可流式投递的前文首次非空时立即创建正文消息，后续累计快照只编辑同一个远端 message ID；普通回复中的 mention 后半段按下节在 final 后新发，不同 assistant message 不合并。`final=true` 是该消息的权威结束快照，允许比此前更短或为空；已有远端消息必须编辑到最终空文本，尚未创建且从未有可投递正文的空最终事件不发送空白新消息。
 
 正文增量可先于 `message_start` 到达；迟到或重复的开始事件复用当前尚未结束、上游身份兼容的 stream，保留累计正文和本地 message ID。消息结束后或出现明确不同的上游身份时才分配下一条消息 ID。续接任务为新 worker 的正文与通知使用独立输出段；从头计数的 `assistant-1` 不覆盖前一进程已经发出的消息，旧 outbox 仍沿持久 ID 排空。
 
 正文编辑以最新累计快照为准，首次创建不等待整轮结束；编辑最多每 1000ms 一次并按目标串行，最终快照优先完成，不得由旧快照覆盖新快照。正文按 3000 UTF-8 bytes 上限分段，每段在自己的窗口（该段起点起 3000 bytes）内取层级最高、同层最靠后的自然断点：段落/换行 > 句末标点（。！？；…! ? .）> 逗号/顿号（，、,;）> 空白；窗口内没有任何断点（如无分隔的长串、URL、代码）才在该窗口末尾硬切，ASCII 标点只在后面是空白或文本结尾时才算断点，避免小数、缩写与 URL 里的点被误判。断点字符归上一段，其后的空白留在下一段开头，不修剪也不吞并。每段的边界只由该段自己的窗口决定，因此已由满窗口定界的段在流式增量下逐字稳定、不重排，规模变化只发生在仍在累计的最后一段及其新增段；保留原始换行、空格和 inline 标记；分段 stream 使用稳定的 client message ID，分段数量变化时清理 stale tail。每次网络操作前持久化该分段的目标快照及 `desiredVersion`/`ackedVersion`；首次 create 在网络请求前 durable 标为 `unknown`，送达未知时不重跑 Agent，重连/重启沿用稳定 ID 绑定已创建消息并将最新 desired 快照补做 edit。
+
+#### 普通回复中的 mention
+
+本节转换仅针对助手的普通正文流；命令回执、入站引用、工具结果、进度卡及其他宿主生成文本不作为 mention 指令解析。群与线程中的 `@[uid:显示名]` 生成一个明确点名，显示名非空、单行，UID 使用成员 API 提供的真实值。以第一个未转义冒号分隔 UID 与显示名，显示名中的 `\`、`]` 分别以 `\\`、`\]` 表达；支持同一消息中的多个人和重复出现的同一人。Markdown 围栏代码块、行内代码及转义标记保持字面文本，普通 `@名字` 与其他无效标记不产生结构化 mention。私聊中的标记保持字面文本；本项只提供明确 UID 点名，不新增广播语法或名称兜底匹配。
+
+宿主把完整标记转换为 `@显示名`，为每个位置生成 `{uid, offset, length}`，offset/length 相对于最终发送段正文，以 UTF-16 code unit 计数；`mention.uids` 按该段出现顺序去重，`mention.entities` 保留每次出现并按 offset 排序。发送和编辑的 payload 使用同一确定性转换，不能在编辑中遗漏或保留过期 mention。UID 或 mention 元数据发生变化也算目标快照变化，不能因可见文本相同而跳过投递。转换不重新查询成员或用户资料；名称与 UID 来自已确认的标记，不在出站阶段另行猜测身份。
+
+流式状态按单条 assistant message 隔离。未出现 mention 时沿用上述实时流式规则；出现完整有效 mention 后，其前文仍按原规则投递，从第一个 mention 起的后半段等待该消息 `final=true`。增量尾部尚不能判定是正文还是 mention 的标记前缀先暂存，已确定的普通前文照常发送，不把半个标记泄漏到已发送正文；确认不是标记后恢复为普通文本。该消息一旦进入后半段暂存，后续内容在其 final 前不发送，其他 assistant message 的独立投递不受影响。
+
+final 到达时重新以权威快照确定前文与后半段：删除、移动或修正 mention、缩短正文、最终空正文均按最终结果处理，已流式发送的前文照常修正并清理 stale tail，最终无有效 mention 时按普通正文完成。有效 mention 后半段不得追加到已创建的前文消息里，而是以独立、稳定的 outbox 分段创建新消息；若正文从 mention 开始，首条正文消息等待 final。最终拼接的可见正文等于 final 的完整转换结果，不能丢字或重复前文。
+
+mention 与后半段构成上述通用分段的明确例外：第一个 mention 是强制新消息边界；其后按转换后正文的 3000 UTF-8 bytes 上限及既有自然断点优先级分段，单个 mention 的可见文本作为原子片段，不在其内部切开，每段独立重算 entities 偏移。单个标记的可见文本本身超出一段上限时保持字面文本、按普通正文分段，不发送该标记的 mention。其他原始换行、空格及 inline 标记保持不变。
+
+final 的本地结算是一次 durable transaction：原子提交前文的最终目标快照更新、过期前文段的清理目标、全部后半段的 outbox 入队，以及该 assistant message 的 final 幂等状态；这些属于同一个 final 的提交，不能只保证尾段之间原子。事务提交前不开始任何由该 final 新触发的发送或编辑，任务终态结算与输出排空也不能先于该提交；提交失败则整体回滚。目标快照必须足以确定性重建各段的正文与 mention，不能依赖进程内成员缓存。沿用既有 desired/acked 版本、发送前 unknown 状态、稳定 client message ID、失败预算与停机取消；成功回执丢失后的重试、重复 final、重连和重启不得另建同一尾段。尚未 final 的暂存内容不作为已确认回复投递；取消、失败或停机不自动把它补发，恢复仍遵循原任务/session 的续跑与独立输出命名空间。
+
+API 创建新消息时即携带完整 `mention.uids`/`mention.entities`，不额外发送点名通知；后续重试/对账修正只更新原消息，不通过重新创建消息补提醒。此项承诺结构化 mention 及服务端新消息提醒路径，不承诺操作系统推送送达，也不撤回已经发出消息的提醒。端到端验收须在真实 Octo 群/线程确认显示与提醒，不能仅以编辑接口返回成功或客户端可见 `@名字` 判为通过。
+
+#### 进度展示
 
 真实 `tool_start`/`tool_end`、`turn_start`/`turn_end`、`todo_update` 和 `run_end` 事件由单一 `ExecutionTracker` 累计阶段、工具、todo、终态和 elapsed；每一轮——任务开始的一轮，或追加消息开启的新一轮——各自在其第一份真实工具或 todo 进度出现时懒建一张可编辑卡，之后只编辑该轮的卡。追加消息被接受时，上一轮的卡片立即以一次终态编辑收尾（`completed`），新的一轮从自己的第一份真实进度起在会话底部另开一张卡，因此正在看的进度始终在最新消息下方，而不是停在任务最初那次工具调用处；该轮的卡沿用任务当前的 todo 清单，阶段、工具与耗时只统计本轮。运行中 elapsed 只在真实事件到达时随卡片刷新，事件编辑遵守 1000ms 合并窗口，无事件时不做周期重绘；卡片 edit 使用严格递增的单卡 sequence，终态为 `completed`、`cancelled` 或 `failed`。卡片采用“摘要头部—当前状态—任务清单—子代理—执行轨迹”的进度通知布局；任务清单按阶段→任务的树形层级渲染，使用分支连接线和嵌套区块表达父子关系；任务节点只显示状态图标、任务内容和 blocker，不重复渲染状态文字；富布局下阶段标题与任务分支使用结构化 ColumnSet 分列，避免依赖比例字体空格对齐；富布局能力下使用强调色 Container、状态/耗时摘要和带状态元数据的步骤面板，轨迹步骤使用 Web 端兼容的 ColumnSet，轨迹行使用固定 24px 等宽标记列和 stretch 正文列，状态摘要置于正文列并允许自然换行，避免窄屏下正文被状态列挤压；状态图标与步骤内容、状态摘要同处彩色背景 Container 内；子代理列表位于执行轨迹之前；当对应区块超过三个步骤且能力支持 `Action.ToggleVisibility` 时，在标题行右侧提供“展开”/“收起”控件，默认展示最近三个步骤，其余步骤通过“展开”查看；能力支持 `Action.ToggleVisibility` 时，卡片头部始终提供“收起”/“展开”整卡详情控件：运行中默认展开任务、子代理和执行轨迹详情，收起后只保留摘要头部、当前状态与告警；终态卡片默认收起这三类详情，保留状态摘要，并可通过头部的“展开”恢复；状态标记按语义统一：成功/已完成使用绿色 `✓`，等待、取消和阻塞使用中性灰色 `-`，失败和放弃使用红色 `×`，进行中使用蓝色/Accent `•`；取消任务内容在支持 `RichTextBlock` 时使用删除线；能力不足时保持信息完整的降级文本。内置 `hub`/IRC、`task`、`todo` 和 `ask` 工具使用操作级安全摘要，IRC 轨迹显示方向、目标或协作状态，不显示消息正文；命令类工具显示压成单行的有界命令文本摘要，便于在轨迹里直接看到所运行的命令。卡片只展示安全摘要，不转发工具参数/结果、原始 payload、模型思考或秘密。超出渲染预算且仍可展开时，轨迹与子代理都使用同一组紧凑行，并放进各自区块的灰色 emphasis 历史带：每个步骤一行文本，状态字形后用不换行空格连接 `·` 与摘要，仍按状态着色，不用 ColumnSet 分列，以便同样的节点预算容纳更多隐藏行；能力不支持展开时没有可隐藏的状态，这些紧凑行照常显示（历史带保持可见），隐藏计数同样照常给出。
 富布局下子代理区块由 OMP 自身的 subagent 事件驱动，而不是从工具调用名推断：worker 订阅 `progress` 级别后，`subagent_lifecycle` 的 `started` 记下一个真实的子代理（取 payload 的 `id`、`agent` 与可选 `description`），`completed`/`failed`/`aborted` 才是它的终态，`subagent_progress` 提供进行中的 `status` 与可选 `lastIntent`；同一 id 的终态之后不再被进度帧复活，`aborted` 归一为“已取消”。卡片只关心子代理的整体状态：行内容是 agent 名称、用途摘要、生命周期状态，以及当前正在运行的工具与已用工具次数（`<n> 次调用`），不渲染每个子代理自己的 `HH:mm:ss` 或耗时，也不展示 `subagent_event` 之类的子事件；子代理自己的会话记录保留全部细节。仍在运行或等待的子代理作为默认丰富行；已完成、失败、取消或停止的子代理默认隐藏，能力支持 `Action.ToggleVisibility` 时随“展开”在子代理区块的灰色 emphasis 历史带（`subagent_omitted_steps`）里以紧凑行查看，每个子代理只渲染一次，能力不支持该动作时该带保持可见而不是被折叠藏起；卡片只渲染事件报告过的子代理，OMP 不提供该订阅时该区块整体不出现（worker 记一条日志并照常执行）。执行轨迹默认展示最近三个工具步骤的丰富行，其余步骤（丰富窗口裁掉的较旧行与被预算剪掉的步骤）统一渲染在轨迹区块的灰色 emphasis 历史带（`timeline_omitted_steps`）里，一条单行紧凑文本一个步骤；该带是步骤列表 `timeline_detail` 的兄弟节点而不是子节点，因为 Web 客户端的 agent-progress 层会把 `#timeline_detail` 直接子级里有填充的 Container 重绘成失败步骤红块，放在外面才保住灰色填充。丰富行在状态摘要行首显示该步骤的 `HH:mm:ss` 本地墙钟时间（取快照里持久化的 `startedAtMs`，重放补发的终态卡同样显示），紧凑行是单行文本、不带时间。当前 OMP worker 以通用 RPC `tool_execution_start`/`tool_execution_end` 形成安全工具事件：`bash` 的摘要是压成单行、截断到 72 字符的命令文本，路径类工具只取安全文件名组件，其余工具按操作语义派生；命令文本中的凭据形态字符串由卡片层统一脱敏，宿主始终不转发原始 args/result。OMP 另有可选的 `set_subagent_subscription` 生命周期/进度事件桥，但它不属于 `pi.on` 专用 hook，且尚未纳入本服务的 `WorkerEvent` 卡片契约。
@@ -297,7 +345,7 @@ Octo 断线不取消已经开始的 Agent；正文 outbox 与任务状态持久�
 5. 私聊与两个群/线程的上下文不串线；交错完成的结果各自返回原聊天；同一持久 session 在共享说明 version 不变时连续任务不重复注入，version 变化时只注入一次新的完整快照并给出变化说明；共享说明读取失败不启动 worker。
 6. 私聊获得 `ask`、`octo_send_file` 与 `channel_control`；群/线程额外获得 `octo_management`，其 `description-read` 实时读取对应服务端 `GROUP.md` 或独立 `THREAD.md`（分别对应 `groups/{id}/md` 与 `groups/{parent}/threads/{short}/md`），`group-info`/`group-members`/`group-update`/`list-threads`/`create-thread`/`thread-info`/`thread-members`/`thread-join`/`thread-leave`/`thread-delete` 作用于当前群或当前线程，写操作依赖服务端授权；`thread-dispatch` 把一条任务派发给本群 thread，交付按该 thread 的追加模式处置（并入可接收 steering 的运行中回合，否则成为该 thread 的任务）、结果如实回到工具结果与发起群回执、向两个聊天各投递一条可见说明，派发深度为 1；新建和无可靠 marker 的恢复 session 首次注入共享说明，普通未变化 turn 不注入；工具不能改写目标聊天或 cwd。
 7. 同规范化目录的两个聊天写入任务不重叠；`/new`、`/reset`、`/move` 在运行或排队时拒绝；`/move` 同时取得真实 source/target lease，未确认停止时两目录跨重启保持 blocked。
-8. 长正文保留原始换行、空格和 inline 标记；每个 assistant message 独立 stream，首次非空累计快照立即 create，后续累计快照以同一 message ID 每 1000ms 最多一次串行 edit，最终更短或空快照权威生效；正文按 3000 UTF-8 bytes 上限分段：窗口内取 段落/换行 > 句末标点 > 逗号/顿号 > 空白 的最高层自然断点，无断点才硬切，已由满窗口定界的段不随流式增量重排，并清理 stale tail，异步 prompt 失败、本地完成和 worker 异常退出均正确结束任务状态，不生成通用完成文字。
+8. 普通正文保留原始换行、空格和 inline 标记；每个 assistant message 独立 stream，可投递前文首次非空时立即 create，后续以同一 message ID 每 1000ms 最多一次串行 edit，最终更短或空快照权威生效；正文按 3000 UTF-8 bytes 上限和既定自然断点优先级分段，已由满窗口定界的普通段不随流式增量重排，并清理 stale tail。结构化 mention 的标记转换、前文/后半段边界和原子分段按验收 57–59 的专门契约执行。异步 prompt 失败、本地完成和 worker 异常退出均正确结束任务状态，不生成通用完成文字。
 9. 正文 outbox 在 create 前 durable 记录 `unknown`，保存 desired/acked 版本；断线、重启或送达未知恢复时沿用稳定 client ID、编辑最新快照且不重跑 Agent，不因失败重复创建；单条投递的失败有界收敛——退避重试到 6 次或遇到永久失败即标记 `dead` 并把队尾让给后续消息，重启恢复仍从队首排空 pending。
    失败归属实际发出的快照版本：在途旧版本失败时若已有新 desired 版本，不消耗新版本的重试预算，也不据旧错误将新版本标记 dead；未知送达后的修正请求按修正时实际读取的版本计数。服务停止导致的在途请求中止不消耗投递预算，保留持久行供下一进程恢复，不因停机耗尽最后一次重试而丢弃正文。
    普通文字、文件和送达未知提示也纳入同一停机取消与排空流程；中止后的持久状态和重试次数保持不变。文件检查或未知提示结束后若服务已停止，不再开始下一次发送，恢复后沿用原 client ID 投递。
@@ -360,8 +408,17 @@ Octo 断线不取消已经开始的 Agent；正文 outbox 与任务状态持久�
 51. 正常重启通知：真实 CLI 经 Super 兼容的测试守护端重启，两次发送成功时 owner 私聊按顺序收到旧进程停机、新进程启动通知，PID 与各自实际进程一致；聊天 `/restart` 的原发起聊天回执保留，群与线程只接收其原有命令回执，不接收生命周期通知。任务仍按原 session 续接，不重放已接受 prompt。
 52. 生命周期通知失败：分别模拟启动和停机通知被拒、网络失败及发送不响应，每次通知在独立 2 秒预算内结束等待并留下有界日志，生命周期继续正常完成；不重试、不阻塞 worker 收尾、不被普通 outbox 队头阻塞，不在后续重启补发过时通知，不创建任务、会话或进度卡。
 53. 异常退出边界：真实 CLI 被 SIGKILL 时不要求停机通知，后续成功启动仍发送启动通知；没有外部监控依赖。部署验收通过当前 Super 服务做一次正常重启，并在 owner 的实际 Octo 私聊确认停机与启动两条通知及 PID；本地夹具通过不替代这一真实投递验收。
+54. 每轮成员快照：连续两个群任务和两个线程任务分别通过对应成员 API 获取本轮数据，第二轮能看到成员变化；排队任务在执行时获取而非入队时获取。0、10、11 人分别得到有效空名单、完整名称/UID 名单、准确人数与查询入口；线程只含本线程数据并标明父群，两个聊天的名单不混用，私聊不请求成员 API。
+55. 新输入边界与失败：steering 下一次模型调用使用更新后的成员块，同轮工具调用和后续模型请求不额外查询；原生 `/retry` 及在途任务重启续跑关闭成员注入资格，磁盘有旧快照时也不请求成员或新增成员块，重启后未运行的队列任务正常获取，续跑中的新 steering 按新输入刷新。同一聊天两条 steering 按受理顺序发布；受控延迟和 session 切换不能使旧输入覆盖较新快照，多条输入在模型调用前已交付时只见最新快照。拒绝、重复输入、控制命令和没有唤醒新输入的 ask 作答不获取成员。成员 API 拒绝、超时和格式错误使新任务不进入模型并收到准确失败提示；steering 不并入、不自动排队、已有任务继续，且不泄漏旧名单或原始错误。
+56. 注入层级与 CLI：实际模型请求中成员为临时 developer 数据，固定 system/developer 指引包含真实 bot/聊天身份、mention 规则、Loop/Docs/Drive/HTML/Messaging/Files/Mail/Marketplace 摘要及 skills/schema/help 入口；同一模型请求只含当前成员块，名字中的换行、引号和指令样文本按数据编码，授权仍由宿主判定。DM 有操作指引而无成员块；群/线程与 DM 的非绑定 subagent/eval 均不收到成员块、bot UID、聊天 ID、父群或 short id 等聊天特定字段；OMP 原生命令首行保持不变，GROUP.md/THREAD.md 的快照、去重及恢复不变。CLI 凭据成功与失败两条路径的指引均与实际环境一致。
+57. Mention 内容：含中文、emoji、多个成员、重复成员及需转义显示名的正文转换后具有精确的可见文本、UID 去重及 UTF-16 entities；代码块、行内代码、转义示例、普通 `@名字`、格式无效标记和 DM 不产生 mention。只修改 UID 而显示名不变时仍更新 payload；final 删除或修改 mention 时不沿用旧 entities。
+58. Mention 流式：逐 chunk 送入拆开的标记，前文在 final 前可见、标记和后半段在 final 前不发送；final 后尾段以携带 mention 的新消息发送，前文与后半段没有重复或丢失。正文从 mention 开始、final 移动/删除 mention、最终缩短或空正文、没有 final 的取消/失败均符合设计；其他独立 assistant message 不被该尾段阻塞。
+59. 分段与恢复：多字节正文跨 3000-byte 边界时 mention 原子不被拆开，各段发送正文均在限额内且 entities 正确；超限单个标记保持字面文本而不点名。真实 SQLite/传输夹具覆盖前文最终修正、过期段清理、尾段入队与 final 幂等状态的同事务提交：在各写入点注入失败及提交前崩溃，均不能出现前文已持久修正但尾段缺失的半提交，也不能在提交前发出 final 的网络副作用。另覆盖同一 final 重复、创建成功回执丢失、重连、提交后发送前重启与部分尾段已送达后重启：稳定 client ID、正文、UID 和 entities 一致，不重跑模型、不重复创建尾段；停机不会发送尚未 final 的内容。
+60. 真实 Octo 验收：在允许群和 CommunityTopic 各发送一条具有可见流式前文及真实成员 mention 的回复，确认前文先出现、final 后新消息显示正确成员且进入接收方的 @提醒；无额外点名通知。另确认普通无 mention 回复保持既有流式体验。单元测试、HTTP 成功或只有文字 `@名字` 均不能替代这项真实客户端验收。
 
 ## 实施前提与未决事项
+每轮成员上下文、固定操作指引、CLI 能力入口及普通回复 mention 的目标契约已于 2026-11-02 确认，待按验收 54–60 实施和验证；下文的既有验收证据不代表这些新增契约已经落地。本次规格修订不部署服务或改变运行中的凭据、权限和会话。
+
 既有实现已完成 `/new`/`/reset` 目录绑定、原生 `/move`、精确外部 session 恢复、正文 outbox、执行 tracker、卡片和生命周期边界；共享说明采用 session/version/OMP lifecycle context 设计；线程默认继承父群工作目录已实现：`src/threads/thread-target.ts` 是线程目标父群解析的单一来源，传输层 `contextPath` 与服务的默认目录解析都经它取父群 ID。线程隔离工作区已按验收 25 落地（`src/workspace/worktree.ts` 的 worktree port + 绑定的 `cwd_pinned`），依赖部署解析出的 OMP 可执行文件提供 `worktree add`；OMP 未启用 `worktree.clone` 时新工作区不含被忽略文件。Worktrunk 生命周期已按验收 31 落地：`src/workspace/worktrunk.ts` 负责兼容探测（稳定 v0.76.x）、wt 命令参数与结果解析、单行错误边界，`src/workspace/worktree.ts` 在本机有兼容 wt 时用它创建、合并与清理，否则创建与清理回退现状；宿主调用不传 `-y`，命令审批按本机 Worktrunk 的项目配置进行。Agent 的 Octo 身份已按验收 27 落地：`src/runtime/octo-cli.ts` 维护每个 bot 一份 octo-cli 凭据目录，`workerEnv` 以 allowlist 把三个变量注入 OMP worker，其余 `OCTO_*` 继续被剥离；该路径要求部署环境存在 `octo-cli`，缺失时只降级为无 CLI 身份。模型切换已按验收 32 落地：`src/commands/model-switch.ts` 负责选择器解析与有界列表渲染，`chat_models` 表按聊天目标持久化模型，任务路径与 `/new`、`/reset`、`/move` 组装 worker 时读取该值并传 `--model`，`/switch` 的探测复用既有 `WorkerFactory` 起一个 fresh、无 prompt 的一次性 worker 并清理其临时会话目录。原生扩展通知的聊天可见性已按验收 40 落地：`WorkerNoticeEvent` 进入 `WorkerEvent` 联合类型，worker 事件翻译层把上游 `notify` 帧净化转换为该事件，`src/service.ts` 在 `workAfterStop` 判定与进度追踪之前按级别标签投递，复用出站队列的持久化、分块与有界重试，同一上游帧 id 经既有 stream 去重不重复投递。本地命令的群说明提交豁免已按验收 41 落地：`LocalCommandEvent` 进入 `WorkerEvent` 联合类型（worker 仅在匹配的 no-agent 完成恰好发出一次），`src/service.ts` 在 `workAfterStop` 判定前置位 `localOnly`，该回合跳过 context commit、sidecar 照常移除、ledger 保持 pending 至下一真实生成回合。子区归档与合并后自动归档已按验收 42/43 落地：`ChannelTransport.archiveThread` 调 `POST /v1/bot/groups/{g}/threads/{s}/archive`，`octo_management` 的 `thread-archive` 与默认 pipeline 的 `thread-merge` 收尾都只经 `planThreadArchive` 排定，`CoreService` 在该聊天回合输出排空后执行一次归档，仅瞬时失败（5xx 或 `err.server.bot_api.store_failed`）按 5 秒间隔最多 5 次尝试、停止时放弃、最终失败只向发起聊天补一条有界说明。
 
 配置卡片已按验收 47 落地：`src/cards/command-card.ts` 是纯渲染（一行 `Input.ChoiceSet` + 一次 `Action.Submit`，终态帧无输入无动作），`src/commands/command-cards.ts` 持有进程内菜单会话（上限 200、TTL 15 分钟、按 owner 与 messageId/聊天/actionId 精确绑定、同聊天同类命令串行应用、发送在途点击保留重试、失效与失败都回落到文本），`src/service.ts` 只把 Bot 事件的 `cfg:` 前缀 action 交给它、其余仍交给问答卡。
