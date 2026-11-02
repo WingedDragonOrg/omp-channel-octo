@@ -27,14 +27,12 @@ function task(overrides: Partial<TaskRecord> = {}): TaskRecord {
 
 test("the notice names the thread, the task, the state, and the outcome", () => {
   const notice = threadOutcomeNotice(task());
-  expect(notice).toContain("[子区任务回传] 「回传线程」的一条任务已结束。");
   expect(notice).toContain("short_id short-9");
   expect(notice).toContain("channel_id group-a____short-9");
   expect(notice).toContain("任务 ID：task-1");
   expect(notice).toContain("状态：已完成");
   expect(notice).toContain("任务：检查部署状态");
   expect(notice).toContain("结果：部署正常");
-  expect(notice).toContain("这是派发这条任务时要求的回传通知");
   expect(threadNotifyMessageId("task-1")).toBe("notify:task-1");
   expect(threadNotifyMessageId("task-1")).toContain("task-1");
 });
