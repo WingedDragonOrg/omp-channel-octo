@@ -25,7 +25,7 @@
 | 服务端节流 | 上游 `Mininglamp-OSS/octo-server` `modules/bot_api/typing.go` | 按 (robot, channel_id, channel_type) 记 `typing_start`/`typing_count`（Redis，各 TTL 180s）：窗口开启后 ≤90s 内每个 POST 都派发 CMDTyping；90s 后静默丢弃（HTTP 仍 200）；开键过期（距开窗 180s）才允许新窗口，每计数周期至多 3 个窗口。**密集多轮会话（回合间隔约 90–180s）时后一回合的 typing 最长约 90s 不显示，这是「等待一会才出现」的最常见来源；bot 侧不可绕行、不可观测** |
 | 客户端显示 | 上游 `Mininglamp-OSS/octo-web` `TypingManager.tsx` / `module.tsx` | CMD 监听器 `cmd=="typing"` → `addTyping` 即时显示；每条 typing 状态 8s 自灭（`Typing.start` `setTimeout 8s`），重复 CMD `restart` 续期；**同会话任意新消息到达即清除 typing**；回前台/重连 `resetAll` 全清 |
 
-结论：worker 启动不是延迟源；可感延迟来自 (a) 附件组装期间无 typing（自身消息最长 120s，并串行阻塞同连接后续消息）、(b) 服务端 90s/180s 死区（外部约束，本仓库规格第 25 行已记录）、(c) 客户端「任意消息清除 + 3s 续期」造成的秒级空窗。本设计修 (a) 并把首个 typing 提前到「门后判定 agent-attached」；(b)(c) 属外部契约，按要求在验收汇报中与「已验证的发送时机」分开陈述。
+结论：worker 启动不是延迟源；可感延迟来自 (a) 附件组装期间无 typing（自身消息最长 120s，并串行阻塞同连接后续消息）、(b) 服务端 90s/180s 死区（外部约束，本仓库规格第 25 行已记录）、(c) 客户端「任意消息清除 + 3s 续期」造成的秒级空窗。本设计将首个 typing 提前到「门后判定 agent-attached」，并在新的消息租约加入时立即补发，覆盖追加和排队消息；服务端节流仍是外部约束，验收区分本端发送时机与客户端显示效果。
 
 ## 范围
 
@@ -58,7 +58,7 @@
 | --- | --- | --- |
 | 触发时机 | 权限门通过、判定 agent-attached 后**立即**发，进入附件组装/转写之前 | owner 拍板；准备与排队阶段不再被无关慢工作延后 |
 | 排队等待期间 | 亮起（同聊天排队与跨聊天同目录等待一致） | owner 拍板「反馈最早」；typing 语义为「已受理在处理」，不承诺「正在执行」 |
-| 追加（steer） | 不变：运行任务的续期环持续；命中 steer 的消息租约立即释放 | 该聊天已亮；用户消息到达清一次，≤3s+RTT 复亮 |
+| 追加（steer）与排队消息 | 新消息租约立即补发 typing，并从该次发送起重排同一条 3s 续期环；task 租约接续不重发 | 客户端会因新消息清除 typing；接收时补发使本端不必等待下一 tick |
 | 非 agent 命令（`/status`、`/new`、`/cancel` 等） | 不亮 | 命令秒内应答，typing 是噪音 |
 | 待回答问题答复 | 答复消息本身不点亮；被唤醒的任务在接受时亮起 | 答复即输入的既有语义不变 |
 | intercepting 注册命令 | 组装期间亮起，handler 完成后熄灭 | 生产环境注册表为空（仅契约 seam）；handler 自流，不接管任务生命周期 |
@@ -70,7 +70,7 @@
 **TypingLease**（服务内，按 `targetKey(bot, target)` 单例）：
 
 - 状态：owner 集合、renew timer、在途请求 abort。
-- `acquire(owner)`：首个 owner 开环——立即 `POST /v1/bot/typing`（2s deadline，与现有 trackActivity 同款收集进 `activityOperations`），随后每 3s 续期；后续 owner 只加入集合，不开第二条环。
+- `acquire(owner)`：首个 owner 开环——立即 `POST /v1/bot/typing`（2s deadline，与现有 trackActivity 同款收集进 `activityOperations`），随后每 3s 续期；已有环时，新的 `msg:` owner 立即补发、取消上一在途请求并重排唯一的续期 timer，重复 owner 与 `task:` owner 仅加入集合。
 - `release(owner)`：最后一个 owner 离开时清 timer、abort 在途请求。
 - 防御兜底：每次 tick 对 `task:` 前缀 owner 校验任务行状态（`store.getTask`），行缺失或终态自动释放（覆盖排队中 `/cancel` 等一切漏 release 路径）。`msg:` 租约不依赖兜底回收——它的释放由调用方 try/finally 硬保证（见「归宿」）。
 - 服务停止：`stopInternal` 置 `stopping` 后 `acquire` 立即失效（no-op，切断新入口，含 host tool `deliverToChat` 等并发调用方）；全部租约的 `releaseAll` 固定发生在 `activityOperations` settle 之后、`store.close()` 之前（清 timer + abort 在途），tick 兜底不会打到已关闭的 store。
@@ -107,7 +107,7 @@
 
 ## 验收标准
 
-1. 时序证据（本文件「当前时序与延迟定位」）：最早安全触发点 = 权限门通过且判定 agent-attached；可测边界 = typing 调用先于附件下载开始、先于 worker 创建。
+1. 时序证据（本文件「当前时序与延迟定位」）：最早安全触发点 = 权限门通过且判定 agent-attached；可测边界 = typing 调用先于附件下载开始、先于 worker 创建。已有续期环时，追加和排队消息立即补发，下一次续期从该次补发起计时，仍只有一条续期环。
 2. 行为测试断言相对时序与路径开/灭（需要夹具扩展：共享 `FakeTransport` 记录 typing 调用序列）：typing 先于附件下载与 worker 创建发出；附件下载期间续期继续；权限拒绝/不支持/成员命令/非 agent 命令路径零 typing；附件拒收、intercepting claim 去重早退等一切出口无泄漏（归宿 try/finally 覆盖全矩阵）；`/queue` 空参数零 typing；steer 命中后消息租约释放且环不断；排队等待期间保持；任务终态熄灭；排队中 `/cancel` 由 tick 兜底释放。
 3. `bun run typecheck` 与 `bun test` 通过。
 4. 主规格（typing 契约条目）与根 `AGENTS.md` 同步；汇报区分「已验证的发送时机」与「未验证的客户端显示效果」。

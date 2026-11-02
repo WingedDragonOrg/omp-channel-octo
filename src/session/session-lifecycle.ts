@@ -3,8 +3,8 @@
  * 两条命令各自的候选 worker 台账、状态验证与回执时序。
  *
  * 模块不依赖 `service.ts`：持久层（绑定行、worker 台账、聊天模型）、worker 工厂与配置按原样注入。
- * 按 cwd 的租约本体由 `TaskScheduler` 持有，运行中任务与 blocked 集合仍是 `CoreService` 的进程内
- * 状态，分别经 `tryAcquireCommandDirectories`、`hasRuntime`、`isDirectoryBlocked`/`blockDirectory`
+ * 按 session 的租约本体由 `TaskScheduler` 持有，运行中任务与 blocked 集合仍是 `CoreService` 的进程内
+ * 状态，分别经 `tryAcquireCommandSession`、`hasRuntime`、`isDirectoryBlocked`/`blockDirectory`
  * 端口跨越；模块内不保存副本，所以被 block 的目录在绑定探测与任务调度两侧保持同一个语义。
  */
 
@@ -30,7 +30,7 @@ import { ensureProjectSessionDir, projectSessionDir, sessionsRoot } from "./sess
 import { withStoppedWorker, type WorkerSession } from "../runtime/worker-lease.ts";
 import type { ChannelStore } from "../store/index.ts";
 import type { BindingRecord } from "../store/store-records.ts";
-import type { DirectoryLease } from "../tasks/task-scheduler.ts";
+import type { SessionLease } from "../tasks/task-scheduler.ts";
 import { threadParentGroupId } from "../threads/thread-target.ts";
 import {
   canonicalExistingDirectory,
@@ -42,7 +42,7 @@ import {
 /**
  * 生命周期可以触及的自有状态之外的一切：持久化的绑定行/worker 台账/聊天模型、命令启动候选
  * worker 用的工厂、会话目录布局所依据的配置、绑定键所落的 bot 身份（getter：start 之后才知
- * 道），以及 `CoreService` 侧围绕目录的状态——运行中任务、blocked 集合、cwd 租约与聊天出站队列。
+ * 道），以及 `CoreService` 侧围绕 session 的状态——运行中任务、blocked 集合、session 租约与聊天出站队列。
  */
 export interface SessionLifecycleDeps {
   readonly store: Pick<
@@ -66,10 +66,10 @@ export interface SessionLifecycleDeps {
   /** 把该 cwd 标为不可用（worker 无法确认停止时）。 */
   readonly blockDirectory: (cwd: string) => void;
   /**
-   * 为一次目录级命令租下全部给定 cwd，任一忙碌时返回 `undefined`（由 `TaskScheduler` 的目录
-   * 租约链、运行中任务与 blocked 集合共同判定）。租约在命令的 finally 里释放。
+   * 为当前聊天的 session（未绑定时按聊天标识）获取命令租约；`cwds` 仅用于拒绝仍被未确认停止的
+   * worker 阻塞的目录。正常任务按 session 独占，不因其他聊天使用相同 cwd 而互相阻塞。
    */
-  readonly tryAcquireCommandDirectories: (cwds: readonly string[]) => DirectoryLease | undefined;
+  readonly tryAcquireCommandSession: (target: ChatTarget, cwds: readonly string[]) => SessionLease | undefined;
   /** 为该聊天排一条回执文本，与其他命令路径一致。 */
   readonly enqueueText: Outbox["enqueueText"];
 }
@@ -184,9 +184,13 @@ export class SessionLifecycle {
       await this.deps.enqueueText(target, `目录无效：${safeErrorMessage(error, "无法访问该目录")}`, null);
       return;
     }
-    const commandLease = this.deps.tryAcquireCommandDirectories([cwd]);
+    const commandLease = this.deps.tryAcquireCommandSession(target, [cwd]);
     if (!commandLease) {
-      await this.deps.enqueueText(target, "目标目录当前被任务或未确认会话占用，请稍后重试。", null);
+      await this.deps.enqueueText(
+        target,
+        "相关会话正在运行，或目标目录存在未确认停止的 worker，请稍后重试。",
+        null,
+      );
       return;
     }
     try {
@@ -301,9 +305,13 @@ export class SessionLifecycle {
       await this.deps.enqueueText(target, "绑定的 OMP 会话文件不存在，未迁移。", null);
       return;
     }
-    const commandLease = this.deps.tryAcquireCommandDirectories([previous.cwd, cwd]);
+    const commandLease = this.deps.tryAcquireCommandSession(target, [previous.cwd, cwd]);
     if (!commandLease) {
-      await this.deps.enqueueText(target, "源目录或目标目录当前被任务或未确认会话占用，请稍后重试。", null);
+      await this.deps.enqueueText(
+        target,
+        "相关会话正在运行，或源/目标目录存在未确认停止的 worker，请稍后重试。",
+        null,
+      );
       return;
     }
     try {

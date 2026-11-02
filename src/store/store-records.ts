@@ -2,7 +2,7 @@
  * 持久层的记录类型：每张表在 TypeScript 侧的形状，被 store 门面与各领域模块共用。
  */
 
-import type { ChatAppendMode, ChatExecutionState, ChatTarget, WorkerProcess } from "../contracts.ts";
+import type { ChatAppendMode, ChatExecutionState, ChatTarget, TextMention, WorkerProcess } from "../contracts.ts";
 
 export interface BindingRecord extends ChatTarget {
   botUid: string;
@@ -30,6 +30,8 @@ export interface InboundClaim {
   supported: boolean;
   kind: "task" | "command";
 }
+
+export type CommandClaimState = "pending" | "completed" | "failed";
 
 /**
  * 用户/服务已下达的停止意图：`interrupt` 停止当前回合，`question_timeout` 是等待回答超时导致的停轮。
@@ -101,6 +103,11 @@ export interface ProgressCardRecord extends ChatTarget {
   attempts: number;
 }
 
+export interface OutboxTextPayload {
+  text: string;
+  mention: TextMention | null;
+}
+
 export interface OutboxRecord extends ChatTarget {
   id: string;
   botUid: string;
@@ -118,17 +125,48 @@ export interface OutboxRecord extends ChatTarget {
   segmentIndex: number;
   desiredVersion: number;
   ackedVersion: number;
+  mention: TextMention | null;
+  streamFinal: boolean;
+  createPayload: OutboxTextPayload | null;
+}
+
+export interface TextStreamOutboxSegment {
+  text: string;
+  mention: TextMention | null;
+}
+
+export interface TextStreamOutboxCommit {
+  botUid: string;
+  target: ChatTarget;
+  taskId: string;
+  streamMessageId: string;
+  segments: readonly TextStreamOutboxSegment[];
+  final: boolean;
+  forceFinalSentinel: boolean;
 }
 
 export type OutboxInsert = Omit<
   OutboxRecord,
-  "state" | "attempts" | "lastError" | "remoteMessageId" | "streamMessageId" | "segmentIndex" | "desiredVersion" | "ackedVersion"
+  | "state"
+  | "attempts"
+  | "lastError"
+  | "remoteMessageId"
+  | "streamMessageId"
+  | "segmentIndex"
+  | "desiredVersion"
+  | "ackedVersion"
+  | "mention"
+  | "streamFinal"
+  | "createPayload"
 > & {
   remoteMessageId?: string | null;
   streamMessageId?: string | null;
   segmentIndex?: number;
   desiredVersion?: number;
   ackedVersion?: number;
+  mention?: TextMention | null;
+  streamFinal?: boolean;
+  createPayload?: OutboxTextPayload | null;
 };
 
 /** 关闭原因：`cancelled`＝用户 `/cancel`，`interrupted`＝用户 `/interrupt`，`ended`＝生命周期收尾。 */
@@ -204,5 +242,28 @@ export interface AllowedChatRecord extends ChatTarget {
   channelId: string;
   grantedBy: string;
   grantedAt: number;
+}
+
+/** A durable owner click; action and Bot event identities are both unique per Bot. */
+export interface ChatGrantOperationInput extends ChatTarget {
+  actionId: string;
+  eventId: number;
+  botUid: string;
+  ownerId: string;
+  actorId: string;
+  channelType: 2 | 5;
+  channelId: string;
+  cardMessageId: string;
+  /** Stable client message ID used if the card edit cannot deliver the receipt. */
+  resultMessageId: string;
+}
+
+export interface ChatGrantOperationRecord extends ChatGrantOperationInput {
+  acceptedAt: number;
+  /** Last sequence used on the confirmation card; a new grant card starts at 1. */
+  cardEditSeq: number;
+  configMirrorState: "pending" | "succeeded" | "failed";
+  configMirrorError: string | null;
+  resultState: "pending" | "delivered";
 }
 

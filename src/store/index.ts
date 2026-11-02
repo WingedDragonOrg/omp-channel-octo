@@ -1,21 +1,22 @@
 /**
  * `ChannelStore` 门面：SQLite 之上的一层持久化 API。物理形状与 db 辅助在 `store-schema.ts`，
- * 记录类型在 `store-records.ts`，各领域读写分布在 `store-chats/tasks/cards/workers/ledgers/outbox/questions.ts`。
+ * 记录类型在 `store-records.ts`，各领域读写分布在 `store-chats/grants/tasks/cards/workers/ledgers/outbox/questions.ts`。
  */
 
 import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ChatAppendMode, ChatTarget } from "../contracts.ts";
-import type { BindingRecord, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord } from "./store-records.ts";
+import type { BindingRecord, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState } from "./store-records.ts";
 import { applySchema } from "./store-schema.ts";
 import { claimOwnerEnrollment, clearChatModel, ensureBinding, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, grantAllowedChat, hasOwnerEnrollment, listAllowedChats, setBotUid, setChatMode, setChatModel, setOwnerId, updateBindingSession } from "./store-chats.ts";
-import { acceptTask, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getLatestTask, getTask, isTaskResuming, listQueuedTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim } from "./store-tasks.ts";
+import { acceptTask, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, isTaskResuming, listQueuedTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim } from "./store-tasks.ts";
 import { clearProgressCard, listProgressCards, recordProgressCardAttempt, saveProgressCard } from "./store-cards.ts";
 import { listWorkerLedger, markWorkerStopped, recordWorker } from "./store-workers.ts";
 import { advanceHistoryLedger, clearContextLedger, commitContextInjection, commitHistoryInjection, getContextLedger, getHistoryLedger, prepareContextInjection, prepareHistoryInjection, pruneHistoryLedger } from "./store-ledgers.ts";
-import { acknowledgeTextOutbox, beginTextCreate, bindTextOutbox, countPendingOutbox, countUnknownOutbox, enqueueOutbox, failTextOutbox, getBotEventCursor, getOutbox, listPendingOutbox, listPendingOutboxTargets, listTextStream, markOutboxDead, markOutboxFailure, markOutboxSent, setBotEventCursor, updateTextOutbox } from "./store-outbox.ts";
+import { acknowledgeTextOutbox, beginTextCreate, bindTextOutbox, commitTextStream, countPendingOutbox, countUnknownOutbox, enqueueOutbox, failTextOutbox, getBotEventCursor, getOutbox, listPendingOutbox, listPendingOutboxTargets, listTextStream, markOutboxDead, markOutboxFailure, markOutboxSent, setBotEventCursor, updateTextOutbox } from "./store-outbox.ts";
 import { answerClosedQuestion, answerQuestion, answerQuestions, cancelQuestion, cancelQuestions, cancelTaskQuestions, createQuestion, getQuestion, listPendingQuestions, listQuestionsByCard, listTaskQuestions, markQuestionsSettled, pendingQuestionIds, reserveQuestionCardSeq, setQuestionCard, setQuestionsCard, updateQuestionPayloads } from "./store-questions.ts";
+import { acceptChatGrantOperation, getChatGrantOperation, getChatGrantOperationByEvent, listPendingChatGrantOperations, markChatGrantConfigMirror, markChatGrantResultDelivered, nextChatGrantCardEditSeq } from "./store-grants.ts";
 
 export class ChannelStore {
   private readonly db: Database;
@@ -83,6 +84,36 @@ export class ChannelStore {
     return listAllowedChats(this.db, botUid);
   }
 
+  /** Atomically records the accepted owner action and grants its target chat. */
+  acceptChatGrantOperation(operation: ChatGrantOperationInput): boolean {
+    return acceptChatGrantOperation(this.db, operation);
+  }
+
+  getChatGrantOperation(botUid: string, actionId: string): ChatGrantOperationRecord | null {
+    return getChatGrantOperation(this.db, botUid, actionId);
+  }
+
+  getChatGrantOperationByEvent(botUid: string, eventId: number): ChatGrantOperationRecord | null {
+    return getChatGrantOperationByEvent(this.db, botUid, eventId);
+  }
+
+  /** Operations with an unfinished config mirror or result receipt, oldest first. */
+  listPendingChatGrantOperations(botUid: string): ChatGrantOperationRecord[] {
+    return listPendingChatGrantOperations(this.db, botUid);
+  }
+
+  markChatGrantConfigMirror(botUid: string, actionId: string, state: "succeeded" | "failed", error?: string): boolean {
+    return markChatGrantConfigMirror(this.db, botUid, actionId, state, error);
+  }
+
+  markChatGrantResultDelivered(botUid: string, actionId: string): boolean {
+    return markChatGrantResultDelivered(this.db, botUid, actionId);
+  }
+
+  nextChatGrantCardEditSeq(botUid: string, actionId: string): number {
+    return nextChatGrantCardEditSeq(this.db, botUid, actionId);
+  }
+
   ensureBinding(binding: BindingRecord): void {
     ensureBinding(this.db, binding);
   }
@@ -95,6 +126,9 @@ export class ChannelStore {
     return acceptTask(this.db, claim, task);
   }
 
+  getCommandClaimState(botUid: string, target: ChatTarget, messageId: string): CommandClaimState | null {
+    return getCommandClaimState(this.db, botUid, target, messageId);
+  }
   claimCommand(claim: InboundClaim): boolean {
     return claimCommand(this.db, claim);
   }
@@ -379,6 +413,10 @@ export class ChannelStore {
   listTextStream(botUid: string, taskId: string, streamMessageId: string): OutboxRecord[] {
     return listTextStream(this.db, botUid, taskId, streamMessageId);
   }
+  commitTextStream(stream: TextStreamOutboxCommit): boolean {
+    return commitTextStream(this.db, stream);
+  }
+
 
   updateTextOutbox(id: string, text: string, desiredVersion: number): boolean {
     return updateTextOutbox(this.db, id, text, desiredVersion);

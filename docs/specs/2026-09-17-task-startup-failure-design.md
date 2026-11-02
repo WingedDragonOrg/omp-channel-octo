@@ -25,7 +25,7 @@
 
 - 启动前失败（群说明读取、绑定会话文件、worker 进程创建与就绪）的分类、日志、任务行与聊天文案。
 - worker 工厂（`src/omp/index.ts` 的 `create`）与宿主绑定检查抛出的类型化原因码（`src/contracts.ts` 的 `TaskStartupError`）。
-- 已存在 worker 之后失败的任务行与日志同样带上真实原因（聊天文案保持现状）。
+- 已存在 worker 之后失败时，聊天文案附带原始异常消息，任务行与日志带上有界原因。
 - 主规格中「共享说明读取失败则该任务失败且不得启动 worker」的承诺与验收保持逐字不变。
 
 ### 不包含
@@ -37,8 +37,8 @@
 
 ## 已知约束
 
-- `src/errors.ts` 的既有约定：错误对象本身不进日志与卡片。本设计只放行**有界（≤200 字符）、单行、控制字符清除**的文本，以及固定词表里的原因码；原始错误对象、协议载荷与凭据不出现在任何面。
-- 群/子区的对话文案对群成员可见，聊天文案因此不含路径；路径只出现在服务日志与任务行（`tasks.cwd` 本来就存目录，任务行是 owner 侧 SQLite）。
+- 日志与任务行使用有界（≤200 字符）、单行、控制字符清除的文本及固定词表里的原因码。
+- worker 创建后的执行异常原始消息发至任务所在聊天；群和子区成员可见其中可能出现的路径、请求内容或凭据。启动失败继续使用分类提示。
 - 聊天文案与任务行都不能因这次改动变得不可 grep：`群说明读取失败` 仍是该类的行内前缀。
 - 失败分类必须与「worker 是否已存在」解耦：`workerFactory.create` 可能已经 spawn 子进程后才失败（2026-09-17 现场），此时 `worker` 变量仍未赋值，但失败点已经属于 worker 启动而不是群说明读取。
 
@@ -49,9 +49,9 @@
 | 原因来源 | 类型化错误 `TaskStartupError`（`code` 取有界词表） | 字符串匹配会被消息改写悄悄打断；原因码可直接进日志、任务行与文案，且无泄密面 |
 | 类别划分 | 4 类：`context`（群说明读取）/ `binding`（绑定不可用）/ `worker`（worker 启动失败）/ `generic`（已启动后失败） | 与 owner 提出的验收一致（群说明读取失败 vs worker 启动失败/目录不可用）；每类对应一个可执行动作 |
 | 类别判定 | 有原因码时按码归类（`cwd-missing`/`session-invalid` → `binding`，其余 worker 码 → `worker`）；无原因码时按阶段（群说明读取阶段 → `context`，其余启动阶段 → `worker`） | 阶段只用于兜底，主判据是码；`create` 已 spawn 后失败仍归 `worker` |
-| 聊天文案 | 固定句式 + 具体原因码，不含路径、不含原始错误；`context` 与 `generic` 沿用逐字不变的两句 | 群可见面的信息量固定且安全；owner 用于定位的两句保持原样 |
+| 聊天文案 | 启动失败使用分类句式与原因码；执行失败附带原始异常消息 | 任务所在聊天可直接看到执行失败原因 |
 | 真实原因去向 | 服务日志一行（`[task] 启动失败 … kind=… code=… phase=… detail=…`，worker 已存在时为 `执行失败`）与任务行 `error_text`（`<类前缀>（<原因码>）：<单行文本>`） | 现场缺的正是这两处：日志空白、任务行只有固定文案；原因码进任务行便于按码检索 |
-| 文本有界 | `failureText()` 单行化 + 控制字符清除 + ≤200 字符 | 与既有「卡片/群消息只放有界文案」一致；日志与 SQLite 行不会被无界 dump 污染 |
+| 日志与任务行文本有界 | `failureText()` 单行化 + 控制字符清除 + ≤200 字符 | 日志与 SQLite 行保持有界 |
 | 类前缀 | 任务行前缀沿用既有词汇（`群说明读取失败`、`任务执行失败`）并新增 `绑定不可用`、`worker 启动失败` | 历史行与 grep 习惯不被打断 |
 | 群说明读取失败 | 保持现状：任务失败且不启动 worker | owner 拍板 2026-09-17；主规格第 129 行与验收第 204 条已确认该承诺，群说明承载群内规则，静默降级会让回复脱离群约定 |
 | 启动失败重试 | 不加：把默认启动预算从 10 秒提高到 30 秒（`startupTimeoutMs` 仍可覆盖） | owner 拍板 2026-09-17；实测失败来自环境瞬时变慢，给慢启动更多时间比多跑一次握手更省 |
@@ -105,9 +105,9 @@ export function classifyStartupFailure(error: unknown, phase: TaskStartupPhase):
 | `context` | 群说明读取/规范化失败（群/子区任务） | `群说明读取失败，未启动任务。` | `群说明读取失败` |
 | `binding` | `cwd-missing`、`session-invalid` | `任务未启动：绑定的工作目录或会话不可用（<code>）。` | `绑定不可用` |
 | `worker` | 其余 worker 启动码与启动阶段的无码失败 | `任务未启动：OMP 运行进程启动失败（<code>）。` | `worker 启动失败` |
-| `generic` | worker 已创建后的失败 | `任务执行失败；未能可靠完成。` | `任务执行失败` |
+| `generic` | worker 已创建后的失败 | `任务执行失败；未能可靠完成。`，另附原始异常消息 | `任务执行失败` |
 
-任务行格式为 `<类前缀>（<原因码>）：<单行文本>`（如 `绑定不可用（cwd-missing）：OMP worker cwd does not exist: …`），聊天文案只带原因码、不带路径。
+任务行格式为 `<类前缀>（<原因码>）：<单行文本>`（如 `绑定不可用（cwd-missing）：OMP worker cwd does not exist: …`）。执行失败的原始异常消息使用既有 outbox 发送。
 
 类码（无具体原因码时使用）：`context-read`、`binding-unavailable`、`worker-start`、`task-failed`。
 
@@ -115,7 +115,7 @@ export function classifyStartupFailure(error: unknown, phase: TaskStartupPhase):
 
 - `runTask` 的启动阶段跟踪：`let phase: TaskStartupPhase = "context"`，群说明读取（仅群/子区）完成后置为 `"startup"`。
 - 失败分支（`!worker`）：`console.error` 一行（`[task] 未启动 task=<id> target=<key> phase=<phase> kind=<kind> code=<code>：<detail>`）、`markFailed(taskId, row)`、`finishProgress("failed")`、`enqueueText(notice)`。
-- 已存在 worker 的失败分支：聊天文案保持 `任务执行失败；未能可靠完成。`，任务行改为 `任务执行失败：<detail>`，并同样记录一行日志（现状是行内只有常量 `worker failed`、日志空白）。
+- 已存在 worker 的失败分支：聊天文案附带原始异常消息，任务行记录有界 detail，并同样记录一行日志。
 - 删除 `genericTaskFailure` 与 `contextFailure`（被分类结果取代）。
 
 ## 失败模式
@@ -130,14 +130,14 @@ export function classifyStartupFailure(error: unknown, phase: TaskStartupPhase):
 | spawn、身份失败 | `worker` 类：对应码 |
 | 看门狗启动失败 | `worker` 类：`watchdog-unavailable`；有界 detail 区分 spawn 异常、提前退出（退出码 + ≤1024 字符 stderr 头部摘要、单行化）、stdout 读取失败、就绪超时（含预算毫秒数）；任一失败都 SIGKILL 回收该看门狗子进程，随后由工厂停止已启动的 OMP 进程组，安全门禁不变（watchdog 未就绪不创建 worker） |
 | 私聊任务（无群说明读取） | 不产生 `context` 类：读说明阶段被跳过 |
-| worker 已创建后的失败 | `generic` 类：文案不变，行与日志带真实原因 |
+| worker 已创建后的失败 | `generic` 类：聊天收到原始异常消息，行与日志带有界原因 |
 | 任务被取消 | 不变：仍走 `markCancelled` 与取消回执 |
 | 无码错误进入启动阶段 | `worker` 类，类码 `worker-start` |
 
 ## 错误与边界情况
 
 - `failureText` 的输入是 `Error.message`（或字符串），空结果回落到固定兜底文案；跨行与超长文本被压平、截断到 200 字符，避免日志注入与无界行。
-- 文案里的原因码来自固定词表，不含路径、昵称、token 或载荷片段。
+- 启动失败文案里的原因码来自固定词表。
 - 事件顺序不变：仍是先 `markFailed` 再投递文案（`enqueueText` 绑定 taskId，重启后按 outbox 恢复投递）。
 - 任务行只追加前缀与真实原因，`/status` 不读取它，群成员看不到。
 - 取消竞态：`runtime.cancelRequested` 优先，分类逻辑不介入。
@@ -149,7 +149,7 @@ export function classifyStartupFailure(error: unknown, phase: TaskStartupPhase):
 2. 绑定工作区目录不存在时：真实 worker 工厂在 spawn 之前以 `cwd-missing` 失败；任务行以 `绑定不可用（cwd-missing）：` 开头；聊天文案为 `任务未启动：绑定的工作目录或会话不可用（cwd-missing）。`；没有 worker 进程。
 3. worker 未就绪（缩短启动预算的真实工厂）以 `not-ready` 失败：任务行以 `worker 启动失败` 开头且含 `not-ready`；聊天文案含 `not-ready`。
 4. 子进程提前退出归 `exited`；spawn/身份/看门狗失败各有码且都归 `worker` 类。
-5. worker 已创建后失败：聊天文案保持 `任务执行失败；未能可靠完成。`，任务行与日志含真实原因（不再是常量 `worker failed`）。
+5. worker 已创建后失败：聊天文案包含原始异常消息，任务行与日志含有界原因。
 6. 私聊任务失败不会出现 `群说明读取失败`：无群说明读取阶段时按码归 `worker`/`binding` 类。
 7. 既有断言不变：`tests/core-group-context.test.ts` 的群说明失败用例、取消/中断路径与 outbox 恢复行为全部保持通过。
 8. worker 启动预算默认 30 秒：冷启动慢到十几秒、但确有进展的子进程不再被判失败；`startupTimeoutMs` 仍逐项覆盖该默认值（`not-ready` 的失败用例用缩短的预算驱动）。

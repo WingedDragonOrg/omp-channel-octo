@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
-import type { ChannelTransport, ChatTarget, TextEvent } from "./contracts.ts";
+import type { ChannelTransport, ChatTarget, TextEvent, TextMention } from "./contracts.ts";
 import { asAppError, failureText, type AppError } from "./errors.ts";
 import type { ChannelStore } from "./store/index.ts";
-import type { OutboxRecord } from "./store/store-records.ts";
+import type { OutboxRecord, TextStreamOutboxCommit, TextStreamOutboxSegment } from "./store/store-records.ts";
+import { parseReplyMemberMarkers, type ReplyTextPart } from "./outbox-mentions.ts";
 import { streamTargetKey, targetKey } from "./target.ts";
 
 const MAX_TEXT_BYTES = 3_000;
@@ -105,6 +106,126 @@ export function splitUtf8(text: string, maxBytes = MAX_TEXT_BYTES): string[] {
   }
   return chunks;
 }
+interface MentionSpan {
+  start: number;
+  end: number;
+  uid: string;
+  codeUnitLength: number;
+}
+
+function isInsideMention(cut: number, mentions: readonly MentionSpan[]): boolean {
+  let lower = 0;
+  let upper = mentions.length - 1;
+  while (lower <= upper) {
+    const middle = Math.floor((lower + upper) / 2);
+    const mention = mentions[middle] as MentionSpan;
+    if (cut <= mention.start) {
+      upper = middle - 1;
+    } else if (cut >= mention.end) {
+      lower = middle + 1;
+    } else {
+      return true;
+    }
+  }
+  return false;
+}
+
+function findMentionSafeCut(
+  characters: readonly string[],
+  start: number,
+  end: number,
+  mentions: readonly MentionSpan[],
+): number {
+  let sentence = -1;
+  let clause = -1;
+  let word = -1;
+  for (let cut = end; cut > start; cut -= 1) {
+    if (isInsideMention(cut, mentions)) continue;
+    const tier = cutTier(characters, cut);
+    if (tier === 0) continue;
+    if (tier === 1) return cut;
+    if (tier === 2 && sentence < 0) sentence = cut;
+    else if (tier === 3 && clause < 0) clause = cut;
+    else if (tier === 4 && word < 0) word = cut;
+  }
+  if (sentence > 0) return sentence;
+  if (clause > 0) return clause;
+  if (word > 0) return word;
+  return end;
+}
+
+/** Splits one parsed message while keeping mention atoms intact and entity offsets in UTF-16 units. */
+function splitMentionedText(parts: readonly ReplyTextPart[]): TextStreamOutboxSegment[] {
+  const textParts: string[] = [];
+  const mentions: MentionSpan[] = [];
+  let codePointOffset = 0;
+  for (const part of parts) {
+    textParts.push(part.text);
+    let partCodePoints = 0;
+    for (const _character of part.text) partCodePoints += 1;
+    if (part.type === "mention") {
+      mentions.push({
+        start: codePointOffset,
+        end: codePointOffset + partCodePoints,
+        uid: part.uid,
+        codeUnitLength: part.text.length,
+      });
+    }
+    codePointOffset += partCodePoints;
+  }
+
+  const characters = Array.from(textParts.join(""));
+  if (characters.length === 0) return [];
+  const codeUnitOffsets = new Array<number>(characters.length + 1);
+  codeUnitOffsets[0] = 0;
+  for (let index = 0; index < characters.length; index += 1) {
+    codeUnitOffsets[index + 1] = (codeUnitOffsets[index] ?? 0) + (characters[index]?.length ?? 0);
+  }
+
+  const chunks: TextStreamOutboxSegment[] = [];
+  let start = 0;
+  while (start < characters.length) {
+    let bytes = 0;
+    let end = start;
+    while (end < characters.length) {
+      const size = utf8ByteLength(characters[end]?.codePointAt(0) ?? 0);
+      if (bytes + size > MAX_TEXT_BYTES) break;
+      bytes += size;
+      end += 1;
+    }
+    let cut = end === characters.length
+      ? end
+      : findMentionSafeCut(characters, start, end, mentions);
+    if (cut < characters.length && isInsideMention(cut, mentions)) {
+      const atom = mentions.find((mention) => cut > mention.start && cut < mention.end);
+      if (atom) cut = atom.start > start ? atom.start : atom.end;
+    }
+
+    const uids: string[] = [];
+    const uidSet = new Set<string>();
+    const entities: TextMention["entities"] = [];
+    for (const mention of mentions) {
+      if (mention.start < start || mention.end > cut) continue;
+      const uid = mention.uid;
+      if (!uidSet.has(uid)) {
+        uidSet.add(uid);
+        uids.push(uid);
+      }
+      entities.push({
+        uid,
+        offset: (codeUnitOffsets[mention.start] ?? 0) - (codeUnitOffsets[start] ?? 0),
+        length: mention.codeUnitLength,
+      });
+    }
+    chunks.push({
+      text: characters.slice(start, cut).join(""),
+      mention: entities.length === 0 ? null : { uids, entities },
+    });
+    start = cut;
+  }
+  return chunks;
+}
+
 
 function isPermanentOutboxError(error: unknown, item: OutboxRecord): boolean {
   if (!error || typeof error !== "object") return false;
@@ -139,9 +260,19 @@ export interface OutboxDeps {
   started(): boolean;
 }
 
+export interface StreamTextOptions {
+  /** Enables the ordinary assistant reply marker syntax; notices and host text must leave this false. */
+  parseMentions?: boolean;
+}
+
 export interface Outbox {
   enqueueText(target: ChatTarget, text: string, taskId: string | null): void;
-  enqueueStreamText(target: ChatTarget, taskId: string, event: TextEvent): void;
+  enqueueStreamText(
+    target: ChatTarget,
+    taskId: string,
+    event: TextEvent,
+    options?: StreamTextOptions,
+  ): void;
   flush(target: ChatTarget, announceUnknown?: boolean): Promise<void>;
   flushAll(): void;
   /** 注册一个任务的文本投递取消句柄：任务被中断时中止其所有在途尝试。 */
@@ -196,47 +327,42 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
     }
   }
 
-  function enqueueStreamText(target: ChatTarget, taskId: string, event: TextEvent): void {
+  function enqueueStreamText(
+    target: ChatTarget,
+    taskId: string,
+    event: TextEvent,
+    options: StreamTextOptions = {},
+  ): void {
     if (!deps.botUid()) return;
-    const streamMessageId = `${taskId}:${event.messageId}`;
-    const previous = deps.store.listTextStream(currentBotUid(), taskId, streamMessageId);
-    const version = previous.reduce(
-      (highest, item) => Math.max(highest, item.desiredVersion),
-      0,
-    ) + 1;
-    const chunks = event.text.length === 0 ? [] : splitUtf8(event.text);
-    const segmentCount = Math.max(previous.length, chunks.length);
-    let changed = false;
-    for (let segmentIndex = 0; segmentIndex < segmentCount; segmentIndex += 1) {
-      const chunk = chunks[segmentIndex] ?? "";
-      const existing = previous[segmentIndex];
-      if (existing) {
-        if (existing.text === chunk) continue;
-        if (deps.store.updateTextOutbox(existing.id, chunk, version)) changed = true;
-        continue;
-      }
-      if (chunk.length === 0) continue;
-      deps.store.enqueueOutbox({
-        id: randomUUID(),
-        botUid: currentBotUid(),
-        channelId: target.channelId,
-        channelType: target.channelType,
-        taskId,
-        kind: "text",
-        text: chunk,
-        path: null,
-        fileKind: null,
-        clientMsgNo: randomUUID(),
-        streamMessageId,
-        segmentIndex,
-        desiredVersion: version,
-        ackedVersion: 0,
-      });
-      changed = true;
+    const bodyStreamId = `${taskId}:${event.messageId}`;
+    const previousBody = deps.store.listTextStream(currentBotUid(), taskId, bodyStreamId);
+    if (!event.final && previousBody.some((item) => item.streamFinal)) return;
+    const canParseMentions =
+      options.parseMentions === true &&
+      (target.channelType === 2 || target.channelType === 5);
+    const bodySegments = canParseMentions
+      ? splitMentionedText(parseReplyMemberMarkers(event.text, !event.final, MAX_TEXT_BYTES))
+      : event.text.length === 0
+        ? []
+        : splitUtf8(event.text).map((text) => ({ text, mention: null }));
+    const bodyCommit: TextStreamOutboxCommit = {
+      botUid: currentBotUid(),
+      target,
+      taskId,
+      streamMessageId: bodyStreamId,
+      segments: bodySegments,
+      final: event.final,
+      forceFinalSentinel: event.final,
+    };
+    const changed = deps.store.commitTextStream(bodyCommit);
+    if (event.final) {
+      // Final snapshots bypass the edit merge window, even if they only repeat a persisted final.
+      void flushTarget(target).catch(() => {});
+      return;
     }
     if (!changed) return;
-    if (previous.length > 0) {
-      scheduleStreamFlush(target, streamMessageId);
+    if (previousBody.length > 0) {
+      scheduleStreamFlush(target, bodyStreamId);
     } else {
       void flushTarget(target).catch(() => {});
     }
@@ -310,6 +436,8 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
     if (!deps.botUid() || !deps.started()) return Promise.resolve();
     const key = targetKey(target);
     if (outboxActive.has(key)) return outboxFlushes.get(key) ?? Promise.resolve();
+    // New flush triggers must not bypass an active retry delay for a failed delivery.
+    if (retryTimers.has(key)) return outboxFlushes.get(key) ?? Promise.resolve();
     outboxActive.add(key);
     const drain = flushTargetInternal(target, announceUnknown, key);
     outboxFlushes.set(key, drain);
@@ -508,7 +636,13 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
       if (item.remoteMessageId) {
         markStreamEditStarted(item, target);
         await withDeliveryAttempt(item.taskId, (signal) =>
-          deps.transport.editText(target, item.remoteMessageId!, item.text ?? "", signal),
+          deps.transport.editText(
+            target,
+            item.remoteMessageId!,
+            item.text ?? "",
+            signal,
+            item.mention ?? undefined,
+          ),
         );
         return {
           remoteMessageId: item.remoteMessageId,
@@ -517,10 +651,19 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
         };
       }
       const reconcile = item.state === "unknown";
-      if (!reconcile) deps.store.beginTextCreate(item.id);
+      deps.store.beginTextCreate(item.id);
       markStreamEditStarted(item, target);
+      const createPayload = deps.store.getOutbox(item.id)?.createPayload ??
+        item.createPayload ??
+        { text: item.text ?? "", mention: item.mention };
       const receipt = await withDeliveryAttempt(item.taskId, (signal) =>
-        deps.transport.sendText(target, item.text ?? "", item.clientMsgNo, signal),
+        deps.transport.sendText(
+          target,
+          createPayload.text,
+          item.clientMsgNo,
+          signal,
+          createPayload.mention ?? undefined,
+        ),
       );
       if (!receipt?.messageId) throw new Error("stream text send did not return a remote message id");
       return { remoteMessageId: receipt.messageId, reconcile, attemptedVersion: item.desiredVersion };
@@ -536,7 +679,14 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
   function registerTask(taskId: string): { stop(): void } {
     const controller = new AbortController();
     textAbortControllers.set(taskId, controller);
-    return { stop: () => controller.abort() };
+    return {
+      stop: () => {
+        controller.abort();
+        if (textAbortControllers.get(taskId) === controller) {
+          textAbortControllers.delete(taskId);
+        }
+      },
+    };
   }
 
   /** 丢弃任务的取消句柄（任务结束时调用，无需中止）。 */

@@ -2,18 +2,26 @@
  * 出站投递：outbox 的创建、版本推进、确认与失败收敛，以及 Bot 事件队列的游标。
  */
 
+import { randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
 import type { ChatTarget } from "../contracts.ts";
-import type { OutboxInsert, OutboxRecord } from "./store-records.ts";
+import type { OutboxInsert, OutboxRecord, OutboxTextPayload, TextStreamOutboxCommit } from "./store-records.ts";
 import { SqlValue, asNullableString, asNumber, asString, outboxFromRow, query, run, targetValues, targetWhere, transaction } from "./store-schema.ts";
 
 export function enqueueOutbox(db: Database, record: OutboxInsert): void {
+  const mention = record.mention ?? null;
+  const createPayload = record.createPayload ?? (
+    record.kind === "text" && record.text !== null
+      ? { text: record.text, mention }
+      : null
+  );
   run(db,
     `INSERT INTO outbox(
        id, bot_uid, channel_type, channel_id, task_id, kind, text, path, file_kind, client_msg_no,
-       remote_message_id, stream_message_id, segment_index, desired_version, acked_version, state, created_at
+       remote_message_id, stream_message_id, segment_index, desired_version, acked_version,
+       mention_json, stream_final, create_payload_json, state, created_at
      )
-     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
     [
       record.id,
       record.botUid,
@@ -30,6 +38,9 @@ export function enqueueOutbox(db: Database, record: OutboxInsert): void {
       record.segmentIndex ?? 0,
       record.desiredVersion ?? 0,
       record.ackedVersion ?? 0,
+      mention === null ? null : JSON.stringify(mention),
+      record.streamFinal === true ? 1 : 0,
+      createPayload === null ? null : JSON.stringify(createPayload),
       Date.now(),
     ],
   );
@@ -42,16 +53,29 @@ export function getOutbox(db: Database, id: string): OutboxRecord | null {
 
 export function beginTextCreate(db: Database, id: string): boolean {
   return transaction(db, () => {
-    const row = query(db,
-      "SELECT kind, remote_message_id, state FROM outbox WHERE id = ?",
-      [id],
-    )[0];
-    if (!row || row.kind !== "text" || asNullableString(row.remote_message_id)) return false;
-    if (row.state === "unknown") return true;
-    if (row.state !== "pending") return false;
+    const row = query(db, "SELECT * FROM outbox WHERE id = ?", [id])[0];
+    if (!row) return false;
+    const item = outboxFromRow(row);
+    if (item.kind !== "text" || item.remoteMessageId) return false;
+    const createPayload = item.createPayload ?? (
+      item.text === null ? null : { text: item.text, mention: item.mention }
+    );
+    const serializedPayload = createPayload === null ? null : JSON.stringify(createPayload);
+    if (item.state === "unknown") {
+      if (item.createPayload === null && serializedPayload !== null) {
+        run(db,
+          "UPDATE outbox SET create_payload_json = ? WHERE id = ? AND state = 'unknown' AND remote_message_id IS NULL",
+          [serializedPayload, id],
+        );
+      }
+      return true;
+    }
+    if (item.state !== "pending") return false;
     return run(db,
-      "UPDATE outbox SET state = 'unknown', last_error = NULL WHERE id = ? AND state = 'pending' AND remote_message_id IS NULL",
-      [id],
+      `UPDATE outbox
+       SET state = 'unknown', create_payload_json = COALESCE(create_payload_json, ?), last_error = NULL
+       WHERE id = ? AND state = 'pending' AND remote_message_id IS NULL`,
+      [serializedPayload, id],
     ).changes === 1;
   });
 }
@@ -64,6 +88,130 @@ export function listTextStream(db: Database, botUid: string, taskId: string, str
     [botUid, taskId, streamMessageId],
   ).map((row) => outboxFromRow(row));
 }
+function mentionJson(mention: OutboxTextPayload["mention"]): string | null {
+  return mention === null ? null : JSON.stringify(mention);
+}
+
+function createPayloadJson(text: string, mention: OutboxTextPayload["mention"]): string {
+  return JSON.stringify({ text, mention });
+}
+
+/** Persists one assistant-message snapshot and its segment updates in a single transaction. */
+export function commitTextStream(db: Database, stream: TextStreamOutboxCommit): boolean {
+  return transaction(db, () => {
+    const previous = query(db,
+      `SELECT * FROM outbox
+       WHERE bot_uid = ? AND task_id = ? AND stream_message_id = ?
+       ORDER BY segment_index ASC, created_at ASC, rowid ASC`,
+      [stream.botUid, stream.taskId, stream.streamMessageId],
+    ).map((row) => outboxFromRow(row));
+    if (!stream.final && previous.some((item) => item.streamFinal)) return false;
+
+    const byIndex = new Map(previous.map((item) => [item.segmentIndex, item]));
+    const previousCount = previous.reduce((count, item) => Math.max(count, item.segmentIndex + 1), 0);
+    const needsFinalSentinel =
+      stream.final &&
+      stream.forceFinalSentinel &&
+      previousCount === 0 &&
+      stream.segments.length === 0;
+    const segmentCount = Math.max(
+      previousCount,
+      stream.segments.length,
+      needsFinalSentinel ? 1 : 0,
+    );
+    const version = previous.reduce(
+      (highest, item) => Math.max(highest, item.desiredVersion),
+      0,
+    ) + 1;
+    let changed = false;
+
+    for (let segmentIndex = 0; segmentIndex < segmentCount; segmentIndex += 1) {
+      const segment = stream.segments[segmentIndex] ?? { text: "", mention: null };
+      const existing = byIndex.get(segmentIndex);
+      if (!existing) {
+        if (segmentIndex >= stream.segments.length && !needsFinalSentinel) continue;
+        if (segmentIndex < stream.segments.length && segment.text.length === 0) continue;
+        const id = randomUUID();
+        const clientMsgNo = randomUUID();
+        run(db,
+          `INSERT INTO outbox(
+             id, bot_uid, channel_type, channel_id, task_id, kind, text, path, file_kind, client_msg_no,
+             remote_message_id, stream_message_id, segment_index, desired_version, acked_version,
+             mention_json, stream_final, create_payload_json, state, created_at
+           )
+           VALUES(?, ?, ?, ?, ?, 'text', ?, NULL, NULL, ?, NULL, ?, ?, ?, 0, ?, ?, ?, 'pending', ?)`,
+          [
+            id,
+            stream.botUid,
+            stream.target.channelType,
+            stream.target.channelId,
+            stream.taskId,
+            segment.text,
+            clientMsgNo,
+            stream.streamMessageId,
+            segmentIndex,
+            version,
+            mentionJson(segment.mention),
+            stream.final ? 1 : 0,
+            createPayloadJson(segment.text, segment.mention),
+            Date.now(),
+          ],
+        );
+        changed = true;
+        continue;
+      }
+
+      const textChanged = existing.text !== segment.text;
+      const mentionChanged = mentionJson(existing.mention) !== mentionJson(segment.mention);
+      const payloadChanged = textChanged || mentionChanged;
+      const finalChanged = stream.final && !existing.streamFinal;
+      if (!payloadChanged && !finalChanged) continue;
+
+      const desiredVersion = payloadChanged ? version : existing.desiredVersion;
+      const preservesUnknownCreate = existing.state === "unknown" && !existing.remoteMessageId;
+      const nextState = payloadChanged
+        ? preservesUnknownCreate
+          ? "unknown"
+          : existing.remoteMessageId && existing.ackedVersion >= desiredVersion
+            ? "sent"
+            : "pending"
+        : existing.state;
+      const previouslyAcknowledgedEmptySentinel =
+        existing.state === "sent" &&
+        existing.text === "" &&
+        !existing.remoteMessageId;
+      const nextCreatePayload = payloadChanged &&
+        !existing.remoteMessageId &&
+        existing.attempts === 0 &&
+        (existing.state === "pending" || previouslyAcknowledgedEmptySentinel)
+        ? createPayloadJson(segment.text, segment.mention)
+        : existing.createPayload === null
+          ? null
+          : createPayloadJson(existing.createPayload.text, existing.createPayload.mention);
+      run(db,
+        `UPDATE outbox
+         SET text = ?, mention_json = ?, desired_version = ?, state = ?, stream_final = ?,
+             create_payload_json = ?, attempts = CASE WHEN ? THEN 0 ELSE attempts END,
+             last_error = CASE WHEN ? THEN NULL ELSE last_error END
+         WHERE id = ?`,
+        [
+          segment.text,
+          mentionJson(segment.mention),
+          desiredVersion,
+          nextState,
+          existing.streamFinal || stream.final ? 1 : 0,
+          nextCreatePayload,
+          payloadChanged ? 1 : 0,
+          payloadChanged ? 1 : 0,
+          existing.id,
+        ],
+      );
+      changed = true;
+    }
+    return changed;
+  });
+}
+
 
 export function updateTextOutbox(db: Database, id: string, text: string, desiredVersion: number): boolean {
   return transaction(db, () => {

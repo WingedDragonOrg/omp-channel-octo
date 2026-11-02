@@ -1,11 +1,11 @@
 /**
  * SQLite 的物理形状：建表 DDL、列迁移、行解码、带 db 句柄的查询辅助，以及 `openChannelStore`。
- * 领域读写分布在 `store-chats/tasks/cards/delivery/ledgers`，门面在 `index.ts`。
+ * 领域读写分布在 `store-chats/grants/tasks/cards/workers/delivery/ledgers/outbox/questions`，门面在 `index.ts`。
  */
 
 import { Database } from "bun:sqlite";
-import type { ChatExecutionState, ChatTarget } from "../contracts.ts";
-import type { ContextLedgerRecord, HistoryLedgerRecord, OutboxRecord, QuestionRecord, TaskRecord, TaskStopIntent } from "./store-records.ts";
+import type { ChatExecutionState, ChatTarget, TextMention } from "../contracts.ts";
+import type { ContextLedgerRecord, HistoryLedgerRecord, OutboxRecord, OutboxTextPayload, QuestionRecord, TaskRecord, TaskStopIntent } from "./store-records.ts";
 
 export type SqlValue = string | number | null | Uint8Array;
 export type SqlRow = Record<string, unknown>;
@@ -187,6 +187,9 @@ export function applySchema(db: Database): void {
       segment_index INTEGER NOT NULL DEFAULT 0,
       desired_version INTEGER NOT NULL DEFAULT 0,
       acked_version INTEGER NOT NULL DEFAULT 0,
+      mention_json TEXT,
+      stream_final INTEGER NOT NULL DEFAULT 0,
+      create_payload_json TEXT,
       created_at INTEGER NOT NULL,
       sent_at INTEGER
     );
@@ -282,6 +285,26 @@ export function applySchema(db: Database): void {
       event_id INTEGER NOT NULL CHECK(event_id >= 0),
       updated_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS chat_grant_operations (
+      bot_uid TEXT NOT NULL,
+      action_id TEXT NOT NULL,
+      event_id INTEGER NOT NULL CHECK(event_id >= 0),
+      owner_id TEXT NOT NULL,
+      actor_id TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type IN (2, 5)),
+      channel_id TEXT NOT NULL,
+      card_message_id TEXT NOT NULL,
+      result_message_id TEXT NOT NULL,
+      accepted_at INTEGER NOT NULL,
+      card_edit_seq INTEGER NOT NULL DEFAULT 1 CHECK(card_edit_seq >= 1),
+      config_mirror_state TEXT NOT NULL CHECK(config_mirror_state IN ('pending', 'succeeded', 'failed')),
+      config_mirror_error TEXT,
+      result_state TEXT NOT NULL CHECK(result_state IN ('pending', 'delivered')),
+      PRIMARY KEY(bot_uid, action_id),
+      UNIQUE(bot_uid, event_id)
+    );
+    CREATE INDEX IF NOT EXISTS chat_grant_operations_recovery
+      ON chat_grant_operations(bot_uid, config_mirror_state, result_state, accepted_at, event_id);
   `);
   // 两个 prompt 标记列同一次引入。补列与旧行收尾必须在同一事务里：中途崩溃要么都回滚（下次
   // 打开重来），要么都生效——否则会留下「列已补上、旧 started 行没被标记」的中间态，把旧行的
@@ -306,6 +329,9 @@ export function applySchema(db: Database): void {
     "ALTER TABLE outbox ADD COLUMN segment_index INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE outbox ADD COLUMN desired_version INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE outbox ADD COLUMN acked_version INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE outbox ADD COLUMN mention_json TEXT",
+    "ALTER TABLE outbox ADD COLUMN stream_final INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE outbox ADD COLUMN create_payload_json TEXT",
     "ALTER TABLE worker_ledger ADD COLUMN move_target_cwd TEXT",
     "ALTER TABLE tasks ADD COLUMN message_seq INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN history_eligible INTEGER NOT NULL DEFAULT 1",
@@ -472,6 +498,53 @@ export function taskFromRow(row: SqlRow): TaskRecord {
   };
 }
 
+function mentionFromValue(value: unknown): TextMention | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  if (!Array.isArray(row.uids) || !Array.isArray(row.entities)) return null;
+  if (!row.uids.every((uid) => typeof uid === "string")) return null;
+  const entities: TextMention["entities"] = [];
+  for (const value of row.entities) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const entity = value as Record<string, unknown>;
+    if (
+      typeof entity.uid !== "string" ||
+      typeof entity.offset !== "number" ||
+      !Number.isSafeInteger(entity.offset) ||
+      entity.offset < 0 ||
+      typeof entity.length !== "number" ||
+      !Number.isSafeInteger(entity.length) ||
+      entity.length < 1
+    ) {
+      return null;
+    }
+    entities.push({ uid: entity.uid, offset: entity.offset, length: entity.length });
+  }
+  return { uids: [...row.uids] as string[], entities };
+}
+
+function mentionFromJson(value: unknown): TextMention | null {
+  if (typeof value !== "string") return null;
+  try {
+    return mentionFromValue(JSON.parse(value) as unknown);
+  } catch {
+    return null;
+  }
+}
+
+function createPayloadFromJson(value: unknown): OutboxTextPayload | null {
+  if (typeof value !== "string") return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const row = parsed as Record<string, unknown>;
+    if (typeof row.text !== "string") return null;
+    return { text: row.text, mention: mentionFromValue(row.mention) };
+  } catch {
+    return null;
+  }
+}
+
 export function outboxFromRow(row: SqlRow): OutboxRecord {
   const kind = row.kind === "file" ? "file" : "text";
   const fileKind = row.file_kind === "image" || row.file_kind === "file" ? row.file_kind : null;
@@ -495,6 +568,9 @@ export function outboxFromRow(row: SqlRow): OutboxRecord {
     segmentIndex: asNumber(row.segment_index),
     desiredVersion: asNumber(row.desired_version),
     ackedVersion: asNumber(row.acked_version),
+    mention: mentionFromJson(row.mention_json),
+    streamFinal: asNumber(row.stream_final) !== 0,
+    createPayload: createPayloadFromJson(row.create_payload_json),
   };
 }
 

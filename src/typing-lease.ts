@@ -5,7 +5,8 @@ import { targetKey } from "./target.ts";
  * Typing 租约：按 (bot, chat) 单例的「正在输入」续期环。
  *
  * 一条续期环对应一个 target：首个 owner acquire 时立即发一次 `POST /v1/bot/typing`，之后每
- * `renewMs` 续期；最后一个 owner release 时清 timer 并 abort 在途请求。owner 是两个前缀族：
+ * `renewMs` 续期；新的消息 owner 立即重发并重排同一个 timer，task 接续不重发。
+ * 最后一个 owner release 时清 timer 并 abort 在途请求。owner 是两个前缀族：
  * `msg:<messageId>`（门后到任务接受之间的消息租约，由调用方 try/finally 保证释放）与
  * `task:<taskId>`（任务租约，runTask 终态释放，另有每 tick 的任务行状态兜底——queued 任务被
  * `/cancel` 或启动失败等任何漏 release 路径都在下一 tick 内回收）。
@@ -120,7 +121,12 @@ export function createTypingLeaseManager(options: TypingLeaseOptions): TypingLea
       const key = targetKey(target);
       const existing = entries.get(key);
       if (existing) {
+        const refresh = owner.startsWith("msg:") && !existing.owners.has(owner);
         existing.owners.add(owner);
+        if (refresh) {
+          stopEntry(existing);
+          tick(key, existing);
+        }
         return;
       }
       const entry: LeaseEntry = {

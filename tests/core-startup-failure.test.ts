@@ -140,11 +140,12 @@ test("a worker failure in a private chat never reports the group-context wording
   }
 });
 
-test("a failure after the worker exists keeps the generic notice and records the real reason", async () => {
+test("a failure after the worker exists sends the original exception message", async () => {
+  const reason = `OMP model reported an error: Codex websocket transport error: websocket closed (1006)\n${"detail ".repeat(40)}`;
   const harness = await createCoreHarness({
     allowedGroupIds: ["group-startup-runtime"],
     prompt: async () => {
-      throw new Error("OMP worker already has a prompt in progress");
+      throw new Error(reason);
     },
   });
   const logged = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -160,11 +161,11 @@ test("a failure after the worker exists keeps the generic notice and records the
     );
     const status = await waitForStatus(harness.service, group, (next) => next.state === "failed");
     expect(status.state).toBe("failed");
-    expect(sentTexts(harness)).toContain("任务执行失败；未能可靠完成。");
+    expect(sentTexts(harness).join("")).toContain(reason);
 
     const row = taskRow(harness, "task-runtime-failure");
     expect(row.error_text).toStartWith("任务执行失败（task-failed）：");
-    expect(row.error_text).toContain("already has a prompt in progress");
+    expect(row.error_text).toContain("Codex websocket transport error");
 
     const lines = taskLogLines(logged.mock.calls);
     expect(lines).toHaveLength(1);

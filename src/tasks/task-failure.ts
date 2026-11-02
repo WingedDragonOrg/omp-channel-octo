@@ -7,10 +7,10 @@
 import { TaskStartupError, type TaskStartupCode } from "../contracts.ts";
 import { failureText } from "../errors.ts";
 
-/** 启动阶段:群说明读取(仅群/子区)之后、worker 创建之前的一切都算 `startup`。 */
-export type TaskStartupPhase = "context" | "startup";
+/** Startup read phases precede worker startup and have distinct, non-sensitive user notices. */
+export type TaskStartupPhase = "context" | "members" | "startup";
 
-export type TaskFailureKind = "context" | "binding" | "worker" | "generic";
+export type TaskFailureKind = "context" | "members" | "binding" | "worker" | "generic";
 
 export type TaskFailure = {
   readonly kind: TaskFailureKind;
@@ -45,6 +45,12 @@ const KIND_WORDS: Record<TaskFailureKind, {
     classCode: "context-read",
     fallback: "群说明读取失败",
   },
+  members: {
+    notice: "成员信息读取失败，未启动任务。",
+    row: "成员信息读取失败",
+    classCode: "member-read",
+    fallback: "成员信息读取失败",
+  },
   binding: {
     notice: "任务未启动：绑定的工作目录或会话不可用",
     row: "绑定不可用",
@@ -65,15 +71,32 @@ const KIND_WORDS: Record<TaskFailureKind, {
   },
 };
 
+function safeMemberFailureDetail(error: unknown): string {
+  let message = "";
+  try {
+    message = error instanceof Error ? error.message : "";
+  } catch {
+    return "成员 API 请求失败";
+  }
+  if (message === "成员 API 查询超时") return "成员 API 查询超时";
+  if (message === "成员 API 响应格式无效") return "成员 API 响应格式无效";
+  if (message === "线程成员查询身份无效") return "成员查询目标无效";
+  return "成员 API 请求失败";
+}
+
 function describeTaskFailure(kind: TaskFailureKind, code: string | undefined, error: unknown): TaskFailure {
   const words = KIND_WORDS[kind];
   const resolved = code ?? words.classCode;
-  const detail = failureText(error, words.fallback);
+  // Member API errors are external response bodies; only fixed, recognized classifications may
+  // enter logs or durable task rows.
+  const detail = kind === "members"
+    ? safeMemberFailureDetail(error)
+    : failureText(error, words.fallback);
   return {
     kind,
     code: resolved,
     detail,
-    notice: kind === "context" || kind === "generic"
+    notice: kind === "context" || kind === "members" || kind === "generic"
       ? words.notice
       : `${words.notice}（${resolved}）。`,
     row: `${words.row}（${resolved}）：${detail}`,
@@ -81,18 +104,26 @@ function describeTaskFailure(kind: TaskFailureKind, code: string | undefined, er
 }
 
 /**
- * Classifies a failure raised before a worker existed. A typed code wins; without one the phase
- * decides, because a group context failure is the only class that describes "we never got as far
- * as the worker".
+ * A typed worker startup error wins except during member reads, whose external error details are
+ * never trusted as log or task-row content.
  */
 export function classifyStartupFailure(error: unknown, phase: TaskStartupPhase): TaskFailure {
-  if (error instanceof TaskStartupError) {
+  if (phase !== "members" && error instanceof TaskStartupError) {
     return describeTaskFailure(BINDING_CODES[error.code] === true ? "binding" : "worker", error.code, error);
   }
-  return describeTaskFailure(phase === "context" ? "context" : "worker", undefined, error);
+  const kind = phase === "context"
+    ? "context"
+    : phase === "members"
+      ? "members"
+      : "worker";
+  return describeTaskFailure(kind, undefined, error);
 }
 
-/** Classifies a failure raised after the worker existed: the chat notice stays the generic one. */
+/** A failure raised after the worker existed includes its original exception message in chat. */
 export function classifyTaskFailure(error: unknown): TaskFailure {
-  return describeTaskFailure("generic", undefined, error);
+  const failure = describeTaskFailure("generic", undefined, error);
+  return {
+    ...failure,
+    notice: `${failure.notice}\n${error instanceof Error ? error.message : String(error)}`,
+  };
 }

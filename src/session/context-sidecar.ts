@@ -2,6 +2,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { chmod, mkdir, open, readFile, rename, rm, unlink, type FileHandle } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { ChatTarget, ContextInjection, GroupContext } from "../contracts.ts";
+import { agentContextFromUnknown, type AgentContext } from "./agent-context.ts";
 
 export const CONTEXT_SIDECAR_SCHEMA_VERSION = 1 as const;
 
@@ -30,17 +31,37 @@ export interface ContextSidecar {
   botUid: string;
   target: ChatTarget;
   sessionId: string;
+  turnId?: string;
   snapshot: GroupContext;
   injectionDecision: InjectionDecision;
   attemptId: string;
   marker: ContextSidecarMarker;
   previousVersion?: number;
   prepared?: ContextPreparedReceipt;
+  agentContext?: AgentContext;
+}
+
+export interface StagedAgentContext {
+  messageId: string;
+  text: string;
+  agentContext: AgentContext;
+}
+
+export interface AgentContextOverlay {
+  botUid: string;
+  target: ChatTarget;
+  sessionId: string;
+  turnId: string;
+  attemptId: string;
+  agentContext: AgentContext;
+  pending: StagedAgentContext[];
 }
 
 const SIDECAR_FILE_PREFIX = "context-";
 const SIDECAR_FILE_SUFFIX = ".json";
 const BOUND_SESSION_FILE = "bound-session.json";
+const AGENT_CONTEXT_OVERLAY_SCHEMA_VERSION = 1 as const;
+const AGENT_CONTEXT_OVERLAY_SUFFIX = ".agent-context.json";
 
 /**
  * The session the host is currently driving inside this scope.  One worker
@@ -73,7 +94,7 @@ function safeVersion(value: unknown, field: string): number {
 
 function targetFromUnknown(value: unknown, field: string): ChatTarget {
   if (!isContextSidecarObject(value)
-    || (value.channelType !== 2 && value.channelType !== 5)
+    || (value.channelType !== 1 && value.channelType !== 2 && value.channelType !== 5)
     || typeof value.channelId !== "string"
     || value.channelId.length === 0) {
     throw new Error(`context sidecar ${field} is invalid`);
@@ -146,6 +167,7 @@ function assertSidecarIdentity(sidecar: ContextSidecar): void {
   requiredNonEmptyString(sidecar.botUid, "botUid");
   requiredNonEmptyString(sidecar.sessionId, "sessionId");
   requiredNonEmptyString(sidecar.attemptId, "attemptId");
+  if (sidecar.turnId !== undefined) requiredNonEmptyString(sidecar.turnId, "turnId");
   const target = targetFromUnknown(sidecar.target, "target");
   const snapshot = snapshotFromUnknown(sidecar.snapshot);
   if (sidecar.injectionDecision !== "initial"
@@ -177,17 +199,22 @@ function sidecarForValidation(value: unknown): ContextSidecar {
   const target = targetFromUnknown(value.target, "target");
   const marker = markerFromUnknown(value.marker);
   const prepared = value.prepared === undefined ? undefined : preparedFromUnknown(value.prepared);
+  const agentContext = value.agentContext === undefined
+    ? undefined
+    : agentContextFromUnknown(value.agentContext);
   const sidecar: ContextSidecar = {
     schemaVersion: value.schemaVersion as typeof CONTEXT_SIDECAR_SCHEMA_VERSION,
     botUid: requiredNonEmptyString(value.botUid, "botUid"),
     target,
     sessionId: requiredNonEmptyString(value.sessionId, "sessionId"),
+    ...(value.turnId === undefined ? {} : { turnId: requiredNonEmptyString(value.turnId, "turnId") }),
     snapshot,
     injectionDecision: value.injectionDecision as InjectionDecision,
     attemptId: requiredNonEmptyString(value.attemptId, "attemptId"),
     marker,
     ...(value.previousVersion === undefined ? {} : { previousVersion: safeVersion(value.previousVersion, "previous version") }),
     ...(prepared === undefined ? {} : { prepared }),
+    ...(agentContext === undefined ? {} : { agentContext }),
   };
   assertSidecarIdentity(sidecar);
   return sidecar;
@@ -223,6 +250,11 @@ export function contextSidecarFileName(realSessionId: string): string {
 export function contextSidecarPath(sidecarRoot: string, realSessionId: string): string {
   requiredNonEmptyString(sidecarRoot, "sidecar root");
   return join(resolve(sidecarRoot), contextSidecarFileName(realSessionId));
+}
+
+export function agentContextOverlayPath(sidecarPath: string): string {
+  requiredNonEmptyString(sidecarPath, "sidecar path");
+  return `${resolve(sidecarPath)}${AGENT_CONTEXT_OVERLAY_SUFFIX}`;
 }
 
 export function boundSessionPath(sidecarRoot: string): string {
@@ -308,6 +340,7 @@ export async function writeContextSidecar(
   await ensurePrivateDirectory(root);
   const path = contextSidecarPath(root, sidecar.sessionId);
   await atomicWriteJson(path, sidecar);
+  await removeAgentContextOverlay(path).catch(() => {});
   return path;
 }
 
@@ -364,6 +397,90 @@ export async function readContextSidecar(path: string): Promise<ContextSidecar> 
   return sidecarForValidation(value);
 }
 
+export async function readAgentContextOverlay(
+  path: string,
+  sidecar: ContextSidecar,
+): Promise<AgentContextOverlay | undefined> {
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(agentContextOverlayPath(path), "utf8")) as unknown;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return undefined;
+    throw new Error(`context sidecar agent context could not be read: ${error instanceof Error ? error.message : "invalid JSON"}`);
+  }
+  if (!isContextSidecarObject(value) || value.schemaVersion !== AGENT_CONTEXT_OVERLAY_SCHEMA_VERSION) {
+    throw new Error("context sidecar agent context is invalid");
+  }
+  const botUid = requiredNonEmptyString(value.botUid, "agent context botUid");
+  const target = targetFromUnknown(value.target, "agent context target");
+  const sessionId = requiredNonEmptyString(value.sessionId, "agent context sessionId");
+  const turnId = requiredNonEmptyString(value.turnId, "agent context turnId");
+  const attemptId = requiredNonEmptyString(value.attemptId, "agent context attemptId");
+  if (
+    botUid !== sidecar.botUid
+    || sessionId !== sidecar.sessionId
+    || target.channelType !== sidecar.target.channelType
+    || target.channelId !== sidecar.target.channelId
+  ) {
+    throw new Error("context sidecar agent context identity does not match");
+  }
+  if (sidecar.turnId === undefined || turnId !== sidecar.turnId || attemptId !== sidecar.attemptId) {
+    return undefined;
+  }
+  if (!Array.isArray(value.pending)) throw new Error("context sidecar staged agent context is invalid");
+  const pending = value.pending.map((entry): StagedAgentContext => {
+    if (!isContextSidecarObject(entry)) throw new Error("context sidecar staged agent context is invalid");
+    return {
+      messageId: requiredNonEmptyString(entry.messageId, "staged messageId"),
+      text: requiredNonEmptyString(entry.text, "staged text"),
+      agentContext: agentContextFromUnknown(entry.agentContext),
+    };
+  });
+  return {
+    botUid,
+    target,
+    sessionId,
+    turnId,
+    attemptId,
+    agentContext: agentContextFromUnknown(value.agentContext),
+    pending,
+  };
+}
+
+export async function writeAgentContextOverlay(
+  path: string,
+  sidecar: ContextSidecar,
+  agentContext: AgentContext,
+  pending: readonly StagedAgentContext[],
+): Promise<void> {
+  assertSidecarIdentity(sidecar);
+  if (sidecar.turnId === undefined) throw new Error("context sidecar turn ID is missing");
+  const normalizedPending = pending.map((entry): StagedAgentContext => {
+    if (typeof entry.messageId !== "string" || entry.messageId.length === 0 || typeof entry.text !== "string") {
+      throw new Error("context sidecar staged agent context is invalid");
+    }
+    return {
+      messageId: entry.messageId,
+      text: entry.text,
+      agentContext: agentContextFromUnknown(entry.agentContext),
+    };
+  });
+  await atomicWriteJson(agentContextOverlayPath(path), {
+    schemaVersion: AGENT_CONTEXT_OVERLAY_SCHEMA_VERSION,
+    botUid: sidecar.botUid,
+    target: { ...sidecar.target },
+    sessionId: sidecar.sessionId,
+    turnId: sidecar.turnId,
+    attemptId: sidecar.attemptId,
+    agentContext: agentContextFromUnknown(agentContext),
+    pending: normalizedPending,
+  });
+}
+
+export async function removeAgentContextOverlay(path: string): Promise<void> {
+  await removeFileIfPresent(agentContextOverlayPath(path));
+}
+
 /** Add only the extension's matching receipt; snapshot and marker remain unchanged. */
 export async function writePreparedReceipt(
   path: string,
@@ -385,12 +502,21 @@ export async function writePreparedReceipt(
   return next;
 }
 
-export async function removeContextSidecar(path: string): Promise<void> {
+
+async function removeFileIfPresent(path: string): Promise<void> {
   try {
     await unlink(path);
   } catch (error) {
     if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
   }
+}
+export async function removeContextSidecar(path: string): Promise<void> {
+  const results = await Promise.allSettled([
+    removeFileIfPresent(path),
+    removeAgentContextOverlay(path),
+  ]);
+  const failure = results.find((result) => result.status === "rejected");
+  if (failure?.status === "rejected") throw failure.reason;
 }
 
 export const clearContextSidecar = removeContextSidecar;

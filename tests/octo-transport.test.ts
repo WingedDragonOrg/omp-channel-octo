@@ -590,6 +590,7 @@ describe("Octo text send and target context", () => {
     expect(currentFixture.getLatestEditedText(receipt.messageId!)).toBe("");
   });
 
+
   test("enforces the 3000-byte UTF-8 limit for type-1 edits", async () => {
     fixture = await createOctoProtocolFixture();
     transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });

@@ -28,6 +28,8 @@ export interface TaskEventsDeps {
   control: TaskEventControl;
   /** 服务是否已进入关停：关停后到达的事件一律丢弃。 */
   stopping: () => boolean;
+  /** Enable structured mentions for assistant text, independently of notice delivery. */
+  parseAssistantMentions: boolean;
   outbox: Pick<Outbox, "enqueueStreamText">;
   progress: Pick<TaskProgress, "apply">;
   /**
@@ -104,7 +106,12 @@ export class TaskEvents {
       // 空 messageId 一律丢弃；空 final 文本仍更新聚合与出站（收尾帧照常落编辑）。
       if (event.messageId.trim().length === 0 || (event.text.length === 0 && !event.final)) return;
       this.assistantTexts.set(event.messageId, event.text);
-      this.deps.outbox.enqueueStreamText(this.deps.target, this.deps.taskId, event);
+      this.deps.outbox.enqueueStreamText(
+        this.deps.target,
+        this.deps.taskId,
+        event,
+        { parseMentions: this.deps.parseAssistantMentions },
+      );
       return;
     }
     if (event.type === "steer_consumed") {

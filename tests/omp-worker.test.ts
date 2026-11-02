@@ -77,6 +77,7 @@ async function withHarness<T>(
 	options: {
 		descendantDelayMs?: number;
 		sessionFile?: string;
+		contextScope?: WorkerOptions["contextScope"];
 		envReport?: boolean;
 		cliEnv?: () => Record<string, string> | undefined;
 		model?: string;
@@ -125,6 +126,7 @@ async function withHarness<T>(
 		cwd: tempDir,
 		sessionDir: tempDir,
 		...(requestedSessionFile === undefined ? {} : { sessionFile: requestedSessionFile }),
+		...(options.contextScope === undefined ? {} : { contextScope: options.contextScope }),
 		...(options.model === undefined ? {} : { model: options.model }),
 		onSpawn: processInfo => {
 			spawned = processInfo;
@@ -331,6 +333,20 @@ describe("OMP RPC worker", () => {
 			expect(argumentValue(startup.argv, "--cwd")).toBe(harness.tempDir);
 			expect(argumentValue(startup.argv, "--session-dir")).toBe(harness.tempDir);
 		});
+	});
+	test("forwards direct-message context scope to the real OMP child environment", async () => {
+		const contextScope: WorkerOptions["contextScope"] = {
+			sidecarRoot: "/tmp/omp-context-sidecars/direct-message",
+			botUid: "bot-context-direct-message",
+			target: { channelType: 1, channelId: "owner-direct-message" },
+		};
+		await withHarness("normal", async harness => {
+			const childEnv = JSON.parse(await readFile(harness.envPath, "utf8")) as Record<string, string>;
+			expect(childEnv["OMP_CHANNEL_OCTO_CONTEXT_ROOT"]).toBe(contextScope.sidecarRoot);
+			expect(childEnv["OMP_CHANNEL_OCTO_CONTEXT_BOT_UID"]).toBe(contextScope.botUid);
+			expect(childEnv["OMP_CHANNEL_OCTO_CONTEXT_CHANNEL_TYPE"]).toBe("1");
+			expect(childEnv["OMP_CHANNEL_OCTO_CONTEXT_CHANNEL_ID"]).toBe("owner-direct-message");
+		}, { envReport: true, contextScope });
 	});
 	test("carries the CLI credential names into the child and strips every other OCTO_ variable", async () => {
 		const hostToken = Bun.env["OCTO_BOT_TOKEN"];

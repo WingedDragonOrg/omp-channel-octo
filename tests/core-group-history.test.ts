@@ -12,8 +12,8 @@ import {
 } from "./fixtures/core-fakes";
 
 const GROUP: ChatTarget = { channelId: "group-a", channelType: 2 };
-const THREAD: ChatTarget = { channelId: "thread-1", channelType: 5 };
-const GROUP_IDS = ["group-a", "thread-1"];
+const THREAD: ChatTarget = { channelId: "group-a____thread-1", channelType: 5 };
+const GROUP_IDS = ["group-a"];
 const T0 = Date.UTC(2026, 8, 16, 5, 0);
 
 interface LedgerRow {
@@ -643,6 +643,34 @@ test("keeps private chats and threads out of each other's history", async () => 
     expect(rows).toHaveLength(2);
     expect(rows.map((row) => row.last_seq).sort()).toEqual([2, 3]);
     expect(rows.every((row) => row.phase === "committed")).toBe(true);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("an explicitly allowed malformed thread target fails closed before member and history reads", async () => {
+  const malformedThread: ChatTarget = { channelId: "thread-1", channelType: 5 };
+  const harness = await createCoreHarness({
+    groupHistory: { enabled: true, maxMessages: 5 },
+    allowedGroupIds: [malformedThread.channelId],
+  });
+  try {
+    await harness.service.handleInbound(
+      triggerMessage(harness, 1, "@bot malformed thread task", malformedThread),
+    );
+    const status = await waitForStatus(
+      harness.service,
+      malformedThread,
+      (next) => next.state === "failed",
+    );
+
+    expect(status.state).toBe("failed");
+    expect(harness.workers.prompts).toHaveLength(0);
+    expect(
+      harness.transport.managementCalls.filter(({ action }) => action.endsWith("-members")),
+    ).toEqual([]);
+    expect(harness.transport.historyCalls).toEqual([]);
+    expect(ledgerRows(harness)).toEqual([]);
   } finally {
     await closeCoreHarness(harness);
   }

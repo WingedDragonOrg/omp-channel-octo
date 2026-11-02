@@ -228,9 +228,15 @@ test("a steered message keeps one renewal loop running and it stops at completio
     vi.advanceTimersByTime(3_000);
     await Promise.resolve();
     expect(harness.transport.typingCalls).toHaveLength(beforeSteer + 1);
+    vi.advanceTimersByTime(1_000);
     await harness.service.handleInbound({ ...chat, messageId: "steer-2", text: "second message" });
+    // 新消息会清除客户端 typing；已有任务的续期环也必须立即补发，不能等下一 tick。
+    expect(harness.transport.typingCalls).toHaveLength(beforeSteer + 2);
     const afterSteer = harness.transport.typingCalls.length;
-    vi.advanceTimersByTime(3_000);
+    vi.advanceTimersByTime(2_000);
+    await Promise.resolve();
+    expect(harness.transport.typingCalls).toHaveLength(afterSteer);
+    vi.advanceTimersByTime(1_000);
     await Promise.resolve();
     // 合并进运行中的回合后：消息租约释放，仍只有运行任务的一条环在续期。
     expect(harness.transport.typingCalls).toHaveLength(afterSteer + 1);
@@ -261,6 +267,7 @@ test("a queued task stays typed through the wait on exactly one loop until its t
     await harness.service.handleInbound({ ...chat, messageId: "queue-1", text: "first task" });
     await harness.workers.waitForPromptCount(1);
     await harness.service.handleInbound({ ...chat, messageId: "queue-2", text: "second task" });
+    expect(harness.transport.typingCalls).toHaveLength(2);
     const waiting = harness.transport.typingCalls.length;
     vi.advanceTimersByTime(3_000);
     await Promise.resolve();

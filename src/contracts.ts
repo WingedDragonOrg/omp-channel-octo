@@ -238,12 +238,14 @@ export interface ChannelTransport {
     text: string,
     clientMsgNo: string,
     signal?: AbortSignal,
+    mention?: TextMention,
   ): Promise<SendReceipt>;
   editText(
     target: ChatTarget,
     messageId: string,
     text: string,
     signal?: AbortSignal,
+    mention?: TextMention,
   ): Promise<void>;
   sendTyping(target: ChatTarget, signal?: AbortSignal): Promise<void>;
   sendProgressCard(
@@ -348,6 +350,11 @@ export interface ThreadSummary {
 }
  
 export type ProgressCard = ExecutionSnapshot;
+export interface TextMention {
+  uids: string[];
+  entities: Array<{ uid: string; offset: number; length: number }>;
+}
+
 
 export interface TextEvent {
   type: "text";
@@ -712,6 +719,8 @@ export interface AllowlistWriteback {
 
 export interface CliCredentialPort {
   provision(botUid: string): Promise<void>;
+  /** Actual worker CLI identity, undefined until per-bot provisioning has succeeded. */
+  env(): Record<string, string> | undefined;
 }
 
 export interface RestartPort {

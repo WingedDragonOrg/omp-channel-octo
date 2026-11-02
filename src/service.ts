@@ -2,6 +2,7 @@ import { GroupHistoryCoordinator } from "./inbound/history-coordinator.ts";
 import { ModelSwitchController } from "./commands/model-controller.ts";
 import { CONFIG_CARD_ACTION_PREFIX, createConfigMenuDesk, type ConfigMenuDesk } from "./commands/command-cards.ts";
 import { ProgressCards } from "./cards/progress-cards.ts";
+import { CHAT_GRANT_ACTION_PREFIX } from "./cards/chat-grant-card.ts";
 import {
   isCommand,
   normalizeCommandHandlers,
@@ -20,6 +21,7 @@ import {
   sweepAttachments,
 } from "./inbound/attachments.ts";
 import { ChatAuthorization } from "./inbound/chat-authorization.ts";
+import { createChatGrantDesk, type ChatGrantDesk } from "./inbound/chat-grants.ts";
 import { acquireBotLock, assertBotLockFree, type LockHandle } from "./runtime/bot-lock.ts";
 import { openTrackedWorker, type TrackedWorker, type WorkerSession } from "./runtime/worker-lease.ts";
 import { TaskStartupError } from "./contracts.ts";
@@ -42,6 +44,8 @@ import type {
 } from "./contracts.ts";
 import { DEFAULT_ASK_TIMEOUT_MS } from "./contracts.ts";
 import { TurnContext } from "./session/turn-context.ts";
+import { memberSnapshotFor, normalizeAgentMembers, type AgentContext, type AgentMemberSnapshot } from "./session/agent-context.ts";
+import { threadShortId, threadParentGroupId } from "./threads/thread-target.ts";
 import { createBotEventLoop, type BotEventLoop } from "./bot-events.ts";
 import { createOutboxDelivery, type Outbox } from "./outbox.ts";
 import { createHostTools, type HostToolHost } from "./host-tools.ts";
@@ -56,7 +60,7 @@ import {
 } from "./session/project-session.ts";
 import { ensureProjectSessionDir, sessionsRoot } from "./session/session-dir.ts";
 import { ChannelStore, openChannelStore } from "./store/index.ts";
-import type { BindingRecord, TaskRecord } from "./store/store-records.ts";
+import type { BindingRecord, InboundClaim, TaskRecord } from "./store/store-records.ts";
 import { isGroupTarget, targetKey, taskTarget } from "./target.ts";
 import { createTypingLeaseManager, type TypingLeaseManager } from "./typing-lease.ts";
 import { createDisplayNameCache, type DisplayNameCache } from "./display-name.ts";
@@ -144,12 +148,15 @@ const UNCERTAIN_RECOVERY_NOTICE =
   "任务未自动恢复：无法确认 OMP 是否已接受该输入，请核对会话后继续。";
 const RESEARCH_HISTORY_EMPTY_TEXT =
   "本聊天还没有可导出的研究记录：先让任务运行 /autoresearch 并完成记录后再试。";
+const MEMBER_LOOKUP_TIMEOUT_MS = 5_000;
+const MEMBER_LOOKUP_FAILURE_STEER_NOTICE = "成员信息读取失败，本条消息未并入当前回合。";
 type RuntimeTask = {
   taskId: string;
   target: ChatTarget;
   cwd: string;
   lease?: TrackedWorker;
   cancelRequested: boolean;
+  cancelController: AbortController;
   cancelReplySent: boolean;
   /**
    * 停机挂起：关停时置位，`runTask` 据此不把中断当成任务失败/取消——行保留 prompt 标记，
@@ -167,6 +174,10 @@ type RuntimeTask = {
   workAfterStop: boolean;
   /** Steered messages not yet observed as consumed, in delivery order (OMP's queue is FIFO). */
   steerDeliveries: { text: string }[];
+  /** Serializes each member lookup, sidecar publication and worker delivery in input order. */
+  steerSerial: Promise<void>;
+  turnContext: TurnContext;
+  agentContext?: AgentContext;
   stopActivity?: (abortProgress?: boolean) => void;
   stopText?: () => void;
   /** Closes the progress card of the round that just ended; a steered message starts a new round. */
@@ -181,6 +192,9 @@ function receiptText(prefix: string, text: string): string {
     ? `${excerpt.slice(0, RECEIPT_EXCERPT_CHARS)}…`
     : excerpt;
   return `${prefix} ▸ ${bounded}`;
+}
+function isNativeRetryPrompt(text: string): boolean {
+  return /^\/retry(?:\s|$)/u.test(text.trimStart());
 }
 
 function statusState(task: TaskRecord | null, hasBinding: boolean): ChatExecutionState {
@@ -197,6 +211,8 @@ class CoreService implements ChannelService {
   private readonly models: ModelSwitchController;
   /** `/switch`、`/mode` 配置卡片的进程内会话：绑定、owner 校验、应用串行与有界回收都在它内部。 */
   private readonly configMenus: ConfigMenuDesk;
+  /** Owner-confirmed unlisted-chat cards and their durable SQLite grant operations. */
+  private readonly chatGrants: ChatGrantDesk;
   private readonly authorization: ChatAuthorization;
   private readonly materializer: InboundMaterializer;
   private readonly progressCards: ProgressCards;
@@ -225,6 +241,8 @@ class CoreService implements ChannelService {
   /** typing 租约：agent-attached 消息从门后到任务终态的持续「正在输入」。 */
   private readonly typingLeases: TypingLeaseManager;
   private bot: BotIdentity | undefined;
+  /** Captured after per-bot credential provisioning; never inferred from CLI installation. */
+  private cliIdentityReady = false;
   private readonly activityOperations = new Set<Promise<void>>();
   /**
    * 恢复任务先占调度序、后执行所等的启动门：`start()` 接线全部成功才放行，失败即拒绝，
@@ -297,7 +315,6 @@ class CoreService implements ChannelService {
       store: this.store,
       botUid: () => this.bot?.uid,
       stopping: () => this.stopping,
-      hasRuntimeInDirectory: cwd => this.hasRuntimeInDirectory(cwd),
       isDirectoryBlocked: cwd => this.blockedDirectories.has(cwd),
       reconcileBinding: (taskId, target, binding) =>
         this.reconcileTaskBinding(taskId, target, binding),
@@ -314,7 +331,7 @@ class CoreService implements ChannelService {
       hasRuntime: target => this.hasRuntime(target),
       isDirectoryBlocked: cwd => this.blockedDirectories.has(cwd),
       blockDirectory: cwd => { this.blockedDirectories.add(cwd); },
-      tryAcquireCommandDirectories: cwds => this.scheduler.tryAcquireCommandDirectories(cwds),
+      tryAcquireCommandSession: (target, cwds) => this.scheduler.tryAcquireCommandSession(target, cwds),
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
     });
     this.typingLeases = createTypingLeaseManager({
@@ -336,6 +353,16 @@ class CoreService implements ChannelService {
       rootDir: researchReportsRoot(options.config.stateDir),
       spoolRootDir: join(options.config.stateDir, "spool"),
     });
+    this.chatGrants = createChatGrantDesk({
+      store: this.store,
+      transport: options.transport,
+      bot: () => this.bot,
+      stopping: () => this.stopping,
+      shutdownSignal: this.shutdownController.signal,
+      allowlistWriteback: options.allowlistWriteback,
+      isChatPermitted: (target) => this.authorization.isPermittedChat(target),
+      enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
+    });
     this.authorization = new ChatAuthorization({
       bot: () => this.bot,
       allowedGroupIds: options.config.allowedGroupIds,
@@ -345,6 +372,7 @@ class CoreService implements ChannelService {
       shutdownSignal: this.shutdownController.signal,
       commandClaim: (message, name) => this.commandClaim(message, name),
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
+      offerUnlistedChat: (message, bot) => this.chatGrants.offer(message, bot),
     });
     this.materializer = new InboundMaterializer({
       config: this.options.config,
@@ -381,11 +409,14 @@ class CoreService implements ChannelService {
       transport: this.options.transport,
       botUid: () => this.bot?.uid,
       stopping: () => this.stopping,
-      // 配置卡片的点击只进配置会话（绑定校验、owner 判定与应用都在那里），其余 action 一律
-      // 交给问答卡；两条路径互不创建对方的行或任务。
-      onCardAction: (action) => action.actionId.startsWith(CONFIG_CARD_ACTION_PREFIX)
+      // Each card family has its own binding and effect boundary; unknown actions remain ask-card only.
+      onCardAction: (action, eventId) => action.actionId.startsWith(CONFIG_CARD_ACTION_PREFIX)
         ? this.configMenus.handleAction(action)
-        : this.questions.answerFromCard(action),
+        : action.actionId.startsWith(CHAT_GRANT_ACTION_PREFIX)
+          ? this.chatGrants.handleAction(eventId, action)
+          : this.questions.answerFromCard(action),
+      onCardActionRetriesExhausted: (action, eventId) =>
+        this.chatGrants.onRetriesExhausted(eventId, action),
     });
     this.threadArchives = new ThreadArchiveScheduler({
       store: this.store,
@@ -465,13 +496,23 @@ class CoreService implements ChannelService {
     this.bot = identity;
     try {
       this.store.setBotUid(identity.uid);
-      // The agent's own Octo identity: the per-bot octo-cli store every later worker inherits.
-      // Best effort by contract - a missing CLI must not keep the channel from starting.
-      await this.options.cliCredentials?.provision(identity.uid).catch((error: unknown) => {
-        console.error(
-          `[octo-cli] 凭据准备失败：${error instanceof Error ? error.message : String(error)}`,
-        );
-      });
+      this.cliIdentityReady = false;
+      const cliCredentials = this.options.cliCredentials;
+      if (cliCredentials) {
+        try {
+          await cliCredentials.provision(identity.uid);
+          const env = cliCredentials.env();
+          this.cliIdentityReady = typeof env?.OCTO_CONFIG_DIR === "string"
+            && env.OCTO_CONFIG_DIR.trim().length > 0
+            && typeof env.OCTO_API_BASE_URL === "string"
+            && env.OCTO_API_BASE_URL.trim().length > 0
+            && env.OCTO_BOT_ID === identity.uid;
+        } catch (error) {
+          console.error(
+            `[octo-cli] 凭据准备失败：${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
       // 附件目录按 14 天保留期清理；best-effort，清理失败不影响启动。
       await sweepAttachments(this.options.config.stateDir, ATTACHMENT_MAX_AGE_MS).catch(() => 0);
       const configuredOwner =
@@ -535,6 +576,7 @@ class CoreService implements ChannelService {
         },
       );
       if (this.stopping) throw new Error("channel 正在停止");
+      await this.chatGrants.recoverPending(identity.uid);
       this.outbox.flushAll();
       this.botEvents.start();
       this.startupGate.resolve();
@@ -684,6 +726,14 @@ class CoreService implements ChannelService {
     const text = message.text.trim();
     if (this.store.hasOwnerEnrollment(this.bot.uid, message, message.messageId)) return;
     let ownerId = this.store.getOwnerId(this.bot.uid)?.trim() || null;
+    if (this.authorization.isOwnerMentionedGrantPassphrase(message, ownerId)) {
+      const claimState = this.store.getCommandClaimState(this.bot.uid, message, message.messageId);
+      if (claimState === "pending" || claimState === "completed") return;
+      if (claimState === "failed") {
+        await this.authorization.retryClaimedOwnerGrant(message, ownerId);
+        return;
+      }
+    }
     if (
       !ownerId &&
       message.channelType === 1 &&
@@ -862,13 +912,7 @@ class CoreService implements ChannelService {
     return false;
   }
 
-  /** 该 cwd 是否有进程内运行任务：调度侧的目录判定遍历同一份 runtimes。 */
-  private hasRuntimeInDirectory(cwd: string): boolean {
-    for (const runtime of this.runtimes.values()) {
-      if (runtime.cwd === cwd) return true;
-    }
-    return false;
-  }
+
 
   /** The chat's task whose OMP prompt is currently in flight, if any. */
   private runningRuntime(target: ChatTarget): RuntimeTask | undefined {
@@ -888,17 +932,69 @@ class CoreService implements ChannelService {
     return undefined;
   }
 
-  private async deliverSteer(target: ChatTarget, text: string): Promise<boolean> {
-    const runtime = this.runningRuntime(target);
-    if (!runtime?.lease) return false;
-    // Recorded before the request so the delivery order matches the RPC command order even when
-    // two appends race; a refused frame removes its own entry.
+  private async fetchMemberSnapshot(
+    target: ChatTarget,
+    cancelSignal?: AbortSignal,
+  ): Promise<AgentMemberSnapshot> {
+    const controller = new AbortController();
+    const signals = cancelSignal === undefined
+      ? [controller.signal, this.shutdownController.signal]
+      : [controller.signal, this.shutdownController.signal, cancelSignal];
+    const signal = AbortSignal.any(signals);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let removeAbortListener = (): void => {};
+    const aborted = new Promise<never>((_, reject) => {
+      const rejectAborted = (): void => {
+        reject(signal.reason ?? new Error("成员 API 请求已取消"));
+      };
+      if (signal.aborted) rejectAborted();
+      else {
+        signal.addEventListener("abort", rejectAborted, { once: true });
+        removeAbortListener = () => signal.removeEventListener("abort", rejectAborted);
+      }
+    });
+    timer = setTimeout(
+      () => controller.abort(new Error("成员 API 查询超时")),
+      MEMBER_LOOKUP_TIMEOUT_MS,
+    );
+    try {
+      if (signal.aborted) throw signal.reason ?? new Error("成员 API 请求已取消");
+      let request: Promise<unknown>;
+      if (target.channelType === 2) {
+        request = this.options.transport.getGroupMembers(target.channelId, signal);
+      } else if (target.channelType === 5) {
+        const groupId = threadParentGroupId(target.channelId);
+        const shortId = threadShortId(target.channelId);
+        if (groupId === null || shortId === null) throw new Error("线程成员查询身份无效");
+        request = this.options.transport.getThreadMembers(groupId, shortId, signal);
+      } else {
+        throw new Error("私聊不读取成员");
+      }
+      const response = await Promise.race([request, aborted]);
+      return memberSnapshotFor(target, normalizeAgentMembers(response));
+    } finally {
+      clearTimeout(timer);
+      removeAbortListener();
+    }
+  }
+
+  private canDeliverSteer(runtime: RuntimeTask): boolean {
+    return this.runtimes.get(runtime.taskId) === runtime
+      && runtime.promptInFlight
+      && runtime.lease !== undefined
+      && !runtime.cancelRequested
+      && runtime.stopCause !== "question"
+      && !runtime.suspended
+      && !this.stopping;
+  }
+
+  private async deliverSteer(runtime: RuntimeTask, text: string): Promise<boolean> {
+    if (!this.canDeliverSteer(runtime) || !runtime.lease) return false;
     const delivery = { text };
     runtime.steerDeliveries.push(delivery);
     if (runtime.steerDeliveries.length > MAX_PENDING_STEERS) runtime.steerDeliveries.shift();
     try {
       await runtime.lease.worker.steer(text);
-      // The message starts a new round: its progress belongs below the message, not above it.
       runtime.rollProgressCard?.();
       return true;
     } catch {
@@ -907,12 +1003,6 @@ class CoreService implements ChannelService {
       return false;
     }
   }
-
-  /**
-   * A steered message left OMP's queue and joined the running turn's context. The queue is FIFO
-   * and this channel is its only user-attributed producer, so the consumption follows the
-   * delivery order; a mismatch is worth a log line but never changes the answer already sent.
-   */
   private noteSteerConsumed(runtime: RuntimeTask, event: SteerConsumedEvent): void {
     const delivered = runtime.steerDeliveries.shift();
     if (delivered === undefined) {
@@ -924,13 +1014,110 @@ class CoreService implements ChannelService {
     this.outbox.enqueueText(runtime.target, receiptText("已并入当前回合", event.text), null);
   }
 
+  private async deliverSteeringMessage(
+    runtime: RuntimeTask,
+    message: InboundMessage,
+    text: string,
+    claim: InboundClaim,
+  ): Promise<boolean> {
+    if (!this.canDeliverSteer(runtime)) {
+      if (runtime.cancelRequested) {
+        this.store.completeCommand(claim);
+        return true;
+      }
+      this.store.releaseClaim(claim);
+      return false;
+    }
+
+    let previousContext: AgentContext | undefined;
+    let contextUpdated = false;
+    let contextStaged = false;
+    if (isGroupTarget(runtime.target)) {
+      try {
+        const guideInDeveloper = runtime.agentContext?.guideInDeveloper ?? false;
+        const nextContext: AgentContext = isNativeRetryPrompt(text)
+          ? { cliReady: this.cliIdentityReady, guideInDeveloper }
+          : {
+              cliReady: this.cliIdentityReady,
+              guideInDeveloper,
+              memberSnapshot: await this.fetchMemberSnapshot(
+                runtime.target,
+                runtime.cancelController.signal,
+              ),
+            };
+        if (!this.canDeliverSteer(runtime)) {
+          if (runtime.cancelRequested) {
+            this.store.completeCommand(claim);
+            return true;
+          }
+          this.store.releaseClaim(claim);
+          return false;
+        }
+        if (isNativeRetryPrompt(text)) {
+          previousContext = await runtime.turnContext.updateAgentContext(nextContext);
+          contextUpdated = true;
+        } else {
+          previousContext = await runtime.turnContext.stageAgentContext(message.messageId, text, nextContext);
+          contextStaged = true;
+        }
+        runtime.agentContext = nextContext;
+      } catch {
+        if (this.stopping) {
+          this.store.releaseClaim(claim);
+          return true;
+        }
+        if (runtime.cancelRequested) {
+          this.store.completeCommand(claim);
+          return true;
+        }
+        const noMembers: AgentContext = {
+          cliReady: this.cliIdentityReady,
+          guideInDeveloper: runtime.agentContext?.guideInDeveloper ?? false,
+        };
+        await runtime.turnContext.updateAgentContext(noMembers).catch(() => {});
+        runtime.agentContext = noMembers;
+        this.store.completeCommand(claim);
+        await this.outbox.enqueueText(runtime.target, MEMBER_LOOKUP_FAILURE_STEER_NOTICE, null);
+        return true;
+      }
+    }
+
+    if (await this.deliverSteer(runtime, text)) {
+      this.store.completeCommand(claim);
+      this.history.recordSteered(message, runtime.lease?.worker.sessionId ?? "");
+      return true;
+    }
+
+    if (contextStaged || contextUpdated) {
+      const restored: AgentContext = previousContext ?? {
+        cliReady: this.cliIdentityReady,
+        guideInDeveloper: runtime.agentContext?.guideInDeveloper ?? false,
+      };
+      if (contextStaged) {
+        await runtime.turnContext.discardStagedAgentContext(message.messageId).catch(() => {});
+      } else {
+        await runtime.turnContext.updateAgentContext(restored).catch(() => {});
+      }
+      runtime.agentContext = restored;
+    }
+    if (this.stopping) {
+      this.store.releaseClaim(claim);
+      return true;
+    }
+    if (runtime.cancelRequested) {
+      this.store.completeCommand(claim);
+      return true;
+    }
+    this.store.releaseClaim(claim);
+    return false;
+  }
+
   /**
-   * In `steer` mode a message that arrives while its chat runs an OMP prompt is injected into that
-   * turn instead of starting a second task.  Without a live streaming turn, or when OMP refuses
-   * the frame, the text becomes an ordinary durable queued task so nothing is dropped.
-   * A turn already stopped at the ask deadline is never steered: its answer must queue behind the
-   * cleanup that is reaping the process group, not ride along with a turn that is being torn down.
-   * Returns true when the message was consumed as a steering message.
+   * In `steer` mode a message that arrives while its chat runs an OMP prompt is injected into that turn
+   * instead of starting a second task.
+   * Member lookups and staged snapshots follow serialized input order; the extension exposes a
+   * snapshot only after OMP includes its steering message in model context. A member-read failure
+   * is consumed without changing the running prompt.
    */
   private async appendToRunningTask(message: InboundMessage, text: string): Promise<boolean> {
     this.throwIfStopping();
@@ -939,13 +1126,10 @@ class CoreService implements ChannelService {
     if (!runtime || runtime.stopCause === "question") return false;
     const claim = this.commandClaim(message, "steer");
     if (!this.store.claimCommand(claim)) return true;
-    if (await this.deliverSteer(message, text)) {
-      this.store.completeCommand(claim);
-      this.history.recordSteered(message, runtime.lease?.worker.sessionId ?? "");
-      return true;
-    }
-    this.store.releaseClaim(claim);
-    return false;
+    const delivery = runtime.steerSerial.then(() =>
+      this.deliverSteeringMessage(runtime, message, text, claim));
+    runtime.steerSerial = delivery.then(() => {}, () => {});
+    return await delivery;
   }
 
   private async handleInterceptingCommand(
@@ -1227,8 +1411,8 @@ class CoreService implements ChannelService {
       if (targetKey(runtime.target) !== targetKey(target)) continue;
       active = true;
       runtime.cancelRequested = true;
+      runtime.cancelController.abort(new Error("task cancelled"));
       runtime.stopText?.();
-      this.outbox.forgetTask(runtime.taskId);
       runtime.stopActivity?.();
       runtime.cancelReplySent = true;
       if (runtime.lease) {
@@ -1376,14 +1560,14 @@ class CoreService implements ChannelService {
     };
     let accepted: boolean;
     // Measured before acceptance so the new task's own row cannot count itself as the work it waits for.
-    const startsBehind = this.scheduler.hasBlockingWork(message, task.cwd);
+    const startsBehind = this.scheduler.hasBlockingWork(message);
     try {
       accepted = this.store.acceptTask(this.taskClaim(message), task);
     } catch {
       throw new Error("本地状态盘写入失败，任务未接收。");
     }
     if (!accepted) return false;
-    // 持久接受即点亮 task 租约：排队等待（同聊天或跨聊天同目录）到终态都保持「正在输入」。
+    // 持久接受即点亮 task 租约：同聊天或同会话排队等待到终态都保持「正在输入」。
     this.typingLeases.acquire(message, `task:${task.id}`);
     if (startsBehind) this.scheduler.markWaiting(task.id);
     this.scheduler.scheduleTask(task.id);
@@ -1428,7 +1612,7 @@ class CoreService implements ChannelService {
   }
 
 
-  private async runTask(taskId: string, lockedCwd?: string): Promise<void> {
+  private async runTask(taskId: string, expectedCwd?: string): Promise<void> {
     const persistedTask = this.store.getTask(taskId);
     if (!persistedTask || persistedTask.state !== "queued") return;
     const bindingAtStart = await this.reconcileTaskBinding(
@@ -1439,7 +1623,7 @@ class CoreService implements ChannelService {
     const task = bindingAtStart
       ? { ...persistedTask, cwd: bindingAtStart.cwd, sessionId: bindingAtStart.sessionId }
       : persistedTask;
-    if (lockedCwd !== undefined && task.cwd !== lockedCwd) {
+    if (expectedCwd !== undefined && task.cwd !== expectedCwd) {
       this.scheduler.takeWaitingReceipt(taskId);
       this.store.markFailed(taskId, "绑定目录在启动前再次变更，任务未启动。");
       await this.outbox.enqueueText(taskTarget(task), GENERIC_TASK_FAILURE_NOTICE, taskId);
@@ -1460,29 +1644,31 @@ class CoreService implements ChannelService {
     if (this.scheduler.takeWaitingReceipt(taskId)) {
       this.outbox.enqueueText(taskTarget(task), receiptText("开始执行排队消息", task.text), null);
     }
-    const runtime: RuntimeTask = {
-      taskId,
-      target: taskTarget(task),
-      cwd: task.cwd,
-      cancelRequested: false,
-      cancelReplySent: false,
-      suspended: false,
-      promptInFlight: false,
-      stopCause: null,
-      workAfterStop: false,
-      steerDeliveries: [],
-    };
-    this.runtimes.set(taskId, runtime);
-    const textDelivery = this.outbox.registerTask(taskId);
     const target = taskTarget(task);
-    /** 本回合的群说明事务：快照、ledger 决策与本回合 sidecar 都归它，服务只按序调用。 */
-    const turnContext = isGroupTarget(target) ? new TurnContext({
+    const turnContext = new TurnContext({
       store: this.store,
       transport: this.options.transport,
       stateDir: this.options.config.stateDir,
       botUid: this.bot!.uid,
       target,
-    }) : null;
+    });
+    const runtime: RuntimeTask = {
+      taskId,
+      target,
+      cwd: task.cwd,
+      cancelRequested: false,
+      cancelController: new AbortController(),
+      cancelReplySent: false,
+      promptInFlight: false,
+      suspended: false,
+      stopCause: null,
+      workAfterStop: false,
+      steerDeliveries: [],
+      steerSerial: Promise.resolve(),
+      turnContext,
+    };
+    this.runtimes.set(taskId, runtime);
+    const textDelivery = this.outbox.registerTask(taskId);
     const progress = this.progressCards.startTask(taskId, target);
     /** 本回合的 worker 事件归集：通知帧、本地命令标记、assistant 文本与 steer 消费都归它。 */
     const events = new TaskEvents({
@@ -1490,6 +1676,7 @@ class CoreService implements ChannelService {
       taskId,
       control: runtime,
       stopping: () => this.stopping,
+      parseAssistantMentions: true,
       outbox: this.outbox,
       progress,
       persistResearchReport: report => this.persistResearchReport(target, report),
@@ -1504,13 +1691,30 @@ class CoreService implements ChannelService {
     runtime.rollProgressCard = () => progress.roll();
 
     try {
-      if (turnContext) await turnContext.load();
+      await turnContext.load();
       if (runtime.cancelRequested) {
         this.store.markCancelled(taskId);
         return;
       }
-      // Everything past the group-context read is "startup": a failure here is no longer a context
-      // read problem, so the classification must not keep reporting one.
+      startupPhase = "members";
+      const guideInDeveloper = resuming || isNativeRetryPrompt(task.text);
+      let agentContext: AgentContext = {
+        cliReady: this.cliIdentityReady,
+        guideInDeveloper,
+      };
+      if (!guideInDeveloper && isGroupTarget(target)) {
+        agentContext = {
+          cliReady: this.cliIdentityReady,
+          guideInDeveloper,
+          memberSnapshot: await this.fetchMemberSnapshot(target, runtime.cancelController.signal),
+        };
+      }
+      if (runtime.cancelRequested) {
+        this.store.markCancelled(taskId);
+        return;
+      }
+      runtime.agentContext = agentContext;
+      // All lookups required by the model turn are complete; later failures belong to worker startup.
       startupPhase = "startup";
       const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.options.config), task.cwd);
       const binding = bindingAtStart ?? this.store.getBinding(this.bot!.uid, target);
@@ -1526,9 +1730,8 @@ class CoreService implements ChannelService {
         throw new TaskStartupError("session-invalid", "恢复所需的会话绑定缺失或身份不匹配");
       }
       const chatModel = this.store.getChatModel(this.bot!.uid, target);
-      const contextScope = turnContext?.workerScope;
       const workerOptions: Omit<WorkerOptions, "onSpawn"> = {
-        ...(contextScope === undefined ? {} : { contextScope }),
+        contextScope: turnContext.workerScope,
         cwd: task.cwd,
         sessionDir,
         ...(chatModel === null ? {} : { model: chatModel }),
@@ -1574,7 +1777,7 @@ class CoreService implements ChannelService {
       // 续接不重放原文、也不重灌历史快照：原回合的上下文与会话消息都在会话里；群/子区说明
       // 的注入事务照常发布——会话侧车正是为「原生续跑回合」准备的（`context` 钩子补灌），
       // 上一进程未结算的 pending 事务在这里被接手，成功的续跑回合照常提交。
-      contextInjection = turnContext ? await turnContext.prepare(verified.sessionId) : undefined;
+      contextInjection = await turnContext.prepare(verified.sessionId, agentContext);
       const historyTurn = resuming ? null : await this.history.prepareTurn(task, target, verified.sessionId);
       const promptContext: PromptContext = {
         tools: createHostTools(this.hostToolHost(), task),
@@ -1629,7 +1832,8 @@ class CoreService implements ChannelService {
         if (!questionTimeout) this.questions.cancelForTask(taskId, "interrupted");
         progress.finish("cancelled");
       } else if (!runtime.suspended) {
-        if (turnContext) await turnContext.complete(worker.sessionId, events.localOnly);
+        await runtime.steerSerial;
+        await turnContext.complete(worker.sessionId, events.localOnly);
         this.store.markCompleted(taskId, events.resultText);
         progress.finish("completed");
         this.outbox.flush(target);
@@ -1651,9 +1855,8 @@ class CoreService implements ChannelService {
         // 与成功分支同一判据：显式 /interrupt 的终态不保留恢复快照（提问超时相反）。
         if (!questionTimeout) this.questions.cancelForTask(taskId, "interrupted");
         progress.finish("cancelled");
-      } else if (runtime.suspended) {
-        // 停机挂起：不是失败，也不是取消。行保持 started 与 prompt 标记，遗留提问保持 pending，
-        // 由新进程按续接语义恢复；这里既不结算也不发任何通知。
+      } else if (runtime.suspended || this.stopping) {
+        // Stop aborts startup I/O before its per-runtime suspend loop; `stopping` closes that race.
         console.error(`[task] 停机挂起，任务保持未结算 task=${taskId}`);
       } else {
         const failure = runtime.lease

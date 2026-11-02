@@ -1,14 +1,17 @@
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
-import type { AllowlistWriteback, InboundMessage } from "../src/contracts";
+import { openChannelStore } from "../src/store/index.ts";
+import type { AllowlistWriteback, BotEvent, BotEventFetch, CardFrame, ChatTarget, InboundMessage, SendReceipt } from "../src/contracts";
 import {
   closeCoreHarness,
   createCoreHarness,
+  FakeTransport,
   inbound,
   waitForStatus,
   type CoreHarness,
 } from "./fixtures/core-fakes";
+import { cardActionEvent } from "./fixtures/core-fakes";
 
 const ALLOWED = ["group-allowed"];
 const DENIED_GROUP = "group-denied";
@@ -25,10 +28,14 @@ class FakeWriteback implements AllowlistWriteback {
   }
 }
 
+async function nextImmediate(): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setImmediate(resolve);
+  return promise;
+}
+
 async function settle(): Promise<void> {
-  for (let tick = 0; tick < 50; tick += 1) {
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
+  for (let tick = 0; tick < 50; tick += 1) await nextImmediate();
 }
 
 function sentToChat(
@@ -47,9 +54,92 @@ async function waitForSent(
 ): Promise<void> {
   for (let attempt = 0; attempt < 10_000; attempt += 1) {
     if (sentToChat(harness, target).length >= count) return;
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await nextImmediate();
   }
   throw new Error(`transport recorded ${sentToChat(harness, target).length} of ${count} messages`);
+}
+
+async function waitForAck(harness: CoreHarness, eventId: number): Promise<void> {
+  for (let attempt = 0; attempt < 10_000; attempt += 1) {
+    if (harness.transport.ackedEvents.includes(eventId)) return;
+    await nextImmediate();
+  }
+  throw new Error(`Bot event ${eventId} was not acknowledged`);
+}
+
+function actionIdFromFrame(frame: CardFrame): string {
+  const actions = frame.card["actions"];
+  if (!Array.isArray(actions) || typeof actions[0]?.["id"] !== "string") {
+    throw new Error("onboarding card has no submit action");
+  }
+  return actions[0]["id"];
+}
+
+function cardAction(
+  harness: CoreHarness,
+  overrides: {
+    eventId: number;
+    operatorUid?: string;
+    channelId?: string;
+    channelType?: 2 | 5;
+    messageId?: string;
+  },
+) {
+  const sent = harness.transport.sentCards[0];
+  if (!sent) throw new Error("onboarding card was not sent");
+  return cardActionEvent(overrides.eventId, {
+    actionId: actionIdFromFrame(sent.frame),
+    messageId: overrides.messageId ?? sent.messageId,
+    channelType: overrides.channelType ?? 2,
+    channelId: overrides.channelId ?? DENIED_GROUP,
+    operatorUid: overrides.operatorUid ?? "owner-1",
+    inputs: {},
+  });
+}
+
+function frameText(frame: CardFrame): string {
+  return JSON.stringify(frame.card);
+}
+
+class DelayedCardTransport extends FakeTransport {
+  readonly cardSendStarted = Promise.withResolvers<CardFrame>();
+  readonly releaseCardSend = Promise.withResolvers<void>();
+  readonly eventDelivered = Promise.withResolvers<BotEvent>();
+  private readonly unackedEvents = new Map<number, BotEvent>();
+
+  override async sendCard(
+    target: ChatTarget,
+    frame: CardFrame,
+    clientMsgNo: string,
+    signal?: AbortSignal,
+  ): Promise<SendReceipt | null> {
+    this.cardSendStarted.resolve(frame);
+    await this.releaseCardSend.promise;
+    return await super.sendCard(target, frame, clientMsgNo, signal);
+  }
+
+  override async fetchBotEvents(fetch: BotEventFetch): Promise<BotEvent[] | null> {
+    if (fetch.signal?.aborted) throw new Error("fixture bot events aborted");
+    const ready = [...this.unackedEvents.values()]
+      .filter((event) => event.eventId > fetch.afterEventId)
+      .sort((left, right) => left.eventId - right.eventId)
+      .slice(0, fetch.limit);
+    if (ready.length > 0) {
+      this.eventFetches.push(fetch.afterEventId);
+      return ready;
+    }
+    const events = await super.fetchBotEvents(fetch);
+    for (const event of events ?? []) {
+      this.unackedEvents.set(event.eventId, event);
+      this.eventDelivered.resolve(event);
+    }
+    return events;
+  }
+
+  override async ackBotEvent(eventId: number, signal?: AbortSignal): Promise<void> {
+    await super.ackBotEvent(eventId, signal);
+    this.unackedEvents.delete(eventId);
+  }
 }
 
 function queryRows(harness: CoreHarness, sql: string): Array<Record<string, unknown>> {
@@ -83,7 +173,42 @@ test("an owner mention offers an interactive grant without starting a task", asy
     expect(harness.transport.sentCards[0]!.frame.profile).toBe("octo/v2");
     expect(queryRows(harness, "SELECT 1 FROM allowed_chats")).toHaveLength(0);
     expect(harness.workers.prompts).toHaveLength(0);
+    await harness.service.handleInbound(ownerGroupMessage({
+      messageId: "unlisted-card-throttled",
+      text: "再次开通",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    expect(harness.transport.sentCards).toHaveLength(1);
   } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("concurrent unlisted owner mentions share one in-flight onboarding offer", async () => {
+  const transport = new DelayedCardTransport({
+    bot: { uid: "bot-unlisted-concurrent", name: "Fixture Bot" },
+  });
+  transport.cardSupported = true;
+  const harness = await createCoreHarness({ transport, allowedGroupIds: ALLOWED });
+  try {
+    const first = harness.service.handleInbound(ownerGroupMessage({
+      messageId: "unlisted-concurrent-first",
+      text: "请处理这项任务",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    await transport.cardSendStarted.promise;
+    await harness.service.handleInbound(ownerGroupMessage({
+      messageId: "unlisted-concurrent-second",
+      text: "再试一次",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    expect(transport.sentCards).toHaveLength(0);
+    transport.releaseCardSend.resolve();
+    await first;
+    expect(transport.sentCards).toHaveLength(1);
+    expect(harness.workers.prompts).toHaveLength(0);
+  } finally {
+    transport.releaseCardSend.resolve();
     await closeCoreHarness(harness);
   }
 });
@@ -363,6 +488,423 @@ test("a failed config write-back keeps the durable grant and says so", async () 
     await harness.service.handleInbound(work);
     await waitForStatus(harness.service, work, (status) => status.state === "completed");
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["照常干活"]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a card grant reports mirror failure without rolling back the durable permission", async () => {
+  const writeback = new FakeWriteback();
+  writeback.failure = new Error("fixture config is read-only");
+  const harness = await createCoreHarness({ allowedGroupIds: ALLOWED, allowlistWriteback: writeback });
+  harness.transport.cardSupported = true;
+  try {
+    await harness.service.handleInbound(ownerGroupMessage({
+      messageId: "unlisted-card-mirror-failure",
+      text: "请开通这个群",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    const card = harness.transport.sentCards[0]!;
+    harness.transport.pushBotEvent(cardAction(harness, { eventId: 55 }));
+    await harness.transport.waitForCardEdit(() => true);
+    await waitForAck(harness, 55);
+
+    expect(queryRows(harness, "SELECT channel_type, channel_id FROM allowed_chats"))
+      .toEqual([{ channel_type: 2, channel_id: DENIED_GROUP }]);
+    expect(frameText(harness.transport.cardEdits[0]!.frame)).toContain("写回失败");
+    expect(frameText(harness.transport.cardEdits[0]!.frame)).toContain("仅在状态盘生效");
+    expect(writeback.appended).toEqual([]);
+    expect(harness.workers.prompts).toHaveLength(0);
+    expect(harness.transport.cardEdits[0]!.messageId).toBe(card.messageId);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a failed card edit falls back to one persisted result message before event acknowledgement", async () => {
+  const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
+  harness.transport.cardSupported = true;
+  harness.transport.cardEditFailure = new Error("fixture card edit unavailable");
+  try {
+    await harness.service.handleInbound(ownerGroupMessage({
+      messageId: "unlisted-card-edit-failure",
+      text: "请开通这个群",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    harness.transport.pushBotEvent(cardAction(harness, { eventId: 56 }));
+    await waitForSent(harness, { channelId: DENIED_GROUP, channelType: 2 }, 1);
+    await waitForAck(harness, 56);
+    expect(harness.transport.cardEdits).toHaveLength(0);
+    expect(sentToChat(harness, { channelId: DENIED_GROUP, channelType: 2 })[0]!.text)
+      .toContain("已开通本群");
+    expect(queryRows(harness, "SELECT 1 FROM allowed_chats")).toHaveLength(1);
+
+    harness.transport.pushBotEvent(cardAction(harness, { eventId: 57 }));
+    await waitForAck(harness, 57);
+    expect(sentToChat(harness, { channelId: DENIED_GROUP, channelType: 2 }))
+      .toHaveLength(1);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("only the current owner may approve the card bound to its exact chat and message", async () => {
+  const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
+  harness.transport.cardSupported = true;
+  try {
+    await harness.service.handleInbound(ownerGroupMessage({
+      messageId: "grant-card-binding",
+      text: "请开通这个群",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    const card = harness.transport.sentCards[0]!;
+    expect(card.frame.profile).toBe("octo/v2");
+    expect(frameText(card.frame)).toContain("只有 Bot owner 可以确认");
+    expect(frameText(card.frame)).toContain("群成员");
+
+    harness.transport.pushBotEvent(cardAction(harness, { eventId: 51, operatorUid: "member-1" }));
+    await waitForAck(harness, 51);
+    await waitForSent(harness, { channelId: DENIED_GROUP, channelType: 2 }, 1);
+    expect(sentToChat(harness, { channelId: DENIED_GROUP, channelType: 2 })[0]!.text)
+      .toContain("仅 Bot owner 可以开通");
+    expect(queryRows(harness, "SELECT 1 FROM allowed_chats")).toHaveLength(0);
+
+    harness.transport.pushBotEvent(cardAction(harness, {
+      eventId: 52,
+      channelId: "another-group",
+    }));
+    harness.transport.pushBotEvent(cardAction(harness, {
+      eventId: 53,
+      messageId: "another-card",
+    }));
+    await waitForAck(harness, 53);
+    expect(queryRows(harness, "SELECT 1 FROM allowed_chats")).toHaveLength(0);
+
+    harness.transport.pushBotEvent(cardAction(harness, { eventId: 54 }));
+    await harness.transport.waitForCardEdit(() => true);
+    await waitForAck(harness, 54);
+    expect(queryRows(harness, "SELECT channel_type, channel_id, granted_by FROM allowed_chats"))
+      .toEqual([{ channel_type: 2, channel_id: DENIED_GROUP, granted_by: "owner-1" }]);
+    expect(harness.transport.cardEdits).toHaveLength(1);
+    expect(harness.transport.cardEdits[0]!.messageId).toBe(card.messageId);
+    expect(harness.workers.prompts).toHaveLength(0);
+    expect(queryRows(harness, "SELECT 1 FROM tasks")).toHaveLength(0);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+test("a persisted owner change invalidates every card sent to the previous owner", async () => {
+  const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
+  harness.transport.cardSupported = true;
+  try {
+    await harness.service.handleInbound(ownerGroupMessage({
+      messageId: "grant-card-owner-change",
+      text: "请开通",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    const store = await openChannelStore(harness.stateDir);
+    try {
+      store.setOwnerId(harness.bot.uid, "owner-2");
+    } finally {
+      store.close();
+    }
+
+    harness.transport.pushBotEvent(cardAction(harness, { eventId: 55, operatorUid: "owner-1" }));
+    harness.transport.pushBotEvent(cardAction(harness, { eventId: 56, operatorUid: "owner-2" }));
+    await waitForAck(harness, 56);
+    expect(queryRows(harness, "SELECT 1 FROM allowed_chats")).toHaveLength(0);
+    expect(harness.transport.cardEdits).toHaveLength(0);
+    expect(harness.workers.prompts).toHaveLength(0);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("replaying an accepted card click does not repeat its receipt or grant", async () => {
+  const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
+  harness.transport.cardSupported = true;
+  try {
+    await harness.service.handleInbound(ownerGroupMessage({
+      messageId: "grant-card-replay",
+      text: "开通这个群",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    const click = cardAction(harness, { eventId: 61 });
+    harness.transport.pushBotEvent(click);
+    await harness.transport.waitForCardEdit(() => true);
+    await waitForAck(harness, 61);
+
+    harness.transport.pushBotEvent(cardAction(harness, { eventId: 62 }));
+    await waitForAck(harness, 62);
+    expect(harness.transport.cardEdits).toHaveLength(1);
+    expect(sentToChat(harness, { channelId: DENIED_GROUP, channelType: 2 })).toHaveLength(0);
+    expect(queryRows(harness, "SELECT 1 FROM allowed_chats")).toHaveLength(1);
+    expect(queryRows(harness, "SELECT 1 FROM tasks")).toHaveLength(0);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a durable card grant resumes its pending result after restart before replay is acknowledged", async () => {
+  const writeback = new FakeWriteback();
+  const first = await createCoreHarness({ allowedGroupIds: ALLOWED, allowlistWriteback: writeback });
+  let click: BotEvent | null = null;
+  first.transport.cardSupported = true;
+  try {
+    await first.service.handleInbound(ownerGroupMessage({
+      messageId: "grant-card-recovery",
+      text: "开通这个群",
+      mentionedUserIds: [first.bot.uid],
+    }));
+    click = cardAction(first, { eventId: 71 });
+    first.transport.cardEditFailure = new Error("temporary card edit failure");
+    first.transport.setOffline();
+    first.transport.pushBotEvent(click);
+    await waitForCondition(() => queryRows(first, "SELECT 1 FROM allowed_chats").length === 1);
+    await settle();
+    expect(first.transport.ackedEvents).toHaveLength(0);
+    expect(writeback.appended).toEqual([DENIED_GROUP]);
+  } finally {
+    await closeCoreHarness(first, { remove: false });
+  }
+
+  const recovered = await createCoreHarness({
+    root: first.root,
+    allowedGroupIds: ALLOWED,
+    allowlistWriteback: writeback,
+  });
+  try {
+    expect(recovered.transport.cardEdits).toHaveLength(1);
+    expect(recovered.transport.cardEdits[0]!.messageId).toBe("card-1");
+    expect(writeback.appended).toEqual([DENIED_GROUP]);
+
+    if (click === null) throw new Error("accepted card click was not created");
+    recovered.transport.pushBotEvent(click);
+    await waitForAck(recovered, 71);
+    expect(recovered.transport.cardEdits).toHaveLength(1);
+    expect(recovered.transport.ackedEvents).toEqual([71]);
+    expect(recovered.workers.prompts).toHaveLength(0);
+    expect(queryRows(recovered, "SELECT 1 FROM allowed_chats")).toHaveLength(1);
+  } finally {
+    await closeCoreHarness(recovered);
+  }
+});
+
+test("an unaccepted old card after restart only asks its owner to mention the bot again", async () => {
+  const first = await createCoreHarness({ allowedGroupIds: ALLOWED });
+  first.transport.cardSupported = true;
+  let click: BotEvent | null = null;
+  try {
+    await first.service.handleInbound(ownerGroupMessage({
+      messageId: "grant-card-old",
+      text: "请开通",
+      mentionedUserIds: [first.bot.uid],
+    }));
+    click = cardAction(first, { eventId: 81 });
+  } finally {
+    await closeCoreHarness(first, { remove: false });
+  }
+
+  const recovered = await createCoreHarness({ root: first.root, allowedGroupIds: ALLOWED });
+  try {
+    if (click === null) throw new Error("old card click was not created");
+    recovered.transport.pushBotEvent(click);
+    await waitForAck(recovered, 81);
+    await waitForSent(recovered, { channelId: DENIED_GROUP, channelType: 2 }, 1);
+    expect(sentToChat(recovered, { channelId: DENIED_GROUP, channelType: 2 })[0]!.text)
+      .toContain("重新 @Fixture Bot");
+    expect(queryRows(recovered, "SELECT 1 FROM allowed_chats")).toHaveLength(0);
+    expect(queryRows(recovered, "SELECT 1 FROM tasks")).toHaveLength(0);
+  } finally {
+    await closeCoreHarness(recovered);
+  }
+});
+
+test("a failed text-grant claim is reclaimed before the now-authorized phrase can route as work", async () => {
+  const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
+  try {
+    const original = ownerGroupMessage({
+      messageId: "grant-text-failed-claim",
+      text: "开通本群",
+      mentionedUserIds: [harness.bot.uid],
+    });
+    await harness.service.handleInbound(original);
+    const database = new Database(join(harness.stateDir, "channel.sqlite"));
+    try {
+      database.query(
+        "UPDATE inbound SET command_state = 'failed' WHERE bot_uid = ? AND channel_type = 2 AND channel_id = ? AND message_id = ?",
+      ).run(harness.bot.uid, DENIED_GROUP, original.messageId);
+    } finally {
+      database.close();
+    }
+
+    await harness.service.handleInbound(original);
+    expect(harness.workers.prompts).toHaveLength(0);
+    expect(queryRows(harness, "SELECT kind, command_state FROM inbound WHERE message_id = 'grant-text-failed-claim'"))
+      .toEqual([{ kind: "command", command_state: "completed" }]);
+
+    const fresh = ownerGroupMessage({
+      messageId: "grant-text-fresh-authorized",
+      text: "开通本群",
+      mentionedUserIds: [harness.bot.uid],
+    });
+    await harness.service.handleInbound(fresh);
+    await waitForStatus(harness.service, fresh, (status) => status.state === "completed");
+    expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["开通本群"]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a redelivered text claim stays a command while a new matching message is ordinary work", async () => {
+  const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
+  try {
+    const original = ownerGroupMessage({
+      messageId: "grant-text-redelivery",
+      text: "开通本群",
+      mentionedUserIds: [harness.bot.uid],
+    });
+    await harness.service.handleInbound(original);
+    await waitForSent(harness, { channelId: DENIED_GROUP, channelType: 2 }, 1);
+    await harness.service.handleInbound(original);
+
+    const fresh = ownerGroupMessage({
+      messageId: "grant-text-new-message",
+      text: "开通本群",
+      mentionedUserIds: [harness.bot.uid],
+    });
+    await harness.service.handleInbound(fresh);
+    await waitForStatus(harness.service, fresh, (status) => status.state === "completed");
+    expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["开通本群"]);
+    expect(queryRows(harness, "SELECT message_id, kind FROM inbound ORDER BY message_id")).toEqual([
+      { message_id: "grant-text-new-message", kind: "task" },
+      { message_id: "grant-text-redelivery", kind: "command" },
+    ]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a failed interactive send falls back to the exact text passphrase without granting", async () => {
+  const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
+  harness.transport.cardSupported = true;
+  harness.transport.cardSendFailure = new Error("card deployment unavailable");
+  try {
+    await harness.service.handleInbound(ownerGroupMessage({
+      messageId: "grant-card-fallback",
+      text: "请处理这里",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    await waitForSent(harness, { channelId: DENIED_GROUP, channelType: 2 }, 1);
+    expect(harness.transport.sentCards).toHaveLength(0);
+    expect(sentToChat(harness, { channelId: DENIED_GROUP, channelType: 2 })[0]!.text)
+      .toContain("@Fixture Bot 开通本群");
+    expect(queryRows(harness, "SELECT 1 FROM allowed_chats")).toHaveLength(0);
+    expect(harness.workers.prompts).toHaveLength(0);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+async function waitForCondition(condition: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 10_000; attempt += 1) {
+    if (condition()) return;
+    await nextImmediate();
+  }
+  throw new Error("condition did not become true");
+}
+test("events during card send reject non-owners promptly and bind owner clicks only after receipt", async () => {
+  const transport = new DelayedCardTransport({
+    bot: { uid: "bot-inflight-grant", name: "Fixture Bot" },
+  });
+  transport.cardSupported = true;
+  const harness = await createCoreHarness({ transport, allowedGroupIds: ALLOWED });
+  let fakeTimers = false;
+  try {
+    const inbound = harness.service.handleInbound(ownerGroupMessage({
+      messageId: "grant-card-inflight",
+      text: "请开通",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    const frame = await transport.cardSendStarted.promise;
+    const actionId = actionIdFromFrame(frame);
+    const memberClick = cardActionEvent(90, {
+      actionId,
+      messageId: "card-1",
+      channelType: 2,
+      channelId: DENIED_GROUP,
+      operatorUid: "member-1",
+      inputs: {},
+    });
+    const ownerClick = cardActionEvent(91, {
+      actionId,
+      messageId: "card-1",
+      channelType: 2,
+      channelId: DENIED_GROUP,
+      operatorUid: "owner-1",
+      inputs: {},
+    });
+    vi.useFakeTimers();
+    fakeTimers = true;
+    transport.pushBotEvent(memberClick);
+    transport.pushBotEvent(ownerClick);
+
+    await transport.eventDelivered.promise;
+    await transport.waitForAck(90);
+    for (let tick = 0; tick < 30; tick++) await Promise.resolve();
+    const promptSent = transport.sent.some(({ text }) => text.includes("仅 Bot owner 可以开通"));
+    const promptQueued = queryRows(
+      harness,
+      "SELECT 1 FROM outbox WHERE text = '仅 Bot owner 可以开通。' AND state IN ('pending', 'unknown')",
+    ).length > 0;
+    expect(promptSent || promptQueued).toBe(true);
+    expect(transport.ackedEvents).not.toContain(91);
+    expect(queryRows(harness, "SELECT 1 FROM allowed_chats")).toHaveLength(0);
+
+    transport.releaseCardSend.resolve();
+    await inbound;
+    for (let attempt = 0; attempt < 2 && !transport.ackedEvents.includes(91); attempt++) {
+      vi.advanceTimersByTime(5_000);
+      for (let tick = 0; tick < 30; tick++) await Promise.resolve();
+    }
+    expect(transport.ackedEvents).toContain(91);
+    await transport.waitForCardEdit(() => true);
+    expect(queryRows(harness, "SELECT channel_id FROM allowed_chats"))
+      .toEqual([{ channel_id: DENIED_GROUP }]);
+    expect(harness.workers.prompts).toHaveLength(0);
+  } finally {
+    transport.releaseCardSend.resolve();
+    await closeCoreHarness(harness);
+    if (fakeTimers) vi.useRealTimers();
+  }
+});
+
+test("a thread card names and grants only its own scope", async () => {
+  const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
+  harness.transport.cardSupported = true;
+  try {
+    await harness.service.handleInbound(inbound({
+      messageId: "grant-thread-card",
+      channelId: DENIED_THREAD,
+      channelType: 5,
+      text: "请开通子区",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    expect(harness.transport.sentCards).toHaveLength(1);
+    expect(frameText(harness.transport.sentCards[0]!.frame)).toContain("本子区");
+    expect(
+      (harness.transport.sentCards[0]!.frame.card["actions"] as Array<{ title: string }>)[0]!.title,
+    ).toBe("开通本子区");
+
+    harness.transport.pushBotEvent(cardAction(harness, {
+      eventId: 101,
+      channelId: DENIED_THREAD,
+      channelType: 5,
+    }));
+    await harness.transport.waitForCardEdit(() => true);
+    await waitForAck(harness, 101);
+    expect(queryRows(harness, "SELECT channel_type, channel_id FROM allowed_chats"))
+      .toEqual([{ channel_type: 5, channel_id: DENIED_THREAD }]);
   } finally {
     await closeCoreHarness(harness);
   }

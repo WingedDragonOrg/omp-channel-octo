@@ -35,7 +35,9 @@ test("/thread turns the message into an instructed task without creating anythin
     await harness.workers.waitForPromptCount(1);
 
     // Nothing is created up front: no thread, no workspace, no receipt.
-    expect(harness.transport.managementCalls).toEqual([]);
+    expect(harness.transport.managementCalls).toEqual([
+      { action: "group-members", groupId: "group-allowed", shortId: null },
+    ]);
     expect(harness.worktrees?.requests).toEqual([]);
     expect(harness.transport.sent.some(({ text }) => text.includes("子区"))).toBe(false);
 

@@ -114,6 +114,7 @@ import type {
   InboundMessage,
   InboundQuote,
   SendReceipt,
+  TextMention,
   ThreadSummary,
   UserInfo,
 } from "../contracts.ts";
@@ -239,12 +240,18 @@ export class OctoTransport implements ChannelTransport {
     text: string,
     clientMsgNo: string,
     signal?: AbortSignal,
+    mention?: TextMention,
   ): Promise<SendReceipt> {
     validateTarget(target);
     if (Buffer.byteLength(text, "utf8") > MAX_TEXT_BYTES) {
       throw new OctoError(`Octo text message exceeds ${MAX_TEXT_BYTES} UTF-8 bytes`);
     }
-    return this.sendMessage(target, { type: TEXT_MESSAGE_TYPE, content: text }, clientMsgNo, signal);
+    return this.sendMessage(
+      target,
+      { type: TEXT_MESSAGE_TYPE, content: text, ...(mention === undefined ? {} : { mention }) },
+      clientMsgNo,
+      signal,
+    );
   }
 
   async editText(
@@ -252,6 +259,7 @@ export class OctoTransport implements ChannelTransport {
     messageId: string,
     text: string,
     signal?: AbortSignal,
+    mention?: TextMention,
   ): Promise<void> {
     validateTarget(target);
     if (messageId.length === 0) throw new OctoError("Octo text message id is required");
@@ -267,7 +275,11 @@ export class OctoTransport implements ChannelTransport {
           message_id: messageId,
           channel_id: target.channelId,
           channel_type: target.channelType,
-          content_edit: JSON.stringify({ type: TEXT_MESSAGE_TYPE, content: text }),
+          content_edit: JSON.stringify({
+            type: TEXT_MESSAGE_TYPE,
+            content: text,
+            ...(mention === undefined ? {} : { mention }),
+          }),
         }),
       },
       "message edit",

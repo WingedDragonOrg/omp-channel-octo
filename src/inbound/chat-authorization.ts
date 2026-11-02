@@ -38,6 +38,8 @@ const MENTION_PREF_TIMEOUT_MS = 5_000;
 const UNLISTED_CHAT_PASSPHRASE = "开通本群";
 /** One notice per unlisted chat per window, so a burst of messages cannot become a burst of replies. */
 const UNLISTED_CHAT_NOTICE_TTL_MS = 10 * 60 * 1_000;
+/** Bound the process-local map while preserving one notice per chat during its TTL. */
+const MAX_UNLISTED_CHAT_NOTICES = 500;
 /** Same window for the members-cannot-command notice: the first command of a chat is explained once. */
 const MEMBER_COMMAND_NOTICE_TTL_MS = 10 * 60 * 1_000;
 
@@ -72,6 +74,7 @@ export interface ChatAuthorizationDeps {
   readonly transport: Pick<ChannelTransport, "getGroupMentionPref">;
   readonly shutdownSignal: AbortSignal;
   readonly commandClaim: (message: InboundMessage, name: string) => InboundClaim;
+  readonly offerUnlistedChat: (message: InboundMessage, bot: BotIdentity) => Promise<void>;
   readonly enqueueText: Outbox["enqueueText"];
 }
 
@@ -118,35 +121,63 @@ export class ChatAuthorization {
 
   /**
    * The single exception to "an allowlist rejection is silent": an owner's @Bot mention in an
-   * unlisted group or thread gets one short, throttled notice with the passphrase, and the exact
-   * passphrase enables that chat durably. Every other rejection path is unchanged - a non-owner,
-   * an unmentioned message, a bot echo, and every DM stay reply-less, task-less and unlogged, and
-   * a chat the owner already enabled never reaches here.
+   * unlisted group or thread gets one short, throttled card/text onboarding offer. The exact
+   * passphrase is handled before this rejection path so a redelivered grant never becomes work.
+   * Every other rejection remains silent.
    */
+  isOwnerMentionedGrantPassphrase(message: InboundMessage, ownerId: string | null): boolean {
+    const bot = this.deps.bot();
+    if (!bot || !ownerId || !message.supported) return false;
+    const senderId = message.senderId.trim();
+    return senderId === ownerId.trim()
+      && senderId !== bot.uid
+      && (message.channelType === 2 || message.channelType === 5)
+      && message.mentionedUserIds.includes(bot.uid)
+      && message.text.trim() === UNLISTED_CHAT_PASSPHRASE;
+  }
+
   async handleUnlistedOwnerContact(message: InboundMessage, ownerId: string | null): Promise<void> {
     const bot = this.deps.bot();
     if (!bot || !ownerId) return;
     const senderId = message.senderId.trim();
-    if (senderId !== ownerId || senderId === bot.uid) return;
+    if (senderId !== ownerId.trim() || senderId === bot.uid) return;
     if (message.channelType !== 2 && message.channelType !== 5) return;
     if (!message.mentionedUserIds.includes(bot.uid)) return;
     if (this.isPermittedChat(message)) return;
-    if (message.text.trim() === UNLISTED_CHAT_PASSPHRASE) {
+    if (this.isOwnerMentionedGrantPassphrase(message, ownerId)) {
       await this.grantUnlistedChat(message);
       return;
     }
-    this.noticeUnlistedChat(message, bot.name.trim().length > 0 ? bot.name.trim() : bot.uid);
+    await this.noticeUnlistedChat(message, bot);
   }
 
-  /** 本群 vs 本子区: the notice, the confirmation and the grant row all name the same scope. */
-  private noticeUnlistedChat(message: InboundMessage, botName: string): void {
+  /** Reclaims a previously failed text grant before an already-open chat can route it as work. */
+  async retryClaimedOwnerGrant(message: InboundMessage, ownerId: string | null): Promise<void> {
+    if (!this.isOwnerMentionedGrantPassphrase(message, ownerId)) return;
+    await this.grantUnlistedChat(message);
+  }
+
+  /** 本群 vs 本子区: throttling is per real chat id, and the card builder owns the copy. */
+  private async noticeUnlistedChat(message: InboundMessage, bot: BotIdentity): Promise<void> {
     const key = targetKey(message);
+    const now = Date.now();
+    for (const [noticeKey, sentAt] of this.unlistedChatNotices) {
+      if (now - sentAt >= UNLISTED_CHAT_NOTICE_TTL_MS) this.unlistedChatNotices.delete(noticeKey);
+    }
     const lastNoticedAt = this.unlistedChatNotices.get(key);
-    if (lastNoticedAt !== undefined && Date.now() - lastNoticedAt < UNLISTED_CHAT_NOTICE_TTL_MS) return;
-    const scope = message.channelType === 5 ? "本子区" : "本群";
-    this.deps.enqueueText(message, `${scope}未开通。回复「@${botName} ${UNLISTED_CHAT_PASSPHRASE}」即可开通${scope}。`, null);
-    // Only a queued notice opens the window: a failed enqueue still leaves the next message free to try again.
-    this.unlistedChatNotices.set(key, Date.now());
+    if (lastNoticedAt !== undefined && now - lastNoticedAt < UNLISTED_CHAT_NOTICE_TTL_MS) return;
+    if (this.unlistedChatNotices.size >= MAX_UNLISTED_CHAT_NOTICES) {
+      const oldest = this.unlistedChatNotices.keys().next().value;
+      if (oldest !== undefined) this.unlistedChatNotices.delete(oldest);
+    }
+    // Reserve before awaiting the transport so simultaneous owner mentions cannot fan out cards.
+    this.unlistedChatNotices.set(key, now);
+    try {
+      await this.deps.offerUnlistedChat(message, bot);
+    } catch (error) {
+      if (this.unlistedChatNotices.get(key) === now) this.unlistedChatNotices.delete(key);
+      throw error;
+    }
   }
 
   /**

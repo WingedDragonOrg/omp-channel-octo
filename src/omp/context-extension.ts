@@ -1,3 +1,9 @@
+import {
+	AGENT_GUIDANCE_PREFIX,
+	MEMBER_CONTEXT_PREFIX,
+	formatAgentGuidance,
+	formatMemberContext,
+} from "../session/agent-context.ts";
 import { isAbsolute } from "node:path";
 import {
 	contextSidecarPath,
@@ -5,8 +11,10 @@ import {
 	preparedReceiptFor,
 	readBoundSession,
 	readContextSidecar,
+	readAgentContextOverlay,
 	writePreparedReceipt,
 	type ContextSidecar,
+	type AgentContextOverlay,
 } from "../session/context-sidecar.ts";
 
 export { contextSidecarFileName } from "../session/context-sidecar.ts";
@@ -32,9 +40,23 @@ type ExtensionScope = {
 	root: string;
 	botUid: string;
 	target: {
-		channelType: 2 | 5;
+		channelType: 1 | 2 | 5;
 		channelId: string;
 	};
+};
+
+type TurnSidecar = {
+	scope: ExtensionScope;
+	sessionId: string;
+	sidecar: ContextSidecar;
+	agentContextOverlay?: AgentContextOverlay;
+};
+
+type ContextObservation = {
+	turnId: string | undefined;
+	attemptId: string;
+	userMessageCount: number;
+	acceptedPendingCount: number;
 };
 
 const ROOT_ENV = "OMP_CHANNEL_OCTO_CONTEXT_ROOT";
@@ -72,7 +94,7 @@ function readScope(): ExtensionScope | undefined {
 	}
 	if (!isAbsolute(root)) throw new Error("context extension root must be absolute");
 	const parsedChannelType = Number(channelType);
-	if (parsedChannelType !== 2 && parsedChannelType !== 5) throw new Error("context extension target type is invalid");
+	if (parsedChannelType !== 1 && parsedChannelType !== 2 && parsedChannelType !== 5) throw new Error("context extension target type is invalid");
 	return {
 		root,
 		botUid,
@@ -173,22 +195,24 @@ function systemPromptFromEvent(event: ExtensionEvent, context: ExtensionContext)
 }
 
 function formatCompactionContext(sidecar: ContextSidecar): string {
-	const snapshot = formatSharedContext(sidecar.snapshot, "unchanged");
-	return [
-		"压缩恢复边界（来自当前 turn 的 immutable 群/线程快照）：",
+	const lines = [
+		sidecar.target.channelType === 1
+			? "压缩恢复边界（当前私聊 turn 身份）："
+			: "压缩恢复边界（来自当前 turn 的 immutable 群/线程快照）：",
 		`bot=${sidecar.botUid}`,
 		`target=${sidecar.target.channelType}:${sidecar.target.channelId}`,
 		`session=${sidecar.sessionId}`,
-		`version=${sidecar.snapshot.version}`,
-		snapshot,
-	].join("\n");
+	];
+	if (sidecar.target.channelType !== 1) {
+		lines.push(
+			`version=${sidecar.snapshot.version}`,
+			formatSharedContext(sidecar.snapshot, "unchanged"),
+		);
+	}
+	return lines.join("\n");
 }
 
-async function turnSidecar(event: ExtensionEvent, context: ExtensionContext): Promise<{
-	scope: ExtensionScope;
-	sessionId: string;
-	sidecar: ContextSidecar;
-} | undefined> {
+async function turnSidecar(event: ExtensionEvent, context: ExtensionContext): Promise<TurnSidecar | undefined> {
 	let scope: ExtensionScope | undefined;
 	try {
 		scope = readScope();
@@ -207,7 +231,19 @@ async function turnSidecar(event: ExtensionEvent, context: ExtensionContext): Pr
 	const bound = await boundSessionFor(scope, context);
 	if (bound !== undefined && bound !== sessionId) return undefined;
 	const sidecar = validateSidecar(await sidecarForScope(scope, sessionId, context), scope, sessionId, context);
-	return { scope, sessionId, sidecar };
+	const agentContextOverlay = await readAgentContextOverlay(
+		contextSidecarPath(scope.root, sessionId),
+		sidecar,
+	).catch(error => abortAndThrow(
+		context,
+		error instanceof Error ? error.message : "agent context overlay could not be read",
+	));
+	return {
+		scope,
+		sessionId,
+		sidecar,
+		...(agentContextOverlay === undefined ? {} : { agentContextOverlay }),
+	};
 }
 
 async function prepareSharedContext(scope: ExtensionScope, sidecar: ContextSidecar, context: ExtensionContext): Promise<string> {
@@ -222,13 +258,125 @@ async function prepareSharedContext(scope: ExtensionScope, sidecar: ContextSidec
 	return formatSharedContext(sidecar.snapshot, sidecar.injectionDecision, sidecar.previousVersion);
 }
 
-async function beforeAgentStart(event: ExtensionEvent, context: ExtensionContext): Promise<{ systemPrompt: string[] } | undefined> {
+function isManagedAgentContextMessage(value: unknown): boolean {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+	const message = value as Record<string, unknown>;
+	if (message.role !== "developer" || typeof message.content !== "string") return false;
+	return message.content.startsWith(MEMBER_CONTEXT_PREFIX)
+		|| message.content.startsWith(AGENT_GUIDANCE_PREFIX);
+}
+
+function userMessageText(value: unknown): string | undefined {
+	if (typeof value === "string") return value;
+	if (Array.isArray(value)) {
+		let text = "";
+		for (const part of value) {
+			if (
+				part !== null && typeof part === "object" && !Array.isArray(part)
+				&& "text" in part && typeof part.text === "string"
+			) {
+				text += part.text;
+			}
+		}
+		return text;
+	}
+	if (
+		value !== null && typeof value === "object" && !Array.isArray(value)
+		&& "text" in value && typeof value.text === "string"
+	) {
+		return value.text;
+	}
+	return undefined;
+}
+
+function userMessageTexts(messages: readonly unknown[]): Array<string | undefined> {
+	const texts: Array<string | undefined> = [];
+	for (const value of messages) {
+		if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
+		const message = value as Record<string, unknown>;
+		if (message.role === "user") texts.push(userMessageText(message.content));
+	}
+	return texts;
+}
+
+function noteAgentStart(
+	observations: Map<string, ContextObservation>,
+	turn: TurnSidecar,
+	prompt: unknown,
+): void {
+	const previous = observations.get(turn.sessionId);
+	const sameTurn = previous !== undefined
+		&& previous.turnId === turn.sidecar.turnId
+		&& previous.attemptId === turn.sidecar.attemptId;
+	let acceptedPendingCount = sameTurn ? previous.acceptedPendingCount : 0;
+	const nextPending = turn.agentContextOverlay?.pending[acceptedPendingCount];
+	if (sameTurn && typeof prompt === "string" && nextPending?.text === prompt) {
+		acceptedPendingCount += 1;
+	}
+	observations.set(turn.sessionId, {
+		turnId: turn.sidecar.turnId,
+		attemptId: turn.sidecar.attemptId,
+		userMessageCount: (previous?.userMessageCount ?? 0) + 1,
+		acceptedPendingCount,
+	});
+}
+
+function agentContextForModelRequest(
+	observations: Map<string, ContextObservation>,
+	turn: TurnSidecar,
+	messages: readonly unknown[],
+): AgentContextOverlay["agentContext"] | ContextSidecar["agentContext"] {
+	const currentUserMessages = userMessageTexts(messages);
+	const overlay = turn.agentContextOverlay;
+	const previous = observations.get(turn.sessionId);
+	const sameTurn = previous !== undefined
+		&& previous.turnId === turn.sidecar.turnId
+		&& previous.attemptId === turn.sidecar.attemptId;
+	let acceptedPendingCount = sameTurn
+		? Math.min(previous.acceptedPendingCount, overlay?.pending.length ?? 0)
+		: 0;
+	if (sameTurn && overlay) {
+		for (const text of currentUserMessages.slice(previous.userMessageCount)) {
+			const pending = overlay.pending[acceptedPendingCount];
+			if (!pending || text !== pending.text) break;
+			acceptedPendingCount += 1;
+		}
+	}
+	observations.set(turn.sessionId, {
+		turnId: turn.sidecar.turnId,
+		attemptId: turn.sidecar.attemptId,
+		userMessageCount: currentUserMessages.length,
+		acceptedPendingCount,
+	});
+	return overlay?.pending[acceptedPendingCount - 1]?.agentContext
+		?? overlay?.agentContext
+		?? turn.sidecar.agentContext;
+}
+
+async function beforeAgentStart(
+	event: ExtensionEvent,
+	context: ExtensionContext,
+	observeAgentStart: (turn: TurnSidecar, prompt: unknown) => void,
+): Promise<{ systemPrompt: string[] } | undefined> {
 	const turn = await turnSidecar(event, context);
 	if (!turn) return undefined;
-	const originalSystemPrompt = systemPromptFromEvent(event, context);
-	if (turn.sidecar.injectionDecision === "unchanged") return { systemPrompt: [...originalSystemPrompt] };
+	observeAgentStart(turn, event.prompt);
+	const originalSystemPrompt = systemPromptFromEvent(event, context)
+		.filter(line => !line.startsWith(AGENT_GUIDANCE_PREFIX));
+	const agentContext = turn.agentContextOverlay?.agentContext ?? turn.sidecar.agentContext;
+	const systemPrompt = agentContext === undefined || agentContext.guideInDeveloper
+		? originalSystemPrompt
+		: [
+				...originalSystemPrompt,
+				formatAgentGuidance(
+					turn.sidecar.botUid,
+					turn.sidecar.target,
+					agentContext.cliReady,
+				),
+			];
+	if (turn.sidecar.injectionDecision === "unchanged") return { systemPrompt };
 	const formatted = await prepareSharedContext(turn.scope, turn.sidecar, context);
-	return { systemPrompt: [...originalSystemPrompt, formatted] };
+	return { systemPrompt: [...systemPrompt, formatted] };
 }
 
 async function sessionCompacting(event: ExtensionEvent, context: ExtensionContext): Promise<{
@@ -267,8 +415,13 @@ async function sessionCompacting(event: ExtensionEvent, context: ExtensionContex
 
 export default function contextExtension(api: ExtensionApi): void {
 	let continuationAttempt: string | undefined;
+	const contextObservations = new Map<string, ContextObservation>();
 	api.on("before_agent_start", async (event, context) => {
-		const result = await beforeAgentStart(event, context);
+		const result = await beforeAgentStart(
+			event,
+			context,
+			(turn, prompt) => noteAgentStart(contextObservations, turn, prompt),
+		);
 		if (result) continuationAttempt = undefined;
 		return result;
 	});
@@ -276,15 +429,46 @@ export default function contextExtension(api: ExtensionApi): void {
 	// each model call, and its developer message is transient rather than a new user turn.
 	api.on("context", async (event, context) => {
 		const turn = await turnSidecar(event, context);
-		if (!turn || turn.sidecar.injectionDecision === "unchanged") return undefined;
+		if (!turn) return undefined;
 		const key = `${turn.sessionId}:${turn.sidecar.attemptId}`;
-		if (turn.sidecar.prepared && continuationAttempt !== key) return undefined;
-		if (!Array.isArray(event.messages)) return abortAndThrow(context, "context messages are invalid");
-		const content = await prepareSharedContext(turn.scope, turn.sidecar, context);
-		continuationAttempt = key;
-		return {
-			messages: [...event.messages, { role: "developer", content, timestamp: Date.now() }],
-		};
+		const injectShared = turn.sidecar.injectionDecision !== "unchanged"
+			&& (!turn.sidecar.prepared || continuationAttempt === key);
+		const baseAgentContext = turn.agentContextOverlay?.agentContext ?? turn.sidecar.agentContext;
+		if (!Array.isArray(event.messages)) {
+			if (baseAgentContext === undefined && !injectShared) return undefined;
+			return abortAndThrow(context, "context messages are invalid");
+		}
+		const messages = event.messages.filter(message => !isManagedAgentContextMessage(message));
+		const agentContext = agentContextForModelRequest(contextObservations, turn, messages);
+		const nextMessages = [...messages];
+		const timestamp = Date.now();
+		if (agentContext?.guideInDeveloper) {
+			nextMessages.push({
+				role: "developer",
+				content: formatAgentGuidance(turn.sidecar.botUid, turn.sidecar.target, agentContext.cliReady),
+				timestamp,
+			});
+		}
+		if (agentContext?.memberSnapshot) {
+			nextMessages.push({
+				role: "developer",
+				content: formatMemberContext(turn.sidecar.target, agentContext.memberSnapshot),
+				timestamp,
+			});
+		}
+		if (injectShared) {
+			const content = await prepareSharedContext(turn.scope, turn.sidecar, context);
+			continuationAttempt = key;
+			nextMessages.push({ role: "developer", content, timestamp });
+		}
+		if (nextMessages.length === event.messages.length
+			&& messages.length === event.messages.length
+			&& agentContext?.guideInDeveloper !== true
+			&& agentContext?.memberSnapshot === undefined
+			&& !injectShared) {
+			return undefined;
+		}
+		return { messages: nextMessages };
 	});
 	api.on("session.compacting", sessionCompacting);
 }

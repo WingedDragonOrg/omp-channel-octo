@@ -1,33 +1,38 @@
 /**
- * 单个任务的群说明回合事务：快照读取、injection ledger 的 prepare/commit、bound session 与
- * 本回合 sidecar 的发布/清理都在这里。`service.ts` 的 `runTask` 只按顺序调用
- * `load` → `workerScope` → `prepare` → `complete`，不再持有 sidecar 路径、ledger 决策或
- * prepared receipt 的校验细节。
+ * 维护单个任务的共享群说明事务，以及成员/固定操作指引的临时 agent context。
+ * `service.ts` 的 `runTask` 依次调用 `load` → `workerScope` → `prepare` → `complete`；
+ * steering 的 context 写入独立 overlay，普通输入先暂存，OMP 确认消息进入模型上下文后才生效，
+ * 避免覆盖 extension 同时写入的共享上下文 receipt。
  *
- * 模块不依赖 `service.ts`：context ledger 的三条 store 读写、群说明读取、stateDir、bot 身份与
- * 本回合目标都由 `CoreService` 以窄端口注入。一个 task 一个 `TurnContext`：`load()` 取快照，
- * `prepare(sessionId)` 在绑定会话确认之后发布本回合 sidecar 并返回注入内容，
- * `complete(sessionId, localOnly)` 只在任务普通成功分支结算（校验 prepared receipt 与 marker
- * CAS，然后清理 sidecar）；取消/中断/失败路径不调用它，本回合的 sidecar 保留给下一次重放。
+ * 模块不依赖 `service.ts`：store、transport、stateDir、bot 身份和本回合目标都由 `CoreService`
+ * 以窄端口注入。一个 task 一个 `TurnContext`：`load()` 取共享快照，`prepare(sessionId,
+ * agentContext)` 在绑定会话确认之后发布本回合 sidecar，`complete(sessionId, localOnly)` 只在
+ * 任务普通成功分支结算共享说明（校验 prepared receipt 与 marker CAS，然后清理 sidecar）。
+ * 取消/中断/失败路径不调用它，本回合的 sidecar 保留给下一次重放。
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { ChannelTransport, ChatTarget, ContextInjection, GroupContext, WorkerOptions } from "../contracts.ts";
 import {
   normalizeGroupContext,
+  emptyGroupContext,
   preparedReceiptMatches,
   readContextSidecar,
+  readAgentContextOverlay,
   removeContextSidecar,
   writeBoundSession,
   writeContextSidecar,
+  writeAgentContextOverlay,
   type ContextSidecar,
+  type StagedAgentContext,
 } from "./context-sidecar.ts";
+import type { AgentContext } from "./agent-context.ts";
 import type { ChannelStore } from "../store/index.ts";
 
 /**
- * What one turn may touch outside its own state: the context ledger rows, one group-context read,
- * and the identity/paths those rows are keyed by.
+ * What one turn may touch outside its own state: its shared-context ledger and read, plus bound
+ * session and agent-context sidecar files keyed by the current bot/chat identity.
  */
 export interface TurnContextDeps {
   readonly store: Pick<
@@ -43,10 +48,14 @@ export interface TurnContextDeps {
 export class TurnContext {
   /** `load()` 取到的完整群/子区快照。 */
   private snapshot: GroupContext | null = null;
+  /** 私聊不读取或持久化共享群说明。 */
+  private hasSharedContext = false;
   /** 本回合的注入内容：`prepare` 的产物，也是 `promptContext` 的来源。 */
   private injection: ContextInjection | undefined;
   /** 本回合 sidecar 的精确路径；未发布或已清理时为 undefined。 */
   private sidecarPath: string | undefined;
+  /** Distinguishes this task's overlay from a late writer from an older turn in the same session. */
+  private turnId: string | undefined;
   /** 成功分支是否需要结算 ledger：`injectionDecision` 为 unchanged 时为 false。 */
   private needsCommit = false;
   /** scope 侧车目录：同一个回合里 scope、bound session 与 sidecar 复用同一份路径。 */
@@ -55,16 +64,21 @@ export class TurnContext {
   constructor(private readonly deps: TurnContextDeps) {}
 
   /**
-   * 读取本回合的群说明快照。这里失败即启动阶段的读取失败，调用方在它返回之后才把
-   * `startupPhase` 推进到 startup。
+   * 读取本回合的群说明快照；私聊只使用该门面发布会话作用域，不触碰群说明 API。
    */
   async load(): Promise<GroupContext | null> {
+    if (this.deps.target.channelType === 1) {
+      this.snapshot = emptyGroupContext();
+      this.hasSharedContext = false;
+      return null;
+    }
     this.snapshot = normalizeGroupContext(await this.deps.transport.getGroupContext(this.deps.target));
+    this.hasSharedContext = true;
     return this.snapshot;
   }
 
   /** 组装群/子区 worker options 时的 scope。 */
-  get workerScope(): WorkerOptions["contextScope"] {
+  get workerScope(): NonNullable<WorkerOptions["contextScope"]> {
     return {
       sidecarRoot: this.sidecarRoot(),
       botUid: this.deps.botUid,
@@ -77,67 +91,133 @@ export class TurnContext {
    * 注入）、写 bound session 与本回合 sidecar，并返回交给 `worker.prompt` 的注入内容。
    * 群说明版本回退直接抛错，任务不启动。
    */
-  async prepare(sessionId: string): Promise<ContextInjection | undefined> {
-    const snapshot = this.snapshot;
-    if (!snapshot) throw new Error("群说明快照缺失");
+  async prepare(sessionId: string, agentContext: AgentContext): Promise<ContextInjection | undefined> {
+    const snapshot = this.snapshot ?? emptyGroupContext();
     const target = this.deps.target;
     const botUid = this.deps.botUid;
-    const existingLedger = this.deps.store.getContextLedger(botUid, target, sessionId);
-    if (existingLedger && existingLedger.version > snapshot.version) {
-      throw new Error("群说明版本回退，未启动任务");
+    let injection: ContextInjection | undefined;
+    let injectionDecision: ContextInjection["injectionDecision"] = "unchanged";
+    let attemptId: string = randomUUID();
+    const turnId = randomUUID();
+    let phase: "pending" | "committed" = "committed";
+    let previousVersion: number | undefined;
+
+    if (this.hasSharedContext) {
+      const existingLedger = this.deps.store.getContextLedger(botUid, target, sessionId);
+      if (existingLedger && existingLedger.version > snapshot.version) {
+        throw new Error("群说明版本回退，未启动任务");
+      }
+      let ledger = existingLedger;
+      if (!ledger || ledger.version < snapshot.version) {
+        ledger = this.deps.store.prepareContextInjection(botUid, target, sessionId, snapshot.version);
+      }
+      previousVersion = ledger.previousVersion ?? undefined;
+      injectionDecision = ledger.phase === "committed" && ledger.version === snapshot.version
+        ? "unchanged"
+        : previousVersion === undefined
+          ? "initial"
+          : "version-change";
+      const explanation = injectionDecision === "version-change" && previousVersion !== undefined
+        ? `群说明版本从 ${previousVersion} 更新为 ${snapshot.version}，注入最新完整快照。`
+        : injectionDecision === "initial"
+          ? "首次注入当前群/线程共享说明完整快照。"
+          : `群说明版本 ${snapshot.version} 未变化，本轮不重复注入正文。`;
+      injection = {
+        snapshot: { ...snapshot },
+        injectionDecision,
+        attemptId: ledger.attemptId,
+        explanation,
+      };
+      attemptId = ledger.attemptId;
+      phase = ledger.phase;
+      this.injection = injection;
+      this.needsCommit = injectionDecision !== "unchanged";
     }
-    let ledger = existingLedger;
-    if (!ledger || ledger.version < snapshot.version) {
-      ledger = this.deps.store.prepareContextInjection(botUid, target, sessionId, snapshot.version);
-    }
-    const previousVersion = ledger.previousVersion;
-    const injectionDecision: ContextInjection["injectionDecision"] = ledger.phase === "committed"
-      && ledger.version === snapshot.version
-      ? "unchanged"
-      : previousVersion === null
-        ? "initial"
-        : "version-change";
-    const explanation = injectionDecision === "version-change" && previousVersion !== null
-      ? `群说明版本从 ${previousVersion} 更新为 ${snapshot.version}，注入最新完整快照。`
-      : injectionDecision === "initial"
-        ? "首次注入当前群/线程共享说明完整快照。"
-        : `群说明版本 ${snapshot.version} 未变化，本轮不重复注入正文。`;
-    const injection: ContextInjection = {
-      snapshot: { ...snapshot },
-      injectionDecision,
-      attemptId: ledger.attemptId,
-      explanation,
-    };
-    this.injection = injection;
-    this.needsCommit = injectionDecision !== "unchanged";
+
     const sidecar: ContextSidecar = {
       schemaVersion: 1,
       botUid,
       target: { ...target },
+      turnId,
       sessionId,
       snapshot: { ...snapshot },
       injectionDecision,
-      attemptId: ledger.attemptId,
+      attemptId,
       marker: {
-        phase: ledger.phase,
+        phase,
         botUid,
         target: { ...target },
         sessionId,
         version: snapshot.version,
-        attemptId: ledger.attemptId,
+        attemptId,
       },
-      ...(previousVersion === null ? {} : { previousVersion }),
+      ...(previousVersion === undefined ? {} : { previousVersion }),
+      agentContext,
     };
-    // The scope publishes the session this turn belongs to; it stays as the
-    // scope's current session so sub-sessions OMP opens in the same worker
-    // are never mistaken for a channel turn.
+    // The scope publishes the session this turn belongs to before its first model request.
     await writeBoundSession(this.sidecarRoot(), {
       botUid,
       target: { ...target },
       sessionId,
     });
     this.sidecarPath = await writeContextSidecar(this.sidecarRoot(), sidecar);
+    this.turnId = turnId;
     return injection;
+  }
+
+  /** Replace only the current transient agent context; receipt writes live in a separate file. */
+  async updateAgentContext(agentContext: AgentContext): Promise<AgentContext | undefined> {
+    const sidecarPath = this.sidecarPath;
+    if (!sidecarPath) throw new Error("本回合 agent context 尚未发布");
+    const sidecar = await this.currentTurnSidecar(sidecarPath);
+    const overlay = await readAgentContextOverlay(sidecarPath, sidecar);
+    await writeAgentContextOverlay(sidecarPath, sidecar, agentContext, overlay?.pending ?? []);
+    return overlay?.agentContext ?? sidecar.agentContext;
+  }
+
+  /** Stage a steering snapshot; OMP exposes it only after its user message appears in model context. */
+  async stageAgentContext(
+    messageId: string,
+    text: string,
+    agentContext: AgentContext,
+  ): Promise<AgentContext | undefined> {
+    const sidecarPath = this.sidecarPath;
+    if (!sidecarPath) throw new Error("本回合 agent context 尚未发布");
+    const sidecar = await this.currentTurnSidecar(sidecarPath);
+    const overlay = await readAgentContextOverlay(sidecarPath, sidecar);
+    const previous = overlay?.agentContext ?? sidecar.agentContext;
+    const pending: StagedAgentContext[] = [
+      ...(overlay?.pending ?? []),
+      { messageId, text, agentContext },
+    ];
+    await writeAgentContextOverlay(sidecarPath, sidecar, previous ?? agentContext, pending);
+    return previous;
+  }
+
+  /** Remove a staged input that OMP refused; other accepted/pending inputs remain intact. */
+  async discardStagedAgentContext(messageId: string): Promise<void> {
+    const sidecarPath = this.sidecarPath;
+    if (!sidecarPath) return;
+    const sidecar = await this.currentTurnSidecar(sidecarPath);
+    const overlay = await readAgentContextOverlay(sidecarPath, sidecar);
+    if (!overlay) return;
+    const pending = overlay.pending.filter((entry) => entry.messageId !== messageId);
+    if (pending.length === overlay.pending.length) return;
+    await writeAgentContextOverlay(sidecarPath, sidecar, overlay.agentContext, pending);
+  }
+
+  private async currentTurnSidecar(sidecarPath: string): Promise<ContextSidecar> {
+    const sidecar = await readContextSidecar(sidecarPath);
+    if (
+      !this.turnId
+      || sidecar.turnId !== this.turnId
+      || sidecar.botUid !== this.deps.botUid
+      || sidecar.target.channelType !== this.deps.target.channelType
+      || sidecar.target.channelId !== this.deps.target.channelId
+    ) {
+      throw new Error("本回合 agent context 身份不匹配");
+    }
+    return sidecar;
   }
 
   /**
@@ -161,6 +241,7 @@ export class TurnContext {
         || sidecar.target.channelType !== this.deps.target.channelType
         || sidecar.target.channelId !== this.deps.target.channelId
         || sidecar.snapshot.version !== injection.snapshot.version
+        || sidecar.turnId !== this.turnId
         || sidecar.attemptId !== injection.attemptId
         || !sidecar.prepared
         || !preparedReceiptMatches(sidecar, sidecar.prepared)
@@ -178,8 +259,12 @@ export class TurnContext {
       }
     }
     if (this.sidecarPath) {
-      await removeContextSidecar(this.sidecarPath).catch(() => {});
+      const sidecar = await readContextSidecar(this.sidecarPath).catch(() => undefined);
+      if (sidecar?.turnId === this.turnId) {
+        await removeContextSidecar(this.sidecarPath).catch(() => {});
+      }
       this.sidecarPath = undefined;
+      this.turnId = undefined;
     }
   }
 

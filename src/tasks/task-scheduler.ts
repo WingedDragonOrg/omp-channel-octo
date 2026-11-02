@@ -1,15 +1,13 @@
 /**
- * 任务调度与目录租约的唯一所有者：每个聊天的任务串行链、已排定任务、关停要等的在途任务、
- * 排队等待任务的启动回执，以及按 cwd 的租约链都在这里。外部只能经 `scheduleTask`/
- * `hasBlockingWork`/`tryAcquireCommandDirectories`/`markWaiting`/`takeWaitingReceipt`/
- * `settle` 观察，本对象的 map 不外露。
+ * 任务调度与会话租约的唯一所有者：每聊天的任务串行链、已排定任务、关停要等的在途任务、
+ * 排队等待任务的启动回执，以及按 session / chat key 持有的租约链都在这里。外部只能经
+ * `scheduleTask`/`hasBlockingWork`/`tryAcquireCommandSession`/`markWaiting`/
+ * `takeWaitingReceipt`/`settle` 观察，本对象的 map 不外露。
  *
  * 模块不依赖 `service.ts`：任务行与绑定行的读取、绑定核对、真正的执行入口（`runTask`）、
- * bot 身份与停止态、运行中任务与 blocked 集合（`CoreService` 遍历自己的 runtimes），以及
- * 回执与终态通知的投递路径都按原样注入。运行中任务与 blocked 集合仍然只有一个所有者，调度
- * 侧的判定因此与绑定探测侧保持同一个语义。
+ * bot 身份与停止态、blocked 集合、回执与终态通知的投递路径都按原样注入。会话租约与 blocked
+ * 集合仍然分别只有一个所有者，调度侧与绑定探测侧因此保持同一安全语义。
  */
-
 import type { ChatTarget } from "../contracts.ts";
 import type { Outbox } from "../outbox.ts";
 import type { ChannelStore } from "../store/index.ts";
@@ -18,19 +16,17 @@ import { GENERIC_TASK_FAILURE_NOTICE } from "./task-failure.ts";
 import { targetKey, taskTarget } from "../target.ts";
 
 /**
- * 按目录的租约：`/new`、`/move` 在命令体内占据一个或多个 cwd，`ready` 在它们都空闲后兑现，
- * `complete` 恰好释放一次。租约本体（按 cwd 的 Promise 链）由 `TaskScheduler` 持有，租约不
- * 在两个模块里各存一份。
+ * 按 session 与聊天键的租约：任务和 `/new`、`/move` 共用对应的会话锁，聊天键还防止命令期间
+ * 绑定切换后同聊天的新任务越过命令。`ready` 在它们都空闲后兑现，`complete` 恰好释放一次。
  */
-export type DirectoryLease = {
+export type SessionLease = {
   ready: Promise<void>;
   complete(): void;
 };
 
 /**
- * 调度可以触及的外部状态：持久层里的任务行与绑定行、bot 身份（getter：start 之后才知道，
- * 任务只在接受后才会被排定）、停止态、进程内的运行中任务与 blocked 集合、绑定核对、真正的
- * 执行入口，以及启动回执与终态通知两条投递路径。
+ * 调度访问持久层任务与绑定行、bot 身份、停止态、目录 block 状态、绑定核对、执行入口，以及
+ * 启动回执与终态通知投递路径。
  */
 export interface TaskSchedulerDeps {
   readonly store: Pick<
@@ -44,8 +40,6 @@ export interface TaskSchedulerDeps {
   readonly botUid: () => string | undefined;
   /** channel 是否正在停止：停止后不再启动排定任务。 */
   readonly stopping: () => boolean;
-  /** 该 cwd 是否有进程内运行任务——`CoreService` 遍历自己的 runtimes。 */
-  readonly hasRuntimeInDirectory: (cwd: string) => boolean;
   /** 该 cwd 是否因 worker 无法确认停止而被 block。 */
   readonly isDirectoryBlocked: (cwd: string) => boolean;
   /**
@@ -57,7 +51,7 @@ export interface TaskSchedulerDeps {
     target: ChatTarget,
     binding: BindingRecord | null,
   ) => Promise<BindingRecord | null>;
-  /** 启动一个已排定任务；`cwd` 是调度已租下的目录。 */
+  /** 启动一个已排定任务；`cwd` 是启动前核对用的绑定目录，并非互斥键。 */
   readonly runTask: (taskId: string, cwd?: string) => Promise<void>;
   /**
    * 启动门：恢复任务先占住调度序，但要等服务接线成功才真正执行。`start()` 失败时该 Promise
@@ -73,27 +67,25 @@ export interface TaskSchedulerDeps {
 export class TaskScheduler {
   /** 每个聊天的任务串行链：该聊天的下一个任务接在上一个（或已排定的任务）之后。 */
   private readonly chatTails = new Map<string, Promise<void>>();
-  /** 已排定任务的操作：目录序靠前的任务据此等待。 */
+  /** 已排定任务操作：同 session 的较早任务据此等待。 */
   private readonly scheduledTasks = new Map<string, Promise<void>>();
   /** 关停要等的在途任务（已排定任务的操作）。 */
   private readonly taskOperations = new Set<Promise<void>>();
   /**
-   * Tasks accepted while their chat or directory was already busy. They get one start receipt
+   * Tasks accepted while their chat or session was already busy. They get one start receipt
    * when they finally begin, so a message that waited is distinguishable from one that started
    * right away. In-memory only: a restart interrupts such tasks instead of starting them.
    */
   private readonly waiting = new Set<string>();
-  /** 按 cwd 的租约链：`/new`、`/move` 与任务启动共用的目录占用。 */
-  private readonly directoryTails = new Map<string, Promise<void>>();
+  /** Tasks and session commands share per-session and per-chat lease tails. */
+  private readonly sessionTails = new Map<string, Promise<void>>();
+  /** True when this chat or its bound session already has queued or running work. */
+  hasBlockingWork(target: ChatTarget): boolean {
+    const sessionKey = this.sessionKey(target, this.bindingFor(target));
+    return this.hasLeaseFor(target, sessionKey) || this.hasQueuedWork(target, sessionKey);
+  }
 
   constructor(private readonly deps: TaskSchedulerDeps) {}
-
-  /** True when a new task on this chat cannot start at once: the chat or its directory is busy. */
-  hasBlockingWork(target: ChatTarget, cwd: string): boolean {
-    if (this.chatTails.has(targetKey(target))) return true;
-    if (this.deps.store.listQueuedTasks().some((queued) => queued.cwd === cwd)) return true;
-    return this.deps.hasRuntimeInDirectory(cwd);
-  }
 
   /** 排定一个任务：接在该聊天的任务链之后执行，并进入关停要等的在途集合。 */
   scheduleTask(taskId: string): void {
@@ -114,7 +106,7 @@ export class TaskScheduler {
     void next.then(cleanup, cleanup);
   }
 
-  /** 记下「这条任务在忙聊天或忙目录后面等过」：启动时取回，据此补一条启动回执。 */
+  /** 记下「这条任务在忙聊天或忙 session 后面等过」：启动时取回，据此补一条启动回执。 */
   markWaiting(taskId: string): void {
     this.waiting.add(taskId);
   }
@@ -134,67 +126,105 @@ export class TaskScheduler {
     return Promise.allSettled([...this.taskOperations]);
   }
 
-  /** 为一次目录级命令租下全部给定 cwd，任一忙碌时返回 `undefined`；租约在命令的 finally 里释放。 */
-  tryAcquireCommandDirectories(cwds: readonly string[]): DirectoryLease | undefined {
-    const unique = [...new Set(cwds)];
-    if (unique.some(cwd => this.directoryUnavailable(cwd))) return undefined;
-    const leases = unique.map(cwd => this.createDirectoryLease(cwd));
-    return {
-      ready: Promise.all(leases.map(lease => lease.ready)).then(() => {}),
-      complete: () => {
-        for (const lease of leases) lease.complete();
-      },
-    };
-  }
-
-  /** 该 cwd 现在是否不可用于启动：被 block、已有租约、有运行中任务或有排队任务。 */
-  private directoryUnavailable(cwd: string): boolean {
-    if (this.deps.isDirectoryBlocked(cwd) || this.directoryTails.has(cwd)) return true;
-    if (this.deps.hasRuntimeInDirectory(cwd)) return true;
-    for (const task of this.deps.store.listQueuedTasks()) {
-      if (task.cwd === cwd) return true;
+  /**
+   * A command holds the current session and chat keys, while cwd is consulted only for an
+   * unverified worker left by recovery. Different sessions in the same cwd remain independent.
+   */
+  tryAcquireCommandSession(
+    target: ChatTarget,
+    cwds: readonly string[],
+  ): SessionLease | undefined {
+    const sessionKey = this.sessionKey(target, this.bindingFor(target));
+    if (
+      this.hasLeaseFor(target, sessionKey)
+      || this.hasQueuedWork(target, sessionKey)
+      || cwds.some((cwd) => this.deps.isDirectoryBlocked(cwd))
+    ) {
+      return undefined;
     }
-    return false;
+    return this.createSessionLease(target, sessionKey);
   }
 
-  private createDirectoryLease(cwd: string): DirectoryLease {
-    const previous = this.directoryTails.get(cwd);
+  private bindingFor(target: ChatTarget): BindingRecord | null {
+    const botUid = this.deps.botUid();
+    return botUid === undefined ? null : this.deps.store.getBinding(botUid, target);
+  }
+
+  private sessionKey(target: ChatTarget, binding: BindingRecord | null): string {
+    return binding?.sessionId
+      ? `session:${binding.sessionId}`
+      : `chat:${targetKey(target)}`;
+  }
+
+  private leaseKeys(target: ChatTarget, sessionKey: string): string[] {
+    return [...new Set([sessionKey, `chat:${targetKey(target)}`])];
+  }
+
+  private hasLeaseFor(target: ChatTarget, sessionKey: string): boolean {
+    if (this.chatTails.has(targetKey(target))) return true;
+    return this.leaseKeys(target, sessionKey).some((key) => this.sessionTails.has(key));
+  }
+
+  private hasQueuedWork(target: ChatTarget, sessionKey: string): boolean {
+    const chatKey = targetKey(target);
+    return this.deps.store.listQueuedTasks().some((task) => {
+      const queuedTarget = taskTarget(task);
+      return targetKey(queuedTarget) === chatKey
+        || this.sessionKey(queuedTarget, this.bindingFor(queuedTarget)) === sessionKey;
+    });
+  }
+
+  private createSessionLease(target: ChatTarget, sessionKey: string): SessionLease {
+    const keys = this.leaseKeys(target, sessionKey);
+    const previous = keys.flatMap((key) => {
+      const tail = this.sessionTails.get(key);
+      return tail === undefined ? [] : [tail];
+    });
     const completion = Promise.withResolvers<void>();
     const lease = completion.promise;
-    this.directoryTails.set(cwd, lease);
+    for (const key of keys) this.sessionTails.set(key, lease);
     let complete = false;
     return {
-      ready: previous?.catch(() => {}) ?? Promise.resolve(),
+      ready: Promise.all(previous.map((tail) => tail.catch(() => {}))).then(() => {}),
       complete: () => {
         if (complete) return;
         complete = true;
-        if (this.directoryTails.get(cwd) === lease) this.directoryTails.delete(cwd);
+        for (const key of keys) {
+          if (this.sessionTails.get(key) === lease) this.sessionTails.delete(key);
+        }
         completion.resolve();
       },
     };
   }
 
-  private async acquireDirectoryLease(cwd: string): Promise<DirectoryLease> {
-    const lease = this.createDirectoryLease(cwd);
+  private async acquireSessionLease(
+    target: ChatTarget,
+    sessionKey: string,
+  ): Promise<SessionLease> {
+    const lease = this.createSessionLease(target, sessionKey);
     await lease.ready;
     return lease;
   }
 
-  /** 目录序在该任务之前、且核对后的 cwd 相同的已排定任务，供本次启动等待。 */
-  private async earlierDirectoryOperations(task: TaskRecord, cwd: string): Promise<Promise<void>[]> {
+  /** Earlier queued tasks bound to this session must finish before the current task starts. */
+  private async earlierSessionOperations(
+    task: TaskRecord,
+    sessionKey: string,
+  ): Promise<Promise<void>[]> {
     const queued = this.deps.store.listQueuedTasks();
-    const currentIndex = queued.findIndex(candidate => candidate.id === task.id);
+    const currentIndex = queued.findIndex((candidate) => candidate.id === task.id);
     if (currentIndex < 0) return [];
     const operations: Promise<void>[] = [];
     for (let index = 0; index < currentIndex; index += 1) {
       const earlier = queued[index];
       if (!earlier) continue;
+      const target = taskTarget(earlier);
       const binding = await this.deps.reconcileBinding(
         earlier.id,
-        taskTarget(earlier),
-        this.deps.store.getBinding(this.deps.botUid()!, taskTarget(earlier)),
+        target,
+        this.bindingFor(target),
       );
-      if ((binding?.cwd ?? earlier.cwd) !== cwd) continue;
+      if (this.sessionKey(target, binding) !== sessionKey) continue;
       const operation = this.scheduledTasks.get(earlier.id);
       if (operation) operations.push(operation);
     }
@@ -208,44 +238,48 @@ export class TaskScheduler {
       // 启动失败：这条排定任务不执行，行仍以 queued 留给下一次进程。
       return;
     }
-    let lease: DirectoryLease | undefined;
+    let lease: SessionLease | undefined;
     try {
       for (let attempt = 0; attempt < 4; attempt += 1) {
         const current = this.deps.store.getTask(taskId);
         if (this.deps.stopping() || !current || current.state !== "queued") return;
+        const target = taskTarget(current);
         const binding = await this.deps.reconcileBinding(
           taskId,
-          taskTarget(current),
-          this.deps.store.getBinding(this.deps.botUid()!, taskTarget(current)),
+          target,
+          this.bindingFor(target),
         );
         const reconciledCurrent = this.deps.store.getTask(taskId);
         if (this.deps.stopping() || !reconciledCurrent || reconciledCurrent.state !== "queued") return;
         const cwd = binding?.cwd ?? reconciledCurrent.cwd;
-        const earlier = await this.earlierDirectoryOperations(reconciledCurrent, cwd);
-        await Promise.all(earlier.map(operation => operation.catch(() => {})));
+        const sessionKey = this.sessionKey(target, binding);
+        const earlier = await this.earlierSessionOperations(reconciledCurrent, sessionKey);
+        await Promise.all(earlier.map((operation) => operation.catch(() => {})));
 
         const beforeLease = this.deps.store.getTask(taskId);
         if (this.deps.stopping() || !beforeLease || beforeLease.state !== "queued") return;
-        lease = await this.acquireDirectoryLease(cwd);
+        const beforeTarget = taskTarget(beforeLease);
+        lease = await this.acquireSessionLease(beforeTarget, sessionKey);
 
         const refreshed = await this.deps.reconcileBinding(
           taskId,
-          taskTarget(beforeLease),
-          this.deps.store.getBinding(this.deps.botUid()!, taskTarget(beforeLease)),
+          beforeTarget,
+          this.bindingFor(beforeTarget),
         );
         const latest = this.deps.store.getTask(taskId);
         if (this.deps.stopping() || !latest || latest.state !== "queued") return;
         const currentCwd = refreshed?.cwd ?? latest.cwd;
-        if (currentCwd !== cwd) {
+        const currentSessionKey = this.sessionKey(beforeTarget, refreshed);
+        if (currentCwd !== cwd || currentSessionKey !== sessionKey) {
           lease.complete();
           lease = undefined;
           continue;
         }
-        const newlyEarlier = await this.earlierDirectoryOperations(latest, currentCwd);
+        const newlyEarlier = await this.earlierSessionOperations(latest, currentSessionKey);
         if (newlyEarlier.length > 0) {
           lease.complete();
           lease = undefined;
-          await Promise.all(newlyEarlier.map(operation => operation.catch(() => {})));
+          await Promise.all(newlyEarlier.map((operation) => operation.catch(() => {})));
           continue;
         }
         await this.deps.runTask(taskId, cwd);
@@ -254,7 +288,7 @@ export class TaskScheduler {
       const task = this.deps.store.getTask(taskId);
       if (!task || task.state !== "queued") return;
       this.takeWaitingReceipt(taskId);
-      this.deps.store.markFailed(taskId, "绑定目录在启动前持续变更，任务未启动。");
+      this.deps.store.markFailed(taskId, "绑定会话或目录在启动前持续变更，任务未启动。");
       await this.deps.enqueueText(taskTarget(task), GENERIC_TASK_FAILURE_NOTICE, taskId);
       await this.deps.notifyThreadOutcome(taskId);
     } finally {

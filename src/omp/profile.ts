@@ -311,7 +311,6 @@ export function workerEnv(scope?: WorkerContextScope, cliEnv?: Record<string, st
 	}
 	if (
 		!scope
-		|| scope.target.channelType === 1
 		|| !isAbsolute(scope.sidecarRoot)
 		|| scope.sidecarRoot.length === 0
 		|| scope.botUid.length === 0

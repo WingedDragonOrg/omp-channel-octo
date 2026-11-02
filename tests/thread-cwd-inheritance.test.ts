@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { ChatTarget } from "../src/contracts";
+import { threadParentGroupId, threadShortId } from "../src/threads/thread-target.ts";
 import {
   closeCoreHarness,
   createCoreHarness,
@@ -15,7 +16,7 @@ import {
  * `docs/specs/2026-09-12-octo-channel-design.md` (default work directory order) and the
  * acceptance matrix in `local://thread-cwd-inheritance-cases.md`.
  */
-const ALLOWED_GROUP_IDS = ["group-a", "group-a____thread-1", "____thread"];
+const ALLOWED_GROUP_IDS = ["group-a", "group-a____thread-1", "group-b"];
 const GROUP: ChatTarget = { channelId: "group-a", channelType: 2 };
 const THREAD: ChatTarget = { channelId: "group-a____thread-1", channelType: 5 };
 
@@ -206,16 +207,21 @@ test("C4 a thread with a verified session keeps its cwd and session when the par
   }
 });
 
-test("C5 a channelType 5 target without a parent segment in its id falls back to the default directory", async () => {
+test("C5 a valid thread without a parent binding starts in the default directory", async () => {
   const harness = await createHarness();
   try {
     const dirA = await createWorkDirectory(harness, "dirA");
     await deliver(harness, GROUP, "c5-parent-new", `/new ${dirA}`);
 
-    const orphan: ChatTarget = { channelId: "group-a", channelType: 5 };
-    const prompt = await runTask(harness, orphan, "c5-orphan-task", "thread without a parent segment");
+    const unboundThread: ChatTarget = { channelId: "group-b____thread-5", channelType: 5 };
+    const prompt = await runTask(
+      harness,
+      unboundThread,
+      "c5-unbound-parent-task",
+      "thread whose parent group has no binding",
+    );
     expect(prompt.cwd).toBe(join(harness.root, "tmp"));
-    expect((await harness.service.status(orphan)).cwd).toBe(join(harness.root, "tmp"));
+    expect((await harness.service.status(unboundThread)).cwd).toBe(join(harness.root, "tmp"));
 
     expect((await harness.service.status(GROUP)).cwd).toBe(dirA);
   } finally {
@@ -223,20 +229,10 @@ test("C5 a channelType 5 target without a parent segment in its id falls back to
   }
 });
 
-test("C6 an empty parent segment (\"____thread\") falls back to the default directory", async () => {
-  const harness = await createHarness();
-  try {
-    const dirA = await createWorkDirectory(harness, "dirA");
-    await deliver(harness, GROUP, "c6-parent-new", `/new ${dirA}`);
-
-    const emptyParent: ChatTarget = { channelId: "____thread", channelType: 5 };
-    const prompt = await runTask(harness, emptyParent, "c6-empty-parent-task", "thread with an empty parent id");
-    expect(prompt.cwd).toBe(join(harness.root, "tmp"));
-    expect((await harness.service.status(emptyParent)).cwd).toBe(join(harness.root, "tmp"));
-
-    expect((await harness.service.status(GROUP)).cwd).toBe(dirA);
-  } finally {
-    await closeCoreHarness(harness);
+test("C6 malformed thread ids remain invalid for parent-directory resolution", () => {
+  for (const channelId of ["group-a", "____thread"]) {
+    expect(threadParentGroupId(channelId)).toBeNull();
+    expect(threadShortId(channelId)).toBeNull();
   }
 });
 

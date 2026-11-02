@@ -1,5 +1,5 @@
 import { expect, test, vi } from "bun:test";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -717,6 +717,7 @@ test("a running tool card only re-renders on real events and stops at terminal",
     workerGate.resolve();
     for (let step = 0; step < 10 && transport.progressCardEdits.at(-1)?.progress.state !== "completed"; step += 1) {
       vi.advanceTimersByTime(1_000);
+      await stat(harness.stateDir);
       await flushMicrotasks();
     }
     const terminal = transport.progressCardEdits.at(-1);
@@ -985,6 +986,7 @@ test("an edge-refused card body is retried without step summaries and still clos
     workerGate.resolve();
     for (let step = 0; step < 10 && transport.progressCardEdits.at(-1)?.progress.state !== "completed"; step += 1) {
       vi.advanceTimersByTime(1_000);
+      await stat(harness.stateDir);
       await flushMicrotasks();
     }
     const terminal = transport.progressCardEdits.at(-1);

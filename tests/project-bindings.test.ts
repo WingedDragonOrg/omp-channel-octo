@@ -207,7 +207,7 @@ class MoveStopFailureFactory extends FakeWorkerFactory {
     return createNumber === 2 ? new StopFalseWorker(worker) : worker;
   }
 }
-class CommandLeaseWorker implements OmpWorker {
+class CommandSessionWorker implements OmpWorker {
   constructor(
     private readonly inner: OmpWorker,
     private readonly refreshStarted: Gate,
@@ -281,8 +281,8 @@ class CommandLeaseWorker implements OmpWorker {
   }
 }
 
-class CommandLeaseGateFactory extends FakeWorkerFactory {
-  readonly targetAttempt = createGate();
+class CommandSessionGateFactory extends FakeWorkerFactory {
+  readonly independentTaskStarted = createGate("independent task during command", 1_000);
   readonly commandStarted = createGate("command operation", 1_000);
   readonly releaseCommandCreate = createGate();
   readonly releaseCommandMove = createGate();
@@ -293,7 +293,7 @@ class CommandLeaseGateFactory extends FakeWorkerFactory {
   private commandMode: "new" | "move" = "new";
   private commandClaimed = false;
   private commandInFlight = false;
-  private targetLeaseViolated = false;
+  private independentTaskStartedDuringCommand = false;
   constructor(promptHandler: FakePrompt) {
     super(promptHandler);
   }
@@ -310,16 +310,16 @@ class CommandLeaseGateFactory extends FakeWorkerFactory {
     this.commandMode = "move";
   }
 
-  get didViolateTargetLease(): boolean {
-    return this.targetLeaseViolated;
+  get didStartIndependentTaskDuringCommand(): boolean {
+    return this.independentTaskStartedDuringCommand;
   }
 
   override async create(options: WorkerOptions): Promise<OmpWorker> {
     const isCommand = !this.commandClaimed && options.cwd === this.commandCwd;
     if (!isCommand) {
       if (this.commandInFlight) {
-        this.targetLeaseViolated = true;
-        this.targetAttempt.release();
+        this.independentTaskStartedDuringCommand = true;
+        this.independentTaskStarted.release();
       }
       return super.create(options);
     }
@@ -331,7 +331,7 @@ class CommandLeaseGateFactory extends FakeWorkerFactory {
       await this.releaseCommandCreate.promise;
     }
     const worker = await workerPromise;
-    return new CommandLeaseWorker(
+    return new CommandSessionWorker(
       worker,
       this.commandRefreshStarted,
       this.releaseCommandRefresh,
@@ -453,6 +453,194 @@ test("/move keeps the session identity while changing the bound directory", asyn
     await closeCoreHarness(harness);
   }
 });
+for (const occupiedDirectory of ["source", "destination"] as const) {
+  test(`/move succeeds while another chat runs in the ${occupiedDirectory} directory`, async () => {
+    const taskStarted = createGate(`other chat task (${occupiedDirectory})`, 1_000);
+    const releaseTask = createGate();
+    const heldTaskText = `move-other-chat-hold-${occupiedDirectory}`;
+    const harness = await createCoreHarness({
+      prompt: async ({ onStop, text }) => {
+        if (text !== heldTaskText) return;
+        taskStarted.release();
+        onStop(() => releaseTask.release());
+        await releaseTask.promise;
+      },
+    });
+    const target = { channelId: `dm-project-move-occupied-${occupiedDirectory}`, channelType: 1 as const };
+    const otherTarget = {
+      channelId: `dm-project-move-occupied-other-${occupiedDirectory}`,
+      channelType: 1 as const,
+    };
+    const source = await realpath(await mkdtemp(join(harness.root, `move-occupied-source-${occupiedDirectory}-`)));
+    const destination = await realpath(
+      await mkdtemp(join(harness.root, `move-occupied-destination-${occupiedDirectory}-`)),
+    );
+    const otherCwd = occupiedDirectory === "source" ? source : destination;
+    let store: ChannelStore | undefined;
+    let otherTask: Promise<void> | undefined;
+    try {
+      await harness.service.handleInbound(
+        inbound({ messageId: `move-occupied-bind-${occupiedDirectory}`, ...target, text: `/new ${source}` }),
+      );
+      await harness.service.handleInbound(
+        inbound({
+          messageId: `move-occupied-other-bind-${occupiedDirectory}`,
+          ...otherTarget,
+          text: `/new ${otherCwd}`,
+        }),
+      );
+      store = await openChannelStore(harness.stateDir);
+      const before = store.getBinding(harness.bot.uid, target);
+      const otherBefore = store.getBinding(harness.bot.uid, otherTarget);
+      expect(before).not.toBeNull();
+      expect(otherBefore).not.toBeNull();
+      if (!before?.sessionId || !otherBefore?.sessionId) throw new Error("initial bindings lack session identities");
+      expect(before.sessionId).not.toBe(otherBefore.sessionId);
+
+      otherTask = harness.service.handleInbound(
+        inbound({
+          messageId: `move-occupied-hold-${occupiedDirectory}`,
+          ...otherTarget,
+          text: heldTaskText,
+        }),
+      );
+      await taskStarted.wait();
+      await waitForStatus(harness.service, otherTarget, status => status.state === "running");
+
+      await harness.service.handleInbound(
+        inbound({
+          messageId: `move-occupied-command-${occupiedDirectory}`,
+          ...target,
+          text: `/move ${destination}`,
+        }),
+      );
+
+      const after = store.getBinding(harness.bot.uid, target);
+      expect(after?.cwd).toBe(destination);
+      expect(after?.sessionId).toBe(before.sessionId);
+      if (!after?.sessionFile || !after.sessionId) throw new Error("moved binding lacks persisted session state");
+      const movedState = await loadValidatedSessionState(after.sessionFile, after.sessionId);
+      expect(movedState.state.cwd).toBe(destination);
+      expect(movedState.state.sessionId).toBe(before.sessionId);
+
+      expect(store.getBinding(harness.bot.uid, otherTarget)?.cwd).toBe(otherCwd);
+      expect(store.getLatestTask(harness.bot.uid, otherTarget)?.state).toBe("running");
+    } finally {
+      releaseTask.release();
+      await otherTask?.catch(() => {});
+      store?.close();
+      await closeCoreHarness(harness);
+    }
+  });
+}
+
+test("/new creates an independent session in a directory used by another chat's running task", async () => {
+  const taskStarted = createGate("other chat task for /new", 1_000);
+  const releaseTask = createGate();
+  const heldTaskText = "new-other-chat-hold";
+  const harness = await createCoreHarness({
+    prompt: async ({ onStop, text }) => {
+      if (text !== heldTaskText) return;
+      taskStarted.release();
+      onStop(() => releaseTask.release());
+      await releaseTask.promise;
+    },
+  });
+  const target = { channelId: "dm-project-new-occupied", channelType: 1 as const };
+  const otherTarget = { channelId: "dm-project-new-occupied-other", channelType: 1 as const };
+  const source = await realpath(await mkdtemp(join(harness.root, "new-occupied-source-")));
+  const destination = await realpath(await mkdtemp(join(harness.root, "new-occupied-destination-")));
+  let store: ChannelStore | undefined;
+  let otherTask: Promise<void> | undefined;
+  try {
+    await harness.service.handleInbound(
+      inbound({ messageId: "new-occupied-bind", ...target, text: `/new ${source}` }),
+    );
+    await harness.service.handleInbound(
+      inbound({ messageId: "new-occupied-other-bind", ...otherTarget, text: `/new ${destination}` }),
+    );
+    store = await openChannelStore(harness.stateDir);
+    const before = store.getBinding(harness.bot.uid, target);
+    const otherBefore = store.getBinding(harness.bot.uid, otherTarget);
+    expect(before).not.toBeNull();
+    expect(otherBefore).not.toBeNull();
+    if (!before?.sessionId || !otherBefore?.sessionId) throw new Error("initial bindings lack session identities");
+    expect(before.sessionId).not.toBe(otherBefore.sessionId);
+
+    otherTask = harness.service.handleInbound(
+      inbound({ messageId: "new-occupied-hold", ...otherTarget, text: heldTaskText }),
+    );
+    await taskStarted.wait();
+    await waitForStatus(harness.service, otherTarget, status => status.state === "running");
+
+    await harness.service.handleInbound(
+      inbound({ messageId: "new-occupied-command", ...target, text: `/new ${destination}` }),
+    );
+
+    const after = store.getBinding(harness.bot.uid, target);
+    expect(after?.cwd).toBe(destination);
+    expect(after?.sessionId).not.toBe(before?.sessionId);
+    expect(after?.sessionId).not.toBe(otherBefore?.sessionId);
+    if (!after?.sessionFile || !after.sessionId) throw new Error("new binding lacks persisted session state");
+    const newState = await loadValidatedSessionState(after.sessionFile, after.sessionId);
+    expect(newState.state.cwd).toBe(destination);
+    expect(newState.state.sessionId).toBe(after.sessionId);
+
+    expect(store.getBinding(harness.bot.uid, otherTarget)?.cwd).toBe(destination);
+    expect(store.getLatestTask(harness.bot.uid, otherTarget)?.state).toBe("running");
+  } finally {
+    releaseTask.release();
+    await otherTask?.catch(() => {});
+    store?.close();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a running task in the current chat still blocks /move", async () => {
+  const taskStarted = createGate("current chat busy task", 1_000);
+  const releaseTask = createGate();
+  const heldTaskText = "current-chat-busy-hold";
+  const harness = await createCoreHarness({
+    prompt: async ({ onStop, text }) => {
+      if (text !== heldTaskText) return;
+      taskStarted.release();
+      onStop(() => releaseTask.release());
+      await releaseTask.promise;
+    },
+  });
+  const target = { channelId: "dm-project-move-current-busy", channelType: 1 as const };
+  const source = await realpath(await mkdtemp(join(harness.root, "move-current-busy-source-")));
+  const destination = await realpath(await mkdtemp(join(harness.root, "move-current-busy-destination-")));
+  let store: ChannelStore | undefined;
+  let runningTask: Promise<void> | undefined;
+  try {
+    await harness.service.handleInbound(
+      inbound({ messageId: "move-current-busy-bind", ...target, text: `/new ${source}` }),
+    );
+    store = await openChannelStore(harness.stateDir);
+    const before = store.getBinding(harness.bot.uid, target);
+    expect(before).not.toBeNull();
+
+    runningTask = harness.service.handleInbound(
+      inbound({ messageId: "move-current-busy-hold", ...target, text: heldTaskText }),
+    );
+    await taskStarted.wait();
+    await waitForStatus(harness.service, target, status => status.state === "running");
+
+    await harness.service.handleInbound(
+      inbound({ messageId: "move-current-busy-command", ...target, text: `/move ${destination}` }),
+    );
+
+    expect(store.getBinding(harness.bot.uid, target)).toEqual(before);
+    expect(store.getLatestTask(harness.bot.uid, target)?.state).toBe("running");
+    expect(harness.workers.prompts.some(({ text }) => text === `/move ${destination}`)).toBe(false);
+  } finally {
+    releaseTask.release();
+    await runningTask?.catch(() => {});
+    store?.close();
+    await closeCoreHarness(harness);
+  }
+});
 
 test("different chats retain independent project/session bindings", async () => {
   const harness = await createCoreHarness();
@@ -542,105 +730,59 @@ test("/move does not replace the binding when worker-ledger finalization fails",
     await closeCoreHarness(harness);
   }
 });
-test("directory execution preserves durable acceptance order across chats", async () => {
-  const holdStarted = createGate();
-  const releaseHold = createGate();
-  const harness = await createCoreHarness({
-    prompt: async ({ onStop, text }) => {
-      if (text !== "order-hold") return;
-      holdStarted.release();
-      onStop(() => releaseHold.release());
-      await releaseHold.promise;
-    },
-  });
-  const firstTarget = { channelId: "dm-project-order-first", channelType: 1 as const };
-  const secondTarget = { channelId: "dm-project-order-second", channelType: 1 as const };
-  const source = await realpath(await mkdtemp(join(harness.root, "order-source-")));
-  let holdTask: Promise<void> | undefined;
-  let firstQueuedTask: Promise<void> | undefined;
-  let secondQueuedTask: Promise<void> | undefined;
-  try {
-    await harness.service.handleInbound(
-      inbound({ messageId: "order-bind-first", ...firstTarget, text: `/new ${source}` }),
-    );
-    await harness.service.handleInbound(
-      inbound({ messageId: "order-bind-second", ...secondTarget, text: `/new ${source}` }),
-    );
-    holdTask = harness.service.handleInbound(
-      inbound({ messageId: "order-hold", ...firstTarget, text: "order-hold" }),
-    );
-    await holdStarted.promise;
-    firstQueuedTask = harness.service.handleInbound(
-      inbound({ messageId: "order-first-queued", ...firstTarget, text: "/queue order-first-queued" }),
-    );
-    await firstQueuedTask;
-    secondQueuedTask = harness.service.handleInbound(
-      inbound({ messageId: "order-second-queued", ...secondTarget, text: "order-second-queued" }),
-    );
-    await secondQueuedTask;
-    releaseHold.release();
-    await harness.workers.waitForPromptCount(3);
-    expect(harness.workers.prompts.map(({ text }) => text)).toEqual([
-      "order-hold",
-      "order-first-queued",
-      "order-second-queued",
-    ]);
-  } finally {
-    releaseHold.release();
-    await Promise.all(
-      [holdTask, firstQueuedTask, secondQueuedTask]
-        .filter((task): task is Promise<void> => task !== undefined)
-        .map(task => task.catch(() => {})),
-    );
-    await closeCoreHarness(harness);
-  }
-});
 for (const commandKind of ["new", "move"] as const) {
-  test(`project commands hold the target directory lease while ${commandKind} is gated`, async () => {
+  test(`another chat can finish a same-cwd task while /${commandKind} is gated`, async () => {
     const holdStarted = createGate(`command hold (${commandKind})`, 1_000);
     const releaseHold = createGate();
-    const workers = new CommandLeaseGateFactory(async ({ onStop, text }) => {
-      if (text !== "command-lease-hold") return;
-      holdStarted.release();
-      onStop(() => releaseHold.release());
-      await releaseHold.promise;
+    let holdFinished = false;
+    let queuedTaskStartedAfterHold = false;
+    const workers = new CommandSessionGateFactory(async ({ onStop, text }) => {
+      if (text === "command-lease-hold") {
+        holdStarted.release();
+        onStop(() => releaseHold.release());
+        await releaseHold.promise;
+        holdFinished = true;
+        return;
+      }
+      if (text === "command-lease-queued") queuedTaskStartedAfterHold = holdFinished;
     });
     const harness = await createCoreHarness({ workers });
     const firstTarget = {
-      channelId: `dm-project-command-lease-first-${commandKind}`,
+      channelId: `dm-project-command-session-first-${commandKind}`,
       channelType: 1 as const,
     };
     const secondTarget = {
-      channelId: `dm-project-command-lease-second-${commandKind}`,
+      channelId: `dm-project-command-session-second-${commandKind}`,
       channelType: 1 as const,
     };
-    const source = await realpath(await mkdtemp(join(harness.root, `command-lease-source-${commandKind}-`)));
+    const source = await realpath(await mkdtemp(join(harness.root, `command-session-source-${commandKind}-`)));
     const destination = await realpath(
-      await mkdtemp(join(harness.root, `command-lease-destination-${commandKind}-`)),
+      await mkdtemp(join(harness.root, `command-session-destination-${commandKind}-`)),
     );
     const commandSource = await realpath(
-      await mkdtemp(join(harness.root, `command-lease-command-source-${commandKind}-`)),
+      await mkdtemp(join(harness.root, `command-session-command-source-${commandKind}-`)),
     );
     let holdTask: Promise<void> | undefined;
     let queuedTask: Promise<void> | undefined;
     let commandTask: Promise<void> | undefined;
+    let bindingStore: ChannelStore | undefined;
+    let commandSessionId: string | undefined;
     try {
       await harness.service.handleInbound(
-        inbound({ messageId: `command-lease-bind-${commandKind}`, ...firstTarget, text: `/new ${source}` }),
+        inbound({ messageId: `command-session-bind-${commandKind}`, ...firstTarget, text: `/new ${source}` }),
       );
-      const binding = await harness.service.status(firstTarget);
-      if (!binding.sessionId) throw new Error("fresh binding did not return a session id");
-      const bindingStore = await openChannelStore(harness.stateDir);
+      const firstBinding = await harness.service.status(firstTarget);
+      if (!firstBinding.sessionId) throw new Error("fresh binding did not return a session id");
+      bindingStore = await openChannelStore(harness.stateDir);
       const sessionFile = bindingStore.getBinding(harness.bot.uid, firstTarget)?.sessionFile;
-      bindingStore.close();
       if (!sessionFile) throw new Error("fresh binding did not persist a session file");
       holdTask = harness.service.handleInbound(
-        inbound({ messageId: `command-lease-hold-${commandKind}`, ...firstTarget, text: "command-lease-hold" }),
+        inbound({ messageId: `command-session-hold-${commandKind}`, ...firstTarget, text: "command-lease-hold" }),
       );
       await holdStarted.wait();
       queuedTask = harness.service.handleInbound(
         inbound({
-          messageId: `command-lease-queued-${commandKind}`,
+          messageId: `command-session-queued-${commandKind}`,
           ...firstTarget,
           text: "/queue command-lease-queued",
         }),
@@ -651,45 +793,77 @@ for (const commandKind of ["new", "move"] as const) {
         `${JSON.stringify({
           type: "session",
           version: 3,
-          id: binding.sessionId,
+          id: firstBinding.sessionId,
           cwd: destination,
           previousSessionFiles: [sessionFile],
         })}\n`,
         "utf8",
       );
+
       if (commandKind === "move") {
         await harness.service.handleInbound(
-          inbound({ messageId: `command-lease-command-bind-${commandKind}`, ...secondTarget, text: `/new ${commandSource}` }),
+          inbound({
+            messageId: `command-session-command-bind-${commandKind}`,
+            ...secondTarget,
+            text: `/new ${commandSource}`,
+          }),
         );
-      }
-      if (commandKind === "move") {
+        const priorCommandBinding = bindingStore.getBinding(harness.bot.uid, secondTarget);
+        if (!priorCommandBinding?.sessionId) throw new Error("move target did not persist a session id");
+        commandSessionId = priorCommandBinding.sessionId;
         workers.configureMove(commandSource, destination);
       } else {
         workers.configureNew(destination);
       }
       commandTask = harness.service.handleInbound(
         inbound({
-          messageId: `command-lease-command-${commandKind}`,
+          messageId: `command-session-command-${commandKind}`,
           ...secondTarget,
           text: commandKind === "new" ? `/new ${destination}` : `/move ${destination}`,
         }),
       );
       await workers.commandStarted.wait();
+
       releaseHold.release();
+      await workers.independentTaskStarted.wait();
+      await harness.workers.waitForPromptCount(2);
+      await waitForStatus(harness.service, firstTarget, status => status.state === "completed");
+
+      const firstTask = bindingStore.getLatestTask(harness.bot.uid, firstTarget);
+      expect(firstTask?.state).toBe("completed");
+      expect(queuedTaskStartedAfterHold).toBe(true);
+      const heldPrompt = workers.prompts.find(({ text }) => text === "command-lease-hold");
+      const queuedPrompt = workers.prompts.find(({ text }) => text === "command-lease-queued");
+      if (!heldPrompt || !queuedPrompt) throw new Error("same-chat task prompts were not both recorded");
+      expect(queuedPrompt.cwd).toBe(destination);
+      expect(queuedPrompt.sessionId).toBe(heldPrompt.sessionId);
+      expect(queuedPrompt.sessionId).toBe(firstBinding.sessionId);
+      expect(workers.didStartIndependentTaskDuringCommand).toBe(true);
+      if (commandKind === "move") {
+        expect(bindingStore.getBinding(harness.bot.uid, secondTarget)).toMatchObject({
+          cwd: commandSource,
+          sessionId: commandSessionId,
+        });
+      } else {
+        expect(bindingStore.getBinding(harness.bot.uid, secondTarget)).toBeNull();
+      }
+
       if (commandKind === "move") workers.releaseCommandMove.release();
       else workers.releaseCommandCreate.release();
       await workers.commandRefreshStarted.wait();
-      const targetAttempted = await Promise.race([
-        workers.targetAttempt.promise.then(() => true),
-        new Promise<boolean>(resolve => setTimeout(() => resolve(false), 150)),
-      ]);
-      expect(targetAttempted).toBe(false);
-      expect(workers.didViolateTargetLease).toBe(false);
-      expect(workers.prompts.some(({ text }) => text === "command-lease-queued")).toBe(false);
       workers.releaseCommandRefresh.release();
       await commandTask;
-      await harness.workers.waitForPromptCount(commandKind === "move" ? 3 : 2);
-      expect(workers.didViolateTargetLease).toBe(false);
+
+      const commandBinding = bindingStore.getBinding(harness.bot.uid, secondTarget);
+      expect(commandBinding?.cwd).toBe(destination);
+      if (!commandBinding?.sessionId) throw new Error("completed command did not persist its session id");
+      expect(queuedPrompt.sessionId).not.toBe(commandBinding.sessionId);
+      if (commandKind === "move") {
+        if (!commandSessionId) throw new Error("move command had no original session id");
+        expect(commandBinding.sessionId).toBe(commandSessionId);
+      } else {
+        expect(commandBinding.sessionId).not.toBe(firstBinding.sessionId);
+      }
     } finally {
       releaseHold.release();
       workers.releaseCommandCreate.release();
@@ -700,6 +874,7 @@ for (const commandKind of ["new", "move"] as const) {
           .filter((task): task is Promise<void> => task !== undefined)
           .map(task => task.catch(() => {})),
       );
+      bindingStore?.close();
       await closeCoreHarness(harness);
     }
   });
@@ -771,7 +946,7 @@ test("cancelled queued tasks do not wait on a successor after reconcile resumes"
     await closeCoreHarness(harness);
   }
 });
-test("a queued task reacquires the moved cwd lock after its chat predecessor without a tail cycle", async () => {
+test("a queued task follows its session's moved cwd after its chat predecessor", async () => {
   const holdStarted = createGate();
   const releaseHold = createGate();
   const harness = await createCoreHarness({

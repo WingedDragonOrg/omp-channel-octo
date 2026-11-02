@@ -143,6 +143,7 @@ test("group dispatch freezes scoped management/file tools to the current target 
     expect(harness.transport.sentFiles[0]?.path).toContain(join(harness.stateDir, "spool"));
     expect(harness.transport.sentFiles[0]?.path).toMatch(/picture\.png$/u);
     expect(harness.transport.managementCalls).toEqual([
+      { action: "group-members", groupId: "group-tools", shortId: null },
       { action: "group-info", groupId: "group-tools", shortId: null },
       { action: "create-thread", groupId: "group-tools", shortId: null },
     ]);
@@ -241,6 +242,7 @@ test("thread dispatch resolves management actions to the parent group and curren
     await waitForStatus(harness.service, THREAD_TOOLS, (status) => status.state === "completed");
 
     expect(harness.transport.managementCalls).toEqual([
+      { action: "thread-members", groupId: "group-tools", shortId: "topic-7" },
       { action: "thread-info", groupId: "group-tools", shortId: "topic-7" },
       { action: "list-threads", groupId: "group-tools", shortId: null },
       { action: "thread-delete", groupId: "group-tools", shortId: "topic-7" },
@@ -348,6 +350,12 @@ test("thread-delete retries a transient store failure on a fresh connection", as
     prompt: async ({ append, promptContext }) => {
       const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
       if (!management) throw new Error("management tool missing");
+      harness.transport.failManagementTimes([
+        Object.assign(new Error("Octo thread delete failed with HTTP 400: 服务器内部错误。"), {
+          status: 400,
+          code: "err.server.bot_api.store_failed",
+        }),
+      ]);
       const deleted = await management.execute(
         { action: "thread-delete", short_id: "topic-9" },
         new AbortController().signal,
@@ -361,12 +369,6 @@ test("thread-delete retries a transient store failure on a fresh connection", as
     harness.transport.setThreads("group-tools", [threadRecord("topic-9")]);
     // The shape the real transport reports for the server's transient storage failure: the wire
     // status is a 400, while the body's `store_failed` code says the operation failed internally.
-    harness.transport.failManagementTimes([
-      Object.assign(new Error("Octo thread delete failed with HTTP 400: 服务器内部错误。"), {
-        status: 400,
-        code: "err.server.bot_api.store_failed",
-      }),
-    ]);
     await harness.service.handleInbound(
       inbound({ messageId: "delete-retry-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
@@ -383,6 +385,7 @@ test("thread-delete retries a transient store failure on a fresh connection", as
 
     expect(await readText(join(cwd, "thread-delete.log"))).toBe("已删除线程 topic-9\n");
     expect(harness.transport.managementCalls).toEqual([
+      { action: "group-members", groupId: "group-tools", shortId: null },
       { action: "thread-delete", groupId: "group-tools", shortId: "topic-9" },
       { action: "thread-delete", groupId: "group-tools", shortId: "topic-9", freshConnection: true },
     ]);
@@ -397,6 +400,15 @@ test("thread-delete reports one bounded line when the retry fails too", async ()
     prompt: async ({ append, promptContext }) => {
       const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
       if (!management) throw new Error("management tool missing");
+      harness.transport.failManagementTimes([
+        Object.assign(new Error("Octo thread delete failed with HTTP 503"), { status: 503 }),
+        Object.assign(
+          new Error(
+            `Octo thread delete failed with HTTP 500:\n服务器内部错误。${"重试之后仍然失败。".repeat(60)}`,
+          ),
+          { status: 500 },
+        ),
+      ]);
       const outcome = await management
         .execute({ action: "thread-delete", short_id: "topic-9" }, new AbortController().signal)
         .then((value) => `resolved:${value}`)
@@ -408,16 +420,6 @@ test("thread-delete reports one bounded line when the retry fails too", async ()
     const cwd = join(harness.root, "delete exhausted cwd");
     await mkdir(cwd, { recursive: true });
     harness.transport.setThreads("group-tools", [threadRecord("topic-9")]);
-    harness.transport.failManagementTimes([
-      // A 5xx is transient as well; the retry then meets the noisy final failure.
-      Object.assign(new Error("Octo thread delete failed with HTTP 503"), { status: 503 }),
-      Object.assign(
-        new Error(
-          `Octo thread delete failed with HTTP 500:\n服务器内部错误。${"重试之后仍然失败。".repeat(60)}`,
-        ),
-        { status: 500 },
-      ),
-    ]);
     await harness.service.handleInbound(
       inbound({ messageId: "delete-exhausted-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
@@ -438,6 +440,7 @@ test("thread-delete reports one bounded line when the retry fails too", async ()
     expect(message).toHaveLength(200);
     expect(message.startsWith("Octo thread delete failed with HTTP 500: 服务器内部错误。")).toBe(true);
     expect(harness.transport.managementCalls).toEqual([
+      { action: "group-members", groupId: "group-tools", shortId: null },
       { action: "thread-delete", groupId: "group-tools", shortId: "topic-9" },
       { action: "thread-delete", groupId: "group-tools", shortId: "topic-9", freshConnection: true },
     ]);
@@ -454,6 +457,9 @@ test("thread-delete does not retry a permanent server rejection", async () => {
     prompt: async ({ append, promptContext }) => {
       const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
       if (!management) throw new Error("management tool missing");
+      harness.transport.failManagementTimes([
+        Object.assign(new Error("Octo thread delete failed with HTTP 403: 无删除权限。"), { status: 403 }),
+      ]);
       const outcome = await management
         .execute({ action: "thread-delete", short_id: "topic-9" }, new AbortController().signal)
         .then((value) => `resolved:${value}`)
@@ -465,9 +471,6 @@ test("thread-delete does not retry a permanent server rejection", async () => {
     const cwd = join(harness.root, "delete permanent cwd");
     await mkdir(cwd, { recursive: true });
     harness.transport.setThreads("group-tools", [threadRecord("topic-9")]);
-    harness.transport.failManagementTimes([
-      Object.assign(new Error("Octo thread delete failed with HTTP 403: 无删除权限。"), { status: 403 }),
-    ]);
     await harness.service.handleInbound(
       inbound({ messageId: "delete-permanent-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
@@ -486,6 +489,7 @@ test("thread-delete does not retry a permanent server rejection", async () => {
       "rejected:Octo thread delete failed with HTTP 403: 无删除权限。\n",
     );
     expect(harness.transport.managementCalls).toEqual([
+      { action: "group-members", groupId: "group-tools", shortId: null },
       { action: "thread-delete", groupId: "group-tools", shortId: "topic-9" },
     ]);
     await expect(harness.transport.listThreads("group-tools")).resolves.toMatchObject([
@@ -565,8 +569,10 @@ test("thread dispatch queues the task in the target thread and reports it in bot
         `2:group-tools|已在子区 thread-1（${dispatchedChannelId}）作为独立任务执行。`,
       ]);
     expect(harness.transport.managementCalls).toEqual([
+      { action: "group-members", groupId: "group-tools", shortId: null },
       { action: "create-thread", groupId: "group-tools", shortId: null },
       { action: "thread-info", groupId: "group-tools", shortId: "thread-1" },
+      { action: "thread-members", groupId: "group-tools", shortId: "thread-1" },
     ]);
   } finally {
     await closeCoreHarness(harness);
@@ -1635,6 +1641,7 @@ test("thread-archive does not retry a permanent failure and reports one bounded 
       await yieldRealIo(harness.stateDir);
       expect(archiveCalls()).toBe(1);
       expect(harness.transport.managementCalls).toEqual([
+        { action: "group-members", groupId: "group-tools", shortId: null },
         { action: "thread-archive", groupId: "group-tools", shortId: "topic-9" },
       ]);
       const notices = harness.transport.sent.filter(({ text: body }) => body.startsWith("归档失败："));

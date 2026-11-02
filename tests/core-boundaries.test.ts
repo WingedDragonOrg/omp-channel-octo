@@ -438,6 +438,13 @@ test("starting the channel provisions the CLI credential for the bot it register
       provision: async (botUid: string) => {
         provisioned.push(botUid);
       },
+      env: () => provisioned.length === 0
+        ? undefined
+        : {
+            OCTO_CONFIG_DIR: "/private/octo-cli-test",
+            OCTO_API_BASE_URL: "https://im.example.test/",
+            OCTO_BOT_ID: provisioned.at(-1)!,
+          },
     },
   });
   try {
@@ -453,6 +460,7 @@ test("a credential provisioning failure does not keep the channel from serving",
       provision: async () => {
         throw new Error("octo-cli 不可用");
       },
+      env: () => undefined,
     },
   });
   try {

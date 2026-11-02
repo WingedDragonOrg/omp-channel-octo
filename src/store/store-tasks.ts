@@ -4,9 +4,26 @@
 
 import { Database } from "bun:sqlite";
 import type { ChatTarget } from "../contracts.ts";
-import type { InboundClaim, StoppedTaskRecovery, TaskRecord, TaskRestartRecovery, TaskStopIntent } from "./store-records.ts";
+import type { CommandClaimState, InboundClaim, StoppedTaskRecovery, TaskRecord, TaskRestartRecovery, TaskStopIntent } from "./store-records.ts";
 import { asNumber, asStopIntent, asString, query, run, targetValues, targetWhere, taskFromRow, transaction } from "./store-schema.ts";
 import { cancelTaskQuestions } from "./store-questions.ts";
+
+/** Returns the persisted command state; task rows and unknown messages return null. */
+export function getCommandClaimState(
+  db: Database,
+  botUid: string,
+  target: ChatTarget,
+  messageId: string,
+): CommandClaimState | null {
+  const row = query(db,
+    `SELECT command_state FROM inbound
+     WHERE bot_uid = ? AND ${targetWhere(target)} AND message_id = ? AND kind = 'command'`,
+    [botUid, ...targetValues(target), messageId],
+  )[0];
+  if (!row) return null;
+  const state = asString(row.command_state);
+  return state === "pending" || state === "completed" || state === "failed" ? state : null;
+}
 
 export function acceptTask(db: Database, claim: InboundClaim, task: TaskRecord): boolean {
   return transaction(db, () => {

@@ -7,13 +7,14 @@ const BOT_EVENT_POLL_WAIT_SECONDS = 20;
 const BOT_EVENT_POLL_LIMIT = 50;
 const BOT_EVENT_POLL_IDLE_MS = 1_000;
 const BOT_EVENT_POLL_BACKOFF_MS = 5_000;
-/** Attempts applied to one event before it is acknowledged and dropped, so the queue keeps moving. */
+/** Attempts before a terminal callback; accepted durable work can keep the event unacknowledged. */
 const BOT_EVENT_MAX_ATTEMPTS = 5;
 
 /**
- * 一个事件的处理结果：`handled`/`ignored` 终结该事件（可 ACK），`retry` 保留游标重读。
+ * 一个事件的处理结果：`handled`/`ignored` 可 ACK，`retry` 保留有限重试计数，`pending` 等待恢复并保留游标。
  */
-export type BotEventOutcome = "handled" | "ignored" | "retry";
+export type BotEventOutcome = "handled" | "ignored" | "retry" | "pending";
+export type BotEventExhaustionOutcome = "handled" | "pending";
 
 /** 一次 Bot 事件队列消费：轮询、应用、确认、推进游标。 */
 export interface BotEventLoopDeps {
@@ -21,8 +22,16 @@ export interface BotEventLoopDeps {
   readonly transport: ChannelTransport;
   botUid(): string | undefined;
   stopping(): boolean;
-  /** 处理一次卡片点击；抛错按 `retry` 对待。 */
-  onCardAction(action: BotCardAction): Promise<BotEventOutcome>;
+  /** 处理一次卡片点击；抛错按 `retry` 对待，event id 用于持久操作去重。 */
+  onCardAction(action: BotCardAction, eventId: number): Promise<BotEventOutcome>;
+  /** 处理重试耗尽时恢复已接受操作或投递失败提示；`pending` 继续保留事件且不 ACK。 */
+  onCardActionRetriesExhausted?(
+    action: BotCardAction,
+    eventId: number,
+  ): Promise<BotEventExhaustionOutcome | void>;
+  /** Narrow retry controls for deterministic event-consumer tests; production uses the constants above. */
+  readonly maxAttempts?: number;
+  readonly retryDelayMs?: number;
 }
 
 export interface BotEventLoop {
@@ -55,6 +64,8 @@ function waitFor(ms: number, signal: AbortSignal): Promise<void> {
  */
 export function createBotEventLoop(deps: BotEventLoopDeps): BotEventLoop {
   const eventAttempts = new Map<number, number>();
+  const maxAttempts = deps.maxAttempts ?? BOT_EVENT_MAX_ATTEMPTS;
+  const retryDelayMs = deps.retryDelayMs ?? BOT_EVENT_POLL_BACKOFF_MS;
   let abort: AbortController | undefined;
   let loop: Promise<void> | undefined;
 
@@ -82,17 +93,38 @@ export function createBotEventLoop(deps: BotEventLoopDeps): BotEventLoop {
       for (const event of events) {
         if (signal.aborted || deps.stopping()) return;
         const outcome = event.kind === "card_action"
-          ? await deps.onCardAction(event.action).catch((): BotEventOutcome => "retry")
+          ? await deps.onCardAction(event.action, event.eventId).catch((): BotEventOutcome => "retry")
           : "ignored";
+        if (outcome === "pending") {
+          // A durable grant exists; keep its event unacknowledged until mirror/result recovery finishes.
+          eventAttempts.delete(event.eventId);
+          await waitFor(retryDelayMs, signal);
+          break;
+        }
         if (outcome === "retry") {
           const attempts = (eventAttempts.get(event.eventId) ?? 0) + 1;
           eventAttempts.set(event.eventId, attempts);
           // Keep the cursor: the next round re-reads this event from the same place.
-          if (attempts < BOT_EVENT_MAX_ATTEMPTS) {
-            await waitFor(BOT_EVENT_POLL_BACKOFF_MS, signal);
+          if (attempts < maxAttempts) {
+            await waitFor(retryDelayMs, signal);
             break;
           }
-          console.error(`[bot-events] dropped event ${event.eventId} after ${attempts} attempts`);
+          if (attempts === maxAttempts) {
+            console.error(`[bot-events] exhausted event ${event.eventId} after ${attempts} attempts`);
+          }
+          if (event.kind === "card_action") {
+            let exhaustedOutcome: BotEventExhaustionOutcome | void;
+            try {
+              exhaustedOutcome = await deps.onCardActionRetriesExhausted?.(event.action, event.eventId);
+            } catch (error) {
+              console.error(`[bot-events] exhausted-event notice failed：${safeErrorMessage(error, "send failed")}`);
+              exhaustedOutcome = "pending";
+            }
+            if (exhaustedOutcome === "pending") {
+              await waitFor(retryDelayMs, signal);
+              break;
+            }
+          }
         }
         try {
           await deps.transport.ackBotEvent(event.eventId, signal);
