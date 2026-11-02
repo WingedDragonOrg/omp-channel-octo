@@ -267,3 +267,41 @@ export interface ChatGrantOperationRecord extends ChatGrantOperationInput {
   resultState: "pending" | "delivered";
 }
 
+export type ThreadWorkspaceLayout = "single" | "shared" | "separate";
+export type ThreadWorkspaceStatus = "preparing" | "ready" | "failed";
+
+export interface ThreadWorkspaceProjectRecord {
+  name: string;
+  repo: string;
+  base?: string;
+  path: string | null;
+  branch: string | null;
+  created: boolean;
+}
+
+export interface ThreadWorkspaceRecord extends ChatTarget {
+  botUid: string;
+  channelType: 5;
+  channelId: string;
+  layout: ThreadWorkspaceLayout;
+  /** Present only for the legacy `worktree_name` API, which retains parent-cwd fallback. */
+  legacyWorktreeName?: string;
+  status: ThreadWorkspaceStatus;
+  entryPath: string | null;
+  projects: ThreadWorkspaceProjectRecord[];
+  error: string | null;
+}
+
+export type ThreadWorkspaceIntentStatus = "preparing" | "failed" | "complete";
+
+export interface ThreadWorkspaceIntentRecord {
+  id: string;
+  botUid: string;
+  groupId: string;
+  status: ThreadWorkspaceIntentStatus;
+  channelIds: string[];
+  error: string | null;
+}
+
+export type ThreadWorkspaceIntentInput =
+  Omit<ThreadWorkspaceIntentRecord, "error" | "status"> & { status: "preparing"; error?: string | null };

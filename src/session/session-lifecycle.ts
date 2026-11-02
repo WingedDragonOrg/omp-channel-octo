@@ -3,8 +3,8 @@
  * 两条命令各自的候选 worker 台账、状态验证与回执时序。
  *
  * 模块不依赖 `service.ts`：持久层（绑定行、worker 台账、聊天模型）、worker 工厂与配置按原样注入。
- * 按 session 的租约本体由 `TaskScheduler` 持有，运行中任务与 blocked 集合仍是 `CoreService` 的进程内
- * 状态，分别经 `tryAcquireCommandSession`、`hasRuntime`、`isDirectoryBlocked`/`blockDirectory`
+ * 按 session 与工作区资源的租约本体由 `TaskScheduler` 持有，运行中任务与 blocked 集合仍是 `CoreService`
+ * 的进程内状态，分别经 `tryAcquireCommandSession`、`hasRuntime`、`isDirectoryBlocked`/`blockDirectory`
  * 端口跨越；模块内不保存副本，所以被 block 的目录在绑定探测与任务调度两侧保持同一个语义。
  */
 
@@ -29,7 +29,7 @@ import {
 import { ensureProjectSessionDir, projectSessionDir, sessionsRoot } from "./session-dir.ts";
 import { withStoppedWorker, type WorkerSession } from "../runtime/worker-lease.ts";
 import type { ChannelStore } from "../store/index.ts";
-import type { BindingRecord } from "../store/store-records.ts";
+import type { BindingRecord, ThreadWorkspaceRecord } from "../store/store-records.ts";
 import type { SessionLease } from "../tasks/task-scheduler.ts";
 import { threadParentGroupId } from "../threads/thread-target.ts";
 import {
@@ -48,6 +48,8 @@ export interface SessionLifecycleDeps {
   readonly store: Pick<
     ChannelStore,
     | "getBinding"
+    | "getThreadWorkspace"
+    | "workspaceDirectories"
     | "ensureBinding"
     | "getActiveTask"
     | "getChatModel"
@@ -66,12 +68,28 @@ export interface SessionLifecycleDeps {
   /** 把该 cwd 标为不可用（worker 无法确认停止时）。 */
   readonly blockDirectory: (cwd: string) => void;
   /**
-   * 为当前聊天的 session（未绑定时按聊天标识）获取命令租约；`cwds` 仅用于拒绝仍被未确认停止的
-   * worker 阻塞的目录。正常任务按 session 独占，不因其他聊天使用相同 cwd 而互相阻塞。
+   * 为当前聊天的 session（未绑定时按聊天标识）获取命令租约；当命令命中 thread_workspaces 的
+   * entry/project 资源组（或绑定已 pin 的工作区）时，同时租下展开后的工作区资源键。普通 cwd 上的
+   * 其他 session 不因此互相阻塞；`cwds` 仍用于拒绝仍被未确认停止的 worker 阻塞的目录。
    */
   readonly tryAcquireCommandSession: (target: ChatTarget, cwds: readonly string[]) => SessionLease | undefined;
   /** 为该聊天排一条回执文本，与其他命令路径一致。 */
   readonly enqueueText: Outbox["enqueueText"];
+}
+
+export async function threadWorkspaceIsAvailable(workspace: ThreadWorkspaceRecord): Promise<boolean> {
+  if (workspace.status !== "ready" || workspace.projects.length === 0) return false;
+  if (workspace.layout === "shared" && workspace.entryPath === null) return false;
+  if (workspace.entryPath !== null) {
+    const entryPath = await canonicalExistingDirectory(workspace.entryPath).catch(() => null);
+    if (entryPath !== workspace.entryPath) return false;
+  }
+  for (const project of workspace.projects) {
+    if (!project.created || project.path === null || project.branch === null) return false;
+    const projectPath = await canonicalExistingDirectory(project.path).catch(() => null);
+    if (projectPath !== project.path) return false;
+  }
+  return true;
 }
 
 export class SessionLifecycle {
@@ -113,18 +131,51 @@ export class SessionLifecycle {
   }
 
   /**
-   * 该聊天后续 worker 的默认 cwd：已校验的会话目录优先；隔离工作区的 pin 目录失效时继续往下
-   * 走；子区回退到父群绑定的目录（父群目录不可用则同样往下）；最后落到配置的默认工作目录。
+   * 该聊天后续 worker 的默认 cwd：已校验的会话目录优先；共享工作区缺失时 fail closed。旧式单工作树
+   * 保留其父群 cwd 回退，其它 cwd 顺序保持兼容。
    */
   async defaultWorkDirectory(target: ChatTarget): Promise<string> {
     const botUid = this.deps.bot()?.uid;
     const binding = botUid === undefined ? null : this.deps.store.getBinding(botUid, target);
-    if (binding?.sessionFile) return canonicalExistingDirectory(binding.cwd);
+    const workspace = botUid === undefined || target.channelType !== 5
+      ? null
+      : this.deps.store.getThreadWorkspace(botUid, target);
+    let legacyFallback = false;
+    if (workspace !== null) {
+      const related = new Set(binding === null ? [] : this.deps.store.workspaceDirectories(binding.cwd));
+      const bindingUsesWorkspace = binding === null
+        || binding.cwdPinned === true
+        || (workspace.entryPath !== null && related.has(workspace.entryPath))
+        || workspace.projects.some((project) => project.path !== null && related.has(project.path));
+      if (bindingUsesWorkspace) {
+        const workspaceAvailable = await threadWorkspaceIsAvailable(workspace);
+        legacyFallback = !workspaceAvailable
+          && workspace.layout === "single"
+          && workspace.legacyWorktreeName !== undefined
+          && workspace.status === "ready";
+        if (!workspaceAvailable && !legacyFallback) {
+          throw new Error("子区工作区未就绪或资源已缺失");
+        }
+        if (!legacyFallback) {
+          if (binding !== null) {
+            const bindingCwd = await canonicalExistingDirectory(binding.cwd).catch(() => null);
+            if (bindingCwd !== binding.cwd) throw new Error("子区工作区 cwd 已缺失");
+            return bindingCwd;
+          }
+          // A ready owner record can exist before the first binding; bootstrap in owned resources,
+          // never by falling through to the parent thread's cwd.
+          const workspaceCwd = workspace.entryPath ?? workspace.projects[0]?.path ?? null;
+          if (workspaceCwd === null) throw new Error("子区工作区路径缺失");
+          return canonicalExistingDirectory(workspaceCwd);
+        }
+      }
+    }
+    if (binding?.sessionFile && !legacyFallback) return canonicalExistingDirectory(binding.cwd);
     if (binding?.cwdPinned === true) {
       try {
         return await canonicalExistingDirectory(binding.cwd);
       } catch {
-        // An isolated workspace that no longer exists falls back to the ordinary order below.
+        // An owned workspace was rejected above; retain the legacy fallback for unowned pins.
       }
     }
     if (target.channelType === 5) {
@@ -148,6 +199,13 @@ export class SessionLifecycle {
    */
   async probeDirectory(target: ChatTarget): Promise<string | null> {
     try {
+      const botUid = this.deps.bot()?.uid;
+      const workspace = botUid === undefined || target.channelType !== 5
+        ? null
+        : this.deps.store.getThreadWorkspace(botUid, target);
+      if (workspace !== null) {
+        return await this.defaultWorkDirectory(target).catch(() => null);
+      }
       return await this.defaultWorkDirectory(target).catch(() =>
         resolveWorkDirectory("", this.deps.config),
       );
@@ -168,6 +226,7 @@ export class SessionLifecycle {
       return;
     }
     const previous = await this.reconcileExternalBinding(target);
+    const hasExplicitCwd = argument.trim().length > 0;
     let cwd: string;
     try {
       const trimmed = argument.trim();
@@ -242,6 +301,7 @@ export class SessionLifecycle {
         sessionId: created.fresh.sessionId,
         cwd: created.fresh.cwd,
         sessionFile: created.fresh.sessionFile,
+        cwdPinned: hasExplicitCwd ? false : previous?.cwdPinned === true,
         // 主动换会话的唯一痕迹：问答卡据此拒绝切换前提出的旧问题的迟到提交（`/move` 保持会话
         // 身份，因此不写这里）。切换失败走下面的 catch，绑定与这个时间都不落。
         sessionSwitchedAt: Date.now(),

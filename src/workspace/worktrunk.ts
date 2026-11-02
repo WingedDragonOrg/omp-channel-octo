@@ -16,8 +16,6 @@ import type {
  * invocation with a single bounded line instead of waiting for an interactive prompt.
  */
 
-/** Only the stable v0.76.x line is treated as compatible. */
-const WORKTRUNK_VERSION_PREFIX = "0.76.";
 const VERSION_PATTERN = /v?(\d+\.\d+\.\d+)/u;
 export const WORKTRUNK_TIMEOUT_DEFAULTS = {
   probeMs: 5_000,
@@ -117,38 +115,33 @@ export interface ProbeWorktrunkOptions {
 }
 
 /**
- * Probes candidates in order; a candidate counts only when `--version` exits 0 and reports a
- * v0.76.x version. The probe runs per operation (never cached), so installing or upgrading wt
- * takes effect without a channel restart.
+ * Probes candidates in order and uses the first executable one. Any `--version` output is optional
+ * display metadata only; neither its format nor exit status gates availability. The probe runs per
+ * operation (never cached), so installing or upgrading wt takes effect without a channel restart.
  */
 export async function probeWorktrunk(options: ProbeWorktrunkOptions): Promise<WorktrunkProbe> {
-  let incompatible: { command: string; version: string } | null = null;
   for (const command of options.candidates) {
     const result = await runCommand([command, "--version"], {
       timeoutMs: options.timeoutMs ?? WORKTRUNK_TIMEOUT_DEFAULTS.probeMs,
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     });
-    if (!result || result.exitCode !== 0 || result.timedOut || result.aborted) continue;
+    if (!result) continue;
+    if (result.aborted) throw new Error("Worktrunk 探测已取消");
     const matched = VERSION_PATTERN.exec(result.stdout) ?? VERSION_PATTERN.exec(result.stderr);
-    const patchLevel = matched?.[1];
-    if (patchLevel === undefined) continue;
-    if (patchLevel.startsWith(WORKTRUNK_VERSION_PREFIX)) {
-      return { available: true, command, version: `v${patchLevel}` };
-    }
-    incompatible ??= { command, version: `v${patchLevel}` };
+    return {
+      available: true,
+      command,
+      ...(matched === null ? {} : { version: `v${matched[1]}` }),
+    };
   }
-  return incompatible === null
-    ? { available: false, reason: "missing" }
-    : { available: false, reason: "incompatible", command: incompatible.command, version: incompatible.version };
+  return { available: false, reason: "missing" };
 }
 
-/** One bounded sentence for a probe result; used by the merge command prompt and tool errors. */
-export function worktrunkUnavailableText(probe: WorktrunkProbe): string {
-  if (!probe.available && probe.reason === "incompatible") {
-    return `本机 Worktrunk 版本不受支持（${probe.version}，需要 v0.76.x）`;
-  }
-  return "本机没有可用的 Worktrunk（需要 v0.76.x）";
+/** Describes the missing-executable case; executable wt failures are surfaced by their command. */
+export function worktrunkUnavailableText(): string {
+  return "本机没有可用的 Worktrunk";
 }
+
 
 export interface WorktrunkRunOptions {
   command: string;
@@ -159,6 +152,8 @@ export interface WorktrunkRunOptions {
 export interface WorktrunkCreateOptions extends WorktrunkRunOptions {
   repoRoot: string;
   branch: string;
+  /** Git ref used as the start point for the new branch. */
+  base?: string;
   /** Exact worktree directory, pinned through `--config-set worktree-path`. */
   path: string;
 }
@@ -172,6 +167,7 @@ export async function worktrunkCreate(options: WorktrunkCreateOptions): Promise<
       "switch",
       "--create",
       options.branch,
+      ...(options.base === undefined ? [] : ["--base", options.base]),
       "--no-cd",
       "--format",
       "json",
@@ -272,7 +268,11 @@ export async function worktrunkRemove(options: WorktrunkRemoveOptions): Promise<
       ...(options.force ? ["-f"] : []),
       options.path,
     ],
-    { timeoutMs: options.timeoutMs, ...(options.signal === undefined ? {} : { signal: options.signal }) },
+    {
+      cwd: options.path,
+      timeoutMs: options.timeoutMs,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    },
   );
   if (!result) throw new Error(`无法执行 Worktrunk（${options.command}）：${options.path}`);
   if (result.timedOut) throw new Error(`删除隔离工作区超时（${options.timeoutMs} ms）：${options.path}`);
@@ -297,7 +297,7 @@ export interface GitWorktreeRemoveOptions {
 }
 
 /**
- * The git fallback for removal, used when no compatible wt exists. git itself refuses the main
+ * The git fallback for removal, used when no executable wt exists. git itself refuses the main
  * worktree and paths that are not worktrees of a repository, and refuses dirty worktrees without
  * `--force`; the branch is left untouched.
  */

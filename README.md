@@ -38,7 +38,7 @@ OMP 以 **yolo 模式**运行，channel 不增加逐次操作审批，也不是�
 
 可选：
 
-- **Worktrunk 稳定版 v0.76.x**：提供隔离工作区创建、合并及清理。缺少兼容版本时，创建回退到 `omp worktree add`，清理回退到 git；工作区合并需要兼容 Worktrunk。
+- **Worktrunk**：提供隔离工作区创建、合并及清理。宿主使用本机可执行的 wt，命令兼容性由 wt 自身判定；缺少 wt 时创建回退到 `omp worktree add`，清理回退到 git，合并需先安装 wt。
 - **octo-cli**：服务可为每个 Bot 配置独立 CLI 身份，使助手能以该 Bot 调用更多 Octo 接口。
 - **Super**：托管常驻进程，并提供 `oco status`、`oco restart` 所需的守护进程识别与操作能力。
 
@@ -107,8 +107,8 @@ oco run --config ~/.oco/config/config.json
 | `/new [目录]` | 创建新会话；回执显示会话、目录及可查询到的实际模型。 |
 | `/reset [目录]` | 重置为新会话，保留旧历史文件。 |
 | `/move <目录>` | 通过 OMP 原生迁移保留当前会话 ID、历史与附件。 |
-| `/thread <任务>` | 在群内交由助手创建隔离子区并派发任务。 |
-| `/thread merge [补充说明]` | 在符合条件的隔离子区内请求合并；默认合并成功后删除工作区和已合并分支。命令本身即合并与清理的确认。 |
+| `/thread <任务>` | 在群内交由助手按项目与耦合程度创建隔离子区，工作区和背景就绪后派发任务。 |
+| `/thread merge [补充说明]` | 单项目及 separate 子区请求合并；默认合并成功后删除工作区和已合并分支。shared 多项目工作区只回复不支持提示。 |
 | `/queue <文本>` | 显式追加一个排队任务。 |
 | `/mode [steer\|queue]` | 查看或设置新消息的追加方式，默认 `steer`。 |
 | `/switch [模型]` | 查看当前模型与可用列表，或切换并保存本聊天模型。支持 `provider/id`、模型 ID/唯一子串、`@角色` 和 `:level` 后缀。 |
@@ -132,6 +132,37 @@ oco run --config ~/.oco/config/config.json
 助手可以在普通回复中使用结构化 mention 点名成员，完整的 mention 和后续正文在同一条消息中流式更新；代码示例和普通 `@名字` 文本不会自动点名。正文超过单条消息长度限制时按既有规则分段。
 
 安装并配置 `octo-cli` 后，助手可按当前 Bot 的权限使用 Loop、Docs、Drive、HTML、消息、文件、邮件和 Marketplace 等能力；它会通过 CLI 的 `skills`、`schema` 和帮助按需发现具体操作。
+
+### 多项目子区
+
+助手通过 `octo_management` 的 `create-thread` 统一创建子区、准备 worktree、绑定 cwd，并写入 Octo `THREAD.md` 背景说明。多项目由助手显式选择 layout：
+
+- `shared`：一个子区、一个非仓库入口目录，入口下每个项目各有独立 Git worktree。适合需要同一回合联动修改的项目。
+- `separate`：一次调用按项目创建多个子区，各自绑定来源仓库的隔离 worktree。适合可以独立派发的工作。
+
+参数示例（路径替换为本机真实仓库）：
+
+```json
+{
+  "action": "create-thread",
+  "name": "登录链路联调",
+  "worktree_name": "login-flow",
+  "layout": "shared",
+  "projects": [
+    {"name": "web", "repo": "/workspace/web", "base": "main"},
+    {"name": "api", "repo": "/workspace/api", "base": "main"}
+  ],
+  "background": "联调登录链路，涉及前端与 API。"
+}
+```
+
+同一参数改为 `"layout": "separate"`，返回 `threads` 列表，每项携带 `short_id`、`cwd`、项目路径与分支。单项目可省略 layout；既有 `name` + `worktree_name` 单仓库调用继续可用。
+
+只有结果 `ready: true` 才能继续 `thread-dispatch`；全部 worktree、持久绑定与共享说明均须成功。部分失败会返回已完成/未确认资源与错误，保留现场，不自动开始实施。THREAD.md 仅含创建目的、项目及实际路径；具体目标、实施要求与验收写在派发正文中。
+
+远端创建结果未知时，持久创建意图会阻止同组尚无绑定的新子区自动执行，已有绑定不受影响；owner 可显式 `/new <目录>` 建立确定绑定。shared 要求状态目录和入口祖先位于 Git worktree 之外，否则创建前即拒绝，避免把用户仓库误当入口。
+
+shared 不支持 `/thread merge` 或工具 `thread-merge`。`thread-delete` 按持久资源归属清理，默认保留脏工作树和占用中的资源；`force: true` 才丢弃未提交改动。显式 `/new <目录>` 或 `/move <目录>` 改变当前绑定，但保留原工作区归属以便删除时清理；`/new` 无目录沿用工作区。
 
 ### 原生 `/autoresearch`
 

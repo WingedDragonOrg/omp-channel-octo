@@ -1417,6 +1417,7 @@ export interface CoreHarness {
   readonly transport: FakeTransport;
   readonly workers: FakeWorkerFactory;
   readonly worktrees: FakeWorktrees | undefined;
+  readonly worktreePort: WorktreePort | undefined;
   readonly service: ChannelService;
 }
 
@@ -1429,8 +1430,8 @@ export class FakeWorktrees implements WorktreePort {
   readonly merges: WorktreeMergeRequest[] = [];
   /** Removal requests recorded by `remove`. */
   readonly removals: WorktreeRemovalRequest[] = [];
-  /** The probe answer `worktrunk()` reports; tests flip it to model a missing or old wt. */
-  probe: WorktrunkProbe = { available: true, command: "wt", version: "v0.76.0" };
+  /** The probe answer `worktrunk()` reports; tests can model an unavailable wt. */
+  probe: WorktrunkProbe = { available: true, command: "wt" };
   /** When set, `merge` rejects with this error instead of returning a summary. */
   mergeFailure: Error | undefined;
   /** When set, `remove` rejects with this error instead of reporting an outcome. */
@@ -1441,11 +1442,15 @@ export class FakeWorktrees implements WorktreePort {
   constructor(private readonly root: string) {}
 
   async create(request: ThreadWorkspaceRequest): Promise<ThreadWorkspace> {
-    this.requests.push({ ...request });
+    const { onPlanned, ...recordedRequest } = request;
+    this.requests.push({ ...recordedRequest });
     if (this.failure) throw this.failure;
-    const cwd = join(this.root, "worktrees", request.threadId);
+    const cwd = request.path ?? join(this.root, "worktrees", request.threadId);
+    const branch = request.threadId;
+    const repo = await realpath(request.baseDir);
+    onPlanned?.({ cwd, branch, repo });
     await mkdir(cwd, { recursive: true });
-    return { cwd: await realpath(cwd), branch: request.threadId };
+    return { cwd: await realpath(cwd), branch };
   }
 
   async merge(request: WorktreeMergeRequest): Promise<WorktreeMergeSummary> {
@@ -1496,6 +1501,8 @@ export interface CoreHarnessOptions {
   restart?: RestartPort;
   /** Isolated thread workspaces; `null` omits the port so isolate reports an unconfigured deployment. */
   worktrees?: FakeWorktrees | null;
+  /** Injects a real or instrumented host WorktreePort in integration tests. */
+  worktreePort?: WorktreePort;
   /** Per-bot octo-cli credential port; absent means the deployment has no such capability. */
   cliCredentials?: CliCredentialPort;
   /** Allowlist mirror into the config file; absent means a hand-built config with no path. */
@@ -1516,8 +1523,10 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
       startOnline: options.startOnline ?? true,
     });
   const workers = options.workers ?? new FakeWorkerFactory(options.prompt);
-  const worktrees =
-    options.worktrees === null ? undefined : (options.worktrees ?? new FakeWorktrees(root));
+  const worktreePort =
+    options.worktrees === null
+      ? undefined
+      : (options.worktreePort ?? options.worktrees ?? new FakeWorktrees(root));
   const config = {
     ...(options.ownerId === null ? {} : { ownerId: options.ownerId ?? "owner-1" }),
     allowedGroupIds: options.allowedGroupIds ?? [
@@ -1538,7 +1547,7 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
     config,
     transport,
     workerFactory: workers,
-    ...(worktrees === undefined ? {} : { worktrees }),
+    ...(worktreePort === undefined ? {} : { worktrees: worktreePort }),
     ...(options.commandHandlers === undefined ? {} : { commandHandlers: options.commandHandlers }),
     ...(options.restart === undefined ? {} : { restart: options.restart }),
     ...(options.cliCredentials === undefined ? {} : { cliCredentials: options.cliCredentials }),
@@ -1552,7 +1561,8 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
     bot: transport.bot,
     transport,
     workers,
-    worktrees,
+    worktrees: worktreePort instanceof FakeWorktrees ? worktreePort : undefined,
+    worktreePort,
     service,
   };
 }

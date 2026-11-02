@@ -16,8 +16,11 @@ import type { ChannelStore } from "../store/index.ts";
 import type { InboundClaim } from "../store/store-records.ts";
 import { worktrunkUnavailableText } from "../workspace/worktrunk.ts";
 
-const THREAD_USAGE =
-  "用法：/thread <任务>；助手会先明确意图、确定子区名称与 worktree_name，然后新建隔离子区并把任务派发进去；子区内 /thread merge [补充说明] 即确认把本区工作合并回目标分支并清理隔离工作区（默认删除工作区与已合并分支，保留需说明理由；补充说明随合并指令一起交给助手）。";
+const THREAD_USAGE = [
+  "用法：/thread <任务>；无项目需求时沿用普通子区；单项目可沿用 worktree_name，或用 projects=[{name,repo,base?}] 指定仓库（repo 用绝对规范路径，省略 layout 表示 single）；多项目必须列出 projects 并明确选择 layout=shared|separate；",
+  "background 只写简短用途，不放任务正文、SDD 或验收标准；创建后必须确认整批 ready=true 才可派发，未就绪时报告资源结果并停止；",
+  "之后用 thread-dispatch 派发任务；子区内 /thread merge [补充说明] 即确认合并回目标分支并默认清理隔离工作区与已合并分支，保留需说明理由。",
+].join("");
 const THREAD_GROUP_ONLY_TEXT = "/thread 需要在群聊中使用。";
 const THREAD_NESTED_TEXT = "当前会话已是子区，不能再建子区。";
 const THREAD_MERGE_THREAD_ONLY_TEXT = "/thread merge 只在子区中使用。";
@@ -25,6 +28,7 @@ const THREAD_MERGE_NO_WORKSPACE_TEXT =
   "当前子区未绑定隔离工作区，/thread merge 不可用。";
 const THREAD_MERGE_UNCONFIGURED_TEXT =
   "本部署未配置隔离工作区能力，/thread merge 不可用。";
+const THREAD_MERGE_MULTI_PROJECT_TEXT = "当前为多项目工作区，不支持 /thread merge。";
 
 /**
  * Instruction block for a `/thread` message: the command hands the intent over instead of
@@ -40,16 +44,17 @@ const THREAD_MERGE_UNCONFIGURED_TEXT =
  */
 function threadIntentPrompt(intent: string): string {
   return [
-    "用户希望把下面这件事放进一个新的隔离子区处理，而不是在当前会话直接执行。",
-    "先理解意图，并据此确定子区名称（简洁、能说明这件事）与 worktree_name（ASCII 小写连字符，如 fix-login-flow）。",
-    "需求简单或非常明确时不要在这里澄清；其余情况先按 SDD 的要素（目标、范围、约束与验收标准）向 owner 问最少必要的问题（够派发即可，不要在当前会话展开细节），再派发。",
-    "然后调用 octo_management：create-thread（name=子区名称，worktree_name=你定的名字）创建隔离子区，",
-    "再用 thread-dispatch（short_id=该子区）把任务派发进去；派发的任务正文按 SDD 格式写（目标、范围、约束与验收标准），需求明确程度决定子区能否直接生成 SDD：",
-    "- 简单或非常明确（目标与验收标准能直接写清、足以直接生成 SDD、没有需要 owner 决策的歧义或取舍）：直接按 SDD 格式写清要做什么（可整理原始意图，但不要丢信息），让子区直接生成 SDD 并立刻开工；",
-    "- 否则：按 SDD 格式写明已知的目标、范围、约束与验收标准，并要求子区先按 SDD 格式把尚不明确的需求澄清成 SDD（可实施的设计）再动手，需要 owner 拍板的问题在子区内用 ask 提出；环境里有 spec-design 等需求澄清或设计技能时，引导子区用该技能完成澄清。",
-    "派发时自行判断是否要回执：只有你派发后不会再盯着这份活、又需要在它结束（完成/失败/取消/中断）时知道结果，才给 thread-dispatch 传 notify=true；你会在子区里持续交互、或结果不需要回报时不要开（默认 false，不开就不回报）。",
-    "详细的需求澄清在子区内进行：不要在当前会话执行这件事，也不要在当前会话做过于详细的需求澄清。",
-    "完成后简要汇报子区名称、short_id 与工作区路径。",
+    "用户希望把下面这件事放进隔离子区处理，而不是在当前会话直接执行。",
+    "先理解意图，确定简洁的子区名称与工作区计划：无项目/Worktree 需求时可建普通子区；单项目可沿用 worktree_name，若需指定仓库或 base 则用 projects=[{name,repo,base?}] 且省略 layout（表示 single）；多项目必须列出每个项目并明确选择 layout=shared 或 separate（每项 repo 为绝对规范路径，base 为可选 Git 起始 ref；shared 是一个子区，separate 是每个项目一个子区）。",
+    "项目、repo 或多项目 layout 无法从意图中可靠确定时，只向 owner 问最少必要的问题；不要臆造 repo 路径，也不要用当前 cwd 代替项目 repo。",
+    "调用 octo_management create-thread 时传入完整 projects/layout；background 只写简短用途，不放任务正文、SDD 或验收标准。创建结果会包含实际成功资源路径，不要预先臆造路径。",
+    "必须等待 create-thread 返回整批 ready=true 后才能调用 thread-dispatch；若 ready=false，说明各项目/子区的成功与失败资源并停止，不派发任何实现任务。",
+    "整批就绪后，再按 short_id（separate 时逐项目对应）调用 thread-dispatch。派发正文按 SDD 格式写（目标、范围、约束与验收标准）：",
+    "- 需求简单或非常明确时，保留全部意图并按 SDD 格式写清，让子区直接生成 SDD 并立刻开工；",
+    "- 否则先按 SDD 要素写已知信息，并在子区内用最少问答补齐 owner 决策，必要时引导使用 spec-design 等技能；详细的需求澄清在子区内进行，不要留在当前会话。",
+    "background 不要在 dispatch 时重写；SDD、任务细节和验收标准只放在派发正文。",
+    "只在你派发后不会继续关注且需要终态回报时设置 notify=true；否则默认 false。",
+    "完成后简要汇报子区名称、short_id 与真实工作区路径。",
     "",
     "原始意图：",
     intent,
@@ -112,7 +117,9 @@ function threadMergePrompt(workspacePath: string, note: string): string {
  * 工作区能力。
  */
 export interface ThreadCommandsDeps {
-  readonly store: Pick<ChannelStore, "getBinding" | "releaseClaim">;
+  readonly store: Pick<ChannelStore, "getBinding" | "getThreadWorkspace" | "releaseClaim">;
+  /** 阻止未就绪或已缺失工作区的命令改写当前回合或创建任务。 */
+  readonly refuseIncompleteThreadWorkspace: (message: InboundMessage) => Promise<boolean>;
   /** 绑定行按键的 bot 身份；start 之前不存在，命令只在 start 之后到达。 */
   readonly botUid: () => string | undefined;
   /** 隔离工作区能力：缺席即本部署未配置，合并命令只回文案。 */
@@ -178,9 +185,9 @@ export class ThreadCommands {
 
   /**
    * `/thread merge`: a sub-thread that is bound to an isolated workspace can hand the merge
-   * instruction to the assistant; a compatible local Worktrunk must exist, because merging has no
+   * instruction to the assistant; an executable local Worktrunk must exist, because merging has no
    * fallback. Every other caller — the main group, DMs, a thread without a bound workspace, a
-   * deployment without the capability, a missing or incompatible wt — gets one prompt and no
+   * deployment without the capability or a missing wt — gets one prompt and no
    * task. The command runs nothing itself: the prompt is delivered like any other message the
    * assistant has to read (steering when the running turn accepts it, otherwise a durable task),
    * and the assistant drives `octo_management`'s `thread-merge`.
@@ -190,6 +197,12 @@ export class ThreadCommands {
       await this.deps.enqueueText(message, THREAD_MERGE_THREAD_ONLY_TEXT, null);
       return;
     }
+    const ownership = this.deps.store.getThreadWorkspace(this.deps.botUid()!, message);
+    if (ownership?.layout === "shared") {
+      await this.deps.enqueueText(message, THREAD_MERGE_MULTI_PROJECT_TEXT, null);
+      return;
+    }
+    if (await this.deps.refuseIncompleteThreadWorkspace(message)) return;
     const worktrees = this.deps.worktrees;
     if (!worktrees) {
       await this.deps.enqueueText(message, THREAD_MERGE_UNCONFIGURED_TEXT, null);
@@ -204,7 +217,7 @@ export class ThreadCommands {
     if (!available.available) {
       await this.deps.enqueueText(
         message,
-        `${worktrunkUnavailableText(available)}，/thread merge 不可用。`,
+        `${worktrunkUnavailableText()}，/thread merge 不可用。`,
         null,
       );
       return;

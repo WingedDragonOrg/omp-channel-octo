@@ -734,6 +734,12 @@ export interface ThreadWorkspaceRequest {
   label: string;
   /** Server-assigned thread id, used to keep the workspace name unique. */
   threadId: string;
+  /** Exact project worktree directory, when the caller owns a shared workspace entry. */
+  path?: string;
+  /** Git ref from which the new branch starts. */
+  base?: string;
+  /** Persist planned ownership before the worktree creation command can have side effects. */
+  onPlanned?: (workspace: { cwd: string; branch: string; repo: string }) => void;
 }
 
 export interface ThreadWorkspace {
@@ -743,11 +749,10 @@ export interface ThreadWorkspace {
   branch: string;
 }
 
-/** Result of probing the local Worktrunk CLI; only stable v0.76.x counts as available. */
+/** `version` is display metadata only and does not affect whether an executable wt is available. */
 export type WorktrunkProbe =
-  | { available: true; command: string; version: string }
-  | { available: false; reason: "missing" }
-  | { available: false; reason: "incompatible"; command: string; version: string };
+  | { available: true; command: string; version?: string }
+  | { available: false; reason: "missing" };
 
 /** One `wt merge` invocation; every optional field maps to a wt flag, wt's defaults apply otherwise. */
 export interface WorktreeMergeRequest {
@@ -778,6 +783,10 @@ export interface WorktreeRemovalRequest {
   path: string;
   /** Discard uncommitted changes instead of refusing to remove a dirty worktree. */
   force?: boolean;
+  /** Canonical source repository whose Git common directory owns the worktree. */
+  repo?: string;
+  /** Expected checked-out branch for the owned worktree. */
+  branch?: string;
 }
 
 export type WorktreeRemovalOutcome =
@@ -785,16 +794,19 @@ export type WorktreeRemovalOutcome =
   | { kind: "removed"; via: "wt" | "git"; branchOutcome: "deleted" | "kept" | null };
 
 export interface WorktreePort {
-  /** Creates a new git worktree beside the repository that contains `baseDir`. */
+  /**
+   * Creates a worktree at `request.path` when supplied, otherwise beside the repository containing
+   * `baseDir`.
+   */
   create(request: ThreadWorkspaceRequest, signal?: AbortSignal): Promise<ThreadWorkspace>;
   /**
-   * Merges the workspace's branch into the target branch through the Worktrunk pipeline.
-   * There is no fallback: without a compatible wt this rejects with a bounded reason.
-   */
+   * Merges the workspace's branch into the target branch through the Worktrunk pipeline. There is
+   * no fallback: without an executable wt this rejects with a bounded reason.
+  */
   merge(request: WorktreeMergeRequest, signal?: AbortSignal): Promise<WorktreeMergeSummary>;
   /**
-   * Removes one workspace (the `thread-delete` linkage): through wt when available, otherwise
-   * through plain git. A workspace that is already gone reports `missing`.
+   * Removes one workspace through wt when available, otherwise through plain git; it rejects the
+   * primary checkout, symlink paths, and source or branch identities that do not match ownership.
    */
   remove(request: WorktreeRemovalRequest, signal?: AbortSignal): Promise<WorktreeRemovalOutcome>;
   /** Probes the local Worktrunk; the result drives creation, merging and the command prompts. */

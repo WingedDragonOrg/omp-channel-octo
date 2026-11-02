@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { copyFile, mkdir, realpath, rm, stat } from "node:fs/promises";
+import { copyFile, mkdir, realpath, rm, rmdir, stat } from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
 import { throwIfAborted } from "./abort.ts";
 import { normalizeGroupContext } from "./session/context-sidecar.ts";
@@ -17,6 +17,14 @@ import type {
 import { isTransientServerFailure } from "./errors.ts";
 import type { ChannelStore } from "./store/index.ts";
 import type { TaskRecord } from "./store/store-records.ts";
+import type { ThreadWorkspaceRecord } from "./store/store-records.ts";
+import type { DirectoryLease } from "./tasks/task-scheduler.ts";
+import { threadWorkspaceIsAvailable } from "./session/session-lifecycle.ts";
+import {
+  createThreadWorkspaceBatch,
+  validateThreadCreation,
+  type ThreadWorkspaceBatchResult,
+} from "./workspace/thread-workspaces.ts";
 import { taskTarget } from "./target.ts";
 import { threadChannelId, threadParentGroupId, threadShortId } from "./threads/thread-target.ts";
 import { worktreeSlug } from "./workspace/worktree.ts";
@@ -42,7 +50,23 @@ export interface HostToolHost {
     | "deleteThread"
   >;
   readonly worktrees: WorktreePort | undefined;
-  readonly store: Pick<ChannelStore, "enqueueOutbox" | "getBinding" | "ensureBinding" | "getOwnerId">;
+  readonly store: Pick<
+    ChannelStore,
+    | "enqueueOutbox"
+    | "getBinding"
+    | "ensureBinding"
+    | "getOwnerId"
+    | "getThreadWorkspace"
+    | "saveThreadWorkspace"
+    | "saveThreadWorkspaces"
+    | "saveThreadWorkspaceIntent"
+    | "addThreadWorkspaceIntentChannel"
+    | "completeThreadWorkspaceIntent"
+    | "failThreadWorkspaceIntent"
+    | "isThreadWorkspaceIntentBlocked"
+    | "workspaceDirectories"
+  >;
+  tryAcquireWorkspaceDirectories(cwds: readonly string[], task: TaskRecord): DirectoryLease | undefined;
   /** 任务必然属于已注册的 Bot，构造工具时身份一定存在。 */
   readonly botUid: string;
   enqueueText(target: ChatTarget, text: string, taskId: string | null): void;
@@ -156,6 +180,67 @@ function managementThread(thread: ThreadSummary): {
     updated_at: thread.updatedAt,
   };
 }
+function workspaceProjectResults(outcome: ThreadWorkspaceBatchResult["threads"][number]) {
+  return outcome.record.projects.map((project, index) => ({
+    name: project.name,
+    repo: project.repo,
+    ...(project.base === undefined ? {} : { base: project.base }),
+    path: project.path,
+    branch: project.branch,
+    created: project.created,
+    ...(outcome.projectErrors[index] === undefined ? {} : { error: outcome.projectErrors[index] }),
+  }));
+}
+
+function threadWorkspaceCreationResult(batch: ThreadWorkspaceBatchResult): Record<string, unknown> {
+  if (batch.layout === "separate") {
+    return {
+      layout: batch.layout,
+      ready: batch.ready,
+      threads: batch.threads.map((outcome) => ({
+        ...managementThread(outcome.thread),
+        ready: outcome.record.status === "ready",
+        cwd: outcome.record.projects[0]?.created ? outcome.record.projects[0].path : null,
+        projects: workspaceProjectResults(outcome),
+        ...(outcome.error === undefined ? {} : { error: outcome.error }),
+      })),
+      ...(batch.error === undefined ? {} : { error: batch.error }),
+      ...(batch.remoteFailures.length === 0 ? {} : { failed_projects: batch.remoteFailures }),
+    };
+  }
+
+  const outcome = batch.threads[0];
+  if (outcome === undefined) {
+    return {
+      layout: batch.layout,
+      ready: false,
+      cwd: null,
+      projects: [],
+      ...(batch.error === undefined ? {} : { error: batch.error }),
+      ...(batch.remoteFailures.length === 0 ? {} : { failed_projects: batch.remoteFailures }),
+    };
+  }
+  const project = outcome.record.projects[0];
+  const result: Record<string, unknown> = {
+    ...managementThread(outcome.thread),
+    layout: batch.layout,
+    ready: outcome.record.status === "ready",
+    cwd: batch.layout === "shared"
+      ? outcome.record.entryPath
+      : project?.created ? project.path : null,
+    projects: workspaceProjectResults(outcome),
+    ...(outcome.error === undefined ? {} : { error: outcome.error }),
+    ...(batch.error === undefined ? {} : { batch_error: batch.error }),
+  };
+  if (batch.legacyWorktreeName !== undefined) {
+    if (project?.created && project.path !== null && project.branch !== null) {
+      result.worktree = { path: project.path, branch: project.branch };
+    } else {
+      result.worktree_error = outcome.projectErrors[0] ?? outcome.error ?? batch.error ?? "隔离工作区创建失败";
+    }
+  }
+  return result;
+}
 
 export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[] {
   const target = taskTarget(task);
@@ -264,7 +349,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
   const managementTool: HostTool = {
     name: "octo_management",
     description:
-      "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；create-thread 可带 worktree_name 为线程建立独立 git worktree 并把线程目录绑定到它（本机有兼容 Worktrunk 时经 wt 创建，否则经 OMP）；thread-delete 默认清理干净的工作区，force=true 时连同未提交改动一起强制清理（本机无兼容 wt 时回退 git）；thread-merge 把当前子区隔离工作区的分支经本机 Worktrunk（wt）的 merge pipeline 合并回目标分支，仅绑定隔离工作区的子区可用，省略参数即 wt 默认 pipeline（合并成功且工作区已被删除时自动排定本子区归档）；thread-archive 归档一个子区（幂等，short_id 省略即当前子区），与合并收尾一样排定在本回合最后一条回复送达后执行——任何发进子区的消息都会把归档子区解档，所以工具内不即时归档；thread-dispatch 把一条任务派发给本群的某个 thread，结果按该子区的追加模式处置——steer 且该子区有可接收 steering 的运行中回合时并入该回合（delivery=steered），否则在该子区作为独立任务执行（delivery=queued），两种情况本群都收到一条回执；可选 notify=true 让这条派发任务在结束（完成/失败/取消/中断）时向本聊天回传一条有界结果通知（默认 false，自行判断是否需要）；派发出去的任务不能再派发。目标固定为当前聊天，不能指向其他群。",
+      "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；create-thread 可用 projects 声明一个或多个真实 Git 仓库，单项目默认 single，多项目必须指定 shared 或 separate；shared 将多个项目放在一个非仓库入口下，separate 为每个项目创建独立线程；background 只写入用途、项目名、已创建路径和 separate 相关 short_id；worktree_name 保留旧式单项目 worktree 命名，也可与 projects 组合为命名 seed。thread-delete 按持久化所有权清理工作区，默认保留脏工作区，force=true 才强制清理；thread-merge 将当前单项目隔离工作区合并回目标分支（shared 多项目工作区不支持）；thread-archive 归档一个子区（幂等，short_id 省略即当前子区），与合并收尾一样排定在本回合最后一条回复送达后执行——任何发进子区的消息都会把归档子区解档，所以工具内不即时归档；thread-dispatch 把一条任务派发给本群的某个 thread，结果按该子区的追加模式处置——steer 且该子区有可接收 steering 的运行中回合时并入该回合（delivery=steered），否则在该子区作为独立任务执行（delivery=queued），两种情况本群都收到一条回执；可选 notify=true 让这条派发任务在结束（完成/失败/取消/中断）时向本聊天回传一条有界结果通知（默认 false，自行判断是否需要）；派发出去的任务不能再派发。目标固定为当前聊天，不能指向其他群。",
     parameters: {
       type: "object",
       properties: {
@@ -302,8 +387,31 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
         },
         worktree_name: {
           type: "string",
-          description:
-            "create-thread：给出名称即为新线程建立独立 git worktree（建在调用方当前目录所属仓库旁，目录 <仓库名>.<名称>，如 omp-channel-octo.fix-login），并把线程目录绑定过去；名称需包含 ASCII 字母或数字（如 fix-login）。成功返回 worktree 路径与分支，失败返回 worktree_error。省略则线程按默认目录继承。",
+          description: "create-thread：旧式单项目 worktree 路径名称；与 projects 组合时作为分支命名 seed，单项目直接使用，多项目按项目 slug 和序号区分。",
+        },
+        projects: {
+          type: "array",
+          description: "create-thread：每项指定一个项目名、绝对 Git 仓库路径和可选起始 commit/ref；多项目必须显式提供 layout。",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string", description: "项目显示名。" },
+              repo: { type: "string", description: "绝对 Git 仓库路径。" },
+              base: { type: "string", description: "该项目 worktree 的起始 commit/ref。" },
+            },
+            required: ["name", "repo"],
+            additionalProperties: false,
+          },
+        },
+        layout: {
+          type: "string",
+          enum: ["shared", "separate"],
+          description: "create-thread：多个项目必须指定 shared（一个线程、一个非仓库入口）或 separate（每项目一个线程）；单项目省略时为 single。",
+        },
+        background: {
+          type: "string",
+          maxLength: 500,
+          description: "create-thread：简短用途说明；只写用途、项目名、实际创建路径和 separate 相关 short_id，不包含当前任务正文。",
         },
         notify: {
           type: "boolean",
@@ -486,12 +594,33 @@ async function runManagementTool(
     }
     case "create-thread": {
       const name = namedText("name", MAX_MANAGEMENT_NAME_CHARS);
-      const workspaceName = worktreeName();
-      const thread = await transport.createThread(groupId, name, signal);
-      const workspace = workspaceName === undefined
-        ? {}
-        : await createThreadWorkspace(host, task.cwd, thread, workspaceName, signal);
-      return JSON.stringify({ ...managementThread(thread), ...workspace });
+      const creation = await validateThreadCreation(args, task.cwd, worktreeName(), signal);
+      if (creation.workspace === null) {
+        const thread = await transport.createThread(groupId, name, signal);
+        if (creation.background !== undefined) {
+          try {
+            await transport.updateGroupContext(
+              { channelId: thread.channelId, channelType: 5 },
+              `用途：${creation.background}`,
+              signal,
+            );
+          } catch (error) {
+            return JSON.stringify({
+              ...managementThread(thread),
+              background_error: boundedManagementError(error, "线程说明写入失败"),
+            });
+          }
+        }
+        return JSON.stringify(managementThread(thread));
+      }
+      const result = await createThreadWorkspaceBatch(
+        host,
+        groupId,
+        name,
+        creation.workspace,
+        signal,
+      );
+      return JSON.stringify(threadWorkspaceCreationResult(result));
     }
     case "thread-info": {
       return JSON.stringify(managementThread(await transport.getThread(groupId, threadId(), signal)));
@@ -516,7 +645,7 @@ async function runManagementTool(
       const shortId = threadId();
       const force = optionalBoolean("force") ?? false;
       await deleteThread(host, groupId, shortId, signal);
-      const cleaned = await cleanupThreadWorkspace(host, groupId, shortId, force, signal);
+      const cleaned = await cleanupThreadWorkspace(host, task, groupId, shortId, force, signal);
       return cleaned === null
         ? `已删除线程 ${shortId}`
         : `已删除线程 ${shortId}；${cleaned}`;
@@ -525,18 +654,40 @@ async function runManagementTool(
       if (currentShortId === null) {
         throw new Error("thread-merge 只能在子区中调用");
       }
-      const workspace = host.store.getBinding(host.botUid, {
+      const workspaceTarget: ChatTarget = {
         channelId: threadChannelId(groupId, currentShortId),
         channelType: 5,
-      });
+      };
+      const ownership = host.store.getThreadWorkspace(host.botUid, workspaceTarget);
+      if (ownership?.layout === "shared") {
+        throw new Error("当前为多项目工作区，不支持 /thread merge。");
+      }
+      if (host.store.isThreadWorkspaceIntentBlocked(host.botUid, workspaceTarget)) {
+        throw new Error("当前子区工作区未就绪，无法合并");
+      }
+      if (ownership !== null && !(await threadWorkspaceIsAvailable(ownership))) {
+        throw new Error("当前子区工作区未就绪，无法合并");
+      }
+      const workspace = host.store.getBinding(host.botUid, workspaceTarget);
       if (!workspace || workspace.cwdPinned !== true) {
         throw new Error("当前子区未绑定隔离工作区，无法合并");
       }
       const worktrees = host.worktrees;
       if (!worktrees) throw new Error("本部署未配置隔离工作区能力");
+      const lease = host.tryAcquireWorkspaceDirectories([workspace.cwd], task);
+      if (!lease) throw new Error("隔离工作区正被其他任务使用，无法合并");
       try {
+        await lease.ready;
         const summary = await worktrees.merge(mergeRequest(workspace.cwd), signal);
-        // 默认 pipeline 删掉工作区（合并完成即收尾）时排定归档：本子区在回合输出排空后归档。
+        if (summary.removed === true && ownership !== null) {
+          const project = ownership.projects.find(({ path }) => path === workspace.cwd);
+          if (project !== undefined) {
+            project.created = false;
+            project.path = null;
+            project.branch = null;
+            host.store.saveThreadWorkspace(ownership);
+          }
+        }
         let archive: "scheduled" | null = null;
         if (summary.removed === true) {
           host.planThreadArchive(target, groupId, currentShortId);
@@ -545,6 +696,8 @@ async function runManagementTool(
         return JSON.stringify({ merged: true, ...summary, ...(archive === null ? {} : { archive }) });
       } catch (error) {
         throw new Error(boundedManagementError(error, "合并隔离工作区失败"));
+      } finally {
+        lease.complete();
       }
     }
     case "thread-archive": {
@@ -596,77 +749,172 @@ async function deleteThread(
 }
 
 /**
- * The `thread-delete` linkage: once the server has deleted the thread, its isolated workspace is
- * removed through wt, or through plain git when no compatible wt exists. Only a `cwd_pinned`
- * binding is touched; a workspace with uncommitted changes stays in place unless `force` discards
- * them. The result is one bounded single-line note appended to the delete receipt — a cleanup
- * failure never turns the (already effective) delete into a failure.
+ * Thread deletion owns local resources independently of the current binding: `/new` and `/move`
+ * may detach that binding while the worktree still belongs to the deleted thread.
  */
 async function cleanupThreadWorkspace(
   host: HostToolHost,
+  task: TaskRecord,
   groupId: string,
   shortId: string,
   force: boolean,
   signal?: AbortSignal,
 ): Promise<string | null> {
-  const worktrees = host.worktrees;
-  if (!worktrees) return null;
-  const binding = host.store.getBinding(host.botUid, {
-    channelId: threadChannelId(groupId, shortId),
-    channelType: 5,
-  });
-  if (!binding || binding.cwdPinned !== true) return null;
+  const target: ChatTarget = { channelId: threadChannelId(groupId, shortId), channelType: 5 };
+  const ownership = host.store.getThreadWorkspace(host.botUid, target);
+  if (ownership !== null) {
+    return cleanupOwnedThreadWorkspace(host, task, ownership, force, signal);
+  }
+
+  const binding = host.store.getBinding(host.botUid, target);
+  if (!binding || binding.cwdPinned !== true || !host.worktrees) return null;
+  const lease = host.tryAcquireWorkspaceDirectories([binding.cwd], task);
+  if (!lease) return "工作区正被其他任务使用，资源已保留";
   try {
-    const outcome = await worktrees.remove({ path: binding.cwd, force }, signal);
-    if (outcome.kind === "missing") return "隔离工作区已不存在";
-    if (outcome.branchOutcome === "deleted") return "隔离工作区已清理（分支已删除）";
-    return "隔离工作区已清理";
+    await lease.ready;
+    const outcome = await host.worktrees.remove({ path: binding.cwd, force }, signal);
+    return outcome.kind === "missing"
+      ? "隔离工作区已不存在"
+      : outcome.branchOutcome === "deleted"
+        ? "隔离工作区已清理（分支已删除）"
+        : "隔离工作区已清理";
   } catch (error) {
-    const prefix = force ? "隔离工作区清理失败：" : "隔离工作区未清理：";
-    const suffix = force ? "" : "（可传 force=true 强制删除）";
-    const room = MAX_MANAGEMENT_ERROR_CHARS - prefix.length - suffix.length;
-    const reason = truncateForTool(
-      boundedManagementError(error, "无法清理隔离工作区"),
-      room,
-    );
-    return `${prefix}${reason}${suffix}`;
+    return cleanupFailureMessage(error, force);
+  } finally {
+    lease.complete();
   }
 }
 
-/**
- * Gives a freshly created thread its own git worktree and pins the thread binding to it, so
- * tasks dispatched into that thread never share the parent group's directory. The workspace is
- * reported next to the created thread; a workspace that cannot be created becomes
- * `worktree_error` instead of a thrown rejection, because the thread itself already exists and
- * keeps the ordinary directory order.
- */
-async function createThreadWorkspace(
+async function cleanupOwnedThreadWorkspace(
   host: HostToolHost,
-  baseDir: string,
-  thread: ThreadSummary,
-  workspaceName: string,
+  task: TaskRecord,
+  ownership: ThreadWorkspaceRecord,
+  force: boolean,
   signal?: AbortSignal,
-): Promise<{ worktree: { path: string; branch: string } } | { worktree_error: string }> {
-  const worktrees = host.worktrees;
-  if (!worktrees) return { worktree_error: "本部署未配置隔离工作区能力" };
+): Promise<string | null> {
+  ownership.status = "failed";
+  ownership.error = "线程已删除；本地工作区清理尚未完成";
   try {
-    const workspace = await worktrees.create(
-      { baseDir, label: workspaceName, threadId: thread.shortId },
-      signal,
-    );
-    host.store.ensureBinding({
-      botUid: host.botUid,
-      channelId: thread.channelId,
-      channelType: 5,
-      sessionId: randomUUID(),
-      cwd: workspace.cwd,
-      sessionFile: null,
-      cwdPinned: true,
-    });
-    return { worktree: { path: workspace.cwd, branch: workspace.branch } };
+    host.store.saveThreadWorkspace(ownership);
   } catch (error) {
-    return { worktree_error: boundedManagementError(error, "隔离工作区创建失败") };
+    return `清理前无法持久化工作区状态，资源已保留：${boundedManagementError(error, "存储失败")}`;
   }
+
+  const ownedPaths = ownership.projects
+    .filter((project) => project.created && project.path !== null)
+    .map((project) => project.path!);
+  if (ownership.entryPath !== null) ownedPaths.push(ownership.entryPath);
+  if (ownedPaths.length === 0) {
+    const unresolved = ownership.projects.some(
+      (project) => project.created || project.path !== null || project.branch !== null,
+    );
+    return unresolved ? "工作区所有权不完整，规划资源已保留" : null;
+  }
+
+  const lease = host.tryAcquireWorkspaceDirectories(ownedPaths, task);
+  if (!lease) return "工作区正被其他任务使用，资源已保留";
+  const notes: string[] = [];
+  const worktrees = host.worktrees;
+  try {
+    await lease.ready;
+    for (const project of ownership.projects) {
+      if (!project.created) {
+        if (project.path !== null) notes.push(`${project.name} 的创建状态未确认，路径已保留`);
+        continue;
+      }
+      const projectPath = project.path;
+      const projectBranch = project.branch;
+      if (projectPath === null || projectBranch === null) {
+        notes.push(`${project.name} 缺少路径或分支所有权，未自动清理`);
+        continue;
+      }
+      if (!worktrees) {
+        notes.push(`${project.name} 工作区能力不可用，资源已保留`);
+        continue;
+      }
+      try {
+        const outcome = await worktrees.remove(
+          {
+            path: projectPath,
+            force,
+            repo: project.repo,
+            branch: projectBranch,
+          },
+          signal,
+        );
+        const prior = { created: project.created, path: project.path, branch: project.branch };
+        project.created = false;
+        project.path = null;
+        project.branch = null;
+        try {
+          host.store.saveThreadWorkspace(ownership);
+        } catch (error) {
+          Object.assign(project, prior);
+          notes.push(`${project.name} 已移除但所有权更新失败：${boundedManagementError(error, "存储失败")}`);
+          continue;
+        }
+        if (outcome.kind === "missing") {
+          notes.push(`${project.name} 工作区已不存在`);
+        } else if (outcome.branchOutcome === "deleted") {
+          notes.push(`${project.name} 已清理（分支已删除）`);
+        } else {
+          notes.push(`${project.name} 已清理`);
+        }
+      } catch (error) {
+        notes.push(cleanupFailureMessage(error, force));
+      }
+    }
+
+    const entryPath = ownership.entryPath;
+    if (
+      ownership.layout === "shared" &&
+      entryPath !== null &&
+      ownership.projects.every((project) => project.path === null && project.branch === null && !project.created)
+    ) {
+      try {
+        await rmdir(entryPath);
+        ownership.entryPath = null;
+        try {
+          host.store.saveThreadWorkspace(ownership);
+          notes.push("共享入口已清理");
+        } catch (error) {
+          ownership.entryPath = entryPath;
+          notes.push(`共享入口已移除但所有权更新失败：${boundedManagementError(error, "存储失败")}`);
+        }
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") {
+          ownership.entryPath = null;
+          try {
+            host.store.saveThreadWorkspace(ownership);
+          } catch (saveError) {
+            ownership.entryPath = entryPath;
+            notes.push(`共享入口状态更新失败：${boundedManagementError(saveError, "存储失败")}`);
+          }
+        } else if (code === "ENOTEMPTY" || code === "EEXIST") {
+          notes.push("共享入口仍含有文件，已保留");
+        } else {
+          notes.push(`共享入口未清理：${boundedManagementError(error, "清理失败")}`);
+        }
+      }
+    }
+  } catch (error) {
+    notes.push(`工作区清理失败：${boundedManagementError(error, "清理失败")}`);
+  } finally {
+    lease.complete();
+  }
+  return notes.length === 0 ? null : truncateForTool(notes.join("；"), MAX_MANAGEMENT_ERROR_CHARS);
+}
+
+function cleanupFailureMessage(error: unknown, force: boolean): string {
+  const prefix = force ? "隔离工作区清理失败：" : "隔离工作区未清理：";
+  const suffix = force ? "" : "（可传 force=true 强制删除）";
+  const room = MAX_MANAGEMENT_ERROR_CHARS - prefix.length - suffix.length;
+  const reason = truncateForTool(
+    boundedManagementError(error, "无法清理隔离工作区"),
+    room,
+  );
+  return `${prefix}${reason}${suffix}`;
 }
 /**
  * Hands one task to a thread of the current group: the thread shows the handoff, and the content
@@ -723,6 +971,36 @@ async function dispatchThreadTask(
   notify: boolean,
   signal: AbortSignal,
 ): Promise<string> {
+  const threadTarget: ChatTarget = { channelId: threadChannelId(groupId, shortId), channelType: 5 };
+  if (host.store.isThreadWorkspaceIntentBlocked(host.botUid, threadTarget)) {
+    throw new Error("子区工作区未就绪，未派发任务。");
+  }
+  const ownership = host.store.getThreadWorkspace(host.botUid, threadTarget);
+  if (ownership !== null) {
+    const binding = host.store.getBinding(host.botUid, threadTarget);
+    const workspaceAvailable = await threadWorkspaceIsAvailable(ownership);
+    const legacyFallback =
+      ownership.layout === "single" &&
+      ownership.legacyWorktreeName !== undefined &&
+      ownership.status === "ready" &&
+      ownership.projects.length === 1 &&
+      !workspaceAvailable;
+    const bindingUsesWorkspace = binding !== null && (() => {
+      const related = new Set(host.store.workspaceDirectories(binding.cwd));
+      return (
+        (ownership.entryPath !== null && related.has(ownership.entryPath)) ||
+        ownership.projects.some(
+          (project) => project.path !== null && related.has(project.path),
+        )
+      );
+    })();
+    if (
+      (binding === null && !legacyFallback) ||
+      (bindingUsesWorkspace && !workspaceAvailable && !legacyFallback)
+    ) {
+      throw new Error("子区工作区未就绪，未派发任务。");
+    }
+  }
   const thread = await host.transport.getThread(groupId, shortId, signal);
   if (thread.groupId.length > 0 && thread.groupId !== groupId) {
     throw new Error(`thread ${shortId} does not belong to the current group`);

@@ -7,7 +7,7 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ChatAppendMode, ChatTarget } from "../contracts.ts";
-import type { BindingRecord, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState } from "./store-records.ts";
+import type { BindingRecord, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput } from "./store-records.ts";
 import { applySchema } from "./store-schema.ts";
 import { claimOwnerEnrollment, clearChatModel, ensureBinding, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, grantAllowedChat, hasOwnerEnrollment, listAllowedChats, setBotUid, setChatMode, setChatModel, setOwnerId, updateBindingSession } from "./store-chats.ts";
 import { acceptTask, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, isTaskResuming, listQueuedTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim } from "./store-tasks.ts";
@@ -17,6 +17,7 @@ import { advanceHistoryLedger, clearContextLedger, commitContextInjection, commi
 import { acknowledgeTextOutbox, beginTextCreate, bindTextOutbox, commitTextStream, countPendingOutbox, countUnknownOutbox, enqueueOutbox, failTextOutbox, getBotEventCursor, getOutbox, listPendingOutbox, listPendingOutboxTargets, listTextStream, markOutboxDead, markOutboxFailure, markOutboxSent, setBotEventCursor, updateTextOutbox } from "./store-outbox.ts";
 import { answerClosedQuestion, answerQuestion, answerQuestions, cancelQuestion, cancelQuestions, cancelTaskQuestions, createQuestion, getQuestion, listPendingQuestions, listQuestionsByCard, listTaskQuestions, markQuestionsSettled, pendingQuestionIds, reserveQuestionCardSeq, setQuestionCard, setQuestionsCard, updateQuestionPayloads } from "./store-questions.ts";
 import { acceptChatGrantOperation, getChatGrantOperation, getChatGrantOperationByEvent, listPendingChatGrantOperations, markChatGrantConfigMirror, markChatGrantResultDelivered, nextChatGrantCardEditSeq } from "./store-grants.ts";
+import { addThreadWorkspaceIntentChannel, completeThreadWorkspaceIntent, failThreadWorkspaceIntent, getThreadWorkspace, getThreadWorkspaceIntent, isThreadWorkspaceIntentBlocked, isWorkspaceDirectoryOwned, listThreadWorkspaceIntents, listThreadWorkspaces, saveThreadWorkspace, saveThreadWorkspaceIntent, saveThreadWorkspaces, workspaceDirectories } from "./store-workspaces.ts";
 
 export class ChannelStore {
   private readonly db: Database;
@@ -120,6 +121,58 @@ export class ChannelStore {
 
   getBinding(botUid: string, target: ChatTarget): BindingRecord | null {
     return getBinding(this.db, botUid, target);
+  }
+
+  saveThreadWorkspace(record: ThreadWorkspaceRecord): void {
+    saveThreadWorkspace(this.db, record);
+  }
+
+  saveThreadWorkspaces(records: readonly ThreadWorkspaceRecord[]): void {
+    saveThreadWorkspaces(this.db, records);
+  }
+
+  getThreadWorkspace(botUid: string, target: ChatTarget): ThreadWorkspaceRecord | null {
+    return getThreadWorkspace(this.db, botUid, target);
+  }
+
+  listThreadWorkspaces(botUid: string): ThreadWorkspaceRecord[] {
+    return listThreadWorkspaces(this.db, botUid);
+  }
+
+  saveThreadWorkspaceIntent(record: ThreadWorkspaceIntentInput): void {
+    saveThreadWorkspaceIntent(this.db, record);
+  }
+
+  addThreadWorkspaceIntentChannel(botUid: string, id: string, channelId: string): void {
+    addThreadWorkspaceIntentChannel(this.db, botUid, id, channelId);
+  }
+
+  completeThreadWorkspaceIntent(botUid: string, id: string): void {
+    completeThreadWorkspaceIntent(this.db, botUid, id);
+  }
+
+  failThreadWorkspaceIntent(botUid: string, id: string, error: string | null = null): void {
+    failThreadWorkspaceIntent(this.db, botUid, id, error);
+  }
+
+  getThreadWorkspaceIntent(botUid: string, id: string): ThreadWorkspaceIntentRecord | null {
+    return getThreadWorkspaceIntent(this.db, botUid, id);
+  }
+
+  listThreadWorkspaceIntents(botUid: string, groupId: string): ThreadWorkspaceIntentRecord[] {
+    return listThreadWorkspaceIntents(this.db, botUid, groupId);
+  }
+
+  isThreadWorkspaceIntentBlocked(botUid: string, target: ChatTarget): boolean {
+    return isThreadWorkspaceIntentBlocked(this.db, botUid, target);
+  }
+
+  isWorkspaceDirectoryOwned(cwd: string): boolean {
+    return isWorkspaceDirectoryOwned(this.db, cwd);
+  }
+
+  workspaceDirectories(cwd: string): string[] {
+    return workspaceDirectories(this.db, cwd);
   }
 
   acceptTask(claim: InboundClaim, task: TaskRecord): boolean {

@@ -799,7 +799,7 @@ test("create-thread worktree_name binds the new thread to a workspace of its own
   }
 });
 
-test("create-thread worktree_name reports a workspace failure while keeping the thread usable", async () => {
+test("create-thread worktree_name leaves failed workspace non-dispatchable", async () => {
   const harness = await createCoreHarness({
     prompt: async ({ append, promptContext }) => {
       const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
@@ -848,10 +848,10 @@ test("create-thread worktree_name reports a workspace failure while keeping the 
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(2);
-    await waitForStatus(harness.service, thread, (status) => status.state === "completed");
-    expect(harness.workers.prompts[1]?.cwd).toBe(cwd);
-    await expect(harness.service.status(thread)).resolves.toMatchObject({ cwd });
+    expect(harness.workers.prompts).toHaveLength(1);
+    expect(harness.transport.sent.some(({ text }) =>
+      text === "当前子区工作区未就绪或资源已缺失，未接收任务。"
+    )).toBe(true);
   } finally {
     await closeCoreHarness(harness);
   }
@@ -1213,8 +1213,7 @@ test("thread-merge reports the port's failure and refuses a thread without a wor
   }
 });
 
-test("thread-delete cleans the deleted thread's bound workspace and reports it", async () => {
-  const log: string[] = [];
+test("thread-delete removes each deleted thread's bound workspace", async () => {
   const harness = await createCoreHarness({
     prompt: async ({ promptContext, text }) => {
       const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
@@ -1222,24 +1221,19 @@ test("thread-delete cleans the deleted thread's bound workspace and reports it",
       const signal = new AbortController().signal;
       if (text === "create two workspace threads") {
         for (const name of ["清理一", "清理二"]) {
-          const created = JSON.parse(
-            await management.execute(
-              { action: "create-thread", name, worktree_name: `cleanup-${name === "清理一" ? "one" : "two"}` },
-              signal,
-            ),
-          ) as { short_id: string };
-          log.push(`created:${created.short_id}\n`);
+          await management.execute(
+            { action: "create-thread", name, worktree_name: `cleanup-${name === "清理一" ? "one" : "two"}` },
+            signal,
+          );
         }
         return;
       }
       if (text === "delete the first thread") {
-        const result = await management.execute({ action: "thread-delete", short_id: "thread-1" }, signal);
-        log.push(`${result}\n`);
+        await management.execute({ action: "thread-delete", short_id: "thread-1" }, signal);
         return;
       }
       if (text === "delete the missing-workspace thread") {
-        const result = await management.execute({ action: "thread-delete", short_id: "thread-2" }, signal);
-        log.push(`${result}\n`);
+        await management.execute({ action: "thread-delete", short_id: "thread-2" }, signal);
       }
     },
   });
@@ -1262,8 +1256,7 @@ test("thread-delete cleans the deleted thread's bound workspace and reports it",
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
 
-    // The delete removes the workspace through the port (wt by default, git fallback inside) and
-    // the receipt names the outcome.
+    // Persisted repository and branch ownership is passed to the worktree removal port.
     await harness.service.handleInbound(
       inbound({
         messageId: "cleanup-delete-one",
@@ -1275,10 +1268,10 @@ test("thread-delete cleans the deleted thread's bound workspace and reports it",
     await harness.workers.waitForPromptCount(2);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
     expect(worktrees.removals).toEqual([
-      { path: join(harness.root, "worktrees", "thread-1"), force: false },
+      { path: join(harness.root, "worktrees", "thread-1"), force: false, repo: cwd, branch: "thread-1" },
     ]);
 
-    // A workspace that is already gone is reported instead of failing the delete.
+    // Deleting a thread whose workspace is already gone remains successful.
     worktrees.removal = { kind: "missing" };
     await harness.service.handleInbound(
       inbound({
@@ -1291,19 +1284,17 @@ test("thread-delete cleans the deleted thread's bound workspace and reports it",
     await harness.workers.waitForPromptCount(3);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
     expect(worktrees.removals).toEqual([
-      { path: join(harness.root, "worktrees", "thread-1"), force: false },
-      { path: join(harness.root, "worktrees", "thread-2"), force: false },
+      { path: join(harness.root, "worktrees", "thread-1"), force: false, repo: cwd, branch: "thread-1" },
+      { path: join(harness.root, "worktrees", "thread-2"), force: false, repo: cwd, branch: "thread-2" },
     ]);
+    await expect(harness.transport.listThreads("group-tools")).resolves.toEqual([]);
 
-    expect(log.join("\n")).toContain("已删除线程 thread-1；隔离工作区已清理（分支已删除）");
-    expect(log.join("\n")).toContain("已删除线程 thread-2；隔离工作区已不存在");
   } finally {
     await closeCoreHarness(harness);
   }
 });
 
 test("thread-delete keeps a dirty workspace unless force discards it", async () => {
-  const log: string[] = [];
   const harness = await createCoreHarness({
     prompt: async ({ promptContext, text }) => {
       const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
@@ -1311,30 +1302,19 @@ test("thread-delete keeps a dirty workspace unless force discards it", async () 
       const signal = new AbortController().signal;
       if (text === "create two dirty threads") {
         for (const name of ["脏一", "脏二"]) {
-          const created = JSON.parse(
-            await management.execute(
-              { action: "create-thread", name, worktree_name: `dirty-${name === "脏一" ? "one" : "two"}` },
-              signal,
-            ),
-          ) as { short_id: string };
-          log.push(`created:${created.short_id}\n`);
+          await management.execute(
+            { action: "create-thread", name, worktree_name: `dirty-${name === "脏一" ? "one" : "two"}` },
+            signal,
+          );
         }
         return;
       }
       if (text === "delete without force") {
-        const result = await management.execute(
-          { action: "thread-delete", short_id: "thread-1" },
-          signal,
-        );
-        log.push(`${result}\n`);
+        await management.execute({ action: "thread-delete", short_id: "thread-1" }, signal);
         return;
       }
       if (text === "delete with force") {
-        const result = await management.execute(
-          { action: "thread-delete", short_id: "thread-2", force: true },
-          signal,
-        );
-        log.push(`${result}\n`);
+        await management.execute({ action: "thread-delete", short_id: "thread-2", force: true }, signal);
       }
     },
   });
@@ -1371,10 +1351,12 @@ test("thread-delete keeps a dirty workspace unless force discards it", async () 
     await harness.workers.waitForPromptCount(2);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
 
-    // The workspace stays; the receipt names the reason and how to discard it.
-    expect(log.join("\n")).toContain(
-      "已删除线程 thread-1；隔离工作区未清理：删除隔离工作区失败（退出码 1）：Cannot remove worktree: dirty-one has uncommitted changes（可传 force=true 强制删除）",
-    );
+    expect(worktrees.removals).toEqual([
+      { path: join(harness.root, "worktrees", "thread-1"), force: false, repo: cwd, branch: "thread-1" },
+    ]);
+    await expect(harness.transport.listThreads("group-tools")).resolves.toMatchObject([
+      { shortId: "thread-2" },
+    ]);
 
     worktrees.removeFailure = undefined;
     await harness.service.handleInbound(
@@ -1388,10 +1370,10 @@ test("thread-delete keeps a dirty workspace unless force discards it", async () 
     await harness.workers.waitForPromptCount(3);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
     expect(worktrees.removals).toEqual([
-      { path: join(harness.root, "worktrees", "thread-1"), force: false },
-      { path: join(harness.root, "worktrees", "thread-2"), force: true },
+      { path: join(harness.root, "worktrees", "thread-1"), force: false, repo: cwd, branch: "thread-1" },
+      { path: join(harness.root, "worktrees", "thread-2"), force: true, repo: cwd, branch: "thread-2" },
     ]);
-    expect(log.join("\n")).toContain("已删除线程 thread-2；隔离工作区已清理（分支已删除）");
+    await expect(harness.transport.listThreads("group-tools")).resolves.toEqual([]);
   } finally {
     await closeCoreHarness(harness);
   }

@@ -11,7 +11,7 @@ import {
   type BuiltinAction,
   type BuiltinHandlers,
 } from "./commands/command-routing.ts";
-import { SessionLifecycle } from "./session/session-lifecycle.ts";
+import { SessionLifecycle, threadWorkspaceIsAvailable } from "./session/session-lifecycle.ts";
 import { TaskScheduler } from "./tasks/task-scheduler.ts";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
@@ -70,7 +70,7 @@ import { ThreadArchiveScheduler } from "./threads/thread-archive.ts";
 import { ThreadCommands } from "./commands/thread-commands.ts";
 import { ServiceRestart } from "./runtime/service-restart.ts";
 import { TaskEvents } from "./tasks/task-events.ts";
-import { existingSessionFile } from "./workspace/workdir.ts";
+import { canonicalExistingDirectory, existingSessionFile } from "./workspace/workdir.ts";
 import {
   createResearchReportStore,
   researchReportsRoot,
@@ -120,6 +120,7 @@ const DEFAULT_INTERRUPT_IDLE_TEXT =
   "当前没有正在运行的回合可中断；任务尚未进入执行阶段时可用 /cancel 取消。";
 /** Steered messages tracked for the consumption receipt; older entries fall out of observation. */
 const MAX_PENDING_STEERS = 32;
+const THREAD_WORKSPACE_UNAVAILABLE_TEXT = "当前子区工作区未就绪或资源已缺失，未接收任务。";
 const LIFECYCLE_NOTICE_TIMEOUT_MS = 2_000;
 
 type LifecycleNotice = "startup" | "stop";
@@ -315,7 +316,8 @@ class CoreService implements ChannelService {
       store: this.store,
       botUid: () => this.bot?.uid,
       stopping: () => this.stopping,
-      isDirectoryBlocked: cwd => this.blockedDirectories.has(cwd),
+      hasRuntimeInDirectory: cwd => this.hasRuntimeInDirectory(cwd),
+      isDirectoryBlocked: cwd => this.isWorkspaceDirectoryBlocked(cwd),
       reconcileBinding: (taskId, target, binding) =>
         this.reconcileTaskBinding(taskId, target, binding),
       runTask: (taskId, cwd) => this.runTask(taskId, cwd),
@@ -329,7 +331,7 @@ class CoreService implements ChannelService {
       config: options.config,
       bot: () => this.bot,
       hasRuntime: target => this.hasRuntime(target),
-      isDirectoryBlocked: cwd => this.blockedDirectories.has(cwd),
+      isDirectoryBlocked: cwd => this.isWorkspaceDirectoryBlocked(cwd),
       blockDirectory: cwd => { this.blockedDirectories.add(cwd); },
       tryAcquireCommandSession: (target, cwds) => this.scheduler.tryAcquireCommandSession(target, cwds),
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
@@ -427,6 +429,7 @@ class CoreService implements ChannelService {
     });
     this.threadCommands = new ThreadCommands({
       store: this.store,
+      refuseIncompleteThreadWorkspace: message => this.refuseIncompleteThreadWorkspace(message),
       botUid: () => this.bot?.uid,
       ...(options.worktrees === undefined ? {} : { worktrees: options.worktrees }),
       materialize: (message, text) => this.materializer.materialize(message, text),
@@ -807,6 +810,7 @@ class CoreService implements ChannelService {
       }
       const handler = this.commandHandlers.get(command.name);
       if (handler) {
+        if (await this.refuseIncompleteThreadWorkspace(message)) return;
         if (handler.intercept) {
           await this.handleInterceptingCommand(message, command, handler);
         } else {
@@ -814,6 +818,7 @@ class CoreService implements ChannelService {
         }
         return;
       }
+      if (await this.refuseIncompleteThreadWorkspace(message)) return;
       // 未注册的 /xxx 不是命令，仍按普通任务走唯一组装点，附件照常取回。
       await this.withMessageTyping(message, async () => {
         const slashPrompt = await this.materializer.materialize(message);
@@ -823,6 +828,7 @@ class CoreService implements ChannelService {
       });
       return;
     }
+    if (await this.refuseIncompleteThreadWorkspace(message)) return;
     if (await this.questions.answerPendingQuestion(message, text)) return;
     await this.withMessageTyping(message, async() => {
       const promptText = await this.materializer.materialize(message);
@@ -900,8 +906,58 @@ class CoreService implements ChannelService {
     target: ChatTarget,
     binding: BindingRecord | null,
   ): Promise<BindingRecord | null> {
+    if (await this.threadWorkspaceIncomplete(target)) return binding;
     if (binding !== null && this.store.isTaskResuming(taskId)) return binding;
     return this.sessions.reconcileExternalBinding(target, binding);
+  }
+
+  private isWorkspaceDirectoryBlocked(cwd: string): boolean {
+    const requestedDirectories = this.store.workspaceDirectories(cwd);
+    for (const blockedCwd of this.blockedDirectories) {
+      const blockedDirectories = this.store.workspaceDirectories(blockedCwd);
+      if (blockedDirectories.some((directory) => requestedDirectories.includes(directory))) return true;
+    }
+    return false;
+  }
+
+  private async threadWorkspaceIncomplete(
+    target: ChatTarget,
+    requireBinding = false,
+  ): Promise<boolean> {
+    if (target.channelType !== 5 || this.bot === undefined) return false;
+    try {
+      if (this.store.isThreadWorkspaceIntentBlocked(this.bot.uid, target)) return true;
+      const workspace = this.store.getThreadWorkspace(this.bot.uid, target);
+      if (workspace === null) return false;
+      const missingLegacyWorktree =
+        workspace.layout === "single"
+        && workspace.legacyWorktreeName !== undefined
+        && workspace.status === "ready"
+        && !(await threadWorkspaceIsAvailable(workspace));
+      if (missingLegacyWorktree) return false;
+      const binding = this.store.getBinding(this.bot.uid, target);
+      // Fresh inbound can create a binding inside a ready workspace; a persisted task cannot
+      // trust its old cwd without the binding that established it.
+      if (binding === null) {
+        return requireBinding || !(await threadWorkspaceIsAvailable(workspace));
+      }
+      const related = new Set(this.store.workspaceDirectories(binding.cwd));
+      const stillOwned =
+        (workspace.entryPath !== null && related.has(workspace.entryPath))
+        || workspace.projects.some((project) => project.path !== null && related.has(project.path));
+      if (!stillOwned) return false;
+      if (!(await threadWorkspaceIsAvailable(workspace))) return true;
+      const bindingCwd = await canonicalExistingDirectory(binding.cwd).catch(() => null);
+      return bindingCwd !== binding.cwd;
+    } catch {
+      return true;
+    }
+  }
+
+  private async refuseIncompleteThreadWorkspace(target: ChatTarget): Promise<boolean> {
+    if (!await this.threadWorkspaceIncomplete(target)) return false;
+    await this.outbox.enqueueText(target, THREAD_WORKSPACE_UNAVAILABLE_TEXT, null);
+    return true;
   }
 
   private hasRuntime(target: ChatTarget): boolean {
@@ -912,7 +968,16 @@ class CoreService implements ChannelService {
     return false;
   }
 
-
+  /** 该 cwd 是否与进程内任一运行任务共享工作区资源。 */
+  private hasRuntimeInDirectory(cwd: string): boolean {
+    const requested = new Set(this.store.workspaceDirectories(cwd));
+    for (const runtime of this.runtimes.values()) {
+      if (this.store.workspaceDirectories(runtime.cwd).some((directory) => requested.has(directory))) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   /** The chat's task whose OMP prompt is currently in flight, if any. */
   private runningRuntime(target: ChatTarget): RuntimeTask | undefined {
@@ -1121,6 +1186,7 @@ class CoreService implements ChannelService {
    */
   private async appendToRunningTask(message: InboundMessage, text: string): Promise<boolean> {
     this.throwIfStopping();
+    if (await this.refuseIncompleteThreadWorkspace(message)) return true;
     if (this.store.getChatMode(this.bot!.uid, message) !== "steer") return false;
     const runtime = this.runningRuntime(message);
     if (!runtime || runtime.stopCause === "question") return false;
@@ -1336,6 +1402,7 @@ class CoreService implements ChannelService {
    * so it always takes the durable task path minus the command prefix.
    */
   private async handleQueue(message: InboundMessage, argument: string): Promise<void> {
+    if (await this.refuseIncompleteThreadWorkspace(message)) return;
     const text = argument.trim();
     if (text.length === 0) {
       await this.outbox.enqueueText(message, QUEUE_USAGE, null);
@@ -1495,6 +1562,7 @@ class CoreService implements ChannelService {
     historyEligible = true,
     relay: TaskRelayTarget | null = null,
   ): Promise<boolean> {
+    if (await this.refuseIncompleteThreadWorkspace(message)) return false;
     this.throwIfStopping();
     let binding = await this.sessions.reconcileExternalBinding(
       message,
@@ -1560,7 +1628,7 @@ class CoreService implements ChannelService {
     };
     let accepted: boolean;
     // Measured before acceptance so the new task's own row cannot count itself as the work it waits for.
-    const startsBehind = this.scheduler.hasBlockingWork(message);
+    const startsBehind = this.scheduler.hasBlockingWork(message, task.cwd);
     try {
       accepted = this.store.acceptTask(this.taskClaim(message), task);
     } catch {
@@ -1593,7 +1661,12 @@ class CoreService implements ChannelService {
       flushTarget: (target) => this.outbox.flush(target),
       planThreadArchive: (target, groupId, shortId) =>
         this.threadArchives.schedule(target, groupId, shortId),
+      tryAcquireWorkspaceDirectories: (cwds, task) =>
+        this.scheduler.tryAcquireWorkspaceDirectories(cwds, task),
       deliverToChat: async (message, relay) => {
+        if (await this.threadWorkspaceIncomplete(message)) {
+          throw new Error("子区工作区未就绪，未派发任务。");
+        }
         if (await this.appendToRunningTask(message, message.text)) return "steered";
         await this.acceptTask(message, message.text, true, relay ?? null);
         return "queued";
@@ -1615,10 +1688,20 @@ class CoreService implements ChannelService {
   private async runTask(taskId: string, expectedCwd?: string): Promise<void> {
     const persistedTask = this.store.getTask(taskId);
     if (!persistedTask || persistedTask.state !== "queued") return;
+    const targetAtStart = taskTarget(persistedTask);
+    if (await this.threadWorkspaceIncomplete(targetAtStart, true)) {
+      this.scheduler.takeWaitingReceipt(taskId);
+      this.store.markFailed(taskId, THREAD_WORKSPACE_UNAVAILABLE_TEXT);
+      this.questions.cancelForTask(taskId, "ended");
+      this.questions.rejectForTask(taskId, new Error("task finished"));
+      await this.outbox.enqueueText(targetAtStart, THREAD_WORKSPACE_UNAVAILABLE_TEXT, taskId);
+      await this.notifyThreadOutcome(taskId);
+      return;
+    }
     const bindingAtStart = await this.reconcileTaskBinding(
       taskId,
-      taskTarget(persistedTask),
-      this.store.getBinding(this.bot!.uid, taskTarget(persistedTask)),
+      targetAtStart,
+      this.store.getBinding(this.bot!.uid, targetAtStart),
     );
     const task = bindingAtStart
       ? { ...persistedTask, cwd: bindingAtStart.cwd, sessionId: bindingAtStart.sessionId }
@@ -1630,7 +1713,7 @@ class CoreService implements ChannelService {
       await this.notifyThreadOutcome(taskId);
       return;
     }
-    if (this.blockedDirectories.has(task.cwd)) {
+    if (this.isWorkspaceDirectoryBlocked(task.cwd)) {
       // 旧 worker 的死亡未确认：任务保持排队、继续占住该目录的队列位，绝不启动第二个写者，
       // 也不把它当作失败丢掉；下一个进程再试。失败收尾只留给确定无法恢复的情形。
       console.error(`[task] 目录仍被未确认的 worker 占用，任务保持排队 task=${taskId}`);

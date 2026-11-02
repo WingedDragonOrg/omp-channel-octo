@@ -1,12 +1,14 @@
 /**
- * 任务调度与会话租约的唯一所有者：每聊天的任务串行链、已排定任务、关停要等的在途任务、
- * 排队等待任务的启动回执，以及按 session / chat key 持有的租约链都在这里。外部只能经
- * `scheduleTask`/`hasBlockingWork`/`tryAcquireCommandSession`/`markWaiting`/
- * `takeWaitingReceipt`/`settle` 观察，本对象的 map 不外露。
+ * 任务调度与会话/目录租约的唯一所有者：每个聊天的任务串行链、已排定任务、关停要等的在途
+ * 任务、排队等待任务的启动回执，以及按 session / chat key 与按 cwd 的租约链都在这里。外部只能经
+ * `scheduleTask`/`hasBlockingWork`/`tryAcquireCommandSession`/`tryAcquireCommandDirectories`/
+ * `tryAcquireWorkspaceDirectories`/`markWaiting`/`takeWaitingReceipt`/`settle` 观察，本对象的
+ * map 不外露。
  *
  * 模块不依赖 `service.ts`：任务行与绑定行的读取、绑定核对、真正的执行入口（`runTask`）、
- * bot 身份与停止态、blocked 集合、回执与终态通知的投递路径都按原样注入。会话租约与 blocked
- * 集合仍然分别只有一个所有者，调度侧与绑定探测侧因此保持同一安全语义。
+ * bot 身份与停止态、运行中任务与 blocked 集合、回执与终态通知的投递路径都按原样注入。会话
+ * 租约、工作区目录租约与 blocked 集合仍然分别只有一个所有者，调度侧与绑定探测侧因此保持
+ * 同一安全语义。
  */
 import type { ChatTarget } from "../contracts.ts";
 import type { Outbox } from "../outbox.ts";
@@ -25,8 +27,18 @@ export type SessionLease = {
 };
 
 /**
- * 调度访问持久层任务与绑定行、bot 身份、停止态、目录 block 状态、绑定核对、执行入口，以及
- * 启动回执与终态通知投递路径。
+ * 按目录的租约：工作区命令在命令体内占据一个或多个 cwd，`ready` 在它们都空闲后兑现，
+ * `complete` 恰好释放一次。租约本体（按 cwd 的 Promise 链）由 `TaskScheduler` 持有，租约不
+ * 在两个模块里各存一份。
+ */
+export type DirectoryLease = {
+  ready: Promise<void>;
+  complete(): void;
+};
+
+/**
+ * 调度访问持久层任务与绑定行、bot 身份、停止态、进程内的运行中任务与 blocked 集合、绑定核对、
+ * 执行入口，以及启动回执与终态通知投递路径。
  */
 export interface TaskSchedulerDeps {
   readonly store: Pick<
@@ -35,11 +47,15 @@ export interface TaskSchedulerDeps {
     | "listQueuedTasks"
     | "getBinding"
     | "markFailed"
+    | "isWorkspaceDirectoryOwned"
+    | "workspaceDirectories"
   >;
   /** 绑定行与任务行按键的 bot 身份。 */
   readonly botUid: () => string | undefined;
   /** channel 是否正在停止：停止后不再启动排定任务。 */
   readonly stopping: () => boolean;
+  /** 该 cwd 是否有进程内运行任务——`CoreService` 遍历自己的 runtimes。 */
+  readonly hasRuntimeInDirectory: (cwd: string) => boolean;
   /** 该 cwd 是否因 worker 无法确认停止而被 block。 */
   readonly isDirectoryBlocked: (cwd: string) => boolean;
   /**
@@ -51,7 +67,7 @@ export interface TaskSchedulerDeps {
     target: ChatTarget,
     binding: BindingRecord | null,
   ) => Promise<BindingRecord | null>;
-  /** 启动一个已排定任务；`cwd` 是启动前核对用的绑定目录，并非互斥键。 */
+  /** 启动一个已排定任务；`cwd` 是启动前核对用的绑定目录；工作区资源已由调度租下。 */
   readonly runTask: (taskId: string, cwd?: string) => Promise<void>;
   /**
    * 启动门：恢复任务先占住调度序，但要等服务接线成功才真正执行。`start()` 失败时该 Promise
@@ -67,22 +83,39 @@ export interface TaskSchedulerDeps {
 export class TaskScheduler {
   /** 每个聊天的任务串行链：该聊天的下一个任务接在上一个（或已排定的任务）之后。 */
   private readonly chatTails = new Map<string, Promise<void>>();
-  /** 已排定任务操作：同 session 的较早任务据此等待。 */
+  /** 已排定任务操作：同 session 或同工作区资源的较早任务据此等待。 */
   private readonly scheduledTasks = new Map<string, Promise<void>>();
   /** 关停要等的在途任务（已排定任务的操作）。 */
   private readonly taskOperations = new Set<Promise<void>>();
   /**
-   * Tasks accepted while their chat or session was already busy. They get one start receipt
-   * when they finally begin, so a message that waited is distinguishable from one that started
-   * right away. In-memory only: a restart interrupts such tasks instead of starting them.
+   * Tasks accepted while their chat, session, or workspace was already busy. They get one start
+   * receipt when they finally begin, so a message that waited is distinguishable from one that
+   * started right away. In-memory only: a restart interrupts such tasks instead of starting them.
    */
   private readonly waiting = new Set<string>();
   /** Tasks and session commands share per-session and per-chat lease tails. */
   private readonly sessionTails = new Map<string, Promise<void>>();
-  /** True when this chat or its bound session already has queued or running work. */
-  hasBlockingWork(target: ChatTarget): boolean {
-    const sessionKey = this.sessionKey(target, this.bindingFor(target));
-    return this.hasLeaseFor(target, sessionKey) || this.hasQueuedWork(target, sessionKey);
+  /** 按 cwd 的租约链：`/new`、`/move` 与任务启动共用的工作区目录占用。 */
+  private readonly directoryTails = new Map<string, Promise<void>>();
+  /** The expanded resource keys owned by each currently executing task, for safe host-tool reuse. */
+  private readonly taskDirectoryLeases = new Map<string, ReadonlySet<string>>();
+
+  /**
+   * True when a new task on this chat cannot start at once: the chat or its bound session is
+   * busy, or an owned workspace resource for this cwd is busy. Ordinary sessions in the same
+   * cwd remain independent, so a plain cwd does not make this true on its own.
+   */
+  hasBlockingWork(target: ChatTarget, cwd: string): boolean {
+    const binding = this.bindingFor(target);
+    const sessionKey = this.sessionKey(target, binding);
+    if (this.hasLeaseFor(target, sessionKey) || this.hasQueuedWork(target, sessionKey)) {
+      return true;
+    }
+    const directories = this.ownedDirectoryKeys(
+      [cwd],
+      binding?.cwdPinned === true ? binding.cwd : undefined,
+    );
+    return directories.length > 0 && this.directoriesUnavailable(directories);
   }
 
   constructor(private readonly deps: TaskSchedulerDeps) {}
@@ -106,7 +139,7 @@ export class TaskScheduler {
     void next.then(cleanup, cleanup);
   }
 
-  /** 记下「这条任务在忙聊天或忙 session 后面等过」：启动时取回，据此补一条启动回执。 */
+  /** 记下「这条任务在忙聊天、忙 session 或忙工作区后面等过」：启动时取回，据此补一条启动回执。 */
   markWaiting(taskId: string): void {
     this.waiting.add(taskId);
   }
@@ -127,14 +160,17 @@ export class TaskScheduler {
   }
 
   /**
-   * A command holds the current session and chat keys, while cwd is consulted only for an
-   * unverified worker left by recovery. Different sessions in the same cwd remain independent.
+   * A command holds the current session and chat keys, while cwd is consulted for an unverified
+   * worker left by recovery. When the command touches an owned workspace (or a pinned workspace
+   * binding), its expanded resource keys are leased too so sibling projects cannot overlap.
+   * Different sessions in the same ordinary cwd remain independent.
    */
   tryAcquireCommandSession(
     target: ChatTarget,
     cwds: readonly string[],
   ): SessionLease | undefined {
-    const sessionKey = this.sessionKey(target, this.bindingFor(target));
+    const binding = this.bindingFor(target);
+    const sessionKey = this.sessionKey(target, binding);
     if (
       this.hasLeaseFor(target, sessionKey)
       || this.hasQueuedWork(target, sessionKey)
@@ -142,7 +178,33 @@ export class TaskScheduler {
     ) {
       return undefined;
     }
-    return this.createSessionLease(target, sessionKey);
+    const directories = this.ownedDirectoryKeys(
+      cwds,
+      binding?.cwdPinned === true ? binding.cwd : undefined,
+    );
+    if (directories.length > 0 && this.directoriesUnavailable(directories)) return undefined;
+    return this.createLeases(target, sessionKey, directories);
+  }
+
+  /** Lease every owned resource related to these paths, not just the caller's cwd spelling. */
+  tryAcquireCommandDirectories(cwds: readonly string[]): DirectoryLease | undefined {
+    const directories = this.workspaceKeys(cwds);
+    if (this.directoriesUnavailable(directories)) return undefined;
+    const leases = directories.map((cwd) => this.createDirectoryLease(cwd));
+    return this.combineLeases(leases);
+  }
+
+  /**
+   * A host operation may reuse the running task's exclusive resource lease only when every
+   * requested key is already covered. A wider request goes through the ordinary busy check.
+   */
+  tryAcquireWorkspaceDirectories(cwds: readonly string[], task: TaskRecord): DirectoryLease | undefined {
+    const requested = this.workspaceKeys(cwds);
+    const held = this.taskDirectoryLeases.get(task.id);
+    if (held && requested.every((directory) => held.has(directory))) {
+      return { ready: Promise.resolve(), complete: () => {} };
+    }
+    return this.tryAcquireCommandDirectories(cwds);
   }
 
   private bindingFor(target: ChatTarget): BindingRecord | null {
@@ -174,6 +236,68 @@ export class TaskScheduler {
     });
   }
 
+  /**
+   * The resource keys a task or command must lease: only owned workspace resources (or the
+   * caller's pinned workspace cwd), never an ordinary cwd. This keeps main's per-session lease
+   * rule intact: different sessions in the same ordinary cwd still run concurrently.
+   */
+  private ownedDirectoryKeys(cwds: readonly string[], pinnedCwd?: string): string[] {
+    const directories = new Set<string>();
+    for (const cwd of cwds) {
+      if (cwd !== pinnedCwd && !this.deps.store.isWorkspaceDirectoryOwned(cwd)) continue;
+      for (const directory of this.workspaceKeys([cwd])) directories.add(directory);
+    }
+    return [...directories].sort();
+  }
+
+  private directoriesUnavailable(directories: readonly string[]): boolean {
+    const requested = new Set(directories);
+    if (directories.some((cwd) =>
+      this.deps.isDirectoryBlocked(cwd)
+      || this.directoryTails.has(cwd)
+      || this.deps.hasRuntimeInDirectory(cwd)
+    )) {
+      return true;
+    }
+    return this.deps.store.listQueuedTasks().some((task) =>
+      this.workspaceKeys([task.cwd]).some((cwd) => requested.has(cwd))
+    );
+  }
+
+  private workspaceKeys(cwds: readonly string[]): string[] {
+    const directories = new Set<string>();
+    for (const cwd of cwds) {
+      for (const directory of this.deps.store.workspaceDirectories(cwd)) directories.add(directory);
+    }
+    return [...directories].sort();
+  }
+
+  private combineLeases(leases: readonly DirectoryLease[]): DirectoryLease {
+    return {
+      ready: Promise.all(leases.map((lease) => lease.ready)).then(() => {}),
+      complete: () => {
+        for (const lease of leases) lease.complete();
+      },
+    };
+  }
+
+  /**
+   * Create both leases synchronously, before anything awaits, so a command and a scheduled task
+   * cannot interleave between registering their session and directory tails.
+   */
+  private createLeases(
+    target: ChatTarget,
+    sessionKey: string,
+    directories: readonly string[],
+  ): SessionLease {
+    const sessionLease = this.createSessionLease(target, sessionKey);
+    if (directories.length === 0) return sessionLease;
+    return this.combineLeases([
+      sessionLease,
+      this.combineLeases(directories.map((cwd) => this.createDirectoryLease(cwd))),
+    ]);
+  }
+
   private createSessionLease(target: ChatTarget, sessionKey: string): SessionLease {
     const keys = this.leaseKeys(target, sessionKey);
     const previous = keys.flatMap((key) => {
@@ -197,19 +321,31 @@ export class TaskScheduler {
     };
   }
 
-  private async acquireSessionLease(
-    target: ChatTarget,
-    sessionKey: string,
-  ): Promise<SessionLease> {
-    const lease = this.createSessionLease(target, sessionKey);
-    await lease.ready;
-    return lease;
+  private createDirectoryLease(cwd: string): DirectoryLease {
+    const previous = this.directoryTails.get(cwd);
+    const completion = Promise.withResolvers<void>();
+    const lease = completion.promise;
+    this.directoryTails.set(cwd, lease);
+    let complete = false;
+    return {
+      ready: previous?.catch(() => {}) ?? Promise.resolve(),
+      complete: () => {
+        if (complete) return;
+        complete = true;
+        if (this.directoryTails.get(cwd) === lease) this.directoryTails.delete(cwd);
+        completion.resolve();
+      },
+    };
   }
 
-  /** Earlier queued tasks bound to this session must finish before the current task starts. */
-  private async earlierSessionOperations(
+  /**
+   * Earlier queued tasks must finish before the current task starts when they share its session
+   * or any of its leased workspace resource keys.
+   */
+  private async earlierOperations(
     task: TaskRecord,
     sessionKey: string,
+    directories: ReadonlySet<string>,
   ): Promise<Promise<void>[]> {
     const queued = this.deps.store.listQueuedTasks();
     const currentIndex = queued.findIndex((candidate) => candidate.id === task.id);
@@ -224,7 +360,11 @@ export class TaskScheduler {
         target,
         this.bindingFor(target),
       );
-      if (this.sessionKey(target, binding) !== sessionKey) continue;
+      const earlierCwd = binding?.cwd ?? earlier.cwd;
+      const sharesSession = this.sessionKey(target, binding) === sessionKey;
+      const sharesDirectory = directories.size > 0
+        && this.workspaceKeys([earlierCwd]).some((directory) => directories.has(directory));
+      if (!sharesSession && !sharesDirectory) continue;
       const operation = this.scheduledTasks.get(earlier.id);
       if (operation) operations.push(operation);
     }
@@ -253,13 +393,22 @@ export class TaskScheduler {
         if (this.deps.stopping() || !reconciledCurrent || reconciledCurrent.state !== "queued") return;
         const cwd = binding?.cwd ?? reconciledCurrent.cwd;
         const sessionKey = this.sessionKey(target, binding);
-        const earlier = await this.earlierSessionOperations(reconciledCurrent, sessionKey);
+        const directories = this.ownedDirectoryKeys(
+          [cwd],
+          binding?.cwdPinned === true ? binding.cwd : undefined,
+        );
+        const earlier = await this.earlierOperations(
+          reconciledCurrent,
+          sessionKey,
+          new Set(directories),
+        );
         await Promise.all(earlier.map((operation) => operation.catch(() => {})));
 
         const beforeLease = this.deps.store.getTask(taskId);
         if (this.deps.stopping() || !beforeLease || beforeLease.state !== "queued") return;
         const beforeTarget = taskTarget(beforeLease);
-        lease = await this.acquireSessionLease(beforeTarget, sessionKey);
+        lease = this.createLeases(beforeTarget, sessionKey, directories);
+        await lease.ready;
 
         const refreshed = await this.deps.reconcileBinding(
           taskId,
@@ -275,14 +424,26 @@ export class TaskScheduler {
           lease = undefined;
           continue;
         }
-        const newlyEarlier = await this.earlierSessionOperations(latest, currentSessionKey);
+        const newlyEarlier = await this.earlierOperations(
+          latest,
+          currentSessionKey,
+          new Set(directories),
+        );
         if (newlyEarlier.length > 0) {
           lease.complete();
           lease = undefined;
           await Promise.all(newlyEarlier.map((operation) => operation.catch(() => {})));
           continue;
         }
-        await this.deps.runTask(taskId, cwd);
+        const taskDirectories = new Set(directories);
+        if (taskDirectories.size > 0) this.taskDirectoryLeases.set(taskId, taskDirectories);
+        try {
+          await this.deps.runTask(taskId, cwd);
+        } finally {
+          if (this.taskDirectoryLeases.get(taskId) === taskDirectories) {
+            this.taskDirectoryLeases.delete(taskId);
+          }
+        }
         return;
       }
       const task = this.deps.store.getTask(taskId);

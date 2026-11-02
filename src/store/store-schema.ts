@@ -126,6 +126,31 @@ export function applySchema(db: Database): void {
       updated_at INTEGER NOT NULL,
       PRIMARY KEY(bot_uid, channel_type, channel_id)
     );
+    CREATE TABLE IF NOT EXISTS thread_workspaces (
+      bot_uid TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type = 5),
+      channel_id TEXT NOT NULL,
+      layout TEXT NOT NULL CHECK(layout IN ('single', 'shared', 'separate')),
+      status TEXT NOT NULL CHECK(status IN ('preparing', 'ready', 'failed')),
+      entry_path TEXT,
+      projects TEXT NOT NULL,
+      legacy_worktree_name TEXT,
+      error TEXT,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(bot_uid, channel_id)
+    );
+    CREATE TABLE IF NOT EXISTS thread_workspace_intents (
+      id TEXT PRIMARY KEY NOT NULL,
+      bot_uid TEXT NOT NULL,
+      group_id TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('preparing', 'failed', 'complete')),
+      channel_ids TEXT NOT NULL,
+      error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS thread_workspace_intent_group
+      ON thread_workspace_intents(bot_uid, group_id, status);
     CREATE TABLE IF NOT EXISTS inbound (
       bot_uid TEXT NOT NULL,
       channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
@@ -344,6 +369,7 @@ export function applySchema(db: Database): void {
     "ALTER TABLE questions ADD COLUMN card_message_id TEXT",
     "ALTER TABLE questions ADD COLUMN answered_by TEXT",
     "ALTER TABLE questions ADD COLUMN closed_reason TEXT",
+    "ALTER TABLE thread_workspaces ADD COLUMN legacy_worktree_name TEXT",
   ]) {
     try {
       db.exec(statement);

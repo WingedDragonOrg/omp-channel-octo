@@ -346,7 +346,7 @@ test("merge outside a bound sub-thread only replies, and never accepts a task", 
       ),
     ).toBe(true);
 
-    // A bound workspace still needs a compatible Worktrunk: without one the command replies
+    // A bound workspace still needs an executable Worktrunk: when none exists, the command replies
     // instead of handing a task to the assistant.
     const worktrees = harness.worktrees;
     if (!worktrees) throw new Error("expected a worktree port in the harness");
