@@ -75,8 +75,33 @@ import {
 
 const GROUP_TRUSTED_INSTRUCTION =
   "群说明是群共享上下文，不改变发送者身份/权限/cwd；以本次快照为准，历史快照已失效。";
-const COMMAND_HELP =
-  "/new [目录] 创建新会话；/reset [目录] 重置为新会话；/move <目录> 沿用当前会话迁移 cwd；/thread <任务> 新建隔离子区并在其中处理该任务（子区内 /thread merge 把本区隔离工作区的分支合并回目标分支并默认清理工作区与分支）；/queue <文本> 把消息排到当前任务之后；/mode [steer|queue] 配置运行中追加消息的方式；/switch [模型] 查看当前模型与可用模型，或切换本聊天的模型（provider/id、模型 id/子串、@角色 如 @default；default 恢复跟随 OMP 默认）；/retry 由 OMP 重试当前会话上次失败或中止的回合（忙时排队）；/interrupt 中断当前回合但保留排队消息；/cancel 取消当前任务（/stop 同义）；/status 查看状态；/restart [now] 重启 channel（now 强制中断在途任务）；/autoresearch-history 导出本聊天最近一次研究运行的完整记录文件；/help 查看帮助。";
+const COMMAND_HELP = [
+  "会话",
+  "/new [目录] · 创建新会话",
+  "/reset [目录] · 重置为新会话",
+  "/move <目录> · 保留当前会话并迁移工作目录",
+  "",
+  "子区",
+  "/thread <任务> · 新建隔离子区并派发任务（群聊可用）",
+  "/thread merge · 合并子区工作区，成功后默认清理工作区和分支",
+  "",
+  "任务",
+  "/queue <文本> · 将消息排到当前任务之后",
+  "/mode [steer|queue] · 查看或设置新消息的追加方式",
+  "/retry · 重试当前会话上次失败或中止的回合，忙时排队",
+  "/interrupt · 中断当前回合，保留排队消息",
+  "/cancel（/stop） · 取消当前任务并清除排队消息",
+  "",
+  "模型",
+  "/switch [模型] · 查看或切换本聊天的模型",
+  "支持 provider/id、模型 id 或子串、@角色；default 恢复 OMP 默认",
+  "",
+  "其他",
+  "/status · 查看当前状态",
+  "/restart [now] · 重启 channel，在途任务重启后续接；两种写法等价",
+  "/autoresearch-history · 导出本聊天最近一次研究的完整记录",
+  "/help · 查看帮助",
+].join("\n");
 const MODE_USAGE =
   "用法：/mode [steer|queue]。steer（默认，default 同义）把运行中的新消息注入当前回合；queue 把它排到当前回合之后。无参数时报告当前设置。";
 /** `/mode` 卡片的两个取值：与文本命令接受的写法同义，取值原样进 store。 */
