@@ -31,12 +31,25 @@ async function settle(): Promise<void> {
   }
 }
 
-async function waitForSent(harness: CoreHarness, count: number): Promise<void> {
+function sentToChat(
+  harness: CoreHarness,
+  target: { channelId: string; channelType: number },
+) {
+  return harness.transport.sent.filter(({ target: sentTarget }) =>
+    sentTarget.channelId === target.channelId && sentTarget.channelType === target.channelType,
+  );
+}
+
+async function waitForSent(
+  harness: CoreHarness,
+  target: { channelId: string; channelType: number },
+  count: number,
+): Promise<void> {
   for (let attempt = 0; attempt < 10_000; attempt += 1) {
-    if (harness.transport.sent.length >= count) return;
+    if (sentToChat(harness, target).length >= count) return;
     await new Promise<void>((resolve) => setImmediate(resolve));
   }
-  throw new Error(`transport recorded ${harness.transport.sent.length} of ${count} messages`);
+  throw new Error(`transport recorded ${sentToChat(harness, target).length} of ${count} messages`);
 }
 
 function queryRows(harness: CoreHarness, sql: string): Array<Record<string, unknown>> {
@@ -66,10 +79,11 @@ test("an owner mention in an unlisted group gets one throttled notice and never 
       text: "@Bot 看下这个群",
       mentionedUserIds: [botUid],
     }));
-    await waitForSent(harness, 1);
+    await waitForSent(harness, { channelId: DENIED_GROUP, channelType: 2 }, 1);
 
-    expect(harness.transport.sent).toHaveLength(1);
-    const notice = harness.transport.sent[0]!;
+    const groupReplies = sentToChat(harness, { channelId: DENIED_GROUP, channelType: 2 });
+    expect(groupReplies).toHaveLength(1);
+    const notice = groupReplies[0]!;
     expect(notice.target).toMatchObject({ channelId: DENIED_GROUP, channelType: 2 });
     expect(notice.text).toContain("本群未开通");
     expect(notice.text).toContain("开通本群");
@@ -99,7 +113,7 @@ test("an owner mention in an unlisted group gets one throttled notice and never 
     }));
     await settle();
 
-    expect(harness.transport.sent).toHaveLength(1);
+    expect(sentToChat(harness, { channelId: DENIED_GROUP, channelType: 2 })).toHaveLength(1);
     expect(harness.workers.prompts).toHaveLength(0);
     expect((await harness.service.status({ channelId: DENIED_GROUP, channelType: 2 })).state).toBe("none");
     // The rejection path persists nothing: no dedup row, no task, no queued reply, and the grant
@@ -128,10 +142,12 @@ test("the owner's passphrase enables the group durably and it survives a restart
       text: " 开通本群 ",
       mentionedUserIds: [first.bot.uid],
     }));
-    await waitForSent(first, 2);
+    await waitForSent(first, { channelId: DENIED_GROUP, channelType: 2 }, 2);
 
-    expect(first.transport.sent[0]!.text).toContain("本群未开通");
-    expect(first.transport.sent[1]!.text).toContain("已开通本群");
+    const groupReplies = sentToChat(first, { channelId: DENIED_GROUP, channelType: 2 });
+    expect(groupReplies).toHaveLength(2);
+    expect(groupReplies[0]!.text).toContain("本群未开通");
+    expect(groupReplies[1]!.text).toContain("已开通本群");
     expect(writeback.appended).toEqual([DENIED_GROUP]);
     expect(queryRows(first, "SELECT channel_type, channel_id, granted_by FROM allowed_chats")).toEqual([
       { channel_type: 2, channel_id: DENIED_GROUP, granted_by: "owner-1" },
@@ -148,8 +164,10 @@ test("the owner's passphrase enables the group durably and it survives a restart
     await first.service.handleInbound(work);
     await waitForStatus(first.service, work, (status) => status.state === "completed");
     expect(first.workers.prompts.map(({ text }) => text)).toEqual(["现在开始干活"]);
-    expect(first.transport.sent.filter(({ text }) => text.includes("未开通"))).toHaveLength(1);
-    expect(first.transport.sent.filter(({ text }) => text.includes("已开通"))).toHaveLength(1);
+    expect(sentToChat(first, { channelId: DENIED_GROUP, channelType: 2 })
+      .filter(({ text }) => text.includes("未开通"))).toHaveLength(1);
+    expect(sentToChat(first, { channelId: DENIED_GROUP, channelType: 2 })
+      .filter(({ text }) => text.includes("已开通"))).toHaveLength(1);
   } finally {
     await closeCoreHarness(first, { remove: false });
   }
@@ -191,8 +209,9 @@ test("the passphrase only works for the owner, only verbatim, and only with a me
     await settle();
 
     // The near-miss got the ordinary notice; nothing granted and no task started.
-    expect(harness.transport.sent).toHaveLength(1);
-    expect(harness.transport.sent[0]!.text).toContain("本群未开通");
+    const groupReplies = sentToChat(harness, { channelId: DENIED_GROUP, channelType: 2 });
+    expect(groupReplies).toHaveLength(1);
+    expect(groupReplies[0]!.text).toContain("本群未开通");
     expect(queryRows(harness, "SELECT 1 FROM allowed_chats")).toHaveLength(0);
     expect(harness.workers.prompts).toHaveLength(0);
     expect(queryRows(harness, "SELECT 1 FROM tasks")).toHaveLength(0);
@@ -203,8 +222,9 @@ test("the passphrase only works for the owner, only verbatim, and only with a me
       text: "开通本群",
       mentionedUserIds: [harness.bot.uid],
     }));
-    await waitForSent(harness, 2);
-    expect(harness.transport.sent[1]!.text).toContain("已开通本群");
+    await waitForSent(harness, { channelId: DENIED_GROUP, channelType: 2 }, 2);
+    expect(sentToChat(harness, { channelId: DENIED_GROUP, channelType: 2 })[1]!.text)
+      .toContain("已开通本群");
     expect(queryRows(harness, "SELECT 1 FROM allowed_chats")).toHaveLength(1);
   } finally {
     await closeCoreHarness(harness);
@@ -222,9 +242,10 @@ test("a thread carries its own notice and grant while its parent group stays unl
       text: "@Bot 子区里干活",
       mentionedUserIds: [botUid],
     }));
-    await waitForSent(harness, 1);
-    expect(harness.transport.sent[0]!.text).toContain("本子区未开通");
-    expect(harness.transport.sent[0]!.text).toContain("开通本子区");
+    await waitForSent(harness, { channelId: DENIED_THREAD, channelType: 5 }, 1);
+    const threadReplies = sentToChat(harness, { channelId: DENIED_THREAD, channelType: 5 });
+    expect(threadReplies[0]!.text).toContain("本子区未开通");
+    expect(threadReplies[0]!.text).toContain("开通本子区");
 
     await harness.service.handleInbound(inbound({
       messageId: "unlisted-thread-grant",
@@ -233,8 +254,9 @@ test("a thread carries its own notice and grant while its parent group stays unl
       text: "开通本群",
       mentionedUserIds: [botUid],
     }));
-    await waitForSent(harness, 2);
-    expect(harness.transport.sent[1]!.text).toContain("已开通本子区");
+    await waitForSent(harness, { channelId: DENIED_THREAD, channelType: 5 }, 2);
+    expect(sentToChat(harness, { channelId: DENIED_THREAD, channelType: 5 })[1]!.text)
+      .toContain("已开通本子区");
     expect(queryRows(harness, "SELECT channel_type, channel_id FROM allowed_chats")).toEqual([
       { channel_type: 5, channel_id: DENIED_THREAD },
     ]);
@@ -250,7 +272,8 @@ test("a thread carries its own notice and grant while its parent group stays unl
     await harness.service.handleInbound(threadWork);
     await waitForStatus(harness.service, threadWork, (status) => status.state === "completed");
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["子区任务"]);
-    expect(harness.transport.sent.map(({ text }) => text).filter((text) => text.includes("未开通"))).toHaveLength(1);
+    expect(sentToChat(harness, { channelId: DENIED_THREAD, channelType: 5 })
+      .map(({ text }) => text).filter((text) => text.includes("未开通"))).toHaveLength(1);
 
     // Granting the parent group covers its threads, including one that never had its own entry.
     await harness.service.handleInbound(ownerGroupMessage({
@@ -258,8 +281,9 @@ test("a thread carries its own notice and grant while its parent group stays unl
       text: "开通本群",
       mentionedUserIds: [botUid],
     }));
-    await waitForSent(harness, 3);
-    expect(harness.transport.sent[2]!.text).toContain("已开通本群");
+    await waitForSent(harness, { channelId: DENIED_GROUP, channelType: 2 }, 1);
+    expect(sentToChat(harness, { channelId: DENIED_GROUP, channelType: 2 })[0]!.text)
+      .toContain("已开通本群");
     const sibling = inbound({
       messageId: "unlisted-sibling-thread",
       channelId: "group-denied____topic-2",
@@ -290,7 +314,8 @@ test("an allowlisted chat runs its message and never sees the notice", async () 
     await settle();
 
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["允许群任务"]);
-    expect(harness.transport.sent.filter(({ text }) => text.includes("未开通"))).toHaveLength(0);
+    expect(sentToChat(harness, { channelId: "group-allowed", channelType: 2 })
+      .filter(({ text }) => text.includes("未开通"))).toHaveLength(0);
     expect(queryRows(harness, "SELECT 1 FROM allowed_chats")).toHaveLength(0);
   } finally {
     await closeCoreHarness(harness);
@@ -307,8 +332,9 @@ test("a failed config write-back keeps the durable grant and says so", async () 
       text: "开通本群",
       mentionedUserIds: [harness.bot.uid],
     }));
-    await waitForSent(harness, 1);
-    expect(harness.transport.sent[0]!.text).toContain("写回失败");
+    await waitForSent(harness, { channelId: DENIED_GROUP, channelType: 2 }, 1);
+    expect(sentToChat(harness, { channelId: DENIED_GROUP, channelType: 2 })[0]!.text)
+      .toContain("写回失败");
     expect(queryRows(harness, "SELECT 1 FROM allowed_chats")).toHaveLength(1);
 
     const work = ownerGroupMessage({

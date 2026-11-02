@@ -9,6 +9,16 @@ import {
   waitForStatus,
 } from "./fixtures/core-fakes";
 
+function sentToChat(
+  messages: readonly { target: { channelId: string; channelType: number }; text: string }[],
+  target: { channelId: string; channelType: number },
+) {
+  return messages.filter(({ target: sentTarget }) =>
+    sentTarget.channelId === target.channelId && sentTarget.channelType === target.channelType,
+  );
+}
+
+
 
 test("only the owner and an explicitly mentioned bot can execute", async () => {
   const harness = await createCoreHarness();
@@ -148,7 +158,7 @@ test("a bare mention runs a normal turn instead of being refused as unsupported"
 
     expect(harness.workers.prompts).toHaveLength(1);
     expect(harness.workers.prompts[0]!.text).toBe("");
-    expect(harness.transport.sent.map((message) => message.text))
+    expect(sentToChat(harness.transport.sent, bare).map((message) => message.text))
       .not.toContain("不支持的消息类型，不会启动任务。");
   } finally {
     await closeCoreHarness(harness);
@@ -169,8 +179,9 @@ test("an unconfigured bot enrolls on the first supported non-empty DM without ru
 
     expect(harness.workers.prompts).toHaveLength(0);
     expect(await readText(join(harness.root, "tmp", "effects.log"))).toBe("");
-    expect(harness.transport.sent).toHaveLength(1);
-    const confirmation = harness.transport.sent[0]!;
+    const confirmations = sentToChat(harness.transport.sent, first);
+    expect(confirmations).toHaveLength(1);
+    const confirmation = confirmations[0]!;
     expect(confirmation.target).toMatchObject({ channelId: "dm-enrollment", channelType: 1 });
     expect(confirmation.text).toContain("alice");
   } finally {
@@ -189,13 +200,14 @@ test("the enrollment message is durably deduplicated across repost and restart",
   });
   try {
     await first.service.handleInbound(message);
-    expect(first.transport.sent).toHaveLength(1);
-    expect(first.transport.sent[0]!.text).toContain("alice");
-    const firstReplyCount = first.transport.sent.length;
+    const confirmations = sentToChat(first.transport.sent, message);
+    expect(confirmations).toHaveLength(1);
+    expect(confirmations[0]!.text).toContain("alice");
+    const firstReplyCount = confirmations.length;
     await first.service.handleInbound(message);
 
     expect(first.workers.prompts).toHaveLength(0);
-    expect(first.transport.sent).toHaveLength(firstReplyCount);
+    expect(sentToChat(first.transport.sent, message)).toHaveLength(firstReplyCount);
     expect(await readText(join(first.root, "tmp", "effects.log"))).toBe("");
   } finally {
     await closeCoreHarness(first, { remove: false });
@@ -210,7 +222,7 @@ test("the enrollment message is durably deduplicated across repost and restart",
     await restarted.service.handleInbound(message);
 
     expect(restarted.workers.prompts).toHaveLength(0);
-    expect(restarted.transport.sent).toHaveLength(0);
+    expect(sentToChat(restarted.transport.sent, message)).toHaveLength(0);
     expect(await readText(join(first.root, "tmp", "effects.log"))).toBe("");
   } finally {
     await closeCoreHarness(restarted);
@@ -231,8 +243,9 @@ test("owner enrollment is isolated by bot UID in the durable store", async () =>
   });
   try {
     await first.service.handleInbound(firstMessage);
-    expect(first.transport.sent).toHaveLength(1);
-    expect(first.transport.sent[0]!.text).toContain("alice");
+    const firstConfirmations = sentToChat(first.transport.sent, firstMessage);
+    expect(firstConfirmations).toHaveLength(1);
+    expect(firstConfirmations[0]!.text).toContain("alice");
     expect(first.workers.prompts).toHaveLength(0);
   } finally {
     await closeCoreHarness(first, { remove: false });
@@ -252,8 +265,9 @@ test("owner enrollment is isolated by bot UID in the durable store", async () =>
   });
   try {
     await second.service.handleInbound(secondMessage);
-    expect(second.transport.sent).toHaveLength(1);
-    expect(second.transport.sent[0]!.text).toContain("bob");
+    const secondConfirmations = sentToChat(second.transport.sent, secondMessage);
+    expect(secondConfirmations).toHaveLength(1);
+    expect(secondConfirmations[0]!.text).toContain("bob");
     expect(second.workers.prompts).toHaveLength(0);
 
     const task = inbound({
@@ -430,7 +444,8 @@ test("two concurrent first DMs produce exactly one durable owner", async () => {
     ]);
 
     const confirmations = harness.transport.sent.filter(({ target }) =>
-      target.channelId === aliceTarget.channelId || target.channelId === bobTarget.channelId,
+      (target.channelId === aliceTarget.channelId && target.channelType === aliceTarget.channelType)
+      || (target.channelId === bobTarget.channelId && target.channelType === bobTarget.channelType),
     );
     expect(confirmations).toHaveLength(1);
     const winner =
@@ -546,7 +561,7 @@ test("a failed enrollment confirmation write fails closed and does not consume t
 
     expect(harness.workers.prompts).toHaveLength(0);
     expect(
-      harness.transport.sent.filter(({ target }) => target.channelId === message.channelId),
+      sentToChat(harness.transport.sent, message),
     ).toHaveLength(0);
     expect(await readText(join(harness.root, "tmp", "effects.log"))).toBe("");
   } finally {
@@ -555,9 +570,7 @@ test("a failed enrollment confirmation write fails closed and does not consume t
   }
 
   await harness.service.handleInbound(message);
-  const confirmations = harness.transport.sent.filter(
-    ({ target }) => target.channelId === message.channelId,
-  );
+  const confirmations = sentToChat(harness.transport.sent, message);
   expect(confirmations).toHaveLength(1);
   expect(confirmations[0]!.text).toContain("alice");
   expect(harness.workers.prompts).toHaveLength(0);

@@ -18,6 +18,104 @@ function sentText(message: FixtureSentMessage): string {
   return typeof content === "string" ? content : "";
 }
 
+const STARTUP_NOTICE_TEXT = "omp-channel-octo 已启动";
+const STOP_NOTICE_TEXT = "omp-channel-octo 正在停止";
+type LifecycleKind = "startup" | "stop";
+
+/** Lifecycle notices identify themselves by their first line; business replies start elsewhere. */
+function lifecycleKind(message: FixtureSentMessage): LifecycleKind | undefined {
+  const text = sentText(message);
+  if (text.startsWith(STARTUP_NOTICE_TEXT)) return "startup";
+  if (text.startsWith(STOP_NOTICE_TEXT)) return "stop";
+  return undefined;
+}
+
+function lifecycleMessages(fixture: OctoProtocolFixture, kind: LifecycleKind): FixtureSentMessage[] {
+  return fixture.sentMessages.filter((message) => lifecycleKind(message) === kind);
+}
+
+/** Replies the command/task paths produced, with lifecycle notices filtered out. */
+function businessMessages(fixture: OctoProtocolFixture): FixtureSentMessage[] {
+  return fixture.sentMessages.filter((message) => lifecycleKind(message) === undefined);
+}
+
+/** The notice labels its own process PID; parse that label instead of guessing from digits. */
+const LIFECYCLE_PID_PATTERN = /(?:PID|进程(?:号)?)\s*[:：=]?\s*(\d+)/i;
+
+function lifecyclePid(message: FixtureSentMessage): number | undefined {
+  const match = LIFECYCLE_PID_PATTERN.exec(sentText(message));
+  return match ? Number(match[1]) : undefined;
+}
+
+/** True when the notice names this exact process as its PID. */
+function mentionsPid(message: FixtureSentMessage, pid: number): boolean {
+  return lifecyclePid(message) === pid;
+}
+
+function lifecycleNoticeFor(
+  fixture: OctoProtocolFixture,
+  kind: LifecycleKind,
+  pid: number,
+): FixtureSentMessage | undefined {
+  return lifecycleMessages(fixture, kind).find((message) => mentionsPid(message, pid));
+}
+
+const LIFECYCLE_TIME_PATTERN =
+  /(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.\d+)?[^0-9+-]*([+-]\d{2}:?\d{2})/;
+
+/**
+ * A lifecycle notice goes to the configured owner's DM only, carries the real PID of the process
+ * that emitted it, and stamps the event with that process's local wall clock and UTC offset.
+ */
+function expectLifecycleNotice(
+  message: FixtureSentMessage,
+  fixture: OctoProtocolFixture,
+  kind: LifecycleKind,
+  pid: number,
+  ownerUid = fixture.ownerUid,
+): void {
+  expect(lifecycleKind(message)).toBe(kind);
+  expect(message.body).toMatchObject({
+    channel_id: ownerUid,
+    channel_type: 1,
+    payload: { type: 1 },
+  });
+  expect(mentionsPid(message, pid)).toBe(true);
+  const text = sentText(message);
+  expect(text).not.toContain(fixture.botToken);
+  if (kind === "stop") {
+    expect(text).toContain("omp-channel-octo 正在停止；在途任务将挂起，启动后继续。");
+  }
+  const match = LIFECYCLE_TIME_PATTERN.exec(text);
+  expect(match).not.toBeNull();
+  if (!match) throw new Error("Lifecycle notice has no local timestamp with numeric offset");
+  const rawOffset = match[3]!;
+  const offset = rawOffset.includes(":") ? rawOffset : `${rawOffset.slice(0, 3)}:${rawOffset.slice(3)}`;
+  const timestamp = Date.parse(`${match[1]}T${match[2]}${offset}`);
+  expect(Number.isFinite(timestamp)).toBe(true);
+  expect(Math.abs(Date.now() - timestamp)).toBeLessThanOrEqual(120_000);
+  // The CLI runs in a fixed fractional-offset zone, independently of Bun test's own timezone.
+  expect(offset).toBe("+05:45");
+}
+
+/** Wait for one lifecycle event and assert its route, PID, and event-time stamp together. */
+async function waitForLifecycleNotice(
+  fixture: OctoProtocolFixture,
+  kind: LifecycleKind,
+  pid: number,
+  description: string,
+  ownerUid = fixture.ownerUid,
+  timeoutMs = 5_000,
+): Promise<FixtureSentMessage> {
+  const notice = await waitForFixture(
+    () => lifecycleNoticeFor(fixture, kind, pid),
+    timeoutMs,
+    description,
+  );
+  expectLifecycleNotice(notice, fixture, kind, pid, ownerUid);
+  return notice;
+}
+
 async function waitForChildExit(child: Bun.Subprocess, timeoutMs = 5_000): Promise<number> {
   const timeout = Promise.withResolvers<never>();
   // This integration test controls an external CLI process, so a real timeout is required to bound a hang.
@@ -27,6 +125,17 @@ async function waitForChildExit(child: Bun.Subprocess, timeoutMs = 5_000): Promi
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Integration-only real delay: the fixture holds an HTTP send response for 400 ms, and fake timers
+ * cannot advance a separate child process, so the only way to observe that the CLI still awaits
+ * that send (rather than closing its WebSocket first) is to let a little real time pass.
+ */
+async function pauseWhileChildIsBlocked(ms: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  await promise;
 }
 
 const CHECKOUT_ROOT = resolve(import.meta.dir, "..");
@@ -39,6 +148,7 @@ function cliEnvironment(root: string, binDir?: string): NodeJS.ProcessEnv {
   return {
     ...process.env,
     HOME: root,
+    TZ: "Asia/Kathmandu",
     ...(binDir === undefined ? {} : { PATH: `${binDir}:${process.env.PATH ?? ""}` }),
   };
 }
@@ -61,7 +171,7 @@ function workerStartupCwds(logText: string): string[] {
   return cwds;
 }
 
-test("real CLI serve handles a status message and exits cleanly on SIGTERM", async () => {
+test("real CLI sends lifecycle notices to configured owner around /status and SIGTERM", async () => {
   let root: string | undefined;
   let fixture: OctoProtocolFixture | undefined;
   let child: Bun.Subprocess | undefined;
@@ -69,15 +179,19 @@ test("real CLI serve handles a status message and exits cleanly on SIGTERM", asy
   try {
     const currentRoot = await mkdtemp(join(tmpdir(), "octo-cli-lifecycle-"));
     root = currentRoot;
-    const currentFixture = await createOctoProtocolFixture();
+    // A held send response makes "the stop notice was attempted before the transport closed"
+    // observable: the process must still be waiting on this request, so its socket stays open.
+    const currentFixture = await createOctoProtocolFixture({ sendMessageDelayMs: 400 });
     fixture = currentFixture;
+    // Distinguish the channel's configured owner from BotIdentity.ownerUid returned by registration.
+    const configuredOwnerId = "configured-channel-owner";
     const configPath = join(currentRoot, "config.json");
     await writeFile(
       configPath,
       JSON.stringify({
         apiUrl: currentFixture.apiUrl,
         botToken: currentFixture.botToken,
-        ownerId: currentFixture.ownerUid,
+        ownerId: configuredOwnerId,
         allowedGroupIds: [],
         stateDir: join(currentRoot, "state"),
         ompCommand: process.execPath,
@@ -101,21 +215,34 @@ test("real CLI serve handles a status message and exits cleanly on SIGTERM", asy
       5_000,
       "CLI did not authenticate its WebSocket connection",
     );
+    await waitForLifecycleNotice(
+      currentFixture,
+      "startup",
+      spawned.pid,
+      "CLI did not send the startup lifecycle notice to the configured owner",
+      configuredOwnerId,
+    );
+
     currentFixture.sendInbound(connection, {
-      fromUid: currentFixture.ownerUid,
-      channelId: `${currentFixture.ownerUid}@${currentFixture.botUid}`,
+      fromUid: configuredOwnerId,
+      channelId: `${configuredOwnerId}@${currentFixture.botUid}`,
       channelType: 1,
       text: "/status",
       messageId: "9007199254741999",
     });
 
     const statusReply = await waitForFixture(
-      () => currentFixture.sentMessages.find(({ body }) => body.channel_id === currentFixture.ownerUid),
+      () =>
+        currentFixture.sentMessages.find(
+          (message) =>
+            message.body.channel_id === configuredOwnerId &&
+            sentText(message).includes("state=none"),
+        ),
       5_000,
       "CLI did not send the status response through REST",
     );
     expect(statusReply.body).toMatchObject({
-      channel_id: currentFixture.ownerUid,
+      channel_id: configuredOwnerId,
       channel_type: 1,
       payload: {
         type: 1,
@@ -124,6 +251,20 @@ test("real CLI serve handles a status message and exits cleanly on SIGTERM", asy
     });
 
     spawned.kill("SIGTERM");
+    // Repeated stop signals share the same shutdown and must not duplicate the owner notice.
+    spawned.kill("SIGTERM");
+    await waitForLifecycleNotice(
+      currentFixture,
+      "stop",
+      spawned.pid,
+      "CLI did not send the stopping lifecycle notice to the configured owner",
+      configuredOwnerId,
+    );
+    // The fixture holds this response for 400 ms. A process that closed the transport before
+    // awaiting the attempt would flip `closed` while the send is still in flight.
+    await pauseWhileChildIsBlocked(150);
+    expect(connection.closed).toBe(false);
+
     const exitCode = await waitForChildExit(spawned);
     const [stdoutText, stderrText] = await capturedOutput;
     expect(exitCode).toBe(0);
@@ -133,6 +274,9 @@ test("real CLI serve handles a status message and exits cleanly on SIGTERM", asy
       "CLI did not close the Octo WebSocket connection",
     );
     expect(connection.closed).toBe(true);
+    // Repeated SIGTERM shares one stop attempt; each lifecycle event is sent once for this process.
+    expect(lifecycleMessages(currentFixture, "startup")).toHaveLength(1);
+    expect(lifecycleMessages(currentFixture, "stop")).toHaveLength(1);
     expect(stdoutText).not.toContain(currentFixture.botToken);
     expect(stderrText).not.toContain(currentFixture.botToken);
   } finally {
@@ -140,17 +284,17 @@ test("real CLI serve handles a status message and exits cleanly on SIGTERM", asy
       child.kill("SIGKILL");
       await child.exited;
     }
-    if (outputPromise) await outputPromise.catch(() => {});
+    if (outputPromise) await outputPromise;
     if (fixture) await fixture.close();
     if (root) await rm(root, { recursive: true, force: true });
   }
-});
+}, 20_000);
 
 test("a second start refuses before it registers the Bot and leaves the running instance serving", async () => {
   let root: string | undefined;
   let fixture: OctoProtocolFixture | undefined;
-  let child: Bun.Subprocess | undefined;
   let outputPromise: Promise<[string, string]> | undefined;
+  const children: Bun.Subprocess[] = [];
   try {
     const currentRoot = await mkdtemp(join(tmpdir(), "octo-cli-duplicate-start-"));
     root = currentRoot;
@@ -174,7 +318,7 @@ test("a second start refuses before it registers the Bot and leaves the running 
       [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "start", "--config", configPath],
       { stdout: "pipe", stderr: "pipe", env: cliEnvironment(currentRoot) },
     );
-    child = spawned;
+    children.push(spawned);
     const stdout = new Response(spawned.stdout).text();
     const stderr = new Response(spawned.stderr).text();
     outputPromise = Promise.all([stdout, stderr]);
@@ -184,11 +328,19 @@ test("a second start refuses before it registers the Bot and leaves the running 
       5_000,
       "CLI did not authenticate its WebSocket connection",
     );
+    await waitForLifecycleNotice(
+      currentFixture,
+      "startup",
+      spawned.pid,
+      "the running CLI did not send its startup lifecycle notice",
+    );
 
     const duplicate = Bun.spawn(
       [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "start", "--config", configPath],
       { stdout: "pipe", stderr: "pipe", env: cliEnvironment(currentRoot) },
     );
+    const duplicatePid = duplicate.pid;
+    children.push(duplicate);
     const [duplicateCode, , duplicateErr] = await Promise.all([
       waitForChildExit(duplicate, 10_000),
       new Response(duplicate.stdout).text(),
@@ -199,6 +351,15 @@ test("a second start refuses before it registers the Bot and leaves the running 
     // Registering again is what would cut the online instance off, so the refusal must precede it.
     expect(currentFixture.registerRequests).toHaveLength(1);
     expect(spawned.exitCode).toBeNull();
+    // A refused duplicate never becomes ready, so it neither starts nor stops with a notice, and the
+    // one running instance must not announce itself again on its behalf.
+    expect(lifecycleMessages(currentFixture, "startup")).toHaveLength(1);
+    expect(lifecycleMessages(currentFixture, "stop")).toHaveLength(0);
+    expect(
+      currentFixture.sentMessages.some(
+        (message) => lifecycleKind(message) !== undefined && mentionsPid(message, duplicatePid),
+      ),
+    ).toBe(false);
 
     currentFixture.sendInbound(connection, {
       fromUid: currentFixture.ownerUid,
@@ -208,19 +369,61 @@ test("a second start refuses before it registers the Bot and leaves the running 
       messageId: "9007199254742201",
     });
     await waitForFixture(
-      () => currentFixture.sentMessages.some(({ body }) => body.channel_id === currentFixture.ownerUid),
+      () =>
+        currentFixture.sentMessages.some(
+          (message) =>
+            message.body.channel_id === currentFixture.ownerUid &&
+            sentText(message).includes("state=none"),
+        ),
       5_000,
       "the running instance stopped answering after the refused duplicate start",
     );
 
+    // Reconnecting the transport is not a new start: the owner gets no second startup notice.
+    currentFixture.kickConnection(0);
+    const reconnected = await currentFixture.waitForConnection(2, 8_000);
+    await waitForFixture(
+      () => reconnected.ready ? reconnected : undefined,
+      5_000,
+      "the running instance did not reconnect its Octo WebSocket",
+    );
+    const beforeReconnectStatus = currentFixture.sentMessages.length;
+    currentFixture.sendInbound(reconnected, {
+      fromUid: currentFixture.ownerUid,
+      channelId: `${currentFixture.ownerUid}@${currentFixture.botUid}`,
+      channelType: 1,
+      text: "/status",
+      messageId: "9007199254742202",
+    });
+    await waitForFixture(
+      () =>
+        currentFixture.sentMessages
+          .slice(beforeReconnectStatus)
+          .find((message) => sentText(message).includes("state=none")),
+      5_000,
+      "the reconnected instance did not serve commands",
+    );
+    // The reconnected transport is already serving; give an erroneous reconnect notice time to
+    // surface before asserting that the only startup notice is still the original one.
+    await pauseWhileChildIsBlocked(200);
+    expect(lifecycleMessages(currentFixture, "startup")).toHaveLength(1);
+
     spawned.kill("SIGTERM");
+    await waitForLifecycleNotice(
+      currentFixture,
+      "stop",
+      spawned.pid,
+      "the running CLI did not send its stopping lifecycle notice",
+    );
     expect(await waitForChildExit(spawned)).toBe(0);
   } finally {
-    if (child && child.exitCode === null) {
-      child.kill("SIGKILL");
-      await child.exited;
+    for (const child of children) {
+      if (child.exitCode === null) {
+        child.kill("SIGKILL");
+        await child.exited;
+      }
     }
-    if (outputPromise) await outputPromise.catch(() => {});
+    if (outputPromise) await outputPromise;
     if (fixture) await fixture.close();
     if (root) await rm(root, { recursive: true, force: true });
   }
@@ -320,7 +523,10 @@ test("real CLI runs the owner's group command with the bot mention placed before
     ]);
 
     await waitForFixture(
-      () => currentFixture.sentMessages.length === 4 ? currentFixture.sentMessages : undefined,
+      () => {
+        const replies = businessMessages(currentFixture);
+        return replies.length === 4 ? replies : undefined;
+      },
       5_000,
       "CLI did not answer the two owner commands, the member notice, and the sentinel status request",
     );
@@ -331,11 +537,11 @@ test("real CLI runs the owner's group command with the bot mention placed before
       "CLI did not acknowledge every inbound frame",
     );
 
-    const replies = currentFixture.sentMessages.map((message) => ({
+    const replies = businessMessages(currentFixture).map((message) => ({
       channelId: message.body.channel_id,
       content: sentText(message),
     }));
-    expect(currentFixture.sentMessages).toHaveLength(4);
+    expect(businessMessages(currentFixture)).toHaveLength(4);
     const statusReplies = replies.filter(({ content }) => content.includes("state=none"));
     expect(statusReplies).toHaveLength(3);
     expect(replies.filter(({ channelId }) => channelId === groupId)).toHaveLength(3);
@@ -354,11 +560,11 @@ test("real CLI runs the owner's group command with the bot mention placed before
       child.kill("SIGKILL");
       await child.exited;
     }
-    if (outputPromise) await outputPromise.catch(() => {});
+    if (outputPromise) await outputPromise;
     if (fixture) await fixture.close();
     if (root) await rm(root, { recursive: true, force: true });
   }
-});
+}, 15_000);
 
 test("real CLI restarts through the detected supervisor program and the replacement process serves afterwards", async () => {
   let root: string | undefined;
@@ -367,7 +573,8 @@ test("real CLI restarts through the detected supervisor program and the replacem
   try {
     const currentRoot = await mkdtemp(join(tmpdir(), "octo-cli-restart-"));
     root = currentRoot;
-    const currentFixture = await createOctoProtocolFixture();
+    // Held sends keep the old transport observably open while the stop notice is in flight.
+    const currentFixture = await createOctoProtocolFixture({ sendMessageDelayMs: 400 });
     fixture = currentFixture;
     const markerPath = join(currentRoot, "super-restart-ran");
     const fakeBin = join(currentRoot, "bin");
@@ -427,6 +634,12 @@ exit 2
       5_000,
       "first CLI did not authenticate its WebSocket connection",
     );
+    await waitForLifecycleNotice(
+      currentFixture,
+      "startup",
+      first.pid,
+      "the first CLI did not send its startup lifecycle notice",
+    );
     currentFixture.sendInbound(firstConnection, {
       fromUid: currentFixture.ownerUid,
       channelId: `${currentFixture.ownerUid}@${currentFixture.botUid}`,
@@ -442,15 +655,28 @@ exit 2
     );
     expect(sentText(acknowledgement)).toContain("正在重启 channel");
 
+    const firstStop = await waitForLifecycleNotice(
+      currentFixture,
+      "stop",
+      first.pid,
+      "the first CLI did not send its stopping lifecycle notice",
+    );
+    await pauseWhileChildIsBlocked(150);
+    expect(firstConnection.closed).toBe(false);
     expect(await waitForChildExit(first, 10_000)).toBe(0);
-    await firstOutput.catch(() => {});
+    await firstOutput;
     await waitForFixture(
       () => existsSync(markerPath) ? true : undefined,
       5_000,
       "the detected supervisor program did not restart the CLI",
     );
+    // The chat receipt belongs to the restart request, not to the lifecycle notices: it survives
+    // the old process and is not re-sent by the replacement.
+    expect(currentFixture.sentMessages).toContain(acknowledgement);
+    expect(
+      currentFixture.sentMessages.filter((message) => sentText(message).includes("正在重启 channel")),
+    ).toHaveLength(1);
 
-    const beforeRestart = currentFixture.sentMessages.length;
     const second = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe", env: cliEnv });
     children.push(second);
     const secondOutput = Promise.all([new Response(second.stdout).text(), new Response(second.stderr).text()]);
@@ -460,8 +686,23 @@ exit 2
       5_000,
       "restarted CLI did not authenticate its WebSocket connection",
     );
-    // The restart no longer announces itself: the replacement process proves it is serving by
-    // answering a status command in the same chat.
+    const secondStartup = await waitForLifecycleNotice(
+      currentFixture,
+      "startup",
+      second.pid,
+      "the replacement CLI did not send its startup lifecycle notice",
+    );
+    // Restart order: old stop first, replacement start second; the old receipt stays in between or
+    // before them but never disappears.
+    expect(currentFixture.sentMessages.indexOf(firstStop)).toBeLessThan(
+      currentFixture.sentMessages.indexOf(secondStartup),
+    );
+    expect(currentFixture.sentMessages.indexOf(acknowledgement)).toBeLessThan(
+      currentFixture.sentMessages.indexOf(secondStartup),
+    );
+
+    const beforeRestart = currentFixture.sentMessages.length;
+    // After its lifecycle startup notice, the replacement also answers commands in the same chat.
     currentFixture.sendInbound(secondConnection, {
       fromUid: currentFixture.ownerUid,
       channelId: `${currentFixture.ownerUid}@${currentFixture.botUid}`,
@@ -484,8 +725,24 @@ exit 2
     expect(afterRestart).not.toContain("因重启中断");
 
     second.kill("SIGTERM");
+    await waitForLifecycleNotice(
+      currentFixture,
+      "stop",
+      second.pid,
+      "the replacement CLI did not send its stopping lifecycle notice",
+    );
     expect(await waitForChildExit(second)).toBe(0);
-    await secondOutput.catch(() => {});
+    await secondOutput;
+
+    // The whole restart produced exactly one notice per event, in process order.
+    const startupNotices = lifecycleMessages(currentFixture, "startup");
+    const stopNotices = lifecycleMessages(currentFixture, "stop");
+    expect(startupNotices).toHaveLength(2);
+    expect(stopNotices).toHaveLength(2);
+    expect(mentionsPid(startupNotices[0]!, first.pid)).toBe(true);
+    expect(mentionsPid(startupNotices[1]!, second.pid)).toBe(true);
+    expect(mentionsPid(stopNotices[0]!, first.pid)).toBe(true);
+    expect(mentionsPid(stopNotices[1]!, second.pid)).toBe(true);
   } finally {
     for (const child of children) {
       if (child.exitCode === null) {
@@ -498,14 +755,15 @@ exit 2
   }
 }, 20_000);
 
-test("real CLI run stays out of the supervisor's way and refuses a restart", async () => {
+test("real CLI run ignores Super, refuses restart, and reports SIGINT shutdown", async () => {
   let root: string | undefined;
   let fixture: OctoProtocolFixture | undefined;
   const children: Bun.Subprocess[] = [];
   try {
     const currentRoot = await mkdtemp(join(tmpdir(), "octo-cli-run-"));
     root = currentRoot;
-    const currentFixture = await createOctoProtocolFixture();
+    // Held sends make the stop notice's position relative to transport close observable.
+    const currentFixture = await createOctoProtocolFixture({ sendMessageDelayMs: 400 });
     fixture = currentFixture;
     const fakeBin = join(currentRoot, "bin");
     const callsPath = join(currentRoot, "super-calls.log");
@@ -561,8 +819,22 @@ exit 0
     expect(sentText(reply)).toContain("未检测到守护进程");
     expect(existsSync(callsPath)).toBe(false);
 
-    spawned.kill("SIGTERM");
+    spawned.kill("SIGINT");
+    await waitForLifecycleNotice(
+      currentFixture,
+      "stop",
+      spawned.pid,
+      "the debugging CLI did not send the stopping lifecycle notice on SIGINT",
+    );
+    await pauseWhileChildIsBlocked(150);
+    expect(connection.closed).toBe(false);
     expect(await waitForChildExit(spawned)).toBe(0);
+    await waitForFixture(
+      () => connection.closed ? connection : undefined,
+      5_000,
+      "the debugging CLI did not close its WebSocket after stopping",
+    );
+    expect(lifecycleMessages(currentFixture, "stop")).toHaveLength(1);
   } finally {
     for (const child of children) {
       if (child.exitCode === null) {
@@ -1064,6 +1336,12 @@ test("real CLI killed after an accepted interrupt never resumes that turn", asyn
       5_000,
       "first CLI did not authenticate its WebSocket connection",
     );
+    await waitForLifecycleNotice(
+      currentFixture,
+      "startup",
+      first.pid,
+      "the first CLI did not send its startup lifecycle notice",
+    );
     currentFixture.sendInbound(firstConnection, {
       fromUid: currentFixture.ownerUid,
       channelId: chatId,
@@ -1093,7 +1371,11 @@ test("real CLI killed after an accepted interrupt never resumes that turn", asyn
     // 中断已回执、prompt 仍未收束：此刻 SIGKILL，进程连一次关停清理都跑不到。
     first.kill("SIGKILL");
     await first.exited;
-    await firstOutput.catch(() => {});
+    await firstOutput;
+    await pauseWhileChildIsBlocked(200);
+    // A killed process cannot run the stopping path, so the owner never hears a stop notice.
+    expect(lifecycleMessages(currentFixture, "stop")).toHaveLength(0);
+    expect(lifecycleMessages(currentFixture, "startup")).toHaveLength(1);
 
     const second = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe", env: cliEnv });
     children.push(second);
@@ -1104,6 +1386,14 @@ test("real CLI killed after an accepted interrupt never resumes that turn", asyn
       5_000,
       "restarted CLI did not authenticate its WebSocket connection",
     );
+    await waitForLifecycleNotice(
+      currentFixture,
+      "startup",
+      second.pid,
+      "the replacement CLI did not send its startup lifecycle notice after SIGKILL",
+    );
+    expect(lifecycleMessages(currentFixture, "startup")).toHaveLength(2);
+    expect(lifecycleMessages(currentFixture, "stop")).toHaveLength(0);
     const sentBefore = currentFixture.sentMessages.length;
     currentFixture.sendInbound(secondConnection, {
       fromUid: currentFixture.ownerUid,
@@ -1126,7 +1416,7 @@ test("real CLI killed after an accepted interrupt never resumes that turn", asyn
     expect(row?.state).toBe("interrupted");
     expect(row?.errorText).toBe("用户中断当前回合");
     // 派发只有那一次：没有 /retry，也没有原文重放。
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await pauseWhileChildIsBlocked(200);
     const prompts = rpcLogEntries(rpcLogPath).filter((entry) => entry.kind === "prompt");
     expect(prompts.map((entry) => entry.message)).toEqual(["挂住的回合"]);
     const replayed = currentFixture.sentMessages.slice(sentBefore).map(sentText).join("\n");
@@ -1135,7 +1425,7 @@ test("real CLI killed after an accepted interrupt never resumes that turn", asyn
 
     second.kill("SIGTERM");
     expect(await waitForChildExit(second)).toBe(0);
-    await secondOutput.catch(() => {});
+    await secondOutput;
   } finally {
     for (const child of children) {
       if (child.exitCode === null) {

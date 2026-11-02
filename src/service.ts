@@ -91,6 +91,20 @@ const DEFAULT_INTERRUPT_IDLE_TEXT =
   "当前没有正在运行的回合可中断；任务尚未进入执行阶段时可用 /cancel 取消。";
 /** Steered messages tracked for the consumption receipt; older entries fall out of observation. */
 const MAX_PENDING_STEERS = 32;
+const LIFECYCLE_NOTICE_TIMEOUT_MS = 2_000;
+
+type LifecycleNotice = "startup" | "stop";
+
+/** Format wall-clock fields and their offset together, rather than pairing local time with UTC Z. */
+function localTimestamp(date: Date): string {
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  const offsetMinutes = -date.getTimezoneOffset();
+  const offsetSign = offsetMinutes >= 0 ? "+" : "-";
+  const absoluteOffset = Math.abs(offsetMinutes);
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+    + `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+    + `${offsetSign}${pad(Math.floor(absoluteOffset / 60))}:${pad(absoluteOffset % 60)}`;
+}
 /** Characters of the triggering message shown in a start/consumption receipt. */
 const RECEIPT_EXCERPT_CHARS = 20;
 const DEFAULT_CANCELLED_TEXT = "当前任务已取消；不回滚已发生的副作用。";
@@ -195,6 +209,10 @@ class CoreService implements ChannelService {
   private lock: LockHandle | undefined;
   private started = false;
   private stopping = false;
+  /** True after transport readiness and task recovery preparation, until shutdown completes. */
+  private ready = false;
+  /** Coalesces concurrent start calls and lets stop await an in-flight startup notice. */
+  private startPromise: Promise<void> | undefined;
   /** channel 重启的所有者：/restart 校验、延期重启排定与跨进程重启通报都不再留在服务里。 */
   private readonly serviceRestart: ServiceRestart;
   /** `/thread` 家族命令的所有者：意图交接、合并交接与资格文案都不再留在服务里。 */
@@ -389,8 +407,24 @@ class CoreService implements ChannelService {
     };
   }
 
-  async start(): Promise<void> {
-    if (this.started) return;
+  start(): Promise<void> {
+    if (this.startPromise) return this.startPromise;
+    if (this.started) return Promise.resolve();
+    if (this.stopping) return Promise.reject(new Error("channel 正在停止"));
+    const startPromise = this.startInternal();
+    this.startPromise = startPromise;
+    void startPromise.then(
+      () => {
+        if (this.startPromise === startPromise) this.startPromise = undefined;
+      },
+      () => {
+        if (this.startPromise === startPromise) this.startPromise = undefined;
+      },
+    );
+    return startPromise;
+  }
+
+  private async startInternal(): Promise<void> {
     if (this.stopping) throw new Error("channel 正在停止");
     // 每次启动一条新门：这一批排定任务要么等到接线成功，要么随失败一起被放弃。
     this.startupGate = Promise.withResolvers<void>();
@@ -479,7 +513,10 @@ class CoreService implements ChannelService {
       this.outbox.flushAll();
       this.botEvents.start();
       this.startupGate.resolve();
+      this.ready = true;
+      await this.sendLifecycleNotice("startup");
     } catch (error) {
+      this.ready = false;
       this.started = false;
       this.startupGate.reject(error instanceof Error ? error : new Error("channel 启动失败"));
       await this.botEvents.stop();
@@ -490,7 +527,6 @@ class CoreService implements ChannelService {
       throw error;
     }
   }
-
   async stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     this.stopPromise = this.stopInternal();
@@ -499,12 +535,15 @@ class CoreService implements ChannelService {
 
   private async stopInternal(): Promise<void> {
     if (this.stopping) return;
+    const wasReady = this.ready;
     this.stopping = true;
     this.threadArchives.stop();
     this.started = false;
-    // Abort inbound I/O first so in-flight downloads/transcriptions/lookups unwind while the rest
-    // of shutdown runs; their cleanup (claim rollback, temp-file removal) is awaited below.
+    // Seal inbound processing and abort its I/O before any lifecycle send or worker shutdown.
     this.shutdownController.abort();
+    // A ready start may still be sending its startup notice; leave the connection open until it ends.
+    if (wasReady && this.startPromise) await this.startPromise.catch(() => {});
+    if (wasReady) await this.sendLifecycleNotice("stop");
     const runtimes = [...this.runtimes.values()];
     for (const runtime of runtimes) {
       // 停机不是用户的 /cancel：只挂起。任务行保留 prompt 标记，由新进程按续接语义恢复；
@@ -530,13 +569,50 @@ class CoreService implements ChannelService {
     this.outbox.stopTimers();
     await this.outbox.settle();
     await this.options.transport.stop().catch(() => {});
+    // A start still in preparation or awaiting CONNACK must unwind before its store is closed.
+    if (this.startPromise) await this.startPromise.catch(() => {});
     if (this.lock) {
       await this.lock.release().catch(() => {});
       this.lock = undefined;
     }
+    this.ready = false;
     this.store.close();
   }
 
+  private async sendLifecycleNotice(notice: LifecycleNotice): Promise<void> {
+    if (notice === "startup" && this.stopping) return;
+    const botUid = this.bot!.uid;
+    try {
+      const ownerId = this.store.getOwnerId(botUid)?.trim();
+      if (!ownerId) return;
+      const controller = new AbortController();
+      const body = notice === "startup"
+        ? "omp-channel-octo 已启动"
+        : "omp-channel-octo 正在停止；在途任务将挂起，启动后继续。";
+      const send = this.options.transport.sendText(
+        { channelType: 1, channelId: ownerId },
+        `${body} 本地时间=${localTimestamp(new Date())} PID=${process.pid}`,
+        `lifecycle-${notice}-${botUid}-${process.pid}`,
+        controller.signal,
+      );
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          send,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              controller.abort();
+              reject(new Error("lifecycle notice timed out"));
+            }, LIFECYCLE_NOTICE_TIMEOUT_MS);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch {
+      console.error("[lifecycle] 生命周期通知发送失败或超时，继续服务生命周期处理");
+    }
+  }
   /**
    * typing 的「门后即亮」段：agent-attached 消息在权限校验通过、进入附件组装/转写与接受之前
    * 亮起；其后的任何出口（组装失败、附件拒绝、重投去重、steer 命中、任务接受、抛错）都被

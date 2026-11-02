@@ -10,6 +10,8 @@ Restart recovery must preserve exclusive session ownership. Confirm the previous
 
 Restart checks: `bun tests/benchmarks/restart.ts` executes the fixed offline real-CLI/process/SQLite workload for graceful restart and SIGKILL, including exclusive session ownership, committed effects, queue order and duplicate inbound delivery. `tests/core-restart.test.ts`, `tests/store-restart.test.ts`, `tests/core-ask-restart.test.ts`, and `tests/core-progress-card-recovery.test.ts` cover recovery boundaries. Native host `toolCallId` is distinct from RPC request ID and is preserved by retry; ask answer replay and card edit sequences must survive repeated restarts.
 
+`CoreService` owns lifecycle notices to the current channel owner's DM: one startup notice after transport readiness and recovery preparation, and one stopping notice after inbound is sealed but before worker shutdown and transport closure. Both carry local time with UTC offset and the channel PID. Resolve only the configured/persisted channel owner, never `BotIdentity.ownerUid`. Sends bypass the durable outbox, have an independent 2-second budget, and never retry or replay; failure must not prevent lifecycle cleanup. Repeated starts/stops and reconnects do not duplicate notices; an unclaimed channel skips them. Preserve the pending-start/stop ordering and test with `tests/core-lifecycle-notices.test.ts` plus the real CLI lifecycle fixture.
+
 ## Architecture & Data Flow
 
 The main runtime path is:

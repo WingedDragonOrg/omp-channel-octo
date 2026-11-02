@@ -1,7 +1,7 @@
 # OMP Octo 个人远程助手设计
 
 日期：2026-09-12
-修订日期：2026-09-17
+修订日期：2026-11-02
 状态：产品设计已确认
 
 ## 背景与目标
@@ -11,6 +11,8 @@
 ## 范围
 
 包含个人单 Bot、单服务实例、文本指令与回复、执行状态、新建会话、指定目录、取消、会话恢复、消息去重和连接重建。支持私聊、指定群及 CommunityTopic 线程（channelType=5）内明确 @Bot 的指令；支持群/线程共享说明、线程默认继承父群工作目录、群/线程对话历史的增量上下文注入（详细设计见 `docs/specs/2026-09-16-group-history-context-design.md`）、线程隔离工作区的 Worktrunk 生命周期（详细设计见 `docs/specs/2026-09-17-thread-worktrunk-design.md`）、任务启动失败的分类报错与可观测性（详细设计见 `docs/specs/2026-09-17-task-startup-failure-design.md`）、常见入站消息类型的内容提取与附件接收（详细设计见 `docs/specs/2026-09-16-inbound-message-content-design.md`）、`thread-dispatch` 的派发任务完成回传（`notify` 开关，详细设计见 `docs/specs/2026-09-17-thread-completion-notify-design.md`）、出站文件和持久化问答、已开通群/子区内成员的消息驱动与 ask 卡片作答（命令仍仅 owner；详细设计见 `docs/specs/2026-09-17-group-member-participation-design.md`）、子区归档与合并后自动归档（详细设计见 `docs/specs/2026-09-17-thread-archive-design.md`）。
+
+包含发给当前 owner 私聊的服务启动就绪与正常停机通知：覆盖 Super、`oco` 和聊天命令最终触发的同一服务生命周期，按事件做有界发送，不承担异常离线监控。
 
 不包含终端会话接管、多用户服务、通用网络 Agent gateway、文档评论任务、服务端通用 bot_task、群历史归档与检索、出站附件之外的通用文件托管和交互 callback 系统。channel 仅提供由 OMP host tool 明确发起的出站图片/文件发送，以及由能力 profile 明确启用的 Octo raw type17 `octo/v1` AdaptiveCard 1.5 进度展示和 `octo/v2` 交互问答卡片；交互卡片的上行只使用该 Bot 自己的事件队列（`/v1/bot/events` 轮询与 ack），不注册回调地址、不实现通用 callback 或审批流。收到的入站消息按已确认的类型表提取内容，贴纸、系统与 CMD 等没有内容的类型明确告知，不作为成功执行。范围以个人 IM 交互为准，不继承参考适配器的其他任务入口。
 
@@ -127,7 +129,7 @@ channel 支持下列命令，`/help` 展示用法；`/retry` 经 OMP 原生命�
 
 `/cancel` 与 `/stop` 是控制路径：发送 abort、等待 worker 停止，并清除该聊天的待执行消息与排队任务，因此同时也丢弃尚未消费的 steering 与排队消息；不回滚已经发生的副作用。
 
-`/restart` 由 channel 按自身 PID 检测出的守护进程执行（见 `2026-09-16-oco-cli-entry-design.md`）；未检测到时明确拒绝，不猜测重启机制。命令以独立会话派生，守护进程负责停止 channel；命令没有停止进程时 channel 继续服务并记录告警。`/restart` 与 `/restart now` 都允许忙时重启，发起聊天收到一次请求回执。停机保留在途任务与队列，新进程先核验并停止遗留 worker，再沿任务原 session 续接，随后执行队列；恢复成功不发中断、取消或 PID 通报。无法确认旧进程停止的目录保持阻塞；session 身份或 prompt 接受状态不明时明确报告恢复失败。可续接任务继续编辑原进度卡，并保留待答问题。
+`/restart` 由 channel 按自身 PID 检测出的守护进程执行（见 `2026-09-16-oco-cli-entry-design.md`）；未检测到时明确拒绝，不猜测重启机制。命令以独立会话派生，守护进程负责停止 channel；命令没有停止进程时 channel 继续服务并记录告警。`/restart` 与 `/restart now` 都允许忙时重启，发起聊天收到一次请求回执。停机保留在途任务与队列，新进程先核验并停止遗留 worker，再沿任务原 session 续接，随后执行队列；任务恢复成功不另发中断、取消或恢复完成通报，服务启停本身按生命周期通知规则向 owner 私聊发送时间与 PID。无法确认旧进程停止的目录保持阻塞；session 身份或 prompt 接受状态不明时明确报告恢复失败。可续接任务继续编辑原进度卡，并保留待答问题。
 
 `/switch [模型]` 按聊天目标查看与切换模型：无参数时报告「当前模型 + 按 provider 分组的可用模型（总模型数超过 80 时截断并说明总数）」——有运行中的回合时由该回合的活会话读 `get_state`/`get_available_models`（模型标注「运行中会话」，与本聊天指定值不同时并列给出），否则用既有 `WorkerFactory` 起一个 fresh 一次性 worker（临时会话目录，`mkdtemp` 创建、读完即停并删除）读取，空闲且未指定时标注「OMP 默认」；带参数时把选择器原样交给 OMP 自己的 `/switch` 解析——`provider/id`、模型 id 或唯一子串、`@角色`（OMP `settings.modelRoles` 的映射）与 `:level` 后缀都由 OMP 决定，channel 不复制解析规则；解析成功时把 `provider/id:level` 写入状态盘 `chat_models`（按 `botUid` 与真实聊天目标隔离，不继承），解析失败回单行中文错误且不改状态。生效分两部分：有运行中的回合时选择器直接分发给该回合的活会话（OMP 只改本会话、不产生 agent 回合，实测回合运行中可用且该回合继续跑完）；之后启动的 worker（任务路径与 `/new`、`/reset`、`/move`）组装 `WorkerOptions` 时读取该值并传 `--model`，resume 的会话也因此覆盖记录里的模型，服务重启后仍生效。`default`（不含 `/`）清除本聊天模型、之后跟随 OMP 默认，运行中的会话不被改动（要移动它用 `/switch @default`）。该命令不取目录 lease——探测 worker 是 fresh、不跑 agent 回合、独立会话目录的一次性进程，不读写任何聊天会话；worker ledger 以 `switch-` 前缀记录并在停止后清除，临时目录随即删除。
 
@@ -268,6 +270,18 @@ typing 的已排定 tick 在服务进入 stopping 后直接回收该租约环，
 
 服务停止时先封闭新的入站处理并中止附件下载、语音转写和免@查询，等待已开始的入站清理完成后才关闭状态盘。尚未持久接受的入站以有界取消错误返回，使传输层保留重投资格；附件组装释放临时 claim、删除本次新建文件，重启后同一消息可重新接收。即使在途 I/O 恰好成功返回，也先检查停止状态，再决定是否进入后续处理。
 
+**生命周期私聊通知（2026-11-02 确认）**：生命周期通知由服务本身统一发出，不在 Super hooks、CLI 或聊天命令各自建立发送逻辑。只发给当前 Bot 已确认的 owner 的私聊（channelType=1），配置中的显式 owner 优先，并按既有规则写入该 Bot 的状态盘；未显式配置时使用状态盘持久 owner。不使用 Bot 注册响应中的 `ownerUid` 替代 channel 的控制权绑定，不向群、线程、最近发言人或其他 Bot 的 owner 发送。尚未认领时跳过，不在后来首次认领时补发；首次认领回执保持现状。
+
+启动通知正文为 `omp-channel-octo 已启动`，另附事件发生时的本地时间（含时区偏移）和当前服务 PID。发送时必须已完成 Bot 身份与独占锁确认、遗留 worker 回收及恢复任务调度准备，并已建立 Octo 连接、开放服务处理；它表示 channel 就绪，不表示所有遗留任务已执行完成。启动失败或重复实例被独占锁拒绝时不发送；每次成功启动最多尝试一次，连接重连、重复调用 `start()` 不重复发送。发送前若已进入 stopping，跳过启动通知。
+
+正常停机通知正文为 `omp-channel-octo 正在停止；在途任务将挂起，启动后继续。`，另附本次停机事件的本地时间（含时区偏移）和当前服务 PID。在封闭新入站并中止入站 I/O 后、开始等待 worker 等停机资源收尾前尝试发送，此时 Octo transport 与状态盘尚未关闭。仅对已成功就绪的服务发送，初始化失败清理不发；重复 `stop()`、重复信号共用同一次停机，不重复发送。不宣称进程已经退出，不改变任务挂起、目录独占和重启续接语义。
+
+Super 的启动、停止、重启，`oco` 触发的服务重启，SIGINT/SIGTERM，以及聊天 `/restart` 或 `channel_control.restart` 最终触发的正常生命周期，遵守同一通知规则。正常重启时，owner 私聊先收到旧进程正在停止、再收到新进程已启动（两次发送都成功时）；聊天 `/restart` 原有的发起聊天回执和 `channel_control.restart` 的延期说明保留，它们不是生命周期通知。服务恢复不增加其他 PID 完成通报或任务打断通报。
+
+生命周期通知使用现有 transport 文本发送能力，每个事件一次发送尝试，独立的 2 秒总等待预算，不复用已被停机中止的入站 signal。失败或超时只记录一条有界、无凭据的服务日志，继续启动或停机，不改变它们原有的成功与失败判定；网络故障仍遵守服务自身连接与恢复语义。通知不进入持久 outbox，不登记重启通报行，不跨进程补发、不重试，不等待已有任务输出队列，也不启动 OMP、建立聊天会话或创建任务、进度卡。通知发出后进程仍可能继续运行一段收尾时间；无回执或超时不承诺远端绝对未收到，也不以补发实现恰好一次。
+
+SIGKILL、进程崩溃、断电及启动前认证失败等无法执行正常通知路径的情形不承诺停机或失败通知；不添加外部监控、异常离线告警、心跳、重启风暴聚合或新的配置开关。异常后成功重新启动仍按成功启动规则发送通知。
+
 Octo 断线不取消已经开始的 Agent；正文 outbox 与任务状态持久化，重连后按聊天顺序继续投递，不重跑任务。重连采用有上限退避（1s 起、翻倍、上限 30s，向下抖动）并重新认证；服务端主动 DISCONNECT（被踢，如同一 Bot 的另一次登录接管会话）与底层断线走同一条退避重连路径；只有注册或 CONNACK 认证失败才停止重连并给出本地明确错误。重复消息经持久去重。文字和文件 outbox 按聊天顺序发送，送达未知时沿用稳定 client message ID；投递失败按有上限退避重试（1s 起、翻倍、上限 30s、向下抖动），连续失败到 6 次或遇到永久失败（4xx，`err.server.bot_api.store_failed` 除外）就把该行标记 `dead`、在 `last_error` 与日志里保留真实失败原因，随即继续投递队尾——一条投不出去的消息不会把整个聊天永久静音；成功投递或内容更新会清零尝试计数。文件永久失败同样标记 dead 并报告，不阻塞后续文字回复。
 
 会话文件按项目隔离存放在 `sessionsDir`（缺省 `~/.oco/sessions`，可配置）下：每个项目（任务绑定的 canonical cwd）一个 `<basename>-<路径摘要>` 子目录，worker 以该项目目录作为 `--session-dir` 启动——不同聊天、不同隔离子区工作区互不共享会话目录。改动前的 `<stateDir>/sessions` 扁平根保留在恢复候选里，已有绑定继续按记录的绝对 `session_file` 恢复。
@@ -341,6 +355,12 @@ Octo 断线不取消已经开始的 Agent；正文 outbox 与任务状态持久�
 
 48. 迟到提交：问题关闭后的卡片提交按关闭原因分流——关闭原因是用户明确停止（`/cancel`、`/interrupt`，含重启恢复里结算这两种意图的行）或该问题提出于最后一次 `/new`/`/reset` 之前时，只回一次「该问题已失效，本次点击未作为答案。」且不落答案；其余关闭（任务 completed/failed、恢复收尾、重启接受状态未知、续接失败、超时清扫）按行 compare-and-set 记为 answered 并把「原问题＋还原后的答案＋提交人」作为该聊天的新输入投递（空闲成为 durable 任务、忙碌按该聊天追加模式并入，恰好一次唤醒），既不恢复原任务、也不重放原 prompt、也不作为同聊天另一张待答问题的答案；已记录答案的问题再收到的提交静默（不覆盖、不投递）；同一提交的事件重投、重复投递与服务重启都不产生第二次记录或第二次投递；无权限点击、无绑定卡片与未知 action 一律不生效；落答的卡片随即 best-effort 改写成终态（已回复并带署名，或按关闭原因关闭）。
 
+49. 生命周期启动通知：配置 owner 或已有持久 owner 时，真实 CLI 启动并建立 Octo 连接、完成恢复调度准备后，owner 私聊收到一条 `omp-channel-octo 已启动`，含本次事件时间、时区偏移及实际服务 PID；其他私聊、群与线程收不到该通知。通知不表示恢复任务已完成。重复 `start()`、Octo 重连、启动失败及独占锁拒绝均不重复或误发；未认领 owner 时跳过，首次认领不补发。
+50. 生命周期停机通知：对已就绪的真实 CLI 发送 SIGTERM 或 SIGINT，封闭新入站后、关闭 Octo 连接前向 owner 私聊发送一条 `omp-channel-octo 正在停止；在途任务将挂起，启动后继续。`，含本次事件时间、时区偏移及旧服务 PID；重复 stop 或信号仅尝试一次，初始化失败清理不发。进程仍完成既有 worker、目录锁与状态盘收尾，不把停机改为取消任务。
+51. 正常重启通知：真实 CLI 经 Super 兼容的测试守护端重启，两次发送成功时 owner 私聊按顺序收到旧进程停机、新进程启动通知，PID 与各自实际进程一致；聊天 `/restart` 的原发起聊天回执保留，群与线程只接收其原有命令回执，不接收生命周期通知。任务仍按原 session 续接，不重放已接受 prompt。
+52. 生命周期通知失败：分别模拟启动和停机通知被拒、网络失败及发送不响应，每次通知在独立 2 秒预算内结束等待并留下有界日志，生命周期继续正常完成；不重试、不阻塞 worker 收尾、不被普通 outbox 队头阻塞，不在后续重启补发过时通知，不创建任务、会话或进度卡。
+53. 异常退出边界：真实 CLI 被 SIGKILL 时不要求停机通知，后续成功启动仍发送启动通知；没有外部监控依赖。部署验收通过当前 Super 服务做一次正常重启，并在 owner 的实际 Octo 私聊确认停机与启动两条通知及 PID；本地夹具通过不替代这一真实投递验收。
+
 ## 实施前提与未决事项
 既有实现已完成 `/new`/`/reset` 目录绑定、原生 `/move`、精确外部 session 恢复、正文 outbox、执行 tracker、卡片和生命周期边界；共享说明采用 session/version/OMP lifecycle context 设计；线程默认继承父群工作目录已实现：`src/threads/thread-target.ts` 是线程目标父群解析的单一来源，传输层 `contextPath` 与服务的默认目录解析都经它取父群 ID。线程隔离工作区已按验收 25 落地（`src/workspace/worktree.ts` 的 worktree port + 绑定的 `cwd_pinned`），依赖部署解析出的 OMP 可执行文件提供 `worktree add`；OMP 未启用 `worktree.clone` 时新工作区不含被忽略文件。Worktrunk 生命周期已按验收 31 落地：`src/workspace/worktrunk.ts` 负责兼容探测（稳定 v0.76.x）、wt 命令参数与结果解析、单行错误边界，`src/workspace/worktree.ts` 在本机有兼容 wt 时用它创建、合并与清理，否则创建与清理回退现状；宿主调用不传 `-y`，命令审批按本机 Worktrunk 的项目配置进行。Agent 的 Octo 身份已按验收 27 落地：`src/runtime/octo-cli.ts` 维护每个 bot 一份 octo-cli 凭据目录，`workerEnv` 以 allowlist 把三个变量注入 OMP worker，其余 `OCTO_*` 继续被剥离；该路径要求部署环境存在 `octo-cli`，缺失时只降级为无 CLI 身份。模型切换已按验收 32 落地：`src/commands/model-switch.ts` 负责选择器解析与有界列表渲染，`chat_models` 表按聊天目标持久化模型，任务路径与 `/new`、`/reset`、`/move` 组装 worker 时读取该值并传 `--model`，`/switch` 的探测复用既有 `WorkerFactory` 起一个 fresh、无 prompt 的一次性 worker 并清理其临时会话目录。原生扩展通知的聊天可见性已按验收 40 落地：`WorkerNoticeEvent` 进入 `WorkerEvent` 联合类型，worker 事件翻译层把上游 `notify` 帧净化转换为该事件，`src/service.ts` 在 `workAfterStop` 判定与进度追踪之前按级别标签投递，复用出站队列的持久化、分块与有界重试，同一上游帧 id 经既有 stream 去重不重复投递。本地命令的群说明提交豁免已按验收 41 落地：`LocalCommandEvent` 进入 `WorkerEvent` 联合类型（worker 仅在匹配的 no-agent 完成恰好发出一次），`src/service.ts` 在 `workAfterStop` 判定前置位 `localOnly`，该回合跳过 context commit、sidecar 照常移除、ledger 保持 pending 至下一真实生成回合。子区归档与合并后自动归档已按验收 42/43 落地：`ChannelTransport.archiveThread` 调 `POST /v1/bot/groups/{g}/threads/{s}/archive`，`octo_management` 的 `thread-archive` 与默认 pipeline 的 `thread-merge` 收尾都只经 `planThreadArchive` 排定，`CoreService` 在该聊天回合输出排空后执行一次归档，仅瞬时失败（5xx 或 `err.server.bot_api.store_failed`）按 5 秒间隔最多 5 次尝试、停止时放弃、最终失败只向发起聊天补一条有界说明。
 
@@ -349,6 +369,8 @@ Octo 断线不取消已经开始的 Agent；正文 outbox 与任务状态持久�
 迟到提交的三个边界取舍——换过会话（`/new`/`/reset`）之后提出的旧卡、用户明确 `/cancel`／`/interrupt` 之后的旧卡、以及已答复的卡片上再来一次不同的选择——已由 owner 于 2026-09-21 在本子区确认，分别维持「只回一次失效说明」「只回一次失效说明」「静默且不覆盖已落定答案」的处置。
 
 迟到提交已按验收 48 落地：`questions.closed_reason` 随取消落在同一事务（`/cancel` 与 `/interrupt` 记用户停止，任务自行结束、恢复收尾与重启相关收尾记 `ended`，迁移前旧行与 `expired` 按 `ended` 读取），`chats.session_switched_at` 由 `/new`/`/reset` 成功切换时写入（`/move` 保持会话身份、不记切换），`src/questions.ts` 按这两个事实把关闭行的点击分流为「迟到答复」「静默」与「失效提示」三种处置，迟到答复复用既有等待超时唤醒路径（同一 compare-and-set、同一追加模式投递、同一份问题与答案渲染）。
+
+生命周期私聊通知已按验收 49–53 接入 `CoreService`：启动操作在连接和恢复准备完成后发送启动通知，正常停机先封闭入站，再通过独立文本请求发送停机通知，最后收尾 worker、transport 与状态盘。并发启动共用启动 Promise；已就绪但启动通知尚在途时，停机先等待该次有界发送结束，保持启停通知和连接关闭顺序。当前 owner 从状态盘按 Bot 身份读取，通知使用独立的 2 秒 signal 与 deadline，不创建持久 outbox 或重启通报行。
 
 研究只读呈现与完整记录导出切片按验收 44/45 落线：`src/omp/events.ts` 通过每个 prompt 独立的 `ResearchTracker` 折叠权威工具帧，`src/tasks/task-events.ts` 将 `research_update` 的完整报告交回服务落盘，`src/cards/progress-cards.ts` 拥有该任务最近快照、研究帧开卡与滚卡结转。`src/research/research-report.ts` 负责按 bot+真实聊天摘要键控的原子 latest 与导出不可变 spool（同聊天链式有序写入、stop 排水）；`src/service.ts` 接线报告存储并实现 owner-only 硬拦截 `/autoresearch-history`（入队 file outbox、messageId 级持久去重、入队失败自清 spool）。
 
@@ -461,3 +483,9 @@ outbox 有界失败与队列放行的验收证据（验收 9）：`tests/core-ou
 配置卡片的验收证据（验收 47）：`tests/core-command-card.test.ts` 用真实 CoreService、真实 SQLite、夹具 worker 与可点击的假 transport 覆盖 14 例——`/switch` 卡片的模型选择落 `chat_models`、下一个 worker 带 `--model`，且不产生生成回合；`/mode` 卡片只认 owner（成员点击静默且不消耗卡片），随后的文本命令与重复投递都不会被旧卡覆盖；`default` 选择清空聊天模型，终态卡承载该命令的逐字回执且帧内无输入、无动作；回合运行中的点击走该回合的活会话（全程只有一个 worker，`switchModel` 分发与 store 同步）；同聊天的待答问题与任务计数不受配置点击影响，问答路径随后照常工作；非 owner、串消息、串聊天、未发放 action id 与未发放取值的点击一律不改变状态，其中只有 owner 点击未知卡片时得到一段有界重开指引；部署不支持卡片、帧被拒、发送抛错三条路径都逐字给出原文本回执；旧菜单被新命令取代后，晚到的旧卡不再可点击；跨进程重启后旧卡作废而新进程的新卡照常；新菜单取代同聊天的同类旧菜单；在途的目录查询被更新的文本选择取代后不发卡（0 张）且该选择保持生效。另有二个单元级用例直接驱动菜单会话（应用写成真实的 `chat_modes` 落库）：发送回执未绑定前的点击返回重试、绑定后才应用并改写为无控件终态；TTL 过期、伪造 action id、非 owner 点击与 200 张上限（最旧先失效、最新仍可用）分别断言。`tests/model-switch.test.ts` 增加 2 例覆盖卡片的取值构造：只发放能作选择器的 `provider/id`（空 provider、含空白与重复条目被丢弃）且上限与文本目录一致（`default` + 80 条），卡片的当前值行与文本回退首行同源。
 
 配置卡片独立验收（2026-09-21）：本地 AdaptiveCards 3.0.4 浏览器渲染实际 builder 输出，340px 与 440px 宽度均无 SDK 校验错误；包含 80 个模型加默认选项的帧为 89 节点。另将实际 CoreService 生成的卡片接入本地浏览器，选择 `fixture/fast`、`queue` 并分别点击「应用」，提交经 Bot 事件消费路径后从 SQLite 回读得到 `model=fixture/fast`、`mode=queue`，两次配置均未产生生成回合。最终 `bun run typecheck` 与 `bun test` 通过（746 项），固定配置入口基准为 6/6，文本回退为 6/6。该验收使用本地 transport/worker 夹具；真实 Octo 客户端呈现与线上点击尚未验收，未部署或重启常驻服务。
+
+生命周期通知验收（2026-11-02，验收 49–53）：`tests/core-lifecycle-notices.test.ts` 与 `tests/cli-lifecycle.test.ts` 共 19 项通过，覆盖配置 owner 与持久 owner、未认领跳过、启动准备失败、重复启停及重连、在途启动通知与停机竞态、停机前封闭入站且早于 worker/transport 收尾、拒绝及忽略取消的发送各自受 2 秒预算约束，以及 outbox 队头阻塞不影响通知。真实 CLI 的本地时间使用独立 `Asia/Kathmandu` 环境验收 `+05:45` 偏移，SIGTERM/SIGINT 时通知发送期间 WebSocket 保持开放，重复实例与 SIGKILL 后重启各按既定规则运行。受影响的 10 个测试文件共 128 项通过；`bun run typecheck` 与完整 `bun test` 通过（66 个文件、867 项、4826 个断言），普通业务回复的测试按目标聊天隔离，生命周期消息在 transport 夹具中保留实际记录。
+
+同次离线真实进程烟测 `bun tests/benchmarks/restart.ts` 的优雅重启、SIGKILL 两种场景均通过：2 个原任务续接、2 个排队任务继续，会话重叠、重复副作用及任务打断通报均为 0。此次通知实现不改变任务恢复和持久 outbox 语义。
+
+当前 Super 部署已经通过 `oco restart` 加载实现，随后完成一次新版本到新版本的正常重启验收（PID 30637 → 30740）。在已登录的 Octo Web「O-小爱」owner 私聊中实际观察到：`2026-11-02T15:43:24+08:00` 的旧进程正在停止通知，随后是同秒的新进程已启动通知；两条正文的 PID 与 Super 实际进程一致。新进程持续 Healthy，并保持已建立的 HTTPS 连接。真实私聊 `/status` 返回原会话、`queued=0`、`outbox=0`；随后同一聊天的文件操作经实际 OMP 完成，31 字节内容及末尾换行精确核对，助手完成回复在客户端可见，任务行记为 completed，验收临时文件已删除。

@@ -26,6 +26,12 @@ import {
 const flushMicrotasks = async (): Promise<void> => {
   for (let step = 0; step < 8; step += 1) await Promise.resolve();
 };
+function sentForTarget(transport: FakeTransport, target: ChatTarget) {
+  return transport.sent.filter(
+    ({ target: sentTarget }) =>
+      sentTarget.channelType === target.channelType && sentTarget.channelId === target.channelId,
+  );
+}
 
 /**
  * One extension notice frame as `WorkerNoticeEvent` carries it (e.g. `/autoresearch` enable /
@@ -247,7 +253,7 @@ class AbortableTypingTransport extends PresentationTransport {
 
 }
 
-test("a complete assistant text event is one lossless message without lifecycle chatter", async () => {
+test("a complete assistant text event is one lossless message in its target chat", async () => {
   const transport = new PresentationTransport();
   const body = "Use `inline code` here.\n\nKeep this as a second paragraph.\n  Preserve spacing.";
   const harness = await createCoreHarness({
@@ -271,7 +277,7 @@ test("a complete assistant text event is one lossless message without lifecycle 
       (status) => status.state === "completed" && status.outbox === 0,
     );
 
-    expect(transport.sent.map(({ text }) => text)).toEqual([body]);
+    expect(sentForTarget(transport, task).map(({ text }) => text)).toEqual([body]);
   } finally {
     await closeCoreHarness(harness);
   }
@@ -301,13 +307,13 @@ test("separate assistant text events are delivered as separate messages", async 
       (status) => status.state === "completed" && status.outbox === 0,
     );
 
-    expect(transport.sent.map(({ text }) => text)).toEqual([first, second]);
+    expect(sentForTarget(transport, task).map(({ text }) => text)).toEqual([first, second]);
   } finally {
     await closeCoreHarness(harness);
   }
 });
 
-test("a task with no assistant text does not fabricate a reply", async () => {
+test("a task with no assistant text sends no reply to its target chat", async () => {
   const transport = new PresentationTransport();
   const harness = await createCoreHarness({
     transport,
@@ -343,7 +349,7 @@ test("a task with no assistant text does not fabricate a reply", async () => {
       (status) => status.state === "completed" && status.outbox === 0,
     );
 
-    expect(transport.sent).toHaveLength(0);
+    expect(sentForTarget(transport, task)).toHaveLength(0);
   } finally {
     await closeCoreHarness(harness);
   }
@@ -420,7 +426,7 @@ test("tool progress uses one editable card, keeps typing alive, and closes compl
     expect(transport.progressCardEdits.map(({ cardSeq }) => cardSeq)).toEqual(
       [...transport.progressCardEdits].map(({ cardSeq }) => cardSeq).sort((a, b) => a - b),
     );
-    expect(transport.sent.map(({ text }) => text)).toEqual([body]);
+    expect(sentForTarget(transport, task).map(({ text }) => text)).toEqual([body]);
     const typingCount = transport.typingCalls.length;
     vi.advanceTimersByTime(6_000);
     await Promise.resolve();
@@ -526,7 +532,7 @@ test("a steered message closes the current card and the next round opens a new o
     ]);
     expect(transport.progressCardEdits.filter((edit) => edit.messageId === "progress-card-2"))
       .not.toHaveLength(0);
-    expect(transport.sent.map(({ text }) => text)).toEqual(["second round done"]);
+    expect(sentForTarget(transport, target).map(({ text }) => text)).toEqual(["second round done"]);
   } finally {
     await closeCoreHarness(harness);
   }
@@ -593,7 +599,7 @@ test("todo phases and tool summaries remain on the terminal completed card", asy
       state: "succeeded",
       summary: "checks passed",
     });
-    expect(transport.sent.map(({ text }) => text)).toEqual([body]);
+    expect(sentForTarget(transport, task).map(({ text }) => text)).toEqual([body]);
   } finally {
     vi.useRealTimers();
     await closeCoreHarness(harness);
@@ -903,7 +909,7 @@ test("a progress-card API failure does not block the assistant body", async () =
       (status) => status.state === "completed" && status.outbox === 0,
     );
 
-    expect(transport.sent.map(({ text }) => text)).toEqual([body]);
+    expect(sentForTarget(transport, task).map(({ text }) => text)).toEqual([body]);
   } finally {
     await closeCoreHarness(harness);
   }

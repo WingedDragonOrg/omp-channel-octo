@@ -6,6 +6,16 @@ import {
   waitForStatus,
 } from "./fixtures/core-fakes";
 
+function sentToChat(
+  messages: readonly { target: { channelId: string; channelType: number } }[],
+  target: { channelId: string; channelType: number },
+) {
+  return messages.filter(({ target: sentTarget }) =>
+    sentTarget.channelId === target.channelId && sentTarget.channelType === target.channelType,
+  );
+}
+
+
 
 test("accepts an unmentioned group message once the server reports 免@", async () => {
   const harness = await createCoreHarness();
@@ -52,7 +62,8 @@ test("keeps requiring an @mention while the group decision is off or unreadable"
     await harness.service.handleInbound(failed);
 
     expect(harness.workers.prompts).toHaveLength(0);
-    expect(harness.transport.sent).toHaveLength(0);
+    expect(sentToChat(harness.transport.sent, closed)).toHaveLength(0);
+    expect(sentToChat(harness.transport.sent, failed)).toHaveLength(0);
   } finally {
     await closeCoreHarness(harness);
   }

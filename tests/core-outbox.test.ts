@@ -15,6 +15,10 @@ import {
   waitForStatus,
 } from "./fixtures/core-fakes";
 
+function sameTarget(actual: ChatTarget, expected: ChatTarget): boolean {
+  return actual.channelType === expected.channelType && actual.channelId === expected.channelId;
+}
+
 function isBody(text: string, expected: string): boolean {
   return text === expected;
 }
@@ -32,6 +36,7 @@ async function flushPromises(): Promise<void> {
  */
 class RefusingBodyTransport extends FakeTransport {
   failBody: string | undefined;
+  failTarget: ChatTarget | undefined;
 
   override async sendText(
     target: ChatTarget,
@@ -39,7 +44,7 @@ class RefusingBodyTransport extends FakeTransport {
     clientMsgNo: string,
     signal?: AbortSignal,
   ): Promise<SendReceipt> {
-    if (text === this.failBody) {
+    if (this.failTarget && sameTarget(target, this.failTarget) && text === this.failBody) {
       const error = Object.assign(
         new Error(
           "Octo send message failed with HTTP 500 (err.server.bot_api.send_failed): internal error",
@@ -82,17 +87,24 @@ test("a completed task is not rerun when an assistant body outbox item is resent
       (status) => status.state === "completed" && status.outbox > 0,
     );
     expect(completedWithOutbox.outbox).toBeGreaterThan(0);
-    const failedHead = await transport.waitForAttempt((attempt) => Boolean(attempt.error));
+    const failedHead = await transport.waitForAttempt(
+      (attempt) => sameTarget(attempt.target, message) && Boolean(attempt.error),
+    );
     expect(failedHead.text).toBe(body);
 
     await transport.reconnect();
     await waitForStatus(harness.service, message, (status) => status.outbox === 0);
 
-    const headAttempts = transport.attempts.filter(({ clientMsgNo }) => clientMsgNo === failedHead.clientMsgNo);
+    const headAttempts = transport.attempts.filter(
+      ({ target: attemptTarget, clientMsgNo }) =>
+        sameTarget(attemptTarget, message) && clientMsgNo === failedHead.clientMsgNo,
+    );
     expect(headAttempts.length).toBeGreaterThanOrEqual(2);
     expect(headAttempts.some(({ error }) => Boolean(error))).toBe(true);
     expect(headAttempts.at(-1)?.error).toBeUndefined();
-    const successfulBodies = transport.sent.filter(({ text }) => isBody(text, body));
+    const successfulBodies = transport.sent.filter(
+      ({ target: sentTarget, text }) => sameTarget(sentTarget, message) && isBody(text, body),
+    );
     expect(successfulBodies).toHaveLength(1);
     expect((await readText(join(harness.root, "tmp", "effects.log"))).trim()).toBe(
       "offline work",
@@ -104,12 +116,15 @@ test("a completed task is not rerun when an assistant body outbox item is resent
 
 test("a body that fails once is retried by itself and the next reply follows without a reconnect", async () => {
   vi.useFakeTimers();
+  const target = { channelId: "dm-outbox-order", channelType: 1 as const };
+  const firstBody = "first assistant body";
+  const secondBody = "second assistant body";
   const transport = new FakeTransport({
     bot: { uid: "bot-outbox-order", name: "Outbox Bot" },
   });
-  const firstBody = "first assistant body";
-  const secondBody = "second assistant body";
-  transport.failOnceWhen(({ text }) => text === firstBody);
+  transport.failOnceWhen(
+    ({ target: sentTarget, text }) => sameTarget(sentTarget, target) && text === firstBody,
+  );
   const harness = await createCoreHarness({
     transport,
     prompt: async ({ emit, text }) => {
@@ -121,7 +136,6 @@ test("a body that fails once is retried by itself and the next reply follows wit
     },
   });
   try {
-    const target = { channelId: "dm-outbox-order", channelType: 1 as const };
     const first = inbound({ messageId: "outbox-first", ...target, text: "first" });
     const second = inbound({ messageId: "outbox-second", ...target, text: "second" });
     await harness.service.handleInbound(first);
@@ -137,15 +151,26 @@ test("a body that fails once is retried by itself and the next reply follows wit
     for (let elapsed = 0; elapsed < 60_000; elapsed += 250) {
       vi.advanceTimersByTime(250);
       await flushPromises();
-      if (transport.sent.some(({ text }) => text === secondBody)) break;
+      if (
+        transport.sent.some(
+          ({ target: sentTarget, text }) => sameTarget(sentTarget, target) && text === secondBody,
+        )
+      ) break;
     }
     // The failed body is retried by itself (stable client ID) and the queue keeps its order.
     expect(
       transport.sent
-        .filter(({ text }) => isBody(text, firstBody) || isBody(text, secondBody))
+        .filter(
+          ({ target: sentTarget, text }) =>
+            sameTarget(sentTarget, target) &&
+            (isBody(text, firstBody) || isBody(text, secondBody)),
+        )
         .map(({ text }) => text),
     ).toEqual([firstBody, secondBody]);
-    const firstAttempts = transport.attempts.filter(({ text }) => isBody(text, firstBody));
+    const firstAttempts = transport.attempts.filter(
+      ({ target: attemptTarget, text }) =>
+        sameTarget(attemptTarget, target) && isBody(text, firstBody),
+    );
     expect(firstAttempts.length).toBeGreaterThanOrEqual(2);
     expect(new Set(firstAttempts.map(({ clientMsgNo }) => clientMsgNo)).size).toBe(1);
     await waitForStatus(harness.service, target, (status) => status.outbox === 0);
@@ -157,11 +182,13 @@ test("a body that fails once is retried by itself and the next reply follows wit
 
 test("a body the server keeps refusing is given up within a bounded budget and never mutes later replies", async () => {
   vi.useFakeTimers();
+  const target = { channelId: "dm-outbox-budget", channelType: 1 as const };
   const firstBody = "body the server keeps refusing";
   const secondBody = "body after the refused one";
   const transport = new RefusingBodyTransport({
     bot: { uid: "bot-outbox-budget", name: "Outbox Bot" },
   });
+  transport.failTarget = target;
   transport.failBody = firstBody;
   const harness = await createCoreHarness({
     transport,
@@ -174,7 +201,6 @@ test("a body the server keeps refusing is given up within a bounded budget and n
     },
   });
   try {
-    const target = { channelId: "dm-outbox-budget", channelType: 1 as const };
     const first = inbound({ messageId: "budget-first", ...target, text: "first" });
     const second = inbound({ messageId: "budget-second", ...target, text: "second" });
     await harness.service.handleInbound(first);
@@ -193,12 +219,18 @@ test("a body the server keeps refusing is given up within a bounded budget and n
     for (let elapsed = 0; elapsed < 300_000 && !delivered; elapsed += 500) {
       vi.advanceTimersByTime(500);
       await flushPromises();
-      delivered = transport.sent.some(({ text }) => isBody(text, secondBody));
+      delivered = transport.sent.some(
+        ({ target: sentTarget, text }) =>
+          sameTarget(sentTarget, target) && isBody(text, secondBody),
+      );
     }
 
     // Bounded: retries back off instead of resending once per second for hours. Five minutes of
     // attempted retries stay within a handful of attempts.
-    const firstAttempts = transport.attempts.filter(({ text }) => isBody(text, firstBody));
+    const firstAttempts = transport.attempts.filter(
+      ({ target: attemptTarget, text }) =>
+        sameTarget(attemptTarget, target) && isBody(text, firstBody),
+    );
     expect(firstAttempts.length).toBeGreaterThanOrEqual(2);
     expect(firstAttempts.length).toBeLessThanOrEqual(8);
     expect(new Set(firstAttempts.map(({ clientMsgNo }) => clientMsgNo)).size).toBe(1);
@@ -263,7 +295,11 @@ test("a restart delivers the pending outbox the previous process left behind", a
     try {
       expect(second.workers.prompts).toHaveLength(0);
       await waitForStatus(second.service, message, (status) => status.outbox === 0);
-      expect(online.sent.some(({ text }) => isBody(text, body))).toBe(true);
+      expect(
+        online.sent.some(
+          ({ target: sentTarget, text }) => sameTarget(sentTarget, message) && isBody(text, body),
+        ),
+      ).toBe(true);
     } finally {
       await closeCoreHarness(second);
     }
@@ -326,17 +362,29 @@ test("offline media remains retryable after repeated unknown attempts and expose
       target,
       (status) => status.state === "completed" && status.outbox > 0,
     );
-    for (let attempt = 0; attempt < 80 && transport.fileAttempts.length < 3; attempt += 1) {
+    for (
+      let attempt = 0;
+      attempt < 80 &&
+      transport.fileAttempts.filter(({ target: attemptTarget }) => sameTarget(attemptTarget, target)).length < 3;
+      attempt += 1
+    ) {
       await Bun.sleep(50);
     }
-    expect(transport.fileAttempts.length).toBeGreaterThanOrEqual(3);
+    expect(
+      transport.fileAttempts.filter(({ target: attemptTarget }) => sameTarget(attemptTarget, target)).length,
+    ).toBeGreaterThanOrEqual(3);
     expect((await harness.service.status(target)).unknownOutbox).toBeGreaterThan(0);
 
     await transport.reconnect();
     await waitForStatus(harness.service, target, (status) => status.outbox === 0);
-    expect(transport.sentFiles).toHaveLength(1);
     expect(
-      transport.sent.some(({ text }) => text.includes("送达状态未知")),
+      transport.sentFiles.filter(({ target: sentTarget }) => sameTarget(sentTarget, target)),
+    ).toHaveLength(1);
+    expect(
+      transport.sent.some(
+        ({ target: sentTarget, text }) =>
+          sameTarget(sentTarget, target) && text.includes("送达状态未知"),
+      ),
     ).toBe(true);
   } finally {
     await closeCoreHarness(harness);

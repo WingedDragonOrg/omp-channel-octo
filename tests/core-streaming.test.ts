@@ -3,6 +3,7 @@ import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openChannelStore } from "../src/store";
+import type { ChatTarget } from "../src/contracts.ts";
 import type { RemoteTextMessage, TextRequest } from "./fixtures/core-fakes";
 import {
   assistantText,
@@ -20,17 +21,44 @@ async function flushPromises(): Promise<void> {
   }
 }
 
-function textSends(transport: FakeTransport): TextRequest[] {
-  return transport.textRequests.filter(({ operation }) => operation === "send");
+function sameTarget(actual: ChatTarget, expected: ChatTarget): boolean {
+  return actual.channelType === expected.channelType && actual.channelId === expected.channelId;
 }
 
-function textEdits(transport: FakeTransport): TextRequest[] {
-  return transport.textRequests.filter(({ operation }) => operation === "edit");
+function textSends(transport: FakeTransport, target: ChatTarget): TextRequest[] {
+  return transport.textRequests.filter(
+    (request) => request.operation === "send" && sameTarget(request.target, target),
+  );
+}
+
+function textEdits(transport: FakeTransport, target: ChatTarget): TextRequest[] {
+  return transport.textRequests.filter(
+    (request) => request.operation === "edit" && sameTarget(request.target, target),
+  );
+}
+
+function waitForTargetRemoteText(
+  transport: FakeTransport,
+  target: ChatTarget,
+  predicate: (message: RemoteTextMessage) => boolean,
+): Promise<RemoteTextMessage> {
+  return transport.waitForRemoteText(
+    (message) => sameTarget(message.target, target) && predicate(message),
+  );
+}
+
+function remoteTextById(
+  transport: FakeTransport,
+  target: ChatTarget,
+  messageId: string,
+): RemoteTextMessage | undefined {
+  const message = transport.remoteTextMessages.get(messageId);
+  return message && sameTarget(message.target, target) ? message : undefined;
 }
 
 async function flushUntilRemoteCount(
   transport: FakeTransport,
-  target: { channelId: string; channelType: 1 | 2 | 5 },
+  target: ChatTarget,
   count: number,
 ): Promise<boolean> {
   for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -45,13 +73,17 @@ class SlowInitialSendTransport extends FakeTransport {
   private readonly initialSendGate = Promise.withResolvers<void>();
   private initialSendPending = true;
 
+  constructor(private readonly target: ChatTarget) {
+    super();
+  }
+
   override async sendText(
-    target: { channelId: string; channelType: 1 | 2 | 5 },
+    target: ChatTarget,
     text: string,
     clientMsgNo: string,
     signal?: AbortSignal,
   ) {
-    if (this.initialSendPending) {
+    if (this.initialSendPending && sameTarget(target, this.target)) {
       this.initialSendPending = false;
       this.initialSendStarted.resolve();
       await this.initialSendGate.promise;
@@ -69,14 +101,18 @@ class ReceiptLostTransport extends FakeTransport {
   private readonly firstReceiptGate = Promise.withResolvers<void>();
   private loseNextReceipt = true;
 
+  constructor(private readonly target: ChatTarget) {
+    super();
+  }
+
   override async sendText(
-    target: { channelId: string; channelType: 1 | 2 | 5 },
+    target: ChatTarget,
     text: string,
     clientMsgNo: string,
     signal?: AbortSignal,
   ) {
     const receipt = await super.sendText(target, text, clientMsgNo, signal);
-    if (!this.loseNextReceipt) return receipt;
+    if (!sameTarget(target, this.target) || !this.loseNextReceipt) return receipt;
     this.loseNextReceipt = false;
     this.firstSendAccepted.resolve();
     await this.firstReceiptGate.promise;
@@ -114,35 +150,35 @@ test("assistant snapshots are visible before prompt end and final snapshots are 
   try {
     await harness.service.handleInbound(task);
     await harness.workers.waitForPromptCount(1);
-    await transport.waitForRemoteText((message) => message.text === "draft");
+    await waitForTargetRemoteText(transport, task, (message) => message.text === "draft");
 
     expect(transport.visibleText(task)).toBe("draft");
-    expect(textSends(transport)).toHaveLength(1);
-    expect(textEdits(transport)).toHaveLength(0);
+    expect(textSends(transport, task)).toHaveLength(1);
+    expect(textEdits(transport, task)).toHaveLength(0);
 
     allowBurst.resolve();
     await flushPromises();
     vi.advanceTimersByTime(999);
     await flushPromises();
     expect(transport.visibleText(task)).toBe("draft");
-    expect(textEdits(transport)).toHaveLength(0);
+    expect(textEdits(transport, task)).toHaveLength(0);
 
     vi.advanceTimersByTime(1);
     await flushPromises();
     expect(transport.visibleText(task)).toBe("draft with latest");
-    expect(textEdits(transport)).toHaveLength(1);
+    expect(textEdits(transport, task)).toHaveLength(1);
 
     allowFinal.resolve();
     await flushPromises();
     vi.advanceTimersByTime(999);
     await flushPromises();
     expect(transport.visibleText(task)).toBe("draft with latest");
-    expect(textEdits(transport)).toHaveLength(1);
+    expect(textEdits(transport, task)).toHaveLength(1);
 
     vi.advanceTimersByTime(1);
     await flushPromises();
     expect(transport.visibleText(task)).toBe("final authoritative");
-    expect(textEdits(transport)).toHaveLength(2);
+    expect(textEdits(transport, task)).toHaveLength(2);
     expect((await harness.service.status(task)).state).toBe("running");
 
     finishPrompt.resolve();
@@ -151,8 +187,8 @@ test("assistant snapshots are visible before prompt end and final snapshots are 
       task,
       (status) => status.state === "completed" && status.outbox === 0,
     );
-    const edits = textEdits(transport);
-    expect(textSends(transport)).toHaveLength(1);
+    const edits = textEdits(transport, task);
+    expect(textSends(transport, task)).toHaveLength(1);
     const firstMessageId = edits[0]?.messageId;
     expect(firstMessageId).toBeDefined();
     if (typeof firstMessageId !== "string") return;
@@ -179,7 +215,7 @@ test("continuous 100ms assistant deltas still produce a visible edit within one 
     transport,
     prompt: async ({ emit }) => {
       emit(assistantText("assistant-continuous", "draft 0", false));
-      await transport.waitForRemoteText((message) => message.text === "draft 0");
+      await waitForTargetRemoteText(transport, task, (message) => message.text === "draft 0");
       for (let index = 1; index <= 20; index += 1) {
         await new Promise<void>((resolve) => setTimeout(resolve, 100));
         emit(assistantText("assistant-continuous", `draft ${index}`, false));
@@ -190,12 +226,12 @@ test("continuous 100ms assistant deltas still produce a visible edit within one 
   try {
     await harness.service.handleInbound(task);
     await harness.workers.waitForPromptCount(1);
-    await transport.waitForRemoteText((message) => message.text === "draft 0");
+    await waitForTargetRemoteText(transport, task, (message) => message.text === "draft 0");
     for (let index = 0; index < 10; index += 1) {
       vi.advanceTimersByTime(100);
       await flushPromises();
     }
-    expect(textEdits(transport).length).toBeGreaterThan(0);
+    expect(textEdits(transport, task).length).toBeGreaterThan(0);
     for (let index = 0; index < 12; index += 1) {
       vi.advanceTimersByTime(100);
       await flushPromises();
@@ -216,12 +252,12 @@ test("continuous 100ms assistant deltas still produce a visible edit within one 
 
 test("a final correction arriving while the first create is slow is edited onto that remote message", async () => {
   vi.useFakeTimers();
-  const transport = new SlowInitialSendTransport();
   const task = inbound({
     messageId: "stream-slow-create-correction",
     channelId: "dm-stream-slow-create-correction",
     text: "correct a slow create",
   });
+  const transport = new SlowInitialSendTransport(task);
   const harness = await createCoreHarness({
     transport,
     prompt: async ({ emit }) => {
@@ -246,8 +282,8 @@ test("a final correction arriving while the first create is slow is edited onto 
 
     expect(transport.listRemoteText(task)).toHaveLength(1);
     expect(transport.visibleText(task)).toBe("authoritative final");
-    expect(textSends(transport)).toHaveLength(1);
-    expect(textEdits(transport).at(-1)?.text).toBe("authoritative final");
+    expect(textSends(transport, task)).toHaveLength(1);
+    expect(textEdits(transport, task).at(-1)?.text).toBe("authoritative final");
   } finally {
     transport.releaseInitialSend();
     vi.useRealTimers();
@@ -257,12 +293,12 @@ test("a final correction arriving while the first create is slow is edited onto 
 
 test("an empty final arriving while the first create is slow clears the accepted remote draft", async () => {
   vi.useFakeTimers();
-  const transport = new SlowInitialSendTransport();
   const task = inbound({
     messageId: "stream-slow-create-empty",
     channelId: "dm-stream-slow-create-empty",
     text: "clear a slow create",
   });
+  const transport = new SlowInitialSendTransport(task);
   const harness = await createCoreHarness({
     transport,
     prompt: async ({ emit }) => {
@@ -287,8 +323,8 @@ test("an empty final arriving while the first create is slow clears the accepted
 
     expect(transport.listRemoteText(task)).toHaveLength(1);
     expect(transport.visibleText(task)).toBe("");
-    expect(textSends(transport)).toHaveLength(1);
-    expect(textEdits(transport).at(-1)?.text).toBe("");
+    expect(textSends(transport, task)).toHaveLength(1);
+    expect(textEdits(transport, task).at(-1)?.text).toBe("");
   } finally {
     transport.releaseInitialSend();
     vi.useRealTimers();
@@ -298,12 +334,12 @@ test("an empty final arriving while the first create is slow clears the accepted
 
 test("an accepted create with a lost receipt recovers by stable client message number", async () => {
   vi.useFakeTimers();
-  const transport = new ReceiptLostTransport();
   const task = inbound({
     messageId: "stream-lost-receipt",
     channelId: "dm-stream-lost-receipt",
     text: "recover the lost receipt",
   });
+  const transport = new ReceiptLostTransport(task);
   const harness = await createCoreHarness({
     transport,
     prompt: async ({ emit }) => {
@@ -328,12 +364,12 @@ test("an accepted create with a lost receipt recovers by stable client message n
       (status) => status.state === "completed" && status.outbox === 0,
     );
 
-    const sends = textSends(transport);
+    const sends = textSends(transport, task);
     expect(sends).toHaveLength(2);
     expect(sends[0]?.clientMsgNo).toBe(sends[1]?.clientMsgNo);
     expect(transport.listRemoteText(task)).toHaveLength(1);
     expect(transport.visibleText(task)).toBe("authoritative after receipt loss");
-    expect(textEdits(transport).at(-1)?.text).toBe("authoritative after receipt loss");
+    expect(textEdits(transport, task).at(-1)?.text).toBe("authoritative after receipt loss");
   } finally {
     transport.releaseFirstReceipt();
     vi.useRealTimers();
@@ -342,13 +378,13 @@ test("an accepted create with a lost receipt recovers by stable client message n
 });
 test("a final arriving after an unknown create preserves reconciliation and edits the latest body", async () => {
   vi.useFakeTimers();
-  const transport = new ReceiptLostTransport();
   const allowFinal = Promise.withResolvers<void>();
   const task = inbound({
     messageId: "stream-lost-receipt-final-later",
     channelId: "dm-stream-lost-receipt-final-later",
     text: "recover a final after receipt loss",
   });
+  const transport = new ReceiptLostTransport(task);
   const harness = await createCoreHarness({
     transport,
     prompt: async ({ emit }) => {
@@ -389,12 +425,12 @@ test("a final arriving after an unknown create preserves reconciliation and edit
       (status) => status.state === "completed" && status.outbox === 0,
     );
 
-    const sends = textSends(transport);
+    const sends = textSends(transport, task);
     expect(sends).toHaveLength(2);
     expect(sends[0]?.clientMsgNo).toBe(sends[1]?.clientMsgNo);
     expect(transport.listRemoteText(task)).toHaveLength(1);
     expect(transport.visibleText(task)).toBe("latest final body");
-    expect(textEdits(transport).at(-1)?.text).toBe("latest final body");
+    expect(textEdits(transport, task).at(-1)?.text).toBe("latest final body");
   } finally {
     allowFinal.resolve();
     transport.releaseFirstReceipt();
@@ -448,13 +484,15 @@ test("an in-flight create recovery keeps the accepted remote ID and latest persi
     await waitForStatus(restarted.service, target, (status) => status.outbox === 0);
 
     expect(workers.prompts).toHaveLength(0);
-    const recoverySends = textSends(transport).filter(({ clientMsgNo: value }) => value === clientMsgNo);
+    const recoverySends = textSends(transport, target).filter(
+      ({ clientMsgNo: value }) => value === clientMsgNo,
+    );
     expect(recoverySends).toHaveLength(2);
     expect(recoverySends[0]?.clientMsgNo).toBe(recoverySends[1]?.clientMsgNo);
     expect(transport.listRemoteText(target)).toHaveLength(1);
     expect(transport.visibleText(target)).toBe("latest persisted body");
-    expect(textEdits(transport).at(-1)?.messageId).toBe(accepted.messageId);
-    expect(textEdits(transport).at(-1)?.text).toBe("latest persisted body");
+    expect(textEdits(transport, target).at(-1)?.messageId).toBe(accepted.messageId);
+    expect(textEdits(transport, target).at(-1)?.text).toBe("latest persisted body");
   } finally {
     if (restarted) await closeCoreHarness(restarted);
     if (!storeClosed) store.close();
@@ -478,7 +516,7 @@ test("an empty final snapshot closes an existing assistant message without sendi
     transport,
     prompt: async ({ emit }) => {
       emit(assistantText("assistant-empty-final", partial, false));
-      await transport.waitForRemoteText((message) => message.text === partial);
+      await waitForTargetRemoteText(transport, task, (message) => message.text === partial);
       emit(assistantText("assistant-empty-final", "", true));
       emit(assistantText("assistant-empty-new", "", true));
     },
@@ -499,9 +537,9 @@ test("an empty final snapshot closes an existing assistant message without sendi
 
     expect(transport.listRemoteText(task)).toHaveLength(1);
     expect(transport.visibleText(task)).toBe("");
-    expect(textSends(transport)).toHaveLength(1);
-    expect(textEdits(transport)).toHaveLength(1);
-    expect(textEdits(transport)[0]?.messageId).toBe(finalMessage?.messageId);
+    expect(textSends(transport, task)).toHaveLength(1);
+    expect(textEdits(transport, task)).toHaveLength(1);
+    expect(textEdits(transport, task)[0]?.messageId).toBe(finalMessage?.messageId);
   } finally {
     vi.useRealTimers();
     await closeCoreHarness(harness);
@@ -542,8 +580,8 @@ test("two assistant messages with identical text keep independent remote identit
     expect(remote).toHaveLength(2);
     expect(remote.map(({ text }) => text)).toEqual(["same response", "same response"]);
     expect(new Set(remote.map(({ messageId }) => messageId)).size).toBe(2);
-    expect(textSends(transport)).toHaveLength(2);
-    expect(new Set(textSends(transport).map(({ clientMsgNo }) => clientMsgNo)).size).toBe(2);
+    expect(textSends(transport, task)).toHaveLength(2);
+    expect(new Set(textSends(transport, task).map(({ clientMsgNo }) => clientMsgNo)).size).toBe(2);
   } finally {
     vi.useRealTimers();
     await closeCoreHarness(harness);
@@ -566,7 +604,7 @@ test("a slow assistant edit never overlaps a newer edit and cannot leave an old 
     transport,
     prompt: async ({ emit }) => {
       emit(assistantText("assistant-slow", "base", false));
-      await transport.waitForRemoteText((message) => message.text === "base");
+      await waitForTargetRemoteText(transport, task, (message) => message.text === "base");
       emit(assistantText("assistant-slow", "older snapshot", false));
       await allowFinal.promise;
       emit(assistantText("assistant-slow", "new final snapshot", true));
@@ -576,11 +614,11 @@ test("a slow assistant edit never overlaps a newer edit and cannot leave an old 
   try {
     await harness.service.handleInbound(task);
     await harness.workers.waitForPromptCount(1);
-    await transport.waitForRemoteText((message) => message.text === "base");
+    await waitForTargetRemoteText(transport, task, (message) => message.text === "base");
     vi.advanceTimersByTime(1_000);
     await flushPromises();
 
-    const firstEdit = textEdits(transport)[0];
+    const firstEdit = textEdits(transport, task)[0];
     expect(firstEdit).toBeDefined();
     if (!firstEdit) return;
     expect(firstEdit.text).toBe("older snapshot");
@@ -590,14 +628,14 @@ test("a slow assistant edit never overlaps a newer edit and cannot leave an old 
     await flushPromises();
     vi.advanceTimersByTime(1_000);
     await flushPromises();
-    expect(textEdits(transport)).toHaveLength(1);
+    expect(textEdits(transport, task)).toHaveLength(1);
     expect(transport.visibleText(task)).toBe("base");
 
     releaseFirstEdit();
-    for (let attempt = 0; attempt < 8 && textEdits(transport).length < 2; attempt += 1) {
+    for (let attempt = 0; attempt < 8 && textEdits(transport, task).length < 2; attempt += 1) {
       await flushPromises();
     }
-    const edits = textEdits(transport);
+    const edits = textEdits(transport, task);
     expect(edits).toHaveLength(2);
     expect(edits[1]?.text).toBe("new final snapshot");
     expect(edits[1]?.messageId).toBe(firstEdit.messageId);
@@ -635,7 +673,7 @@ test("a failed final edit is retried after reconnect along its known remote mess
     transport,
     prompt: async ({ emit }) => {
       emit(assistantText("assistant-reconnect", partial, false));
-      await transport.waitForRemoteText((message) => message.text === partial);
+      await waitForTargetRemoteText(transport, task, (message) => message.text === partial);
       await allowFinal.promise;
       emit(assistantText("assistant-reconnect", final, true));
     },
@@ -643,24 +681,24 @@ test("a failed final edit is retried after reconnect along its known remote mess
   try {
     await harness.service.handleInbound(task);
     await harness.workers.waitForPromptCount(1);
-    await transport.waitForRemoteText((message) => message.text === partial);
+    await waitForTargetRemoteText(transport, task, (message) => message.text === partial);
     transport.setOffline();
     allowFinal.resolve();
     await flushPromises();
     vi.advanceTimersByTime(1_000);
     await flushPromises();
 
-    const failedEdit = textEdits(transport).find(({ error }) => error !== undefined);
+    const failedEdit = textEdits(transport, task).find(({ error }) => error !== undefined);
     expect(failedEdit).toBeDefined();
     if (!failedEdit) return;
     expect(transport.listRemoteText(task)).toHaveLength(1);
     expect(transport.visibleText(task)).toBe(partial);
-    expect(textSends(transport)).toHaveLength(1);
+    expect(textSends(transport, task)).toHaveLength(1);
 
     await transport.reconnect();
     vi.advanceTimersByTime(2_000);
     await flushPromises();
-    const delivered = transport.remoteTextMessages.get(failedEdit.messageId!);
+    const delivered = remoteTextById(transport, task, failedEdit.messageId!);
     expect(delivered?.text).toBe(final);
     await waitForStatus(
       harness.service,
@@ -668,8 +706,8 @@ test("a failed final edit is retried after reconnect along its known remote mess
       (status) => status.state === "completed" && status.outbox === 0,
     );
 
-    expect(textSends(transport)).toHaveLength(1);
-    expect(textEdits(transport).every(({ messageId }) => messageId === failedEdit.messageId)).toBe(true);
+    expect(textSends(transport, task)).toHaveLength(1);
+    expect(textEdits(transport, task).every(({ messageId }) => messageId === failedEdit.messageId)).toBe(true);
     expect(transport.visibleText(task)).toBe(final);
     expect(harness.workers.prompts).toHaveLength(1);
   } finally {
@@ -692,7 +730,7 @@ test("a restart resumes a failed final edit by remote id and never prompts the c
   });
   const firstWorkers = new FakeWorkerFactory(async ({ emit }) => {
     emit(assistantText("assistant-restart", partial, false));
-    await transport.waitForRemoteText((message) => message.text === partial);
+    await waitForTargetRemoteText(transport, task, (message) => message.text === partial);
     await allowFinal.promise;
     emit(assistantText("assistant-restart", final, true));
   });
@@ -701,13 +739,13 @@ test("a restart resumes a failed final edit by remote id and never prompts the c
   try {
     await first.service.handleInbound(task);
     await first.workers.waitForPromptCount(1);
-    await transport.waitForRemoteText((message) => message.text === partial);
+    await waitForTargetRemoteText(transport, task, (message) => message.text === partial);
     transport.setOffline();
     allowFinal.resolve();
     await flushPromises();
     vi.advanceTimersByTime(1_000);
     await flushPromises();
-    failedEdit = textEdits(transport).find(({ error }) => error !== undefined) ?? null;
+    failedEdit = textEdits(transport, task).find(({ error }) => error !== undefined) ?? null;
     expect(failedEdit).not.toBeNull();
     if (!failedEdit) return;
   } finally {
@@ -731,7 +769,7 @@ test("a restart resumes a failed final edit by remote id and never prompts the c
     await transport.reconnect();
     vi.advanceTimersByTime(2_000);
     await flushPromises();
-    const delivered = transport.remoteTextMessages.get(failedEditRecord.messageId!);
+    const delivered = remoteTextById(transport, task, failedEditRecord.messageId!);
     expect(delivered?.text).toBe(final);
     await waitForStatus(
       restarted.service,
@@ -739,8 +777,8 @@ test("a restart resumes a failed final edit by remote id and never prompts the c
       (status) => status.state === "completed" && status.outbox === 0,
     );
 
-    expect(textSends(transport)).toHaveLength(1);
-    expect(textEdits(transport).every(({ messageId }) => messageId === failedEditRecord.messageId)).toBe(true);
+    expect(textSends(transport, task)).toHaveLength(1);
+    expect(textEdits(transport, task).every(({ messageId }) => messageId === failedEditRecord.messageId)).toBe(true);
     expect(transport.visibleText(task)).toBe(final);
   } finally {
     vi.useRealTimers();
@@ -762,7 +800,11 @@ test("a long UTF-8 snapshot is split at 3000 bytes and a shorter final snapshot 
     transport,
     prompt: async ({ emit }) => {
       emit(assistantText("assistant-long", longBody, false));
-      await transport.waitForRemoteText(() => transport.listRemoteText(task).length >= 2);
+      await waitForTargetRemoteText(
+        transport,
+        task,
+        () => transport.listRemoteText(task).length >= 2,
+      );
       emit(assistantText("assistant-long", final, true));
     },
   });
@@ -785,8 +827,8 @@ test("a long UTF-8 snapshot is split at 3000 bytes and a shorter final snapshot 
     expect(remote.length).toBeGreaterThan(1);
     expect(remote.every(({ text }) => Buffer.byteLength(text, "utf8") <= 3_000)).toBe(true);
     expect(transport.visibleText(task)).toBe(final);
-    expect(textSends(transport).length).toBeGreaterThan(1);
-    expect(textEdits(transport).some(({ text }) => text === "")).toBe(true);
+    expect(textSends(transport, task).length).toBeGreaterThan(1);
+    expect(textEdits(transport, task).some(({ text }) => text === "")).toBe(true);
   } finally {
     vi.useRealTimers();
     await closeCoreHarness(harness);
@@ -862,7 +904,7 @@ test("cancel aborts an in-flight assistant edit promptly and preserves its lates
     transport,
     prompt: async ({ emit, onStop, isStopped }) => {
       emit(assistantText("assistant-cancel", partial, false));
-      await transport.waitForRemoteText((message) => message.text === partial);
+      await waitForTargetRemoteText(transport, task, (message) => message.text === partial);
       emit(assistantText("assistant-cancel", latest, false));
       onStop(() => stopped.resolve());
       await stopped.promise;
@@ -872,11 +914,11 @@ test("cancel aborts an in-flight assistant edit promptly and preserves its lates
   try {
     await harness.service.handleInbound(task);
     await harness.workers.waitForPromptCount(1);
-    await transport.waitForRemoteText((message) => message.text === partial);
+    await waitForTargetRemoteText(transport, task, (message) => message.text === partial);
     await flushPromises();
     vi.advanceTimersByTime(1_000);
     await flushPromises();
-    const editStarted = textEdits(transport).find(({ error }) => error === undefined);
+    const editStarted = textEdits(transport, task).find(({ error }) => error === undefined);
     expect(editStarted).toBeDefined();
     if (!editStarted) return;
 
@@ -895,12 +937,12 @@ test("cancel aborts an in-flight assistant edit promptly and preserves its lates
     await stopped.promise;
     await flushPromises();
     expect(editStarted.error).toMatch(/aborted|cancel/i);
-    expect(transport.remoteTextMessages.get(editStarted.messageId!)?.text).toBe(partial);
+    expect(remoteTextById(transport, task, editStarted.messageId!)?.text).toBe(partial);
 
     await transport.reconnect();
     vi.advanceTimersByTime(2_000);
     await flushPromises();
-    const delivered = transport.remoteTextMessages.get(editStarted.messageId!);
+    const delivered = remoteTextById(transport, task, editStarted.messageId!);
     expect(delivered?.text).toBe(latest);
     expect(transport.visibleText(task)).toContain(latest);
   } finally {
@@ -916,19 +958,26 @@ test("stop aborts an in-flight assistant edit without waiting for the network ga
   const transport = new FakeTransport();
   const releaseEdit = transport.holdNextEdit();
   const stopped = Promise.withResolvers<void>();
-  const editStartedPromise = transport.waitForTextRequest(
-    (request) => request.operation === "edit" && request.error === undefined,
-  );
   const task = inbound({
     messageId: "stream-stop-task",
     channelId: "dm-stream-stop",
     text: "stop stream",
   });
+  const editStartedPromise = transport.waitForTextRequest(
+    (request) =>
+      request.operation === "edit" &&
+      request.error === undefined &&
+      sameTarget(request.target, task),
+  );
   const harness = await createCoreHarness({
     transport,
     prompt: async ({ emit, onStop }) => {
       emit(assistantText("assistant-stop", "before stop", false));
-      await transport.waitForRemoteText((message) => message.text === "before stop");
+      await waitForTargetRemoteText(
+        transport,
+        task,
+        (message) => message.text === "before stop",
+      );
       emit(assistantText("assistant-stop", "pending stop", false));
       onStop(() => stopped.resolve());
       await stopped.promise;

@@ -19,6 +19,18 @@ const FILE_BYTES = new Uint8Array([16, 32, 48, 64, 80, 96, 112, 128]);
 const SHUTDOWN_FLAVORED = /(stopping|shutdown|停止|正在停止|cancell?ed|aborted?)/iu;
 const DATABASE_CLOSED = /(sqlite|database|closed)/iu;
 
+function sentToChat(harness: CoreHarness, target: { channelId: string; channelType: number }) {
+  return harness.transport.sent.filter(({ target: sentTarget }) =>
+    sentTarget.channelId === target.channelId && sentTarget.channelType === target.channelType,
+  );
+}
+
+function attemptsToChat(harness: CoreHarness, target: { channelId: string; channelType: number }) {
+  return harness.transport.attempts.filter(({ target: attemptTarget }) =>
+    attemptTarget.channelId === target.channelId && attemptTarget.channelType === target.channelType,
+  );
+}
+
 interface InboundOutcome {
   readonly kind: "resolved" | "rejected";
   readonly error?: unknown;
@@ -73,6 +85,9 @@ test("stop 中止在途附件下载：入站以有界取消拒绝、claim 回滚
     return originalDownload(request);
   };
   const message = inbound({
+    channelId: "group-allowed",
+    channelType: 2,
+    mentionedUserIds: [first.bot.uid],
     messageId: "shutdown-attachment-1",
     text: "总结这份文件",
     attachments: [
@@ -95,10 +110,9 @@ test("stop 中止在途附件下载：入站以有界取消拒绝、claim 回滚
       : String(outcome.error);
     expect(errorText).not.toMatch(DATABASE_CLOSED);
     expect(errorText).toMatch(SHUTDOWN_FLAVORED);
-    // 停机中断不产生任何派工与用户可见回复（尤其不是附件拒绝文案）。
-    expect(first.workers.prompts).toHaveLength(0);
-    expect(first.transport.sent).toHaveLength(0);
-    expect(first.transport.attempts).toHaveLength(0);
+    // 入站未接受，因此没有派工，也没有向被拒绝的聊天发送业务回复；owner 启停通知是独立事件。
+    expect(sentToChat(first, message)).toHaveLength(0);
+    expect(attemptsToChat(first, message)).toHaveLength(0);
     // 中断清理先于状态盘关闭完成：临时附件目录已不存在。
     expect(existsSync(attachmentDirectory(first.stateDir, message, message.messageId))).toBe(false);
 
@@ -171,9 +185,8 @@ test("stop 中止普通入站的异步门禁：有界取消拒绝而非静默 AC
       : String(outcome.error);
     expect(errorText).not.toMatch(DATABASE_CLOSED);
     expect(errorText).toMatch(SHUTDOWN_FLAVORED);
-    expect(first.workers.prompts).toHaveLength(0);
-    expect(first.transport.sent).toHaveLength(0);
-    expect(first.transport.attempts).toHaveLength(0);
+    expect(sentToChat(first, message)).toHaveLength(0);
+    expect(attemptsToChat(first, message)).toHaveLength(0);
 
     second = await createCoreHarness({ root: first.root });
     second.transport.setGroupMentionPref("group-allowed", { effective: true });
@@ -194,7 +207,7 @@ test("stop 中止普通入站的异步门禁：有界取消拒绝而非静默 AC
 
 /**
  * 停机窗口内新到达的入站同样不能以静默 resolve 被 ACK：进入即拒绝、有界取消风味，
- * 不写历史、不建任务、不回复。
+ * 不写历史、不建任务，也不向被拒绝的群聊天发送业务回复；owner 启停通知是独立事件。
  */
 test("stop 之后到达的入站立即以有界取消拒绝，不产生任何副作用", async () => {
   const harness = await createCoreHarness();
@@ -202,7 +215,13 @@ test("stop 之后到达的入站立即以有界取消拒绝，不产生任何副
     await harness.service.stop();
     const observed = observeInbound(
       harness.service.handleInbound(
-        inbound({ messageId: "shutdown-late-arrival-1", text: "停机后到达的消息" }),
+        inbound({
+          channelId: "group-allowed",
+          channelType: 2,
+          mentionedUserIds: [harness.bot.uid],
+          messageId: "shutdown-late-arrival-1",
+          text: "停机后到达的消息",
+        }),
       ),
     );
     await observed.settled;
@@ -215,8 +234,8 @@ test("stop 之后到达的入站立即以有界取消拒绝，不产生任何副
     expect(errorText).not.toMatch(DATABASE_CLOSED);
     expect(errorText).toMatch(SHUTDOWN_FLAVORED);
     expect(harness.workers.prompts).toHaveLength(0);
-    expect(harness.transport.sent).toHaveLength(0);
-    expect(harness.transport.attempts).toHaveLength(0);
+    expect(sentToChat(harness, { channelId: "group-allowed", channelType: 2 })).toHaveLength(0);
+    expect(attemptsToChat(harness, { channelId: "group-allowed", channelType: 2 })).toHaveLength(0);
   } finally {
     await closeCoreHarness(harness);
   }
@@ -234,7 +253,10 @@ test("a mention decision resolving after stop cannot acknowledge unaccepted inpu
   let observed: ObservedInbound | undefined;
   try {
     observed = observeInbound(harness.service.handleInbound(inbound({
-      channelType: 2, channelId: "group-allowed", mentionedUserIds: [], text: "ordinary input",
+      channelType: 2,
+      channelId: "group-allowed",
+      mentionedUserIds: [],
+      text: "ordinary input",
     })));
     await entered.promise;
     const stopping = harness.service.stop();
@@ -242,7 +264,7 @@ test("a mention decision resolving after stop cannot acknowledge unaccepted inpu
     await stopping;
     expect(observed.outcome()?.kind).toBe("rejected");
     expect(harness.workers.prompts).toHaveLength(0);
-    expect(harness.transport.sent).toHaveLength(0);
+    expect(sentToChat(harness, { channelId: "group-allowed", channelType: 2 })).toHaveLength(0);
   } finally {
     release.resolve();
     await observed?.settled;
@@ -264,6 +286,9 @@ test("a download resolving during stop cleans the newly materialized file", asyn
     return download(request);
   };
   const message = inbound({
+    channelId: "group-allowed",
+    channelType: 2,
+    mentionedUserIds: [harness.bot.uid],
     text: "late attachment",
     attachments: [{ url, kind: "file", name: "late.bin", size: FILE_BYTES.length, durationSeconds: 0 }],
   });
@@ -277,7 +302,7 @@ test("a download resolving during stop cleans the newly materialized file", asyn
     expect(observed.outcome()?.kind).toBe("rejected");
     expect(existsSync(attachmentDirectory(harness.stateDir, message, message.messageId))).toBe(false);
     expect(harness.workers.prompts).toHaveLength(0);
-    expect(harness.transport.sent).toHaveLength(0);
+    expect(sentToChat(harness, message)).toHaveLength(0);
   } finally {
     release.resolve();
     await observed?.settled;

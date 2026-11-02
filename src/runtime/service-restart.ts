@@ -9,7 +9,7 @@ import type { ChannelStore } from "../store/index.ts";
 
 const RESTART_USAGE = "用法：/restart [now]。两种写法等价：重启后新进程会续接在途任务。";
 const RESTART_UNAVAILABLE_TEXT = "未检测到守护进程，无法重启 channel。";
-/** 唯一的一条重启回执：不做 PID/完成通报，任务续接由任务行自己保证。 */
+/** 命令仅发送请求回执；owner 私聊的启停通知由 CoreService 统一发送。 */
 const RESTART_ACK_TEXT = "正在重启 channel；在途任务会在重启后继续。";
 const CHANNEL_RESTART_SCHEDULED_TEXT =
   "已排定重启：本回合结束后、channel 空闲时执行守护进程的重启。";

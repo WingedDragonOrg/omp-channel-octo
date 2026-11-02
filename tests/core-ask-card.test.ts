@@ -24,6 +24,13 @@ async function readAnswers(harness: { root: string }): Promise<unknown> {
   return JSON.parse(await readText(join(harness.root, "tmp", "answer.log")));
 }
 
+function sentToChat(transport: FakeTransport, target: ChatTarget) {
+  return transport.sent.filter(({ target: sentTarget }) =>
+    sentTarget.channelId === target.channelId && sentTarget.channelType === target.channelType,
+  );
+}
+
+
 function cardActions(edit: { frame: { card: Record<string, unknown> } }): string[] {
   const actions = edit.frame.card.actions;
   if (!Array.isArray(actions)) return [];
@@ -157,7 +164,7 @@ test("a card click answers the pending question and rewrites the card", async ()
       throw new Error("ask card was not sent");
     }
     // The card carries the question; the text path stays silent unless the card cannot be sent.
-    expect(harness.transport.sent).toHaveLength(0);
+    expect(sentToChat(harness.transport, target)).toHaveLength(0);
     expect(card.frame.profile).toBe("octo/v2");
 
     harness.transport.pushBotEvent(cardActionEvent(7, {
@@ -587,7 +594,7 @@ test("an empty submission keeps the question open behind fresh action ids", asyn
 
     const rerendered = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
     expect(cardActions(rerendered)).toEqual(["ask_submit#2"]);
-    expect(harness.transport.sent.map(({ text }) => text)).toContain(
+    expect(sentToChat(harness.transport, target).map(({ text }) => text)).toContain(
       "未收到内容：请填写后重新提交，或直接回复本消息作答。",
     );
     await expect(harness.service.status(target)).resolves.toMatchObject({
@@ -908,7 +915,7 @@ test("a click replay after the reply was recorded stays silent and updates nothi
       (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
     );
     await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
-    const textsAfterAnswer = harness.transport.sent.length;
+    const textsAfterAnswer = sentToChat(harness.transport, target).length;
 
     // At-least-once delivery: the click that answered the question is delivered again.
     harness.transport.pushBotEvent(cardActionEvent(51, {
@@ -921,7 +928,7 @@ test("a click replay after the reply was recorded stays silent and updates nothi
     }));
 
     await harness.transport.waitForAck(51);
-    expect(harness.transport.sent).toHaveLength(textsAfterAnswer);
+    expect(sentToChat(harness.transport, target)).toHaveLength(textsAfterAnswer);
     expect(harness.transport.cardEdits).toHaveLength(1);
     expect(await readAnswers(harness)).toMatchObject({
       answers: [{ id: "deployment-target", answer: "2" }],
@@ -951,7 +958,7 @@ test("a failed card send falls back to the text question", async () => {
     await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 1);
 
     expect(harness.transport.sentCards).toHaveLength(0);
-    const question = harness.transport.sent.map(({ text }) => text).join("\n");
+    const question = sentToChat(harness.transport, target).map(({ text }) => text).join("\n");
     expect(question).toContain("问题：Which deployment target?");
     expect(question).toContain("直接回复选项编号作为答案");
 
@@ -1002,7 +1009,7 @@ test("one submit answers every question of a multi-question card", async () => {
     expect(pending.pendingQuestionIds).toHaveLength(4);
 
     // One card carries all four questions: per-question inputs and a single submit.
-    expect(harness.transport.sent).toHaveLength(0);
+    expect(sentToChat(harness.transport, target)).toHaveLength(0);
     expect(harness.transport.sentCards).toHaveLength(1);
     const card = harness.transport.sentCards[0];
     if (!card) {
@@ -1213,13 +1220,13 @@ test("a replayed set submission answers nothing twice", async () => {
       answers: [{ id: "target", answer: "1" }, { id: "window", answer: "tonight" }],
     });
     const editsAfterAnswer = harness.transport.cardEdits.length;
-    const textsAfterAnswer = harness.transport.sent.length;
+    const textsAfterAnswer = sentToChat(harness.transport, target).length;
 
     // At-least-once delivery: the submission that answered the card is delivered again.
     harness.transport.pushBotEvent(cardActionEvent(122, click));
     await harness.transport.waitForAck(122);
     expect(harness.transport.cardEdits).toHaveLength(editsAfterAnswer);
-    expect(harness.transport.sent).toHaveLength(textsAfterAnswer);
+    expect(sentToChat(harness.transport, target)).toHaveLength(textsAfterAnswer);
     expect(await readAnswers(harness)).toMatchObject({
       answers: [{ id: "target", answer: "1" }, { id: "window", answer: "tonight" }],
     });
@@ -1317,10 +1324,12 @@ test("a set without card support asks in text and one reply answers the rest", a
     await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 2);
 
     // Only the first question had to be shown: one reply settles the whole set.
-    const question = await harness.transport.waitForRemoteText(({ text }) =>
-      text.includes("问题 1/2：Which deployment target?"));
+    const question = await harness.transport.waitForRemoteText(({ text, target: sentTarget }) =>
+      sentTarget.channelId === target.channelId
+      && sentTarget.channelType === target.channelType
+      && text.includes("问题 1/2：Which deployment target?"));
     expect(question.text).toContain("直接回复本消息即作为整组答案");
-    expect(harness.transport.sent).toHaveLength(1);
+    expect(sentToChat(harness.transport, target)).toHaveLength(1);
 
     await harness.service.handleInbound(
       inbound({ messageId: "set-plain-reply", ...target, text: "production, tonight" }),
@@ -1331,7 +1340,7 @@ test("a set without card support asks in text and one reply answers the rest", a
       target,
       (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
     );
-    expect(harness.transport.sent).toHaveLength(1);
+    expect(sentToChat(harness.transport, target)).toHaveLength(1);
     expect(await readAnswers(harness)).toEqual({
       answers: [
         { id: "target", questionId: expect.any(String), answeredBy: "owner-1", answer: "production, tonight" },
@@ -1365,7 +1374,7 @@ test("a timed-out question stops the turn and stays pending until the reply wake
     // 静默停住：一次 abort、没有提示消息、卡片没有被改写（按钮保持可提交）。
     expect(harness.workers.workers[0]?.abortCalls).toBe(1);
     expect(harness.transport.cardEdits).toHaveLength(0);
-    expect(harness.transport.sent).toHaveLength(0);
+    expect(sentToChat(harness.transport, target)).toHaveLength(0);
     const card = harness.transport.sentCards[0];
     if (!card) {
       throw new Error("ask card was not sent");
@@ -1445,7 +1454,7 @@ test("a card submission after the timeout answers once and wakes the agent", asy
     await harness.transport.waitForAck(42);
     expect(harness.transport.cardEdits).toHaveLength(editsAfterAnswer);
     expect(harness.workers.prompts).toHaveLength(promptsAfterAnswer);
-    expect(harness.transport.sent.map(({ text }) => text)).not.toContain(
+    expect(sentToChat(harness.transport, target).map(({ text }) => text)).not.toContain(
       "该问题已失效，本次点击未作为答案。",
     );
   } finally {
@@ -1507,7 +1516,7 @@ test("a submission on a card the task failure closed becomes the chat's new inpu
     expect(wake).toContain("原等待已结束");
     expect(wake).toContain("When do we ship?");
     expect(wake).toContain("答案（由 owner-1 回复）：ship it tonight");
-    expect(harness.transport.sent.map(({ text }) => text)).not.toContain(
+    expect(sentToChat(harness.transport, target).map(({ text }) => text)).not.toContain(
       "该问题已失效，本次点击未作为答案。",
     );
     const edit = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
@@ -1757,7 +1766,7 @@ test("a declined card does not fall back to re-asking an answer recorded during 
     await harness.service.handleInbound(inbound({ ...target, text: "recorded-answer" }));
     release.resolve();
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
-    expect(harness.transport.sent).toHaveLength(0);
+    expect(sentToChat(harness.transport, target)).toHaveLength(0);
     expect(await readAnswers(harness)).toMatchObject({
       answers: [{ id: "fallback", answer: "recorded-answer", answeredBy: "owner-1" }],
     });
