@@ -2,6 +2,7 @@ import { expect, test, vi } from "bun:test";
 import { mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ThreadSummary } from "../src/contracts";
+import { WorktreeMergeExecutionError } from "../src/threads/thread-merge";
 import { ChannelStore } from "../src/store";
 import {
   assistantText,
@@ -1090,6 +1091,15 @@ test("thread-merge merges the bound workspace through the port and reports wt's 
           signal,
           mergeOperationId,
         );
+        const retried = JSON.parse(
+          await management.execute(
+            { action: "thread-merge", target: "release-1", remove: false },
+            signal,
+            mergeOperationId,
+          ),
+        ) as { merged: boolean; replayed?: boolean; target?: string };
+        expect(retried).toMatchObject({ merged: true, replayed: true, target: "release-1" });
+        management.onResultAccepted?.(mergeOperationId);
         log.push(`merged:${result}\n`);
         if (mergeCallCount === 2) {
           const replay = await management.execute(
@@ -1179,8 +1189,20 @@ test("thread-merge merges the bound workspace through the port and reports wt's 
     // The workspace's own directory goes to the port; wt's defaults are left alone except for the
     // caller's parameters, and the tool result carries wt's result object back to the agent.
     expect(worktrees.merges).toEqual([
-      { cwd: workspace, target: "release-1", remove: false },
-      { cwd: workspace, target: "release-1", remove: false },
+      {
+        cwd: workspace,
+        repo: cwd,
+        branch: "thread-1",
+        target: "release-1",
+        remove: false,
+      },
+      {
+        cwd: workspace,
+        repo: cwd,
+        branch: "thread-1",
+        target: "release-1",
+        remove: false,
+      },
     ]);
     const mergeStore = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
     try {
@@ -1269,18 +1291,22 @@ test("thread-merge reports the port's failure and refuses a thread without a wor
         return;
       }
       if (text === "merge without a workspace") {
+        const callId = "merge-tool-unbound";
         const outcome = await management
-          .execute({ action: "thread-merge" }, signal)
+          .execute({ action: "thread-merge" }, signal, callId)
           .then((value) => `resolved:${value}`)
           .catch((error: Error) => `rejected:${error.message}`);
+        management.onResultAccepted?.(callId);
         log.push(`${outcome}\n`);
         return;
       }
       if (text === "merge that conflicts") {
+        const callId = "merge-tool-failure";
         const outcome = await management
-          .execute({ action: "thread-merge" }, signal)
+          .execute({ action: "thread-merge" }, signal, callId)
           .then((value) => `resolved:${value}`)
           .catch((error: Error) => `rejected:${error.message}`);
+        management.onResultAccepted?.(callId);
         log.push(`${outcome}\n`);
       }
     },
@@ -1323,8 +1349,9 @@ test("thread-merge reports the port's failure and refuses a thread without a wor
     const thread = { channelId: "group-tools____thread-1", channelType: 5 as const };
     const workspace = join(harness.root, "worktrees", "thread-1");
     await waitForStatus(harness.service, thread, (status) => status.cwd === workspace);
-    worktrees.mergeFailure = new Error(
-      "合并失败（退出码 1）：Rebase onto main incomplete CONFLICT (content): Merge conflict in shared.txt",
+    worktrees.mergeFailure = new WorktreeMergeExecutionError(
+      1,
+      "Rebase onto main incomplete CONFLICT (content): Merge conflict in shared.txt",
     );
     await harness.service.handleInbound(
       inbound({
@@ -1785,7 +1812,9 @@ test("a default-pipeline merge schedules the thread's archive beside the merge r
         return;
       }
       if (text === "merge and archive") {
-        const result = await management.execute({ action: "thread-merge" }, signal);
+        const callId = "merge-archive-tool-call";
+        const result = await management.execute({ action: "thread-merge" }, signal, callId);
+        management.onResultAccepted?.(callId);
         log.push(`${result}\n`);
         emit(assistantText("merge-archive-reply", "合并完成，本子区随后归档", true));
       }
@@ -1827,7 +1856,7 @@ test("a default-pipeline merge schedules the thread's archive beside the merge r
 
     // 合并结果与归档排定分别可见；归档在回复之后、以发起排定的子区为目标执行。
     expect(log.join("\n")).toContain('"archive":"scheduled"');
-    expect(worktrees.merges).toEqual([{ cwd: workspace }]);
+    expect(worktrees.merges).toEqual([{ cwd: workspace, repo: cwd, branch: "thread-1" }]);
     expect(harness.transport.managementCalls.filter((call) => call.action === "thread-archive")).toEqual([
       { action: "thread-archive", groupId: "group-tools", shortId: "thread-1" },
     ]);

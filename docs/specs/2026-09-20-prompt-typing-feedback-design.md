@@ -33,7 +33,7 @@
 
 - 按 (bot, chat) 的 typing 租约：门后判定 agent-attached 、进入组装点之前亮起，每 3s 续期；同一聊天任一时刻至多一条续期环。
 - 租约接续：任务被持久接受时在同一条续期环上并入 `task:<id>` owner（先 acquire task 租约、调用方随后 release 消息租约，环不重启）；**任务排队等待（同聊天排队与跨聊天同目录等待）期间保持亮起**；任务终态（完成/失败/取消/启动失败/排队中取消）熄灭。
-- agent-attached 命令路径（`/queue <文本>`、`/thread <任务>`、`/thread merge`、observing 注册命令）在各自交给 agent 前的同一点位亮起。
+- agent-attached 命令路径（`/queue <文本>`、`/thread <任务>`、`/thread merge` 的失败修复输入、observing 注册命令）在各自交给 agent 前的同一点位亮起；成功的宿主合并不产生 agent 任务。
 - `runTask` 入口幂等 acquire：普通接受路径与重启恢复的调度链都能在开始执行时点亮；恢复任务仍遵守旧 worker 退出及目录串行门禁。
 - 行为测试（相对时序与路径开/灭）、`bun run typecheck`、`bun test`，主规格、根 `AGENTS.md` 同步。
 

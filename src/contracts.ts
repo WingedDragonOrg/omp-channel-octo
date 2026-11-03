@@ -426,6 +426,34 @@ export interface WorkerProcess {
   cwd: string;
 }
 
+/** Identity of the detached wt process group owned by one durable host merge operation. */
+export type WorktreeMergeProcessIdentity = WorkerProcess;
+
+/** Durable business result of one Worktrunk run, stored before command receipt/tool delivery. */
+export type WorktreeMergeOutcome =
+  | { kind: "succeeded"; summary: WorktreeMergeSummary }
+  | { kind: "execution-failed"; exitCode: number; diagnostic: string };
+
+/** Durable lifecycle callbacks for the single wt merge command (never for probes/create/remove). */
+export interface WorktreeMergeLifecycle {
+  /** Previously persisted result for this exact source; callers replay it without re-running wt. */
+  readonly existingOutcome?: WorktreeMergeOutcome;
+  /** Persist an intent before spawning the guarded wt process. */
+  beforeSpawn(cwd: string): void;
+  /** Persist the verified command process identity before it is allowed to run. */
+  onSpawn(identity: WorktreeMergeProcessIdentity): void;
+  /** Mark the command exited only after its whole process group and output pipes are drained. */
+  onConfirmedExit(): void;
+  /** Persist a known business outcome while retaining its lease for delivery/replay. */
+  complete(outcome: WorktreeMergeOutcome): void;
+  /** Remove the durable lease only after its result has been durably accepted by its consumer. */
+  settle(): void;
+  /** Clear an intent when no wt command was started and no process can still act. */
+  onNotSpawned(): void;
+  /** Keep the operation blocked when process exit cannot be confirmed. */
+  onUnknown(): void;
+}
+
 export interface WorkerContextScope {
   sidecarRoot: string;
   botUid: string;
@@ -484,12 +512,13 @@ export interface HostTool {
   parameters: Record<string, unknown>;
   /**
    * Runs one native tool call. `toolCallId` is OMP's own identity for the call — independent of
-   * the RPC request id and reused when a retry re-executes the same call — when the frame carried
-   * one; legacy frames pass `undefined`. A consumer whose state must outlive the process (for
-   * example a question whose answer may arrive after a restart) keys durable state on it instead
-   * of the RPC request id.
+   * the RPC request id and reused when a retry re-executes the same call; when the frame carried
+   * one, legacy frames pass `undefined`. A consumer whose state must outlive the process keys
+   * durable state on it instead of the RPC request id.
    */
   execute(args: Record<string, unknown>, signal: AbortSignal, toolCallId?: string): Promise<string>;
+  /** Called when OMP reports `tool_execution_end` for the exact native tool call. */
+  onResultAccepted?(toolCallId: string): void;
 }
 
 export interface ContextInjection {
@@ -829,6 +858,10 @@ export type WorktrunkProbe =
 export interface WorktreeMergeRequest {
   /** The worktree to merge; `wt merge` merges the branch checked out here into the target. */
   cwd: string;
+  /** Canonical repository recorded by ownership; validation only, never passed to wt. */
+  repo?: string;
+  /** Checked-out branch recorded by ownership; validation only, never passed to wt. */
+  branch?: string;
   /** Target branch; wt defaults to the repository's default branch. */
   target?: string;
   squash?: boolean;
@@ -838,6 +871,8 @@ export interface WorktreeMergeRequest {
   remove?: boolean;
   ff?: boolean;
   stage?: "all" | "tracked" | "none";
+  /** Internal process lifecycle; never serialized to wt's command arguments. */
+  lifecycle?: WorktreeMergeLifecycle;
 }
 
 export interface WorktreeMergeSummary {
@@ -882,6 +917,8 @@ export interface WorktreePort {
    * primary checkout, symlink paths, and source or branch identities that do not match ownership.
    */
   remove(request: WorktreeRemovalRequest, signal?: AbortSignal): Promise<WorktreeRemovalOutcome>;
+  /** Confirms or terminates only the exact process group identity recorded by a host merge. */
+  recoverMergeProcess?(identity: WorktreeMergeProcessIdentity): Promise<boolean>;
   /** Probes the local Worktrunk; the result drives creation, merging and the command prompts. */
   worktrunk(signal?: AbortSignal): Promise<WorktrunkProbe>;
 }

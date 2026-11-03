@@ -1,25 +1,35 @@
 /**
- * `/thread` 家族的命令所有者：`/thread <任务>` 把意图交给助手去新建隔离子区，`/thread merge`
- * 把 owner 的合并确认交给助手去执行——两条命令都只组装交给助手的指令正文，并按该聊天的追加
- * 模式交付（steering 或排队任务），自己既不创建子区也不运行合并；用法与资格文案（群聊限定、
- * 子区限定、未绑定工作区、未配置能力）同样留在这里。
- *
- * 模块不依赖 `service.ts`：命令 claim 的释放、附件与引用的唯一组装点、运行中回合的并入、任务
- * 接受与回执投递都由 `CoreService` 以端口注入——正文因此走的仍是普通消息那条路径，命令本身
- * 不另开一套组装或调度。bot 身份用 getter（start 之后才存在），隔离工作区能力由部署决定，
- * 缺席时合并命令只回一条文案。
+ * `/thread` 家族命令：`/thread <任务>` 把意图交给助手创建/派发子区；`/thread merge` 则由宿主直接
+ * 执行 Worktrunk pipeline。命令 claim、普通任务接管、回执与调度仍通过 `CoreService` 端口完成。
  */
 
-import type { InboundMessage, WorktreePort } from "../contracts.ts";
+import { createHash } from "node:crypto";
+import type { InboundMessage, WorktreeMergeSummary, WorktreePort } from "../contracts.ts";
 import type { Outbox } from "../outbox.ts";
 import type { ChannelStore } from "../store/index.ts";
-import type { InboundClaim } from "../store/store-records.ts";
+import type { BindingRecord, HostMergeLeaseRecord, InboundClaim } from "../store/store-records.ts";
+import { WorktreeMergeExecutionError } from "../threads/thread-merge.ts";
 import { worktrunkUnavailableText } from "../workspace/worktrunk.ts";
 
+import { safeDisplayText } from "../cards/execution-text.ts";
+function stableUuid(namespace: string, sourceId: string): string {
+  const bytes = createHash("sha256").update(`${namespace}\0${sourceId}`).digest();
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const value = bytes.subarray(0, 16).toString("hex");
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
+}
+
+function mergeReceiptId(botUid: string, target: InboundMessage, sourceId: string): string {
+  return stableUuid(
+    "thread-merge-receipt",
+    JSON.stringify([botUid, target.channelType, target.channelId, sourceId]),
+  );
+}
 const THREAD_USAGE = [
   "用法：/thread <任务>；无项目需求时沿用普通子区；单项目可沿用 worktree_name，或用 projects=[{name,repo,base?}] 指定仓库（repo 用绝对规范路径，省略 layout 表示 single）；多项目必须列出 projects 并明确选择 layout=shared|separate；",
   "background 只写简短用途，不放任务正文、SDD 或验收标准；创建后必须确认整批 ready=true 才可派发，未就绪时报告资源结果并停止；",
-  "之后用 thread-dispatch 派发任务；子区内 /thread merge [补充说明] 即确认合并回目标分支并默认清理隔离工作区与已合并分支，保留需说明理由。",
+  "之后用 thread-dispatch 派发任务；子区内 /thread merge [补充说明] 由宿主执行默认合并与清理；仅实际合并失败后派发一次修复任务，并保留补充说明。",
 ].join("");
 const THREAD_GROUP_ONLY_TEXT = "/thread 需要在群聊中使用。";
 const THREAD_NESTED_TEXT = "当前会话已是子区，不能再建子区。";
@@ -76,31 +86,26 @@ function readThreadMergeNote(argument: string): string | undefined {
   return note.length > 200 ? `${note.slice(0, 199)}…` : note;
 }
 
-/**
- * Instruction block for a `/thread merge` message: like the creation prompt it hands the intent
- * to the assistant instead of acting itself. The command is the owner's confirmation to merge and
- * clean up, so the body names the default pipeline (stages and commits the workspace changes,
- * squashes, rebases onto the target branch, fast-forwards it, then removes the worktree and its
- * merged branch) as the expected behaviour and asks for a stated reason plus an explicit
- * `remove:false` whenever the workspace must be kept; it also states that the removal takes the
- * sub-thread's cwd with it as a known result that must not be repeated as a caveat or used as a
- * reason to keep the workspace. A trailing note after the `merge` keyword is the owner's own
- * supplement and is carried along verbatim. The merge itself is executed by the host through
- * `octo_management`'s `thread-merge`, and a default-pipeline merge also schedules the sub-thread's
- * archive after the turn's own reply is delivered — so the body tells the assistant not to archive
- * by itself and to report that disposition. Every outcome, including a conflict that must be
- * resolved before retrying, is reported to the owner.
- */
-function threadMergePrompt(workspacePath: string, note: string): string {
+function boundedMergeError(error: unknown): string {
+  return safeDisplayText(error instanceof Error ? error.message : String(error), 200) ?? "未知错误";
+}
+
+function threadMergeRepairPrompt(
+  workspacePath: string,
+  note: string,
+  error: string,
+  originalCommand: string,
+): string {
   return [
-    "用户要求把本子区（隔离工作区）已完成的工作合并回目标分支，走本机 Worktrunk（wt）的 merge pipeline。",
-    "这条命令即代表 owner 确认合并并清理：除非有明确必要理由并向 owner 说明，直接按默认参数执行。",
-    "默认 pipeline 会暂存并提交工作区改动、squash、rebase 到目标分支、fast-forward，合并成功后删除工作区与已合并分支；执行前先确认本子区的工作已收尾。",
-    "要保留工作区时必须说明必要理由，并显式传 remove:false；目标分支等其他参数确有需要时同样显式传入并说明理由。",
-    "工作区被删除后本子区 cwd 随之失效，这是该命令的既定结果、owner 已知：不要在汇报里反复说明这一点，也不要把 cwd 失效当作保留工作区的理由——保留工作区的必要理由应是尚未收尾的具体工作（例如部署、验收）。",
-    "合并由宿主执行：调用 octo_management 的 thread-merge 动作，不要自己运行 wt。",
-    "合并成功后宿主按本子区当前 listen 策略向创建聊天回传单一摘要；默认 pipeline 会排定在本回合最后一条回复送达后归档，不要自行再调 thread-archive。",
-    "成功后在本子区说明目标分支与处置即可；失败时（例如 rebase 冲突或 pre-merge 检查失败）只在本子区修复再重试，不向创建聊天发失败或修复通知。",
+    "用户已确认合并当前子区工作区。宿主实际执行默认 wt merge pipeline 时失败；请在原工作区检查并修复这次失败所需的最小问题。",
+    "保留当前仓库与工作区，不要自行运行 wt；修复后调用 octo_management 的 thread-merge 动作让宿主重试。向 owner 说明修复和最终结果。",
+    "失败与修复过程只留在本子区，不要向创建聊天发送失败或修复通知。",
+    "",
+    "原始 /thread merge 命令（敏感内容已遮盖）：",
+    originalCommand,
+    "",
+    "宿主返回的实际执行错误：",
+    error,
     ...(note.length === 0 ? [] : ["", "owner 补充说明：", note]),
     "",
     "隔离工作区：",
@@ -108,34 +113,63 @@ function threadMergePrompt(workspacePath: string, note: string): string {
   ].join("\n");
 }
 
+function threadMergeReceipt(summary: WorktreeMergeSummary & { archive?: "scheduled" }): string {
+  const workspace = summary.removed
+    ? "已清理工作区与已合并分支"
+    : "按参数保留工作区";
+  const archive = summary.archive === "scheduled" ? "；回执送达后将归档子区" : "";
+  return `子区合并成功：${summary.branch} → ${summary.target}；${workspace}${archive}。`;
+}
+
 /**
- * `/thread` 家族命令可以触及的自有状态之外的一切：绑定行与命令 claim 的持久层、公用的消息
- * 组装点（附件与引用随正文进入任务）、命令路径共用的 claim 与 typing 租约包装、运行中回合
- * 的并入、任务接受与回执投递，以及 bot 身份（getter：start 之后才知道）与部署可选的隔离
- * 工作区能力。
+ * `/thread` 命令可触及的状态端口：绑定/所有权资格、命令 claim、隔离合并执行、稳定回执与归档，
+ * 以及常规任务接管。宿主合并的调度与目录租约由 CoreService 持有。
  */
 export interface ThreadCommandsDeps {
-  readonly store: Pick<ChannelStore, "getBinding" | "getThreadWorkspace" | "releaseClaim">;
+  readonly store: Pick<ChannelStore, "getBinding" | "getThreadWorkspace" | "getTaskByMessageId" | "getCommandClaimState" | "completeCommand" | "releaseClaim">;
   /** Ensures creation provenance/default policy before a merge-intent mutation. */
   readonly ensureThreadListen: (message: InboundMessage) => Promise<void>;
-  /** A confirmed merge intent suppresses task notices until a successful merge event is saved. */
-  readonly beginThreadMerge: (message: InboundMessage) => void;
   /** 阻止未就绪或已缺失工作区的命令改写当前回合或创建任务。 */
   readonly refuseIncompleteThreadWorkspace: (message: InboundMessage) => Promise<boolean>;
   /** 绑定行按键的 bot 身份；start 之前不存在，命令只在 start 之后到达。 */
   readonly botUid: () => string | undefined;
   /** 隔离工作区能力：缺席即本部署未配置，合并命令只回文案。 */
   readonly worktrees?: WorktreePort;
+  readonly archiveGeneration: (target: InboundMessage) => number;
+  readonly stopping: () => boolean;
+  readonly executeHostMerge: (
+    message: InboundMessage,
+    binding: BindingRecord,
+    receiptOutboxId: string,
+    archiveGeneration: number,
+    operatorNote: string,
+  ) => Promise<WorktreeMergeSummary & { archive?: "scheduled" }>;
+  /** 将一条已持久化成功回执入队；id 由命令 sourceId 稳定派生。 */
+  readonly enqueueMergeReceipt: (target: InboundMessage, id: string, text: string) => void;
+  /** 命令结果已持久交付后释放对应 outcome lease。 */
+  readonly settleHostMerge: (target: InboundMessage, sourceId: string) => void;
+  /** 启动恢复成功结果时，重建严格 receipt barrier 后的归档排定。 */
+  readonly recoverMergeArchive: (target: InboundMessage, receiptOutboxId: string) => void;
+  /** 以 strict receipt barrier 异步启动已经排定的归档。 */
+  readonly runThreadArchive: (target: InboundMessage) => void;
+  /**
+   * 原始命令 ID 作为稳定 operationId 读取已有成功收据：非 null 表示该操作已成功，
+   * 直接返回而不再执行 wt、不改新操作的 pending；回执/归档由既有 lease/outbox 负责。
+   */
+  readonly replayThreadMergeSuccess: (
+    target: InboundMessage,
+    operationId: string,
+  ) => Promise<string | null>;
   /** 唯一组装点：`/thread` 的正文与随消息发来的图片/引用一起进入任务。 */
   readonly materialize: (message: InboundMessage, text?: string) => Promise<string | null>;
-  /** 命令 claim：与普通命令同一条持久化路径，命令自己组装正文前先释放它。 */
+  /** 命令 claim 与普通命令同一路径；仅 `/thread <任务>` 会在接受任务前释放。 */
   readonly commandClaim: (message: InboundMessage, name: string) => InboundClaim;
   /** 与普通消息同一条的门后 typing 包装。 */
   readonly withMessageTyping: <T>(message: InboundMessage, work: () => Promise<T>) => Promise<T>;
   /** 运行中的回合接受 steering 时把指令并入该回合，否则返回 false 走排队任务。 */
   readonly appendToRunningTask: (message: InboundMessage, text: string) => Promise<boolean>;
-  /** 把组装好的正文接受为该聊天的任务；返回是否真正落盘。 */
-  readonly acceptTask: (message: InboundMessage, text: string) => Promise<boolean>;
+  /** 把修复上下文按普通 durable task 语义接受；schedule=false 留给 startup restart recovery。 */
+  readonly acceptTask: (message: InboundMessage, text: string, schedule?: boolean) => Promise<boolean>;
   /** 回一条资格/用法文案。 */
   readonly enqueueText: Outbox["enqueueText"];
 }
@@ -185,20 +219,69 @@ export class ThreadCommands {
     });
   }
 
+  /** Resume only durable command delivery; a known merge outcome is never executed again. */
+  async recoverHostMergeOutcome(lease: HostMergeLeaseRecord): Promise<void> {
+    const outcome = lease.outcome;
+    if (!outcome) throw new Error("host merge command recovery requires a persisted outcome");
+    const target: InboundMessage = {
+      channelType: lease.channelType,
+      channelId: lease.channelId,
+      messageId: lease.sourceId,
+      senderId: lease.senderId ?? "",
+      text: lease.commandText ?? "",
+      mentionedUserIds: [],
+      attachments: [],
+      quoted: null,
+      supported: true,
+      messageSeq: lease.messageSeq ?? 0,
+      messageTimestamp: 0,
+    };
+    if (outcome.kind === "succeeded") {
+      if (lease.commandText === null) throw new Error("host merge success recovery is missing its original command");
+      const receiptId = lease.receiptOutboxId ?? mergeReceiptId(lease.botUid, target, lease.sourceId);
+      this.deps.enqueueMergeReceipt(target, receiptId, threadMergeReceipt({
+        ...outcome.summary,
+        ...(outcome.summary.removed ? { archive: "scheduled" as const } : {}),
+      }));
+      if (outcome.summary.removed) this.deps.recoverMergeArchive(target, receiptId);
+      this.completeRecoveredMergeCommand(lease.botUid, target);
+      this.deps.settleHostMerge(target, lease.sourceId);
+      return;
+    }
+    if (lease.commandText === null) throw new Error("host merge repair recovery is missing its original command");
+    await this.acceptMergeRepairTask({
+      message: target,
+      sourceId: lease.sourceId,
+      workspacePath: lease.cwd,
+      note: lease.operatorNote ?? "",
+      error: safeDisplayText(outcome.diagnostic, 200) ?? "未知错误",
+      originalCommand: lease.commandText,
+      schedule: false,
+    });
+    this.completeRecoveredMergeCommand(lease.botUid, target);
+    this.deps.settleHostMerge(target, lease.sourceId);
+  }
+
+  private completeRecoveredMergeCommand(botUid: string, message: InboundMessage): void {
+    const claim = this.deps.commandClaim(message, "thread");
+    this.deps.store.completeCommand(claim);
+    if (this.deps.store.getCommandClaimState(botUid, message, message.messageId) !== "completed") {
+      throw new Error("recovered host merge command completion was not persisted");
+    }
+  }
+
   /**
-   * `/thread merge`: a sub-thread that is bound to an isolated workspace can hand the merge
-   * instruction to the assistant; an executable local Worktrunk must exist, because merging has no
-   * fallback. Every other caller — the main group, DMs, a thread without a bound workspace, a
-   * deployment without the capability or a missing wt — gets one prompt and no
-   * task. The command runs nothing itself: the prompt is delivered like any other message the
-   * assistant has to read (steering when the running turn accepts it, otherwise a durable task),
-   * and the assistant drives `octo_management`'s `thread-merge`.
+   * `/thread merge`: host-first；资格拒绝只回复，不接任务。实际 wt pipeline 成功后回稳定 outbox
+   * receipt；只有 shared core 明确标记为执行失败时，才用稳定合成消息创建一次修复 task。
    */
   private async handleThreadMergeCommand(message: InboundMessage, mergeNote: string): Promise<void> {
     if (message.channelType !== 5) {
       await this.deps.enqueueText(message, THREAD_MERGE_THREAD_ONLY_TEXT, null);
       return;
     }
+    const replay = await this.deps.replayThreadMergeSuccess(message, message.messageId);
+    if (replay !== null) return;
+    const archiveGeneration = this.deps.archiveGeneration(message);
     const ownership = this.deps.store.getThreadWorkspace(this.deps.botUid()!, message);
     if (ownership?.layout === "shared") {
       await this.deps.enqueueText(message, THREAD_MERGE_MULTI_PROJECT_TEXT, null);
@@ -225,12 +308,83 @@ export class ThreadCommands {
       return;
     }
     await this.deps.ensureThreadListen(message);
-    this.deps.beginThreadMerge(message);
-    this.deps.store.releaseClaim(this.deps.commandClaim(message, "thread"));
+    const receiptOutboxId = mergeReceiptId(this.deps.botUid()!, message, message.messageId);
+    const note = safeDisplayText(mergeNote, 200) ?? "";
+    const originalCommand = safeDisplayText(message.text, 800)
+      ?? `/thread merge${note.length === 0 ? "" : ` ${note}`}`;
     await this.deps.withMessageTyping(message, async () => {
-      const body = threadMergePrompt(binding.cwd, mergeNote);
-      if (await this.deps.appendToRunningTask(message, body)) return;
-      await this.deps.acceptTask(message, body);
+      let summary: WorktreeMergeSummary & { archive?: "scheduled" };
+      try {
+        summary = await this.deps.executeHostMerge(
+          message,
+          binding,
+          receiptOutboxId,
+          archiveGeneration,
+          note,
+        );
+      } catch (error) {
+        if (this.deps.stopping()) return;
+        if (error instanceof WorktreeMergeExecutionError) {
+          await this.acceptMergeRepairTask({
+            message,
+            sourceId: message.messageId,
+            workspacePath: binding.cwd,
+            note,
+            error: boundedMergeError(error),
+            originalCommand,
+          });
+          this.deps.settleHostMerge(message, message.messageId);
+          return;
+        }
+        await this.deps.enqueueText(
+          message,
+          `合并未完成且不会自动重试：${boundedMergeError(error)}。请先核对目标分支与工作区，再决定是否重新发起。`,
+          null,
+        );
+        return;
+      }
+      if (this.deps.stopping()) return;
+      this.deps.enqueueMergeReceipt(message, receiptOutboxId, threadMergeReceipt(summary));
+      this.deps.runThreadArchive(message);
+      this.deps.settleHostMerge(message, message.messageId);
     });
+  }
+
+  private async acceptMergeRepairTask(input: {
+    readonly message: InboundMessage;
+    readonly sourceId: string;
+    readonly workspacePath: string;
+    readonly note: string;
+    readonly error: string;
+    readonly originalCommand: string;
+    readonly schedule?: boolean;
+  }): Promise<void> {
+    const repairMessage: InboundMessage = {
+      ...input.message,
+      messageId: `thread-merge-repair:${input.sourceId}`,
+      text: input.originalCommand,
+      mentionedUserIds: [],
+      attachments: [],
+      quoted: null,
+    };
+    const prompt = threadMergeRepairPrompt(
+      input.workspacePath,
+      input.note,
+      input.error,
+      input.originalCommand,
+    );
+    const accepted = await this.deps.acceptTask(repairMessage, prompt, input.schedule);
+    if (accepted) return;
+    const botUid = this.deps.botUid();
+    const existing = botUid === undefined
+      ? null
+      : this.deps.store.getTaskByMessageId(botUid, repairMessage, repairMessage.messageId);
+    if (existing) return;
+    await this.deps.enqueueText(
+      input.message,
+      "合并已实际失败，但修复任务未能持久接收；合并结果已保留待恢复，未重新执行合并。",
+      null,
+    );
+    throw new Error("merge repair task was not durably accepted");
   }
 }

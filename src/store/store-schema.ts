@@ -307,6 +307,31 @@ export function applySchema(db: Database): void {
       state TEXT NOT NULL CHECK(state IN ('running', 'stopping', 'stopped', 'unknown')),
       updated_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS host_merge_leases (
+      id TEXT PRIMARY KEY NOT NULL,
+      bot_uid TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type = 5),
+      channel_id TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      cwd TEXT NOT NULL,
+      phase TEXT NOT NULL CHECK(phase IN ('starting', 'running', 'exited', 'unknown')),
+      pid INTEGER,
+      pgid INTEGER,
+      process_identity TEXT,
+      source_text TEXT,
+      operator_note TEXT,
+      sender_id TEXT,
+      message_seq INTEGER,
+      receipt_outbox_id TEXT,
+      outcome_kind TEXT CHECK(outcome_kind IS NULL OR outcome_kind IN ('succeeded', 'execution-failed')),
+      outcome_json TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS host_merge_leases_bot_cwd
+      ON host_merge_leases(bot_uid, cwd, phase);
+    CREATE INDEX IF NOT EXISTS host_merge_leases_source
+      ON host_merge_leases(bot_uid, channel_type, channel_id, source_id, created_at);
     CREATE TABLE IF NOT EXISTS session_context_ledger (
       bot_uid TEXT NOT NULL,
       channel_type INTEGER NOT NULL CHECK(channel_type IN (2, 5)),
@@ -422,6 +447,13 @@ export function applySchema(db: Database): void {
     "ALTER TABLE questions ADD COLUMN answered_by TEXT",
     "ALTER TABLE questions ADD COLUMN closed_reason TEXT",
     "ALTER TABLE thread_workspaces ADD COLUMN legacy_worktree_name TEXT",
+    "ALTER TABLE host_merge_leases ADD COLUMN source_text TEXT",
+    "ALTER TABLE host_merge_leases ADD COLUMN operator_note TEXT",
+    "ALTER TABLE host_merge_leases ADD COLUMN sender_id TEXT",
+    "ALTER TABLE host_merge_leases ADD COLUMN message_seq INTEGER",
+    "ALTER TABLE host_merge_leases ADD COLUMN receipt_outbox_id TEXT",
+    "ALTER TABLE host_merge_leases ADD COLUMN outcome_kind TEXT",
+    "ALTER TABLE host_merge_leases ADD COLUMN outcome_json TEXT",
   ]) {
     try {
       db.exec(statement);

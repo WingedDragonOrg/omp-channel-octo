@@ -1172,6 +1172,13 @@ class RpcWorker implements OmpWorker {
 
 	#emitWorkerEvent(active: PromptRun, frame: RpcFrame): void {
 		try {
+			if (frame.type === "tool_execution_end") {
+				const toolCallId = typeof frame.toolCallId === "string" ? frame.toolCallId : "";
+				const toolName = typeof frame.toolName === "string" ? frame.toolName : "";
+				if (toolCallId.length > 0 && toolName.length > 0) {
+					this.#activeTools.get(toolName)?.onResultAccepted?.(toolCallId);
+				}
+			}
 			emitWorkerEvent(active, frame, this.#subagentFrames);
 		} catch (error) {
 			this.#rejectPrompt(active, asError(error, "OMP event callback failed"));

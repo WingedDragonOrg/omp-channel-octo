@@ -1,9 +1,9 @@
 /**
  * 任务调度与会话/目录租约的唯一所有者：每个聊天的任务串行链、已排定任务、关停要等的在途
  * 任务、排队等待任务的启动回执，以及按 session / chat key 与按 cwd 的租约链都在这里。外部只能经
- * `scheduleTask`/`hasBlockingWork`/`tryAcquireCommandSession`/`tryAcquireCommandDirectories`/
- * `tryAcquireWorkspaceDirectories`/`markWaiting`/`takeWaitingReceipt`/`settle` 观察，本对象的
- * map 不外露。
+ * `scheduleTask`/`hasBlockingWork`/`reserveCommandSession`/`tryAcquireCommandSession`/
+ * `tryAcquireCommandDirectories`/`tryAcquireWorkspaceDirectories`/`markWaiting`/`takeWaitingReceipt`/
+ * `settle` 观察，本对象的 map 不外露。
  *
  * 模块不依赖 `service.ts`：任务行与绑定行的读取、绑定核对、真正的执行入口（`runTask`）、
  * bot 身份与停止态、运行中任务与 blocked 集合、回执与终态通知的投递路径都按原样注入。会话
@@ -35,6 +35,22 @@ export type DirectoryLease = {
   ready: Promise<void>;
   complete(): void;
 };
+
+/** A FIFO intent barrier that blocks later writes without acquiring any lease while earlier work drains. */
+export interface CommandSessionReservation {
+  tryAcquire(): SessionLease | undefined;
+  release(): void;
+}
+
+interface CommandReservationRecord {
+  readonly order: number;
+  readonly target: ChatTarget;
+  readonly sessionKey: string;
+  readonly sessionKeys: readonly string[];
+  readonly directories: readonly string[];
+  readonly ready: Promise<void>;
+  release(): void;
+}
 
 /**
  * 调度访问持久层任务与绑定行、bot 身份、停止态、进程内的运行中任务与 blocked 集合、绑定核对、
@@ -99,6 +115,10 @@ export class TaskScheduler {
   private readonly directoryTails = new Map<string, Promise<void>>();
   /** The expanded resource keys owned by each currently executing task, for safe host-tool reuse. */
   private readonly taskDirectoryLeases = new Map<string, ReadonlySet<string>>();
+  /** Scheduling order lets command barriers distinguish earlier tasks from later chatTails. */
+  private readonly scheduledOrder = new Map<string, number>();
+  private readonly commandReservations = new Set<CommandReservationRecord>();
+  private nextOrder = 0;
 
   /**
    * True when a new task on this chat cannot start at once: the chat or its bound session is
@@ -108,14 +128,28 @@ export class TaskScheduler {
   hasBlockingWork(target: ChatTarget, cwd: string): boolean {
     const binding = this.bindingFor(target);
     const sessionKey = this.sessionKey(target, binding);
-    if (this.hasLeaseFor(target, sessionKey) || this.hasQueuedWork(target, sessionKey)) {
-      return true;
-    }
     const directories = this.ownedDirectoryKeys(
       [cwd],
       binding?.cwdPinned === true ? binding.cwd : undefined,
     );
+    if (
+      this.hasConflictingReservation(target, sessionKey, directories)
+      || this.hasLeaseFor(target, sessionKey)
+      || this.hasQueuedWork(target, sessionKey)
+    ) {
+      return true;
+    }
     return directories.length > 0 && this.directoriesUnavailable(directories);
+  }
+  /** A command reservation is a FIFO barrier even when an active task could normally accept steering. */
+  hasPendingCommandReservation(target: ChatTarget, cwd: string): boolean {
+    const binding = this.bindingFor(target);
+    const sessionKey = this.sessionKey(target, binding);
+    const directories = this.ownedDirectoryKeys(
+      [cwd],
+      binding?.cwdPinned === true ? binding.cwd : undefined,
+    );
+    return this.hasConflictingReservation(target, sessionKey, directories);
   }
 
   constructor(private readonly deps: TaskSchedulerDeps) {}
@@ -124,6 +158,8 @@ export class TaskScheduler {
   scheduleTask(taskId: string): void {
     const task = this.deps.store.getTask(taskId);
     if (!task) return;
+    const order = ++this.nextOrder;
+    this.scheduledOrder.set(taskId, order);
     const target = taskTarget(task);
     const chatKey = targetKey(target);
     const previousChat = this.chatTails.get(chatKey) ?? Promise.resolve();
@@ -134,6 +170,7 @@ export class TaskScheduler {
     const cleanup = () => {
       if (this.chatTails.get(chatKey) === next) this.chatTails.delete(chatKey);
       if (this.scheduledTasks.get(taskId) === next) this.scheduledTasks.delete(taskId);
+      if (this.scheduledOrder.get(taskId) === order) this.scheduledOrder.delete(taskId);
       this.taskOperations.delete(next);
     };
     void next.then(cleanup, cleanup);
@@ -171,24 +208,65 @@ export class TaskScheduler {
   ): SessionLease | undefined {
     const binding = this.bindingFor(target);
     const sessionKey = this.sessionKey(target, binding);
+    const directories = this.ownedDirectoryKeys(
+      cwds,
+      binding?.cwdPinned === true ? binding.cwd : undefined,
+    );
     if (
-      this.hasLeaseFor(target, sessionKey)
+      this.hasConflictingReservation(target, sessionKey, directories)
+      || this.hasLeaseFor(target, sessionKey)
       || this.hasQueuedWork(target, sessionKey)
       || cwds.some((cwd) => this.deps.isDirectoryBlocked(cwd))
     ) {
       return undefined;
     }
+    if (directories.length > 0 && this.directoriesUnavailable(directories)) return undefined;
+    return this.createLeases(target, sessionKey, directories);
+  }
+
+  /**
+   * Install a FIFO barrier before waiting for accepted work. Later tasks wait on this intent;
+   * the owner itself acquires its real session/directory leases only after earlier work drains.
+   */
+  reserveCommandSession(target: ChatTarget, cwds: readonly string[]): CommandSessionReservation {
+    const binding = this.bindingFor(target);
+    const sessionKey = this.sessionKey(target, binding);
     const directories = this.ownedDirectoryKeys(
       cwds,
       binding?.cwdPinned === true ? binding.cwd : undefined,
     );
-    if (directories.length > 0 && this.directoriesUnavailable(directories)) return undefined;
-    return this.createLeases(target, sessionKey, directories);
+    const completion = Promise.withResolvers<void>();
+    let reservation!: CommandReservationRecord;
+    reservation = {
+      order: ++this.nextOrder,
+      target: { ...target },
+      sessionKey,
+      sessionKeys: this.leaseKeys(target, sessionKey),
+      directories,
+      ready: completion.promise,
+      release: () => {
+        if (!this.commandReservations.delete(reservation)) return;
+        completion.resolve();
+      },
+    };
+    this.commandReservations.add(reservation);
+    return {
+      tryAcquire: () => this.tryAcquireReservedCommandSession(reservation),
+      release: () => reservation.release(),
+    };
   }
 
   /** Lease every owned resource related to these paths, not just the caller's cwd spelling. */
   tryAcquireCommandDirectories(cwds: readonly string[]): DirectoryLease | undefined {
     const directories = this.workspaceKeys(cwds);
+    if (
+      this.commandReservations.size > 0
+      && [...this.commandReservations].some((reservation) =>
+        reservation.directories.some((directory) => directories.includes(directory))
+      )
+    ) {
+      return undefined;
+    }
     if (this.directoriesUnavailable(directories)) return undefined;
     const leases = directories.map((cwd) => this.createDirectoryLease(cwd));
     return this.combineLeases(leases);
@@ -222,14 +300,93 @@ export class TaskScheduler {
     return [...new Set([sessionKey, `chat:${targetKey(target)}`])];
   }
 
+  private reservationConflicts(
+    reservation: CommandReservationRecord,
+    target: ChatTarget,
+    sessionKey: string,
+    directories: readonly string[],
+  ): boolean {
+    const sessionKeys = new Set(this.leaseKeys(target, sessionKey));
+    return reservation.sessionKeys.some((key) => sessionKeys.has(key))
+      || reservation.directories.some((directory) => directories.includes(directory));
+  }
+
+  private hasConflictingReservation(
+    target: ChatTarget,
+    sessionKey: string,
+    directories: readonly string[],
+    beforeOrder = Number.POSITIVE_INFINITY,
+    excluded?: CommandReservationRecord,
+  ): boolean {
+    return [...this.commandReservations].some((reservation) =>
+      reservation !== excluded
+      && reservation.order < beforeOrder
+      && this.reservationConflicts(reservation, target, sessionKey, directories)
+    );
+  }
+
+  private firstBlockingReservation(
+    target: ChatTarget,
+    sessionKey: string,
+    directories: readonly string[],
+    taskOrder: number,
+  ): CommandReservationRecord | undefined {
+    return [...this.commandReservations]
+      .filter((reservation) =>
+        reservation.order < taskOrder
+        && this.reservationConflicts(reservation, target, sessionKey, directories)
+      )
+      .sort((left, right) => left.order - right.order)[0];
+  }
+  private async waitForPriorReservations(
+    target: ChatTarget,
+    sessionKey: string,
+    directories: readonly string[],
+    taskOrder: number,
+  ): Promise<void> {
+    while (!this.deps.stopping()) {
+      const reservation = this.firstBlockingReservation(target, sessionKey, directories, taskOrder);
+      if (!reservation) return;
+      await reservation.ready;
+    }
+  }
+
+  private tryAcquireReservedCommandSession(
+    reservation: CommandReservationRecord,
+  ): SessionLease | undefined {
+    if (!this.commandReservations.has(reservation)) return undefined;
+    const binding = this.bindingFor(reservation.target);
+    const sessionKey = this.sessionKey(reservation.target, binding);
+    const directories = reservation.directories;
+    if (
+      sessionKey !== reservation.sessionKey
+      || this.hasConflictingReservation(
+        reservation.target,
+        sessionKey,
+        directories,
+        reservation.order,
+        reservation,
+      )
+      || this.leaseKeys(reservation.target, sessionKey).some((key) => this.sessionTails.has(key))
+      || this.hasQueuedWork(reservation.target, sessionKey, reservation.order)
+      || directories.some((cwd) => this.deps.isDirectoryBlocked(cwd))
+      || this.directoriesUnavailable(directories, reservation.order)
+    ) {
+      return undefined;
+    }
+    return this.createLeases(reservation.target, sessionKey, directories);
+  }
+
   private hasLeaseFor(target: ChatTarget, sessionKey: string): boolean {
     if (this.chatTails.has(targetKey(target))) return true;
     return this.leaseKeys(target, sessionKey).some((key) => this.sessionTails.has(key));
   }
 
-  private hasQueuedWork(target: ChatTarget, sessionKey: string): boolean {
+  private hasQueuedWork(target: ChatTarget, sessionKey: string, beforeOrder?: number): boolean {
     const chatKey = targetKey(target);
     return this.deps.store.listQueuedTasks().some((task) => {
+      const order = this.scheduledOrder.get(task.id) ?? -1;
+      if (beforeOrder !== undefined && order >= beforeOrder) return false;
       const queuedTarget = taskTarget(task);
       return targetKey(queuedTarget) === chatKey
         || this.sessionKey(queuedTarget, this.bindingFor(queuedTarget)) === sessionKey;
@@ -250,7 +407,7 @@ export class TaskScheduler {
     return [...directories].sort();
   }
 
-  private directoriesUnavailable(directories: readonly string[]): boolean {
+  private directoriesUnavailable(directories: readonly string[], beforeOrder?: number): boolean {
     const requested = new Set(directories);
     if (directories.some((cwd) =>
       this.deps.isDirectoryBlocked(cwd)
@@ -259,9 +416,13 @@ export class TaskScheduler {
     )) {
       return true;
     }
-    return this.deps.store.listQueuedTasks().some((task) =>
-      this.workspaceKeys([task.cwd]).some((cwd) => requested.has(cwd))
-    );
+    return this.deps.store.listQueuedTasks().some((task) => {
+      const order = this.scheduledOrder.get(task.id) ?? -1;
+      if (beforeOrder !== undefined && order >= beforeOrder) return false;
+      const target = taskTarget(task);
+      const cwd = this.bindingFor(target)?.cwd ?? task.cwd;
+      return this.workspaceKeys([cwd]).some((directory) => requested.has(directory));
+    });
   }
 
   private workspaceKeys(cwds: readonly string[]): string[] {
@@ -397,12 +558,17 @@ export class TaskScheduler {
           [cwd],
           binding?.cwdPinned === true ? binding.cwd : undefined,
         );
+        const taskOrder = this.scheduledOrder.get(taskId) ?? Number.POSITIVE_INFINITY;
+        await this.waitForPriorReservations(target, sessionKey, directories, taskOrder);
+        if (this.deps.stopping()) return;
         const earlier = await this.earlierOperations(
           reconciledCurrent,
           sessionKey,
           new Set(directories),
         );
         await Promise.all(earlier.map((operation) => operation.catch(() => {})));
+        await this.waitForPriorReservations(target, sessionKey, directories, taskOrder);
+        if (this.deps.stopping()) return;
 
         const beforeLease = this.deps.store.getTask(taskId);
         if (this.deps.stopping() || !beforeLease || beforeLease.state !== "queued") return;

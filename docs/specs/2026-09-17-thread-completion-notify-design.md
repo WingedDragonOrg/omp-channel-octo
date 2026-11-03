@@ -27,11 +27,11 @@
 
 ## 合并事件单一归属与失败隔离
 
-合并成功事件的唯一发布者是宿主合并成功路径，不是 agent 的自然语言、任务 completed，也不是归档回调。当前入口为 host-tools 的 thread-merge，在 WorktreePort.merge 成功返回、资源记录更新及归档排定后调用 `HostToolHost.publishThreadMergeSuccess(target, summary, archive, operationId)`，由 CoreService 持久化并交付。真实 WorktreePort 从 Git common directory 读取合并后目标 ref 的提交；事件包含 summary.target、commit、summary.removed 与 archive=scheduled/not-scheduled。Worktrunk 的 removed=true 会启动后台清理，不能据此声称路径已消失，通知表述为「工作区清理：已排定」；removed=false 表述保留。归档同样只表述已排定或未排定。
+合并成功事件的唯一发布者是宿主合并成功路径，不是 agent 的自然语言、任务 completed，也不是归档回调。`/thread merge` 命令、`thread-merge` 工具与持久成功结果的恢复共用 `publishThreadMergeSuccess(target, summary, archive, operationId)`，由 CoreService 持久化并交付。真实 WorktreePort 从已经验证的 Git common directory 读取合并后目标 ref 的提交；事件包含 summary.target、commit、summary.removed 与 archive=scheduled/not-scheduled。宿主会额外等待异步清理的实际路径消失及完整进程组退出，不只依据 Worktrunk 的 removed=true；父聊天通知保留「工作区清理：已排定」的保守表述，removed=false 表述保留。归档同样只表述已排定或未排定。
 
-资格通过的 /thread merge 在交给 agent 前持久设置 mergePending；直接 thread-merge 在真实执行前设置，并将该子区在途任务标为 relaySuppressed，后续接受的修复任务继承此标记。mergePending 期间所有派发终态回传被抑制；成功后解除子区 pending，但这些任务自身标记不解除，防止合并任务结束再发普通结果。失败保持 pending，重启和后续修复失败均不唤醒父会话。资格拒绝不置 pending；shared 命令仍只有固定拒绝文案、零任务，直接 host 合并拒绝只抑制当前任务，不影响后续正常 task 档派发。
+资格通过的 `/thread merge` 命令与 `thread-merge` 工具在宿主实际执行前持久设置 mergePending，并将该子区在途任务标为 relaySuppressed，后续接受的修复任务继承此标记。mergePending 期间所有派发终态回传被抑制；成功后解除子区 pending，但这些任务自身标记不解除，防止合并任务结束再发普通结果。失败保持 pending，重启和后续修复失败均不唤醒父会话。资格拒绝不置 pending；shared 命令仍只有固定拒绝文案、零任务，直接 host 合并拒绝只抑制当前任务，不影响后续正常 task 档派发。
 
-另一工作区的 host-first /thread merge 必须复用同一宿主事件所有者：原消息 ID 作为稳定 operationId，先调用 `replayThreadMergeSuccess(target, operationId)` 读取已有成功收据；未命中时在资格通过、实际执行前复用 `ensureThreadListen` / `beginThreadMerge`，成功完成合并及归档排定后仅调用同一 `publishThreadMergeSuccess(target, summary, archive, operationId)` 一次，不能从命令回执另发通知。host tool 的 operationId 为 task.id 与 native toolCallId 的组合，同一调用重试保持身份；旧协议缺少 toolCallId 时使用 task.id。已成功操作的重放不再次执行 wt、不改新操作的 pending。该集成不假设对方已经合入。
+宿主优先命令使用原消息 ID 作为稳定 operationId，通过 `replayThreadMergeSuccess(target, operationId)` 读取已有成功收据；未命中时在资格通过、实际执行前复用 `ensureThreadListen` / `beginThreadMerge`，合并成功及归档排定后仅调用同一成功事件发布者，不能从命令回执另发通知。host tool 的 operationId 为 task.id 与 native toolCallId 的组合，同一调用重试保持身份。持久 host merge outcome 的恢复只补交付同一事件，不重新执行 wt；已成功操作的重放不改变新操作的 pending。
 
 ## 交付与内容
 

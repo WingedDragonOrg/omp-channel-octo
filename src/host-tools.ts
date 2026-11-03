@@ -11,6 +11,7 @@ import type {
   InboundMessage,
   ThreadListenLevel,
   ThreadSummary,
+  WorktreeMergeLifecycle,
   WorktreeMergeRequest,
   WorktreeMergeSummary,
   WorktreePort,
@@ -29,6 +30,10 @@ import {
 import { taskTarget } from "./target.ts";
 import { threadChannelId, threadParentGroupId, threadShortId } from "./threads/thread-target.ts";
 import { worktreeSlug } from "./workspace/worktree.ts";
+import {
+  mergeThreadWorkspace,
+  WorktreeMergeExecutionError,
+} from "./threads/thread-merge.ts";
 /**
  * Host tools need only the channel capabilities they actually use. The service passes this port
  * while keeping task scheduling, session migration and outbound delivery internals private.
@@ -51,6 +56,11 @@ export interface HostToolHost {
     | "deleteThread"
   >;
   readonly worktrees: WorktreePort | undefined;
+  readonly worktreeMergeLifecycle?: (
+    target: ChatTarget,
+    cwd: string,
+    sourceId?: string,
+  ) => WorktreeMergeLifecycle;
   readonly store: Pick<
     ChannelStore,
     | "enqueueOutbox"
@@ -69,7 +79,6 @@ export interface HostToolHost {
     | "ensureThreadListen"
     | "getThreadListen"
     | "setThreadListen"
-    | "beginThreadMerge"
     | "suppressTaskRelay"
   >;
   tryAcquireWorkspaceDirectories(cwds: readonly string[], task: TaskRecord): DirectoryLease | undefined;
@@ -77,11 +86,13 @@ export interface HostToolHost {
   readonly botUid: string;
   enqueueText(target: ChatTarget, text: string, taskId: string | null): void;
   flushTarget(target: ChatTarget): Promise<void>;
+  /** Current generation; a new inbound invalidates an archive planned by an older merge. */
+  threadArchiveGeneration(target: ChatTarget): number;
   /**
    * `thread-archive`（以及默认 pipeline 的 `thread-merge` 收尾）：把一次子区归档排定到该聊天
    * 本回合输出排空之后执行——任何发进子区的消息都会把归档子区解档，所以工具内不即时归档。
    */
-  planThreadArchive(target: ChatTarget, groupId: string, shortId: string): void;
+  planThreadArchive(target: ChatTarget, groupId: string, shortId: string, generation?: number): void;
   publishThreadMergeSuccess(
     target: ChatTarget,
     summary: WorktreeMergeSummary,
@@ -404,6 +415,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
   const actions = dispatchable
     ? [...MANAGEMENT_BASE_ACTIONS, MANAGEMENT_DISPATCH_ACTION]
     : [...MANAGEMENT_BASE_ACTIONS];
+  const pendingMergeLifecycles = new Map<string, WorktreeMergeLifecycle>();
   const managementTool: HostTool = {
     name: "octo_management",
     description:
@@ -481,7 +493,25 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
       additionalProperties: false,
     },
     execute: async (args, signal, toolCallId) =>
-      runManagementTool(host, task, target, parentGroupId, currentShortId, args, signal, toolCallId),
+      runManagementTool(
+        host,
+        task,
+        target,
+        parentGroupId,
+        currentShortId,
+        args,
+        signal,
+        toolCallId,
+        toolCallId === undefined
+          ? undefined
+          : (lifecycle) => pendingMergeLifecycles.set(toolCallId, lifecycle),
+      ),
+    onResultAccepted: (toolCallId) => {
+      const lifecycle = pendingMergeLifecycles.get(toolCallId);
+      if (!lifecycle) return;
+      lifecycle.settle();
+      pendingMergeLifecycles.delete(toolCallId);
+    },
   };
   return [channelTool, managementTool, fileTool, askTool];
 }
@@ -526,6 +556,7 @@ async function runManagementTool(
   args: Record<string, unknown>,
   signal: AbortSignal,
   toolCallId?: string,
+  onWorktreeMergeLifecycle?: (lifecycle: WorktreeMergeLifecycle) => void,
 ): Promise<string> {
   const action = args.action;
   const known: readonly string[] = [...MANAGEMENT_BASE_ACTIONS, MANAGEMENT_DISPATCH_ACTION];
@@ -548,8 +579,8 @@ async function runManagementTool(
    * `thread-merge` parameters, one-to-one with wt's merge flags; every omitted field keeps wt's
    * default (squash, commit, rebase, fast-forward, remove the worktree, stage everything).
    */
-  const mergeRequest = (cwd: string): WorktreeMergeRequest => {
-    const request: WorktreeMergeRequest = { cwd };
+  const mergeRequest = (): Omit<WorktreeMergeRequest, "cwd" | "repo" | "branch" | "lifecycle"> => {
+    const request: Omit<WorktreeMergeRequest, "cwd" | "repo" | "branch" | "lifecycle"> = {};
     const target = optionalText("target")?.trim();
     if (target !== undefined && target.length > 0) {
       if (target.length > MAX_MANAGEMENT_NAME_CHARS) {
@@ -743,55 +774,45 @@ async function runManagementTool(
       const replay = await host.replayThreadMergeSuccess(workspaceTarget, operationId);
       if (replay !== null) return replay;
       host.store.suppressTaskRelay(task.id);
-      const ownership = host.store.getThreadWorkspace(host.botUid, workspaceTarget);
-      if (ownership?.layout === "shared") {
-        throw new Error("当前为多项目工作区，不支持 /thread merge。");
-      }
-      ensureThreadListenForTarget(host, workspaceTarget);
-      if (host.store.isThreadWorkspaceIntentBlocked(host.botUid, workspaceTarget)) {
-        throw new Error("当前子区工作区未就绪，无法合并");
-      }
-      if (ownership !== null && !(await threadWorkspaceIsAvailable(ownership))) {
-        throw new Error("当前子区工作区未就绪，无法合并");
-      }
-      const workspace = host.store.getBinding(host.botUid, workspaceTarget);
-      if (!workspace || workspace.cwdPinned !== true) {
-        throw new Error("当前子区未绑定隔离工作区，无法合并");
-      }
-      const worktrees = host.worktrees;
-      if (!worktrees) throw new Error("本部署未配置隔离工作区能力");
-      const request = mergeRequest(workspace.cwd);
-      const lease = host.tryAcquireWorkspaceDirectories([workspace.cwd], task);
-      if (!lease) throw new Error("隔离工作区正被其他任务使用，无法合并");
       try {
-        await lease.ready;
-        host.store.beginThreadMerge(host.botUid, workspaceTarget);
-        const summary = await worktrees.merge(request, signal);
-        if (summary.removed === true && ownership !== null) {
-          const project = ownership.projects.find(({ path }) => path === workspace.cwd);
-          if (project !== undefined) {
-            project.created = false;
-            project.path = null;
-            project.branch = null;
-            host.store.saveThreadWorkspace(ownership);
-          }
-        }
-        let archive: "scheduled" | null = null;
-        if (summary.removed === true) {
-          host.planThreadArchive(target, groupId, currentShortId);
-          archive = "scheduled";
-        }
+        const result = await mergeThreadWorkspace(
+          {
+            botUid: host.botUid,
+            store: host.store,
+            worktrees: host.worktrees,
+            sourceId: operationId,
+            requireStableSourceId: true,
+            ...(host.worktreeMergeLifecycle === undefined
+              ? {}
+              : {
+                  worktreeMergeLifecycle: (mergeTarget, cwd, sourceId) => {
+                    const lifecycle = host.worktreeMergeLifecycle!(mergeTarget, cwd, sourceId);
+                    onWorktreeMergeLifecycle?.(lifecycle);
+                    return lifecycle;
+                  },
+                }),
+            beforeMerge: () => {
+              ensureThreadListenForTarget(host, workspaceTarget);
+            },
+            archiveGeneration: () => host.threadArchiveGeneration(workspaceTarget),
+            planThreadArchive: (archiveTarget, archiveGroupId, shortId, generation) =>
+              host.planThreadArchive(archiveTarget, archiveGroupId, shortId, generation),
+            tryAcquireDirectories: (cwds) => host.tryAcquireWorkspaceDirectories(cwds, task),
+          },
+          workspaceTarget,
+          mergeRequest(),
+          signal,
+        );
         await host.publishThreadMergeSuccess(
           workspaceTarget,
-          summary,
-          archive ?? "not-scheduled",
+          result,
+          result.archive === "scheduled" ? "scheduled" : "not-scheduled",
           operationId,
         );
-        return JSON.stringify({ merged: true, ...summary, ...(archive === null ? {} : { archive }) });
+        return JSON.stringify({ merged: true, ...result });
       } catch (error) {
+        if (error instanceof WorktreeMergeExecutionError) throw error;
         throw new Error(boundedManagementError(error, "合并隔离工作区失败"));
-      } finally {
-        lease.complete();
       }
     }
     case "thread-archive": {

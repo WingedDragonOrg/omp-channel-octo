@@ -1,7 +1,7 @@
 # 子区 worktree 的 Worktrunk 生命周期
 
 日期：2026-09-17
-修订日期：2026-11-02
+修订日期：2026-11-03
 
 ## 背景与目标
 
@@ -13,7 +13,7 @@
 
 - `create-thread --worktree_name` 的 wt 创建路径（`wt switch --create`，保留现有目录/分支命名与占用退让）与 `omp worktree add` 回退。
 - `thread-delete` 的隔离工作区清理：新增可选布尔参数 `force`；默认只清理干净工作区，`wt` 不可用时回退 `git worktree remove`；清理结果进入同一条工具回执。
-- 子区命令 `/thread merge`：只做检查并注入「合并指令」prompt（与建区 prompt 同构、内容不同），命令即 owner 对合并 + 清理的确认——正文要求除非有明确必要理由（并向 owner 说明）直接按默认参数执行，要保留工作区须说明理由并显式传 `remove:false`；经 `octo_management` 新增的 `thread-merge` 动作由宿主执行 `wt merge`。
+- 子区命令 `/thread merge`：宿主取得工作区独占后直接执行默认合并与清理；成功不创建 agent 任务，回执送达后归档子区。仅实际合并执行失败时交给本聊天 agent 修复，修复后通过同一宿主 `thread-merge` 核心重试。
 - 主规格、AGENTS.md 与测试同步。
 
 ### 不包含
@@ -33,9 +33,9 @@
 
 | 决策 | 选择 | 理由 |
 | --- | --- | --- |
-| 接入层 | 宿主侧执行 wt（`src/workspace/worktrunk.ts` + worktree 端口），agent 只经 `octo_management` 触发 | 与现有 create-thread 的 worktree 路径同构；审批、超时与错误边界集中在宿主 |
+| 接入层 | 命令与 `octo_management thread-merge` 共用宿主合并核心，底层经 worktree 端口执行 wt | 资格、资源租约、成功状态与归档只有一套实现 |
 | 创建回退 | `wt` 不可用回退 `omp worktree add` | 不回归现状 |
-| merge 形态 | `/thread merge` 只注入合并指令 prompt；命令即 owner 的合并 + 清理确认——除非有明确必要理由（并说明）按默认参数执行，保留工作区须说明理由并显式 `remove:false` | owner 定稿：命令发出即默认收尾，执行与参数仍由 agent 决定 |
+| merge 形态 | `/thread merge` 先由宿主直接执行默认 pipeline；实际执行失败才交给 agent | 命令即 owner 对默认合并和清理的确认，正常路径不启动模型 |
 | merge 默认行为 | 沿用 `wt merge` 默认 pipeline（squash、rebase、fast-forward、合并后删除工作区与分支） | owner 定稿：wt 默认删除 |
 | merge 无回退 | `wt` 不可用时命令只提示、不注入任务 | 合并必须有可执行的 wt |
 | 删除联动 | 默认只清理干净工作区；`force=true` 用 `-f`/`--force`；wt 不可用回退 git | owner 定稿：默认干净清理，force 由 agent 自行传参 |
@@ -106,9 +106,23 @@ shared 的 `/thread merge` 只回复「当前为多项目工作区，不支持 /
 
 ### 合并（/thread merge → thread-merge → wt merge）
 
-命令路径（service）：`/thread merge` 按首词识别 merge，后接分隔符时保留 owner 补充说明，`merge-fix` 仍是创建意图。shared 先按上述固定提示拒绝，不产生任务。单项目/separate 在 channelType=5、该子区绑定隔离工作区（`cwd_pinned`）且 wt 可用时，释放命令 claim 后把合并指令按该聊天追加模式交付：可 steering 则并入，否则 durable 任务。非子区、未绑定工作区、部署无能力、wt 不可用时均只回复提示。
+#### 宿主优先合并 SDD
 
-合并指令 prompt 与建区 prompt 同构（意图 → 确认收尾 → 调用 `octo_management` → 汇报并处置失败），内容为：owner 要求把本子区的隔离工作区工作合并回目标分支；合并由宿主执行，调用 `octo_management` 的 `thread-merge`，不要自己运行 wt；默认走 wt 默认 pipeline（暂存工作区改动并提交、squash、rebase 到目标分支、fast-forward，合并后删除工作区与分支）；这条命令即代表 owner 确认合并并清理——除非有明确必要理由（并说明）直接按默认参数执行，要保留工作区须说明理由并显式传 `remove:false`，其他参数确有需要时显式传入并说明理由；工作区删除后本子区 cwd 随之失效是该命令的既定结果、owner 已知，正文要求不反复说明、也不作为保留理由；成功汇报目标分支与结果细节；失败（rebase 冲突、pre-merge 检查失败）在本子区处置后重试并最终汇报；附当前隔离工作区路径。
+**目标与范围。** `/thread merge` 按首词识别 merge，后接分隔符时保留 owner 补充说明，`merge-fix` 仍是创建意图。命令即 owner 对默认暂存、提交、squash、rebase、fast-forward、删除 worktree 与已合并分支的确认。正常路径由宿主直接完成，不启动 worker、模型或 agent 任务。补充说明是失败接管时的上下文，不作为 shell 文本或 wt 参数执行。
+
+**资格边界。** 沿用 owner、允许列表、mention 与消息身份门禁。shared 在探测 wt 前固定回复「当前为多项目工作区，不支持 /thread merge。」；非子区、未绑定隔离工作区、工作区未就绪、无隔离能力、无 wt、目录缺失、非 linked worktree 或持久来源/分支不符均明确拒绝，零合并副作用、零修复任务。不得操作主检出或被替换的路径。
+
+**调度与取消。** 合并前等待较早接受的任务释放聊天、会话和持久工作区资源组（含子目录绑定），再取得同组独占；未确认停止的 worker 继续阻塞资源。等待时不能先持有较早任务启动所需的租约，也不能让后续写任务越过合并。取得租约后重新核对绑定与资源身份，独占覆盖 wt 退出及清理确认。等待与执行响应 `/cancel`、`/interrupt` 和服务停止，取消不是可修复的 merge 失败。
+
+**共享核心。** 命令与 `octo_management thread-merge` 共用 `threads/thread-merge.ts` 的资格校验、worktree 调用、成功归属更新与归档排定。工具仍支持下述可选参数，并复用其调用任务已经持有的完整资源租约；命令调用传默认选项。底层只把已实际运行的 wt merge 非零退出归类为可修复执行失败；启动前拒绝、取消和成功结果无法确认均不冒充冲突或检查失败，不自动重跑副作用。
+
+**成功交付。** 成功须同时确认原 worktree 路径消失和整个 wt/Git/hook 进程组退出，不只依赖 wt JSON 的 `removed:true`。Worktrunk 可在主命令退出后留下空占位目录并异步清理；宿主在原合并的超时和取消预算内等待自然收尾，不把合法清理子进程当作遗留进程提前杀掉。已知结果先写入 `host_merge_leases`，再将实际来源分支、目标分支与清理结果送入稳定身份的持久 outbox；失败修复同样使用稳定任务身份，交付持久确认之后才 settle 结果记录。启动只补交付、不重跑 merge；恢复归档还须等待遗留进度卡恢复结束及 transport 就绪。工作树删除造成 cwd 消失不阻止回执或归档。归档是远端子区归档，不是删除；成功回执确实送达且既有进度卡输出排空后才执行。新授权且实际受理的输入取消排定，原命令重投去重不取消；服务停止放弃排定，归档沿用既有瞬时失败重试及有界失败通知。回执尚未送达或已永久失败时不能先归档。
+
+**失败接管与去重。** 实际 rebase 冲突、pre-merge hook 非零退出保留现场，将真实、脱敏、单行有界诊断、工作区路径、原命令与 owner 补充说明交给该聊天 agent；修复后调用宿主 `thread-merge` 重试，不由 agent 直接运行 wt。原命令持久 claim 始终保留，失败接管使用稳定消息身份，重投与重启不能再执行一次成功合并或创建第二个修复任务。外部 Git 副作用与 SQLite 不是事务；结果不明时保持已受理状态、停止自动重放，不能猜测成功或重新合并。
+
+**进程所有权与恢复。** 在 wt spawn 前持久化本次宿主合并的资源占用，再记录可验证的 PID、PGID 与进程身份；watchdog 覆盖宿主意外退出，正常取消确认整个 Git/hook 进程组退出后才释放租约。进程退出与业务结果确认分开：即使整个组已经退出，成功结果/归属更新或明确执行失败尚未持久确认的记录仍是未终结操作。启动时在恢复任务之前核验遗留进程并停止或保持资源阻塞，未确认终结的合并绝不重放；结果未知的工作区持久阻塞，不能因新 channel 进程忘掉内存 lease 而允许并发写。未能启动子进程的明确结果可释放占用。schema 变更须在真实数据库的只读一致性备份上以应用迁移演练并重复打开，验证旧表逐行摘要不变。
+
+**验收。** 先运行零 agent 成功路径的失败回归；实现后验证宿主真实合并、目标内容、worktree/分支删除、回执先于唯一归档。用临时真实 Git 仓库分别制造 rebase 冲突与 pre-merge 失败，验证实际执行在接管之前、现场保留且接管一次、修复后工具重试成功。覆盖资格拒绝、重复投递/重启、运行与排队占用、跨聊天资源别名、取消/停止、cwd 删除及归档失败。只在临时仓库执行合并/删除验收，不触碰常驻服务。
 
 工具路径（host-tools）：`octo_management` 新增动作 `thread-merge`，仅在当前聊天是子区时可执行（否则单行错误）。可选参数一一对应 wt 语义，全部省略即 wt 默认 pipeline：
 
@@ -116,7 +130,7 @@ shared 的 `/thread merge` 只回复「当前为多项目工作区，不支持 /
 - `squash`、`commit`、`rebase`、`remove`、`ff`：布尔，默认 true；false 映射 `--no-squash`/`--no-commit`/`--no-rebase`/`--no-remove`/`--no-ff`。
 - `stage`：`all`/`tracked`/`none`，默认 `all`。
 
-执行前校验：该子区绑定存在且 `cwd_pinned`、部署提供隔离能力、wt 可用、工作区目录存在且是 linked worktree（`rev-parse --git-dir` ≠ `--git-common-dir`，防止在主检出上误合并）；随后在宿主内以工作区为 cwd 运行 `wt merge --format json`（600 秒上限、随工具取消信号中止、不传 `-y`）。成功返回 wt 的结果对象（`branch`/`target`/`squashed`/`rebased`/`committed`/`removed`）；失败返回单行 ≤200 字符原因——rebase 冲突时 wt 已把工作区留在 rebase 现场、目标分支未改动，agent 解决或按提示 abort 后可重试。
+执行前校验：该子区绑定存在且 `cwd_pinned`、部署提供隔离能力、wt 可用、目录存在且是 linked worktree（`rev-parse --git-dir` ≠ `--git-common-dir`），并与持久归属中的来源仓库和分支相符；随后宿主以工作区为 cwd 运行 `wt merge --format json`（600 秒上限、随取消信号中止、不传 `-y`）。合并进程及其 Git/hook 子进程退出前不释放资源租约。成功返回 wt 的结果对象（`branch`/`target`/`squashed`/`rebased`/`committed`/`removed`）；失败返回脱敏单行 ≤200 字符诊断。rebase 冲突保留现场，agent 解决或按诊断 abort 后通过工具重试；较晚阶段失败不猜测目标分支或清理是否已发生。
 
 ### thread-delete 联动清理
 
@@ -134,14 +148,14 @@ shared 的 `/thread merge` 只回复「当前为多项目工作区，不支持 /
 - `src/workspace/worktrunk.ts`（新）：候选探测、wt switch/merge/remove 的 argv 与 JSON 解析、git worktree 删除回退、linked worktree 校验、共享的受限命令执行与单行错误文本。
 - `src/workspace/worktree.ts`：保留 slug/候选命名与端口组装；工厂更名 `createWorktreePort`（创建优先 wt，不可用回退现状）。
 - `src/threads/thread-target.ts`：新增 `threadChannelId(groupId, shortId)`——线程目标 ID 组装与解析同源。
-- `src/service.ts`：`/thread merge` 分支、合并指令 prompt、提示文案、`/help` 与 `/thread` 用法更新。
-- `src/host-tools.ts`：`thread-merge` 动作、`thread-delete` 的 `force` 与清理回执、工具描述更新。
+- `src/commands/thread-commands.ts`、`src/service.ts`：宿主优先命令编排、失败接管、回执与归档接线；`TaskScheduler` 提供工作区独占。
+- `src/threads/thread-merge.ts`：命令与 host tool 共用的资格、合并与成功收尾核心；`src/host-tools.ts` 保留工具参数映射与 `thread-delete` 清理回执。
 
 ## 错误与边界情况
 
 - 未审批的 hook：非交互环境下 wt 以非零退出并给出说明，宿主压成单行 ≤200 字符回报；创建成为 `worktree_error`，合并成为工具错误，删除成为回执里的清理失败说明；宿主永不传 `-y` 或 `--no-hooks`。
 - linked worktree 校验在本地判定，不依赖 wt 行为；工作区目录不存在时合并明确报「已不存在」。
-- 合并冲突或 pre-merge 失败：工作区不删除、目标分支未改动；工具返回单行原因，agent 处置后重试。
+- 合并冲突或 pre-merge 失败：保留工作现场，交付真实有界诊断供 agent 修复并通过 host tool 重试；不得声称所有非零退出都保证目标分支未变，失败可能发生在 pipeline 的较晚阶段。
 - 合并成功且按默认删除工作区后：该子区绑定仍指向已删除目录，子区继续工作需显式 `/new <目录>`、`/move <目录>`，或删除该子区（此时清理回执说明工作区已不存在）。
 - `thread-delete` 的服务端删除保持既有语义；本地清理遇到运行/排队/未确认停止的任务占用时保留资源并报告，不与任务并发删除。
 - shared 创建前检查状态目录与入口祖先不位于 Git worktree 内；否则入口会向上发现用户仓库，故在创建 intent 或远端资源前明确拒绝，不自动选择其他目录。
@@ -150,7 +164,7 @@ shared 的 `/thread merge` 只回复「当前为多项目工作区，不支持 /
 ## 验收标准
 
 1. wt 可用时 `create-thread --worktree_name` 经 `wt switch --create` 创建：目录 `<repo>.<slug>`（被占用退让 `<slug>-<thread_id>`）、分支同名、hooks 按 `.config/wt.toml` 执行，绑定 cwd 为该目录；wt 不可用时行为与现状一致（`omp worktree add`）。
-2. 子区中 `/thread merge`：绑定隔离工作区且 wt 可用时注入合并指令 prompt（含 `thread-merge` 与汇报/处置要求），命令本身不执行 wt；主群、私聊、未绑定工作区的子区、部署无隔离能力、wt 不可用时只回一条提示、不注入任务。
+2. 子区中 `/thread merge`：绑定隔离工作区且 wt 可用时宿主先执行默认合并，成功零 agent 任务、清理工作树和分支，回执送达及进度卡排空后归档一次；实际执行失败才接管修复。资格拒绝只回提示、不执行、不创建任务；重投、重启、忙碌、取消和停止保持独占及去重边界。
 3. `octo_management` 的 `thread-merge` 在合法子区上执行 `wt merge`（默认 pipeline，或逐参数映射的 `--no-*`/`--stage`/`target`），成功返回结果对象、失败返回单行 ≤200 字符原因；非子区、未绑定工作区、目录不存在或非 linked worktree、wt 不可用时明确拒绝且不执行。
 4. `thread-delete`：按持久归属安全清理；验证占用、脏改动、force、路径替换、显式换绑和未知入口文件。历史单项目绑定保持兼容，服务端删除与重试语义不变。
 5. `bun run typecheck` 与 `bun test` 通过；主规格与 AGENTS.md 同步；用临时真实仓库验证创建、单项目合并与删除，不在用户项目主检出执行验收副作用。
@@ -164,6 +178,16 @@ shared 的 `/thread merge` 只回复「当前为多项目工作区，不支持 /
 - `bun tests/benchmarks/restart.ts` 的 graceful 与 SIGKILL 两种真实 CLI/worker/SQLite 工作负载均完成续接及排队恢复：`session_overlaps=0`、`duplicate_effects=0`、`disruption_notices=0`。
 - Rebase 到包含群开通、成员上下文及 mention 流式输出的主分支后，保留普通共享目录的跨会话并行，并为持久工作区叠加资源组独占。`bun run typecheck` 通过；全量 `bun test` 为 989 pass、0 fail（74 文件、989 例）。同一集成版本再次通过本机 wt v0.80.0 的真实 host 创建、任务访问、separate 合并及 shared 删除 smoke，以及 graceful/SIGKILL 恢复基准。
 - Octo API 与消息表面在本次 smoke 中使用隔离夹具，未完成线上 thread 创建、THREAD.md 写入权限或真实客户端验收；未重启常驻服务。
+
+## 2026-11-03 宿主优先合并验收
+
+- 零 agent 成功回归先在原实现失败：预期宿主 merge 调用一次，实际为空。实现后的命令、调度与持久恢复子集为 40 pass、0 fail。
+- 临时真实仓库经 `CoreService.handleInbound("/thread merge")` → 真实 Worktrunk v0.80.0 → Git 默认 pipeline 完成一次合并：已提交内容与未提交文件均进入目标分支，worktree 路径和已合并分支均消失；worker 与 agent task 数均为零，回执先于唯一归档。同一命令重投没有第二次合并。
+- 真实 wt 的异步清理已单独取证：主命令退出后保留空占位目录，原进程组中的后台清理约一秒后移除路径及 trash。宿主成功边界等待这一步结束；取消和超时仍受原合并预算约束。
+- SQLite 以运行中数据库的只读一致性备份演练应用迁移并重复打开：原 20 张表的行数和逐行摘要完全一致，新增 `host_merge_leases`。临时源码副本移除该表的创建迁移后，相关行为测试按预期因表缺失失败；仓库源码未参与该变异。
+- 真实 CLI/worker/SQLite 的 graceful 和 SIGKILL 基准均恢复在途及排队任务：`session_overlaps=0`、`duplicate_effects=0`、`disruption_notices=0`。
+- 最终 `bun run typecheck` 通过；完整 `bun test` 为 1023 pass、0 fail，覆盖 77 个文件。临时真实 Git 的 rebase 冲突与 pre-merge hook 失败均先由宿主执行，再由唯一修复任务保留现场、处置并通过 host tool 重试收尾。
+- Octo 消息与归档使用隔离 transport 夹具；本次未操作线上子区或重启常驻服务。
 
 ## 未决事项
 

@@ -32,13 +32,17 @@ export const SAFE_MIN_PID = 2;
  * after an unexpected worker-parent exit.
  */
 const WATCHDOG_SCRIPT = String.raw`
-const watchdogArgs = process.argv.slice(-4);
+const watchdogArgs = process.argv.slice(-6);
 const parentPid = Number(watchdogArgs[0]);
 const workerPid = Number(watchdogArgs[1]);
 const workerPgid = Number(watchdogArgs[2]);
 const parentIdentity = watchdogArgs[3] ?? "";
+const configuredKillGraceMs = Number(watchdogArgs[4]);
+const terminateOnWorkerExit = watchdogArgs[5] !== "false";
+const killGraceMs = Number.isFinite(configuredKillGraceMs) ? Math.max(0, configuredKillGraceMs) : 10_000;
 const decoder = new TextDecoder();
 let terminating = false;
+let killSent = false;
 let killDeadline = 0;
 
 function processAlive(pid) {
@@ -91,14 +95,22 @@ function signalGroup(signal) {
 function beginTermination() {
   if (!terminating) {
     terminating = true;
-    killDeadline = Date.now() + 10000;
+    killDeadline = Date.now() + killGraceMs;
     signalGroup("SIGTERM");
   }
   if (!groupAlive()) {
     process.exit(0);
     return;
   }
-  if (Date.now() >= killDeadline) signalGroup("SIGKILL");
+  if (Date.now() >= killDeadline) {
+    if (killSent) {
+      process.exit(1);
+      return;
+    }
+    killSent = true;
+    killDeadline = Date.now() + 1000;
+    signalGroup("SIGKILL");
+  }
 }
 
 process.stdout.write("__omp_watchdog_ready__\n");
@@ -107,7 +119,7 @@ setInterval(() => {
     beginTermination();
     return;
   }
-  if (!parentAlive() || !processAlive(workerPid)) beginTermination();
+  if (!parentAlive() || (terminateOnWorkerExit && !processAlive(workerPid)) || !groupAlive()) beginTermination();
 }, 100);
 `;
 
@@ -250,25 +262,33 @@ export type WatchdogStartResult =
 	| { readonly ok: true; readonly watchdog: RpcChild }
 	| { readonly ok: false; readonly reason: WatchdogFailureReason; readonly detail: string };
 
-function spawnWatchdogProcess(childPid: number, workerPgid: number, parentIdentity: string): RpcChild {
-	return Bun.spawn(
-		[
-			process.execPath,
-			"-e",
-			WATCHDOG_SCRIPT,
-			String(process.pid),
-			String(childPid),
-			String(workerPgid),
-			parentIdentity,
-		],
-		{
-			stdin: "ignore",
-			env: workerEnv(),
-			stdout: "pipe",
-			stderr: "pipe",
-			detached: true,
-		},
-	) as unknown as RpcChild;
+function spawnWatchdogProcess(
+  childPid: number,
+  workerPgid: number,
+  parentIdentity: string,
+  killGraceMs: number,
+  terminateOnWorkerExit: boolean,
+): RpcChild {
+  return Bun.spawn(
+    [
+      process.execPath,
+      "-e",
+      WATCHDOG_SCRIPT,
+      String(process.pid),
+      String(childPid),
+      String(workerPgid),
+      parentIdentity,
+      String(killGraceMs),
+      String(terminateOnWorkerExit),
+    ],
+    {
+      stdin: "ignore",
+      env: workerEnv(),
+      stdout: "pipe",
+      stderr: "pipe",
+      detached: true,
+    },
+  ) as unknown as RpcChild;
 }
 
 /**
@@ -294,18 +314,24 @@ async function drainBounded(stream: ReadableStream<Uint8Array>, maxChars: number
 }
 
 export async function createWatchdog(
-	childPid: number,
-	workerPgid: number,
-	parentIdentity: string,
-	readyTimeoutMs: number = DEFAULT_WATCHDOG_READY_TIMEOUT_MS,
-	spawnWatchdog: () => RpcChild = () => spawnWatchdogProcess(childPid, workerPgid, parentIdentity),
+  childPid: number,
+  workerPgid: number,
+  parentIdentity: string,
+  readyTimeoutMs: number = DEFAULT_WATCHDOG_READY_TIMEOUT_MS,
+  spawnWatchdog?: () => RpcChild,
+  killGraceMs: number = 10_000,
+  /** Worktrunk cleanup outlives its leader, so only its watchdog disables this check. */
+  terminateOnWorkerExit: boolean = true,
 ): Promise<WatchdogStartResult> {
 	if (process.platform === "win32") {
 		return { ok: false, reason: "unsupported-platform", detail: "parent-death watchdog is not available on this platform" };
 	}
 	let watchdog: RpcChild;
 	try {
-		watchdog = spawnWatchdog();
+    watchdog =
+      spawnWatchdog === undefined
+        ? spawnWatchdogProcess(childPid, workerPgid, parentIdentity, killGraceMs, terminateOnWorkerExit)
+        : spawnWatchdog();
 	} catch (error) {
 		return { ok: false, reason: "spawn-failed", detail: `spawn failed: ${failureText(error, "unknown spawn error")}` };
 	}

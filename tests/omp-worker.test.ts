@@ -2176,10 +2176,11 @@ describe("OMP RPC worker", () => {
 		});
 	});
 
-	test("registers host tools as essential before prompting and returns textual results", async () => {
+	test("registers host tools as essential before prompting and acknowledges accepted tool results", async () => {
 		await withHarness("host-tool", async harness => {
 			let receivedArgs: Record<string, unknown> | undefined;
 			let receivedToolCallId: string | undefined;
+			let acceptedToolCallId: string | undefined;
 			const tool: HostTool = {
 				name: "fixture_echo",
 				description: "Echo a fixture value",
@@ -2188,6 +2189,9 @@ describe("OMP RPC worker", () => {
 					receivedArgs = args;
 					receivedToolCallId = toolCallId;
 					return `host result: ${String(args.message)}`;
+				},
+				onResultAccepted: toolCallId => {
+					acceptedToolCallId = toolCallId;
 				},
 			};
 			const context: PromptContext = { tools: [tool] };
@@ -2210,6 +2214,7 @@ describe("OMP RPC worker", () => {
 			// OMP's own call identity rides the frame next to the RPC request id, so a consumer
 			// that must survive a restart can key durable state on it.
 			expect(receivedToolCallId).toBe("fixture-tool-call-1");
+			expect(acceptedToolCallId).toBe(receivedToolCallId);
 		});
 	});
 

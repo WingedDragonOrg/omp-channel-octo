@@ -299,6 +299,8 @@ type HostToolRegistration = {
 };
 const hostTools = new Map<string, HostToolRegistration>();
 let pendingHostToolRequestId: string | undefined;
+let pendingHostToolCallId: string | undefined;
+let pendingHostToolName: string | undefined;
 let streaming = false;
 /**
  * Id of the last completed local-only run, remembered so a later prompt can replay its
@@ -852,13 +854,24 @@ function emitHostToolCall(): void {
 		}
 		toolArguments = parsed as Frame;
 	}
+	pendingHostToolCallId =
+		flag("--host-tool-no-call-id") === undefined ? "fixture-tool-call-1" : undefined;
+	pendingHostToolName = toolName;
 	emit({ type: "agent_start" });
+	if (pendingHostToolCallId !== undefined) {
+		emit({
+			type: "tool_execution_start",
+			toolCallId: pendingHostToolCallId,
+			toolName,
+			args: toolArguments,
+		});
+	}
 	// `toolCallId` is OMP's own identity for the call (independent of the RPC request id, reused
 	// when a retry re-executes the call). `--host-tool-no-call-id` models a legacy/absent field.
 	emit({
 		type: "host_tool_call",
 		id: pendingHostToolRequestId,
-		...(flag("--host-tool-no-call-id") === undefined ? { toolCallId: "fixture-tool-call-1" } : {}),
+		...(pendingHostToolCallId === undefined ? {} : { toolCallId: pendingHostToolCallId }),
 		toolName,
 		arguments: toolArguments,
 	});
@@ -891,7 +904,18 @@ function completeHostToolTurn(command: Frame): void {
 	const result = resultText(command.result);
 	const text = isError ? `fixture tool failed: ${result}` : `fixture tool returned: ${result}`;
 	const message = { id: "fixture-host-assistant-1", role: "assistant", content: [{ type: "text", text }] };
+	if (pendingHostToolCallId !== undefined && pendingHostToolName !== undefined) {
+		emit({
+			type: "tool_execution_end",
+			toolCallId: pendingHostToolCallId,
+			toolName: pendingHostToolName,
+			result: command.result,
+			isError,
+		});
+	}
 	pendingHostToolRequestId = undefined;
+	pendingHostToolCallId = undefined;
+	pendingHostToolName = undefined;
 	emit({ type: "message_start", message: { ...message, content: [] } });
 	emit({
 		type: "message_update",

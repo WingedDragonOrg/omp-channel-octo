@@ -130,250 +130,50 @@ test("the instructed task sets the sub-thread up with the agent's own names", as
     await closeCoreHarness(harness);
   }
 });
-
-test("a sub-thread's /thread merge hands over a merge instruction instead of running wt", async () => {
-  const harness = await createCoreHarness({
-    prompt: async ({ promptContext, text }) => {
-      if (!text.includes("原始意图")) return; // only the creation hand-over drives octo_management
-      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
-      if (!management) throw new Error("management tool missing");
-      await management.execute(
-        { action: "create-thread", name: "合并流程", worktree_name: "merge-flow" },
-        new AbortController().signal,
-      );
-    },
-  });
+test("/thread merge refuses non-thread and unbound targets without accepting a task", async () => {
+  const harness = await createCoreHarness();
   try {
     const group = { channelId: "group-allowed", channelType: 2 as const };
-    const parentCwd = join(harness.root, "project");
-    await mkdir(parentCwd, { recursive: true });
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "merge-bind",
-        ...group,
-        text: `/new ${parentCwd}`,
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "merge-create",
-        ...group,
-        text: "/thread 先把子区建出来",
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    await harness.workers.waitForPromptCount(1);
+    const thread = { channelId: "group-allowed____unbound", channelType: 5 as const };
+    await harness.service.handleInbound(inbound({
+      messageId: "merge-outside-group",
+      ...group,
+      text: "/thread merge",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    await harness.service.handleInbound(inbound({
+      messageId: "merge-outside-dm",
+      text: "/thread merge",
+    }));
+    await harness.service.handleInbound(inbound({
+      messageId: "merge-unbound-thread",
+      ...thread,
+      text: "/thread merge",
+      mentionedUserIds: [harness.bot.uid],
+    }));
 
-    const thread = { channelId: `${group.channelId}____thread-1`, channelType: 5 as const };
-    const workspace = join(harness.root, "worktrees", "thread-1");
-    // The hand-over task pins the thread's binding inside its own run: wait for the workspace to
-    // show up as the thread's directory before merging.
-    await waitForStatus(harness.service, thread, (status) => status.cwd === workspace);
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "merge-ask",
-        ...thread,
-        text: "/thread merge",
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    await harness.workers.waitForPromptCount(2);
-    const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
-    try {
-      expect(store.getThreadListen(harness.bot.uid, thread)?.mergePending).toBe(true);
-      expect(store.getLatestTask(harness.bot.uid, thread)?.relaySuppressed).toBe(true);
-    } finally {
-      store.close();
-    }
-
-    // The command runs nothing itself; the assistant receives the merge instruction and runs it
-    // in the thread's bound workspace.
+    expect(harness.transport.sent.filter(({ text }) =>
+      text === "/thread merge 只在子区中使用。",
+    )).toHaveLength(2);
+    expect(harness.transport.sent.some(({ text }) =>
+      text === "当前子区未绑定隔离工作区，/thread merge 不可用。",
+    )).toBe(true);
     expect(harness.worktrees?.merges).toEqual([]);
-    expect(harness.workers.prompts[1]?.cwd).toBe(workspace);
-    await waitForStatus(harness.service, thread, (status) => status.state === "completed");
-  } finally {
-    await closeCoreHarness(harness);
-  }
-});
-
-test("a sub-thread's /thread merge is recognised by its first word and carries the trailing note", async () => {
-  const harness = await createCoreHarness({
-    prompt: async ({ promptContext, text }) => {
-      if (!text.includes("原始意图")) return; // only the creation hand-over drives octo_management
-      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
-      if (!management) throw new Error("management tool missing");
-      await management.execute(
-        { action: "create-thread", name: "合并补充", worktree_name: "merge-note" },
-        new AbortController().signal,
-      );
-    },
-  });
-  try {
-    const group = { channelId: "group-allowed", channelType: 2 as const };
-    const parentCwd = join(harness.root, "project");
-    await mkdir(parentCwd, { recursive: true });
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "merge-note-bind",
-        ...group,
-        text: `/new ${parentCwd}`,
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "merge-note-create",
-        ...group,
-        text: "/thread 先建一个子区",
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    await harness.workers.waitForPromptCount(1);
-
-    const thread = { channelId: `${group.channelId}____thread-1`, channelType: 5 as const };
-    const workspace = join(harness.root, "worktrees", "thread-1");
-    await waitForStatus(harness.service, thread, (status) => status.cwd === workspace);
-
-    // A comma (or any other separator) right after the keyword still selects merge, and the
-    // rest of the argument reaches the assistant as the owner's supplement.
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "merge-note-run",
-        ...thread,
-        text: "/thread merge, 已经完成的话，merge 一下",
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    await harness.workers.waitForPromptCount(2);
-    expect(harness.workers.prompts[1]?.cwd).toBe(workspace);
-    expect(harness.workers.prompts[1]?.text).toContain("thread-merge");
-    expect(harness.workers.prompts[1]?.text).toContain("owner 补充说明：");
-    expect(harness.workers.prompts[1]?.text).toContain("已经完成的话，merge 一下");
-
-    // A thread name that merely starts with the keyword is still an ordinary creation intent.
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "merge-note-name",
-        ...thread,
-        text: "/thread merge-fix",
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    await harness.transport.waitForAttempt(
-      ({ text }) => text === "当前会话已是子区，不能再建子区。",
-    );
-    expect(harness.workers.prompts).toHaveLength(2);
-  } finally {
-    await closeCoreHarness(harness);
-  }
-});
-
-test("merge outside a bound sub-thread only replies, and never accepts a task", async () => {
-  const harness = await createCoreHarness({
-    prompt: async ({ promptContext, text }) => {
-      if (!text.includes("原始意图")) return; // only the creation hand-over drives octo_management
-      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
-      if (!management) throw new Error("management tool missing");
-      await management.execute(
-        { action: "create-thread", name: "合并提示", worktree_name: "merge-prompts" },
-        new AbortController().signal,
-      );
-    },
-  });
-  try {
-    const group = { channelId: "group-allowed", channelType: 2 as const };
-    const parentCwd = join(harness.root, "project");
-    await mkdir(parentCwd, { recursive: true });
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "merge-prompt-bind",
-        ...group,
-        text: `/new ${parentCwd}`,
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "merge-prompt-create",
-        ...group,
-        text: "/thread 先建一个子区",
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    await harness.workers.waitForPromptCount(1);
-
-    // The main group and DMs do not support the command.
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "merge-in-group",
-        ...group,
-        text: "/thread merge",
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    await harness.service.handleInbound(
-      inbound({ messageId: "merge-in-dm", text: "/thread merge" }),
-    );
-    expect(
-      harness.transport.sent.filter(({ text }) => text === "/thread merge 只在子区中使用。"),
-    ).toHaveLength(2);
-
-    // A thread without a bound workspace gets a prompt too.
-    const unbound = { channelId: `${group.channelId}____topic-unknown`, channelType: 5 as const };
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "merge-unbound",
-        ...unbound,
-        text: "/thread merge",
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    expect(
-      harness.transport.sent.some(
-        ({ text }) => text === "当前子区未绑定隔离工作区，/thread merge 不可用。",
-      ),
-    ).toBe(true);
-
-    // A bound workspace still needs an executable Worktrunk: when none exists, the command replies
-    // instead of handing a task to the assistant.
-    const worktrees = harness.worktrees;
-    if (!worktrees) throw new Error("expected a worktree port in the harness");
-    const thread = { channelId: `${group.channelId}____thread-1`, channelType: 5 as const };
-    const workspace = join(harness.root, "worktrees", "thread-1");
-    // The hand-over task pins the thread's binding inside its own run: wait for the workspace to
-    // show up as the thread's directory before checking the merge prompt.
-    await waitForStatus(harness.service, thread, (status) => status.cwd === workspace);
-    worktrees.probe = { available: false, reason: "missing" };
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "merge-no-wt",
-        ...thread,
-        text: "/thread merge",
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    expect(
-      harness.transport.sent.some(
-        ({ text }) => text.includes("本机没有可用的 Worktrunk") && text.includes("不可用"),
-      ),
-    ).toBe(true);
+    expect(harness.workers.prompts).toEqual([]);
+    expect((await harness.service.status(group)).state).toBe("none");
+    expect((await harness.service.status(thread)).state).toBe("none");
     const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
     try {
-      expect(store.getThreadListen(harness.bot.uid, unbound)?.mergePending ?? false).toBe(false);
       expect(store.getThreadListen(harness.bot.uid, thread)?.mergePending ?? false).toBe(false);
     } finally {
       store.close();
     }
-
-    // None of the prompts above accepted a task or reached the worker.
-    expect(harness.workers.prompts).toHaveLength(1);
-    expect(harness.worktrees?.merges).toEqual([]);
-    await waitForStatus(harness.service, group, (status) => status.state === "completed");
   } finally {
     await closeCoreHarness(harness);
   }
 });
+
+
 test("shared sub-thread merge command is notice-only and leaves task listening available", async () => {
   const created = { channelId: "" };
   const harness = await createCoreHarness({

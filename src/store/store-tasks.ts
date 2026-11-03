@@ -146,6 +146,21 @@ export function releaseClaim(db: Database, claim: InboundClaim): void {
   );
 }
 
+/** Find only the durable task claimed by this exact message; recovery never guesses by latest task. */
+export function getTaskByMessageId(
+  db: Database,
+  botUid: string,
+  target: ChatTarget,
+  messageId: string,
+): TaskRecord | null {
+  const row = query(db,
+    `SELECT * FROM tasks
+     WHERE bot_uid = ? AND ${targetWhere(target)} AND message_id = ?
+     ORDER BY accepted_at DESC, rowid DESC LIMIT 1`,
+    [botUid, ...targetValues(target), messageId],
+  )[0];
+  return row ? taskFromRow(row) : null;
+}
 export function getTask(db: Database, taskId: string): TaskRecord | null {
   const row = query(db, "SELECT * FROM tasks WHERE id = ?", [taskId])[0];
   return row ? taskFromRow(row) : null;

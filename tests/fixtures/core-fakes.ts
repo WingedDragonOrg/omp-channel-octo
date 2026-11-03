@@ -1606,8 +1606,8 @@ export class FakeWorktrees implements WorktreePort {
   readonly requests: ThreadWorkspaceRequest[] = [];
   /** When set, `create` rejects with this error instead of returning a workspace. */
   failure: Error | undefined;
-  /** Merge requests recorded by `merge`; the fake never runs wt. */
-  readonly merges: WorktreeMergeRequest[] = [];
+  /** Merge requests recorded by `merge`; lifecycle callbacks model a process that exits before its result. */
+  readonly merges: Omit<WorktreeMergeRequest, "lifecycle">[] = [];
   /** Removal requests recorded by `remove`. */
   readonly removals: WorktreeRemovalRequest[] = [];
   /** The probe answer `worktrunk()` reports; tests can model an unavailable wt. */
@@ -1634,7 +1634,18 @@ export class FakeWorktrees implements WorktreePort {
   }
 
   async merge(request: WorktreeMergeRequest): Promise<WorktreeMergeSummary> {
-    this.merges.push({ ...request });
+    const { lifecycle, ...recordedRequest } = request;
+    this.merges.push({ ...recordedRequest });
+    if (lifecycle) {
+      lifecycle.beforeSpawn(request.cwd);
+      lifecycle.onSpawn({
+        pid: 0x7fff_ffff,
+        pgid: 0x7fff_ffff,
+        identity: "pid=2147483647;start=fixture",
+        cwd: request.cwd,
+      });
+      lifecycle.onConfirmedExit();
+    }
     if (this.mergeFailure) throw this.mergeFailure;
     return {
       branch: "fixture-branch",

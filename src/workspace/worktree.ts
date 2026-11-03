@@ -1,9 +1,10 @@
 import type { BigIntStats, Stats } from "node:fs";
-import { lstat, realpath, stat } from "node:fs/promises";
+import { lstat, readdir, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
 import type {
   ThreadWorkspace,
   ThreadWorkspaceRequest,
+  WorktreeMergeProcessIdentity,
   WorktreeMergeRequest,
   WorktreeMergeSummary,
   WorktreePort,
@@ -11,11 +12,12 @@ import type {
   WorktreeRemovalRequest,
   WorktrunkProbe,
 } from "../contracts.ts";
+import { groupAlive, isSafeGroupId, queryProcess, terminateProcessGroup } from "../omp/process.ts";
+import type { WorktrunkCleanupWaitContext } from "./worktrunk.ts";
 import {
   commandFailure,
   defaultWorktrunkCandidates,
   gitWorktreeRemove,
-  isLinkedWorktree,
   probeWorktrunk,
   runCommand,
   WORKTRUNK_TIMEOUT_DEFAULTS,
@@ -144,6 +146,112 @@ async function lstatIfPresent(path: string): Promise<PathStat | null> {
     if (missingPath(error)) return null;
     throw error;
   }
+}
+
+interface WorktreeMergeIdentity {
+  requestedPath: string;
+  path: string;
+  device: number | bigint;
+  inode: number | bigint;
+  commonDir: string;
+  branch: string | null;
+}
+
+async function waitForWorktreeRemoval(
+  identity: WorktreeMergeIdentity,
+  context: WorktrunkCleanupWaitContext,
+): Promise<void> {
+  for (;;) {
+    const current = await lstatIfPresent(identity.path);
+    if (current === null) return;
+    // wt moves the removed tree into .git/wt/trash and briefly leaves an empty path placeholder.
+    if (current.isSymbolicLink() || !current.isDirectory()) {
+      throw new Error(`Worktrunk 后台清理期间隔离工作区路径已更换，无法确认删除：${identity.requestedPath}`);
+    }
+    if (
+      (current.dev !== identity.device || current.ino !== identity.inode) &&
+      (await readdir(identity.path)).length > 0
+    ) {
+      throw new Error(`Worktrunk 后台清理期间隔离工作区路径已更换，无法确认删除：${identity.requestedPath}`);
+    }
+    if (context.interrupted()) {
+      throw new Error(`等待 Worktrunk 后台清理已取消：${identity.requestedPath}`);
+    }
+    const remainingMs = context.remainingMs();
+    if (remainingMs <= 0) {
+      throw new Error(`等待 Worktrunk 后台清理超时：${identity.requestedPath}`);
+    }
+    await Bun.sleep(Math.min(20, remainingMs));
+  }
+}
+
+async function inspectWorktreeForMerge(
+  request: WorktreeMergeRequest,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<WorktreeMergeIdentity> {
+  if (signal?.aborted === true) throw new Error(`合并隔离工作区已取消：${request.cwd}`);
+  const requestedPath = resolve(request.cwd);
+  const pathStat = await lstatIfPresent(requestedPath);
+  if (pathStat === null) throw new Error(`隔离工作区目录已不存在：${request.cwd}`);
+  if (pathStat.isSymbolicLink() || !pathStat.isDirectory()) {
+    throw new Error(`不是独立的 git worktree，无法合并：${request.cwd}`);
+  }
+  const path = await realpath(requestedPath);
+  if (path !== requestedPath) {
+    throw new Error(`隔离工作区路径已更换，拒绝合并：${request.cwd}`);
+  }
+  const topLevel = await gitDirectory(path, "--show-toplevel", timeoutMs, signal);
+  const gitDir = await gitDirectory(path, "--git-dir", timeoutMs, signal);
+  const commonDir = await gitDirectory(path, "--git-common-dir", timeoutMs, signal);
+  if (topLevel !== path || gitDir === commonDir) {
+    throw new Error(`不是独立的 git worktree，无法合并：${request.cwd}`);
+  }
+  const branchResult = await runCommand(
+    ["git", "-C", path, "branch", "--show-current"],
+    { timeoutMs, ...(signal === undefined ? {} : { signal }) },
+  );
+  if (!branchResult) throw new Error(`无法执行 git，无法核对隔离工作区分支：${request.cwd}`);
+  if (branchResult.timedOut) throw new Error(`核对隔离工作区分支超时：${request.cwd}`);
+  if (branchResult.aborted) throw new Error(`核对隔离工作区分支已取消：${request.cwd}`);
+  if (branchResult.exitCode !== 0) {
+    throw new Error(`核对隔离工作区分支失败：${commandFailure(branchResult)}`);
+  }
+  const branch = branchResult.stdout.trim() || null;
+  if (request.branch !== undefined && branch !== request.branch) {
+    throw new Error(`隔离工作区分支与所有权记录不匹配：${request.cwd}`);
+  }
+  if (request.repo !== undefined) {
+    const sourcePath = resolve(request.repo);
+    const sourceRoot = await realpath(sourcePath);
+    if (sourceRoot !== sourcePath) {
+      throw new Error(`来源仓库路径已更换，拒绝合并：${request.cwd}`);
+    }
+    const sourceCommonDir = await gitDirectory(sourceRoot, "--git-common-dir", timeoutMs, signal);
+    if (sourceCommonDir !== commonDir) {
+      throw new Error(`隔离工作区所属仓库与所有权记录不匹配：${request.cwd}`);
+    }
+  }
+  const identity: WorktreeMergeIdentity = {
+    requestedPath,
+    path,
+    device: pathStat.dev,
+    inode: pathStat.ino,
+    commonDir,
+    branch,
+  };
+  const current = await lstatIfPresent(requestedPath);
+  if (
+    current === null ||
+    current.isSymbolicLink() ||
+    !current.isDirectory() ||
+    current.dev !== identity.device ||
+    current.ino !== identity.inode ||
+    (await realpath(requestedPath)) !== identity.path
+  ) {
+    throw new Error(`隔离工作区路径已更换，拒绝合并：${request.cwd}`);
+  }
+  return identity;
 }
 
 async function exactWorktreePath(path: string): Promise<string> {
@@ -386,10 +494,8 @@ export function createWorktreePort(options: WorktreePortOptions): WorktreePort {
     },
 
     /**
-     * `wt merge` runs the branch checked out in the workspace into the target branch (squash,
-     * rebase, fast-forward, and removal of the worktree afterwards by default). The linked
-     * worktree check keeps a merge from ever running against the primary checkout; conflicts and
-     * pre-merge failures leave the workspace in place with a bounded reason.
+     * `wt merge` only starts after the linked worktree path, common repository, and checked-out
+     * branch have been verified against persisted ownership when available.
      */
     async merge(
       request: WorktreeMergeRequest,
@@ -399,33 +505,20 @@ export function createWorktreePort(options: WorktreePortOptions): WorktreePort {
       if (!available.available) {
         throw new Error(worktrunkUnavailableText());
       }
-      const present = await stat(request.cwd).then(
-        () => true,
-        () => false,
-      );
-      if (!present) {
-        throw new Error(`隔离工作区目录已不存在：${request.cwd}`);
-      }
-      const linked = await isLinkedWorktree(request.cwd, {
-        timeoutMs: removeTimeoutMs,
-        ...(signal === undefined ? {} : { signal }),
-      });
-      if (!linked) {
-        throw new Error(`不是独立的 git worktree，无法合并：${request.cwd}`);
-      }
-      const commonDir = await gitDirectory(request.cwd, "--git-common-dir", mergeTimeoutMs, signal);
+      const identity = await inspectWorktreeForMerge(request, removeTimeoutMs, signal);
       const summary = await worktrunkMerge({
         command: available.command,
-        cwd: request.cwd,
+        cwd: identity.path,
         request,
         timeoutMs: mergeTimeoutMs,
+        waitForRemovedWorktree: (context) => waitForWorktreeRemoval(identity, context),
         ...(signal === undefined ? {} : { signal }),
       });
       const targetRef = summary.target.startsWith("refs/heads/")
         ? summary.target
         : `refs/heads/${summary.target}`;
       const targetHead = await runCommand(
-        ["git", "--git-dir", commonDir, "rev-parse", "--verify", "--end-of-options", targetRef],
+        ["git", "--git-dir", identity.commonDir, "rev-parse", "--verify", "--end-of-options", targetRef],
         { timeoutMs: mergeTimeoutMs, ...(signal === undefined ? {} : { signal }) },
       );
       if (!targetHead || targetHead.timedOut || targetHead.aborted || targetHead.exitCode !== 0) {
@@ -436,6 +529,23 @@ export function createWorktreePort(options: WorktreePortOptions): WorktreePort {
       const commit = targetHead.stdout.trim();
       if (commit.length === 0) throw new Error(`合并后 Git 未返回目标提交：${targetRef}`);
       return { ...summary, commit };
+    },
+
+    async recoverMergeProcess(identity: WorktreeMergeProcessIdentity): Promise<boolean> {
+      if (
+        process.platform === "win32" ||
+        identity.pid !== identity.pgid ||
+        !isSafeGroupId(identity.pgid) ||
+        identity.identity.length === 0
+      ) {
+        return false;
+      }
+      if (!groupAlive(identity.pgid)) return true;
+      const snapshot = await queryProcess(identity.pid);
+      if (!snapshot || snapshot.pgid !== identity.pgid || snapshot.identity !== identity.identity) {
+        return false;
+      }
+      return terminateProcessGroup(identity.pgid, 1_000);
     },
 
     async remove(
