@@ -20,7 +20,7 @@
 | 权限门 | `handleInbound` → `isAllowed` | SQLite 本地判定；群 owner 免@ 冷缓存时多一次 `GET /v1/bot/groups/{no}/mention_pref`（60s 缓存），通常 <0.3s |
 | 待回答问题判定 | `answerPendingQuestion` | SQLite，快 |
 | 消息组装（唯一组装点） | `materializeInbound` | 纯文本零成本；**含附件时逐条下载+语音转写：单条超时 60s、整消息预算 120s（`ATTACHMENT_DOWNLOAD_BUDGET_MS`），期间没有任何 typing** |
-| 接受与调度 | `acceptTask` → `scheduleTask` | 绑定重解析（本地）、SQLite 事务、目录租约与聊天串行链；空闲时 <0.1s，忙时排队 |
+| 接受与调度 | `acceptTask` → `scheduleTask` | 绑定重解析（本地）、SQLite 事务、聊天串行链与精确 session 租约；独立 session 不因目录或 shared 资源归属排队；显式破坏操作按实际资源占用保护 |
 | 任务开始 | `runTask` 入口 | `markStarted` 后 `startTyping()` 发出**首个** typing POST；随后才是群说明读取、session 目录、**worker 创建**、history sync、prompt。**worker 启动不延后 typing（startTyping 已先于 worker 创建）** |
 | 服务端节流 | 上游 `Mininglamp-OSS/octo-server` `modules/bot_api/typing.go` | 按 (robot, channel_id, channel_type) 记 `typing_start`/`typing_count`（Redis，各 TTL 180s）：窗口开启后 ≤90s 内每个 POST 都派发 CMDTyping；90s 后静默丢弃（HTTP 仍 200）；开键过期（距开窗 180s）才允许新窗口，每计数周期至多 3 个窗口。**密集多轮会话（回合间隔约 90–180s）时后一回合的 typing 最长约 90s 不显示，这是「等待一会才出现」的最常见来源；bot 侧不可绕行、不可观测** |
 | 客户端显示 | 上游 `Mininglamp-OSS/octo-web` `TypingManager.tsx` / `module.tsx` | CMD 监听器 `cmd=="typing"` → `addTyping` 即时显示；每条 typing 状态 8s 自灭（`Typing.start` `setTimeout 8s`），重复 CMD `restart` 续期；**同会话任意新消息到达即清除 typing**；回前台/重连 `resetAll` 全清 |

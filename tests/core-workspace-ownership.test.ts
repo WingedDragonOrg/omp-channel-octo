@@ -364,7 +364,7 @@ test("/new and /move preserve workspace ownership while explicit cwd changes det
   }
 });
 
-test("an unconfirmed worker inside one shared project blocks tasks in sibling projects after restart", async () => {
+test("an unconfirmed worker inside one shared project blocks only overlapping tasks after restart", async () => {
   const root = await mkdtemp(join(tmpdir(), "omp-core-workspace-blocked-"));
   let harness: CoreHarness | undefined;
   const target: ThreadTarget = { channelId: "group-tools____thread-blocked", channelType: 5 };
@@ -381,13 +381,14 @@ test("an unconfirmed worker inside one shared project blocks tasks in sibling pr
   const projectA = await realpath(projectAPath);
   const projectASource = await realpath(projectASourcePath);
   const projectB = await realpath(projectBPath);
-  const task = taskRow(target, "blocked-project-task", projectB);
+  const task = taskRow(target, "blocked-project-task", projectASource);
+  const laterTask = taskRow(laterTarget, "persisted-independent-project-task", projectB);
   const binding: BindingRecord = {
     botUid: bot.uid,
     channelId: target.channelId,
     channelType: 5,
     sessionId: task.sessionId,
-    cwd: projectB,
+    cwd: projectASource,
     sessionFile: null,
     cwdPinned: true,
   };
@@ -395,8 +396,8 @@ test("an unconfirmed worker inside one shared project blocks tasks in sibling pr
     botUid: bot.uid,
     channelId: laterTarget.channelId,
     channelType: 5,
-    sessionId: "later-project-session",
-    cwd: projectA,
+    sessionId: laterTask.sessionId,
+    cwd: projectB,
     sessionFile: null,
     cwdPinned: true,
   };
@@ -421,19 +422,19 @@ test("an unconfirmed worker inside one shared project blocks tasks in sibling pr
         state: "running",
       });
       seedQueuedTask(store, task);
+      seedQueuedTask(store, laterTask);
     });
 
     const workers = new FakeWorkerFactory();
     workers.recovered = false;
     harness = await createCoreHarness({ root, bot, workers });
     await waitForStatus(harness.service, target, (status) => status.queued === 1);
-    await harness.service.handleInbound(ownerMessage(harness, laterTarget, "blocked-project-later", "later work"));
-    await waitForStatus(harness.service, laterTarget, (status) => status.queued === 1);
+    await waitForStatus(harness.service, laterTarget, (status) => status.state === "completed");
 
-    expect(workers.prompts).toHaveLength(0);
+    expect(workers.prompts.map(({ text }) => text)).toEqual(["task persisted-independent-project-task"]);
     expect(await withStore(root, (store) => store.getTask(task.id)?.state)).toBe("queued");
-    expect(await withStore(root, (store) => store.getLatestTask(bot.uid, laterTarget)?.state)).toBe("queued");
-    expect(await withStore(root, (store) => store.listQueuedTasks())).toHaveLength(2);
+    expect(await withStore(root, (store) => store.getLatestTask(bot.uid, laterTarget)?.state)).toBe("completed");
+    expect(await withStore(root, (store) => store.listQueuedTasks())).toEqual([expect.objectContaining({ id: task.id })]);
   } finally {
     if (harness) await closeCoreHarness(harness);
     else await rm(root, { recursive: true, force: true });

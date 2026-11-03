@@ -18,13 +18,14 @@ import {
 import { SessionLifecycle, threadWorkspaceIsAvailable } from "./session/session-lifecycle.ts";
 import {
   TaskScheduler,
-  type CommandSessionReservation,
+  resourcePathsRelated,
+  type DestructiveCommandReservation,
   type CommitLease,
   type SessionLease,
 } from "./tasks/task-scheduler.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, rm } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
   ATTACHMENT_MAX_AGE_MS,
   sweepAttachments,
@@ -54,9 +55,11 @@ import type {
   WorkerGoalRun,
   WorktreeMergeLifecycle,
   WorktreeMergeOutcome,
+  WorktreeMergePlan,
   WorktreeMergeProcessIdentity,
   WorktreeRemovalLifecycle,
   WorktreeRemovalStep,
+  WorktreeMergeRequest,
   WorkerOptions,
   WorktreeMergeSummary,
 } from "./contracts.ts";
@@ -443,7 +446,6 @@ class CoreService implements ChannelService {
       store: this.store,
       botUid: () => this.bot?.uid,
       stopping: () => this.stopping,
-      hasRuntimeInDirectory: cwd => this.hasRuntimeInDirectory(cwd),
       isDirectoryBlocked: cwd => this.isWorkspaceDirectoryBlocked(cwd),
       reconcileBinding: (taskId, target, binding) =>
         this.reconcileTaskBinding(taskId, target, binding),
@@ -695,7 +697,7 @@ class CoreService implements ChannelService {
           }
           continue;
         }
-        this.blockedDirectories.add(lease.cwd);
+        for (const resourceCwd of lease.resourceCwds) this.blockedDirectories.add(resourceCwd);
         const processIdentity = this.hostMergeProcessIdentity(lease);
         if (processIdentity && this.options.worktrees?.recoverMergeProcess) {
           let stopped = false;
@@ -1220,10 +1222,8 @@ class CoreService implements ChannelService {
   }
 
   private isWorkspaceDirectoryBlocked(cwd: string): boolean {
-    const requestedDirectories = this.store.workspaceDirectories(cwd);
     for (const blockedCwd of this.blockedDirectories) {
-      const blockedDirectories = this.store.workspaceDirectories(blockedCwd);
-      if (blockedDirectories.some((directory) => requestedDirectories.includes(directory))) return true;
+      if (resourcePathsRelated(cwd, blockedCwd)) return true;
     }
     return false;
   }
@@ -1360,16 +1360,6 @@ class CoreService implements ChannelService {
     return false;
   }
 
-  /** 该 cwd 是否与进程内任一运行任务共享工作区资源。 */
-  private hasRuntimeInDirectory(cwd: string): boolean {
-    const requested = new Set(this.store.workspaceDirectories(cwd));
-    for (const runtime of this.runtimes.values()) {
-      if (this.store.workspaceDirectories(runtime.cwd).some((directory) => requested.has(directory))) {
-        return true;
-      }
-    }
-    return false;
-  }
 
   /** The chat's task whose OMP prompt is currently in flight, if any. */
   private runningRuntime(target: ChatTarget): RuntimeTask | undefined {
@@ -2719,7 +2709,7 @@ class CoreService implements ChannelService {
       );
       return;
     }
-    const commandReservation = this.scheduler.reserveCommandSession(message, [binding.cwd]);
+    const commandReservation = this.scheduler.reserveDestructiveCommandSession(message, [binding.cwd]);
     const workspace = await this.resolveCommitWorkspace(message, binding).catch((error: unknown) => {
       commandReservation.release();
       throw error;
@@ -3285,7 +3275,7 @@ class CoreService implements ChannelService {
   private async acquireThreadMergeLease(
     target: ChatTarget,
     expectedBinding: BindingRecord,
-    reservation: CommandSessionReservation,
+    reservation: DestructiveCommandReservation,
     signal: AbortSignal,
   ): Promise<SessionLease> {
     const botUid = this.bot?.uid;
@@ -3335,7 +3325,8 @@ class CoreService implements ChannelService {
   private createHostMergeLifecycle(
     target: ChatTarget,
     cwd: string,
-    sourceId?: string,
+    sourceId: string | undefined,
+    resourceCwds: readonly string[],
     commandContext?: {
       readonly commandText: string;
       readonly operatorNote: string;
@@ -3371,12 +3362,13 @@ class CoreService implements ChannelService {
         settle: () => this.store.settleHostMergeLease(existing.id),
         onNotSpawned: () => {},
         onUnknown: () => {
-          this.blockedDirectories.add(existing.cwd);
+          for (const resourceCwd of existing.resourceCwds) this.blockedDirectories.add(resourceCwd);
           if (existing.phase !== "unknown") this.store.markHostMergeLeaseUnknown(existing.id);
         },
       };
     }
     const id = randomUUID();
+    const plannedResources = [...resourceCwds];
     let reserved = false;
     let confirmedExit = false;
     let outcomePersisted = false;
@@ -3398,6 +3390,7 @@ class CoreService implements ChannelService {
           target,
           sourceId,
           cwd,
+          resourceCwds: plannedResources,
           ...commandContext,
         });
         reserved = true;
@@ -3432,7 +3425,7 @@ class CoreService implements ChannelService {
       },
       onUnknown: () => {
         if (!reserved || outcomePersisted) return;
-        this.blockedDirectories.add(cwd);
+        for (const resourceCwd of plannedResources) this.blockedDirectories.add(resourceCwd);
         this.store.markHostMergeLeaseUnknown(id);
       },
     };
@@ -3458,34 +3451,73 @@ class CoreService implements ChannelService {
     if (shutdownSignal.aborted) abortOnShutdown();
     else shutdownSignal.addEventListener("abort", abortOnShutdown, { once: true });
 
-    const reservation = this.scheduler.reserveCommandSession(message, [expectedBinding.cwd]);
-    const lifecycle = this.createHostMergeLifecycle(message, expectedBinding.cwd, message.messageId, {
-      commandText: safeDisplayText(message.text, 800) ?? "/thread merge",
-      operatorNote: safeDisplayText(operatorNote, 200) ?? "",
-      senderId: message.senderId,
-      messageSeq: message.messageSeq,
-      receiptOutboxId,
-    }, () => {
-      const current = this.store.getBinding(botUid, message);
-      if (
-        !current
-        || current.cwdPinned !== true
-        || current.cwd !== expectedBinding.cwd
-        || current.sessionId !== expectedBinding.sessionId
-      ) {
-        throw new Error("合并执行前子区绑定已变更，未执行合并。");
-      }
-      this.store.completeCommand(this.commandClaim(message, "thread"));
-    });
+    let reservation: DestructiveCommandReservation | undefined;
     let lease: SessionLease | undefined;
     try {
-      lease = await this.acquireThreadMergeLease(
+      const prior = this.store.getHostMergeLeaseBySourceId(botUid, message, message.messageId);
+      let plan: WorktreeMergePlan | undefined;
+      let resourceCwds: readonly string[];
+      if (prior?.outcome !== undefined && prior.outcome !== null) {
+        resourceCwds = prior.resourceCwds;
+      } else {
+        reservation = this.scheduler.reserveDestructiveCommandSession(message, [expectedBinding.cwd]);
+        const worktrees = this.options.worktrees;
+        if (!worktrees) throw new Error("本部署未配置隔离工作区能力");
+        const request: WorktreeMergeRequest = { cwd: expectedBinding.cwd };
+        const ownership = this.store.getThreadWorkspace(botUid, message);
+        if (ownership !== null) {
+          const project = ownership.projects.find(
+            (candidate) =>
+              candidate.created
+              && candidate.path === expectedBinding.cwd
+              && candidate.branch !== null,
+          );
+          if (!project || project.branch === null) {
+            throw new Error("当前子区隔离工作区与持久化所有权不匹配，无法合并");
+          }
+          request.repo = project.repo;
+          request.branch = project.branch;
+        }
+        plan = await worktrees.planMerge(request, controller.signal);
+        resourceCwds = plan.cwds;
+        reservation.extend(resourceCwds);
+      }
+
+      const lifecycle = this.createHostMergeLifecycle(
         message,
-        expectedBinding,
-        reservation,
-        controller.signal,
+        expectedBinding.cwd,
+        message.messageId,
+        resourceCwds,
+        {
+          commandText: safeDisplayText(message.text, 800) ?? "/thread merge",
+          operatorNote: safeDisplayText(operatorNote, 200) ?? "",
+          senderId: message.senderId,
+          messageSeq: message.messageSeq,
+          receiptOutboxId,
+        },
+        () => {
+          const current = this.store.getBinding(botUid, message);
+          if (
+            !current
+            || current.cwdPinned !== true
+            || current.cwd !== expectedBinding.cwd
+            || current.sessionId !== expectedBinding.sessionId
+          ) {
+            throw new Error("合并执行前子区绑定已变更，未执行合并。");
+          }
+          this.store.completeCommand(this.commandClaim(message, "thread"));
+        },
       );
-      const coveredDirectories = new Set(this.store.workspaceDirectories(expectedBinding.cwd));
+
+      if (reservation !== undefined) {
+        lease = await this.acquireThreadMergeLease(
+          message,
+          expectedBinding,
+          reservation,
+          controller.signal,
+        );
+      }
+      const coveredResources = new Set(resourceCwds.map((cwd) => resolve(cwd)));
       const host: ThreadMergeHost = {
         botUid,
         store: this.store,
@@ -3502,13 +3534,11 @@ class CoreService implements ChannelService {
             receiptOutboxIds: [receiptOutboxId],
           });
         },
-        tryAcquireDirectories: async (cwds) => {
-          const requestedDirectories = new Set(
-            cwds.flatMap((cwd) => this.store.workspaceDirectories(cwd)),
-          );
+        tryAcquireResources: async (cwds) => {
+          const requestedResources = cwds.map((cwd) => resolve(cwd));
           if (
-            requestedDirectories.size === 0
-            || [...requestedDirectories].some((cwd) => !coveredDirectories.has(cwd))
+            requestedResources.length === 0
+            || requestedResources.some((cwd) => !coveredResources.has(cwd))
           ) {
             return undefined;
           }
@@ -3517,7 +3547,7 @@ class CoreService implements ChannelService {
       };
       let summary: WorktreeMergeSummary & { archive?: "scheduled" };
       try {
-        summary = await mergeThreadWorkspace(host, message, {}, controller.signal);
+        summary = await mergeThreadWorkspace(host, message, {}, controller.signal, plan);
       } catch (error) {
         lifecycle.onUnknown();
         this.pendingHostMergeArchives.delete(targetKeyValue);
@@ -3533,7 +3563,7 @@ class CoreService implements ChannelService {
       );
       return summary;
     } finally {
-      reservation.release();
+      reservation?.release();
       lease?.complete();
       shutdownSignal.removeEventListener("abort", abortOnShutdown);
       // The controller stays active until handleCommand has durably accepted the receipt or repair.
@@ -3607,7 +3637,11 @@ class CoreService implements ChannelService {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
       }
-      sessionLease = await this.scheduler.tryAcquireCommandSession(message, repositoryCwds, resourcePaths);
+      sessionLease = await this.scheduler.tryAcquireDestructiveCommandSession(
+        message,
+        repositoryCwds,
+        resourcePaths,
+      );
       if (!sessionLease) {
         return { kind: "refused", message: "当前子区或其工作区资源正被任务占用；清理命令已立即拒绝，未排队。" };
       }
@@ -3925,10 +3959,10 @@ class CoreService implements ChannelService {
       replayThreadMergeSuccess: (target, operationId) =>
         this.replayThreadMergeSuccess(target, operationId),
       threadArchiveGeneration: (target) => this.threadArchives.generation(target),
-      worktreeMergeLifecycle: (target, cwd, sourceId) =>
-        this.createHostMergeLifecycle(target, cwd, sourceId),
-      tryAcquireWorkspaceDirectories: (cwds, task) =>
-        this.scheduler.tryAcquireWorkspaceDirectories(cwds, task),
+      worktreeMergeLifecycle: (target, cwd, sourceId, resourceCwds) =>
+        this.createHostMergeLifecycle(target, cwd, sourceId, resourceCwds),
+      tryAcquireDestructiveResources: (cwds, task) =>
+        this.scheduler.tryAcquireDestructiveResources(cwds, task),
       deliverToChat: async (message) => {
         if (await this.threadWorkspaceIncomplete(message)) {
           throw new Error("子区工作区未就绪，未派发任务。");

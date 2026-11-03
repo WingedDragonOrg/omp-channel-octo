@@ -8,7 +8,7 @@ import type {
 } from "../contracts.ts";
 import type { ChannelStore } from "../store/index.ts";
 import type { ThreadWorkspaceRecord } from "../store/store-records.ts";
-import type { DirectoryLease } from "../tasks/task-scheduler.ts";
+import type { DestructiveResourceLease } from "../tasks/task-scheduler.ts";
 
 function isAborted(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
@@ -20,7 +20,7 @@ export interface ThreadWorkspaceCleanupOptions {
   readonly worktrees: WorktreePort | undefined;
   readonly force: boolean;
   readonly deleteBranch: boolean;
-  readonly lease: DirectoryLease;
+  readonly lease: DestructiveResourceLease;
   readonly signal?: AbortSignal;
   readonly lifecycle?: (
     project: ThreadWorkspaceRecord["projects"][number],

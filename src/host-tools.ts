@@ -20,7 +20,7 @@ import { isTransientServerFailure } from "./errors.ts";
 import type { ChannelStore } from "./store/index.ts";
 import type { TaskRecord } from "./store/store-records.ts";
 import type { ThreadWorkspaceRecord } from "./store/store-records.ts";
-import type { DirectoryLease } from "./tasks/task-scheduler.ts";
+import type { DestructiveResourceLease } from "./tasks/task-scheduler.ts";
 import { threadWorkspaceIsAvailable } from "./session/session-lifecycle.ts";
 import {
   createThreadWorkspaceBatch,
@@ -63,7 +63,8 @@ export interface HostToolHost {
   readonly worktreeMergeLifecycle?: (
     target: ChatTarget,
     cwd: string,
-    sourceId?: string,
+    sourceId: string | undefined,
+    resourceCwds: readonly string[],
   ) => WorktreeMergeLifecycle;
   readonly store: Pick<
     ChannelStore,
@@ -86,10 +87,10 @@ export interface HostToolHost {
     | "suppressTaskRelay"
     | "listThreadWorkspaces"
   >;
-  tryAcquireWorkspaceDirectories(
+  tryAcquireDestructiveResources(
     cwds: readonly string[],
     task: TaskRecord,
-  ): Promise<DirectoryLease | undefined>;
+  ): Promise<DestructiveResourceLease | undefined>;
   /** 任务必然属于已注册的 Bot，构造工具时身份一定存在。 */
   readonly botUid: string;
   enqueueText(target: ChatTarget, text: string, taskId: string | null): void;
@@ -794,8 +795,13 @@ async function runManagementTool(
             ...(host.worktreeMergeLifecycle === undefined
               ? {}
               : {
-                  worktreeMergeLifecycle: (mergeTarget, cwd, sourceId) => {
-                    const lifecycle = host.worktreeMergeLifecycle!(mergeTarget, cwd, sourceId);
+                  worktreeMergeLifecycle: (mergeTarget, cwd, sourceId, resourceCwds) => {
+                    const lifecycle = host.worktreeMergeLifecycle!(
+                      mergeTarget,
+                      cwd,
+                      sourceId,
+                      resourceCwds,
+                    );
                     onWorktreeMergeLifecycle?.(lifecycle);
                     return lifecycle;
                   },
@@ -806,7 +812,7 @@ async function runManagementTool(
             archiveGeneration: () => host.threadArchiveGeneration(workspaceTarget),
             planThreadArchive: (archiveTarget, archiveGroupId, shortId, generation) =>
               host.planThreadArchive(archiveTarget, archiveGroupId, shortId, generation),
-            tryAcquireDirectories: (cwds) => host.tryAcquireWorkspaceDirectories(cwds, task),
+            tryAcquireResources: (cwds) => host.tryAcquireDestructiveResources(cwds, task),
           },
           workspaceTarget,
           mergeRequest(),
@@ -891,7 +897,7 @@ async function cleanupThreadWorkspace(
 
   const binding = host.store.getBinding(host.botUid, target);
   if (!binding || binding.cwdPinned !== true || !host.worktrees) return null;
-  const lease = await host.tryAcquireWorkspaceDirectories([binding.cwd], task);
+  const lease = await host.tryAcquireDestructiveResources([binding.cwd], task);
   if (!lease) return "工作区正被其他任务使用，资源已保留";
   try {
     await lease.ready;
@@ -915,8 +921,18 @@ async function cleanupOwnedThreadWorkspace(
   force: boolean,
   signal?: AbortSignal,
 ): Promise<string | null> {
+  ownership.status = "failed";
+  ownership.error = "线程已删除；本地工作区清理尚未完成";
+  try {
+    host.store.saveThreadWorkspace(ownership);
+  } catch (error) {
+    return `清理前无法持久化工作区状态，资源已保留：${boundedManagementError(error, "存储失败")}`;
+  }
+
   const ownedPaths = threadWorkspaceCleanupPaths(ownership, false);
-  const lease = await host.tryAcquireWorkspaceDirectories(ownedPaths, task);
+  const lease = ownedPaths.length === 0
+    ? { ready: Promise.resolve(), complete() {} }
+    : await host.tryAcquireDestructiveResources(ownedPaths, task);
   if (!lease) return "工作区正被其他任务使用，资源已保留";
   const result = await cleanupOwnedWorkspace({
     ownership,

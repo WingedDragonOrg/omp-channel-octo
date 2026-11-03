@@ -55,6 +55,7 @@ test("legacy channel databases create durable host merge lease storage", async (
         target: { channelType: 5, channelId: "group-legacy____thread-legacy" },
         sourceId: "legacy-command-message",
         cwd: "/work/legacy-thread",
+        resourceCwds: ["/work/legacy-thread"],
       });
       expect(store.getOwnerId("bot-existing")).toBe("owner-existing");
       expect(store.listHostMergeLeases("bot-legacy")).toMatchObject([{
@@ -69,6 +70,7 @@ test("legacy channel databases create durable host merge lease storage", async (
         sourceId: "legacy-source",
         phase: "unknown",
         cwd: "/work/existing-thread",
+        resourceCwds: ["/work/existing-thread"],
       }]);
     } finally {
       store.close();
@@ -114,6 +116,7 @@ test("host merge outcome survives restart until delivery settles the lease", asy
         target: { channelType: 5, channelId: "group-merge____thread" },
         sourceId: "merge-command",
         cwd: "/work/merge-thread",
+        resourceCwds: ["/work/merge-thread", "/work/target-checkout"],
         commandText: "/thread merge preserve note token=[redacted]",
         operatorNote: "preserve note",
         senderId: "owner-1",
@@ -147,6 +150,7 @@ test("host merge outcome survives restart until delivery settles the lease", asy
         pid: 43001,
         pgid: 43001,
         processIdentity: "pid=43001;start=Wed Jun 10 12:00:00 2026",
+        resourceCwds: ["/work/merge-thread", "/work/target-checkout"],
         outcome: { kind: "succeeded", summary: { branch: "thread-branch", removed: true, commit: "actual-target-commit" } },
       }]);
     } finally {
@@ -176,6 +180,7 @@ test("host merge outcome survives restart until delivery settles the lease", asy
         target: { channelType: 5, channelId: "group-merge____thread" },
         sourceId: "unknown-command",
         cwd: "/work/merge-thread",
+        resourceCwds: ["/work/merge-thread"],
       });
       restarted.markHostMergeLeaseUnknown("unknown-host-merge-operation");
       expect(restarted.listHostMergeLeases("bot-merge")).toMatchObject([{ phase: "unknown" }]);
@@ -199,6 +204,7 @@ test("a confirmed pre-execution process exit can release a running lease, but un
         target: { channelType: 5, channelId: "group-parked____thread" },
         sourceId: "parked-merge-call",
         cwd: "/work/parked-thread",
+        resourceCwds: ["/work/parked-thread"],
       });
       store.recordHostMergeProcess("parked-host-merge", {
         pid: 43002,
@@ -214,6 +220,7 @@ test("a confirmed pre-execution process exit can release a running lease, but un
         target: { channelType: 5, channelId: "group-parked____thread" },
         sourceId: "unknown-merge-call",
         cwd: "/work/parked-thread",
+        resourceCwds: ["/work/parked-thread"],
       });
       store.markHostMergeLeaseUnknown("unknown-host-merge");
       expect(() => store.completeHostMergeLease("unknown-host-merge", "not-spawned")).toThrow();

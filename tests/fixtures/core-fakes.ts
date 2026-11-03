@@ -49,6 +49,7 @@ import type {
   WorkerModelSwitch,
   WorkerOptions,
   WorkerProcess,
+  WorktreeMergePlan,
   WorktreeMergeRequest,
   WorktreeMergeSummary,
   WorktreePort,
@@ -1622,6 +1623,12 @@ export class FakeWorktrees implements WorktreePort {
   removeFailure: Error | undefined;
   /** What `remove` reports; `missing` models a workspace that is already gone. */
   removal: WorktreeRemovalOutcome = { kind: "removed", via: "wt", branchOutcome: "deleted" };
+  /** Explicit plan fixture: omitted targets resolve to this wt-default branch. */
+  mergeDefaultTarget = "main";
+  /** Explicit checked-out target path; absent means the target has no other checkout. */
+  mergeTargetPath: string | undefined;
+  /** When set, `planMerge` rejects instead of producing a target path plan. */
+  mergePlanFailure: Error | undefined;
 
   constructor(private readonly root: string) {}
 
@@ -1635,6 +1642,17 @@ export class FakeWorktrees implements WorktreePort {
     onPlanned?.({ cwd, branch, repo });
     await mkdir(cwd, { recursive: true });
     return { cwd: await realpath(cwd), branch };
+  }
+
+  async planMerge(request: WorktreeMergeRequest): Promise<WorktreeMergePlan> {
+    if (this.mergePlanFailure) throw this.mergePlanFailure;
+    const sourcePath = await realpath(request.cwd);
+    const cwds = [sourcePath];
+    if (this.mergeTargetPath !== undefined) {
+      const targetPath = await realpath(this.mergeTargetPath);
+      if (!cwds.includes(targetPath)) cwds.push(targetPath);
+    }
+    return { target: request.target ?? this.mergeDefaultTarget, cwds };
   }
 
   async merge(request: WorktreeMergeRequest): Promise<WorktreeMergeSummary> {

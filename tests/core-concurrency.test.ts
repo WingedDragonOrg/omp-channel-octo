@@ -154,6 +154,87 @@ test("different sessions in the same normalized directory run concurrently", asy
   }
 });
 
+// A workspace ownership record must not turn independent sessions into directory writers.
+for (const scenario of [
+  { name: "parent runs before child", first: "parent", second: "api", parentFirst: true },
+  { name: "child runs before parent", first: "api", second: "parent", parentFirst: false },
+  { name: "sibling projects", first: "api", second: "web", parentFirst: false },
+  { name: "shared entry and project", first: "entry", second: "api", parentFirst: false },
+  { name: "same owned cwd", first: "api", second: "api", parentFirst: false },
+  { name: "project and descendant", first: "api", second: "src", parentFirst: false },
+] as const) {
+  test(`independent workspace sessions finish concurrently: ${scenario.name}`, async () => {
+    const started = deferred();
+    const release = deferred();
+    const secondFinished = deferred();
+    const harness = await createCoreHarness({
+      prompt: async ({ append, emit, text }) => {
+        if (text === "held work") {
+          await append("effects.log", "held:start\n");
+          started.resolve();
+          await release.promise;
+          await append("effects.log", "held:end\n");
+        } else {
+          await append("effects.log", "independent:done\n");
+          emit(assistantText("independent-reply", "independent completed", true));
+          secondFinished.resolve();
+        }
+      },
+    });
+    const parent = { channelType: 2 as const, channelId: "group-tools" };
+    const child = { channelType: 5 as const, channelId: "group-tools____owned" };
+    const sibling = { channelType: 5 as const, channelId: "group-tools____other" };
+    const first = scenario.parentFirst ? parent : child;
+    const second = scenario.second === "parent" ? parent : sibling;
+    const paths = {
+      parent: join(harness.root, "repos"),
+      entry: join(harness.root, "repos", "shared"),
+      api: join(harness.root, "repos", "shared", "api"),
+      web: join(harness.root, "repos", "shared", "web"),
+      src: join(harness.root, "repos", "shared", "api", "src"),
+    };
+    let store: ChannelStore | undefined;
+    const message = (target: ChatTarget, messageId: string, text: string) =>
+      inbound({ ...target, messageId, text, mentionedUserIds: [harness.bot.uid] });
+    try {
+      await mkdir(paths.src, { recursive: true });
+      await mkdir(paths.web, { recursive: true });
+      await harness.service.handleInbound(message(first, "bind-held", `/new ${paths[scenario.first]}`));
+      await harness.service.handleInbound(message(second, "bind-independent", `/new ${paths[scenario.second]}`));
+      store = await openChannelStore(harness.stateDir);
+      store.saveThreadWorkspace({
+        botUid: harness.bot.uid,
+        ...child,
+        layout: "shared",
+        status: "ready",
+        entryPath: paths.entry,
+        projects: [
+          { name: "api", repo: paths.parent, path: paths.api, branch: "api", created: true },
+          { name: "web", repo: paths.parent, path: paths.web, branch: "web", created: true },
+        ],
+        error: null,
+      });
+      await harness.service.handleInbound(message(first, "held-task", "held work"));
+      await within(started.promise, "held worker prompt");
+      await harness.service.handleInbound(message(second, "independent-task", "independent work"));
+      await within(secondFinished.promise, "independent worker effects before held worker exits");
+      await within(
+        waitForStatus(harness.service, second, status => status.state === "completed"),
+        "independent completion",
+      );
+      expect(await readText(join(paths[scenario.second], "effects.log"))).toContain("independent:done\n");
+      expect(await readText(join(paths[scenario.first], "effects.log"))).not.toContain("held:end");
+      await waitForReplies(harness, second, "independent completed");
+      expect(harness.workers.prompts[0]?.sessionId).not.toBe(harness.workers.prompts[1]?.sessionId);
+    } finally {
+      release.resolve();
+      await waitForTerminalTasks(harness, [first, second]);
+      store?.close();
+      await closeCoreHarness(harness);
+    }
+  });
+}
+
 test("tasks in one chat remain queued in arrival order", async () => {
   const firstStarted = deferred();
   const releaseFirst = deferred();

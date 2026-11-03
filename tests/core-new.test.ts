@@ -289,3 +289,79 @@ test("/new keeps its receipt model-free when OMP reports no current model", asyn
     await closeCoreHarness(harness);
   }
 });
+test("/new in a shared workspace does not wait for a held task in another project", async () => {
+  const heldStarted = Promise.withResolvers<void>();
+  const releaseHeld = Promise.withResolvers<void>();
+  const harness = await createCoreHarness({
+    prompt: async ({ text }) => {
+      if (text === "hold owned project") {
+        heldStarted.resolve();
+        await releaseHeld.promise;
+      }
+    },
+  });
+  const first = { channelId: "group-tools____owned-new-api", channelType: 5 as const };
+  const second = { channelId: "group-tools____owned-new-web", channelType: 5 as const };
+  const entry = join(harness.root, "shared-workspace");
+  const api = join(entry, "api");
+  const web = join(entry, "web");
+  try {
+    await mkdir(api, { recursive: true });
+    await mkdir(web, { recursive: true });
+    for (const [target, path, messageId] of [
+      [first, api, "owned-new-api"],
+      [second, web, "owned-new-web"],
+    ] as const) {
+      await harness.service.handleInbound(inbound({
+        messageId,
+        ...target,
+        text: `/new ${path}`,
+        mentionedUserIds: [harness.bot.uid],
+      }));
+    }
+    const store = await openChannelStore(harness.stateDir);
+    try {
+      store.saveThreadWorkspace({
+        botUid: harness.bot.uid,
+        ...first,
+        layout: "shared",
+        status: "ready",
+        entryPath: entry,
+        projects: [
+          { name: "api", repo: harness.root, path: api, branch: "api", created: true },
+          { name: "web", repo: harness.root, path: web, branch: "web", created: true },
+        ],
+        error: null,
+      });
+    } finally {
+      store.close();
+    }
+
+    const heldTask = harness.service.handleInbound(inbound({
+      messageId: "owned-new-held",
+      ...first,
+      text: "hold owned project",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    await heldStarted.promise;
+    const previous = await harness.service.status(second);
+
+    await harness.service.handleInbound(inbound({
+      messageId: "owned-new-independent",
+      ...second,
+      text: `/new ${web}`,
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    const renewed = await harness.service.status(second);
+    expect(renewed.sessionId).not.toBe(previous.sessionId);
+    expect(renewed.cwd).toBe(web);
+    expect((await harness.service.status(first)).state).toBe("running");
+
+    releaseHeld.resolve();
+    await heldTask;
+    await waitForStatus(harness.service, first, status => status.state === "completed");
+  } finally {
+    releaseHeld.resolve();
+    await closeCoreHarness(harness);
+  }
+});

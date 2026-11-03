@@ -20,6 +20,10 @@ import {
 const GROUP_ID = "group-allowed";
 /** wt-compatible fixture; the merge stages below call real Git and do not claim to run Worktrunk. */
 const WT_PIPELINE_FIXTURE = String.raw`if [ "$1" = "--version" ]; then printf 'wt v0.80.0\n'; exit 0; fi
+if [ "$1" = "config" ] && [ "$2" = "state" ] && [ "$3" = "default-branch" ]; then
+  printf 'main\n'
+  exit 0
+fi
 [ "$1" = "merge" ] || exit 64
 branch=$(git branch --show-current)
 target=main

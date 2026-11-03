@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { isAbsolute } from "node:path";
 import type { ChatTarget, WorktreeMergeOutcome, WorktreeRemovalStep } from "../contracts.ts";
 import type {
   HostMergeLeaseInput,
@@ -67,6 +68,25 @@ function phase(value: unknown): HostMergeLeaseRecord["phase"] {
   return value === "starting" || value === "running" || value === "exited" ? value : "unknown";
 }
 
+function resourceCwds(row: Record<string, unknown>, cwd: string): string[] {
+  const encoded = asNullableString(row.resource_cwds);
+  if (encoded === null) return [cwd];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(encoded);
+  } catch {
+    throw new Error("invalid persisted host merge resource paths");
+  }
+  if (
+    !Array.isArray(parsed)
+    || parsed.length === 0
+    || parsed.some((path) => typeof path !== "string" || path.length === 0 || !isAbsolute(path))
+    || !parsed.includes(cwd)
+  ) {
+    throw new Error("invalid persisted host merge resource paths");
+  }
+  return parsed as string[];
+}
 function decodeHostMergeLease(row: Record<string, unknown>): HostMergeLeaseRecord {
   return {
     id: asString(row.id),
@@ -75,6 +95,7 @@ function decodeHostMergeLease(row: Record<string, unknown>): HostMergeLeaseRecor
     channelId: asString(row.channel_id),
     sourceId: asString(row.source_id),
     cwd: asString(row.cwd),
+    resourceCwds: resourceCwds(row, asString(row.cwd)),
     phase: phase(row.phase),
     pid: nullablePositiveInteger(row.pid),
     pgid: nullablePositiveInteger(row.pgid),
@@ -158,9 +179,13 @@ export function reserveHostMergeLease(db: Database, input: HostMergeLeaseInput):
     || input.target.channelId.length === 0
     || input.sourceId.length === 0
     || input.cwd.length === 0
+    || !Array.isArray(input.resourceCwds)
+    || input.resourceCwds.length === 0
+    || input.resourceCwds.some((path) => typeof path !== "string" || path.length === 0 || !isAbsolute(path))
+    || !input.resourceCwds.includes(input.cwd)
     || (input.messageSeq !== undefined && (!Number.isSafeInteger(input.messageSeq) || input.messageSeq < 0))
   ) {
-    throw new Error("invalid host merge lease identity");
+    throw new Error("invalid host merge lease identity or resource paths");
   }
   const existing = query(db,
     `SELECT id FROM host_merge_leases
@@ -172,16 +197,17 @@ export function reserveHostMergeLease(db: Database, input: HostMergeLeaseInput):
   const now = Date.now();
   run(db,
     `INSERT INTO host_merge_leases(
-       id, bot_uid, channel_type, channel_id, source_id, cwd, phase, pid, pgid, process_identity,
+       id, bot_uid, channel_type, channel_id, source_id, cwd, resource_cwds, phase, pid, pgid, process_identity,
        source_text, operator_note, sender_id, message_seq, receipt_outbox_id, outcome_kind, outcome_json,
        created_at, updated_at
-     ) VALUES(?, ?, 5, ?, ?, ?, 'starting', NULL, NULL, NULL, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
+     ) VALUES(?, ?, 5, ?, ?, ?, ?, 'starting', NULL, NULL, NULL, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
     [
       input.id,
       input.botUid,
       input.target.channelId,
       input.sourceId,
       input.cwd,
+      JSON.stringify(input.resourceCwds),
       input.commandText ?? null,
       input.operatorNote ?? null,
       input.senderId ?? null,

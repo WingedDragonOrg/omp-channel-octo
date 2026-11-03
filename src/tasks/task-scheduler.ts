@@ -1,14 +1,11 @@
 /**
- * 任务调度与会话/目录租约的唯一所有者：每个聊天的任务串行链、已排定任务、关停要等的在途
- * 任务、排队等待任务的启动回执，以及按 session / chat key 与按 cwd 的租约链都在这里。外部只能经
- * `scheduleTask`/`hasBlockingWork`/`reserveCommandSession`/`tryAcquireCommandSession`/
- * `tryAcquireCommandDirectories`/`tryAcquireWorkspaceDirectories`/`markWaiting`/`takeWaitingReceipt`/
- * `settle` 观察，本对象的 map 不外露。
+ * 任务调度与会话租约的唯一所有者：每个聊天的任务串行链、已排定任务、关停要等的在途
+ * 任务、排队等待任务的启动回执，以及按 session / chat key 的租约链都在这里。显式破坏性操作
+ * 另持 canonical worktree root 与精确路径的排他租约；普通任务不因 cwd 或 workspace 所有权互锁。
  *
  * 模块不依赖 `service.ts`：任务行与绑定行的读取、绑定核对、真正的执行入口（`runTask`）、
- * bot 身份与停止态、运行中任务与 blocked 集合、回执与终态通知的投递路径都按原样注入。会话
- * 租约、工作区目录租约与 blocked 集合仍然分别只有一个所有者，调度侧与绑定探测侧因此保持
- * 同一安全语义。
+ * bot 身份与停止态、运行中任务与 blocked 集合、绑定探测、回执与终态通知的投递路径都按原样注入。
+ * 会话租约、破坏性资源租约与 blocked 集合仍然分别只有一个所有者。
  */
 import type { ChatTarget } from "../contracts.ts";
 import type { Outbox } from "../outbox.ts";
@@ -16,6 +13,8 @@ import type { ChannelStore } from "../store/index.ts";
 import type { BindingRecord, TaskRecord } from "../store/store-records.ts";
 import { GENERIC_TASK_FAILURE_NOTICE } from "./task-failure.ts";
 import { targetKey, taskTarget } from "../target.ts";
+import { lstat } from "node:fs/promises";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 
 /**
  * 按 session 与聊天键的租约：任务和 `/new`、`/move` 共用对应的会话锁，聊天键还防止命令期间
@@ -26,19 +25,17 @@ export type SessionLease = {
   complete(): void;
 };
 
-/**
- * 按目录的租约：工作区命令在命令体内占据一个或多个 cwd，`ready` 在它们都空闲后兑现，
- * `complete` 恰好释放一次。租约本体（按 cwd 的 Promise 链）由 `TaskScheduler` 持有，租约不
- * 在两个模块里各存一份。
- */
-export type DirectoryLease = {
+/** Destructive path/root lock; ordinary execution never acquires one. */
+export type DestructiveResourceLease = {
   ready: Promise<void>;
   complete(): void;
 };
 
-/** A FIFO intent barrier that blocks later writes without acquiring any lease while earlier work drains. */
-export interface CommandSessionReservation {
+/** A destructive FIFO intent that blocks later writes while earlier work drains. */
+export interface DestructiveCommandReservation {
   readonly order: number;
+  /** Add exact resource paths to this FIFO intent before its first acquisition attempt. */
+  extend(cwds: readonly string[]): void;
   tryAcquire(): Promise<SessionLease | undefined>;
   release(): void;
 }
@@ -46,15 +43,24 @@ export interface CommandSessionReservation {
 interface CommandReservationRecord {
   readonly order: number;
   readonly target: ChatTarget;
-  readonly sessionKey: string;
   readonly sessionKeys: readonly string[];
-  readonly directories: readonly string[];
-  readonly repositoryCwds: readonly string[];
+  resourcePaths: readonly string[];
+  repositoryCwds: readonly string[];
+  readonly ownerTaskId?: string;
   readonly ready: Promise<void>;
   release(): void;
 }
-
-/** Exclusive Git-worktree lease held for a native commit task. */
+interface ActiveResourceUse {
+  readonly paths: readonly string[];
+  readonly roots: ReadonlySet<string>;
+}
+interface SessionLeaseOwner {
+  readonly taskId?: string;
+}
+interface ActiveResourceUse {
+  readonly paths: readonly string[];
+  readonly roots: ReadonlySet<string>;
+}
 export type CommitLease = {
   readonly root: string;
   readonly taskId: string;
@@ -74,16 +80,12 @@ export interface TaskSchedulerDeps {
     | "listQueuedTasks"
     | "getBinding"
     | "markFailed"
-    | "isWorkspaceDirectoryOwned"
-    | "workspaceDirectories"
     | "isCommitTask"
   >;
   /** 绑定行与任务行按键的 bot 身份。 */
   readonly botUid: () => string | undefined;
   /** channel 是否正在停止：停止后不再启动排定任务。 */
   readonly stopping: () => boolean;
-  /** 该 cwd 是否有进程内运行任务——`CoreService` 遍历自己的 runtimes。 */
-  readonly hasRuntimeInDirectory: (cwd: string) => boolean;
   /** 该 cwd 是否因 worker 无法确认停止而被 block。 */
   readonly isDirectoryBlocked: (cwd: string) => boolean;
   /**
@@ -109,7 +111,7 @@ export interface TaskSchedulerDeps {
     binding: BindingRecord | null,
     cwd: string,
   ) => Promise<boolean>;
-  /** 启动一个已排定任务；`cwd` 是启动前核对用的绑定目录；工作区资源已由调度租下。 */
+  /** 启动一个已排定任务；`cwd` 是启动前核对用的绑定目录。 */
   readonly runTask: (taskId: string, cwd?: string) => Promise<void>;
   /**
    * 启动门：恢复任务先占住调度序，但要等服务接线成功才真正执行。`start()` 失败时该 Promise
@@ -123,70 +125,51 @@ export interface TaskSchedulerDeps {
 }
 
 export class TaskScheduler {
-  /** 每个聊天的任务串行链：该聊天的下一个任务接在上一个（或已排定的任务）之后。 */
+  /** 每个聊天的任务串行链：该聊天的下一个任务接在上一个（或已排定任务）之后。 */
   private readonly chatTails = new Map<string, Promise<void>>();
-  /** 已排定任务操作：同 session 或同工作区资源的较早任务据此等待。 */
+  /** 已排定任务操作：同 session 的较早任务据此等待。 */
   private readonly scheduledTasks = new Map<string, Promise<void>>();
   /** 关停要等的在途任务（已排定任务的操作）。 */
   private readonly taskOperations = new Set<Promise<void>>();
-  /**
-   * Tasks accepted while their chat, session, or workspace was already busy. They get one start
-   * receipt when they finally begin, so a message that waited is distinguishable from one that
-   * started right away. In-memory only: a restart interrupts such tasks instead of starting them.
-   */
+  /** In-memory marker used to add the startup receipt to tasks that waited for their chat/session. */
   private readonly waiting = new Set<string>();
   /** Tasks and session commands share per-session and per-chat lease tails. */
   private readonly sessionTails = new Map<string, Promise<void>>();
-  /** 按 cwd 的租约链：`/new`、`/move` 与任务启动共用的工作区目录占用。 */
-  private readonly directoryTails = new Map<string, Promise<void>>();
-  /** The expanded resource keys owned by each currently executing task, for safe host-tool reuse. */
-  private readonly taskDirectoryLeases = new Map<string, ReadonlySet<string>>();
-  /** Scheduling order lets command barriers distinguish earlier tasks from later chatTails. */
+  private readonly sessionLeaseOwners = new Map<string, Set<SessionLeaseOwner>>();
+  /** Scheduling order lets command barriers distinguish earlier work from later task tails. */
   private readonly scheduledOrder = new Map<string, number>();
   private readonly commandReservations = new Set<CommandReservationRecord>();
   private nextOrder = 0;
-  /** Ordinary task roots remain shared; only a commit or host merge excludes all other writers. */
-  private readonly activeRepositoryTasks = new Map<string, string>();
+  /** Ordinary workers and session-control workers are shared resource users. */
+  private readonly activeResourceUsers = new Map<string, ActiveResourceUse>();
   private readonly exclusiveRepositoryRoots = new Map<string, { owner: string; done: Promise<void> }>();
-  private repositoryLeaseSequence = 0;
+  private readonly exclusiveResourcePaths = new Map<string, { owner: string; done: Promise<void> }>();
 
   /**
-   * True when a new task on this chat cannot start at once: the chat or its bound session is
-   * busy, or an owned workspace resource for this cwd is busy. Ordinary sessions in the same
-   * cwd remain independent, so a plain cwd does not make this true on its own.
+   * True when a new task on this chat cannot start at once: the chat/session is busy, or an
+   * explicit destructive operation owns an overlapping path. Ordinary cwd ownership is irrelevant.
    */
   hasBlockingWork(target: ChatTarget, cwd: string): boolean {
     const binding = this.bindingFor(target);
     const sessionKey = this.sessionKey(target, binding);
-    const directories = this.ownedDirectoryKeys(
-      [cwd],
-      binding?.cwdPinned === true ? binding.cwd : undefined,
-    );
-    if (
-      this.hasConflictingReservation(target, sessionKey, directories)
+    return this.hasConflictingReservation(target, sessionKey)
       || this.hasLeaseFor(target, sessionKey)
       || this.hasQueuedWork(target, sessionKey)
-    ) {
-      return true;
-    }
-    return directories.length > 0 && this.directoriesUnavailable(directories);
+      || this.hasExclusivePathConflict(cwd);
   }
+
   /** A command reservation is a FIFO barrier even when an active task could normally accept steering. */
   async hasPendingCommandReservation(target: ChatTarget, cwd: string): Promise<boolean> {
     const binding = this.bindingFor(target);
     const sessionKey = this.sessionKey(target, binding);
-    const directories = this.ownedDirectoryKeys(
-      [cwd],
-      binding?.cwdPinned === true ? binding.cwd : undefined,
-    );
     return await this.firstBlockingReservation(
       target,
       sessionKey,
-      directories,
       Number.POSITIVE_INFINITY,
       cwd,
     ) !== undefined;
   }
+
 
   constructor(private readonly deps: TaskSchedulerDeps) {}
 
@@ -212,7 +195,7 @@ export class TaskScheduler {
     void next.then(cleanup, cleanup);
   }
 
-  /** 记下「这条任务在忙聊天、忙 session 或忙工作区后面等过」：启动时取回，据此补一条启动回执。 */
+  /** 记下「这条任务在忙聊天、忙 session 或排他资源后面等过」：启动时取回，据此补一条启动回执。 */
   markWaiting(taskId: string): void {
     this.waiting.add(taskId);
   }
@@ -233,9 +216,8 @@ export class TaskScheduler {
   }
 
   /**
-   * Register a FIFO intent before asynchronous root probes, then acquire the exclusive commit
-   * lease only after earlier writers and reservations are clear. Later tasks cannot cross the
-   * intent while those checks are in flight.
+   * Install a FIFO intent before asynchronous root probes, then acquire exclusive ownership only
+   * after earlier work and reservations clear. Later tasks cannot cross the intent meanwhile.
    */
   async tryAcquireCommit(
     target: ChatTarget,
@@ -246,25 +228,24 @@ export class TaskScheduler {
   ): Promise<CommitLease | undefined> {
     const binding = this.bindingFor(target);
     const sessionKey = this.sessionKey(target, binding);
+    const paths = this.resourcePaths([cwd, root]);
+    const roots = new Set([root]);
     const reservation = this.createCommandReservationRecord(
       target,
       [cwd, root],
-      this.workspaceKeys([root]),
+      true,
       orderHint,
     );
     const order = reservation.order;
-    const directories = reservation.directories;
     const unavailable = (): boolean =>
       this.deps.stopping()
-      || this.hasConflictingReservation(target, sessionKey, directories, order, reservation)
+      || this.hasConflictingReservation(target, sessionKey, order, reservation)
       || this.hasSessionLeaseFor(target, sessionKey)
       || this.hasQueuedWork(target, sessionKey, order)
-      || this.activeRepositoryTasksHas(root)
-      || this.exclusiveRepositoryRoots.has(root)
-      || this.deps.isDirectoryBlocked(cwd)
-      || this.deps.isDirectoryBlocked(root)
-      || this.directoriesUnavailable(directories, order);
-    let rootLease: { complete(): void } | undefined;
+      || paths.some((path) => this.deps.isDirectoryBlocked(path))
+      || this.hasActiveResourceConflict(paths, roots, taskId)
+      || this.hasExclusiveResourceConflict(paths, roots);
+    let resourceLease: DestructiveResourceLease | undefined;
     let sessionLease: SessionLease | undefined;
     let transferred = false;
     let acquiredLease: CommitLease | undefined;
@@ -272,19 +253,19 @@ export class TaskScheduler {
       if (
         unavailable()
         || await this.hasConflictingRepositoryReservation(root, order, reservation)
+        || await this.hasEarlierQueuedResourceUse(paths, roots, order)
         || await this.repositoryIsBlocked(root)
-        || await this.repositoryDirectoryLeaseConflicts(root)
         || unavailable()
         || await this.hasConflictingRepositoryReservation(root, order, reservation)
       ) {
         return undefined;
       }
 
-      // This intent was registered before any Git probe; later tasks and host merges cannot
-      // overtake it while the root is being checked and the exclusive lease is installed.
-      rootLease = this.reserveExclusiveRepositoryRoot(root, taskId);
-      if (!rootLease) return undefined;
-      sessionLease = this.createLeases(target, sessionKey, directories);
+      if (unavailable()) return undefined;
+      resourceLease = this.reserveExclusiveResources(roots, paths, taskId);
+      if (!resourceLease) return undefined;
+      sessionLease = this.createSessionLease(target, sessionKey);
+
       const lease: CommitLease = {
         root,
         taskId,
@@ -292,32 +273,17 @@ export class TaskScheduler {
         ready: sessionLease.ready,
         complete: () => {
           sessionLease!.complete();
-          rootLease!.complete();
+          resourceLease!.complete();
           reservation.release();
         },
       };
       acquiredLease = lease;
       transferred = true;
 
-      for (const candidate of this.deps.store.listQueuedTasks()) {
-        const candidateOrder = this.scheduledOrder.get(candidate.id) ?? -1;
-        if (candidateOrder >= order) continue;
-        const candidateTarget = taskTarget(candidate);
-        if (
-          targetKey(candidateTarget) === targetKey(target)
-          || this.sessionKey(candidateTarget, this.bindingFor(candidateTarget)) === sessionKey
-        ) {
-          lease.complete();
-          return undefined;
-        }
-        if (await this.repositoryRootForTask(candidate) === root) {
-          lease.complete();
-          return undefined;
-        }
-      }
       if (
-        this.deps.stopping()
-        || this.activeRepositoryTasksHas(root)
+        await this.hasEarlierQueuedResourceUse(paths, roots, order)
+        || this.deps.stopping()
+        || this.hasActiveResourceConflict(paths, roots, taskId)
         || await this.repositoryIsBlocked(root)
       ) {
         lease.complete();
@@ -330,74 +296,70 @@ export class TaskScheduler {
     } finally {
       if (!transferred) {
         sessionLease?.complete();
-        rootLease?.complete();
+        resourceLease?.complete();
         reservation.release();
       }
     }
   }
 
-  /** Repository-only reservation for a queued `/commit` recovered before native dispatch. */
+  /** Repository-root reservation for a queued `/commit` recovered before native dispatch. */
   async tryAcquireCommitRepository(root: string, taskId: string): Promise<CommitLease | undefined> {
     const task = this.deps.store.getTask(taskId);
     const order = this.scheduledOrder.get(taskId);
     if (!task || task.state !== "queued" || order === undefined) return undefined;
     const target = taskTarget(task);
     const binding = this.bindingFor(target);
-    const reservation = this.createCommandReservationRecord(
-      target,
-      [binding?.cwd ?? task.cwd, root],
-      this.workspaceKeys([root]),
-      order,
-    );
-    const ownDirectories = this.taskDirectoryLeases.get(taskId) ?? new Set<string>();
-    const directories = this.workspaceKeys([root]).filter((directory) => !ownDirectories.has(directory));
-    let rootLease: { complete(): void } | undefined;
-    let directoryLeases: DirectoryLease[] = [];
+    const cwd = binding?.cwd ?? task.cwd;
+    const paths = this.resourcePaths([cwd, root]);
+    const roots = new Set([root]);
+    const reservation = this.createCommandReservationRecord(target, [cwd, root], true, order);
+    let resourceLease: DestructiveResourceLease | undefined;
     let transferred = false;
+    let acquiredLease: CommitLease | undefined;
     try {
       if (
         this.deps.stopping()
-        || this.activeRepositoryTasksHas(root)
-        || this.exclusiveRepositoryRoots.has(root)
-        || this.directoriesUnavailable(directories, order, taskId)
+        || this.hasConflictingReservation(target, this.sessionKey(target, binding), order, reservation)
+        || this.hasSessionLeaseFor(target, this.sessionKey(target, binding), taskId)
+        || this.hasQueuedWork(target, this.sessionKey(target, binding), order, taskId)
+        || paths.some((path) => this.deps.isDirectoryBlocked(path))
+        || this.hasActiveResourceConflict(paths, roots, taskId)
+        || this.hasExclusiveResourceConflict(paths, roots)
         || await this.hasConflictingRepositoryReservation(root, order, reservation)
+        || await this.hasEarlierQueuedResourceUse(paths, roots, order, taskId)
         || await this.repositoryIsBlocked(root)
-        || await this.repositoryDirectoryLeaseConflicts(root, ownDirectories)
-        || this.deps.stopping()
-        || this.activeRepositoryTasksHas(root)
-        || this.exclusiveRepositoryRoots.has(root)
-        || this.directoriesUnavailable(directories, order, taskId)
-        || await this.hasConflictingRepositoryReservation(root, order, reservation)
       ) {
         return undefined;
       }
-      rootLease = this.reserveExclusiveRepositoryRoot(root, taskId);
-      if (!rootLease) return undefined;
-      directoryLeases = directories.map((directory) => this.createDirectoryLease(directory));
+      if (
+        this.deps.stopping()
+        || this.hasConflictingReservation(target, this.sessionKey(target, binding), order, reservation)
+        || this.hasSessionLeaseFor(target, this.sessionKey(target, binding), taskId)
+        || this.hasQueuedWork(target, this.sessionKey(target, binding), order, taskId)
+        || paths.some((path) => this.deps.isDirectoryBlocked(path))
+        || this.hasActiveResourceConflict(paths, roots, taskId)
+        || this.hasExclusiveResourceConflict(paths, roots)
+      ) {
+        return undefined;
+      }
+      resourceLease = this.reserveExclusiveResources(roots, paths, taskId);
+      if (!resourceLease) return undefined;
       const lease: CommitLease = {
         root,
         taskId,
         order,
-        ready: Promise.all(directoryLeases.map((directoryLease) => directoryLease.ready)).then(() => {}),
+        ready: Promise.resolve(),
         complete: () => {
-          for (const directoryLease of directoryLeases) directoryLease.complete();
-          rootLease!.complete();
+          resourceLease!.complete();
           reservation.release();
         },
       };
+      acquiredLease = lease;
       transferred = true;
-      for (const candidate of this.deps.store.listQueuedTasks()) {
-        if (candidate.id === taskId) continue;
-        const candidateOrder = this.scheduledOrder.get(candidate.id) ?? -1;
-        if (candidateOrder >= order) continue;
-        if (await this.repositoryRootForTask(candidate) === root) {
-          lease.complete();
-          return undefined;
-        }
-      }
       if (
-        this.deps.stopping()
-        || this.activeRepositoryTasksHas(root)
+        await this.hasEarlierQueuedResourceUse(paths, roots, order, taskId)
+        || this.deps.stopping()
+        || this.hasActiveResourceConflict(paths, roots, taskId)
         || await this.repositoryIsBlocked(root)
       ) {
         lease.complete();
@@ -405,16 +367,11 @@ export class TaskScheduler {
       }
       return lease;
     } catch {
-      if (transferred) {
-        rootLease?.complete();
-        for (const directoryLease of directoryLeases) directoryLease.complete();
-        reservation.release();
-      }
+      acquiredLease?.complete();
       return undefined;
     } finally {
       if (!transferred) {
-        rootLease?.complete();
-        for (const directoryLease of directoryLeases) directoryLease.complete();
+        resourceLease?.complete();
         reservation.release();
       }
     }
@@ -465,60 +422,61 @@ export class TaskScheduler {
   }
 
   /**
-   * A command holds the current session and chat keys, while cwd is consulted for an unverified
-   * worker left by recovery. When the command touches an owned workspace (or a pinned workspace
-   * binding), its expanded resource keys are leased too so sibling projects cannot overlap.
-   * Different sessions in the same ordinary cwd remain independent.
+   * Session controls share actual path/root usage with ordinary workers so destructive operations
+   * can drain them. They do not block independent ordinary tasks using the same repository.
    */
   async tryAcquireCommandSession(
     target: ChatTarget,
     cwds: readonly string[],
-    extraDirectories: readonly string[] = [],
   ): Promise<SessionLease | undefined> {
     const binding = this.bindingFor(target);
     const sessionKey = this.sessionKey(target, binding);
-    const reservation = this.createCommandReservationRecord(target, cwds, extraDirectories);
-    const directories = reservation.directories;
-    let repositoryLease: { complete(): void } | undefined;
+    const reservation = this.createCommandReservationRecord(target, cwds);
+    const paths = this.resourcePaths(cwds);
     let sessionLease: SessionLease | undefined;
     let transferred = false;
-    const unavailable = (): boolean =>
+    const unavailable = (roots: ReadonlySet<string>): boolean =>
       this.deps.stopping()
-      || this.hasConflictingReservation(target, sessionKey, directories, reservation.order, reservation)
+      || this.hasConflictingReservation(target, sessionKey, reservation.order, reservation)
       || this.hasSessionLeaseFor(target, sessionKey)
       || this.hasQueuedWork(target, sessionKey, reservation.order)
-      || cwds.some((cwd) => this.deps.isDirectoryBlocked(cwd))
-      || this.directoriesUnavailable(directories, reservation.order);
+      || paths.some((path) => this.deps.isDirectoryBlocked(path))
+      || this.hasExclusiveResourceConflict(paths, roots);
     try {
-      if (unavailable()) return undefined;
-      const roots = new Set<string>();
-      for (const cwd of new Set(cwds)) {
-        const root = await this.deps.repositoryRoot(cwd);
-        if (root !== null) roots.add(root);
+      const noRoots = new Set<string>();
+      if (unavailable(noRoots)) return undefined;
+      if (await this.hasConflictingResourceReservation(paths, noRoots, reservation.order, reservation)) {
+        return undefined;
       }
+      if (unavailable(noRoots)) return undefined;
+      const roots = await this.repositoryRoots(cwds);
       if (
-        unavailable()
+        await this.hasConflictingResourceReservation(paths, roots, reservation.order, reservation)
+        || unavailable(roots)
         || this.sessionKey(target, this.bindingFor(target)) !== sessionKey
-        || await this.hasConflictingRepositoryReservations([...roots], reservation.order, reservation)
       ) {
         return undefined;
       }
-      repositoryLease = this.reserveRepositoryTasks(
-        [...roots],
-        `command:${targetKey(target)}`,
-      );
-      if (!repositoryLease) return undefined;
       for (const root of roots) {
         if (await this.repositoryIsBlocked(root)) return undefined;
       }
-      if (unavailable()) return undefined;
-      sessionLease = this.createLeases(target, sessionKey, directories);
+      if (
+        await this.hasConflictingResourceReservation(paths, roots, reservation.order, reservation)
+        || unavailable(roots)
+      ) {
+        return undefined;
+      }
+
+      sessionLease = this.createSessionLease(target, sessionKey);
+      const owner = `session-command:${targetKey(target)}:${reservation.order}`;
+      const usage: ActiveResourceUse = { paths, roots };
+      this.activeResourceUsers.set(owner, usage);
       transferred = true;
       return {
         ready: sessionLease.ready,
         complete: () => {
+          if (this.activeResourceUsers.get(owner) === usage) this.activeResourceUsers.delete(owner);
           sessionLease!.complete();
-          repositoryLease!.complete();
           reservation.release();
         },
       };
@@ -527,21 +485,67 @@ export class TaskScheduler {
     } finally {
       if (!transferred) {
         sessionLease?.complete();
-        repositoryLease?.complete();
         reservation.release();
       }
     }
   }
 
+  /** Acquire a session lease and exclusive resource lease for local destructive chat commands. */
+  async tryAcquireDestructiveCommandSession(
+    target: ChatTarget,
+    repositoryCwds: readonly string[],
+    resourcePaths: readonly string[],
+  ): Promise<SessionLease | undefined> {
+    const reservation = this.createCommandReservationRecord(
+      target,
+      resourcePaths,
+      true,
+      undefined,
+      undefined,
+      repositoryCwds,
+    );
+    let transferred = false;
+    try {
+      const lease = await this.tryAcquireReservedCommandSession(reservation);
+      if (!lease) return undefined;
+      transferred = true;
+      return {
+        ready: lease.ready,
+        complete: () => {
+          lease.complete();
+          reservation.release();
+        },
+      };
+    } catch {
+      return undefined;
+    } finally {
+      if (!transferred) reservation.release();
+    }
+  }
+
   /**
-   * Install a FIFO barrier before waiting for accepted work. Later tasks wait on this intent;
-   * the owner itself acquires its real session/directory leases only after earlier work drains.
+   * Install a destructive FIFO barrier before waiting for accepted work. Later tasks that use one
+   * of these explicit paths or canonical roots wait; ordinary session reservations never do this.
    */
-  reserveCommandSession(target: ChatTarget, cwds: readonly string[]): CommandSessionReservation {
-    const reservation = this.createCommandReservationRecord(target, cwds);
+  reserveDestructiveCommandSession(
+    target: ChatTarget,
+    cwds: readonly string[],
+  ): DestructiveCommandReservation {
+    const reservation = this.createCommandReservationRecord(target, cwds, true);
+    let acquisitionStarted = false;
     return {
       order: reservation.order,
-      tryAcquire: () => this.tryAcquireReservedCommandSession(reservation),
+      extend: additionalCwds => {
+        if (acquisitionStarted || !this.commandReservations.has(reservation)) {
+          throw new Error("destructive reservation resources must be extended before acquisition");
+        }
+        reservation.resourcePaths = [...new Set([...reservation.resourcePaths, ...additionalCwds])];
+        reservation.repositoryCwds = [...new Set([...reservation.repositoryCwds, ...additionalCwds])];
+      },
+      tryAcquire: () => {
+        acquisitionStarted = true;
+        return this.tryAcquireReservedCommandSession(reservation);
+      },
       release: () => reservation.release(),
     };
   }
@@ -549,27 +553,22 @@ export class TaskScheduler {
   private createCommandReservationRecord(
     target: ChatTarget,
     cwds: readonly string[],
-    extraDirectories: readonly string[] = [],
+    destructive = false,
     order?: number,
+    ownerTaskId?: string,
+    repositoryCwds?: readonly string[],
   ): CommandReservationRecord {
     const binding = this.bindingFor(target);
     const sessionKey = this.sessionKey(target, binding);
-    const directories = [...new Set([
-      ...this.ownedDirectoryKeys(
-        cwds,
-        binding?.cwdPinned === true ? binding.cwd : undefined,
-      ),
-      ...extraDirectories,
-    ])].sort();
     const completion = Promise.withResolvers<void>();
     let reservation!: CommandReservationRecord;
     reservation = {
       order: order ?? ++this.nextOrder,
       target: { ...target },
-      sessionKey,
       sessionKeys: this.leaseKeys(target, sessionKey),
-      directories,
-      repositoryCwds: [...new Set(cwds)],
+      resourcePaths: destructive ? [...new Set(cwds)] : [],
+      repositoryCwds: destructive ? [...new Set(repositoryCwds ?? cwds)] : [],
+      ...(ownerTaskId === undefined ? {} : { ownerTaskId }),
       ready: completion.promise,
       release: () => {
         if (!this.commandReservations.delete(reservation)) return;
@@ -580,74 +579,176 @@ export class TaskScheduler {
     return reservation;
   }
 
-  /** Lease every owned resource related to these paths, not just the caller's cwd spelling. */
-  async tryAcquireCommandDirectories(cwds: readonly string[]): Promise<DirectoryLease | undefined> {
-    const directories = this.workspaceKeys(cwds);
-    if (
-      this.commandReservations.size > 0
-      && [...this.commandReservations].some((reservation) =>
-        reservation.directories.some((directory) => directories.includes(directory))
-      )
-    ) {
-      return undefined;
-    }
-    if (this.directoriesUnavailable(directories)) return undefined;
-    const directoryLeases = directories.map((cwd) => this.createDirectoryLease(cwd));
-    let repositoryLease: { complete(): void } | undefined;
+  /** Promote a host operation to exclusive ownership of its exact paths and canonical roots. */
+  async tryAcquireDestructiveResources(
+    cwds: readonly string[],
+    task: TaskRecord,
+  ): Promise<DestructiveResourceLease | undefined> {
+    const target = taskTarget(task);
+    const sessionKey = this.sessionKey(target, this.bindingFor(target));
+    const reservation = this.createCommandReservationRecord(target, cwds, true, undefined, task.id, []);
+    const order = reservation.order;
+    const paths = this.resourcePaths(cwds);
+    let resourceLease: DestructiveResourceLease | undefined;
     let transferred = false;
     try {
-      const roots = new Set<string>();
-      for (const cwd of new Set(cwds)) {
-        const root = await this.deps.repositoryRoot(cwd);
-        if (root !== null) roots.add(root);
+      const repositoryCwds: string[] = [];
+      for (const cwd of cwds) {
+        try {
+          await lstat(cwd);
+          repositoryCwds.push(cwd);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
       }
-      repositoryLease = this.reserveRepositoryTasks([...roots], "directory-command");
-      if (!repositoryLease) return undefined;
-      for (const root of roots) {
-        if (await this.repositoryIsBlocked(root)) return undefined;
+      reservation.repositoryCwds = repositoryCwds;
+      const roots = await this.repositoryRoots(repositoryCwds);
+      const unavailable = (): boolean =>
+        this.deps.stopping()
+        || paths.some((path) => this.deps.isDirectoryBlocked(path))
+        || this.hasActiveResourceConflict(paths, roots, task.id)
+        || this.hasExclusiveResourceConflict(paths, roots)
+        || this.hasQueuedWork(target, sessionKey, order, task.id);
+      if (
+        unavailable()
+        || this.hasConflictingReservation(target, sessionKey, order, reservation, task.id)
+        || await this.hasConflictingResourceReservation(paths, roots, order, reservation, task.id)
+        || await this.hasEarlierQueuedResourceUse(paths, roots, order, task.id)
+        || await this.repositoriesAreBlocked(roots)
+        || unavailable()
+      ) {
+        return undefined;
+      }
+      resourceLease = this.reserveExclusiveResources(roots, paths, task.id);
+      if (!resourceLease) return undefined;
+      if (
+        await this.hasEarlierQueuedResourceUse(paths, roots, order, task.id)
+        || await this.repositoriesAreBlocked(roots)
+      ) {
+        return undefined;
+      }
+      if (
+        this.deps.stopping()
+        || paths.some((path) => this.deps.isDirectoryBlocked(path))
+        || this.hasActiveResourceConflict(paths, roots, task.id)
+        || this.hasQueuedWork(target, sessionKey, order, task.id)
+      ) {
+        return undefined;
       }
       transferred = true;
       return {
-        ready: Promise.all(directoryLeases.map((lease) => lease.ready)).then(() => {}),
+        ready: Promise.resolve(),
         complete: () => {
-          for (const lease of directoryLeases) lease.complete();
-          repositoryLease!.complete();
+          resourceLease!.complete();
+          reservation.release();
         },
       };
     } catch {
       return undefined;
     } finally {
       if (!transferred) {
-        for (const lease of directoryLeases) lease.complete();
-        repositoryLease?.complete();
+        resourceLease?.complete();
+        reservation.release();
       }
     }
   }
-
-  /**
-   * A host operation may reuse the running task's exclusive resource lease only when every
-   * requested key is already covered. A wider request goes through the ordinary busy check.
-   */
-  async tryAcquireWorkspaceDirectories(
-    cwds: readonly string[],
-    task: TaskRecord,
-  ): Promise<DirectoryLease | undefined> {
-    const requested = this.workspaceKeys(cwds);
-    const held = this.taskDirectoryLeases.get(task.id);
-    if (requested.length > 0 && held && requested.every((directory) => held.has(directory))) {
-      return { ready: Promise.resolve(), complete: () => {} };
-    }
-    return this.tryAcquireCommandDirectories(cwds);
-  }
-
   private bindingFor(target: ChatTarget): BindingRecord | null {
     const botUid = this.deps.botUid();
     return botUid === undefined ? null : this.deps.store.getBinding(botUid, target);
   }
 
-  private activeRepositoryTasksHas(root: string): boolean {
-    for (const activeRoot of this.activeRepositoryTasks.values()) {
-      if (activeRoot === root) return true;
+  private hasActiveResourceConflict(
+    paths: readonly string[],
+    roots: ReadonlySet<string>,
+    excludedOwner?: string,
+  ): boolean {
+    for (const [owner, usage] of this.activeResourceUsers) {
+      if (owner === excludedOwner) continue;
+      if ([...roots].some((root) => usage.roots.has(root))) return true;
+      if (
+        paths.some((path) =>
+          usage.paths.some((activePath) => resourcePathsRelated(path, activePath))
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private hasExclusiveResourceConflict(
+    paths: readonly string[],
+    roots: ReadonlySet<string>,
+  ): boolean {
+    for (const root of roots) {
+      if (this.exclusiveRepositoryRoots.has(root)) return true;
+      for (const heldRoot of this.exclusiveRepositoryRoots.keys()) {
+        if (resourcePathsRelated(root, heldRoot)) return true;
+      }
+      for (const heldPath of this.exclusiveResourcePaths.keys()) {
+        if (resourcePathsRelated(root, heldPath)) return true;
+      }
+    }
+    for (const path of paths) {
+      for (const heldRoot of this.exclusiveRepositoryRoots.keys()) {
+        if (resourcePathsRelated(path, heldRoot)) return true;
+      }
+      for (const heldPath of this.exclusiveResourcePaths.keys()) {
+        if (resourcePathsRelated(path, heldPath)) return true;
+      }
+    }
+    return false;
+  }
+
+  private hasExclusivePathConflict(cwd: string): boolean {
+    return this.hasExclusiveResourceConflict(this.resourcePaths([cwd]), new Set<string>());
+  }
+
+  private exclusiveResourceBlocker(
+    cwd: string,
+    root: string | null,
+    excludedTaskId: string,
+  ): { owner: string; done: Promise<void> } | undefined {
+    if (root !== null) {
+      const reservation = this.exclusiveRepositoryRoots.get(root);
+      if (reservation && reservation.owner !== excludedTaskId) return reservation;
+    }
+    const path = resolve(cwd);
+    for (const [heldRoot, reservation] of this.exclusiveRepositoryRoots) {
+      if (
+        reservation.owner !== excludedTaskId
+        && resourcePathsRelated(path, heldRoot)
+      ) {
+        return reservation;
+      }
+    }
+    for (const [heldPath, reservation] of this.exclusiveResourcePaths) {
+      if (
+        reservation.owner !== excludedTaskId
+        && resourcePathsRelated(path, heldPath)
+      ) {
+        return reservation;
+      }
+    }
+    return undefined;
+  }
+
+  private resourcePaths(cwds: readonly string[]): string[] {
+    return [...new Set(cwds.map((cwd) => resolve(cwd)))].sort();
+  }
+
+  private async repositoryRoots(cwds: readonly string[]): Promise<Set<string>> {
+    const roots = new Set<string>();
+    for (const cwd of new Set(cwds)) {
+      const root = await this.deps.repositoryRoot(cwd);
+      if (root !== null) roots.add(root);
+    }
+    return roots;
+  }
+
+  private async repositoriesAreBlocked(roots: ReadonlySet<string>): Promise<boolean> {
+    for (const root of roots) {
+      if (await this.repositoryIsBlocked(root)) return true;
     }
     return false;
   }
@@ -655,61 +756,51 @@ export class TaskScheduler {
   private repositoryIsBlocked(root: string): Promise<boolean> {
     return this.deps.repositoryBlocked(root);
   }
-  private reserveRepositoryTasks(
-    roots: readonly string[],
-    owner: string,
-  ): { complete(): void } | undefined {
-    const uniqueRoots = [...new Set(roots)];
-    if (uniqueRoots.some((root) => this.exclusiveRepositoryRoots.has(root))) return undefined;
-    const entries = uniqueRoots.map((root, index) => [
-      `${owner}:${++this.repositoryLeaseSequence}:${index}`,
-      root,
-    ] as const);
-    for (const [key, root] of entries) this.activeRepositoryTasks.set(key, root);
-    let complete = false;
-    return {
-      complete: () => {
-        if (complete) return;
-        complete = true;
-        for (const [key] of entries) this.activeRepositoryTasks.delete(key);
-      },
-    };
-  }
 
-  private async repositoryDirectoryLeaseConflicts(
-    root: string,
-    allowedDirectories: ReadonlySet<string> = new Set(),
-  ): Promise<boolean> {
-    const rootResources = new Set(this.workspaceKeys([root]));
-    for (const directory of this.directoryTails.keys()) {
-      if (allowedDirectories.has(directory)) continue;
-      if (this.workspaceKeys([directory]).some((resource) => rootResources.has(resource))) return true;
-      try {
-        if (await this.deps.repositoryRoot(directory) === root) return true;
-      } catch {
-        // A directory whose repository cannot be identified must not be allowed to overlap a
-        // commit; this is the fail-closed counterpart to treating an explicit non-repository as null.
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private reserveExclusiveRepositoryRoot(
-    root: string,
+  private reserveExclusiveResources(
+    roots: ReadonlySet<string>,
+    paths: readonly string[],
     owner: string,
-  ): { complete(): void } | undefined {
-    if (this.exclusiveRepositoryRoots.has(root)) return undefined;
-    const completed = Promise.withResolvers<void>();
-    const entry = { owner, done: completed.promise };
-    this.exclusiveRepositoryRoots.set(root, entry);
-    let complete = false;
+  ): DestructiveResourceLease | undefined {
+    if (this.hasExclusiveResourceConflict(paths, roots)) return undefined;
+    const rootEntries = [...roots].map((root) => {
+      const completion = Promise.withResolvers<void>();
+      const entry = {
+        owner,
+        done: completion.promise,
+        complete: completion.resolve,
+      };
+      this.exclusiveRepositoryRoots.set(root, entry);
+      return [root, entry] as const;
+    });
+    const pathEntries = paths.map((path) => {
+      const completion = Promise.withResolvers<void>();
+      const entry = {
+        owner,
+        done: completion.promise,
+        complete: completion.resolve,
+      };
+      this.exclusiveResourcePaths.set(path, entry);
+      return [path, entry] as const;
+    });
+    let completed = false;
     return {
+      ready: Promise.resolve(),
       complete: () => {
-        if (complete) return;
-        complete = true;
-        if (this.exclusiveRepositoryRoots.get(root) === entry) this.exclusiveRepositoryRoots.delete(root);
-        completed.resolve();
+        if (completed) return;
+        completed = true;
+        for (const [root, entry] of rootEntries) {
+          if (this.exclusiveRepositoryRoots.get(root) === entry) {
+            this.exclusiveRepositoryRoots.delete(root);
+          }
+          entry.complete();
+        }
+        for (const [key, entry] of pathEntries) {
+          if (this.exclusiveResourcePaths.get(key) === entry) {
+            this.exclusiveResourcePaths.delete(key);
+          }
+          entry.complete();
+        }
       },
     };
   }
@@ -719,13 +810,6 @@ export class TaskScheduler {
     return task.text === "/commit" && this.deps.store.isCommitTask(task.id);
   }
 
-  private async repositoryRootForTask(task: TaskRecord): Promise<string | null> {
-    const target = taskTarget(task);
-    const binding = await this.deps.reconcileBinding(task.id, target, this.bindingFor(target));
-    const current = this.deps.store.getTask(task.id);
-    if (!current || current.state !== "queued") return null;
-    return this.deps.repositoryRoot(binding?.cwd ?? current.cwd);
-  }
 
   private sessionKey(target: ChatTarget, binding: BindingRecord | null): string {
     return binding?.sessionId
@@ -741,24 +825,23 @@ export class TaskScheduler {
     reservation: CommandReservationRecord,
     target: ChatTarget,
     sessionKey: string,
-    directories: readonly string[],
   ): boolean {
     const sessionKeys = new Set(this.leaseKeys(target, sessionKey));
-    return reservation.sessionKeys.some((key) => sessionKeys.has(key))
-      || reservation.directories.some((directory) => directories.includes(directory));
+    return reservation.sessionKeys.some((key) => sessionKeys.has(key));
   }
 
   private hasConflictingReservation(
     target: ChatTarget,
     sessionKey: string,
-    directories: readonly string[],
     beforeOrder = Number.POSITIVE_INFINITY,
     excluded?: CommandReservationRecord,
+    excludedOwnerTaskId?: string,
   ): boolean {
     return [...this.commandReservations].some((reservation) =>
       reservation !== excluded
+      && (excludedOwnerTaskId === undefined || reservation.ownerTaskId !== excludedOwnerTaskId)
       && reservation.order < beforeOrder
-      && this.reservationConflicts(reservation, target, sessionKey, directories)
+      && this.reservationConflicts(reservation, target, sessionKey)
     );
   }
 
@@ -768,35 +851,91 @@ export class TaskScheduler {
     excluded?: CommandReservationRecord,
   ): Promise<boolean> {
     for (const reservation of this.commandReservations) {
-      if (reservation === excluded || reservation.order >= beforeOrder) continue;
+      if (
+        reservation === excluded
+        || reservation.order >= beforeOrder
+        || reservation.resourcePaths.length === 0
+      ) {
+        continue;
+      }
+      for (const path of reservation.resourcePaths) {
+        if (resourcePathsRelated(root, path)) return true;
+      }
       for (const cwd of reservation.repositoryCwds) {
         try {
           if (await this.deps.repositoryRoot(cwd) === root) return true;
         } catch {
-          // An earlier unresolved root is a barrier, not permission to let a writer pass.
+          // An earlier unresolved destructive root is a barrier, not permission to write.
           return true;
         }
       }
     }
     return false;
   }
-  private async hasConflictingRepositoryReservations(
-    roots: readonly string[],
+
+
+  private async hasConflictingResourceReservation(
+    paths: readonly string[],
+    roots: ReadonlySet<string>,
     beforeOrder: number,
     excluded?: CommandReservationRecord,
+    excludedOwnerTaskId?: string,
   ): Promise<boolean> {
-    for (const root of roots) {
-      if (await this.hasConflictingRepositoryReservation(root, beforeOrder, excluded)) return true;
+    for (const reservation of this.commandReservations) {
+      if (
+        reservation === excluded
+        || (excludedOwnerTaskId !== undefined && reservation.ownerTaskId === excludedOwnerTaskId)
+        || reservation.order >= beforeOrder
+        || reservation.resourcePaths.length === 0
+      ) {
+        continue;
+      }
+      if (
+        paths.some((path) =>
+          reservation.resourcePaths.some((cwd) => resourcePathsRelated(path, cwd))
+        )
+      ) {
+        return true;
+      }
+      for (const cwd of reservation.repositoryCwds) {
+        try {
+          const root = await this.deps.repositoryRoot(cwd);
+          if (root !== null && roots.has(root)) return true;
+        } catch {
+          // An earlier unresolved destructive root is a barrier, not permission to write.
+          return true;
+        }
+      }
     }
     return false;
   }
 
-
-  private async hasEarlierQueuedRepositoryWork(root: string, beforeOrder: number): Promise<boolean> {
+  private async hasEarlierQueuedResourceUse(
+    paths: readonly string[],
+    roots: ReadonlySet<string>,
+    beforeOrder: number,
+    excludedTaskId?: string,
+  ): Promise<boolean> {
     for (const task of this.deps.store.listQueuedTasks()) {
+      if (task.id === excludedTaskId) continue;
       const order = this.scheduledOrder.get(task.id) ?? -1;
       if (order >= beforeOrder) continue;
-      if (await this.repositoryRootForTask(task) === root) return true;
+      try {
+        const target = taskTarget(task);
+        const binding = await this.deps.reconcileBinding(
+          task.id,
+          target,
+          this.bindingFor(target),
+        );
+        const current = this.deps.store.getTask(task.id);
+        if (!current || current.state !== "queued") continue;
+        const cwd = binding?.cwd ?? current.cwd;
+        if (paths.some((path) => resourcePathsRelated(path, cwd))) return true;
+        const taskRoot = await this.deps.repositoryRoot(cwd);
+        if (taskRoot !== null && roots.has(taskRoot)) return true;
+      } catch {
+        return true;
+      }
     }
     return false;
   }
@@ -804,23 +943,35 @@ export class TaskScheduler {
   private async firstBlockingReservation(
     target: ChatTarget,
     sessionKey: string,
-    directories: readonly string[],
     taskOrder: number,
     cwd?: string,
+    skipRepositoryProbe = false,
   ): Promise<CommandReservationRecord | undefined> {
     const candidates = [...this.commandReservations]
       .filter((reservation) => reservation.order < taskOrder)
       .sort((left, right) => left.order - right.order);
     let taskRoot: string | null | undefined;
     for (const reservation of candidates) {
-      if (this.reservationConflicts(reservation, target, sessionKey, directories)) {
+      if (this.reservationConflicts(reservation, target, sessionKey)) return reservation;
+      if (cwd === undefined || reservation.resourcePaths.length === 0) continue;
+      if (reservation.resourcePaths.some((path) => resourcePathsRelated(path, cwd))) {
         return reservation;
       }
-      if (cwd === undefined) continue;
-      if (taskRoot === undefined) taskRoot = await this.deps.repositoryRoot(cwd);
+      if (skipRepositoryProbe) continue;
+      if (taskRoot === undefined) {
+        try {
+          taskRoot = await this.deps.repositoryRoot(cwd);
+        } catch {
+          return reservation;
+        }
+      }
       if (taskRoot === null) continue;
       for (const reservedCwd of reservation.repositoryCwds) {
-        if (await this.deps.repositoryRoot(reservedCwd) === taskRoot) return reservation;
+        try {
+          if (await this.deps.repositoryRoot(reservedCwd) === taskRoot) return reservation;
+        } catch {
+          return reservation;
+        }
       }
     }
     return undefined;
@@ -829,101 +980,118 @@ export class TaskScheduler {
   private async waitForPriorReservations(
     target: ChatTarget,
     sessionKey: string,
-    directories: readonly string[],
     taskOrder: number,
     cwd?: string,
+    skipRepositoryProbe = false,
   ): Promise<void> {
     while (!this.deps.stopping()) {
       const reservation = await this.firstBlockingReservation(
         target,
         sessionKey,
-        directories,
         taskOrder,
         cwd,
+        skipRepositoryProbe,
       );
       if (!reservation) return;
       await reservation.ready;
     }
   }
 
+
   private async tryAcquireReservedCommandSession(
     reservation: CommandReservationRecord,
   ): Promise<SessionLease | undefined> {
     if (!this.commandReservations.has(reservation)) return undefined;
-    const binding = this.bindingFor(reservation.target);
-    const sessionKey = this.sessionKey(reservation.target, binding);
-    const directories = reservation.directories;
-    const locallyUnavailable = (): boolean =>
+    const sessionKey = this.sessionKey(reservation.target, this.bindingFor(reservation.target));
+    const paths = this.resourcePaths(reservation.resourcePaths);
+    const locallyUnavailable = (roots: ReadonlySet<string>): boolean =>
       !this.commandReservations.has(reservation)
       || sessionKey !== this.sessionKey(reservation.target, this.bindingFor(reservation.target))
       || this.hasConflictingReservation(
         reservation.target,
         sessionKey,
-        directories,
         reservation.order,
         reservation,
       )
       || this.leaseKeys(reservation.target, sessionKey).some((key) => this.sessionTails.has(key))
       || this.hasQueuedWork(reservation.target, sessionKey, reservation.order)
-      || directories.some((cwd) => this.deps.isDirectoryBlocked(cwd))
-      || this.directoriesUnavailable(directories, reservation.order);
-    if (locallyUnavailable()) return undefined;
-
-    const roots = new Set<string>();
-    for (const cwd of reservation.repositoryCwds) {
-      const root = await this.deps.repositoryRoot(cwd);
-      if (root !== null) roots.add(root);
+      || paths.some((path) => this.deps.isDirectoryBlocked(path))
+      || this.hasActiveResourceConflict(paths, roots)
+      || this.hasExclusiveResourceConflict(paths, roots);
+    const unavailableAfterReserve = (roots: ReadonlySet<string>): boolean =>
+      !this.commandReservations.has(reservation)
+      || sessionKey !== this.sessionKey(reservation.target, this.bindingFor(reservation.target))
+      || this.hasConflictingReservation(
+        reservation.target,
+        sessionKey,
+        reservation.order,
+        reservation,
+      )
+      || this.leaseKeys(reservation.target, sessionKey).some((key) => this.sessionTails.has(key))
+      || this.hasQueuedWork(reservation.target, sessionKey, reservation.order)
+      || paths.some((path) => this.deps.isDirectoryBlocked(path))
+      || this.hasActiveResourceConflict(paths, roots);
+    if (reservation.resourcePaths.length === 0) return undefined;
+    const roots = await this.repositoryRoots(reservation.repositoryCwds);
+    if (locallyUnavailable(roots)) return undefined;
+    if (await this.hasConflictingResourceReservation(paths, roots, reservation.order, reservation)) {
+      return undefined;
     }
-    if (locallyUnavailable()) return undefined;
+    if (await this.hasEarlierQueuedResourceUse(paths, roots, reservation.order)) return undefined;
+    if (await this.repositoriesAreBlocked(roots)) {
+      throw new Error("该 Git 工作树仍有无法确认停止的 worker，无法安全合并。");
+    }
+    if (locallyUnavailable(roots)) return undefined;
 
-    for (const root of roots) {
-      if (await this.hasConflictingRepositoryReservation(root, reservation.order, reservation)) {
-        return undefined;
-      }
-      if (await this.repositoryIsBlocked(root)) {
-        throw new Error("该 Git 工作树仍有无法确认停止的 worker，无法安全合并。");
-      }
+    const resourceLease = this.reserveExclusiveResources(
+      roots,
+      paths,
+      `destructive:${targetKey(reservation.target)}:${reservation.order}`,
+    );
+    if (!resourceLease) return undefined;
+    let transferred = false;
+    try {
       if (
-        await this.hasEarlierQueuedRepositoryWork(root, reservation.order)
-        || await this.repositoryDirectoryLeaseConflicts(root)
+        await this.hasEarlierQueuedResourceUse(paths, roots, reservation.order)
+        || await this.repositoriesAreBlocked(roots)
+        || unavailableAfterReserve(roots)
       ) {
         return undefined;
       }
+      const sessionLease = this.createSessionLease(reservation.target, sessionKey);
+      let completed = false;
+      transferred = true;
+      return {
+        ready: sessionLease.ready,
+        complete: () => {
+          if (completed) return;
+          completed = true;
+          sessionLease.complete();
+          resourceLease.complete();
+        },
+      };
+    } finally {
+      if (!transferred) resourceLease.complete();
     }
-    if (locallyUnavailable()) return undefined;
-    if ([...roots].some((root) =>
-      this.activeRepositoryTasksHas(root) || this.exclusiveRepositoryRoots.has(root)
-    )) {
-      return undefined;
-    }
-
-    const rootLeases: { complete(): void }[] = [];
-    for (const root of roots) {
-      const rootLease = this.reserveExclusiveRepositoryRoot(
-        root,
-        `host-merge:${targetKey(reservation.target)}:${reservation.order}`,
-      );
-      if (!rootLease) {
-        for (const held of rootLeases) held.complete();
-        return undefined;
-      }
-      rootLeases.push(rootLease);
-    }
-    const sessionLease = this.createLeases(reservation.target, sessionKey, directories);
-    let complete = false;
-    return {
-      ready: sessionLease.ready,
-      complete: () => {
-        if (complete) return;
-        complete = true;
-        sessionLease.complete();
-        for (const rootLease of rootLeases) rootLease.complete();
-      },
-    };
   }
 
-  private hasSessionLeaseFor(target: ChatTarget, sessionKey: string): boolean {
-    return this.leaseKeys(target, sessionKey).some((key) => this.sessionTails.has(key));
+  private hasSessionLeaseFor(
+    target: ChatTarget,
+    sessionKey: string,
+    excludedTaskId?: string,
+  ): boolean {
+    const keys = this.leaseKeys(target, sessionKey);
+    for (const key of keys) {
+      const owners = this.sessionLeaseOwners.get(key);
+      if (owners === undefined) {
+        if (this.sessionTails.has(key)) return true;
+        continue;
+      }
+      for (const owner of owners) {
+        if (owner.taskId !== excludedTaskId) return true;
+      }
+    }
+    return false;
   }
 
   private hasLeaseFor(target: ChatTarget, sessionKey: string): boolean {
@@ -931,9 +1099,15 @@ export class TaskScheduler {
     return this.leaseKeys(target, sessionKey).some((key) => this.sessionTails.has(key));
   }
 
-  private hasQueuedWork(target: ChatTarget, sessionKey: string, beforeOrder?: number): boolean {
+  private hasQueuedWork(
+    target: ChatTarget,
+    sessionKey: string,
+    beforeOrder?: number,
+    excludedTaskId?: string,
+  ): boolean {
     const chatKey = targetKey(target);
     return this.deps.store.listQueuedTasks().some((task) => {
+      if (task.id === excludedTaskId) return false;
       const order = this.scheduledOrder.get(task.id) ?? -1;
       if (beforeOrder !== undefined && order >= beforeOrder) return false;
       const queuedTarget = taskTarget(task);
@@ -942,78 +1116,12 @@ export class TaskScheduler {
     });
   }
 
-  /**
-   * The resource keys a task or command must lease: only owned workspace resources (or the
-   * caller's pinned workspace cwd), never an ordinary cwd. This keeps main's per-session lease
-   * rule intact: different sessions in the same ordinary cwd still run concurrently.
-   */
-  private ownedDirectoryKeys(cwds: readonly string[], pinnedCwd?: string): string[] {
-    const directories = new Set<string>();
-    for (const cwd of cwds) {
-      if (cwd !== pinnedCwd && !this.deps.store.isWorkspaceDirectoryOwned(cwd)) continue;
-      for (const directory of this.workspaceKeys([cwd])) directories.add(directory);
-    }
-    return [...directories].sort();
-  }
 
-  private directoriesUnavailable(
-    directories: readonly string[],
-    beforeOrder?: number,
-    excludedTaskId?: string,
-  ): boolean {
-    const requested = new Set(directories);
-    if (directories.some((cwd) =>
-      this.deps.isDirectoryBlocked(cwd)
-      || this.directoryTails.has(cwd)
-      || this.deps.hasRuntimeInDirectory(cwd)
-    )) {
-      return true;
-    }
-    return this.deps.store.listQueuedTasks().some((task) => {
-      if (task.id === excludedTaskId) return false;
-      const order = this.scheduledOrder.get(task.id) ?? -1;
-      if (beforeOrder !== undefined && order >= beforeOrder) return false;
-      const target = taskTarget(task);
-      const cwd = this.bindingFor(target)?.cwd ?? task.cwd;
-      return this.workspaceKeys([cwd]).some((directory) => requested.has(directory));
-    });
-  }
-
-  private workspaceKeys(cwds: readonly string[]): string[] {
-    const directories = new Set<string>();
-    for (const cwd of cwds) {
-      for (const directory of this.deps.store.workspaceDirectories(cwd)) directories.add(directory);
-    }
-    return [...directories].sort();
-  }
-
-  private combineLeases(leases: readonly DirectoryLease[]): DirectoryLease {
-    return {
-      ready: Promise.all(leases.map((lease) => lease.ready)).then(() => {}),
-      complete: () => {
-        for (const lease of leases) lease.complete();
-      },
-    };
-  }
-
-  /**
-   * Create both leases synchronously, before anything awaits, so a command and a scheduled task
-   * cannot interleave between registering their session and directory tails.
-   */
-  private createLeases(
+  private createSessionLease(
     target: ChatTarget,
     sessionKey: string,
-    directories: readonly string[],
+    ownerTaskId?: string,
   ): SessionLease {
-    const sessionLease = this.createSessionLease(target, sessionKey);
-    if (directories.length === 0) return sessionLease;
-    return this.combineLeases([
-      sessionLease,
-      this.combineLeases(directories.map((cwd) => this.createDirectoryLease(cwd))),
-    ]);
-  }
-
-  private createSessionLease(target: ChatTarget, sessionKey: string): SessionLease {
     const keys = this.leaseKeys(target, sessionKey);
     const previous = keys.flatMap((key) => {
       const tail = this.sessionTails.get(key);
@@ -1021,7 +1129,13 @@ export class TaskScheduler {
     });
     const completion = Promise.withResolvers<void>();
     const lease = completion.promise;
-    for (const key of keys) this.sessionTails.set(key, lease);
+    const owner: SessionLeaseOwner = ownerTaskId === undefined ? {} : { taskId: ownerTaskId };
+    for (const key of keys) {
+      this.sessionTails.set(key, lease);
+      const owners = this.sessionLeaseOwners.get(key) ?? new Set<SessionLeaseOwner>();
+      owners.add(owner);
+      this.sessionLeaseOwners.set(key, owners);
+    }
     let complete = false;
     return {
       ready: Promise.all(previous.map((tail) => tail.catch(() => {}))).then(() => {}),
@@ -1030,37 +1144,20 @@ export class TaskScheduler {
         complete = true;
         for (const key of keys) {
           if (this.sessionTails.get(key) === lease) this.sessionTails.delete(key);
+          const owners = this.sessionLeaseOwners.get(key);
+          owners?.delete(owner);
+          if (owners?.size === 0) this.sessionLeaseOwners.delete(key);
         }
         completion.resolve();
       },
     };
   }
 
-  private createDirectoryLease(cwd: string): DirectoryLease {
-    const previous = this.directoryTails.get(cwd);
-    const completion = Promise.withResolvers<void>();
-    const lease = completion.promise;
-    this.directoryTails.set(cwd, lease);
-    let complete = false;
-    return {
-      ready: previous?.catch(() => {}) ?? Promise.resolve(),
-      complete: () => {
-        if (complete) return;
-        complete = true;
-        if (this.directoryTails.get(cwd) === lease) this.directoryTails.delete(cwd);
-        completion.resolve();
-      },
-    };
-  }
 
-  /**
-   * Earlier queued tasks must finish before the current task starts when they share its session
-   * or any of its leased workspace resource keys.
-   */
+  /** Commit-related tasks preserve repository order; ordinary tasks only serialize by session. */
   private async earlierOperations(
     task: TaskRecord,
     sessionKey: string,
-    directories: ReadonlySet<string>,
     skipRepositoryOrdering = false,
   ): Promise<Promise<void>[]> {
     const queued = this.deps.store.listQueuedTasks();
@@ -1070,9 +1167,10 @@ export class TaskScheduler {
       candidate.id !== task.id
       && (this.scheduledOrder.get(candidate.id) ?? -1) < taskOrder
     );
-    const commitOrderingRequired = !skipRepositoryOrdering && (
-      this.isCommitTask(task)
-      || earlierTasks.some((candidate) => this.isCommitTask(candidate))
+    const currentIsCommit = !skipRepositoryOrdering && this.isCommitTask(task);
+    const commitOrderingRequired = currentIsCommit || (
+      !skipRepositoryOrdering
+      && earlierTasks.some((candidate) => this.isCommitTask(candidate))
     );
     const currentBinding = this.bindingFor(taskTarget(task));
     const currentRoot = commitOrderingRequired
@@ -1080,7 +1178,6 @@ export class TaskScheduler {
       : null;
     const operations: Promise<void>[] = [];
     for (const earlier of earlierTasks) {
-      if (!earlier) continue;
       const target = taskTarget(earlier);
       const binding = await this.deps.reconcileBinding(
         earlier.id,
@@ -1089,12 +1186,12 @@ export class TaskScheduler {
       );
       const earlierCwd = binding?.cwd ?? earlier.cwd;
       const sharesSession = this.sessionKey(target, binding) === sessionKey;
-      const sharesDirectory = directories.size > 0
-        && this.workspaceKeys([earlierCwd]).some((directory) => directories.has(directory));
+      const earlierIsCommit = !skipRepositoryOrdering && this.isCommitTask(earlier);
       const sharesRepository = !skipRepositoryOrdering
+        && (currentIsCommit || earlierIsCommit)
         && currentRoot !== null
         && await this.deps.repositoryRoot(earlierCwd) === currentRoot;
-      if (!sharesSession && !sharesDirectory && !sharesRepository) continue;
+      if (!sharesSession && !sharesRepository) continue;
       const operation = this.scheduledTasks.get(earlier.id);
       if (operation) operations.push(operation);
     }
@@ -1135,10 +1232,6 @@ export class TaskScheduler {
         const commitTask = this.isCommitTask(reconciledCurrent);
         if (!commitTask && this.deps.isDirectoryBlocked(cwd)) return;
         const sessionKey = this.sessionKey(target, binding);
-        const directories = this.ownedDirectoryKeys(
-          [cwd],
-          binding?.cwdPinned === true ? binding.cwd : undefined,
-        );
         const taskOrder = this.scheduledOrder.get(taskId) ?? Number.POSITIVE_INFINITY;
         let skipRepositoryOrdering = false;
         try {
@@ -1149,24 +1242,23 @@ export class TaskScheduler {
           await this.waitForPriorReservations(
             target,
             sessionKey,
-            directories,
             taskOrder,
-            skipRepositoryOrdering ? undefined : cwd,
+            cwd,
+            skipRepositoryOrdering,
           );
           if (this.deps.stopping()) return;
           const earlier = await this.earlierOperations(
             reconciledCurrent,
             sessionKey,
-            new Set(directories),
             skipRepositoryOrdering,
           );
           await Promise.all(earlier.map((operation) => operation.catch(() => {})));
           await this.waitForPriorReservations(
             target,
             sessionKey,
-            directories,
             taskOrder,
-            skipRepositoryOrdering ? undefined : cwd,
+            cwd,
+            skipRepositoryOrdering,
           );
           if (this.deps.stopping()) return;
         } catch {
@@ -1177,7 +1269,7 @@ export class TaskScheduler {
         const beforeLease = this.deps.store.getTask(taskId);
         if (this.deps.stopping() || !beforeLease || beforeLease.state !== "queued") return;
         const beforeTarget = taskTarget(beforeLease);
-        lease = this.createLeases(beforeTarget, sessionKey, directories);
+        lease = this.createSessionLease(beforeTarget, sessionKey, taskId);
         await lease.ready;
 
         const refreshed = await this.deps.reconcileBinding(
@@ -1211,7 +1303,6 @@ export class TaskScheduler {
           const newlyEarlier = await this.earlierOperations(
             latest,
             currentSessionKey,
-            new Set(directories),
             skipRepositoryOrdering,
           );
           if (newlyEarlier.length > 0) {
@@ -1224,6 +1315,7 @@ export class TaskScheduler {
           await this.failRepositoryProbe(taskId, beforeTarget);
           return;
         }
+
         let activeRoot: string | undefined;
         if (!commitTask && !skipRepositoryOrdering) {
           let root: string | null;
@@ -1240,42 +1332,38 @@ export class TaskScheduler {
             } catch {
               blocked = true;
             }
-            if (blocked) {
-              const failure = "该 Git 工作树仍有无法确认停止的 worker，任务未启动。";
-              this.takeWaitingReceipt(taskId);
-              this.deps.store.markFailed(taskId, failure);
-              await this.deps.enqueueText(beforeTarget, failure, taskId);
-              await this.deps.notifyThreadOutcome(taskId);
-              return;
-            }
-            const reservation = this.exclusiveRepositoryRoots.get(root);
-            if (reservation !== undefined) {
-              lease.complete();
-              lease = undefined;
-              await reservation.done.catch(() => {});
-              continue;
-            }
-            this.activeRepositoryTasks.set(taskId, root);
+            // Keep accepted work queued while an unconfirmed worker owns this Git worktree.
+            if (blocked) return;
             activeRoot = root;
           }
         }
-        const taskDirectories = new Set(directories);
-        if (taskDirectories.size > 0) this.taskDirectoryLeases.set(taskId, taskDirectories);
+        const blocker = this.exclusiveResourceBlocker(currentCwd, activeRoot ?? null, taskId);
+        if (blocker !== undefined) {
+          lease.complete();
+          lease = undefined;
+          await blocker.done.catch(() => {});
+          continue;
+        }
+
+        // Publish actual cwd and Git-root usage before yielding to another operation.
+        const activeUse: ActiveResourceUse = {
+          paths: this.resourcePaths([currentCwd]),
+          roots: activeRoot === undefined ? new Set<string>() : new Set([activeRoot]),
+        };
+        this.activeResourceUsers.set(taskId, activeUse);
         try {
-          await this.deps.runTask(taskId, cwd);
+          await this.deps.runTask(taskId, currentCwd);
         } finally {
-          if (activeRoot !== undefined && this.activeRepositoryTasks.get(taskId) === activeRoot) {
+          if (activeRoot !== undefined && this.activeResourceUsers.get(taskId) === activeUse) {
             let blocked = true;
             try {
               blocked = await this.repositoryIsBlocked(activeRoot);
             } catch {
-              // Keep the canonical root reservation if the blocked state cannot be established.
+              // Keep unconfirmed activity until restart, when worker recovery rechecks it.
             }
-            // Retain an unconfirmed root in this scheduler until restart, when worker recovery rechecks it.
-            if (!blocked) this.activeRepositoryTasks.delete(taskId);
-          }
-          if (this.taskDirectoryLeases.get(taskId) === taskDirectories) {
-            this.taskDirectoryLeases.delete(taskId);
+            if (!blocked) this.activeResourceUsers.delete(taskId);
+          } else if (!this.deps.isDirectoryBlocked(currentCwd)) {
+            this.activeResourceUsers.delete(taskId);
           }
         }
         return;
@@ -1290,4 +1378,15 @@ export class TaskScheduler {
       lease?.complete();
     }
   }
+}
+export function resourcePathsRelated(left: string, right: string): boolean {
+  const resolvedLeft = resolve(left);
+  const resolvedRight = resolve(right);
+  return pathContains(resolvedLeft, resolvedRight) || pathContains(resolvedRight, resolvedLeft);
+}
+
+function pathContains(parent: string, child: string): boolean {
+  const relation = relative(parent, child);
+  return relation === ""
+    || (!isAbsolute(relation) && relation !== ".." && !relation.startsWith(`..${sep}`));
 }

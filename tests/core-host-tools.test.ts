@@ -1856,7 +1856,12 @@ test("a default-pipeline merge schedules the thread's archive beside the merge r
 
     // 合并结果与归档排定分别可见；归档在回复之后、以发起排定的子区为目标执行。
     expect(log.join("\n")).toContain('"archive":"scheduled"');
-    expect(worktrees.merges).toEqual([{ cwd: workspace, repo: cwd, branch: "thread-1" }]);
+    expect(worktrees.merges).toHaveLength(1);
+    expect(worktrees.merges[0]).toMatchObject({
+      cwd: workspace,
+      repo: cwd,
+      branch: "thread-1",
+    });
     expect(harness.transport.managementCalls.filter((call) => call.action === "thread-archive")).toEqual([
       { action: "thread-archive", groupId: "group-tools", shortId: "thread-1" },
     ]);

@@ -55,7 +55,6 @@ function schedulerFor(store: ChannelStore, overrides: Partial<TaskSchedulerDeps>
     store,
     botUid: () => botUid,
     stopping: () => false,
-    hasRuntimeInDirectory: () => false,
     isDirectoryBlocked: () => false,
     reconcileBinding: async (_taskId, _target, binding) => binding,
     repositoryRoot: async () => null,
@@ -274,7 +273,7 @@ test("workspace directory expansion covers entries, owned projects, subdirectori
   });
 });
 
-test("a command lease in one shared project excludes sibling projects and the shared entry", async () => {
+test("destructive workspace leases protect actual paths and exempt only their owning task", async () => {
   await withStore(async (store, _stateDir, root) => {
     const entry = join(root, "thread-workspaces", "thread-lease");
     const projectA = join(entry, "project-a");
@@ -294,28 +293,57 @@ test("a command lease in one shared project excludes sibling projects and the sh
       { name: "project-b", repo, path: canonicalProjectB, branch: "thread-project-b", created: true },
     ]));
 
-    const scheduler = schedulerFor(store);
-    const targetB = { channelType: 5 as const, channelId: "group-b____thread-lease" };
-    const lease = await scheduler.tryAcquireCommandDirectories([canonicalChild]);
-    expect(lease).toBeDefined();
-    if (!lease) throw new Error("expected a project directory lease");
-    await lease.ready;
+    const firstTarget = { channelType: 5 as const, channelId: "group-a____thread-owner" };
+    const secondTarget = { channelType: 5 as const, channelId: "group-b____thread-other" };
+    const first = taskFor(firstTarget, "message-first", "task-first", canonicalChild);
+    const second = taskFor(secondTarget, "message-second", "task-second", canonicalChild);
+    expect(store.acceptTask(first.claim, first.task)).toBe(true);
 
-    expect(scheduler.hasBlockingWork(targetB, canonicalProjectB)).toBe(true);
-    expect(await scheduler.tryAcquireCommandDirectories([canonicalProjectB])).toBeUndefined();
-    expect(await scheduler.tryAcquireCommandDirectories([canonicalEntry])).toBeUndefined();
+    const firstStarted = Promise.withResolvers<void>();
+    const secondStarted = Promise.withResolvers<void>();
+    const releaseFirst = Promise.withResolvers<void>();
+    const releaseSecond = Promise.withResolvers<void>();
+    const scheduler = schedulerFor(store, {
+      runTask: async (taskId) => {
+        store.markStarted(taskId);
+        if (taskId === first.task.id) {
+          firstStarted.resolve();
+          await releaseFirst.promise;
+        } else {
+          secondStarted.resolve();
+          await releaseSecond.promise;
+        }
+      },
+    });
+    scheduler.scheduleTask(first.task.id);
+    await firstStarted.promise;
 
-    lease.complete();
-    const entryLease = await scheduler.tryAcquireCommandDirectories([canonicalEntry]);
-    expect(entryLease).toBeDefined();
-    if (!entryLease) throw new Error("expected a shared-entry lease after release");
-    await entryLease.ready;
-    expect(await scheduler.tryAcquireCommandDirectories([canonicalProjectA])).toBeUndefined();
-    entryLease.complete();
+    const ownerLease = await scheduler.tryAcquireDestructiveResources([canonicalProjectA], first.task);
+    expect(ownerLease).toBeDefined();
+    if (!ownerLease) throw new Error("expected the owning task to upgrade its shared resource");
+    await ownerLease.ready;
+    ownerLease.complete();
+    const siblingLease = await scheduler.tryAcquireDestructiveResources([canonicalProjectB], first.task);
+    expect(siblingLease).toBeDefined();
+    siblingLease?.complete();
+
+    expect(store.acceptTask(second.claim, second.task)).toBe(true);
+    scheduler.scheduleTask(second.task.id);
+    await secondStarted.promise;
+    expect(
+      await scheduler.tryAcquireDestructiveResources([canonicalProjectA], first.task),
+    ).toBeUndefined();
+    expect(
+      await scheduler.tryAcquireDestructiveResources([canonicalEntry], first.task),
+    ).toBeUndefined();
+
+    releaseFirst.resolve();
+    releaseSecond.resolve();
+    await scheduler.settle();
   });
 });
 
-test("queued tasks from separate project directories serialize on their shared workspace ownership", async () => {
+test("queued tasks from separate project directories do not serialize on shared workspace ownership", async () => {
   await withStore(async (store, _stateDir, root) => {
     const entry = join(root, "thread-workspaces", "thread-order");
     const projectA = join(entry, "project-a");
@@ -358,14 +386,14 @@ test("queued tasks from separate project directories serialize on their shared w
     scheduler.scheduleTask(first.task.id);
     await firstStarted.promise;
     scheduler.scheduleTask(second.task.id);
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(secondStartCount).toBe(0);
+    await secondStarted.promise;
+    expect(secondStartCount).toBe(1);
 
     releaseFirst.resolve();
-    await secondStarted.promise;
     await scheduler.settle();
   });
 });
+
 
 test("a batch ownership commit rolls back every row when one target is not a CommunityTopic", async () => {
   await withStore(async (store, _stateDir, root) => {

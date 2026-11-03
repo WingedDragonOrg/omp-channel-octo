@@ -66,6 +66,23 @@ common=$(git rev-parse --path-format=absolute --git-common-dir)
 repo=$(dirname "$common")
 git -C "$repo" merge --no-ff --no-edit feature >/dev/null
 printf '{"branch":"feature","target":"main","squashed":false,"rebased":false,"committed":true,"removed":false}\n'`;
+const WT_PLAN_STUB = String.raw`if [ "$1" = "--version" ]; then echo "wt v0.80.0"; exit 0; fi
+if [ "$1" = "config" ]; then
+  printf '%s\n' "$@" > "$0.default-argv"
+  [ "$2" = "state" ] && [ "$3" = "default-branch" ] || exit 64
+  printf 'main\n'
+  exit 0
+fi
+exit 64`;
+const WT_PLAN_FAIL_STUB = String.raw`if [ "$1" = "--version" ]; then echo "wt v0.80.0"; exit 0; fi
+if [ "$1" = "config" ]; then
+  printf '%s\n' "$@" > "$0.default-argv"
+  [ "$2" = "state" ] && [ "$3" = "default-branch" ] || exit 64
+  exit 19
+fi
+exit 64`;
+
+
 
 const WT_REMOVE_STUB = String.raw`set -e
 if [ "$1" = "--version" ]; then echo "wt v0.80.0"; exit 0; fi
@@ -264,6 +281,101 @@ test("the Worktrunk probe accepts any successful version and reports a missing c
     await rm(root, { recursive: true, force: true });
   }
 });
+test("merge planning resolves wt's default branch to its actual checked-out worktree", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-")));
+  try {
+    const repo = await createRepo(root);
+    const source = join(root, "source");
+    await runGit(repo, ["worktree", "add", "-q", source, "-b", "source-branch"]);
+    const wt = await writeStub(root, WT_PLAN_STUB, "wt");
+    const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [wt] });
+
+    const plan = await port.planMerge({ cwd: source, repo, branch: "source-branch" });
+
+    expect(plan).toEqual({ target: "main", cwds: [await realpath(source), await realpath(repo)] });
+    expect((await readFile(`${wt}.default-argv`, "utf8")).trim().split("\n")).toEqual([
+      "config",
+      "state",
+      "default-branch",
+    ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("merge planning maps an explicit refs/heads target to its distinct linked checkout", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-")));
+  try {
+    const repo = await createRepo(root);
+    const source = join(root, "source");
+    const targetCheckout = join(root, "target checkout");
+    await runGit(repo, ["worktree", "add", "-q", source, "-b", "source-branch"]);
+    await runGit(repo, ["worktree", "add", "-q", targetCheckout, "-b", "release-target"]);
+    const wt = await writeStub(root, WT_PLAN_STUB, "wt");
+    const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [wt] });
+
+    const plan = await port.planMerge({
+      cwd: source,
+      repo,
+      branch: "source-branch",
+      target: "refs/heads/release-target",
+    });
+
+    expect(plan).toEqual({
+      target: "refs/heads/release-target",
+      cwds: [await realpath(source), await realpath(targetCheckout)],
+    });
+    expect(existsSync(`${wt}.default-argv`)).toBe(false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("merge planning includes no fabricated checkout for an unchecked-out target branch", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-")));
+  try {
+    const repo = await createRepo(root);
+    const source = join(root, "source");
+    await runGit(repo, ["worktree", "add", "-q", source, "-b", "source-branch"]);
+    await runGit(repo, ["branch", "unlinked-target"]);
+    const wt = await writeStub(root, WT_PLAN_STUB, "wt");
+    const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [wt] });
+
+    const plan = await port.planMerge({
+      cwd: source,
+      repo,
+      branch: "source-branch",
+      target: "unlinked-target",
+    });
+
+    expect(plan).toEqual({ target: "unlinked-target", cwds: [await realpath(source)] });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("merge planning rejects a failed wt default-branch lookup instead of returning source-only", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-")));
+  try {
+    const repo = await createRepo(root);
+    const source = join(root, "source");
+    await runGit(repo, ["worktree", "add", "-q", source, "-b", "source-branch"]);
+    const wt = await writeStub(root, WT_PLAN_FAIL_STUB, "wt");
+    const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [wt] });
+
+    await expect(
+      port.planMerge({ cwd: source, repo, branch: "source-branch" }),
+    ).rejects.toThrow();
+    expect((await readFile(`${wt}.default-argv`, "utf8")).trim().split("\n")).toEqual([
+      "config",
+      "state",
+      "default-branch",
+    ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 
 test("creates the worktree through wt at the agreed directory and branch", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-")));

@@ -899,6 +899,14 @@ export type WorktrunkProbe =
   | { available: true; command: string; version?: string }
   | { available: false; reason: "missing" };
 
+/** Resolved Worktrunk target and the exact checked-out source/target worktree paths. */
+export interface WorktreeMergePlan {
+  /** Target ref exactly as passed to `wt merge` (resolved to wt's default when omitted). */
+  target: string;
+  /** Canonical source path, followed by the checked-out target path when one exists. */
+  cwds: readonly string[];
+}
+
 /** One `wt merge` invocation; every optional field maps to a wt flag, wt's defaults apply otherwise. */
 export interface WorktreeMergeRequest {
   /** The worktree to merge; `wt merge` merges the branch checked out here into the target. */
@@ -960,10 +968,12 @@ export interface WorktreePort {
    * `baseDir`.
    */
   create(request: ThreadWorkspaceRequest, signal?: AbortSignal): Promise<ThreadWorkspace>;
+  /** Resolves wt's merge target and checked-out source/target paths without merging. */
+  planMerge(request: WorktreeMergeRequest, signal?: AbortSignal): Promise<WorktreeMergePlan>;
   /**
    * Merges the workspace's branch into the target branch through the Worktrunk pipeline. There is
    * no fallback: without an executable wt this rejects with a bounded reason.
-  */
+   */
   merge(request: WorktreeMergeRequest, signal?: AbortSignal): Promise<WorktreeMergeSummary>;
   /**
    * Removes one workspace through wt when available, otherwise through plain git. It rejects

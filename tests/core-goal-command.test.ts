@@ -1,3 +1,6 @@
+
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
 import { expect, test, vi } from "bun:test";
 import { WorkerGoalError } from "../src/contracts";
 import { openChannelStore } from "../src/store";
@@ -558,6 +561,233 @@ test("goal controls isolate sessions sharing an ordinary working directory", asy
     await waitForStatus(harness.service, targetB, status => status.state === "completed");
   } finally {
     releaseHold.resolve();
+    await closeCoreHarness(harness);
+  }
+});
+test("goal control and execution proceed while a sibling session holds the same cwd", async () => {
+  const sibling = { channelId: "dm-goal-shared-worktree", channelType: 1 as const };
+  const heldStarted = deferred();
+  const releaseHeld = deferred();
+  const resumeStarted = deferred();
+  const releaseResume = deferred();
+  const harness = await createCoreHarness({
+    prompt: async ({ text }) => {
+      if (text === "hold shared goal directory") {
+        heldStarted.resolve();
+        await releaseHeld.promise;
+      }
+    },
+  });
+  try {
+    const sessionId = await prepareBoundSession(harness);
+    await harness.service.handleInbound(inbound({
+      ...DM,
+      messageId: "goal-shared-create",
+      text: "/goal set Keep a goal in the shared directory",
+    }));
+    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    expect(harness.workers.goalRuns).toHaveLength(1);
+
+    await harness.service.handleInbound(inbound({
+      ...sibling,
+      messageId: "goal-shared-prime-sibling",
+      text: "create the sibling session",
+    }));
+    await waitForStatus(harness.service, sibling, status => status.state === "completed");
+    const store = await openChannelStore(harness.stateDir);
+    try {
+      expect(store.getBinding(harness.bot.uid, DM)?.cwd)
+        .toBe(store.getBinding(harness.bot.uid, sibling)?.cwd);
+      expect(store.getBinding(harness.bot.uid, sibling)?.sessionId).not.toBe(sessionId);
+    } finally {
+      store.close();
+    }
+
+    const heldTask = harness.service.handleInbound(inbound({
+      ...sibling,
+      messageId: "goal-shared-held-task",
+      text: "hold shared goal directory",
+    }));
+    await heldStarted.promise;
+    await harness.service.handleInbound(inbound({
+      ...DM,
+      messageId: "goal-shared-pause",
+      text: "/goal pause",
+    }));
+    const paused = await openChannelStore(harness.stateDir);
+    try {
+      expect(paused.getGoalSession(harness.bot.uid, DM, sessionId)).toMatchObject({ status: "paused" });
+    } finally {
+      paused.close();
+    }
+
+    const defaultHandler = harness.workers.goalHandler;
+    harness.workers.goalHandler = async context => {
+      if (context.request.op !== "resume") return defaultHandler(context);
+      resumeStarted.resolve();
+      const goal = { ...context.current.goal!, status: "active" as const };
+      context.emit({ type: "goal_accepted", goalId: goal.id });
+      context.emit({ type: "goal_updated", goal });
+      context.emit({ type: "prompt_accepted" });
+      await releaseResume.promise;
+      return {
+        goal,
+        state: { enabled: true, mode: "active", goal },
+      };
+    };
+    await harness.service.handleInbound(inbound({
+      ...DM,
+      messageId: "goal-shared-resume",
+      text: "/goal resume",
+    }));
+    await waitForGoalOrPrompt(harness, harness.workers.prompts.length, 1);
+    await resumeStarted.promise;
+    expect((await harness.service.status(DM)).state).toBe("running");
+    expect((await harness.service.status(sibling)).state).toBe("running");
+
+    releaseResume.resolve();
+    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    releaseHeld.resolve();
+    await heldTask;
+    await waitForStatus(harness.service, sibling, status => status.state === "completed");
+  } finally {
+    releaseResume.resolve();
+    releaseHeld.resolve();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("goal control and execution proceed across owned sibling projects while one is held", async () => {
+  const heldStarted = deferred();
+  const releaseHeld = deferred();
+  const resumeStarted = deferred();
+  const releaseResume = deferred();
+  const harness = await createCoreHarness({
+    prompt: async ({ text }) => {
+      if (text === "hold owned project") {
+        heldStarted.resolve();
+        await releaseHeld.promise;
+      }
+    },
+  });
+  const api = { channelId: "group-tools____owned", channelType: 5 as const };
+  const web = { channelId: "group-tools____other", channelType: 5 as const };
+  const parent = join(harness.root, "repos");
+  const entry = join(parent, "shared");
+  const apiPath = join(entry, "api");
+  const webPath = join(entry, "web");
+  let sessionId: string;
+  try {
+    await Promise.all([
+      mkdir(join(apiPath, "src"), { recursive: true }),
+      mkdir(webPath, { recursive: true }),
+    ]);
+    for (const [target, path, messageId] of [
+      [api, apiPath, "goal-owned-api"],
+      [web, webPath, "goal-owned-web"],
+    ] as const) {
+      await harness.service.handleInbound(inbound({
+        messageId,
+        ...target,
+        text: `/new ${path}`,
+        mentionedUserIds: [harness.bot.uid],
+      }));
+      await harness.service.handleInbound(inbound({
+        messageId: `${messageId}-prime`,
+        ...target,
+        text: "prepare owned goal session",
+        mentionedUserIds: [harness.bot.uid],
+      }));
+      await waitForStatus(harness.service, target, status => status.state === "completed");
+    }
+
+    const store = await openChannelStore(harness.stateDir);
+    try {
+      store.saveThreadWorkspace({
+        botUid: harness.bot.uid,
+        ...api,
+        layout: "shared",
+        status: "ready",
+        entryPath: entry,
+        projects: [
+          { name: "api", repo: parent, path: apiPath, branch: "api", created: true },
+          { name: "web", repo: parent, path: webPath, branch: "web", created: true },
+        ],
+        error: null,
+      });
+      sessionId = store.getBinding(harness.bot.uid, api)!.sessionId;
+    } finally {
+      store.close();
+    }
+    const goal = {
+      id: `fixture-goal-${sessionId}`,
+      objective: "Keep the API goal",
+      status: "active" as const,
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+    };
+    const goalStore = await openChannelStore(harness.stateDir);
+    try {
+      goalStore.saveGoalSessionProgress(harness.bot.uid, api, sessionId, goal);
+      harness.workers.setNativeGoal(sessionId, goal);
+    } finally {
+      goalStore.close();
+    }
+
+    const heldTask = harness.service.handleInbound(inbound({
+      messageId: "goal-owned-held-task",
+      ...web,
+      text: "hold owned project",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    await heldStarted.promise;
+    await harness.service.handleInbound(inbound({
+      messageId: "goal-owned-pause",
+      ...api,
+      text: "/goal pause",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    const paused = await openChannelStore(harness.stateDir);
+    try {
+      expect(paused.getGoalSession(harness.bot.uid, api, sessionId)).toMatchObject({ status: "paused" });
+    } finally {
+      paused.close();
+    }
+
+    const defaultHandler = harness.workers.goalHandler;
+    harness.workers.goalHandler = async context => {
+      if (context.request.op !== "resume") return defaultHandler(context);
+      resumeStarted.resolve();
+      const activeGoal = { ...context.current.goal!, status: "active" as const };
+      context.emit({ type: "goal_accepted", goalId: activeGoal.id });
+      context.emit({ type: "goal_updated", goal: activeGoal });
+      context.emit({ type: "prompt_accepted" });
+      await releaseResume.promise;
+      const completeGoal = { ...activeGoal, status: "complete" as const };
+      context.emit({ type: "goal_updated", goal: completeGoal });
+      return {
+        goal: completeGoal,
+        state: { enabled: true, mode: "exiting", goal: completeGoal },
+      };
+    };
+    await harness.service.handleInbound(inbound({
+      messageId: "goal-owned-resume",
+      ...api,
+      text: "/goal resume",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    await waitForGoalOrPrompt(harness, harness.workers.prompts.length);
+    await resumeStarted.promise;
+    expect((await harness.service.status(api)).state).toBe("running");
+    expect((await harness.service.status(web)).state).toBe("running");
+
+    releaseResume.resolve();
+    releaseHeld.resolve();
+    await heldTask;
+    await waitForStatus(harness.service, web, status => status.state === "completed");
+  } finally {
+    releaseResume.resolve();
+    releaseHeld.resolve();
     await closeCoreHarness(harness);
   }
 });

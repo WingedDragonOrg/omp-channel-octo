@@ -53,7 +53,8 @@ test("/thread merge runs in the host and emits one default merge-listen notice",
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, parent, status => status.state === "completed");
     await harness.service.handleInbound(message);
-    expect(harness.worktrees?.merges).toEqual([{ cwd: workspace }]);
+    expect(harness.worktrees?.merges).toHaveLength(1);
+    expect(harness.worktrees?.merges[0]).toMatchObject({ cwd: workspace });
     expect(store.getLatestTask(harness.bot.uid, thread)).toBeNull();
     expect(harness.workers.prompts.map(({ text }) => text)).toHaveLength(1);
     expect(harness.workers.prompts[0]?.text.startsWith("[子区合并回传]")).toBe(true);
@@ -307,6 +308,7 @@ test("startup recovers a known host merge outcome through one listen event", asy
         target: thread,
         sourceId,
         cwd: workspace,
+        resourceCwds: [workspace],
         commandText: "/thread merge",
         operatorNote: "",
         senderId: "owner-1",
@@ -463,6 +465,7 @@ test("startup recovers and blocks unresolved host merge leases before queued wor
         target: thread,
         sourceId: "merge-recovery-command",
         cwd: workspace,
+        resourceCwds: [workspace],
       });
       setup.recordHostMergeProcess("unresolved-host-merge", processIdentity);
     } finally {
@@ -567,6 +570,7 @@ test("startup with a removed workspace waits for card recovery before replaying 
         target: thread,
         sourceId: "merge-card-recovery-command",
         cwd: workspace,
+        resourceCwds: [workspace],
         commandText: "/thread merge",
         senderId: "owner-1",
         receiptOutboxId,
@@ -733,6 +737,7 @@ test("startup kills a real detached merge process group before blocking queued w
         target: thread,
         sourceId: "real-merge-recovery-command",
         cwd: workspace,
+        resourceCwds: [workspace],
       });
       setup.recordHostMergeProcess("real-unresolved-host-merge", processIdentity);
     } finally {
@@ -744,6 +749,7 @@ test("startup kills a real detached merge process group before blocking queued w
     if (!recover) throw new Error("worktree port lacks merge process recovery");
     const worktrees: WorktreePort = {
       create: (request, signal) => realPort.create(request, signal),
+      planMerge: (request, signal) => realPort.planMerge(request, signal),
       merge: (request, signal) => {
         mergeCalls += 1;
         return realPort.merge(request, signal);
@@ -853,7 +859,8 @@ test("/thread merge waits for a running workspace task before acquiring its leas
     finish.resolve();
     await merge;
     await harness.transport.waitForManagementCalls(({ action }) => action === "thread-archive");
-    expect(harness.worktrees?.merges).toEqual([{ cwd: workspace }]);
+    expect(harness.worktrees?.merges).toHaveLength(1);
+    expect(harness.worktrees?.merges[0]).toMatchObject({ cwd: workspace });
     expect(harness.workers.prompts.filter(({ text }) => text === "existing workspace task")).toHaveLength(1);
   } finally {
     finish.resolve();
@@ -942,7 +949,8 @@ test("a host merge reservation runs before later same-chat workspace writes", as
     finishMerge.resolve();
     await merge;
     await laterStarted.promise;
-    expect(harness.worktrees?.merges).toEqual([{ cwd: workspace }]);
+    expect(harness.worktrees?.merges).toHaveLength(1);
+    expect(harness.worktrees?.merges[0]).toMatchObject({ cwd: workspace });
   } finally {
     finishEarlier.resolve();
     finishLater.resolve();
@@ -1013,7 +1021,8 @@ test("/thread merge waits for the previous task's terminal progress-card edit", 
 
     finishTerminalEdit.resolve();
     await harness.transport.waitForManagementCalls(({ action }) => action === "thread-archive");
-    expect(harness.worktrees?.merges).toEqual([{ cwd: workspace }]);
+    expect(harness.worktrees?.merges).toHaveLength(1);
+    expect(harness.worktrees?.merges[0]).toMatchObject({ cwd: workspace });
   } finally {
     finishTask.resolve();
     finishTerminalEdit.resolve();
@@ -1116,9 +1125,12 @@ test("/thread merge waits for queued cross-chat work in a project subdirectory w
     releaseSecond.resolve();
     await merge;
     await harness.transport.waitForManagementCalls(({ action }) => action === "thread-archive");
-    expect(harness.worktrees?.merges).toEqual([
-      { cwd: project, repo: "/repos/api", branch: "thread-api" },
-    ]);
+    expect(harness.worktrees?.merges).toHaveLength(1);
+    expect(harness.worktrees?.merges[0]).toMatchObject({
+      cwd: project,
+      repo: "/repos/api",
+      branch: "thread-api",
+    });
     expect(harness.workers.prompts.map(({ text }) => text).filter(
       text => text === "first project task" || text === "queued project task",
     )).toEqual([
@@ -1398,7 +1410,8 @@ test("a new authorized message during host merge prevents a later archive schedu
     await harness.workers.waitForPromptCount(1);
 
     expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
-    expect(harness.worktrees.merges).toEqual([{ cwd: workspace }]);
+    expect(harness.worktrees.merges).toHaveLength(1);
+    expect(harness.worktrees.merges[0]).toMatchObject({ cwd: workspace });
   } finally {
     releaseMerge.resolve();
     store.close();
@@ -2076,7 +2089,8 @@ test("a merge root reservation queues later steering from another chat", async (
     await harness.workers.waitForPromptCount(2);
     await waitForStatus(harness.service, writer, status => status.state === "completed");
     expect(sequence).toEqual(["writer", "merge", "late"]);
-    expect(harness.worktrees!.merges).toEqual([{ cwd: workspace }]);
+    expect(harness.worktrees!.merges).toHaveLength(1);
+    expect(harness.worktrees!.merges[0]).toMatchObject({ cwd: workspace });
   } finally {
     releaseWriter.resolve();
     releaseMerge.resolve();

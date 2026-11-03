@@ -1810,6 +1810,7 @@ test("a partial shared workspace batch stays unready and refuses thread dispatch
           ? Promise.reject(new Error("fixture second project worktree creation failed"))
           : port.create(request, signal),
       merge: (request, signal) => port.merge(request, signal),
+      planMerge: (request, signal) => port.planMerge(request, signal),
       remove: (request, signal) => port.remove(request, signal),
       worktrunk: (signal) => port.worktrunk(signal),
     }),
@@ -2016,6 +2017,7 @@ test("host thread-merge rejects a shared workspace before calling the real Workt
       },
       remove: (request, signal) => port.remove(request, signal),
       worktrunk: (signal) => port.worktrunk(signal),
+      planMerge: (request, signal) => port.planMerge(request, signal),
     }),
   });
   let firstRepo = "";

@@ -3,6 +3,7 @@ import type {
   ChatTarget,
   WorktreeMergeLifecycle,
   WorktreeMergeOutcome,
+  WorktreeMergePlan,
   WorktreeMergeRequest,
   WorktreeMergeSummary,
   WorktreePort,
@@ -10,7 +11,7 @@ import type {
 import { threadWorkspaceIsAvailable } from "../session/session-lifecycle.ts";
 import type { ChannelStore } from "../store/index.ts";
 import type { ThreadWorkspaceRecord } from "../store/store-records.ts";
-import type { DirectoryLease } from "../tasks/task-scheduler.ts";
+import type { DestructiveResourceLease } from "../tasks/task-scheduler.ts";
 import { threadParentGroupId, threadShortId } from "./thread-target.ts";
 import { WorktreeMergeExecutionError, worktrunkUnavailableText } from "../workspace/worktrunk.ts";
 
@@ -32,7 +33,8 @@ export interface ThreadMergeHost {
   readonly worktreeMergeLifecycle?: (
     target: ChatTarget,
     cwd: string,
-    sourceId?: string,
+    sourceId: string | undefined,
+    resourceCwds: readonly string[],
   ) => WorktreeMergeLifecycle;
   readonly planThreadArchive: (
     target: ChatTarget,
@@ -43,12 +45,12 @@ export interface ThreadMergeHost {
   /** Generation captured by the command turn; an intervening inbound prevents stale archival. */
   readonly archiveGeneration: () => number;
   /**
-   * Optional caller preflight after qualification, ownership checks and directory lease, before
-   * the merge port runs: host tools persist listen provenance here. Merge suppression belongs to
-   * WorktreeMergeLifecycle.beforeSpawn, after the port has verified the worktree identity.
+   * Optional caller preflight after qualification, ownership checks and destructive resource
+   * acquisition, before the merge port runs: host tools persist listen provenance here. Merge
+   * suppression belongs to WorktreeMergeLifecycle.beforeSpawn, after worktree identity validation.
    */
   readonly beforeMerge?: () => void;
-  readonly tryAcquireDirectories: (cwds: readonly string[]) => Promise<DirectoryLease | undefined>;
+  readonly tryAcquireResources: (cwds: readonly string[]) => Promise<DestructiveResourceLease | undefined>;
 }
 
 /**
@@ -61,6 +63,7 @@ export async function mergeThreadWorkspace(
   target: ChatTarget,
   options: Omit<WorktreeMergeRequest, "cwd" | "repo" | "branch" | "lifecycle">,
   signal?: AbortSignal,
+  preplanned?: WorktreeMergePlan,
 ): Promise<WorktreeMergeSummary & { archive?: "scheduled" }> {
   const archiveGeneration = host.archiveGeneration();
   if (signal !== undefined) throwIfAborted(signal);
@@ -73,37 +76,37 @@ export async function mergeThreadWorkspace(
 
   const binding = host.store.getBinding(host.botUid, target);
   const hasStableSourceId = typeof host.sourceId === "string" && host.sourceId.length > 0;
-  const lifecycle = hasStableSourceId
-    ? host.worktreeMergeLifecycle?.(target, binding?.cwd ?? "", host.sourceId)
+  const replayLifecycle = hasStableSourceId
+    ? host.worktreeMergeLifecycle?.(target, binding?.cwd ?? "", host.sourceId, [])
     : undefined;
-  const replayOutcome = lifecycle?.existingOutcome;
-  if (replayOutcome !== undefined) {
-    if (replayOutcome.kind === "execution-failed") {
-      throw new WorktreeMergeExecutionError(replayOutcome.exitCode, replayOutcome.diagnostic);
+  const replayOutcome = (outcome: WorktreeMergeOutcome): WorktreeMergeSummary & { archive?: "scheduled" } => {
+    if (outcome.kind === "execution-failed") {
+      throw new WorktreeMergeExecutionError(outcome.exitCode, outcome.diagnostic);
     }
-    const ownership = host.store.getThreadWorkspace(host.botUid, target);
-    if (replayOutcome.summary.removed && binding && ownership !== null) {
-      const projectIndex = ownership.projects.findIndex(
+    const replayOwnership = host.store.getThreadWorkspace(host.botUid, target);
+    if (outcome.summary.removed && binding && replayOwnership !== null) {
+      const projectIndex = replayOwnership.projects.findIndex(
         (project) =>
-          project.created &&
-          project.path === binding.cwd &&
-          project.branch === replayOutcome.summary.branch,
+          project.created
+          && project.path === binding.cwd
+          && project.branch === outcome.summary.branch,
       );
       if (projectIndex >= 0) {
         host.store.saveThreadWorkspace({
-          ...ownership,
-          projects: ownership.projects.map((project, index) =>
+          ...replayOwnership,
+          projects: replayOwnership.projects.map((project, index) =>
             index === projectIndex ? { ...project, created: false, path: null, branch: null } : project,
           ),
         });
       }
     }
-    if (replayOutcome.summary.removed) {
+    if (outcome.summary.removed) {
       host.planThreadArchive(target, groupId, shortId, archiveGeneration);
-      return { ...replayOutcome.summary, archive: "scheduled" };
+      return { ...outcome.summary, archive: "scheduled" };
     }
-    return replayOutcome.summary;
-  }
+    return outcome.summary;
+  };
+  if (replayLifecycle?.existingOutcome !== undefined) return replayOutcome(replayLifecycle.existingOutcome);
 
   const ownership = host.store.getThreadWorkspace(host.botUid, target);
   if (ownership?.layout === "shared") {
@@ -137,20 +140,37 @@ export async function mergeThreadWorkspace(
     throw new Error("thread-merge 缺少可用于安全重试的 toolCallId，拒绝执行");
   }
 
-  const lease = await host.tryAcquireDirectories([binding.cwd]);
+  const request: WorktreeMergeRequest = { ...options, cwd: binding.cwd };
+  if (ownership !== null) {
+    const project = ownership.projects[ownedProjectIndex];
+    if (!project || project.path !== binding.cwd || project.branch === null) {
+      throw new Error("当前子区隔离工作区与持久化所有权不匹配，无法合并");
+    }
+    request.repo = project.repo;
+    request.branch = project.branch;
+  }
+  const plan = preplanned ?? await worktrees.planMerge(request, signal);
+  request.target = plan.target;
+
+  const lease = await host.tryAcquireResources(plan.cwds);
   if (!lease) throw new Error("隔离工作区正被其他任务使用，无法合并");
   try {
     await lease.ready;
     if (signal !== undefined) throwIfAborted(signal);
-    const request: WorktreeMergeRequest = { ...options, cwd: binding.cwd };
-    if (ownership !== null) {
-      const project = ownership.projects[ownedProjectIndex];
-      if (!project || project.path !== binding.cwd || project.branch === null) {
-        throw new Error("当前子区隔离工作区与持久化所有权不匹配，无法合并");
-      }
-      request.repo = project.repo;
-      request.branch = project.branch;
+    const currentPlan = await worktrees.planMerge(request, signal);
+    if (
+      currentPlan.target !== plan.target
+      || currentPlan.cwds.length !== plan.cwds.length
+      || currentPlan.cwds.some((cwd, index) => cwd !== plan.cwds[index])
+    ) {
+      throw new Error("执行合并前工作区目标已变化，未执行合并。");
     }
+    if (signal !== undefined) throwIfAborted(signal);
+
+    const lifecycle = hasStableSourceId
+      ? host.worktreeMergeLifecycle?.(target, binding.cwd, host.sourceId, plan.cwds)
+      : undefined;
+    if (lifecycle?.existingOutcome !== undefined) return replayOutcome(lifecycle.existingOutcome);
     let confirmedExit = false;
     let outcomePersisted = false;
     if (lifecycle) {

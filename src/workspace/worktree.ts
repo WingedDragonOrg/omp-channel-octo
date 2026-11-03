@@ -4,6 +4,7 @@ import { basename, dirname, isAbsolute, resolve } from "node:path";
 import type {
   ThreadWorkspace,
   ThreadWorkspaceRequest,
+  WorktreeMergePlan,
   WorktreeMergeProcessIdentity,
   WorktreeMergeRequest,
   WorktreeMergeSummary,
@@ -232,6 +233,85 @@ async function inspectWorktreeForMerge(
   }
   return identity;
 }
+interface ListedWorktree {
+  path: string;
+  branch: string | null;
+  prunable: boolean;
+}
+
+function parseGitWorktreeList(output: string): ListedWorktree[] {
+  const worktrees: ListedWorktree[] = [];
+  let current: ListedWorktree | null = null;
+  const finish = (): void => {
+    if (current !== null) worktrees.push(current);
+    current = null;
+  };
+  for (const field of output.split("\0")) {
+    if (field.length === 0) {
+      finish();
+    } else if (field.startsWith("worktree ")) {
+      finish();
+      current = { path: field.slice("worktree ".length), branch: null, prunable: false };
+    } else if (current !== null && field.startsWith("branch ")) {
+      current.branch = field.slice("branch ".length);
+    } else if (current !== null && field.startsWith("prunable ")) {
+      current.prunable = true;
+    }
+  }
+  finish();
+  return worktrees;
+}
+
+function mergeBranchName(ref: string): string {
+  return ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
+}
+
+async function inspectMergeTargetWorktree(
+  requestedPath: string,
+  expectedBranch: string,
+  expectedCommonDir: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const absolutePath = resolve(requestedPath);
+  const initial = await lstatIfPresent(absolutePath);
+  if (initial === null) return null;
+  if (initial.isSymbolicLink() || !initial.isDirectory()) {
+    throw new Error(`目标分支的 Git worktree 路径已更换，拒绝合并：${requestedPath}`);
+  }
+  const path = await realpath(absolutePath);
+  const topLevel = await gitDirectory(path, "--show-toplevel", timeoutMs, signal);
+  const commonDir = await gitDirectory(path, "--git-common-dir", timeoutMs, signal);
+  if (topLevel !== path || commonDir !== expectedCommonDir) {
+    throw new Error(`目标分支 worktree 所属仓库或路径已更换，拒绝合并：${requestedPath}`);
+  }
+  const branchResult = await runCommand(
+    ["git", "-C", path, "branch", "--show-current"],
+    { timeoutMs, ...(signal === undefined ? {} : { signal }) },
+  );
+  if (!branchResult) throw new Error(`无法执行 git，无法核对目标分支 worktree：${requestedPath}`);
+  if (branchResult.timedOut) throw new Error(`核对目标分支 worktree 超时：${requestedPath}`);
+  if (branchResult.aborted) throw new Error(`核对目标分支 worktree 已取消：${requestedPath}`);
+  if (branchResult.exitCode !== 0) {
+    throw new Error(`核对目标分支 worktree 失败：${commandFailure(branchResult)}`);
+  }
+  if (mergeBranchName(branchResult.stdout.trim()) !== expectedBranch) {
+    throw new Error(`目标分支 worktree 在规划期间已更换，拒绝合并：${requestedPath}`);
+  }
+  const current = await lstatIfPresent(absolutePath);
+  if (
+    current === null ||
+    current.isSymbolicLink() ||
+    !current.isDirectory() ||
+    current.dev !== initial.dev ||
+    current.ino !== initial.ino ||
+    (await realpath(absolutePath)) !== path
+  ) {
+    throw new Error(`目标分支 worktree 在规划期间已更换，拒绝合并：${requestedPath}`);
+  }
+  return path;
+}
+
 
 async function exactWorktreePath(path: string): Promise<string> {
   const absolutePath = resolve(path);
@@ -704,7 +784,73 @@ export function createWorktreePort(options: WorktreePortOptions): WorktreePort {
   const probe = (signal?: AbortSignal): Promise<WorktrunkProbe> =>
     probeWorktrunk({ candidates, ...(signal === undefined ? {} : { signal }) });
 
+
   return {
+    async planMerge(
+      request: WorktreeMergeRequest,
+      signal?: AbortSignal,
+    ): Promise<WorktreeMergePlan> {
+      const available = await probe(signal);
+      if (!available.available) throw new Error(worktrunkUnavailableText());
+      const identity = await inspectWorktreeForMerge(request, mergeTimeoutMs, signal);
+
+      let target = request.target;
+      if (target === undefined) {
+        const defaultBranch = await runCommand(
+          [available.command, "config", "state", "default-branch"],
+          { cwd: identity.path, timeoutMs: mergeTimeoutMs, ...(signal === undefined ? {} : { signal }) },
+        );
+        if (!defaultBranch) {
+          throw new Error(`无法执行 Worktrunk，无法解析默认合并目标：${request.cwd}`);
+        }
+        if (defaultBranch.timedOut) {
+          throw new Error(`解析 Worktrunk 默认合并目标超时：${request.cwd}`);
+        }
+        if (defaultBranch.aborted) {
+          throw new Error(`解析 Worktrunk 默认合并目标已取消：${request.cwd}`);
+        }
+        if (defaultBranch.exitCode !== 0) {
+          throw new Error(`读取 Worktrunk 默认合并目标失败：${commandFailure(defaultBranch)}`);
+        }
+        target = defaultBranch.stdout.trim();
+      }
+      if (target.trim().length === 0) {
+        throw new Error(`Worktrunk 未返回有效的合并目标：${request.cwd}`);
+      }
+
+      const worktrees = await runCommand(
+        ["git", "-C", identity.path, "worktree", "list", "--porcelain", "-z"],
+        { timeoutMs: mergeTimeoutMs, ...(signal === undefined ? {} : { signal }) },
+      );
+      if (!worktrees) throw new Error(`无法执行 git，无法读取 worktree 列表：${request.cwd}`);
+      if (worktrees.timedOut) throw new Error(`读取 Git worktree 列表超时：${request.cwd}`);
+      if (worktrees.aborted) throw new Error(`读取 Git worktree 列表已取消：${request.cwd}`);
+      if (worktrees.exitCode !== 0) {
+        throw new Error(`读取 Git worktree 列表失败：${commandFailure(worktrees)}`);
+      }
+
+      const targetBranch = mergeBranchName(target);
+      const cwds = [identity.path];
+      for (const worktree of parseGitWorktreeList(worktrees.stdout)) {
+        if (
+          worktree.prunable ||
+          worktree.branch === null ||
+          mergeBranchName(worktree.branch) !== targetBranch
+        ) {
+          continue;
+        }
+        const targetPath = await inspectMergeTargetWorktree(
+          worktree.path,
+          targetBranch,
+          identity.commonDir,
+          mergeTimeoutMs,
+          signal,
+        );
+        if (targetPath !== null && !cwds.includes(targetPath)) cwds.push(targetPath);
+      }
+      if (isAborted(signal)) throw new Error(`规划合并隔离工作区已取消：${request.cwd}`);
+      return { target, cwds };
+    },
     worktrunk(signal) {
       return probe(signal);
     },

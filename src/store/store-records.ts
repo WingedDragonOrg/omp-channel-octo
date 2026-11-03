@@ -267,6 +267,8 @@ export interface HostMergeLeaseRecord extends ChatTarget {
   channelType: 5;
   sourceId: string;
   cwd: string;
+  /** Canonical source and checked-out target paths held by this destructive merge. */
+  resourceCwds: readonly string[];
   phase: "starting" | "running" | "exited" | "unknown";
   pid: number | null;
   pgid: number | null;
@@ -287,6 +289,7 @@ export interface HostMergeLeaseInput {
   target: ChatTarget;
   sourceId: string;
   cwd: string;
+  resourceCwds: readonly string[];
   commandText?: string;
   operatorNote?: string;
   senderId?: string;

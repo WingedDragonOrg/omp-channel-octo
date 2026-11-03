@@ -1115,8 +1115,9 @@ test("/interrupt directs an active commit to /commit stop without aborting its n
   }
 });
 
-test("an unconfirmed commit stop returns promptly and blocks repository descendants and retries", async () => {
-  const { harness, commits } = await createCommitHarness();
+test("an unconfirmed commit stop returns promptly and keeps repository descendants queued", async () => {
+  const transport = new CommitProgressTransport();
+  const { harness, commits } = await createCommitHarness({ transport });
   const commitTarget = { channelType: 1 as const, channelId: "dm-unconfirmed-stop" };
   const writerTarget = { channelType: 1 as const, channelId: "dm-unconfirmed-writer" };
   const retryTarget = { channelType: 1 as const, channelId: "dm-unconfirmed-retry" };
@@ -1145,11 +1146,11 @@ test("an unconfirmed commit stop returns promptly and blocks repository descenda
     expect(harness.workers.prompts).toHaveLength(0);
 
     runGate.resolve({ exitCode: 1, headBefore: HEAD_A, headAfter: HEAD_A });
-    await waitUntil(async () => {
-      const task = await latestTask(harness, writerTarget);
-      return task?.state === "failed" || task?.state === "completed";
-    }, "blocked descendant outcome");
-    expect(await latestTask(harness, writerTarget)).toMatchObject({ state: "failed" });
+    await waitUntil(
+      () => latestProgress(transport)?.commit?.result !== undefined,
+      "unknown commit card result",
+    );
+    expect(await latestTask(harness, writerTarget)).toMatchObject({ state: "queued" });
     expect(harness.workers.prompts).toHaveLength(0);
 
     await send(harness, retryTarget, "unconfirmed-commit-retry", "/commit");
@@ -1447,6 +1448,11 @@ test("a failed Git root probe does not let a same-repository writer bypass an ac
     expect(stdout).toBe("");
 
     await send(harness, writerTarget, "git-probe-writer", "must not bypass the commit");
+    await waitForStatus(harness.service, writerTarget, (status) => status.state === "queued");
+    expect(harness.workers.prompts).toHaveLength(0);
+
+    runGate.resolve(SUCCESS_RESULT);
+    await waitForStatus(harness.service, commitTarget, (status) => status.state === "completed");
     await waitForStatus(harness.service, writerTarget, (status) => status.state === "failed");
     const reply = await waitForReply(
       harness,
@@ -1764,6 +1770,64 @@ test("an undispatched durable commit stays queued when restart finds an unconfir
   }
 });
 
+test("a recovered undispatched commit runs after it reacquires its own session and repository leases", async () => {
+  const first = await createCommitHarness();
+  const target = { channelType: 1 as const, channelId: "dm-commit-recovery-runs" };
+  let repo: string;
+  try {
+    repo = await createRepo(first.harness.root, "recovery-runs-commit-repo");
+    await bind(first.harness, target, repo);
+  } finally {
+    await closeCoreHarness(first.harness, { remove: false });
+  }
+
+  const taskId = "undispatched-commit-recovery-runs";
+  const messageId = "undispatched-commit-recovery-runs-message";
+  const sessionId = `session-${target.channelType}-${target.channelId}`;
+  await withStore(first.harness, (store) => {
+    const claim = {
+      botUid: first.harness.bot.uid,
+      target,
+      messageId,
+      senderId: "owner-1",
+      text: "/commit",
+      supported: true,
+      kind: "command" as const,
+    };
+    expect(store.claimCommand(claim)).toBe(true);
+    expect(store.acceptCommitTask(claim, {
+      id: taskId,
+      botUid: first.harness.bot.uid,
+      ...target,
+      messageId,
+      senderId: "owner-1",
+      text: "/commit",
+      sessionId,
+      cwd: repo,
+      state: "queued",
+      resultText: null,
+      errorText: null,
+      messageSeq: 0,
+      historyEligible: false,
+      relaySuppressed: false,
+    })).toBe(true);
+  });
+
+  const restarted = await createCommitHarness({ root: first.harness.root, bot: first.harness.bot });
+  try {
+    await waitForStatus(restarted.harness.service, target, (status) => status.state === "completed");
+    expect(await latestTask(restarted.harness, target)).toMatchObject({
+      id: taskId,
+      state: "completed",
+      text: "/commit",
+    });
+    expect(restarted.commits.calls).toHaveLength(1);
+    expect(restarted.commits.calls[0]?.runCalls).toBe(1);
+  } finally {
+    await closeCoreHarness(restarted.harness);
+  }
+});
+
 
 function harnessTexts(harness: CoreHarness, target: ChatTarget): string[] {
   return harness.transport.sent
@@ -1808,7 +1872,8 @@ test("commit stop releases a pending host merge only after native commit settlem
     await send(harness, target, "stop-before-host-merge", "/commit stop");
     await merge;
     await waitForStatus(harness.service, target, (status) => status.state === "cancelled" && status.outbox === 0);
-    expect(harness.worktrees!.merges).toEqual([{ cwd: workspace }]);
+    expect(harness.worktrees!.merges).toHaveLength(1);
+    expect(harness.worktrees!.merges[0]).toMatchObject({ cwd: workspace, target: "main" });
     expect(harness.workers.prompts).toEqual([]);
   } finally {
     runGate.resolve(STOPPED_RESULT);
@@ -1849,7 +1914,8 @@ test("a running host merge blocks another chat's commit in the same linked workt
 
     finishMerge.resolve();
     await merge;
-    expect(harness.worktrees!.merges).toEqual([{ cwd: workspace }]);
+    expect(harness.worktrees!.merges).toHaveLength(1);
+    expect(harness.worktrees!.merges[0]).toMatchObject({ cwd: workspace, target: "main" });
   } finally {
     finishMerge.resolve();
     await merge;
