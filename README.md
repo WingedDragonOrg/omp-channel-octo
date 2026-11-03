@@ -108,10 +108,11 @@ oco run --config ~/.oco/config/config.json
 | `/new [目录]` | 创建新会话；回执显示会话、目录及可查询到的实际模型。 |
 | `/reset [目录]` | 重置为新会话，保留旧历史文件。 |
 | `/move <目录>` | 通过 OMP 原生迁移保留当前会话 ID、历史与附件。 |
+| `/fork [子区名称]` | 即时将当前主群/子区的已落盘上下文分叉到同父群的新子区；独立 session，共用当前目录，源任务继续。 |
 | `/thread <任务>` | 在群内交由助手按项目与耦合程度创建隔离子区，工作区和背景就绪后派发任务。 |
 | `/thread model [选择器\|clear]` | 主群查询、设置或清除所属子区默认模型；只影响子区下一次 worker 启动，主群自身模型不变。 |
-| `/thread merge [补充说明]` | 单项目及 separate 子区请求合并；默认合并成功后删除工作区和已合并分支。shared 多项目工作区只回复不支持提示。 |
-| `/thread remove [--force]` | 在目标子区由宿主清理其持久拥有的 worktree 与分支，全部完成后归档、保留聊天记录。默认保护 dirty 和未合并提交；`--force` 明确授权丢弃未提交改动与未合并分支。 |
+| `/thread merge [补充说明]` | 单项目及 separate 子区合并并清理工作区；shared 多项目拒绝。沿用目录的 fork 子区仅归档 Octo，保留本地资源。 |
+| `/thread remove [--force]` | 清理当前子区持久拥有的 worktree 与分支后归档；默认保护 dirty 和未合并提交，force 授权丢弃。沿用目录的 fork 子区仅归档 Octo。 |
 | `/queue <文本>` | 显式追加一个排队任务。 |
 | `/mode [steer\|queue]` | 查看或设置新消息的追加方式，默认 `steer`。 |
 | `/switch [provider\|模型]` | 查看当前模型、下一次启动策略与全部 provider 列表；参数精确匹配 provider 时仅查询该 provider，如 `/switch openai-codex`。全局和筛选列表均最多展示 100 个模型，超限明确展示数及总数，可直接 `/switch provider/model`。其余选择器继续原生切换并保存本聊天模型：`provider/id`、模型 ID/唯一子串、`@角色`、`:level`。 |
@@ -151,6 +152,14 @@ oco run --config ~/.oco/config/config.json
 助手可以在普通回复中使用结构化 mention 点名成员，完整的 mention 和后续正文在同一条消息中流式更新；代码示例和普通 `@名字` 文本不会自动点名。正文超过单条消息长度限制时按既有规则分段。
 
 安装并配置 `octo-cli` 后，助手可按当前 Bot 的权限使用 Loop、Docs、Drive、HTML、消息、文件、邮件和 Marketplace 等能力；它会通过 CLI 的 `skills`、`schema` 和帮助按需发现具体操作。
+
+### 会话分叉
+
+`/fork [子区名称]` 与独立 `fork` 宿主工具（仅可选 `name`）只从当前聊天的精确持久绑定分叉。主群创建所属子区，子区创建同父群的同级子区。源回合运行中也立即使用受管理的 OMP `--fork` 进程读取已落盘历史；准备进程退出确认后才发布新绑定，新子区等待实际新消息再 `--resume`。未落盘的首轮、失效绑定或未知进程结果明确失败，不自动创建空会话。
+
+新旧 session 独立推进，文件共用同一目录，不新建 Git worktree。新子区不复制源工作区归属、模型显式覆盖、待答问题、队列、goal 续跑授权或上下文注入回执。模型按新子区自身显式设置、父群子区默认、OMP 自行决定的顺序解析。已知部分结果保留；远端创建结果不明时不再次创建。
+
+持久标记的沿用目录 fork 子区执行 `/thread merge`、`/thread remove [--force]` 时只归档 Octo，保留聊天、共用目录、Git 分支以及源/目标 session 文件。merge 等待本聊天较早工作，remove 忙时拒绝；均不等待同目录的其他聊天。回执、正文和进度卡排空后归档，新授权入站会取消排定；不发布 Git 合并成功通知。详细契约见 `docs/specs/2026-11-03-thread-fork-design.md`。
 
 ### 多项目子区
 

@@ -118,11 +118,11 @@ async function canonicalSessionFile(sessionFile: string): Promise<string> {
 
 export async function loadValidatedSessionState(
   sessionFile: string,
-  expectedId: string,
+  expectedId?: string,
 ): Promise<LoadedSessionState> {
   const canonicalFile = await canonicalSessionFile(resolve(sessionFile));
   const header = await readSessionHeader(canonicalFile);
-  if (expectedId.length === 0 || header.id !== expectedId) {
+  if (expectedId !== undefined && (expectedId.length === 0 || header.id !== expectedId)) {
     throw new Error("OMP session state does not match its session header identity");
   }
   const cwd = await canonicalExistingDirectory(header.cwd);

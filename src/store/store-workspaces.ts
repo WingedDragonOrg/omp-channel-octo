@@ -174,6 +174,16 @@ export function listThreadWorkspaceIntents(
 
 export function isThreadWorkspaceIntentBlocked(db: Database, botUid: string, target: ChatTarget): boolean {
   if (target.channelType !== 5) return false;
+  const fork = query(
+    db,
+    "SELECT id, phase FROM thread_forks WHERE bot_uid = ? AND thread_channel_id = ?",
+    [botUid, target.channelId],
+  )[0];
+  if (fork) {
+    if (fork.phase !== "ready") return true;
+    const intent = getThreadWorkspaceIntent(db, botUid, asString(fork.id));
+    if (intent?.status !== "complete") return true;
+  }
   const separator = target.channelId.indexOf("____");
   if (separator <= 0) return false;
   const groupId = target.channelId.slice(0, separator);
@@ -205,6 +215,11 @@ function finalizeWorkspaceIntentFromRecords(
   intent: ThreadWorkspaceIntentRecord,
 ): ThreadWorkspaceIntentRecord {
   if (intent.status !== "preparing" || intent.channelIds.length === 0) return intent;
+  // Fork completion publishes its own ready record and intent in one transaction. Workspace rows
+  // are not fork-owned evidence, and a read-side recovery must not finalize a fork intent early.
+  if (query(db, "SELECT 1 FROM thread_forks WHERE bot_uid = ? AND id = ?", [intent.botUid, intent.id]).length > 0) {
+    return intent;
+  }
   const workspaces = intent.channelIds.map((channelId) =>
     getThreadWorkspace(db, intent.botUid, { channelType: 5, channelId }),
   );
@@ -227,40 +242,87 @@ function updateThreadWorkspaceIntent(
   status: "complete" | "failed",
   error: string | null,
 ): void {
-  transaction(db, () => {
-    const row = query(
-      db,
-      "SELECT status, channel_ids FROM thread_workspace_intents WHERE bot_uid = ? AND id = ?",
-      [botUid, id],
-    )[0];
-    if (!row) throw new Error("thread workspace intent does not exist");
-    const current = threadWorkspaceIntentStatus(row.status);
-    if (current === status) return;
-    if (current !== "preparing") throw new Error("thread workspace intent is already finalized");
-    const channelIds = threadWorkspaceIntentChannels(row.channel_ids);
-    const workspaces = channelIds.map((channelId) =>
-      getThreadWorkspace(db, botUid, { channelType: 5, channelId }),
-    );
-    if (
-      (status === "complete" && (
-        channelIds.length === 0
-        || workspaces.some((workspace) =>
-          workspace?.status !== "ready" || workspace.projects.some((project) => !project.created)
-        )
-      ))
-      || (status === "failed" && workspaces.some(
-        (workspace) => workspace === null || workspace.status === "preparing",
-      ))
-    ) {
-      throw new Error("thread workspace intent cannot finalize before every mapped workspace is terminal");
-    }
-    run(
-      db,
-      `UPDATE thread_workspace_intents SET status = ?, error = ?, updated_at = ?
-       WHERE bot_uid = ? AND id = ? AND status = 'preparing'`,
-      [status, error, Date.now(), botUid, id],
-    );
-  });
+  transaction(db, () => updateThreadWorkspaceIntentInTransaction(db, botUid, id, status, error));
+}
+
+export function completeThreadWorkspaceIntentInTransaction(db: Database, botUid: string, id: string): void {
+  updateThreadWorkspaceIntentInTransaction(db, botUid, id, "complete", null);
+}
+
+function updateThreadWorkspaceIntentInTransaction(
+  db: Database,
+  botUid: string,
+  id: string,
+  status: "complete" | "failed",
+  error: string | null,
+): void {
+  const row = query(
+    db,
+    "SELECT status, group_id, channel_ids FROM thread_workspace_intents WHERE bot_uid = ? AND id = ?",
+    [botUid, id],
+  )[0];
+  if (!row) throw new Error("thread workspace intent does not exist");
+  const current = threadWorkspaceIntentStatus(row.status);
+  if (current === status) return;
+  if (current !== "preparing") throw new Error("thread workspace intent is already finalized");
+  const channelIds = threadWorkspaceIntentChannels(row.channel_ids);
+  const workspaces = channelIds.map((channelId) =>
+    getThreadWorkspace(db, botUid, { channelType: 5, channelId }),
+  );
+  const hasForkRecord = query(
+    db,
+    "SELECT 1 FROM thread_forks WHERE id = ? AND bot_uid = ?",
+    [id, botUid],
+  ).length > 0;
+  const readyFork = status === "complete"
+    && readyForkIntentEvidence(db, botUid, id, asString(row.group_id), channelIds);
+  if (status === "complete" && hasForkRecord && !readyFork) {
+    throw new Error("thread workspace intent cannot complete before its fork is ready");
+  }
+  if (
+    (status === "complete" && !readyFork && (
+      channelIds.length === 0
+      || workspaces.some((workspace) =>
+        workspace?.status !== "ready" || workspace.projects.some((project) => !project.created)
+      )
+    ))
+    || (status === "failed" && workspaces.some(
+      (workspace) => workspace === null || workspace.status === "preparing",
+    ))
+  ) {
+    throw new Error("thread workspace intent cannot finalize before every mapped workspace is terminal");
+  }
+  run(
+    db,
+    `UPDATE thread_workspace_intents SET status = ?, error = ?, updated_at = ?
+     WHERE bot_uid = ? AND id = ? AND status = 'preparing'`,
+    [status, error, Date.now(), botUid, id],
+  );
+}
+
+function readyForkIntentEvidence(
+  db: Database,
+  botUid: string,
+  id: string,
+  groupId: string,
+  channelIds: readonly string[],
+): boolean {
+  if (channelIds.length !== 1) return false;
+  const fork = query(
+    db,
+    `SELECT phase, group_id, thread_channel_id, session_id, session_file, cwd
+     FROM thread_forks WHERE id = ? AND bot_uid = ?`,
+    [id, botUid],
+  )[0];
+  return Boolean(
+    fork
+    && fork.phase === "ready"
+    && asString(fork.group_id) === groupId
+    && asString(fork.thread_channel_id) === channelIds[0]
+    && asString(fork.session_id).length > 0
+    && asString(fork.session_file).length > 0
+    && asString(fork.cwd).length > 0
+  );
 }
 
 function threadWorkspaceIntentFromRow(row: Record<string, unknown>): ThreadWorkspaceIntentRecord {

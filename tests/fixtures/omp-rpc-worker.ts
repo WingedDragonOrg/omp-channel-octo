@@ -13,6 +13,8 @@ type Frame = Record<string, unknown>;
 
 type Scenario =
 	| "normal"
+	| "fork"
+	| "fork-not-ready"
 	| "session-settled"
 	| "goal-run"
 	| "goal-no-generation"
@@ -220,10 +222,18 @@ const scenario = (flag("--fixture-scenario") ?? "normal") as Scenario;
 const cwdArg = flag("--cwd") ? resolve(flag("--cwd")!) : process.cwd();
 const sessionDir = resolve(flag("--session-dir") ?? dirname(flag("--fixture-log") ?? cwdArg));
 const resumeArg = flag("--resume") ?? flag("--session");
-const sessionFile = resumeArg && (resumeArg.includes("/") || resumeArg.endsWith(".jsonl"))
-	? resolve(resumeArg)
-	: join(sessionDir, `fixture-${scenario}.jsonl`);
-const sessionId = `fixture-session-${scenario}`;
+const forkArg = flag("--fork");
+const forkState = flag("--fixture-fork-state");
+const sessionFile = forkArg
+	? join(sessionDir, `fixture-${scenario}-forked.jsonl`)
+	: resumeArg && (resumeArg.includes("/") || resumeArg.endsWith(".jsonl"))
+		? resolve(resumeArg)
+		: join(sessionDir, `fixture-${scenario}.jsonl`);
+const sessionId = forkArg && forkState === "same-session"
+	? flag("--fixture-source-session-id") ?? `fixture-session-${scenario}`
+	: forkArg
+		? `fixture-session-${scenario}-forked`
+		: `fixture-session-${scenario}`;
 /**
  * `--model` mirrors the real CLI: the first slash separates provider from model id, an optional
  * `:level` suffix sets the thinking level, and a worker started with it reports both.
@@ -366,23 +376,21 @@ let sessionIsSettled = true;
 let goalPreflightGateUsed = false;
 let goalToolsGateUsed = false;
 function persistSessionHeader(): void {
-	writeFileSync(
-		sessionFile,
-		`${JSON.stringify({
-			type: "session",
-			version: 3,
-			id: sessionId,
-			timestamp: new Date().toISOString(),
-			cwd: process.cwd(),
-		})}\n`,
-		"utf8",
-	);
+	if (forkState === "missing-file") return;
+	const header: Frame = {
+		type: "session",
+		version: 3,
+		id: forkState === "mismatched-id" ? `${sessionId}-header` : sessionId,
+		timestamp: new Date().toISOString(),
+		cwd: forkState === "wrong-cwd" ? dirname(cwdArg) : process.cwd(),
+	};
+	if (forkState === "invalid-header") delete header.cwd;
+	writeFileSync(sessionFile, `${JSON.stringify(header)}\n`, "utf8");
 }
 
-// A supplied --resume path represents an already-selected session.  The real
-// OMP process materializes a missing explicit path during startup as well.
-if (resumeArg) persistSessionHeader();
-
+// Resume selects an existing session; native fork creates a distinct one before
+// startup finishes. Neither path receives a prompt during initialization.
+if (resumeArg || forkArg) persistSessionHeader();
 
 appendLog({
 	kind: "startup",
@@ -394,13 +402,15 @@ appendLog({
 	sessionFile,
 });
 
-emit({
-	type: "ready",
-	protocolVersion: 1,
-	supportedProtocolVersions: [1, 2],
-	maxFrameBytes: 1024 * 1024,
-	maxReassembledFrameBytes: 64 * 1024 * 1024,
-});
+if (scenario !== "fork-not-ready") {
+	emit({
+		type: "ready",
+		protocolVersion: 1,
+		supportedProtocolVersions: [1, 2],
+		maxFrameBytes: 1024 * 1024,
+		maxReassembledFrameBytes: 64 * 1024 * 1024,
+	});
+}
 
 if (scenario === "autoresearch") {
 	// An extension re-attaching during startup can broadcast before any prompt exists;

@@ -20,6 +20,7 @@ import {
   TaskScheduler,
   resourcePathsRelated,
   type DestructiveCommandReservation,
+  type CommandSessionBarrier,
   type CommitLease,
   type SessionLease,
 } from "./tasks/task-scheduler.ts";
@@ -107,6 +108,7 @@ import {
   threadOutcomeNotice,
 } from "./threads/thread-notify.ts";
 import { ThreadArchiveScheduler } from "./threads/thread-archive.ts";
+import { ThreadForkController } from "./threads/thread-fork.ts";
 import { mergeThreadWorkspace, type ThreadMergeHost } from "./threads/thread-merge.ts";
 import {
   cleanupOwnedThreadWorkspace,
@@ -131,10 +133,11 @@ const COMMAND_HELP = [
   "/move <目录> · 保留当前会话并迁移工作目录",
   "",
   "子区",
+  "/fork [子区名称] · 分叉当前会话历史到同父群新子区",
   "/thread <任务> · 新建隔离子区并派发任务（群聊可用）",
   "/thread model [选择器|clear] · owner 在主群设置、查询或清除子区默认模型",
-  "/thread merge · 宿主先合并子区工作区；仅实际合并失败时派发一次修复任务",
-  "/thread remove [--force] · 清理当前子区 worktree 与分支后归档；force 可丢弃未提交改动和未合并分支",
+  "/thread merge · 合并隔离工作区；沿用目录的分叉子区仅归档",
+  "/thread remove [--force] · 清理当前子区工作区与分支后归档；分叉子区仅归档",
   "",
   "任务",
   "/queue <文本> · 将消息排到当前任务之后",
@@ -341,6 +344,14 @@ class CoreService implements ChannelService {
   /** Active owner-triggered removals share the same cancel/stop discipline as host merges. */
   private readonly threadRemovalControllers = new Map<string, Set<AbortController>>();
   private readonly threadRemovalControllersByCommand = new Map<string, AbortController>();
+  /** Fork command lifetime remains active through result delivery and durable claim completion. */
+  private readonly forkCommandTargets = new Map<string, ChatTarget>();
+  /** Fork archive waits and receipt-gated runs avoid the target cwd/Git resource locks. */
+  private readonly forkArchiveControllers = new Map<string, Set<AbortController>>();
+  private readonly forkArchiveStates = new Map<
+    AbortController,
+    { commandKey: string; targetKey: string; commandComplete: boolean; archiveComplete: boolean }
+  >();
   /** Per-chat progress edit tails remain visible after task leases release until terminal edits settle. */
   private readonly progressTails = new Map<string, Map<string, () => Promise<void>>>();
   /** A host command's archive is published only after its durable success receipt is inserted. */
@@ -393,6 +404,7 @@ class CoreService implements ChannelService {
   private readonly threadCommands: ThreadCommands;
   /** 子区归档排定的所有者：排定 map 与停止信号都在它内部，服务只负责接线与调用。 */
   private readonly threadArchives: ThreadArchiveScheduler;
+  private readonly threadForks: ThreadForkController;
   private stopPromise: Promise<void> | undefined;
   constructor(
     private readonly options: ChannelServiceOptions,
@@ -457,6 +469,16 @@ class CoreService implements ChannelService {
       awaitStartReady: () => this.startupGate.promise,
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
       notifyThreadOutcome: taskId => this.notifyThreadOutcome(taskId),
+    });
+    this.threadForks = new ThreadForkController({
+      store: this.store,
+      workerFactory: options.workerFactory,
+      transport: options.transport,
+      scheduler: this.scheduler,
+      botUid: () => this.bot?.uid,
+      stateDir: options.config.stateDir,
+      shutdownSignal: this.shutdownController.signal,
+      blockDirectory: cwd => { this.blockedDirectories.add(cwd); },
     });
     this.sessions = new SessionLifecycle({
       store: this.store,
@@ -569,6 +591,7 @@ class CoreService implements ChannelService {
         await this.ensureThreadListen(message);
       },
       refuseIncompleteThreadWorkspace: message => this.refuseIncompleteThreadWorkspace(message),
+      archiveForkThread: (message, mode) => this.archiveForkThread(message, mode),
       botUid: () => this.bot?.uid,
       ...(options.worktrees === undefined ? {} : { worktrees: options.worktrees }),
       archiveGeneration: target => this.threadArchives.generation(target),
@@ -597,12 +620,16 @@ class CoreService implements ChannelService {
     this.serviceRestart = new ServiceRestart({
       store: this.store,
       stopping: () => this.stopping,
-      // OMP runtime、原生 commit 与 host-first merge 共用同一在途视图，延期重启不会截断宿主合并回执。
+      // OMP runtime、原生 commit、thread operations 与 fork 命令回执共用同一在途视图，延期重启不会截断回执。
+      // OMP runtime, native commit, thread operations, fork preparation and fork command receipts share the restart view.
       hasRunning: () =>
         this.runtimes.size > 0
         || this.commitOperationsByTask.size > 0
         || this.threadMergeControllers.size > 0
-        || this.threadRemovalControllers.size > 0,
+        || this.threadRemovalControllers.size > 0
+        || this.threadForks.running
+        || this.forkCommandTargets.size > 0
+        || this.forkArchiveControllers.size > 0,
       restart: options.restart,
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
     });
@@ -610,6 +637,7 @@ class CoreService implements ChannelService {
     // （不再包一层 async），`handleCommand` 里的 await 因此仍是原来的微任务边界；只有
     // `restart` 的返回值参与重启判定。
     this.builtinHandlers = {
+      fork: (message, argument) => this.handleFork(message, argument),
       commit: (message, argument) => this.handleCommit(message, argument),
       new: (message, argument) => this.sessions.handleNew(message, argument),
       move: (message, argument) => this.sessions.handleMove(message, argument),
@@ -747,6 +775,7 @@ class CoreService implements ChannelService {
           if (ledger.moveTargetCwd) this.blockedDirectories.add(ledger.moveTargetCwd);
         }
       }
+      await this.threadForks.recoverStartup(identity.uid);
       // 旧版重启通报已随续接机制移除：遗留行静默清理，绝不再投递。
       this.serviceRestart.consumeStartupNotices(identity.uid);
       // started→queued（prompt 标记随行保留）由存储域一次性完成；先补发遗留卡片终态，恢复
@@ -847,6 +876,8 @@ class CoreService implements ChannelService {
     if (this.stopping) return;
     const wasReady = this.ready;
     this.stopping = true;
+    this.abortAllThreadForks(new Error("channel stopping"));
+    this.abortAllForkArchiveWaits(new Error("channel stopping"));
     this.abortAllThreadMerges(new Error("channel stopping"));
     this.abortAllThreadRemovals(new Error("channel stopping"));
     this.threadArchives.stop();
@@ -877,6 +908,7 @@ class CoreService implements ChannelService {
     }
     this.outbox.abortAll();
     await this.scheduler.settle();
+    await this.threadForks.settle();
     await Promise.allSettled([...this.activityOperations]);
     // Inbound handlers aborted above finish their bounded cleanup here, while the store is still
     // open: interrupted assembly rolls its command claim back so a redelivery is not swallowed.
@@ -1033,7 +1065,7 @@ class CoreService implements ChannelService {
     if (!message.supported) {
       const claim = this.commandClaim(message, "unsupported");
       if (!this.store.claimCommand(claim)) return;
-      this.threadArchives.cancel(message);
+      this.cancelThreadArchives(message);
       try {
         await this.outbox.enqueueText(message, "不支持的消息类型，不会启动任务。", null);
         this.store.completeCommand(claim);
@@ -1078,7 +1110,7 @@ class CoreService implements ChannelService {
     }
     if (await this.refuseIncompleteThreadWorkspace(message)) return;
     if (await this.questions.answerPendingQuestion(message, text)) {
-      this.threadArchives.cancel(message);
+      this.cancelThreadArchives(message);
       return;
     }
     await this.withMessageTyping(message, async() => {
@@ -1318,6 +1350,23 @@ class CoreService implements ChannelService {
   ): Promise<boolean> {
     if (target.channelType !== 5 || this.bot === undefined) return false;
     try {
+      const parentGroupId = threadParentGroupId(target.channelId);
+      if (parentGroupId !== null) {
+        const unknownRemoteFork = this.store.listThreadForks(this.bot.uid).some(record => {
+          if (
+            record.groupId !== parentGroupId
+            || record.thread !== null
+            || (record.phase !== "creating" && record.phase !== "failed")
+          ) {
+            return false;
+          }
+          const intent = this.store.getThreadWorkspaceIntent(this.bot!.uid, record.id);
+          return intent?.status === "preparing" && intent.channelIds.length === 0;
+        });
+        if (unknownRemoteFork) return true;
+      }
+      const fork = this.store.getThreadForkByTarget(this.bot.uid, target);
+      if (fork !== null && fork.phase !== "ready") return true;
       if (this.store.isThreadWorkspaceIntentBlocked(this.bot.uid, target)) return true;
       const workspace = this.store.getThreadWorkspace(this.bot.uid, target);
       if (workspace === null) return false;
@@ -1590,7 +1639,7 @@ class CoreService implements ChannelService {
     if (await this.scheduler.hasPendingCommandReservation(message, runtime.cwd)) return false;
     const claim = this.commandClaim(message, "steer");
     if (!this.store.claimCommand(claim)) return true;
-    this.threadArchives.cancel(message);
+    this.cancelThreadArchives(message);
     const delivery = runtime.steerSerial.then(() =>
       this.deliverSteeringMessage(runtime, message, text, claim, deliveryGuard, beforeWorkerSteer));
     runtime.steerSerial = delivery.then(() => {}, () => {});
@@ -1609,7 +1658,7 @@ class CoreService implements ChannelService {
       this.throwIfStopping();
       const claim = this.commandClaim(message, command.name);
       if (!this.store.claimCommand(claim)) return;
-      this.threadArchives.cancel(message);
+      this.cancelThreadArchives(message);
       try {
         await handler.handle({
           message: { ...message, text: body },
@@ -1646,6 +1695,29 @@ class CoreService implements ChannelService {
     }
   }
 
+  private async handleFork(message: InboundMessage, argument: string): Promise<void> {
+    let result: string;
+    try {
+      result = await this.trackForkOperation(this.threadForks.command(message, argument));
+    } catch (error) {
+      const detail = safeDisplayText(error instanceof Error ? error.message : String(error), 1000);
+      await this.outbox.enqueueText(
+        message,
+        `分叉未完成：${detail ?? "操作结果保持安全状态。"}`,
+        null,
+      );
+      return;
+    }
+    await this.outbox.enqueueText(message, result, null);
+  }
+
+  private trackForkOperation<T>(operation: Promise<T>, checkDeferredRestartOnSettle = false): Promise<T> {
+    this.operationSet(operation.then(() => {}, () => {}));
+    return checkDeferredRestartOnSettle
+      ? operation.finally(() => this.serviceRestart.maybeRunDeferred())
+      : operation;
+
+  }
   private async handleCommand(
     message: InboundMessage,
     name: string,
@@ -1655,12 +1727,23 @@ class CoreService implements ChannelService {
     // 认领仍按键原始命令名（别名在 claim 之后只影响走哪个 handler），认领失败即丢弃。
     const claim = this.commandClaim(message, name);
     if (!this.store.claimCommand(claim)) return;
-    this.threadArchives.cancel(message);
+    const forkCommandKey = action === "fork" ? this.threadMergeCommandKey(message) : null;
+    if (forkCommandKey !== null) this.forkCommandTargets.set(forkCommandKey, { ...message });
     try {
+      this.cancelThreadArchives(message);
+      if (
+        (action === "new" || action === "move")
+        && this.store.getThreadForkByTarget(this.bot!.uid, message) !== null
+        && await this.refuseIncompleteThreadWorkspace(message)
+      ) {
+        this.store.completeCommand(claim);
+        return;
+      }
       const restartRequested = await this.builtinHandlers[action](message, argument);
       const commandKey = this.threadMergeCommandKey(message);
       if (
-        this.threadMergeControllersByCommand.has(commandKey)
+        forkCommandKey !== null
+        || this.threadMergeControllersByCommand.has(commandKey)
         || this.threadRemovalControllersByCommand.has(commandKey)
       ) {
         await this.outbox.flush(message);
@@ -1680,6 +1763,11 @@ class CoreService implements ChannelService {
         this.finishThreadMergeCommand(message)
         || this.finishThreadRemovalCommand(message)
       ) this.serviceRestart.maybeRunDeferred();
+      if (action === "thread") this.completeForkArchiveCommand(message);
+      if (forkCommandKey !== null) {
+        this.forkCommandTargets.delete(forkCommandKey);
+        this.serviceRestart.maybeRunDeferred();
+      }
     }
   }
 
@@ -1690,10 +1778,13 @@ class CoreService implements ChannelService {
   private async handleInterrupt(target: ChatTarget): Promise<void> {
     const mergeCancelled = this.abortThreadMerges(target, new Error("thread merge interrupted"));
     const removalCancelled = this.abortThreadRemovals(target, new Error("thread removal interrupted"));
+    const forkCancelled = this.threadForks.abortTarget(target, new Error("fork interrupted"));
+    const archiveCancelled = this.abortForkArchiveWaits(target, new Error("fork archive interrupted"));
+    const hostOperationCancelled = mergeCancelled || removalCancelled || forkCancelled || archiveCancelled;
     if (this.commitOperationsByTarget.has(targetKey(target))) {
       await this.outbox.enqueueText(
         target,
-        mergeCancelled || removalCancelled
+        hostOperationCancelled
           ? "当前是 Git 提交任务；请使用 /commit stop。/interrupt 不会中断或伪确认提交。等待或执行中的子区宿主操作已请求中止。"
           : "当前是 Git 提交任务；请使用 /commit stop。/interrupt 不会中断或伪确认提交。",
         null,
@@ -1704,7 +1795,7 @@ class CoreService implements ChannelService {
     if (!runtime?.lease) {
       await this.outbox.enqueueText(
         target,
-        mergeCancelled || removalCancelled
+        hostOperationCancelled
           ? "已请求中止正在等待或执行的子区宿主操作；进程结果若未确认，资源将保持封锁且不会自动重试。"
           : DEFAULT_INTERRUPT_IDLE_TEXT,
         null,
@@ -1728,7 +1819,7 @@ class CoreService implements ChannelService {
     }
     await this.outbox.enqueueText(
       target,
-      mergeCancelled || removalCancelled
+      hostOperationCancelled
         ? `${DEFAULT_INTERRUPTED_TEXT} 正在等待或执行的子区宿主操作也已请求中止。`
         : DEFAULT_INTERRUPTED_TEXT,
       null,
@@ -2976,6 +3067,8 @@ class CoreService implements ChannelService {
     if (binding) this.invalidateGoalResumeChecks(target, binding.sessionId);
     const mergeCancelled = this.abortThreadMerges(target, new Error("thread merge cancelled"));
     const removalCancelled = this.abortThreadRemovals(target, new Error("thread removal cancelled"));
+    const forkCancelled = this.threadForks.abortTarget(target, new Error("fork cancelled"));
+    const archiveCancelled = this.abortForkArchiveWaits(target, new Error("fork archive cancelled"));
     const queued = this.store.cancelQueued(this.bot!.uid, target);
     const queuedCommit = this.commitOperationsByTarget.get(targetKey(target));
     if (queuedCommit && queued.includes(queuedCommit.taskId)) {
@@ -3026,7 +3119,7 @@ class CoreService implements ChannelService {
       ? "无法确认提交进程已停止；排队任务已清除，工作树仍受保护。"
       : completedCommit?.result !== undefined
         ? `当前提交已完成，无法取消或回滚；HEAD=${this.shortHead(completedCommit.result.headAfter)}。`
-        : queued.length > 0 || active || mergeCancelled || removalCancelled
+        : queued.length > 0 || active || mergeCancelled || removalCancelled || forkCancelled || archiveCancelled
           ? DEFAULT_CANCELLED_TEXT
           : "当前没有可取消的任务。";
     await this.outbox.enqueueText(target, response, null);
@@ -3055,6 +3148,56 @@ class CoreService implements ChannelService {
     for (const controllers of this.threadRemovalControllers.values()) {
       for (const controller of controllers) controller.abort(reason);
     }
+  }
+  private cancelThreadArchives(target: InboundMessage): void {
+    this.threadArchives.cancel(target);
+    this.abortForkArchiveWaits(target, new Error("new inbound"));
+  }
+
+  private abortForkArchiveWaits(target: ChatTarget, reason: Error): boolean {
+    const controllers = this.forkArchiveControllers.get(targetKey(target));
+    if (!controllers) return false;
+    for (const controller of controllers) controller.abort(reason);
+    return controllers.size > 0;
+  }
+
+  private abortAllForkArchiveWaits(reason: Error): void {
+    for (const controllers of this.forkArchiveControllers.values()) {
+      for (const controller of controllers) controller.abort(reason);
+    }
+  }
+  private completeForkArchiveCommand(message: InboundMessage): void {
+    const commandKey = this.threadMergeCommandKey(message);
+    for (const [controller, state] of this.forkArchiveStates) {
+      if (state.commandKey !== commandKey) continue;
+      state.commandComplete = true;
+      this.finishForkArchiveState(controller, state);
+    }
+  }
+
+  private finishForkArchiveOperation(controller: AbortController): void {
+    const state = this.forkArchiveStates.get(controller);
+    if (!state) return;
+    state.archiveComplete = true;
+    this.finishForkArchiveState(controller, state);
+  }
+
+  private finishForkArchiveState(
+    controller: AbortController,
+    state: { commandKey: string; targetKey: string; commandComplete: boolean; archiveComplete: boolean },
+  ): void {
+    if (!state.commandComplete || !state.archiveComplete) return;
+    this.forkArchiveStates.delete(controller);
+    const controllers = this.forkArchiveControllers.get(state.targetKey);
+    controllers?.delete(controller);
+    if (controllers?.size === 0 && this.forkArchiveControllers.get(state.targetKey) === controllers) {
+      this.forkArchiveControllers.delete(state.targetKey);
+    }
+    this.serviceRestart.maybeRunDeferred();
+  }
+
+  private abortAllThreadForks(reason: Error): void {
+    this.threadForks.abortAll(reason);
   }
   private threadMergeCommandKey(message: InboundMessage): string {
     return `${targetKey(message)}\0${message.messageId}`;
@@ -3102,6 +3245,14 @@ class CoreService implements ChannelService {
       ? this.store.getGoalSession(this.bot!.uid, target, current.sessionId)
       : null;
     const policy = this.store.resolveChatModel(this.bot!.uid, target);
+    const targetKeyValue = targetKey(target);
+    const forkState = this.threadForks.runningTargets().includes(targetKeyValue)
+      ? "fork-preparing"
+      : [...this.forkCommandTargets.values()].some((commandTarget) => targetKey(commandTarget) === targetKeyValue)
+        ? "fork-command"
+        : this.forkArchiveControllers.has(targetKeyValue)
+          ? "fork-archive"
+          : null;
     const live = this.liveWorker(target);
     let liveModel = "无运行中会话";
     if (live) {
@@ -3116,7 +3267,7 @@ class CoreService implements ChannelService {
     }
     await this.outbox.enqueueText(
       target,
-      `session=${session}\ncwd=${cwd}\nstate=${taskState}\ngoal=${goal?.status ?? "none"}\nmode=${current.mode}\nmodel=${modelPolicyDescription(policy.model, policy.source)}（下次启动策略）\nliveModel=${liveModel}\nqueued=${current.queued}\noutbox=${current.outbox}\nunknown=${current.unknownOutbox}`,
+      `session=${session}\ncwd=${cwd}\nstate=${taskState}${forkState === null ? "" : `\noperation=${forkState}`}\ngoal=${goal?.status ?? "none"}\nmode=${current.mode}\nmodel=${modelPolicyDescription(policy.model, policy.source)}（下次启动策略）\nliveModel=${liveModel}\nqueued=${current.queued}\noutbox=${current.outbox}\nunknown=${current.unknownOutbox}`,
       null,
     );
   }
@@ -3263,7 +3414,7 @@ class CoreService implements ChannelService {
       throw new Error("本地状态盘写入失败，任务未接收。");
     }
     if (!accepted) return false;
-    this.threadArchives.cancel(message);
+    this.cancelThreadArchives(message);
     // 持久接受即点亮 task 租约：同聊天或同会话排队等待到终态都保持「正在输入」。
     this.typingLeases.acquire(message, `task:${task.id}`);
     if (startsBehind) this.scheduler.markWaiting(task.id);
@@ -3917,7 +4068,83 @@ class CoreService implements ChannelService {
     void tail.then(remove, remove);
   }
 
-  private runThreadArchive(target: ChatTarget): void {
+  private async archiveForkThread(
+    message: InboundMessage,
+    mode: "merge" | "remove",
+  ): Promise<void> {
+    if (message.channelType !== 5) throw new Error("分叉子区归档只能在子区中执行。");
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) throw new Error("Bot 身份未注册，无法归档分叉子区。");
+    const record = this.store.getThreadForkByTarget(botUid, message);
+    const groupId = threadParentGroupId(message.channelId);
+    const shortId = threadShortId(message.channelId);
+    if (
+      record?.phase !== "ready"
+      || record.thread === null
+      || groupId === null
+      || shortId === null
+      || record.groupId !== groupId
+      || record.thread.groupId !== groupId
+      || record.thread.shortId !== shortId
+      || record.thread.channelId !== message.channelId
+    ) {
+      throw new Error("当前分叉子区尚未就绪或身份不匹配，未安排归档。");
+    }
+    if (mode === "remove" && this.scheduler.hasChatWork(message)) {
+      await this.outbox.enqueueText(message, "当前子区有任务正在运行或排队，未归档。", null);
+      return;
+    }
+
+    const key = targetKey(message);
+    const controller = new AbortController();
+    const controllers = this.forkArchiveControllers.get(key) ?? new Set<AbortController>();
+    controllers.add(controller);
+    this.forkArchiveControllers.set(key, controllers);
+    const activity = {
+      commandKey: this.threadMergeCommandKey(message),
+      targetKey: key,
+      commandComplete: false,
+      archiveComplete: false,
+    };
+    this.forkArchiveStates.set(controller, activity);
+    let barrier: CommandSessionBarrier | undefined;
+    let archiveOperation: Promise<void> | undefined;
+    try {
+      const generation = this.threadArchives.generation(message);
+      if (mode === "merge") {
+        barrier = this.scheduler.reserveSessionBarrier(message);
+        try {
+          await barrier.waitForPrior(controller.signal);
+        } catch (error) {
+          if (controller.signal.aborted) return;
+          throw error;
+        }
+      }
+      if (controller.signal.aborted || this.threadArchives.generation(message) !== generation) return;
+      const receiptId = createHash("sha256")
+        .update(JSON.stringify(["thread-fork-archive", botUid, message.channelType, message.channelId, message.messageId, mode]))
+        .digest("hex");
+      const receiptText = "此分叉子区仅执行 Octo 归档；不会进行 Git 合并，也不会删除或改写共享目录与分支。";
+      this.enqueueHostCommandReceipt(message, receiptId, receiptText, mode);
+      this.pendingHostMergeArchives.set(key, {
+        target: { ...message },
+        groupId,
+        shortId,
+        generation,
+        receiptOutboxIds: [receiptId],
+      });
+      archiveOperation = this.runThreadArchive(message);
+    } finally {
+      barrier?.release();
+      if (archiveOperation === undefined) this.finishForkArchiveOperation(controller);
+      else void archiveOperation.then(
+        () => this.finishForkArchiveOperation(controller),
+        () => this.finishForkArchiveOperation(controller),
+      );
+    }
+  }
+
+  private runThreadArchive(target: ChatTarget): Promise<void> {
     const key = targetKey(target);
     const pending = this.pendingHostMergeArchives.get(key);
     if (pending) {
@@ -3933,8 +4160,11 @@ class CoreService implements ChannelService {
     const progressTail = Promise.allSettled(
       [...(this.progressTails.get(key)?.values() ?? [])].map((getTail) => getTail()),
     ).then(() => {});
-    this.operationSet(this.threadArchives.run(target, progressTail));
+    const operation = this.threadArchives.run(target, progressTail);
+    this.operationSet(operation);
+    return operation;
   }
+
 
   /**
    * Host tools 的宿主适配：工具模块只看到它真正需要的状态。重启排定已委托给独立的
@@ -3973,6 +4203,8 @@ class CoreService implements ChannelService {
       },
       askQuestions: (task, target, args, signal, toolCallId) =>
         this.questions.askQuestions(task, target, args, signal, toolCallId),
+      forkSession: (task, args, signal, toolCallId) =>
+        this.trackForkOperation(this.threadForks.tool(task, args, signal, toolCallId), true),
       channelStatus: () => ({
         pid: process.pid,
         restart_pending: this.serviceRestart.pending,
@@ -3980,6 +4212,9 @@ class CoreService implements ChannelService {
           ...[...this.runtimes.values()].map((runtime) => targetKey(runtime.target)),
           ...this.commitOperationsByTarget.keys(),
           ...this.threadMergeControllers.keys(),
+          ...this.threadForks.runningTargets(),
+          ...[...this.forkCommandTargets.values()].map(targetKey),
+          ...this.forkArchiveControllers.keys(),
         ])],
         queued_tasks: this.store.listQueuedTasks().length,
         blocked_cwds: this.blockedDirectories.size,

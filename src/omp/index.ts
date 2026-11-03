@@ -202,6 +202,10 @@ function modelLevel(frame: unknown): string | null {
 	return typeof level === "string" && level.length > 0 ? level : null;
 }
 
+function startupAbortError(signal: AbortSignal): Error {
+	return signal.reason instanceof Error ? signal.reason : new Error("OMP worker startup aborted");
+}
+
 class RpcWorker implements OmpWorker {
 	#child: RpcChild;
 	#watchdog: RpcChild | undefined;
@@ -281,7 +285,38 @@ class RpcWorker implements OmpWorker {
 		return this.#sessionId;
 	}
 
-	async initialize(): Promise<void> {
+	async initialize(signal?: AbortSignal): Promise<ProjectSessionState> {
+		if (!signal) return this.#initializeCore();
+		if (signal.aborted) {
+			this.#readyPromise.catch(() => {});
+			await this.stop();
+			throw startupAbortError(signal);
+		}
+
+		const aborted = Promise.withResolvers<never>();
+		const onAbort = (): void => {
+			aborted.reject(startupAbortError(signal));
+			void this.stop().catch(() => false);
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		const initialization = this.#initializeCore();
+		try {
+			const state = await Promise.race([initialization, aborted.promise]);
+			if (signal.aborted) throw startupAbortError(signal);
+			return state;
+		} catch (error) {
+			if (signal.aborted) {
+				const stopped = await this.stop();
+				if (stopped) await initialization.catch(() => {});
+				throw startupAbortError(signal);
+			}
+			throw error;
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
+	}
+
+	async #initializeCore(): Promise<ProjectSessionState> {
 		try {
 			await this.#waitWithTimeout(this.#readyPromise, this.#startupTimeoutMs, "OMP worker did not become ready");
 		} catch (error) {
@@ -308,7 +343,7 @@ class RpcWorker implements OmpWorker {
 			throw taskStartupError("handshake-failed", error);
 		}
 		try {
-			await this.refreshState();
+			return await this.refreshState();
 		} catch (error) {
 			throw taskStartupError("session-invalid", error);
 		}
@@ -1284,14 +1319,32 @@ class OmpWorkerFactory implements WorkerFactory {
 	}
 
 	async create(options: WorkerOptions): Promise<OmpWorker> {
-
 		if (!options || !isAbsolute(options.cwd) || !isAbsolute(options.sessionDir))
 			throw new Error("OMP worker cwd and sessionDir must be absolute");
+		if (options.signal?.aborted) throw startupAbortError(options.signal);
+		if (options.sessionFile !== undefined && options.forkFrom !== undefined) {
+			throw new TaskStartupError("session-invalid", "OMP worker cannot resume and fork in the same startup");
+		}
+		if (options.forkFrom !== undefined && (!isAbsolute(options.forkFrom) || options.forkFrom.length === 0)) {
+			throw new TaskStartupError("session-invalid", "OMP fork source session file must be absolute");
+		}
 		if (!existsSync(options.cwd)) throw new TaskStartupError("cwd-missing", `OMP worker cwd does not exist: ${options.cwd}`);
 		if (!existsSync(options.sessionDir)) throw new TaskStartupError("session-dir-missing", `OMP worker sessionDir does not exist: ${options.sessionDir}`);
 		const cwd = realpathSync(options.cwd);
 		const sessionDir = realpathSync(options.sessionDir);
 		if (!existsSync(sessionDir)) throw new TaskStartupError("session-dir-missing", `OMP worker sessionDir does not exist: ${sessionDir}`);
+
+		let forkSourceState: ProjectSessionState | undefined;
+		if (options.forkFrom !== undefined) {
+			try {
+				forkSourceState = (await loadValidatedSessionState(options.forkFrom)).state;
+				if (forkSourceState.cwd !== cwd) throw new Error("OMP fork source cwd does not match the requested worker cwd");
+			} catch (error) {
+				throw taskStartupError("session-invalid", error);
+			}
+		}
+		if (options.signal?.aborted) throw startupAbortError(options.signal);
+
 		const command = [
 			this.#options.ompCommand,
 			...stripEnforcedArgs(this.#options.extraArgs ?? []),
@@ -1308,6 +1361,7 @@ class OmpWorkerFactory implements WorkerFactory {
 		];
 		if (options.model) command.push("--model", options.model);
 		if (options.sessionFile) command.push("--resume", resolve(options.sessionFile));
+		else if (forkSourceState) command.push("--fork", forkSourceState.sessionFile);
 		if (options.goalContinuation === true) command.push("--config", FIXED_GOAL_RPC_CONFIG_PATH);
 		let child: RpcChild;
 		try {
@@ -1364,14 +1418,24 @@ class OmpWorkerFactory implements WorkerFactory {
 			snapshot.pgid,
 			this.#startupTimeoutMs,
 			this.#cancelTimeoutMs,
-			!options.sessionFile,
+			!options.sessionFile && forkSourceState === undefined,
 			options.goalContinuation === true,
 		);
 		try {
-			await worker.initialize();
+			const state = await worker.initialize(options.signal);
+			if (options.signal?.aborted) throw startupAbortError(options.signal);
+			if (forkSourceState) {
+				if (state.sessionId === forkSourceState.sessionId || state.sessionFile === forkSourceState.sessionFile) {
+					throw new TaskStartupError("session-invalid", "OMP native fork did not create a distinct session");
+				}
+				if (state.cwd !== cwd || state.cwd !== forkSourceState.cwd) {
+					throw new TaskStartupError("session-invalid", "OMP native fork session cwd does not match the source session");
+				}
+			}
 			return worker;
 		} catch (error) {
 			await worker.stop();
+			if (options.signal?.aborted) throw startupAbortError(options.signal);
 			throw taskStartupError("handshake-failed", asError(error, "OMP RPC worker failed during startup"));
 		}
 	}

@@ -507,6 +507,8 @@ export interface WorkerOptions {
   cwd: string;
   sessionDir: string;
   sessionFile?: string;
+  /** Exact source JSONL path for a native fork; mutually exclusive with `sessionFile`. */
+  forkFrom?: string;
   /**
    * Canonical `provider/id` the worker starts with (`--model`). It wins over the model recorded in
    * a resumed session, so a chat's switch applies from the next started turn on.
@@ -518,6 +520,11 @@ export interface WorkerOptions {
    * active OMP profile has `goal.enabled: false`.
    */
   goalContinuation?: boolean;
+  /**
+   * Cancels worker startup. If the process has spawned, startup rejects only after its managed
+   * process group has been stopped or handed to the existing recovery path.
+   */
+  signal?: AbortSignal;
   /**
    * Called immediately after spawn. The caller MUST durably record the running process before
    * worker initialization can fail.

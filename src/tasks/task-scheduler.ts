@@ -16,6 +16,27 @@ import { targetKey, taskTarget } from "../target.ts";
 import { lstat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
+async function waitForAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("operation aborted");
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal.reason instanceof Error ? signal.reason : new Error("operation aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([operation, aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return waitForAbort(
+    new Promise<void>(resolve => setTimeout(resolve, milliseconds)),
+    signal,
+  );
+}
+
 /**
  * 按 session 与聊天键的租约：任务和 `/new`、`/move` 共用对应的会话锁，聊天键还防止命令期间
  * 绑定切换后同聊天的新任务越过命令。`ready` 在它们都空闲后兑现，`complete` 恰好释放一次。
@@ -37,6 +58,12 @@ export interface DestructiveCommandReservation {
   /** Add exact resource paths to this FIFO intent before its first acquisition attempt. */
   extend(cwds: readonly string[]): void;
   tryAcquire(): Promise<SessionLease | undefined>;
+  release(): void;
+}
+
+export interface CommandSessionBarrier {
+  /** Waits for work scheduled before this barrier on the exact chat/session, never cwd/Git peers. */
+  waitForPrior(signal: AbortSignal): Promise<void>;
   release(): void;
 }
 
@@ -487,6 +514,87 @@ export class TaskScheduler {
         sessionLease?.complete();
         reservation.release();
       }
+    }
+  }
+
+  /** A FIFO chat/session barrier with no cwd or repository ownership. */
+  reserveSessionBarrier(target: ChatTarget): CommandSessionBarrier {
+    const binding = this.bindingFor(target);
+    const sessionKey = this.sessionKey(target, binding);
+    const reservation = this.createCommandReservationRecord(target, []);
+    return {
+      waitForPrior: signal => this.waitForPriorSessionWork(reservation, sessionKey, signal),
+      release: () => reservation.release(),
+    };
+  }
+
+  hasChatWork(target: ChatTarget): boolean {
+    const key = targetKey(target);
+    const binding = this.bindingFor(target);
+    const sessionKeys = new Set(this.leaseKeys(target, this.sessionKey(target, binding)));
+    return this.chatTails.has(key)
+      || this.deps.store.listQueuedTasks().some(task => targetKey(taskTarget(task)) === key)
+      || [...this.commandReservations].some(reservation =>
+        reservation.sessionKeys.some(sessionKey => sessionKeys.has(sessionKey)),
+      );
+  }
+
+  /**
+   * Keep a shared source cwd/root in use while an independent fork preparation runs. Unlike an
+   * ordinary session acquisition this neither waits for nor rejects other shared users; it only
+   * refuses blocked or destructive ownership and publishes its paths after all async probes.
+   */
+  async tryAcquireSharedResources(
+    owner: string,
+    cwds: readonly string[],
+  ): Promise<DestructiveResourceLease | undefined> {
+    const paths = this.resourcePaths(cwds);
+    if (
+      owner.length === 0
+      || paths.length === 0
+      || this.deps.stopping()
+      || this.activeResourceUsers.has(owner)
+      || paths.some(path => this.deps.isDirectoryBlocked(path))
+      || this.hasExclusiveResourceConflict(paths, new Set<string>())
+    ) {
+      return undefined;
+    }
+    try {
+      const roots = await this.repositoryRoots(cwds);
+      const unavailable = (): boolean =>
+        this.deps.stopping()
+        || paths.some(path => this.deps.isDirectoryBlocked(path))
+        || this.hasExclusiveResourceConflict(paths, roots);
+      if (
+        unavailable()
+        || await this.hasConflictingResourceReservation(
+          paths,
+          roots,
+          Number.POSITIVE_INFINITY,
+        )
+        || await this.repositoriesAreBlocked(roots)
+        || await this.hasConflictingResourceReservation(
+          paths,
+          roots,
+          Number.POSITIVE_INFINITY,
+        )
+        || unavailable()
+      ) {
+        return undefined;
+      }
+      const usage: ActiveResourceUse = { paths, roots };
+      this.activeResourceUsers.set(owner, usage);
+      let completed = false;
+      return {
+        ready: Promise.resolve(),
+        complete: () => {
+          if (completed) return;
+          completed = true;
+          if (this.activeResourceUsers.get(owner) === usage) this.activeResourceUsers.delete(owner);
+        },
+      };
+    } catch {
+      return undefined;
     }
   }
 
@@ -1114,6 +1222,48 @@ export class TaskScheduler {
       return targetKey(queuedTarget) === chatKey
         || this.sessionKey(queuedTarget, this.bindingFor(queuedTarget)) === sessionKey;
     });
+  }
+
+  private async waitForPriorSessionWork(
+    reservation: CommandReservationRecord,
+    sessionKey: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    while (this.commandReservations.has(reservation)) {
+      if (this.deps.stopping()) throw new Error("channel stopping");
+      if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("operation aborted");
+      const earlierReservations = [...this.commandReservations]
+        .filter(candidate =>
+          candidate !== reservation
+          && candidate.order < reservation.order
+          && this.reservationConflicts(candidate, reservation.target, sessionKey),
+        )
+        .map(candidate => candidate.ready);
+      if (earlierReservations.length > 0) {
+        await waitForAbort(Promise.all(earlierReservations).then(() => {}), signal);
+        continue;
+      }
+      const earlier = [...this.scheduledTasks.entries()]
+        .filter(([taskId]) => (this.scheduledOrder.get(taskId) ?? Number.POSITIVE_INFINITY) < reservation.order)
+        .filter(([taskId]) => {
+          const task = this.deps.store.getTask(taskId);
+          if (!task) return false;
+          const target = taskTarget(task);
+          return this.reservationConflicts(
+            reservation,
+            target,
+            this.sessionKey(target, this.bindingFor(target)),
+          );
+        })
+        .map(([, operation]) => operation);
+      if (earlier.length > 0) {
+        await waitForAbort(Promise.allSettled(earlier).then(() => {}), signal);
+        continue;
+      }
+      if (!this.hasQueuedWork(reservation.target, sessionKey, reservation.order)) return;
+      await abortableDelay(50, signal);
+    }
+    throw new Error("session barrier was released");
   }
 
 

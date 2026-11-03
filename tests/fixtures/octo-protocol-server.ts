@@ -109,6 +109,7 @@ export interface FixtureManagementThread {
   name: string;
   creator_uid: string;
   status: number;
+  archived?: boolean;
   member_count: number;
   message_count: number;
   created_at: string;
@@ -125,6 +126,7 @@ type ManagementRoute =
   | { kind: "thread-create"; groupId: string }
   | { kind: "thread-info"; groupId: string; shortId: string }
   | { kind: "thread-delete"; groupId: string; shortId: string }
+  | { kind: "thread-archive"; groupId: string; shortId: string }
   | { kind: "thread-members"; groupId: string; shortId: string }
   | { kind: "thread-join"; groupId: string; shortId: string }
   | { kind: "thread-leave"; groupId: string; shortId: string };
@@ -776,6 +778,14 @@ export class OctoProtocolFixture {
       if (method === "DELETE") return { kind: "thread-delete", groupId, shortId };
       return null;
     }
+    const archive = /^\/v1\/bot\/groups\/([^/]+)\/threads\/([^/]+)\/archive$/.exec(pathname);
+    if (archive?.[1] !== undefined && archive[2] !== undefined && method === "POST") {
+      return {
+        kind: "thread-archive",
+        groupId: decodeURIComponent(archive[1]),
+        shortId: decodeURIComponent(archive[2]),
+      };
+    }
     const action = /^\/v1\/bot\/groups\/([^/]+)\/threads\/([^/]+)\/(members|join|leave)$/.exec(pathname);
     if (action?.[1] !== undefined && action[2] !== undefined) {
       const groupId = decodeURIComponent(action[1]);
@@ -895,6 +905,23 @@ export class OctoProtocolFixture {
         this.managedThreads.set(
           groupId,
           (this.managedThreads.get(groupId) ?? []).filter((thread) => thread.short_id !== route.shortId),
+        );
+        writeJson(response, 200, { status: 200 });
+        return;
+      }
+      case "thread-archive": {
+        const threads = this.managedThreads.get(groupId) ?? [];
+        if (!threads.some((thread) => thread.short_id === route.shortId)) {
+          writeJson(response, 400, {
+            error: { code: "err.server.bot_api.request_invalid", message: "请求参数有误。" },
+            msg: "请求参数有误。",
+            status: 400,
+          });
+          return;
+        }
+        this.managedThreads.set(
+          groupId,
+          threads.map((thread) => thread.short_id === route.shortId ? { ...thread, archived: true } : thread),
         );
         writeJson(response, 200, { status: 200 });
         return;

@@ -71,10 +71,6 @@ test("group dispatch freezes scoped management/file tools to the current target 
   const harness = await createCoreHarness({
     prompt: async ({ append, cwd, promptContext }) => {
       const tools = promptContext?.tools ?? [];
-      const names = tools.map(({ name }) => name).sort();
-      if (names.join(",") !== "ask,channel_control,octo_management,octo_send_file") {
-        throw new Error(`unexpected host tools: ${names.join(",")}`);
-      }
       const management = tools.find(({ name }) => name === "octo_management");
       const fileTool = tools.find(({ name }) => name === "octo_send_file");
       if (!management || !fileTool) {

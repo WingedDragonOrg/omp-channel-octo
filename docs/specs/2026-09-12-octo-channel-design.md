@@ -18,6 +18,8 @@
 
 包含 owner-only 原生持续目标管理 `/goal`：创建时 token 预算、状态查询、暂停、恢复、删除、跨回合执行与在途目标跨服务重启续接，详细契约见 `docs/specs/2026-11-02-goal-command-design.md`。
 
+包含主群/子区已落盘上下文即时分叉：owner-only `/fork [子区名称]` 和独立 `fork` 宿主工具共用原生 CLI `--fork`，沿用 cwd、建立独立 session 并绑定同父群新子区。详细契约见 `docs/specs/2026-11-03-thread-fork-design.md`。
+
 不包含终端会话接管、多用户服务、通用网络 Agent gateway、文档评论任务、服务端通用 bot_task、群历史归档与检索、出站附件之外的通用文件托管和交互 callback 系统。channel 仅提供由 OMP host tool 明确发起的出站图片/文件发送，以及由能力 profile 明确启用的 Octo raw type17 `octo/v1` AdaptiveCard 1.5 进度展示和 `octo/v2` 交互问答卡片；交互卡片的上行只使用该 Bot 自己的事件队列（`/v1/bot/events` 轮询与 ack），不注册回调地址、不实现通用 callback 或审批流。收到的入站消息按已确认的类型表提取内容，贴纸、系统与 CMD 等没有内容的类型明确告知，不作为成功执行。范围以个人 IM 交互为准，不继承参考适配器的其他任务入口。
 
 ## 已知约束与资料
@@ -196,10 +198,11 @@ channel 支持下列命令，`/help` 展示用法；`/retry` 经 OMP 原生命�
 | `/new [目录]` | 创建并绑定 fresh OMP 会话；省略目录时按目标默认目录解析，无可用绑定时使用 `~/tmp`；成功回执含 session id、cwd 与该会话实际生效的模型（`已创建会话 <id>，cwd=<目录>，模型=<provider/id[:level]>`，未指定聊天模型时取 OMP 实际默认；模型查询失败或未报告时以不含模型的回执送达）；切换成功时把本次切换时间写进该聊天的绑定（`chats.session_switched_at`），问答卡据此判定切换前提出的旧问题不再接受迟到提交；切换失败不改动绑定，也不记切换 |
 | `/reset [目录]` | 与 `/new` 使用相同的目录解析，但明确重置为 fresh 会话；原会话历史文件保留；与 `/new` 共用创建路径，成功回执同式（含实际模型），会话切换时间同样记录 |
 | `/move <目录>` | 调用当前会话的 OMP 原生 `/move`，校验刷新后的 session state，沿用同一 session ID、历史和附件 |
+| `/fork [子区名称]` | 从当前主群/子区精确持久绑定即时 native fork，创建同父群新子区并绑定独立 session，共用 cwd；源回合继续，新子区等待实际新消息再 resume |
 | `/thread <任务>` | 交给助手处理：助手自行确定子区名称与 `worktree_name`，新建带独立 git worktree 的 CommunityTopic 子区并把任务派发进去（派发正文按 SDD 格式写；清晰到可直接生成 SDD 的需求直接开工，否则发起会话只做够派发的最少澄清、剩余澄清由子区按 SDD 格式进行）；只在群聊中可用 |
 | `/thread model [选择器\|clear]` | 仅 owner 在主群查询/设置/清除所属子区默认模型；原生 fresh probe 解析成功后持久化，主群自身模型不变；下次子区 worker 启动生效，不切换运行中会话 |
-| `/thread merge` | 仅隔离 worktree 子区可用；宿主独占后直接执行默认 wt 合并/清理，成功零 agent 任务，回执送达后归档。实际执行失败才将诊断和现场交给本聊天 agent 修复，再用 host `thread-merge` 重试。尾随文字作为 owner 补充上下文保留，不拼入 shell；资格不符只回明确提示 |
-| `/thread remove [--force]` | 仅 owner 在目标子区清理持久拥有的 worktree 及分支，全部成功后归档并保留聊天记录；支持 single/separate/shared。默认 dirty 或未并入来源默认分支时报错保留，`--force` 授权丢弃未提交改动和未合并分支；占用/身份不符/未知进程不绕过，部分失败不归档 |
+| `/thread merge` | 沿用目录的 ready fork 子区仅归档 Octo。普通隔离 worktree 子区由宿主独占执行 wt 合并/清理，成功零 agent 任务、回执送达后归档；仅实际执行失败交给本聊天 agent 修复。尾随文字作为 owner 上下文，不拼入 shell |
+| `/thread remove [--force]` | 沿用目录的 ready fork 子区仅归档 Octo，保留本地资源。普通 single/separate/shared 子区清理持久拥有的 worktree 及分支后归档；默认保护 dirty 和未合并提交，force 授权丢弃；占用/身份不符/未知进程不绕过，部分失败不归档 |
 | `/queue <文本>` | 把该文本作为排队任务追加在当前任务之后，不受当前追加模式影响；正文经与普通任务相同的组装点，随消息发来的附件以本机绝对路径进入排队任务的正文 |
 | `/mode [steer\|queue]` | 设置/报告该聊天的追加模式：`steer`（默认，`default` 同义）把运行中的新消息注入当前回合，`queue` 把它变成排队任务；无参数时报告当前设置，部署声明 `octo/v2` 时改发 owner-only 配置卡片（一行选择 + 一次提交；卡片不可用时回退为同一段文本） |
 | `/switch [provider\|模型]` | 查询实际模型、下一次启动策略与来源；无参数查询全部 provider，参数精确匹配 OMP 当前目录的 provider 时仅查询该 provider。两种查询都只读、最多展示 100 个模型（default 控制项另计），卡片与文本标明范围及展示数/总数，超过时明确「仅展示前 100 个，共 N 个」并引导筛选或直接 `/switch provider/model`。`default` 优先清除显式覆盖，子区重新继承主群子区默认，否则不指定参数、由 OMP 自行决定。其余参数由 OMP 原生解析并切换（`provider/id`、模型 id/子串、`@角色`、`:level`），成功后持久化。运行中使用活会话，空闲用 fresh probe；菜单不可用时同源文本回退。 |
@@ -249,6 +252,8 @@ channel 支持下列命令，`/help` 展示用法；`/retry` 经 OMP 原生命�
 
 群中使用 `@Bot /new <目录>`、`@Bot /reset <目录>` 或 `@Bot /move <目录>` 等相同命令；剥离已验证的 Bot mention 后解析。命令与 mention 的先后顺序不固定：客户端可能发送 `@Bot /command <参数>` 或 `/command <参数> @Bot`，解析前剥离全部已验证的 Bot mention，无论它位于命令前、命令后还是参数中间，并清理剥离处残留的空白。结构化 span 与文本对不上或缺失时，退回按 mention uid 列表匹配独立出现的 `@BotName` 或 `@BotUid` 词元（两侧为空白或文本边界，允许尾随冒号）；未指向当前 Bot 的文本型 `@` 不剥离，用户正文中的其他 `@` 保持原样。命令只允许 owner 发起：成员发来的 `/` 开头消息一律不执行、也不交给 Agent（OMP 会在 RPC prompt 路径对内建命令做分发，透传等于把命令面暴露给成员），同一聊天 10 分钟窗口内至多回一条提示「命令仅 owner 可用；需要助手做事请直接 @<BotName> 说明。」，并按既有命令 claim 去重、重投不重复提示。channel 内置 `/new`、`/reset`、`/move`、`/thread`、`/queue`、`/mode`、`/switch`、`/commit`、`/interrupt`、`/cancel`、`/stop`、`/status`、`/help`、`/restart`、`/autoresearch-history` 始终硬拦截，不发送给模型；若存在同名观察器也不能改变这一安全语义。其他 slash 输入按原始 `message.text` 作为普通 OMP task 透传，未知命令不再返回“不支持的命令”。
 
+`/fork` 同属 owner-only channel 控制命令：在 pending ask、steering 和 OMP slash prompt 路径之前硬拦截，仅在已授权主群/子区执行；不生成任务或回答源问题。
+
 `/goal` 同属 owner-only 内置硬拦截命令；命令参数转为持久结构化请求，不进入普通模型 prompt。控制接受（原生响应及 exact goal ID）与实际 `agent_start` 生成接受分别记账；RPC 前先持久化派发意图，缺少控制接受的已派发请求不重放。暂停、删除、中断、取消及 ask 超时先撤销持续授权，取消该聊天尚未执行的目标启动/恢复请求；普通排队消息沿用各停止命令既有规则。目标恢复按原会话及 exact goal ID，停止意图优先，不通过普通续接正文替代原生目标。
 
 `/retry` 保持 OMP 原生语义（v18.2.6）：会话末尾可重试的失败或中止回合由 OMP 恢复，成功时回执为 `Retrying the last failed turn.`，没有可重试回合时为 `Nothing to retry.`。channel 沿用绑定会话与既有 slash 任务路径，不从任务表复制上一条 prompt；owner/允许列表/mention、持久去重、会话串行与群历史首行保护保持不变。运行中的消息不会把 `/retry` 当成 steering；需要先中止当前回合时可使用 `/interrupt`。worker 把当前 prompt 分派期间、响应确认之前的 `command_output.text` 转为 info 通知，通过既有有界通知 outbox 单独投递；帧无上游 id，使用请求 id 与输出序号生成唯一消息 id。确认后的旁路命令输出（如回合运行中的 `/switch`）不归入该回合。无生成的 `agentInvoked:false` 正常本地完成；成功重试的 `agentInvoked:true` 等待真实 `agent_end`，助手正文与进度照常交付。
@@ -266,6 +271,21 @@ channel 在工具进度之上补两块由权威实验状态驱动的只读呈现
 省略目录时的默认目录按目标解析：① 已有已验证会话或显式隔离工作区绑定（`cwd_pinned`）沿用规范化 cwd；② 未建立会话且没有隔离绑定的 CommunityTopic 线程取父群当前绑定 cwd；③ 首次无可用绑定时取 `~/tmp`。父群由真实 channel ID 的 `____` 前段解析。shared 入口或任一项目路径缺失时拒绝执行；preparing/failed 的工作区也不可按继承顺序回落。历史单仓库绑定的既有失效回退契约保持。
 
 `/thread <任务>` 把原始意图与交付说明交给助手，不由命令同步建区。正文经过同一附件/引用组装点，沿聊天追加模式 steering 或成为 durable 任务。助手确定名称、项目列表和布局，多项目自行按耦合程度选择 shared/separate，用 `create-thread` 完成工作区、绑定与简短背景；只有 ready 才能 `thread-dispatch`。派发正文按 SDD 的目标、范围、约束与验收写：明确需求直接让子区生成可实施 SDD 并开工，否则发起聊天只做够交接的最少澄清，余下澄清留在子区，需要 owner 决策时用 ask，环境有 spec-design 时使用。详细澄清与实施不在父会话开展。部分创建或说明失败只报告资源状态，不派发、不回落父目录执行。命令仅在群聊中创建，DM/子区拒绝创建，空正文回复用法；派发显示与发起群回执沿用既有路径。
+
+#### 会话分叉与共用目录子区
+
+`/fork [子区名称]` 与 `fork({name?})` 只取当前调用聊天的精确持久绑定；工具不接受源聊天、文件或目录参数，须有原生 `toolCallId` 以持久去重。主群创建所属子区，子区创建同父群同级子区；沿用现有 owner、allowlist 与工具授权，不复制权限。
+
+源回合可继续运行：独立受管理进程通过 `--fork <精确 sessionFile>` 读取已落盘历史，不占源 session 执行租约，不发送用户 prompt 或摘要请求。新 session 的不同 ID、有效文件、相同 canonical cwd 经核验，准备进程退出确认并收尾 ledger 后才可绑定；目标首次实际新消息用该文件 `--resume`。尚无落盘源文件或失效绑定立即失败。
+
+`thread_forks` 持久记录来源、准备目录、新 session、远端子区、阶段与错误；复用线程创建意图保护未知远端结果。目标说明成功后，在同一事务发布 binding、默认 merge listen、ready 与意图完成。已知远端结果仅恢复同一子区的说明/绑定，不重新 fork 或创建；未知结果不猜测、不重试创建。未 ready 记录即使有 binding 也不可自动执行或回落空会话。准备过程登记共享路径/root 使用以保护破坏操作，不串行化普通同 cwd 任务。
+
+目标不复制源 workspace 归属、显式模型、pending ask、宿主队列、卡片动作、goal 续跑授权或上下文回执；后续 worker 走目标自身的模型策略与群/线程上下文。目录共用、session 历史独立；原生读取之后的源输出不承诺进入目标。
+
+持久标记为沿用目录的 ready fork 子区，`/thread merge`、`/thread remove [--force]` 和当前子区的 host `thread-merge` 均只排定 Octo 归档。merge 等待本聊天较早运行/排队工作，remove 忙时拒绝；不因源聊天同 cwd 而等待，不执行 Git 或清理目录/分支/session，不产生合并事件或修复任务。归档等待真实回执、正文和终态卡排空，沿用新入站取消、瞬时失败重试和停机放弃。普通 worktree/shared 的下述语义保持。
+
+#### 隔离工作区收尾
+
 
 `/thread merge` 是子区中的宿主合并入口：`/thread` 参数去首尾空白后首词为 `merge`（后为行尾或非字母数字、下划线、连字符分隔符，`merge-fix` 不算）即进入该路径。宿主验证子区、隔离绑定、持久资源身份与 wt 能力，等待较早任务释放聊天、session 和实际操作工作树后取得操作期独占，直接执行 wt 默认暂存/提交/squash/rebase/fast-forward/删除 pipeline。正常路径不启动 worker、模型或 agent 任务；结果通过持久 outbox 送达，已有进度卡输出排空后归档子区，cwd 被删除不影响这一路径。只有已实际执行的 wt merge 非零退出才把脱敏有界诊断、工作区、原命令与 owner 尾随补充说明交给本聊天 agent 修复，再经同一 host `thread-merge` 核心重试；资格拒绝、取消或结果未知不派修复。命令 claim 保留，接管输入身份稳定，重复投递与重启不重跑成功合并或重复创建修复任务；Git 与 SQLite 间结果不明时停止自动重放。等待和执行响应取消、中断及停机。详细 SDD、操作独占及交付验收见 `2026-09-17-thread-worktrunk-design.md`。
 
@@ -333,6 +353,8 @@ Mention 规则要求助手使用 `@[uid:显示名]` 表达明确点名，UID 来
 shared 多项目工作区的 `/thread merge` 固定回复「当前为多项目工作区，不支持 /thread merge。」并终止命令处理；不创建合并任务、不调用 wt。直接 `thread-merge` 也按持久归属拒绝，不能绕过此边界。separate 与单项目保留上述单仓库流程。
 
 `octo_management` 的 `description-read` 每次通过实时 `getGroupContext` 读取服务端当前说明，不使用 prompt 或 compaction 快照；`description-write` 只更新当前群/线程目标且需要服务端 `bot_admin` 权限。写入成功后，后续任务和 extension sidecar 使用新的 version；当前 turn 已经建立的 context 不回写。私聊不读取或注入群说明，也不获得群说明动作。
+
+群和线程还提供独立 `fork` 宿主工具，参数只有可选 `name`，与 `/fork` 使用同一持久流程；不通过 `octo_management create-thread` 创建空会话来替代分叉。
 
 所有任务都获得固定目标与 cwd 的 `ask`、`octo_send_file` 工具，以及控制 channel 自身的 `channel_control`；群和线程额外获得复合工具 `octo_management`。`channel_control` 的 `restart` 排定一次 channel 重启：它在本回合结束后、且 channel 没有运行中或排队任务时才让检测出的守护进程重启自己，重启后按持久任务状态恢复；因此在自己的回合里改完代码即可让新实现生效（自迭代），既不打断正在投递的回复，也不需要外部脚本或延迟作业。未检测到守护进程时明确回复未检测到且不猜测重启机制。`status` 返回进程 PID、运行中的会话目标、排队任务数、被阻塞目录数与是否已排定重启，供重启前后核对。文件工具的相对路径按任务 cwd 解析，绝对路径可指向本地其他文件，系统不提供目录沙箱保证；发送前复制到 stateDir spool；outbox 保存稳定 client message ID，断线重试不重跑任务。文件永久失败标记 dead 并报告，但不得阻塞后续文字 outbox。
 

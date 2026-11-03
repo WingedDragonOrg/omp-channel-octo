@@ -1728,6 +1728,9 @@ test("a refused merge repair remains pending when its exact stable task was not 
       store,
       handleThreadModel: async () => {},
       ensureThreadListen: async () => {},
+      archiveForkThread: async () => {
+        throw new Error("unexpected fork archive path in worktree merge repair test");
+      },
       replayThreadMergeSuccess: async () => null,
       refuseIncompleteThreadWorkspace: async () => false,
       botUid: () => harness.bot.uid,

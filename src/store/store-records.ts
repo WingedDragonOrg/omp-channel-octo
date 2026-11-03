@@ -2,7 +2,7 @@
  * 持久层的记录类型：每张表在 TypeScript 侧的形状，被 store 门面与各领域模块共用。
  */
 
-import type { ChatAppendMode, ChatExecutionState, ChatTarget, TextMention, ThreadListenLevel, WorkerGoal, WorkerGoalRun, WorkerProcess, WorktreeMergeOutcome, WorktreeRemovalStep } from "../contracts.ts";
+import type { ChatAppendMode, ChatExecutionState, ChatTarget, TextMention, ThreadListenLevel, ThreadSummary, WorkerGoal, WorkerGoalRun, WorkerProcess, WorktreeMergeOutcome, WorktreeRemovalStep } from "../contracts.ts";
 
 export interface BindingRecord extends ChatTarget {
   botUid: string;
@@ -257,7 +257,7 @@ export interface WorkerLedgerRecord extends WorkerProcess {
   id: string;
   botUid: string;
   sessionId: string;
-  sessionFile: string;
+  sessionFile: string | null;
   moveTargetCwd: string | null;
   state: "running" | "stopping" | "stopped" | "unknown";
 }
@@ -428,3 +428,42 @@ export interface ThreadWorkspaceIntentRecord {
 
 export type ThreadWorkspaceIntentInput =
   Omit<ThreadWorkspaceIntentRecord, "error" | "status"> & { status: "preparing"; error?: string | null };
+
+export type ThreadForkPhase =
+  | "preparing"
+  | "prepared"
+  | "creating"
+  | "remote-created"
+  | "ready"
+  | "failed";
+
+export interface ThreadForkRecord {
+  id: string;
+  botUid: string;
+  sourceChannelType: 2 | 5;
+  sourceChannelId: string;
+  sourceSessionId: string;
+  sourceSessionFile: string;
+  cwd: string;
+  groupId: string;
+  name: string;
+  preparationDir: string;
+  phase: ThreadForkPhase;
+  preparationStarted: boolean;
+  sessionId: string | null;
+  sessionFile: string | null;
+  thread: ThreadSummary | null;
+  error: string | null;
+}
+
+export interface ThreadForkInput extends Omit<
+  ThreadForkRecord,
+  "phase" | "sessionId" | "sessionFile" | "thread" | "error" | "preparationStarted"
+> {
+  phase?: ThreadForkPhase;
+  sessionId?: string | null;
+  sessionFile?: string | null;
+  thread?: ThreadSummary | null;
+  preparationStarted?: boolean;
+  error?: string | null;
+}

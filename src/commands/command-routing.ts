@@ -63,6 +63,7 @@ const BUILTIN_ALIASES = {
   reset: "new",
   move: "move",
   thread: "thread",
+  fork: "fork",
   cancel: "cancel",
   stop: "cancel",
   commit: "commit",

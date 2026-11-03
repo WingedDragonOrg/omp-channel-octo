@@ -15,6 +15,7 @@ export const VALUE_FLAGS_TO_STRIP = new Set([
 	"--approval-mode",
 	"--cwd",
 	"--session-dir",
+	"--fork",
 	"--resume",
 	"--session",
 	"-r",

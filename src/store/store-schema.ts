@@ -150,6 +150,32 @@ export function applySchema(db: Database): void {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS thread_forks (
+      id TEXT PRIMARY KEY NOT NULL,
+      bot_uid TEXT NOT NULL,
+      source_channel_type INTEGER NOT NULL CHECK(source_channel_type IN (2, 5)),
+      source_channel_id TEXT NOT NULL,
+      source_session_id TEXT NOT NULL,
+      source_session_file TEXT NOT NULL,
+      cwd TEXT NOT NULL,
+      group_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      preparation_dir TEXT NOT NULL,
+      phase TEXT NOT NULL CHECK(phase IN ('preparing', 'prepared', 'creating', 'remote-created', 'ready', 'failed')),
+      preparation_started INTEGER NOT NULL DEFAULT 0 CHECK(preparation_started IN (0, 1)),
+      session_id TEXT,
+      session_file TEXT,
+      thread_channel_id TEXT,
+      thread_json TEXT,
+      error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      CHECK((thread_channel_id IS NULL) = (thread_json IS NULL))
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS thread_forks_target
+      ON thread_forks(bot_uid, thread_channel_id) WHERE thread_channel_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS thread_forks_bot
+      ON thread_forks(bot_uid, created_at, id);
     CREATE INDEX IF NOT EXISTS thread_workspace_intent_group
       ON thread_workspace_intents(bot_uid, group_id, status);
     CREATE TABLE IF NOT EXISTS thread_listens (
@@ -298,7 +324,7 @@ export function applySchema(db: Database): void {
       id TEXT PRIMARY KEY NOT NULL,
       bot_uid TEXT NOT NULL,
       session_id TEXT NOT NULL,
-      session_file TEXT NOT NULL,
+      session_file TEXT,
       pid INTEGER NOT NULL,
       pgid INTEGER NOT NULL,
       identity TEXT NOT NULL,
@@ -478,6 +504,8 @@ export function applySchema(db: Database): void {
       if (!String(error).includes("duplicate column")) throw error;
     }
   }
+  migrateWorkerLedgerNullableSessionFile(db);
+  migrateThreadForkPreparationStarted(db);
   db.exec(
     "CREATE INDEX IF NOT EXISTS host_merge_leases_operation_source ON host_merge_leases(bot_uid, operation_kind, channel_type, channel_id, source_id, created_at)",
   );
@@ -507,6 +535,51 @@ export function applySchema(db: Database): void {
     "CREATE INDEX IF NOT EXISTS questions_card ON questions(bot_uid, channel_type, channel_id, card_message_id)",
   );
   migrateProgressCards(db);
+}
+
+function migrateWorkerLedgerNullableSessionFile(db: Database): void {
+  const sessionFileColumn = query(db, "PRAGMA table_info(worker_ledger)")
+    .find((row) => asString(row.name) === "session_file");
+  if (!sessionFileColumn) throw new Error("worker ledger session_file column does not exist");
+  if (asNumber(sessionFileColumn.notnull) === 0) return;
+
+  transaction(db, () => {
+    db.exec(`
+      CREATE TABLE worker_ledger_nullable (
+        id TEXT PRIMARY KEY NOT NULL,
+        bot_uid TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        session_file TEXT,
+        pid INTEGER NOT NULL,
+        pgid INTEGER NOT NULL,
+        identity TEXT NOT NULL,
+        cwd TEXT NOT NULL,
+        move_target_cwd TEXT,
+        state TEXT NOT NULL CHECK(state IN ('running', 'stopping', 'stopped', 'unknown')),
+        updated_at INTEGER NOT NULL
+      );
+      INSERT INTO worker_ledger_nullable(
+        id, bot_uid, session_id, session_file, pid, pgid, identity, cwd,
+        move_target_cwd, state, updated_at
+      )
+      SELECT
+        id, bot_uid, session_id, session_file, pid, pgid, identity, cwd,
+        move_target_cwd, state, updated_at
+      FROM worker_ledger;
+      DROP TABLE worker_ledger;
+      ALTER TABLE worker_ledger_nullable RENAME TO worker_ledger;
+    `);
+  });
+}
+
+function migrateThreadForkPreparationStarted(db: Database): void {
+  const columns = query(db, "PRAGMA table_info(thread_forks)");
+  if (columns.some((row) => asString(row.name) === "preparation_started")) return;
+  transaction(db, () => {
+    db.exec(
+      "ALTER TABLE thread_forks ADD COLUMN preparation_started INTEGER NOT NULL DEFAULT 0 CHECK(preparation_started IN (0, 1))",
+    );
+  });
 }
 
 function migrateThreadListen(db: Database): void {

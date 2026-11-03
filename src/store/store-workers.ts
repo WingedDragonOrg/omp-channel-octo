@@ -31,21 +31,33 @@ export function recordWorker(db: Database, worker: WorkerLedgerRecord): void {
   );
 }
 
+export function getWorkerLedger(db: Database, botUid: string, id: string): WorkerLedgerRecord | null {
+  const row = query(
+    db,
+    "SELECT * FROM worker_ledger WHERE bot_uid = ? AND id = ?",
+    [botUid, id],
+  )[0];
+  return row ? workerLedgerFromRow(row) : null;
+}
+
 export function listWorkerLedger(db: Database, botUid: string): WorkerLedgerRecord[] {
-  return query(db, "SELECT * FROM worker_ledger WHERE bot_uid = ? AND state != 'stopped'", [botUid]).map(
-    (row) => ({
-      id: asString(row.id),
-      botUid: asString(row.bot_uid),
-      sessionId: asString(row.session_id),
-      sessionFile: asString(row.session_file),
-      pid: asNumber(row.pid),
-      pgid: asNumber(row.pgid),
-      identity: asString(row.identity),
-      cwd: asString(row.cwd),
-      moveTargetCwd: asNullableString(row.move_target_cwd),
-      state: row.state === "running" || row.state === "stopping" || row.state === "unknown" ? row.state : "stopped",
-    }),
-  );
+  return query(db, "SELECT * FROM worker_ledger WHERE bot_uid = ? AND state != 'stopped'", [botUid])
+    .map(workerLedgerFromRow);
+}
+
+function workerLedgerFromRow(row: Record<string, unknown>): WorkerLedgerRecord {
+  return {
+    id: asString(row.id),
+    botUid: asString(row.bot_uid),
+    sessionId: asString(row.session_id),
+    sessionFile: asNullableString(row.session_file),
+    pid: asNumber(row.pid),
+    pgid: asNumber(row.pgid),
+    identity: asString(row.identity),
+    cwd: asString(row.cwd),
+    moveTargetCwd: asNullableString(row.move_target_cwd),
+    state: row.state === "running" || row.state === "stopping" || row.state === "unknown" ? row.state : "stopped",
+  };
 }
 
 export function markWorkerStopped(db: Database, id: string): void {

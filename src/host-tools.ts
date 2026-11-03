@@ -73,6 +73,7 @@ export interface HostToolHost {
     | "ensureBinding"
     | "getOwnerId"
     | "getThreadWorkspace"
+    | "getThreadForkByTarget"
     | "saveThreadWorkspace"
     | "saveThreadWorkspaces"
     | "saveThreadWorkspaceIntent"
@@ -118,6 +119,12 @@ export interface HostToolHost {
   askQuestions(
     task: TaskRecord,
     target: ChatTarget,
+    args: Record<string, unknown>,
+    signal: AbortSignal,
+    toolCallId?: string,
+  ): Promise<string>;
+  forkSession(
+    task: TaskRecord,
     args: Record<string, unknown>,
     signal: AbortSignal,
     toolCallId?: string,
@@ -409,6 +416,19 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
     },
     execute: async (args, signal, toolCallId) => host.askQuestions(task, target, args, signal, toolCallId),
   };
+  const forkTool: HostTool = {
+    name: "fork",
+    description: "从当前 session 历史快照创建同父群新子区，并使用独立 session 和相同工作目录；源会话继续运行，不创建 worktree，也不自动派发历史任务。",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "新子区名称；省略时由当前聊天名称生成。" },
+      },
+      required: [],
+      additionalProperties: false,
+    },
+    execute: async (args, signal, toolCallId) => host.forkSession(task, args, signal, toolCallId),
+  };
   const channelTool = createChannelTool(host);
   const parentGroupId =
     target.channelType === 2
@@ -522,7 +542,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
       pendingMergeLifecycles.delete(toolCallId);
     },
   };
-  return [channelTool, managementTool, fileTool, askTool];
+  return [channelTool, managementTool, fileTool, askTool, forkTool];
 }
 
 /**
@@ -779,6 +799,21 @@ async function runManagementTool(
         channelId: threadChannelId(groupId, currentShortId),
         channelType: 5,
       };
+      const fork = host.store.getThreadForkByTarget(host.botUid, workspaceTarget);
+      if (fork !== null && fork.phase !== "ready") {
+        throw new Error("当前分叉子区尚未完成绑定，不会执行合并或归档。");
+      }
+      if (fork?.phase === "ready") {
+        if (!fork.thread) throw new Error("已就绪的分叉子区缺少远端身份，未执行合并。");
+        host.planThreadArchive(workspaceTarget, groupId, fork.thread.shortId);
+        return JSON.stringify({
+          archive_only: true,
+          archived: "scheduled",
+          merged: false,
+          local_resources_changed: false,
+          short_id: fork.thread.shortId,
+        });
+      }
       const operationId = toolCallId === undefined ? task.id : JSON.stringify([task.id, toolCallId]);
       const replay = await host.replayThreadMergeSuccess(workspaceTarget, operationId);
       if (replay !== null) return replay;

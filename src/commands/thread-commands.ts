@@ -1,6 +1,7 @@
 /**
- * `/thread` 家族命令：`/thread <任务>` 把意图交给助手创建/派发子区；`/thread merge` 与 `/thread remove`
- * 则由宿主直接处理本地工作区。命令 claim、常规任务接管、回执与归档仍通过 `CoreService` 完成。
+ * `/thread` 家族命令：`/thread <任务>` 把意图交给助手创建/派发子区；具备 ready fork 来源记录的子区，
+ * `/thread merge` 与 `/thread remove` 只归档 Octo 子区；普通隔离工作区仍由宿主处理本地操作。
+ * 命令 claim、常规任务接管、回执与归档仍通过 `CoreService` 完成。
  */
 import { createHash } from "node:crypto";
 import type { InboundMessage, WorktreeMergeSummary, WorktreePort } from "../contracts.ts";
@@ -36,9 +37,9 @@ const THREAD_USAGE = [
   "用法：/thread <任务>；无项目需求时沿用普通子区；无 projects 时可直接提供 legacy worktree_name 建立单仓 worktree；显式 projects（包括 single）必须提供完整任务 worktree_name 和互不冲突的稳定 ASCII 项目名（如 admin-web、customer-web），省略 layout 表示 single；多项目必须明确选择 layout=shared|separate；",
   "agent 根据任务意图和已知仓库用途自行确定完整语义任务名并规范化为 1–100 字符 ASCII slug；项目名也要是互不冲突的 1–100 字符 ASCII slug。名称过长时改用更短但完整的语义名，不翻译、不截断；只有无法判断项目真实身份时才向 owner 问最少必要问题。",
   "background 只写简短用途，不放任务正文、SDD 或验收标准；实际路径以 create-thread 返回为准，不预先臆造。整批 ready=true 后才可派发，未就绪时报告资源结果并停止；",
-  "之后用 thread-dispatch 派发任务；子区内 /thread merge [补充说明] 由宿主执行默认合并与清理；仅实际合并失败后派发一次修复任务，并保留补充说明；子区内 /thread remove [--force] 清理本地隔离工作区并在成功后归档。",
+  "之后用 thread-dispatch 派发任务；普通子区内 /thread merge [补充说明] 由宿主执行默认合并与清理；仅实际合并失败后派发一次修复任务，并保留补充说明；普通子区内 /thread remove [--force] 清理本地隔离工作区并在成功后归档；已就绪的 fork 子区的这两个命令只归档 Octo 子区，不触碰本地资源。",
 ].join("");
-const THREAD_REMOVE_USAGE = "用法：/thread remove [--force]；只清理当前子区持久记录归属的本地隔离工作区与分支。";
+const THREAD_REMOVE_USAGE = "用法：/thread remove [--force]；普通子区清理当前子区持久记录归属的本地隔离工作区与分支；已就绪的 fork 子区只归档 Octo 子区。";
 const THREAD_GROUP_ONLY_TEXT = "/thread 需要在群聊中使用。";
 const THREAD_NESTED_TEXT = "当前会话已是子区，不能再建子区。";
 const THREAD_MERGE_THREAD_ONLY_TEXT = "/thread merge 只在子区中使用。";
@@ -164,11 +165,13 @@ function threadMergeReceipt(summary: WorktreeMergeSummary & { archive?: "schedul
  * 以及常规任务接管。宿主合并的调度与目录租约由 `CoreService` 持有。
  */
 export interface ThreadCommandsDeps {
-  readonly store: Pick<ChannelStore, "getBinding" | "getThreadWorkspace" | "getTaskByMessageId" | "getCommandClaimState" | "completeCommand" | "releaseClaim" | "getHostRemovalLeaseBySourceId">;
+  readonly store: Pick<ChannelStore, "getBinding" | "getThreadWorkspace" | "getThreadForkByTarget" | "getTaskByMessageId" | "getCommandClaimState" | "completeCommand" | "releaseClaim" | "getHostRemovalLeaseBySourceId">;
   /** Read or change the group default using the same serialized model-config path as `/switch`. */
   readonly handleThreadModel: (message: InboundMessage, argument: string) => Promise<void>;
   /** Ensures creation provenance/default policy before a merge-intent mutation. */
   readonly ensureThreadListen: (message: InboundMessage) => Promise<void>;
+  /** Ready fork provenance selects the shared durable Octo archive path without local cleanup. */
+  readonly archiveForkThread: (message: InboundMessage, mode: "merge" | "remove") => Promise<void>;
   /** 阻止未就绪或已缺失工作区的命令改写当前回合或创建任务。 */
   readonly refuseIncompleteThreadWorkspace: (message: InboundMessage) => Promise<boolean>;
   /** 绑定行按键的 bot 身份；start 之前不存在，命令只在 start 之后到达。 */
@@ -378,11 +381,21 @@ export class ThreadCommands {
     this.deps.settleHostRemoval(message, sourceId);
   }
 
+  private async archiveReadyFork(message: InboundMessage, mode: "merge" | "remove"): Promise<boolean> {
+    const botUid = this.deps.botUid();
+    if (botUid === undefined || this.deps.store.getThreadForkByTarget(botUid, message)?.phase !== "ready") {
+      return false;
+    }
+    await this.deps.archiveForkThread(message, mode);
+    return true;
+  }
+
   private async handleThreadRemoveCommand(message: InboundMessage, force: boolean): Promise<void> {
     if (message.channelType !== 5) {
       await this.deps.enqueueText(message, THREAD_REMOVE_THREAD_ONLY_TEXT, null);
       return;
     }
+    if (await this.archiveReadyFork(message, "remove")) return;
     const botUid = this.deps.botUid();
     if (botUid === undefined) {
       await this.deps.enqueueText(message, "Bot 身份未注册，未执行本地清理。", null);
@@ -458,6 +471,7 @@ export class ThreadCommands {
       await this.deps.enqueueText(message, THREAD_MERGE_THREAD_ONLY_TEXT, null);
       return;
     }
+    if (await this.archiveReadyFork(message, "merge")) return;
     const replay = await this.deps.replayThreadMergeSuccess(message, message.messageId);
     if (replay !== null) return;
     const archiveGeneration = this.deps.archiveGeneration(message);
