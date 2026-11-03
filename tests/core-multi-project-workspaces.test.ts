@@ -1373,6 +1373,7 @@ test("an occupied shared project path is preserved while ownership follows the s
         return port.create(request, signal);
       },
       merge: (request, signal) => port.merge(request, signal),
+      planMerge: (request, signal) => port.planMerge(request, signal),
       remove: (request, signal) => port.remove(request, signal),
       worktrunk: (signal) => port.worktrunk(signal),
     }),
@@ -1624,6 +1625,7 @@ test("the actual shared project candidate is persisted before Git creates its wo
         }, signal);
       },
       merge: (request, signal) => port.merge(request, signal),
+      planMerge: (request, signal) => port.planMerge(request, signal),
       remove: (request, signal) => port.remove(request, signal),
       worktrunk: (signal) => port.worktrunk(signal),
     }),

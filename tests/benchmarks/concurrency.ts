@@ -567,6 +567,7 @@ exec git -C "$repo" worktree add -q -b "$branch" "$path"
     "Shared concurrency workspace",
     {
       layout: "shared",
+      worktreeNameSeed: "concurrency-smoke",
       projects: [
         { name: "alpha", repo: await realpath(repoAlpha) },
         { name: "beta", repo: await realpath(repoBeta) },
