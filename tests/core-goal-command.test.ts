@@ -21,7 +21,8 @@ async function waitForGoalOrPrompt(
   promptCount: number,
   goalRunCount = 0,
 ): Promise<void> {
-  for (let attempt = 0; attempt < 10_000; attempt += 1) {
+  const deadline = performance.now() + 3_000;
+  while (performance.now() < deadline) {
     if (
       harness.workers.goalRuns.length > goalRunCount
       || harness.workers.prompts.length > promptCount
@@ -69,7 +70,8 @@ async function waitForTaskState(
 ): Promise<void> {
   const store = await openChannelStore(harness.stateDir);
   try {
-    for (let attempt = 0; attempt < 10_000; attempt += 1) {
+    const deadline = performance.now() + 3_000;
+    while (performance.now() < deadline) {
       if (store.getTask(taskId)?.state === state) return;
       const next = Promise.withResolvers<void>();
       setImmediate(next.resolve);
@@ -81,7 +83,8 @@ async function waitForTaskState(
   }
 }
 async function waitForSentText(harness: CoreHarness, previousCount: number): Promise<string> {
-  for (let attempt = 0; attempt < 10_000; attempt += 1) {
+  const deadline = performance.now() + 3_000;
+  while (performance.now() < deadline) {
     const sent = harness.transport.sent.slice(previousCount);
     if (sent.length > 0) return sent.at(-1)!.text;
     const next = Promise.withResolvers<void>();

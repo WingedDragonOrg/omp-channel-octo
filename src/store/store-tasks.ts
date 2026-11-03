@@ -50,32 +50,7 @@ export function acceptTask(db: Database, claim: InboundClaim, task: TaskRecord, 
         now,
       ],
     );
-    const mergePending = task.channelType === 5 && asNumber(query(db,
-      "SELECT merge_pending FROM thread_listens WHERE bot_uid = ? AND channel_id = ?",
-      [task.botUid, task.channelId],
-    )[0]?.merge_pending) !== 0;
-    run(db,
-      `INSERT INTO tasks(
-         id, bot_uid, channel_type, channel_id, message_id, sender_id, text, session_id, cwd,
-         state, accepted_at, message_seq, history_eligible, relay_suppressed
-       )
-       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`,
-      [
-        task.id,
-        task.botUid,
-        task.channelType,
-        task.channelId,
-        task.messageId,
-        task.senderId,
-        task.text,
-        task.sessionId,
-        task.cwd,
-        now,
-        task.messageSeq,
-        task.historyEligible ? 1 : 0,
-        task.relaySuppressed || mergePending ? 1 : 0,
-      ],
-    );
+    insertTask(db, task, now);
     if (goalRequest) insertGoalTask(db, task, goalRequest);
     return true;
   });
@@ -84,6 +59,78 @@ export function acceptTask(db: Database, claim: InboundClaim, task: TaskRecord, 
 /** Suppress one task's completion relay without changing its thread's merge policy. */
 export function suppressTaskRelay(db: Database, taskId: string): void {
   run(db, "UPDATE tasks SET relay_suppressed = 1 WHERE id = ?", [taskId]);
+}
+
+/**
+ * Atomically converts an already-claimed builtin command into a durable task. Unlike releasing
+ * and re-claiming the inbound row, this leaves no window where redelivery could repeat the effect.
+ */
+export function acceptCommitTask(db: Database, claim: InboundClaim, task: TaskRecord): boolean {
+  return transaction(db, () => {
+    const now = Date.now();
+    const converted = run(db,
+      `UPDATE inbound
+       SET sender_id = ?, text = ?, supported = ?, kind = 'task', task_id = ?, command_state = 'completed', accepted_at = ?
+       WHERE bot_uid = ? AND channel_type = ? AND channel_id = ? AND message_id = ?
+         AND kind = 'command' AND command_state = 'pending'`,
+      [
+        claim.senderId,
+        claim.text,
+        claim.supported ? 1 : 0,
+        task.id,
+        now,
+        claim.botUid,
+        claim.target.channelType,
+        claim.target.channelId,
+        claim.messageId,
+      ],
+    ).changes === 1;
+    if (!converted) return false;
+    insertTask(db, task, now);
+    return true;
+  });
+}
+
+/** Only builtin admission converts a command claim into a completed-command task claim. */
+export function isCommitTask(db: Database, taskId: string): boolean {
+  return query(db,
+    `SELECT 1 FROM tasks t
+     JOIN inbound i ON i.bot_uid = t.bot_uid AND i.channel_type = t.channel_type
+       AND i.channel_id = t.channel_id AND i.message_id = t.message_id
+     WHERE t.id = ? AND t.text = '/commit' AND i.task_id = t.id
+       AND i.kind = 'task' AND i.command_state = 'completed'`,
+    [taskId],
+  )[0] !== undefined;
+}
+
+/** Shared insertion for accepted tasks; relay suppression also honors the thread's merge intent. */
+function insertTask(db: Database, task: TaskRecord, acceptedAt: number): void {
+  const mergePending = task.channelType === 5 && asNumber(query(db,
+    "SELECT merge_pending FROM thread_listens WHERE bot_uid = ? AND channel_id = ?",
+    [task.botUid, task.channelId],
+  )[0]?.merge_pending) !== 0;
+  run(db,
+    `INSERT INTO tasks(
+       id, bot_uid, channel_type, channel_id, message_id, sender_id, text, session_id, cwd,
+       state, accepted_at, message_seq, history_eligible, relay_suppressed
+     )
+     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`,
+    [
+      task.id,
+      task.botUid,
+      task.channelType,
+      task.channelId,
+      task.messageId,
+      task.senderId,
+      task.text,
+      task.sessionId,
+      task.cwd,
+      acceptedAt,
+      task.messageSeq,
+      task.historyEligible ? 1 : 0,
+      task.relaySuppressed || mergePending ? 1 : 0,
+    ],
+  );
 }
 
 export function claimCommand(db: Database, claim: InboundClaim): boolean {

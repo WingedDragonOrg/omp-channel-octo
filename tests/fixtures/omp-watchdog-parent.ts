@@ -18,6 +18,7 @@ const tempDirArg = flag("--temp-dir");
 const markerArg = flag("--marker");
 const readyArg = flag("--ready");
 const processInfoArg = flag("--process-info");
+const nativeCommitConfigArg = flag("--native-commit-config");
 if (!tempDirArg || !markerArg || !readyArg || !processInfoArg) throw new Error("watchdog parent fixture paths are required");
 
 const tempDir = resolve(tempDirArg);
@@ -26,6 +27,37 @@ const readyPath = resolve(readyArg);
 const processInfoPath = resolve(processInfoArg);
 const workerFixture = resolve(import.meta.dir, "omp-rpc-worker.ts");
 const logPath = join(tempDir, "worker.log");
+if (nativeCommitConfigArg) {
+  const nativeCommitFixture = resolve(import.meta.dir, "native-commit-cli.ts");
+  let spawnedCommit: WorkerProcess | undefined;
+  const nativeFactory = createWorkerFactory({
+    ompCommand: process.execPath,
+    extraArgs: [nativeCommitFixture, "--fixture-config", resolve(nativeCommitConfigArg)],
+    startupTimeoutMs: 2_000,
+    cancelTimeoutMs: 800,
+  });
+  const commitWorker = await nativeFactory.createCommit({
+    cwd: tempDir,
+    onSpawn: processInfo => {
+      spawnedCommit = processInfo;
+      writeFileSync(processInfoPath, JSON.stringify(processInfo), "utf8");
+    },
+  });
+  void commitWorker.run().catch(() => {});
+  const deadline = Date.now() + 2_000;
+  while (!existsSync(markerPath) && Date.now() < deadline) await Bun.sleep(5);
+  if (!spawnedCommit || !existsSync(markerPath)) {
+    await commitWorker.stop();
+    throw new Error("watchdog parent fixture commit child did not become ready");
+  }
+  writeFileSync(readyPath, `${process.pid}\n`, "utf8");
+
+  // The commit child has its own watchdog. Killing this parent must reap that
+  // child group even though this process cannot run worker cleanup.
+  setInterval(() => {}, 1_000);
+  await new Promise<never>(() => {});
+}
+
 
 let spawned: WorkerProcess | undefined;
 const factory = createWorkerFactory({

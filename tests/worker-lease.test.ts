@@ -105,6 +105,9 @@ async function withHarness<T>(
       onSpawn(process);
       return worker;
     },
+    createCommit: async () => {
+      throw new Error("unexpected native commit in RPC worker lease test");
+    },
     recover: async (spawned) => {
       if (options.recoverResult === false) return false;
       return runningProcesses.delete(spawned.identity);

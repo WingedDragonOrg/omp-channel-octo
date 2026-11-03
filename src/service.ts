@@ -16,6 +16,7 @@ import { SessionLifecycle, threadWorkspaceIsAvailable } from "./session/session-
 import {
   TaskScheduler,
   type CommandSessionReservation,
+  type CommitLease,
   type SessionLease,
 } from "./tasks/task-scheduler.ts";
 import { createHash, randomUUID } from "node:crypto";
@@ -28,7 +29,7 @@ import {
 import { ChatAuthorization } from "./inbound/chat-authorization.ts";
 import { createChatGrantDesk, type ChatGrantDesk } from "./inbound/chat-grants.ts";
 import { acquireBotLock, assertBotLockFree, type LockHandle } from "./runtime/bot-lock.ts";
-import { openTrackedWorker, type TrackedWorker, type WorkerSession } from "./runtime/worker-lease.ts";
+import { openTrackedCommit, openTrackedWorker, type TrackedCommit, type TrackedWorker, type WorkerSession } from "./runtime/worker-lease.ts";
 import { TaskStartupError, WorkerGoalError } from "./contracts.ts";
 import type {
   BotIdentity,
@@ -39,6 +40,7 @@ import type {
   ChatAppendMode,
   ChatExecutionState,
   ChatTarget,
+  CommitResult,
   ContextInjection,
   PromptContext,
   InboundMessage,
@@ -121,6 +123,8 @@ const COMMAND_HELP = [
   "/retry · 重试当前会话上次失败或中止的回合，忙时排队",
   "/interrupt · 中断当前回合，保留排队消息",
   "/cancel（/stop） · 取消当前任务并清除排队消息",
+  "/commit · 提交当前绑定项目",
+  "/commit stop · 停止当前聊天的提交，不回滚已发生的副作用",
   "",
   "模型",
   "/switch [模型] · 查看或切换本聊天的模型",
@@ -140,10 +144,12 @@ const MODE_CARD_CHOICES: readonly { title: string; value: string }[] = [
   { title: "queue：运行中的新消息排到当前回合之后", value: "queue" },
 ];
 const QUEUE_USAGE = "用法：/queue <文本>；把该消息排到当前任务之后执行。";
+const COMMIT_USAGE = "用法：/commit（提交当前项目）或 /commit stop（停止当前聊天的提交）。";
 const DEFAULT_INTERRUPTED_TEXT = "已中断当前回合；已排队的消息会继续执行。";
 const DEFAULT_INTERRUPT_REJECTED_TEXT = "中断请求未被 OMP 接受，当前回合仍在运行。";
 const DEFAULT_INTERRUPT_IDLE_TEXT =
   "当前没有正在运行的回合可中断；任务尚未进入执行阶段时可用 /cancel 取消。";
+const COMMIT_BUSY_TEXT = "当前项目有任务正在运行或排队，提交操作繁忙，未启动提交。";
 /** Steered messages tracked for the consumption receipt; older entries fall out of observation. */
 const MAX_PENDING_STEERS = 32;
 const THREAD_WORKSPACE_UNAVAILABLE_TEXT = "当前子区工作区未就绪或资源已缺失，未接收任务。";
@@ -218,6 +224,24 @@ class GoalDirectoryBusyError extends Error {
   }
 }
 
+type CommitOperation = {
+  taskId: string;
+  target: ChatTarget;
+  root: string;
+  binding: BindingRecord;
+  reservation: CommitLease;
+  done: Promise<void>;
+  finish(): void;
+  workerReady: Promise<void>;
+  markWorkerReady(): void;
+  tracked?: TrackedCommit;
+  result?: CommitResult;
+  stopPromise?: Promise<boolean>;
+  stopRequested: boolean;
+  stopConfirmed?: boolean;
+  shutdownRequested: boolean;
+};
+
 /** Single-line, bounded excerpt of the triggering message for a start/consumption receipt. */
 function receiptText(prefix: string, text: string): string {
   const excerpt = text.replaceAll(/\s+/gu, " ").trim();
@@ -291,6 +315,8 @@ class CoreService implements ChannelService {
   private readonly goalResumeChecks = new Map<string, { generation: number; active: number }>();
   /** Active host-first thread merges: /cancel, /interrupt and stop abort waits and wt execution. */
   private readonly threadMergeControllers = new Map<string, Set<AbortController>>();
+  /** Active host merge command identities stay registered through durable receipt/repair acceptance. */
+  private readonly threadMergeControllersByCommand = new Map<string, AbortController>();
   /** Per-chat progress edit tails remain visible after task leases release until terminal edits settle. */
   private readonly progressTails = new Map<string, Map<string, () => Promise<void>>>();
   /** A host command's archive is published only after its durable success receipt is inserted. */
@@ -303,6 +329,8 @@ class CoreService implements ChannelService {
   }>();
   /** Startup-recovered archives stay staged until progress-card recovery and transport readiness. */
   private readonly recoveredHostMergeArchiveTargets = new Set<string>();
+  private readonly commitOperationsByTask = new Map<string, CommitOperation>();
+  private readonly commitOperationsByTarget = new Map<string, CommitOperation>();
   private readonly blockedDirectories = new Set<string>();
   /** 问题与问答卡：等待者、卡片代次与问题行的所有者。 */
   /** 出站投递：文字、流式编辑与文件共用的队列。 */
@@ -398,6 +426,10 @@ class CoreService implements ChannelService {
       isDirectoryBlocked: cwd => this.isWorkspaceDirectoryBlocked(cwd),
       reconcileBinding: (taskId, target, binding) =>
         this.reconcileTaskBinding(taskId, target, binding),
+      repositoryRoot: cwd => this.repositoryRoot(cwd),
+      repositoryBlocked: root => this.isRepositoryBlocked(root),
+      shouldRunTaskBeforeRepositoryProbe: (taskId, target, binding, cwd) =>
+        this.shouldRunTaskBeforeRepositoryProbe(taskId, target, binding, cwd),
       runTask: (taskId, cwd) => this.runTask(taskId, cwd),
       awaitStartReady: () => this.startupGate.promise,
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
@@ -535,8 +567,11 @@ class CoreService implements ChannelService {
     this.serviceRestart = new ServiceRestart({
       store: this.store,
       stopping: () => this.stopping,
-      // 在途任务视图直接借用 runtimes 本身：idle 判定与延期重启看到同一份集合。
-      hasRunning: () => this.runtimes.size > 0,
+      // OMP runtime、原生 commit 与 host-first merge 共用同一在途视图，延期重启不会截断宿主合并回执。
+      hasRunning: () =>
+        this.runtimes.size > 0
+        || this.commitOperationsByTask.size > 0
+        || this.threadMergeControllers.size > 0,
       restart: options.restart,
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
     });
@@ -544,6 +579,7 @@ class CoreService implements ChannelService {
     // （不再包一层 async），`handleCommand` 里的 await 因此仍是原来的微任务边界；只有
     // `restart` 的返回值参与重启判定。
     this.builtinHandlers = {
+      commit: (message, argument) => this.handleCommit(message, argument),
       new: (message, argument) => this.sessions.handleNew(message, argument),
       move: (message, argument) => this.sessions.handleMove(message, argument),
       thread: (message, argument) => this.threadCommands.handle(message, argument),
@@ -777,6 +813,11 @@ class CoreService implements ChannelService {
       if (runtime.lease) {
         await runtime.lease.close().catch(() => false);
       }
+    }
+    for (const operation of [...this.commitOperationsByTask.values()]) {
+      operation.shutdownRequested = true;
+      await operation.workerReady;
+      await this.stopCommitProcess(operation).catch(() => false);
     }
     this.outbox.abortAll();
     await this.scheduler.settle();
@@ -1096,6 +1137,90 @@ class CoreService implements ChannelService {
     return false;
   }
 
+  private async isRepositoryBlocked(root: string): Promise<boolean> {
+    if (this.isWorkspaceDirectoryBlocked(root)) return true;
+    for (const blockedCwd of this.blockedDirectories) {
+      if (blockedCwd === root) return true;
+      try {
+        if (await this.repositoryRoot(blockedCwd) === root) return true;
+      } catch {
+        // Unknown blocked roots must not be treated as safe for another writer.
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Returns a worktree's own top-level checkout, not the shared Git common directory. */
+  private async repositoryRoot(cwd: string): Promise<string | null> {
+    const child = Bun.spawn(["git", "-C", cwd, "rev-parse", "--show-toplevel"], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    if (exitCode !== 0) {
+      if (/not a git repository/i.test(stderr)) return null;
+      throw new Error("Git worktree root lookup failed.");
+    }
+    const root = stdout.trim();
+    if (root.length === 0) throw new Error("Git worktree root lookup returned no path.");
+    return canonicalExistingDirectory(root);
+  }
+  private async shouldRunTaskBeforeRepositoryProbe(
+    taskId: string,
+    target: ChatTarget,
+    binding: BindingRecord | null,
+    cwd: string,
+  ): Promise<boolean> {
+    const task = this.store.getTask(taskId);
+    if (task === null) return false;
+    const goalTask = this.store.getGoalTask(taskId);
+    if (task.text === "/commit" && this.store.isCommitTask(taskId)) return false;
+    const goalResuming = goalTask !== null && this.store.isGoalTaskResuming(taskId);
+    const resuming = this.store.isTaskResuming(taskId) || goalResuming;
+    // A missing/mismatched goal binding or missing bound session file is rejected by runTask
+    // before worker startup; let that path revoke continuation and classify the goal error.
+    if (
+      goalTask !== null
+      && (
+        task.sessionId !== goalTask.sessionId
+        || binding === null
+        || binding.sessionId !== goalTask.sessionId
+      )
+    ) {
+      return true;
+    }
+    if (targetKey(taskTarget(task)) !== targetKey(target)) return true;
+    if (resuming) {
+      if (
+        binding === null
+        || binding.sessionFile === null
+        || binding.sessionId !== task.sessionId
+        || await existingSessionFile(binding.sessionFile) === null
+      ) {
+        return true;
+      }
+    } else if (
+      goalTask !== null
+      && binding !== null
+      && binding.sessionFile !== null
+      && await existingSessionFile(binding.sessionFile) === null
+    ) {
+      return true;
+    }
+    try {
+      await canonicalExistingDirectory(cwd);
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
   private async threadWorkspaceIncomplete(
     target: ChatTarget,
     requireBinding = false,
@@ -1182,24 +1307,21 @@ class CoreService implements ChannelService {
       ? [controller.signal, this.shutdownController.signal]
       : [controller.signal, this.shutdownController.signal, cancelSignal];
     const signal = AbortSignal.any(signals);
+    if (signal.aborted) throw signal.reason ?? new Error("成员 API 请求已取消");
     let timer: ReturnType<typeof setTimeout> | undefined;
     let removeAbortListener = (): void => {};
     const aborted = new Promise<never>((_, reject) => {
       const rejectAborted = (): void => {
         reject(signal.reason ?? new Error("成员 API 请求已取消"));
       };
-      if (signal.aborted) rejectAborted();
-      else {
-        signal.addEventListener("abort", rejectAborted, { once: true });
-        removeAbortListener = () => signal.removeEventListener("abort", rejectAborted);
-      }
+      signal.addEventListener("abort", rejectAborted, { once: true });
+      removeAbortListener = () => signal.removeEventListener("abort", rejectAborted);
     });
     timer = setTimeout(
       () => controller.abort(new Error("成员 API 查询超时")),
       MEMBER_LOOKUP_TIMEOUT_MS,
     );
     try {
-      if (signal.aborted) throw signal.reason ?? new Error("成员 API 请求已取消");
       let request: Promise<unknown>;
       if (target.channelType === 2) {
         request = this.options.transport.getGroupMembers(target.channelId, signal);
@@ -1384,7 +1506,7 @@ class CoreService implements ChannelService {
     const runtime = this.runningRuntime(message);
     if (!runtime || runtime.stopCause === "question") return false;
     if (deliveryGuard && !deliveryGuard()) return false;
-    if (this.scheduler.hasPendingCommandReservation(message, runtime.cwd)) return false;
+    if (await this.scheduler.hasPendingCommandReservation(message, runtime.cwd)) return false;
     const claim = this.commandClaim(message, "steer");
     if (!this.store.claimCommand(claim)) return true;
     this.threadArchives.cancel(message);
@@ -1455,6 +1577,9 @@ class CoreService implements ChannelService {
     this.threadArchives.cancel(message);
     try {
       const restartRequested = await this.builtinHandlers[action](message, argument);
+      if (this.threadMergeControllersByCommand.has(this.threadMergeCommandKey(message))) {
+        await this.outbox.flush(message);
+      }
       this.store.completeCommand(claim);
       if (restartRequested === true) {
         await this.serviceRestart.request();
@@ -1465,6 +1590,8 @@ class CoreService implements ChannelService {
       }
       const detail = safeDisplayText(error instanceof Error ? error.message : String(error), 180);
       throw new Error(detail === undefined ? "命令未能持久完成。" : `命令未能持久完成：${detail}`);
+    } finally {
+      if (this.finishThreadMergeCommand(message)) this.serviceRestart.maybeRunDeferred();
     }
   }
 
@@ -1474,6 +1601,16 @@ class CoreService implements ChannelService {
    */
   private async handleInterrupt(target: ChatTarget): Promise<void> {
     const mergeCancelled = this.abortThreadMerges(target, new Error("thread merge interrupted"));
+    if (this.commitOperationsByTarget.has(targetKey(target))) {
+      await this.outbox.enqueueText(
+        target,
+        mergeCancelled
+          ? "当前是 Git 提交任务；请使用 /commit stop。/interrupt 不会中断或伪确认提交。等待或执行中的子区合并已中止。"
+          : "当前是 Git 提交任务；请使用 /commit stop。/interrupt 不会中断或伪确认提交。",
+        null,
+      );
+      return;
+    }
     const runtime = this.runningRuntime(target);
     if (!runtime?.lease) {
       await this.outbox.enqueueText(
@@ -1963,7 +2100,7 @@ class CoreService implements ChannelService {
       return operation(live, binding);
     }
 
-    const sessionLease = this.scheduler.tryAcquireCommandSession(target, [binding.cwd]);
+    const sessionLease = await this.scheduler.tryAcquireCommandSession(target, [binding.cwd]);
     if (!sessionLease) throw new GoalDirectoryBusyError();
     let tracked: TrackedWorker | undefined;
     try {
@@ -2352,6 +2489,309 @@ class CoreService implements ChannelService {
     }
   }
 
+
+  private async resolveCommitWorkspace(
+    target: ChatTarget,
+    binding: BindingRecord,
+  ): Promise<{ root: string } | { error: string }> {
+    const cwd = await canonicalExistingDirectory(binding.cwd).catch(() => null);
+    if (cwd === null) return { error: "绑定目录不存在或不可访问，未创建提交任务。" };
+    if (await this.threadWorkspaceIncomplete(target, true)) {
+      return { error: THREAD_WORKSPACE_UNAVAILABLE_TEXT };
+    }
+
+    const botUid = this.bot?.uid;
+    const relatedDirectories = new Set([
+      ...this.store.workspaceDirectories(binding.cwd),
+      ...this.store.workspaceDirectories(cwd),
+    ]);
+    const relatedWorkspaces = botUid === undefined
+      ? []
+      : this.store.listThreadWorkspaces(botUid).filter((workspace) =>
+        (workspace.entryPath !== null && relatedDirectories.has(workspace.entryPath))
+        || workspace.projects.some((project) =>
+          project.path !== null && relatedDirectories.has(project.path),
+        ),
+      );
+    if (relatedWorkspaces.length > 1) {
+      return { error: "当前项目关联多个持久化工作区，无法安全确定提交范围。" };
+    }
+    const workspace = relatedWorkspaces[0];
+    if (workspace?.layout === "shared") {
+      return { error: "共享工作区包含多个项目，不支持 /commit。" };
+    }
+    if (workspace && workspace.projects.length !== 1) {
+      return { error: "当前工作区包含多个项目或 worktree，无法安全确定提交范围。" };
+    }
+    if (workspace && workspace.status !== "ready") {
+      return { error: THREAD_WORKSPACE_UNAVAILABLE_TEXT };
+    }
+    const project = workspace?.projects[0];
+    if (workspace && (!project?.created || project.path === null)) {
+      return { error: "当前工作区项目记录不完整，未创建提交任务。" };
+    }
+
+    let root: string | null;
+    try {
+      root = await this.repositoryRoot(cwd);
+    } catch {
+      return { error: "Git 工作树状态无法确认，未创建提交任务。" };
+    }
+    if (root === null) return { error: "当前绑定目录不属于可用的 Git 工作树，未创建提交任务。" };
+    if (project) {
+      const projectPath = await canonicalExistingDirectory(project.path!).catch(() => null);
+      let projectRoot: string | null;
+      try {
+        projectRoot = projectPath === null ? null : await this.repositoryRoot(projectPath);
+      } catch {
+        return { error: "持久化项目的 Git 工作树状态无法确认，未创建提交任务。" };
+      }
+      if (projectRoot !== root) {
+        return { error: "绑定目录与持久化项目记录不一致，未创建提交任务。" };
+      }
+    }
+    return { root };
+  }
+
+  private newCommitOperation(
+    taskId: string,
+    target: ChatTarget,
+    root: string,
+    binding: BindingRecord,
+    reservation: CommitLease,
+  ): CommitOperation {
+    const done = Promise.withResolvers<void>();
+    const workerReady = Promise.withResolvers<void>();
+    const operation: CommitOperation = {
+      taskId,
+      target,
+      root,
+      binding,
+      reservation,
+      done: done.promise,
+      finish: done.resolve,
+      workerReady: workerReady.promise,
+      markWorkerReady: workerReady.resolve,
+      stopRequested: false,
+      shutdownRequested: false,
+    };
+    this.commitOperationsByTask.set(taskId, operation);
+    this.commitOperationsByTarget.set(targetKey(target), operation);
+    return operation;
+  }
+
+  private forgetCommitOperation(operation: CommitOperation): void {
+    operation.reservation.complete();
+    operation.markWorkerReady();
+    if (this.commitOperationsByTask.get(operation.taskId) === operation) {
+      this.commitOperationsByTask.delete(operation.taskId);
+    }
+    if (this.commitOperationsByTarget.get(targetKey(operation.target)) === operation) {
+      this.commitOperationsByTarget.delete(targetKey(operation.target));
+    }
+    operation.finish();
+  }
+
+  private abandonCommitOperation(operation: CommitOperation): void {
+    this.typingLeases.release(operation.target, `task:${operation.taskId}`);
+    this.forgetCommitOperation(operation);
+    this.serviceRestart.maybeRunDeferred();
+  }
+
+  private async handleCommit(message: InboundMessage, argument: string): Promise<void> {
+    if (argument === "stop") {
+      await this.handleCommitStop(message);
+      return;
+    }
+    if (argument.length > 0) {
+      await this.outbox.enqueueText(message, COMMIT_USAGE, null);
+      return;
+    }
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) return;
+    const initialBinding = this.store.getBinding(botUid, message);
+    const binding = initialBinding;
+    this.throwIfStopping();
+    if (binding === null) {
+      await this.outbox.enqueueText(
+        message,
+        "当前聊天没有绑定的项目，请先使用 /new [目录] 创建会话。",
+        null,
+      );
+      return;
+    }
+    const commandReservation = this.scheduler.reserveCommandSession(message, [binding.cwd]);
+    const workspace = await this.resolveCommitWorkspace(message, binding).catch((error: unknown) => {
+      commandReservation.release();
+      throw error;
+    });
+    if ("error" in workspace) {
+      commandReservation.release();
+      await this.outbox.enqueueText(message, workspace.error, null);
+      return;
+    }
+
+    const taskId = randomUUID();
+    let reservation: CommitLease | undefined;
+    try {
+      reservation = await this.scheduler.tryAcquireCommit(
+        message,
+        binding.cwd,
+        workspace.root,
+        taskId,
+        commandReservation.order,
+      );
+    } finally {
+      commandReservation.release();
+    }
+    if (!reservation) {
+      await this.outbox.enqueueText(message, COMMIT_BUSY_TEXT, null);
+      return;
+    }
+    const currentBinding = this.store.getBinding(botUid, message);
+    if (
+      currentBinding === null
+      || currentBinding.cwd !== binding.cwd
+      || currentBinding.sessionId !== binding.sessionId
+      || currentBinding.sessionFile !== binding.sessionFile
+      || currentBinding.cwdPinned !== binding.cwdPinned
+    ) {
+      reservation.complete();
+      await this.outbox.enqueueText(message, "提交绑定已变化，请重新确认当前项目后重试。", null);
+      return;
+    }
+    const operation = this.newCommitOperation(taskId, message, workspace.root, binding, reservation);
+    const task: TaskRecord = {
+      id: taskId,
+      botUid,
+      channelId: message.channelId,
+      channelType: message.channelType,
+      messageId: message.messageId,
+      senderId: message.senderId,
+      text: "/commit",
+      sessionId: binding.sessionId,
+      cwd: binding.cwd,
+      state: "queued",
+      resultText: null,
+      errorText: null,
+      messageSeq: message.messageSeq,
+      historyEligible: false,
+      relaySuppressed: false,
+    };
+    let accepted = false;
+    try {
+      accepted = this.store.acceptCommitTask(this.commandClaim(message, "commit"), task);
+    } catch {
+      this.abandonCommitOperation(operation);
+      throw new Error("本地状态盘写入失败，提交任务未接收。");
+    }
+    if (!accepted) {
+      this.abandonCommitOperation(operation);
+      return;
+    }
+    this.typingLeases.acquire(message, `task:${taskId}`);
+    this.scheduler.scheduleCommitTask(
+      taskId,
+      reservation,
+      (id) => this.runCommitTask(id, undefined, operation),
+      () => this.abandonCommitOperation(operation),
+    );
+    this.outbox.enqueueText(message, "开始提交当前项目。", taskId);
+  }
+
+  private stopCommitOperation(operation: CommitOperation): Promise<boolean> {
+    operation.stopRequested = true;
+    operation.stopPromise ??= (async () => {
+      await operation.workerReady;
+      try {
+        const stopped = await this.stopCommitProcess(operation);
+        operation.stopConfirmed = stopped;
+        return stopped;
+      } catch {
+        operation.stopConfirmed = false;
+        this.blockedDirectories.add(operation.root);
+        return false;
+      }
+    })();
+    return operation.stopPromise;
+  }
+
+  private commitResultNotice(result: CommitResult, stopRequested: boolean): string {
+    const heads = `HEAD=${this.shortHead(result.headBefore)}→${this.shortHead(result.headAfter)}`;
+    if (result.exitCode === 0) {
+      return result.headBefore === result.headAfter
+        ? `提交已完成，没有新提交。${heads}。`
+        : `提交已完成。${heads}。`;
+    }
+    if (stopRequested) {
+      return result.headBefore !== result.headAfter
+        ? `提交已停止，但 HEAD 已变化；已产生的提交保留且不会回滚。${heads}。`
+        : `已停止当前提交；${heads}；不会回滚已发生的副作用。`;
+    }
+    return result.headBefore !== result.headAfter
+      ? `提交失败，退出码 ${result.exitCode}；HEAD 已变化，已产生的提交保留且不会回滚。${heads}。`
+      : `提交失败，退出码 ${result.exitCode}。${heads}。`;
+  }
+
+  private async handleCommitStop(target: ChatTarget): Promise<void> {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) return;
+    const operation = this.commitOperationsByTarget.get(targetKey(target));
+    const activeTask = operation
+      ? this.store.getTask(operation.taskId)
+      : this.store.getActiveTask(botUid, target);
+    if (
+      activeTask !== null
+      && activeTask.state === "queued"
+      && this.store.isCommitTask(activeTask.id)
+    ) {
+      this.scheduler.takeWaitingReceipt(activeTask.id);
+      this.store.markCancelled(activeTask.id, "commit cancelled before start");
+      this.questions.cancelForTask(activeTask.id, "cancelled");
+      if (operation) this.abandonCommitOperation(operation);
+      await this.outbox.enqueueText(target, "已停止尚未开始的提交；没有 Git 副作用。", null);
+      return;
+    }
+    if (!operation) {
+      await this.outbox.enqueueText(target, "当前没有正在进行的提交。", null);
+      return;
+    }
+    const completedResult = operation.result;
+    if (completedResult !== undefined) {
+      await operation.done;
+      await this.outbox.enqueueText(
+        target,
+        this.commitResultNotice(
+          completedResult,
+          operation.stopRequested && operation.stopConfirmed === true,
+        ),
+        null,
+      );
+      return;
+    }
+
+    const stopped = await this.stopCommitOperation(operation);
+    if (!stopped) {
+      await this.outbox.enqueueText(target, "无法确认提交进程已停止；不会重试或回滚，工作树仍受保护。", null);
+      return;
+    }
+    await operation.done;
+    const result = operation.result;
+    await this.outbox.enqueueText(
+      target,
+      result === undefined
+        ? "已停止当前提交；不会回滚已发生的副作用。"
+        : this.commitResultNotice(
+          result,
+          operation.stopRequested && operation.stopConfirmed === true,
+        ),
+      null,
+    );
+  }
+
+  private shortHead(head: string | null): string {
+    return head === null ? "未知" : head.slice(0, 8);
+  }
   /**
    * `/queue` is the explicit way to append behind the running task regardless of the chat's mode,
    * so it always takes the durable task path minus the command prefix.
@@ -2425,13 +2865,37 @@ class CoreService implements ChannelService {
     if (binding) this.invalidateGoalResumeChecks(target, binding.sessionId);
     const mergeCancelled = this.abortThreadMerges(target, new Error("thread merge cancelled"));
     const queued = this.store.cancelQueued(this.bot!.uid, target);
+    const queuedCommit = this.commitOperationsByTarget.get(targetKey(target));
+    if (queuedCommit && queued.includes(queuedCommit.taskId)) {
+      this.abandonCommitOperation(queuedCommit);
+    }
     for (const taskId of queued) this.scheduler.takeWaitingReceipt(taskId);
-    // 存储域在取消这些排队任务时已顺手把它们的待答问题置为 cancelled：这些行不再是 pending，
-    // 聊天级清扫看不到它们，卡片会留在开放状态。逐任务按「待答∪已取消」收口，卡片才会关。
+    // The store cancels queued questions with their tasks; settle cards before the chat-level cleanup.
     for (const taskId of queued) this.questions.cancelForTask(taskId, "cancelled");
     for (const taskId of queued) await this.notifyThreadOutcome(taskId);
     this.questions.cancelForTarget(target);
     let active = false;
+    let commitStopUnconfirmed = false;
+    let completedCommit: CommitOperation | undefined;
+    const commitOperation = this.commitOperationsByTarget.get(targetKey(target));
+    const commitTask = commitOperation ? this.store.getTask(commitOperation.taskId) : undefined;
+    if (commitOperation && commitTask?.state === "running") {
+      active = true;
+      if (commitOperation.result === undefined) {
+        const stopped = await this.stopCommitOperation(commitOperation);
+        if (!stopped) {
+          commitStopUnconfirmed = true;
+        } else {
+          await commitOperation.done;
+          if (this.store.getTask(commitOperation.taskId)?.state === "completed") {
+            completedCommit = commitOperation;
+          }
+        }
+      } else {
+        await commitOperation.done;
+        completedCommit = commitOperation;
+      }
+    }
     for (const runtime of this.runtimes.values()) {
       if (targetKey(runtime.target) !== targetKey(target)) continue;
       active = true;
@@ -2446,13 +2910,14 @@ class CoreService implements ChannelService {
       this.questions.rejectForTask(runtime.taskId, new Error("task cancelled"));
       this.store.markCancelled(runtime.taskId);
     }
-    await this.outbox.enqueueText(
-      target,
-      queued.length > 0 || active || mergeCancelled
-        ? DEFAULT_CANCELLED_TEXT
-        : "当前没有可取消的任务。",
-      null,
-    );
+    const response = commitStopUnconfirmed
+      ? "无法确认提交进程已停止；排队任务已清除，工作树仍受保护。"
+      : completedCommit?.result !== undefined
+        ? `当前提交已完成，无法取消或回滚；HEAD=${this.shortHead(completedCommit.result.headAfter)}。`
+        : queued.length > 0 || active || mergeCancelled
+          ? DEFAULT_CANCELLED_TEXT
+          : "当前没有可取消的任务。";
+    await this.outbox.enqueueText(target, response, null);
   }
   private abortThreadMerges(target: ChatTarget, reason: Error): boolean {
     const controllers = this.threadMergeControllers.get(targetKey(target));
@@ -2465,6 +2930,25 @@ class CoreService implements ChannelService {
     for (const controllers of this.threadMergeControllers.values()) {
       for (const controller of controllers) controller.abort(reason);
     }
+  }
+  private threadMergeCommandKey(message: InboundMessage): string {
+    return `${targetKey(message)}\0${message.messageId}`;
+  }
+
+  private finishThreadMergeCommand(message: InboundMessage): boolean {
+    const commandKey = this.threadMergeCommandKey(message);
+    const controller = this.threadMergeControllersByCommand.get(commandKey);
+    if (!controller) return false;
+    this.threadMergeControllersByCommand.delete(commandKey);
+    const targetKeyValue = targetKey(message);
+    const controllers = this.threadMergeControllers.get(targetKeyValue);
+    if (controllers) {
+      controllers.delete(controller);
+      if (controllers.size === 0 && this.threadMergeControllers.get(targetKeyValue) === controllers) {
+        this.threadMergeControllers.delete(targetKeyValue);
+      }
+    }
+    return true;
   }
 
 
@@ -2656,7 +3140,11 @@ class CoreService implements ChannelService {
       ) {
         throw new Error("等待合并期间子区绑定已变更，未执行合并。");
       }
-      const lease = reservation.tryAcquire();
+      const acquisition = reservation.tryAcquire();
+      const lease = await waitWithAbort(acquisition, signal).catch((error: unknown) => {
+        void acquisition.then((lateLease) => lateLease?.complete(), () => {});
+        throw error;
+      });
       if (lease) {
         try {
           await waitWithAbort(lease.ready, signal);
@@ -2799,6 +3287,7 @@ class CoreService implements ChannelService {
     const controller = new AbortController();
     const controllers = this.threadMergeControllers.get(targetKeyValue) ?? new Set<AbortController>();
     controllers.add(controller);
+    this.threadMergeControllersByCommand.set(this.threadMergeCommandKey(message), controller);
     this.threadMergeControllers.set(targetKeyValue, controllers);
     const shutdownSignal = this.shutdownController.signal;
     const abortOnShutdown = (): void => controller.abort(new Error("channel stopping"));
@@ -2849,7 +3338,7 @@ class CoreService implements ChannelService {
             receiptOutboxId,
           });
         },
-        tryAcquireDirectories: (cwds) => {
+        tryAcquireDirectories: async (cwds) => {
           const requestedDirectories = new Set(
             cwds.flatMap((cwd) => this.store.workspaceDirectories(cwd)),
           );
@@ -2883,10 +3372,7 @@ class CoreService implements ChannelService {
       reservation.release();
       lease?.complete();
       shutdownSignal.removeEventListener("abort", abortOnShutdown);
-      controllers.delete(controller);
-      if (controllers.size === 0 && this.threadMergeControllers.get(targetKeyValue) === controllers) {
-        this.threadMergeControllers.delete(targetKeyValue);
-      }
+      // The controller stays active until handleCommand has durably accepted the receipt or repair.
     }
   }
 
@@ -3040,7 +3526,11 @@ class CoreService implements ChannelService {
       channelStatus: () => ({
         pid: process.pid,
         restart_pending: this.serviceRestart.pending,
-        running_targets: [...this.runtimes.values()].map((runtime) => targetKey(runtime.target)),
+        running_targets: [...new Set([
+          ...[...this.runtimes.values()].map((runtime) => targetKey(runtime.target)),
+          ...this.commitOperationsByTarget.keys(),
+          ...this.threadMergeControllers.keys(),
+        ])],
         queued_tasks: this.store.listQueuedTasks().length,
         blocked_cwds: this.blockedDirectories.size,
       }),
@@ -3049,11 +3539,267 @@ class CoreService implements ChannelService {
   }
 
 
+  private async stopCommitProcess(operation: CommitOperation): Promise<boolean> {
+    if (operation.tracked) {
+      try {
+        const stopped = await operation.tracked.close(true);
+        if (!stopped) this.blockedDirectories.add(operation.root);
+        return stopped;
+      } catch {
+        this.blockedDirectories.add(operation.root);
+        return false;
+      }
+    }
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) {
+      this.blockedDirectories.add(operation.root);
+      return false;
+    }
+    try {
+      const ledger = this.store.listWorkerLedger(botUid).find((record) => record.id === operation.taskId);
+      if (!ledger) return true;
+      let stopped = false;
+      try {
+        stopped = await this.options.workerFactory.recover(ledger);
+        if (stopped) this.store.markWorkerStopped(ledger.id);
+      } catch {
+        stopped = false;
+      }
+      if (!stopped) {
+        this.blockedDirectories.add(ledger.cwd);
+        this.blockedDirectories.add(operation.root);
+      }
+      return stopped;
+    } catch {
+      this.blockedDirectories.add(operation.root);
+      return false;
+    }
+  }
+
+  private async runCommitTask(
+    taskId: string,
+    expectedCwd?: string,
+    scheduledOperation?: CommitOperation,
+  ): Promise<void> {
+    const persisted = this.store.getTask(taskId);
+    if (!persisted || persisted.state !== "queued") return;
+    const target = taskTarget(persisted);
+    let operation = scheduledOperation;
+    let acquiredReservation: CommitLease | undefined;
+    let taskStarted = false;
+    try {
+      if (this.stopping) return;
+      const binding = this.store.getBinding(persisted.botUid, target);
+      let current = this.store.getTask(taskId);
+      if (this.stopping || !current || current.state !== "queued") return;
+      if (
+        binding === null
+        || binding.cwd !== current.cwd
+        || binding.sessionId !== current.sessionId
+        || (expectedCwd !== undefined && binding.cwd !== expectedCwd)
+        || (operation !== undefined && (
+          binding.sessionFile !== operation.binding.sessionFile
+          || binding.cwdPinned !== operation.binding.cwdPinned
+        ))
+      ) {
+        this.store.markFailed(taskId, "提交绑定在执行前发生变化，未提交。");
+        this.outbox.enqueueText(target, "提交绑定已变化，请重新确认当前项目后重试。", taskId);
+        return;
+      }
+      const workspace = await this.resolveCommitWorkspace(target, binding);
+      current = this.store.getTask(taskId);
+      if (this.stopping || !current || current.state !== "queued") return;
+      if ("error" in workspace) {
+        this.store.markFailed(taskId, workspace.error);
+        this.outbox.enqueueText(target, workspace.error, taskId);
+        return;
+      }
+      if (operation && operation.root !== workspace.root) {
+        this.store.markFailed(taskId, "提交工作树在调度前发生变化，未执行。");
+        this.outbox.enqueueText(target, "提交工作树已变化，未执行提交。", taskId);
+        return;
+      }
+      if (!operation) {
+        acquiredReservation = await this.scheduler.tryAcquireCommitRepository(workspace.root, taskId);
+        current = this.store.getTask(taskId);
+        if (this.stopping || !current || current.state !== "queued") return;
+        if (!acquiredReservation) {
+          // A recovered 0/0 commit has not entered the native CLI yet. Keep it queued while an
+          // unconfirmed worker still owns this Git worktree; restart will re-evaluate the lease.
+          if (await this.isRepositoryBlocked(workspace.root)) return;
+          this.store.markFailed(taskId, COMMIT_BUSY_TEXT);
+          this.outbox.enqueueText(target, COMMIT_BUSY_TEXT, taskId);
+          return;
+        }
+        operation = this.newCommitOperation(
+          taskId,
+          target,
+          workspace.root,
+          binding,
+          acquiredReservation,
+        );
+      }
+      if (operation.stopRequested) {
+        this.store.markCancelled(taskId, "commit stopped before dispatch");
+        return;
+      }
+      if (this.stopping || operation.shutdownRequested || this.isWorkspaceDirectoryBlocked(workspace.root)) {
+        return;
+      }
+      if (!this.store.markStarted(taskId)) return;
+      taskStarted = true;
+      this.typingLeases.acquire(target, `task:${taskId}`);
+      this.store.markTaskPromptStarted(taskId, persisted.sessionId);
+
+      const model = this.store.getChatModel(persisted.botUid, target);
+      try {
+        try {
+          operation.tracked = await openTrackedCommit({
+            workerFactory: this.options.workerFactory,
+            store: this.store,
+            worker: {
+              cwd: workspace.root,
+              ...(model === null ? {} : { model }),
+            },
+            ledger: {
+              id: taskId,
+              botUid: persisted.botUid,
+              sessionId: persisted.sessionId,
+              sessionFile: binding.sessionFile ?? "",
+            },
+            blockDirectory: (cwd) => this.blockedDirectories.add(cwd),
+          });
+        } finally {
+          operation.markWorkerReady();
+        }
+      } catch {
+        const stopped = operation.stopRequested
+          ? await this.stopCommitOperation(operation)
+          : await this.stopCommitProcess(operation);
+        if (this.stopping || operation.shutdownRequested) return;
+        if (!stopped) {
+          this.outbox.enqueueText(target, "无法确认提交进程已停止；任务保持 fail-closed。", taskId);
+          return;
+        }
+        if (operation.stopRequested) {
+          this.store.markCancelled(taskId, "commit stopped before native execution");
+          return;
+        }
+        this.store.markFailed(taskId, "native commit worker could not be created");
+        this.outbox.enqueueText(target, "提交启动失败，Git 命令未执行。", taskId);
+        return;
+      }
+      const tracked = operation.tracked;
+      if (tracked === undefined) throw new Error("tracked commit worker missing after startup");
+
+      if (this.stopping || operation.shutdownRequested || operation.stopRequested) {
+        const stopped = operation.stopRequested
+          ? await this.stopCommitOperation(operation)
+          : await this.stopCommitProcess(operation);
+        if (operation.stopRequested && !this.stopping) {
+          if (stopped) {
+            this.store.markCancelled(taskId, "commit stopped before native execution");
+          } else {
+            this.outbox.enqueueText(target, "无法确认提交进程已停止；任务保持 fail-closed。", taskId);
+          }
+        }
+        return;
+      }
+
+      let result: CommitResult;
+      try {
+        const runPromise = tracked.worker.run();
+        const shutdownSignal = this.shutdownController.signal;
+        let shutdownListener: (() => void) | undefined;
+        const shutdownPromise = new Promise<never>((_, reject) => {
+          const onShutdown = () => reject(new Error("service is shutting down"));
+          shutdownListener = onShutdown;
+          if (shutdownSignal.aborted) onShutdown();
+          else shutdownSignal.addEventListener("abort", onShutdown, { once: true });
+        });
+        try {
+          result = await Promise.race([runPromise, shutdownPromise]);
+          operation.result = result;
+        } finally {
+          if (shutdownListener) shutdownSignal.removeEventListener("abort", shutdownListener);
+        }
+      } catch {
+        const stopped = operation.stopRequested
+          ? await this.stopCommitOperation(operation)
+          : await this.stopCommitProcess(operation);
+        if (this.stopping || operation.shutdownRequested) return;
+        if (!stopped) {
+          this.outbox.enqueueText(target, "无法确认提交进程已停止或结果；任务保持 fail-closed。", taskId);
+          return;
+        }
+        if (operation.stopRequested) {
+          this.store.markCancelled(taskId, "commit stopped without a reported result");
+          this.outbox.enqueueText(
+            target,
+            "已停止提交进程，但命令未返回 HEAD 结果；请检查当前 HEAD，且不会自动重试或回滚。",
+            taskId,
+          );
+          return;
+        }
+        const failure = "native commit worker failed before reporting its result";
+        this.store.markFailed(taskId, failure);
+        this.outbox.enqueueText(target, "提交未能返回结果；请检查仓库 HEAD 后再决定是否重试。", taskId);
+        return;
+      }
+
+      const closed = operation.stopRequested
+        ? await this.stopCommitOperation(operation)
+        : await this.stopCommitProcess(operation);
+      if (!closed) {
+        this.outbox.enqueueText(
+          target,
+          `无法确认提交进程已退出，任务保持 fail-closed；${this.commitResultNotice(result, false)}`,
+          taskId,
+        );
+        return;
+      }
+      if (this.stopping || operation.shutdownRequested) return;
+
+      const stopConfirmed = operation.stopRequested && operation.stopConfirmed === true;
+      const summary = this.commitResultNotice(result, stopConfirmed);
+      if (stopConfirmed && result.exitCode !== 0) {
+        this.store.markCancelled(taskId, "commit stopped");
+        this.outbox.enqueueText(target, summary, taskId);
+      } else if (result.exitCode === 0) {
+        this.store.markCompleted(taskId, summary);
+        this.outbox.enqueueText(target, summary, taskId);
+      } else {
+        this.store.markFailed(taskId, summary);
+        this.outbox.enqueueText(target, summary, taskId);
+      }
+    } catch {
+      if (this.stopping || operation?.shutdownRequested) return;
+      const failure = "native commit task failed before completion";
+      const task = this.store.getTask(taskId);
+      if (task?.state === "queued" || task?.state === "running") {
+        this.store.markFailed(taskId, failure);
+        this.outbox.enqueueText(target, "提交启动失败，无法确认结果；请检查仓库 HEAD 后再决定是否重试。", taskId);
+      }
+    } finally {
+      operation?.markWorkerReady();
+      if (taskStarted || operation !== undefined) {
+        this.typingLeases.release(target, `task:${taskId}`);
+      }
+      if (operation) this.forgetCommitOperation(operation);
+      else acquiredReservation?.complete();
+      this.serviceRestart.maybeRunDeferred();
+    }
+  }
+
   private async runTask(taskId: string, expectedCwd?: string): Promise<void> {
     const persistedTask = this.store.getTask(taskId);
     if (!persistedTask || persistedTask.state !== "queued") return;
     const target = taskTarget(persistedTask);
     const goalTask = this.store.getGoalTask(taskId);
+    if (persistedTask.text === "/commit" && this.store.isCommitTask(taskId)) {
+      await this.runCommitTask(taskId, expectedCwd);
+      return;
+    }
     if (await this.threadWorkspaceIncomplete(target, true)) {
       if (goalTask) {
         const cancelled = this.store.stopGoalContinuation(this.bot!.uid, target, goalTask.sessionId, "pause");

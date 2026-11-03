@@ -81,7 +81,10 @@ export interface HostToolHost {
     | "setThreadListen"
     | "suppressTaskRelay"
   >;
-  tryAcquireWorkspaceDirectories(cwds: readonly string[], task: TaskRecord): DirectoryLease | undefined;
+  tryAcquireWorkspaceDirectories(
+    cwds: readonly string[],
+    task: TaskRecord,
+  ): Promise<DirectoryLease | undefined>;
   /** 任务必然属于已注册的 Bot，构造工具时身份一定存在。 */
   readonly botUid: string;
   enqueueText(target: ChatTarget, text: string, taskId: string | null): void;
@@ -774,6 +777,7 @@ async function runManagementTool(
       const replay = await host.replayThreadMergeSuccess(workspaceTarget, operationId);
       if (replay !== null) return replay;
       host.store.suppressTaskRelay(task.id);
+
       try {
         const result = await mergeThreadWorkspace(
           {
@@ -882,7 +886,7 @@ async function cleanupThreadWorkspace(
 
   const binding = host.store.getBinding(host.botUid, target);
   if (!binding || binding.cwdPinned !== true || !host.worktrees) return null;
-  const lease = host.tryAcquireWorkspaceDirectories([binding.cwd], task);
+  const lease = await host.tryAcquireWorkspaceDirectories([binding.cwd], task);
   if (!lease) return "工作区正被其他任务使用，资源已保留";
   try {
     await lease.ready;
@@ -925,7 +929,7 @@ async function cleanupOwnedThreadWorkspace(
     return unresolved ? "工作区所有权不完整，规划资源已保留" : null;
   }
 
-  const lease = host.tryAcquireWorkspaceDirectories(ownedPaths, task);
+  const lease = await host.tryAcquireWorkspaceDirectories(ownedPaths, task);
   if (!lease) return "工作区正被其他任务使用，资源已保留";
   const notes: string[] = [];
   const worktrees = host.worktrees;

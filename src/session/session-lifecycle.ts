@@ -72,7 +72,10 @@ export interface SessionLifecycleDeps {
    * entry/project 资源组（或绑定已 pin 的工作区）时，同时租下展开后的工作区资源键。普通 cwd 上的
    * 其他 session 不因此互相阻塞；`cwds` 仍用于拒绝仍被未确认停止的 worker 阻塞的目录。
    */
-  readonly tryAcquireCommandSession: (target: ChatTarget, cwds: readonly string[]) => SessionLease | undefined;
+  readonly tryAcquireCommandSession: (
+    target: ChatTarget,
+    cwds: readonly string[],
+  ) => Promise<SessionLease | undefined>;
   /** 为该聊天排一条回执文本，与其他命令路径一致。 */
   readonly enqueueText: Outbox["enqueueText"];
 }
@@ -243,7 +246,7 @@ export class SessionLifecycle {
       await this.deps.enqueueText(target, `目录无效：${safeErrorMessage(error, "无法访问该目录")}`, null);
       return;
     }
-    const commandLease = this.deps.tryAcquireCommandSession(target, [cwd]);
+    const commandLease = await this.deps.tryAcquireCommandSession(target, [cwd]);
     if (!commandLease) {
       await this.deps.enqueueText(
         target,
@@ -365,7 +368,7 @@ export class SessionLifecycle {
       await this.deps.enqueueText(target, "绑定的 OMP 会话文件不存在，未迁移。", null);
       return;
     }
-    const commandLease = this.deps.tryAcquireCommandSession(target, [previous.cwd, cwd]);
+    const commandLease = await this.deps.tryAcquireCommandSession(target, [previous.cwd, cwd]);
     if (!commandLease) {
       await this.deps.enqueueText(
         target,

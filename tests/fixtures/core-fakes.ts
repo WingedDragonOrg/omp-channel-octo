@@ -15,6 +15,8 @@ import type {
   ChannelCommandHandler,
   ChannelService,
   ChannelStatus,
+  CommitWorker,
+  CommitWorkerOptions,
   ChannelTransport,
   ChatTarget,
   CliCredentialPort,
@@ -1546,7 +1548,9 @@ export class FakeWorkerFactory implements WorkerFactory {
     );
     this.workers.push(worker);
     return worker;
-
+  }
+  async createCommit(_options: CommitWorkerOptions): Promise<CommitWorker> {
+    throw new Error("FakeWorkerFactory does not implement native commit workers");
   }
   async recover(_process: WorkerProcess): Promise<boolean> {
     return this.recovered;

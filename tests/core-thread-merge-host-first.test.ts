@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { groupAlive, queryProcess } from "../src/omp/process.ts";
 import { createWorktreePort } from "../src/workspace/worktree.ts";
 import type { WorktreePort } from "../src/contracts.ts";
@@ -1906,6 +1906,119 @@ test("service stop aborts an in-progress host merge without archive or repair ta
     expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
     expect(store.getLatestTask(harness.bot.uid, thread)).toBeNull();
   } finally {
+    store.close();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a merge root reservation queues later steering from another chat", async () => {
+  const writerStarted = Promise.withResolvers<void>();
+  const mergeStarted = Promise.withResolvers<void>();
+  const releaseWriter = Promise.withResolvers<void>();
+  const releaseMerge = Promise.withResolvers<void>();
+  const sequence: string[] = [];
+  let appendedMessages: () => string[] = () => [];
+  let readRunningTargets!: () => Promise<string[]>;
+  const controlSignal = new AbortController().signal;
+  const harness = await createCoreHarness({
+    prompt: async ({ text, appended, promptContext }) => {
+      if (text === "writer before root merge") {
+        sequence.push("writer");
+        appendedMessages = () => appended().map(message => message.text);
+        const control = promptContext!.tools!.find(tool => tool.name === "channel_control")!;
+        readRunningTargets = async () => {
+          const status = JSON.parse(await control.execute({ action: "status" }, controlSignal));
+          return status.running_targets;
+        };
+        writerStarted.resolve();
+        await releaseWriter.promise;
+      } else if (text === "late writer after root merge") {
+        sequence.push("late");
+      }
+    },
+  });
+  const thread = { channelId: "group-allowed____merge-root-steering", channelType: 5 as const };
+  const writer = { channelId: "dm-root-steering", channelType: 1 as const };
+  const workspace = join(harness.root, "root-steering");
+  const child = join(workspace, "src");
+  const store = await openChannelStore(harness.stateDir);
+  let merge: Promise<void> | undefined;
+  try {
+    await mkdir(child, { recursive: true });
+    await Bun.$`git init -q ${workspace}`.quiet();
+    const writerSessionFile = join(harness.root, "root-steering-session.jsonl");
+    await writeFile(writerSessionFile, `${JSON.stringify({
+      type: "session",
+      id: "writer-root-steering",
+      cwd: child,
+      previousSessionFiles: [],
+    })}\n`);
+    store.ensureBinding({
+      botUid: harness.bot.uid,
+      ...thread,
+      cwd: workspace,
+      sessionId: "merge-root-steering",
+      sessionFile: null,
+      cwdPinned: true,
+    });
+    store.ensureBinding({
+      botUid: harness.bot.uid,
+      ...writer,
+      cwd: child,
+      sessionId: "writer-root-steering",
+      sessionFile: writerSessionFile,
+    });
+    const worktrees = harness.worktreePort!;
+    const mergeWorktree = worktrees.merge.bind(worktrees);
+    worktrees.merge = async (request, signal) => {
+      sequence.push("merge");
+      mergeStarted.resolve();
+      await releaseMerge.promise;
+      return mergeWorktree(request, signal);
+    };
+    await harness.service.handleInbound(inbound({
+      ...writer,
+      messageId: "writer-before-root-merge",
+      text: "writer before root merge",
+    }));
+    await writerStarted.promise;
+    merge = harness.service.handleInbound(inbound({
+      ...thread,
+      messageId: "merge-root-steering-command",
+      text: "/thread merge",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    const mergeTargetKey = `5:${thread.channelId}`;
+    const deadline = performance.now() + 3_000;
+    let runningTargets = await readRunningTargets();
+    while (!runningTargets.includes(mergeTargetKey) && performance.now() < deadline) {
+      const next = Promise.withResolvers<void>();
+      setImmediate(next.resolve);
+      await next.promise;
+      runningTargets = await readRunningTargets();
+    }
+    expect(runningTargets).toContain(mergeTargetKey);
+    await harness.service.handleInbound(inbound({
+      ...writer,
+      messageId: "late-writer-after-root-merge",
+      text: "late writer after root merge",
+    }));
+    expect(appendedMessages()).toEqual([]);
+    expect(store.getLatestTask(harness.bot.uid, writer)?.state).toBe("queued");
+
+    releaseWriter.resolve();
+    await mergeStarted.promise;
+    expect(sequence).toEqual(["writer", "merge"]);
+    releaseMerge.resolve();
+    await merge;
+    await harness.workers.waitForPromptCount(2);
+    await waitForStatus(harness.service, writer, status => status.state === "completed");
+    expect(sequence).toEqual(["writer", "merge", "late"]);
+    expect(harness.worktrees!.merges).toEqual([{ cwd: workspace }]);
+  } finally {
+    releaseWriter.resolve();
+    releaseMerge.resolve();
+    await merge;
     store.close();
     await closeCoreHarness(harness);
   }

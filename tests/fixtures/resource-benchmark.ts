@@ -25,6 +25,7 @@ const service = await createChannelService({
   workerFactory: {
     recover: (info) => factory.recover(info),
     sessionRootsFor: async () => [],
+    createCommit: (options) => factory.createCommit(options),
     create: (options) => factory.create({ ...options, onSpawn: (info) => {
       pids.push(info.pid);
       options.onSpawn(info);

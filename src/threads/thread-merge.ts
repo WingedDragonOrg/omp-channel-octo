@@ -48,7 +48,7 @@ export interface ThreadMergeHost {
    * WorktreeMergeLifecycle.beforeSpawn, after the port has verified the worktree identity.
    */
   readonly beforeMerge?: () => void;
-  readonly tryAcquireDirectories: (cwds: readonly string[]) => DirectoryLease | undefined;
+  readonly tryAcquireDirectories: (cwds: readonly string[]) => Promise<DirectoryLease | undefined>;
 }
 
 /**
@@ -137,7 +137,7 @@ export async function mergeThreadWorkspace(
     throw new Error("thread-merge 缺少可用于安全重试的 toolCallId，拒绝执行");
   }
 
-  const lease = host.tryAcquireDirectories([binding.cwd]);
+  const lease = await host.tryAcquireDirectories([binding.cwd]);
   if (!lease) throw new Error("隔离工作区正被其他任务使用，无法合并");
   try {
     await lease.ready;

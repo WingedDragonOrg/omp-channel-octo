@@ -1,4 +1,6 @@
 import type {
+  CommitWorker,
+  CommitWorkerOptions,
   OmpWorker,
   WorkerFactory,
   WorkerOptions,
@@ -8,6 +10,7 @@ import type { ChannelStore } from "../store/index.ts";
 import type { WorkerLedgerRecord } from "../store/store-records.ts";
 
 export type WorkerSession = Omit<OmpWorker, "stop">;
+export type CommitSession = Omit<CommitWorker, "stop">;
 
 export interface TrackedWorker {
   readonly worker: WorkerSession;
@@ -15,6 +18,12 @@ export interface TrackedWorker {
    * The first call selects recovery. All calls share the stop and ledger-finalization promise,
    * including a rejected finalization.
    */
+  close(recoverOnFailure?: boolean): Promise<boolean>;
+}
+
+export interface TrackedCommit {
+  readonly worker: CommitSession;
+  /** Shares the stop and ledger-finalization promise with every caller. */
   close(recoverOnFailure?: boolean): Promise<boolean>;
 }
 
@@ -27,29 +36,54 @@ export interface OpenTrackedWorkerOptions {
   readonly blockDirectory: (cwd: string) => void;
 }
 
-function blockUnconfirmedWorker(
-  options: OpenTrackedWorkerOptions,
+export interface OpenTrackedCommitOptions {
+  readonly workerFactory: WorkerFactory;
+  readonly store: Pick<ChannelStore, "recordWorker" | "markWorkerStopped">;
+  readonly worker: Omit<CommitWorkerOptions, "onSpawn">;
+  readonly ledger: Omit<WorkerLedgerRecord, keyof WorkerProcess | "state" | "moveTargetCwd">;
+  readonly blockDirectory: (cwd: string) => void;
+}
+
+interface StoppableWorker {
+  stop(): Promise<boolean>;
+}
+
+interface OpenTrackedProcessOptions<TWorker extends StoppableWorker> {
+  readonly workerFactory: Pick<WorkerFactory, "recover">;
+  readonly store: Pick<ChannelStore, "recordWorker" | "markWorkerStopped">;
+  readonly create: (onSpawn: (process: WorkerProcess) => void) => Promise<TWorker>;
+  readonly ledger: Omit<WorkerLedgerRecord, keyof WorkerProcess | "state" | "moveTargetCwd">;
+  readonly moveTargetCwd?: string;
+  readonly blockDirectory: (cwd: string) => void;
+}
+
+interface TrackedProcess<TWorker extends StoppableWorker> {
+  readonly worker: Omit<TWorker, "stop">;
+  close(recoverOnFailure?: boolean): Promise<boolean>;
+}
+
+function blockUnconfirmedProcess(
+  options: Pick<OpenTrackedProcessOptions<StoppableWorker>, "blockDirectory" | "moveTargetCwd">,
   spawned: WorkerProcess | undefined,
 ): void {
   if (spawned) options.blockDirectory(spawned.cwd);
   if (options.moveTargetCwd !== undefined) options.blockDirectory(options.moveTargetCwd);
 }
 
-export async function openTrackedWorker(options: OpenTrackedWorkerOptions): Promise<TrackedWorker> {
+async function openTrackedProcess<TWorker extends StoppableWorker>(
+  options: OpenTrackedProcessOptions<TWorker>,
+): Promise<TrackedProcess<TWorker>> {
   let spawned: WorkerProcess | undefined;
-  let worker: OmpWorker;
+  let worker: TWorker;
   try {
-    worker = await options.workerFactory.create({
-      ...options.worker,
-      onSpawn: (processInfo) => {
-        spawned = processInfo;
-        options.store.recordWorker({
-          ...options.ledger,
-          ...processInfo,
-          moveTargetCwd: options.moveTargetCwd ?? null,
-          state: "running",
-        });
-      },
+    worker = await options.create((processInfo) => {
+      spawned = processInfo;
+      options.store.recordWorker({
+        ...options.ledger,
+        ...processInfo,
+        moveTargetCwd: options.moveTargetCwd ?? null,
+        state: "running",
+      });
     });
   } catch (error) {
     if (spawned) {
@@ -66,7 +100,7 @@ export async function openTrackedWorker(options: OpenTrackedWorkerOptions): Prom
           // Preserve the original create failure.
         }
       } else {
-        blockUnconfirmedWorker(options, spawned);
+        blockUnconfirmedProcess(options, spawned);
       }
     }
     throw error;
@@ -90,7 +124,7 @@ export async function openTrackedWorker(options: OpenTrackedWorkerOptions): Prom
           }
         }
         if (stopped) options.store.markWorkerStopped(options.ledger.id);
-        else blockUnconfirmedWorker(options, spawned);
+        else blockUnconfirmedProcess(options, spawned);
         return stopped;
       })();
     }
@@ -98,6 +132,27 @@ export async function openTrackedWorker(options: OpenTrackedWorkerOptions): Prom
   };
 
   return { worker, close };
+}
+
+export async function openTrackedWorker(options: OpenTrackedWorkerOptions): Promise<TrackedWorker> {
+  return openTrackedProcess({
+    workerFactory: options.workerFactory,
+    store: options.store,
+    create: (onSpawn) => options.workerFactory.create({ ...options.worker, onSpawn }),
+    ledger: options.ledger,
+    ...(options.moveTargetCwd === undefined ? {} : { moveTargetCwd: options.moveTargetCwd }),
+    blockDirectory: options.blockDirectory,
+  });
+}
+
+export async function openTrackedCommit(options: OpenTrackedCommitOptions): Promise<TrackedCommit> {
+  return openTrackedProcess({
+    workerFactory: options.workerFactory,
+    store: options.store,
+    create: (onSpawn) => options.workerFactory.createCommit({ ...options.worker, onSpawn }),
+    ledger: options.ledger,
+    blockDirectory: options.blockDirectory,
+  });
 }
 
 /** Returns the candidate result only after the worker stops and its ledger is finalized. */

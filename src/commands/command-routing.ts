@@ -65,6 +65,7 @@ const BUILTIN_ALIASES = {
   thread: "thread",
   cancel: "cancel",
   stop: "cancel",
+  commit: "commit",
   status: "status",
   help: "help",
   goal: "goal",

@@ -115,6 +115,32 @@ launchctl bootout "gui/$(id -u)/com.omp.channel-octo"
 
 入站记录绑定原始聊天、发送者、消息 ID、会话 ID 和目录；之后回复只使用该记录，不读取可变的“当前聊天”。群和线程输出对成员可见，不发送完整工具原始结果、模型思考或系统上下文；发送助手可见正文与真实工具执行的简短进度。进度不作为普通聊天文字，而是在首次真实工具进度时懒建同一张可编辑卡，后续按最新状态编辑；卡片不可用或状态接口故障不得阻断正文。助手正文仍可能包含用户明确要求的文件内容，不承诺自动识别所有敏感信息。
 
+### 原生代码提交命令 SDD
+
+**目标与范围**：owner 通过 `/commit` 提交当前聊天绑定的单仓库、单 worktree 工作区，通过 `/commit stop` 停止该聊天当前的提交操作。只提供这两种写法；其他参数返回用法。提交由已安装 OMP 的原生 commit 路径完成，channel 不用普通模型请求替代提交，也不自行生成 Git commit。命令不推送。
+
+**原生能力核实**：本机 OMP 18.15.0 提供 CLI 子命令 `omp commit`，没有 RPC commit 或内置 `/commit`；把 `/commit` 当 RPC prompt 会进入普通模型回合，不能作为本实现。channel 经已配置的 OMP executable 调用 `commit`，不导入 OMP runtime。保留原生默认提交策略：已有 staged changes 时使用它们，没有时自动 stage 当前仓库的改动，可能更新 changelog，并可能把同一仓库的改动拆为多个 commit。channel 不公开 `--push`、`--dry-run`、`--legacy`、`--context` 等参数。
+
+CLI 不提供结构化提交结果，退出码 0 也可能表示没有改动，退出码 1 的降级路径也可能已经产生提交。因此运行前后读取真实 Git HEAD，结果回执区分无新提交、成功创建提交、非零退出但已产生提交，以及停止时已经落下的提交。停止通过既有受管进程组终止机制执行，不发送 RPC `abort`；中断可能保留 staged/changelog 改动或 Git lock，channel 不自动撤销或删除。
+
+**授权与工作区**：沿用 owner、允许列表和 mention 门禁以及持久消息去重。必须存在当前聊天绑定；根据持久 workspace 的 layout、项目路径与归属判断支持范围，不解析 GROUP.md/THREAD.md。shared、多仓库或多 worktree 工作区在启动提交前拒绝，包括把绑定改到 shared 的某个项目子目录的情况。separate 布局按每个子区自己的单项目绑定处理；源仓库有其他正常 linked worktree 不构成拒绝条件。
+
+**调度与生命周期**：提交持有聊天、会话及完整工作区资源组的写租约，直至受管进程确认退出；同资源已有写操作时明确报告忙碌。普通共享 cwd 的提交也不能与该目录内其他聊天的写任务无保护并发。提交使用现有 worker 工厂、进程组、parent-death watchdog 与持久 worker ledger，不另建无人负责的后台进程。接纳与副作用开始意图先落盘；重启先确认旧进程退出，已发出的提交不重放、不通过普通会话续接再执行；结果不确定时明确提示核对 Git 状态。
+
+接纳将已认领的命令行在同一事务内转换为 `text="/commit"` 的 durable task，不释放并重新认领入站消息。原生提交身份由该事务保留的 `inbound.kind=task`、`command_state=completed` 及任务关联确定；`completed` 在此表示命令接纳已转移，不表示 Git 已完成。普通队列或派发正文即使恰为 `/commit`，仍按普通 OMP 任务处理。提交不创建或 prompt 聊天的 RPC 会话；ledger 的会话字段只归因于该任务的原绑定。原生进程先停在 gate，身份、watchdog 与 ledger 登记完成，且任务 `prompt_started=1` 落盘后，才允许 `run()` 释放 gate。该路径永不记录 `prompt_accepted`，因此中途重启按已有 `1/0` 不确定接受路径终结，不进入普通 `/retry` 或同会话 continuation。
+
+Git 写锁以规范化 worktree top-level 为边界，绑定在仓库子目录也占用同一写锁；不同 linked worktree 仍各自独立。普通任务彼此保留既有同 cwd 多会话并行，提交则排斥同工作树的普通任务、持续目标、会话命令及工作区 Host Tool 写操作；持续目标的租约保留到 `session_settled`。宿主线程合并与提交共用该 worktree 排他边界，并遵循已登记的 FIFO 命令预留；后续消息不能通过 steering 越过预留。退出未确认的 worker 无论绑定在 root 还是子目录，都封锁该工作树，不能通过另一个 cwd 绕过。
+
+**停止语义**：`/commit stop` 是即时控制路径，不取得待停止提交持有的执行队列位置。只停止同一聊天对应的提交，不清除无关排队任务，不停止其他聊天或普通任务。停止回执以进程实际退出和提交结果为准；已完成的提交保留，不执行回滚；无活动、重复 stop、完成与停止竞争均不得误报已停止。无法确认退出时保留资源阻塞。
+
+既有 `/cancel`（`/stop`）也会取消本聊天的提交，并按原语义清除本聊天的排队任务；`/commit stop` 保留无关队列。`/interrupt` 保持对 OMP 回合（含持续目标）的中断语义，遇到 native commit 时提示使用 `/commit stop`，不对提交或其他会话发送 RPC abort。
+
+**反馈与验收**：向原聊天反馈启动、提交完成、提交失败或停止结果，错误有界且不转发原始模型/工具日志。行为回归覆盖权限、持久工作区拒绝、正常 linked worktree、资源竞争、持续目标及宿主合并之间的租约、停止边界、创建失败与关闭竞态，以及恢复。延迟重启将原生提交与等待/执行中的宿主合并均计入活动操作，合并回执处理完成后才重新评估空闲状态。真实 smoke 必须通过临时单项目 Git 仓库执行原生提交，核对 HEAD、文件内容及 channel 回执，并用受控运行场景验证 stop 和进程清理；不提交实现仓库、不推送、不部署、不重启常驻服务。
+
+隔离验收使用临时 channel 实例、`FakeTransport`、真实 OMP CLI 和临时 Git 仓库：普通 `/commit` 创建 `d986aec1b887cef130272b7bffe8e26c7dddcd76`，文件内容与 clean 状态核对通过，channel 收到启动和 `HEAD=5e388075→d986aec1` 完成回执。真实 pre-commit hook 阻塞期间发送 `/commit stop`，受管进程组确认消失、HEAD 保持 `d986aec1…`。separate 的单项目 linked worktree 创建 `8908099f91f694da18132de8fd006aad5ba748fe`，源工作树 HEAD 保持 `46588bc3…`，linked 工作树 clean，channel 收到对应提交结果。该验收没有连接真实 Octo transport，不代表常驻服务已加载此实现。
+
+最终检查：`bun run typecheck` 通过；专项命令/goal/宿主合并/worker 生命周期测试为 117 pass、0 fail；`bun test` 为 1149 pass、0 fail（83 个文件）。`bun tests/benchmarks/restart.ts` 的 graceful 与 SIGKILL 两个真实 CLI 恢复场景均通过，恢复任务与队列各 2 次，session overlap 和 duplicate effect 均为 0。`bun tests/benchmarks/goal.ts` 通过真实 OMP、隔离 profile/session 和 localhost 模型验证有限目标完成、pause/resume、drop、graceful/SIGKILL 恢复及 disabled 门禁，23 次本地模型请求，无重复目标创建。回归同时覆盖已派发提交不重放，以及未派发的 `0/0` 提交在未确认 worker 阻塞期间继续保持 queued。
+
 ### 命令
 
 channel 支持下列命令，`/help` 展示用法；`/retry` 经 OMP 原生命令透传，其余由 channel 自身命令注册表处理。这里不依赖 Octo 客户端提供命令菜单 API。
@@ -134,6 +160,8 @@ channel 支持下列命令，`/help` 展示用法；`/retry` 经 OMP 原生命�
 | `/goal pause`、`/goal resume`、`/goal drop` | 暂停后续续跑、恢复或删除目标；控制请求不排在持续目标后面，启动/恢复遵循任务和目录串行 |
 | `/goal budget [N\|off]` | 无参数查看预算；创建后修改/清除明确反馈原生 RPC 不支持 |
 | `/retry` | 在当前绑定的 OMP 会话中重试上次失败或中止的回合，由 OMP 原生实现判定与恢复；与其他原生 slash 输入相同，忙时按独立任务排队，执行时以会话当时的状态为准 |
+| `/commit` | 用 OMP 原生 commit 提交当前聊天绑定的单仓库、单 worktree 工作区；持久 shared/多项目归属或资源忙碌时拒绝，不推送 |
+| `/commit stop` | 即时停止本聊天当前提交，确认进程清理后报告结果；不停止无关任务、不回滚已完成提交 |
 | `/interrupt` | 中止当前聊天的运行中回合，保留已排队消息与它后面的排队任务；不终止 worker |
 | `/cancel`（`/stop` 同义） | 取消当前聊天正在执行的任务，并清除该聊天待执行消息 |
 | `/status` | 返回当前会话、目录、追加模式和运行/排队/中断状态 |
@@ -159,7 +187,7 @@ channel 支持下列命令，`/help` 展示用法；`/retry` 经 OMP 原生命�
 
 `/switch` 与 `/mode` 的无参数回执在部署声明 `octo/v2` 时改以 owner-only 配置卡片投递：卡片渲染在 `src/cards/command-card.ts`（纯函数），生命周期在 `src/commands/command-cards.ts`。卡片是一行 `Input.ChoiceSet`（id `config_value`，取值与标题原样来自本聊天当下状态——`/mode` 为 `steer`/`queue`，`/switch` 为 `default` 加目录里可作选择器的 `provider/id`，目录条目上限 80）加唯一一次 `Action.Submit`（id `cfg:<类型>:<会话 id>`）；帧的 `plain` 与文本回执逐字一致，因此不支持该能力、帧被拒、发送失败或没有回执的部署收到的仍是原来的文本。菜单会话是进程内的临时状态，不落任何持久化结构：最多 200 张、15 分钟后过期，跨重启自然作废。点击按 owner（当次从状态盘读取，不是点击负载里的值）与精确绑定（messageId + 真实聊天 + actionId + 发布时的 owner）校验：非 owner、串聊天、串消息的点击只 ack 不生效，也不消耗 owner 的卡片；发送回执尚未绑定前到达的点击保留重试。应用走与文本命令同一条路径（`/switch` 的选择器仍由 OMP 解析、成功后落 `chat_models`；`/mode` 仍写 `chat_modes`），并只接受本卡发放过的取值。同聊天的同一类配置命令（文本或点击）按到达顺序串行：后到的选择一定最后落库；每次请求一开始就取该聊天的代次票据并让旧菜单失效，探测、目录查询或发送期间被更新的命令取代的请求不再发布卡片（票据归还即回收代次状态，表不随访问过的聊天增长），点击同样让代次前进，因此迟到的旧探测不会在点击之后发出新卡。串行到本项时再核对停机、owner 与聊天授权，任一不成立就不执行这次应用、只回一行有界回执（排队期间换 owner、移出允许清单或进程开始停止都不会被迟到的旧命令改配置）。被取代或过期的旧卡（含发送在途、发送完成时进程正在停止与跨进程残留）不再可点击，只回一段有界的重开指引。点击先让卡片失效再应用，重复投递不会在更新的选择之后再次落地；应用后卡片改写成无输入、无动作的终态并承载该命令的逐字回执（OMP 拒绝选择器时展示的就是「未找到」那一行，不谎报成功），改写失败时同一段回执走文本出口。
 
-群中使用 `@Bot /new <目录>`、`@Bot /reset <目录>` 或 `@Bot /move <目录>` 等相同命令；剥离已验证的 Bot mention 后解析。命令与 mention 的先后顺序不固定：客户端可能发送 `@Bot /command <参数>` 或 `/command <参数> @Bot`，解析前剥离全部已验证的 Bot mention，无论它位于命令前、命令后还是参数中间，并清理剥离处残留的空白。结构化 span 与文本对不上或缺失时，退回按 mention uid 列表匹配独立出现的 `@BotName` 或 `@BotUid` 词元（两侧为空白或文本边界，允许尾随冒号）；未指向当前 Bot 的文本型 `@` 不剥离，用户正文中的其他 `@` 保持原样。命令只允许 owner 发起：成员发来的 `/` 开头消息一律不执行、也不交给 Agent（OMP 会在 RPC prompt 路径对内建命令做分发，透传等于把命令面暴露给成员），同一聊天 10 分钟窗口内至多回一条提示「命令仅 owner 可用；需要助手做事请直接 @<BotName> 说明。」，并按既有命令 claim 去重、重投不重复提示。channel 内置 `/new`、`/reset`、`/move`、`/thread`、`/queue`、`/mode`、`/switch`、`/interrupt`、`/cancel`、`/stop`、`/status`、`/help`、`/restart`、`/autoresearch-history` 始终硬拦截，不发送给模型；若存在同名观察器也不能改变这一安全语义。其他 slash 输入按原始 `message.text` 作为普通 OMP task 透传，未知命令不再返回“不支持的命令”。
+群中使用 `@Bot /new <目录>`、`@Bot /reset <目录>` 或 `@Bot /move <目录>` 等相同命令；剥离已验证的 Bot mention 后解析。命令与 mention 的先后顺序不固定：客户端可能发送 `@Bot /command <参数>` 或 `/command <参数> @Bot`，解析前剥离全部已验证的 Bot mention，无论它位于命令前、命令后还是参数中间，并清理剥离处残留的空白。结构化 span 与文本对不上或缺失时，退回按 mention uid 列表匹配独立出现的 `@BotName` 或 `@BotUid` 词元（两侧为空白或文本边界，允许尾随冒号）；未指向当前 Bot 的文本型 `@` 不剥离，用户正文中的其他 `@` 保持原样。命令只允许 owner 发起：成员发来的 `/` 开头消息一律不执行、也不交给 Agent（OMP 会在 RPC prompt 路径对内建命令做分发，透传等于把命令面暴露给成员），同一聊天 10 分钟窗口内至多回一条提示「命令仅 owner 可用；需要助手做事请直接 @<BotName> 说明。」，并按既有命令 claim 去重、重投不重复提示。channel 内置 `/new`、`/reset`、`/move`、`/thread`、`/queue`、`/mode`、`/switch`、`/commit`、`/interrupt`、`/cancel`、`/stop`、`/status`、`/help`、`/restart`、`/autoresearch-history` 始终硬拦截，不发送给模型；若存在同名观察器也不能改变这一安全语义。其他 slash 输入按原始 `message.text` 作为普通 OMP task 透传，未知命令不再返回“不支持的命令”。
 
 `/goal` 同属 owner-only 内置硬拦截命令；命令参数转为持久结构化请求，不进入普通模型 prompt。控制接受（原生响应及 exact goal ID）与实际 `agent_start` 生成接受分别记账；RPC 前先持久化派发意图，缺少控制接受的已派发请求不重放。暂停、删除、中断、取消及 ask 超时先撤销持续授权，取消该聊天尚未执行的目标启动/恢复请求；普通排队消息沿用各停止命令既有规则。目标恢复按原会话及 exact goal ID，停止意图优先，不通过普通续接正文替代原生目标。
 

@@ -58,6 +58,9 @@ function schedulerFor(store: ChannelStore, overrides: Partial<TaskSchedulerDeps>
     hasRuntimeInDirectory: () => false,
     isDirectoryBlocked: () => false,
     reconcileBinding: async (_taskId, _target, binding) => binding,
+    repositoryRoot: async () => null,
+    repositoryBlocked: async () => false,
+    shouldRunTaskBeforeRepositoryProbe: async () => false,
     runTask: async () => {},
     awaitStartReady: async () => {},
     enqueueText: async () => {},
@@ -293,21 +296,21 @@ test("a command lease in one shared project excludes sibling projects and the sh
 
     const scheduler = schedulerFor(store);
     const targetB = { channelType: 5 as const, channelId: "group-b____thread-lease" };
-    const lease = scheduler.tryAcquireCommandDirectories([canonicalChild]);
+    const lease = await scheduler.tryAcquireCommandDirectories([canonicalChild]);
     expect(lease).toBeDefined();
     if (!lease) throw new Error("expected a project directory lease");
     await lease.ready;
 
     expect(scheduler.hasBlockingWork(targetB, canonicalProjectB)).toBe(true);
-    expect(scheduler.tryAcquireCommandDirectories([canonicalProjectB])).toBeUndefined();
-    expect(scheduler.tryAcquireCommandDirectories([canonicalEntry])).toBeUndefined();
+    expect(await scheduler.tryAcquireCommandDirectories([canonicalProjectB])).toBeUndefined();
+    expect(await scheduler.tryAcquireCommandDirectories([canonicalEntry])).toBeUndefined();
 
     lease.complete();
-    const entryLease = scheduler.tryAcquireCommandDirectories([canonicalEntry]);
+    const entryLease = await scheduler.tryAcquireCommandDirectories([canonicalEntry]);
     expect(entryLease).toBeDefined();
     if (!entryLease) throw new Error("expected a shared-entry lease after release");
     await entryLease.ready;
-    expect(scheduler.tryAcquireCommandDirectories([canonicalProjectA])).toBeUndefined();
+    expect(await scheduler.tryAcquireCommandDirectories([canonicalProjectA])).toBeUndefined();
     entryLease.complete();
   });
 });

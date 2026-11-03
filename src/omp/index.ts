@@ -1,6 +1,8 @@
 import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import type {
+	CommitWorker,
+	CommitWorkerOptions,
 	HostTool,
 	OmpWorker,
 	PromptContext,
@@ -54,6 +56,7 @@ import {
 	modelErrorFromFrame,
 	noticeEventFromFrame,
 } from "./events.ts";
+import { createNativeCommitWorker } from "./commit.ts";
 
 const FIXED_CONTEXT_EXTENSION_PATH = resolve(import.meta.dir, "context-extension.ts");
 const FIXED_GOAL_RPC_CONFIG_PATH = resolve(import.meta.dir, "goal-rpc.yml");
@@ -1371,6 +1374,19 @@ class OmpWorkerFactory implements WorkerFactory {
 			await worker.stop();
 			throw taskStartupError("handshake-failed", asError(error, "OMP RPC worker failed during startup"));
 		}
+	}
+
+	async createCommit(options: CommitWorkerOptions): Promise<CommitWorker> {
+		const cliEnv = this.#options.cliEnv?.();
+		return createNativeCommitWorker({
+			ompCommand: this.#options.ompCommand,
+			extraArgs: this.#options.extraArgs ?? [],
+			startupTimeoutMs: this.#startupTimeoutMs,
+			cancelTimeoutMs: this.#cancelTimeoutMs,
+			...(cliEnv === undefined ? {} : { cliEnv }),
+			...(this.#options.spawnWatchdog === undefined ? {} : { spawnWatchdog: this.#options.spawnWatchdog }),
+			commit: options,
+		});
 	}
 
 	async recover(processInfo: WorkerProcess): Promise<boolean> {

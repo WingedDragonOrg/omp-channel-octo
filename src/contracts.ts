@@ -454,6 +454,32 @@ export interface WorktreeMergeLifecycle {
   onUnknown(): void;
 }
 
+/** Native OMP CLI `commit` outcome, including the real Git HEAD on either side of execution. */
+export interface CommitResult {
+  exitCode: number;
+  headBefore: string | null;
+  headAfter: string | null;
+}
+
+export interface CommitWorkerOptions {
+  cwd: string;
+  /** Canonical `provider/id` passed to the native CLI when the chat has selected a model. */
+  model?: string;
+  /**
+   * Called after managed process identity and watchdog setup. The caller MUST durably record this
+   * process before `CommitWorker.run()` can release the native CLI gate and cause Git side effects.
+   */
+  onSpawn: (process: WorkerProcess) => void;
+}
+
+/** One managed native `omp commit` operation, kept separate from the chat's RPC session. */
+export interface CommitWorker {
+  /** Starts the native CLI once and resolves with its exit code and the actual before/after HEAD. */
+  run(): Promise<CommitResult>;
+  /** Terminates the whole managed process group; false means termination was not confirmed. */
+  stop(): Promise<boolean>;
+}
+
 export interface WorkerContextScope {
   sidecarRoot: string;
   botUid: string;
@@ -648,6 +674,8 @@ export interface OmpWorker {
 export interface WorkerFactory {
   sessionRootsFor?(cwd: string): Promise<readonly string[]>;
   create(options: WorkerOptions): Promise<OmpWorker>;
+  /** Creates a managed native CLI commit worker, with no RPC session or prompt side effects. */
+  createCommit(options: CommitWorkerOptions): Promise<CommitWorker>;
   /**
    * Recovers a worker process. Resolves `false` when termination cannot be confirmed; callers
    * MUST keep `process.cwd` blocked from reuse in that case.
