@@ -6,7 +6,7 @@ import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { WorktreeMergeExecutionError } from "../src/threads/thread-merge";
-import { createWorktreePort, worktreeCandidates, worktreeSlug } from "../src/workspace/worktree";
+import { createWorktreePort } from "../src/workspace/worktree";
 
 
 import { groupAlive, terminateProcessGroup, waitForGroupGone } from "../src/omp/process.ts";
@@ -154,20 +154,89 @@ async function recordedArgv(stub: string): Promise<string[]> {
 /** A worktree stub set where wt is unavailable, so creation exercises the omp fallback. */
 const NOWT = ["/nonexistent/wt"];
 
-test("worktreeSlug keeps ASCII names readable and empties non-ASCII ones", () => {
-  expect(worktreeSlug("Fix Login Bug")).toBe("fix-login-bug");
-  expect(worktreeSlug("  Spaced   name! ")).toBe("spaced-name");
-  expect(worktreeSlug("a".repeat(40))).toBe("a".repeat(32));
-  expect(worktreeSlug("修复登录")).toBe("");
-  expect(worktreeSlug("emoji 🎉")).toBe("emoji");
+test("creates a worktree with every word in a long readable task name", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-")));
+  try {
+    const repo = await createRepo(root);
+    const wt = await writeStub(root, WT_SWITCH_STUB, "wt");
+    const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [wt] });
+    const slug = "complete-human-readable-worktree-names-preserve-every-meaningful-word";
+
+    const workspace = await port.create({
+      baseDir: repo,
+      label: "Complete human readable worktree names preserve every meaningful word",
+      threadId: "123456789012345",
+    });
+
+    expect(workspace).toEqual({ cwd: join(root, `project.${slug}`), branch: slug });
+    expect(await runGit(workspace.cwd, ["branch", "--show-current"])).toBe(slug);
+    expect(await readFile(join(workspace.cwd, "file.txt"), "utf8")).toBe("hello\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
-test("worktreeCandidates prefer the thread name and keep the thread id as fallback", () => {
-  expect(worktreeCandidates("/repo", "fix-login", "123456789012345")).toEqual([
-    { path: "/repo.fix-login", branch: "fix-login" },
-    { path: "/repo.fix-login-123456789012345", branch: "fix-login-123456789012345" },
-  ]);
+test("rejects task names over 100 normalized characters before planning or allocating resources", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-")));
+  try {
+    const repo = await createRepo(root);
+    const omp = await writeStub(root, TRANSLATING_STUB);
+    const port = createWorktreePort({ command: omp, worktrunkCandidates: NOWT });
+    let planned = false;
+
+    await expect(
+      port.create({
+        baseDir: repo,
+        label: "feature feature feature feature feature feature feature feature feature feature feature feature feature",
+        threadId: "123456789012345",
+        onPlanned: () => {
+          planned = true;
+        },
+      }),
+    ).rejects.toThrow(/100/);
+
+    expect(planned).toBe(false);
+    expect(await runGit(repo, ["for-each-ref", "--format=%(refname:short)", "refs/heads/"])).toBe("main");
+    expect(existsSync(join(root, "project.feature-feature-feature-feature-feature-feature-feature-feature-feature-feature-feature-feature-feature"))).toBe(false);
+    expect(existsSync(`${omp}.argv`)).toBe(false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
+
+test("creates an exact 100-character slug and preserves its full base through collision suffixes", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-")));
+  try {
+    const repo = await createRepo(root);
+    const wt = await writeStub(root, WT_SWITCH_STUB, "wt");
+    const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [wt] });
+    const slug = "a".repeat(100);
+    expect(slug).toHaveLength(100);
+
+    const workspaces = [];
+    for (let index = 0; index < 3; index += 1) {
+      workspaces.push(
+        await port.create({
+          baseDir: repo,
+          label: slug,
+          threadId: `12345678901234${index}`,
+        }),
+      );
+    }
+
+    expect(workspaces.map(({ cwd, branch }) => ({ cwd, branch }))).toEqual([
+      { cwd: join(root, `project.${slug}`), branch: slug },
+      { cwd: join(root, `project.${slug}-2`), branch: `${slug}-2` },
+      { cwd: join(root, `project.${slug}-3`), branch: `${slug}-3` },
+    ]);
+    for (const workspace of workspaces) {
+      expect(await runGit(workspace.cwd, ["branch", "--show-current"])).toBe(workspace.branch);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 
 test("the Worktrunk probe accepts any successful version and reports a missing cli", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-")));
@@ -280,6 +349,49 @@ test("creates at an explicit shared project path from the requested base and rep
   }
 });
 
+test("keeps explicit shared paths across branch conflicts and suffixes actual path conflicts", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-")));
+  try {
+    const repo = await createRepo(root);
+    const wt = await writeStub(root, WT_SWITCH_STUB, "wt");
+    const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [wt] });
+    const entry = join(root, "thread-workspaces", "thread-123");
+    const requestedPath = join(entry, "project alpha");
+    await mkdir(entry, { recursive: true });
+    await runGit(repo, ["branch", "shared-project"]);
+    const planned: Array<{ cwd: string; branch: string; repo: string }> = [];
+
+    const workspaces = [];
+    for (let index = 0; index < 3; index += 1) {
+      workspaces.push(
+        await port.create({
+          baseDir: repo,
+          label: "Shared Project",
+          threadId: `12345678901234${index}`,
+          path: requestedPath,
+          onPlanned: (plan) => planned.push(plan),
+        }),
+      );
+    }
+
+    expect(workspaces.map(({ cwd, branch }) => ({ cwd, branch }))).toEqual([
+      { cwd: requestedPath, branch: "shared-project-2" },
+      { cwd: `${requestedPath}-2`, branch: "shared-project-3" },
+      { cwd: `${requestedPath}-3`, branch: "shared-project-4" },
+    ]);
+    expect(planned.map(({ cwd, branch }) => ({ cwd, branch }))).toEqual(
+      workspaces.map(({ cwd, branch }) => ({ cwd, branch })),
+    );
+    expect(planned.every((plan) => plan.repo === repo)).toBe(true);
+    for (const workspace of workspaces) {
+      expect(await runGit(workspace.cwd, ["branch", "--show-current"])).toBe(workspace.branch);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+
 test("passes the requested base to the real-git OMP fallback", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-")));
   try {
@@ -317,7 +429,7 @@ test("passes the requested base to the real-git OMP fallback", async () => {
   }
 });
 
-test("steps aside to the thread id and falls back to omp when wt is missing", async () => {
+test("allocates readable numeric suffixes for real branch and path conflicts", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-")));
   try {
     const repo = await createRepo(root);
@@ -326,33 +438,52 @@ test("steps aside to the thread id and falls back to omp when wt is missing", as
       worktrunkCandidates: NOWT,
     });
 
-    await expect(
-      port.create({ baseDir: repo, label: "Fix Login Bug", threadId: "123456789012345" }),
-    ).resolves.toEqual({
-      cwd: join(root, "project.fix-login-bug"),
-      branch: "fix-login-bug",
+    await runGit(repo, ["branch", "branch-collision"]);
+    const branchConflict = await port.create({
+      baseDir: repo,
+      label: "Branch Collision",
+      threadId: "111222333444555",
     });
-    expect(await readFile(join(root, "project.fix-login-bug", "file.txt"), "utf8")).toBe("hello\n");
-
-    // A branch of the same name belongs to someone else: the thread keeps the numeric fallback.
-    await runGit(repo, ["branch", "second"]);
-    await expect(
-      port.create({ baseDir: repo, label: "Second", threadId: "111222333444555" }),
-    ).resolves.toEqual({
-      cwd: join(root, "project.second-111222333444555"),
-      branch: "second-111222333444555",
+    expect(branchConflict).toEqual({
+      cwd: join(root, "project.branch-collision"),
+      branch: "branch-collision-2",
     });
 
-    // So does an occupied directory.
-    await mkdir(join(root, "project.occupied"));
-    await expect(
-      port.create({ baseDir: repo, label: "occupied", threadId: "222333444555666" }),
-    ).resolves.toEqual({
-      cwd: join(root, "project.occupied-222333444555666"),
-      branch: "occupied-222333444555666",
+    await mkdir(join(root, "project.path-collision"));
+    const pathConflict = await port.create({
+      baseDir: repo,
+      label: "Path Collision",
+      threadId: "222333444555666",
+    });
+    expect(pathConflict).toEqual({
+      cwd: join(root, "project.path-collision-2"),
+      branch: "path-collision",
     });
 
-    // Non-ASCII names cannot name a workspace, so they are refused instead of renamed.
+    await mkdir(join(root, "project.repeated-collision"));
+    await mkdir(join(root, "project.repeated-collision-2"));
+    const repeatedPathConflict = await port.create({
+      baseDir: repo,
+      label: "Repeated Collision",
+      threadId: "333444555666777",
+    });
+    expect(repeatedPathConflict).toEqual({
+      cwd: join(root, "project.repeated-collision-3"),
+      branch: "repeated-collision",
+    });
+
+    await runGit(repo, ["branch", "branch-collision-chain"]);
+    await runGit(repo, ["branch", "branch-collision-chain-2"]);
+    const repeatedBranchConflict = await port.create({
+      baseDir: repo,
+      label: "Branch Collision Chain",
+      threadId: "444555666777888",
+    });
+    expect(repeatedBranchConflict).toEqual({
+      cwd: join(root, "project.branch-collision-chain"),
+      branch: "branch-collision-chain-3",
+    });
+
     await expect(
       port.create({ baseDir: repo, label: "修复登录", threadId: "987654321098765" }),
     ).rejects.toThrow(/ASCII/);
@@ -417,7 +548,7 @@ test("same-named worktrees stay isolated across separate source repositories", a
   }
 });
 
-test("concurrent creation in one repository reserves distinct branches and paths", async () => {
+test("concurrent creation in one repository reserves readable distinct branches and paths", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-")));
   try {
     const repo = await createRepo(root);
@@ -447,15 +578,8 @@ test("concurrent creation in one repository reserves distinct branches and paths
     const branches = workspaces.map((workspace) => workspace.branch).sort();
     const primaryPath = join(root, "project.concurrent");
 
-    expect(paths).toContain(primaryPath);
-    expect(paths).toHaveLength(2);
-    expect(new Set(paths).size).toBe(2);
-    expect(new Set(branches).size).toBe(2);
-    expect(
-      paths.filter((path) => path !== primaryPath).every((path) =>
-        [join(root, "project.concurrent-111222333444555"), join(root, "project.concurrent-222333444555666")].includes(path),
-      ),
-    ).toBe(true);
+    expect(paths).toEqual([primaryPath, `${primaryPath}-2`].sort());
+    expect(branches).toEqual(["concurrent", "concurrent-2"]);
     for (const workspace of workspaces) {
       expect(existsSync(workspace.cwd)).toBe(true);
       expect(await runGit(workspace.cwd, ["rev-parse", "--show-toplevel"])).toBe(workspace.cwd);

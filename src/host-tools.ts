@@ -80,6 +80,7 @@ export interface HostToolHost {
     | "getThreadListen"
     | "setThreadListen"
     | "suppressTaskRelay"
+    | "listThreadWorkspaces"
   >;
   tryAcquireWorkspaceDirectories(
     cwds: readonly string[],
@@ -422,7 +423,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
   const managementTool: HostTool = {
     name: "octo_management",
     description:
-      "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；create-thread 可用 projects 声明一个或多个真实 Git 仓库，单项目默认 single，多项目必须指定 shared 或 separate，创建策略 listen 默认为 merge，可选 off、merge、task。listen=off 无自动回传；merge 只在宿主真实合并成功后回传；task 还会回传派发任务的四种终态。所有合并/修复失败留在子区；thread-listen 查询或修改策略，目标是创建方。thread-delete 按持久化所有权清理工作区；thread-archive 在本回合回复送达后执行。thread-dispatch 受当前群范围、权限、深度和追加模式约束，结果与后续终态通知由持久化策略决定。",
+      "管理当前群/线程：读取与管理群信息、共享说明和 thread。create-thread 的显式 projects（包括 single）必须提供完整任务 worktree_name；每项 projects[].name 独立生成稳定项目目录 slug，必须是互不冲突的 ASCII 名称。名称不翻译、不截断，无法规范化或发生冲突时请改用明确限定名（如 admin-web、customer-web）。单项目省略 layout 表示 single，多项目明确选择 shared 或 separate。background 只描述用途与实际路径；listen 与派发/合并策略按各字段说明。",
     parameters: {
       type: "object",
       properties: {
@@ -460,15 +461,15 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
         },
         worktree_name: {
           type: "string",
-          description: "create-thread：旧式单项目 worktree 路径名称；与 projects 组合时作为分支命名 seed，单项目直接使用，多项目按项目 slug 和序号区分。",
+          description: "create-thread：完整任务名，规范化为 ASCII 小写单连字符 slug（1–100 字符）；显式 projects（包括 single）必填，必须保留完整语义，不翻译、不截断，超长时提供更短但完整的名称。无 projects 时作为旧式单仓库 worktree 名称。",
         },
         projects: {
           type: "array",
-          description: "create-thread：每项指定一个项目名、绝对 Git 仓库路径和可选起始 commit/ref；多项目必须显式提供 layout。",
+          description: "create-thread：每项指定项目显示名、绝对 Git 仓库路径和可选起始 commit/ref；name 同时生成稳定项目目录 slug，规范化后必须唯一且为 1–100 字符 ASCII slug。无可用 ASCII 字符、过长或归一化冲突均在创建前拒绝；请改用明确限定项目名（如 admin-web、customer-web），不要翻译或截断。显式 projects 必须同时提供完整 worktree_name。多项目必须显式提供 layout。",
           items: {
             type: "object",
             properties: {
-              name: { type: "string", description: "项目显示名。" },
+              name: { type: "string", description: "明确的项目名，同时作为稳定目录 slug 来源；规范化后须为唯一的 1–100 字符 ASCII slug；冲突时改用明确限定名（如 admin-web、customer-web），不翻译或截断。" },
               repo: { type: "string", description: "绝对 Git 仓库路径。" },
               base: { type: "string", description: "该项目 worktree 的起始 commit/ref。" },
             },
@@ -615,11 +616,11 @@ async function runManagementTool(
     if (value === undefined || value.length === 0) return undefined;
     if (value.length > MAX_MANAGEMENT_WORKTREE_NAME_CHARS) {
       throw new Error(
-        `worktree_name must be at most ${MAX_MANAGEMENT_WORKTREE_NAME_CHARS} characters`,
+        `worktree_name must be at most ${MAX_MANAGEMENT_WORKTREE_NAME_CHARS} characters; provide a shorter complete semantic name`,
       );
     }
     if (worktreeSlug(value).length === 0) {
-      throw new Error("worktree_name must contain ASCII letters or digits (e.g. fix-login)");
+      throw new Error("worktree_name must contain ASCII letters or digits");
     }
     return value;
   };

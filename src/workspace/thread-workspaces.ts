@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, realpath, stat } from "node:fs/promises";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import type {
   ChannelTransport,
   ThreadListenLevel,
@@ -18,10 +18,12 @@ import { worktreeSlug } from "./worktree.ts";
 
 const MAX_THREAD_NAME_CHARS = 200;
 const MAX_PROJECT_NAME_CHARS = 200;
+const MAX_NORMALIZED_SLUG_CHARS = 100;
 const MAX_BACKGROUND_CHARS = 500;
 const MAX_ERROR_CHARS = 200;
 const INPUT_CHECK_TIMEOUT_MS = 10_000;
 const DEFAULT_BACKGROUND = "在所列项目工作区中处理相关工作。";
+const sharedEntryAllocationTails = new Map<string, Promise<void>>();
 type WorkspaceLayout = ThreadWorkspaceRecord["layout"];
 
 export interface ThreadWorkspaceHost {
@@ -37,6 +39,7 @@ export interface ThreadWorkspaceHost {
     | "addThreadWorkspaceIntentChannel"
     | "completeThreadWorkspaceIntent"
     | "failThreadWorkspaceIntent"
+    | "listThreadWorkspaces"
   >;
   readonly botUid: string;
 }
@@ -47,8 +50,8 @@ export interface ThreadWorkspaceCreatePlan {
   background: string;
   /** Legacy worktree-only requests retain the `worktree` response field. */
   legacyWorktreeName?: string;
-  /** When supplied with projects, this is the branch-name seed for the batch. */
-  worktreeNameSeed?: string;
+  /** Full normalized task slug shared by every project in this batch. */
+  worktreeNameSeed: string;
 }
 
 export interface ValidatedThreadCreation {
@@ -84,6 +87,19 @@ function optionalString(args: Record<string, unknown>, field: string): string | 
   if (value === undefined) return undefined;
   if (typeof value !== "string") throw new Error(`${field} must be a string`);
   return value;
+}
+
+function normalizedTaskSlug(name: string): string {
+  const slug = worktreeSlug(name);
+  if (slug.length === 0) {
+    throw new Error("worktree_name must contain ASCII letters or digits");
+  }
+  if (slug.length > MAX_NORMALIZED_SLUG_CHARS) {
+    throw new Error(
+      `worktree_name normalized slug must be at most ${MAX_NORMALIZED_SLUG_CHARS} characters; provide a shorter complete semantic name`,
+    );
+  }
+  return slug;
 }
 
 async function canonicalRepository(path: string, signal?: AbortSignal): Promise<string> {
@@ -228,7 +244,7 @@ export async function validateThreadCreation(
         projects: [{ name: legacyWorktreeName, repo }],
         background: background ?? DEFAULT_BACKGROUND,
         legacyWorktreeName,
-        worktreeNameSeed: legacyWorktreeName,
+        worktreeNameSeed: normalizedTaskSlug(legacyWorktreeName),
       },
       listen,
       ...(background === undefined ? {} : { background }),
@@ -240,9 +256,20 @@ export async function validateThreadCreation(
   if (rawProjects.length > 1 && layout === undefined) {
     throw new Error("layout is required when projects contains more than one project");
   }
+  const taskName = optionalString(args, "worktree_name")?.trim();
+  if (taskName === undefined || taskName.length === 0) {
+    throw new Error("projects requires a full worktree_name task slug");
+  }
+  if (taskName.length > MAX_NORMALIZED_SLUG_CHARS) {
+    throw new Error(
+      `worktree_name must be at most ${MAX_NORMALIZED_SLUG_CHARS} characters; provide a shorter complete semantic name`,
+    );
+  }
+  const taskSlug = normalizedTaskSlug(taskName);
 
-  const names = new Set<string>();
-  const projects: ThreadWorkspaceCreatePlan["projects"] = [];
+  const rawNames = new Set<string>();
+  const projectSlugs = new Set<string>();
+  const parsedProjects: Array<{ name: string; repo: string; base?: string }> = [];
   for (const [index, value] of rawProjects.entries()) {
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
       throw new Error(`projects[${index}] must be an object`);
@@ -256,19 +283,40 @@ export async function validateThreadCreation(
     if (name.length === 0 || name.length > MAX_PROJECT_NAME_CHARS) {
       throw new Error(`projects[${index}].name must contain 1-${MAX_PROJECT_NAME_CHARS} characters`);
     }
-    if (names.has(name)) throw new Error("project names must be unique");
-    names.add(name);
+    const slug = worktreeSlug(name);
+    if (slug.length === 0) {
+      throw new Error(`projects[${index}].name must contain ASCII letters or digits`);
+    }
+    if (slug.length > MAX_NORMALIZED_SLUG_CHARS) {
+      throw new Error(
+        `projects[${index}].name normalized slug must be at most ${MAX_NORMALIZED_SLUG_CHARS} characters`,
+      );
+    }
+    if (rawNames.has(name) || projectSlugs.has(slug)) {
+      throw new Error("project names must have unique normalized ASCII slugs");
+    }
+    rawNames.add(name);
+    projectSlugs.add(slug);
     if (typeof project.repo !== "string" || project.repo.trim().length === 0) {
       throw new Error(`projects[${index}].repo must be a non-empty absolute path`);
     }
-    const repo = await canonicalRepository(project.repo.trim(), signal);
     let base: string | undefined;
     if (project.base !== undefined) {
       if (typeof project.base !== "string") throw new Error(`projects[${index}].base must be a string`);
       base = project.base.trim();
-      await validateBase(repo, base, signal);
     }
-    projects.push({ name, repo, ...(base === undefined ? {} : { base }) });
+    parsedProjects.push({ name, repo: project.repo.trim(), ...(base === undefined ? {} : { base }) });
+  }
+
+  const projects: ThreadWorkspaceCreatePlan["projects"] = [];
+  for (const project of parsedProjects) {
+    const repo = await canonicalRepository(project.repo, signal);
+    if (project.base !== undefined) await validateBase(repo, project.base, signal);
+    projects.push({
+      name: project.name,
+      repo,
+      ...(project.base === undefined ? {} : { base: project.base }),
+    });
   }
 
   return {
@@ -276,16 +324,15 @@ export async function validateThreadCreation(
       layout: layout ?? "single",
       projects,
       background: background ?? DEFAULT_BACKGROUND,
-      ...(legacyWorktreeName === undefined ? {} : { worktreeNameSeed: legacyWorktreeName }),
+      worktreeNameSeed: taskSlug,
     },
     listen,
     ...(background === undefined ? {} : { background }),
   };
 }
 
-function projectDirectoryName(project: ThreadWorkspaceProjectRecord, index: number): string {
-  const slug = worktreeSlug(project.name) || "workspace";
-  return `project-${index + 1}-${slug}`;
+function projectDirectoryName(project: Pick<ThreadWorkspaceProjectRecord, "name">): string {
+  return worktreeSlug(project.name);
 }
 
 
@@ -322,6 +369,105 @@ function workspaceRecord(
     ...(legacyWorktreeName === undefined ? {} : { legacyWorktreeName }),
     error: null,
   };
+}
+
+function withSharedEntryPlan(
+  record: ThreadWorkspaceRecord,
+  entryPath: string | null,
+): ThreadWorkspaceRecord {
+  return {
+    ...record,
+    entryPath,
+    projects: record.projects.map((project) => ({
+      ...project,
+      path: entryPath === null ? null : join(entryPath, projectDirectoryName(project)),
+      branch: null,
+      created: false,
+    })),
+  };
+}
+
+
+function errorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+  return typeof error.code === "string" ? error.code : undefined;
+}
+
+async function allocateSharedEntry(
+  host: ThreadWorkspaceHost,
+  record: ThreadWorkspaceRecord,
+  taskSlug: string,
+  signal: AbortSignal,
+): Promise<string> {
+  const stateDir = await realpath(host.stateDir);
+  return withSharedEntryAllocationLock(stateDir, async () => {
+    const parent = join(stateDir, "thread-workspaces");
+    await validateSharedWorkspaceParent(stateDir, signal);
+    await mkdir(parent, { recursive: true });
+    if (await realpath(parent) !== parent || !(await stat(parent)).isDirectory()) {
+      throw new Error("共享工作区入口父目录不是规范目录，拒绝创建");
+    }
+
+    const reservedPaths = new Set(
+      host.store.listThreadWorkspaces(host.botUid)
+        .filter((workspace) => workspace.channelId !== record.channelId)
+        .flatMap((workspace) => workspace.entryPath === null ? [] : [workspace.entryPath]),
+    );
+    for (let suffix = 1; ; suffix += 1) {
+      const name = suffix === 1 ? taskSlug : `${taskSlug}-${suffix}`;
+      const candidate = join(parent, name);
+      if (reservedPaths.has(candidate)) continue;
+      try {
+        await lstat(candidate);
+        continue;
+      } catch (error) {
+        if (errorCode(error) !== "ENOENT") throw error;
+      }
+
+      const planned = withSharedEntryPlan(record, candidate);
+      host.store.saveThreadWorkspace(planned);
+      Object.assign(record, planned);
+      try {
+        await mkdir(candidate);
+        const canonical = await realpath(candidate);
+        if (canonical !== candidate || !(await stat(canonical)).isDirectory()) {
+          throw new Error("共享工作区入口路径被替换，拒绝使用");
+        }
+        return candidate;
+      } catch (error) {
+        if (errorCode(error) !== "EEXIST") throw error;
+        const cleared = withSharedEntryPlan(record, null);
+        host.store.saveThreadWorkspace(cleared);
+        Object.assign(record, cleared);
+      }
+    }
+  });
+}
+
+function withSharedEntryAllocationLock<T>(
+  stateDir: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = sharedEntryAllocationTails.get(stateDir) ?? Promise.resolve();
+  const current = previous.then(operation);
+  const tail: Promise<void> = current.then(
+    () => {},
+    () => {},
+  );
+  sharedEntryAllocationTails.set(stateDir, tail);
+  return current.finally(() => {
+    if (sharedEntryAllocationTails.get(stateDir) === tail) {
+      sharedEntryAllocationTails.delete(stateDir);
+    }
+  });
+}
+
+function isRequestedPathCandidate(candidate: string, requestedPath: string): boolean {
+  if (candidate === requestedPath) return true;
+  if (!candidate.startsWith(`${requestedPath}-`) || dirname(candidate) !== dirname(requestedPath)) {
+    return false;
+  }
+  return /^-(?:[2-9]|[1-9]\d+)$/u.test(candidate.slice(requestedPath.length));
 }
 
 function ensureThreadBinding(
@@ -369,9 +515,7 @@ export async function createThreadWorkspaceBatch(
 
   const stateDir = await realpath(host.stateDir);
   if (plan.layout === "shared") await validateSharedWorkspaceParent(stateDir, signal);
-  const entryPath = plan.layout === "shared"
-    ? join(stateDir, "thread-workspaces", randomUUID())
-    : null;
+  let entryPath: string | null = null;
   const outcomes: ThreadWorkspaceOutcome[] = [];
   const remoteFailures: ThreadWorkspaceBatchResult["remoteFailures"] = [];
   const errors: string[] = [];
@@ -435,7 +579,7 @@ export async function createThreadWorkspaceBatch(
       host.botUid,
       thread,
       plan.layout,
-      plan.layout === "shared" ? entryPath : null,
+      entryPath,
       projects,
       plan.legacyWorktreeName,
     );
@@ -487,28 +631,23 @@ export async function createThreadWorkspaceBatch(
     }
   }
 
-  if (plan.layout === "shared" && outcomes.length === 1) {
+  if (plan.layout === "shared" && outcomes.length === 1 && host.worktrees !== undefined) {
     const outcome = outcomes[0]!;
     const record = outcome.record;
     if (!cannotCreateResources.has(record)) {
       try {
-        await mkdir(entryPath!, { recursive: true });
-        if (await realpath(entryPath!) !== entryPath) {
-          throw new Error("共享工作区入口路径被替换，拒绝使用");
-        }
+        const sharedEntryPath = await allocateSharedEntry(
+          host,
+          record,
+          plan.worktreeNameSeed,
+          signal,
+        );
+        entryPath = sharedEntryPath;
         entryAvailable = true;
-        host.store.saveThreadWorkspace(record);
+        ensureThreadBinding(host, outcome.thread, sharedEntryPath);
       } catch (error) {
         const detail = addFailure(errors, error, "共享工作区入口创建或持久化失败");
         outcome.error = detail;
-      }
-      if (entryAvailable) {
-        try {
-          ensureThreadBinding(host, outcome.thread, entryPath!);
-        } catch (error) {
-          const detail = addFailure(errors, error, "共享工作区绑定失败");
-          outcome.error = detail;
-        }
       }
     }
   }
@@ -526,14 +665,9 @@ export async function createThreadWorkspaceBatch(
           continue;
         }
         const requestedPath = plan.layout === "shared"
-          ? join(entryPath!, projectDirectoryName(project, index))
+          ? join(entryPath!, projectDirectoryName(project))
           : undefined;
-        const seed = plan.worktreeNameSeed;
-        const label = seed === undefined
-          ? `project-${index + 1}-${project.name}`
-          : plan.projects.length === 1
-            ? seed
-            : `${worktreeSlug(seed).slice(0, 18)}-${index + 1}-${worktreeSlug(project.name) || "project"}`;
+        const label = plan.worktreeNameSeed;
         const request: ThreadWorkspaceRequest = {
           baseDir: project.repo,
           label,
@@ -547,7 +681,7 @@ export async function createThreadWorkspaceBatch(
             if (!plan.legacyWorktreeName && planned.repo !== project.repo) {
               throw new Error("WorktreePort 选择的来源仓库与项目不一致");
             }
-            if (requestedPath !== undefined && planned.cwd !== requestedPath) {
+            if (requestedPath !== undefined && !isRequestedPathCandidate(planned.cwd, requestedPath)) {
               throw new Error("WorktreePort 选择的路径与共享项目目录不一致");
             }
             project.path = planned.cwd;
@@ -564,7 +698,7 @@ export async function createThreadWorkspaceBatch(
             canonicalPath !== workspace.cwd ||
             !details.isDirectory() ||
             workspace.branch.length === 0 ||
-            (requestedPath !== undefined && canonicalPath !== requestedPath) ||
+            (requestedPath !== undefined && !isRequestedPathCandidate(canonicalPath, requestedPath)) ||
             (project.path !== null && project.path !== canonicalPath)
           ) {
             throw new Error("WorktreePort 创建的目录与计划所有权不一致");

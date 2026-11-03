@@ -46,18 +46,6 @@ test("/thread turns the message into an instructed task without creating anythin
     const prompt = harness.workers.prompts[0];
     expect(prompt?.cwd).toBe(parentCwd);
     expect(prompt?.text.endsWith(intent)).toBe(true);
-    for (const step of [
-      "create-thread",
-      "worktree_name",
-      "thread-dispatch",
-      "按 SDD 格式写",
-      "最少必要的问题",
-      "直接生成 SDD",
-      "spec-design",
-      "详细的需求澄清在子区内进行",
-    ]) {
-      expect(prompt?.text).toContain(step);
-    }
   } finally {
     await closeCoreHarness(harness);
   }

@@ -11,7 +11,7 @@
 
 ### 包含
 
-- `create-thread --worktree_name` 的 wt 创建路径（`wt switch --create`，保留现有目录/分支命名与占用退让）与 `omp worktree add` 回退。
+- `create-thread --worktree_name` 的 wt 创建路径（`wt switch --create`，完整语义 slug 与递增占用退让）与 `omp worktree add` 回退。
 - `thread-delete` 的隔离工作区清理：新增可选布尔参数 `force`；默认只清理干净工作区，`wt` 不可用时回退 `git worktree remove`；清理结果进入同一条工具回执。
 - 子区命令 `/thread merge`：宿主取得工作区独占后直接执行默认合并与清理；成功不创建 agent 任务，回执送达后归档子区。仅实际合并执行失败时交给本聊天 agent 修复，修复后通过同一宿主 `thread-merge` 核心重试。
 - 主规格、AGENTS.md 与测试同步。
@@ -39,7 +39,7 @@
 | merge 默认行为 | 沿用 `wt merge` 默认 pipeline（squash、rebase、fast-forward、合并后删除工作区与分支） | owner 定稿：wt 默认删除 |
 | merge 无回退 | `wt` 不可用时命令只提示、不注入任务 | 合并必须有可执行的 wt |
 | 删除联动 | 默认只清理干净工作区；`force=true` 用 `-f`/`--force`；wt 不可用回退 git | owner 定稿：默认干净清理，force 由 agent 自行传参 |
-| 目录命名 | 保留 `<repo>.<slug>` 与 `<slug>-<threadId>` 退让；wt 侧用 `--config-set worktree-path` 固定到候选路径 | 验收要求目录/分支符合既有约定 |
+| 目录命名 | shared 入口使用任务 slug、项目目录使用独立项目 slug；single/separate 保持 `<repo>.<任务 slug>`；实际重名才追加 `-2`、`-3` | 名称完整可读、项目顺序无关，wt 侧固定实际候选路径 |
 
 ## 设计
 
@@ -51,7 +51,7 @@
 
 创建参数：
 
-- `name`：子区名称；`worktree_name`：可选 ASCII 工作区/分支命名种子，沿用现有命名能力。
+- `name`：子区名称；`worktree_name`：agent 提供的简短、完整语义任务名。显式 `projects` 创建必须提供；未提供 projects 时仍可省略以创建普通子区。
 - `projects`：显式项目列表，每项 `{name, repo, base?}`；`repo` 是项目仓库的绝对路径，`base` 是可选起始 Git ref。未提供项目时，原单仓库工作区仍取调用方 cwd 所属仓库。
 - `layout`：多项目必须由 agent 根据任务耦合选择 `shared` 或 `separate`，不要求 owner 每次决定；单项目可省略。
 - `background`：为什么创建、涉及哪些项目的简短背景。宿主补充实际成功的 worktree 路径；不是任务、SDD、实施要求或验收要求。
@@ -59,6 +59,34 @@
 `shared` 一次创建一个 thread，cwd 是宿主状态目录下独立的入口目录。入口本身不是 Git 仓库；每个项目在入口内拥有来自其 `repo` 的独立 Git worktree，不共享项目主检出，不把多个项目变成一个仓库。
 
 `separate` 一次按项目分别创建多个 thread，每个 thread 绑定各自 `repo` 派生的 worktree。返回每个项目的 short id、实际路径、分支和创建结果。背景说明可列出相关子区，便于定位；后续派发不重写背景。
+
+#### 可读命名与分配 SDD
+
+**目标。** 新建资源使用完整可读的任务名和独立项目名；项目输入顺序不参与目录或分支命名。只改变新建分配，不迁移、重命名或重新推导已有入口、worktree、分支及持久归属。
+
+**输入与长度。** agent 为 `worktree_name` 选择简短完整语义名，建议直接提供 ASCII 小写、单连字符分词的 slug。宿主沿用 ASCII 规范化（小写、连续非字母数字转为单连字符、去掉首尾连字符），不翻译中文，不调用模型、不按字符截断。任务 slug 与项目 slug 均须为 1–100 字符；工具输入 `worktree_name` 同样最多 100 字符。超长或无可用 ASCII 的输入在远端创建前拒绝，提示提供更短但完整的语义名称。冲突后缀不占基础 slug 的 100 字符额度，完整保留基础名称。
+
+显式 `projects` 必须提供 `worktree_name`，包括 single；缺少时提示 agent 补齐任务 slug，不从线程显示名或项目名称猜任务。每个 `projects[].name` 既是显示名，也是独立项目 slug 的来源，通常直接使用项目/仓库名。规范化后无 ASCII、超长、重复显示名或重复 slug 均在任何远端创建前拒绝；要求使用 `admin-web`、`customer-web` 这类明确限定名，不自动添加项目序号。同一来源仓库沿用现有多 worktree 能力；使用 `backend-baseline`、`backend-feature` 等用途名称区分目录，不增加创建模式。
+
+**布局与分支。**
+
+| 资源 | 正常名称 | 真实冲突时 |
+| --- | --- | --- |
+| shared 入口 | `<stateDir>/thread-workspaces/<任务 slug>` | 同父目录 `<任务 slug>-2`、`-3`，跳过占用路径 |
+| shared 项目目录 | `<入口>/<项目 slug>` | 同父目录 `<项目 slug>-2`、`-3`，只在实际路径占用时退让 |
+| single/separate worktree | `<repo>.<任务 slug>` | 同父目录 `<repo>.<任务 slug>-2`、`-3` |
+| 各项目分支 | `<任务 slug>` | 仅在对应 Git 仓库重名时 `<任务 slug>-2`、`-3` |
+
+不同 Git 仓库可以使用同一个完整任务分支名；分支重名不改变 shared 内正常项目目录名。项目排列序号不进入正常资源名。示例任务 `fix-login-flow` 的 shared 入口下为 `backend/`、`frontend/`，两个仓库分支均为 `fix-login-flow`；这些是规则示意，不是固定资源路径。
+
+**所有权与竞态。** 保留创建前持久 intent、每个实际候选在副作用前持久化、Git common-dir 串行分配、整批 ready 和资源组租约。shared 入口独占创建，不复用已有目录、文件或符号链接；分配须同时排除持久归属预留和文件系统占用。冲突分配只选新候选，不删除或覆盖已有资源。路径候选改变时先更新持久计划，成功回执、绑定与资源记录使用实际确认路径/分支；不能将计划值当作成功，不能从 THREAD.md 推断归属。取消或异常恢复继续 fail closed，不重新生成旧名称或重放创建。
+
+入口的预留不等于创建确认：独占 mkdir 前同时保存该入口下各项目的计划路径，`created=false`，实际 Git 候选确定后再由 `onPlanned` 更新。若入口被外部抢占且后续计划撤销或保存失败，这些未确认计划仍阻止删除入口；清理只在确认创建的项目均安全移除、且不存在未确认计划时尝试空目录删除。复用现有资源字段，不新增命名迁移。
+
+**交付与说明。** 创建结果和 SQLite 保存实际路径及分支；Octo THREAD.md 只含背景、项目、实际成功路径及 separate 关联线程，不加入任务正文或验收。host-tool schema、`/thread` handoff 与操作说明共同要求 agent 提供任务 slug 和明确项目名。
+
+**验收。** TDD 先观察完整任务名被截断、项目序号污染路径/分支的失败。真实 Git 回归覆盖 shared/single/separate、交换项目顺序、任务与项目长度边界、显示名/规范化冲突、入口/路径/分支占用、批内与并发重名；验证回执、SQLite、真实 Git 和 THREAD.md 一致。复用部分失败、取消、恢复、租约、dirty 保护及按归属删除测试，旧记录重开不改名。另以抛弃式真实仓库和本地 transport fixture smoke shared/separate，运行 typecheck、全量测试和离线 restart 工作负载；不操作常驻服务或用户已有资源。
+
 
 #### 状态、归属与就绪
 
@@ -97,12 +125,12 @@ shared 的 `/thread merge` 只回复「当前为多项目工作区，不支持 /
 
 ### 创建（create-thread --worktree_name）
 
-无显式项目的单仓库路径由调用方 cwd 解析仓库根；显式 projects 则各用传入 repo。按 canonical Git common-dir 串行分配目录/分支并执行创建，排除已占用分支和目录，候选为 `<repo>.<slug>` 与 `<slug>-<threadId>`；shared 使用入口内指定项目路径。随后：
+无显式项目的单仓库路径由调用方 cwd 解析仓库根；显式 projects 则各用传入 repo。按上述可读命名 SDD 分配：canonical Git common-dir 下串行排除已占用分支和目录，实际冲突以递增后缀退让；shared 使用独立项目路径，分支冲突不改变正常项目目录。随后：
 
 - wt 可用：`wt switch --create <branch> --no-cd --format json --config-set worktree-path="<候选路径>"`（在仓库根运行，120 秒上限）。hooks 按项目配置执行（pre-start 阻塞）。返回 JSON 的 `path` 经 realpath 作为绑定 cwd。
 - wt 不可用：现状 `omp worktree add <path> -b <branch> -C <baseDir> -q`。
 
-目录与分支命名、占用退让继续沿用现有约定；错误单行 ≤200 字符，不重试、不自动清理。绑定继续写入 `chats.cwd_pinned`，资源状态和派发门禁按上述多项目 SDD 管理。
+目录与分支使用完整 slug，超长明确拒绝；错误单行 ≤200 字符，命令失败不重试、不自动清理。绑定继续写入 `chats.cwd_pinned`，资源状态和派发门禁按上述多项目 SDD 管理。
 
 ### 合并（/thread merge → thread-merge → wt merge）
 
@@ -146,7 +174,8 @@ shared 的 `/thread merge` 只回复「当前为多项目工作区，不支持 /
 
 - `src/contracts.ts`：`WorktreePort` 增加 `worktrunk()`/`merge()`/`remove()`；新增 `WorktrunkProbe`、`WorktreeMergeRequest`、`WorktreeMergeSummary`、`WorktreeRemovalRequest`、`WorktreeRemovalOutcome`。
 - `src/workspace/worktrunk.ts`（新）：候选探测、wt switch/merge/remove 的 argv 与 JSON 解析、git worktree 删除回退、linked worktree 校验、共享的受限命令执行与单行错误文本。
-- `src/workspace/worktree.ts`：保留 slug/候选命名与端口组装；工厂更名 `createWorktreePort`（创建优先 wt，不可用回退现状）。
+- `src/workspace/worktree.ts`：完整 ASCII slug、common-dir 内独立分支/路径递增分配和 `createWorktreePort` 端口组装（创建优先 wt，不可用回退 OMP）。
+- `src/workspace/thread-workspaces.ts`：创建前任务与项目命名校验、shared 入口持久预留与独占创建、项目路径组合、整批资源就绪及实际路径背景发布。
 - `src/threads/thread-target.ts`：新增 `threadChannelId(groupId, shortId)`——线程目标 ID 组装与解析同源。
 - `src/commands/thread-commands.ts`、`src/service.ts`：宿主优先命令编排、失败接管、回执与归档接线；`TaskScheduler` 提供工作区独占。
 - `src/threads/thread-merge.ts`：命令与 host tool 共用的资格、合并与成功收尾核心；`src/host-tools.ts` 保留工具参数映射与 `thread-delete` 清理回执。
@@ -163,7 +192,7 @@ shared 的 `/thread merge` 只回复「当前为多项目工作区，不支持 /
 
 ## 验收标准
 
-1. wt 可用时 `create-thread --worktree_name` 经 `wt switch --create` 创建：目录 `<repo>.<slug>`（被占用退让 `<slug>-<thread_id>`）、分支同名、hooks 按 `.config/wt.toml` 执行，绑定 cwd 为该目录；wt 不可用时行为与现状一致（`omp worktree add`）。
+1. wt 可用时 `create-thread --worktree_name` 经 `wt switch --create` 创建：single/separate 目录 `<repo>.<完整任务 slug>`、分支为任务 slug，shared 入口为任务 slug、项目目录独立命名；实际占用才递增后缀。hooks 按 `.config/wt.toml` 执行，绑定 cwd 为实际路径；wt 不可用时通过 `omp worktree add` 使用相同分配结果。
 2. 子区中 `/thread merge`：绑定隔离工作区且 wt 可用时宿主先执行默认合并，成功零 agent 任务、清理工作树和分支，回执送达及进度卡排空后归档一次；实际执行失败才接管修复。资格拒绝只回提示、不执行、不创建任务；重投、重启、忙碌、取消和停止保持独占及去重边界。
 3. `octo_management` 的 `thread-merge` 在合法子区上执行 `wt merge`（默认 pipeline，或逐参数映射的 `--no-*`/`--stage`/`target`），成功返回结果对象、失败返回单行 ≤200 字符原因；非子区、未绑定工作区、目录不存在或非 linked worktree、wt 不可用时明确拒绝且不执行。
 4. `thread-delete`：按持久归属安全清理；验证占用、脏改动、force、路径替换、显式换绑和未知入口文件。历史单项目绑定保持兼容，服务端删除与重试语义不变。
@@ -188,6 +217,17 @@ shared 的 `/thread merge` 只回复「当前为多项目工作区，不支持 /
 - 真实 CLI/worker/SQLite 的 graceful 和 SIGKILL 基准均恢复在途及排队任务：`session_overlaps=0`、`duplicate_effects=0`、`disruption_notices=0`。
 - 最终 `bun run typecheck` 通过；完整 `bun test` 为 1023 pass、0 fail，覆盖 77 个文件。临时真实 Git 的 rebase 冲突与 pre-merge hook 失败均先由宿主执行，再由唯一修复任务保留现场、处置并通过 host tool 重试收尾。
 - Octo 消息与归档使用隔离 transport 夹具；本次未操作线上子区或重启常驻服务。
+
+## 2026-11-03 可读工作区命名验收
+
+- TDD 先观察到底层 5 例、多项目层 13 例可读命名失败：完整任务名被截断、入口不含任务名、项目序号进入路径与分支、缺少任务 slug 仍创建，以及占用退让不符合约定。另以持久候选写入后注入外部空目录、拒绝计划撤销保存的确定性用例，先确认 thread-delete 会删掉外部目录，再验证其被保留。
+- 工作区、归属、host tools 与 thread 命令相关 6 文件回归为 112 pass、0 fail；覆盖 100 字符边界、分支/路径独立递增、项目顺序、同仓库用途目录、持久入口预留、并发、失败批次和旧记录。`bun run typecheck` 通过。
+- 全量 `bun test` 在独立临时 `TMPDIR` 中执行：1229 pass、0 fail，覆盖 85 文件、7623 条断言。初次与相关回归并发时，固定夹具身份 `bot-fixture` 的跨进程独占锁冲突导致 4 例启动失败；隔离测试锁命名空间后完整通过，未为此修改产品锁逻辑。
+- 两个抛弃式真实 Git 仓库经 `CoreService` → host tool → 本机真实 wt v0.80.0 创建两批 shared（第二批交换项目顺序）和一批 separate，共 6 个项目 worktree。观察到完整任务入口、稳定 `backend/` 与 `frontend/` 目录、不同仓库同任务分支，以及第二批真实冲突时的 `-2` 后缀。SQLite、工具回执、实际 Git 路径/分支和本地 THREAD.md 说明一致。
+- 同一 smoke 加入历史入口及带序号的项目路径，停止并重建服务后逐值比较全部归属不变；随后通过 thread-delete 清理新旧测试资源。来源主检出的 HEAD 与干净状态不变，最终每仓库仅保留主 worktree。
+- 真实 wt 在第一项目创建成功后取消批次：结果不 ready、派发拒绝；重启保留已确认和未确认计划。thread-delete 只清理确认成功的 worktree，保留未确认计划与入口；来源仓库保持干净且仅有主 worktree。
+- 离线真实 CLI/worker/SQLite restart 基准的 graceful 与 SIGKILL 两场均续接在途任务并恢复队列：`seamless_restart_cases=2`、`session_overlaps=0`、`duplicate_effects=0`、`disruption_notices=0`。
+- Octo 表面使用本地 transport 夹具，未连接线上 Bot；测试仓库、状态目录和一次性脚本均仅用于隔离验收。没有提交、推送、合并或重启常驻服务。
 
 ## 未决事项
 

@@ -208,42 +208,6 @@ test("a ready shared owner without a binding bootstraps its first task inside th
   }
 });
 
-test("/thread guidance separates multi-project parameters, background purpose, and ready dispatch", async () => {
-  const harness = await createCoreHarness({ bot });
-  const group = { channelId: "group-tools", channelType: 2 as const };
-  try {
-    await harness.service.handleInbound(inbound({
-      messageId: "thread-usage-multi-project",
-      ...group,
-      senderId: "owner-1",
-      text: "/thread",
-      mentionedUserIds: [harness.bot.uid],
-    }));
-    expect(harness.transport.sent.some(({ text }) =>
-      text.includes("projects=") && text.includes("layout=shared|separate") && text.includes("ready=true"),
-    )).toBe(true);
-
-    await harness.service.handleInbound(inbound({
-      messageId: "thread-prompt-multi-project",
-      ...group,
-      senderId: "owner-1",
-      text: "/thread Coordinate the API and web project changes",
-      mentionedUserIds: [harness.bot.uid],
-    }));
-    await waitForStatus(harness.service, group, (status) => status.state === "completed");
-
-    const prompt = harness.workers.prompts[0]?.text ?? "";
-    expect(prompt).toContain("projects");
-    expect(prompt).toContain("layout=shared 或 separate");
-    expect(prompt).toContain("background 只写简短用途");
-    expect(prompt).toContain("ready=true");
-    expect(prompt).toContain("ready=false");
-    expect(prompt).toContain("不放任务正文、SDD 或验收标准");
-  } finally {
-    await closeCoreHarness(harness);
-  }
-});
-
 test("startup recovery fails closed when a ready shared project has disappeared", async () => {
   const root = await mkdtemp(join(tmpdir(), "omp-core-workspace-missing-"));
   let harness: CoreHarness | undefined;

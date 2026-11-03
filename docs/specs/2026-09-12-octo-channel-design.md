@@ -291,6 +291,9 @@ Mention 规则要求助手使用 `@[uid:显示名]` 表达明确点名，UID 来
 
 `create-thread` 支持 `projects:[{name,repo,base?}]`、`layout`、`background` 与既有 `worktree_name`。单项目可省略 layout；多项目必须显式选择 `shared` 或 `separate`。shared 创建一个 thread，以状态目录下非仓库入口为 cwd，入口内每个项目各有其 repo 派生的隔离 worktree；separate 按每个项目的 repo 分别创建 thread/worktree，返回各自 short id、实际路径、分支与状态。`background` 仅说明创建目的与涉及项目，宿主写入实际成功路径和必要关联子区，不承载任务、SDD 或验收；具体工作严格来自后续派发。既有 `worktree_name` 单仓库路径与命名能力保留，无显式项目时从调用方 cwd 解析源仓库；名称必须含 ASCII 字母或数字。wt 优先、不可用时回退真实 `omp worktree add`，wt 执行失败不静默切换。SQLite 独立保存资源归属和 preparing/ready/failed 状态，每步记录计划与确认结果；整次调用全部工作区、绑定和 THREAD.md 成功才 ready。部分失败返回已完成/失败/未确认资源，保留现场，不自动派发；重启后 preparing/failed 仍不可执行，也不能回落到父目录。普通入站与 thread-dispatch 共用门禁。显式 `/new`、`/move` 只改变当前绑定，不遗失旧资源；shared 缺失项目或入口时停止执行。详细接口、资源租约、失败与验收 SDD 统一见 `2026-09-17-thread-worktrunk-design.md`。
 
+新建隔离资源的任务名由 agent 通过 `worktree_name` 提供，显式 projects 时必填。ASCII 小写、单连字符规范化后任务与项目 slug 均限 1–100 字符，不截断单词；超长要求 agent 缩短完整语义。shared 入口使用完整任务 slug，入口内项目目录独立使用项目 slug，各不同仓库分支使用同一完整任务 slug；single/separate 保持 `<repo>.<任务 slug>` 布局。实际路径或分支重名才追加 `-2`、`-3`，项目显示名或规范化冲突则创建前要求明确限定名。分配仍在持久归属及既有竞态安全边界内完成，实际计划、成功回执与 THREAD.md 路径一致；已有资源和归属不改名。详细边界及验收见既有 Worktrunk SDD。
+
+
 子区通过 `create-thread listen=off|merge|task` 设置回传策略，省略为 `merge`；`thread-listen` 查询或修改，`thread-info` 展示当前档位。目标持久化为创建方聊天，已有子区升级为 merge，旧在途派发遵循当前策略。merge 仅回传宿主实际合并成功；task 额外回传独立派发任务的 completed/failed/cancelled/interrupted；off 不自动回传。普通停机挂起不回传，恢复后的真实终态按当前策略决定。steering 派发没有独立终态。合并意图、尝试及后续修复持久抑制任务通知，任意档位都不得通过任务失败旁路回传合并失败。shared 不支持合并，默认静默，需要派发结果时显式 task。合成通知沿既有权限、去重和追加路径交付，messageSeq=0，不成为待答问题答案。任务通知仅带来源、任务 ID、状态与必要固定说明；合并通知仅带来源、目标分支、实际提交、工作区清理和归档排定状态，不附原始任务或 agent 输出。详见 `2026-09-17-thread-completion-notify-design.md`。
 
 回传输入明确标注其来自子区，是系统结果通知而非用户新消息、待答问题答案或新增授权。宿主提供可追溯来源与必要终态摘要，并引导助手结合当前任务和待确认事项自行判断相关性：相关时说明结果补充或改变了什么，不把子区结论视为用户确认；不相关时明确是另一项任务，不混入当前任务结论。是否回复、整合结果或继续处理由助手决定，不因收到回传自动切换工作；既有权限、追加模式和去重边界保持不变。

@@ -29,7 +29,8 @@ import {
 
 /**
  * Isolated thread workspaces are linked Git worktrees from the calling chat's canonical repository.
- * They use the caller's exact project path when supplied and otherwise create a sibling worktree.
+ * They prefer the caller's project path when supplied and otherwise create a sibling worktree;
+ * actual path collisions add readable numeric suffixes.
  * Candidate selection and creation are serialized by Git common directory.
  *
  * Creation prefers the local Worktrunk CLI (`wt switch --create`) and falls back to the OMP
@@ -39,12 +40,7 @@ import {
  * the `thread-delete` linkage also works on deployments without Worktrunk.
  */
 
-const MAX_SLUG_CHARS = 32;
-
-export interface WorktreeCandidate {
-  path: string;
-  branch: string;
-}
+const MAX_SLUG_CHARS = 100;
 
 export interface WorktreePortOptions {
   /** Resolved OMP executable; the fallback creates worktrees with its `worktree add` command. */
@@ -57,32 +53,14 @@ export interface WorktreePortOptions {
 }
 
 /**
- * ASCII slug used for the worktree directory and branch. Names without usable ASCII characters
- * (for example Chinese names) yield an empty slug; `octo_management` rejects that up front so a
- * workspace always carries the name the caller gave it.
+ * Full ASCII slug used for the worktree directory and branch. Names without usable ASCII
+ * characters (for example Chinese names) yield an empty slug; callers reject that up front.
  */
 export function worktreeSlug(label: string): string {
   return label
     .toLowerCase()
     .replace(/[^a-z0-9]+/gu, "-")
-    .slice(0, MAX_SLUG_CHARS)
     .replace(/^-+|-+$/gu, "");
-}
-
-/**
- * Workspace locations to try, most readable first; the first free candidate wins. `slug` must be
- * a non-empty `worktreeSlug` result: a name that carries no ASCII letters or digits cannot name a
- * workspace, and callers reject it before reaching this point.
- */
-export function worktreeCandidates(
-  repoRoot: string,
-  slug: string,
-  threadId: string,
-): WorktreeCandidate[] {
-  return [
-    { path: `${repoRoot}.${slug}`, branch: slug },
-    { path: `${repoRoot}.${slug}-${threadId}`, branch: `${slug}-${threadId}` },
-  ];
 }
 
 function isAborted(signal?: AbortSignal): boolean {
@@ -371,6 +349,11 @@ export function createWorktreePort(options: WorktreePortOptions): WorktreePort {
       if (slug.length === 0) {
         throw new Error(`worktree 名称必须包含 ASCII 字母或数字：${request.label}`);
       }
+      if (slug.length > MAX_SLUG_CHARS) {
+        throw new Error(
+          `worktree 名称超过 ${MAX_SLUG_CHARS} 个字符；请提供较短但保留完整语义的名称：${request.label}`,
+        );
+      }
       const root = await runCommand(
         ["git", "-C", request.baseDir, "rev-parse", "--show-toplevel"],
         { timeoutMs: createTimeoutMs, ...(signal === undefined ? {} : { signal }) },
@@ -407,18 +390,20 @@ export function createWorktreePort(options: WorktreePortOptions): WorktreePort {
         }
         const taken = new Set(branches.stdout.split("\n").map((line) => line.trim()));
         const exactPath = request.path === undefined ? undefined : await exactWorktreePath(request.path);
-        let candidate: WorktreeCandidate | undefined;
-        for (const entry of worktreeCandidates(repoRoot, slug, request.threadId)) {
-          if (taken.has(entry.branch)) continue;
-          const path = exactPath ?? entry.path;
-          if (await lstatIfPresent(path)) continue;
-          candidate = { path, branch: entry.branch };
-          break;
+        const requestedPath = exactPath ?? `${repoRoot}.${slug}`;
+        let branch = slug;
+        let branchSuffix = 2;
+        while (taken.has(branch)) {
+          branch = `${slug}-${branchSuffix}`;
+          branchSuffix += 1;
         }
-        if (!candidate) {
-          const path = exactPath ?? `${repoRoot}.${slug}`;
-          throw new Error(`无法为线程分配隔离工作区目录：${path} 已被占用`);
+        let path = requestedPath;
+        let pathSuffix = 2;
+        while (await lstatIfPresent(path)) {
+          path = `${requestedPath}-${pathSuffix}`;
+          pathSuffix += 1;
         }
+        const candidate = { path, branch };
 
         request.onPlanned?.({
           cwd: candidate.path,
