@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type {
   ThreadWorkspace,
   ThreadWorkspaceRequest,
+  WorktreeMergePlan,
   WorktreeMergeRequest,
   WorktreeMergeSummary,
   WorktreePort,
@@ -213,6 +214,10 @@ class RecordingWorktrees implements WorktreePort {
 
   async create(_request: ThreadWorkspaceRequest): Promise<ThreadWorkspace> {
     throw new Error("thread remove tests do not create worktrees");
+  }
+
+  async planMerge(_request: WorktreeMergeRequest): Promise<WorktreeMergePlan> {
+    throw new Error("thread remove must not plan worktree merges");
   }
 
   async merge(_request: WorktreeMergeRequest): Promise<WorktreeMergeSummary> {

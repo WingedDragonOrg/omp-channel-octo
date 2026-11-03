@@ -83,7 +83,7 @@
 
 **操作安全。** native commit、宿主 merge、workspace remove 是显式副作用边界：按实际操作路径及 canonical Git worktree root 检查正在使用和较早接受的冲突工作，取得操作期排他后复核资源身份，直到进程组确认退出才释放。独立 linked worktree 不因共同来源仓库或父目录而互斥。Host Tool 不继承调用任务的假定目录独占；必须申请操作排他，只能豁免自己的调用任务，不能忽略其他使用者。shared 清理按持久记录逐项保护项目及入口，不删除未知资源或递归删除未知文件。force 只授权既定脏改动丢弃，不绕过占用和进程安全。
 
-**操作接口与集成。** `tryAcquireCommandSession` 只负责会话控制；`reserveDestructiveCommandSession` 表示显式破坏操作的 FIFO 意图，`tryAcquireDestructiveResources(cwds, task)` 负责 Host Tool 的操作期升级。命名调整和 thread remove 的集成应继续从持久资源记录获取操作路径，并调用同一排他入口；不得让普通任务重新预租工作区，也不得用“调用者正在运行”替代其他使用者检查。权限、清理归属、来源/分支验证及远端删除策略仍归各自现有模块。
+**操作接口与集成。** `tryAcquireCommandSession` 只负责会话控制；`reserveDestructiveCommandSession` 表示显式破坏操作的 FIFO 意图，`tryAcquireDestructiveResources(cwds, task)` 负责 Host Tool 的操作期升级。`/thread remove` 使用 `tryAcquireDestructiveCommandSession(target, repositoryCwds, resourcePaths)`：完整持久资源路径参与排他，仅实际存在的路径参与 Git root 探测，占用时立即拒绝、不排队，缺失 worktree 的残留分支仍可清理。命名与清理继续使用持久资源记录；不得让普通任务重新预租工作区，也不得用“调用者正在运行”替代其他使用者检查。权限、清理归属、来源/分支验证及远端删除策略仍归各自现有模块。
 
 merge 的操作路径由 `WorktreePort.planMerge` 提供 source＋真实 target checkout；默认目标使用 wt 自身的分支解析。取得排他后复核计划并固定显式 target，不能以项目来源目录或整个 Git common-dir 代替实际目标路径。目标没有 checkout 时只记录 source，不伪造目录；Git 负责 ref 原子更新。
 
