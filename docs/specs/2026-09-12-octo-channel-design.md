@@ -68,7 +68,7 @@
 
 `/new`、`/move` 的候选 worker 通过 `withStoppedWorker` 运行：scope 验证会话、确认进程停止并完成台账更新后才交付结果，调用方随后持久化绑定并发送回执。停止未确认或台账更新失败不会交付成功结果；操作失败仍执行关闭，关闭中的台账错误优先返回，否则保留原操作错误。聊天/会话租约覆盖整个 scope 和绑定提交。
 
-`commands/thread-commands.ts` 负责 `/thread` 的任务交接及 `/thread merge` 的宿主优先编排，命令去重仍在服务入口完成。命令与工具复用 `threads/thread-merge.ts` 的合并核心；只有真实 merge 执行失败生成稳定身份的修复输入。`threads/thread-archive.ts` 独占待归档集合和停止唤醒信号；新授权入站取消排定，归档等待回执送达及进度卡排空，保持瞬时失败重试与停止放弃契约。
+`commands/thread-commands.ts` 负责 `/thread` 的任务交接及 `/thread merge` 的宿主优先编排，命令去重仍在服务入口完成。命令与工具复用 `threads/thread-merge.ts` 的合并核心；只有真实 merge 执行失败生成稳定身份的修复输入。`threads/thread-archive.ts` 独占待归档集合和停止唤醒信号；新授权入站取消排定，归档等待指定成功回执 `sent`、进度卡 tail 与聊天 outbox 排空。出站退避期间持续等待，不能以等待超时替代排空；保持瞬时归档失败重试与停止放弃契约。
 
 `tasks/task-scheduler.ts` 独占聊天串行链、排定任务、聊天/会话租约、等待回执标记及关停任务快照；不同会话不因 cwd 相同而互相排队。运行中 worker 和 blocked 目录仍由服务管理，调度仅经明确端口查询。`commands/command-routing.ts` 统一内建命令别名及注册校验，从别名表推导的 action 类型约束完整分派表；durable claim 保留用户输入的命令名，重启仍在 claim 完成后请求，未知命令照常走既有 handler 或 OMP 任务路径。
 

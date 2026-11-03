@@ -17,8 +17,7 @@ import { targetKey } from "../target.ts";
 /** 排定的子区归档：仅瞬时失败重试（最多 5 次尝试、每次间隔 5 秒），永久失败即刻结束。 */
 const THREAD_ARCHIVE_ATTEMPTS = 5;
 const THREAD_ARCHIVE_RETRY_MS = 5_000;
-/** 归档前等该聊天出站队列排空的有界轮询（100ms 一次，最多 10 秒）。 */
-const THREAD_ARCHIVE_DRAIN_MS = 10_000;
+/** 归档前按 100ms 轮询出站状态；重试退避不能被误当作队列排空。 */
 const THREAD_ARCHIVE_DRAIN_POLL_MS = 100;
 
 /**
@@ -212,11 +211,11 @@ export class ThreadArchiveScheduler {
     }
   }
 
-  /** 等普通 outbox 排空；成功合并的指定回执另由无超时的严格 barrier 确认。 */
+  /** 等所有待投递正文完成；停止或新授权入站会中止等待。 */
   private async drainChatOutbox(target: ChatTarget, signal: AbortSignal): Promise<void> {
     const botUid = this.deps.botUid();
     if (botUid === undefined) return;
-    for (let waited = 0; waited < THREAD_ARCHIVE_DRAIN_MS; waited += THREAD_ARCHIVE_DRAIN_POLL_MS) {
+    while (!signal.aborted && !this.deps.stopping()) {
       await this.deps.outbox.flush(target).catch(() => {});
       if (signal.aborted || this.deps.stopping()) return;
       if (this.deps.store.countPendingOutbox(botUid, target) === 0) return;

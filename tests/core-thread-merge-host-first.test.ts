@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import { Database } from "bun:sqlite";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir, rm, writeFile } from "node:fs/promises";
@@ -517,7 +517,7 @@ test("startup recovers and blocks unresolved host merge leases before queued wor
   }
 });
 
-test("startup waits for progress-card recovery before replaying a delivered merge archive", async () => {
+test("startup with a removed workspace waits for card recovery before replaying a delivered merge archive", async () => {
   const original = await createCoreHarness();
   const thread = { channelId: "group-allowed____merge-card-recovery", channelType: 5 as const };
   const workspace = join(original.root, "workspace");
@@ -542,7 +542,6 @@ test("startup waits for progress-card recovery before replaying a delivered merg
   try {
     await closeCoreHarness(original, { remove: false });
     originalStopped = true;
-    await mkdir(workspace);
     const store = await openChannelStore(original.stateDir);
     try {
       store.ensureBinding({
@@ -1630,6 +1629,64 @@ test("a permanently dead success receipt prevents archive", async () => {
     await closeCoreHarness(harness);
   }
 });
+
+for (const settlement of ["delivered", "cancelled", "stopped"] as const) {
+  test(`a delivered merge receipt waits for pending assistant output until ${settlement}`, async () => {
+    const harness = await createCoreHarness();
+    const thread = { channelId: "group-allowed____merge-output-drain", channelType: 5 as const };
+    const store = await openChannelStore(harness.stateDir);
+    const calls: string[] = [];
+    const receiptId = "merge-output-drain-receipt";
+    const outputId = "merge-output-drain-assistant";
+    const archives = new ThreadArchiveScheduler({
+      store,
+      botUid: () => harness.bot.uid,
+      stopping: () => false,
+      transport: { archiveThread: async () => { calls.push("archive"); } },
+      // An outbox in retry backoff legitimately has no active flush to await.
+      outbox: { flush: async () => {}, enqueueText: async () => {} },
+    });
+    let operation: Promise<void> | undefined;
+    vi.useFakeTimers();
+    try {
+      for (const id of [receiptId, outputId]) {
+        store.enqueueOutbox({
+          id,
+          botUid: harness.bot.uid,
+          ...thread,
+          taskId: null,
+          kind: "text",
+          text: id === receiptId ? "子区合并成功" : "assistant final output",
+          path: null,
+          fileKind: null,
+          clientMsgNo: id,
+        });
+      }
+      store.markOutboxSent(receiptId);
+      archives.schedule(thread, "group-allowed", "merge-output-drain", 0, receiptId);
+      operation = archives.run(thread, Promise.resolve());
+      for (let step = 0; step < 120; step += 1) {
+        vi.advanceTimersByTime(100);
+        await Bun.file(join(harness.stateDir, "channel.sqlite")).stat();
+      }
+      expect(store.countPendingOutbox(harness.bot.uid, thread)).toBe(1);
+      expect(calls).toEqual([]);
+
+      if (settlement === "delivered") store.markOutboxSent(outputId);
+      else if (settlement === "cancelled") archives.cancel(thread);
+      else archives.stop();
+      vi.advanceTimersByTime(100);
+      await operation;
+      expect(calls).toEqual(settlement === "delivered" ? ["archive"] : []);
+    } finally {
+      archives.stop();
+      await operation;
+      vi.useRealTimers();
+      store.close();
+      await closeCoreHarness(harness);
+    }
+  });
+}
 test("a refused merge repair remains pending when its exact stable task was not accepted", async () => {
   const harness = await createCoreHarness();
   const thread = { channelId: "group-allowed____merge-repair-refused", channelType: 5 as const };
