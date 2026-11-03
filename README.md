@@ -113,7 +113,7 @@ oco run --config ~/.oco/config/config.json
 | `/thread merge [补充说明]` | 单项目及 separate 子区请求合并；默认合并成功后删除工作区和已合并分支。shared 多项目工作区只回复不支持提示。 |
 | `/queue <文本>` | 显式追加一个排队任务。 |
 | `/mode [steer\|queue]` | 查看或设置新消息的追加方式，默认 `steer`。 |
-| `/switch [模型]` | 查看当前模型与可用列表，或切换并保存本聊天模型。支持 `provider/id`、模型 ID/唯一子串、`@角色` 和 `:level` 后缀。 |
+| `/switch [provider\|模型]` | 查看当前模型、下一次启动策略与全部 provider 列表；参数精确匹配 provider 时仅查询该 provider，如 `/switch openai-codex`。全局和筛选列表均最多展示 100 个模型，超限明确展示数及总数，可直接 `/switch provider/model`。其余选择器继续原生切换并保存本聊天模型：`provider/id`、模型 ID/唯一子串、`@角色`、`:level`。 |
 | `/switch default` | 清除本聊天显式设置；子区重新继承主群子区默认，否则不指定模型、由 OMP 自行决定；运行中的会话不变。 |
 | `/goal`、`/goal show` | 查看当前会话的原生目标、状态、用量及预算。 |
 | `/goal set [--budget N] <目标>` | 创建目标并持续执行；`N` 为正整数 token 预算。 |

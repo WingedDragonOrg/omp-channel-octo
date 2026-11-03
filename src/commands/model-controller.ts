@@ -25,6 +25,7 @@ import {
   boundedSelectorText,
   formatModelCatalog,
   modelCatalogCurrent,
+  modelCatalogSummary,
   modelPolicyDescription,
   modelWithLevel,
   switchCardChoices,
@@ -89,8 +90,8 @@ export interface ModelSwitchControllerDeps {
   /** Queues one text message for the chat; the command path awaits it as it always has. */
   readonly enqueueText: (target: ChatTarget, text: string, taskId: string | null) => void;
   /**
-   * 配置卡片菜单：无参数命令把回执渲染成一张可选卡片，卡片不可用时按同一段文本回退；非空
-   * 命令让旧卡片失效并按到达顺序落地。生命周期在 `./command-cards.ts`，这里只调用窄面。
+   * Catalog queries render a selectable card with a text fallback; selections use the same
+   * serialized application path as card clicks. Lifecycle lives in `./command-cards.ts`.
    */
   readonly menu: ConfigMenuPort;
 }
@@ -99,40 +100,61 @@ export class ModelSwitchController {
   constructor(private readonly deps: ModelSwitchControllerDeps) {}
 
   /**
-   * `/switch [选择器]`: no argument reports OMP's observed current model separately from the
-   * policy for the next worker and every model OMP offers. `default` drops the chat's model;
-   * anything else is handed to OMP's own `/switch`, which resolves `provider/id`, a model id or
-   * substring, `@role`, and an optional `:level` suffix against its live catalog. The resolved
-   * `provider/id:level` is stored for the chat, so workers started later receive it as `--model`.
-   * When a turn is already running, OMP consumes the command locally and switches that session.
+   * Empty and exact-provider requests query OMP's live catalog. Other selectors and card clicks
+   * use OMP's native resolution; only an accepted selection persists a chat model.
    */
   async handleSwitch(message: InboundMessage, argument: string): Promise<void> {
     const requested = argument.trim();
-    if (requested.length === 0) {
-      // 先拿到代次票据再查询：这次探测期间被更新的同类命令会让它作废，迟到的目录不得发布新卡。
-      const ticket = this.deps.menu.begin(message, "switch");
-      try {
-        const live = this.deps.liveWorker(message);
-        let catalog: WorkerModelCatalog;
-        try {
-          catalog = live
-            ? await live.models()
-            : await this.withProbeWorker(message, worker => worker.models());
-        } catch (error) {
-          if (ticket.current()) await this.deps.enqueueText(message, switchFailureText(error), null);
+    // Hold the generation across catalog lookup, probe cleanup and card delivery.
+    const ticket = this.deps.menu.begin(message, "switch");
+    try {
+      let view: CommandCardView | undefined;
+      let receipt: string;
+      if (requested.length === 0) {
+        const result = await this.inspectSwitch(message, requested);
+        if (typeof result === "string") {
+          if (ticket.current()) this.deps.enqueueText(message, result, null);
           return;
         }
-        await this.deps.menu.open(message, this.switchMenuView(message, live !== undefined, catalog), ticket);
-      } finally {
-        ticket.release();
+        view = result;
+      } else {
+        receipt = await this.deps.menu.serialize("switch", message, async () => {
+          const result = await this.inspectSwitch(message, requested);
+          if (typeof result === "string") return result;
+          view = result;
+          return result.plain;
+        });
+        if (view === undefined) {
+          this.deps.enqueueText(message, receipt, null);
+          return;
+        }
       }
-      return;
+      await this.deps.menu.open(message, view, ticket);
+    } finally {
+      ticket.release();
     }
-    // 非空命令先让本聊天旧的模型卡片失效，再按到达顺序应用：卡片点击走同一段应用逻辑，
-    // 因此更慢的旧探测不会覆盖更新的选择。
-    this.deps.menu.invalidate(message, "switch");
-    const receipt = await this.deps.menu.serialize("switch", message, () => this.applySwitch(message, requested));
-    await this.deps.enqueueText(message, receipt, null);
+  }
+
+  /** One worker reads the catalog and, only for a non-provider selector, resolves the switch. */
+  private async inspectSwitch(target: ChatTarget, requested: string): Promise<CommandCardView | string> {
+    if (requested.toLowerCase() === "default" || /\s/u.test(requested)) {
+      return this.applySwitch(target, requested);
+    }
+    const live = this.deps.liveWorker(target);
+    let result: { catalog: WorkerModelCatalog; provider: string | undefined } | { outcome: WorkerModelSwitch };
+    try {
+      const inspect = async (worker: WorkerSession) => {
+        const catalog = await worker.models();
+        const provider = catalog.available.some(model => model.provider === requested) ? requested : undefined;
+        if (requested.length === 0 || provider !== undefined) return { catalog, provider };
+        return { outcome: await worker.switchModel(requested) };
+      };
+      result = live ? await inspect(live) : await this.withProbeWorker(target, inspect);
+    } catch (error) {
+      return switchFailureText(error);
+    }
+    if ("catalog" in result) return this.switchMenuView(target, live !== undefined, result.catalog, result.provider);
+    return this.switchReceipt(target, requested, result.outcome, live !== undefined);
   }
 
   /** Owner's `/thread model` control path; it never uses or changes the parent group's live worker. */
@@ -188,26 +210,34 @@ export class ModelSwitchController {
     } catch (error) {
       return switchFailureText(error);
     }
+    return this.switchReceipt(target, requested, outcome, live !== undefined);
+  }
+
+  /** Persist only native resolution success, after a throwaway worker has finished cleanup. */
+  private switchReceipt(target: ChatTarget, requested: string, outcome: WorkerModelSwitch, running: boolean): string {
     if (!outcome.ok) return notFoundModelText(requested);
     const model = modelWithLevel(outcome.model, outcome.level);
     this.deps.store.setChatModel(this.deps.botUid(), target, model);
-    return live === undefined
-      ? `已切换本聊天模型为 ${model}，从下一回合开始生效。`
-      : `已切换本聊天模型为 ${model}（运行中会话已同步切换）。`;
+    return running
+      ? `已切换本聊天模型为 ${model}（运行中会话已同步切换）。`
+      : `已切换本聊天模型为 ${model}，从下一回合开始生效。`;
   }
 
-  /**
-   * The empty `/switch` card reports OMP's observed model separately from the policy for the next
-   * worker; `plain` carries the same information if cards are unavailable.
-   */
-  private switchMenuView(target: ChatTarget, running: boolean, catalog: WorkerModelCatalog): CommandCardView {
+  /** The filtered catalog reports observed state, next-worker policy and bounded model options. */
+  private switchMenuView(
+    target: ChatTarget, running: boolean, catalog: WorkerModelCatalog, provider?: string,
+  ): CommandCardView {
     const { current, label, policy } = this.chatModel(target, running, catalog);
+    const models = provider === undefined
+      ? catalog.available
+      : catalog.available.filter(model => model.provider === provider);
     return {
       kind: "switch",
       current: modelCatalogCurrent(current, label),
       nextModel: modelPolicyDescription(policy.model, policy.source),
-      choices: switchCardChoices(catalog.available),
-      plain: formatModelCatalog({ current, label, models: catalog.available, policy }),
+      catalogSummary: modelCatalogSummary(models, provider),
+      choices: switchCardChoices(models),
+      plain: formatModelCatalog({ current, label, models, policy, ...(provider === undefined ? {} : { provider }) }),
     };
   }
 

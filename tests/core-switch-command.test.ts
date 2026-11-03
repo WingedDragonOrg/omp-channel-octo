@@ -333,3 +333,37 @@ test("a deployment without any available model says so", async () => {
     await closeCoreHarness(harness);
   }
 });
+
+test("default clears a model even when OMP advertises a provider named default", async () => {
+  const harness = await createCoreHarness();
+  const store = await openChannelStore(harness.stateDir);
+  try {
+    harness.workers.catalog.available.push({ provider: "default", id: "provider-model" });
+    store.setChatModel(harness.bot.uid, DM, "fixture/fast");
+    await harness.service.handleInbound(inbound({ ...DM, messageId: "default-provider", text: "/switch DEFAULT" }));
+    expect(store.getChatModel(harness.bot.uid, DM)).toBeNull();
+    expect(harness.workers.workers.flatMap(worker => worker.switchDispatches)).toEqual([]);
+    expect(harness.transport.sentCards).toEqual([]);
+    await harness.service.handleInbound(inbound({ ...DM, messageId: "default-provider-task", text: "run" }));
+    await harness.workers.waitForPromptCount(1);
+    expect(harness.workers.creations.at(-1)?.model).toBeUndefined();
+  } finally { store.close(); await closeCoreHarness(harness); }
+});
+
+test("non-exact provider tokens retain OMP model-id and substring resolution without extra probes", async () => {
+  const harness = await createCoreHarness();
+  const store = await openChannelStore(harness.stateDir);
+  try {
+    harness.workers.catalog.available = [{ provider: "openai-codex", id: "unique-model" }];
+    for (const [index, selector] of ["unique-model", "unique", "openai"].entries()) {
+      await harness.service.handleInbound(inbound({ ...DM, messageId: `native-selector-${index}`, text: `/switch ${selector}` }));
+      expect(store.getChatModel(harness.bot.uid, DM)).toBe("openai-codex/unique-model");
+      expect(harness.workers.creations).toHaveLength(index + 1);
+      expect(harness.workers.workers[index]?.switchDispatches).toEqual([selector]);
+      expect(harness.workers.workers[index]?.stopped).toBe(true);
+    }
+    await harness.service.handleInbound(inbound({ ...DM, messageId: "case-provider", text: "/switch OPENAI-CODEX" }));
+    expect(harness.workers.workers.at(-1)?.switchDispatches).toEqual(["OPENAI-CODEX"]);
+    expect(harness.transport.sentCards).toEqual([]);
+  } finally { store.close(); await closeCoreHarness(harness); }
+});

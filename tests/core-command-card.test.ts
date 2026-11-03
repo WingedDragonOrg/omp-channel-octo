@@ -231,13 +231,13 @@ test("a configuration click leaves the chat's pending question and tasks untouch
     await harness.service.handleInbound(inbound({ ...target, messageId: "ask-start", text: "needs an answer" }));
     await harness.workers.waitForPromptCount(1);
     const pending = await waitForStatus(harness.service, target, status => status.pendingQuestionIds.length > 0);
-    await harness.service.handleInbound(inbound({ ...target, messageId: "ask-menu", text: "/mode" }));
+    await harness.service.handleInbound(inbound({ ...target, messageId: "ask-menu", text: "/switch fixture" }));
     const card = configCards(transport)[0]!;
-    transport.pushBotEvent(cardActionEvent(1, select(card, "queue")));
+    transport.pushBotEvent(cardActionEvent(1, select(card, "fixture/fast")));
     await transport.waitForAck(1);
     const store = await openChannelStore(harness.stateDir);
     try {
-      expect(store.getChatMode(harness.bot.uid, target)).toBe("queue");
+      expect(store.getChatModel(harness.bot.uid, target)).toBe("fixture/fast");
       expect(store.countQueuedTasks(harness.bot.uid, target)).toBe(0);
       expect(store.pendingQuestionIds(harness.bot.uid, target)).toEqual(pending.pendingQuestionIds);
     } finally { store.close(); }
@@ -313,18 +313,20 @@ test("a deployment that cannot carry cards keeps the command's original text rep
   } finally { await closeCoreHarness(plain); }
 
   const transport = cardTransport();
-  transport.cardSendRefusal = () => true;
+  let refusedPlain = "";
+  transport.cardSendRefusal = frame => { refusedPlain = frame.plain; return true; };
   const refused = await createCoreHarness({ transport });
   try {
     await refused.service.handleInbound(inbound({ messageId: "refused-switch", text: "/switch" }));
-    expectSwitchListing(chatTexts(transport, { channelId: "dm-owner", channelType: 1 }));
+    expect(chatTexts(transport, { channelId: "dm-owner", channelType: 1 })).toEqual([refusedPlain]);
+    const switchPlain = refusedPlain;
     await refused.service.handleInbound(inbound({ messageId: "refused-mode", text: "/mode" }));
     expect(chatTexts(transport, { channelId: "dm-owner", channelType: 1 }).at(-1)).toContain("当前追加模式：steer");
     // 抛错的发送同样回退，并且不留下任何可点击的会话。
     transport.cardSendRefusal = undefined;
     transport.cardSendFailure = new Error("card transport down");
     await refused.service.handleInbound(inbound({ messageId: "failed-switch", text: "/switch" }));
-    expectSwitchListing(chatTexts(transport, { channelId: "dm-owner", channelType: 1 }));
+    expect(chatTexts(transport, { channelId: "dm-owner", channelType: 1 }).at(-1)).toBe(switchPlain);
     expect(transport.sentCards).toHaveLength(0);
   } finally { await closeCoreHarness(refused); }
 });
@@ -544,10 +546,10 @@ test("a catalog probe superseded by a text switch cannot publish an active menu"
     await running.promise;
     const worker = harness.workers.workers[0]!;
     const models = worker.models.bind(worker);
+    let held = false;
     worker.models = async () => {
       const catalog = await models();
-      queried.resolve();
-      await release.promise;
+      if (!held) { held = true; queried.resolve(); await release.promise; }
       return catalog;
     };
     const oldMenu = harness.service.handleInbound(inbound({ messageId: "slow-menu", text: "/switch" }));
@@ -562,4 +564,146 @@ test("a catalog probe superseded by a text switch cannot publish an active menu"
     finish.resolve();
     await closeCoreHarness(harness);
   }
+});
+
+// A provider query must not be interpreted as a native selector, even if it could resolve one.
+test("an exact provider query is read-only and its card applies only on an owner click", async () => {
+  const transport = cardTransport();
+  const harness = await createCoreHarness({ transport });
+  const target = { channelId: "dm-owner", channelType: 1 as const };
+  const store = await openChannelStore(harness.stateDir);
+  try {
+    store.setChatModel(harness.bot.uid, target, "other/fast");
+    await harness.service.handleInbound(inbound({ messageId: "provider-query", text: "/switch fixture" }));
+    const cards = configCards(transport);
+    expect(cards).toHaveLength(1);
+    const card = cards[0]!;
+    const input = nodes(card.frame.card).find(node => node.type === "Input.ChoiceSet")!;
+    const values = (input.choices as { value: string }[]).map(choice => choice.value);
+    expect(values).toEqual(["default", "fixture/default", "fixture/fast"]);
+    expect(cardTexts(card.frame).join("\n")).toContain("provider fixture");
+    expect(cardTexts(card.frame).join("\n")).toContain("展示 2 个，共 2 个");
+    expect(card.frame.plain).not.toContain("other：");
+    expect(store.getChatModel(harness.bot.uid, target)).toBe("other/fast");
+    expect(harness.workers.workers[0]?.switchDispatches).toEqual([]);
+    expect(harness.workers.workers[0]?.stopped).toBe(true);
+    expect(store.listWorkerLedger(harness.bot.uid)).toEqual([]);
+    expect(harness.workers.prompts).toEqual([]);
+    const action = select(card, "fixture/fast");
+    transport.pushBotEvent(cardActionEvent(1, { ...action, operatorUid: "member-1" }));
+    await transport.waitForAck(1);
+    expect(store.getChatModel(harness.bot.uid, target)).toBe("other/fast");
+    transport.pushBotEvent(cardActionEvent(2, action));
+    await transport.waitForAck(2);
+    expect(store.getChatModel(harness.bot.uid, target)).toBe("fixture/fast");
+    await harness.service.handleInbound(inbound({ messageId: "after-query-click", text: "/switch other/fast" }));
+    transport.pushBotEvent(cardActionEvent(3, action));
+    await transport.waitForAck(3);
+    expect(store.getChatModel(harness.bot.uid, target)).toBe("other/fast");
+  } finally { store.close(); await closeCoreHarness(harness); }
+});
+
+for (const provider of [false, true]) {
+  for (const count of [100, 101]) {
+    test(`${provider ? "provider" : "global"} catalog shows 100 model choices and reports ${count} accurately`, async () => {
+      const transport = cardTransport();
+      const harness = await createCoreHarness({ transport });
+      try {
+        const models = Array.from({ length: count }, (_, index) => ({ provider: "fixture", id: `m${index}` }));
+        harness.workers.catalog = {
+          current: "other/current", level: null,
+          available: provider ? [{ provider: "other", id: "outside" }, ...models] : models,
+        };
+        await harness.service.handleInbound(inbound({
+          messageId: "bounded-menu", text: provider ? "/switch fixture" : "/switch",
+        }));
+        const card = configCards(transport)[0];
+        expect(card).toBeDefined();
+        const choices = nodes(card!.frame.card).find(node => node.type === "Input.ChoiceSet")!.choices as { value: string }[];
+        expect(choices.map(choice => choice.value)).toEqual([
+          "default", ...Array.from({ length: 100 }, (_, index) => `fixture/m${index}`),
+        ]);
+        const visible = cardTexts(card!.frame).join("\n");
+        for (const text of [visible, card!.frame.plain]) {
+          expect(text).toContain(provider ? "provider fixture" : "全部 provider");
+          expect(text).toContain(`展示${count > 100 ? "前 100" : " 100"} 个，共 ${count} 个`);
+          expect(text.includes("仅展示前 100 个")).toBe(count > 100);
+          if (count > 100) {
+            expect(text).toContain("/switch <provider>");
+            expect(text).toContain("/switch provider/model");
+          }
+        }
+        transport.pushBotEvent(cardActionEvent(1, select(card!, "fixture/m99")));
+        await transport.waitForAck(1);
+        const store = await openChannelStore(harness.stateDir);
+        try { expect(store.getChatModel(harness.bot.uid, card!.target)).toBe("fixture/m99"); }
+        finally { store.close(); }
+      } finally { await closeCoreHarness(harness); }
+    });
+  }
+}
+
+test("running provider queries use the live catalog and the newest filter invalidates older cards", async () => {
+  const running = Promise.withResolvers<void>();
+  const finish = Promise.withResolvers<void>();
+  const queried = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const transport = cardTransport();
+  const harness = await createCoreHarness({
+    transport, prompt: async () => { running.resolve(); await finish.promise; },
+  });
+  try {
+    await harness.service.handleInbound(inbound({ messageId: "filter-running", text: "hold" }));
+    await running.promise;
+    const worker = harness.workers.workers[0]!;
+    const before = await worker.models();
+    await harness.service.handleInbound(inbound({ messageId: "first-filter", text: "/switch fixture" }));
+    const old = configCards(transport)[0];
+    expect(old).toBeDefined();
+    const models = worker.models.bind(worker);
+    let held = false;
+    worker.models = async () => {
+      const catalog = await models();
+      if (!held) { held = true; queried.resolve(); await release.promise; }
+      return catalog;
+    };
+    const slow = harness.service.handleInbound(inbound({ messageId: "slow-filter", text: "/switch fixture" }));
+    await queried.promise;
+    const newer = harness.service.handleInbound(inbound({ messageId: "new-filter", text: "/switch other" }));
+    release.resolve();
+    await Promise.all([slow, newer]);
+    const cards = configCards(transport);
+    expect(cards).toHaveLength(2);
+    expect(cardTexts(cards[1]!.frame).join("\n")).toContain("provider other");
+    transport.pushBotEvent(cardActionEvent(1, select(old!, "fixture/fast")));
+    await transport.waitForAck(1);
+    expect(worker.switchDispatches).toEqual([]);
+    expect(await worker.models()).toEqual(before);
+    expect((await harness.service.status({ channelId: "dm-owner", channelType: 1 })).queued).toBe(0);
+    expect(harness.workers.creations).toHaveLength(1);
+  } finally {
+    release.resolve(); finish.resolve();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a refused provider card falls back to the filtered counts and truncation guidance", async () => {
+  const transport = cardTransport();
+  transport.cardSendRefusal = () => true;
+  const harness = await createCoreHarness({ transport });
+  try {
+    harness.workers.catalog.available = [
+      { provider: "other", id: "outside" },
+      ...Array.from({ length: 101 }, (_, index) => ({ provider: "fixture", id: `m${index}` })),
+    ];
+    await harness.service.handleInbound(inbound({ messageId: "filtered-fallback", text: "/switch fixture" }));
+    const text = chatTexts(transport, { channelId: "dm-owner", channelType: 1 }).at(-1)!;
+    expect(text).toContain("provider fixture");
+    expect(text).toContain("仅展示前 100 个，共 101 个");
+    expect(text).not.toContain("other：");
+    expect(text).toContain("m99");
+    expect(text).not.toContain("m100");
+    expect(text).toContain("/switch provider/model");
+    expect(harness.workers.workers[0]?.switchDispatches).toEqual([]);
+  } finally { await closeCoreHarness(harness); }
 });

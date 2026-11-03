@@ -20,9 +20,10 @@ channel 需要一个 owner 可见的模型切换入口：在聊天里查看当�
 ### 包含
 
 - 新内置命令 `/switch`：
-  - 无参数：报告本聊天当前模型与可用模型列表（含角色可用性说明由 OMP 解析，见下）。
-  - 带参数：把选择器交给 OMP 自己的 `/switch` 解析并应用（`provider/id`、模型 id/子串、`@角色`、`:level`）。
-  - `default`：清除本聊天显式模型；子区重新继承所属主群的子区默认，其他聊天不指定模型（`@default` 是角色写法，走原生解析）。
+  - 无参数：报告本聊天当前模型、下一次启动策略及全部 provider 模型列表。
+  - 精确 provider 参数：查询该 provider 的列表，不切换模型；全局与筛选列表均最多展示 100 个模型，卡片与文本标明范围、展示数及总数，超过时明确「仅展示前 100 个，共 N 个」并引导 provider 筛选或直接 `/switch provider/model`。可实施 SDD 及菜单交互边界见主规格的「`/switch` provider 目录与 100 模型展示 SDD」。
+  - 其余参数：把选择器交给 OMP 自己的 `/switch` 解析并应用（`provider/id`、模型 id/子串、`@角色`、`:level`）。
+  - `default`：优先清除本聊天显式模型；子区重新继承所属主群的子区默认，其他聊天不指定模型（`@default` 是角色写法，走原生解析）。
 - 主群 `/thread model [选择器|clear]`：查询、设置或清除本群所属子区的默认模型；只允许 owner 在主群执行。
 - 生效路径分两部分：
   - **已有运行中的回合**：选择器直接分发给该回合的活会话，会话就地切换（OMP 只改本会话，不产生 agent 回合）。
@@ -86,31 +87,32 @@ channel 需要一个 owner 可见的模型切换入口：在聊天里查看当�
 
 ### 命令接入
 
-`BUILTIN_COMMANDS` 与既有命令分派硬拦截 `/switch`，`/thread` 路由精确 `model` 子命令；`/help` 说明查询、选择器、子区默认与清覆盖语义。模型控制命令不消费正文附件，聊天有待回答问题时仍正常执行。
+`/switch` 是 owner-only 内置硬拦截命令，`/thread` 路由精确 `model` 子命令；两者不发给模型、不消费正文附件，也不回答待答问题。`/help` 说明 `/switch [provider|模型]`、provider 精确查询、100 模型上限、原生选择器、子区默认与清覆盖语义。
 
 参数去首尾空白后：
 
-- 空：报告当前模型 + 可用模型列表。
-- `default`（大小写不敏感，且不含 `/`）：清除本聊天模型。
-- 其他：交给 OMP 解析。
+- 空：报告当前模型 + 全部 provider 的列表。
+- `default`（大小写不敏感，且不含 `/`）：优先清除本聊天模型，即使目录包含同名 provider。
+- 精确命中实时目录的 provider：显示筛选菜单，不调用原生切换、不写模型。
+- 其他：交给 OMP 解析，不复制模糊匹配规则。
 
 ### 探测 worker
 
 `withProbeWorker(target, run)` 是 `/switch` 三种路径共用的探针：按 `defaultWorkDirectory(target)` 解析 cwd（失败回退配置的默认目录，全部不可用回 `无法解析该聊天的工作目录，/switch 暂不可用。`），`mkdtemp(join(tmpdir(), "omp-channel-octo-switch-"))` 作为会话目录，`workerFactory.create({cwd, sessionDir, onSpawn})` 并按既有惯例写入 worker ledger（前缀 `switch-`），`run` 完成后停止 worker（失败走既有恢复路径并计入 blocked 目录），随即删除临时目录。
 
-### 三条路径
+### 查询、选择与默认路径
 
-1. **无参数**：取 `catalog = live.models()`（有运行中回合）或 `withProbeWorker(worker => worker.models())`。`models()` 读 `get_state` 的模型与级别、`get_available_models` 的列表。回执：
+1. **无参数或精确 provider**：运行中用活 worker，空闲用 fresh probe；`models()` 读 `get_state` 的模型与级别、`get_available_models` 的列表。按 provider 精确筛选后再应用 100 模型上限；选项去重及有效性规则与文本列表共用，default 控制项另计。`octo/v2` 可用时发 owner-only 模型选择卡，否则发同源文本：
 
    ```
    当前模型：<provider/id[:level]>（<来源>）
-   可用模型（来自 OMP 已配置 provider，共 N 个）：
+   可用模型（全部 provider 或 provider <标识>；展示 M 个，共 N 个）
    <provider>：<id1>、<id2>…
    ```
 
-   查询同时报告当前 live 模型（或 fresh 探测模型）与下一次启动策略，来源为本聊天指定、主群子区默认或不指定由 OMP 自行决定。无模型报告时明确未知，不拿配置伪造运行状态；列表为空时报告 OMP 没有可用模型；总模型数超过 80 时按 provider 顺序截断并说明总数。
+   查询同时报告当前 live 模型（或 fresh 探测模型）与下一次启动策略，来源为本聊天指定、主群子区默认或不指定由 OMP 自行决定。无模型报告时明确未知，不拿配置伪造运行状态。空目录也说明范围及 0/0，并报告 OMP 没有可用模型；超限明确「仅展示前 100 个，共 N 个；其余模型未列出」，引导 `/switch <provider>` 或直接 `/switch provider/model`。查询不写模型、不调用切换、不启动生成回合。probe 停止并清理后再发布菜单。
 
-2. **`/switch <选择器>`**：`liveWorker(target)` 命中时直接 `live.switchModel(选择器)`，否则 `withProbeWorker(worker => worker.switchModel(选择器))`。`switchModel` 发出 `prompt` 帧 `/switch <选择器>`，以响应前到达的 `config_update` 为成功信号（带 `model.provider`/`model.id` 与 `thinkingLevel`）；没有它就视为选择器被 OMP 拒绝。成功时把 `provider/id:level` 写入 `chat_models`，回执：
+2. **`/switch <选择器>`**：与目录判定共用一个 worker；未精确命中 provider 时调用该 worker 的原生 `switchModel`。点击应用仍走 `applySwitch`，不再把卡片的 `provider/id` 解释为 provider 查询。选择器通过 `prompt` 帧 `/switch <选择器>` 原样分发，响应前的 `config_update`（模型及 thinking level）是成功信号；成功后才持久化 `provider/id:level`，空闲 probe 的结果在停止清理后落库。回执：
 
    - `已切换本聊天模型为 <值>，从下一回合开始生效。`（空闲，探测 worker 解析）
    - `已切换本聊天模型为 <值>（运行中会话已同步切换）。`（运行中回合）
@@ -169,7 +171,7 @@ store 侧保留 `getChatModel`、`setChatModel`、`clearChatModel`；增加主�
 
 ## 验收标准
 
-1. 空 `/switch`：报告查询到的模型与按 provider 分组的可用列表，并显示下一次启动策略和来源。运行中模型与配置不同也必须分别展示，不把「不指定」当作一个具体模型；fresh 探测不代表 resume 模型。
+1. 空 `/switch` 查询全部 provider；精确 provider 参数只查询该 provider；查询不修改设置或运行中模型。报告查询到的模型与下一次启动策略和来源，两者不同时分别展示，不把「不指定」当作具体模型，fresh 探测不代表 resume 模型。卡片与文本均正确表达范围及展示数/总数；全局和筛选后分别验证 100 完整展示、101 仅展示 100 并提示真实总数及缺项，default 控制项不计入 100 模型上限。
 2. `/switch <选择器>`（`provider/id`、模型 id/子串、`@角色`、`:level`）：回执明确；此后该聊天新建的 worker 带 `--model <解析后的 provider/id:level>`（测试断言 `WorkerOptions.model` 与真实子进程 argv；真机脚本验证 `switchModel` 的返回值与 `get_state` 一致），`/status` 的 `model=` 显示新值。
 3. 运行中切换：回合运行中发 `/switch` 时由该回合的活会话执行（测试断言探测 worker 没有被创建），真机验证会话模型立即变化且该回合正常跑完。
 4. 持久化：写库后服务重启（重建服务实例、同一 stateDir），该聊天新回合的 worker 仍带同一 `--model`。

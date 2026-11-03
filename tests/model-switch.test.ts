@@ -71,10 +71,10 @@ test("a missing observed model and an empty or oversized catalog stay explicit",
     policy: { model: null, source: "omp" },
   });
   const lines = text.split("\n");
-  expect(lines.find(line => line.startsWith("可用模型（"))).toContain(`共 ${many.length} 个`);
   const renderedIds = lines.filter(line => line.startsWith("fixture：")).flatMap(line => line.slice("fixture：".length).split("、"));
   expect(renderedIds.length).toBe(MODEL_CATALOG_MAX_MODELS);
-  expect(lines.at(-1)).toContain(`共 ${many.length} 个`);
+  expect(text).not.toContain("m100");
+  expect(text).toContain("仅展示前 100 个，共 103 个");
 });
 
 

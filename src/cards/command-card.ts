@@ -24,6 +24,8 @@ export interface CommandCardView {
   kind: CommandCardKind;
   current: string;
   nextModel?: string;
+  /** Catalog scope, total and display count; absent for commands without a model catalog. */
+  catalogSummary?: string;
   choices: readonly { title: string; value: string }[];
   plain: string;
 }
@@ -74,6 +76,9 @@ export function buildCommandCard(view: CommandCardView, actionId: string): CardF
             spacing: "Small",
           }]),
       { type: "TextBlock", text: copy.note, wrap: true, spacing: "Small", isSubtle: true },
+      ...(view.catalogSummary === undefined ? [] : [{
+        type: "TextBlock", text: cardText(view.catalogSummary), wrap: true, spacing: "Small",
+      }]),
       {
         type: "Input.ChoiceSet",
         id: COMMAND_INPUT_ID,
