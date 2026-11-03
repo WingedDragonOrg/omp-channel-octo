@@ -13,10 +13,11 @@ import type {
   WorktrunkProbe,
 } from "../contracts.ts";
 import { groupAlive, isSafeGroupId, queryProcess, terminateProcessGroup } from "../omp/process.ts";
-import type { WorktrunkCleanupWaitContext } from "./worktrunk.ts";
+import type { CommandResult, WorktrunkCleanupWaitContext } from "./worktrunk.ts";
 import {
   commandFailure,
   defaultWorktrunkCandidates,
+  gitBranchRemove,
   gitWorktreeRemove,
   probeWorktrunk,
   runCommand,
@@ -325,6 +326,376 @@ async function inspectWorktreeForRemoval(
   return identity;
 }
 
+async function runRemovalGitCommand(
+  cwd: string,
+  args: string[],
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<CommandResult> {
+  const result = await runCommand(
+    ["git", "-C", cwd, ...args],
+    { timeoutMs, ...(signal === undefined ? {} : { signal }) },
+  );
+  if (!result) throw new Error(`无法执行 git ${args[0] ?? ""}：${cwd}`);
+  if (result.timedOut) throw new Error(`Git 命令超时：${args[0] ?? ""}`);
+  if (result.aborted) throw new Error(`Git 命令已取消：${args[0] ?? ""}`);
+  return result;
+}
+
+interface GitBranchTip {
+  ref: string;
+  oid: string;
+}
+
+async function readGitRef(
+  repoRoot: string,
+  ref: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const result = await runRemovalGitCommand(
+    repoRoot,
+    ["rev-parse", "--verify", "--quiet", ref],
+    timeoutMs,
+    signal,
+  );
+  if (result.exitCode === 1) return null;
+  if (result.exitCode !== 0) throw new Error(`读取 Git 分支失败：${commandFailure(result)}`);
+  const oid = result.stdout.trim();
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/iu.test(oid)) {
+    throw new Error(`Git 未返回有效的分支提交：${ref}`);
+  }
+  return oid;
+}
+
+async function resolveGitRef(
+  repoRoot: string,
+  ref: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<GitBranchTip | null> {
+  const valid = await runRemovalGitCommand(repoRoot, ["check-ref-format", ref], timeoutMs, signal);
+  if (valid.exitCode === 1) return null;
+  if (valid.exitCode !== 0) throw new Error(`核对 Git ref 失败：${commandFailure(valid)}`);
+  const oid = await readGitRef(repoRoot, ref, timeoutMs, signal);
+  return oid === null ? null : { ref, oid };
+}
+
+async function resolveDefaultBranch(
+  repoRoot: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<GitBranchTip | null> {
+  const configured = await runRemovalGitCommand(
+    repoRoot,
+    ["config", "--local", "--get", "worktrunk.default-branch"],
+    timeoutMs,
+    signal,
+  );
+  if (configured.exitCode === 0) {
+    const name = configured.stdout.trim();
+    const candidates = name.startsWith("refs/")
+      ? [name]
+      : name.includes("/")
+        ? [`refs/remotes/${name}`, `refs/heads/${name}`]
+        : [`refs/heads/${name}`];
+    for (const candidate of candidates) {
+      const resolved = await resolveGitRef(repoRoot, candidate, timeoutMs, signal);
+      if (resolved) return resolved;
+    }
+    if (!name.startsWith("refs/") && !name.includes("/")) {
+      const remoteRefs = await runRemovalGitCommand(
+        repoRoot,
+        ["for-each-ref", "--format=%(refname)", "refs/remotes/"],
+        timeoutMs,
+        signal,
+      );
+      if (remoteRefs.exitCode !== 0) throw new Error(`读取 remote refs 失败：${commandFailure(remoteRefs)}`);
+      const matches = remoteRefs.stdout
+        .split("\n")
+        .map((ref) => ref.trim())
+        .filter((ref) => ref.endsWith(`/${name}`) && !ref.endsWith("/HEAD"));
+      if (matches.length === 1) {
+        const resolved = await resolveGitRef(repoRoot, matches[0]!, timeoutMs, signal);
+        if (resolved) return resolved;
+      }
+    }
+    throw new Error("无法解析 worktrunk.default-branch，拒绝默认删除；请显式使用 --force");
+  }
+  if (configured.exitCode !== 1) {
+    throw new Error(`读取 worktrunk.default-branch 失败：${commandFailure(configured)}`);
+  }
+
+  const remotesResult = await runRemovalGitCommand(repoRoot, ["remote"], timeoutMs, signal);
+  if (remotesResult.exitCode !== 0) throw new Error(`读取 Git remotes 失败：${commandFailure(remotesResult)}`);
+  const pushDefaultResult = await runRemovalGitCommand(
+    repoRoot,
+    ["config", "--local", "--get", "remote.pushDefault"],
+    timeoutMs,
+    signal,
+  );
+  if (pushDefaultResult.exitCode !== 0 && pushDefaultResult.exitCode !== 1) {
+    throw new Error(`读取 primary remote 失败：${commandFailure(pushDefaultResult)}`);
+  }
+  const pushDefault = pushDefaultResult.exitCode === 0 ? pushDefaultResult.stdout.trim() : "";
+  const remoteNames = new Set([
+    "origin",
+    ...remotesResult.stdout.split("\n").map((remote) => remote.trim()).filter(Boolean),
+    ...(pushDefault.length === 0 ? [] : [pushDefault]),
+  ]);
+  const remoteHeads: Array<{ remote: string; tip: GitBranchTip }> = [];
+  for (const remote of remoteNames) {
+    const symbolicHead = await runRemovalGitCommand(
+      repoRoot,
+      ["symbolic-ref", "--quiet", `refs/remotes/${remote}/HEAD`],
+      timeoutMs,
+      signal,
+    );
+    if (symbolicHead.exitCode === 1) continue;
+    if (symbolicHead.exitCode !== 0) {
+      throw new Error(`读取缓存 remote HEAD 失败：${commandFailure(symbolicHead)}`);
+    }
+    const ref = symbolicHead.stdout.trim();
+    if (!ref.startsWith(`refs/remotes/${remote}/`) || ref.endsWith("/HEAD")) {
+      throw new Error(`缓存 remote HEAD 无法确认默认分支：${remote}`);
+    }
+    const tip = await resolveGitRef(repoRoot, ref, timeoutMs, signal);
+    if (!tip) throw new Error(`缓存 remote HEAD 指向不存在的分支：${remote}`);
+    remoteHeads.push({ remote, tip });
+  }
+  const remoteDefault =
+    remoteHeads.find(({ remote }) => remote === pushDefault) ??
+    remoteHeads.find(({ remote }) => remote === "origin") ??
+    (remoteHeads.length === 1 ? remoteHeads[0] : undefined);
+  if (remoteDefault) return remoteDefault.tip;
+  if (remoteHeads.length > 1) {
+    throw new Error("存在多个无法区分的缓存 remote HEAD，拒绝默认删除；请显式使用 --force");
+  }
+
+  const branchesResult = await runRemovalGitCommand(
+    repoRoot,
+    ["for-each-ref", "--format=%(refname)", "refs/heads/"],
+    timeoutMs,
+    signal,
+  );
+  if (branchesResult.exitCode !== 0) throw new Error(`读取本地分支失败：${commandFailure(branchesResult)}`);
+  const localRefs = branchesResult.stdout.split("\n").map((ref) => ref.trim()).filter(Boolean);
+
+  const initDefault = await runRemovalGitCommand(
+    repoRoot,
+    ["config", "--get", "init.defaultBranch"],
+    timeoutMs,
+    signal,
+  );
+  if (initDefault.exitCode === 0) {
+    const initRef = `refs/heads/${initDefault.stdout.trim()}`;
+    if (localRefs.includes(initRef)) {
+      const resolved = await resolveGitRef(repoRoot, initRef, timeoutMs, signal);
+      if (resolved) return resolved;
+    }
+  } else if (initDefault.exitCode !== 1) {
+    throw new Error(`读取 init.defaultBranch 失败：${commandFailure(initDefault)}`);
+  }
+
+  if (localRefs.length === 1) return resolveGitRef(repoRoot, localRefs[0]!, timeoutMs, signal);
+  const conventional = ["main", "master", "develop", "trunk"]
+    .map((name) => `refs/heads/${name}`)
+    .filter((ref) => localRefs.includes(ref));
+  if (conventional.length === 1) {
+    return resolveGitRef(repoRoot, conventional[0]!, timeoutMs, signal);
+  }
+  return null;
+}
+
+async function branchIsMergedIntoDefault(
+  repoRoot: string,
+  branchHead: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const defaultBranch = await resolveDefaultBranch(repoRoot, timeoutMs, signal);
+  if (!defaultBranch) {
+    throw new Error("无法可靠确认来源仓库默认分支，拒绝默认删除；请显式使用 --force");
+  }
+  const result = await runRemovalGitCommand(
+    repoRoot,
+    ["merge-base", "--is-ancestor", branchHead, defaultBranch.oid],
+    timeoutMs,
+    signal,
+  );
+  if (result.exitCode === 0) return true;
+  if (result.exitCode === 1) return false;
+  throw new Error(`核对分支是否并入默认分支失败：${commandFailure(result)}`);
+}
+
+async function branchCheckedOutElsewhere(
+  repoRoot: string,
+  branchRef: string,
+  ownerPath: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const result = await runRemovalGitCommand(
+    repoRoot,
+    ["worktree", "list", "--porcelain", "-z"],
+    timeoutMs,
+    signal,
+  );
+  if (result.exitCode !== 0) throw new Error(`核对分支 worktree 所有权失败：${commandFailure(result)}`);
+  const expectedPath = resolve(ownerPath);
+  let currentPath: string | null = null;
+  for (const field of result.stdout.split("\0")) {
+    if (field.length === 0) {
+      currentPath = null;
+    } else if (field.startsWith("worktree ")) {
+      currentPath = resolve(field.slice("worktree ".length));
+    } else if (field === `branch ${branchRef}` && currentPath !== null && currentPath !== expectedPath) {
+      return currentPath;
+    }
+  }
+  return null;
+}
+
+async function removeOwnedWorktreeAndBranch(
+  request: WorktreeRemovalRequest,
+  timeoutMs: number,
+  probe: (signal?: AbortSignal) => Promise<WorktrunkProbe>,
+  signal?: AbortSignal,
+): Promise<WorktreeRemovalOutcome> {
+  if (!request.repo || !request.branch) {
+    throw new Error("删除关联分支必须提供来源仓库和所有权分支");
+  }
+  const requestedRepo = resolve(request.repo);
+  const repoRoot = await realpath(requestedRepo);
+  if (repoRoot !== requestedRepo) throw new Error(`来源仓库路径已更换，拒绝删除分支：${request.repo}`);
+  if ((await gitDirectory(repoRoot, "--show-toplevel", timeoutMs, signal)) !== repoRoot) {
+    throw new Error(`来源仓库记录不是 Git 仓库根目录：${request.repo}`);
+  }
+  const sourceCommonDir = await gitDirectory(repoRoot, "--git-common-dir", timeoutMs, signal);
+  const initial = await inspectWorktreeForRemoval(request, timeoutMs, signal);
+  if (initial && initial.commonDir !== sourceCommonDir) {
+    throw new Error(`隔离工作区所属仓库与所有权记录不匹配：${request.path}`);
+  }
+  const ownerPath = initial?.path ?? resolve(request.path);
+  const branchRef = `refs/heads/${request.branch}`;
+  const validBranchRef = await runRemovalGitCommand(
+    repoRoot,
+    ["check-ref-format", branchRef],
+    timeoutMs,
+    signal,
+  );
+  if (validBranchRef.exitCode !== 0) throw new Error(`所有权记录中的分支名无效：${request.branch}`);
+  const originalHead = await readGitRef(repoRoot, branchRef, timeoutMs, signal);
+  const checkedOutElsewhere = await branchCheckedOutElsewhere(
+    repoRoot,
+    branchRef,
+    ownerPath,
+    timeoutMs,
+    signal,
+  );
+  if (checkedOutElsewhere) {
+    throw new Error(`分支仍在其他 worktree 检出，拒绝删除：${checkedOutElsewhere}`);
+  }
+
+  if (request.force !== true && initial !== null) {
+    const status = await runRemovalGitCommand(
+      initial.path,
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      timeoutMs,
+      signal,
+    );
+    if (status.exitCode !== 0) throw new Error(`检查隔离工作区改动失败：${commandFailure(status)}`);
+    if (status.stdout.length > 0) {
+      throw new Error(`隔离工作区有未提交改动，拒绝默认删除；请显式使用 --force：${request.path}`);
+    }
+  }
+  if (request.force !== true && originalHead !== null) {
+    if (!(await branchIsMergedIntoDefault(repoRoot, originalHead, timeoutMs, signal))) {
+      throw new Error(`分支未并入来源仓库默认分支，拒绝默认删除；请显式使用 --force：${request.branch}`);
+    }
+  }
+
+  const current = await inspectWorktreeForRemoval(request, timeoutMs, signal);
+  if (
+    (initial === null && current !== null) ||
+    (initial !== null &&
+      (current === null ||
+        current.path !== initial.path ||
+        current.device !== initial.device ||
+        current.inode !== initial.inode ||
+        current.commonDir !== initial.commonDir ||
+        current.branch !== initial.branch))
+  ) {
+    throw new Error(`隔离工作区在删除前已更换，拒绝删除：${request.path}`);
+  }
+
+  let worktreeRemoval: WorktreeRemovalOutcome | null = null;
+  if (current !== null) {
+    await assertWorktreePathUnchanged(current);
+    if (isAborted(signal)) throw new Error(`删除隔离工作区已取消：${request.path}`);
+    const available = await probe(signal);
+    if (isAborted(signal)) throw new Error(`删除隔离工作区已取消：${request.path}`);
+    const lifecycle = request.lifecycle?.("worktree");
+    worktreeRemoval = available.available
+      ? await worktrunkRemove({
+          command: available.command,
+          path: current.path,
+          force: request.force === true,
+          keepBranch: true,
+          managed: true,
+          timeoutMs,
+          ...(lifecycle === undefined ? {} : { lifecycle }),
+          ...(signal === undefined ? {} : { signal }),
+        })
+      : await gitWorktreeRemove({
+          path: current.path,
+          force: request.force === true,
+          timeoutMs,
+          managed: true,
+          ...(lifecycle === undefined ? {} : { lifecycle }),
+          ...(signal === undefined ? {} : { signal }),
+        });
+    if (worktreeRemoval.kind !== "removed") {
+      throw new Error(`无法确认隔离工作区已删除：${request.path}`);
+    }
+    if (await lstatIfPresent(current.requestedPath)) {
+      throw new Error(`删除后隔离工作区路径仍存在，拒绝处理分支：${request.path}`);
+    }
+  }
+
+  const finish = (branchOutcome: "deleted" | "kept" | "missing"): WorktreeRemovalOutcome => {
+    if (current === null) return { kind: "missing", branchOutcome };
+    if (!worktreeRemoval || worktreeRemoval.kind !== "removed") {
+      throw new Error(`无法确认隔离工作区已删除：${request.path}`);
+    }
+    return { kind: "removed", via: worktreeRemoval.via, branchOutcome };
+  };
+
+  const currentHead = await readGitRef(repoRoot, branchRef, timeoutMs, signal);
+  if (currentHead === null) return finish(originalHead === null ? "missing" : "deleted");
+  if (originalHead === null || currentHead !== originalHead) return finish("kept");
+  if (
+    await branchCheckedOutElsewhere(repoRoot, branchRef, ownerPath, timeoutMs, signal)
+  ) {
+    return finish("kept");
+  }
+  if (request.force !== true && !(await branchIsMergedIntoDefault(repoRoot, originalHead, timeoutMs, signal))) {
+    return finish("kept");
+  }
+
+  const branchLifecycle = request.lifecycle?.("branch");
+  await gitBranchRemove({
+    repoRoot,
+    branchRef,
+    expectedHead: originalHead,
+    timeoutMs,
+    ...(branchLifecycle === undefined ? {} : { lifecycle: branchLifecycle }),
+    ...(signal === undefined ? {} : { signal }),
+  });
+  const remainingHead = await readGitRef(repoRoot, branchRef, timeoutMs, signal);
+  return finish(remainingHead === null ? "deleted" : "kept");
+}
+
 export function createWorktreePort(options: WorktreePortOptions): WorktreePort {
   const createTimeoutMs = options.createTimeoutMs ?? WORKTRUNK_TIMEOUT_DEFAULTS.createMs;
   const mergeTimeoutMs = options.mergeTimeoutMs ?? WORKTRUNK_TIMEOUT_DEFAULTS.mergeMs;
@@ -537,6 +908,9 @@ export function createWorktreePort(options: WorktreePortOptions): WorktreePort {
       request: WorktreeRemovalRequest,
       signal?: AbortSignal,
     ): Promise<WorktreeRemovalOutcome> {
+      if (request.deleteBranch === true) {
+        return removeOwnedWorktreeAndBranch(request, removeTimeoutMs, probe, signal);
+      }
       const initial = await inspectWorktreeForRemoval(request, removeTimeoutMs, signal);
       if (initial === null) return { kind: "missing" };
       const available = await probe(signal);

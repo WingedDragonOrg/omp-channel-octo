@@ -455,6 +455,16 @@ export interface WorktreeMergeLifecycle {
   onUnknown(): void;
 }
 
+/** One destructive stage of an owned-worktree removal. */
+export type WorktreeRemovalStep = "worktree" | "branch";
+
+/** Per-command process tracking for worktree removal; it never represents a merge result. */
+export type WorktreeRemovalLifecycle = Pick<
+  WorktreeMergeLifecycle,
+  "beforeSpawn" | "onSpawn" | "onConfirmedExit" | "onNotSpawned" | "onUnknown"
+>;
+
+
 /** Native OMP CLI `commit` outcome with actual HEADs and optional sanitized Git metadata. */
 export interface CommitResult {
   exitCode: number;
@@ -924,17 +934,25 @@ export interface WorktreeMergeSummary {
 export interface WorktreeRemovalRequest {
   /** Worktree directory to remove. */
   path: string;
-  /** Discard uncommitted changes instead of refusing to remove a dirty worktree. */
+  /** Discard uncommitted changes and, with deleteBranch, permit deleting an unmerged branch. */
   force?: boolean;
   /** Canonical source repository whose Git common directory owns the worktree. */
   repo?: string;
-  /** Expected checked-out branch for the owned worktree. */
+  /** Recorded local branch associated with the owned worktree. */
   branch?: string;
+  /** Also delete the recorded branch after worktree removal; omitted retains legacy worktree-only behavior. */
+  deleteBranch?: boolean;
+  /** Returns fresh process callbacks for each destructive command actually spawned. */
+  lifecycle?: (step: WorktreeRemovalStep) => WorktreeRemovalLifecycle;
 }
 
 export type WorktreeRemovalOutcome =
-  | { kind: "missing" }
-  | { kind: "removed"; via: "wt" | "git"; branchOutcome: "deleted" | "kept" | null };
+  | { kind: "missing"; branchOutcome?: "deleted" | "missing" | "kept" }
+  | {
+      kind: "removed";
+      via: "wt" | "git";
+      branchOutcome: "deleted" | "kept" | "missing" | null;
+    };
 
 export interface WorktreePort {
   /**
@@ -948,8 +966,9 @@ export interface WorktreePort {
   */
   merge(request: WorktreeMergeRequest, signal?: AbortSignal): Promise<WorktreeMergeSummary>;
   /**
-   * Removes one workspace through wt when available, otherwise through plain git; it rejects the
-   * primary checkout, symlink paths, and source or branch identities that do not match ownership.
+   * Removes one workspace through wt when available, otherwise through plain git. It rejects
+   * unowned, replaced or separately checked-out paths; deleteBranch adds a separately tracked,
+   * compare-and-delete branch step, while omitted retains worktree-only behavior.
    */
   remove(request: WorktreeRemovalRequest, signal?: AbortSignal): Promise<WorktreeRemovalOutcome>;
   /** Confirms or terminates only the exact process group identity recorded by a host merge. */

@@ -43,6 +43,7 @@
 | 线程隔离 | `create-thread` 支持 `projects:[{name,repo,base?}]`、`layout` 与简短 `background`；多项目由 agent 显式选择 shared（一个非仓库入口内多个隔离 worktree）或 separate（每项目一个 thread/worktree），单项目保留 `worktree_name`。宿主准备实际工作区、持久化绑定并写入 THREAD.md 后才报告 ready、允许派发 | 工作区与项目来源明确，任务只来自后续派发正文；详细 SDD 见 `2026-09-17-thread-worktrunk-design.md` |
 | 工作区合并 | 单项目/separate 子区的 `/thread merge` 由宿主取得独占后直接执行默认 pipeline，成功清理工作树和分支、回执送达后归档；零 agent 任务。只有实际合并执行失败才交给本聊天 agent 修复，再经 host `thread-merge` 重试。shared 固定拒绝且不创建任务 | 正常路径不启动模型，资格拒绝与执行失败分离 |
 | 工作区清理 | `thread-delete` 在服务端删除成功后按持久资源归属清理，不依赖活动 cwd；有可用 wt 时 `wt remove`，否则 `git worktree remove`。占用中、未确认创建、身份不符或脏 worktree 保留，显式 force 才丢弃脏改动，入口只删除空目录 | 显式换目录不遗失原资源归属，也不误删用户目录或未知文件 |
+| 清理并归档 | owner 在目标子区执行 `/thread remove [--force]`；按持久归属清理 single/separate/shared worktree 和分支，全部确认完成且回执/正文/终态卡排空后归档；正常路径零 agent 任务。默认保护 dirty 和未合并提交，force 明确授权丢弃两者；部分失败保留残留记录、不归档 | 只处置已验证资源，不合并、不删除聊天记录；未知进程与未知业务结果均封锁原资源组 |
 | 子区回传 | 子区持久策略 `listen=off|merge|task`，默认 merge，仅实际合并成功回传创建方聊天；task 额外回传派发任务四种终态；off 静默。合并失败及修复失败始终在子区处理。通知按接收聊天追加模式交付且不回答 pending ask | 单一子区策略、稳定事件去重；普通任务不打扰父会话 |
 | 迁移 | `/move <目录>` 使用 OMP 原生 `/move`，沿用当前 session ID、历史与附件 | 保持会话连续性，不伪造新会话 |
 | 调度 | 同聊天、同会话串行；普通共享目录允许不同会话并行；命中持久工作区归属的入口、项目及子目录按资源组串行，迁移持有自身聊天/会话与源、目标资源组 lease | 保持会话独占和普通目录协作，同时避免通过不同 cwd 并发写同一隔离 worktree |
@@ -69,6 +70,8 @@
 `/new`、`/move` 的候选 worker 通过 `withStoppedWorker` 运行：scope 验证会话、确认进程停止并完成台账更新后才交付结果，调用方随后持久化绑定并发送回执。停止未确认或台账更新失败不会交付成功结果；操作失败仍执行关闭，关闭中的台账错误优先返回，否则保留原操作错误。聊天/会话租约覆盖整个 scope 和绑定提交。
 
 `commands/thread-commands.ts` 负责 `/thread` 的任务交接及 `/thread merge` 的宿主优先编排，命令去重仍在服务入口完成。命令与工具复用 `threads/thread-merge.ts` 的合并核心；只有真实 merge 执行失败生成稳定身份的修复输入。`threads/thread-archive.ts` 独占待归档集合和停止唤醒信号；新授权入站取消排定，归档等待指定成功回执 `sent`、进度卡 tail 与聊天 outbox 排空。出站退避期间持续等待，不能以等待超时替代排空；保持瞬时归档失败重试与停止放弃契约。
+
+`/thread remove` 与 `thread-delete` 的持久资源清理由 `threads/thread-workspace-cleanup.ts` 独占，调用方显式选择分支策略。remove 的每个 worktree/branch 步骤复用 `workspace/worktrunk.ts` 的受管进程与 watchdog，并在 `host_merge_leases` 以 `operation_kind=thread-remove` 记录原完整资源组、步骤、进程身份及结果；旧行默认为 merge，两个结果命名空间独立。只有已知业务 outcome 可在启动时补发回执并排定归档，`exited` 但无 outcome 仍属未知，不重做 Git。缺失目录仍保留调度资源键，只对现存 cwd 探测 Git root。
 
 `tasks/task-scheduler.ts` 独占聊天串行链、排定任务、聊天/会话租约、等待回执标记及关停任务快照；不同会话不因 cwd 相同而互相排队。运行中 worker 和 blocked 目录仍由服务管理，调度仅经明确端口查询。`commands/command-routing.ts` 统一内建命令别名及注册校验，从别名表推导的 action 类型约束完整分派表；durable claim 保留用户输入的命令名，重启仍在 claim 完成后请求，未知命令照常走既有 handler 或 OMP 任务路径。
 
@@ -170,6 +173,7 @@ channel 支持下列命令，`/help` 展示用法；`/retry` 经 OMP 原生命�
 | `/thread <任务>` | 交给助手处理：助手自行确定子区名称与 `worktree_name`，新建带独立 git worktree 的 CommunityTopic 子区并把任务派发进去（派发正文按 SDD 格式写；清晰到可直接生成 SDD 的需求直接开工，否则发起会话只做够派发的最少澄清、剩余澄清由子区按 SDD 格式进行）；只在群聊中可用 |
 | `/thread model [选择器\|clear]` | 仅 owner 在主群查询/设置/清除所属子区默认模型；原生 fresh probe 解析成功后持久化，主群自身模型不变；下次子区 worker 启动生效，不切换运行中会话 |
 | `/thread merge` | 仅隔离 worktree 子区可用；宿主独占后直接执行默认 wt 合并/清理，成功零 agent 任务，回执送达后归档。实际执行失败才将诊断和现场交给本聊天 agent 修复，再用 host `thread-merge` 重试。尾随文字作为 owner 补充上下文保留，不拼入 shell；资格不符只回明确提示 |
+| `/thread remove [--force]` | 仅 owner 在目标子区清理持久拥有的 worktree 及分支，全部成功后归档并保留聊天记录；支持 single/separate/shared。默认 dirty 或未并入来源默认分支时报错保留，`--force` 授权丢弃未提交改动和未合并分支；占用/身份不符/未知进程不绕过，部分失败不归档 |
 | `/queue <文本>` | 把该文本作为排队任务追加在当前任务之后，不受当前追加模式影响；正文经与普通任务相同的组装点，随消息发来的附件以本机绝对路径进入排队任务的正文 |
 | `/mode [steer\|queue]` | 设置/报告该聊天的追加模式：`steer`（默认，`default` 同义）把运行中的新消息注入当前回合，`queue` 把它变成排队任务；无参数时报告当前设置，部署声明 `octo/v2` 时改发 owner-only 配置卡片（一行选择 + 一次提交；卡片不可用时回退为同一段文本） |
 | `/switch [provider\|模型]` | 查询实际模型、下一次启动策略与来源；无参数查询全部 provider，参数精确匹配 OMP 当前目录的 provider 时仅查询该 provider。两种查询都只读、最多展示 100 个模型（default 控制项另计），卡片与文本标明范围及展示数/总数，超过时明确「仅展示前 100 个，共 N 个」并引导筛选或直接 `/switch provider/model`。`default` 优先清除显式覆盖，子区重新继承主群子区默认，否则不指定参数、由 OMP 自行决定。其余参数由 OMP 原生解析并切换（`provider/id`、模型 id/子串、`@角色`、`:level`），成功后持久化。运行中使用活会话，空闲用 fresh probe；菜单不可用时同源文本回退。 |

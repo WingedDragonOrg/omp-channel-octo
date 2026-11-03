@@ -1,10 +1,12 @@
-# 子区归档与 merge 后自动归档
+# 子区归档与工作区收尾
 
-日期：2026-09-17（2026-11-03 更新：宿主合并回执 barrier 与严格出站排空）
+日期：2026-09-17（2026-11-03 更新：宿主合并、清理回执 barrier 与严格出站排空）
 
 ## 背景与目标
 
 `octo_management` 增加 `thread-archive` 动作：归档当前群/子区的子区（与其他 `thread-*` 动作同口径，子区里省略 `short_id` 即当前线程），幂等。子区 `/thread merge` 合并成功后自动归档该子区（默认 pipeline）：合并完成即归档、无需手动归档；归档失败不改变 merge 结果本身。
+
+owner 在目标子区执行 `/thread remove [--force]` 时，宿主按持久归属清理全部 worktree、关联分支及 shared 空入口；全部结果确认后使用同一执行器归档，保留聊天记录。部分清理、未知结果及资源占用不排定归档，不创建 agent 任务或合并事件。
 
 ## 已知事实
 
@@ -20,6 +22,7 @@
 - 传输层 `archiveThread`（`src/contracts.ts`、`src/octo/index.ts`）。
 - `octo_management` 新增 `thread-archive` 动作（含工具描述与参数说明）。
 - `thread-merge` 成功后自动归档（默认 pipeline、工作区已删除的路径）。
+- `/thread remove` 全部持久资源清理确认后的归档，覆盖 single/separate/shared 及路径已经缺失的结果交付。
 - 回合末执行器：排定 → 该聊天回合输出（含进度卡终态编辑）投递排空 → 归档；有界重试与失败说明。
 - 主规格、AGENTS.md 与测试同步。
 
@@ -34,8 +37,8 @@
 | 决策 | 选择 | 理由 |
 | --- | --- | --- |
 | 归档时机 | 工具内不即时归档，只「排定」；在该聊天任务回合末、回合输出与进度卡终态编辑排空后执行 | 任何消息都会把归档子区解档；即时归档会被紧随其后的回复解档 |
-| 自动归档条件 | `thread-merge` 成功且默认 pipeline（工作区已删除，`summary.removed === true`）时排定 | 「合并完成即归档」对应默认路径；显式保留工作区通常意味着还要继续用这个子区 |
-| 排定载体 | `ThreadArchiveScheduler`（`src/threads/thread-archive.ts`）进程内 `Map<string, PendingThreadArchive>`（键为 `targetKey`），一次性（执行或放弃后清除）；宿主命令先持久化稳定成功回执，再发布携带该 outbox ID 的归档计划 | 单一归档所有者；成功事实不依赖已删除的 cwd |
+| 自动归档条件 | `thread-merge` 成功且工作区已删除，或 `/thread remove` 全部记录资源清理确认后排定 | 未清理的资源、部分失败或未知结果留在子区处理 |
+| 排定载体 | `ThreadArchiveScheduler` 的进程内一次性 Map；宿主先持久化稳定回执，再发布携带全部回执 outbox ID 的归档计划 | 单一归档所有者；成功事实不依赖已删除的 cwd |
 | 新消息 | 该聊天的新入站（过权限门禁后）清除该聊天的待归档 | 用户回来了就不归档；避免归档↔解档抖动 |
 | 重试 | 仅瞬时失败（HTTP 5xx，或 bot API 把内部 500 包裹成 400 的 `err.server.bot_api.store_failed`）重试：最多 5 次尝试、尝试间隔 5s；永久 4xx 立即失败；停止时放弃 | 与既有 `deleteThread` 的瞬发失败认知一致（`src/errors.ts` 的 `isTransientServerFailure` 是两处共用的判定）；计时走 `setTimeout`，测试用假定时器推进，不真等 5s 壁钟 |
 | 结果可见性 | 合并结果进工具结果与回复；归档成功只留服务日志（子区状态即证据）；归档失败向发起聊天回一条 ≤200 字符单行说明 | 归档成功后再向子区发消息会把它解档；失败说明只影响收尾，不改变 merge 结果 |
@@ -67,7 +70,7 @@
   3. 每次尝试前确认排定仍在（排空期间的新消息可能已取消它）且服务未在停止；在则按重试策略调用 `transport.archiveThread`。
   4. 结束即清除排定；成功留一条 `[thread-archive] 已归档子区 <shortId> target=<key>` 服务日志；失败留一条 `[thread-archive] 归档失败 …` 服务日志并向发起聊天投一条 `归档失败：<单行 ≤200 字符>`。
 - 服务停止时调用 `stop()` 唤醒重试等待；调度器在 `stopping` 时放弃待归档：不执行、不通知。
-- 宿主 `/thread merge` 成功无需 agent 任务：命令持久化稳定回执后发布归档计划，服务收集该聊天残留的进度卡 tail 并启动同一执行器；指定回执必须为 `sent`，`dead`、缺行或未知状态都不能作为成功交付证据。
+- 宿主 `/thread merge` 或 `/thread remove` 成功无需 agent 任务：命令持久化稳定回执后发布归档计划，服务收集该聊天残留的进度卡 tail 并启动同一执行器；指定回执的每一个分段都必须为 `sent`，任何分段 `dead`、缺行或未知都不能作为完整交付证据。remove 的逐项目实际结果沿既有 3000 UTF-8 bytes 边界分段并在恢复时复用原稳定身份。
 - 已有未消费宿主成功 outcome 的启动恢复在进度卡恢复、transport 启动完成后释放归档计划；回执使用原稳定 ID，工作树缺失不阻止结果交付，也不重跑 Git。普通停机仍取消进程内等待，不把归档失败回传父群。
 
 ### 重试语义

@@ -2,10 +2,10 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
-  WorktreeMergeLifecycle,
   WorktreeMergeProcessIdentity,
   WorktreeMergeRequest,
   WorktreeMergeSummary,
+  WorktreeRemovalLifecycle,
   WorktreeRemovalOutcome,
   WorktrunkProbe,
 } from "../contracts.ts";
@@ -81,11 +81,13 @@ export interface RunCommandOptions {
   timeoutMs: number;
   signal?: AbortSignal;
   cwd?: string;
-  /** Worktree merge alone uses a parked process group and parent-death watchdog before wt starts. */
+  /** Establish a guarded process group and parent-death watchdog before running the command. */
   parentDeathWatchdog?: boolean;
+  /** Label for guarded-process diagnostics; defaults to the historical merge wording. */
+  operation?: string;
   /** Capture at most this much text per output stream while still draining it to EOF. */
   maxOutputChars?: number;
-  lifecycle?: WorktreeMergeLifecycle;
+  lifecycle?: WorktreeRemovalLifecycle;
   /** A successful wt cleanup must finish its real filesystem work before the process group settles. */
   waitForBackgroundCleanup?: {
     shouldWait(result: CommandResult): boolean;
@@ -172,8 +174,9 @@ export async function runCommand(
   options: RunCommandOptions,
 ): Promise<CommandResult | null> {
   const guarded = options.parentDeathWatchdog === true;
+  const operation = options.operation ?? "Worktrunk merge";
   if (guarded && process.platform === "win32") {
-    throw new Error("无法为 Worktrunk merge 建立受监护的进程组");
+    throw new Error(`无法为 ${operation} 建立受监护的进程组`);
   }
   if (guarded && signalIsAborted(options.signal)) {
     return {
@@ -284,7 +287,7 @@ export async function runCommand(
     ]);
     if (!snapshot || snapshot.pgid !== child.pid || !parent) {
       await stopBeforeStart(snapshot?.pgid === child.pid);
-      throw new Error("Worktrunk merge 进程身份无法确认");
+      throw new Error(`${operation} 进程身份无法确认`);
     }
     const watchdogStart = await createWatchdog(
       child.pid,
@@ -297,7 +300,7 @@ export async function runCommand(
     );
     if (!watchdogStart.ok) {
       await stopBeforeStart(true);
-      throw new Error("Worktrunk merge 进程监护不可用");
+      throw new Error(`${operation} 进程监护不可用`);
     }
     watchdog = watchdogStart.watchdog;
     try {
@@ -308,7 +311,7 @@ export async function runCommand(
     }
     if (signalIsAborted(options.signal)) {
       await stopBeforeStart(true);
-      throw new Error("Worktrunk merge 已取消");
+      throw new Error(`${operation} 已取消`);
     }
     try {
       (child as unknown as Bun.Subprocess<"pipe", "pipe", "pipe">).stdin.write("run\n");
@@ -327,7 +330,7 @@ export async function runCommand(
         await Promise.all([stdoutReader.cancel().catch(() => {}), stderrReader.cancel().catch(() => {})]);
       }
       reportUnknown();
-      throw new Error("Worktrunk merge 启动状态无法确认");
+      throw new Error(`${operation} 启动状态无法确认`);
     }
   }
 
@@ -378,7 +381,7 @@ export async function runCommand(
       } finally {
         await Promise.all([stdoutReader.cancel().catch(() => {}), stderrReader.cancel().catch(() => {})]);
       }
-      throw new Error("Worktrunk merge 进程组退出状态无法确认");
+      throw new Error(`${operation} 进程组退出状态无法确认`);
     }
     if (outcome.kind === "stopped") {
       const drained = await within(completion, COMMAND_GROUP_STOP_MS);
@@ -388,7 +391,7 @@ export async function runCommand(
         } finally {
           await Promise.all([stdoutReader.cancel().catch(() => {}), stderrReader.cancel().catch(() => {})]);
         }
-        throw new Error("Worktrunk merge 输出管道未排空，进程退出状态无法确认");
+        throw new Error(`${operation} 输出管道未排空，进程退出状态无法确认`);
       }
       result = drained.value;
     } else {
@@ -464,7 +467,7 @@ export async function runCommand(
     if (detached && !groupGone) groupGone = await terminateCommandGroup(child.pid);
     if (!groupGone) {
       reportUnknown();
-      throw new Error("Worktrunk merge 进程组退出状态无法确认");
+      throw new Error(`${operation} 进程组退出状态无法确认`);
     }
     processGroupConfirmed = true;
     const executionDidNotStart = guarded && result.stderr.includes(notStartedMarker);
@@ -706,9 +709,14 @@ export async function worktrunkMerge(options: WorktrunkMergeOptions): Promise<Wo
 export interface WorktrunkRemoveOptions extends WorktrunkRunOptions {
   path: string;
   force: boolean;
+  /** Keep the branch so the caller can delete it as a separate compare-and-swap step. */
+  keepBranch?: boolean;
+  /** Use the guarded process group even if no durable lifecycle callbacks were supplied. */
+  managed?: boolean;
+  lifecycle?: WorktreeRemovalLifecycle;
 }
 
-/** Removes the worktree through `wt remove --foreground`; wt deletes a merged branch with it. */
+/** Removes one worktree; `keepBranch` prevents wt from owning the separate branch deletion step. */
 export async function worktrunkRemove(options: WorktrunkRemoveOptions): Promise<WorktreeRemovalOutcome> {
   const result = await runCommand(
     [
@@ -717,12 +725,16 @@ export async function worktrunkRemove(options: WorktrunkRemoveOptions): Promise<
       "--foreground",
       "--format",
       "json",
+      ...(options.keepBranch ? ["--no-delete-branch"] : []),
       ...(options.force ? ["-f"] : []),
       options.path,
     ],
     {
       cwd: options.path,
       timeoutMs: options.timeoutMs,
+      parentDeathWatchdog: options.managed === true || options.lifecycle !== undefined,
+      operation: "Worktrunk removal",
+      ...(options.lifecycle === undefined ? {} : { lifecycle: options.lifecycle }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     },
   );
@@ -746,6 +758,9 @@ export interface GitWorktreeRemoveOptions {
   force: boolean;
   timeoutMs: number;
   signal?: AbortSignal;
+  /** Use the guarded process group even if no durable lifecycle callbacks were supplied. */
+  managed?: boolean;
+  lifecycle?: WorktreeRemovalLifecycle;
 }
 
 /**
@@ -764,7 +779,14 @@ export async function gitWorktreeRemove(options: GitWorktreeRemoveOptions): Prom
       ...(options.force ? ["--force"] : []),
       options.path,
     ],
-    { timeoutMs: options.timeoutMs, ...(options.signal === undefined ? {} : { signal: options.signal }) },
+    {
+      cwd: options.path,
+      timeoutMs: options.timeoutMs,
+      parentDeathWatchdog: options.managed === true || options.lifecycle !== undefined,
+      operation: "Git worktree removal",
+      ...(options.lifecycle === undefined ? {} : { lifecycle: options.lifecycle }),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    },
   );
   if (!result) throw new Error("无法执行 git，未清理隔离工作区");
   if (result.timedOut) throw new Error(`删除隔离工作区超时（${options.timeoutMs} ms）：${options.path}`);
@@ -774,6 +796,38 @@ export async function gitWorktreeRemove(options: GitWorktreeRemoveOptions): Prom
   }
   return { kind: "removed", via: "git", branchOutcome: null };
 }
+export interface GitBranchRemoveOptions {
+  repoRoot: string;
+  branchRef: string;
+  expectedHead: string;
+  timeoutMs: number;
+  signal?: AbortSignal;
+  lifecycle?: WorktreeRemovalLifecycle;
+}
+
+/** Deletes exactly the branch ref value inspected by the caller, never a ref moved in the meantime. */
+export async function gitBranchRemove(options: GitBranchRemoveOptions): Promise<void> {
+  const result = await runCommand(
+    ["git", "-C", options.repoRoot, "update-ref", "--no-deref", "-d", options.branchRef, options.expectedHead],
+    {
+      cwd: options.repoRoot,
+      timeoutMs: options.timeoutMs,
+      parentDeathWatchdog: true,
+      operation: "Git branch removal",
+      ...(options.lifecycle === undefined ? {} : { lifecycle: options.lifecycle }),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    },
+  );
+  if (!result) throw new Error(`无法执行 git，未删除关联分支：${options.branchRef}`);
+  if (result.timedOut) {
+    throw new Error(`删除关联分支超时（${options.timeoutMs} ms）：${options.branchRef}`);
+  }
+  if (result.aborted) throw new Error(`删除关联分支已取消：${options.branchRef}`);
+  if (result.exitCode !== 0) {
+    throw new Error(`删除关联分支失败（退出码 ${result.exitCode}）：${commandFailure(result)}`);
+  }
+}
+
 
 /**
  * True when `path` is a linked git worktree (its private git dir differs from the common dir).

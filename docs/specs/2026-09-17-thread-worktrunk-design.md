@@ -14,6 +14,7 @@
 - `create-thread --worktree_name` 的 wt 创建路径（`wt switch --create`，完整语义 slug 与递增占用退让）与 `omp worktree add` 回退。
 - `thread-delete` 的隔离工作区清理：新增可选布尔参数 `force`；默认只清理干净工作区，`wt` 不可用时回退 `git worktree remove`；清理结果进入同一条工具回执。
 - 子区命令 `/thread merge`：宿主取得工作区独占后直接执行默认合并与清理；成功不创建 agent 任务，回执送达后归档子区。仅实际合并执行失败时交给本聊天 agent 修复，修复后通过同一宿主 `thread-merge` 核心重试。
+- 子区命令 `/thread remove [--force]`：宿主清理持久拥有的单项目或 shared 多项目 worktree 与分支，全部确认完成后归档 Octo 子区、保留聊天记录。
 - 主规格、AGENTS.md 与测试同步。
 
 ### 不包含
@@ -170,6 +171,24 @@ shared 的 `/thread merge` 只回复「当前为多项目工作区，不支持 /
 
 `force` 默认 false；脏工作区保留并提示可传 `force=true`，显式 force 才丢弃未提交改动。清理失败只影响回执，保留未清理资源的归属记录；无隔离能力或无资源时不清理。已显式换到其他目录的 thread 仍清理其原来拥有的资源，不清理新的活动目录。shared 入口仅用空目录删除，未知文件保留。
 
+### 宿主清理并归档命令 SDD（2026-11-03）
+
+owner 已确认 `/thread remove [--force]` 的以下契约，并授权按 TDD 实施：
+
+- **入口与范围**：仅在当前子区执行，沿用 owner、allowlist、mention 和 durable command claim；只把完整首词 `remove` 识别为控制命令，`remove-fix` 等仍走既有任务语义。只接受可选 `--force`，其余参数返回用法。控制路径不下载附件、不回答 pending ask、不创建模型或 agent 任务，不执行 Git 合并，不删除远端 Octo 子区，不产生合并成功事件或创建方通知。
+- **默认保护**：按持久所有权清理 single、separate 和 shared 的资源，不从当前 cwd、路径命名或 THREAD.md 推断。默认要求 worktree 干净，且 Git 确认关联分支已并入来源仓库默认分支；dirty、未合并或无法确认时保留该项目资源并报错，提示显式 `--force`。成功清理必须删除 worktree 及其关联分支，不默默保留分支。
+- **默认分支判定**：使用本地 `worktrunk.default-branch`、已缓存 remote HEAD 或可唯一确定的本地默认分支；不为清理发起网络查询。默认安全判定采用 Git 提交祖先关系，squash/rebase 后无法按该关系确认时仍要求显式 force。
+- **共享清理策略**：从现有 `thread-delete` 提取唯一资源清理流程，调用方显式选择是否要求删除分支；只有新命令要求 `deleteBranch: true`，既有 `thread-delete` 的分支保留/删除策略不变。工作树移除与分支删除分别确认，不能因为一次 remove 调用返回成功就清空所有归属；worktree 已删但分支失败时保留可追溯的 branch-only 残留和原资源路径，供新命令核对。
+- **force 授权**：`--force` 明确授权丢弃已记录 worktree 内的未提交改动（含未跟踪文件），并删除未合并分支；唯一提交可能失去引用。force 不绕过 linked worktree、来源仓库、分支、路径身份、资源占用或进程退出确认，也不删除源仓库、主 checkout、未知路径或 shared 入口内的未知文件。Worktrunk 的 `-f` 与 `-D` 授权不同，不得仅以 `-f` 代替本命令的完整 force 契约。
+- **缺失与换绑**：显式 `/new <dir>` 或 `/move <dir>` 不改变原资源归属，不清理新的用户目录。worktree 已缺失时仍核对记录中的分支；只有关联分支也已删除，才确认该项目完整清理。分支仍在其他 worktree 检出时拒绝删除。资源已全部不存在可完成归档，不要求先恢复 cwd。未确认创建或归属不完整的资源保留并说明。
+- **调度与进程**：复用工作区清理所有者、完整资源组租约与现有进程/watchdog 机制；子目录绑定、task、goal、commit、merge 和未确认退出进程均参与占用判断。占用时拒绝而不强杀未知进程。租约覆盖身份核验、破坏性操作、整个受管进程组确认退出及结果持久化。不能因删除成功后资源映射缩小而提前释放原资源组。
+- **去重与恢复**：破坏性副作用前记录命令及逐项执行意图、进程所有权；逐项持久化实际 worktree/分支结果和残留。重复消息不再次执行。取消或停机停止后续项目，确认在途进程组退出后才释放资源；未确认退出或结果未知时保留资源阻塞，不自动重放破坏性操作。确认结果的恢复只交付稳定回执，不重做 Git。
+- **异常分流**：普通、已确认退出的项目清理失败可以继续其他项目；进程退出未知或取消/停机立即停止后续项目。受管步骤在副作用前保存 intent、spawn 身份并在整组退出后确认；未知步骤与原完整资源组的阻塞一起持久保留，不能沿用现有文本错误处理后无条件放行的语义。
+- **部分失败**：安全可清理的项目可独立完成，已成功项不回滚。任何残留、未知结果、分支未删或 shared 入口非空均不归档；回执逐项说明已清理结果与残留路径/原因，残留所有权持久保留，新消息发起的命令仅处理剩余资源。shared 入口仅在项目清理确认后用空目录删除。
+- **归档与反馈**：全部资源清理确认后，持久稳定回执分别说明项目、分支实际状态和“归档已排定”。复用 `ThreadArchiveScheduler`，指定回执 `sent`、该聊天正文及进度卡终态输出排空后才执行归档。成功后不再往子区发消息，失败沿现有瞬时错误最多五次、间隔五秒及永久错误有界通知契约；新授权入站取消、停机放弃仍有效。归档状态不冒充清理结果。
+- **执行与回执**：有 wt 时受管执行 `wt remove --foreground --no-delete-branch`，否则受管执行 `git worktree remove`；其后以预读 OID 条件删除记录分支引用。每个步骤独立记录进程身份，分支移动或锁失败保留分支并报告真实有界诊断。清理回执逐项携带项目、实际路径、分支及清理/缺失/残留状态；超过 3000 UTF-8 bytes 时按既有分段规则保存稳定身份的多个 outbox 行，全部回执分段 `sent` 才允许归档。
+- **验收**：先证明宿主命令缺失行为，再验证单项目/shared、子目录和换绑、缺失 worktree/分支、dirty/未合并/default/force、分支另处检出、未知路径、部分失败、重复消息、取消/停止/恢复及归档顺序。真实 Git/process smoke 只用抛弃式仓库和本地 transport fixture，目标分支 HEAD 不因 remove 被改写，零额外 agent 任务。执行相关 core/workspace/archive/host-tools 回归、typecheck、全量测试；涉及生命周期或持久化时执行 restart benchmark 和抛弃式迁移演练。不自动提交、推送、合并或重启常驻服务；线上边界单独报告。
+
 ### 模块与接口
 
 - `src/contracts.ts`：`WorktreePort` 增加 `worktrunk()`/`merge()`/`remove()`；新增 `WorktrunkProbe`、`WorktreeMergeRequest`、`WorktreeMergeSummary`、`WorktreeRemovalRequest`、`WorktreeRemovalOutcome`。
@@ -179,6 +198,8 @@ shared 的 `/thread merge` 只回复「当前为多项目工作区，不支持 /
 - `src/threads/thread-target.ts`：新增 `threadChannelId(groupId, shortId)`——线程目标 ID 组装与解析同源。
 - `src/commands/thread-commands.ts`、`src/service.ts`：宿主优先命令编排、失败接管、回执与归档接线；`TaskScheduler` 提供工作区独占。
 - `src/threads/thread-merge.ts`：命令与 host tool 共用的资格、合并与成功收尾核心；`src/host-tools.ts` 保留工具参数映射与 `thread-delete` 清理回执。
+- `src/threads/thread-workspace-cleanup.ts`：`thread-delete` 与 `/thread remove` 共用的持久资源清理、逐项归属更新及空入口处置；旧删除工具保留原分支策略。
+- `src/store/store-host-merges.ts`：同一受管宿主进程台账按 `operation_kind` 区分 merge/remove；remove 保存步骤、原完整资源组和待交付结果，不产生合并成功事件。
 
 ## 错误与边界情况
 
@@ -228,6 +249,17 @@ shared 的 `/thread merge` 只回复「当前为多项目工作区，不支持 /
 - 真实 wt 在第一项目创建成功后取消批次：结果不 ready、派发拒绝；重启保留已确认和未确认计划。thread-delete 只清理确认成功的 worktree，保留未确认计划与入口；来源仓库保持干净且仅有主 worktree。
 - 离线真实 CLI/worker/SQLite restart 基准的 graceful 与 SIGKILL 两场均续接在途任务并恢复队列：`seamless_restart_cases=2`、`session_overlaps=0`、`duplicate_effects=0`、`disruption_notices=0`。
 - Octo 表面使用本地 transport 夹具，未连接线上 Bot；测试仓库、状态目录和一次性脚本均仅用于隔离验收。没有提交、推送、合并或重启常驻服务。
+
+## 2026-11-03 清理并归档验收
+
+- TDD 先观察到宿主命令未清理、默认误移除未合并 worktree、分支遗留、缺失路径和分支锁诊断缺失的失败回归；实现后覆盖真实 Git 的默认保护、force、分支 CAS、其他 worktree 检出、路径替换、shared 部分结果和取消。
+- 实际 Worktrunk v0.80.0 在抛弃式仓库经 CoreService 完成普通与 force 两种清理：两个 worktree 及关联分支均已删除，来源目标分支 HEAD 不变，回执先于唯一归档，重复命令不重复归档，额外 worker 和合并事件均为零。Octo transport 使用本地夹具。
+- 当前源码复核另以实际 wt v0.80.0 经宿主批次创建 shared（一个子区、两个项目）和 separate（两个子区、每区一个项目），确认持久状态 ready、项目分支及来源 common-dir 正确；随后由 `/thread remove` 清理四个真实 worktree 与分支、归档三个夹具子区。dirty/未合并项目先被默认命令保留，再由显式 force 清理；两个来源仓库 HEAD 均不变，无额外 worker、合并事件或线上 Octo 请求。
+- 真实阻塞删除进程组在 `/cancel` 后确认退出，原 worktree、分支及目标 HEAD 保留；重启回归验证已退出但业务结果未知时保留原完整资源组阻塞，已知结果只恢复回执与归档、不重做删除。长回执逐项覆盖全部项目，任一回执分段未送达均不归档。
+- 运行中状态库经只读一致性备份，在私有临时副本调用应用迁移并连续打开三次；原 25 张表、8,802 行的所有旧列逐行摘要与行数一致，新增四列 `operation_kind`、`removal_step`、`removal_resources_json`、`removal_outcome_json`，`integrity_check=ok`。remove 步骤、资源组与结果跨重开保留，merge/remove 命名空间独立；原数据库未执行迁移。
+- `bun tests/benchmarks/restart.ts` 的 graceful 与 SIGKILL 均通过：恢复任务和排队任务各 2 项，`session_overlaps=0`、`duplicate_effects=0`、`disruption_notices=0`。
+- `bun run typecheck` 通过；独立 TMPDIR 下完整 `bun test` 为 1249 pass、0 fail，90 个文件。测试未绕过生产 bot 独占锁。
+- 未提交、推送、合并或重启常驻服务；未删除真实用户子区/工作树。线上归档权限、服务端解档处理时序及真实客户端归档状态未在本次验收。
 
 ## 未决事项
 

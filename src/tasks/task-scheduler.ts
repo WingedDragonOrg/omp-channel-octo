@@ -473,10 +473,11 @@ export class TaskScheduler {
   async tryAcquireCommandSession(
     target: ChatTarget,
     cwds: readonly string[],
+    extraDirectories: readonly string[] = [],
   ): Promise<SessionLease | undefined> {
     const binding = this.bindingFor(target);
     const sessionKey = this.sessionKey(target, binding);
-    const reservation = this.createCommandReservationRecord(target, cwds);
+    const reservation = this.createCommandReservationRecord(target, cwds, extraDirectories);
     const directories = reservation.directories;
     let repositoryLease: { complete(): void } | undefined;
     let sessionLease: SessionLease | undefined;

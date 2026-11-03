@@ -1617,7 +1617,7 @@ test("a permanently dead success receipt prevents archive", async () => {
       clientMsgNo: "permanently-dead-merge-receipt-client",
     });
     store.markOutboxDead(receiptOutboxId, "fixture permanent delivery failure");
-    archives.schedule(thread, "group-allowed", "merge-dead-receipt", 0, receiptOutboxId);
+    archives.schedule(thread, "group-allowed", "merge-dead-receipt", 0, [receiptOutboxId]);
 
     await archives.run(thread, Promise.resolve());
 
@@ -1663,7 +1663,7 @@ for (const settlement of ["delivered", "cancelled", "stopped"] as const) {
         });
       }
       store.markOutboxSent(receiptId);
-      archives.schedule(thread, "group-allowed", "merge-output-drain", 0, receiptId);
+      archives.schedule(thread, "group-allowed", "merge-output-drain", 0, [receiptId]);
       operation = archives.run(thread, Promise.resolve());
       for (let step = 0; step < 120; step += 1) {
         vi.advanceTimersByTime(100);
@@ -1724,6 +1724,10 @@ test("a refused merge repair remains pending when its exact stable task was not 
       executeHostMerge: async () => {
         throw new WorktreeMergeExecutionError(1, "actual merge failure");
       },
+      executeHostRemoval: async () => ({ kind: "refused", message: "unused" }),
+      enqueueRemovalReceipt: () => {},
+      settleHostRemoval: () => {},
+      recoverRemovalArchive: () => {},
       enqueueMergeReceipt: () => {},
       settleHostMerge: () => {
         settleCalls += 1;

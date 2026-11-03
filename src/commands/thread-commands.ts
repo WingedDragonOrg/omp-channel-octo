@@ -1,13 +1,19 @@
 /**
- * `/thread` 家族命令：`/thread <任务>` 把意图交给助手创建/派发子区；`/thread merge` 则由宿主直接
- * 执行 Worktrunk pipeline。命令 claim、普通任务接管、回执与调度仍通过 `CoreService` 端口完成。
+ * `/thread` 家族命令：`/thread <任务>` 把意图交给助手创建/派发子区；`/thread merge` 与 `/thread remove`
+ * 则由宿主直接处理本地工作区。命令 claim、常规任务接管、回执与归档仍通过 `CoreService` 完成。
  */
-
 import { createHash } from "node:crypto";
 import type { InboundMessage, WorktreeMergeSummary, WorktreePort } from "../contracts.ts";
 import type { Outbox } from "../outbox.ts";
 import type { ChannelStore } from "../store/index.ts";
-import type { BindingRecord, HostMergeLeaseRecord, InboundClaim } from "../store/store-records.ts";
+import type {
+  BindingRecord,
+  HostMergeLeaseRecord,
+  HostRemovalLeaseRecord,
+  HostThreadRemovalOutcome,
+  InboundClaim,
+  ThreadWorkspaceRecord,
+} from "../store/store-records.ts";
 import { WorktreeMergeExecutionError } from "../threads/thread-merge.ts";
 import { worktrunkUnavailableText } from "../workspace/worktrunk.ts";
 
@@ -30,8 +36,9 @@ const THREAD_USAGE = [
   "用法：/thread <任务>；无项目需求时沿用普通子区；无 projects 时可直接提供 legacy worktree_name 建立单仓 worktree；显式 projects（包括 single）必须提供完整任务 worktree_name 和互不冲突的稳定 ASCII 项目名（如 admin-web、customer-web），省略 layout 表示 single；多项目必须明确选择 layout=shared|separate；",
   "agent 根据任务意图和已知仓库用途自行确定完整语义任务名并规范化为 1–100 字符 ASCII slug；项目名也要是互不冲突的 1–100 字符 ASCII slug。名称过长时改用更短但完整的语义名，不翻译、不截断；只有无法判断项目真实身份时才向 owner 问最少必要问题。",
   "background 只写简短用途，不放任务正文、SDD 或验收标准；实际路径以 create-thread 返回为准，不预先臆造。整批 ready=true 后才可派发，未就绪时报告资源结果并停止；",
-  "之后用 thread-dispatch 派发任务；子区内 /thread merge [补充说明] 由宿主执行默认合并与清理；仅实际合并失败后派发一次修复任务，并保留补充说明。",
+  "之后用 thread-dispatch 派发任务；子区内 /thread merge [补充说明] 由宿主执行默认合并与清理；仅实际合并失败后派发一次修复任务，并保留补充说明；子区内 /thread remove [--force] 清理本地隔离工作区并在成功后归档。",
 ].join("");
+const THREAD_REMOVE_USAGE = "用法：/thread remove [--force]；只清理当前子区持久记录归属的本地隔离工作区与分支。";
 const THREAD_GROUP_ONLY_TEXT = "/thread 需要在群聊中使用。";
 const THREAD_NESTED_TEXT = "当前会话已是子区，不能再建子区。";
 const THREAD_MERGE_THREAD_ONLY_TEXT = "/thread merge 只在子区中使用。";
@@ -40,6 +47,9 @@ const THREAD_MERGE_NO_WORKSPACE_TEXT =
 const THREAD_MERGE_UNCONFIGURED_TEXT =
   "本部署未配置隔离工作区能力，/thread merge 不可用。";
 const THREAD_MERGE_MULTI_PROJECT_TEXT = "当前为多项目工作区，不支持 /thread merge。";
+const THREAD_REMOVE_THREAD_ONLY_TEXT = "/thread remove 只在子区中使用。";
+const THREAD_REMOVE_NO_OWNERSHIP_TEXT = "当前子区没有持久隔离工作区归属；为避免误删当前目录，未执行清理。";
+const THREAD_REMOVE_UNCONFIGURED_TEXT = "本部署未配置隔离工作区能力，/thread remove 不可用。";
 
 /**
  * Instruction block for a `/thread` message: the command hands the intent over instead of
@@ -98,7 +108,23 @@ function readThreadMergeNote(argument: string): string | undefined {
   return note.length > 200 ? `${note.slice(0, 199)}…` : note;
 }
 
-function boundedMergeError(error: unknown): string {
+function readThreadRemoveForce(argument: string): boolean | null | undefined {
+  const trimmed = argument.trim();
+  if (!/^remove(?:$|\s)/iu.test(trimmed)) return undefined;
+  const rest = trimmed.slice("remove".length).trim();
+  if (rest.length === 0) return false;
+  if (rest === "--force") return true;
+  return null;
+}
+
+function removalReceiptId(botUid: string, target: InboundMessage, sourceId: string): string {
+  return stableUuid(
+    "thread-remove-receipt",
+    JSON.stringify([botUid, target.channelType, target.channelId, sourceId]),
+  );
+}
+
+function boundedThreadCommandError(error: unknown): string {
   return safeDisplayText(error instanceof Error ? error.message : String(error), 200) ?? "未知错误";
 }
 
@@ -138,7 +164,7 @@ function threadMergeReceipt(summary: WorktreeMergeSummary & { archive?: "schedul
  * 以及常规任务接管。宿主合并的调度与目录租约由 `CoreService` 持有。
  */
 export interface ThreadCommandsDeps {
-  readonly store: Pick<ChannelStore, "getBinding" | "getThreadWorkspace" | "getTaskByMessageId" | "getCommandClaimState" | "completeCommand" | "releaseClaim">;
+  readonly store: Pick<ChannelStore, "getBinding" | "getThreadWorkspace" | "getTaskByMessageId" | "getCommandClaimState" | "completeCommand" | "releaseClaim" | "getHostRemovalLeaseBySourceId">;
   /** Read or change the group default using the same serialized model-config path as `/switch`. */
   readonly handleThreadModel: (message: InboundMessage, argument: string) => Promise<void>;
   /** Ensures creation provenance/default policy before a merge-intent mutation. */
@@ -158,10 +184,24 @@ export interface ThreadCommandsDeps {
     archiveGeneration: number,
     operatorNote: string,
   ) => Promise<WorktreeMergeSummary & { archive?: "scheduled" }>;
+  /** Execute owned local cleanup under CoreService's session, directory and process leases. */
+  readonly executeHostRemoval: (
+    message: InboundMessage,
+    ownership: ThreadWorkspaceRecord,
+    force: boolean,
+    receiptOutboxId: string,
+  ) => Promise<HostThreadRemovalOutcome | { kind: "refused"; message: string }>;
   /** 将一条已持久化成功回执入队；id 由命令 sourceId 稳定派生。 */
   readonly enqueueMergeReceipt: (target: InboundMessage, id: string, text: string) => void;
   /** 命令结果已持久交付后释放对应 outcome lease。 */
   readonly settleHostMerge: (target: InboundMessage, sourceId: string) => void;
+  readonly enqueueRemovalReceipt: (target: InboundMessage, id: string, text: string) => void;
+  readonly settleHostRemoval: (target: InboundMessage, sourceId: string) => void;
+  readonly recoverRemovalArchive: (
+    target: InboundMessage,
+    receiptOutboxId: string,
+    archiveGeneration?: number,
+  ) => void;
   /** 启动恢复成功结果时，重建严格 receipt barrier 后的归档排定。 */
   readonly recoverMergeArchive: (target: InboundMessage, receiptOutboxId: string) => void;
   /** 以 strict receipt barrier 异步启动已经排定的归档。 */
@@ -211,6 +251,12 @@ export class ThreadCommands {
     const mergeNote = readThreadMergeNote(argument);
     if (mergeNote !== undefined) {
       await this.handleThreadMergeCommand(message, mergeNote);
+      return;
+    }
+    const removeForce = readThreadRemoveForce(argument);
+    if (removeForce !== undefined) {
+      if (removeForce === null) await this.deps.enqueueText(message, THREAD_REMOVE_USAGE, null);
+      else await this.handleThreadRemoveCommand(message, removeForce);
       return;
     }
     if (message.channelType === 5) {
@@ -263,7 +309,7 @@ export class ThreadCommands {
         ...(outcome.summary.removed ? { archive: "scheduled" as const } : {}),
       }));
       if (outcome.summary.removed) this.deps.recoverMergeArchive(target, receiptId);
-      this.completeRecoveredMergeCommand(lease.botUid, target);
+      this.completeRecoveredThreadCommand(lease.botUid, target);
       this.deps.settleHostMerge(target, lease.sourceId);
       return;
     }
@@ -277,16 +323,130 @@ export class ThreadCommands {
       originalCommand: lease.commandText,
       schedule: false,
     });
-    this.completeRecoveredMergeCommand(lease.botUid, target);
+    this.completeRecoveredThreadCommand(lease.botUid, target);
     this.deps.settleHostMerge(target, lease.sourceId);
   }
 
-  private completeRecoveredMergeCommand(botUid: string, message: InboundMessage): void {
+  /** Restore only the durable receipt/archive path; never retry a removal after process recovery. */
+  async recoverHostRemovalOutcome(lease: HostRemovalLeaseRecord): Promise<void> {
+    const outcome = lease.outcome;
+    if (outcome === null) throw new Error("host removal recovery requires a persisted outcome");
+    if (lease.commandText === null || lease.receiptOutboxId.length === 0) {
+      throw new Error("host removal recovery is missing its original receipt identity");
+    }
+    const target: InboundMessage = {
+      channelType: lease.channelType,
+      channelId: lease.channelId,
+      messageId: lease.sourceId,
+      senderId: lease.senderId ?? "",
+      text: lease.commandText,
+      mentionedUserIds: [],
+      attachments: [],
+      quoted: null,
+      supported: true,
+      messageSeq: lease.messageSeq ?? 0,
+      messageTimestamp: 0,
+    };
+    this.deps.enqueueRemovalReceipt(target, lease.receiptOutboxId, outcome.receiptText);
+    if (outcome.kind === "complete") {
+      this.deps.recoverRemovalArchive(target, lease.receiptOutboxId);
+    }
+    this.completeRecoveredThreadCommand(lease.botUid, target);
+    this.deps.settleHostRemoval(target, lease.sourceId);
+  }
+
+  private completeRecoveredThreadCommand(botUid: string, message: InboundMessage): void {
     const claim = this.deps.commandClaim(message, "thread");
     this.deps.store.completeCommand(claim);
     if (this.deps.store.getCommandClaimState(botUid, message, message.messageId) !== "completed") {
-      throw new Error("recovered host merge command completion was not persisted");
+      throw new Error("recovered host command completion was not persisted");
     }
+  }
+
+  private publishHostRemovalOutcome(
+    message: InboundMessage,
+    sourceId: string,
+    receiptOutboxId: string,
+    outcome: HostThreadRemovalOutcome,
+    archiveGeneration: number,
+  ): void {
+    this.deps.enqueueRemovalReceipt(message, receiptOutboxId, outcome.receiptText);
+    if (outcome.kind === "complete") {
+      this.deps.recoverRemovalArchive(message, receiptOutboxId, archiveGeneration);
+      this.deps.runThreadArchive(message);
+    }
+    this.deps.settleHostRemoval(message, sourceId);
+  }
+
+  private async handleThreadRemoveCommand(message: InboundMessage, force: boolean): Promise<void> {
+    if (message.channelType !== 5) {
+      await this.deps.enqueueText(message, THREAD_REMOVE_THREAD_ONLY_TEXT, null);
+      return;
+    }
+    const botUid = this.deps.botUid();
+    if (botUid === undefined) {
+      await this.deps.enqueueText(message, "Bot 身份未注册，未执行本地清理。", null);
+      return;
+    }
+    const existing = this.deps.store.getHostRemovalLeaseBySourceId(botUid, message, message.messageId);
+    if (existing !== null) {
+      if (existing.outcome === null) {
+        await this.deps.enqueueText(
+          message,
+          "此前的本地清理进程结果未确认；资源保持封锁，本次不会重试。",
+          null,
+        );
+        return;
+      }
+      this.publishHostRemovalOutcome(
+        message,
+        message.messageId,
+        existing.receiptOutboxId,
+        existing.outcome,
+        this.deps.archiveGeneration(message),
+      );
+      return;
+    }
+    const ownership = this.deps.store.getThreadWorkspace(botUid, message);
+    if (ownership === null) {
+      await this.deps.enqueueText(message, THREAD_REMOVE_NO_OWNERSHIP_TEXT, null);
+      return;
+    }
+    if (!this.deps.worktrees) {
+      await this.deps.enqueueText(message, THREAD_REMOVE_UNCONFIGURED_TEXT, null);
+      return;
+    }
+    const receiptOutboxId = removalReceiptId(botUid, message, message.messageId);
+    const archiveGeneration = this.deps.archiveGeneration(message);
+    let result: HostThreadRemovalOutcome | { kind: "refused"; message: string };
+    try {
+      result = await this.deps.executeHostRemoval(
+        message,
+        ownership,
+        force,
+        receiptOutboxId,
+      );
+    } catch (error) {
+      if (this.deps.stopping()) return;
+      await this.deps.enqueueText(
+        message,
+        `本地工作区清理未完成且不会自动重试：${boundedThreadCommandError(error)}。请核对资源后重新执行 /thread remove。`,
+        null,
+      );
+      return;
+    }
+    if (this.deps.stopping()) return;
+    if (result.kind === "refused") {
+      await this.deps.enqueueText(message, result.message, null);
+      return;
+    }
+    this.publishHostRemovalOutcome(
+      message,
+      message.messageId,
+      receiptOutboxId,
+      result,
+      archiveGeneration,
+    );
   }
 
   /**
@@ -349,7 +509,7 @@ export class ThreadCommands {
             sourceId: message.messageId,
             workspacePath: binding.cwd,
             note,
-            error: boundedMergeError(error),
+            error: boundedThreadCommandError(error),
             originalCommand,
           });
           this.deps.settleHostMerge(message, message.messageId);
@@ -357,7 +517,7 @@ export class ThreadCommands {
         }
         await this.deps.enqueueText(
           message,
-          `合并未完成且不会自动重试：${boundedMergeError(error)}。请先核对目标分支与工作区，再决定是否重新发起。`,
+          `合并未完成且不会自动重试：${boundedThreadCommandError(error)}。请先核对目标分支与工作区，再决定是否重新发起。`,
           null,
         );
         return;

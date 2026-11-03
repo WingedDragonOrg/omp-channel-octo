@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { copyFile, mkdir, realpath, rm, rmdir, stat } from "node:fs/promises";
+import { copyFile, mkdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
 import { throwIfAborted } from "./abort.ts";
 import { normalizeGroupContext } from "./session/context-sidecar.ts";
@@ -34,6 +34,10 @@ import {
   mergeThreadWorkspace,
   WorktreeMergeExecutionError,
 } from "./threads/thread-merge.ts";
+import {
+  cleanupOwnedThreadWorkspace as cleanupOwnedWorkspace,
+  threadWorkspaceCleanupPaths,
+} from "./threads/thread-workspace-cleanup.ts";
 /**
  * Host tools need only the channel capabilities they actually use. The service passes this port
  * while keeping task scheduling, session migration and outbound delivery internals private.
@@ -911,118 +915,21 @@ async function cleanupOwnedThreadWorkspace(
   force: boolean,
   signal?: AbortSignal,
 ): Promise<string | null> {
-  ownership.status = "failed";
-  ownership.error = "线程已删除；本地工作区清理尚未完成";
-  try {
-    host.store.saveThreadWorkspace(ownership);
-  } catch (error) {
-    return `清理前无法持久化工作区状态，资源已保留：${boundedManagementError(error, "存储失败")}`;
-  }
-
-  const ownedPaths = ownership.projects
-    .filter((project) => project.created && project.path !== null)
-    .map((project) => project.path!);
-  if (ownership.entryPath !== null) ownedPaths.push(ownership.entryPath);
-  if (ownedPaths.length === 0) {
-    const unresolved = ownership.projects.some(
-      (project) => project.created || project.path !== null || project.branch !== null,
-    );
-    return unresolved ? "工作区所有权不完整，规划资源已保留" : null;
-  }
-
+  const ownedPaths = threadWorkspaceCleanupPaths(ownership, false);
   const lease = await host.tryAcquireWorkspaceDirectories(ownedPaths, task);
   if (!lease) return "工作区正被其他任务使用，资源已保留";
-  const notes: string[] = [];
-  const worktrees = host.worktrees;
-  try {
-    await lease.ready;
-    for (const project of ownership.projects) {
-      if (!project.created) {
-        if (project.path !== null) notes.push(`${project.name} 的创建状态未确认，路径已保留`);
-        continue;
-      }
-      const projectPath = project.path;
-      const projectBranch = project.branch;
-      if (projectPath === null || projectBranch === null) {
-        notes.push(`${project.name} 缺少路径或分支所有权，未自动清理`);
-        continue;
-      }
-      if (!worktrees) {
-        notes.push(`${project.name} 工作区能力不可用，资源已保留`);
-        continue;
-      }
-      try {
-        const outcome = await worktrees.remove(
-          {
-            path: projectPath,
-            force,
-            repo: project.repo,
-            branch: projectBranch,
-          },
-          signal,
-        );
-        const prior = { created: project.created, path: project.path, branch: project.branch };
-        project.created = false;
-        project.path = null;
-        project.branch = null;
-        try {
-          host.store.saveThreadWorkspace(ownership);
-        } catch (error) {
-          Object.assign(project, prior);
-          notes.push(`${project.name} 已移除但所有权更新失败：${boundedManagementError(error, "存储失败")}`);
-          continue;
-        }
-        if (outcome.kind === "missing") {
-          notes.push(`${project.name} 工作区已不存在`);
-        } else if (outcome.branchOutcome === "deleted") {
-          notes.push(`${project.name} 已清理（分支已删除）`);
-        } else {
-          notes.push(`${project.name} 已清理`);
-        }
-      } catch (error) {
-        notes.push(cleanupFailureMessage(error, force));
-      }
-    }
-
-    const entryPath = ownership.entryPath;
-    if (
-      ownership.layout === "shared" &&
-      entryPath !== null &&
-      ownership.projects.every((project) => project.path === null && project.branch === null && !project.created)
-    ) {
-      try {
-        await rmdir(entryPath);
-        ownership.entryPath = null;
-        try {
-          host.store.saveThreadWorkspace(ownership);
-          notes.push("共享入口已清理");
-        } catch (error) {
-          ownership.entryPath = entryPath;
-          notes.push(`共享入口已移除但所有权更新失败：${boundedManagementError(error, "存储失败")}`);
-        }
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code === "ENOENT") {
-          ownership.entryPath = null;
-          try {
-            host.store.saveThreadWorkspace(ownership);
-          } catch (saveError) {
-            ownership.entryPath = entryPath;
-            notes.push(`共享入口状态更新失败：${boundedManagementError(saveError, "存储失败")}`);
-          }
-        } else if (code === "ENOTEMPTY" || code === "EEXIST") {
-          notes.push("共享入口仍含有文件，已保留");
-        } else {
-          notes.push(`共享入口未清理：${boundedManagementError(error, "清理失败")}`);
-        }
-      }
-    }
-  } catch (error) {
-    notes.push(`工作区清理失败：${boundedManagementError(error, "清理失败")}`);
-  } finally {
-    lease.complete();
-  }
-  return notes.length === 0 ? null : truncateForTool(notes.join("；"), MAX_MANAGEMENT_ERROR_CHARS);
+  const result = await cleanupOwnedWorkspace({
+    ownership,
+    store: host.store,
+    worktrees: host.worktrees,
+    force,
+    deleteBranch: false,
+    lease,
+    ...(signal === undefined ? {} : { signal }),
+  });
+  return result.messages.length === 0
+    ? null
+    : truncateForTool(result.messages.join("；"), MAX_MANAGEMENT_ERROR_CHARS);
 }
 
 function cleanupFailureMessage(error: unknown, force: boolean): string {

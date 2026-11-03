@@ -111,6 +111,7 @@ oco run --config ~/.oco/config/config.json
 | `/thread <任务>` | 在群内交由助手按项目与耦合程度创建隔离子区，工作区和背景就绪后派发任务。 |
 | `/thread model [选择器\|clear]` | 主群查询、设置或清除所属子区默认模型；只影响子区下一次 worker 启动，主群自身模型不变。 |
 | `/thread merge [补充说明]` | 单项目及 separate 子区请求合并；默认合并成功后删除工作区和已合并分支。shared 多项目工作区只回复不支持提示。 |
+| `/thread remove [--force]` | 在目标子区由宿主清理其持久拥有的 worktree 与分支，全部完成后归档、保留聊天记录。默认保护 dirty 和未合并提交；`--force` 明确授权丢弃未提交改动与未合并分支。 |
 | `/queue <文本>` | 显式追加一个排队任务。 |
 | `/mode [steer\|queue]` | 查看或设置新消息的追加方式，默认 `steer`。 |
 | `/switch [provider\|模型]` | 查看当前模型、下一次启动策略与全部 provider 列表；参数精确匹配 provider 时仅查询该 provider，如 `/switch openai-codex`。全局和筛选列表均最多展示 100 个模型，超限明确展示数及总数，可直接 `/switch provider/model`。其余选择器继续原生切换并保存本聊天模型：`provider/id`、模型 ID/唯一子串、`@角色`、`:level`。 |
@@ -184,6 +185,8 @@ oco run --config ~/.oco/config/config.json
 远端创建结果未知时，持久创建意图会阻止同组尚无绑定的新子区自动执行，已有绑定不受影响；owner 可显式 `/new <目录>` 建立确定绑定。shared 要求状态目录和入口祖先位于 Git worktree 之外，否则创建前即拒绝，避免把用户仓库误当入口。
 
 shared 不支持 `/thread merge` 或工具 `thread-merge`。`thread-delete` 按持久资源归属清理，默认保留脏工作树和占用中的资源；`force: true` 才丢弃未提交改动。显式 `/new <目录>` 或 `/move <目录>` 改变当前绑定，但保留原工作区归属以便删除时清理；`/new` 无目录沿用工作区。
+
+`/thread remove` 支持 single、separate 和 shared。它不执行合并、不启动模型任务；按持久归属处理原工作区，换绑后的用户目录不受影响。默认要求干净且 Git 确认分支已并入来源默认分支，成功时删除 worktree 和关联分支；`--force` 可丢弃未提交文件及未合并分支，唯一提交可能失去引用。占用、退出未确认、来源/分支不符的资源始终保留；缺失 worktree 仍核对残留分支。shared 入口只在为空时删除。部分失败保留逐项结果和残留路径，不归档；全部清理确认、回执每个分段与正文/终态卡排空后才归档。
 
 ### 持续目标 `/goal`
 

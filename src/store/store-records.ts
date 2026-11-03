@@ -2,7 +2,7 @@
  * 持久层的记录类型：每张表在 TypeScript 侧的形状，被 store 门面与各领域模块共用。
  */
 
-import type { ChatAppendMode, ChatExecutionState, ChatTarget, TextMention, ThreadListenLevel, WorkerGoal, WorkerGoalRun, WorkerProcess, WorktreeMergeOutcome } from "../contracts.ts";
+import type { ChatAppendMode, ChatExecutionState, ChatTarget, TextMention, ThreadListenLevel, WorkerGoal, WorkerGoalRun, WorkerProcess, WorktreeMergeOutcome, WorktreeRemovalStep } from "../contracts.ts";
 
 export interface BindingRecord extends ChatTarget {
   botUid: string;
@@ -292,6 +292,44 @@ export interface HostMergeLeaseInput {
   senderId?: string;
   messageSeq?: number;
   receiptOutboxId?: string;
+}
+
+export type HostThreadRemovalOutcome =
+  | { kind: "complete"; receiptText: string }
+  | { kind: "partial"; receiptText: string };
+
+export interface HostRemovalLeaseRecord extends ChatTarget {
+  id: string;
+  botUid: string;
+  channelType: 5;
+  sourceId: string;
+  cwd: string;
+  phase: "starting" | "running" | "exited" | "unknown";
+  pid: number | null;
+  pgid: number | null;
+  processIdentity: string | null;
+  step: WorktreeRemovalStep | null;
+  resourcePaths: string[];
+  commandText: string | null;
+  senderId: string | null;
+  messageSeq: number | null;
+  receiptOutboxId: string;
+  outcome: HostThreadRemovalOutcome | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface HostRemovalLeaseInput {
+  id: string;
+  botUid: string;
+  target: ChatTarget;
+  sourceId: string;
+  cwd: string;
+  resourcePaths: readonly string[];
+  commandText: string;
+  senderId: string;
+  messageSeq: number;
+  receiptOutboxId: string;
 }
 
 export interface ContextLedgerRecord extends ChatTarget {

@@ -313,6 +313,7 @@ export function applySchema(db: Database): void {
       channel_type INTEGER NOT NULL CHECK(channel_type = 5),
       channel_id TEXT NOT NULL,
       source_id TEXT NOT NULL,
+      operation_kind TEXT NOT NULL DEFAULT 'merge' CHECK(operation_kind IN ('merge', 'thread-remove')),
       cwd TEXT NOT NULL,
       phase TEXT NOT NULL CHECK(phase IN ('starting', 'running', 'exited', 'unknown')),
       pid INTEGER,
@@ -325,6 +326,9 @@ export function applySchema(db: Database): void {
       receipt_outbox_id TEXT,
       outcome_kind TEXT CHECK(outcome_kind IS NULL OR outcome_kind IN ('succeeded', 'execution-failed')),
       outcome_json TEXT,
+      removal_step TEXT CHECK(removal_step IS NULL OR removal_step IN ('worktree', 'branch')),
+      removal_resources_json TEXT,
+      removal_outcome_json TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -461,6 +465,10 @@ export function applySchema(db: Database): void {
     "ALTER TABLE host_merge_leases ADD COLUMN receipt_outbox_id TEXT",
     "ALTER TABLE host_merge_leases ADD COLUMN outcome_kind TEXT",
     "ALTER TABLE host_merge_leases ADD COLUMN outcome_json TEXT",
+    "ALTER TABLE host_merge_leases ADD COLUMN operation_kind TEXT NOT NULL DEFAULT 'merge' CHECK(operation_kind IN ('merge', 'thread-remove'))",
+    "ALTER TABLE host_merge_leases ADD COLUMN removal_step TEXT CHECK(removal_step IS NULL OR removal_step IN ('worktree', 'branch'))",
+    "ALTER TABLE host_merge_leases ADD COLUMN removal_resources_json TEXT",
+    "ALTER TABLE host_merge_leases ADD COLUMN removal_outcome_json TEXT",
   ]) {
     try {
       db.exec(statement);
@@ -468,6 +476,9 @@ export function applySchema(db: Database): void {
       if (!String(error).includes("duplicate column")) throw error;
     }
   }
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS host_merge_leases_operation_source ON host_merge_leases(bot_uid, operation_kind, channel_type, channel_id, source_id, created_at)",
+  );
   migrateThreadListen(db);
   const questionColumns = query(db, "PRAGMA table_info(questions)");
   const cardSeqWasMissing = !questionColumns.some((row) => asString(row.name) === "card_seq");

@@ -23,7 +23,7 @@ import {
   type SessionLease,
 } from "./tasks/task-scheduler.ts";
 import { createHash, randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
+import { lstat, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
   ATTACHMENT_MAX_AGE_MS,
@@ -55,21 +55,30 @@ import type {
   WorktreeMergeLifecycle,
   WorktreeMergeOutcome,
   WorktreeMergeProcessIdentity,
+  WorktreeRemovalLifecycle,
+  WorktreeRemovalStep,
   WorkerOptions,
   WorktreeMergeSummary,
 } from "./contracts.ts";
 import type {
+  BindingRecord,
   GoalTaskRecord,
   GoalTaskRequest,
+  HostMergeLeaseRecord,
+  HostRemovalLeaseRecord,
+  HostThreadRemovalOutcome,
+  InboundClaim,
+  TaskRecord,
   ThreadListenRecord,
   ThreadMergeEventRecord,
+  ThreadWorkspaceRecord,
 } from "./store/store-records.ts";
 import { DEFAULT_ASK_TIMEOUT_MS } from "./contracts.ts";
 import { TurnContext } from "./session/turn-context.ts";
 import { memberSnapshotFor, normalizeAgentMembers, type AgentContext, type AgentMemberSnapshot } from "./session/agent-context.ts";
 import { threadShortId, threadParentGroupId } from "./threads/thread-target.ts";
 import { createBotEventLoop, type BotEventLoop } from "./bot-events.ts";
-import { createOutboxDelivery, type Outbox } from "./outbox.ts";
+import { createOutboxDelivery, splitUtf8, type Outbox } from "./outbox.ts";
 import { createHostTools, type HostToolHost } from "./host-tools.ts";
 import { InboundMaterializer } from "./inbound/inbound-materializer.ts";
 import { InboundShutdownError, safeErrorMessage } from "./errors.ts";
@@ -83,7 +92,6 @@ import {
 } from "./session/project-session.ts";
 import { ensureProjectSessionDir, sessionsRoot } from "./session/session-dir.ts";
 import { ChannelStore, openChannelStore } from "./store/index.ts";
-import type { BindingRecord, InboundClaim, TaskRecord, HostMergeLeaseRecord } from "./store/store-records.ts";
 import { isGroupTarget, targetKey, taskTarget } from "./target.ts";
 import { createTypingLeaseManager, type TypingLeaseManager } from "./typing-lease.ts";
 import { createDisplayNameCache, type DisplayNameCache } from "./display-name.ts";
@@ -97,6 +105,10 @@ import {
 } from "./threads/thread-notify.ts";
 import { ThreadArchiveScheduler } from "./threads/thread-archive.ts";
 import { mergeThreadWorkspace, type ThreadMergeHost } from "./threads/thread-merge.ts";
+import {
+  cleanupOwnedThreadWorkspace,
+  threadWorkspaceCleanupPaths,
+} from "./threads/thread-workspace-cleanup.ts";
 import { ThreadCommands } from "./commands/thread-commands.ts";
 import { ServiceRestart } from "./runtime/service-restart.ts";
 import { TaskEvents } from "./tasks/task-events.ts";
@@ -119,6 +131,8 @@ const COMMAND_HELP = [
   "/thread <任务> · 新建隔离子区并派发任务（群聊可用）",
   "/thread model [选择器|clear] · owner 在主群设置、查询或清除子区默认模型",
   "/thread merge · 宿主先合并子区工作区；仅实际合并失败时派发一次修复任务",
+  "/thread remove [--force] · 清理当前子区 worktree 与分支后归档；force 可丢弃未提交改动和未合并分支",
+  "",
   "任务",
   "/queue <文本> · 将消息排到当前任务之后",
   "/mode [steer|queue] · 查看或设置新消息的追加方式",
@@ -321,6 +335,9 @@ class CoreService implements ChannelService {
   private readonly threadMergeControllers = new Map<string, Set<AbortController>>();
   /** Active host merge command identities stay registered through durable receipt/repair acceptance. */
   private readonly threadMergeControllersByCommand = new Map<string, AbortController>();
+  /** Active owner-triggered removals share the same cancel/stop discipline as host merges. */
+  private readonly threadRemovalControllers = new Map<string, Set<AbortController>>();
+  private readonly threadRemovalControllersByCommand = new Map<string, AbortController>();
   /** Per-chat progress edit tails remain visible after task leases release until terminal edits settle. */
   private readonly progressTails = new Map<string, Map<string, () => Promise<void>>>();
   /** A host command's archive is published only after its durable success receipt is inserted. */
@@ -329,7 +346,7 @@ class CoreService implements ChannelService {
     readonly groupId: string;
     readonly shortId: string;
     readonly generation: number;
-    readonly receiptOutboxId: string;
+    readonly receiptOutboxIds: readonly string[];
   }>();
   /** Startup-recovered archives stay staged until progress-card recovery and transport readiness. */
   private readonly recoveredHostMergeArchiveTargets = new Set<string>();
@@ -556,8 +573,14 @@ class CoreService implements ChannelService {
       stopping: () => this.stopping,
       executeHostMerge: (message, binding, receiptOutboxId, archiveGeneration, operatorNote) =>
         this.executeHostThreadMerge(message, binding, receiptOutboxId, archiveGeneration, operatorNote),
+      executeHostRemoval: (message, ownership, force, receiptOutboxId) =>
+        this.executeHostThreadRemoval(message, ownership, force, receiptOutboxId),
       enqueueMergeReceipt: (target, id, text) => this.enqueueThreadMergeReceipt(target, id, text),
       settleHostMerge: (target, sourceId) => this.settleHostMergeForSource(target, sourceId),
+      enqueueRemovalReceipt: (target, id, text) => this.enqueueThreadRemovalReceipt(target, id, text),
+      settleHostRemoval: (target, sourceId) => this.settleHostRemovalForSource(target, sourceId),
+      recoverRemovalArchive: (target, receiptOutboxId, archiveGeneration) =>
+        this.recoverHostRemovalArchive(target, receiptOutboxId, archiveGeneration),
       recoverMergeArchive: (target, receiptOutboxId) =>
         this.recoverHostMergeArchive(target, receiptOutboxId),
       runThreadArchive: target => this.runThreadArchive(target),
@@ -576,7 +599,8 @@ class CoreService implements ChannelService {
       hasRunning: () =>
         this.runtimes.size > 0
         || this.commitOperationsByTask.size > 0
-        || this.threadMergeControllers.size > 0,
+        || this.threadMergeControllers.size > 0
+        || this.threadRemovalControllers.size > 0,
       restart: options.restart,
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
     });
@@ -685,6 +709,30 @@ class CoreService implements ChannelService {
           }
         }
         this.store.markHostMergeLeaseUnknown(lease.id);
+      }
+      for (const lease of this.store.listHostRemovalLeases(identity.uid)) {
+        if (lease.outcome !== null) {
+          try {
+            await this.threadCommands.recoverHostRemovalOutcome(lease);
+          } catch (error) {
+            console.error(`[thread remove recovery] 无法恢复清理回执 id=${lease.id}: ${safeErrorMessage(error, "receipt recovery failed")}`);
+          }
+          continue;
+        }
+        this.blockRemovalResources(lease);
+        const processIdentity = this.hostRemovalProcessIdentity(lease);
+        if (processIdentity && this.options.worktrees?.recoverMergeProcess) {
+          let stopped = false;
+          try {
+            stopped = await this.options.worktrees.recoverMergeProcess(processIdentity);
+          } catch (error) {
+            console.error(`[thread remove recovery] 无法确认旧清理进程组已停止 cwd=${lease.cwd}: ${safeErrorMessage(error, "process recovery failed")}`);
+          }
+          if (!stopped) {
+            console.error(`[thread remove recovery] 旧清理进程组仍未确认停止，资源保持封锁 cwd=${lease.cwd}`);
+          }
+        }
+        if (lease.phase !== "unknown") this.store.markHostRemovalLeaseUnknown(lease.id);
       }
       // 重启不丢工作：先把每个遗留 worker 的进程组收干净，再动任何任务状态。无法确认死亡的
       // 目录保持 block——它的任务留在队列继续挡住同目录的新写者（runTask 原样放过）。
@@ -798,6 +846,7 @@ class CoreService implements ChannelService {
     const wasReady = this.ready;
     this.stopping = true;
     this.abortAllThreadMerges(new Error("channel stopping"));
+    this.abortAllThreadRemovals(new Error("channel stopping"));
     this.threadArchives.stop();
     this.pendingHostMergeArchives.clear();
     this.recoveredHostMergeArchiveTargets.clear();
@@ -1131,6 +1180,43 @@ class CoreService implements ChannelService {
       identity: lease.processIdentity,
       cwd: lease.cwd,
     };
+  }
+
+  private hostRemovalProcessIdentity(
+    lease: HostRemovalLeaseRecord,
+  ): WorktreeMergeProcessIdentity | undefined {
+    if (
+      lease.pid === null
+      || lease.pgid === null
+      || lease.processIdentity === null
+      || lease.processIdentity.length === 0
+    ) {
+      return undefined;
+    }
+    return {
+      pid: lease.pid,
+      pgid: lease.pgid,
+      identity: lease.processIdentity,
+      cwd: lease.cwd,
+    };
+  }
+
+  private blockRemovalResources(lease: HostRemovalLeaseRecord): void {
+    this.blockedDirectories.add(lease.cwd);
+    for (const path of lease.resourcePaths) this.blockedDirectories.add(path);
+  }
+
+  private releaseOrBlockHostRemoval(id: string, resourcePaths: readonly string[]): void {
+    try {
+      this.store.releaseHostRemovalLease(id);
+    } catch {
+      for (const path of resourcePaths) this.blockedDirectories.add(path);
+      try {
+        this.store.markHostRemovalLeaseUnknown(id);
+      } catch {
+        // Resource blocks still fail closed if the durable row itself cannot be updated.
+      }
+    }
   }
 
   private isWorkspaceDirectoryBlocked(cwd: string): boolean {
@@ -1582,7 +1668,11 @@ class CoreService implements ChannelService {
     this.threadArchives.cancel(message);
     try {
       const restartRequested = await this.builtinHandlers[action](message, argument);
-      if (this.threadMergeControllersByCommand.has(this.threadMergeCommandKey(message))) {
+      const commandKey = this.threadMergeCommandKey(message);
+      if (
+        this.threadMergeControllersByCommand.has(commandKey)
+        || this.threadRemovalControllersByCommand.has(commandKey)
+      ) {
         await this.outbox.flush(message);
       }
       this.store.completeCommand(claim);
@@ -1596,7 +1686,10 @@ class CoreService implements ChannelService {
       const detail = safeDisplayText(error instanceof Error ? error.message : String(error), 180);
       throw new Error(detail === undefined ? "命令未能持久完成。" : `命令未能持久完成：${detail}`);
     } finally {
-      if (this.finishThreadMergeCommand(message)) this.serviceRestart.maybeRunDeferred();
+      if (
+        this.finishThreadMergeCommand(message)
+        || this.finishThreadRemovalCommand(message)
+      ) this.serviceRestart.maybeRunDeferred();
     }
   }
 
@@ -1606,11 +1699,12 @@ class CoreService implements ChannelService {
    */
   private async handleInterrupt(target: ChatTarget): Promise<void> {
     const mergeCancelled = this.abortThreadMerges(target, new Error("thread merge interrupted"));
+    const removalCancelled = this.abortThreadRemovals(target, new Error("thread removal interrupted"));
     if (this.commitOperationsByTarget.has(targetKey(target))) {
       await this.outbox.enqueueText(
         target,
-        mergeCancelled
-          ? "当前是 Git 提交任务；请使用 /commit stop。/interrupt 不会中断或伪确认提交。等待或执行中的子区合并已中止。"
+        mergeCancelled || removalCancelled
+          ? "当前是 Git 提交任务；请使用 /commit stop。/interrupt 不会中断或伪确认提交。等待或执行中的子区宿主操作已请求中止。"
           : "当前是 Git 提交任务；请使用 /commit stop。/interrupt 不会中断或伪确认提交。",
         null,
       );
@@ -1620,8 +1714,8 @@ class CoreService implements ChannelService {
     if (!runtime?.lease) {
       await this.outbox.enqueueText(
         target,
-        mergeCancelled
-          ? "已中止正在等待或执行的子区合并命令；结果可能未知，未自动重试。"
+        mergeCancelled || removalCancelled
+          ? "已请求中止正在等待或执行的子区宿主操作；进程结果若未确认，资源将保持封锁且不会自动重试。"
           : DEFAULT_INTERRUPT_IDLE_TEXT,
         null,
       );
@@ -1644,8 +1738,8 @@ class CoreService implements ChannelService {
     }
     await this.outbox.enqueueText(
       target,
-      mergeCancelled
-        ? `${DEFAULT_INTERRUPTED_TEXT} 正在等待或执行的子区合并命令也已中止。`
+      mergeCancelled || removalCancelled
+        ? `${DEFAULT_INTERRUPTED_TEXT} 正在等待或执行的子区宿主操作也已请求中止。`
         : DEFAULT_INTERRUPTED_TEXT,
       null,
     );
@@ -2891,6 +2985,7 @@ class CoreService implements ChannelService {
     const binding = this.store.getBinding(this.bot!.uid, target);
     if (binding) this.invalidateGoalResumeChecks(target, binding.sessionId);
     const mergeCancelled = this.abortThreadMerges(target, new Error("thread merge cancelled"));
+    const removalCancelled = this.abortThreadRemovals(target, new Error("thread removal cancelled"));
     const queued = this.store.cancelQueued(this.bot!.uid, target);
     const queuedCommit = this.commitOperationsByTarget.get(targetKey(target));
     if (queuedCommit && queued.includes(queuedCommit.taskId)) {
@@ -2941,7 +3036,7 @@ class CoreService implements ChannelService {
       ? "无法确认提交进程已停止；排队任务已清除，工作树仍受保护。"
       : completedCommit?.result !== undefined
         ? `当前提交已完成，无法取消或回滚；HEAD=${this.shortHead(completedCommit.result.headAfter)}。`
-        : queued.length > 0 || active || mergeCancelled
+        : queued.length > 0 || active || mergeCancelled || removalCancelled
           ? DEFAULT_CANCELLED_TEXT
           : "当前没有可取消的任务。";
     await this.outbox.enqueueText(target, response, null);
@@ -2955,6 +3050,19 @@ class CoreService implements ChannelService {
 
   private abortAllThreadMerges(reason: Error): void {
     for (const controllers of this.threadMergeControllers.values()) {
+      for (const controller of controllers) controller.abort(reason);
+    }
+  }
+
+  private abortThreadRemovals(target: ChatTarget, reason: Error): boolean {
+    const controllers = this.threadRemovalControllers.get(targetKey(target));
+    if (!controllers) return false;
+    for (const controller of controllers) controller.abort(reason);
+    return controllers.size > 0;
+  }
+
+  private abortAllThreadRemovals(reason: Error): void {
+    for (const controllers of this.threadRemovalControllers.values()) {
       for (const controller of controllers) controller.abort(reason);
     }
   }
@@ -2973,6 +3081,22 @@ class CoreService implements ChannelService {
       controllers.delete(controller);
       if (controllers.size === 0 && this.threadMergeControllers.get(targetKeyValue) === controllers) {
         this.threadMergeControllers.delete(targetKeyValue);
+      }
+    }
+    return true;
+  }
+
+  private finishThreadRemovalCommand(message: InboundMessage): boolean {
+    const commandKey = this.threadMergeCommandKey(message);
+    const controller = this.threadRemovalControllersByCommand.get(commandKey);
+    if (!controller) return false;
+    this.threadRemovalControllersByCommand.delete(commandKey);
+    const targetKeyValue = targetKey(message);
+    const controllers = this.threadRemovalControllers.get(targetKeyValue);
+    if (controllers) {
+      controllers.delete(controller);
+      if (controllers.size === 0 && this.threadRemovalControllers.get(targetKeyValue) === controllers) {
+        this.threadRemovalControllers.delete(targetKeyValue);
       }
     }
     return true;
@@ -3375,7 +3499,7 @@ class CoreService implements ChannelService {
             groupId,
             shortId,
             generation,
-            receiptOutboxId,
+            receiptOutboxIds: [receiptOutboxId],
           });
         },
         tryAcquireDirectories: async (cwds) => {
@@ -3416,9 +3540,231 @@ class CoreService implements ChannelService {
     }
   }
 
-  private enqueueThreadMergeReceipt(target: ChatTarget, id: string, text: string): void {
+  private async executeHostThreadRemoval(
+    message: InboundMessage,
+    ownership: ThreadWorkspaceRecord,
+    force: boolean,
+    receiptOutboxId: string,
+  ): Promise<HostThreadRemovalOutcome | { kind: "refused"; message: string }> {
     const botUid = this.bot?.uid;
-    if (botUid === undefined) throw new Error("Bot 身份未注册，无法保存合并成功回执。");
+    const worktrees = this.options.worktrees;
+    if (botUid === undefined) return { kind: "refused", message: "Bot 身份未注册，未执行本地清理。" };
+    if (!worktrees) return { kind: "refused", message: "本部署未配置隔离工作区能力。" };
+
+    const resourcePaths = threadWorkspaceCleanupPaths(ownership, true);
+    const anchor = resourcePaths[0]
+      ?? ownership.projects[0]?.repo
+      ?? ownership.entryPath
+      ?? this.store.getBinding(botUid, message)?.cwd;
+    if (anchor === undefined) {
+      return { kind: "refused", message: "当前子区没有可追踪的本地工作区资源，未执行清理。" };
+    }
+    if (resourcePaths.some(path => this.isWorkspaceDirectoryBlocked(path))) {
+      return {
+        kind: "refused",
+        message: "相关工作区仍受未确认的清理进程封锁；本次未重试，也未归档。",
+      };
+    }
+
+    const targetKeyValue = targetKey(message);
+    const commandKey = this.threadMergeCommandKey(message);
+    const controller = new AbortController();
+    const controllers = this.threadRemovalControllers.get(targetKeyValue) ?? new Set<AbortController>();
+    controllers.add(controller);
+    this.threadRemovalControllers.set(targetKeyValue, controllers);
+    this.threadRemovalControllersByCommand.set(commandKey, controller);
+    const shutdownSignal = this.shutdownController.signal;
+    const abortOnShutdown = (): void => controller.abort(new Error("channel stopping"));
+    if (shutdownSignal.aborted) abortOnShutdown();
+    else shutdownSignal.addEventListener("abort", abortOnShutdown, { once: true });
+
+    let sessionLease: SessionLease | undefined;
+    let reserved = false;
+    let operationUnknown = false;
+    const id = randomUUID();
+    const context = {
+      id,
+      botUid,
+      target: message,
+      sourceId: message.messageId,
+      commandText: safeDisplayText(message.text, 800) ?? "/thread remove",
+      senderId: message.senderId,
+      messageSeq: message.messageSeq,
+      receiptOutboxId,
+      resourcePaths,
+    } as const;
+    try {
+      if (controller.signal.aborted || this.stopping) {
+        return { kind: "refused", message: "channel 正在停止，未开始本地清理。" };
+      }
+      // Missing owned paths still need directory leases; only existing paths can be Git-probed.
+      const repositoryCwds: string[] = [];
+      for (const path of resourcePaths) {
+        try {
+          await lstat(path);
+          repositoryCwds.push(path);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
+      sessionLease = await this.scheduler.tryAcquireCommandSession(message, repositoryCwds, resourcePaths);
+      if (!sessionLease) {
+        return { kind: "refused", message: "当前子区或其工作区资源正被任务占用；清理命令已立即拒绝，未排队。" };
+      }
+      const cleanupLease: SessionLease = {
+        ready: sessionLease.ready,
+        complete: () => {},
+      };
+      const removalLifecycle = (
+        project: ThreadWorkspaceRecord["projects"][number],
+        step: WorktreeRemovalStep,
+      ): WorktreeRemovalLifecycle => {
+        let beforeSpawned = false;
+        let processRunning = false;
+        const expectedCwd = step === "worktree" ? project.path : project.repo;
+        const failClosedProcess = (): void => {
+          operationUnknown = true;
+          for (const path of resourcePaths) this.blockedDirectories.add(path);
+          if (reserved) {
+            try {
+              this.store.markHostRemovalLeaseUnknown(id);
+            } catch {
+              // In-memory directory blocks still protect the running process if persistence also fails.
+            }
+          }
+        };
+        return {
+          beforeSpawn: cwd => {
+            if (this.stopping || controller.signal.aborted) throw new Error("channel 正在停止");
+            if (expectedCwd === null || cwd !== expectedCwd || message.channelType !== 5) {
+              throw new Error("host removal process identity changed before spawn");
+            }
+            if (!reserved) {
+              this.store.reserveHostRemovalLease({ ...context, cwd });
+              reserved = true;
+            }
+            this.store.beginHostRemovalStep(id, step, cwd);
+            beforeSpawned = true;
+          },
+          onSpawn: identity => {
+            if (!reserved || !beforeSpawned || identity.cwd !== expectedCwd) {
+              failClosedProcess();
+              throw new Error("host removal process spawned without its durable reservation");
+            }
+            try {
+              this.store.recordHostRemovalProcess(id, identity);
+              processRunning = true;
+            } catch (error) {
+              failClosedProcess();
+              throw error;
+            }
+          },
+          onConfirmedExit: () => {
+            if (!reserved || !processRunning) {
+              failClosedProcess();
+              throw new Error("host removal process exited without its durable reservation");
+            }
+            try {
+              this.store.markHostRemovalProcessExited(id);
+              processRunning = false;
+              beforeSpawned = false;
+            } catch (error) {
+              failClosedProcess();
+              throw error;
+            }
+          },
+          onNotSpawned: () => {
+            if (!reserved || !beforeSpawned) return;
+            if (processRunning) this.store.markHostRemovalProcessExited(id);
+            this.store.releaseHostRemovalLease(id);
+            reserved = false;
+            beforeSpawned = false;
+            processRunning = false;
+          },
+          onUnknown: failClosedProcess,
+        };
+      };
+
+      const result = await cleanupOwnedThreadWorkspace({
+        ownership,
+        store: this.store,
+        worktrees,
+        force,
+        deleteBranch: true,
+        lease: cleanupLease,
+        signal: controller.signal,
+        lifecycle: removalLifecycle,
+        isUnknown: () => operationUnknown,
+      });
+      if (result.unknown || operationUnknown) {
+        return {
+          kind: "refused",
+          message: "本地清理进程结果未确认；相关资源已封锁，本次不归档且不会自动重试。",
+        };
+      }
+      if (this.stopping || controller.signal.aborted) {
+        if (reserved) this.releaseOrBlockHostRemoval(id, resourcePaths);
+        return { kind: "refused", message: "channel 已停止或清理已中止；本次不归档。" };
+      }
+
+      const detail = result.messages.join("；");
+      const outcome: HostThreadRemovalOutcome = result.complete
+        ? {
+            kind: "complete",
+            receiptText: `本地隔离工作区与记录分支清理完成；回执送达并完成当前输出后将归档子区。\n${detail}`,
+          }
+        : {
+            kind: "partial",
+            receiptText: `本地工作区清理未完整完成，本次不归档；已确认的资源结果已逐项保存。请核对后重新执行 /thread remove。${detail.length === 0 ? "" : `详情：${detail}`}`,
+          };
+      if (!reserved) {
+        this.store.reserveHostRemovalLease({ ...context, cwd: anchor });
+        reserved = true;
+      }
+      this.store.persistHostRemovalOutcome(id, outcome);
+      return outcome;
+    } catch (error) {
+      if (reserved && !operationUnknown) this.releaseOrBlockHostRemoval(id, resourcePaths);
+      const detail = safeDisplayText(safeErrorMessage(error, "清理失败"), 180) ?? "未知错误";
+      return {
+        kind: "refused",
+        message: `本地清理未完成且不会自动重试：${detail}。请先核对资源状态。`,
+      };
+    } finally {
+      sessionLease?.complete();
+      shutdownSignal.removeEventListener("abort", abortOnShutdown);
+    }
+  }
+
+
+  private enqueueThreadMergeReceipt(target: ChatTarget, id: string, text: string): void {
+    this.enqueueHostCommandReceipt(target, id, text, "merge");
+  }
+
+  private enqueueThreadRemovalReceipt(target: ChatTarget, id: string, text: string): void {
+    for (const part of this.removalReceiptParts(id, text)) {
+      this.enqueueHostCommandReceipt(target, part.id, part.text, "remove");
+    }
+  }
+
+  private removalReceiptParts(id: string, text: string): { id: string; text: string }[] {
+    const chunks = splitUtf8(text);
+    return chunks.map((chunk, index) => ({
+      id: index === chunks.length - 1
+        ? id
+        : `${id.slice(0, 24)}${createHash("sha256").update(`${id}:${index}`).digest("hex").slice(0, 12)}`,
+      text: chunk,
+    }));
+  }
+
+  private enqueueHostCommandReceipt(
+    target: ChatTarget,
+    id: string,
+    text: string,
+    operation: "merge" | "remove",
+  ): void {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) throw new Error("Bot 身份未注册，无法保存子区宿主操作回执。");
     try {
       const existing = this.store.getOutbox(id);
       if (existing) {
@@ -3429,7 +3775,7 @@ class CoreService implements ChannelService {
           || existing.kind !== "text"
           || existing.text !== text
         ) {
-          throw new Error("stable merge receipt id conflicts with a different outbox record");
+          throw new Error(`stable thread ${operation} receipt id conflicts with a different outbox record`);
         }
       } else {
         this.store.enqueueOutbox({
@@ -3447,9 +3793,9 @@ class CoreService implements ChannelService {
       }
     } catch (error) {
       const detail = safeDisplayText(error instanceof Error ? error.message : String(error), 160);
-      console.error(`[thread-merge] 成功回执持久化失败 id=${id}: ${detail ?? "outbox write failed"}`);
+      console.error(`[thread-${operation}] 回执持久化失败 id=${id}: ${detail ?? "outbox write failed"}`);
       this.pendingHostMergeArchives.delete(targetKey(target));
-      throw new Error("合并成功回执无法持久化；归档已阻止。", { cause: error });
+      throw new Error(`子区${operation === "merge" ? "合并" : "本地清理"}回执无法持久化；归档已阻止。`, { cause: error });
     }
     void this.outbox.flush(target).catch(() => {});
   }
@@ -3463,6 +3809,36 @@ class CoreService implements ChannelService {
     this.store.settleHostMergeLease(lease.id);
   }
 
+  private settleHostRemovalForSource(target: ChatTarget, sourceId: string): void {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) throw new Error("Bot 身份未注册，无法结算 host removal。");
+    const lease = this.store.getHostRemovalLeaseBySourceId(botUid, target, sourceId);
+    if (!lease) throw new Error("host removal outcome lease disappeared before durable delivery");
+    if (lease.outcome === null) throw new Error("host removal cannot settle before a known outcome is durable");
+    this.store.settleHostRemovalLease(lease.id);
+  }
+
+  private recoverHostRemovalArchive(
+    target: InboundMessage,
+    receiptOutboxId: string,
+    archiveGeneration?: number,
+  ): void {
+    const groupId = threadParentGroupId(target.channelId);
+    const shortId = threadShortId(target.channelId);
+    if (groupId === null || shortId === null) throw new Error("cannot recover archive for an invalid thread target");
+    const outcome = this.store.getHostRemovalLeaseBySourceId(this.bot!.uid, target, target.messageId)!.outcome!;
+    this.pendingHostMergeArchives.set(targetKey(target), {
+      target: { ...target },
+      groupId,
+      shortId,
+      generation: archiveGeneration ?? this.threadArchives.generation(target),
+      receiptOutboxIds: this.removalReceiptParts(receiptOutboxId, outcome.receiptText).map(part => part.id),
+    });
+    if (archiveGeneration === undefined) {
+      this.recoveredHostMergeArchiveTargets.add(targetKey(target));
+    }
+  }
+
   private recoverHostMergeArchive(target: InboundMessage, receiptOutboxId: string): void {
     const groupId = threadParentGroupId(target.channelId);
     const shortId = threadShortId(target.channelId);
@@ -3472,7 +3848,7 @@ class CoreService implements ChannelService {
       groupId,
       shortId,
       generation: this.threadArchives.generation(target),
-      receiptOutboxId,
+      receiptOutboxIds: [receiptOutboxId],
     });
     this.recoveredHostMergeArchiveTargets.add(targetKey(target));
   }
@@ -3517,7 +3893,7 @@ class CoreService implements ChannelService {
         pending.groupId,
         pending.shortId,
         pending.generation,
-        pending.receiptOutboxId,
+        pending.receiptOutboxIds,
       );
     }
     const progressTail = Promise.allSettled(

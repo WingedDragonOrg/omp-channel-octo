@@ -31,8 +31,8 @@ interface PendingThreadArchive {
   readonly groupId: string;
   readonly shortId: string;
   readonly generation: number;
-  /** Host-first merge requires this exact durable success receipt to reach `sent`. */
-  readonly receiptOutboxId?: string;
+  /** Every segment of the host's durable receipt must reach `sent`. */
+  readonly receiptOutboxIds?: readonly string[];
 }
 
 /**
@@ -89,7 +89,7 @@ export class ThreadArchiveScheduler {
     groupId: string,
     shortId: string,
     generation = this.generation(target),
-    receiptOutboxId?: string,
+    receiptOutboxIds?: readonly string[],
   ): void {
     const key = targetKey(target);
     if (generation !== this.generation(target)) return;
@@ -98,7 +98,7 @@ export class ThreadArchiveScheduler {
       groupId,
       shortId,
       generation,
-      ...(receiptOutboxId === undefined ? {} : { receiptOutboxId }),
+      ...(receiptOutboxIds === undefined ? {} : { receiptOutboxIds }),
     });
     const active = this.activeRuns.get(key);
     if (active && active.pending !== this.pendingThreadArchives.get(key)) {
@@ -161,7 +161,7 @@ export class ThreadArchiveScheduler {
       if (!this.isCurrent(key, pending, signal)) return;
       await this.drainChatOutbox(pending.target, signal);
       if (!this.isCurrent(key, pending, signal)) return;
-      if (pending.receiptOutboxId !== undefined) {
+      if (pending.receiptOutboxIds !== undefined) {
         const delivered = await this.waitForReceipt(key, pending, signal);
         if (!delivered || !this.isCurrent(key, pending, signal)) return;
       }
@@ -230,13 +230,12 @@ export class ThreadArchiveScheduler {
     signal: AbortSignal,
   ): Promise<boolean> {
     const botUid = this.deps.botUid();
-    const receiptId = pending.receiptOutboxId;
-    if (botUid === undefined || receiptId === undefined) return false;
+    const receiptIds = pending.receiptOutboxIds;
+    if (botUid === undefined || receiptIds === undefined) return false;
     while (this.isCurrent(key, pending, signal)) {
-      const receipt = this.deps.store.getOutbox(receiptId);
-      if (!receipt) return false;
-      if (receipt.state === "sent") return true;
-      if (receipt.state === "dead") return false;
+      const receipts = receiptIds.map(id => this.deps.store.getOutbox(id));
+      if (receipts.some(receipt => !receipt || receipt.state === "dead")) return false;
+      if (receipts.every(receipt => receipt!.state === "sent")) return true;
       await this.deps.outbox.flush(pending.target).catch(() => {});
       if (!this.isCurrent(key, pending, signal)) return false;
       await pause(THREAD_ARCHIVE_DRAIN_POLL_MS, signal);
