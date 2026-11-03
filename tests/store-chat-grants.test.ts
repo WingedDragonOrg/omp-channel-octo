@@ -290,9 +290,7 @@ test("command claim state is read-only, scoped, and failed claims retryable", as
       errorText: null,
       messageSeq: 0,
       historyEligible: false,
-      relayChannelType: null,
-      relayChannelId: null,
-      relayThreadName: null,
+      relaySuppressed: false,
     };
 
     const store = await openChannelStore(stateDir);

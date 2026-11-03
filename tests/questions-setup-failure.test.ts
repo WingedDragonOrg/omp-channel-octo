@@ -76,9 +76,7 @@ test("a set ask failing on the second question leaves no orphan, no leaked stop 
     errorText: null,
     messageSeq: 0,
     historyEligible: false,
-    relayChannelType: null,
-    relayChannelId: null,
-    relayThreadName: null,
+    relaySuppressed: false,
   });
   const args = {
     questions: [

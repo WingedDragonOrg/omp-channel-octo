@@ -99,9 +99,7 @@ function taskRow(target: ThreadTarget, id: string, cwd: string): TaskRecord {
     errorText: null,
     messageSeq: 0,
     historyEligible: true,
-    relayChannelType: null,
-    relayChannelId: null,
-    relayThreadName: null,
+    relaySuppressed: false,
   };
 }
 
@@ -756,9 +754,8 @@ test("thread outcome relay cannot steer a shared owner after a project disappear
   const sourceTask: TaskRecord = {
     ...taskRow(sourceTarget, "relay-notification-source", sourceCwd),
     text: "complete relay source",
-    relayChannelType: thread.channelType,
-    relayChannelId: thread.channelId,
-    relayThreadName: "source",
+    messageId: "dispatch:relay-notification-source",
+    relaySuppressed: false,
   };
   const activeBinding: BindingRecord = {
     botUid: bot.uid,
@@ -791,6 +788,14 @@ test("thread outcome relay cannot steer a shared owner after a project disappear
         { name: "api", path: projectA },
         { name: "web", path: projectB },
       ]));
+      store.ensureThreadListen({
+        botUid: bot.uid,
+        channelId: sourceTarget.channelId,
+        creatorChannelType: thread.channelType,
+        creatorChannelId: thread.channelId,
+        threadName: "source",
+        listen: "task",
+      });
       seedQueuedTask(store, activeTask);
       seedQueuedTask(store, sourceTask);
     });

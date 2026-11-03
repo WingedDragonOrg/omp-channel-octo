@@ -117,9 +117,7 @@ function taskRow(overrides: Partial<TaskRecord> & Pick<TaskRecord, "id" | "botUi
     errorText: null,
     messageSeq: 0,
     historyEligible: true,
-    relayChannelType: null,
-    relayChannelId: null,
-    relayThreadName: null,
+    relaySuppressed: false,
     ...overrides,
   };
 }

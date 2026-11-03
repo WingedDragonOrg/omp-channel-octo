@@ -14,7 +14,7 @@ import {
 } from "./commands/command-routing.ts";
 import { SessionLifecycle, threadWorkspaceIsAvailable } from "./session/session-lifecycle.ts";
 import { TaskScheduler } from "./tasks/task-scheduler.ts";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
@@ -39,14 +39,19 @@ import type {
   PromptContext,
   InboundMessage,
   SteerConsumedEvent,
-  TaskRelayTarget,
   WorkerEvent,
   WorkerGoal,
   WorkerGoalResult,
   WorkerGoalRun,
   WorkerOptions,
+  WorktreeMergeSummary,
 } from "./contracts.ts";
-import type { GoalTaskRecord, GoalTaskRequest } from "./store/store-records.ts";
+import type {
+  GoalTaskRecord,
+  GoalTaskRequest,
+  ThreadListenRecord,
+  ThreadMergeEventRecord,
+} from "./store/store-records.ts";
 import { DEFAULT_ASK_TIMEOUT_MS } from "./contracts.ts";
 import { TurnContext } from "./session/turn-context.ts";
 import { memberSnapshotFor, normalizeAgentMembers, type AgentContext, type AgentMemberSnapshot } from "./session/agent-context.ts";
@@ -70,7 +75,13 @@ import { isGroupTarget, targetKey, taskTarget } from "./target.ts";
 import { createTypingLeaseManager, type TypingLeaseManager } from "./typing-lease.ts";
 import { createDisplayNameCache, type DisplayNameCache } from "./display-name.ts";
 import { createQuestionDesk, type QuestionDesk } from "./questions.ts";
-import { threadNotifyMessageId, threadOutcomeNotice } from "./threads/thread-notify.ts";
+import {
+  threadMergeMessageId,
+  threadMergeNotice,
+  threadMergeSuppressedMessageId,
+  threadNotifyMessageId,
+  threadOutcomeNotice,
+} from "./threads/thread-notify.ts";
 import { ThreadArchiveScheduler } from "./threads/thread-archive.ts";
 import { ThreadCommands } from "./commands/thread-commands.ts";
 import { ServiceRestart } from "./runtime/service-restart.ts";
@@ -145,8 +156,7 @@ function localTimestamp(date: Date): string {
 const RECEIPT_EXCERPT_CHARS = 20;
 const DEFAULT_CANCELLED_TEXT = "当前任务已取消；不回滚已发生的副作用。";
 /**
- * 中断原因文案：在线结算与重启恢复共用同一份（恢复由存储域按停止意图落终态），`thread-notify`
- * 会把它原样当「原因」回传给派工方，两处措辞漂移会直接改变对外说法。
+ * 中断原因持久化供在线结算与重启恢复共用，用户任务回执使用固定终态说明，不传递此原始原因。
  */
 const INTERRUPT_REASON_TEXT = "用户中断当前回合";
 const QUESTION_TIMEOUT_REASON_TEXT = "等待回答超时，回合已停止";
@@ -445,6 +455,14 @@ class CoreService implements ChannelService {
     });
     this.threadCommands = new ThreadCommands({
       store: this.store,
+      ensureThreadListen: async message => {
+        await this.ensureThreadListen(message);
+      },
+      beginThreadMerge: message => {
+        const botUid = this.bot?.uid;
+        if (botUid === undefined) throw new Error("Bot 身份未注册，无法标记合并意图");
+        this.store.beginThreadMerge(botUid, message);
+      },
       refuseIncompleteThreadWorkspace: message => this.refuseIncompleteThreadWorkspace(message),
       botUid: () => this.bot?.uid,
       ...(options.worktrees === undefined ? {} : { worktrees: options.worktrees }),
@@ -568,18 +586,15 @@ class CoreService implements ChannelService {
         if (this.store.isTaskResuming(task.id) || this.store.isGoalTaskResuming(task.id)) this.questions.beginRecovery(task.id);
       }
       // 恢复任务先占住聊天链与目录序，再让 transport 开始接新入站：任何新消息（含下面的
-      // 恢复失败回执与子区回传）都排在它们后面，而真正执行要等启动门放行。
+      // 恢复失败回执与按持久化监听策略恢复的子区通知排在前面；恢复任务仍等启动门放行。
       for (const task of recovery.queued) this.scheduler.scheduleTask(task.id);
-      // 上一进程已经回执过的停止控制：意图随行落盘、存储域已按它落终态，这里只做收尾。中断要
-      // 收掉该任务自己的遗留提问（只动自己那条 task 的题，不误伤同聊天其他任务）；提问超时停下的
-      // 行必须保留提问——迟到答复照在线路径唤醒新回合。子区派工的回传照常说清楚。
       for (const task of recovery.stopped) {
         // 用户中断的遗留提问记 `interrupted`（迟到提交不可接受）；提问超时停下的行保持可答。
         if (task.stopIntent !== "question_timeout") this.questions.cancelForTask(task.id, "interrupted");
         await this.notifyThreadOutcome(task.id);
       }
-      // 1/0 行（prompt 已落标记、接受状态未知）既不重放也不续接：按实际恢复失败通报、关闭
-      // 该任务遗留的提问，子区派工的回传照常说清楚，不把一次失败的恢复留成静默。
+      // 1/0 行（prompt 已落标记、接受状态未知）既不重放也不续接：发送固定恢复失败回执并关闭遗留提问。
+      // 通知不传递任务正文、Agent 输出或错误载荷。
       for (const task of recovery.uncertain) {
         // 接受状态未知不是用户叫停：关闭行记 `ended`，迟到提交仍作为该聊天的新输入接受。
         this.questions.cancelForTask(task.id, "ended");
@@ -595,6 +610,7 @@ class CoreService implements ChannelService {
         );
         await this.notifyThreadOutcome(task.id);
       }
+      await this.recoverThreadMergeEvents(identity.uid);
       if (this.stopping) throw new Error("channel 正在停止");
       this.started = true;
       await this.options.transport.start(
@@ -1082,8 +1098,14 @@ class CoreService implements ChannelService {
       && !this.stopping;
   }
 
-  private async deliverSteer(runtime: RuntimeTask, text: string): Promise<boolean> {
-    if (!this.canDeliverSteer(runtime) || !runtime.lease) return false;
+  private async deliverSteer(
+    runtime: RuntimeTask,
+    text: string,
+    deliveryGuard?: () => boolean,
+    beforeWorkerSteer?: () => boolean,
+  ): Promise<boolean> {
+    if (!this.canDeliverSteer(runtime) || !runtime.lease || (deliveryGuard && !deliveryGuard())) return false;
+    if (beforeWorkerSteer && !beforeWorkerSteer()) return false;
     const delivery = { text };
     runtime.steerDeliveries.push(delivery);
     if (runtime.steerDeliveries.length > MAX_PENDING_STEERS) runtime.steerDeliveries.shift();
@@ -1113,8 +1135,10 @@ class CoreService implements ChannelService {
     message: InboundMessage,
     text: string,
     claim: InboundClaim,
+    deliveryGuard?: () => boolean,
+    beforeWorkerSteer?: () => boolean,
   ): Promise<boolean> {
-    if (!this.canDeliverSteer(runtime)) {
+    if (!this.canDeliverSteer(runtime) || (deliveryGuard && !deliveryGuard())) {
       if (runtime.cancelRequested) {
         this.store.completeCommand(claim);
         return true;
@@ -1139,7 +1163,7 @@ class CoreService implements ChannelService {
                 runtime.cancelController.signal,
               ),
             };
-        if (!this.canDeliverSteer(runtime)) {
+        if (!this.canDeliverSteer(runtime) || (deliveryGuard && !deliveryGuard())) {
           if (runtime.cancelRequested) {
             this.store.completeCommand(claim);
             return true;
@@ -1156,6 +1180,10 @@ class CoreService implements ChannelService {
         }
         runtime.agentContext = nextContext;
       } catch {
+        if (deliveryGuard) {
+          this.store.releaseClaim(claim);
+          return false;
+        }
         if (this.stopping) {
           this.store.releaseClaim(claim);
           return true;
@@ -1176,7 +1204,7 @@ class CoreService implements ChannelService {
       }
     }
 
-    if (await this.deliverSteer(runtime, text)) {
+    if (await this.deliverSteer(runtime, text, deliveryGuard, beforeWorkerSteer)) {
       this.store.completeCommand(claim);
       this.history.recordSteered(message, runtime.lease?.worker.sessionId ?? "");
       return true;
@@ -1213,16 +1241,22 @@ class CoreService implements ChannelService {
    * snapshot only after OMP includes its steering message in model context. A member-read failure
    * is consumed without changing the running prompt.
    */
-  private async appendToRunningTask(message: InboundMessage, text: string): Promise<boolean> {
+  private async appendToRunningTask(
+    message: InboundMessage,
+    text: string,
+    deliveryGuard?: () => boolean,
+    beforeWorkerSteer?: () => boolean,
+  ): Promise<boolean> {
     this.throwIfStopping();
     if (await this.refuseIncompleteThreadWorkspace(message)) return true;
     if (this.store.getChatMode(this.bot!.uid, message) !== "steer") return false;
     const runtime = this.runningRuntime(message);
     if (!runtime || runtime.stopCause === "question") return false;
+    if (deliveryGuard && !deliveryGuard()) return false;
     const claim = this.commandClaim(message, "steer");
     if (!this.store.claimCommand(claim)) return true;
     const delivery = runtime.steerSerial.then(() =>
-      this.deliverSteeringMessage(runtime, message, text, claim));
+      this.deliverSteeringMessage(runtime, message, text, claim, deliveryGuard, beforeWorkerSteer));
     runtime.steerSerial = delivery.then(() => {}, () => {});
     return await delivery;
   }
@@ -1375,58 +1409,318 @@ class CoreService implements ChannelService {
     }
   }
 
-  /**
-   * The completion relay of `thread-dispatch --notify`: a dispatched task whose row carries a
-   * relay target (`relayChannelType`/`relayChannelId`) reports one bounded notice to the chat
-   * that dispatched it once it reaches a terminal state. The notice is a synthetic inbound
-   * message with a deterministic id (`notify:<task>`), so a replay or a restart can never deliver
-   * it twice; like `wakeTurn` it follows the target chat's append mode and never touches the
-   * pending-question path or the permission gate. A failed delivery only costs the relay and is
-   * logged.
-   *
-   * A graceful stop settles its in-flight tasks as `cancelled` (the stop sets
-   * `runtime.cancelRequested`), and that lifecycle outcome is never relayed: the notice would be
-   * accepted right before this process goes down, only to be interrupted by the next start and
-   * read as a bogus "task interrupted by restart" in the dispatching chat. The `stopping` flag
-   * separates that path from the owner's `/cancel`, which still relays.
-   */
+  /** Dispatched tasks notify only at task level; the durable policy owns recipient provenance. */
   private async notifyThreadOutcome(taskId: string): Promise<void> {
     try {
       if (this.stopping) return;
       const botUid = this.bot?.uid;
       if (botUid === undefined) return;
       const task = this.store.getTask(taskId);
-      if (!task || task.channelType !== 5) return;
-      if (task.relayChannelType === null || task.relayChannelId === null) return;
-      const state = task.state;
       if (
-        state !== "completed"
-        && state !== "failed"
-        && state !== "cancelled"
-        && state !== "interrupted"
+        !task
+        || task.channelType !== 5
+        || !task.messageId.startsWith("dispatch:")
+        || task.relaySuppressed
       ) {
         return;
       }
-      const text = threadOutcomeNotice(task);
+      if (
+        task.state !== "completed"
+        && task.state !== "failed"
+        && task.state !== "cancelled"
+        && task.state !== "interrupted"
+      ) {
+        return;
+      }
+      const source: ChatTarget = { channelId: task.channelId, channelType: 5 };
+      const policy = this.store.getThreadListen(botUid, source);
+      if (policy === null || policy.listen !== "task" || policy.mergePending) return;
+      const ownerId = this.store.getOwnerId(botUid)?.trim() ?? "";
+      if (ownerId.length === 0) return;
+      const recipient: ChatTarget = {
+        channelId: policy.creatorChannelId,
+        channelType: policy.creatorChannelType,
+      };
+      const text = threadOutcomeNotice(task, policy.threadName);
       const message: InboundMessage = {
-        channelId: task.relayChannelId,
-        channelType: task.relayChannelType,
+        ...recipient,
         messageId: threadNotifyMessageId(task.id),
-        senderId: this.store.getOwnerId(botUid)?.trim() || botUid,
+        senderId: ownerId,
         text,
-        mentionedUserIds: [],
+        mentionedUserIds: [botUid],
         attachments: [],
         quoted: null,
         supported: true,
         messageSeq: 0,
         messageTimestamp: Date.now(),
       };
-      if (await this.appendToRunningTask(message, text)) return;
-      await this.acceptTask(message, text);
+      if (!(await this.threadNoticeAuthorized(source, recipient, message, ownerId))) return;
+      const deliveryGuard = (): boolean => {
+        const currentTask = this.store.getTask(task.id);
+        const currentPolicy = this.store.getThreadListen(botUid, source);
+        return !this.stopping
+          && this.bot?.uid === botUid
+          && this.store.getOwnerId(botUid)?.trim() === ownerId
+          && currentTask !== null
+          && currentTask.messageId.startsWith("dispatch:")
+          && !currentTask.relaySuppressed
+          && currentTask.state === task.state
+          && currentPolicy?.listen === "task"
+          && !currentPolicy.mergePending
+          && currentPolicy.creatorChannelType === recipient.channelType
+          && currentPolicy.creatorChannelId === recipient.channelId
+          && this.authorization.isPermittedChat(source)
+          && this.authorization.isPermittedChat(recipient);
+      };
+      if (!deliveryGuard()) return;
+      if (await this.appendToRunningTask(message, text, deliveryGuard)) return;
+      await this.acceptTask(message, text, true, undefined, undefined, deliveryGuard);
     } catch (error) {
       console.error(
         `[thread-notify] 回传投递失败 task=${taskId}：${safeErrorMessage(error, "notify failed")}`,
       );
+    }
+  }
+
+  private async ensureThreadListen(target: ChatTarget): Promise<ThreadListenRecord> {
+    if (target.channelType !== 5) throw new Error("thread listen target must be a thread");
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) throw new Error("Bot 身份未注册，无法读取子区监听策略");
+    const existing = this.store.getThreadListen(botUid, target);
+    if (existing !== null) return existing;
+    const groupId = threadParentGroupId(target.channelId);
+    const shortId = threadShortId(target.channelId);
+    if (groupId === null || shortId === null) throw new Error("无效的子区目标");
+    // Task acceptance has no remote metadata requirement; create-thread and management reads
+    // persist the authoritative name when one is available.
+    return this.store.ensureThreadListen({
+      botUid,
+      channelId: target.channelId,
+      creatorChannelType: 2,
+      creatorChannelId: groupId,
+      threadName: "",
+      listen: "merge",
+    });
+  }
+
+  private async threadNoticeAuthorized(
+    source: ChatTarget,
+    recipient: ChatTarget,
+    message: InboundMessage,
+    ownerId: string,
+  ): Promise<boolean> {
+    return this.authorization.isPermittedChat(source)
+      && this.authorization.isPermittedChat(recipient)
+      && await this.authorization.isAllowed(message, ownerId);
+  }
+
+  private threadMergeEventId(botUid: string, target: ChatTarget, operationId: string): string {
+    return `merge-${createHash("sha256")
+      .update(JSON.stringify([botUid, target.channelType, target.channelId, operationId]))
+      .digest("hex")}`;
+  }
+
+  /**
+   * Persists and routes a confirmed merge once. Reuse `operationId` for retries of one operation:
+   * host tools key it by task/tool-call identity, while a host-first command uses its message ID.
+   */
+  async publishThreadMergeSuccess(
+    target: ChatTarget,
+    summary: WorktreeMergeSummary,
+    archive: "scheduled" | "not-scheduled",
+    operationId: string,
+  ): Promise<void> {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) throw new Error("Bot 身份未注册，无法记录合并事件");
+    await this.ensureThreadListen(target);
+    const commit = summary.commit?.trim() || null;
+    const eventId = this.threadMergeEventId(botUid, target, operationId);
+    const event: ThreadMergeEventRecord = {
+      id: eventId,
+      botUid,
+      channelId: target.channelId,
+      targetBranch: summary.target,
+      commit,
+      removed: summary.removed,
+      archive,
+    };
+    this.store.saveThreadMergeEvent(event);
+    if (!this.store.isThreadMergeEventPending(event.id)) return;
+    try {
+      await this.deliverThreadMergeEvent(event);
+    } catch (error) {
+      console.error(
+        `[thread-merge-notify] 回传投递失败 event=${event.id}：${safeErrorMessage(error, "notify failed")}`,
+      );
+    }
+  }
+
+  /** Returns the durable success receipt for a retried host tool call, without repeating the merge. */
+  async replayThreadMergeSuccess(target: ChatTarget, operationId: string): Promise<string | null> {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) throw new Error("Bot 身份未注册，无法读取合并事件");
+    if (target.channelType !== 5) throw new Error("merge replay target must be a thread");
+    const event = this.store.getThreadMergeEvent(
+      this.threadMergeEventId(botUid, target, operationId),
+    );
+    if (event === null || event.botUid !== botUid || event.channelId !== target.channelId) return null;
+    if (this.store.isThreadMergeEventPending(event.id)) {
+      try {
+        await this.deliverThreadMergeEvent(event);
+      } catch (error) {
+        console.error(
+          `[thread-merge-notify] 回放投递失败 event=${event.id}：${safeErrorMessage(error, "notify failed")}`,
+        );
+      }
+    }
+    return JSON.stringify({
+      merged: true,
+      replayed: true,
+      target: event.targetBranch,
+      commit: event.commit,
+      removed: event.removed,
+      archive: event.archive,
+    });
+  }
+
+  private async recoverThreadMergeEvents(botUid: string): Promise<void> {
+    for (const event of this.store.listPendingThreadMergeEvents(botUid)) {
+      if (this.stopping) return;
+      try {
+        await this.deliverThreadMergeEvent(event, true);
+      } catch (error) {
+        console.error(
+          `[thread-merge-notify] 恢复投递失败 event=${event.id}：${safeErrorMessage(error, "notify failed")}`,
+        );
+      }
+    }
+  }
+
+  private consumeThreadMergeEvent(event: ThreadMergeEventRecord, recipient: ChatTarget): void {
+    const receipt: InboundMessage = {
+      ...recipient,
+      messageId: threadMergeSuppressedMessageId(event.id),
+      senderId: event.botUid,
+      text: "线程合并事件已按 listen=off 消费。",
+      mentionedUserIds: [],
+      attachments: [],
+      quoted: null,
+      supported: true,
+      messageSeq: 0,
+      messageTimestamp: Date.now(),
+    };
+    const claim = this.commandClaim(receipt, "thread-merge-suppressed");
+    const state = this.store.getCommandClaimState(event.botUid, recipient, receipt.messageId);
+    if (state === "completed") {
+      this.store.markThreadMergeEventDelivered(event.id);
+      return;
+    }
+    if (state === "pending" || this.store.claimCommand(claim)) {
+      this.store.completeCommand(claim);
+      this.store.markThreadMergeEventDelivered(event.id);
+    }
+  }
+
+  private async deliverThreadMergeEvent(
+    event: ThreadMergeEventRecord,
+    recovering = false,
+  ): Promise<void> {
+    if (
+      this.stopping
+      || this.bot?.uid !== event.botUid
+      || !this.store.isThreadMergeEventPending(event.id)
+    ) return;
+    const source: ChatTarget = { channelId: event.channelId, channelType: 5 };
+    const policy = this.store.getThreadListen(event.botUid, source) ?? await this.ensureThreadListen(source);
+    const recipient: ChatTarget = {
+      channelId: policy.creatorChannelId,
+      channelType: policy.creatorChannelType,
+    };
+    const messageId = threadMergeMessageId(event.id);
+    const suppressionId = threadMergeSuppressedMessageId(event.id);
+    const message: InboundMessage = {
+      ...recipient,
+      messageId,
+      senderId: "",
+      text: threadMergeNotice(event, policy.threadName),
+      mentionedUserIds: [this.bot.uid],
+      attachments: [],
+      quoted: null,
+      supported: true,
+      messageSeq: 0,
+      messageTimestamp: Date.now(),
+    };
+    const deliveryState = this.store.getCommandClaimState(event.botUid, recipient, messageId);
+    if (deliveryState === "completed") {
+      this.store.markThreadMergeEventDelivered(event.id);
+      return;
+    }
+    if (deliveryState === "pending") {
+      if (!recovering) return;
+      this.store.releaseClaim(this.commandClaim(message, "steer"));
+    }
+    const suppressionState = this.store.getCommandClaimState(event.botUid, recipient, suppressionId);
+    if (suppressionState === "completed" || suppressionState === "pending") {
+      this.consumeThreadMergeEvent(event, recipient);
+      return;
+    }
+    if (policy.listen === "off") {
+      this.consumeThreadMergeEvent(event, recipient);
+      return;
+    }
+    if (policy.mergePending) return;
+    const ownerId = this.store.getOwnerId(event.botUid)?.trim() ?? "";
+    if (ownerId.length === 0) return;
+    message.senderId = ownerId;
+    if (!(await this.threadNoticeAuthorized(source, recipient, message, ownerId))) return;
+    const deliveryGuard = (): boolean => {
+      const currentPolicy = this.store.getThreadListen(event.botUid, source);
+      return !this.stopping
+        && this.bot?.uid === event.botUid
+        && this.store.getOwnerId(event.botUid)?.trim() === ownerId
+        && currentPolicy !== null
+        && currentPolicy.listen !== "off"
+        && !currentPolicy.mergePending
+        && currentPolicy.creatorChannelType === recipient.channelType
+        && currentPolicy.creatorChannelId === recipient.channelId
+        && this.authorization.isPermittedChat(source)
+        && this.authorization.isPermittedChat(recipient);
+    };
+    if (!deliveryGuard()) {
+      if (this.store.getThreadListen(event.botUid, source)?.listen === "off") {
+        this.consumeThreadMergeEvent(event, recipient);
+      }
+      return;
+    }
+    let dispatchIntent = false;
+    const beforeWorkerSteer = (): boolean => {
+      if (!deliveryGuard()) return false;
+      dispatchIntent = this.store.claimThreadMergeDispatchIntent(event.id);
+      return dispatchIntent;
+    };
+    if (await this.appendToRunningTask(message, message.text, deliveryGuard, beforeWorkerSteer)) {
+      if (dispatchIntent) this.store.markThreadMergeEventDelivered(event.id);
+      return;
+    }
+    if (dispatchIntent || !this.store.isThreadMergeEventPending(event.id)) return;
+    if (!deliveryGuard()) {
+      if (this.store.getThreadListen(event.botUid, source)?.listen === "off") {
+        this.consumeThreadMergeEvent(event, recipient);
+      }
+      return;
+    }
+    const accepted = await this.acceptTask(
+      message,
+      message.text,
+      true,
+      undefined,
+      undefined,
+      deliveryGuard,
+    );
+    if (accepted || deliveryGuard()) {
+      this.store.markThreadMergeEventDelivered(event.id);
+    } else if (this.store.getThreadListen(event.botUid, source)?.listen === "off") {
+      this.consumeThreadMergeEvent(event, recipient);
     }
   }
 
@@ -1654,7 +1948,7 @@ class CoreService implements ChannelService {
       ...(tokenBudget === undefined ? {} : { tokenBudget }),
     };
     this.store.releaseClaim(this.commandClaim(message, "goal"));
-    const accepted = await this.acceptTask(message, `目标：${objective}`, false, null, request);
+    const accepted = await this.acceptTask(message, `目标：${objective}`, false, request);
     if (!accepted) {
       await this.outbox.enqueueText(message, "目标任务未能持久接收；没有发送普通模型 prompt。", null);
     }
@@ -1716,7 +2010,6 @@ class CoreService implements ChannelService {
           message,
           `恢复原生目标 ${goalId}`,
           false,
-          null,
           { op: "resume" },
           binding.sessionId,
           resumeCheck.isCurrent,
@@ -2062,11 +2355,13 @@ class CoreService implements ChannelService {
     message: InboundMessage,
     text: string,
     historyEligible = true,
-    relay: TaskRelayTarget | null = null,
     goalRequest?: GoalTaskRequest,
     expectedSessionId?: string,
     acceptGuard?: () => boolean,
   ): Promise<boolean> {
+    if (message.channelType === 5 && threadShortId(message.channelId) !== null) {
+      await this.ensureThreadListen(message);
+    }
     if (await this.refuseIncompleteThreadWorkspace(message)) return false;
     this.throwIfStopping();
     let binding = expectedSessionId === undefined
@@ -2137,9 +2432,7 @@ class CoreService implements ChannelService {
       // Slash prompts never enter ordinary history. Structured goals are a separate RPC payload and
       // stay in their persisted goal request instead of ever being parsed back out of task.text.
       historyEligible: goalRequest === undefined && historyEligible && !isCommand(text),
-      relayChannelType: relay?.channelType ?? null,
-      relayChannelId: relay?.channelId ?? null,
-      relayThreadName: relay?.threadName ?? null,
+      relaySuppressed: false,
     };
     let accepted: boolean;
     // Measured before acceptance so the new task's own row cannot count itself as the work it waits for.
@@ -2176,14 +2469,18 @@ class CoreService implements ChannelService {
       flushTarget: (target) => this.outbox.flush(target),
       planThreadArchive: (target, groupId, shortId) =>
         this.threadArchives.schedule(target, groupId, shortId),
+      publishThreadMergeSuccess: (target, summary, archive, operationId) =>
+        this.publishThreadMergeSuccess(target, summary, archive, operationId),
+      replayThreadMergeSuccess: (target, operationId) =>
+        this.replayThreadMergeSuccess(target, operationId),
       tryAcquireWorkspaceDirectories: (cwds, task) =>
         this.scheduler.tryAcquireWorkspaceDirectories(cwds, task),
-      deliverToChat: async (message, relay) => {
+      deliverToChat: async (message) => {
         if (await this.threadWorkspaceIncomplete(message)) {
           throw new Error("子区工作区未就绪，未派发任务。");
         }
         if (await this.appendToRunningTask(message, message.text)) return "steered";
-        await this.acceptTask(message, message.text, true, relay ?? null);
+        await this.acceptTask(message, message.text);
         return "queued";
       },
       askQuestions: (task, target, args, signal, toolCallId) =>
@@ -2634,8 +2931,7 @@ class CoreService implements ChannelService {
       this.questions.rejectForTask(taskId, new Error("task finished"));
       if (runtime.lease) await runtime.lease.close();
       this.outbox.releaseIfIdle(taskId);
-      // Deregistered before the relay so a creator chat that shares this directory does not read
-      // the relay as work that queued behind this run.
+      // Deregister before a creator-chat notice so a shared directory does not queue behind this run.
       this.runtimes.delete(taskId);
       await this.notifyThreadOutcome(taskId);
       await this.threadArchives.run(target, progress.tail);

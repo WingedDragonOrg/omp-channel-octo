@@ -96,9 +96,7 @@ function taskFor(target: ChatTarget, messageId: string, taskId: string, cwd: str
       errorText: null,
       messageSeq: 0,
       historyEligible: true,
-      relayChannelType: null,
-      relayChannelId: null,
-      relayThreadName: null,
+      relaySuppressed: false,
     },
   };
 }

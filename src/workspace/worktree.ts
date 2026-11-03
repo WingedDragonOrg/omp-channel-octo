@@ -413,13 +413,29 @@ export function createWorktreePort(options: WorktreePortOptions): WorktreePort {
       if (!linked) {
         throw new Error(`不是独立的 git worktree，无法合并：${request.cwd}`);
       }
-      return worktrunkMerge({
+      const commonDir = await gitDirectory(request.cwd, "--git-common-dir", mergeTimeoutMs, signal);
+      const summary = await worktrunkMerge({
         command: available.command,
         cwd: request.cwd,
         request,
         timeoutMs: mergeTimeoutMs,
         ...(signal === undefined ? {} : { signal }),
       });
+      const targetRef = summary.target.startsWith("refs/heads/")
+        ? summary.target
+        : `refs/heads/${summary.target}`;
+      const targetHead = await runCommand(
+        ["git", "--git-dir", commonDir, "rev-parse", "--verify", "--end-of-options", targetRef],
+        { timeoutMs: mergeTimeoutMs, ...(signal === undefined ? {} : { signal }) },
+      );
+      if (!targetHead || targetHead.timedOut || targetHead.aborted || targetHead.exitCode !== 0) {
+        throw new Error(
+          `合并后无法读取目标提交：${targetHead === null ? "git command unavailable" : commandFailure(targetHead)}`,
+        );
+      }
+      const commit = targetHead.stdout.trim();
+      if (commit.length === 0) throw new Error(`合并后 Git 未返回目标提交：${targetRef}`);
+      return { ...summary, commit };
     },
 
     async remove(

@@ -55,6 +55,12 @@ const WT_MERGE_STUB = String.raw`if [ "$1" = "--version" ]; then echo "wt v0.80.
 printf '%s\n' "$@" > "$0.argv"
 [ "$1" = "merge" ] || exit 64
 printf '{"branch":"b","target":"main","squashed":true,"rebased":true,"committed":false,"removed":false}\n'`;
+const WT_REAL_MERGE_STUB = String.raw`if [ "$1" = "--version" ]; then echo "wt v0.80.0"; exit 0; fi
+[ "$1" = "merge" ] || exit 64
+common=$(git rev-parse --path-format=absolute --git-common-dir)
+repo=$(dirname "$common")
+git -C "$repo" merge --no-ff --no-edit feature >/dev/null
+printf '{"branch":"feature","target":"main","squashed":false,"rebased":false,"committed":true,"removed":false}\n'`;
 
 const WT_REMOVE_STUB = String.raw`set -e
 if [ "$1" = "--version" ]; then echo "wt v0.80.0"; exit 0; fi
@@ -516,22 +522,22 @@ test("merge maps its parameters onto the wt pipeline and returns the wt result",
     const wt = await writeStub(root, WT_MERGE_STUB, "wt");
     const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [wt] });
 
-    await expect(
-      port.merge({
-        cwd: join(root, "linked"),
-        target: "release-1",
-        squash: false,
-        remove: false,
-        ff: false,
-        stage: "tracked",
-      }),
-    ).resolves.toEqual({
+    const summary = await port.merge({
+      cwd: join(root, "linked"),
+      target: "release-1",
+      squash: false,
+      remove: false,
+      ff: false,
+      stage: "tracked",
+    });
+    expect(summary).toEqual({
       branch: "b",
       target: "main",
       squashed: true,
       rebased: true,
       committed: false,
       removed: false,
+      commit: await runGit(repo, ["rev-parse", "refs/heads/main"]),
     });
     expect(await recordedArgv(wt)).toEqual([
       "merge",
@@ -544,6 +550,37 @@ test("merge maps its parameters onto the wt pipeline and returns the wt result",
       "--stage",
       "tracked",
     ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+test("non-fast-forward merge reports the real target ref commit", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-")));
+  try {
+    const repo = await createRepo(root);
+    const linked = join(root, "feature-worktree");
+    await runGit(repo, ["worktree", "add", "-q", linked, "-b", "feature"]);
+    await writeFile(join(linked, "feature.txt"), "feature change\n", "utf8");
+    await runGit(linked, ["add", "."]);
+    await runGit(linked, [
+      "-c",
+      "user.email=test@example.com",
+      "-c",
+      "user.name=Fixture",
+      "commit",
+      "-q",
+      "-m",
+      "feature",
+    ]);
+    const featureHead = await runGit(linked, ["rev-parse", "HEAD"]);
+    const wt = await writeStub(root, WT_REAL_MERGE_STUB, "wt");
+    const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [wt] });
+
+    const summary = await port.merge({ cwd: linked, target: "main", ff: false, remove: false });
+    const targetHead = await runGit(repo, ["rev-parse", "refs/heads/main"]);
+    expect(summary.commit).toBe(targetHead);
+    expect(summary.commit).not.toBe(featureHead);
+    expect((await runGit(repo, ["rev-list", "--parents", "-n", "1", targetHead])).split(" ")).toHaveLength(3);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

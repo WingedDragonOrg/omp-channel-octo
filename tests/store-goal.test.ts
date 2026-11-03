@@ -41,9 +41,7 @@ function task(messageId: string, id: string, sessionId: string, text = `display-
     errorText: null,
     messageSeq: 0,
     historyEligible: false,
-    relayChannelType: null,
-    relayChannelId: null,
-    relayThreadName: null,
+    relaySuppressed: false,
   };
 }
 

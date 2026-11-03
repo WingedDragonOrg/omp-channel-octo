@@ -50,13 +50,16 @@ export function acceptTask(db: Database, claim: InboundClaim, task: TaskRecord, 
         now,
       ],
     );
+    const mergePending = task.channelType === 5 && asNumber(query(db,
+      "SELECT merge_pending FROM thread_listens WHERE bot_uid = ? AND channel_id = ?",
+      [task.botUid, task.channelId],
+    )[0]?.merge_pending) !== 0;
     run(db,
       `INSERT INTO tasks(
          id, bot_uid, channel_type, channel_id, message_id, sender_id, text, session_id, cwd,
-         state, accepted_at, message_seq, history_eligible,
-         relay_channel_type, relay_channel_id, relay_thread_name
+         state, accepted_at, message_seq, history_eligible, relay_suppressed
        )
-       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)`,
+       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`,
       [
         task.id,
         task.botUid,
@@ -70,14 +73,17 @@ export function acceptTask(db: Database, claim: InboundClaim, task: TaskRecord, 
         now,
         task.messageSeq,
         task.historyEligible ? 1 : 0,
-        task.relayChannelType,
-        task.relayChannelId,
-        task.relayThreadName,
+        task.relaySuppressed || mergePending ? 1 : 0,
       ],
     );
     if (goalRequest) insertGoalTask(db, task, goalRequest);
     return true;
   });
+}
+
+/** Suppress one task's completion relay without changing its thread's merge policy. */
+export function suppressTaskRelay(db: Database, taskId: string): void {
+  run(db, "UPDATE tasks SET relay_suppressed = 1 WHERE id = ?", [taskId]);
 }
 
 export function claimCommand(db: Database, claim: InboundClaim): boolean {

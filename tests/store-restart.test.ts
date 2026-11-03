@@ -46,9 +46,7 @@ function taskFor(messageId: string, taskId: string, overrides: Partial<TaskRecor
     errorText: null,
     messageSeq: 0,
     historyEligible: true,
-    relayChannelType: null,
-    relayChannelId: null,
-    relayThreadName: null,
+    relaySuppressed: false,
     ...overrides,
   };
 }
@@ -81,9 +79,7 @@ test("重启准备把在途任务按接受顺序重排为 queued，并保留恢�
     accept(store, taskFor("m1", "t1"));
     expect(store.markStarted("t1")).toBe(true);
     accept(store, taskFor("m2", "t2", {
-      relayChannelType: 5,
-      relayChannelId: "thread-relay",
-      relayThreadName: "派发线程",
+      relaySuppressed: true,
       messageSeq: 7,
     }));
     accept(store, taskFor("m3", "t3"));
@@ -117,12 +113,10 @@ test("重启准备把在途任务按接受顺序重排为 queued，并保留恢�
     expect(store.isTaskResuming("t2")).toBe(false);
     expect(store.isTaskResuming("t3")).toBe(true);
     expect(store.getTask("t3")?.sessionId).toBe("session-live-t3");
-    // 接受时的顺序即恢复顺序，relay 元数据与消息序号随行保留。
+    // Task suppression and message sequence persist while restart recovery requeues the task.
     expect(store.listQueuedTasks().map((task) => task.id)).toEqual(["t1", "t2", "t3"]);
     expect(store.getTask("t2")).toMatchObject({
-      relayChannelType: 5,
-      relayChannelId: "thread-relay",
-      relayThreadName: "派发线程",
+      relaySuppressed: true,
       messageSeq: 7,
     });
     // 显式终态绝不再进入队列，也不被当成可续接的任务。

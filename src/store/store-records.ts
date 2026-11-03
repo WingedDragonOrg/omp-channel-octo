@@ -2,7 +2,7 @@
  * 持久层的记录类型：每张表在 TypeScript 侧的形状，被 store 门面与各领域模块共用。
  */
 
-import type { ChatAppendMode, ChatExecutionState, ChatTarget, TextMention, WorkerGoal, WorkerGoalRun, WorkerProcess } from "../contracts.ts";
+import type { ChatAppendMode, ChatExecutionState, ChatTarget, TextMention, ThreadListenLevel, WorkerGoal, WorkerGoalRun, WorkerProcess } from "../contracts.ts";
 
 export interface BindingRecord extends ChatTarget {
   botUid: string;
@@ -55,14 +55,28 @@ export interface TaskRecord extends ChatTarget {
   messageSeq: number;
   /** Whether group history accounting applies to this task and its triggering message. */
   historyEligible: boolean;
-  /**
-   * The completion relay a dispatch asked for (`thread-dispatch --notify`): when this task reaches
-   * a terminal state, one bounded notice goes to the chat that dispatched it. Null means no relay.
-   */
-  relayChannelType: 2 | 5 | null;
-  relayChannelId: string | null;
-  /** Thread display name captured at dispatch time for the notice; only set with a relay target. */
-  relayThreadName: string | null;
+  /** Completion notices are suppressed after a merge intent begins. */
+  relaySuppressed: boolean;
+}
+
+export interface ThreadListenRecord {
+  botUid: string;
+  channelId: string;
+  creatorChannelType: 2 | 5;
+  creatorChannelId: string;
+  threadName: string;
+  listen: ThreadListenLevel;
+  mergePending: boolean;
+}
+
+export interface ThreadMergeEventRecord {
+  id: string;
+  botUid: string;
+  channelId: string;
+  targetBranch: string;
+  commit: string | null;
+  removed: boolean;
+  archive: "scheduled" | "not-scheduled";
 }
 
 /** Persisted form of an accepted structured goal task; task.text is never its execution payload. */

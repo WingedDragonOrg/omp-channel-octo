@@ -1,144 +1,60 @@
-# 派发回传：thread-dispatch 的 notify 开关
+# 子区回传监听级别
 
-日期：2026-09-17
+日期：2026-11-02
 
-## 背景与目标
+## 目标与范围
 
-`thread-dispatch` 把一条任务交到子区后，任务在子区自己的聊天里结束，派发方不会知道结果。本次给派发加一个可选开关 `notify`：派发时由派发方自行判断这条手尾是否需要回报；开启后，该任务运行中到达终态（完成/失败/取消/中断）时，`CoreService` 向发起派发的聊天投递一条有界回传通知（合成入站消息 `notify:<子区任务 id>`），由该聊天的助手作为新输入处理，可以据此向本群反馈或继续处理。
+每个子区持久保存 `listen: off | merge | task`，默认 `merge`，回传目标为创建方聊天。策略在终态交付时读取，修改立即影响尚未结束的任务，跨重启保留。shared 工作区保持合并拒绝，因此默认没有自动回传；显式 task 可接收派发结果。
 
-回传是逐条派发的能力：登记随任务行持久化，重启后仍然有效；默认关闭。
+- off：不自动回传。
+- merge：仅宿主实际完成合并后回传一次。
+- task：派发产生独立任务时，完成、失败、取消、中断可回传；合并成功也回传。
+- 任意档位均不回传合并失败及其修复失败。停机挂起不是任务终态。
 
-## 范围
+## 工具契约
 
-### 包含
+`create-thread` 增加 `listen`（默认 merge），包括 single/shared/separate 与普通子区；separate 每个创建结果各自保存策略及同一创建方目标。`thread-listen` 使用既有 thread-* 定位方式，带 listen 修改，不带时查询。`thread-info` 同时报告策略。修改策略不修改创建方目标。
 
-- `thread-dispatch` 新增可选布尔参数 `notify`（默认 `false`）；派发成为独立任务时，回传目标（派发方聊天）与派发时捕获的子区名随任务行写入。
-- 派发任务运行中终态（`completed`/`failed`/`cancelled`/`interrupted`）的检测点，以及向派发方聊天的通知投递（并入运行中回合或成为其最新任务）。
-- 回传通知的有界文本模板与去重语义（每任务至多一条）。
-- 工具描述中的使用建议（何时开启），以及 `/thread` 交接指令里的同一建议。
-- 主规格、根 `AGENTS.md` 与测试同步。
+`thread-dispatch` 不再接受 notify。派发仍复用权限、深度限制、durable 接受、追加模式和收据；只有独立派发任务有自己的终态通知，steering 部分没有独立终态。已有任务级登记不参与决策。
 
-### 不包含
+## 持久化及迁移
 
-- 子区级 / 聊天级开关或默认值：没有「这个子区一律回传」的登记；由派发方逐条决定，默认关闭。
-- 频率上限与聚合：不设节流窗口、批量摘要或定时器；条数由派发方的判断控制。
-- 停机挂起本身不做结果回传；恢复后的真实终态照常回传。
-- 已被并入运行中回合的派发（没有独立任务行，回传不生效；工具结果与收据说明）。
-- 回传的发送回执与失败重试：投递失败只记一行日志。
-- 对既有任务补开或关闭回传的动作：需要回执的活重新派发时开启。
+新增子区策略表：bot + 子区 channel ID 唯一，保存创建方聊天、名称、listen、mergePending。新增合并成功事件表：稳定操作事件 ID、来源、目标分支、提交、宿主清理处置、归档排定结果，以及 pending / intent / delivered 的交付回执。事件交付复用稳定 synthetic inbound ID 去重；事件 ID 来自稳定操作身份，而不只按目标提交去重，以区分保留工作区后的不同合并尝试。
 
-## 已知约束
+移除 tasks 的 relay_channel_type / relay_channel_id / relay_thread_name 与 TaskRelayTarget。迁移事务先为已有子区建立 merge 策略，再删除旧列。已知旧回传目标仅作为历史来源信息迁移，不保留旧开关；缺少创建方记录的旧子区使用其真实父群。普通已有子区可在首次访问时按真实父群建立默认策略。旧 notify=true 在途任务统一遵循 merge。
 
-- Bot 自己发送的消息永不启动任务：回传必须有意旁路该规则。通知以合成 `InboundMessage` 经 `appendToRunningTask`/`acceptTask` 走与派发相同的 durable 入站路径，不经过 `handleInbound`，因此不触发权限门禁、不会成为待答问题的答案；`messageSeq = 0` 使其不参与群历史水位。
-- 任务终态由任务行落盘（`markCompleted`/`markFailed`/`markCancelled`/`markInterrupted`）。派发是显式交接：派发任务的入站消息 ID 带 `dispatch:` 前缀，派发深度固定为 1；被并入运行中回合的派发不产生任务行。
-- 只有 owner 能驱动 `octo_management`；回传内容单条有界，不含 token、原始工具参数/结果或协议载荷。
-- 同一任务至多通知一次：通知消息 ID 固定为 `notify:<子区任务 id>`，复用 `inbound` 的 durable claim 去重。
-- 旧版本的子区级登记表 `thread_notify` 在 schema 初始化时无条件删除（`DROP TABLE IF EXISTS`），没有读者。
+任务新增 relaySuppressed 标记；不再携带通知开关或目标。派发身份由既有 dispatch: 消息 ID 判断。
 
-## 关键决策
+## 合并事件单一归属与失败隔离
 
-| 决策 | 选择 | 理由 |
-| --- | --- | --- |
-| 开关形态 | `thread-dispatch` 的可选布尔 `notify`（默认 `false`） | 回传是派发方对自己手尾的要求；逐条决定贴合场景，默认关闭不会复现「几乎都开」 |
-| 通知目标 | 发起派发的聊天本身（群聊派发指向该群；子区派发指向该子区） | 回执落在做决定的地方，请求链可追溯 |
-| 消费语义 | 通知作为一条合成入站消息：派发方有可接收 steering 的运行中回合时并入该回合，否则成为其 durable 任务（恰好一次唤醒） | 与派发同构；「派发方助手收到」有明确机制，且一次通知只唤醒一次 |
-| 触发终态 | 运行中产生的 `completed`/`failed`/`cancelled`/`interrupted` | 终态才是有意义的结束点；失败、取消、中断各带独立语义行 |
-| 停止/重启 | 停机挂起期间不回传；恢复后任务的真实终态按原登记回传 | 停机不是任务结果；稳定通知 ID 防止重复回传 |
-| 并入回合的派发 | 不生效：没有任务行就没有登记；工具结果 `notify=skipped` 且收据说明 | 并入的内容随该回合结束，没有独立结束点可回传 |
-| 通知内容 | 有界结构化模板：来源及授权语义、子区身份、任务 id、状态、任务摘要（≤200 字符）、结果/失败原因/取消或中断说明（≤1500 字符）、关联性判断指引；子区名在派发时捕获 | 宿主提供来源与结果，助手根据当前任务判断相关性和是否回复；回传不等于用户答案或新增授权 |
-| 去重 | 通知消息 ID `notify:<子区任务 id>` + `inbound` claim | 同一任务至多一条通知；重启、重放都不重复 |
-| 持久化 | 任务行新增 `relay_channel_type`/`relay_channel_id`/`relay_thread_name`（null = 不登记） | 登记与任务同生命周期；恢复后继续使用原登记回传 |
-| 来源 | 只回传派发任务；子区内直接发出的消息、`/queue`、问答唤醒永不回传 | 人在子区里发消息说明人在场；回传只报告派出去的手尾 |
-| 频率 | 不设硬性上限；工具描述与 `/thread` 指令给出「派发后不再盯、又需要知道结果（含失败）时才开启」的建议 | 条数由派发方的判断控制，机制保持简单 |
-| 投递失败 | 只记 `[thread-notify] 回传投递失败 task=…` 一行日志 | 任务结果本身已在子区聊天；回传是尽力而为的增量 |
+合并成功事件的唯一发布者是宿主合并成功路径，不是 agent 的自然语言、任务 completed，也不是归档回调。当前入口为 host-tools 的 thread-merge，在 WorktreePort.merge 成功返回、资源记录更新及归档排定后调用 `HostToolHost.publishThreadMergeSuccess(target, summary, archive, operationId)`，由 CoreService 持久化并交付。真实 WorktreePort 从 Git common directory 读取合并后目标 ref 的提交；事件包含 summary.target、commit、summary.removed 与 archive=scheduled/not-scheduled。Worktrunk 的 removed=true 会启动后台清理，不能据此声称路径已消失，通知表述为「工作区清理：已排定」；removed=false 表述保留。归档同样只表述已排定或未排定。
 
-## 设计
+资格通过的 /thread merge 在交给 agent 前持久设置 mergePending；直接 thread-merge 在真实执行前设置，并将该子区在途任务标为 relaySuppressed，后续接受的修复任务继承此标记。mergePending 期间所有派发终态回传被抑制；成功后解除子区 pending，但这些任务自身标记不解除，防止合并任务结束再发普通结果。失败保持 pending，重启和后续修复失败均不唤醒父会话。资格拒绝不置 pending；shared 命令仍只有固定拒绝文案、零任务，直接 host 合并拒绝只抑制当前任务，不影响后续正常 task 档派发。
 
-### 工具与登记
+另一工作区的 host-first /thread merge 必须复用同一宿主事件所有者：原消息 ID 作为稳定 operationId，先调用 `replayThreadMergeSuccess(target, operationId)` 读取已有成功收据；未命中时在资格通过、实际执行前复用 `ensureThreadListen` / `beginThreadMerge`，成功完成合并及归档排定后仅调用同一 `publishThreadMergeSuccess(target, summary, archive, operationId)` 一次，不能从命令回执另发通知。host tool 的 operationId 为 task.id 与 native toolCallId 的组合，同一调用重试保持身份；旧协议缺少 toolCallId 时使用 task.id。已成功操作的重放不再次执行 wt、不改新操作的 pending。该集成不假设对方已经合入。
 
-- `thread-dispatch` 读取可选布尔 `notify`（非布尔值报 `notify must be a boolean`，在解析线程之前拒绝），默认 `false`。
-- 派发成为独立任务时：工具把 `{channelType, channelId, threadName}`（调用方聊天 + `getThread` 取到的线程名）交给投递路径，随任务行写入 `relay_*` 三列。工具结果 `notify: "registered"`，收据写「已在子区 … 作为独立任务执行；结束时将把结果回传到这里。」。
-- 派发被并入运行中回合时：没有任务行，回传不登记；工具结果 `notify: "skipped"`（附 `notify_note: 内容并入运行中回合，不会单独回传结果`），收据写「并入的这部分不会单独回传结果。」。
-- `create-thread` 不再有 `notify` 参数，`thread-delete` 不再清理任何登记（登记随任务行自然存在）。
+## 交付与内容
 
-### 检测点
+CoreService 持有实际交付：通知使用持久 owner 身份、messageSeq=0，经 appendToRunningTask / acceptTask 交付，不经过 pending ask 答案路径；在真实 worker.steer 与 durable task 接受之前重新检查当前策略、合并抑制及权限。停止期间不交付。合并事件 pending 表示尚未派发，可在恢复时继续；紧贴真实 RPC 之前持久记录 intent，接受状态不明的 intent 不自动重放；durable 接受、成功交付及 off 消费记 delivered。off 消费后的事件改档或重启不重放；稳定 inbound claim 防止重复。
 
-运行中终态统一从任务运行流程收集：任务收尾（`finally`）中读一次任务终态，属于四个终态即调用 `notifyThreadOutcome`；该路径覆盖运行期间的全部 settle（含 `/cancel` 与 `/interrupt`）。此外，排队取消、启动失败及启动恢复结算也负责回传：
+任务通知仅带来源子区、任务 ID、终态及固定必要说明，不附原始任务正文、agent 全文或原始错误载荷。合并通知仅带来源、事件身份、目标分支、提交、工作区清理状态及归档排定状态。所有可变字段有界。
 
-- `/cancel` 的排队任务在逐个 settle 之后回传（`cancelQueued` 中 `for (const taskId of queued) await this.notifyThreadOutcome(taskId)`）；
-- `runTask`/`runScheduledTask` 的启动前失败在任务落成 `failed` 并回复失败话术之后回传；旧 worker 未确认停止的目录保持 queued，不把等待当失败。
+保留来源与处理指引：系统回传不是用户新消息、问题答案或新增授权；接收 agent 自行判断与当前任务及待确认事项的关联，相关时说明补充或改变了什么，不相关时不混入当前结论，不自动切换工作。
 
-`start()` 经 `prepareTasksForRestart` 保留队列并恢复接受状态明确的任务；接受状态未知、因此落 interrupted 的任务明确回传，持久停止意图也按其真实终态结算。`stopping` 期间由 `notifyThreadOutcome` 守卫跳过；挂起任务不产生终态，恢复完成后才回传。
+## 验收
 
-### 投递
+1. 默认创建和旧数据库迁移后普通派发的所有终态无父聊天消息、任务或 steering，含旧 notify=true 在途任务。
+2. merge 仅真实合并成功回传一次；失败及后续修复失败均留在子区。
+3. off 不回传；task 覆盖派发四种终态与合并成功，合并任务及修复任务无旁路。
+4. create-thread/listen、thread-listen 查询修改和 thread-info 持久有效，跨重启保持，旧 notify 路径全部迁出。
+5. shared 默认静默，task 派发有效，合并仍拒绝。
+6. 内容有界且保留来源语义，ask、权限、去重、追加模式和归档顺序不变。
+7. 先用行为回归测试证明差异；迁移在抛弃式副本以真实 ChannelStore.open 演练并二次打开；隔离 Git/进程 smoke 验证实际合并及通知。运行相关测试、typecheck 与全量测试，不推送、合并或重启常驻服务，不向真实父群发送验收通知。
 
-`CoreService.notifyThreadOutcome(taskId)`：
+## 验收记录
 
-1. `stopping` 为真、bot 未就绪、任务不存在、`channelType !== 5`、`relay_channel_id`/`relay_channel_type` 为空、状态非四个终态之一 → 直接返回。
-2. 用任务行渲染通知文本，组装合成 `InboundMessage`：目标为任务行上的回传目标；`messageId = notify:<taskId>`；`senderId` 为持久 owner（缺失时回退 bot uid）；`messageSeq = 0`；`supported = true`；无附件与引用。
-3. `appendToRunningTask`（派发方有可接收 steering 的运行中回合时并入）→ 否则 `acceptTask`（成为派发方的最新任务）。
-4. 整体 try/catch：任何失败只记一行 `[thread-notify]` 日志，不重试。
-
-回传在任务收尾（`finally`）中于该任务的 runtime 注销之后、`maybeRunDeferredRestart` 之前发出：派发方与子区共享 cwd 时，任务不再被视作「排在这个运行中的回合之后」，因此不会多收一行「开始执行排队消息」回执；同时回传落成的排队任务仍会推迟已排定的重启。
-
-### 通知文本（逐字模板）
-
-```
-[子区任务回传] 「<派发时捕获的线程名>」的一条任务已结束。      ← 名字缺失时为「[子区任务回传] 一条子区任务已结束。」
-这是来自子区的系统回传通知，不是用户新消息、问题答案或新增授权。
-子区：short_id <short_id>；channel_id <channel_id>
-任务 ID：<任务 id>
-状态：已完成 | 失败 | 已取消 | 已中断
-任务：<任务正文 trim 后截 200 字符；空则省略本行>
-结果：<resultText trim 后截 1500 字符；空为「（无正文）」>            ← completed
-失败原因：<errorText trim 后截 1500 字符；空为「（未记录原因）」>      ← failed
-说明：任务已取消（不回滚已发生的副作用）。                           ← cancelled
-说明：<errorText trim 后截 1500 字符；空为「任务已中断。」>           ← interrupted
-
-请结合当前会话，自行判断此结果与正在处理的任务、待确认事项是否相关。
-相关时，说明它补充或改变了什么；子区结论不等于用户确认。
-不相关时，明确这是另一项任务的回报，不混入当前任务结论。
-由你决定如何处理及是否需要回复；不要仅因收到回传就切换当前工作。
-```
-
-截断均以 `…` 结尾（`bounded`）。
-
-### 模块与接口
-
-- `src/contracts.ts`：`TaskRelayTarget`（`channelType: 2 | 5`、`channelId`、`threadName`）。
-- `src/store/store-records.ts`：`TaskRecord` 新增 `relayChannelType`/`relayChannelId`/`relayThreadName`；`ThreadNotifyRecord` 删除。
-- `src/store/store-schema.ts`：`tasks` 三个新列、`thread_notify` 建表移除并在初始化时 `DROP TABLE IF EXISTS`；`taskFromRow` 解码新列。
-- `src/store/store-tasks.ts`：`acceptTask` 写入 relay 列。
-- `src/store/store-chats.ts` / `src/store/index.ts`：删除 `registerThreadNotify`/`getThreadNotify`/`clearThreadNotify` 与门面转发。
-- `src/threads/thread-notify.ts`：`threadOutcomeNotice(task)` 从任务行渲染（模板、`bounded`、`stateLabel`、`outcomeLine`）。
-- `src/host-tools.ts`：`thread-dispatch` 的 `notify` 参数与登记、收据、工具描述；`create-thread` 去掉 `notify`；`thread-delete` 去掉清理；投递接口接收 `TaskRelayTarget | null`。
-- `src/service.ts`：`acceptTask` 接收 relay 目标；`notifyThreadOutcome` 读任务行。
-- `src/commands/thread-commands.ts`：`threadIntentPrompt` 包含是否请求完成通知的判断建议。
-
-## 错误与边界情况
-
-- 通知投递失败（状态盘写入失败等）：只记日志，不重试。
-- 停机挂起期间不回传；恢复后的真实终态以及用户 `/cancel`、`/interrupt`、`ask` 等待超时照常回传。
-- 派发被并入运行中回合：不生成任务行与回传，工具结果与收据说明。
-- 子区被删除：已存在的任务行不受影响（迟到的结束仍如实报告）；期间不能产生新的登记。
-- 派发方聊天已被删除或不可达：通知仍按 durable 路径接受，后续投递由既有 outbox 语义处理。
-- 通知进入派发方时该聊天有待回答问题：不在答案路径上，问题保持待答。
-- 通知以 steering 并入运行中回合时，派发方照常得到一行「已并入当前回合」回执。
-- 任务正文或结果超长：分别截到 200/1500 字符并带 `…`。
-- 同一任务至多一条通知；重启、重放后不重复。
-- 旧版本子区级登记（`thread_notify` 表）随升级删除，不再回传；需要回执的活在新版本里重新派发时开启。
-
-## 验收标准
-
-1. `thread-dispatch notify=true` 且派发成为独立任务：任务行带上回传目标与子区名，工具结果 `notify=registered`、收据注明结束时回传。
-2. 派发任务 `completed`：派发方聊天恰好收到一条合成消息（消息 ID `notify:<任务 id>`），含状态与结果摘要；派发方空闲时成为其一个任务，运行中且可接收 steering 时并入该回合、不成为第二个 prompt。
-3. 派发任务运行中产生的 `failed`/`cancelled`/`interrupted`：各有一条对应语义的通知（`/cancel` 连排队的派发任务一并回传）。
-4. 服务停止只挂起在途任务，不产生结果回传；重启续接后的真实终态至多回传一次，接受状态未知而停止自动恢复时明确回传。
-5. 未带 `notify` 的派发与一切非派发来源的子区任务（直接发的消息、`/queue`）：不产生任何通知、额外回合或登记。
-6. 派发被并入运行中回合：不产生登记与回传，工具结果 `notify=skipped` 且收据说明。
-7. 同一任务至多一条通知；重启后登记保留，持久队列继续执行并回传，新派发照常回传，已通知的结果不重复。
-8. `bun run typecheck` 与 `bun test` 全绿；既有命令、派发与任务流程不回归。
-
-## 未决事项
-
-无。
+- `bun run typecheck` 通过；完整 `bun test` 为 1050 pass / 0 fail，77 个文件、6284 个断言。相关 listen、host tools、群历史、多项目、store、通知测试的独立运行是 87 pass / 0 fail。
+- 状态库使用 SQLite readonly backup 的一致性副本，经真实 ChannelStore.open 迁移并再次打开：501 条任务与既有任务列内容保持一致，26 条旧回传登记迁为来源信息，79 个子区全部默认 merge；19 张既有业务表行数和原 meta 内容保持，旧任务 relay 列已删除，integrity_check=ok。迁移回归在临时跳过迁移调用时按预期失败，恢复调用后通过。
+- 隔离真实 Git/Worktrunk 经 CoreService 和 host 工具完成两次成功合并：默认 merge 回传 1 次，off 回传 0 次，提交与真实目标 ref 一致；真实 rebase 冲突以及后续派发修复失败均 0 次父聊天输入，冲突时目标提交未变。最终通知为 712 UTF-8 bytes，清理和归档按真实排定状态表述。
+- `bun tests/benchmarks/restart.ts` 的 graceful 与 SIGKILL 两种离线真实进程场景通过：原任务续接 2、恢复排队任务 2、打断通报 0、会话重叠 0、重复副作用 0。
+- 本次只在隔离工作区实施，验收使用本地 transport/worker fixture；未向真实父群发送通知，未推送、合并或重启常驻服务。host-first 分支的后续集成遵循上文单一发布接口，本次未改其工作区。

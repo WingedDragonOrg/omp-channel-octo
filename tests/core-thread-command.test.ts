@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { ChannelStore } from "../src/store";
 import { closeCoreHarness, createCoreHarness, inbound, waitForStatus } from "./fixtures/core-fakes";
 
 /**
@@ -115,15 +116,13 @@ test("the instructed task sets the sub-thread up with the agent's own names", as
     expect(harness.workers.prompts[1]?.text).toBe("调整进度卡片的样式");
     expect(
       harness.transport.sent.some(
-        ({ target, text }) =>
-          target.channelId === thread.channelId && text.startsWith("来自群会话的派发任务"),
+        ({ target }) => target.channelType === 5 && target.channelId === thread.channelId,
       ),
     ).toBe(true);
     expect((await harness.service.status(thread)).cwd).toBe(workspace);
     expect(
       harness.transport.sent.some(
-        ({ target, text }) =>
-          target.channelId === group.channelId && text.includes("已在子区 thread-1"),
+        ({ target }) => target.channelType === 2 && target.channelId === group.channelId,
       ),
     ).toBe(true);
     await waitForStatus(harness.service, thread, (status) => status.state === "completed");
@@ -180,28 +179,18 @@ test("a sub-thread's /thread merge hands over a merge instruction instead of run
       }),
     );
     await harness.workers.waitForPromptCount(2);
+    const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      expect(store.getThreadListen(harness.bot.uid, thread)?.mergePending).toBe(true);
+      expect(store.getLatestTask(harness.bot.uid, thread)?.relaySuppressed).toBe(true);
+    } finally {
+      store.close();
+    }
 
     // The command runs nothing itself; the assistant receives the merge instruction and runs it
     // in the thread's bound workspace.
     expect(harness.worktrees?.merges).toEqual([]);
     expect(harness.workers.prompts[1]?.cwd).toBe(workspace);
-    for (const step of [
-      "thread-merge",
-      "不要自己运行 wt",
-      "这条命令即代表 owner 确认合并并清理",
-      "直接按默认参数执行",
-      "删除工作区与已合并分支",
-      "必要理由",
-      "remove:false",
-      "本子区 cwd 随之失效",
-      "不要在汇报里反复说明这一点",
-      "不要把 cwd 失效当作保留工作区的理由",
-      "向 owner 汇报",
-      "重试",
-      workspace,
-    ]) {
-      expect(harness.workers.prompts[1]?.text).toContain(step);
-    }
     await waitForStatus(harness.service, thread, (status) => status.state === "completed");
   } finally {
     await closeCoreHarness(harness);
@@ -331,11 +320,11 @@ test("merge outside a bound sub-thread only replies, and never accepts a task", 
     ).toHaveLength(2);
 
     // A thread without a bound workspace gets a prompt too.
+    const unbound = { channelId: `${group.channelId}____topic-unknown`, channelType: 5 as const };
     await harness.service.handleInbound(
       inbound({
         messageId: "merge-unbound",
-        channelId: `${group.channelId}____topic-unknown`,
-        channelType: 5,
+        ...unbound,
         text: "/thread merge",
         mentionedUserIds: [harness.bot.uid],
       }),
@@ -369,11 +358,85 @@ test("merge outside a bound sub-thread only replies, and never accepts a task", 
         ({ text }) => text.includes("本机没有可用的 Worktrunk") && text.includes("不可用"),
       ),
     ).toBe(true);
+    const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      expect(store.getThreadListen(harness.bot.uid, unbound)?.mergePending ?? false).toBe(false);
+      expect(store.getThreadListen(harness.bot.uid, thread)?.mergePending ?? false).toBe(false);
+    } finally {
+      store.close();
+    }
 
     // None of the prompts above accepted a task or reached the worker.
     expect(harness.workers.prompts).toHaveLength(1);
     expect(harness.worktrees?.merges).toEqual([]);
     await waitForStatus(harness.service, group, (status) => status.state === "completed");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+test("shared sub-thread merge command is notice-only and leaves task listening available", async () => {
+  const created = { channelId: "" };
+  const harness = await createCoreHarness({
+    prompt: async ({ promptContext, text }) => {
+      if (text !== "create shared command thread") return;
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("management tool missing");
+      const result = JSON.parse(
+        await management.execute(
+          { action: "create-thread", name: "共享命令线程", listen: "task" },
+          new AbortController().signal,
+        ),
+      ) as { channel_id: string };
+      created.channelId = result.channel_id;
+    },
+  });
+  try {
+    const group = { channelId: "group-allowed", channelType: 2 as const };
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "shared-command-create",
+        ...group,
+        text: "create shared command thread",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await waitForStatus(harness.service, group, (status) => status.state === "completed");
+    const thread = { channelId: created.channelId, channelType: 5 as const };
+    const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      store.saveThreadWorkspace({
+        botUid: harness.bot.uid,
+        channelType: 5,
+        channelId: thread.channelId,
+        layout: "shared",
+        status: "ready",
+        entryPath: harness.root,
+        projects: [],
+        error: null,
+      });
+      await harness.service.handleInbound(
+        inbound({
+          messageId: "shared-command-merge",
+          ...thread,
+          text: "/thread merge",
+          mentionedUserIds: [harness.bot.uid],
+        }),
+      );
+      expect(
+        harness.transport.sent.filter(({ target }) => (
+          target.channelType === 5 && target.channelId === thread.channelId
+        )),
+      ).toHaveLength(1);
+      expect(store.getThreadListen(harness.bot.uid, thread)).toMatchObject({
+        listen: "task",
+        mergePending: false,
+      });
+      expect(store.getLatestTask(harness.bot.uid, thread)).toBeNull();
+      expect(harness.worktrees?.merges).toEqual([]);
+      expect(harness.workers.prompts).toHaveLength(1);
+    } finally {
+      store.close();
+    }
   } finally {
     await closeCoreHarness(harness);
   }

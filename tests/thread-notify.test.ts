@@ -1,6 +1,11 @@
 import { expect, test } from "bun:test";
-import type { TaskRecord } from "../src/store/store-records";
-import { threadNotifyMessageId, threadOutcomeNotice } from "../src/threads/thread-notify";
+import type { TaskRecord, ThreadMergeEventRecord } from "../src/store/store-records";
+import {
+  threadMergeMessageId,
+  threadMergeNotice,
+  threadNotifyMessageId,
+  threadOutcomeNotice,
+} from "../src/threads/thread-notify";
 
 function task(overrides: Partial<TaskRecord> = {}): TaskRecord {
   return {
@@ -10,56 +15,80 @@ function task(overrides: Partial<TaskRecord> = {}): TaskRecord {
     channelType: 5,
     messageId: "dispatch:1",
     senderId: "owner-1",
-    text: "检查部署状态",
+    text: "PRIVATE_TASK_SECRET",
     sessionId: "session-1",
     cwd: "/tmp/work",
     state: "completed",
-    resultText: "部署正常",
+    resultText: "PRIVATE_RESULT_SECRET",
     errorText: null,
     messageSeq: 0,
     historyEligible: false,
-    relayChannelType: 2,
-    relayChannelId: "group-a",
-    relayThreadName: "回传线程",
+    relaySuppressed: false,
     ...overrides,
   };
 }
 
-test("the notice names the thread, the task, the state, and the outcome", () => {
-  const notice = threadOutcomeNotice(task());
+test("task notices carry stable identity and terminal state but no task or result content", () => {
+  const notice = threadOutcomeNotice(task(), "回传线程");
   expect(notice).toContain("short_id short-9");
   expect(notice).toContain("channel_id group-a____short-9");
   expect(notice).toContain("任务 ID：task-1");
   expect(notice).toContain("状态：已完成");
-  expect(notice).toContain("任务：检查部署状态");
-  expect(notice).toContain("结果：部署正常");
+  expect(notice).toContain("说明：派发任务已完成。");
+  expect(notice).not.toContain("PRIVATE_TASK_SECRET");
+  expect(notice).not.toContain("PRIVATE_RESULT_SECRET");
   expect(threadNotifyMessageId("task-1")).toBe("notify:task-1");
-  expect(threadNotifyMessageId("task-1")).toContain("task-1");
 });
 
-test("failed, cancelled and interrupted outcomes carry their own lines", () => {
+test("each failed, cancelled and interrupted terminal outcome is a fixed summary", () => {
+  const failed = threadOutcomeNotice(
+    task({ state: "failed", resultText: null, errorText: "PRIVATE_ERROR_SECRET" }),
+    "回传线程",
+  );
+  expect(failed).toContain("状态：失败");
+  expect(failed).toContain("说明：派发任务失败。");
+  expect(failed).not.toContain("PRIVATE_ERROR_SECRET");
   expect(
-    threadOutcomeNotice(task({ state: "failed", resultText: null, errorText: "worker failed" })),
-  ).toContain("失败原因：worker failed");
-  expect(
-    threadOutcomeNotice(task({ state: "cancelled", resultText: null })),
-  ).toContain("说明：任务已取消（不回滚已发生的副作用）。");
+    threadOutcomeNotice(task({ state: "cancelled", resultText: null }), "回传线程"),
+  ).toContain("说明：派发任务已取消。");
   expect(
     threadOutcomeNotice(
-      task({ state: "interrupted", resultText: null, errorText: "用户中断当前回合" }),
+      task({ state: "interrupted", resultText: null, errorText: "PRIVATE_STOP_REASON" }),
+      "回传线程",
     ),
-  ).toContain("说明：用户中断当前回合");
-  expect(threadOutcomeNotice(task({ resultText: null }))).toContain("结果：（无正文）");
-  expect(threadOutcomeNotice(task({ text: "  " }))).not.toContain("任务：");
+  ).toContain("说明：派发任务已中断。");
 });
 
-test("long task text and outcome text are cut to their caps with an explicit marker", () => {
+test("merge summaries expose a stable event identity and actual target disposition", () => {
+  const event: ThreadMergeEventRecord = {
+    id: "merge-event-1",
+    botUid: "bot-1",
+    channelId: "group-a____short-9",
+    targetBranch: "release/next",
+    commit: "0123456789abcdef",
+    removed: true,
+    archive: "scheduled",
+  };
+  const notice = threadMergeNotice(event, "回传线程");
+  expect(threadMergeMessageId(event.id)).toBe("merge-notify:merge-event-1");
+  expect(notice).toContain("目标分支：release/next");
+  expect(notice).toContain("目标提交：0123456789abcdef");
+  expect(notice).toContain("工作区清理：已排定");
+  expect(notice).toContain("归档处置：已排定");
+  expect(threadMergeNotice({ ...event, removed: false }, "回传线程")).toContain("工作区清理：保留");
+});
+
+test("untrusted task fields do not appear in bounded task summaries", () => {
   const notice = threadOutcomeNotice(
-    task({ text: "任".repeat(300), resultText: "果".repeat(2_000) }),
+    task({
+      text: "LONG_TASK_SECRET".repeat(200),
+      resultText: "LONG_RESULT_SECRET".repeat(200),
+      errorText: "LONG_ERROR_SECRET".repeat(200),
+    }),
+    "子区".repeat(200),
   );
-  const lines = notice.split("\n");
-  const taskLine = lines.find((line) => line.startsWith("任务：")) ?? "";
-  const resultLine = lines.find((line) => line.startsWith("结果：")) ?? "";
-  expect(taskLine).toBe(`任务：${"任".repeat(200)}…`);
-  expect(resultLine).toBe(`结果：${"果".repeat(1_500)}…`);
+  expect(notice).not.toContain("LONG_TASK_SECRET");
+  expect(notice).not.toContain("LONG_RESULT_SECRET");
+  expect(notice).not.toContain("LONG_ERROR_SECRET");
+  expect(notice.length).toBeLessThan(2_000);
 });

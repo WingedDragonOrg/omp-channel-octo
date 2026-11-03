@@ -38,9 +38,7 @@ const THREAD_MERGE_MULTI_PROJECT_TEXT = "当前为多项目工作区，不支持
  * clarification round, so the thread generates the SDD and starts at once; anything else is
  * dispatched after at most the few SDD-shaped answers it takes to hand it over, with the remaining
  * clarification left to the thread (guided by a clarification skill when the environment has one).
- * Detailed clarification never happens in the originating chat. The dispatch's `notify` flag stays
- * the assistant's own judgment: it asks for a completion relay only for hand-offs it will not keep
- * watching.
+ * Completion notices follow the persisted listen policy for the target thread.
  */
 function threadIntentPrompt(intent: string): string {
   return [
@@ -53,7 +51,7 @@ function threadIntentPrompt(intent: string): string {
     "- 需求简单或非常明确时，保留全部意图并按 SDD 格式写清，让子区直接生成 SDD 并立刻开工；",
     "- 否则先按 SDD 要素写已知信息，并在子区内用最少问答补齐 owner 决策，必要时引导使用 spec-design 等技能；详细的需求澄清在子区内进行，不要留在当前会话。",
     "background 不要在 dispatch 时重写；SDD、任务细节和验收标准只放在派发正文。",
-    "只在你派发后不会继续关注且需要终态回报时设置 notify=true；否则默认 false。",
+    "派发后的完成与合并摘要由子区持久化 listen 策略控制。",
     "完成后简要汇报子区名称、short_id 与真实工作区路径。",
     "",
     "原始意图：",
@@ -101,8 +99,8 @@ function threadMergePrompt(workspacePath: string, note: string): string {
     "要保留工作区时必须说明必要理由，并显式传 remove:false；目标分支等其他参数确有需要时同样显式传入并说明理由。",
     "工作区被删除后本子区 cwd 随之失效，这是该命令的既定结果、owner 已知：不要在汇报里反复说明这一点，也不要把 cwd 失效当作保留工作区的理由——保留工作区的必要理由应是尚未收尾的具体工作（例如部署、验收）。",
     "合并由宿主执行：调用 octo_management 的 thread-merge 动作，不要自己运行 wt。",
-    "合并成功后宿主会按默认 pipeline 自动排定归档本子区（在本回合最后一条回复送达后执行），不要自己再调 thread-archive；显式保留工作区时不会归档。向 owner 汇报时说明这一处置即可。",
-    "成功后向 owner 汇报目标分支与结果细节；失败时（例如 rebase 冲突或 pre-merge 检查失败）先在本子区处置再重试，并把最终结果告诉 owner。",
+    "合并成功后宿主按本子区当前 listen 策略向创建聊天回传单一摘要；默认 pipeline 会排定在本回合最后一条回复送达后归档，不要自行再调 thread-archive。",
+    "成功后在本子区说明目标分支与处置即可；失败时（例如 rebase 冲突或 pre-merge 检查失败）只在本子区修复再重试，不向创建聊天发失败或修复通知。",
     ...(note.length === 0 ? [] : ["", "owner 补充说明：", note]),
     "",
     "隔离工作区：",
@@ -118,6 +116,10 @@ function threadMergePrompt(workspacePath: string, note: string): string {
  */
 export interface ThreadCommandsDeps {
   readonly store: Pick<ChannelStore, "getBinding" | "getThreadWorkspace" | "releaseClaim">;
+  /** Ensures creation provenance/default policy before a merge-intent mutation. */
+  readonly ensureThreadListen: (message: InboundMessage) => Promise<void>;
+  /** A confirmed merge intent suppresses task notices until a successful merge event is saved. */
+  readonly beginThreadMerge: (message: InboundMessage) => void;
   /** 阻止未就绪或已缺失工作区的命令改写当前回合或创建任务。 */
   readonly refuseIncompleteThreadWorkspace: (message: InboundMessage) => Promise<boolean>;
   /** 绑定行按键的 bot 身份；start 之前不存在，命令只在 start 之后到达。 */
@@ -222,6 +224,8 @@ export class ThreadCommands {
       );
       return;
     }
+    await this.deps.ensureThreadListen(message);
+    this.deps.beginThreadMerge(message);
     this.deps.store.releaseClaim(this.deps.commandClaim(message, "thread"));
     await this.deps.withMessageTyping(message, async () => {
       const body = threadMergePrompt(binding.cwd, mergeNote);

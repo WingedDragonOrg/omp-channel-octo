@@ -1,5 +1,5 @@
 import { expect, test, vi } from "bun:test";
-import { mkdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ThreadSummary } from "../src/contracts";
 import { ChannelStore } from "../src/store";
@@ -241,12 +241,14 @@ test("thread dispatch resolves management actions to the parent group and curren
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, THREAD_TOOLS, (status) => status.state === "completed");
 
-    expect(harness.transport.managementCalls).toEqual([
-      { action: "thread-members", groupId: "group-tools", shortId: "topic-7" },
-      { action: "thread-info", groupId: "group-tools", shortId: "topic-7" },
-      { action: "list-threads", groupId: "group-tools", shortId: null },
-      { action: "thread-delete", groupId: "group-tools", shortId: "topic-7" },
-    ]);
+    expect(harness.transport.managementCalls).toEqual(
+      expect.arrayContaining([
+        { action: "thread-members", groupId: "group-tools", shortId: "topic-7" },
+        { action: "thread-info", groupId: "group-tools", shortId: "topic-7" },
+        { action: "list-threads", groupId: "group-tools", shortId: null },
+        { action: "thread-delete", groupId: "group-tools", shortId: "topic-7" },
+      ]),
+    );
     const effects = await readText(join(cwd, "thread-tools.log"));
     expect(effects).toContain(`topic-7|${THREAD_CHANNEL_ID}|Topic seven|1|`);
     expect(effects).toContain("已删除线程 topic-7");
@@ -560,20 +562,30 @@ test("thread dispatch queues the task in the target thread and reports it in bot
     expect(lines[0]).toBe(`group|true|true|queued|thread-1|${dispatchedChannelId}|${cwd}`);
     expect(lines[1]).toBe(`thread|false|检查部署状态|${cwd}`);
     expect(harness.workers.prompts[1]?.cwd).toBe(cwd);
-    const handoff = harness.transport.sent.filter(
-      ({ text }) => text.startsWith("来自群会话的派发任务") || text.startsWith("已在子区 "),
+    expect(
+      harness.transport.sent.some(
+        ({ target, text }) =>
+          target.channelType === 5
+          && target.channelId === dispatchedChannelId
+          && text.includes("检查部署状态"),
+      ),
+    ).toBe(true);
+    expect(
+      harness.transport.sent.some(
+        ({ target, text }) =>
+          target.channelType === 2
+          && target.channelId === GROUP_TOOLS.channelId
+          && text.includes(dispatchedChannelId),
+      ),
+    ).toBe(true);
+    expect(harness.transport.managementCalls).toEqual(
+      expect.arrayContaining([
+        { action: "group-members", groupId: "group-tools", shortId: null },
+        { action: "create-thread", groupId: "group-tools", shortId: null },
+        { action: "thread-info", groupId: "group-tools", shortId: "thread-1" },
+        { action: "thread-members", groupId: "group-tools", shortId: "thread-1" },
+      ]),
     );
-    expect(handoff.map(({ target, text }) => `${target.channelType}:${target.channelId}|${text}`))
-      .toEqual([
-        `5:${dispatchedChannelId}|来自群会话的派发任务：\n\n检查部署状态`,
-        `2:group-tools|已在子区 thread-1（${dispatchedChannelId}）作为独立任务执行。`,
-      ]);
-    expect(harness.transport.managementCalls).toEqual([
-      { action: "group-members", groupId: "group-tools", shortId: null },
-      { action: "create-thread", groupId: "group-tools", shortId: null },
-      { action: "thread-info", groupId: "group-tools", shortId: "thread-1" },
-      { action: "thread-members", groupId: "group-tools", shortId: "thread-1" },
-    ]);
   } finally {
     await closeCoreHarness(harness);
   }
@@ -654,10 +666,20 @@ test("a dispatch into a queue-mode thread lands as its own task, never an answer
     ]);
     expect(await readText(join(threadCwd, "queue-mode.log"))).toBe("");
     expect(
-      harness.transport.sent.some(({ text }) => text === "已在子区 topic-7（group-tools____topic-7）作为独立任务执行。"),
+      harness.transport.sent.some(
+        ({ target, text }) =>
+          target.channelType === 2
+          && target.channelId === GROUP_TOOLS.channelId
+          && text.includes("topic-7"),
+      ),
     ).toBe(true);
     expect(
-      harness.transport.sent.some(({ text }) => text.startsWith("来自群会话的派发任务")),
+      harness.transport.sent.some(
+        ({ target, text }) =>
+          target.channelType === 5
+          && target.channelId === THREAD_TOOLS.channelId
+          && text.includes("第二件事"),
+      ),
     ).toBe(true);
   } finally {
     threadRelease.resolve();
@@ -852,72 +874,15 @@ test("create-thread worktree_name leaves failed workspace non-dispatchable", asy
     expect(harness.transport.sent.some(({ text }) =>
       text === "当前子区工作区未就绪或资源已缺失，未接收任务。"
     )).toBe(true);
-  } finally {
-    await closeCoreHarness(harness);
-  }
-});
-
-test("thread-dispatch notify registers a completion relay on the dispatched task", async () => {
-  const relaySeen = Promise.withResolvers<void>();
-  const harness = await createCoreHarness({
-    prompt: async ({ append, promptContext, text }) => {
-      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
-      if (!management) throw new Error("management tool missing");
-      const signal = new AbortController().signal;
-      if (text === "handoff with notify") {
-        const created = JSON.parse(
-          await management.execute({ action: "create-thread", name: "回传线程" }, signal),
-        ) as { short_id: string; channel_id: string };
-        const registered = JSON.parse(
-          await management.execute(
-            { action: "thread-dispatch", short_id: created.short_id, text: "检查部署状态", notify: true },
-            signal,
-          ),
-        ) as { delivery: string; notify?: string };
-        const rejected = await management
-          .execute({ action: "thread-dispatch", short_id: created.short_id, text: "第三条", notify: "yes" }, signal)
-          .then(() => "resolved")
-          .catch((error: Error) => error.message);
-        await append("notify.log", `${registered.delivery}|${registered.notify}|${rejected}\n`);
-        return;
-      }
-      if (text.startsWith("[子区任务回传]")) {
-        await append("notify.log", "relay\n");
-        relaySeen.resolve();
-        return;
-      }
-      await append("notify.log", `thread:${text}\n`);
-    },
-  });
-  try {
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "notify-handoff",
-        ...GROUP_TOOLS,
-        text: "handoff with notify",
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    await relaySeen.promise;
-
-    expect(await readText(join(harness.root, "tmp", "notify.log"))).toBe(
-      "queued|registered|notify must be a boolean\nthread:检查部署状态\nrelay\n",
-    );
-    expect(
-      harness.transport.sent.some(
-        ({ text }) =>
-          text === "已在子区 thread-1（group-tools____thread-1）作为独立任务执行；结束时将把结果回传到这里。",
-      ),
-    ).toBe(true);
-
     const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
     try {
       expect(
-        store.getLatestTask(harness.bot.uid, { channelId: "group-tools____thread-1", channelType: 5 }),
+        store.getThreadListen(harness.bot.uid, { channelId: thread.channelId, channelType: 5 }),
       ).toMatchObject({
-        relayChannelType: 2,
-        relayChannelId: "group-tools",
-        relayThreadName: "回传线程",
+        listen: "merge",
+        creatorChannelType: 2,
+        creatorChannelId: GROUP_TOOLS.channelId,
+        threadName: "no workspace",
       });
     } finally {
       store.close();
@@ -927,7 +892,91 @@ test("thread-dispatch notify registers a completion relay on the dispatched task
   }
 });
 
-test("a steered dispatch reports its requested notify as skipped", async () => {
+test("thread-listen query and update persist the policy used by dispatched tasks", async () => {
+  const relaySeen = Promise.withResolvers<void>();
+  const createdChannel = { channelId: "" };
+  const harness = await createCoreHarness({
+    prompt: async ({ append, promptContext, text }) => {
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("management tool missing");
+      const signal = new AbortController().signal;
+      if (text === "handoff with listen") {
+        const created = JSON.parse(
+          await management.execute({ action: "create-thread", name: "监听线程" }, signal),
+        ) as { short_id: string; channel_id: string };
+        createdChannel.channelId = created.channel_id;
+        const before = JSON.parse(
+          await management.execute(
+            { action: "thread-listen", short_id: created.short_id },
+            signal,
+          ),
+        ) as { listen: string };
+        const updated = JSON.parse(
+          await management.execute(
+            { action: "thread-listen", short_id: created.short_id, listen: "task" },
+            signal,
+          ),
+        ) as { listen: string };
+        const info = JSON.parse(
+          await management.execute(
+            { action: "thread-info", short_id: created.short_id },
+            signal,
+          ),
+        ) as { listen: string };
+        const dispatched = JSON.parse(
+          await management.execute(
+            { action: "thread-dispatch", short_id: created.short_id, text: "检查部署状态" },
+            signal,
+          ),
+        ) as { delivery: string };
+        await append(
+          "listen.log",
+          `${before.listen}|${updated.listen}|${info.listen}|${dispatched.delivery}\n`,
+        );
+        return;
+      }
+      if (text.startsWith("[子区任务回传]")) {
+        await append("listen.log", "task-notice\n");
+        relaySeen.resolve();
+        return;
+      }
+      await append("listen.log", `thread:${text}\n`);
+    },
+  });
+  try {
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "listen-handoff",
+        ...GROUP_TOOLS,
+        text: "handoff with listen",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await relaySeen.promise;
+
+    expect(await readText(join(harness.root, "tmp", "listen.log"))).toBe(
+      "merge|task|task|queued\nthread:检查部署状态\ntask-notice\n",
+    );
+    const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      const task = store.getLatestTask(harness.bot.uid, {
+        channelId: createdChannel.channelId,
+        channelType: 5,
+      });
+      expect(task?.relaySuppressed).toBe(false);
+      expect(
+        store.getThreadListen(harness.bot.uid, { channelId: createdChannel.channelId, channelType: 5 })?.listen,
+      ).toBe("task");
+      expect(store.getLatestTask(harness.bot.uid, GROUP_TOOLS)?.messageId).toBe(`notify:${task?.id}`);
+    } finally {
+      store.close();
+    }
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a steered dispatch keeps using the running thread without creating a completion task", async () => {
   const threadStarted = Promise.withResolvers<void>();
   const threadRelease = Promise.withResolvers<void>();
   const harness = await createCoreHarness({
@@ -939,11 +988,11 @@ test("a steered dispatch reports its requested notify as skipped", async () => {
           waitForAppend().then((appended) => `steered:${appended.text}`),
           threadRelease.promise.then(() => "closed"),
         ]);
-        await append("steer-notify.log", `${joined}\n`);
+        await append("steer-listen.log", `${joined}\n`);
         await threadRelease.promise;
         return;
       }
-      await append("steer-notify.log", `task:${text}\n`);
+      await append("steer-listen.log", `task:${text}\n`);
     },
   });
   try {
@@ -953,40 +1002,41 @@ test("a steered dispatch reports its requested notify as skipped", async () => {
     await mkdir(threadCwd, { recursive: true });
     harness.transport.setThreads("group-tools", [threadRecord("topic-7")]);
     await harness.service.handleInbound(
-      inbound({ messageId: "steer-notify-group-bind", ...GROUP_TOOLS, text: `/new ${groupCwd}`, mentionedUserIds: [harness.bot.uid] }),
+      inbound({ messageId: "steer-listen-group-bind", ...GROUP_TOOLS, text: `/new ${groupCwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
     await harness.service.handleInbound(
-      inbound({ messageId: "steer-notify-thread-bind", ...THREAD_TOOLS, text: `/new ${threadCwd}`, mentionedUserIds: [harness.bot.uid] }),
+      inbound({ messageId: "steer-listen-thread-bind", ...THREAD_TOOLS, text: `/new ${threadCwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
     const held = harness.service.handleInbound(
-      inbound({ messageId: "steer-notify-hold", ...THREAD_TOOLS, text: "hold the thread", mentionedUserIds: [harness.bot.uid] }),
+      inbound({ messageId: "steer-listen-hold", ...THREAD_TOOLS, text: "hold the thread", mentionedUserIds: [harness.bot.uid] }),
     );
     await threadStarted.promise;
     await harness.workers.waitForPromptCount(1);
     await harness.service.handleInbound(
-      inbound({ messageId: "steer-notify-work", ...GROUP_TOOLS, text: "handoff into the running topic", mentionedUserIds: [harness.bot.uid] }),
+      inbound({ messageId: "steer-listen-work", ...GROUP_TOOLS, text: "handoff into the running topic", mentionedUserIds: [harness.bot.uid] }),
     );
     await harness.workers.waitForPromptCount(2);
     const management = (harness.workers.prompts[1]?.promptContext?.tools ?? []).find(
       ({ name }) => name === "octo_management",
     );
     if (!management) throw new Error("management tool missing");
+    await management.execute(
+      { action: "thread-listen", short_id: "topic-7", listen: "task" },
+      new AbortController().signal,
+    );
     const dispatched = JSON.parse(
       await management.execute(
-        { action: "thread-dispatch", short_id: "topic-7", text: "第二件事", notify: true },
+        { action: "thread-dispatch", short_id: "topic-7", text: "第二件事" },
         new AbortController().signal,
       ),
-    ) as { delivery: string; notify?: string; notify_note?: string };
+    ) as { delivery: string };
 
-    // steer mode: the running turn takes it as steering, so there is no task row to carry a relay.
     expect(dispatched.delivery).toBe("steered");
-    expect(dispatched.notify).toBe("skipped");
-    expect(dispatched.notify_note).toContain("不会单独回传");
     expect((await harness.service.status(THREAD_TOOLS)).queued).toBe(0);
     expect(
       harness.transport.sent.some(
         ({ text }) =>
-          text === "已把任务并入线程 topic-7（group-tools____topic-7）的运行中回合；并入的这部分不会单独回传结果。",
+          text === "已把任务并入线程 topic-7（group-tools____topic-7）的运行中回合。",
       ),
     ).toBe(true);
 
@@ -997,11 +1047,11 @@ test("a steered dispatch reports its requested notify as skipped", async () => {
     const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
     try {
       expect(store.getLatestTask(harness.bot.uid, GROUP_TOOLS)?.messageId.startsWith("notify:")).toBe(false);
-      expect(store.getLatestTask(harness.bot.uid, THREAD_TOOLS)?.relayChannelId).toBeNull();
+      expect(store.getLatestTask(harness.bot.uid, THREAD_TOOLS)?.relaySuppressed).toBe(false);
     } finally {
       store.close();
     }
-    expect(await readText(join(threadCwd, "steer-notify.log"))).toBe("steered:第二件事\n");
+    expect(await readText(join(threadCwd, "steer-listen.log"))).toBe("steered:第二件事\n");
   } finally {
     threadRelease.resolve();
     await closeCoreHarness(harness);
@@ -1010,9 +1060,17 @@ test("a steered dispatch reports its requested notify as skipped", async () => {
 
 test("thread-merge merges the bound workspace through the port and reports wt's result", async () => {
   const log: string[] = [];
+  const mergeNoticeSeen = Promise.withResolvers<void>();
+  let mergeCallCount = 0;
+  const secondMergeFinished = Promise.withResolvers<void>();
   const harness = await createCoreHarness({
     prompt: async ({ promptContext, text }) => {
       const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (text.startsWith("[子区合并回传]")) {
+        log.push(`merge-notice:${text}\n`);
+        mergeNoticeSeen.resolve();
+        return;
+      }
       if (!management) throw new Error("management tool missing");
       const signal = new AbortController().signal;
       if (text === "create the merge thread") {
@@ -1026,11 +1084,22 @@ test("thread-merge merges the bound workspace through the port and reports wt's 
         return;
       }
       if (text === "merge with parameters") {
+        const mergeOperationId = `merge-call-${++mergeCallCount}`;
         const result = await management.execute(
           { action: "thread-merge", target: "release-1", remove: false },
           signal,
+          mergeOperationId,
         );
         log.push(`merged:${result}\n`);
+        if (mergeCallCount === 2) {
+          const replay = await management.execute(
+            { action: "thread-merge", target: "release-1", remove: false },
+            signal,
+            mergeOperationId,
+          );
+          log.push(`replayed:${replay}\n`);
+          secondMergeFinished.resolve();
+        }
         return;
       }
       if (text === "merge with a bad stage") {
@@ -1082,10 +1151,47 @@ test("thread-merge merges the bound workspace through the port and reports wt's 
     );
     await harness.workers.waitForPromptCount(2);
     await waitForStatus(harness.service, thread, (status) => status.state === "completed");
+    await mergeNoticeSeen.promise;
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "merge-run-again",
+        ...thread,
+        text: "merge with parameters",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await secondMergeFinished.promise;
+    await waitForStatus(harness.service, thread, (status) => status.state === "completed");
+    const replayReceipt = log
+      .find((line) => line.startsWith("replayed:"))
+      ?.slice("replayed:".length);
+    expect(JSON.parse(replayReceipt ?? "{}")).toMatchObject({
+      merged: true,
+      replayed: true,
+      target: "release-1",
+      commit: null,
+      removed: false,
+      archive: "not-scheduled",
+    });
+    expect(log.join("\n")).toContain("目标分支：release-1");
+    expect(log.join("\n")).toContain("目标提交：（未记录）");
 
     // The workspace's own directory goes to the port; wt's defaults are left alone except for the
     // caller's parameters, and the tool result carries wt's result object back to the agent.
-    expect(worktrees.merges).toEqual([{ cwd: workspace, target: "release-1", remove: false }]);
+    expect(worktrees.merges).toEqual([
+      { cwd: workspace, target: "release-1", remove: false },
+      { cwd: workspace, target: "release-1", remove: false },
+    ]);
+    const mergeStore = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      const events = mergeStore.listThreadMergeEvents(harness.bot.uid);
+      expect(events).toHaveLength(2);
+      expect(new Set(events.map(({ id }) => id)).size).toBe(2);
+      expect(events.map(({ commit }) => commit)).toEqual([null, null]);
+      expect(mergeStore.getThreadListen(harness.bot.uid, thread)?.mergePending).toBe(false);
+    } finally {
+      mergeStore.close();
+    }
     expect(log.join("\n")).toContain(
       'merged:{"merged":true,"branch":"fixture-branch","target":"release-1","squashed":true,"rebased":true,"committed":true,"removed":false}',
     );
@@ -1101,6 +1207,14 @@ test("thread-merge merges the bound workspace through the port and reports wt's 
     );
     await harness.workers.waitForPromptCount(3);
     await waitForStatus(harness.service, thread, (status) => status.state === "completed");
+    const qualificationStore = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      expect(qualificationStore.getThreadListen(harness.bot.uid, thread)?.mergePending).toBe(false);
+      expect(qualificationStore.getLatestTask(harness.bot.uid, thread)?.relaySuppressed).toBe(true);
+      expect(qualificationStore.listThreadMergeEvents(harness.bot.uid)).toHaveLength(2);
+    } finally {
+      qualificationStore.close();
+    }
     await harness.service.handleInbound(
       inbound({
         messageId: "merge-in-group",
@@ -1113,7 +1227,7 @@ test("thread-merge merges the bound workspace through the port and reports wt's 
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
     expect(log.join("\n")).toContain("rejected:stage must be all, tracked or none");
     expect(log.join("\n")).toContain("rejected:thread-merge 只能在子区中调用");
-    expect(worktrees.merges).toHaveLength(1);
+    expect(worktrees.merges).toHaveLength(2);
   } finally {
     await closeCoreHarness(harness);
   }
@@ -1121,19 +1235,37 @@ test("thread-merge merges the bound workspace through the port and reports wt's 
 
 test("thread-merge reports the port's failure and refuses a thread without a workspace", async () => {
   const log: string[] = [];
+  const notices: string[] = [];
+  const createdShortId = { value: "" };
   const harness = await createCoreHarness({
     prompt: async ({ promptContext, text }) => {
+      if (text.startsWith("[子区")) {
+        notices.push(text);
+        return;
+      }
       const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
       if (!management) throw new Error("management tool missing");
       const signal = new AbortController().signal;
       if (text === "create the failing merge thread") {
         const created = JSON.parse(
           await management.execute(
-            { action: "create-thread", name: "失败合并", worktree_name: "merge-failure" },
+            { action: "create-thread", name: "失败合并", worktree_name: "merge-failure", listen: "task" },
             signal,
           ),
         ) as { short_id: string };
+        createdShortId.value = created.short_id;
         log.push(`created:${created.short_id}\n`);
+        return;
+      }
+      if (text === "dispatch conflict") {
+        await management.execute(
+          {
+            action: "thread-dispatch",
+            short_id: createdShortId.value,
+            text: "merge that conflicts",
+          },
+          signal,
+        );
         return;
       }
       if (text === "merge without a workspace") {
@@ -1153,6 +1285,8 @@ test("thread-merge reports the port's failure and refuses a thread without a wor
       }
     },
   });
+  const root = harness.root;
+  let firstClosed = false;
   try {
     const worktrees = harness.worktrees;
     if (!worktrees) throw new Error("expected a worktree port in the harness");
@@ -1194,13 +1328,13 @@ test("thread-merge reports the port's failure and refuses a thread without a wor
     );
     await harness.service.handleInbound(
       inbound({
-        messageId: "merge-fail-run",
-        ...thread,
-        text: "merge that conflicts",
+        messageId: "merge-fail-dispatch",
+        ...GROUP_TOOLS,
+        text: "dispatch conflict",
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(3);
+    await harness.workers.waitForPromptCount(4);
     await waitForStatus(harness.service, thread, (status) => status.state === "completed");
 
     expect(log.join("\n")).toContain("rejected:当前子区未绑定隔离工作区，无法合并");
@@ -1208,7 +1342,207 @@ test("thread-merge reports the port's failure and refuses a thread without a wor
     expect(failing).toBeDefined();
     expect(failing?.startsWith("rejected:合并失败")).toBe(true);
     expect((failing ?? "").length).toBeLessThanOrEqual(210);
+    for (let attempt = 0; attempt < 50; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      expect(
+        store.getThreadListen(harness.bot.uid, unbound),
+      ).toMatchObject({ listen: "merge", mergePending: false });
+      expect(store.getLatestTask(harness.bot.uid, unbound)?.relaySuppressed).toBe(true);
+      expect(notices).toEqual([]);
+    } finally {
+      store.close();
+    }
+    const eventStore = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      expect(
+        eventStore.getThreadListen(harness.bot.uid, thread),
+      ).toMatchObject({ listen: "task", mergePending: true });
+      expect(eventStore.getLatestTask(harness.bot.uid, thread)?.relaySuppressed).toBe(true);
+      expect(eventStore.listThreadMergeEvents(harness.bot.uid)).toEqual([]);
+    } finally {
+      eventStore.close();
+    }
+    await closeCoreHarness(harness, { remove: false });
+    firstClosed = true;
+    const restarted = await createCoreHarness({
+      root,
+      transport: harness.transport,
+      prompt: async ({ text }) => {
+        if (text.startsWith("[子区")) notices.push(text);
+      },
+    });
+    try {
+      for (let attempt = 0; attempt < 50; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(notices).toEqual([]);
+      const recovered = await ChannelStore.open(join(restarted.stateDir, "channel.sqlite"));
+      try {
+        expect(
+          recovered.getThreadListen(restarted.bot.uid, thread),
+        ).toMatchObject({ listen: "task", mergePending: true });
+        expect(recovered.getLatestTask(restarted.bot.uid, thread)?.relaySuppressed).toBe(true);
+        expect(recovered.listThreadMergeEvents(restarted.bot.uid)).toEqual([]);
+      } finally {
+        recovered.close();
+      }
+    } finally {
+      await closeCoreHarness(restarted);
+    }
   } finally {
+    if (firstClosed) await rm(root, { recursive: true, force: true });
+    else await closeCoreHarness(harness);
+  }
+});
+
+test("shared direct merge refusal suppresses only its task and preserves later task notices", async () => {
+  const created = { channelId: "", shortId: "" };
+  const mergeAttemptStarted = Promise.withResolvers<void>();
+  const allowMergeAttempt = Promise.withResolvers<void>();
+  const mergeRefusalFinished = Promise.withResolvers<void>();
+  const noticeSeen = Promise.withResolvers<void>();
+  const notices: string[] = [];
+  const harness = await createCoreHarness({
+    prompt: async ({ promptContext, text }) => {
+      if (text.startsWith("[子区任务回传]")) {
+        notices.push(text);
+        noticeSeen.resolve();
+        return;
+      }
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("management tool missing");
+      const signal = new AbortController().signal;
+      if (text === "prepare shared task") {
+        const thread = JSON.parse(
+          await management.execute(
+            { action: "create-thread", name: "共享工作区线程", listen: "task" },
+            signal,
+          ),
+        ) as { channel_id: string; short_id: string };
+        created.channelId = thread.channel_id;
+        created.shortId = thread.short_id;
+        const entryPath = join(harness.root, "shared-entry");
+        const projectPath = join(entryPath, "project-one");
+        await mkdir(projectPath, { recursive: true });
+        const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+        try {
+          store.saveThreadWorkspace({
+            botUid: harness.bot.uid,
+            channelType: 5,
+            channelId: thread.channel_id,
+            layout: "shared",
+            status: "ready",
+            entryPath,
+            projects: [{
+              name: "项目一",
+              repo: harness.root,
+              path: projectPath,
+              branch: "main",
+              created: true,
+            }],
+            error: null,
+          });
+          store.ensureBinding({
+            botUid: harness.bot.uid,
+            channelType: 5,
+            channelId: thread.channel_id,
+            sessionId: `shared-${thread.short_id}`,
+            cwd: entryPath,
+            sessionFile: null,
+            cwdPinned: true,
+          });
+        } finally {
+          store.close();
+        }
+        await management.execute(
+          {
+            action: "thread-dispatch",
+            short_id: thread.short_id,
+            text: "attempt unsupported shared merge",
+          },
+          signal,
+        );
+        return;
+      }
+      if (text === "attempt unsupported shared merge") {
+        mergeAttemptStarted.resolve();
+        await allowMergeAttempt.promise;
+        await management
+          .execute({ action: "thread-merge" }, signal)
+          .then(
+            () => "resolved",
+            (error: Error) => `rejected:${error.message}`,
+          );
+        mergeRefusalFinished.resolve();
+        return;
+      }
+      if (text === "dispatch after shared refusal") {
+        await management.execute(
+          {
+            action: "thread-dispatch",
+            short_id: created.shortId,
+            text: "regular after shared refusal",
+          },
+          signal,
+        );
+        return;
+      }
+      if (text === "regular after shared refusal") return;
+      throw new Error(`unexpected prompt: ${text}`);
+    },
+  });
+  try {
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "shared-task-prepare",
+        ...GROUP_TOOLS,
+        text: "prepare shared task",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+    await mergeAttemptStarted.promise;
+    const thread = { channelId: created.channelId, channelType: 5 as const };
+    allowMergeAttempt.resolve();
+    await mergeRefusalFinished.promise;
+    await waitForStatus(harness.service, thread, (status) => status.state === "completed");
+    for (let attempt = 0; attempt < 50; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(notices).toEqual([]);
+
+    const afterRefusal = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      expect(afterRefusal.getThreadListen(harness.bot.uid, thread)).toMatchObject({
+        listen: "task",
+        mergePending: false,
+      });
+      expect(afterRefusal.getLatestTask(harness.bot.uid, thread)?.relaySuppressed).toBe(true);
+    } finally {
+      afterRefusal.close();
+    }
+
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "shared-task-followup",
+        ...GROUP_TOOLS,
+        text: "dispatch after shared refusal",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+    await noticeSeen.promise;
+    await waitForStatus(harness.service, thread, (status) => status.state === "completed");
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain(thread.channelId);
+    const finalStore = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      expect(finalStore.getLatestTask(harness.bot.uid, GROUP_TOOLS)?.messageId).toBe(
+        `notify:${finalStore.getLatestTask(harness.bot.uid, thread)?.id}`,
+      );
+    } finally {
+      finalStore.close();
+    }
+  } finally {
+    allowMergeAttempt.resolve();
     await closeCoreHarness(harness);
   }
 });

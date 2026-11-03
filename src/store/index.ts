@@ -6,11 +6,11 @@
 import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { ChatAppendMode, ChatTarget, WorkerGoal } from "../contracts.ts";
-import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput } from "./store-records.ts";
+import type { ChatAppendMode, ChatTarget, ThreadListenLevel, WorkerGoal } from "../contracts.ts";
+import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadListenRecord, ThreadMergeEventRecord } from "./store-records.ts";
 import { applySchema } from "./store-schema.ts";
 import { claimOwnerEnrollment, clearChatModel, ensureBinding, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, grantAllowedChat, hasOwnerEnrollment, listAllowedChats, setBotUid, setChatMode, setChatModel, setOwnerId, updateBindingSession } from "./store-chats.ts";
-import { acceptTask, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, isTaskResuming, listQueuedTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim } from "./store-tasks.ts";
+import { acceptTask, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, isTaskResuming, listQueuedTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim, suppressTaskRelay } from "./store-tasks.ts";
 import { bindGoalTaskSession, clearGoalSession, finishGoalTaskProgress, getGoalSession, getGoalTask, isGoalTaskResuming, markGoalTaskAccepted, markGoalTaskAgentAccepted, markGoalTaskDispatched, saveGoalSessionProgress, stopGoalContinuation, updateGoalTaskProgress } from "./store-goals.ts";
 import { clearProgressCard, listProgressCards, recordProgressCardAttempt, saveProgressCard } from "./store-cards.ts";
 import { listWorkerLedger, markWorkerStopped, recordWorker } from "./store-workers.ts";
@@ -19,6 +19,7 @@ import { acknowledgeTextOutbox, beginTextCreate, bindTextOutbox, commitTextStrea
 import { answerClosedQuestion, answerQuestion, answerQuestions, cancelQuestion, cancelQuestions, cancelTaskQuestions, createQuestion, getQuestion, listPendingQuestions, listQuestionsByCard, listTaskQuestions, markQuestionsSettled, pendingQuestionIds, reserveQuestionCardSeq, setQuestionCard, setQuestionsCard, updateQuestionPayloads } from "./store-questions.ts";
 import { acceptChatGrantOperation, getChatGrantOperation, getChatGrantOperationByEvent, listPendingChatGrantOperations, markChatGrantConfigMirror, markChatGrantResultDelivered, nextChatGrantCardEditSeq } from "./store-grants.ts";
 import { addThreadWorkspaceIntentChannel, completeThreadWorkspaceIntent, failThreadWorkspaceIntent, getThreadWorkspace, getThreadWorkspaceIntent, isThreadWorkspaceIntentBlocked, isWorkspaceDirectoryOwned, listThreadWorkspaceIntents, listThreadWorkspaces, saveThreadWorkspace, saveThreadWorkspaceIntent, saveThreadWorkspaces, workspaceDirectories } from "./store-workspaces.ts";
+import { beginThreadMerge, claimThreadMergeDispatchIntent, ensureThreadListen, getThreadListen, getThreadMergeEvent, isThreadMergeEventPending, listPendingThreadMergeEvents, listThreadMergeEvents, markThreadMergeEventDelivered, saveThreadMergeEvent, setThreadListen } from "./store-thread-listen.ts";
 
 export class ChannelStore {
   private readonly db: Database;
@@ -176,8 +177,56 @@ export class ChannelStore {
     return workspaceDirectories(this.db, cwd);
   }
 
+  ensureThreadListen(record: Omit<ThreadListenRecord, "mergePending">): ThreadListenRecord {
+    return ensureThreadListen(this.db, record);
+  }
+
+  getThreadListen(botUid: string, target: ChatTarget): ThreadListenRecord | null {
+    return getThreadListen(this.db, botUid, target);
+  }
+
+  setThreadListen(botUid: string, target: ChatTarget, listen: ThreadListenLevel): ThreadListenRecord {
+    return setThreadListen(this.db, botUid, target, listen);
+  }
+
+  beginThreadMerge(botUid: string, target: ChatTarget): void {
+    beginThreadMerge(this.db, botUid, target);
+  }
+
+  saveThreadMergeEvent(record: ThreadMergeEventRecord): void {
+    saveThreadMergeEvent(this.db, record);
+  }
+
+  getThreadMergeEvent(eventId: string): ThreadMergeEventRecord | null {
+    return getThreadMergeEvent(this.db, eventId);
+  }
+
+  listThreadMergeEvents(botUid: string): ThreadMergeEventRecord[] {
+    return listThreadMergeEvents(this.db, botUid);
+  }
+
+  listPendingThreadMergeEvents(botUid: string): ThreadMergeEventRecord[] {
+    return listPendingThreadMergeEvents(this.db, botUid);
+  }
+
+  isThreadMergeEventPending(eventId: string): boolean {
+    return isThreadMergeEventPending(this.db, eventId);
+  }
+
+  claimThreadMergeDispatchIntent(eventId: string): boolean {
+    return claimThreadMergeDispatchIntent(this.db, eventId);
+  }
+
+  markThreadMergeEventDelivered(eventId: string): void {
+    markThreadMergeEventDelivered(this.db, eventId);
+  }
+
   acceptTask(claim: InboundClaim, task: TaskRecord, goalRequest?: GoalTaskRequest): boolean {
     return acceptTask(this.db, claim, task, goalRequest);
+  }
+
+  suppressTaskRelay(taskId: string): void {
+    suppressTaskRelay(this.db, taskId);
   }
 
   getGoalTask(taskId: string): GoalTaskRecord | null {

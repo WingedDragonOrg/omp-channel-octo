@@ -9,9 +9,10 @@ import type {
   GroupMember,
   HostTool,
   InboundMessage,
-  TaskRelayTarget,
+  ThreadListenLevel,
   ThreadSummary,
   WorktreeMergeRequest,
+  WorktreeMergeSummary,
   WorktreePort,
 } from "./contracts.ts";
 import { isTransientServerFailure } from "./errors.ts";
@@ -65,6 +66,11 @@ export interface HostToolHost {
     | "failThreadWorkspaceIntent"
     | "isThreadWorkspaceIntentBlocked"
     | "workspaceDirectories"
+    | "ensureThreadListen"
+    | "getThreadListen"
+    | "setThreadListen"
+    | "beginThreadMerge"
+    | "suppressTaskRelay"
   >;
   tryAcquireWorkspaceDirectories(cwds: readonly string[], task: TaskRecord): DirectoryLease | undefined;
   /** 任务必然属于已注册的 Bot，构造工具时身份一定存在。 */
@@ -76,8 +82,15 @@ export interface HostToolHost {
    * 本回合输出排空之后执行——任何发进子区的消息都会把归档子区解档，所以工具内不即时归档。
    */
   planThreadArchive(target: ChatTarget, groupId: string, shortId: string): void;
-  /** 把一条合成消息交付到它的聊天（thread-dispatch 用）：按该聊天的追加模式并入运行中回合，否则接受为该聊天自己的任务；relay 只在任务真正落盘时随任务持久化。 */
-  deliverToChat(message: InboundMessage, relay?: TaskRelayTarget | null): Promise<"steered" | "queued">;
+  publishThreadMergeSuccess(
+    target: ChatTarget,
+    summary: WorktreeMergeSummary,
+    archive: "scheduled" | "not-scheduled",
+    operationId: string,
+  ): Promise<void>;
+  replayThreadMergeSuccess(target: ChatTarget, operationId: string): Promise<string | null>;
+  /** Delivers a synthetic task through the destination chat's ordinary steer-or-task path. */
+  deliverToChat(message: InboundMessage): Promise<"steered" | "queued">;
   /**
    * `ask`：提问并等待答案。`toolCallId` 是 OMP 给这次工具调用的身份（retry 重执行同一个调用时
    * 复用），提问行据此在跨重启恢复时认回原问题。
@@ -110,6 +123,7 @@ const MANAGEMENT_BASE_ACTIONS = [
   "create-thread",
   "thread-info",
   "thread-members",
+  "thread-listen",
   "thread-join",
   "thread-leave",
   "thread-delete",
@@ -180,6 +194,44 @@ function managementThread(thread: ThreadSummary): {
     updated_at: thread.updatedAt,
   };
 }
+function isThreadListenLevel(value: string): value is ThreadListenLevel {
+  return value === "off" || value === "merge" || value === "task";
+}
+
+function ensureThreadListen(
+  host: HostToolHost,
+  thread: ThreadSummary,
+  creator: ChatTarget = { channelType: 2, channelId: thread.groupId },
+  listen: ThreadListenLevel = "merge",
+) {
+  if (creator.channelType !== 2 && creator.channelType !== 5) {
+    throw new Error("线程监听来源必须是群或子区");
+  }
+  return host.store.ensureThreadListen({
+    botUid: host.botUid,
+    channelId: thread.channelId,
+    creatorChannelType: creator.channelType,
+    creatorChannelId: creator.channelId,
+    threadName: thread.name,
+    listen,
+  });
+}
+
+function ensureThreadListenForTarget(host: HostToolHost, target: ChatTarget) {
+  if (target.channelType !== 5) throw new Error("thread listen target must be a thread");
+  const existing = host.store.getThreadListen(host.botUid, target);
+  if (existing !== null) return existing;
+  const creatorChannelId = threadParentGroupId(target.channelId);
+  if (creatorChannelId === null) throw new Error("无效的子区目标");
+  return host.store.ensureThreadListen({
+    botUid: host.botUid,
+    channelId: target.channelId,
+    creatorChannelType: 2,
+    creatorChannelId,
+    threadName: "",
+    listen: "merge",
+  });
+}
 function workspaceProjectResults(outcome: ThreadWorkspaceBatchResult["threads"][number]) {
   return outcome.record.projects.map((project, index) => ({
     name: project.name,
@@ -192,13 +244,17 @@ function workspaceProjectResults(outcome: ThreadWorkspaceBatchResult["threads"][
   }));
 }
 
-function threadWorkspaceCreationResult(batch: ThreadWorkspaceBatchResult): Record<string, unknown> {
+function threadWorkspaceCreationResult(
+  batch: ThreadWorkspaceBatchResult,
+  listen: ThreadListenLevel,
+): Record<string, unknown> {
   if (batch.layout === "separate") {
     return {
       layout: batch.layout,
       ready: batch.ready,
       threads: batch.threads.map((outcome) => ({
         ...managementThread(outcome.thread),
+        listen,
         ready: outcome.record.status === "ready",
         cwd: outcome.record.projects[0]?.created ? outcome.record.projects[0].path : null,
         projects: workspaceProjectResults(outcome),
@@ -214,6 +270,7 @@ function threadWorkspaceCreationResult(batch: ThreadWorkspaceBatchResult): Recor
     return {
       layout: batch.layout,
       ready: false,
+      listen,
       cwd: null,
       projects: [],
       ...(batch.error === undefined ? {} : { error: batch.error }),
@@ -224,6 +281,7 @@ function threadWorkspaceCreationResult(batch: ThreadWorkspaceBatchResult): Recor
   const result: Record<string, unknown> = {
     ...managementThread(outcome.thread),
     layout: batch.layout,
+    listen,
     ready: outcome.record.status === "ready",
     cwd: batch.layout === "shared"
       ? outcome.record.entryPath
@@ -349,7 +407,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
   const managementTool: HostTool = {
     name: "octo_management",
     description:
-      "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；create-thread 可用 projects 声明一个或多个真实 Git 仓库，单项目默认 single，多项目必须指定 shared 或 separate；shared 将多个项目放在一个非仓库入口下，separate 为每个项目创建独立线程；background 只写入用途、项目名、已创建路径和 separate 相关 short_id；worktree_name 保留旧式单项目 worktree 命名，也可与 projects 组合为命名 seed。thread-delete 按持久化所有权清理工作区，默认保留脏工作区，force=true 才强制清理；thread-merge 将当前单项目隔离工作区合并回目标分支（shared 多项目工作区不支持）；thread-archive 归档一个子区（幂等，short_id 省略即当前子区），与合并收尾一样排定在本回合最后一条回复送达后执行——任何发进子区的消息都会把归档子区解档，所以工具内不即时归档；thread-dispatch 把一条任务派发给本群的某个 thread，结果按该子区的追加模式处置——steer 且该子区有可接收 steering 的运行中回合时并入该回合（delivery=steered），否则在该子区作为独立任务执行（delivery=queued），两种情况本群都收到一条回执；可选 notify=true 让这条派发任务在结束（完成/失败/取消/中断）时向本聊天回传一条有界结果通知（默认 false，自行判断是否需要）；派发出去的任务不能再派发。目标固定为当前聊天，不能指向其他群。",
+      "管理当前群/线程：读群信息与成员、改群名/群公告（需 bot 是群管理员）、读写共享说明、列出/创建/查询/加入/退出/删除 thread；create-thread 可用 projects 声明一个或多个真实 Git 仓库，单项目默认 single，多项目必须指定 shared 或 separate，创建策略 listen 默认为 merge，可选 off、merge、task。listen=off 无自动回传；merge 只在宿主真实合并成功后回传；task 还会回传派发任务的四种终态。所有合并/修复失败留在子区；thread-listen 查询或修改策略，目标是创建方。thread-delete 按持久化所有权清理工作区；thread-archive 在本回合回复送达后执行。thread-dispatch 受当前群范围、权限、深度和追加模式约束，结果与后续终态通知由持久化策略决定。",
     parameters: {
       type: "object",
       properties: {
@@ -370,7 +428,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
         },
         target: {
           type: "string",
-          description: "thread-merge：目标分支；省略使用仓库默认分支。",
+          description: "thread-merge：成功摘要的目标分支；通知按子区策略发送到创建方。",
         },
         squash: { type: "boolean", description: "thread-merge：是否 squash（默认 true）。" },
         commit: { type: "boolean", description: "thread-merge：是否提交待合并内容（默认 true）。" },
@@ -413,17 +471,17 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
           maxLength: 500,
           description: "create-thread：简短用途说明；只写用途、项目名、实际创建路径和 separate 相关 short_id，不包含当前任务正文。",
         },
-        notify: {
-          type: "boolean",
-          description:
-            "thread-dispatch：为 true 时这条派发的任务结束（完成/失败/取消/中断）时向本聊天回传一条有界结果通知，由本聊天的助手作为新输入处理（可并入运行中回合，否则成为该聊天的一个任务）；默认 false。派发后你不再盯这份活、又需要知道它结束时的结果（含失败）时才开启；派发被并入运行中回合时不生效（工具结果里 notify=skipped 且收据会说明）。",
+        listen: {
+          type: "string",
+          enum: ["off", "merge", "task"],
+          description: "create-thread：默认 merge；thread-listen 省略 listen 时查询当前级别。off 不自动回传；merge 仅宿主实际合并成功后回传摘要；task 还回传派发任务的四种终态。合并/修复失败留在子区，所有通知发往创建方。",
         },
       },
       required: ["action"],
       additionalProperties: false,
     },
-    execute: async (args, signal) =>
-      runManagementTool(host, task, target, parentGroupId, currentShortId, args, signal),
+    execute: async (args, signal, toolCallId) =>
+      runManagementTool(host, task, target, parentGroupId, currentShortId, args, signal, toolCallId),
   };
   return [channelTool, managementTool, fileTool, askTool];
 }
@@ -467,6 +525,7 @@ async function runManagementTool(
   currentShortId: string | null,
   args: Record<string, unknown>,
   signal: AbortSignal,
+  toolCallId?: string,
 ): Promise<string> {
   const action = args.action;
   const known: readonly string[] = [...MANAGEMENT_BASE_ACTIONS, MANAGEMENT_DISPATCH_ACTION];
@@ -597,6 +656,7 @@ async function runManagementTool(
       const creation = await validateThreadCreation(args, task.cwd, worktreeName(), signal);
       if (creation.workspace === null) {
         const thread = await transport.createThread(groupId, name, signal);
+        const policy = ensureThreadListen(host, thread, target, creation.listen);
         if (creation.background !== undefined) {
           try {
             await transport.updateGroupContext(
@@ -607,11 +667,12 @@ async function runManagementTool(
           } catch (error) {
             return JSON.stringify({
               ...managementThread(thread),
+              listen: policy.listen,
               background_error: boundedManagementError(error, "线程说明写入失败"),
             });
           }
         }
-        return JSON.stringify(managementThread(thread));
+        return JSON.stringify({ ...managementThread(thread), listen: policy.listen });
       }
       const result = await createThreadWorkspaceBatch(
         host,
@@ -619,11 +680,31 @@ async function runManagementTool(
         name,
         creation.workspace,
         signal,
+        (thread) => ensureThreadListen(host, thread, target, creation.listen),
       );
-      return JSON.stringify(threadWorkspaceCreationResult(result));
+      return JSON.stringify(threadWorkspaceCreationResult(result, creation.listen));
     }
     case "thread-info": {
-      return JSON.stringify(managementThread(await transport.getThread(groupId, threadId(), signal)));
+      const thread = await transport.getThread(groupId, threadId(), signal);
+      const policy = ensureThreadListen(host, thread);
+      return JSON.stringify({ ...managementThread(thread), listen: policy.listen });
+    }
+    case "thread-listen": {
+      const thread = await transport.getThread(groupId, threadId(), signal);
+      const current = ensureThreadListen(host, thread);
+      const listen = optionalText("listen");
+      if (listen === undefined) {
+        return JSON.stringify({ ...managementThread(thread), listen: current.listen });
+      }
+      if (!isThreadListenLevel(listen)) {
+        throw new Error("listen must be off, merge or task");
+      }
+      const updated = host.store.setThreadListen(
+        host.botUid,
+        { channelId: thread.channelId, channelType: 5 },
+        listen,
+      );
+      return JSON.stringify({ ...managementThread(thread), listen: updated.listen });
     }
     case "thread-members": {
       const shortId = threadId();
@@ -658,10 +739,15 @@ async function runManagementTool(
         channelId: threadChannelId(groupId, currentShortId),
         channelType: 5,
       };
+      const operationId = toolCallId === undefined ? task.id : JSON.stringify([task.id, toolCallId]);
+      const replay = await host.replayThreadMergeSuccess(workspaceTarget, operationId);
+      if (replay !== null) return replay;
+      host.store.suppressTaskRelay(task.id);
       const ownership = host.store.getThreadWorkspace(host.botUid, workspaceTarget);
       if (ownership?.layout === "shared") {
         throw new Error("当前为多项目工作区，不支持 /thread merge。");
       }
+      ensureThreadListenForTarget(host, workspaceTarget);
       if (host.store.isThreadWorkspaceIntentBlocked(host.botUid, workspaceTarget)) {
         throw new Error("当前子区工作区未就绪，无法合并");
       }
@@ -674,11 +760,13 @@ async function runManagementTool(
       }
       const worktrees = host.worktrees;
       if (!worktrees) throw new Error("本部署未配置隔离工作区能力");
+      const request = mergeRequest(workspace.cwd);
       const lease = host.tryAcquireWorkspaceDirectories([workspace.cwd], task);
       if (!lease) throw new Error("隔离工作区正被其他任务使用，无法合并");
       try {
         await lease.ready;
-        const summary = await worktrees.merge(mergeRequest(workspace.cwd), signal);
+        host.store.beginThreadMerge(host.botUid, workspaceTarget);
+        const summary = await worktrees.merge(request, signal);
         if (summary.removed === true && ownership !== null) {
           const project = ownership.projects.find(({ path }) => path === workspace.cwd);
           if (project !== undefined) {
@@ -693,6 +781,12 @@ async function runManagementTool(
           host.planThreadArchive(target, groupId, currentShortId);
           archive = "scheduled";
         }
+        await host.publishThreadMergeSuccess(
+          workspaceTarget,
+          summary,
+          archive ?? "not-scheduled",
+          operationId,
+        );
         return JSON.stringify({ merged: true, ...summary, ...(archive === null ? {} : { archive }) });
       } catch (error) {
         throw new Error(boundedManagementError(error, "合并隔离工作区失败"));
@@ -711,8 +805,7 @@ async function runManagementTool(
       }
       const shortId = threadId();
       const text = namedText("text", MAX_MANAGEMENT_TASK_CHARS);
-      const notify = optionalBoolean("notify") ?? false;
-      return dispatchThreadTask(host, task, target, groupId, shortId, text, notify, signal);
+      return dispatchThreadTask(host, task, target, groupId, shortId, text, signal);
     }
     default: {
       throw new Error(`unknown action: ${action}`);
@@ -917,21 +1010,14 @@ function cleanupFailureMessage(error: unknown, force: boolean): string {
   return `${prefix}${reason}${suffix}`;
 }
 /**
- * Hands one task to a thread of the current group: the thread shows the handoff, and the content
- * is delivered the way the target thread handles anything arriving while its run is in flight -
- * its own append mode (a steerable running turn takes it as steering, otherwise it becomes the
- * thread's next durable task). A dispatch is a hand-over rather than the owner's reply, so it is
- * never taken as the answer to an open question, and it keeps the synthetic `dispatch:` id with
- * the owner as sender, so dedup and the depth guard hold. `relay` rides only on the durable-task
- * path: a steered dispatch has no task row to carry it, so it reports no completion. The caller
- * reports which delivery happened. Depth is one: the dispatch tool is withheld from tasks that
- * arrived this way.
+ * Hands one task to a thread of the current group. The synthetic `dispatch:` id with the owner
+ * as sender preserves dedup and the one-hop depth guard; dispatch completion policy comes from
+ * the destination thread's persisted listen level.
  */
 async function dispatchTaskToThread(
   host: HostToolHost,
   thread: ThreadSummary,
   text: string,
-  relay: TaskRelayTarget | null,
 ): Promise<{ messageId: string; delivery: "steered" | "queued" }> {
   const ownerId = host.store.getOwnerId(host.botUid)?.trim() ?? "";
   if (ownerId.length === 0) {
@@ -952,14 +1038,12 @@ async function dispatchTaskToThread(
     supported: true,
     messageSeq: 0,
     messageTimestamp: Date.now(),
-  }, relay);
+  });
   return { messageId, delivery };
 }
 /**
- * The `thread-dispatch` tool: resolves the target thread, hands the task over, and reports the
- * delivery in the calling chat. `notify` is the dispatching assistant's own choice: when set,
- * the task carries a completion relay back to the calling chat, which only takes effect if the
- * hand-off becomes a task of its own.
+ * Resolves the target thread, hands off the task, and reports delivery in the calling chat.
+ * Depth is one: the dispatch tool is withheld from tasks that arrived this way.
  */
 async function dispatchThreadTask(
   host: HostToolHost,
@@ -968,7 +1052,6 @@ async function dispatchThreadTask(
   groupId: string,
   shortId: string,
   text: string,
-  notify: boolean,
   signal: AbortSignal,
 ): Promise<string> {
   const threadTarget: ChatTarget = { channelId: threadChannelId(groupId, shortId), channelType: 5 };
@@ -1005,19 +1088,13 @@ async function dispatchThreadTask(
   if (thread.groupId.length > 0 && thread.groupId !== groupId) {
     throw new Error(`thread ${shortId} does not belong to the current group`);
   }
-  const relay: TaskRelayTarget | null = notify && target.channelType !== 1
-    ? { channelType: target.channelType, channelId: target.channelId, threadName: thread.name }
-    : null;
-  const { messageId, delivery } = await dispatchTaskToThread(host, thread, text, relay);
+  ensureThreadListen(host, thread);
+  const { messageId, delivery } = await dispatchTaskToThread(host, thread, text);
   host.enqueueText(
     target,
     delivery === "steered"
-      ? relay === null
-        ? `已把任务并入线程 ${shortId}（${thread.channelId}）的运行中回合。`
-        : `已把任务并入线程 ${shortId}（${thread.channelId}）的运行中回合；并入的这部分不会单独回传结果。`
-      : relay === null
-        ? `已在子区 ${shortId}（${thread.channelId}）作为独立任务执行。`
-        : `已在子区 ${shortId}（${thread.channelId}）作为独立任务执行；结束时将把结果回传到这里。`,
+      ? `已把任务并入线程 ${shortId}（${thread.channelId}）的运行中回合。`
+      : `已在子区 ${shortId}（${thread.channelId}）作为独立任务执行；后续回传遵循该子区的 listen 策略。`,
     null,
   );
   return JSON.stringify({
@@ -1027,10 +1104,5 @@ async function dispatchThreadTask(
     channel_id: thread.channelId,
     message_id: messageId,
     task_id: task.id,
-    ...(relay === null
-      ? {}
-      : delivery === "queued"
-        ? { notify: "registered" }
-        : { notify: "skipped", notify_note: "内容并入运行中回合，不会单独回传结果" }),
   });
 }

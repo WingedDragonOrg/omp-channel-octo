@@ -5,6 +5,7 @@
 
 import { Database } from "bun:sqlite";
 import type { ChatExecutionState, ChatTarget, TextMention } from "../contracts.ts";
+import { threadParentGroupId } from "../threads/thread-target.ts";
 import type { ContextLedgerRecord, HistoryLedgerRecord, OutboxRecord, OutboxTextPayload, QuestionRecord, TaskRecord, TaskStopIntent } from "./store-records.ts";
 
 export type SqlValue = string | number | null | Uint8Array;
@@ -151,6 +152,27 @@ export function applySchema(db: Database): void {
     );
     CREATE INDEX IF NOT EXISTS thread_workspace_intent_group
       ON thread_workspace_intents(bot_uid, group_id, status);
+    CREATE TABLE IF NOT EXISTS thread_listens (
+      bot_uid TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      creator_channel_type INTEGER NOT NULL CHECK(creator_channel_type IN (2, 5)),
+      creator_channel_id TEXT NOT NULL,
+      thread_name TEXT NOT NULL,
+      listen TEXT NOT NULL CHECK(listen IN ('off', 'merge', 'task')),
+      merge_pending INTEGER NOT NULL DEFAULT 0 CHECK(merge_pending IN (0, 1)),
+      PRIMARY KEY(bot_uid, channel_id)
+    );
+    CREATE TABLE IF NOT EXISTS thread_merge_events (
+      id TEXT PRIMARY KEY NOT NULL,
+      bot_uid TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      target_branch TEXT NOT NULL,
+      commit_hash TEXT,
+      removed INTEGER NOT NULL CHECK(removed IN (0, 1)),
+      archive TEXT NOT NULL CHECK(archive IN ('scheduled', 'not-scheduled')),
+      delivery_state TEXT NOT NULL DEFAULT 'pending' CHECK(delivery_state IN ('pending', 'intent', 'delivered'))
+    );
+    CREATE INDEX IF NOT EXISTS thread_merge_events_bot ON thread_merge_events(bot_uid);
     CREATE TABLE IF NOT EXISTS inbound (
       bot_uid TEXT NOT NULL,
       channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
@@ -185,9 +207,7 @@ export function applySchema(db: Database): void {
       prompt_started INTEGER NOT NULL DEFAULT 0,
       prompt_accepted INTEGER NOT NULL DEFAULT 0,
       stop_intent TEXT,
-      relay_channel_type INTEGER,
-      relay_channel_id TEXT,
-      relay_thread_name TEXT
+      relay_suppressed INTEGER NOT NULL DEFAULT 0 CHECK(relay_suppressed IN (0, 1))
     );
     CREATE TABLE IF NOT EXISTS goal_sessions (
       bot_uid TEXT NOT NULL,
@@ -396,9 +416,6 @@ export function applySchema(db: Database): void {
     "ALTER TABLE tasks ADD COLUMN message_seq INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN history_eligible INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE tasks ADD COLUMN stop_intent TEXT",
-    "ALTER TABLE tasks ADD COLUMN relay_channel_type INTEGER",
-    "ALTER TABLE tasks ADD COLUMN relay_channel_id TEXT",
-    "ALTER TABLE tasks ADD COLUMN relay_thread_name TEXT",
     "ALTER TABLE chats ADD COLUMN cwd_pinned INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE chats ADD COLUMN session_switched_at INTEGER",
     "ALTER TABLE questions ADD COLUMN card_message_id TEXT",
@@ -412,6 +429,7 @@ export function applySchema(db: Database): void {
       if (!String(error).includes("duplicate column")) throw error;
     }
   }
+  migrateThreadListen(db);
   const questionColumns = query(db, "PRAGMA table_info(questions)");
   const cardSeqWasMissing = !questionColumns.some((row) => asString(row.name) === "card_seq");
   const settledAtWasMissing = !questionColumns.some((row) => asString(row.name) === "settled_at");
@@ -428,7 +446,7 @@ export function applySchema(db: Database): void {
       }
     });
   }
-  // 回传登记已由任务行的 relay 字段承载，旧的子区级登记表没有读者。
+  // The former task-level relay table has no readers after per-thread listen policies replaced it.
   db.exec("DROP TABLE IF EXISTS thread_notify");
   db.exec(
     "CREATE INDEX IF NOT EXISTS outbox_stream ON outbox(bot_uid, task_id, stream_message_id, segment_index)",
@@ -437,6 +455,71 @@ export function applySchema(db: Database): void {
     "CREATE INDEX IF NOT EXISTS questions_card ON questions(bot_uid, channel_type, channel_id, card_message_id)",
   );
   migrateProgressCards(db);
+}
+
+function migrateThreadListen(db: Database): void {
+  const taskColumns = new Set(
+    query(db, "PRAGMA table_info(tasks)").map((row) => asString(row.name)),
+  );
+  const legacyRelayColumns = [
+    "relay_channel_type",
+    "relay_channel_id",
+    "relay_thread_name",
+  ];
+  const hasLegacyRelayColumns = legacyRelayColumns.some((column) => taskColumns.has(column));
+  const suppressionMissing = !taskColumns.has("relay_suppressed");
+  const eventColumns = new Set(
+    query(db, "PRAGMA table_info(thread_merge_events)").map((row) => asString(row.name)),
+  );
+  const deliveryStateMissing = !eventColumns.has("delivery_state");
+  const migrationDone = query(db, "SELECT 1 FROM meta WHERE key = ?", ["thread_listen_migration"])[0];
+  if (!hasLegacyRelayColumns && !suppressionMissing && !deliveryStateMissing && migrationDone) return;
+
+  transaction(db, () => {
+    if (deliveryStateMissing) {
+      db.exec("ALTER TABLE thread_merge_events ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'pending' CHECK(delivery_state IN ('pending', 'intent', 'delivered'))");
+    }
+    if (suppressionMissing) {
+      db.exec("ALTER TABLE tasks ADD COLUMN relay_suppressed INTEGER NOT NULL DEFAULT 0 CHECK(relay_suppressed IN (0, 1))");
+    }
+    if (legacyRelayColumns.every((column) => taskColumns.has(column))) {
+      run(db, `
+        INSERT OR IGNORE INTO thread_listens(
+          bot_uid, channel_id, creator_channel_type, creator_channel_id, thread_name, listen, merge_pending
+        )
+        SELECT bot_uid, channel_id, relay_channel_type, relay_channel_id,
+               COALESCE(relay_thread_name, ''), 'merge', 0
+        FROM tasks
+        WHERE channel_type = 5
+          AND relay_channel_type IN (2, 5)
+          AND relay_channel_id IS NOT NULL
+        ORDER BY accepted_at, id
+      `);
+    }
+    for (const table of ["chats", "thread_workspaces"] as const) {
+      for (const row of query(db,
+        `SELECT bot_uid, channel_id FROM ${table} WHERE channel_type = 5 ORDER BY bot_uid, channel_id`,
+      )) {
+        const botUid = asString(row.bot_uid);
+        const channelId = asString(row.channel_id);
+        const creatorChannelId = threadParentGroupId(channelId);
+        if (!creatorChannelId) continue;
+        run(db,
+          `INSERT OR IGNORE INTO thread_listens(
+             bot_uid, channel_id, creator_channel_type, creator_channel_id, thread_name, listen, merge_pending
+           ) VALUES(?, ?, 2, ?, '', 'merge', 0)`,
+          [botUid, channelId, creatorChannelId],
+        );
+      }
+    }
+    for (const column of legacyRelayColumns) {
+      if (taskColumns.has(column)) db.exec(`ALTER TABLE tasks DROP COLUMN ${column}`);
+    }
+    run(db,
+      `INSERT INTO meta(key, value) VALUES('thread_listen_migration', '1')
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    );
+  });
 }
 
 /**
@@ -551,11 +634,7 @@ export function taskFromRow(row: SqlRow): TaskRecord {
     errorText: asNullableString(row.error_text),
     messageSeq: asNumber(row.message_seq),
     historyEligible: asNumber(row.history_eligible) !== 0,
-    relayChannelType: row.relay_channel_type === null || row.relay_channel_type === undefined
-      ? null
-      : (asNumber(row.relay_channel_type) as 2 | 5),
-    relayChannelId: asNullableString(row.relay_channel_id),
-    relayThreadName: asNullableString(row.relay_thread_name),
+    relaySuppressed: asNumber(row.relay_suppressed) !== 0,
   };
 }
 

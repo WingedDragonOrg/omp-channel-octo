@@ -3,6 +3,7 @@ import { lstat, mkdir, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import type {
   ChannelTransport,
+  ThreadListenLevel,
   ThreadSummary,
   ThreadWorkspaceRequest,
   WorktreePort,
@@ -52,6 +53,7 @@ export interface ThreadWorkspaceCreatePlan {
 
 export interface ValidatedThreadCreation {
   workspace: ThreadWorkspaceCreatePlan | null;
+  listen: ThreadListenLevel;
   background?: string;
 }
 
@@ -176,10 +178,20 @@ export async function validateThreadCreation(
   signal?: AbortSignal,
 ): Promise<ValidatedThreadCreation> {
   for (const key of Object.keys(args)) {
-    if (!["action", "name", "worktree_name", "projects", "layout", "background"].includes(key)) {
+    if (!["action", "name", "worktree_name", "projects", "layout", "background", "listen"].includes(key)) {
       throw new Error(`create-thread contains unsupported field: ${key}`);
     }
   }
+  const listenValue = optionalString(args, "listen");
+  if (
+    listenValue !== undefined
+    && listenValue !== "off"
+    && listenValue !== "merge"
+    && listenValue !== "task"
+  ) {
+    throw new Error("listen must be off, merge or task");
+  }
+  const listen = listenValue ?? "merge";
   const layout = optionalString(args, "layout");
   if (layout !== undefined && layout !== "shared" && layout !== "separate") {
     throw new Error("layout must be shared or separate");
@@ -202,7 +214,11 @@ export async function validateThreadCreation(
   if (rawProjects === undefined) {
     if (layout !== undefined) throw new Error("layout requires projects");
     if (legacyWorktreeName === undefined) {
-      return background === undefined ? { workspace: null } : { workspace: null, background };
+      return {
+        workspace: null,
+        listen,
+        ...(background === undefined ? {} : { background }),
+      };
     }
     const repo = await realpath(callerCwd);
     if (!(await stat(repo)).isDirectory()) throw new Error("调用方工作目录不是目录");
@@ -214,6 +230,7 @@ export async function validateThreadCreation(
         legacyWorktreeName,
         worktreeNameSeed: legacyWorktreeName,
       },
+      listen,
       ...(background === undefined ? {} : { background }),
     };
   }
@@ -261,6 +278,7 @@ export async function validateThreadCreation(
       background: background ?? DEFAULT_BACKGROUND,
       ...(legacyWorktreeName === undefined ? {} : { worktreeNameSeed: legacyWorktreeName }),
     },
+    listen,
     ...(background === undefined ? {} : { background }),
   };
 }
@@ -339,6 +357,7 @@ export async function createThreadWorkspaceBatch(
   threadName: string,
   plan: ThreadWorkspaceCreatePlan,
   signal: AbortSignal,
+  onThreadCreated?: (thread: ThreadSummary) => void,
 ): Promise<ThreadWorkspaceBatchResult> {
   if (plan.layout === "separate") {
     for (const project of plan.projects) {
@@ -405,6 +424,12 @@ export async function createThreadWorkspaceBatch(
       }
       break;
     }
+    let listenError: string | undefined;
+    try {
+      onThreadCreated?.(thread);
+    } catch (error) {
+      listenError = addFailure(errors, error, "无法持久化线程监听策略");
+    }
 
     const record = workspaceRecord(
       host.botUid,
@@ -421,7 +446,14 @@ export async function createThreadWorkspaceBatch(
     };
     outcomes.push(outcome);
     records.push(record);
-    let mayCreateResources = true;
+    if (listenError !== undefined) {
+      outcome.error = listenError;
+      outcome.projectErrors = projects.map(() => listenError);
+      record.status = "failed";
+      record.error = listenError;
+      cannotCreateResources.add(record);
+    }
+    let mayCreateResources = listenError === undefined;
     try {
       host.store.addThreadWorkspaceIntentChannel(host.botUid, intentId, thread.channelId);
       mappedIntents.set(thread.channelId, intentId);
