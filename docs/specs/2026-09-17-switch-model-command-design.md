@@ -1,6 +1,7 @@
-# /switch 模型切换命令
+# 聊天模型与子区默认模型
 
 日期：2026-09-17
+修订日期：2026-11-03
 
 ## 背景与目标
 
@@ -21,19 +22,19 @@ channel 需要一个 owner 可见的模型切换入口：在聊天里查看当�
 - 新内置命令 `/switch`：
   - 无参数：报告本聊天当前模型与可用模型列表（含角色可用性说明由 OMP 解析，见下）。
   - 带参数：把选择器交给 OMP 自己的 `/switch` 解析并应用（`provider/id`、模型 id/子串、`@角色`、`:level`）。
-  - `default`：清除本聊天模型，之后启动的 worker 跟随 OMP 默认（`@default` 是角色写法，走原生解析）。
+  - `default`：清除本聊天显式模型；子区重新继承所属主群的子区默认，其他聊天不指定模型（`@default` 是角色写法，走原生解析）。
+- 主群 `/thread model [选择器|clear]`：查询、设置或清除本群所属子区的默认模型；只允许 owner 在主群执行。
 - 生效路径分两部分：
   - **已有运行中的回合**：选择器直接分发给该回合的活会话，会话就地切换（OMP 只改本会话，不产生 agent 回合）。
-  - **未启动 / 之后新建的会话**：把解析后的 `provider/id:level` 存进 `chat_models`；任务、`/new`、`/reset`、`/move` 创建 worker 时传 `--model <值>`，resume 的会话同样被覆盖。
+  - **之后启动的 worker**：统一读取有效策略，按「本聊天显式指定 > 所属主群子区默认 > 不传 model」决定参数；覆盖普通任务及恢复、goal 执行/控制、commit、`/new`、`/reset`、`/move`。主群自己的 `/switch` 不是子区继承来源。
 - `/status` 增加 `model=` 行；`/help`、主规格、根 `AGENTS.md` 的命令清单同步。
 - 测试：纯函数（渲染与边界）、服务集成（持久化/生效/重启保持/运行中切换/错误路径）、真实 RPC fixture（`--model`、`get_state`/`get_available_models`、`/switch` 分发与 `config_update`）。
 
 ### 不包含
 
 - 选择器语法本身的实现（`@角色` 与别名的映射、模糊匹配偏好、`:level` 语义）——一律由 OMP 解析，channel 不复制。
-- 会话的全局默认模型写入（`/model` 的 `set_model` 语义）；channel 只存自己的 `chat_models`。
+- OMP 全局模型配置写入；channel 只管理自己的聊天显式值与主群子区默认。
 - 模型列表缓存或后台刷新（每次命令现探测）。
-- 子区与父群之间的模型继承（模型按聊天目标隔离，与 `/mode` 同粒度）。
 - 角色清单的枚举渲染（列表仍按 provider 分组列出模型；`@角色` 按 OMP 的映射解析）。
 
 ## 已知约束
@@ -54,16 +55,38 @@ channel 需要一个 owner 可见的模型切换入口：在聊天里查看当�
 | 落盘值 | 解析后的 `provider/id:level` | 规范、稳定；模糊选择器不会在下次启动时解析到别的模型；`:level` 保证角色级别一并复现 |
 | 成功判定 | OMP 的 `config_update` 帧 | 结构化信号，带解析后的模型与级别；`command_output` 只是人类可读文本，不解析它 |
 | 模型列表来源 | `get_state` + `get_available_models` | 与真实回合同一 OMP 配置（cwd/env/profile）；列表即「已配置凭据的可用模型」 |
-| 报告当前模型 | 有运行中回合时用该会话的 `get_state`；否则用探测 worker；再否则用本聊天指定值 | 「当前正在使用」以活会话为准；空闲时探测反映新会话会用到的默认 |
-| 持久化粒度 | 每聊天目标（DM/群/子区各自独立，不继承），新表 `chat_models` | 与 `chat_modes` 的既有惯例一致；不耦合 `chats` 绑定的重建/外部重绑 |
+| 报告模型 | live 查询报告运行模型；有效策略报告下一次启动的模型及来源 | 区分运行状态与配置；不把 fresh 探测结果当作 resume 保证 |
+| 持久化粒度 | 显式值按聊天目标隔离；子区默认按 bot 与主群 ID 隔离 | 父群自身模型与子区启动策略分别存储，绑定重建不改变配置 |
 | 探测 worker | 复用 `WorkerFactory`，记录 worker ledger，不取目录 lease | 与 `/new` 候选 worker 同构；fresh、无 agent 回合，不与运行中的回合争用 |
 | 探测会话目录 | 每次 `mkdtemp` 临时目录，停止后删除 | 探测会话文件无长期价值；不污染 `sessionsDir` 下的项目会话目录 |
 
 ## 设计
+### 子区默认模型 SDD
+
+**目标**：owner 在主群统一设置子区下一次启动策略，子区可独立覆盖。未配置任何有效值时完全不传 `model`，包括 resume 会话，由 OMP 自行处理模型选择。
+
+**命令与权限**：
+
+- `/thread model` 查询该主群的子区默认；未配置明确显示「不指定，由 OMP 自行决定」。
+- `/thread model <选择器>` 使用现有 fresh probe 与 OMP 原生 `/switch` 解析；支持规范 ID、唯一子串、角色和级别。只在成功解析且 probe 已完成既有释放流程后写入规范值；失败保留旧值。不得调用主群 live worker 的 `switchModel`。
+- `/thread model clear` 直接删除该主群默认行；不解析 `clear`，不写任何替代模型，不删子区显式值。
+- 仅精确首词 `model`（后接空白或结束）进入此控制路径；`model-fix` 等仍是任务意图，`merge` 保留原路由。
+- DM、子区明确拒绝，不创建/派发任务；沿用 owner、allowlist、mention 与 durable command claim。pending ask 不被回答，附件不下载。
+- 主群默认查询/修改按现有配置序列化机制排序，不使父群 `/switch` 菜单失效、不发布模型选择菜单。
+
+**状态与数据所有权**：
+
+- `chat_models` 与 `getChatModel` 保持 explicit-only；新增 `thread_models(bot_uid, group_id, model, updated_at)`，主键 `(bot_uid, group_id)`，通过现有 schema 初始化增量创建，不迁移/复制旧模型值。
+- `ChannelStore.resolveChatModel(botUid, target)` 是有效优先级唯一所有者，返回模型及 `chat|thread|omp` 来源；子区父群 ID 复用 `threadParentGroupId`，不依赖当前绑定、创建者或 THREAD.md。
+- 所有实际 worker 消费点在启动时读取该解析结果；没有值时 options 不含 `model`。新子区无需复制配置，已有子区也立即适用下一次启动策略。
+- 默认变更不遍历、不打断、不切换已有运行会话。子区显式 `/switch` 仍立即切换本聊天的 live worker；`/switch default` 仅清覆盖，不切 live。
+
+**回执与验收**：设置/清除回执注明下一次 worker 启动生效、运行中会话保持原模型。`/switch` 与 `/status` 显示有效策略及来源；运行中查询同时区分 live 模型与下次启动策略。验证设置→继承→覆盖→清覆盖继承→clear 无参数路径，跨 bot/群与重启隔离、所有 worker 入口、控制边界与命令去重。先观察缺失行为红灯，再实现；抛弃式真实子进程 smoke 检查 argv，旧 SQLite 一致性副本用实际迁移路径连续打开验证数据保留与幂等。验收不连接真实 bot、不向真实群发消息、不部署。
+
 
 ### 命令接入
 
-`BUILTIN_COMMANDS` 增加 `switch`，`handleCommand` 增加分支调用 `handleSwitch(message, argument)`；命令硬拦截（不发给模型），`/help` 增加一行「`/switch [模型]` 查看/切换本聊天模型（`provider/id`、模型 id/子串、`@角色` 如 `@default`；`default` 恢复跟随 OMP 默认）」。`/switch` 是控制命令：不消费正文附件。聊天有待回答问题时命令仍正常执行。
+`BUILTIN_COMMANDS` 与既有命令分派硬拦截 `/switch`，`/thread` 路由精确 `model` 子命令；`/help` 说明查询、选择器、子区默认与清覆盖语义。模型控制命令不消费正文附件，聊天有待回答问题时仍正常执行。
 
 参数去首尾空白后：
 
@@ -85,7 +108,7 @@ channel 需要一个 owner 可见的模型切换入口：在聊天里查看当�
    <provider>：<id1>、<id2>…
    ```
 
-   来源按优先级：运行中会话（`运行中会话`，与本聊天指定值不同时追加 `；本聊天模型 <值>`；相同时为 `本聊天指定`）→ 本聊天指定（`本聊天指定`）→ OMP 默认（`OMP 默认`）。`get_state` 没给模型时为 `当前模型：未知（OMP 未报告）`；列表为空时第二行为 `OMP 当前没有可用模型。`；总模型数超过 80 时按 provider 顺序截断并追加「…（共 N 个）」。
+   查询同时报告当前 live 模型（或 fresh 探测模型）与下一次启动策略，来源为本聊天指定、主群子区默认或不指定由 OMP 自行决定。无模型报告时明确未知，不拿配置伪造运行状态；列表为空时报告 OMP 没有可用模型；总模型数超过 80 时按 provider 顺序截断并说明总数。
 
 2. **`/switch <选择器>`**：`liveWorker(target)` 命中时直接 `live.switchModel(选择器)`，否则 `withProbeWorker(worker => worker.switchModel(选择器))`。`switchModel` 发出 `prompt` 帧 `/switch <选择器>`，以响应前到达的 `config_update` 为成功信号（带 `model.provider`/`model.id` 与 `thinkingLevel`）；没有它就视为选择器被 OMP 拒绝。成功时把 `provider/id:level` 写入 `chat_models`，回执：
 
@@ -94,7 +117,7 @@ channel 需要一个 owner 可见的模型切换入口：在聊天里查看当�
 
    被拒绝时回 `未找到模型 "<选择器>"；发送 /switch 查看可用模型列表。`（选择器经有界化处理：控制字符去掉、空白折叠、截断到 60 字符），不改任何状态。选择器含空白时不发探测，直接按未找到回复（选择器是单个词元，白名单般省掉一次进程启动）。
 
-3. **`/switch default`**：本聊天没有指定值时回 `本聊天未指定模型，继续跟随 OMP 默认。`；否则删除该行，并在空闲（无运行中回合）时用探测 worker 取当前默认，回 `已恢复跟随 OMP 默认模型（当前为 <值>）。`；探测失败或存在运行中会话时省略括号部分。运行中的会话不被改动——要移动它用 `/switch @default`。
+3. **`/switch default`**：删除本聊天显式配置，重新解析有效策略。子区有父群子区默认时回执说明继承的规范值；否则明确不指定模型、由 OMP 自行决定。运行中会话不被改动，回执说明下一次 worker 启动生效；该路径不创建探测 worker。
 
 WebSocket/网络失败一律收敛为 `无法从 OMP 读取模型信息，请稍后重试。`，且不改变持久化状态。命令执行的存储写入先于回执：写库失败走既有「命令未能持久完成，请重试。」路径。
 
@@ -113,11 +136,21 @@ CREATE TABLE IF NOT EXISTS chat_models (
 );
 ```
 
-store 侧：`getChatModel`、`setChatModel`、`clearChatModel`，经 `ChannelStore` 门面暴露。
+```sql
+CREATE TABLE IF NOT EXISTS thread_models (
+  bot_uid TEXT NOT NULL,
+  group_id TEXT NOT NULL,
+  model TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(bot_uid, group_id)
+);
+```
 
-worker 创建点（任务路径、`/new`、`/reset`、`/move`）在组装 `WorkerOptions` 时读取一次 `getChatModel`，有值则设 `model` 传入；`RpcWorkerFactory` 在 `--session-dir` 之后、`--resume` 之前追加 `--model <值>`。没有模型时 argv 与现状完全一致。
+store 侧保留 `getChatModel`、`setChatModel`、`clearChatModel`；增加主群子区默认读写与集中有效策略解析，经 `ChannelStore` 门面暴露。
 
-`/status` 在既有行后增加 `model=`：有值为存储的 `provider/id[:level]`，无值为 `未指定（OMP 默认）`。
+所有实际 worker 创建点读取一次有效策略；有值才设 `model`，RPC 与原生 commit 沿用已有 `--model` 参数构建。没有模型时不传参数，也不强制覆盖 resume 会话记录。
+
+`/status` 的 `model=` 为有效启动策略，带本聊天指定、主群子区默认或 OMP 自行决定的来源；运行中模型与下一次启动策略分别标明。
 
 ### 帧与边界
 
@@ -131,17 +164,27 @@ worker 创建点（任务路径、`/new`、`/reset`、`/move`）在组装 `Worke
 - 探测 cwd 不存在（工作区被删）：按默认目录顺序回退；全部不可用才拒绝命令。
 - `/switch` 输入含引号或其他字符：按字面作为选择器交给 OMP，不做 shell 展开；含空白时按未找到处理。
 - 同一聊天连续多次 `/switch`：每次独立解析，最后一次写入生效；消息 id 去重沿用既有命令 claim。
-- 群/线程/私聊一致：命令在三种目标都可用，模型互不影响。
+- 显式值按私聊/群/子区独立；只有子区会读取所属主群专用默认，主群自身 `/switch` 从不成为继承来源。
 - 运行中回合内 owner 发 `/switch`：活会话立即切换，该回合继续跑完（后续请求用新模型）；未启动的排队任务按启动时的绑定生效。
 
 ## 验收标准
 
-1. 空 `/switch`：回复包含当前模型名（运行中回合为活会话的模型并标注来源；空闲时有聊天模型为该值并标注「本聊天指定」，否则为 OMP 默认并标注「OMP 默认」）与按 provider 分组的可用模型列表，列表条数与 OMP `get_available_models` 一致（可解释为「已配置 provider 的模型」）。
+1. 空 `/switch`：报告查询到的模型与按 provider 分组的可用列表，并显示下一次启动策略和来源。运行中模型与配置不同也必须分别展示，不把「不指定」当作一个具体模型；fresh 探测不代表 resume 模型。
 2. `/switch <选择器>`（`provider/id`、模型 id/子串、`@角色`、`:level`）：回执明确；此后该聊天新建的 worker 带 `--model <解析后的 provider/id:level>`（测试断言 `WorkerOptions.model` 与真实子进程 argv；真机脚本验证 `switchModel` 的返回值与 `get_state` 一致），`/status` 的 `model=` 显示新值。
 3. 运行中切换：回合运行中发 `/switch` 时由该回合的活会话执行（测试断言探测 worker 没有被创建），真机验证会话模型立即变化且该回合正常跑完。
 4. 持久化：写库后服务重启（重建服务实例、同一 stateDir），该聊天新回合的 worker 仍带同一 `--model`。
 5. 无效选择器：回复单行有界中文错误，`chat_models` 不变，后续回合 worker 的 `--model` 维持原值（无模型时完全不变）。
-6. `bun run typecheck` 与 `bun test` 全绿；主规格、根 `AGENTS.md` 的命令清单与实现一致。
+6. 主群设置/clear 不切换运行中的父群/子区；下一次普通任务/恢复、goal、commit、新建/重置/移动会话一致遵循有效策略。子区显式值优先，清覆盖重新继承，clear 后无覆盖的 options 不含 `model`。
+7. 主群命令空参数、解析拒绝、owner/group 门禁、去重、pending ask、附件控制边界与关键词边界全部覆盖；SQLite 旧库升级保留旧配置且重复打开幂等。
+8. `bun run typecheck` 与 `bun test` 全绿；主规格、命令说明与实现一致。
+
+### 本次验证
+
+- TDD 已观察缺失接口、子区任务/恢复/commit 未携带继承模型及设置命令未启动 fresh probe 的红灯；实现后 `bun run typecheck` 通过，`bun test` 为 1164 pass、0 fail（85 个文件）。
+- 抛弃式服务配合真实 RPC 子进程夹具验证 14 次启动：角色解析后继承、普通任务继承、显式覆盖、父群变更后覆盖保留、清覆盖重新继承、clear 后新会话和 resume argv 均无 `--model`、clear 保留其他子区显式值、父群自身模型不变。使用本地 transport 与协议/上下文夹具，不调用模型、不连接真实 Bot。
+- 真实状态库的只读一致性副本经实际 `openChannelStore` 连续打开两次，配置读写/清除和跨 bot 隔离通过；原有 25 张表、7174 行旧列哈希一致，`PRAGMA integrity_check` 为 `ok`，新增表主键为 `(bot_uid, group_id)`。抛弃式源码副本删除该建表 DDL 后，永久迁移回归按预期因缺表失败。
+- 配置卡采用真实 builder 输出，在本地 AdaptiveCards 渲染器验证继承、显式覆盖、不指定三种状态；340/440 px 截图已检查，340 px 无水平溢出、无 schema 验证错误；三张样例各 11 个节点、深度 4，选择 default 后提交值正确。本地渲染不代表真实 Octo 客户端像素验收。
+
 
 ## 未决事项
 

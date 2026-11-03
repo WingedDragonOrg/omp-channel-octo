@@ -21,7 +21,15 @@ import type {
   WorkerModelCatalog,
   WorkerModelSwitch,
 } from "../contracts.ts";
-import { boundedSelectorText, formatModelCatalog, modelCatalogCurrent, modelWithLevel, switchCardChoices } from "./model-switch.ts";
+import {
+  boundedSelectorText,
+  formatModelCatalog,
+  modelCatalogCurrent,
+  modelPolicyDescription,
+  modelWithLevel,
+  switchCardChoices,
+  type ModelSelection,
+} from "./model-switch.ts";
 import type { ChannelStore } from "../store/index.ts";
 import type { WorkerSession } from "../runtime/worker-lease.ts";
 import { openTrackedWorker } from "../runtime/worker-lease.ts";
@@ -33,11 +41,18 @@ const SWITCH_CWD_UNAVAILABLE_TEXT = "无法解析该聊天的工作目录，/swi
 function notFoundModelText(selector: string): string {
   return `未找到模型 "${boundedSelectorText(selector)}"；发送 /switch 查看可用模型列表。`;
 }
-
-/** A `/switch` failure as one bounded line: no working directory, or no usable OMP answer. */
-function switchFailureText(error: unknown): string {
-  return error instanceof SwitchDirectoryError ? SWITCH_CWD_UNAVAILABLE_TEXT : SWITCH_PROBE_FAILED_TEXT;
+/** A thread-default selector OMP could not resolve. */
+function notFoundThreadModelText(selector: string): string {
+  return `未找到模型 "${boundedSelectorText(selector)}"；请使用 /thread model 查看本群默认。`;
 }
+
+function threadModelFailureText(error: unknown): string {
+  return error instanceof SwitchDirectoryError
+    ? "无法解析该主群的工作目录，/thread model 暂不可用。"
+    : SWITCH_PROBE_FAILED_TEXT;
+}
+
+const THREAD_MODEL_CHAT_ONLY_TEXT = "/thread model 仅可在 owner 的主群中使用，不支持 DM 或子区。";
 
 /** A `/switch` probe whose chat directory cannot be resolved; reported apart from worker failures. */
 class SwitchDirectoryError extends Error {
@@ -45,6 +60,10 @@ class SwitchDirectoryError extends Error {
     super("switch probe directory unavailable");
     this.name = "SwitchDirectoryError";
   }
+}
+
+function switchFailureText(error: unknown): string {
+  return error instanceof SwitchDirectoryError ? SWITCH_CWD_UNAVAILABLE_TEXT : SWITCH_PROBE_FAILED_TEXT;
 }
 
 /**
@@ -80,13 +99,12 @@ export class ModelSwitchController {
   constructor(private readonly deps: ModelSwitchControllerDeps) {}
 
   /**
-   * `/switch [选择器]`: no argument reports the model this chat is on plus every model OMP offers;
-   * `default` drops the chat's model; anything else is handed to OMP's own `/switch`, which
-   * resolves `provider/id`, a model id or substring, `@role`, and an optional `:level` suffix
-   * against its live catalog. The resolved `provider/id:level` is stored for the chat, so workers
-   * started later (tasks, `/new`, `/reset`, `/move`) get it as `--model` — and when a turn is
-   * already running, the same dispatch switches that session in place, because OMP consumes the
-   * command locally instead of starting an agent turn.
+   * `/switch [选择器]`: no argument reports OMP's observed current model separately from the
+   * policy for the next worker and every model OMP offers. `default` drops the chat's model;
+   * anything else is handed to OMP's own `/switch`, which resolves `provider/id`, a model id or
+   * substring, `@role`, and an optional `:level` suffix against its live catalog. The resolved
+   * `provider/id:level` is stored for the chat, so workers started later receive it as `--model`.
+   * When a turn is already running, OMP consumes the command locally and switches that session.
    */
   async handleSwitch(message: InboundMessage, argument: string): Promise<void> {
     const requested = argument.trim();
@@ -117,6 +135,38 @@ export class ModelSwitchController {
     await this.deps.enqueueText(message, receipt, null);
   }
 
+  /** Owner's `/thread model` control path; it never uses or changes the parent group's live worker. */
+  async handleThreadModel(target: InboundMessage, argument: string): Promise<void> {
+    if (target.channelType !== 2) {
+      await this.deps.enqueueText(target, THREAD_MODEL_CHAT_ONLY_TEXT, null);
+      return;
+    }
+    const requested = argument.trim();
+    const receipt = await this.deps.menu.serialize("switch", target, async () => {
+      const botUid = this.deps.botUid();
+      if (requested.length === 0) {
+        const model = this.deps.store.getThreadModel(botUid, target.channelId);
+        return `本群子区默认模型：${model ?? "不指定（由 OMP 自行决定）"}。`;
+      }
+      if (requested.toLowerCase() === "clear") {
+        this.deps.store.clearThreadModel(botUid, target.channelId);
+        return "已清除本群子区默认模型；无聊天显式覆盖的子区下次启动由 OMP 自行决定，运行中会话保持原模型。";
+      }
+      if (/\s/u.test(requested)) return notFoundThreadModelText(requested);
+      let outcome: WorkerModelSwitch;
+      try {
+        outcome = await this.withProbeWorker(target, worker => worker.switchModel(requested));
+      } catch (error) {
+        return threadModelFailureText(error);
+      }
+      if (!outcome.ok) return notFoundThreadModelText(requested);
+      const model = modelWithLevel(outcome.model, outcome.level);
+      this.deps.store.setThreadModel(botUid, target.channelId, model);
+      return `已设置本群子区默认模型为 ${model}；无聊天显式覆盖的子区从下次 worker 启动生效，运行中会话保持原模型。`;
+    });
+    await this.deps.enqueueText(target, receipt, null);
+  }
+
   /**
    * Apply one `/switch` request — a selector, or `default` — and return the receipt verbatim. The
    * text command and a card click share this path: both go through OMP's own resolution and persist
@@ -126,7 +176,7 @@ export class ModelSwitchController {
   async applySwitch(target: ChatTarget, requested: string): Promise<string> {
     const live = this.deps.liveWorker(target);
     if (requested.toLowerCase() === "default" && !requested.includes("/")) {
-      return await this.resetChatModel(target, live);
+      return await this.resetChatModel(target);
     }
     // A selector is a single token; catching a stray one here keeps a typo from starting a worker.
     if (/\s/u.test(requested)) return notFoundModelText(requested);
@@ -147,63 +197,48 @@ export class ModelSwitchController {
   }
 
   /**
-   * The empty `/switch` card: the current model and the catalog exactly as the text receipt renders
-   * them — `plain` is that same text, so a deployment that cannot carry cards (or declines this
-   * frame) answers byte-for-byte as before. Choices are `default` plus the catalog's selectors.
+   * The empty `/switch` card reports OMP's observed model separately from the policy for the next
+   * worker; `plain` carries the same information if cards are unavailable.
    */
   private switchMenuView(target: ChatTarget, running: boolean, catalog: WorkerModelCatalog): CommandCardView {
-    const { current, label } = this.chatModel(target, running, catalog);
+    const { current, label, policy } = this.chatModel(target, running, catalog);
     return {
       kind: "switch",
       current: modelCatalogCurrent(current, label),
+      nextModel: modelPolicyDescription(policy.model, policy.source),
       choices: switchCardChoices(catalog.available),
-      plain: formatModelCatalog({ current, label, models: catalog.available }),
+      plain: formatModelCatalog({ current, label, models: catalog.available, policy }),
     };
   }
 
-  /**
-   * The model this chat is on, plus where the value comes from: the live session's model while a
-   * turn runs (that is the model in use), otherwise this chat's stored model, otherwise the model
-   * OMP would start a fresh session with.
-   */
+  /** The observed current model is live only while a worker is running; otherwise it is probe-only. */
   private chatModel(
     target: ChatTarget,
     running: boolean,
     catalog: WorkerModelCatalog,
-  ): { current: string | null; label: string } {
-    const stored = this.deps.store.getChatModel(this.deps.botUid(), target);
-    const live = catalog.current === null ? null : modelWithLevel(catalog.current, catalog.level);
-    if (running && live !== null) {
-      return {
-        current: live,
-        label:
-          stored === null
-            ? "运行中会话"
-            : stored === live
-              ? "本聊天指定"
-              : `运行中会话；本聊天模型 ${stored}`,
-      };
-    }
-    if (stored !== null) return { current: stored, label: "本聊天指定" };
-    return { current: live, label: "OMP 默认" };
+  ): { current: string | null; label: string; policy: ModelSelection } {
+    const policy = this.deps.store.resolveChatModel(this.deps.botUid(), target);
+    const current = catalog.current === null ? null : modelWithLevel(catalog.current, catalog.level);
+    return {
+      current,
+      label: running ? "运行中会话" : "临时探测（不代表恢复会话）",
+      policy,
+    };
   }
 
   /**
-   * `/switch default`: drop this chat's model so later workers start without `--model` and follow
-   * OMP's own default selection. A running session is left alone — `/switch @default` is the
-   * native way to move it.
+   * `/switch default` removes only the chat override. A thread then inherits its group's policy;
+   * with no applicable setting the next worker starts without `--model`, including on resume.
    */
-  private async resetChatModel(target: ChatTarget, live: WorkerSession | undefined): Promise<string> {
-    const previous = this.deps.store.getChatModel(this.deps.botUid(), target);
-    if (previous === null) return "本聊天未指定模型，继续跟随 OMP 默认。";
-    this.deps.store.clearChatModel(this.deps.botUid(), target);
-    let current: string | null = null;
-    if (live === undefined) {
-      const catalog = await this.withProbeWorker(target, worker => worker.models()).catch(() => null);
-      if (catalog !== null && catalog.current !== null) current = modelWithLevel(catalog.current, catalog.level);
-    }
-    return `已恢复跟随 OMP 默认模型${current === null ? "" : `（当前为 ${current}）`}。`;
+  private async resetChatModel(target: ChatTarget): Promise<string> {
+    const botUid = this.deps.botUid();
+    const hadOverride = this.deps.store.getChatModel(botUid, target) !== null;
+    if (hadOverride) this.deps.store.clearChatModel(botUid, target);
+    const policy = this.deps.store.resolveChatModel(botUid, target);
+    const action = hadOverride ? "已清除本聊天显式模型" : "本聊天没有显式模型覆盖";
+    return `${action}；下次启动策略：${modelPolicyDescription(policy.model, policy.source)}，运行中会话保持原模型。`;
   }
+
 
   /**
    * One throwaway worker serves a `/switch` probe: fresh (no `--resume`), no prompt of our own

@@ -35,14 +35,11 @@ test("an empty /switch reports the current model and every available model", asy
   try {
     const before = await probeDirs();
     await harness.service.handleInbound(inbound({ ...DM, messageId: "switch-list", text: "/switch" }));
-    expect(await sentText(harness)).toBe(
-      [
-        "当前模型：fixture/default（OMP 默认）",
-        "可用模型（来自 OMP 已配置 provider，共 3 个）：",
-        "fixture：default、fast",
-        "other：fast",
-      ].join("\n"),
-    );
+    const report = await sentText(harness);
+    expect(report).toContain("当前模型：fixture/default");
+    expect(report).toContain("下次启动策略：不指定（由 OMP 自行决定）");
+    expect(report).toContain("fixture：default、fast");
+    expect(report).toContain("other：fast");
     // The probe is a throwaway fresh worker: one creation, stopped, no ledger row, no temp dir.
     expect(harness.workers.creations.length).toBe(1);
     expect(harness.workers.workers[0]?.stopped).toBe(true);
@@ -158,7 +155,7 @@ test("/switch default goes back to OMP's default model", async () => {
   try {
     await harness.service.handleInbound(inbound({ ...DM, messageId: "switch-before-default", text: "/switch fixture/fast" }));
     await harness.service.handleInbound(inbound({ ...DM, messageId: "switch-default", text: "/switch default" }));
-    expect(await sentText(harness)).toBe("已恢复跟随 OMP 默认模型（当前为 fixture/default）。");
+    expect(await sentText(harness)).toContain("下次启动策略：不指定（由 OMP 自行决定）");
     const store = await openChannelStore(harness.stateDir);
     try {
       expect(store.getChatModel(harness.bot.uid, DM)).toBeNull();
@@ -221,7 +218,8 @@ test("an empty /switch during a turn reports the running session's model", async
     await harness.service.handleInbound(inbound({ ...DM, messageId: "switch-live-switch", text: "/switch @fast" }));
     await harness.service.handleInbound(inbound({ ...DM, messageId: "switch-live-list", text: "/switch" }));
     const text = await sentText(harness);
-    expect(text.split("\n")[0]).toBe("当前模型：other/fast:max（本聊天指定）");
+    expect(text).toContain("当前模型：other/fast:max（运行中会话）");
+    expect(text).toContain("下次启动策略：other/fast:max（本聊天指定）");
     // The running session answered the report itself, so no probe worker was started.
     expect(harness.workers.creations.length).toBe(1);
     finish.resolve();
@@ -325,9 +323,10 @@ test("a deployment without any available model says so", async () => {
   try {
     harness.workers.catalog = { current: "fixture/default", level: null, available: [] };
     await harness.service.handleInbound(inbound({ ...DM, messageId: "switch-no-models", text: "/switch" }));
-    expect(await sentText(harness)).toBe(
-      ["当前模型：fixture/default（OMP 默认）", "OMP 当前没有可用模型。"].join("\n"),
-    );
+    const report = await sentText(harness);
+    expect(report).toContain("当前模型：fixture/default（临时探测");
+    expect(report).toContain("下次启动策略：不指定（由 OMP 自行决定）");
+    expect(report).toContain("OMP 当前没有可用模型。");
     await harness.service.handleInbound(inbound({ ...DM, messageId: "switch-no-models-set", text: "/switch fixture/fast" }));
     expect(await sentText(harness)).toBe('未找到模型 "fixture/fast"；发送 /switch 查看可用模型列表。');
   } finally {

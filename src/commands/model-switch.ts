@@ -16,6 +16,27 @@ export function modelWithLevel(model: string, level: string | null): string {
   return level === null ? model : `${model}:${level}`;
 }
 
+export type ModelSelectionSource = "chat" | "thread" | "omp";
+
+/** Format the configured worker-start policy without presenting it as a live model. */
+export function modelPolicyDescription(
+  model: string | null,
+  source: ModelSelectionSource,
+): string {
+  if (model === null) return "不指定（由 OMP 自行决定）";
+  const label = source === "chat"
+    ? "本聊天指定"
+    : source === "thread"
+      ? "主群子区默认"
+      : "OMP 自行决定";
+  return `${model}（${label}）`;
+}
+
+export interface ModelSelection {
+  model: string | null;
+  source: ModelSelectionSource;
+}
+
 /**
  * A selector as it may appear in an error line: control characters dropped, whitespace collapsed,
  * and length bounded, so no user input can stretch or break a receipt.
@@ -35,17 +56,19 @@ export function modelCatalogCurrent(current: string | null, label: string): stri
 }
 
 /**
- * The empty `/switch` answer: the model the chat is on followed by every available model, grouped
- * by provider and truncated at {@link MODEL_CATALOG_MAX_MODELS}. `current` already carries its
- * level; `label` says where the value comes from (a running session, this chat's setting, OMP's
- * default).
+ * The empty `/switch` answer separates the model observed from OMP from the next worker's policy,
+ * followed by every available model grouped by provider.
  */
 export function formatModelCatalog(input: {
   current: string | null;
   label: string;
   models: readonly WorkerModelInfo[];
+  policy: ModelSelection;
 }): string {
-  const lines: string[] = [`当前模型：${modelCatalogCurrent(input.current, input.label)}`];
+  const lines = [
+    `当前模型：${modelCatalogCurrent(input.current, input.label)}`,
+    `下次启动策略：${modelPolicyDescription(input.policy.model, input.policy.source)}`,
+  ];
   if (input.models.length === 0) {
     lines.push("OMP 当前没有可用模型。");
     return lines.join("\n");
@@ -90,7 +113,7 @@ export function switchCardChoices(
   models: readonly WorkerModelInfo[],
 ): { title: string; value: string }[] {
   const choices: { title: string; value: string }[] = [
-    { title: "跟随 OMP 默认（清除本聊天模型）", value: "default" },
+    { title: "清除本聊天覆盖（子区继承主群默认，否则由 OMP 决定）", value: "default" },
   ];
   const seen = new Set<string>();
   for (const model of models) {

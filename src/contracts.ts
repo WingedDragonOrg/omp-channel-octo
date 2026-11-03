@@ -790,7 +790,7 @@ export interface ChannelStatus {
   cwd: string | null;
   state: ChatExecutionState;
   mode: ChatAppendMode;
-  /** The chat's `provider/id` model, or null when it follows OMP's default. */
+  /** The effective next-worker model; null means no model is passed and OMP decides. */
   model: string | null;
   queued: number;
   outbox: number;

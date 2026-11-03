@@ -68,13 +68,13 @@ function cardTransport(): FakeTransport {
   return transport;
 }
 
-/** The catalog listing the deployment renders when it cannot carry the card. */
-const SWITCH_LISTING = [
-  "当前模型：fixture/default（OMP 默认）",
-  "可用模型（来自 OMP 已配置 provider，共 3 个）：",
-  "fixture：default、fast",
-  "other：fast",
-].join("\n");
+/** Assert the user-facing model policy and catalog without pinning incidental prose. */
+function expectSwitchListing(texts: readonly string[]): void {
+  const latest = texts.at(-1);
+  expect(latest).toContain("不指定");
+  expect(latest).toContain("fixture：default、fast");
+  expect(latest).toContain("other：fast");
+}
 
 /** The first card send is held until released, so a click can precede its receipt. */
 class GatedTransport extends FakeTransport {
@@ -112,6 +112,7 @@ test("model card selection persists and reaches the next worker without a genera
     await harness.service.handleInbound(inbound({ messageId: "model-menu", text: "/switch" }));
     expect(transport.sentCards).toHaveLength(1);
     const card = transport.sentCards[0]!;
+    expect(cardTexts(card.frame)).toContain("下次启动策略：不指定（由 OMP 自行决定）");
     transport.pushBotEvent(cardActionEvent(1, select(card, "fixture/fast")));
     await transport.waitForAck(1);
     const store = await openChannelStore(harness.stateDir);
@@ -166,7 +167,7 @@ test("the switch card's default choice clears the chat model for the next worker
       expect(store.getChatModel(harness.bot.uid, target)).toBeNull();
     } finally { store.close(); }
     const edit = await transport.waitForCardEdit(entry => entry.messageId === card.messageId);
-    expect(cardTexts(edit.frame)).toContain("已恢复跟随 OMP 默认模型（当前为 fixture/default）。");
+    expect(cardTexts(edit.frame).join("\n")).toContain("下次启动策略：不指定（由 OMP 自行决定）");
     expect(hasControls(edit.frame)).toBe(false);
     await harness.service.handleInbound(inbound({ ...target, messageId: "default-task", text: "run the fixture" }));
     await harness.workers.waitForPromptCount(1);
@@ -307,7 +308,7 @@ test("a deployment that cannot carry cards keeps the command's original text rep
   const plain = await createCoreHarness({ transport: unsupported });
   try {
     await plain.service.handleInbound(inbound({ messageId: "plain-switch", text: "/switch" }));
-    expect(chatTexts(unsupported, { channelId: "dm-owner", channelType: 1 })).toEqual([SWITCH_LISTING]);
+    expectSwitchListing(chatTexts(unsupported, { channelId: "dm-owner", channelType: 1 }));
     expect(unsupported.sentCards).toHaveLength(0);
   } finally { await closeCoreHarness(plain); }
 
@@ -316,14 +317,14 @@ test("a deployment that cannot carry cards keeps the command's original text rep
   const refused = await createCoreHarness({ transport });
   try {
     await refused.service.handleInbound(inbound({ messageId: "refused-switch", text: "/switch" }));
-    expect(chatTexts(transport, { channelId: "dm-owner", channelType: 1 })).toEqual([SWITCH_LISTING]);
+    expectSwitchListing(chatTexts(transport, { channelId: "dm-owner", channelType: 1 }));
     await refused.service.handleInbound(inbound({ messageId: "refused-mode", text: "/mode" }));
     expect(chatTexts(transport, { channelId: "dm-owner", channelType: 1 }).at(-1)).toContain("当前追加模式：steer");
     // 抛错的发送同样回退，并且不留下任何可点击的会话。
     transport.cardSendRefusal = undefined;
     transport.cardSendFailure = new Error("card transport down");
     await refused.service.handleInbound(inbound({ messageId: "failed-switch", text: "/switch" }));
-    expect(chatTexts(transport, { channelId: "dm-owner", channelType: 1 }).at(-1)).toBe(SWITCH_LISTING);
+    expectSwitchListing(chatTexts(transport, { channelId: "dm-owner", channelType: 1 }));
     expect(transport.sentCards).toHaveLength(0);
   } finally { await closeCoreHarness(refused); }
 });

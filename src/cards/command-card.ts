@@ -23,6 +23,7 @@ export const COMMAND_INPUT_ID = "config_value";
 export interface CommandCardView {
   kind: CommandCardKind;
   current: string;
+  nextModel?: string;
   choices: readonly { title: string; value: string }[];
   plain: string;
 }
@@ -31,7 +32,7 @@ const KIND_TEXT: Record<CommandCardKind, { title: string; label: string; note: s
   switch: {
     title: "切换本聊天模型",
     label: "模型",
-    note: "选择「default」清除本聊天的模型覆盖，之后启动的回合跟随 OMP 默认；不会重置正在运行的模型。",
+    note: "选择「default」清除本聊天模型覆盖；之后由 OMP 自行决定或按主群子区默认启动，不改变运行中会话。",
     command: "/switch",
   },
   mode: {
@@ -63,8 +64,15 @@ export function buildCommandCard(view: CommandCardView, actionId: string): CardF
     type: "AdaptiveCard",
     version: "1.5",
     body: [
-      { type: "TextBlock", text: copy.title, wrap: true, weight: "Bolder", size: "Medium" },
       { type: "TextBlock", text: `当前：${cardText(view.current)}`, wrap: true, spacing: "Small" },
+      ...(view.nextModel === undefined
+        ? []
+        : [{
+            type: "TextBlock",
+            text: `下次启动策略：${cardText(view.nextModel)}`,
+            wrap: true,
+            spacing: "Small",
+          }]),
       { type: "TextBlock", text: copy.note, wrap: true, spacing: "Small", isSubtle: true },
       {
         type: "Input.ChoiceSet",

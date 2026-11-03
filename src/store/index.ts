@@ -9,7 +9,7 @@ import { dirname } from "node:path";
 import type { ChatAppendMode, ChatTarget, ThreadListenLevel, WorkerGoal, WorktreeMergeOutcome } from "../contracts.ts";
 import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadListenRecord, ThreadMergeEventRecord, HostMergeLeaseRecord, HostMergeLeaseInput } from "./store-records.ts";
 import { applySchema } from "./store-schema.ts";
-import { claimOwnerEnrollment, clearChatModel, ensureBinding, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, grantAllowedChat, hasOwnerEnrollment, listAllowedChats, setBotUid, setChatMode, setChatModel, setOwnerId, updateBindingSession } from "./store-chats.ts";
+import { claimOwnerEnrollment, clearChatModel, clearThreadModel, ensureBinding, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, getThreadModel, grantAllowedChat, hasOwnerEnrollment, listAllowedChats, resolveChatModel, setBotUid, setChatMode, setChatModel, setOwnerId, setThreadModel, updateBindingSession } from "./store-chats.ts";
 import { acceptCommitTask, acceptTask, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, getTaskByMessageId, isCommitTask, isTaskResuming, listQueuedTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim, suppressTaskRelay } from "./store-tasks.ts";
 import { bindGoalTaskSession, clearGoalSession, finishGoalTaskProgress, getGoalSession, getGoalTask, isGoalTaskResuming, markGoalTaskAccepted, markGoalTaskAgentAccepted, markGoalTaskDispatched, saveGoalSessionProgress, stopGoalContinuation, updateGoalTaskProgress } from "./store-goals.ts";
 import { clearProgressCard, listProgressCards, recordProgressCardAttempt, saveProgressCard } from "./store-cards.ts";
@@ -317,7 +317,7 @@ export class ChannelStore {
     setChatMode(this.db, botUid, target, mode);
   }
 
-  /** The chat's `provider/id` model, or null when it follows OMP's default. */
+  /** The chat's explicit model preference; null means no local override. */
   getChatModel(botUid: string, target: ChatTarget): string | null {
     return getChatModel(this.db, botUid, target);
   }
@@ -328,6 +328,25 @@ export class ChannelStore {
 
   clearChatModel(botUid: string, target: ChatTarget): void {
     clearChatModel(this.db, botUid, target);
+  }
+
+  getThreadModel(botUid: string, groupId: string): string | null {
+    return getThreadModel(this.db, botUid, groupId);
+  }
+
+  setThreadModel(botUid: string, groupId: string, model: string): void {
+    setThreadModel(this.db, botUid, groupId, model);
+  }
+
+  clearThreadModel(botUid: string, groupId: string): void {
+    clearThreadModel(this.db, botUid, groupId);
+  }
+
+  resolveChatModel(
+    botUid: string,
+    target: ChatTarget,
+  ): { model: string | null; source: "chat" | "thread" | "omp" } {
+    return resolveChatModel(this.db, botUid, target);
   }
 
   /**

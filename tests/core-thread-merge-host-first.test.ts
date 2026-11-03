@@ -1656,6 +1656,7 @@ test("a refused merge repair remains pending when its exact stable task was not 
     });
     const commands = new ThreadCommands({
       store,
+      handleThreadModel: async () => {},
       ensureThreadListen: async () => {},
       replayThreadMergeSuccess: async () => null,
       refuseIncompleteThreadWorkspace: async () => false,

@@ -184,7 +184,8 @@ test("a restart is accepted while work is running and never cancels it", async (
 });
 
 test("a restart resumes the interrupted turn in its own session without replaying its input", async () => {
-  const target: ChatTarget = { channelId: "dm-resume", channelType: 1 };
+  const group: ChatTarget = { channelId: "group-allowed", channelType: 2 };
+  const target: ChatTarget = { channelId: "group-allowed____thread-resume", channelType: 5 };
   const first = await createCoreHarness({
     prompt: async (context) => {
       context.emit({ type: "text", messageId: "assistant-1", text: "第一步已保存", final: true });
@@ -192,10 +193,22 @@ test("a restart resumes the interrupted turn in its own session without replayin
     },
   });
   try {
-    await first.service.handleInbound(inbound({ messageId: "resume-running", ...target, text: "长任务第一步" }));
+    await first.service.handleInbound(inbound({
+      messageId: "resume-thread-model-policy",
+      ...group,
+      text: "/thread model fixture/fast:high",
+      mentionedUserIds: [first.bot.uid],
+    }));
+    await first.service.handleInbound(inbound({
+      messageId: "resume-running",
+      ...target,
+      text: "长任务第一步",
+      mentionedUserIds: [first.bot.uid],
+    }));
     await first.workers.waitForPromptCount(1);
     await waitForStatus(first.service, target, (status) =>
       status.outbox === 0 && textsFor(first, target).includes("第一步已保存"));
+    expect(first.workers.creations.at(-1)?.model).toBe("fixture/fast:high");
   } finally {
     await closeCoreHarness(first, { remove: false });
   }
@@ -218,6 +231,7 @@ test("a restart resumes the interrupted turn in its own session without replayin
   });
   try {
     await waitForStatus(restarted.service, target, (status) => status.state === "completed" && status.outbox === 0);
+    expect(restarted.workers.creations.at(-1)?.model).toBe("fixture/fast:high");
     expect(restarted.workers.prompts.map((prompt) => prompt.text)).toEqual(["/retry"]);
     expect((await readText(join(first.root, "tmp", "effects.log"))).trim().split("\n")).toEqual(["/retry"]);
     // 续接沿用同一会话：绑定行没有被换掉。
@@ -228,6 +242,36 @@ test("a restart resumes the interrupted turn in its own session without replayin
     expect(delivered).not.toContain("因重启中断");
     expect(delivered).not.toContain("任务已取消");
     expect(delivered).not.toContain("任务已中断");
+  } finally {
+    await closeCoreHarness(restarted);
+  }
+});
+
+test("a resumed thread without a chat or parent model leaves selection to OMP", async () => {
+  const target: ChatTarget = { channelId: "group-b____thread-resume-omp-default", channelType: 5 };
+  const first = await createCoreHarness({ prompt: suspendedPrompt });
+  try {
+    await first.service.handleInbound(inbound({
+      messageId: "resume-omp-default",
+      ...target,
+      text: "hold this resumable turn",
+      mentionedUserIds: [first.bot.uid],
+    }));
+    await first.workers.waitForPromptCount(1);
+    await waitForStatus(first.service, target, status => status.state === "running");
+  } finally {
+    await closeCoreHarness(first, { remove: false });
+  }
+
+  const restarted = await createCoreHarness({
+    root: first.root,
+    bot: first.bot,
+    prompt: recordingPrompt,
+  });
+  try {
+    await waitForStatus(restarted.service, target, status => status.state === "completed" && status.outbox === 0);
+    expect(restarted.workers.creations.at(-1)?.model).toBeUndefined();
+    expect(restarted.workers.prompts.map(prompt => prompt.text)).toEqual(["/retry"]);
   } finally {
     await closeCoreHarness(restarted);
   }

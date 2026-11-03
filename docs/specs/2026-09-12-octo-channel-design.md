@@ -151,10 +151,11 @@ channel 支持下列命令，`/help` 展示用法；`/retry` 经 OMP 原生命�
 | `/reset [目录]` | 与 `/new` 使用相同的目录解析，但明确重置为 fresh 会话；原会话历史文件保留；与 `/new` 共用创建路径，成功回执同式（含实际模型），会话切换时间同样记录 |
 | `/move <目录>` | 调用当前会话的 OMP 原生 `/move`，校验刷新后的 session state，沿用同一 session ID、历史和附件 |
 | `/thread <任务>` | 交给助手处理：助手自行确定子区名称与 `worktree_name`，新建带独立 git worktree 的 CommunityTopic 子区并把任务派发进去（派发正文按 SDD 格式写；清晰到可直接生成 SDD 的需求直接开工，否则发起会话只做够派发的最少澄清、剩余澄清由子区按 SDD 格式进行）；只在群聊中可用 |
+| `/thread model [选择器\|clear]` | 仅 owner 在主群查询/设置/清除所属子区默认模型；原生 fresh probe 解析成功后持久化，主群自身模型不变；下次子区 worker 启动生效，不切换运行中会话 |
 | `/thread merge` | 仅隔离 worktree 子区可用；宿主独占后直接执行默认 wt 合并/清理，成功零 agent 任务，回执送达后归档。实际执行失败才将诊断和现场交给本聊天 agent 修复，再用 host `thread-merge` 重试。尾随文字作为 owner 补充上下文保留，不拼入 shell；资格不符只回明确提示 |
 | `/queue <文本>` | 把该文本作为排队任务追加在当前任务之后，不受当前追加模式影响；正文经与普通任务相同的组装点，随消息发来的附件以本机绝对路径进入排队任务的正文 |
 | `/mode [steer\|queue]` | 设置/报告该聊天的追加模式：`steer`（默认，`default` 同义）把运行中的新消息注入当前回合，`queue` 把它变成排队任务；无参数时报告当前设置，部署声明 `octo/v2` 时改发 owner-only 配置卡片（一行选择 + 一次提交；卡片不可用时回退为同一段文本） |
-| `/switch [模型]` | 无参数时报告本聊天当前模型与可用模型列表（运行中的回合用其活会话读 `get_state`/`get_available_models`，否则由 fresh 一次性 worker 读取）；带参数时把选择器交给 OMP 自己的 `/switch` 解析并应用（`provider/id`、模型 id/子串、`@角色`、`:level`）——有运行中的回合时切该会话，空闲时解析后按聊天持久化、之后启动的 worker 带 `--model`；`default` 恢复跟随 OMP 默认；无参数时在 `octo/v2` 可用的部署改发 owner-only 配置卡片（`default` 加目录选择器），卡片不可用时回退为同一段文本列表 |
+| `/switch [模型]` | 查询当前模型、下一次启动策略与来源及可用模型；原生选择器支持 `provider/id`、模型 id/唯一子串、`@角色`、`:level`。显式选择立即切换本聊天 live 会话并持久化；`default` 清除显式覆盖，子区重新继承主群子区默认，否则不指定参数、由 OMP 自行决定。无参数时可使用 owner-only 配置卡片，卡片不可用时回退文本 |
 | `/goal`、`/goal show` | 查询本聊天绑定的原生目标，显示 goal ID、目标、状态、用量和预算 |
 | `/goal set [--budget N] <目标>` | durable 接纳后结构化创建并持续执行；预算为正整数 token；已有目标时拒绝替换 |
 | `/goal pause`、`/goal resume`、`/goal drop` | 暂停后续续跑、恢复或删除目标；控制请求不排在持续目标后面，启动/恢复遵循任务和目录串行 |
@@ -181,7 +182,11 @@ channel 支持下列命令，`/help` 展示用法；`/retry` 经 OMP 原生命�
 
 `/restart` 由 channel 按自身 PID 检测出的守护进程执行（见 `2026-09-16-oco-cli-entry-design.md`）；未检测到时明确拒绝，不猜测重启机制。命令以独立会话派生，守护进程负责停止 channel；命令没有停止进程时 channel 继续服务并记录告警。`/restart` 与 `/restart now` 都允许忙时重启，发起聊天收到一次请求回执。停机保留在途任务与队列，新进程先核验并停止遗留 worker，再沿任务原 session 续接，随后执行队列；任务恢复成功不另发中断、取消或恢复完成通报，服务启停本身按生命周期通知规则向 owner 私聊发送时间与 PID。无法确认旧进程停止的目录保持阻塞；session 身份或 prompt 接受状态不明时明确报告恢复失败。可续接任务继续编辑原进度卡，并保留待答问题。
 
-`/switch [模型]` 按聊天目标查看与切换模型：无参数时报告「当前模型 + 按 provider 分组的可用模型（总模型数超过 80 时截断并说明总数）」——有运行中的回合时由该回合的活会话读 `get_state`/`get_available_models`（模型标注「运行中会话」，与本聊天指定值不同时并列给出），否则用既有 `WorkerFactory` 起一个 fresh 一次性 worker（临时会话目录，`mkdtemp` 创建、读完即停并删除）读取，空闲且未指定时标注「OMP 默认」；带参数时把选择器原样交给 OMP 自己的 `/switch` 解析——`provider/id`、模型 id 或唯一子串、`@角色`（OMP `settings.modelRoles` 的映射）与 `:level` 后缀都由 OMP 决定，channel 不复制解析规则；解析成功时把 `provider/id:level` 写入状态盘 `chat_models`（按 `botUid` 与真实聊天目标隔离，不继承），解析失败回单行中文错误且不改状态。生效分两部分：有运行中的回合时选择器直接分发给该回合的活会话（OMP 只改本会话、不产生 agent 回合，实测回合运行中可用且该回合继续跑完）；之后启动的 worker（任务路径与 `/new`、`/reset`、`/move`）组装 `WorkerOptions` 时读取该值并传 `--model`，resume 的会话也因此覆盖记录里的模型，服务重启后仍生效。`default`（不含 `/`）清除本聊天模型、之后跟随 OMP 默认，运行中的会话不被改动（要移动它用 `/switch @default`）。该命令不取聊天会话 lease——探测 worker 是 fresh、不跑 agent 回合、独立会话目录的一次性进程，不读写任何聊天会话；worker ledger 以 `switch-` 前缀记录并在停止后清除，临时目录随即删除。
+`/switch [模型]` 按聊天目标查看与切换模型。选择器一律由 OMP 原生 `/switch` 解析，成功后按 bot 和聊天目标将规范 `provider/id[:level]` 写入 `chat_models`；失败不改配置。显式选择在运行中直接切换本聊天 live 会话，空闲时复用 fresh 一次性探测 worker；无参数查询从 live 会话读取实际模型，否则探测目录，并显示下一次启动策略与来源。探测使用临时会话目录、既有 worker ledger 与停止回收流程，不读写聊天会话。
+
+主群 `/thread model [选择器|clear]` 统一管理所属子区默认。空参数查询；未设置明确「不指定，由 OMP 自行决定」。设置始终经 fresh probe 原生解析，不使用父群 live worker、不改变父群 `/switch` 模型；`clear` 仅删除默认，不解析为模型名，不删除子区显式覆盖。数据保存在增量创建的 `thread_models`，主键 `(bot_uid, group_id)`，旧聊天配置不复制。仅 owner 主群可用；DM/子区明确拒绝。精确 `model` 首词加空白/结束才路由控制命令，`model-fix` 等保留任务意图，`merge` 行为不变。沿用 durable claim，pending ask 不被回答、附件不下载，修改默认不污染 `/switch` 菜单。
+
+有效启动策略由状态层统一解析：本聊天显式 `/switch` > 所属主群专用子区默认 > 不传 `model`。主群自己的模型从不成为继承来源。普通任务及恢复、goal 执行/控制、commit、`/new`、`/reset`、`/move` 均在 worker 启动时读取该策略；无值时完全省略参数，resume 会话模型处理交给 OMP。默认变更动态作用于已有和新子区的下一次启动，不中断/批量切换 live 会话。子区 `/switch default` 只删自身覆盖、重新继承；无父群默认时由 OMP 自行决定。回执与 `/switch`、`/status` 区分运行中的实际模型与下一次启动策略。配置按 bot/主群隔离，跨重启保留。详细 SDD 与验收见 `2026-09-17-switch-model-command-design.md`。
 
 一次性模型探测抛错且 worker 停止未获确认时，channel 使用已记录的进程身份执行恢复回收；确认停止后结束 worker 台账，否则保留台账并阻塞工作目录。
 

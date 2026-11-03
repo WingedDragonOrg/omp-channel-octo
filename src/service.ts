@@ -1,5 +1,6 @@
 import { GroupHistoryCoordinator } from "./inbound/history-coordinator.ts";
 import { ModelSwitchController } from "./commands/model-controller.ts";
+import { modelPolicyDescription, modelWithLevel } from "./commands/model-switch.ts";
 import { formatGoalSession, goalErrorText, GOAL_USAGE, parseGoalCommand } from "./commands/goal-command.ts";
 import { CONFIG_CARD_ACTION_PREFIX, createConfigMenuDesk, type ConfigMenuDesk } from "./commands/command-cards.ts";
 import { ProgressCards } from "./cards/progress-cards.ts";
@@ -114,8 +115,8 @@ const COMMAND_HELP = [
   "",
   "子区",
   "/thread <任务> · 新建隔离子区并派发任务（群聊可用）",
+  "/thread model [选择器|clear] · owner 在主群设置、查询或清除子区默认模型",
   "/thread merge · 宿主先合并子区工作区；仅实际合并失败时派发一次修复任务",
-  "",
   "任务",
   "/queue <文本> · 将消息排到当前任务之后",
   "/mode [steer|queue] · 查看或设置新消息的追加方式",
@@ -127,9 +128,8 @@ const COMMAND_HELP = [
   "/commit stop · 停止当前聊天的提交，不回滚已发生的副作用",
   "",
   "模型",
-  "/switch [模型] · 查看或切换本聊天的模型",
-  "支持 provider/id、模型 id 或子串、@角色；default 恢复 OMP 默认",
-  "",
+  "/switch [模型] · 查看或切换本聊天模型",
+  "支持 provider/id、模型 id 或子串、@角色；default 清除本聊天覆盖（子区继承主群默认，否则由 OMP 决定）",
   "其他",
   "/status · 查看当前状态",
   "/restart [now] · 重启 channel，在途任务重启后续接；两种写法等价",
@@ -539,6 +539,7 @@ class CoreService implements ChannelService {
     });
     this.threadCommands = new ThreadCommands({
       store: this.store,
+      handleThreadModel: (message, argument) => this.models.handleThreadModel(message, argument),
       replayThreadMergeSuccess: (target, operationId) =>
         this.replayThreadMergeSuccess(target, operationId),
       ensureThreadListen: async message => {
@@ -1059,7 +1060,7 @@ class CoreService implements ChannelService {
       cwd: binding?.cwd ?? null,
       state: statusState(display, Boolean(binding)),
       mode: this.store.getChatMode(this.bot.uid, target),
-      model: this.store.getChatModel(this.bot.uid, target),
+      model: this.store.resolveChatModel(this.bot.uid, target).model,
       queued: this.store.countQueuedTasks(this.bot.uid, target),
       outbox: this.store.countPendingOutbox(this.bot.uid, target),
       unknownOutbox: this.store.countUnknownOutbox(this.bot.uid, target),
@@ -2117,7 +2118,7 @@ class CoreService implements ChannelService {
       const sessionFile = await existingSessionFile(binding.sessionFile);
       if (!sessionFile) throw new WorkerGoalError("identity-mismatch", "绑定的原生目标会话文件不存在");
       const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.options.config), binding.cwd);
-      const model = this.store.getChatModel(botUid, target);
+      const model = this.store.resolveChatModel(botUid, target).model;
       tracked = await openTrackedWorker({
         workerFactory: this.options.workerFactory,
         store: this.store,
@@ -2960,9 +2961,22 @@ class CoreService implements ChannelService {
     const goal = current.sessionId
       ? this.store.getGoalSession(this.bot!.uid, target, current.sessionId)
       : null;
+    const policy = this.store.resolveChatModel(this.bot!.uid, target);
+    const live = this.liveWorker(target);
+    let liveModel = "无运行中会话";
+    if (live) {
+      try {
+        const catalog = await live.models();
+        liveModel = catalog.current === null
+          ? "未知（OMP 未报告）"
+          : modelWithLevel(catalog.current, catalog.level);
+      } catch {
+        liveModel = "未知（OMP 查询失败）";
+      }
+    }
     await this.outbox.enqueueText(
       target,
-      `session=${session}\ncwd=${cwd}\nstate=${taskState}\ngoal=${goal?.status ?? "none"}\nmode=${current.mode}\nmodel=${current.model ?? "未指定（OMP 默认）"}\nqueued=${current.queued}\noutbox=${current.outbox}\nunknown=${current.unknownOutbox}`,
+      `session=${session}\ncwd=${cwd}\nstate=${taskState}\ngoal=${goal?.status ?? "none"}\nmode=${current.mode}\nmodel=${modelPolicyDescription(policy.model, policy.source)}（下次启动策略）\nliveModel=${liveModel}\nqueued=${current.queued}\noutbox=${current.outbox}\nunknown=${current.unknownOutbox}`,
       null,
     );
   }
@@ -3651,7 +3665,7 @@ class CoreService implements ChannelService {
       this.typingLeases.acquire(target, `task:${taskId}`);
       this.store.markTaskPromptStarted(taskId, persisted.sessionId);
 
-      const model = this.store.getChatModel(persisted.botUid, target);
+      const model = this.store.resolveChatModel(persisted.botUid, target).model;
       try {
         try {
           operation.tracked = await openTrackedCommit({
@@ -3945,7 +3959,7 @@ class CoreService implements ChannelService {
       ) {
         throw new TaskStartupError("session-invalid", "恢复所需的会话绑定缺失或身份不匹配");
       }
-      const chatModel = this.store.getChatModel(this.bot!.uid, target);
+      const chatModel = this.store.resolveChatModel(this.bot!.uid, target).model;
       const workerOptions: Omit<WorkerOptions, "onSpawn"> = {
         contextScope: turnContext.workerScope,
         cwd: task.cwd,

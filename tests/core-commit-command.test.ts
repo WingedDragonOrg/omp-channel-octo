@@ -364,6 +364,26 @@ test("/commit uses the native worker as a durable task without prompting an OMP 
   }
 });
 
+test("a native commit worker receives the thread's inherited model", async () => {
+  const { harness, commits } = await createCommitHarness();
+  const group = { channelType: 2 as const, channelId: "group-a" };
+  const target = { channelType: 5 as const, channelId: "group-a____commit-thread-model" };
+  try {
+    const repo = await createRepo(harness.root, "thread-model-commit-checkout");
+    await send(harness, group, "commit-thread-model-policy", "/thread model fixture/fast:high");
+    await bind(harness, target, repo);
+
+    await send(harness, target, "commit-thread-model-run", "/commit");
+    await waitForStatus(harness.service, target, status => status.state === "completed");
+
+    expect(commits.calls).toHaveLength(1);
+    expect(commits.calls[0]?.options.model).toBe("fixture/fast:high");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+
 test("duplicate delivery of one /commit message creates only one durable commit task", async () => {
   const { harness, commits } = await createCommitHarness();
   const target = { channelType: 1 as const, channelId: "dm-commit-deduplicated" };

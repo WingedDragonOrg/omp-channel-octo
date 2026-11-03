@@ -70,6 +70,16 @@ function threadIntentPrompt(intent: string): string {
 }
 
 /**
+ * `/thread model` is a control command only when `model` is its complete first word. Similar task
+ * names such as `model-fix` stay on the ordinary thread-intent path.
+ */
+function readThreadModelArgument(argument: string): string | undefined {
+  const trimmed = argument.trimStart();
+  if (!/^model(?:$|\s)/iu.test(trimmed)) return undefined;
+  return trimmed.slice("model".length).trim();
+}
+
+/**
  * `/thread` 参数按首词识别合并意图：首词是 `merge`（其后为行尾或非字母数字、下划线、连字符
  * 的分隔符——`merge-fix` 这类名字不算）时返回去掉分隔符并单行化后的补充说明（可为空串），
  * 其余情况返回 `undefined`。
@@ -123,10 +133,12 @@ function threadMergeReceipt(summary: WorktreeMergeSummary & { archive?: "schedul
 
 /**
  * `/thread` 命令可触及的状态端口：绑定/所有权资格、命令 claim、隔离合并执行、稳定回执与归档，
- * 以及常规任务接管。宿主合并的调度与目录租约由 CoreService 持有。
+ * 以及常规任务接管。宿主合并的调度与目录租约由 `CoreService` 持有。
  */
 export interface ThreadCommandsDeps {
   readonly store: Pick<ChannelStore, "getBinding" | "getThreadWorkspace" | "getTaskByMessageId" | "getCommandClaimState" | "completeCommand" | "releaseClaim">;
+  /** Read or change the group default using the same serialized model-config path as `/switch`. */
+  readonly handleThreadModel: (message: InboundMessage, argument: string) => Promise<void>;
   /** Ensures creation provenance/default policy before a merge-intent mutation. */
   readonly ensureThreadListen: (message: InboundMessage) => Promise<void>;
   /** 阻止未就绪或已缺失工作区的命令改写当前回合或创建任务。 */
@@ -189,6 +201,11 @@ export class ThreadCommands {
    * Only groups grow threads, so DMs and threads themselves are refused.
    */
   async handle(message: InboundMessage, argument: string): Promise<void> {
+    const modelArgument = readThreadModelArgument(argument);
+    if (modelArgument !== undefined) {
+      await this.deps.handleThreadModel(message, modelArgument);
+      return;
+    }
     const mergeNote = readThreadMergeNote(argument);
     if (mergeNote !== undefined) {
       await this.handleThreadMergeCommand(message, mergeNote);

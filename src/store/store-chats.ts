@@ -5,6 +5,7 @@
 import { Database } from "bun:sqlite";
 import type { ChatAppendMode, ChatTarget } from "../contracts.ts";
 import type { AllowedChatRecord, BindingRecord, OutboxInsert } from "./store-records.ts";
+import { threadParentGroupId } from "../threads/thread-target.ts";
 import { asNullableString, asNumber, asString, query, run, targetValues, targetWhere, transaction } from "./store-schema.ts";
 import { enqueueOutbox } from "./store-outbox.ts";
 
@@ -172,9 +173,9 @@ export function setChatMode(db: Database, botUid: string, target: ChatTarget, mo
 }
 
 /**
- * The chat's `provider/id` model, or null when it follows OMP's default. Like `chat_modes`, the
- * row is a per-chat preference independent of the session binding, so replacing or losing a
- * binding never changes the chat's model.
+ * The chat's explicit `provider/id[:level]` preference, or null when none is set. Like
+ * `chat_modes`, it is independent of the session binding. Use `resolveChatModel` for worker
+ * startup policy, including a parent group's child-thread default.
  */
 export function getChatModel(db: Database, botUid: string, target: ChatTarget): string | null {
   const row = query(db,
@@ -200,6 +201,51 @@ export function clearChatModel(db: Database, botUid: string, target: ChatTarget)
     `DELETE FROM chat_models WHERE bot_uid = ? AND ${targetWhere(target)}`,
     [botUid, ...targetValues(target)],
   );
+}
+
+export function getThreadModel(db: Database, botUid: string, groupId: string): string | null {
+  const row = query(db,
+    "SELECT model FROM thread_models WHERE bot_uid = ? AND group_id = ?",
+    [botUid, groupId],
+  )[0];
+  if (!row) return null;
+  const model = asString(row.model).trim();
+  return model.length > 0 ? model : null;
+}
+
+export function setThreadModel(db: Database, botUid: string, groupId: string, model: string): void {
+  run(db,
+    `INSERT INTO thread_models(bot_uid, group_id, model, updated_at)
+     VALUES(?, ?, ?, ?)
+     ON CONFLICT(bot_uid, group_id) DO UPDATE SET model = excluded.model, updated_at = excluded.updated_at`,
+    [botUid, groupId, model, Date.now()],
+  );
+}
+
+export function clearThreadModel(db: Database, botUid: string, groupId: string): void {
+  run(db,
+    "DELETE FROM thread_models WHERE bot_uid = ? AND group_id = ?",
+    [botUid, groupId],
+  );
+}
+
+export function resolveChatModel(
+  db: Database,
+  botUid: string,
+  target: ChatTarget,
+): { model: string | null; source: "chat" | "thread" | "omp" } {
+  const chatModel = getChatModel(db, botUid, target);
+  if (chatModel !== null) return { model: chatModel, source: "chat" };
+
+  if (target.channelType === 5) {
+    const groupId = threadParentGroupId(target.channelId);
+    if (groupId !== null) {
+      const threadModel = getThreadModel(db, botUid, groupId);
+      if (threadModel !== null) return { model: threadModel, source: "thread" };
+    }
+  }
+
+  return { model: null, source: "omp" };
 }
 
 export function updateBindingSession(db: Database, botUid: string, target: ChatTarget, sessionId: string, sessionFile: string | null): void {

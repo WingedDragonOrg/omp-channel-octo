@@ -52,7 +52,7 @@ export interface SessionLifecycleDeps {
     | "workspaceDirectories"
     | "ensureBinding"
     | "getActiveTask"
-    | "getChatModel"
+    | "resolveChatModel"
     | "clearContextLedger"
     | "recordWorker"
     | "markWorkerStopped"
@@ -263,7 +263,7 @@ export class SessionLifecycle {
       const ledgerSessionFile = join(sessionDir, `${sessionId}.jsonl`);
       let created: { fresh: ProjectSessionBinding; model: string | null };
       try {
-        const chatModel = this.deps.store.getChatModel(this.deps.bot()!.uid, target);
+        const model = this.deps.store.resolveChatModel(this.deps.bot()!.uid, target).model;
         created = await withStoppedWorker(
           {
             workerFactory: this.deps.workerFactory,
@@ -271,7 +271,7 @@ export class SessionLifecycle {
             worker: {
               cwd,
               sessionDir,
-              ...(chatModel === null ? {} : { model: chatModel }),
+              ...(model === null ? {} : { model }),
             },
             ledger: {
               id: ledgerId,
@@ -383,7 +383,7 @@ export class SessionLifecycle {
       const ledgerId = `move-${randomUUID()}`;
       let moved: ProjectSessionBinding;
       try {
-        const chatModel = this.deps.store.getChatModel(this.deps.bot()!.uid, target);
+        const model = this.deps.store.resolveChatModel(this.deps.bot()!.uid, target).model;
         moved = await withStoppedWorker(
           {
             workerFactory: this.deps.workerFactory,
@@ -392,7 +392,7 @@ export class SessionLifecycle {
               cwd: previous.cwd,
               sessionDir,
               sessionFile,
-              ...(chatModel === null ? {} : { model: chatModel }),
+              ...(model === null ? {} : { model }),
             },
             ledger: {
               id: ledgerId,
