@@ -278,6 +278,94 @@ test("a finished turn whose terminal edit never landed is closed as completed", 
   });
 });
 
+test("recovery keeps a native commit HEAD result and an unknown outcome", async () => {
+  await withRoot(async (root) => {
+    const bot = await prepareRoot(root);
+    const headResult = "提交已完成。HEAD=aaaaaaaa→bbbbbbbb。";
+    const headContent = {
+      message: "fix: preserve recovered commit details\n\nThe title and message body survive restart.",
+      changelog: "### Fixed\n\n- Keep the committed changelog entry.",
+    };
+    const unknownResult = "无法确认提交进程已退出；提交结果未知。";
+
+    const headTracker = createExecutionTracker({ runId: "recovered-commit-head", initialAtMs: 1_000 });
+    headTracker.apply({ type: "commit_progress", atMs: 1_100, summary: "正在提交" });
+    headTracker.apply({
+      type: "commit_result",
+      atMs: 2_000,
+      summary: headResult,
+      content: headContent,
+    } as unknown as Parameters<typeof headTracker.apply>[0]);
+    const headSnapshot = headTracker.apply({ type: "run_end", atMs: 2_100, state: "completed" });
+
+    const unknownTracker = createExecutionTracker({ runId: "recovered-commit-unknown", initialAtMs: 1_000 });
+    unknownTracker.apply({ type: "commit_progress", atMs: 1_100, summary: "正在提交" });
+    unknownTracker.apply({ type: "commit_result", atMs: 2_000, summary: unknownResult });
+    const unknownSnapshot = unknownTracker.apply({ type: "run_end", atMs: 2_100, state: "failed" });
+
+    const headSeed = await seedOpenCard(root, bot.uid, {
+      cardSeq: 11,
+      taskState: "completed",
+      tools: 0,
+      snapshot: encodeExecutionSnapshot(headSnapshot),
+    });
+    const unknownSeed = await seedOpenCard(root, bot.uid, {
+      cardSeq: 12,
+      taskState: "failed",
+      tools: 0,
+      snapshot: encodeExecutionSnapshot(unknownSnapshot),
+    });
+    const transport = new RecoveryTransport({ bot });
+    const harness = await restartWith(root, bot, transport);
+    try {
+      expect(transport.progressCardEdits).toHaveLength(2);
+      const headEdit = transport.progressCardEdits.find(
+        edit => edit.messageId === headSeed.messageId,
+      );
+      expect(headEdit?.progress.state).toBe("completed");
+      expect(headEdit?.progress.commit?.result).toBe(headResult);
+      expect(headEdit?.progress.commit?.content).toEqual(headContent);
+
+      const unknownEdit = transport.progressCardEdits.find(
+        edit => edit.messageId === unknownSeed.messageId,
+      );
+      expect(unknownEdit?.progress.state).toBe("failed");
+      expect(unknownEdit?.progress.commit?.result).toBe(unknownResult);
+      expect(await openCards(root, bot.uid)).toHaveLength(0);
+    } finally {
+      await closeCoreHarness(harness, { remove: false });
+    }
+  });
+});
+
+test("an interrupted commit card without a recorded result closes as unknown, not stopped", async () => {
+  await withRoot(async (root) => {
+    const bot = await prepareRoot(root);
+    const tracker = createExecutionTracker({ runId: "interrupted-commit", initialAtMs: 1_000 });
+    tracker.apply({ type: "commit_progress", atMs: 1_100, summary: "正在提交" });
+    const running = tracker.snapshot(1_800);
+    const seeded = await seedOpenCard(root, bot.uid, {
+      cardSeq: 13,
+      taskState: "started",
+      tools: 0,
+      snapshot: encodeExecutionSnapshot(running),
+    });
+    const transport = new RecoveryTransport({ bot });
+    const harness = await restartWith(root, bot, transport);
+    try {
+      expect(transport.progressCardEdits).toHaveLength(1);
+      const edit = transport.progressCardEdits[0]!;
+      expect(edit.messageId).toBe(seeded.messageId);
+      expect(edit.progress.state).toBe("cancelled");
+      expect(edit.progress.commit?.result).toContain("提交结果未知");
+      expect(edit.progress.commit?.result).not.toContain("已停止");
+      expect(await openCards(root, bot.uid)).toHaveLength(0);
+    } finally {
+      await closeCoreHarness(harness, { remove: false });
+    }
+  });
+});
+
 test("a failed recovery keeps the row and the next start retries it", async () => {
   await withRoot(async (root) => {
     const bot = await prepareRoot(root);

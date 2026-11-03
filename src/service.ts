@@ -3,7 +3,9 @@ import { ModelSwitchController } from "./commands/model-controller.ts";
 import { modelPolicyDescription, modelWithLevel } from "./commands/model-switch.ts";
 import { formatGoalSession, goalErrorText, GOAL_USAGE, parseGoalCommand } from "./commands/goal-command.ts";
 import { CONFIG_CARD_ACTION_PREFIX, createConfigMenuDesk, type ConfigMenuDesk } from "./commands/command-cards.ts";
-import { ProgressCards } from "./cards/progress-cards.ts";
+import { ProgressCards, type TaskProgress } from "./cards/progress-cards.ts";
+import type { CommitContent } from "./cards/commit-content.ts";
+import { COMMIT_RESULT_UNKNOWN, type ExecutionEvent } from "./cards/execution-tracker.ts";
 import { CHAT_GRANT_ACTION_PREFIX } from "./cards/chat-grant-card.ts";
 import {
   isCommand,
@@ -2719,6 +2721,28 @@ class CoreService implements ChannelService {
     return operation.stopPromise;
   }
 
+  /**
+   * Feeds the same evidence the text receipt uses into the card, then closes it. Nothing here
+   * awaits card I/O: the task state and text receipt must never depend on a slow client.
+   */
+  private settleCommitProgress(
+    progress: TaskProgress | undefined,
+    state: "completed" | "failed" | "cancelled",
+    result?: string,
+    content?: CommitContent,
+  ): void {
+    if (!progress) return;
+    if (result !== undefined) {
+      progress.apply({
+        type: "commit_result",
+        atMs: Date.now(),
+        summary: result,
+        ...(content === undefined ? {} : { content }),
+      });
+    }
+    progress.finish(state);
+  }
+
   private commitResultNotice(result: CommitResult, stopRequested: boolean): string {
     const heads = `HEAD=${this.shortHead(result.headBefore)}→${this.shortHead(result.headAfter)}`;
     if (result.exitCode === 0) {
@@ -3603,6 +3627,7 @@ class CoreService implements ChannelService {
     let operation = scheduledOperation;
     let acquiredReservation: CommitLease | undefined;
     let taskStarted = false;
+    let progress: TaskProgress | undefined;
     try {
       if (this.stopping) return;
       const binding = this.store.getBinding(persisted.botUid, target);
@@ -3666,17 +3691,28 @@ class CoreService implements ChannelService {
       taskStarted = true;
       this.typingLeases.acquire(target, `task:${taskId}`);
       this.store.markTaskPromptStarted(taskId, persisted.sessionId);
+      progress = this.progressCards.startTask(taskId, target);
+      this.trackProgressTail(target, taskId, () => progress!.tail);
 
       const model = this.store.resolveChatModel(persisted.botUid, target).model;
+      const commitWorker = {
+        cwd: workspace.root,
+        ...(model === null ? {} : { model }),
+        /**
+         * The native worker calls this only after its gate opens and its process identity is
+         * durably recorded. The callback is synchronous and never awaits card I/O, so a slow or
+         * broken card cannot stop stdout/stderr draining or the CLI result.
+         */
+        onProgress: (event: Extract<ExecutionEvent, { type: "commit_progress" }>) => {
+          progress?.apply(event);
+        },
+      };
       try {
         try {
           operation.tracked = await openTrackedCommit({
             workerFactory: this.options.workerFactory,
             store: this.store,
-            worker: {
-              cwd: workspace.root,
-              ...(model === null ? {} : { model }),
-            },
+            worker: commitWorker,
             ledger: {
               id: taskId,
               botUid: persisted.botUid,
@@ -3745,11 +3781,13 @@ class CoreService implements ChannelService {
           : await this.stopCommitProcess(operation);
         if (this.stopping || operation.shutdownRequested) return;
         if (!stopped) {
+          this.settleCommitProgress(progress, "failed", COMMIT_RESULT_UNKNOWN);
           this.outbox.enqueueText(target, "无法确认提交进程已停止或结果；任务保持 fail-closed。", taskId);
           return;
         }
         if (operation.stopRequested) {
           this.store.markCancelled(taskId, "commit stopped without a reported result");
+          this.settleCommitProgress(progress, "cancelled", COMMIT_RESULT_UNKNOWN);
           this.outbox.enqueueText(
             target,
             "已停止提交进程，但命令未返回 HEAD 结果；请检查当前 HEAD，且不会自动重试或回滚。",
@@ -3759,6 +3797,7 @@ class CoreService implements ChannelService {
         }
         const failure = "native commit worker failed before reporting its result";
         this.store.markFailed(taskId, failure);
+        this.settleCommitProgress(progress, "failed", COMMIT_RESULT_UNKNOWN);
         this.outbox.enqueueText(target, "提交未能返回结果；请检查仓库 HEAD 后再决定是否重试。", taskId);
         return;
       }
@@ -3767,6 +3806,9 @@ class CoreService implements ChannelService {
         ? await this.stopCommitOperation(operation)
         : await this.stopCommitProcess(operation);
       if (!closed) {
+        // Process exit is not confirmed, so neither the task nor the card may claim a stop or a
+        // successful result. The card gets only the fixed unknown line.
+        this.settleCommitProgress(progress, "failed", COMMIT_RESULT_UNKNOWN, result.content);
         this.outbox.enqueueText(
           target,
           `无法确认提交进程已退出，任务保持 fail-closed；${this.commitResultNotice(result, false)}`,
@@ -3780,12 +3822,15 @@ class CoreService implements ChannelService {
       const summary = this.commitResultNotice(result, stopConfirmed);
       if (stopConfirmed && result.exitCode !== 0) {
         this.store.markCancelled(taskId, "commit stopped");
+        this.settleCommitProgress(progress, "cancelled", summary, result.content);
         this.outbox.enqueueText(target, summary, taskId);
       } else if (result.exitCode === 0) {
         this.store.markCompleted(taskId, summary);
+        this.settleCommitProgress(progress, "completed", summary, result.content);
         this.outbox.enqueueText(target, summary, taskId);
       } else {
         this.store.markFailed(taskId, summary);
+        this.settleCommitProgress(progress, "failed", summary, result.content);
         this.outbox.enqueueText(target, summary, taskId);
       }
     } catch {
@@ -3797,6 +3842,22 @@ class CoreService implements ChannelService {
         this.outbox.enqueueText(target, "提交启动失败，无法确认结果；请检查仓库 HEAD 后再决定是否重试。", taskId);
       }
     } finally {
+      if (progress) {
+        if (!progress.finished) {
+          const state = this.store.getTask(taskId)?.state;
+          // A shutdown return leaves the task running for recovery; do not invent a terminal
+          // card there. Real completed/failed/cancelled rows close the card even when their
+          // branch returned before applying a result (finish is a no-op for an unstarted card).
+          if (state === "completed" || state === "failed" || state === "cancelled") {
+            if (state !== "completed" && progress.commitStarted) {
+              progress.apply({ type: "commit_result", atMs: Date.now(), summary: COMMIT_RESULT_UNKNOWN });
+            }
+            progress.finish(state);
+          }
+        }
+        progress.stop(!progress.finished);
+        this.releaseProgressTail(target, taskId, progress.tail);
+      }
       operation?.markWorkerReady();
       if (taskStarted || operation !== undefined) {
         this.typingLeases.release(target, `task:${taskId}`);

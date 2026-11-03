@@ -1,13 +1,24 @@
 import { Database } from "bun:sqlite";
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { ChatTarget, CommitResult, CommitWorker, CommitWorkerOptions, RestartPort } from "../src/contracts.ts";
+import type {
+  ChatTarget,
+  CommitResult,
+  CommitWorker,
+  CommitWorkerOptions,
+  ProgressCard,
+  RestartPort,
+  SendReceipt,
+} from "../src/contracts.ts";
+import { buildExecutionCard, type ExecutionCardCapabilities } from "../src/cards/execution-card.ts";
+import { formatDuration } from "../src/cards/execution-render.ts";
 import { openChannelStore, type ChannelStore } from "../src/store/index.ts";
 import type { BindingRecord, TaskRecord, ThreadWorkspaceRecord } from "../src/store/store-records.ts";
 import {
   closeCoreHarness,
   createCoreHarness,
+  FakeTransport,
   FakeWorkerFactory,
   inbound,
   type CoreHarness,
@@ -31,6 +42,11 @@ class CommitCall implements CommitWorker {
     readonly options: CommitWorkerOptions,
     private readonly factory: ControlledCommitFactory,
   ) {}
+
+  /** Reports one already-filtered native stage, exactly as the worker would after its gate opens. */
+  emitProgress(summary: string): void {
+    this.options.onProgress?.({ type: "commit_progress", atMs: Date.now(), summary });
+  }
 
   run(): Promise<CommitResult> {
     this.runCalls += 1;
@@ -74,6 +90,111 @@ class CommitTestWorkerFactory extends FakeWorkerFactory {
   }
 }
 
+interface RecordedProgressSend {
+  target: ChatTarget;
+  progress: ProgressCard;
+  clientMsgNo: string;
+  messageId: string;
+}
+
+interface RecordedProgressEdit {
+  target: ChatTarget;
+  messageId: string;
+  progress: ProgressCard;
+  cardSeq: number;
+}
+
+type ProgressSendHandler = (
+  target: ChatTarget,
+  progress: ProgressCard,
+  clientMsgNo: string,
+  signal?: AbortSignal,
+) => Promise<SendReceipt | null>;
+
+type ProgressEditHandler = (
+  target: ChatTarget,
+  messageId: string,
+  progress: ProgressCard,
+  cardSeq: number,
+  signal?: AbortSignal,
+) => Promise<void>;
+
+/** Records native commit cards so the test reads the real service-issued frames. */
+class CommitProgressTransport extends FakeTransport {
+  readonly progressSends: RecordedProgressSend[] = [];
+  readonly progressEdits: RecordedProgressEdit[] = [];
+  progressSendHandler: ProgressSendHandler | undefined;
+  progressEditHandler: ProgressEditHandler | undefined;
+
+  override async sendProgressCard(
+    target: ChatTarget,
+    progress: ProgressCard,
+    clientMsgNo: string,
+    signal?: AbortSignal,
+  ): Promise<SendReceipt | null> {
+    const messageId = `commit-progress-${this.progressSends.length + 1}`;
+    this.progressSends.push({ target: { ...target }, progress: { ...progress }, clientMsgNo, messageId });
+    if (this.progressSendHandler) {
+      return this.progressSendHandler(target, progress, clientMsgNo, signal);
+    }
+    return { messageId };
+  }
+
+  override async editProgressCard(
+    target: ChatTarget,
+    messageId: string,
+    progress: ProgressCard,
+    cardSeq: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    this.progressEdits.push({
+      target: { ...target },
+      messageId,
+      progress: { ...progress },
+      cardSeq,
+    });
+    if (this.progressEditHandler) {
+      await this.progressEditHandler(target, messageId, progress, cardSeq, signal);
+    }
+  }
+}
+
+const commitCardCapabilities: ExecutionCardCapabilities = {
+  enabled: true,
+  interactive: true,
+  profiles: ["octo/v1", "octo/v2"],
+  cardVersion: "1.5",
+  elements: ["TextBlock", "RichTextBlock", "Container", "ColumnSet", "ActionSet"],
+  actions: ["Action.OpenUrl", "Action.ToggleVisibility", "Action.CopyToClipboard"],
+  limits: { maxNodes: 200, maxDepth: 16, maxPayloadBytes: 524_288 },
+};
+
+function renderedProgressText(progress: ProgressCard): string {
+  const rendered = buildExecutionCard(progress, commitCardCapabilities);
+  if (!rendered) throw new Error("commit progress card did not build");
+  const text: string[] = [];
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const child of value) visit(child);
+      return;
+    }
+    if (value === null || typeof value !== "object") return;
+    const record = value as Record<string, unknown>;
+    if (typeof record.text === "string") text.push(record.text);
+    for (const child of Object.values(record)) visit(child);
+  };
+  visit(rendered.card);
+  return text.join("\n");
+}
+
+function latestProgress(transport: CommitProgressTransport): ProgressCard | undefined {
+  return transport.progressEdits.at(-1)?.progress ?? transport.progressSends.at(-1)?.progress;
+}
+
+async function flushMicrotasks(rounds = 20): Promise<void> {
+  for (let index = 0; index < rounds; index += 1) await Promise.resolve();
+}
+
 interface CommitHarness {
   harness: CoreHarness;
   commits: ControlledCommitFactory;
@@ -82,6 +203,7 @@ interface CommitHarness {
 async function createCommitHarness(options: {
   root?: string;
   bot?: CoreHarness["bot"];
+  transport?: FakeTransport;
   prompt?: FakePrompt;
   restart?: RestartPort;
 } = {}): Promise<CommitHarness> {
@@ -90,6 +212,7 @@ async function createCommitHarness(options: {
   const harness = await createCoreHarness({
     ...(options.root === undefined ? {} : { root: options.root }),
     ...(options.bot === undefined ? {} : { bot: options.bot }),
+    ...(options.transport === undefined ? {} : { transport: options.transport }),
     ...(options.restart === undefined ? {} : { restart: options.restart }),
     workers,
   });
@@ -1884,6 +2007,407 @@ test("queued slash text matching the commit command remains an ordinary OMP prom
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["/commit"]);
     expect(commits.calls).toEqual([]);
   } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a commit opens no progress card until the native worker reports its first stage", async () => {
+  const transport = new CommitProgressTransport();
+  const { harness, commits } = await createCommitHarness({ transport });
+  const target = { channelType: 1 as const, channelId: "dm-commit-card-lazy" };
+  const runGate = Promise.withResolvers<CommitResult>();
+  try {
+    const repo = await createRepo(harness.root, "commit-card-lazy-repo");
+    await bind(harness, target, repo);
+    commits.runHandler = async () => runGate.promise;
+
+    await send(harness, target, "commit-card-lazy-start", "/commit");
+    await waitUntil(() => commits.calls.length === 1 && commits.calls[0]!.runCalls === 1, "commit run");
+    await flushMicrotasks();
+    expect(transport.progressSends).toHaveLength(0);
+
+    commits.calls[0]!.emitProgress("正在提交");
+    await waitUntil(() => transport.progressSends.length === 1, "first commit card");
+    expect(transport.progressSends[0]!.target).toEqual(target);
+    expect(transport.progressSends[0]!.progress.commit?.summary).toBe("正在提交");
+    expect(transport.progressSends[0]!.progress.state).toBe("running");
+
+    runGate.resolve(SUCCESS_RESULT);
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+  } finally {
+    runGate.resolve(SUCCESS_RESULT);
+    await closeCoreHarness(harness);
+  }
+});
+
+test("one commit card receives merged stages, the real HEAD result, and native commit content", async () => {
+  const transport = new CommitProgressTransport();
+  const { harness, commits } = await createCommitHarness({ transport });
+  const target = { channelType: 1 as const, channelId: "dm-commit-card-success" };
+  const runGate = Promise.withResolvers<CommitResult>();
+  const message = "feat: add compact commit cards\n\nKeep the title and body from the native commit.";
+  const changelog = "### Added\n\n- Show the commit message and changelog entry.";
+  const commitResult: CommitResult = {
+    ...SUCCESS_RESULT,
+    content: { message, changelog },
+  };
+  try {
+    const repo = await createRepo(harness.root, "commit-card-success-repo");
+    await bind(harness, target, repo);
+    commits.runHandler = async (call) => {
+      call.emitProgress("正在提交");
+      call.emitProgress("正在创建提交");
+      await runGate.promise;
+      return commitResult;
+    };
+
+    vi.useFakeTimers();
+    await send(harness, target, "commit-card-success-start", "/commit");
+    await waitUntil(() => commits.calls[0]?.runCalls === 1, "commit run");
+    await waitUntil(() => transport.progressSends.length === 1, "commit card send");
+    await flushMicrotasks();
+
+    vi.advanceTimersByTime(1_000);
+    await waitUntil(() => transport.progressEdits.length >= 1, "merged commit card edit");
+    const first = transport.progressSends[0]!;
+    const merged = transport.progressEdits[0]!;
+    expect(merged.messageId).toBe(first.messageId);
+    expect(merged.progress.state).toBe("running");
+    expect(merged.progress.commit?.recentSteps).toEqual(["正在提交", "正在创建提交"]);
+
+    runGate.resolve(commitResult);
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+    await waitUntil(() => latestProgress(transport)?.commit?.result !== undefined, "terminal commit card");
+    const terminal = transport.progressEdits.at(-1)!;
+    expect(terminal.messageId).toBe(first.messageId);
+    expect(terminal.progress.state).toBe("completed");
+    expect(terminal.progress.commit?.result).toContain(HEAD_B.slice(0, 8));
+    expect(terminal.progress.commit?.content).toEqual({ message, changelog });
+    expect(renderedProgressText(terminal.progress)).toContain(message);
+    expect(renderedProgressText(terminal.progress)).toContain(changelog);
+    expect(renderedProgressText(terminal.progress)).toContain(HEAD_B.slice(0, 8));
+    expect(terminal.progress.tools).toEqual([]);
+    expect(terminal.progress.todos).toEqual([]);
+    expect(transport.progressSends).toHaveLength(1);
+    expect(harness.workers.prompts).toHaveLength(0);
+    expect(harness.workers.creations).toHaveLength(0);
+    const reply = await waitForReply(harness, target, (text) => text.includes(HEAD_B.slice(0, 8)));
+    expect(reply).toContain(HEAD_B.slice(0, 8));
+    const task = await latestTask(harness, target);
+    expect(task?.state).toBe("completed");
+    expect(await taskMarkers(harness, task!.id)).toEqual({ prompt_started: 1, prompt_accepted: 0 });
+  } finally {
+    runGate.resolve(commitResult);
+    vi.useRealTimers();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a silent native commit refreshes elapsed time without adding stages", async () => {
+  const transport = new CommitProgressTransport();
+  const { harness, commits } = await createCommitHarness({ transport });
+  const target = { channelType: 1 as const, channelId: "dm-commit-card-heartbeat" };
+  const runGate = Promise.withResolvers<CommitResult>();
+  try {
+    const repo = await createRepo(harness.root, "commit-card-heartbeat-repo");
+    await bind(harness, target, repo);
+    commits.runHandler = async (call) => {
+      call.emitProgress("正在提交");
+      await runGate.promise;
+      return SUCCESS_RESULT;
+    };
+
+    vi.useFakeTimers();
+    await send(harness, target, "commit-card-heartbeat-start", "/commit");
+    await waitUntil(() => commits.calls[0]?.runCalls === 1, "commit run");
+    await waitUntil(() => transport.progressSends.length === 1, "commit card send");
+    await flushMicrotasks();
+    const editsBeforeRefresh = transport.progressEdits.length;
+
+    vi.advanceTimersByTime(11_000);
+    await waitUntil(
+      () => transport.progressEdits.length > editsBeforeRefresh,
+      "silent commit elapsed refresh",
+    );
+    const refreshed = transport.progressEdits.at(-1)!;
+    expect(refreshed.progress.state).toBe("running");
+    expect(refreshed.progress.commit?.summary).toBe("正在提交");
+    expect(refreshed.progress.commit?.recentSteps).toEqual(["正在提交"]);
+    expect(refreshed.progress.elapsedMs).toBeGreaterThanOrEqual(10_000);
+    expect(renderedProgressText(refreshed.progress)).toContain(
+      formatDuration(refreshed.progress.elapsedMs),
+    );
+    expect(transport.progressSends).toHaveLength(1);
+  } finally {
+    runGate.resolve(SUCCESS_RESULT);
+    vi.useRealTimers();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a commit with no new HEAD completes its card without claiming a creation", async () => {
+  const transport = new CommitProgressTransport();
+  const { harness, commits } = await createCommitHarness({ transport });
+  const target = { channelType: 1 as const, channelId: "dm-commit-card-no-change" };
+  try {
+    const repo = await createRepo(harness.root, "commit-card-no-change-repo");
+    await bind(harness, target, repo);
+    commits.runHandler = async (call) => {
+      call.emitProgress("正在创建提交");
+      return { exitCode: 0, headBefore: HEAD_A, headAfter: HEAD_A };
+    };
+
+    await send(harness, target, "commit-card-no-change-start", "/commit");
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+    const reply = await waitForReply(
+      harness,
+      target,
+      (text) => text.includes(HEAD_A.slice(0, 8)) && text.includes("没有新提交"),
+    );
+    expect(reply).toContain(HEAD_A.slice(0, 8));
+
+    await waitUntil(() => latestProgress(transport)?.commit?.result !== undefined, "no-change card result");
+    const final = latestProgress(transport)!;
+    expect(final.state).toBe("completed");
+    expect(final.commit?.result).toContain("没有新提交");
+    expect(final.commit?.result).toContain(HEAD_A.slice(0, 8));
+    expect(await latestTask(harness, target)).toMatchObject({ state: "completed" });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a failed native commit that advanced HEAD keeps that outcome on the card", async () => {
+  const transport = new CommitProgressTransport();
+  const { harness, commits } = await createCommitHarness({ transport });
+  const target = { channelType: 1 as const, channelId: "dm-commit-card-failed-head" };
+  try {
+    const repo = await createRepo(harness.root, "commit-card-failed-head-repo");
+    await bind(harness, target, repo);
+    commits.runHandler = async (call) => {
+      call.emitProgress("正在创建提交");
+      return { exitCode: 1, headBefore: HEAD_A, headAfter: HEAD_B };
+    };
+
+    await send(harness, target, "commit-card-failed-head-start", "/commit");
+    await waitForStatus(harness.service, target, (status) => status.state === "failed");
+    const reply = await waitForReply(
+      harness,
+      target,
+      (text) => text.includes(HEAD_B.slice(0, 8)) && text.includes("失败"),
+    );
+    expect(reply).toMatch(/保留|不会回滚/u);
+
+    await waitUntil(() => latestProgress(transport)?.commit?.result !== undefined, "failed card result");
+    const final = latestProgress(transport)!;
+    expect(final.state).toBe("failed");
+    expect(final.commit?.result).toContain("失败");
+    expect(final.commit?.result).toContain(HEAD_B.slice(0, 8));
+    expect(renderedProgressText(final)).not.toContain("已停止");
+    expect(await latestTask(harness, target)).toMatchObject({ state: "failed" });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("/commit stop settles the card from the observed HEAD, not from the request alone", async () => {
+  const transport = new CommitProgressTransport();
+  const { harness, commits } = await createCommitHarness({ transport });
+  const target = { channelType: 1 as const, channelId: "dm-commit-card-stopped" };
+  const runGate = Promise.withResolvers<CommitResult>();
+  try {
+    const repo = await createRepo(harness.root, "commit-card-stopped-repo");
+    await bind(harness, target, repo);
+    commits.runHandler = async (call) => {
+      call.emitProgress("正在提交");
+      return runGate.promise;
+    };
+    commits.stopHandler = async () => {
+      runGate.resolve({ exitCode: 130, headBefore: HEAD_A, headAfter: HEAD_B });
+      return true;
+    };
+
+    await send(harness, target, "commit-card-stopped-start", "/commit");
+    await waitUntil(() => commits.calls[0]?.runCalls === 1, "commit run");
+    await send(harness, target, "commit-card-stopped-stop", "/commit stop");
+    await waitForStatus(harness.service, target, (status) => status.state === "cancelled");
+    const reply = await waitForReply(
+      harness,
+      target,
+      (text) => text.includes(HEAD_B.slice(0, 8)) && text.includes("停止"),
+    );
+    expect(reply).not.toContain("已完成");
+
+    await waitUntil(() => latestProgress(transport)?.commit?.result !== undefined, "stopped card result");
+    const final = latestProgress(transport)!;
+    expect(final.state).toBe("cancelled");
+    expect(final.commit?.result).toContain("停止");
+    expect(final.commit?.result).toContain(HEAD_B.slice(0, 8));
+    expect(await latestTask(harness, target)).toMatchObject({ state: "cancelled" });
+  } finally {
+    runGate.resolve({ exitCode: 130, headBefore: HEAD_A, headAfter: HEAD_A });
+    await closeCoreHarness(harness);
+  }
+});
+
+test("an unconfirmed stop never lets the commit card claim it stopped", async () => {
+  const transport = new CommitProgressTransport();
+  const { harness, commits } = await createCommitHarness({ transport });
+  const target = { channelType: 1 as const, channelId: "dm-commit-card-unknown-stop" };
+  const runGate = Promise.withResolvers<CommitResult>();
+  try {
+    const repo = await createRepo(harness.root, "commit-card-unknown-stop-repo");
+    await bind(harness, target, repo);
+    commits.runHandler = async (call) => {
+      call.emitProgress("正在提交");
+      return runGate.promise;
+    };
+    commits.stopHandler = async () => false;
+
+    await send(harness, target, "commit-card-unknown-stop-start", "/commit");
+    await waitUntil(() => commits.calls[0]?.runCalls === 1, "commit run");
+    await send(harness, target, "commit-card-unknown-stop-stop", "/commit stop");
+    await waitForReply(harness, target, (text) => text.includes("无法确认"));
+
+    runGate.resolve({ exitCode: 1, headBefore: HEAD_A, headAfter: HEAD_A });
+    await waitUntil(
+      () => latestProgress(transport)?.commit?.result !== undefined,
+      "unknown commit card result",
+    );
+    const final = latestProgress(transport)!;
+    expect(final.state).not.toBe("running");
+    expect(final.commit?.result).toMatch(/未知|无法确认/u);
+    expect(renderedProgressText(final)).not.toContain("已停止");
+    expect(await latestTask(harness, target)).not.toMatchObject({ state: "cancelled" });
+  } finally {
+    runGate.resolve({ exitCode: 1, headBefore: HEAD_A, headAfter: HEAD_A });
+    await closeCoreHarness(harness);
+  }
+});
+
+test("an unavailable progress card never blocks the native commit result text", async () => {
+  const transport = new CommitProgressTransport();
+  transport.progressSendHandler = async () => null;
+  const { harness, commits } = await createCommitHarness({ transport });
+  const target = { channelType: 1 as const, channelId: "dm-commit-card-unavailable" };
+  try {
+    const repo = await createRepo(harness.root, "commit-card-unavailable-repo");
+    await bind(harness, target, repo);
+    commits.runHandler = async (call) => {
+      call.emitProgress("正在提交");
+      return SUCCESS_RESULT;
+    };
+
+    await send(harness, target, "commit-card-unavailable-start", "/commit");
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+    await waitUntil(() => transport.progressSends.length >= 1, "unavailable card send attempt");
+    const reply = await waitForReply(harness, target, (text) => text.includes(HEAD_B.slice(0, 8)));
+
+    expect(reply).toContain(HEAD_B.slice(0, 8));
+    expect(transport.progressSends.length).toBeGreaterThanOrEqual(1);
+    expect(transport.progressEdits).toHaveLength(0);
+    expect(commits.calls[0]?.runCalls).toBe(1);
+    expect(harness.workers.prompts).toHaveLength(0);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a throwing progress card send never blocks the native commit result text", async () => {
+  const transport = new CommitProgressTransport();
+  transport.progressSendHandler = async () => {
+    throw new Error("fixture commit card send unavailable");
+  };
+  const { harness, commits } = await createCommitHarness({ transport });
+  const target = { channelType: 1 as const, channelId: "dm-commit-card-send-failure" };
+  try {
+    const repo = await createRepo(harness.root, "commit-card-send-failure-repo");
+    await bind(harness, target, repo);
+    commits.runHandler = async (call) => {
+      call.emitProgress("正在提交");
+      return SUCCESS_RESULT;
+    };
+
+    await send(harness, target, "commit-card-send-failure-start", "/commit");
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+    await waitUntil(() => transport.progressSends.length >= 1, "throwing card send attempt");
+    const reply = await waitForReply(harness, target, (text) => text.includes(HEAD_B.slice(0, 8)));
+
+    expect(reply).toContain(HEAD_B.slice(0, 8));
+    expect(transport.progressSends.length).toBeGreaterThanOrEqual(1);
+    expect(transport.progressEdits).toHaveLength(0);
+    expect(commits.calls[0]?.runCalls).toBe(1);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a failing progress card edit never blocks the native commit result text", async () => {
+  const transport = new CommitProgressTransport();
+  transport.progressEditHandler = async () => {
+    throw new Error("fixture commit card edit unavailable");
+  };
+  const { harness, commits } = await createCommitHarness({ transport });
+  const target = { channelType: 1 as const, channelId: "dm-commit-card-edit-failure" };
+  try {
+    const repo = await createRepo(harness.root, "commit-card-edit-failure-repo");
+    await bind(harness, target, repo);
+    commits.runHandler = async (call) => {
+      call.emitProgress("正在提交");
+      return SUCCESS_RESULT;
+    };
+
+    await send(harness, target, "commit-card-edit-failure-start", "/commit");
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+    await waitUntil(() => transport.progressEdits.length >= 1, "failing card edit attempt");
+    const reply = await waitForReply(harness, target, (text) => text.includes(HEAD_B.slice(0, 8)));
+
+    expect(reply).toContain(HEAD_B.slice(0, 8));
+    expect(transport.progressSends).toHaveLength(1);
+    expect(transport.progressEdits.length).toBeGreaterThanOrEqual(1);
+    expect(commits.calls[0]?.runCalls).toBe(1);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a pending progress card send does not hold the native commit or its text receipt", async () => {
+  const transport = new CommitProgressTransport();
+  const releaseSend = Promise.withResolvers<SendReceipt | null>();
+  const sendStarted = Promise.withResolvers<void>();
+  transport.progressSendHandler = async () => {
+    sendStarted.resolve();
+    return releaseSend.promise;
+  };
+  const { harness, commits } = await createCommitHarness({ transport });
+  const target = { channelType: 1 as const, channelId: "dm-commit-card-pending-send" };
+  let runFinished = false;
+  try {
+    const repo = await createRepo(harness.root, "commit-card-pending-send-repo");
+    await bind(harness, target, repo);
+    commits.runHandler = async (call) => {
+      call.emitProgress("正在提交");
+      await sendStarted.promise;
+      runFinished = true;
+      return SUCCESS_RESULT;
+    };
+
+    await send(harness, target, "commit-card-pending-send-start", "/commit");
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+    const reply = await waitForReply(harness, target, (text) => text.includes(HEAD_B.slice(0, 8)));
+
+    expect(runFinished).toBe(true);
+    expect(reply).toContain(HEAD_B.slice(0, 8));
+    expect(commits.calls[0]?.runCalls).toBe(1);
+    expect(transport.progressSends.length).toBeGreaterThanOrEqual(1);
+    expect(transport.progressEdits).toHaveLength(0);
+
+    // The card request may resolve (or hit its own bound) later; the task and its receipt were
+    // already delivered above and must not wait for it.
+    releaseSend.resolve({ messageId: "held-commit-card" });
+    await flushMicrotasks();
+  } finally {
+    releaseSend.resolve(null);
     await closeCoreHarness(harness);
   }
 });

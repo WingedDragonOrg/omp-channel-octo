@@ -32,6 +32,8 @@ import { targetKey } from "../target.ts";
 
 const PROGRESS_MERGE_MS = 1_000;
 const ACTIVITY_REQUEST_TIMEOUT_MS = 2_000;
+/** A silent native commit refreshes its elapsed time without inventing a new phase. */
+const COMMIT_ELAPSED_REFRESH_MS = 10_000;
 /** Recovery attempts for a card left by a previous process before the row is dropped. */
 const PROGRESS_CARD_RECOVERY_ATTEMPTS = 3;
 
@@ -413,6 +415,8 @@ export class ProgressCards {
  */
 export class TaskProgress {
   private timer: NodeJS.Timeout | undefined;
+  private commitHeartbeat: NodeJS.Timeout | undefined;
+  private commitSummary: string | undefined;
   private progressTail: Promise<void> = Promise.resolve();
   private readonly progressAbort = new AbortController();
   private roundIndex = 0;
@@ -441,6 +445,7 @@ export class TaskProgress {
     // 研究带和 todo 一样属于任务而不是单轮，接管时先从快照里恢复任务级快照，否则恢复后
     // 第一次 steer 滚出的新卡会静默丢掉上一进程已经报出来的研究带。
     this.latestResearch = resumed.snapshot.research;
+    this.commitSummary = resumed.snapshot.commit?.summary;
     this.round = {
       ...makeRound(taskId, 0, this.keyPrefix, resumed.tracker),
       started: true,
@@ -456,6 +461,11 @@ export class TaskProgress {
   /** 当前轮已进入终态（终态编辑已入队）：`stop` 据此决定是否 abort 在途编辑。 */
   get finished(): boolean {
     return this.round.finished;
+  }
+
+  /** True once any native commit stage reached this task, so a fallback may close its card. */
+  get commitStarted(): boolean {
+    return this.commitSummary !== undefined;
   }
 
   /**
@@ -475,11 +485,17 @@ export class TaskProgress {
    */
   apply(event: ExecutionEvent): void {
     if (event.type === "research_update") this.latestResearch = event.research;
+    if (event.type === "commit_progress") {
+      this.commitSummary = event.summary;
+      this.startCommitHeartbeat();
+    }
+    if (event.type === "commit_result") this.stopCommitHeartbeat();
     this.track(event, this.round.tracker.apply(event));
   }
 
   /** 终态帧：入队后本轮不再编辑，`stop` 也不再 abort 它。 */
   finish(state: Exclude<ProgressCard["state"], "running">): void {
+    this.stopCommitHeartbeat();
     const current = this.round;
     if (!current.started || current.finished) return;
     current.finished = true;
@@ -505,6 +521,8 @@ export class TaskProgress {
     previous.retired = true;
     clearTimeout(this.timer);
     this.timer = undefined;
+    this.stopCommitHeartbeat();
+    this.commitSummary = undefined;
     this.roundIndex += 1;
     this.round = makeRound(this.taskId, this.roundIndex, this.keyPrefix);
     // The todo list belongs to the task rather than to one round, so the new card keeps it.
@@ -529,6 +547,7 @@ export class TaskProgress {
    * 连在途的运行中编辑一起 abort。
    */
   stop(abortProgress = true): void {
+    this.stopCommitHeartbeat();
     if (!this.round.finished || abortProgress) {
       clearTimeout(this.timer);
       this.timer = undefined;
@@ -545,7 +564,9 @@ export class TaskProgress {
     const startsCard = event.type === "tool_start" ||
       event.type === "tool_end" ||
       event.type === "todo_update" ||
-      event.type === "research_update";
+      event.type === "research_update" ||
+      event.type === "commit_progress" ||
+      event.type === "commit_result";
     if (!current.started && !startsCard) return;
     if (!current.started) {
       current.started = true;
@@ -618,13 +639,42 @@ export class TaskProgress {
     } else {
       parentSignal?.addEventListener("abort", abort, { once: true });
     }
-    const timer = setTimeout(() => controller.abort(), ACTIVITY_REQUEST_TIMEOUT_MS);
+    const deadline = Promise.withResolvers<never>();
+    // A transport that ignores the abort signal must not keep this card operation alive forever;
+    // the caller's task and text receipt never wait for card I/O, and shutdown must still see the
+    // progress tail settle.
+    const timer = setTimeout(() => {
+      controller.abort();
+      deadline.reject(new Error("progress card request timed out"));
+    }, ACTIVITY_REQUEST_TIMEOUT_MS);
+    const timeout = deadline.promise;
     try {
-      return await work(controller.signal);
+      return await Promise.race([work(controller.signal), timeout]);
     } finally {
       clearTimeout(timer);
       parentSignal?.removeEventListener("abort", abort);
     }
+  }
+
+  /**
+   * A native commit can stay silent for minutes while Git or hooks work. Every ten seconds the
+   * same safe summary is re-applied so the snapshot's measured elapsed time advances; the
+   * tracker's bounded history drops the duplicate line, so no stage or percentage is invented.
+   */
+  private startCommitHeartbeat(): void {
+    if (this.commitHeartbeat !== undefined || this.deps.stopping() || this.round.finished) return;
+    this.commitHeartbeat = setInterval(() => {
+      const summary = this.commitSummary;
+      if (summary === undefined || this.round.finished || this.round.retired) return;
+      this.apply({ type: "commit_progress", atMs: Date.now(), summary });
+    }, COMMIT_ELAPSED_REFRESH_MS);
+    this.commitHeartbeat.unref?.();
+  }
+
+  private stopCommitHeartbeat(): void {
+    if (this.commitHeartbeat === undefined) return;
+    clearInterval(this.commitHeartbeat);
+    this.commitHeartbeat = undefined;
   }
 
   private scheduleProgressEdit(): void {

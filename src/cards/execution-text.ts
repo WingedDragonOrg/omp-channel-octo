@@ -16,7 +16,7 @@ function truncateDisplayText(value: string, maximum = MAX_LOCAL_VISIBLE_TEXT_CHA
   return value;
 }
 
-function redactSensitiveText(value: string): string {
+export function redactSensitiveText(value: string): string {
   let redacted = value;
   redacted = redacted.replace(
     /((?:authorization|api[-_.]?key|client[-_.]?secret|cookie|credentials?|pass(?:word|wd)|secret|session[-_.]?token|sig(?:nature)?|token)\s*[:=]\s*)(?:bearer\s+)?[^\s,;&]+/giu,

@@ -15,6 +15,7 @@ import {
   formatDuration,
   handoffAnchorIndex,
   makeCollapsibleSection,
+  makeCommitCardItems,
   makeHeader,
   makeHeaderContainer,
   makeNotice,
@@ -146,7 +147,9 @@ function buildCandidate(
   const visibleTodoTasks = visibleTodos.reduce((count, phase) => count + phase.tasks.length, 0);
   const hiddenTodoTasks = Math.max(0, totalTodoTasks - visibleTodoTasks);
   const elapsed = formatDuration(snapshot.elapsedMs);
-  const metrics = `${snapshot.phaseCount} 个阶段 · ${snapshot.toolCount} 次工具调用 · ${elapsed}`;
+  const metrics = snapshot.commit === undefined
+    ? `${snapshot.phaseCount} 个阶段 · ${snapshot.toolCount} 次工具调用 · ${elapsed}`
+    : `原生提交 · ${elapsed}`;
   const notice = executionNotice(snapshot, visibleTodos);
   const canToggleTraceHistory = canToggle && traceHistoryTools.length > 0;
   const traceHistoryBand = traceHistoryTools.length > 0
@@ -199,11 +202,16 @@ function buildCandidate(
     )
     : null;
   const terminal = snapshot.state !== "running";
-  const detailElementIds = [
-    ...(todoContainer === null ? [] : ["todo_detail"]),
-    ...(subagentContainer === null ? [] : ["subagent_section"]),
-    "timeline_section",
-  ];
+  const commitItems = snapshot.commit === undefined
+    ? null
+    : makeCommitCardItems(snapshot.commit, snapshot.state, richLayout);
+  const detailElementIds = commitItems !== null
+    ? []
+    : [
+      ...(todoContainer === null ? [] : ["todo_detail"]),
+      ...(subagentContainer === null ? [] : ["subagent_section"]),
+      "timeline_section",
+    ];
   // Terminal cards open collapsed behind the header expand control; a running
   // card keeps its live detail open and offers the matching collapse control.
   const overallToggleSets = canToggle
@@ -218,63 +226,69 @@ function buildCandidate(
       makeStatusContainer(snapshot, metrics, richLayout),
     );
     if (notice) body.push(makeNotice(notice));
-    // 研究摘要常显:在 notice 与 todo 之间作为顶层区块渲染,不进任何总折叠目标。
-    if (snapshot.research) {
-      body.push(...makeResearchCardItems(snapshot.research, { canToggle, executionState: snapshot.state, rowLimit: researchRowLimit }));
-    }
-    if (todoContainer) {
-      body.push(overallDetailsVisible ? todoContainer : { ...todoContainer, isVisible: false });
-    }
-    if (richLayout) {
-      const timelineDetail: JsonNode = {
-        type: "Container",
-        id: "timeline_detail",
-        isVisible: true,
-        spacing: "Small",
-        items: timelineItems,
-      };
-      if (subagentContainer) {
+    if (commitItems !== null) {
+      body.push(...commitItems);
+    } else {
+      // 研究摘要常显:在 notice 与 todo 之间作为顶层区块渲染,不进任何总折叠目标。
+      if (snapshot.research) {
+        body.push(...makeResearchCardItems(snapshot.research, { canToggle, executionState: snapshot.state, rowLimit: researchRowLimit }));
+      }
+      if (todoContainer) {
+        body.push(overallDetailsVisible ? todoContainer : { ...todoContainer, isVisible: false });
+      }
+      if (richLayout) {
+        const timelineDetail: JsonNode = {
+          type: "Container",
+          id: "timeline_detail",
+          isVisible: true,
+          spacing: "Small",
+          items: timelineItems,
+        };
+        if (subagentContainer) {
+          body.push(makeCollapsibleSection(
+            "subagent_section",
+            `子代理 · ${totalSubagents}`,
+            [subagentContainer],
+            subagentToggleSets,
+            overallDetailsVisible,
+          ));
+        }
         body.push(makeCollapsibleSection(
-          "subagent_section",
-          `子代理 · ${totalSubagents}`,
-          [subagentContainer],
-          subagentToggleSets,
+          "timeline_section",
+          "执行轨迹",
+          traceHistoryBand === null ? [timelineDetail] : [timelineDetail, traceHistoryBand],
+          traceToggleSets,
           overallDetailsVisible,
         ));
+      } else {
+        body.push({
+          type: "Container",
+          id: "timeline_detail",
+          isVisible: true,
+          spacing: "Medium",
+          items: [
+            makeTextBlock("执行轨迹", { weight: "Bolder", size: "Medium", spacing: "None" }),
+            ...timelineItems,
+          ],
+        });
       }
-      body.push(makeCollapsibleSection(
-        "timeline_section",
-        "执行轨迹",
-        traceHistoryBand === null ? [timelineDetail] : [timelineDetail, traceHistoryBand],
-        traceToggleSets,
-        overallDetailsVisible,
-      ));
-    } else {
-      body.push({
-        type: "Container",
-        id: "timeline_detail",
-        isVisible: true,
-        spacing: "Medium",
-        items: [
-          makeTextBlock("执行轨迹", { weight: "Bolder", size: "Medium", spacing: "None" }),
-          ...timelineItems,
-        ],
-      });
     }
   } else {
     body.push(
-      ...makeHeader(false),
+      ...makeHeader(false, [], snapshot.commit, snapshot.state),
       makeTextBlock(`${executionStateGlyph(snapshot.state)} ${executionStateLabel(snapshot.state)}`, {
         weight: "Bolder",
         color: executionTone(snapshot.state),
         spacing: "Medium",
       }),
       makeTextBlock(metrics, { isSubtle: true, size: "Small", spacing: "Small" }),
-      makeTextBlock(
+    );
+    if (snapshot.commit === undefined) {
+      body.push(makeTextBlock(
         `阶段 ${metricCount(snapshot.phaseCount)} · 工具 ${metricCount(snapshot.toolCount)} · 任务 ${metricCount(totalTodoTasks)} · 耗时 ${elapsed}`,
         { isSubtle: true, size: "Small", spacing: "Small" },
-      ),
-    );
+      ));
+    }
     if (notice) {
       body.push(makeTextBlock(notice.text, {
         color: notice.style === "attention" ? "Attention" : "Default",
@@ -282,16 +296,20 @@ function buildCandidate(
         spacing: "Medium",
       }));
     }
-    // 纯文本降级路径同样常显研究摘要与最近记录,只是没有折叠控件;窗口行数随预算搜索降级。
-    if (snapshot.research) {
-      for (const line of makeResearchFlatLines(snapshot.research, researchRowLimit, snapshot.state)) {
-        body.push(makeTextBlock(line, { spacing: "Small" }));
+    if (commitItems !== null) {
+      body.push(...commitItems);
+    } else {
+      // 纯文本降级路径同样常显研究摘要与最近记录,只是没有折叠控件;窗口行数随预算搜索降级。
+      if (snapshot.research) {
+        for (const line of makeResearchFlatLines(snapshot.research, researchRowLimit, snapshot.state)) {
+          body.push(makeTextBlock(line, { spacing: "Small" }));
+        }
       }
+      if (visibleTodoTasks > 0) {
+        body.push(...todoLines(visibleTodos, hiddenTodoTasks, totalTodoTasks).map(line => makeTextBlock(line, { spacing: "Small" })));
+      }
+      body.push(makeTextBlock("执行轨迹", { weight: "Bolder", size: "Medium", spacing: "Medium" }), ...timelineItems);
     }
-    if (visibleTodoTasks > 0) {
-      body.push(...todoLines(visibleTodos, hiddenTodoTasks, totalTodoTasks).map(line => makeTextBlock(line, { spacing: "Small" })));
-    }
-    body.push(makeTextBlock("执行轨迹", { weight: "Bolder", size: "Medium", spacing: "Medium" }), ...timelineItems);
   }
 
 
@@ -302,20 +320,43 @@ function buildCandidate(
     body,
     metadata: { octo_layout: "agent_progress_v1" },
   };
-  const plainLines = [
-    `处理进度 · ${executionStateLabel(snapshot.state)} · ${metrics}`,
-    "OMP 自动执行",
-    ...(notice ? [notice.text] : []),
-    ...(snapshot.research ? makeResearchFlatLines(snapshot.research, researchRowLimit, snapshot.state) : []),
-    ...visibleTools.map(tool => markdownSafeToolLine(tool)),
-    ...(hiddenTools > 0 ? [`已隐藏前 ${hiddenTools} 个步骤，共 ${snapshot.tools.length} 个步骤`] : []),
-    ...subagents.map(subagent => subagentLine(subagent, true)),
-    ...(hiddenSubagents > 0 ? [`已隐藏 ${hiddenSubagents} 个子代理，共 ${totalSubagents} 个子代理`] : []),
-    ...todoLines(visibleTodos, hiddenTodoTasks, totalTodoTasks),
-  ];
+  const plainLines = snapshot.commit === undefined
+    ? [
+      `处理进度 · ${executionStateLabel(snapshot.state)} · ${metrics}`,
+      "OMP 自动执行",
+      ...(notice ? [notice.text] : []),
+      ...(snapshot.research ? makeResearchFlatLines(snapshot.research, researchRowLimit, snapshot.state) : []),
+      ...visibleTools.map(tool => markdownSafeToolLine(tool)),
+      ...(hiddenTools > 0 ? [`已隐藏前 ${hiddenTools} 个步骤，共 ${snapshot.tools.length} 个步骤`] : []),
+      ...subagents.map(subagent => subagentLine(subagent, true)),
+      ...(hiddenSubagents > 0 ? [`已隐藏 ${hiddenSubagents} 个子代理，共 ${totalSubagents} 个子代理`] : []),
+      ...todoLines(visibleTodos, hiddenTodoTasks, totalTodoTasks),
+    ]
+    : [
+      `提交进度 · ${executionStateLabel(snapshot.state)} · ${metrics}`,
+      "OMP 原生提交",
+      ...(notice ? [notice.text] : []),
+      ...(snapshot.commit.result === undefined ? [] : [snapshot.commit.result]),
+      ...(snapshot.commit.content?.message === undefined
+        ? []
+        : ["提交信息", snapshot.commit.content.message]),
+      ...(snapshot.commit.content?.changelog === undefined
+        ? []
+        : ["变更日志", snapshot.commit.content.changelog]),
+      ...(snapshot.commit.recentSteps.length === 0 ? [snapshot.commit.summary] : snapshot.commit.recentSteps),
+    ];
   // The rich card keeps finished subagents behind the section toggle; the plain rendering has no
   // toggle, so it lists every subagent the session reported.
-  if (!snapshot.research && snapshot.state === "running" && totalTraceTools === 0 && visibleTodoTasks === 0 && subagents.length === 0) plainLines.push("正在准备");
+  if (
+    snapshot.commit === undefined
+    && !snapshot.research
+    && snapshot.state === "running"
+    && totalTraceTools === 0
+    && visibleTodoTasks === 0
+    && subagents.length === 0
+  ) {
+    plainLines.push("正在准备");
+  }
   return { card, plain: plainLines.join("\n") };
 }
 

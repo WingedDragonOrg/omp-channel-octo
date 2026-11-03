@@ -801,6 +801,41 @@ test("preview research card keeps the summary visible and folds recent runs inde
   expect(cardText(nodeById(card, "timeline_detail"))).toContain("autoresearch 基线基准");
 });
 
+/**
+ * Native commit card: six already-filtered stages, no tools/todos/model text, and one real HEAD
+ * transition. The preview exercises the same tracker/builder path the service sends.
+ */
+function nativeCommitPreviewSnapshot(): ExecutionSnapshot {
+  const startedAt = Date.now() - 20_000;
+  const tracker = createExecutionTracker({ runId: "preview-native-commit" });
+  const stages = [
+    "正在解析模型",
+    "正在暂存全部改动",
+    "正在检测变更日志",
+    "正在发现上下文文件",
+    "正在启动提交代理",
+    "正在创建提交",
+    "正在创建拆分提交",
+  ] as const;
+  for (let index = 0; index < stages.length; index += 1) {
+    tracker.apply({
+      type: "commit_progress",
+      atMs: startedAt + index * 1_000,
+      summary: stages[index]!,
+    });
+  }
+  tracker.apply({
+    type: "commit_result",
+    atMs: startedAt + 15_000,
+    summary: "提交已完成。HEAD=5e388075→d986aec1。",
+    content: {
+      message: "fix(cards): show native commit details\n\nKeep the real title and body.",
+      changelog: "### Fixed\n\n- Preserve the commit message and changelog entry.",
+    },
+  });
+  return tracker.apply({ type: "run_end", atMs: startedAt + 20_000, state: "completed" });
+}
+
 const botToken = firstNonEmpty(process.env.BOT_TOKEN, process.env.OCTO_BOT_TOKEN);
 const runPreviewTest = botToken === undefined ? test.skip : test;
 
@@ -923,6 +958,32 @@ runPreviewTest(
     await sendLivePreviewCard(
       preview,
       "研究进度预览卡片（目标与指标摘要、基线 800 最佳 640 改善 20%、运行中第 10 轮、最近 6 条折叠省略 3 条、完整记录入口 /autoresearch-history）",
+    );
+  },
+  { timeout: 30_000 },
+);
+
+runPreviewTest(
+  "native commit progress preview sends a completed commit card with HEAD evidence",
+  async () => {
+    const preview = nativeCommitPreviewSnapshot();
+    expect(preview.tools).toEqual([]);
+    expect(preview.todos).toEqual([]);
+    expect(preview.commit?.recentSteps).toHaveLength(6);
+    // 断言先行：卡片缺失时在发送前失败，不投半截预览。
+    const built = buildExecutionCard(preview, previewCapabilities);
+    expect(built).not.toBeNull();
+    const text = cardText(built!.card as JsonRecord);
+    expect(text).toContain("提交结果");
+    expect(text).toContain("5e388075");
+    expect(text).toContain("d986aec1");
+    expect(text).toContain("fix(cards): show native commit details");
+    expect(text).toContain("Keep the real title and body.");
+    expect(text).toContain("Preserve the commit message and changelog entry.");
+    expect(text).not.toContain("已停止");
+    await sendLivePreviewCard(
+      preview,
+      "原生提交进度预览卡片（固定阶段摘要、HEAD=5e388075→d986aec1、未包含模型/工具原始输出）",
     );
   },
   { timeout: 30_000 },

@@ -10,8 +10,11 @@ import {
   terminateOwnedProcess,
 } from "./process.ts";
 import { stripEnforcedArgs, workerEnv } from "./profile.ts";
+import { readGitCommitContent, readGitHead } from "./git-commit-content.ts";
+import { type CommitOutputParser, createCommitOutputParser } from "./commit-output.ts";
 
 const NATIVE_COMMIT_VALUE_FLAGS = new Set(["--extension", "-e", "--hook"]);
+const COMMIT_START_SUMMARY = "正在提交";
 
 function nativeCommitArgs(extraArgs: readonly string[], model: string | undefined): string[] {
   const output = stripEnforcedArgs(extraArgs);
@@ -31,38 +34,41 @@ function nativeCommitArgs(extraArgs: readonly string[], model: string | undefine
   return filtered;
 }
 
-async function drain(stream: ReadableStream<Uint8Array>): Promise<void> {
+async function drain(
+  stream: ReadableStream<Uint8Array>,
+  parser?: CommitOutputParser,
+): Promise<void> {
   const reader = stream.getReader();
   try {
     for (;;) {
-      const { done } = await reader.read();
+      const { done, value } = await reader.read();
       if (done) return;
+      parser?.write(value);
     }
   } finally {
+    parser?.end();
     reader.releaseLock();
   }
 }
 
-async function gitHead(cwd: string): Promise<string | null> {
-  const child = Bun.spawn(["git", "rev-parse", "--verify", "--quiet", "HEAD"], {
-    cwd,
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-    env: workerEnv(),
-  });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-    child.exited,
-  ]);
-  if (exitCode === 1) return null;
-  if (exitCode !== 0) {
-    throw new Error(`git rev-parse --verify --quiet HEAD failed (${exitCode}): ${stderr.trim()}`);
-  }
-  const head = stdout.trim();
-  if (head.length === 0) throw new Error("git rev-parse --verify --quiet HEAD returned no HEAD");
-  return head;
+/**
+ * Consecutive spinner refreshes are deduplicated while later real transitions remain visible.
+ * A throwing consumer is ignored: card edits and transport I/O must never stall or fail the CLI.
+ */
+function createCommitProgressReporter(
+  onProgress: CommitWorkerOptions["onProgress"],
+): (summary: string) => void {
+  if (onProgress === undefined) return () => {};
+  let lastSummary: string | undefined;
+  return (summary: string): void => {
+    if (lastSummary === summary) return;
+    lastSummary = summary;
+    try {
+      onProgress({ type: "commit_progress", atMs: Date.now(), summary });
+    } catch {
+      // Progress consumers are observability only; the native commit pipeline keeps draining.
+    }
+  };
 }
 
 class NativeCommitWorker implements CommitWorker {
@@ -72,6 +78,7 @@ class NativeCommitWorker implements CommitWorker {
   readonly #cwd: string;
   readonly #cancelTimeoutMs: number;
   readonly #drains: readonly [Promise<void>, Promise<void>];
+  readonly #reportProgress: (summary: string) => void;
   #runPromise: Promise<CommitResult> | undefined;
   #stopPromise: Promise<boolean> | undefined;
   #stopRequested = false;
@@ -85,6 +92,7 @@ class NativeCommitWorker implements CommitWorker {
     cwd: string,
     cancelTimeoutMs: number,
     drains: readonly [Promise<void>, Promise<void>],
+    reportProgress: (summary: string) => void,
   ) {
     let resolveStopOutcome!: (stopped: boolean) => void;
     this.#stopOutcome = new Promise(resolve => {
@@ -97,6 +105,7 @@ class NativeCommitWorker implements CommitWorker {
     this.#cwd = cwd;
     this.#cancelTimeoutMs = cancelTimeoutMs;
     this.#drains = drains;
+    this.#reportProgress = reportProgress;
   }
 
   run(): Promise<CommitResult> {
@@ -120,7 +129,7 @@ class NativeCommitWorker implements CommitWorker {
 
     let headBefore: string | null;
     try {
-      headBefore = await gitHead(this.#cwd);
+      headBefore = await readGitHead(this.#cwd);
     } catch (error) {
       try {
         if (!(await this.stop())) throw new Error("native commit process group did not stop");
@@ -133,6 +142,7 @@ class NativeCommitWorker implements CommitWorker {
       try {
         this.#child.stdin.write("commit\n");
         this.#child.stdin.end?.();
+        this.#reportProgress(COMMIT_START_SUMMARY);
       } catch {
         void this.stop();
       }
@@ -145,8 +155,16 @@ class NativeCommitWorker implements CommitWorker {
       throw new Error("native commit outcome is unknown: process group stop was not confirmed");
     }
     await Promise.all(this.#drains);
-    const headAfter = await gitHead(this.#cwd);
-    return { exitCode, headBefore, headAfter };
+    const headAfter = await readGitHead(this.#cwd);
+    const content = headAfter !== null && headAfter !== headBefore
+      ? await readGitCommitContent(this.#cwd, headBefore, headAfter)
+      : undefined;
+    return {
+      exitCode,
+      headBefore,
+      headAfter,
+      ...(content === undefined ? {} : { content }),
+    };
   }
 
   async #waitForExitOrStop(): Promise<number> {
@@ -207,7 +225,13 @@ export async function createNativeCommitWorker(options: {
     throw taskStartupError("spawn-failed", error);
   }
 
-  const drains: readonly [Promise<void>, Promise<void>] = [drain(child.stdout), drain(child.stderr)];
+  const reportProgress = createCommitProgressReporter(commit.onProgress);
+  const stdoutParser = commit.onProgress === undefined ? undefined : createCommitOutputParser(reportProgress);
+  const stderrParser = commit.onProgress === undefined ? undefined : createCommitOutputParser(reportProgress);
+  const drains: readonly [Promise<void>, Promise<void>] = [
+    drain(child.stdout, stdoutParser),
+    drain(child.stderr, stderrParser),
+  ];
   const parentSnapshot = await queryProcess(process.pid);
   const snapshot = await queryProcess(child.pid);
   if (!snapshot) {
@@ -252,5 +276,5 @@ export async function createNativeCommitWorker(options: {
     throw error;
   }
 
-  return new NativeCommitWorker(child, watchdog, snapshot.pgid, cwd, options.cancelTimeoutMs, drains);
+  return new NativeCommitWorker(child, watchdog, snapshot.pgid, cwd, options.cancelTimeoutMs, drains, reportProgress);
 }

@@ -137,6 +137,23 @@ Git 写锁以规范化 worktree top-level 为边界，绑定在仓库子目录�
 
 **反馈与验收**：向原聊天反馈启动、提交完成、提交失败或停止结果，错误有界且不转发原始模型/工具日志。行为回归覆盖权限、持久工作区拒绝、正常 linked worktree、资源竞争、持续目标及宿主合并之间的租约、停止边界、创建失败与关闭竞态，以及恢复。延迟重启将原生提交与等待/执行中的宿主合并均计入活动操作，合并回执处理完成后才重新评估空闲状态。真实 smoke 必须通过临时单项目 Git 仓库执行原生提交，核对 HEAD、文件内容及 channel 回执，并用受控运行场景验证 stop 和进程清理；不提交实现仓库、不推送、不部署、不重启常驻服务。
 
+#### 原生提交进度卡实施 SDD（2026-11-03）
+
+**输出依据**：已安装 OMP 18.16.0 的 `commit --help`、内嵌 `commit/agentic/index.ts` / `agent.ts` 和抛弃式 Git 仓库的非 TTY 管道实测。CLI 直接写出 `● Resolving model...`、自动 stage、changelog/context 探测、`● Starting commit agent...`、工具结束行、`● agent finished (...)`、fallback 与 `● Creating commit...`。非 TTY 不输出临时 assistant 刷新，但仍输出完整 assistant 正文、工具参数及内部路径，不能直接转发。实测 fallback 创建真实提交后退出码为 1，故输出中的 `Commit created.` 不构成成功判据。
+
+**边界与事件**：`omp/commit.ts` 继续独占 gate、管道读取、进程组、watchdog 与真实 HEAD 结果；释放执行 gate 时报告开始，stdout/stderr 的各自增量解码器只把已核实的固定整行阶段映射为固定中文摘要，工具仅提取已核实白名单名称与结束状态。动态正文、diff、错误详情、模型输出和参数一律丢弃。每条输入行有固定上限，超长行整体丢弃至下一分隔符；UTF-8、ANSI 控制序列及 CR/LF 可跨 chunk，重复刷新不重复记录。
+
+**单一展示链**：`CommitWorkerOptions.onProgress` 同步报告安全的 `commit_progress` 执行事件；回调异常与卡片 I/O 不影响管道排空或 CLI 结果。`CoreService.runCommitTask` 使用现有 `ProgressCards.startTask` / `TaskProgress.apply` / `finish` / `stop` / `tail`，不创建 RPC worker 或 agent 回合。`ExecutionTracker` 的提交快照保留当前摘要、最近 6 条去重步骤、服务依据真实结果产生的终态摘要及经净化限长的提交内容；既有 durable snapshot 编解码与恢复继续负责收尾。卡片标题明确正在提交，采用现有 builder、能力门禁和预算搜索；不以工具调用或 todo 假装原生阶段完成。
+
+**刷新与终态**：实际开始事件开一张卡，所有后续事件更新同一卡，运行中编辑沿用 1 秒合并限频。无新阶段的长命令每 10 秒更新实际耗时，不推断进度或百分比。只有原生进程退出且既有受管进程组退出确认后，才依据 `CommitResult.exitCode/headBefore/headAfter` 呈现完成、无新提交、失败、停止及已产生提交的结果。停止未确认的卡显示结果未知，不写成已停止；保留 watchdog、ledger、目录阻塞与 shutdown 契约。最终文本回执保持独立，卡片不可用、创建/编辑失败不阻断执行、停止或回执。
+
+**提交内容**：终态结果之下展示实际 Git commit message（标题及正文）和本次提交范围内根目录/嵌套 `CHANGELOG.md` 的新增正文，随后展示最近步骤。来源只限已确认变化的 `headBefore..headAfter`；首次提交涵盖初始树，不读取工作树未提交内容，不从 stdout 拼接内容，不展示代码 diff、diff 元数据或内部绝对路径。commit message 合计上限 800 个 Unicode code point，changelog 合计上限 1,200 个；保留换行，截断时附“已截断”标记且计入该上限。凭据沿用展示净化边界；内容读取和脱敏先于持久化，恢复与降级仍执行相同上限。HEAD 未变时不增加内容区；非零退出或停止后已产生的提交同样可展示其真实内容。内容读取失败不改变已经确认的退出码/HEAD 结果，不影响最终文本回执。
+
+**验收**：先增加并观察失败的 parser/worker/core/card 行为测试，再实现。覆盖跨 chunk UTF-8/ANSI/CR、重复与大量输出、敏感内容不投影、单卡持续更新与静默耗时、真实结果各分支、停止失败隔离、卡片故障下仍排空和交付。运行 native commit/core/card 回归、typecheck、全量测试与离线 restart benchmark；抛弃式真实 Git+受管子进程验证提交和停止，真实 CLI 使用隔离 profile 与 localhost 模型替身。必要预览只投当前子区，不注册真实 Bot 连接；本任务不提交、推送、合并或重启常驻服务。
+
+**进度卡与内容验收记录**：`bun run typecheck` 通过；native commit/core/card 专项 170 pass、0 fail，完整 `bun test` 为 1,201 pass、0 fail（85 个文件）。离线 restart benchmark 的 graceful/SIGKILL 两种场景通过，session overlap 和 duplicate effect 均为 0。抛弃式真实 Git、安装版 OMP、localhost 模型替身与 `CoreService` 完成成功、无新提交、退出码 1 但已生成提交、pre-commit hook 阻塞时停止四条路径；4 次操作各创建 1 张卡，共编辑 11 次，无 RPC prompt，受管进程组均退出。实际生成的 `fix: updated tracked value` 标题/正文及新增 changelog 条目进入同一张终态卡，旧历史和未提交内容未进入投影。当前子区只发送 1 张 Octo 预览卡并在原卡上更新内容，未注册真实 Bot 连接；最终 wire envelope 为 28/200 节点。实际 builder 的 340px/440px 本地渲染已检查，Octo 发送与编辑回执已确认；本地 renderer 不等于真实客户端像素验证。既有预览结构测试 7 pass，4 个需 token 的 live case 跳过；上述单卡实发使用当前 Bot 的已验证 `octo-cli` 身份完成。
+
+
 隔离验收使用临时 channel 实例、`FakeTransport`、真实 OMP CLI 和临时 Git 仓库：普通 `/commit` 创建 `d986aec1b887cef130272b7bffe8e26c7dddcd76`，文件内容与 clean 状态核对通过，channel 收到启动和 `HEAD=5e388075→d986aec1` 完成回执。真实 pre-commit hook 阻塞期间发送 `/commit stop`，受管进程组确认消失、HEAD 保持 `d986aec1…`。separate 的单项目 linked worktree 创建 `8908099f91f694da18132de8fd006aad5ba748fe`，源工作树 HEAD 保持 `46588bc3…`，linked 工作树 clean，channel 收到对应提交结果。该验收没有连接真实 Octo transport，不代表常驻服务已加载此实现。
 
 最终检查：`bun run typecheck` 通过；专项命令/goal/宿主合并/worker 生命周期测试为 117 pass、0 fail；`bun test` 为 1149 pass、0 fail（83 个文件）。`bun tests/benchmarks/restart.ts` 的 graceful 与 SIGKILL 两个真实 CLI 恢复场景均通过，恢复任务与队列各 2 次，session overlap 和 duplicate effect 均为 0。`bun tests/benchmarks/goal.ts` 通过真实 OMP、隔离 profile/session 和 localhost 模型验证有限目标完成、pause/resume、drop、graceful/SIGKILL 恢复及 disabled 门禁，23 次本地模型请求，无重复目标创建。回归同时覆盖已派发提交不重放，以及未派发的 `0/0` 提交在未确认 worker 阻塞期间继续保持 queued。

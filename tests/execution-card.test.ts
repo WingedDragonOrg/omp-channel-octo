@@ -2642,3 +2642,326 @@ describe("autoresearch research card", () => {
     expect(sawDegradedRung).toBe(true);
   });
 });
+
+describe("native commit progress", () => {
+  const HEAD_BEFORE = "a".repeat(40);
+  const HEAD_AFTER = "b".repeat(40);
+  const COMMIT_STAGES = [
+    "正在解析模型",
+    "正在暂存全部改动",
+    "正在检测变更日志",
+    "正在发现上下文文件",
+    "正在启动提交代理",
+    "正在创建提交",
+    "正在创建拆分提交",
+  ] as const;
+  type CommitContentSample = { readonly message?: string; readonly changelog?: string };
+
+  function applyCommitResultWithContent(
+    tracker: ExecutionTracker,
+    summary: string,
+    content: CommitContentSample | undefined,
+    atMs = 2_000,
+  ): void {
+    tracker.apply({
+      type: "commit_result",
+      atMs,
+      summary,
+      ...(content === undefined ? {} : { content }),
+      diff: "diff --git a/src/private.ts b/src/private.ts",
+    } as unknown as ExecutionEvent);
+  }
+
+  function commitContentOf(snapshot: ExecutionSnapshot): CommitContentSample | undefined {
+    return (snapshot.commit as unknown as { readonly content?: CommitContentSample } | undefined)?.content;
+  }
+
+  function commitTracker(state: "running" | "completed" | "failed" = "running"): ExecutionTracker {
+    const tracker = createExecutionTracker({ runId: "native-commit" });
+    tracker.apply({ type: "commit_progress", atMs: 1_000, summary: "正在提交" });
+    for (let index = 0; index < COMMIT_STAGES.length; index += 1) {
+      tracker.apply({
+        type: "commit_progress",
+        atMs: 1_100 + index,
+        summary: COMMIT_STAGES[index]!,
+      });
+    }
+    if (state !== "running") {
+      tracker.apply({
+        type: "commit_result",
+        atMs: 2_000,
+        summary: `提交已完成。HEAD=${HEAD_BEFORE.slice(0, 8)}→${HEAD_AFTER.slice(0, 8)}。`,
+      });
+      tracker.apply({ type: "run_end", atMs: 2_000, state });
+    }
+    return tracker;
+  }
+
+  test("projects trusted commit stages, caps the history at six, and keeps the real result", () => {
+    const tracker = createExecutionTracker({ runId: "commit-history" });
+    tracker.apply({ type: "commit_progress", atMs: 1_000, summary: "正在提交" });
+    // A native stage refresh that arrives twice must not consume a second history slot.
+    tracker.apply({ type: "commit_progress", atMs: 1_050, summary: "正在提交" });
+    for (let index = 0; index < COMMIT_STAGES.length; index += 1) {
+      tracker.apply({
+        type: "commit_progress",
+        atMs: 1_100 + index,
+        summary: COMMIT_STAGES[index]!,
+      });
+    }
+
+    const running = tracker.snapshot(2_000);
+    expect(running.commit).toEqual({
+      summary: "正在创建拆分提交",
+      recentSteps: [
+        "正在暂存全部改动",
+        "正在检测变更日志",
+        "正在发现上下文文件",
+        "正在启动提交代理",
+        "正在创建提交",
+        "正在创建拆分提交",
+      ],
+    });
+    // Commit phases are not tools, turns, or todos; the card must not invent those rows.
+    expect(running.tools).toEqual([]);
+    expect(running.todos).toEqual([]);
+    expect(running.toolCount).toBe(0);
+    expect(running.phaseCount).toBe(0);
+
+    const result = `提交已完成。HEAD=${HEAD_BEFORE.slice(0, 8)}→${HEAD_AFTER.slice(0, 8)}。`;
+    tracker.apply({ type: "commit_result", atMs: 2_100, summary: result });
+    const terminal = tracker.apply({ type: "run_end", atMs: 2_100, state: "completed" });
+    expect(terminal.state).toBe("completed");
+    expect(terminal.commit).toEqual({
+      ...running.commit!,
+      result,
+    });
+  });
+
+  test("durable restore keeps a commit HEAD result and an unknown outcome", () => {
+    const completed = commitTracker("completed").snapshot(2_100);
+    const restoredCompleted = restoreExecutionSnapshot(
+      encodeExecutionSnapshot(completed),
+      { state: "completed", atMs: 10_000 },
+    );
+    expect(restoredCompleted?.commit?.result).toContain(HEAD_AFTER.slice(0, 8));
+    expect(restoredCompleted?.commit?.recentSteps).toEqual(completed.commit?.recentSteps);
+
+    const unknownResult = "无法确认提交进程已退出；提交结果未知。";
+    const unknownTracker = createExecutionTracker({ runId: "commit-unknown" });
+    unknownTracker.apply({ type: "commit_progress", atMs: 1_000, summary: "正在提交" });
+    unknownTracker.apply({ type: "commit_result", atMs: 2_000, summary: unknownResult });
+    const failed = unknownTracker.apply({ type: "run_end", atMs: 2_000, state: "failed" });
+    const restoredUnknown = restoreExecutionSnapshot(
+      encodeExecutionSnapshot(failed),
+      { state: "failed", atMs: 10_100 },
+    );
+    expect(restoredUnknown?.state).toBe("failed");
+    expect(restoredUnknown?.commit?.result).toBe(unknownResult);
+    expect(cardText(buildExecutionCard(restoredUnknown!, fullCapabilities)!.card as JsonRecord))
+      .not.toContain("已停止");
+
+    // An older running card has progress but no terminal evidence. The task row may say
+    // cancelled after a restart, but that cannot mean the native process was stopped.
+    const interruptedTracker = createExecutionTracker({ runId: "commit-interrupted" });
+    interruptedTracker.apply({ type: "commit_progress", atMs: 1_000, summary: "正在提交" });
+    const interrupted = interruptedTracker.snapshot(1_500);
+    const restoredInterrupted = restoreExecutionSnapshot(
+      encodeExecutionSnapshot(interrupted),
+      { state: "cancelled", atMs: 10_200 },
+    );
+    expect(restoredInterrupted?.state).toBe("cancelled");
+    expect(restoredInterrupted?.commit?.result).toContain("提交结果未知");
+    const interruptedText = cardText(
+      buildExecutionCard(restoredInterrupted!, fullCapabilities)!.card as JsonRecord,
+    );
+    expect(interruptedText).toContain("提交结果未知");
+    expect(interruptedText).not.toContain("已停止");
+  });
+
+  test("renders the commit title, its bounded stages, and the native HEAD result", () => {
+    const running = commitTracker().snapshot(2_000);
+    const runningRendered = buildExecutionCard(running, fullCapabilities);
+    expect(runningRendered).not.toBeNull();
+    const runningText = cardText(runningRendered!.card as JsonRecord);
+    expect(runningText).toContain("正在提交");
+    expect(runningText).toContain("正在创建拆分提交");
+    // Commit phases are not fake tool/todo activity.
+    expect(runningText).not.toContain("执行轨迹");
+    expect(runningText).not.toContain("工具调用");
+    // The bounded window drops the oldest stage rather than growing the card.
+    expect(runningText).not.toContain("正在解析模型");
+
+    const completed = commitTracker("completed").snapshot(2_100);
+    const completedText = cardText(buildExecutionCard(completed, fullCapabilities)!.card as JsonRecord);
+    expect(completedText).toContain("提交已完成");
+    expect(completedText).toContain(HEAD_BEFORE.slice(0, 8));
+    expect(completedText).toContain(HEAD_AFTER.slice(0, 8));
+    expect(completedText).not.toContain("已停止");
+  });
+
+  test("terminal commit cards lead with the observed result rather than a stale running stage", () => {
+    for (const [state, result] of [
+      ["completed", "提交已完成。HEAD=aaaaaaaa→bbbbbbbb。"],
+      ["failed", "提交失败，退出码 1；HEAD 已变化。HEAD=aaaaaaaa→bbbbbbbb。"],
+      ["cancelled", "已停止当前提交；HEAD=aaaaaaaa→aaaaaaaa。"],
+      ["failed", "提交结果未知；请检查当前 HEAD。"],
+    ] as const) {
+      const tracker = createExecutionTracker();
+      tracker.apply({ type: "commit_progress", atMs: 1_000, summary: "正在创建提交" });
+      tracker.apply({ type: "commit_result", atMs: 2_000, summary: result });
+      const snapshot = tracker.apply({ type: "run_end", atMs: 2_000, state });
+      for (const elements of [fullCapabilities.elements, ["TextBlock"]]) {
+        const built = buildExecutionCard(snapshot, { ...fullCapabilities, elements: elements! })!;
+        const text = cardText(built.card as JsonRecord);
+        expect(text.indexOf(result)).toBeLessThan(text.indexOf("正在创建提交"));
+        expect(built.plain.indexOf(result)).toBeLessThan(built.plain.indexOf("正在创建提交"));
+      }
+    }
+  });
+
+  test("fits full and text-only commit cards within their budgets", () => {
+    const running = commitTracker().snapshot(2_000);
+    const full = buildExecutionCard(running, fullCapabilities);
+    expect(full).not.toBeNull();
+    expect(cardStats(full!.card as JsonRecord).nodes)
+      .toBeLessThanOrEqual(fullCapabilities.limits!.maxNodes! - 1);
+    expect(payloadBytes(full!.card)).toBeLessThanOrEqual(fullCapabilities.limits!.maxPayloadBytes!);
+    expect(cardText(full!.card as JsonRecord)).toContain("正在提交");
+
+    const textOnlyCapabilities: ExecutionCardCapabilities = {
+      enabled: true,
+      interactive: false,
+      profiles: ["octo/v1"],
+      cardVersion: "1.5",
+      elements: ["TextBlock"],
+      limits: { maxNodes: 80, maxDepth: 8, maxPayloadBytes: 32_768 },
+    };
+    const degraded = buildExecutionCard(running, textOnlyCapabilities);
+    expect(degraded).not.toBeNull();
+    const stats = cardStats(degraded!.card as JsonRecord);
+    expect(stats.nodes).toBeLessThanOrEqual(textOnlyCapabilities.limits!.maxNodes! - 1);
+    expect(stats.maxDepth).toBeLessThanOrEqual(textOnlyCapabilities.limits!.maxDepth!);
+    expect(payloadBytes(degraded!.card)).toBeLessThanOrEqual(textOnlyCapabilities.limits!.maxPayloadBytes!);
+    expect(cardText(degraded!.card as JsonRecord)).toContain("正在提交");
+
+    const completed = commitTracker("completed").snapshot(2_100);
+    const completedDegraded = buildExecutionCard(completed, textOnlyCapabilities);
+    expect(completedDegraded).not.toBeNull();
+    const completedText = cardText(completedDegraded!.card as JsonRecord);
+    expect(completedText).toContain(HEAD_AFTER.slice(0, 8));
+  });
+
+  test("stripping free-text summaries keeps the trusted commit HEAD result", () => {
+    const completed = commitTracker("completed").snapshot(2_100);
+    const stripped = stripCardSummaries(completed);
+    expect(stripped.commit?.result).toContain(HEAD_AFTER.slice(0, 8));
+    const rendered = buildExecutionCard(stripped, fullCapabilities);
+    expect(rendered).not.toBeNull();
+    const text = cardText(rendered!.card as JsonRecord);
+    expect(text).toContain(HEAD_BEFORE.slice(0, 8));
+    expect(text).toContain(HEAD_AFTER.slice(0, 8));
+    expect(text).not.toContain("已停止");
+  });
+  test("terminal commit content preserves message and changelog before recent steps", () => {
+    const message = "feat: add compact commit cards\n\nKeep the title and body on separate lines.";
+    const changelog = "### Added\n\n- Show the real commit message.\n- Include the changelog entry.";
+    const content = { message, changelog };
+    const tracker = createExecutionTracker({ runId: "commit-content-render" });
+    tracker.apply({ type: "commit_progress", atMs: 1_000, summary: "正在创建提交" });
+    applyCommitResultWithContent(
+      tracker,
+      "提交已完成。HEAD=aaaaaaaa→bbbbbbbb。",
+      content,
+      2_000,
+    );
+    const terminal = tracker.apply({ type: "run_end", atMs: 2_000, state: "completed" });
+    expect(commitContentOf(terminal)).toEqual(content);
+
+    const textOnlyCapabilities: ExecutionCardCapabilities = {
+      enabled: true,
+      interactive: false,
+      profiles: ["octo/v1"],
+      cardVersion: "1.5",
+      elements: ["TextBlock"],
+      limits: { maxNodes: 80, maxDepth: 8, maxPayloadBytes: 32_768 },
+    };
+    for (const capabilities of [fullCapabilities, textOnlyCapabilities]) {
+      const rendered = buildExecutionCard(terminal, capabilities);
+      expect(rendered).not.toBeNull();
+      const text = cardText(rendered!.card as JsonRecord);
+      expect(text).toContain(message);
+      expect(text).toContain(changelog);
+      expect(text.indexOf(message)).toBeLessThan(text.indexOf("正在创建提交"));
+      expect(text.indexOf(changelog)).toBeLessThan(text.indexOf("正在创建提交"));
+      expect(rendered!.plain).toContain(message);
+      expect(rendered!.plain).toContain(changelog);
+      expect(rendered!.plain.indexOf(message)).toBeLessThan(rendered!.plain.indexOf("正在创建提交"));
+      expect(rendered!.plain.indexOf(changelog)).toBeLessThan(rendered!.plain.indexOf("正在创建提交"));
+      const stats = cardStats(rendered!.card);
+      expect(stats.nodes).toBeLessThanOrEqual(capabilities.limits!.maxNodes! - 1);
+      expect(stats.maxDepth).toBeLessThanOrEqual(capabilities.limits!.maxDepth!);
+      expect(payloadBytes(rendered!.card)).toBeLessThanOrEqual(capabilities.limits!.maxPayloadBytes!);
+      expect(JSON.stringify({ card: rendered!.card, plain: rendered!.plain })).not.toContain("diff --git");
+    }
+  });
+
+  test("commit content is bounded by Unicode code points including truncation markers and survives restore", () => {
+    const tracker = createExecutionTracker({ runId: "commit-content-bounds" });
+    tracker.apply({ type: "commit_progress", atMs: 1_000, summary: "正在创建提交" });
+    applyCommitResultWithContent(tracker, "提交已完成。", {
+      message: "🧪".repeat(850),
+      changelog: "🧩".repeat(1_250),
+    });
+    const terminal = tracker.apply({ type: "run_end", atMs: 2_100, state: "completed" });
+    const bounded = commitContentOf(terminal);
+    expect(bounded?.message).toBeDefined();
+    expect(bounded?.changelog).toBeDefined();
+    const message = bounded?.message ?? "";
+    const changelog = bounded?.changelog ?? "";
+    expect(Array.from(message).length).toBe(800);
+    expect(Array.from(changelog).length).toBe(1_200);
+    expect(message).toContain("已截断");
+    expect(changelog).toContain("已截断");
+    expect(() => encodeURIComponent(message)).not.toThrow();
+    expect(() => encodeURIComponent(changelog)).not.toThrow();
+
+    const restored = restoreExecutionSnapshot(
+      encodeExecutionSnapshot(terminal),
+      { state: "completed", atMs: 10_000 },
+    );
+    expect(restored).not.toBeNull();
+    expect(commitContentOf(restored!)).toEqual(bounded);
+  });
+
+  test("commit content redacts credentials and internal absolute paths without inventing absent content", () => {
+    const tracker = createExecutionTracker({ runId: "commit-content-redaction" });
+    tracker.apply({ type: "commit_progress", atMs: 1_000, summary: "正在创建提交" });
+    applyCommitResultWithContent(tracker, "提交已完成。", {
+      message: "fix: keep safe text\n\nAuthorization: Bearer ultra-secret-token\nSee /Users/private/work/repo/src/secret.ts",
+      changelog: "### Fixed\n\n- Token: ghp_abcdefghijklmnopqrstuvwxyz012345",
+    });
+    const terminal = tracker.apply({ type: "run_end", atMs: 2_100, state: "completed" });
+    const sanitizedContent = commitContentOf(terminal);
+    expect(sanitizedContent?.message).toBeDefined();
+    expect(sanitizedContent?.changelog).toBeDefined();
+    const rendered = buildExecutionCard(terminal, fullCapabilities)!;
+    const serialized = JSON.stringify({
+      snapshot: terminal,
+      card: rendered.card,
+      plain: rendered.plain,
+    });
+    expect(serialized).not.toContain("ultra-secret-token");
+    expect(serialized).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz012345");
+    expect(serialized).not.toContain("/Users/private/work/repo/src/secret.ts");
+
+    const noContentTracker = createExecutionTracker({ runId: "commit-content-absent" });
+    noContentTracker.apply({ type: "commit_progress", atMs: 1_000, summary: "正在创建提交" });
+    noContentTracker.apply({ type: "commit_result", atMs: 2_000, summary: "提交结果未知。" });
+    const noContent = noContentTracker.apply({ type: "run_end", atMs: 2_100, state: "failed" });
+    expect(commitContentOf(noContent)).toBeUndefined();
+    const noContentText = cardText(buildExecutionCard(noContent, fullCapabilities)!.card as JsonRecord);
+    expect(noContentText).not.toContain("feat:");
+    expect(noContentText).not.toContain("### Added");
+  });
+});

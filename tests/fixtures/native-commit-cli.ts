@@ -1,7 +1,15 @@
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 interface FixtureConfig {
-  scenario: "commit" | "commit-exit-1" | "fail" | "hang" | "commit-then-hang" | "interruptible-hang";
+  scenario:
+    | "commit"
+    | "commit-exit-1"
+    | "fail"
+    | "hang"
+    | "commit-then-hang"
+    | "interruptible-hang"
+    | "progress";
   pidPath: string;
   readyPath?: string;
   descendantPidPath?: string;
@@ -9,7 +17,24 @@ interface FixtureConfig {
   cwdPath?: string;
   startedPath?: string;
   outputBytes?: number;
+  commitMessage?: string;
+  followupCommitMessage?: string;
+  commitMessageFile?: string;
+  commitPaths?: string[];
+  commitOutput?: string;
+  postStageAppend?: { path: string; content: string };
+  corruptChangelogBlob?: boolean;
   exitCode?: number;
+  /** Raw stdout bytes, base64 encoded, written one chunk at a time before the scenario finishes. */
+  stdoutChunksBase64?: string[];
+  /** Raw stderr bytes, base64 encoded, written after the stdout chunks. */
+  stderrChunksBase64?: string[];
+  /** Delay between raw chunk writes so a pipe reader observes them as separate reads. */
+  chunkDelayMs?: number;
+  /** Extra unframed bytes written after the chunks to prove the reader keeps draining. */
+  trailingOutputBytes?: number;
+  /** Progress scenario only: create a real commit before exiting (default true). */
+  makeCommit?: boolean;
 }
 
 function flag(name: string): string | undefined {
@@ -42,12 +67,57 @@ function runGit(args: string[]): number {
   return result.exitCode;
 }
 
-function makeCommit(): void {
-  const addExit = runGit(["add", "-A"]);
+function makeCommit(config: FixtureConfig): void {
+  const addArgs = config.commitPaths?.length
+    ? ["add", "-A", "--", ...config.commitPaths]
+    : ["add", "-A"];
+  const addExit = runGit(addArgs);
   if (addExit !== 0) finishWith(addExit);
-  const commitExit = runGit(["-c", "commit.gpgsign=false", "commit", "--no-gpg-sign", "-m", "native commit fixture"]);
+  if (config.postStageAppend) {
+    appendFileSync(
+      join(process.cwd(), config.postStageAppend.path),
+      config.postStageAppend.content,
+    );
+  }
+  const commitArgs = [
+    "-c",
+    "commit.gpgsign=false",
+    "commit",
+    "--no-gpg-sign",
+  ];
+  if (config.commitMessageFile) {
+    commitArgs.push("--file", config.commitMessageFile);
+  } else {
+    commitArgs.push("-m", config.commitMessage ?? "native commit fixture");
+  }
+  const commitExit = runGit(commitArgs);
   if (commitExit !== 0) finishWith(commitExit);
-  process.stdout.write("Commit created.\n");
+  if (config.followupCommitMessage !== undefined) {
+    const followupExit = runGit([
+      "-c",
+      "commit.gpgsign=false",
+      "commit",
+      "--no-gpg-sign",
+      "--allow-empty",
+      "-m",
+      config.followupCommitMessage,
+    ]);
+    if (followupExit !== 0) finishWith(followupExit);
+  }
+  if (config.corruptChangelogBlob) {
+    const result = Bun.spawnSync(["git", "rev-parse", "HEAD:CHANGELOG.md"], {
+      cwd: process.cwd(),
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (result.exitCode !== 0) {
+      throw new Error(`could not resolve fixture changelog blob: ${new TextDecoder().decode(result.stderr)}`);
+    }
+    const blob = new TextDecoder().decode(result.stdout).trim();
+    unlinkSync(join(process.cwd(), ".git", "objects", blob.slice(0, 2), blob.slice(2)));
+  }
+  process.stdout.write(config.commitOutput ?? "Commit created.\n");
 }
 
 function spawnDescendant(path: string, ignoreSigterm: boolean): void {
@@ -74,6 +144,24 @@ async function writeLarge(stream: NodeJS.WriteStream, bytes: number): Promise<vo
   }
 }
 
+async function writeEncodedChunks(
+  stream: NodeJS.WriteStream,
+  chunks: readonly string[] | undefined,
+  delayMs: number,
+): Promise<void> {
+  if (!chunks) return;
+  for (const encoded of chunks) {
+    const bytes = Buffer.from(encoded, "base64");
+    if (bytes.length === 0) continue;
+    if (!stream.write(bytes)) {
+      const drained = Promise.withResolvers<void>();
+      stream.once("drain", drained.resolve);
+      await drained.promise;
+    }
+    if (delayMs > 0) await Bun.sleep(delayMs);
+  }
+}
+
 async function main(): Promise<void> {
   const configPath = flag("--fixture-config");
   if (!configPath) throw new Error("native commit fixture requires --fixture-config");
@@ -89,8 +177,17 @@ async function main(): Promise<void> {
     process.on("SIGTERM", () => {});
   }
 
+  if (config.scenario === "progress") {
+    await writeEncodedChunks(process.stdout, config.stdoutChunksBase64, config.chunkDelayMs ?? 10);
+    await writeEncodedChunks(process.stderr, config.stderrChunksBase64, config.chunkDelayMs ?? 10);
+    if (config.trailingOutputBytes) await writeLarge(process.stdout, config.trailingOutputBytes);
+    if (config.makeCommit !== false) makeCommit(config);
+    process.exitCode = config.exitCode ?? 0;
+    return;
+  }
+
   if (config.scenario === "commit" || config.scenario === "commit-exit-1" || config.scenario === "commit-then-hang") {
-    makeCommit();
+    makeCommit(config);
   }
 
   if (config.scenario === "fail") {

@@ -5,6 +5,7 @@
  */
 
 import { safeDisplayText } from "./execution-text.ts";
+import { sanitizeCommitContent, type CommitContent } from "./commit-content.ts";
 import { sanitizeResearchSnapshot, type ResearchSnapshot, type ResearchUpdateEvent } from "../research/index.ts";
 
 export type ExecutionState = "running" | "completed" | "failed" | "cancelled";
@@ -107,6 +108,26 @@ export type ExecutionEvent =
       readonly atMs: number;
       readonly summary?: string;
     }
+  /**
+   * One already-filtered native `omp commit` stage. The summary is a fixed Chinese line chosen
+   * by the channel parser; tool output, diffs, and model text never reach this event.
+   */
+  | {
+      readonly type: "commit_progress";
+      readonly atMs: number;
+      readonly summary: string;
+    }
+  /**
+   * The service derives the terminal summary from real exit/HEAD/stop evidence. Optional content
+   * is read from the resulting Git commit and changelog, sanitized before it enters this snapshot;
+   * it never comes from CLI stdout, a diff, or an OMP prompt.
+   */
+  | {
+      readonly type: "commit_result";
+      readonly atMs: number;
+      readonly summary: string;
+      readonly content?: CommitContent;
+    }
   | ResearchUpdateEvent;
 
 export interface ExecutionToolSnapshot {
@@ -142,6 +163,17 @@ export interface ExecutionSubagentSnapshot {
   readonly toolCount?: number;
 }
 
+/**
+ * 原生提交进度投影包含安全阶段摘要、最近六步、服务依据退出码/HEAD/stop 产生的终态摘要,
+ * 以及从真实 Git commit 读取并经边界净化的 message/changelog。CLI stdout、diff 与参数不进入快照。
+ */
+export interface ExecutionCommitSnapshot {
+  readonly summary: string;
+  readonly recentSteps: readonly string[];
+  readonly result?: string;
+  readonly content?: CommitContent;
+}
+
 export interface ExecutionSnapshot {
   readonly runId: string;
   readonly state: ExecutionState;
@@ -159,6 +191,8 @@ export interface ExecutionSnapshot {
    * 只供投递层落盘,从不进入快照——重启复原不能复活上 MiB 的全记录载荷。
    */
   readonly research?: ResearchSnapshot;
+  /** Native commit progress; absent for ordinary OMP turns. */
+  readonly commit?: ExecutionCommitSnapshot;
 }
 
 export interface ExecutionTracker {
@@ -175,6 +209,8 @@ export interface ExecutionTrackerOptions {
    * counting from where the process that died had reached instead of dropping back to zero.
    */
   readonly initialPhaseCount?: number;
+  /** Commit projection replayed from a durable card row; absent for ordinary rounds. */
+  readonly initialCommit?: ExecutionCommitSnapshot;
 }
 
 interface MutablePhase {
@@ -208,6 +244,14 @@ const MAX_LOCAL_PHASES = 64;
 const MAX_LOCAL_TASKS = 128;
 /** Ceiling for turns carried in from a stored payload: a corrupt row must not dictate the metric. */
 const MAX_RESTORED_PHASES = 100_000;
+const MAX_COMMIT_STEPS = 6;
+const MAX_COMMIT_SUMMARY = 200;
+/**
+ * A recovery that finds commit progress but no recorded result cannot know what the dead
+ * process did to HEAD. It must never infer "stopped" from the task row; this fixed line is the
+ * only safe terminal it may show.
+ */
+export const COMMIT_RESULT_UNKNOWN = "提交结果未知；请检查当前 HEAD 后再决定是否重试。";
 const ALLOWED_ERROR_CATEGORIES: Record<ExecutionErrorCategory, true> = {
   timeout: true,
   permission: true,
@@ -289,6 +333,42 @@ function copySnapshotTodos(todos: readonly ExecutionTodoPhase[]): ExecutionTodoP
   }));
 }
 
+function appendCommitStep(steps: string[], summary: string): void {
+  // Native phase refreshes repeat the current line; a repeated refresh must not consume one of
+  // the six visible slots or make the card flicker between identical histories.
+  if (steps[steps.length - 1] === summary) return;
+  steps.push(summary);
+  if (steps.length > MAX_COMMIT_STEPS) steps.splice(0, steps.length - MAX_COMMIT_STEPS);
+}
+
+function safeCommitSummary(value: unknown): string | undefined {
+  return safeDisplayText(value, MAX_COMMIT_SUMMARY);
+}
+
+function copiedCommitSnapshot(commit: ExecutionCommitSnapshot | undefined): {
+  summary: string;
+  recentSteps: string[];
+  result?: string;
+  content?: CommitContent;
+} | undefined {
+  if (commit === undefined) return undefined;
+  const summary = safeCommitSummary(commit.summary);
+  if (summary === undefined) return undefined;
+  const recentSteps: string[] = [];
+  for (const step of Array.isArray(commit.recentSteps) ? commit.recentSteps : []) {
+    const safeStep = safeCommitSummary(step);
+    if (safeStep !== undefined) appendCommitStep(recentSteps, safeStep);
+  }
+  const result = safeDisplayText(commit.result, 400);
+  const content = sanitizeCommitContent(commit.content);
+  return {
+    summary,
+    recentSteps,
+    ...(result === undefined ? {} : { result }),
+    ...(content === undefined ? {} : { content }),
+  };
+}
+
 function currentTime(lastAtMs: number, nowMs: number | undefined): number {
   if (nowMs === undefined) return lastAtMs;
   return Math.max(lastAtMs, finiteTime(nowMs) ?? lastAtMs);
@@ -308,6 +388,7 @@ class ExecutionTrackerState implements ExecutionTracker {
   readonly #subagentOrder: string[] = [];
   #todos: ExecutionTodoPhase[] = [];
   #research: ResearchSnapshot | undefined;
+  #commit: { summary: string; recentSteps: string[]; result?: string; content?: CommitContent } | undefined;
   readonly #phaseCountBase: number;
   #startedAtMs: number | null;
   #endedAtMs: number | null = null;
@@ -319,6 +400,7 @@ class ExecutionTrackerState implements ExecutionTracker {
     this.#startedAtMs = options.initialAtMs === undefined ? null : finiteTime(options.initialAtMs);
     this.#lastAtMs = this.#startedAtMs ?? 0;
     this.#phaseCountBase = safePhaseCount(options.initialPhaseCount);
+    this.#commit = copiedCommitSnapshot(options.initialCommit);
   }
 
   apply(event: ExecutionEvent): ExecutionSnapshot {
@@ -355,6 +437,12 @@ class ExecutionTrackerState implements ExecutionTracker {
         break;
       case "research_update":
         this.#updateResearch(event);
+        break;
+      case "commit_progress":
+        this.#updateCommitProgress(event, atMs);
+        break;
+      case "commit_result":
+        this.#recordCommitResult(event, atMs);
         break;
     }
     return this.snapshot(this.#lastAtMs);
@@ -409,6 +497,14 @@ class ExecutionTrackerState implements ExecutionTracker {
       }),
       todos: copySnapshotTodos(this.#todos),
       ...(this.#research === undefined ? {} : { research: this.#research }),
+      ...(this.#commit === undefined ? {} : {
+        commit: {
+          summary: this.#commit.summary,
+          recentSteps: [...this.#commit.recentSteps],
+          ...(this.#commit.result === undefined ? {} : { result: this.#commit.result }),
+          ...(this.#commit.content === undefined ? {} : { content: { ...this.#commit.content } }),
+        },
+      }),
     };
   }
 
@@ -485,6 +581,51 @@ class ExecutionTrackerState implements ExecutionTracker {
   #updateResearch(event: Extract<ExecutionEvent, { type: "research_update" }>): void {
     if (this.#state !== "running") return;
     this.#research = sanitizeResearchSnapshot(event.research);
+  }
+
+  /**
+   * Commit stages are a closed projection: a fixed, already-safe line and at most six visible
+   * slots. The summary is always the latest line, even when the step itself was a repeated
+   * refresh and therefore did not enter the history.
+   */
+  #updateCommitProgress(
+    event: Extract<ExecutionEvent, { type: "commit_progress" }>,
+    atMs: number,
+  ): void {
+    if (this.#state !== "running") return;
+    const summary = safeCommitSummary(event.summary);
+    if (summary === undefined) return;
+    this.#ensureStarted(atMs);
+    const current = this.#commit;
+    if (current === undefined) {
+      this.#commit = { summary, recentSteps: [summary] };
+      return;
+    }
+    current.summary = summary;
+    appendCommitStep(current.recentSteps, summary);
+  }
+
+  #recordCommitResult(
+    event: Extract<ExecutionEvent, { type: "commit_result" }>,
+    atMs: number,
+  ): void {
+    if (this.#state !== "running") return;
+    const result = safeDisplayText(event.summary, 400);
+    const content = sanitizeCommitContent(event.content);
+    if (result === undefined) return;
+    this.#ensureStarted(atMs);
+    const current = this.#commit;
+    if (current === undefined) {
+      this.#commit = {
+        summary: result,
+        recentSteps: [],
+        result,
+        ...(content === undefined ? {} : { content }),
+      };
+      return;
+    }
+    current.result = result;
+    if (content !== undefined) current.content = content;
   }
 
   #startSubagent(event: Extract<ExecutionEvent, { type: "subagent_start" }>, atMs: number): void {
@@ -684,6 +825,7 @@ export function restoreExecutionTracker(
     subagents?: unknown;
     todos?: unknown;
     research?: unknown;
+    commit?: unknown;
   };
   if (!Array.isArray(record.tools) || !Array.isArray(record.todos)) return null;
   const startedAtMs = typeof record.startedAtMs === "number" ? finiteTime(record.startedAtMs) : null;
@@ -693,11 +835,26 @@ export function restoreExecutionTracker(
   const observedAtMs = startedAtMs !== null && typeof record.elapsedMs === "number"
     ? Math.min(startedAtMs + (finiteTime(record.elapsedMs) ?? 0), options.atMs)
     : options.atMs;
+  let initialCommit: ExecutionCommitSnapshot | undefined;
+  if (record.commit !== null && typeof record.commit === "object") {
+    const stored = record.commit as Record<string, unknown>;
+    if (typeof stored.summary === "string") {
+      initialCommit = copiedCommitSnapshot({
+        summary: stored.summary,
+        recentSteps: Array.isArray(stored.recentSteps)
+          ? stored.recentSteps.filter((step): step is string => typeof step === "string")
+          : [],
+        ...(typeof stored.result === "string" ? { result: stored.result } : {}),
+        ...(stored.content === undefined ? {} : { content: stored.content as CommitContent }),
+      });
+    }
+  }
   const tracker = createExecutionTracker({
     runId: typeof record.runId === "string" ? record.runId : "octo-progress",
     ...(startedAtMs === null ? {} : { initialAtMs: startedAtMs }),
     // 终态恢复沿用旧行为(阶段计数归零);续接的一轮属于同一次运行,接着上一进程数到的阶段数走。
     ...(resume ? { initialPhaseCount: safePhaseCount(record.phaseCount) } : {}),
+    ...(initialCommit === undefined ? {} : { initialCommit }),
   });
   const entries = record.tools;
   for (let index = 0; index < entries.length; index += 1) {
@@ -814,6 +971,12 @@ export function restoreExecutionTracker(
     });
   }
   if (resume) return tracker;
+  // The dead native process may already have created a commit and then died before the result
+  // frame landed. Task state alone cannot prove it stopped or failed, so a commit snapshot
+  // without evidence gets one fixed safe terminal instead of a guessed stop.
+  if (initialCommit !== undefined && initialCommit.result === undefined) {
+    tracker.apply({ type: "commit_result", atMs: options.atMs, summary: COMMIT_RESULT_UNKNOWN });
+  }
   tracker.apply({ type: "run_end", atMs: options.atMs, state: options.state });
   return tracker;
 }

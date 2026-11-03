@@ -4,7 +4,7 @@
  * 取舍——那是 `./execution-card.ts` 的事。
  */
 
-import type { ExecutionToolSnapshot, ExecutionTodoPhase, ExecutionTodoTask, ExecutionState, ExecutionToolState, ExecutionSubagentState, ExecutionSubagentSnapshot, TodoStatus, ExecutionErrorCategory, ExecutionSnapshot } from "./execution-tracker.ts";
+import type { ExecutionCommitSnapshot, ExecutionToolSnapshot, ExecutionTodoPhase, ExecutionTodoTask, ExecutionState, ExecutionToolState, ExecutionSubagentState, ExecutionSubagentSnapshot, TodoStatus, ExecutionErrorCategory, ExecutionSnapshot } from "./execution-tracker.ts";
 import { finiteTime } from "./execution-tracker.ts";
 import type { AdaptiveCard, ExecutionCardCapabilities } from "./execution-card.ts";
 
@@ -1156,9 +1156,71 @@ export function cardWithinLimits(card: AdaptiveCard, plain: string, limits: Reso
     && new TextEncoder().encode(JSON.stringify(envelope)).byteLength <= limits.maxPayloadBytes;
 }
 
-export function makeHeader(richLayout: boolean, actionSets: readonly JsonNode[] = []): JsonNode[] {
-  const title = makeTextBlock("处理进度", { weight: "Bolder", size: "Medium", spacing: "None" });
-  const subtitle = makeTextBlock("OMP 执行", { isSubtle: true, size: "Small", spacing: "Small" });
+/**
+ * Commit cards reuse the ordinary header/status layout but name their own subject. A terminal
+ * commit is "提交结果", never "已停止": the only states this projection knows are the evidence
+ * the service recorded, and an unknown outcome must stay unknown.
+ */
+export function makeCommitCardItems(
+  commit: ExecutionCommitSnapshot,
+  state: ExecutionState,
+  richLayout: boolean,
+): JsonNode[] {
+  const items: JsonNode[] = [
+    makeTextBlock(commit.result ?? commit.summary, {
+      weight: "Bolder",
+      size: "Medium",
+      spacing: "None",
+      ...(commit.result === undefined ? {} : { color: executionTone(state) }),
+    }),
+  ];
+  if (commit.content?.message !== undefined) {
+    items.push(
+      makeTextBlock("提交信息", { isSubtle: true, size: "Small", spacing: "Medium" }),
+      makeTextBlock(commit.content.message, { spacing: "Small" }),
+    );
+  }
+  if (commit.content?.changelog !== undefined) {
+    items.push(
+      makeTextBlock("变更日志", { isSubtle: true, size: "Small", spacing: "Medium" }),
+      makeTextBlock(commit.content.changelog, { spacing: "Small" }),
+    );
+  }
+  const history = commit.result === undefined
+    ? commit.recentSteps.filter((step, index) => (
+      !(index === commit.recentSteps.length - 1 && step === commit.summary)
+    ))
+    : commit.recentSteps;
+  if (commit.result !== undefined && history.length > 0) {
+    items.push(makeTextBlock("最近步骤", { isSubtle: true, size: "Small", spacing: "Medium" }));
+  }
+  for (const step of history) {
+    items.push(makeTextBlock(`· ${step}`, { isSubtle: true, size: "Small", spacing: "Small" }));
+  }
+
+  if (!richLayout) return items;
+  return [{
+    type: "Container",
+    id: "commit_detail",
+    spacing: "Medium",
+    items,
+  }];
+}
+
+export function makeHeader(
+  richLayout: boolean,
+  actionSets: readonly JsonNode[] = [],
+  commit?: ExecutionCommitSnapshot,
+  state?: ExecutionState,
+): JsonNode[] {
+  const title = makeTextBlock(
+    commit === undefined ? "处理进度" : state === "running" ? "正在提交" : "提交结果",
+    { weight: "Bolder", size: "Medium", spacing: "None" },
+  );
+  const subtitle = makeTextBlock(
+    commit === undefined ? "OMP 执行" : "OMP 原生提交",
+    { isSubtle: true, size: "Small", spacing: "Small" },
+  );
   if (richLayout) {
     return [
       {
@@ -1200,7 +1262,7 @@ export function makeHeaderContainer(
           : "emphasis",
     bleed: true,
     spacing: "None",
-    items: makeHeader(richLayout, actionSets),
+    items: makeHeader(richLayout, actionSets, snapshot.commit, snapshot.state),
   };
 }
 

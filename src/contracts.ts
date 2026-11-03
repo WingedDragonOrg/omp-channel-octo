@@ -1,4 +1,5 @@
 import type { ExecutionEvent, ExecutionSnapshot } from "./cards/execution-tracker.ts";
+import type { CommitContent } from "./cards/commit-content.ts";
 import type { ProjectSessionState } from "./session/project-session.ts";
 
 export interface ChatTarget {
@@ -454,11 +455,12 @@ export interface WorktreeMergeLifecycle {
   onUnknown(): void;
 }
 
-/** Native OMP CLI `commit` outcome, including the real Git HEAD on either side of execution. */
+/** Native OMP CLI `commit` outcome with actual HEADs and optional sanitized Git metadata. */
 export interface CommitResult {
   exitCode: number;
   headBefore: string | null;
   headAfter: string | null;
+  content?: CommitContent;
 }
 
 export interface CommitWorkerOptions {
@@ -470,11 +472,16 @@ export interface CommitWorkerOptions {
    * process before `CommitWorker.run()` can release the native CLI gate and cause Git side effects.
    */
   onSpawn: (process: WorkerProcess) => void;
+  /**
+   * Synchronous, already-sanitized native commit progress. The callback is never awaited, and a
+   * throwing consumer must not affect pipe draining, the CLI exit code, or the real Git result.
+   */
+  onProgress?: (event: Extract<ExecutionEvent, { type: "commit_progress" }>) => void;
 }
 
 /** One managed native `omp commit` operation, kept separate from the chat's RPC session. */
 export interface CommitWorker {
-  /** Starts the native CLI once and resolves with its exit code and the actual before/after HEAD. */
+  /** Starts the native CLI once and resolves with its exit code, actual before/after HEAD, and optional sanitized content. */
   run(): Promise<CommitResult>;
   /** Terminates the whole managed process group; false means termination was not confirmed. */
   stop(): Promise<boolean>;
