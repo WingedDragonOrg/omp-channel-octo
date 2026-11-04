@@ -1,0 +1,24 @@
+diff --git a/dist/index.mjs b/dist/index.mjs
+index 7c66a8754e854ab5f554c6157431724b1557d998..2b97138b1efe750bb0708d9d7d518154f8db6c82 100644
+--- a/dist/index.mjs
++++ b/dist/index.mjs
+@@ -821,10 +821,9 @@ const mergeHeaders = (...sources) => {
+ const bufferResponse = async (response, signal) => {
+ 	const reader = response.clone().body?.getReader();
+ 	if (!reader) return;
+-	const original = response.body?.getReader();
++	// Bun marks the original body used when a reader is acquired; buffer only the clone.
+ 	const cancel = () => {
+ 		reader.cancel(signal.reason).catch(() => {});
+-		original?.cancel(signal.reason).catch(() => {});
+ 	};
+ 	signal.addEventListener("abort", cancel, { once: true });
+ 	try {
+@@ -835,7 +834,6 @@ const bufferResponse = async (response, signal) => {
+ 	} finally {
+ 		signal.removeEventListener("abort", cancel);
+ 		reader.releaseLock();
+-		original?.releaseLock();
+ 	}
+ };
+ /**

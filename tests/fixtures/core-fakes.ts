@@ -1123,6 +1123,7 @@ class FixtureWorker implements OmpWorker {
     private readonly goalHandler: FakeGoalHandler,
     private readonly recordGoalRun: (record: FakeGoalRunRecord) => void,
     private readonly waitBeforeStop: (sessionId: string) => Promise<void>,
+    private readonly steerFailure: () => Error | undefined,
   ) {
     this.sessionFile = options.sessionFile ?? join(options.sessionDir, `${sessionId}.session`);
     let persistedSessionId: string | undefined;
@@ -1368,6 +1369,8 @@ class FixtureWorker implements OmpWorker {
   }
 
   async steer(text: string): Promise<void> {
+    const failure = this.steerFailure();
+    if (failure) throw failure;
     if (!this.promptInFlight && !this.goalRunInFlight) {
       throw new Error("fixture worker is not streaming a turn");
     }
@@ -1493,6 +1496,8 @@ export class FakeWorkerFactory implements WorkerFactory {
   createFailure: Error | undefined;
   /** When set, every worker's `models()` rejects with this error, mirroring a dead RPC worker. */
   modelsFailure: Error | undefined;
+  /** When set, the next attempted worker steer rejects before appending its message. */
+  steerFailure: Error | undefined;
   /**
    * What `recover` reports for a persisted worker process: `true` means the old process is
    * confirmed stopped, so its directory is free again. The default `false` keeps the directory
@@ -1521,6 +1526,10 @@ export class FakeWorkerFactory implements WorkerFactory {
   failModelsWith(error?: Error): void {
     this.modelsFailure = error;
   }
+  /** Passing `undefined` clears the failure so worker steering appends normally. */
+  failSteerWith(error?: Error): void {
+    this.steerFailure = error;
+  }
 
   async create(options: WorkerOptions): Promise<OmpWorker> {
     this.creations.push(options);
@@ -1545,6 +1554,11 @@ export class FakeWorkerFactory implements WorkerFactory {
       (record) => this.recordGoalRun(record),
       async sessionId => {
         await this.stopHandler?.(sessionId);
+      },
+      () => {
+        const failure = this.steerFailure;
+        this.steerFailure = undefined;
+        return failure;
       },
     );
     this.workers.push(worker);

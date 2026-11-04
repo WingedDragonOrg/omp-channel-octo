@@ -113,7 +113,7 @@ export class TaskEvents {
         this.deps.target,
         this.deps.taskId,
         event,
-        { parseMentions: this.deps.parseAssistantMentions },
+        { parseMentions: this.deps.parseAssistantMentions, observeReferences: true },
       );
       return;
     }

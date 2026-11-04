@@ -197,6 +197,8 @@ export interface QuestionDeskDeps {
    * 为假）。与消息权限门共用同一允许列表，不引入第二套授权。
    */
   memberAnswerAllowed(target: ChatTarget): boolean;
+  /** Observes one plain-text answer only after its durable answer compare-and-set succeeds. */
+  onTextAnswer?(message: InboundMessage, taskId: string): void;
 }
 
 export interface QuestionDesk {
@@ -265,6 +267,14 @@ export function createQuestionDesk(deps: QuestionDeskDeps): QuestionDesk {
     return uid;
   }
 
+  function observeTextAnswer(message: InboundMessage, taskId: string): void {
+    try {
+      deps.onTextAnswer?.(message, taskId);
+    } catch {
+      // Reference observation is best-effort and cannot change the accepted answer.
+    }
+  }
+
 /**
  * A plain reply in the chat holding the pending question is the answer itself — from the owner
  * or, in an enabled group/thread, from any member the gate already let through: a valid
@@ -282,8 +292,9 @@ async function answerPendingQuestion(message: InboundMessage, text: string): Pro
   if (!deps.store.claimCommand(claim)) return true;
   try {
     if (pending.length > 1) {
-      answerQuestionSetFromText(message, pending, text, answeredBy);
+      const answeredQuestion = answerQuestionSetFromText(message, pending, text, answeredBy);
       deps.store.completeCommand(claim);
+      if (answeredQuestion !== undefined) observeTextAnswer(message, answeredQuestion.taskId);
       return true;
     }
     let normalized: string;
@@ -299,6 +310,7 @@ async function answerPendingQuestion(message: InboundMessage, text: string): Pro
       deps.store.completeCommand(claim);
       return true;
     }
+    observeTextAnswer(message, question.taskId);
     deps.store.completeCommand(claim);
     return true;
   } catch {
@@ -358,7 +370,7 @@ function answerQuestionSetFromText(
   pending: readonly QuestionRecord[],
   text: string,
   answeredBy: string,
-): void {
+): QuestionRecord | undefined {
   const botUid = currentBotUid();
   const answers = pending.map((question) => {
     let answer = text;
@@ -392,6 +404,7 @@ function answerQuestionSetFromText(
     }
   }
   wakeForAnswers(speaking, TIMEOUT_WAKE_HEADLINE);
+  return pending.find(question => landed.includes(question.id));
 }
 
 function normalizeAnswer(question: { payload: string }, answer: string): string {

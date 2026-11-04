@@ -16,6 +16,7 @@
     "launchd": "bun run src/cli.ts launchd"
   },
   "dependencies": {
+    "@typesafe-ai/sdk": "0.7.0",
     "curve25519-js": "^0.0.4",
     "ws": "^8.18.3"
   },
@@ -27,5 +28,8 @@
     "markdown-it": "14.1.0",
     "playwright": "1.55.0",
     "typescript": "^5.9.2"
+  },
+  "patchedDependencies": {
+    "@typesafe-ai/sdk@0.7.0": "patches/@typesafe-ai%2Fsdk@0.7.0.patch"
   }
 }

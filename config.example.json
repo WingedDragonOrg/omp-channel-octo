@@ -7,5 +7,6 @@
   "sessionsDir": "~/.oco/sessions",
   "groupHistory": { "enabled": true, "maxMessages": 50 },
   "attachments": { "enabled": true, "maxBytes": 26214400 },
-  "ask": { "timeoutMs": 21600000 }
+  "ask": { "timeoutMs": 21600000 },
+  "decisions": { "enabled": false }
 }

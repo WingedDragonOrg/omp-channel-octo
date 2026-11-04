@@ -15,6 +15,7 @@
 - **群组上下文**：注入群与子区说明、增量聊天历史，按会话记录已读取的位置。
 - **成员与点名**：每条新任务和 steering 获取当前群或子区成员信息；普通回复可生成结构化 @成员提醒。
 - **隔离子区**：为子区创建 git worktree，派发任务，并通过 Worktrunk 合并和清理工作区。
+- **PR/MR 引用**：显式启用外部决策服务后，判断子区对话里的直接工作对象，并将去重后的 PR/MR 链接持久保存到宿主 `thread-info.references`。
 - **恢复与投递**：SQLite 持久化任务、问题及出站队列；重连后恢复投递，已开始的任务不会因重启自动重跑。
 
 ## 安全边界
@@ -257,8 +258,34 @@ channel 另补两块只读呈现，均由权威实验状态驱动，不从工具
 | `groupHistory` | 默认启用，每轮最多注入 50 条群/子区历史。 |
 | `attachments` | 默认启用，附件大小上限 25 MiB；启动时清理超过 14 天的附件。 |
 | `ask.timeoutMs` | 默认 6 小时，可配置为 30 分钟到 7 天的整数毫秒。 |
+| `decisions` | 默认关闭；显式配置协议、HTTPS API 根地址、模型及独立密钥环境变量后，启用子区 PR/MR 引用判断。 |
 
 状态、会话、附件和日志可能包含私有内容，应按敏感数据保存和备份。配置字段及校验以 [src/runtime/config.ts](src/runtime/config.ts) 为准。
+
+### 外部决策与 PR/MR 引用
+
+将以下块合并进私有配置，并在服务启动环境中提供 `OMP_CHANNEL_OCTO_DECISION_KEY`；不要把密钥写入仓库或聊天：
+
+```json
+{
+  "decisions": {
+    "enabled": true,
+    "protocol": "openai-decisions",
+    "baseUrl": "https://api.openai.com",
+    "model": "gpt-6-luna",
+    "apiKeyEnv": "OMP_CHANNEL_OCTO_DECISION_KEY"
+  }
+}
+```
+
+Typesafe 使用 `protocol: "typesafe-systemone"`、`baseUrl: "https://api.typesafe.ai"` 和对应账号可用的模型 ID。`baseUrl` 是 API 根地址，可含代理前缀，不附加 `/v1/decisions` 或 `/v1/systemone`；两种协议分别转换请求，不是仅换地址的同一套 wire format。密钥变量必须以 `OMP_CHANNEL_OCTO_` 开头，由宿主读取，并从 OMP worker 与父进程死亡 watchdog 的环境中剥离，不复用 OMP 账号。
+
+启用意味着允许指定 provider 处理当前子区受理的有限可见正文、简短说明和候选链接。引用文字保留中性来源标记，助手正文只使用最终可见文本；不会加入成员 UID、工具原始结果、文件、附件内容或其他聊天数据。URL 和凭据模式会先净化再限长，但这不是完整的敏感信息识别服务，operator 仍须确认 provider 的数据政策。
+
+只有被高概率判断为本任务产出、修复、评审或跟进对象的链接才绑定；参考或信息不足不绑定。后台判断不阻塞聊天，失败不重试、不通知；已确认引用跨重启保存，未完成判断不恢复、不补扫历史。宿主 `thread-info` 返回 `references: {"mr": [], "pr": []}`，各数组保存规范 URL；这是 channel 本地元数据，不是 Octo/Fleet 远端字段。关闭决策服务后仍可读取已有引用。
+
+Typesafe SDK 0.7.0 在 Bun 的原响应流锁定路径使用随 `bun install` 应用的固定版本补丁；保留 `patches/`、`patchedDependencies` 和锁文件。详见 [引用绑定规格与验收](docs/specs/2026-11-04-thread-pr-mr-reference-binding-design.md)。
+
 
 ## 日常运维
 

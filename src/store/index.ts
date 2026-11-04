@@ -1,6 +1,6 @@
 /**
  * `ChannelStore` 门面：SQLite 之上的一层持久化 API。物理形状与 db 辅助在 `store-schema.ts`，
- * 记录类型在 `store-records.ts`，各领域读写分布在 `store-chats/grants/tasks/cards/workers/ledgers/outbox/questions.ts`。
+ * 记录类型在 `store-records.ts`，各领域读写分布在 `store-chats/grants/tasks/cards/workers/ledgers/outbox/questions/references.ts`。
  */
 
 import { Database } from "bun:sqlite";
@@ -22,6 +22,8 @@ import { acceptChatGrantOperation, getChatGrantOperation, getChatGrantOperationB
 import { addThreadWorkspaceIntentChannel, completeThreadWorkspaceIntent, failThreadWorkspaceIntent, getThreadWorkspace, getThreadWorkspaceIntent, isThreadWorkspaceIntentBlocked, isWorkspaceDirectoryOwned, listThreadWorkspaceIntents, listThreadWorkspaces, saveThreadWorkspace, saveThreadWorkspaceIntent, saveThreadWorkspaces, workspaceDirectories } from "./store-workspaces.ts";
 import { completeThreadFork, getThreadFork, getThreadForkByTarget, listThreadForks, saveThreadFork } from "./store-forks.ts";
 import { beginThreadMerge, claimThreadMergeDispatchIntent, ensureThreadListen, getThreadListen, getThreadMergeEvent, isThreadMergeEventPending, listPendingThreadMergeEvents, listThreadMergeEvents, markThreadMergeEventDelivered, saveThreadMergeEvent, setThreadListen } from "./store-thread-listen.ts";
+import { addThreadReferences, deleteThreadReferences, getThreadReferences, isThreadReferencesDeleted } from "./store-references.ts";
+import type { ThreadReference, ThreadReferences } from "../references/types.ts";
 
 export class ChannelStore {
   private readonly db: Database;
@@ -208,6 +210,22 @@ export class ChannelStore {
 
   setThreadListen(botUid: string, target: ChatTarget, listen: ThreadListenLevel): ThreadListenRecord {
     return setThreadListen(this.db, botUid, target, listen);
+  }
+
+  getThreadReferences(botUid: string, target: ChatTarget): ThreadReferences {
+    return getThreadReferences(this.db, botUid, target);
+  }
+
+  addThreadReferences(botUid: string, target: ChatTarget, references: readonly ThreadReference[]): void {
+    addThreadReferences(this.db, botUid, target, references);
+  }
+
+  isThreadReferencesDeleted(botUid: string, target: ChatTarget): boolean {
+    return isThreadReferencesDeleted(this.db, botUid, target);
+  }
+
+  deleteThreadReferences(botUid: string, target: ChatTarget): void {
+    deleteThreadReferences(this.db, botUid, target);
   }
 
   beginThreadMerge(botUid: string, target: ChatTarget): void {

@@ -1,7 +1,7 @@
 # OMP Octo 个人远程助手设计
 
 日期：2026-09-12
-修订日期：2026-11-03
+修订日期：2026-11-04
 状态：产品设计已确认
 
 ## 背景与目标
@@ -19,6 +19,8 @@
 包含 owner-only 原生持续目标管理 `/goal`：创建时 token 预算、状态查询、暂停、恢复、删除、跨回合执行与在途目标跨服务重启续接，详细契约见 `docs/specs/2026-11-02-goal-command-design.md`。
 
 包含主群/子区已落盘上下文即时分叉：owner-only `/fork [子区名称]` 和独立 `fork` 宿主工具共用原生 CLI `--fork`，沿用 cwd、建立独立 session 并绑定同父群新子区。详细契约见 `docs/specs/2026-11-03-thread-fork-design.md`。
+
+包含可选外部决策服务驱动的子区 PR/MR 引用绑定：operator 显式配置协议、模型和独立密钥后，仅从已受理的当前子区可见正文识别候选，以必要有界上下文判断是否为直接工作对象；高概率结果去重持久化到本地 `thread-info.references`，不改 Octo/Fleet。判断异步尽力而为，已绑定引用跨重启保留，未完成判断不恢复或补扫。详细契约见 `docs/specs/2026-11-04-thread-pr-mr-reference-binding-design.md`。
 
 不包含终端会话接管、多用户服务、通用网络 Agent gateway、文档评论任务、服务端通用 bot_task、群历史归档与检索、出站附件之外的通用文件托管和交互 callback 系统。channel 仅提供由 OMP host tool 明确发起的出站图片/文件发送，以及由能力 profile 明确启用的 Octo raw type17 `octo/v1` AdaptiveCard 1.5 进度展示和 `octo/v2` 交互问答卡片；交互卡片的上行只使用该 Bot 自己的事件队列（`/v1/bot/events` 轮询与 ack），不注册回调地址、不实现通用 callback 或审批流。收到的入站消息按已确认的类型表提取内容，贴纸、系统与 CMD 等没有内容的类型明确告知，不作为成功执行。范围以个人 IM 交互为准，不继承参考适配器的其他任务入口。
 

@@ -16,6 +16,7 @@ import type {
   WorktreeMergeSummary,
   WorktreePort,
 } from "./contracts.ts";
+import type { ThreadReferences } from "./references/types.ts";
 import { isTransientServerFailure } from "./errors.ts";
 import type { ChannelStore } from "./store/index.ts";
 import type { TaskRecord } from "./store/store-records.ts";
@@ -95,6 +96,9 @@ export interface HostToolHost {
   /** 任务必然属于已注册的 Bot，构造工具时身份一定存在。 */
   readonly botUid: string;
   enqueueText(target: ChatTarget, text: string, taskId: string | null): void;
+  threadReferences(target: ChatTarget): ThreadReferences;
+  /** Marks a remotely deleted thread as permanently closed to reference observations. */
+  deleteThreadReferences(target: ChatTarget): void;
   flushTarget(target: ChatTarget): Promise<void>;
   /** Current generation; a new inbound invalidates an archive planned by an older merge. */
   threadArchiveGeneration(target: ChatTarget): number;
@@ -747,7 +751,12 @@ async function runManagementTool(
     case "thread-info": {
       const thread = await transport.getThread(groupId, threadId(), signal);
       const policy = ensureThreadListen(host, thread);
-      return JSON.stringify({ ...managementThread(thread), listen: policy.listen });
+      const threadTarget: ChatTarget = { channelId: thread.channelId, channelType: 5 };
+      return JSON.stringify({
+        ...managementThread(thread),
+        listen: policy.listen,
+        references: host.threadReferences(threadTarget),
+      });
     }
     case "thread-listen": {
       const thread = await transport.getThread(groupId, threadId(), signal);
@@ -786,6 +795,7 @@ async function runManagementTool(
       const shortId = threadId();
       const force = optionalBoolean("force") ?? false;
       await deleteThread(host, groupId, shortId, signal);
+      host.deleteThreadReferences({ channelId: threadChannelId(groupId, shortId), channelType: 5 });
       const cleaned = await cleanupThreadWorkspace(host, task, groupId, shortId, force, signal);
       return cleaned === null
         ? `已删除线程 ${shortId}`

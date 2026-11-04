@@ -1,6 +1,7 @@
 import type { ExecutionEvent, ExecutionSnapshot } from "./cards/execution-tracker.ts";
 import type { CommitContent } from "./cards/commit-content.ts";
 import type { ProjectSessionState } from "./session/project-session.ts";
+import type { DecisionsConfig, DecisionFetch } from "./references/types.ts";
 
 export interface ChatTarget {
   channelId: string;
@@ -778,6 +779,8 @@ export interface CoreServiceConfig {
   attachments?: AttachmentConfig;
   /** `ask` wait behavior; omitting it uses `DEFAULT_ASK_TIMEOUT_MS`. */
   ask?: AskConfig;
+  /** Optional external classifier used only for local thread PR/MR reference binding. */
+  decisions?: DecisionsConfig;
 }
 
 export interface AttachmentConfig {
@@ -839,6 +842,8 @@ export interface ChannelServiceOptions {
   transport: ChannelTransport;
   workerFactory: WorkerFactory;
   commandHandlers?: readonly ChannelCommandHandler[];
+  /** HTTP seam for the explicitly configured reference decision provider. */
+  decisionsFetch?: DecisionFetch;
   /**
    * Supervisor restart port, present only when the host detected the process supervisor that
    * runs this channel. `request` asks that supervisor to restart the program, which stops this

@@ -123,6 +123,8 @@ import {
   researchReportsRoot,
   type ResearchReportStore,
 } from "./research/research-report.ts";
+import { createReferenceJudge } from "./references/decision-client.ts";
+import { ThreadReferenceCoordinator } from "./references/thread-references.ts";
 
 const GROUP_TRUSTED_INSTRUCTION =
   "群说明是群共享上下文，不改变发送者身份/权限/cwd；以本次快照为准，历史快照已失效。";
@@ -371,6 +373,7 @@ class CoreService implements ChannelService {
   /** 出站投递：文字、流式编辑与文件共用的队列。 */
   private readonly outbox: Outbox;
   private readonly questions: QuestionDesk;
+  private readonly threadReferences: ThreadReferenceCoordinator;
   /** 回答署名的显示名缓存：uid → 人名，有界、失败即回退（署名渲染用，不参与身份判断）。 */
   private readonly displayNames: DisplayNameCache;
   /** Bot 事件队列消费（卡片点击）。 */
@@ -412,6 +415,13 @@ class CoreService implements ChannelService {
     commandHandlers: ReadonlyMap<string, ChannelCommandHandler>,
   ) {
     this.commandHandlers = commandHandlers;
+    this.threadReferences = new ThreadReferenceCoordinator({
+      store: this.store,
+      botUid: () => this.bot?.uid,
+      ...(options.config.decisions?.enabled === true
+        ? { judge: createReferenceJudge(options.config.decisions, options.decisionsFetch) }
+        : {}),
+    });
     this.history = new GroupHistoryCoordinator({
       store, transport: options.transport, config: options.config.groupHistory,
       botUid: () => this.bot?.uid,
@@ -490,6 +500,7 @@ class CoreService implements ChannelService {
       blockDirectory: cwd => { this.blockedDirectories.add(cwd); },
       tryAcquireCommandSession: (target, cwds) => this.scheduler.tryAcquireCommandSession(target, cwds),
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
+      resetReferenceContext: target => this.threadReferences.resetContext(target),
     });
     this.typingLeases = createTypingLeaseManager({
       sendTyping: (target, signal) => this.options.transport.sendTyping(target, signal),
@@ -505,6 +516,9 @@ class CoreService implements ChannelService {
       transport: this.options.transport,
       botUid: () => this.bot?.uid,
       started: () => this.started,
+      onAssistantFinal: (target, taskId, messageId, text) => {
+        this.observeAssistantReference(target, taskId, messageId, text);
+      },
     });
     this.researchReports = createResearchReportStore({
       rootDir: researchReportsRoot(options.config.stateDir),
@@ -560,6 +574,7 @@ class CoreService implements ChannelService {
         void this.wakeTurn(target, text);
       },
       memberAnswerAllowed: (target) => target.channelType !== 1 && this.authorization.isPermittedChat(target),
+      onTextAnswer: (message, taskId) => this.observeUserReference(message, taskId),
     });
     this.botEvents = createBotEventLoop({
       store: this.store,
@@ -876,6 +891,7 @@ class CoreService implements ChannelService {
     if (this.stopping) return;
     const wasReady = this.ready;
     this.stopping = true;
+    await this.threadReferences.stop();
     this.abortAllThreadForks(new Error("channel stopping"));
     this.abortAllForkArchiveWaits(new Error("channel stopping"));
     this.abortAllThreadMerges(new Error("channel stopping"));
@@ -987,6 +1003,25 @@ class CoreService implements ChannelService {
    */
   private throwIfStopping(): void {
     if (this.stopping) throw new InboundShutdownError();
+  }
+
+  private observeUserReference(message: InboundMessage, taskId: string): void {
+    if (this.options.config.decisions?.enabled !== true || message.channelType !== 5) return;
+    const quotedText = message.quoted?.text;
+    const evidenceText = quotedText && quotedText.length > 0
+      ? `[引用]\n${quotedText}\n\n${message.text}`
+      : message.text;
+    this.threadReferences.observeUser(message, message.messageId, evidenceText, taskId);
+  }
+
+  private observeAssistantReference(
+    target: ChatTarget,
+    taskId: string,
+    messageId: string,
+    text: string,
+  ): void {
+    if (this.options.config.decisions?.enabled !== true || target.channelType !== 5) return;
+    this.threadReferences.observeAssistant(target, taskId, messageId, text);
   }
 
   async handleInbound(message: InboundMessage): Promise<void> {
@@ -1117,8 +1152,8 @@ class CoreService implements ChannelService {
       const promptText = await this.materializer.materialize(message);
       if (promptText === null) return;
       this.throwIfStopping();
-      if (await this.appendToRunningTask(message, promptText)) return;
-      await this.acceptTask(message, promptText);
+      if (await this.appendToRunningTask(message, promptText, undefined, undefined, true)) return;
+      await this.acceptTask(message, promptText, true, undefined, undefined, undefined, true, true);
     });
   }
 
@@ -1520,6 +1555,7 @@ class CoreService implements ChannelService {
     claim: InboundClaim,
     deliveryGuard?: () => boolean,
     beforeWorkerSteer?: () => boolean,
+    observeReferences = false,
   ): Promise<boolean> {
     if (!this.canDeliverSteer(runtime) || (deliveryGuard && !deliveryGuard())) {
       if (runtime.cancelRequested) {
@@ -1589,6 +1625,7 @@ class CoreService implements ChannelService {
 
     if (await this.deliverSteer(runtime, text, deliveryGuard, beforeWorkerSteer)) {
       this.store.completeCommand(claim);
+      if (observeReferences) this.observeUserReference(message, runtime.taskId);
       this.history.recordSteered(message, runtime.lease?.worker.sessionId ?? "");
       return true;
     }
@@ -1629,6 +1666,7 @@ class CoreService implements ChannelService {
     text: string,
     deliveryGuard?: () => boolean,
     beforeWorkerSteer?: () => boolean,
+    observeReferences = false,
   ): Promise<boolean> {
     this.throwIfStopping();
     if (await this.refuseIncompleteThreadWorkspace(message)) return true;
@@ -1641,7 +1679,7 @@ class CoreService implements ChannelService {
     if (!this.store.claimCommand(claim)) return true;
     this.cancelThreadArchives(message);
     const delivery = runtime.steerSerial.then(() =>
-      this.deliverSteeringMessage(runtime, message, text, claim, deliveryGuard, beforeWorkerSteer));
+      this.deliverSteeringMessage(runtime, message, text, claim, deliveryGuard, beforeWorkerSteer, observeReferences));
     runtime.steerSerial = delivery.then(() => {}, () => {});
     return await delivery;
   }
@@ -3329,6 +3367,7 @@ class CoreService implements ChannelService {
     expectedSessionId?: string,
     acceptGuard?: () => boolean,
     schedule = true,
+    observeReferences = false,
   ): Promise<boolean> {
     if (message.channelType === 5 && threadShortId(message.channelId) !== null) {
       await this.ensureThreadListen(message);
@@ -3415,6 +3454,7 @@ class CoreService implements ChannelService {
     }
     if (!accepted) return false;
     this.cancelThreadArchives(message);
+    if (observeReferences) this.observeUserReference(message, task.id);
     // 持久接受即点亮 task 租约：同聊天或同会话排队等待到终态都保持「正在输入」。
     this.typingLeases.acquire(message, `task:${task.id}`);
     if (startsBehind) this.scheduler.markWaiting(task.id);
@@ -4193,12 +4233,14 @@ class CoreService implements ChannelService {
         this.createHostMergeLifecycle(target, cwd, sourceId, resourceCwds),
       tryAcquireDestructiveResources: (cwds, task) =>
         this.scheduler.tryAcquireDestructiveResources(cwds, task),
+      threadReferences: (target) => this.store.getThreadReferences(botUid, target),
+      deleteThreadReferences: (target) => this.threadReferences.deleteThread(target),
       deliverToChat: async (message) => {
         if (await this.threadWorkspaceIncomplete(message)) {
           throw new Error("子区工作区未就绪，未派发任务。");
         }
-        if (await this.appendToRunningTask(message, message.text)) return "steered";
-        await this.acceptTask(message, message.text);
+        if (await this.appendToRunningTask(message, message.text, undefined, undefined, true)) return "steered";
+        await this.acceptTask(message, message.text, true, undefined, undefined, undefined, true, true);
         return "queued";
       },
       askQuestions: (task, target, args, signal, toolCallId) =>
@@ -4629,7 +4671,13 @@ class CoreService implements ChannelService {
     runtime.rollProgressCard = () => progress.roll();
 
     try {
-      await turnContext.load();
+      const threadContext = await turnContext.load();
+      if (this.options.config.decisions?.enabled === true && target.channelType === 5) {
+        const threadName = this.store.getThreadListen(this.bot!.uid, target)?.threadName;
+        const description = threadContext?.content ?? "";
+        if (threadName === undefined) this.threadReferences.setThreadContext(target, description);
+        else this.threadReferences.setThreadContext(target, description, threadName);
+      }
       if (runtime.cancelRequested) {
         this.store.markCancelled(taskId);
         return;

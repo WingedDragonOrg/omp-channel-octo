@@ -258,11 +258,15 @@ export interface OutboxDeps {
   botUid(): string | undefined;
   /** 只有已启动的服务才投递；未启动时入队内容留给下一个进程恢复。 */
   started(): boolean;
+  /** Called synchronously after a changed assistant final snapshot is durably committed. */
+  onAssistantFinal?(target: ChatTarget, taskId: string, messageId: string, text: string): void;
 }
 
 export interface StreamTextOptions {
   /** Enables the ordinary assistant reply marker syntax; notices and host text must leave this false. */
   parseMentions?: boolean;
+  /** Opts a task-event text stream into post-commit final-snapshot observation. */
+  observeReferences?: boolean;
 }
 
 export interface Outbox {
@@ -355,6 +359,13 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
       forceFinalSentinel: event.final,
     };
     const changed = deps.store.commitTextStream(bodyCommit);
+    if (changed && event.final && options.observeReferences === true && deps.onAssistantFinal) {
+      try {
+        deps.onAssistantFinal(target, taskId, event.messageId, bodySegments.map(segment => segment.text).join(""));
+      } catch {
+        // A synchronous observer must not affect durable outbox work or the worker event path.
+      }
+    }
     if (event.final) {
       // Final snapshots bypass the edit merge window, even if they only repeat a persisted final.
       void flushTarget(target).catch(() => {});

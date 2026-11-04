@@ -1,6 +1,6 @@
 /**
  * SQLite 的物理形状：建表 DDL、列迁移、行解码、带 db 句柄的查询辅助，以及 `openChannelStore`。
- * 领域读写分布在 `store-chats/grants/tasks/cards/workers/delivery/ledgers/outbox/questions`，门面在 `index.ts`。
+ * 领域读写分布在 `store-chats/grants/tasks/cards/workers/delivery/ledgers/outbox/questions/references`，门面在 `index.ts`。
  */
 
 import { Database } from "bun:sqlite";
@@ -197,6 +197,18 @@ export function applySchema(db: Database): void {
       removed INTEGER NOT NULL CHECK(removed IN (0, 1)),
       archive TEXT NOT NULL CHECK(archive IN ('scheduled', 'not-scheduled')),
       delivery_state TEXT NOT NULL DEFAULT 'pending' CHECK(delivery_state IN ('pending', 'intent', 'delivered'))
+    );
+    CREATE TABLE IF NOT EXISTS thread_references (
+      bot_uid TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('mr', 'pr')),
+      canonical_url TEXT NOT NULL,
+      PRIMARY KEY(bot_uid, channel_id, kind, canonical_url)
+    );
+    CREATE TABLE IF NOT EXISTS thread_reference_tombstones (
+      bot_uid TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      PRIMARY KEY(bot_uid, channel_id)
     );
     CREATE INDEX IF NOT EXISTS thread_merge_events_bot ON thread_merge_events(bot_uid);
     CREATE TABLE IF NOT EXISTS inbound (

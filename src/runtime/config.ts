@@ -9,6 +9,7 @@ import {
   type CoreServiceConfig,
   type GroupHistoryConfig,
 } from "../contracts.ts";
+import type { DecisionsConfig, EnabledDecisionsConfig } from "../references/types.ts";
 
 export const OCO_HOME_DIRNAME = ".oco";
 export const DEFAULT_CONFIG_PATH = "~/.oco/config/config.json";
@@ -56,6 +57,7 @@ const CONFIG_KEYS: Record<string, true> = {
   groupHistory: true,
   attachments: true,
   ask: true,
+  decisions: true,
 };
 const TOKEN_ENV_PATTERN = /^(?:OCTO_|OMP_CHANNEL_OCTO_)[A-Za-z_][A-Za-z0-9_]*$/u;
 /** Bot uids reach the filesystem as directory names; only the server's alphabet is allowed. */
@@ -71,6 +73,7 @@ const MAX_ATTACHMENT_MAX_BYTES = 1024 * 1024 * 1024;
 /** `ask` waits below half an hour or above a week are configuration mistakes, not preferences. */
 const MIN_ASK_TIMEOUT_MS = 30 * 60 * 1_000;
 const MAX_ASK_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1_000;
+const DECISIONS_ENV_PATTERN = /^OMP_CHANNEL_OCTO_[A-Za-z_][A-Za-z0-9_]*$/u;
 
 export interface AppConfig extends CoreServiceConfig {
   apiUrl: string;
@@ -256,6 +259,70 @@ function parseAsk(value: unknown): AskConfig {
   return { timeoutMs };
 }
 
+function parseDecisions(value: unknown, env: NodeJS.ProcessEnv): DecisionsConfig | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw configError("decisions 必须是 JSON 对象");
+  }
+  const document = value as Record<string, unknown>;
+  for (const key of Object.keys(document)) {
+    if (!["enabled", "protocol", "baseUrl", "model", "apiKeyEnv"].includes(key)) {
+      throw configError(`不支持字段 decisions.${key}`);
+    }
+  }
+
+  const enabled = document.enabled === undefined ? false : document.enabled;
+  if (typeof enabled !== "boolean") throw configError("decisions.enabled 必须是布尔值");
+  if (!enabled) return { enabled: false };
+
+  const protocol = requireString(document.protocol, "decisions.protocol");
+  if (protocol !== "typesafe-systemone" && protocol !== "openai-decisions") {
+    throw configError("decisions.protocol 必须是 typesafe-systemone 或 openai-decisions");
+  }
+
+  const baseUrl = requireString(document.baseUrl, "decisions.baseUrl");
+  let parsedBaseUrl: URL;
+  try {
+    parsedBaseUrl = new URL(baseUrl);
+  } catch {
+    throw configError("decisions.baseUrl 必须是有效 HTTPS URL");
+  }
+  if (parsedBaseUrl.protocol !== "https:") {
+    throw configError("decisions.baseUrl 必须使用 HTTPS 协议");
+  }
+  const authority = /^https:\/\/([^/?#]*)/iu.exec(baseUrl)?.[1];
+  if (
+    authority === undefined
+    || authority.includes("@")
+    || parsedBaseUrl.username !== ""
+    || parsedBaseUrl.password !== ""
+  ) {
+    throw configError("decisions.baseUrl 不得包含内嵌凭证");
+  }
+  if (parsedBaseUrl.search || parsedBaseUrl.hash || baseUrl.includes("?") || baseUrl.includes("#")) {
+    throw configError("decisions.baseUrl 不得包含 query 或 fragment");
+  }
+  if (/(?:^|\/)v1\/(?:systemone|decisions)\/?$/iu.test(parsedBaseUrl.pathname)) {
+    throw configError("decisions.baseUrl 不得包含协议 endpoint 后缀");
+  }
+
+  const model = requireString(document.model, "decisions.model");
+  const apiKeyEnv = requireString(document.apiKeyEnv, "decisions.apiKeyEnv");
+  if (!DECISIONS_ENV_PATTERN.test(apiKeyEnv)) {
+    throw configError("decisions.apiKeyEnv 必须使用 OMP_CHANNEL_OCTO_ 前缀");
+  }
+  const apiKey = requireString(env[apiKeyEnv], `环境变量 ${apiKeyEnv}`);
+  const resolved: EnabledDecisionsConfig = {
+    enabled: true,
+    protocol,
+    baseUrl: parsedBaseUrl.toString().replace(/\/+$/u, ""),
+    model,
+    apiKeyEnv,
+    apiKey,
+  };
+  return resolved;
+}
+
 export function parseConfig(input: unknown, options: ConfigParseOptions = {}): AppConfig {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw configError("根值必须是 JSON 对象");
@@ -309,6 +376,7 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
   const groupHistory = parseGroupHistory(document.groupHistory);
   const attachments = parseAttachments(document.attachments);
   const ask = parseAsk(document.ask);
+  const decisions = parseDecisions(document.decisions, options.env ?? process.env);
 
   return {
     apiUrl,
@@ -331,6 +399,7 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
     groupHistory,
     attachments,
     ask,
+    ...(decisions === undefined ? {} : { decisions }),
   };
 }
 
@@ -396,5 +465,6 @@ export function toCoreConfig(config: AppConfig): CoreServiceConfig {
     groupHistory: { ...config.groupHistory },
     attachments: { ...config.attachments },
     ask: { ...config.ask },
+    ...(config.decisions === undefined ? {} : { decisions: { ...config.decisions } }),
   };
 }

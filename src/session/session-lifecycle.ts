@@ -78,6 +78,8 @@ export interface SessionLifecycleDeps {
   ) => Promise<SessionLease | undefined>;
   /** 为该聊天排一条回执文本，与其他命令路径一致。 */
   readonly enqueueText: Outbox["enqueueText"];
+  /** Clears volatile reference evidence after a successfully committed fresh session switch. */
+  readonly resetReferenceContext: (target: ChatTarget) => void;
 }
 
 export async function threadWorkspaceIsAvailable(workspace: ThreadWorkspaceRecord): Promise<boolean> {
@@ -314,6 +316,7 @@ export class SessionLifecycle {
       } catch {
         throw new Error("本地状态盘写入失败，会话未切换。");
       }
+      this.deps.resetReferenceContext(target);
       try {
         this.deps.store.clearContextLedger(this.deps.bot()!.uid, target);
         await this.deps.enqueueText(
