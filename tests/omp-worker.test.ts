@@ -17,6 +17,7 @@ import type {
 } from "../src/contracts.ts";
 import type { RpcChild } from "../src/omp/process.ts";
 import { isRecord } from "../src/omp/rpc.ts";
+import { formatAgentGuidance } from "../src/session/agent-context.ts";
 import { FakeWorkerFactory } from "./fixtures/core-fakes";
 
 const fixturePath = resolve(import.meta.dir, "fixtures/omp-rpc-worker.ts");
@@ -397,13 +398,15 @@ describe("OMP RPC worker", () => {
 			expect(argumentValue(startup.argv, "--cwd")).toBe(harness.tempDir);
 			expect(argumentValue(startup.argv, "--session-dir")).toBe(harness.tempDir);
 			expect(argumentValue(startup.argv, "--config")).toBeUndefined();
+			expect(argumentValue(startup.argv, "--append-system-prompt")).toBeUndefined();
 		});
 	});
 	test("forwards direct-message context scope to the real OMP child environment", async () => {
-		const contextScope: WorkerOptions["contextScope"] = {
+		const contextScope: NonNullable<WorkerOptions["contextScope"]> = {
 			sidecarRoot: "/tmp/omp-context-sidecars/direct-message",
 			botUid: "bot-context-direct-message",
 			target: { channelType: 1, channelId: "owner-direct-message" },
+			cliReady: true,
 		};
 		await withHarness("normal", async harness => {
 			const childEnv = JSON.parse(await readFile(harness.envPath, "utf8")) as Record<string, string>;
@@ -666,7 +669,8 @@ describe("OMP RPC worker", () => {
 				(event): event is Extract<WorkerEvent, { type: "steer_consumed" }> => event.type === "steer_consumed",
 			);
 			expect(consumed).toHaveLength(1);
-			expect(consumed[0]?.text).toBe("also check the logs");
+			expect(consumed[0]?.text).toBe("also check the logs\n\nMEMBER_CONTEXT_SUFFIX_V1");
+			expect(consumed[0]?.originalText).toBe("also check the logs");
 			const steered = (await readLog(harness.logPath)).filter(entry => entry.kind === "steer");
 			expect(steered).toHaveLength(1);
 			expect(steered[0]?.message).toBe("also check the logs");
@@ -992,7 +996,13 @@ describe("OMP RPC worker", () => {
 		);
 	});
 
-	test("a no-progress native goal settles truthfully and pauses while remaining incomplete", async () => {
+	test("a no-progress native goal settles truthfully and pauses while retaining its fixed CLI guide", async () => {
+		const contextScope: NonNullable<WorkerOptions["contextScope"]> = {
+			sidecarRoot: join(tmpdir(), "omp-context-sidecars", "native-goal"),
+			botUid: "bot-native-goal",
+			target: { channelType: 1, channelId: "owner-native-goal" },
+			cliReady: true,
+		};
 		await withHarness(
 			"goal-no-progress",
 			async harness => {
@@ -1005,9 +1015,13 @@ describe("OMP RPC worker", () => {
 				expect(result.goal?.status).not.toBe("complete");
 				expect(events.some(event => event.type === "goal_accepted")).toBe(true);
 				expect(events.some(event => event.type === "text" && event.text === "fixture native goal step")).toBe(true);
-				expect(rpcCommands(await readLog(harness.logPath), "prompt")).toEqual([]);
+				const logs = await readLog(harness.logPath);
+				expect(rpcCommands(logs, "prompt")).toEqual([]);
+				expect(argumentValue(startupEntry(logs).argv, "--append-system-prompt")).toBe(
+					formatAgentGuidance(contextScope.botUid, contextScope.target, contextScope.cliReady),
+				);
 			},
-			{ goalContinuation: true },
+			{ goalContinuation: true, contextScope },
 		);
 	});
 
@@ -1239,7 +1253,13 @@ describe("OMP RPC worker", () => {
 		});
 	});
 
-	test("resume continues the interrupted session through OMP's own /retry without replaying the request", async () => {
+	test("resume keeps the fixed CLI guide while continuing the interrupted session through native /retry", async () => {
+		const contextScope: NonNullable<WorkerOptions["contextScope"]> = {
+			sidecarRoot: join(tmpdir(), "omp-context-sidecars", "native-retry"),
+			botUid: "bot-native-retry",
+			target: { channelType: 1, channelId: "owner-native-retry" },
+			cliReady: true,
+		};
 		await withHarness("retry-resume", async harness => {
 			const events: WorkerEvent[] = [];
 			const tool: HostTool = {
@@ -1252,6 +1272,9 @@ describe("OMP RPC worker", () => {
 			// The resume context reaches the child before its retry dispatch, exactly like a
 			// first prompt's host tools.
 			const logs = await readLog(harness.logPath);
+			expect(argumentValue(startupEntry(logs).argv, "--append-system-prompt")).toBe(
+				formatAgentGuidance(contextScope.botUid, contextScope.target, contextScope.cliReady),
+			);
 			const registrationIndex = logs.findIndex(entry => {
 				if (entry.kind !== "command") return false;
 				const command = entry.command as LogEntry | undefined;
@@ -1280,7 +1303,7 @@ describe("OMP RPC worker", () => {
 			const followUp: WorkerEvent[] = [];
 			await harness.worker.prompt("follow up", event => followUp.push(event));
 			expect(followUp.some(event => event.type === "text" && event.text === "fixture completed" && event.final)).toBe(true);
-		});
+		}, { contextScope });
 	});
 
 	test("resume sends one same-session continuation when OMP reports nothing to retry", async () => {

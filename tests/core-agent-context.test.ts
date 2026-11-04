@@ -33,13 +33,13 @@ const OMP_SCOPE_KEYS = [
 
 type ExtensionHandler = (event: unknown, context: unknown) => unknown | Promise<unknown>;
 type ExtensionHooks = {
+  readonly input: ExtensionHandler;
   readonly beforeAgentStart: ExtensionHandler;
   readonly modelContext: ExtensionHandler;
 };
-type ModelMessage = { role: string; content: unknown; [key: string]: unknown };
-type ExtensionResult = { systemPrompt?: unknown; messages?: unknown };
+type ModelMessage = { role?: string; content?: unknown; [key: string]: unknown };
+type ExtensionResult = { text?: unknown; content?: unknown; message?: unknown; messages?: unknown };
 type CapturedTurn = {
-  systemPrompt: string[];
   messages: ModelMessage[];
 };
 
@@ -66,12 +66,13 @@ function captureHooks(): ExtensionHooks {
     },
   };
   contextExtension(api as unknown as Parameters<typeof contextExtension>[0]);
+  const input = handlers.get("input");
   const beforeAgentStart = handlers.get("before_agent_start");
   const modelContext = handlers.get("context");
-  if (beforeAgentStart === undefined || modelContext === undefined) {
-    throw new Error("context extension did not register model request handlers");
+  if (input === undefined || beforeAgentStart === undefined || modelContext === undefined) {
+    throw new Error("context extension did not register consumer message handlers");
   }
-  return { beforeAgentStart, modelContext };
+  return { input, beforeAgentStart, modelContext };
 }
 
 async function withExtensionScope<T>(
@@ -96,8 +97,14 @@ async function withExtensionScope<T>(
   }
 }
 
-function extensionContext(sessionId: string): Record<string, unknown> {
-  return { sessionManager: { getSessionId: () => sessionId }, abort: () => {} };
+function extensionContext(sessionId: string, history: readonly ModelMessage[] = []): Record<string, unknown> {
+  return {
+    sessionManager: {
+      getSessionId: () => sessionId,
+      getBranch: () => history.map((message) => ({ type: "message", message })),
+    },
+    abort: () => {},
+  };
 }
 
 function extensionRecord(value: unknown): ExtensionResult {
@@ -113,30 +120,53 @@ async function invokeModelContext(
 ): Promise<ModelMessage[]> {
   const result = extensionRecord(await hooks.modelContext(
     { type: "context", messages },
-    extensionContext(sessionId),
+    extensionContext(sessionId, messages),
   ));
   return Array.isArray(result.messages) ? result.messages as ModelMessage[] : messages;
+}
+
+async function transformUserText(
+  hooks: ExtensionHooks,
+  sessionId: string,
+  text: string,
+  history: readonly ModelMessage[] = [],
+): Promise<string> {
+  const result = extensionRecord(await hooks.input(
+    { type: "input", source: "rpc", text },
+    extensionContext(sessionId, history),
+  ));
+  return typeof result.text === "string" ? result.text : text;
 }
 
 async function captureTurn(
   hooks: ExtensionHooks,
   sessionId: string,
   text: string,
-  options: { readonly startAgent?: boolean; readonly messages?: ModelMessage[] } = {},
+  options: {
+    readonly startAgent?: boolean;
+    readonly messages?: ModelMessage[];
+    readonly history?: readonly ModelMessage[];
+  } = {},
 ): Promise<CapturedTurn> {
-  const baseSystem = ["base system rule"];
-  let systemPrompt = baseSystem;
+  const history = options.history ?? [];
+  let startMessage: ModelMessage | undefined;
   if (options.startAgent ?? true) {
     const started = extensionRecord(await hooks.beforeAgentStart(
-      { type: "before_agent_start", prompt: text, systemPrompt: baseSystem },
-      extensionContext(sessionId),
+      { type: "before_agent_start", prompt: text },
+      extensionContext(sessionId, history),
     ));
-    if (Array.isArray(started.systemPrompt)) {
-      systemPrompt = started.systemPrompt as string[];
-    }
+    const value = extensionRecord(started.message);
+    if (typeof value.content === "string") startMessage = { role: "custom", ...value };
   }
-  const messages = options.messages ?? [{ role: "user", content: text }];
-  return { systemPrompt, messages: await invokeModelContext(hooks, sessionId, messages) };
+  const messages = options.messages ?? [
+    ...history,
+    {
+      role: "user",
+      content: await transformUserText(hooks, sessionId, text, history),
+    },
+  ];
+  if (startMessage !== undefined) messages.push(startMessage);
+  return { messages: await invokeModelContext(hooks, sessionId, messages) };
 }
 
 function sidecarRoot(record: PromptRecord | undefined): string {
@@ -145,11 +175,11 @@ function sidecarRoot(record: PromptRecord | undefined): string {
 }
 
 function memberBlocks(messages: readonly ModelMessage[]): string[] {
-  return messages
-    .filter(({ role, content }) => role === "developer"
-      && typeof content === "string"
-      && content.startsWith(MEMBER_PREFIX))
-    .map(({ content }) => content as string);
+  return messages.flatMap(({ role, content }) => {
+    if (role !== "user" || typeof content !== "string") return [];
+    const marker = content.indexOf(MEMBER_PREFIX);
+    return marker < 0 ? [] : [content.slice(marker)];
+  });
 }
 
 function parseMemberBlock(content: string): Record<string, unknown> {
@@ -167,54 +197,17 @@ function readyCredentials(botUid: string) {
   };
 }
 
-function expectFixedGuidance(
-  prompt: CapturedTurn,
-  botUid: string,
-  target: ChatTarget,
-  cliReady = true,
-): void {
-  const modelInput = [
-    ...prompt.systemPrompt,
-    ...prompt.messages
-      .filter(({ role, content }) => role === "developer" && typeof content === "string")
-      .map(({ content }) => content as string),
-  ].join("\n");
-  for (const value of [
-    botUid,
-    `channel_type=${target.channelType}`,
-    `channel_id=${target.channelId}`,
-    "octo-cli 是当前 bot 访问 Octo 业务的 CLI 入口",
-    "@[uid:显示名]",
-    "Loop",
-    "Docs",
-    "Drive",
-    "HTML",
-    "Messaging/Files",
-    "Mail",
-    "Marketplace",
-    "octo-cli auth status",
-    "octo-cli skills",
-    "octo-cli skills octo-shared",
-    "octo-cli schema",
-    "--help",
-  ]) {
-    expect(modelInput).toContain(value);
-  }
-  expect(modelInput).toContain(cliReady
-    ? "当前 Bot 的 octo-cli 身份已就绪"
-    : "本轮没有已就绪的 octo-cli 身份");
-}
-
 function inboundFor(
   botUid: string,
   target: ChatTarget,
   messageId: string,
   text: string,
-) {
+): ReturnType<typeof inbound> {
   return inbound({ messageId, ...target, text, mentionedUserIds: target.channelType === 1 ? [] : [botUid] });
 }
 
-test("the extension sends 0, 10, and 11 member counts as temporary developer context without truncating the API count", async () => {
+
+test("the extension persists 0, 10, and 11 member counts in user input without truncating the API count", async () => {
   const bot = { uid: "bot-agent-context-counts", name: "Context Bot" };
   const transport = new FakeTransport({ bot });
   const captured: CapturedTurn[] = [];
@@ -247,7 +240,6 @@ test("the extension sends 0, 10, and 11 member counts as temporary developer con
       await waitForStatus(harness.service, GROUP, (status) => status.state === "completed");
 
       const turn = captured[index]!;
-      expectFixedGuidance(turn, bot.uid, GROUP);
       const blocks = memberBlocks(turn.messages);
       expect(blocks).toHaveLength(1);
       const payload = parseMemberBlock(blocks[0]!);
@@ -260,7 +252,7 @@ test("the extension sends 0, 10, and 11 member counts as temporary developer con
         expect(payload.queryAction).toBe("octo_management.group-members");
         expect(JSON.stringify(payload)).not.toContain("member-11");
       }
-      expect(turn.messages.find(({ role }) => role === "user")?.content).toBe(text);
+      expect(turn.messages.find(({ role }) => role === "user")?.content).toContain(text);
     }
 
     const encoded = memberBlocks(captured[1]!.messages)[0]!;
@@ -352,7 +344,6 @@ test("thread tasks refresh only their thread roster and identify the parent grou
     ] as const;
     for (const [index, [expectedUid, expectedName]] of expectedRows.entries()) {
       const turn = captured[index]!;
-      expectFixedGuidance(turn, bot.uid, THREAD);
       const blocks = memberBlocks(turn.messages);
       expect(blocks).toHaveLength(1);
       const payload = parseMemberBlock(blocks[0]!);
@@ -377,7 +368,7 @@ test("thread tasks refresh only their thread roster and identify the parent grou
   }
 });
 
-test("steering replaces the in-flight developer member block with the newest API snapshot", async () => {
+test("steering preserves earlier member input and appends the newest API snapshot", async () => {
   const bot = { uid: "bot-agent-context-steer", name: "Steering Context Bot" };
   const transport = new FakeTransport({ bot });
   transport.setGroupMembers(GROUP.channelId, [member("member-old", "Old member")]);
@@ -392,13 +383,11 @@ test("steering replaces the in-flight developer member block with the newest API
       started.resolve();
       const steered = await waitForAppend();
       appended.push(steered.text);
+      const history = first.messages.filter(({ role }) => role === "user");
+      const steeredInput = await transformUserText(hooks, sessionId, steered.text, history);
       captured.push(await captureTurn(hooks, sessionId, text, {
         startAgent: false,
-        messages: [
-          { role: "user", content: text },
-          { role: "user", content: steered.text },
-          ...memberBlocks(first.messages).map((content) => ({ role: "developer", content })),
-        ],
+        messages: [...history, { role: "user", content: steeredInput }],
       }));
     });
   });
@@ -425,10 +414,12 @@ test("steering replaces the in-flight developer member block with the newest API
     expect(memberBlocks(captured[0]!.messages).map(parseMemberBlock)[0]?.members)
       .toEqual([{ name: "Old member", uid: "member-old" }]);
     const latestBlocks = memberBlocks(captured[1]!.messages);
-    expect(latestBlocks).toHaveLength(1);
+    expect(latestBlocks).toHaveLength(2);
     expect(parseMemberBlock(latestBlocks[0]!).members)
+      .toEqual([{ name: "Old member", uid: "member-old" }]);
+    expect(parseMemberBlock(latestBlocks[1]!).members)
       .toEqual([{ name: "New member", uid: "member-new" }]);
-    expect(latestBlocks[0]).not.toContain("Old member");
+    expect(latestBlocks[1]).not.toContain("Old member");
     expect(transport.managementCalls.filter(({ action }) => action === "group-members"))
       .toHaveLength(2);
   } finally {
@@ -436,7 +427,7 @@ test("steering replaces the in-flight developer member block with the newest API
   }
 });
 
-test("a resumed native retry sees fixed guidance but neither fetches nor injects stale members", async () => {
+test("a resumed native retry preserves the original member user input without another fetch", async () => {
   const bot = { uid: "bot-agent-context-retry", name: "Retry Context Bot" };
   const transport = new FakeTransport({ bot });
   transport.setGroupMembers(GROUP.channelId, [member("member-before", "Old member")]);
@@ -444,10 +435,15 @@ test("a resumed native retry sees fixed guidance but neither fetches nor injects
   let workers!: FakeWorkerFactory;
   workers = new FakeWorkerFactory(async ({ text, sessionId }) => {
     await withExtensionScope(sidecarRoot(workers.prompts.at(-1)), bot.uid, GROUP, async (hooks) => {
-      captured.push(await captureTurn(hooks, sessionId, text, {
-        startAgent: text !== "/retry",
-        messages: [{ role: "user", content: text }],
-      }));
+      if (text === "/retry") {
+        const history = captured[0]!.messages.filter(({ role }) => role === "user");
+        captured.push(await captureTurn(hooks, sessionId, text, {
+          startAgent: false,
+          messages: [...history, { role: "user", content: text }],
+        }));
+      } else {
+        captured.push(await captureTurn(hooks, sessionId, text));
+      }
     });
   });
   const harness = await createCoreHarness({
@@ -472,25 +468,14 @@ test("a resumed native retry sees fixed guidance but neither fetches nor injects
     expect(transport.managementCalls.filter(({ action }) => action === "group-members"))
       .toHaveLength(1);
     expect(memberBlocks(captured[0]!.messages)).toHaveLength(1);
-    expectFixedGuidance(captured[1]!, bot.uid, GROUP);
-    const retryGuidance = captured[1]!.messages.find(({ role, content }) =>
-      role === "developer" && typeof content === "string" && content.includes("octo-cli auth status"));
-    expect(retryGuidance?.content).toContain(bot.uid);
-    expect(retryGuidance?.content).toContain(`channel_type=${GROUP.channelType}`);
-    expect(retryGuidance?.content).toContain(GROUP.channelId);
-    expect(retryGuidance?.content).toContain("@[uid:显示名]");
-    expect(retryGuidance?.content).toContain("Marketplace");
-    expect(retryGuidance?.content).toContain("当前 Bot 的 octo-cli 身份已就绪");
-    expect(memberBlocks(captured[1]!.messages)).toHaveLength(0);
-    expect(captured[1]!.messages.some(({ role, content }) =>
-      role === "developer" && typeof content === "string" && content.includes("octo-cli skills")))
-      .toBe(true);
+    expect(memberBlocks(captured[1]!.messages)).toEqual(memberBlocks(captured[0]!.messages));
+    expect(captured[1]!.messages.at(-1)).toEqual({ role: "user", content: "/retry" });
   } finally {
     await closeCoreHarness(harness);
   }
 });
 
-test("restart disables the persisted member snapshot, while new steering fetches and publishes its own", async () => {
+test("restart recovers the consumed member input and steering appends a fresh snapshot", async () => {
   const bot = { uid: "bot-agent-context-recovery", name: "Recovery Context Bot" };
   const transport = new FakeTransport({ bot });
   transport.setGroupMembers(GROUP.channelId, [member("member-before-stop", "Before stop")]);
@@ -526,7 +511,7 @@ test("restart disables the persisted member snapshot, while new steering fetches
     await first.workers.waitForPromptCount(1);
     await initialContextReady.promise;
     expect(memberBlocks(initialTurn!.messages)).toHaveLength(1);
-    const staleMemberBlock = memberBlocks(initialTurn!.messages)[0]!;
+    const savedUserHistory = initialTurn!.messages.filter(({ role }) => role === "user");
 
     await closeCoreHarness(first, { remove: false });
     await running;
@@ -545,20 +530,15 @@ test("restart disables the persisted member snapshot, while new steering fetches
         async (hooks) => {
           retryTurn = await captureTurn(hooks, sessionId, text, {
             startAgent: false,
-            messages: [
-              { role: "user", content: "unfinished task" },
-              { role: "developer", content: staleMemberBlock },
-            ],
+            messages: [...savedUserHistory, { role: "user", content: text }],
           });
           resumed.resolve();
           const appended = await waitForAppend();
+          const history = retryTurn!.messages.filter(({ role }) => role === "user");
+          const steeredInput = await transformUserText(hooks, sessionId, appended.text, history);
           steeredTurn = await captureTurn(hooks, sessionId, text, {
             startAgent: false,
-            messages: [
-              { role: "user", content: "unfinished task" },
-              { role: "user", content: appended.text },
-              { role: "developer", content: staleMemberBlock },
-            ],
+            messages: [...history, { role: "user", content: steeredInput }],
           });
           steered.resolve();
         },
@@ -573,8 +553,7 @@ test("restart disables the persisted member snapshot, while new steering fetches
       cliCredentials: readyCredentials(bot.uid),
     });
     await resumed.promise;
-    expect(retryTurn?.messages.map(({ role }) => role)).toContain("developer");
-    expect(memberBlocks(retryTurn!.messages)).toHaveLength(0);
+    expect(memberBlocks(retryTurn!.messages)).toEqual(memberBlocks(initialTurn!.messages));
     expect(transport.managementCalls.filter(({ action }) => action === "group-members"))
       .toHaveLength(1);
 
@@ -587,10 +566,11 @@ test("restart disables the persisted member snapshot, while new steering fetches
     await waitForStatus(restarted.service, GROUP, (status) => status.state === "completed");
 
     expect(resumedWorkers.prompts.map(({ text }) => text)).toEqual(["/retry"]);
-    expect(memberBlocks(steeredTurn!.messages)).toHaveLength(1);
+    expect(memberBlocks(steeredTurn!.messages)).toHaveLength(2);
     expect(parseMemberBlock(memberBlocks(steeredTurn!.messages)[0]!).members)
+      .toEqual([{ name: "Before stop", uid: "member-before-stop" }]);
+    expect(parseMemberBlock(memberBlocks(steeredTurn!.messages)[1]!).members)
       .toEqual([{ name: "After stop", uid: "member-after-stop" }]);
-    expect(memberBlocks(steeredTurn!.messages)[0]).not.toContain("Before stop");
     expect(transport.managementCalls.filter(({ action }) => action === "group-members"))
       .toHaveLength(2);
   } finally {
@@ -626,9 +606,8 @@ test("worker subagent and eval sessions cannot consume bound chat identity or me
 
     expect(memberBlocks(mainTurn!.messages)).toHaveLength(1);
     for (const turn of [subagentTurn!, evalTurn!]) {
-      expect(turn.systemPrompt).toEqual(["base system rule"]);
       expect(turn.messages).toEqual([{ role: "user", content: expect.any(String) }]);
-      const serialized = JSON.stringify({ systemPrompt: turn.systemPrompt, messages: turn.messages });
+      const serialized = JSON.stringify(turn.messages);
       expect(serialized).not.toContain(bot.uid);
       expect(serialized).not.toContain(GROUP.channelId);
       expect(serialized).not.toContain("bound-member");
@@ -726,11 +705,7 @@ test("DM receives identity and CLI guidance without reading group members or gro
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     expect(captured).toBeDefined();
-    expectFixedGuidance(captured!, bot.uid, target, false);
-    const system = captured!.systemPrompt.join("\n");
-    expect(system).toContain("本轮没有已就绪的 octo-cli 身份");
-    expect(system).toContain("继续使用可用的 host tools");
-    expect(system).not.toContain("parentGroupId");
+    expect(captured!.messages).toContainEqual({ role: "user", content: "private task" });
     expect(memberBlocks(captured!.messages)).toHaveLength(0);
     expect(transport.groupContextCalls).toHaveLength(0);
     expect(transport.managementCalls.filter(({ action }) => action.endsWith("-members")))
@@ -786,7 +761,10 @@ test("separate chats receive only their own member roster and bound session iden
       expect(blocks).toHaveLength(1);
       expect(blocks[0]).toContain(expectedUid);
       expect(blocks[0]).not.toContain(absentName);
-      expect(turn.systemPrompt.join("\n")).toContain(target.channelId);
+      expect(parseMemberBlock(blocks[0]!).target).toMatchObject({
+        channelType: target.channelType,
+        channelId: target.channelId,
+      });
     }
     expect(sessions.get("task in group one")).not.toBe(sessions.get("task in group two"));
   } finally {
@@ -817,13 +795,11 @@ test("concurrent member refresh and prepared receipt writes preserve both sideca
       const first = await captureTurn(hooks, sessionId, text);
       promptStarted.resolve({ root, sessionId });
       const appended = await waitForAppend();
+      const history = first.messages.filter(({ role }) => role === "user");
+      const steeredInput = await transformUserText(hooks, sessionId, appended.text, history);
       afterSteer.resolve(await captureTurn(hooks, sessionId, text, {
         startAgent: false,
-        messages: [
-          { role: "user", content: text },
-          { role: "user", content: appended.text },
-          ...memberBlocks(first.messages).map((content) => ({ role: "developer", content })),
-        ],
+        messages: [...history, { role: "user", content: steeredInput }],
       }));
       await finishPrompt.promise;
     });
@@ -872,8 +848,8 @@ test("concurrent member refresh and prepared receipt writes preserve both sideca
       count: 1,
       members: [{ uid: "member-sidecar-race", name: largeName }],
     });
-    expect(memberBlocks(afterSteerTurn.messages)).toHaveLength(1);
-    expect(parseMemberBlock(memberBlocks(afterSteerTurn.messages)[0]!).members).toEqual([
+    expect(memberBlocks(afterSteerTurn.messages)).toHaveLength(2);
+    expect(parseMemberBlock(memberBlocks(afterSteerTurn.messages)[1]!).members).toEqual([
       { uid: "member-sidecar-race", name: largeName },
     ]);
   } finally {
@@ -953,16 +929,18 @@ test("an unaccepted steering cannot publish its member snapshot into the running
   const steerStarted = Promise.withResolvers<void>();
   const rejectSteer = Promise.withResolvers<void>();
   const fallbackTurns: CapturedTurn[] = [];
+  let originalUserHistory: ModelMessage[] = [];
   let inspectRunningTurn: (() => Promise<CapturedTurn>) | undefined;
   let workers!: FakeWorkerFactory;
   workers = new FakeWorkerFactory(async ({ text, sessionId }) => {
     const root = sidecarRoot(workers.prompts.at(-1));
     await withExtensionScope(root, bot.uid, GROUP, async (hooks) => {
       if (text === "original rejected-steer task") {
-        await captureTurn(hooks, sessionId, text);
+        const initial = await captureTurn(hooks, sessionId, text);
+        originalUserHistory = initial.messages.filter(({ role }) => role === "user");
         inspectRunningTurn = () => captureTurn(hooks, sessionId, text, {
           startAgent: false,
-          messages: [{ role: "user", content: text }],
+          messages: originalUserHistory,
         });
         promptStarted.resolve();
         await finishPrompt.promise;

@@ -3,7 +3,12 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import contextExtension, { contextSidecarFileName } from "../src/omp/context-extension.ts";
-import { boundSessionPath } from "../src/session/context-sidecar.ts";
+import {
+  boundSessionPath,
+  readContextSidecar,
+  writeAgentContextOverlay,
+} from "../src/session/context-sidecar.ts";
+import { formatMemberContext, memberSnapshotFor } from "../src/session/agent-context.ts";
 
 type Target = {
   channelType: number;
@@ -31,26 +36,40 @@ type Sidecar = {
   schemaVersion: number;
   botUid: string;
   target: Target;
+  turnId: string;
   sessionId: string;
   snapshot: Snapshot;
   injectionDecision: InjectionDecision;
   attemptId: string;
   marker: Marker;
   previousVersion?: number;
+  compactedContext?: {
+    schemaVersion: number;
+    requestId: string;
+    botUid: string;
+    target: Target;
+    sessionId: string;
+    turnId: string;
+    attemptId: string;
+    snapshot: Snapshot;
+  };
 };
 
 type Handler = (event: unknown, context: unknown) => unknown | Promise<unknown>;
 type Invocation = { value: unknown; error: unknown | undefined };
 
+type PersistentMessage = {
+  customType?: unknown;
+  content?: unknown;
+};
+
 type ContextResult = {
-  systemPrompt?: unknown;
+  message?: unknown;
 };
 
-type CompactingResult = {
-  context?: unknown;
-  preserveData?: unknown;
+type PreCompactResult = {
+  cancel?: unknown;
 };
-
 const BOT_UID = "bot-context-test";
 const TARGET: Target = { channelType: 2, channelId: "group-context-test" };
 const SESSION_ID = "omp-session-real-context-test";
@@ -96,6 +115,7 @@ function sidecarFor(
     schemaVersion: 1,
     botUid: BOT_UID,
     target: TARGET,
+    turnId: "00000000-0000-4000-8000-000000000001",
     sessionId: SESSION_ID,
     snapshot,
     injectionDecision,
@@ -150,29 +170,53 @@ async function readSidecar(sidecarPath: string): Promise<Sidecar & Record<string
   return JSON.parse(await readFile(sidecarPath, "utf8")) as Sidecar & Record<string, unknown>;
 }
 
-function captureHandlers(): { beforeAgentStart: Handler; sessionCompacting: Handler; modelContext?: Handler } {
+function captureHandlers(sendMessage?: (
+  message: { customType: string; content: string; display: false; details: Record<string, unknown> },
+  options?: { triggerTurn?: boolean; deliverAs?: "steer" },
+) => void): {
+  beforeAgentStart: Handler;
+  input?: Handler;
+  sessionBeforeCompact?: Handler;
+  modelContext?: Handler;
+} {
   const handlers = new Map<string, Handler>();
   const api = {
     on(event: string, handler: Handler): void {
       handlers.set(event, handler);
     },
+    ...(sendMessage === undefined ? {} : { sendMessage }),
   };
   contextExtension(api as unknown as Parameters<typeof contextExtension>[0]);
 
   const beforeAgentStart = handlers.get("before_agent_start");
-  const sessionCompacting = handlers.get("session.compacting");
   expect(beforeAgentStart).toEqual(expect.any(Function));
-  expect(sessionCompacting).toEqual(expect.any(Function));
-  if (beforeAgentStart === undefined || sessionCompacting === undefined) {
-    throw new Error("context extension did not register both lifecycle handlers");
+  if (beforeAgentStart === undefined) {
+    throw new Error("context extension did not register the agent-start handler");
   }
+  const input = handlers.get("input");
+  const sessionBeforeCompact = handlers.get("session_before_compact");
   const modelContext = handlers.get("context");
-  return { beforeAgentStart, sessionCompacting, ...(modelContext ? { modelContext } : {}) };
+  return {
+    beforeAgentStart,
+    ...(input ? { input } : {}),
+    ...(sessionBeforeCompact ? { sessionBeforeCompact } : {}),
+    ...(modelContext ? { modelContext } : {}),
+  };
 }
 
-function extensionContext(sessionId: string, abort: () => void): Record<string, unknown> {
+function requireHandler(handler: Handler | undefined, event: string): Handler {
+  expect(handler).toEqual(expect.any(Function));
+  if (handler === undefined) throw new Error(`context extension did not register ${event}`);
+  return handler;
+}
+
+function extensionContext(
+  sessionId: string,
+  abort: () => void,
+  branch: readonly unknown[] = [],
+): Record<string, unknown> {
   return {
-    sessionManager: { getSessionId: () => sessionId },
+    sessionManager: { getSessionId: () => sessionId, getBranch: () => branch },
     abort,
   };
 }
@@ -185,18 +229,18 @@ async function invoke(handler: Handler, event: unknown, context: unknown): Promi
   }
 }
 
-function returnedSystemPrompt(value: unknown): string[] {
-  const result = value as ContextResult | undefined;
-  return Array.isArray(result?.systemPrompt) && result.systemPrompt.every((item) => typeof item === "string")
-    ? (result.systemPrompt as string[])
-    : [];
+
+function returnedMessage(value: unknown): PersistentMessage {
+  return recordValue((value as ContextResult | undefined)?.message);
 }
 
-function returnedCompactionContext(value: unknown): string[] {
-  const result = value as CompactingResult | undefined;
-  return Array.isArray(result?.context) && result.context.every((item) => typeof item === "string")
-    ? (result.context as string[])
-    : [];
+function returnedMessageContent(value: unknown): string | undefined {
+  const content = returnedMessage(value).content;
+  return typeof content === "string" ? content : undefined;
+}
+
+function returnedCancel(value: unknown): boolean {
+  return (value as PreCompactResult | undefined)?.cancel === true;
 }
 
 function recordValue(value: unknown): Record<string, unknown> {
@@ -205,119 +249,405 @@ function recordValue(value: unknown): Record<string, unknown> {
     : {};
 }
 
-test("a native continuation injects pending shared context on every model call and prepares its receipt", async () => {
-  const sidecar = sidecarFor("version-change", {content: "Current retry instructions", present: true, version: 9}, "pending", "retry-attempt", 8);
-  await withSidecar(sidecar, async (_root, path) => {
-    const { modelContext } = captureHandlers();
-    const ctx = extensionContext(SESSION_ID, () => { throw new Error("unexpected abort"); });
-    const messages = [{role: "user", content: "original failed request", timestamp: 1}];
-    for (let call = 0; call < 2; call++) {
-      const result = recordValue(await modelContext?.({type: "context", messages}, ctx));
-      const received = result.messages as Array<Record<string, unknown>> | undefined;
-      expect(received?.slice(0, -1)).toEqual(messages);
-      expect(received?.at(-1)).toMatchObject({role: "developer", content: expect.stringContaining("Current retry instructions")});
-      expect(recordValue((await readSidecar(path)).prepared)).toMatchObject({attemptId: "retry-attempt", sessionId: SESSION_ID, version: 9});
-    }
-    expect(messages).toEqual([{role: "user", content: "original failed request", timestamp: 1}]);
-    expect(await modelContext?.({type: "context", messages}, extensionContext(SUBAGENT_SESSION_ID, () => {}))).toBeUndefined();
+test("leaves native slash-command input byte-for-byte unchanged", async () => {
+  const sidecar = {
+    ...sidecarFor("unchanged", { content: "", present: false, version: 1 }, "committed", "slash-input"),
+    agentContext: {
+      cliReady: true,
+      memberSnapshot: {
+        count: 1,
+        members: [{ uid: "member-a", name: "Alice" }],
+      },
+    },
+  };
+  await withSidecar(sidecar, async () => {
+    const { input } = captureHandlers();
+    const transformInput = requireHandler(input, "input");
+    expect(await transformInput(
+      { type: "input", source: "rpc", text: "/autoresearch" },
+      extensionContext(SESSION_ID, () => {}),
+    )).toBeUndefined();
   });
 });
 
-test("the model context hook does not duplicate a snapshot already injected by before_agent_start", async () => {
-  await withSidecar(sidecarFor("initial", {content: "Shared rules", present: true, version: 1}, "pending", "normal-attempt"), async () => {
-    const { beforeAgentStart, modelContext } = captureHandlers();
+test("large-roster identity changes alter the persisted fingerprint without inlining members", () => {
+  const first = Array.from({ length: 11 }, (_, index) => ({
+    uid: `member-${index}`,
+    name: `Member ${index}`,
+  }));
+  const changed = first.map(member => ({ ...member }));
+  changed[10] = { uid: "member-replaced", name: "Replacement" };
+  const firstSnapshot = memberSnapshotFor(TARGET as Parameters<typeof memberSnapshotFor>[0], first);
+  const changedSnapshot = memberSnapshotFor(TARGET as Parameters<typeof memberSnapshotFor>[0], changed);
+  expect(firstSnapshot).not.toEqual(changedSnapshot);
+  const rendered = formatMemberContext(
+    TARGET as Parameters<typeof formatMemberContext>[0],
+    changedSnapshot,
+  );
+  expect(rendered).not.toContain("member-replaced");
+  expect(rendered).not.toContain("Replacement");
+});
+
+test("persists the canonical member snapshot in the user input through tools and retry", async () => {
+  const sidecar = {
+    ...sidecarFor("unchanged", { content: "", present: false, version: 1 }, "committed", "member-prefix"),
+    agentContext: {
+      cliReady: true,
+      memberSnapshot: {
+        count: 2,
+        members: [
+          { uid: "member-b", name: "Bob" },
+          { uid: "member-a", name: "Alice" },
+        ],
+      },
+    },
+  };
+  await withSidecar(sidecar, async () => {
+    const { input, modelContext } = captureHandlers();
+    const transformInput = requireHandler(input, "input");
     const ctx = extensionContext(SESSION_ID, () => {});
-    await beforeAgentStart({systemPrompt: ["base"]}, ctx);
-    expect(await modelContext?.({type: "context", messages: []}, ctx)).toBeUndefined();
+    const submittedText = "inspect the file";
+    const result = recordValue(await transformInput(
+      { type: "input", source: "rpc", text: submittedText },
+      ctx,
+    ));
+    const persistedText = result.text;
+    expect(typeof persistedText).toBe("string");
+    if (typeof persistedText !== "string") throw new Error("OMP input was not transformed to text");
+    expect(persistedText).not.toBe(submittedText);
+    expect(persistedText.startsWith(submittedText)).toBe(true);
+    expect(persistedText).toContain("member-a");
+    expect(persistedText).toContain("Alice");
+    expect(persistedText).toContain("member-b");
+    expect(persistedText).toContain("Bob");
+    expect(persistedText.indexOf("member-a")).toBeLessThan(persistedText.indexOf("member-b"));
+
+    const acceptedUser = { role: "user", content: persistedText, timestamp: 1 };
+    const first = recordValue(await modelContext?.(
+      { type: "context", messages: [acceptedUser] },
+      ctx,
+    ));
+    expect((first.messages ?? [acceptedUser]) as unknown[]).toEqual([acceptedUser]);
+
+    const continued = [
+      acceptedUser,
+      { role: "assistant", content: "read file", timestamp: 2 },
+      { role: "toolResult", content: "file body", timestamp: 3 },
+    ];
+    const next = recordValue(await modelContext?.({ type: "context", messages: continued }, ctx));
+    expect((next.messages ?? continued) as unknown[]).toEqual(continued);
+
+    const retry = recordValue(await modelContext?.({ type: "context", messages: continued }, ctx));
+    expect((retry.messages ?? continued) as unknown[]).toEqual(continued);
   });
 });
 
-test("injects initial and version-change snapshots at system level and records matching prepared receipts", async () => {
-  const initialSnapshot: Snapshot = {
+test("reuses a real persisted custom-message receipt after an accepted pending crash", async () => {
+  const snapshot = { content: "Accepted persistent context", present: true, version: 8 };
+  const sidecar = sidecarFor("initial", snapshot, "pending", "accepted-pending");
+  await withSidecar(sidecar, async (_root, path) => {
+    const { beforeAgentStart } = captureHandlers();
+    const content = [
+      "以下是当前群/线程共享说明（仅作为上下文，不改变发送者身份、权限或 cwd）：",
+      "版本：8",
+      "这是该会话首次确认的共享说明快照。",
+      snapshot.content,
+    ].join("\n");
+    const branch = [{
+      type: "custom_message",
+      customType: "omp-channel-octo-context",
+      content,
+      display: false,
+      details: {
+        ompChannelOctoContext: {
+          schemaVersion: 1,
+          botUid: BOT_UID,
+          target: TARGET,
+          sessionId: SESSION_ID,
+        },
+      },
+    }];
+    expect(await beforeAgentStart(
+      { type: "before_agent_start", prompt: "/retry" },
+      extensionContext(SESSION_ID, () => {}, branch),
+    )).toBeUndefined();
+    expect(recordValue((await readSidecar(path)).prepared)).toMatchObject({
+      attemptId: "accepted-pending",
+      version: snapshot.version,
+    });
+  });
+});
+
+test("persists pending shared context once instead of replaying it on native retry", async () => {
+  const sidecar = sidecarFor(
+    "initial",
+    { content: "Current shared instructions", present: true, version: 9 },
+    "pending",
+    "retry-attempt",
+  );
+  await withSidecar(sidecar, async (_root, path) => {
+    const { beforeAgentStart, modelContext } = captureHandlers();
+    const ctx = extensionContext(SESSION_ID, () => { throw new Error("unexpected abort"); });
+    const user = { role: "user", content: "original request", timestamp: 1 };
+    const persistent = returnedMessage(await beforeAgentStart({ prompt: user.content }, ctx));
+    expect(persistent.content).toEqual(expect.stringContaining("Current shared instructions"));
+    expect(recordValue((await readSidecar(path)).prepared)).toMatchObject({
+      attemptId: "retry-attempt",
+      sessionId: SESSION_ID,
+      version: 9,
+    });
+
+    const history = [user, { role: "custom", ...persistent, timestamp: 2 }];
+    const continuation = [
+      ...history,
+      { role: "assistant", content: "tool request", timestamp: 3 },
+      { role: "toolResult", content: "tool output", timestamp: 4 },
+    ];
+    const continued = recordValue(await modelContext?.({ type: "context", messages: continuation }, ctx));
+    expect((continued.messages ?? continuation) as unknown[]).toEqual(continuation);
+    const retry = recordValue(await modelContext?.({ type: "context", messages: continuation }, ctx));
+    expect((retry.messages ?? continuation) as unknown[]).toEqual(continuation);
+    expect(await modelContext?.(
+      { type: "context", messages: continuation },
+      extensionContext(SUBAGENT_SESSION_ID, () => {}),
+    )).toBeUndefined();
+  });
+});
+
+
+test("persists an initial shared snapshot as a session message and prepares its receipt", async () => {
+  const snapshot: Snapshot = {
     content: "Initial group instructions must be complete.",
     present: true,
     version: 4,
   };
   await withSidecar(
-    sidecarFor("initial", initialSnapshot, "pending", "attempt-initial"),
+    sidecarFor("initial", snapshot, "pending", "attempt-initial"),
     async (_root, sidecarPath) => {
       const { beforeAgentStart } = captureHandlers();
-      const originalSystemPrompt = ["base system rule", "keep this system instruction"];
-      const event = {
-        type: "before_agent_start",
-        prompt: "first group turn",
-        systemPrompt: [...originalSystemPrompt],
-      };
-      const abort = () => {
-        throw new Error("initial context unexpectedly aborted");
-      };
-
-      const initialResult = await beforeAgentStart(event, extensionContext(SESSION_ID, abort));
-      const initialPrompt = returnedSystemPrompt(initialResult);
-      expect(initialPrompt.slice(0, originalSystemPrompt.length)).toEqual(originalSystemPrompt);
-      expect(initialPrompt.at(-1)).toContain(initialSnapshot.content);
-      expect(initialPrompt.at(-1)).toContain(String(initialSnapshot.version));
-      expect(event.systemPrompt).toEqual(originalSystemPrompt);
-
-      const initialWritten = await readSidecar(sidecarPath);
-      expect(initialWritten.marker).toMatchObject({ phase: "pending", attemptId: "attempt-initial" });
-      const initialPrepared = recordValue(initialWritten.prepared);
-      expect(initialPrepared).toEqual(
-        expect.objectContaining({
-          attemptId: "attempt-initial",
-          botUid: BOT_UID,
-          sessionId: SESSION_ID,
-          version: initialSnapshot.version,
-          target: TARGET,
-        }),
-      );
-    },
-  );
-
-  const changedSnapshot: Snapshot = {
-    content: "Latest group instructions replace the previous snapshot.",
-    present: true,
-    version: 9,
-  };
-  await withSidecar(
-    sidecarFor("version-change", changedSnapshot, "pending", "attempt-version-change", 4),
-    async (_root, sidecarPath) => {
-      const { beforeAgentStart } = captureHandlers();
-      const originalSystemPrompt = ["base system rule"];
-      const event = {
-        type: "before_agent_start",
-        prompt: "group turn after update",
-        systemPrompt: [...originalSystemPrompt],
-      };
       const result = await beforeAgentStart(
-        event,
+        { type: "before_agent_start", prompt: "first group turn" },
         extensionContext(SESSION_ID, () => {
-          throw new Error("version-change context unexpectedly aborted");
+          throw new Error("initial context unexpectedly aborted");
         }),
       );
-      const systemPrompt = returnedSystemPrompt(result);
-      expect(systemPrompt.slice(0, originalSystemPrompt.length)).toEqual(originalSystemPrompt);
-      expect(systemPrompt.at(-1)).toContain(changedSnapshot.content);
-      expect(systemPrompt.at(-1)).toContain(String(changedSnapshot.version));
-      expect(systemPrompt.at(-1)).toMatch(/version|版本/i);
+      const content = returnedMessageContent(result);
+      expect(content).toEqual(expect.stringContaining(snapshot.content));
+      expect(content).toEqual(expect.stringContaining(String(snapshot.version)));
 
       const written = await readSidecar(sidecarPath);
-      const prepared = recordValue(written.prepared);
-      expect(prepared).toEqual(
-        expect.objectContaining({
-          attemptId: "attempt-version-change",
-          botUid: BOT_UID,
-          sessionId: SESSION_ID,
-          version: changedSnapshot.version,
-          target: TARGET,
-        }),
-      );
-      expect(written.marker).toMatchObject({ phase: "pending", version: changedSnapshot.version });
+      expect(written.marker).toMatchObject({ phase: "pending", attemptId: "attempt-initial" });
+      expect(recordValue(written.prepared)).toEqual(expect.objectContaining({
+        attemptId: "attempt-initial",
+        botUid: BOT_UID,
+        sessionId: SESSION_ID,
+        version: snapshot.version,
+        target: TARGET,
+      }));
     },
   );
 });
 
-test("does not return shared context for an unchanged ordinary turn", async () => {
+test("persists initial context when native goal bypasses the prompt-start hook", async () => {
+  const snapshot: Snapshot = {
+    content: "Native goal context must enter persistent session history.",
+    present: true,
+    version: 5,
+  };
+  await withSidecar(
+    sidecarFor("initial", snapshot, "pending", "attempt-native-goal"),
+    async (_root, sidecarPath) => {
+      const sent: Array<{
+        message: { customType: string; content: string; display: false; details: Record<string, unknown> };
+        options?: { triggerTurn?: boolean; deliverAs?: "steer" };
+      }> = [];
+      const { modelContext } = captureHandlers((message, options) => {
+        sent.push({ message, ...(options === undefined ? {} : { options }) });
+      });
+      const context = extensionContext(SESSION_ID, () => {
+        throw new Error("native goal context unexpectedly aborted");
+      });
+      const first = recordValue(await modelContext?.(
+        { type: "context", messages: [] },
+        context,
+      ));
+      const firstMessages = first.messages as Array<Record<string, unknown>>;
+      expect(firstMessages).toHaveLength(1);
+      expect(firstMessages[0]).toMatchObject({
+        role: "custom",
+        customType: "omp-channel-octo-context",
+        content: expect.stringContaining(snapshot.content),
+        display: false,
+      });
+      expect(sent).toHaveLength(1);
+      expect(sent[0]?.options).toEqual({ triggerTurn: false, deliverAs: "steer" });
+
+      const persistent = {
+        type: "message",
+        message: { role: "custom", ...sent[0]!.message },
+      };
+      const retry = await modelContext?.(
+        { type: "context", messages: firstMessages },
+        extensionContext(SESSION_ID, () => {}, [persistent]),
+      );
+      expect(retry).toBeUndefined();
+      expect(sent).toHaveLength(1);
+      expect(recordValue((await readSidecar(sidecarPath)).prepared)).toMatchObject({
+        attemptId: "attempt-native-goal",
+        sessionId: SESSION_ID,
+        version: snapshot.version,
+      });
+    },
+  );
+});
+
+test("restores the committed compaction snapshot immediately after its summary", async () => {
+  const previous: Snapshot = {
+    content: "Previously shared context.",
+    present: true,
+    version: 12,
+  };
+  const fresh: Snapshot = {
+    content: "Fresh instructions preserved by the successful compaction.",
+    present: true,
+    version: 13,
+  };
+  const sidecar = sidecarFor("unchanged", previous, "committed", "attempt-compacted");
+  const receipt = {
+    schemaVersion: 1,
+    requestId: "00000000-0000-4000-8000-000000000002",
+    botUid: BOT_UID,
+    target: TARGET,
+    sessionId: SESSION_ID,
+    turnId: sidecar.turnId,
+    attemptId: sidecar.attemptId,
+    snapshot: fresh,
+  };
+  await withSidecar(sidecar, async (_root, sidecarPath) => {
+    const { beforeAgentStart, modelContext } = captureHandlers();
+    const branch = [{
+      type: "compaction",
+      preserveData: { ompChannelOctoContext: receipt },
+    }];
+    const context = extensionContext(SESSION_ID, () => {
+      throw new Error("committed compaction context unexpectedly aborted");
+    }, branch);
+    expect(await beforeAgentStart(
+      { type: "before_agent_start", prompt: "continue after compaction" },
+      context,
+    )).toBeUndefined();
+
+    const original = [
+      { role: "compactionSummary", content: "Summary retained from compaction." },
+      { role: "assistant", content: "Continue the user task." },
+    ];
+    const restored = recordValue(await modelContext?.(
+      { type: "context", messages: original },
+      context,
+    ));
+    const messages = restored.messages as Array<Record<string, unknown>>;
+    expect(messages).toHaveLength(3);
+    expect(messages[0]).toEqual(original[0]);
+    const contextMessage = messages[1]!;
+    expect(contextMessage.role).toBe("custom");
+    expect(contextMessage.customType).toBe("omp-channel-octo-context");
+    expect(typeof contextMessage.content).toBe("string");
+    if (typeof contextMessage.content !== "string") throw new Error("compacted context is not text");
+    expect(contextMessage.content).toContain(fresh.content);
+    expect(contextMessage.display).toBe(false);
+    expect(messages[2]).toEqual(original[1]);
+    expect((await readSidecar(sidecarPath)).compactedContext).toMatchObject({
+      snapshot: { content: fresh.content, version: fresh.version },
+      requestId: receipt.requestId,
+      turnId: receipt.turnId,
+    });
+
+    expect(await modelContext?.(
+      { type: "context", messages },
+      context,
+    )).toBeUndefined();
+  });
+});
+
+test("fork projection removes only managed context from another chat scope", async () => {
+  const snapshot: Snapshot = {
+    content: "Fresh target context.",
+    present: true,
+    version: 2,
+  };
+  await withSidecar(
+    sidecarFor("unchanged", snapshot, "committed", "attempt-fork-target"),
+    async () => {
+      const { modelContext } = captureHandlers();
+      const sourceTarget = { channelType: 2 as const, channelId: "source-group" };
+      const sourceBusinessText = "Explicit source user business history.";
+      const foreignMemberSuffix = formatMemberContext(sourceTarget, {
+        count: 1,
+        members: [{ uid: "source-member", name: "Source member" }],
+      });
+      const foreignManaged = {
+        role: "custom",
+        customType: "omp-channel-octo-context",
+        content: "SOURCE_MEMORY_MUST_NOT_PROJECT",
+        details: {
+          ompChannelOctoContext: {
+            schemaVersion: 1,
+            botUid: BOT_UID,
+            target: sourceTarget,
+            sessionId: "source-session",
+          },
+        },
+      };
+      const currentManaged = {
+        role: "custom",
+        customType: "omp-channel-octo-context",
+        content: "Current target managed context.",
+        details: {
+          ompChannelOctoContext: {
+            schemaVersion: 1,
+            botUid: BOT_UID,
+            target: TARGET,
+            sessionId: SESSION_ID,
+          },
+        },
+      };
+      const reminderBlock = {
+        type: "text",
+        text: "<system-reminder>fork target reminder</system-reminder>",
+        metadata: { source: "runtime" },
+      };
+      const original = [
+        foreignManaged,
+        {
+          role: "user",
+          content: [
+            reminderBlock,
+            { type: "text", text: `${sourceBusinessText}\n\n${foreignMemberSuffix}` },
+          ],
+        },
+        currentManaged,
+        { role: "assistant", content: "Existing assistant history." },
+      ];
+      const projected = recordValue(await modelContext?.(
+        { type: "context", messages: original },
+        extensionContext(SESSION_ID, () => {}),
+      ));
+      expect(projected.messages).toEqual([
+        {
+          role: "user",
+          content: [
+            reminderBlock,
+            { type: "text", text: sourceBusinessText },
+          ],
+        },
+        currentManaged,
+        original[3],
+      ]);
+    },
+  );
+});
+
+test("does not add a shared message on an unchanged ordinary turn", async () => {
   const snapshot: Snapshot = {
     content: "This unchanged snapshot must stay out of the ordinary prompt.",
     present: true,
@@ -327,22 +657,14 @@ test("does not return shared context for an unchanged ordinary turn", async () =
     sidecarFor("unchanged", snapshot, "committed", "attempt-committed"),
     async (_root, sidecarPath) => {
       const { beforeAgentStart } = captureHandlers();
-      const originalSystemPrompt = ["base system rule"];
-      const event = {
-        type: "before_agent_start",
-        prompt: "ordinary unchanged turn",
-        systemPrompt: [...originalSystemPrompt],
-      };
       const result = await beforeAgentStart(
-        event,
+        { type: "before_agent_start", prompt: "ordinary unchanged turn" },
         extensionContext(SESSION_ID, () => {
           throw new Error("unchanged context unexpectedly aborted");
         }),
       );
 
-      expect(returnedSystemPrompt(result)).not.toContain(snapshot.content);
-      expect(returnedSystemPrompt(result)).toEqual(originalSystemPrompt);
-      expect(event.systemPrompt).toEqual(originalSystemPrompt);
+      expect(returnedMessageContent(result)).toBeUndefined();
       const written = await readSidecar(sidecarPath);
       expect(written.marker).toMatchObject({ phase: "committed", version: snapshot.version });
       expect(written.prepared).toBeUndefined();
@@ -350,34 +672,27 @@ test("does not return shared context for an unchanged ordinary turn", async () =
   );
 });
 
-test("restores the immutable current snapshot during compaction without changing the committed marker", async () => {
+test("cancels compaction when a fresh host read is unavailable and preserves prior context", async () => {
   const snapshot: Snapshot = {
-    content: "The immutable group snapshot must survive compaction.",
+    content: "The last confirmed snapshot must remain available after a read failure.",
     present: true,
     version: 12,
   };
   await withSidecar(
     sidecarFor("unchanged", snapshot, "committed", "attempt-committed"),
     async (_root, sidecarPath) => {
-      const { sessionCompacting } = captureHandlers();
+      const { sessionBeforeCompact } = captureHandlers();
       const before = await readSidecar(sidecarPath);
-      const result = await sessionCompacting(
-        { type: "session.compacting", sessionId: SESSION_ID, messages: [] },
-        extensionContext(SESSION_ID, () => {
-          throw new Error("compaction context unexpectedly aborted");
-        }),
+      const result = await sessionBeforeCompact?.(
+        { type: "session_before_compact", signal: new AbortController().signal },
+        extensionContext(SESSION_ID, () => {}),
       );
-      const context = returnedCompactionContext(result);
-      expect(context).toHaveLength(1);
-      expect(context[0]).toContain(snapshot.content);
-      expect(context[0]).toContain(String(snapshot.version));
-      const preserveData = recordValue((result as CompactingResult | undefined)?.preserveData);
-      expect(preserveData).toEqual(expect.objectContaining({ version: snapshot.version, target: TARGET }));
 
+      expect(returnedCancel(result)).toBe(true);
+      expect(JSON.stringify(result)).not.toContain(snapshot.content);
       const after = await readSidecar(sidecarPath);
       expect(after.snapshot).toEqual(before.snapshot);
       expect(after.marker).toEqual(before.marker);
-      expect(after.prepared).toBeUndefined();
     },
   );
 });
@@ -415,8 +730,8 @@ test("fails closed on a defective sidecar for the bound session without returnin
           process.env.OMP_CHANNEL_OCTO_CONTEXT_CHANNEL_TYPE = String(defect.scopeTarget.channelType);
           process.env.OMP_CHANNEL_OCTO_CONTEXT_CHANNEL_ID = defect.scopeTarget.channelId;
         }
-        const { beforeAgentStart, sessionCompacting } = captureHandlers();
-        const originalSystemPrompt = ["base system rule"];
+        const { beforeAgentStart, sessionBeforeCompact: compactHandler } = captureHandlers();
+        const sessionBeforeCompact = requireHandler(compactHandler, "session_before_compact");
         let abortCalls = 0;
         const context = extensionContext(SESSION_ID, () => {
           abortCalls += 1;
@@ -428,22 +743,20 @@ test("fails closed on a defective sidecar for the bound session without returnin
           {
             type: "before_agent_start",
             prompt: `defective ${defect.name} ordinary turn`,
-            systemPrompt: [...originalSystemPrompt],
           },
           context,
         );
         expect(beforeOutcome.error).toBeDefined();
-        expect(returnedSystemPrompt(beforeOutcome.value)).toEqual([]);
+        expect(returnedMessageContent(beforeOutcome.value)).toBeUndefined();
         expect(abortCalls).toBe(beforeAbortCalls + 1);
 
-        const compactAbortCalls = abortCalls;
         const compactOutcome = await invoke(
-          sessionCompacting,
-          { type: "session.compacting", sessionId: SESSION_ID, messages: [] },
+          sessionBeforeCompact,
+          { type: "session_before_compact", signal: new AbortController().signal },
           context,
         );
-        expect(compactOutcome.error).toBeDefined();
-        expect(abortCalls).toBe(compactAbortCalls + 1);
+        expect(compactOutcome.error).toBeUndefined();
+        expect(returnedCancel(compactOutcome.value)).toBe(true);
 
         if (defect.drop) {
           expect(await readFile(sidecarPath, "utf8").catch(() => undefined)).toBeUndefined();
@@ -456,9 +769,7 @@ test("fails closed on a defective sidecar for the bound session without returnin
   }
 });
 
-test("leaves a session the scope does not govern untouched instead of failing closed", async () => {
-  // OMP runs subagents in their own session inside the worker process, so their
-  // turns reach the extension while the host is driving the parent session.
+test("leaves a subagent input and compaction outside the bound chat session", async () => {
   const snapshot: Snapshot = {
     content: "Group instructions belong to the channel turn only.",
     present: true,
@@ -470,32 +781,31 @@ test("leaves a session the scope does not govern untouched instead of failing cl
       const bound = JSON.parse(await readFile(boundSessionPath(root), "utf8")) as Record<string, unknown>;
       expect(bound).toEqual({ botUid: BOT_UID, target: TARGET, sessionId: SESSION_ID });
 
-      const { beforeAgentStart, sessionCompacting } = captureHandlers();
+      const { beforeAgentStart, input, sessionBeforeCompact: compactHandler } = captureHandlers();
+      const sessionBeforeCompact = requireHandler(compactHandler, "session_before_compact");
       let abortCalls = 0;
       const context = extensionContext(SUBAGENT_SESSION_ID, () => {
         abortCalls += 1;
       });
-      const subagentSystemPrompt = ["subagent system rule"];
-      const event = {
-        type: "before_agent_start",
-        prompt: "subagent probe",
-        systemPrompt: [...subagentSystemPrompt],
-      };
+      const inputHandler = requireHandler(input, "input");
+      expect(await inputHandler(
+        { type: "input", source: "rpc", text: "subagent request" },
+        context,
+      )).toBeUndefined();
 
-      const outcome = await invoke(beforeAgentStart, event, context);
-      expect(outcome.error).toBeUndefined();
-      expect(outcome.value).toBeUndefined();
-      expect(event.systemPrompt).toEqual(subagentSystemPrompt);
-
-      const compactOutcome = await invoke(
-        sessionCompacting,
-        { type: "session.compacting", sessionId: SUBAGENT_SESSION_ID, messages: [] },
+      const outcome = await invoke(
+        beforeAgentStart,
+        { type: "before_agent_start", prompt: "subagent probe" },
         context,
       );
-      expect(compactOutcome.error).toBeUndefined();
-      expect(compactOutcome.value).toBeUndefined();
+      expect(outcome.error).toBeUndefined();
+      expect(outcome.value).toBeUndefined();
 
-      // The sub-session neither aborts nor touches the bound turn's receipt.
+      const compactOutcome = await sessionBeforeCompact(
+        { type: "session_before_compact", signal: new AbortController().signal },
+        context,
+      );
+      expect(compactOutcome).toBeUndefined();
       expect(abortCalls).toBe(0);
       expect(recordValue(await readSidecar(sidecarPath)).prepared).toBeUndefined();
     },
@@ -514,26 +824,23 @@ test("keeps the strict path in a scope that published no bound session", async (
       expect(await readFile(boundSessionPath(root), "utf8").catch(() => undefined)).toBeUndefined();
       const { beforeAgentStart } = captureHandlers();
 
-      // The prepared turn still injects, exactly as before the pointer existed.
       const prepared = await invoke(
         beforeAgentStart,
-        { type: "before_agent_start", prompt: "turn without a published scope", systemPrompt: ["base rule"] },
+        { type: "before_agent_start", prompt: "turn without a published scope" },
         extensionContext(SESSION_ID, () => {
           throw new Error("the prepared turn unexpectedly aborted");
         }),
       );
       expect(prepared.error).toBeUndefined();
-      const prompt = returnedSystemPrompt(prepared.value);
-      expect(prompt.at(-1)).toContain(snapshot.content);
+      expect(returnedMessageContent(prepared.value)).toEqual(
+        expect.stringContaining(snapshot.content),
+      );
       expect(recordValue(await readSidecar(sidecarPath)).prepared).toBeDefined();
 
-      // A session the host never prepared still fails closed instead of
-      // running contextless; the channel publishes a pointer before prompting,
-      // so this branch only covers scopes that never went through a turn.
       let abortCalls = 0;
       const unprepared = await invoke(
         beforeAgentStart,
-        { type: "before_agent_start", prompt: "unprepared session", systemPrompt: [] },
+        { type: "before_agent_start", prompt: "unprepared session" },
         extensionContext(SUBAGENT_SESSION_ID, () => {
           abortCalls += 1;
         }),

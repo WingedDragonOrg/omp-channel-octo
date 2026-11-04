@@ -15,22 +15,6 @@ import {
   type CoreHarness,
 } from "./fixtures/core-fakes";
 
-type ContextInjection = {
-  readonly snapshot?: {
-    readonly content?: string;
-    readonly version?: number;
-  };
-  readonly injectionDecision?: string;
-  readonly attemptId?: string;
-  readonly explanation?: string;
-};
-
-function contextInjection(
-  prompt: { promptContext: unknown } | undefined,
-): ContextInjection | undefined {
-  return (prompt?.promptContext as { contextInjection?: ContextInjection } | undefined)
-    ?.contextInjection;
-}
 
 /**
  * One no-agent local command completion as `LocalCommandEvent` carries it: the command
@@ -52,7 +36,7 @@ async function scrubPreparedReceipt(sidecarRoot: string, sessionId: string): Pro
   await writeContextSidecarFile(path, stripped);
 }
 
-test("injects the complete group snapshot only on the first and changed-version turns", async () => {
+test("keeps a session's loaded shared context until a new session is created", async () => {
   const harness = await createCoreHarness();
   try {
     const group = { channelId: "group-a", channelType: 2 as const };
@@ -75,14 +59,7 @@ test("injects the complete group snapshot only on the first and changed-version 
     await waitForStatus(harness.service, group, (status) => status.state === "completed");
 
     const firstPrompt = harness.workers.prompts[0];
-    const firstInjection = contextInjection(firstPrompt);
     expect(firstPrompt?.text).toBe("first group turn");
-    expect(firstInjection?.snapshot).toMatchObject({
-      content: "Group A instructions",
-      version: 3,
-    });
-    expect(firstInjection?.injectionDecision).toEqual(expect.any(String));
-    expect(firstInjection?.attemptId).toEqual(expect.any(String));
 
     // The scope publishes the session it drives before prompting and keeps it
     // as the current session; OMP opens sub-sessions in the same scope.
@@ -125,25 +102,49 @@ test("injects the complete group snapshot only on the first and changed-version 
     await waitForStatus(harness.service, group, (status) => status.state === "completed");
 
     const changedPrompt = harness.workers.prompts[2];
-    const changedInjection = contextInjection(changedPrompt);
     expect(changedPrompt?.sessionId).toBe(firstPrompt?.sessionId);
     expect(changedPrompt?.text).toBe("third group turn");
-    expect(changedInjection?.snapshot).toMatchObject({
-      content: "Group A updated instructions",
-      version: 4,
+    expect(harness.transport.groupContextCalls).toEqual([group]);
+
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "group-context-new-session",
+        ...group,
+        text: "/new",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    const newSessionId = (await harness.service.status(group)).sessionId;
+    if (!newSessionId) throw new Error("new group session was not created");
+    expect(newSessionId).not.toBe(firstPrompt?.sessionId);
+
+    harness.transport.setGroupContext(group, {
+      content: "Group A latest instructions",
+      version: 5,
+      updatedAt: "2026-09-12T00:03:00.000Z",
+      updatedBy: "admin-a",
     });
-    expect(changedInjection?.injectionDecision).toEqual(expect.any(String));
-    expect(changedInjection?.attemptId).toEqual(expect.any(String));
-    const explanation = changedInjection?.explanation ?? "";
-    expect(explanation).toMatch(/版本|更新/u);
-    expect(explanation).toContain("3");
-    expect(explanation).toContain("4");
+    await harness.service.handleInbound(
+      inbound({
+        messageId: "group-context-fresh-session",
+        ...group,
+        text: "first turn in new session",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(4);
+    await waitForStatus(harness.service, group, (status) => status.state === "completed");
+
+    const freshSessionPrompt = harness.workers.prompts[3];
+    expect(freshSessionPrompt?.sessionId).toBe(newSessionId);
+    expect(freshSessionPrompt?.text).toBe("first turn in new session");
+    expect(harness.transport.groupContextCalls).toEqual([group, group]);
   } finally {
     await closeCoreHarness(harness);
   }
 });
 
-test("reads group context from transport on every group turn and keeps private chats isolated", async () => {
+test("loads group context once per session and keeps private chats isolated", async () => {
   const harness = await createCoreHarness();
   try {
     const group = { channelId: "group-fresh", channelType: 2 as const };
@@ -197,7 +198,7 @@ test("reads group context from transport on every group turn and keeps private c
     expect(privatePrompt?.text).toBe("private task");
     expect(privatePrompt?.text).not.toContain("must never be injected");
     expect(privatePrompt?.text).not.toContain("群说明是群共享上下文");
-    expect(harness.transport.groupContextCalls).toEqual([group, group]);
+    expect(harness.transport.groupContextCalls).toEqual([group]);
   } finally {
     await closeCoreHarness(harness);
   }
@@ -229,14 +230,7 @@ test("a recovered group session does not repeat a committed unchanged snapshot",
 
     const firstPrompt = first.workers.prompts[0];
     if (!firstPrompt) throw new Error("first recovery prompt was not recorded");
-    const firstInjection = contextInjection(firstPrompt);
     expect(firstPrompt.text).toBe("before service recovery");
-    expect(firstInjection?.snapshot).toMatchObject({
-      content: "persistent group instructions",
-      version: 8,
-    });
-    expect(firstInjection?.injectionDecision).toEqual(expect.any(String));
-    expect(firstInjection?.attemptId).toEqual(expect.any(String));
     sessionId = firstPrompt.sessionId;
     expect(sessionId).toBeDefined();
 
@@ -264,7 +258,7 @@ test("a recovered group session does not repeat a committed unchanged snapshot",
     expect(recoveredPrompt?.sessionId).toBe(sessionId);
     expect(recoveredPrompt?.text).toBe("after service recovery");
     expect(recoveredPrompt?.text).not.toContain("persistent group instructions");
-    expect(recoveredPrompt?.text).not.toContain('"groupContext"');
+    expect(first.transport.groupContextCalls).toEqual([group]);
   } finally {
     if (recovered) {
       await closeCoreHarness(recovered);
@@ -339,7 +333,7 @@ test("a local-only command completes without a prepared receipt and leaves the c
       (status) => status.state === "completed" || status.state === "failed",
     );
     expect(localStatus.state).toBe("completed");
-    expect(contextInjection(workers.prompts[0])?.injectionDecision).toBe("initial");
+    expect(workers.prompts[0]?.text).toBe("/autoresearch");
 
     await harness.service.handleInbound(
       inbound({
@@ -359,8 +353,7 @@ test("a local-only command completes without a prepared receipt and leaves the c
 
     // The local-only prompt must not commit the ledger: the next generation still sees the
     // first injection of this version and commits it with its own real receipt.
-    expect(contextInjection(workers.prompts[1])?.injectionDecision).toBe("initial");
-    expect(contextInjection(workers.prompts[1])?.snapshot?.version).toBe(2);
+    expect(workers.prompts[1]?.text).toBe("model turn after local command");
   } finally {
     await closeCoreHarness(harness);
   }
@@ -400,7 +393,7 @@ test("a model turn that produced real events still requires its own prepared rec
     );
     expect(status.state).toBe("failed");
     // The failure is the receipt guard, not an injection-less prompt.
-    expect(contextInjection(workers.prompts[0])?.injectionDecision).toBe("initial");
+    expect(workers.prompts[0]?.text).toBe("model turn with ignored receipt");
   } finally {
     await closeCoreHarness(harness);
   }

@@ -489,7 +489,9 @@ export function emitWorkerEvent(active: PromptRun, frame: RpcFrame, subagentFram
 	if (frame.type === "message_start") {
 		const message = frame.message;
 		if (isUserSteerMessage(message)) {
-			active.onEvent({ type: "steer_consumed", text: messageText(message), atMs: eventTime(frame.timestamp) });
+			const text = messageText(message);
+			const originalText = typeof message.originalText === "string" ? message.originalText : text;
+			active.onEvent({ type: "steer_consumed", text, originalText, atMs: eventTime(frame.timestamp) });
 			return;
 		}
 		if (isRecord(message) && message.role === "assistant") {

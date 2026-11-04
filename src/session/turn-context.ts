@@ -1,34 +1,96 @@
 /**
- * 维护单个任务的共享群说明事务，以及成员/固定操作指引的临时 agent context。
+ * 维护单个任务的共享群说明事务，以及成员输入所需的临时 agent context。
  * `service.ts` 的 `runTask` 依次调用 `load` → `workerScope` → `prepare` → `complete`；
  * steering 的 context 写入独立 overlay，普通输入先暂存，OMP 确认消息进入模型上下文后才生效，
  * 避免覆盖 extension 同时写入的共享上下文 receipt。
  *
  * 模块不依赖 `service.ts`：store、transport、stateDir、bot 身份和本回合目标都由 `CoreService`
  * 以窄端口注入。一个 task 一个 `TurnContext`：`load()` 取共享快照，`prepare(sessionId,
- * agentContext)` 在绑定会话确认之后发布本回合 sidecar，`complete(sessionId, localOnly)` 只在
- * 任务普通成功分支结算共享说明（校验 prepared receipt 与 marker CAS，然后清理 sidecar）。
- * 取消/中断/失败路径不调用它，本回合的 sidecar 保留给下一次重放。
+ * agentContext)` 在绑定会话确认之后发布本回合 sidecar，`complete(sessionId, localOnly)` 结算
+ * 共享说明并保留会话快照，供下一普通 turn 稳定复用。
+ * 取消/中断/失败路径不调用它，本回合的 sidecar 留给同一 session 重放。
  */
 
 import { createHash, randomUUID } from "node:crypto";
+import { access, mkdir, readFile, readdir, rm, watch } from "node:fs/promises";
 import { join } from "node:path";
 import type { ChannelTransport, ChatTarget, ContextInjection, GroupContext, WorkerOptions } from "../contracts.ts";
+import type { AgentContext } from "./agent-context.ts";
+import type { ChannelStore } from "../store/index.ts";
 import {
+  FRESH_CONTEXT_READ_SCHEMA_VERSION,
+  freshContextReadPaths,
+  isContextSidecarObject,
   normalizeGroupContext,
   emptyGroupContext,
   preparedReceiptMatches,
+  contextSidecarPath,
   readContextSidecar,
-  readAgentContextOverlay,
-  removeContextSidecar,
   writeBoundSession,
+  readAgentContextOverlay,
   writeContextSidecar,
   writeAgentContextOverlay,
+  writeFreshContextReadFile,
   type ContextSidecar,
+  type FreshContextReadPaths,
   type StagedAgentContext,
+  type FreshContextReadResponse,
 } from "./context-sidecar.ts";
-import type { AgentContext } from "./agent-context.ts";
-import type { ChannelStore } from "../store/index.ts";
+
+const FRESH_CONTEXT_READ_TIMEOUT_MS = 5_000;
+const FRESH_CONTEXT_READ_POLL_MS = 20;
+const FRESH_CONTEXT_REQUEST_SUFFIX = ".request.json";
+
+function waitForSignal(milliseconds: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  const deferred = Promise.withResolvers<void>();
+  const finish = (): void => {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", finish);
+    deferred.resolve();
+  };
+  const timer = setTimeout(finish, milliseconds);
+  signal.addEventListener("abort", finish, { once: true });
+  if (signal.aborted) finish();
+  return deferred.promise;
+}
+
+function waitForAbortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error("fresh context read aborted"));
+  const aborted = Promise.withResolvers<never>();
+  const onAbort = (): void => aborted.reject(signal.reason ?? new Error("fresh context read aborted"));
+  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) onAbort();
+  return Promise.race([operation, aborted.promise]).finally(() => {
+    signal.removeEventListener("abort", onAbort);
+  });
+}
+
+async function waitForFile(path: string, signal: AbortSignal): Promise<boolean> {
+  while (!signal.aborted) {
+    try {
+      await access(path);
+      return true;
+    } catch {
+      await waitForSignal(FRESH_CONTEXT_READ_POLL_MS, signal);
+    }
+  }
+  return false;
+}
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+
+function sameTarget(left: ChatTarget, right: ChatTarget): boolean {
+  return left.channelType === right.channelType && left.channelId === right.channelId;
+}
+
 
 /**
  * What one turn may touch outside its own state: its shared-context ledger and read, plus bound
@@ -37,12 +99,13 @@ import type { ChannelStore } from "../store/index.ts";
 export interface TurnContextDeps {
   readonly store: Pick<
     ChannelStore,
-    "getContextLedger" | "prepareContextInjection" | "commitContextInjection"
+    "getContextLedger" | "prepareContextInjection" | "commitContextInjection" | "clearContextLedger"
   >;
   readonly transport: Pick<ChannelTransport, "getGroupContext">;
   readonly stateDir: string;
   readonly botUid: string;
   readonly target: ChatTarget;
+  readonly cliReady: boolean;
 }
 
 export class TurnContext {
@@ -60,21 +123,86 @@ export class TurnContext {
   private needsCommit = false;
   /** scope 侧车目录：同一个回合里 scope、bound session 与 sidecar 复用同一份路径。 */
   private root: string | undefined;
+  /** 成功 compaction 的 native preserveData，下一 task 可据此恢复同一完整快照。 */
+  private compactedContextReceipt: ContextSidecar["compactedContext"];
+  /** Fresh candidate awaiting proof of a committed native compaction entry. */
+  private pendingCompaction: ContextSidecar["pendingCompaction"];
 
   constructor(private readonly deps: TurnContextDeps) {}
 
   /**
    * 读取本回合的群说明快照；私聊只使用该门面发布会话作用域，不触碰群说明 API。
    */
-  async load(): Promise<GroupContext | null> {
+  async load(sessionId: string): Promise<GroupContext | null> {
     if (this.deps.target.channelType === 1) {
       this.snapshot = emptyGroupContext();
       this.hasSharedContext = false;
       return null;
     }
-    this.snapshot = normalizeGroupContext(await this.deps.transport.getGroupContext(this.deps.target));
+    const path = contextSidecarPath(this.sidecarRoot(), sessionId);
+    let cached: ContextSidecar | undefined;
+    try {
+      await access(path);
+      cached = await readContextSidecar(path);
+      if (
+        cached.botUid !== this.deps.botUid
+        || cached.sessionId !== sessionId
+        || !sameTarget(cached.target, this.deps.target)
+      ) {
+        throw new Error("群说明会话快照身份不匹配");
+      }
+    } catch (error) {
+      if (!isContextSidecarObject(error) || error.code !== "ENOENT") throw error;
+    }
+    if (!cached) {
+      this.compactedContextReceipt = undefined;
+      this.pendingCompaction = undefined;
+      this.deps.store.clearContextLedger(this.deps.botUid, this.deps.target, sessionId);
+      this.snapshot = normalizeGroupContext(await this.deps.transport.getGroupContext(this.deps.target));
+    } else {
+      this.compactedContextReceipt = cached.compactedContext;
+      this.pendingCompaction = cached.pendingCompaction;
+      const compactedSnapshot = cached.compactedContext?.snapshot;
+      let effectiveSnapshot = cached.snapshot;
+      if (compactedSnapshot && compactedSnapshot.version >= cached.snapshot.version) {
+        if (
+          compactedSnapshot.version === cached.snapshot.version
+          && (
+            compactedSnapshot.present !== cached.snapshot.present
+            || compactedSnapshot.content !== cached.snapshot.content
+          )
+        ) {
+          throw new Error("同版本群说明 sidecar 与压缩快照内容不一致");
+        }
+        this.commitCompactedContext(sessionId, compactedSnapshot.version);
+        effectiveSnapshot = compactedSnapshot;
+      }
+      this.snapshot = normalizeGroupContext(effectiveSnapshot);
+    }
     this.hasSharedContext = true;
     return this.snapshot;
+  }
+
+
+  /** A committed native compaction is durable evidence that its fresh snapshot reached history. */
+  private commitCompactedContext(sessionId: string, version: number): void {
+    const existing = this.deps.store.getContextLedger(this.deps.botUid, this.deps.target, sessionId);
+    if (existing && existing.version > version) throw new Error("群说明压缩快照版本回退");
+    const ledger = !existing || existing.version < version
+      ? this.deps.store.prepareContextInjection(this.deps.botUid, this.deps.target, sessionId, version)
+      : existing;
+    if (
+      ledger.phase === "pending"
+      && !this.deps.store.commitContextInjection(
+        this.deps.botUid,
+        this.deps.target,
+        sessionId,
+        version,
+        ledger.attemptId,
+      )
+    ) {
+      throw new Error("压缩已提交快照未能结算群说明台账");
+    }
   }
 
   /** 组装群/子区 worker options 时的 scope。 */
@@ -83,6 +211,7 @@ export class TurnContext {
       sidecarRoot: this.sidecarRoot(),
       botUid: this.deps.botUid,
       target: { ...this.deps.target },
+      cliReady: this.deps.cliReady,
     };
   }
 
@@ -152,6 +281,8 @@ export class TurnContext {
         attemptId,
       },
       ...(previousVersion === undefined ? {} : { previousVersion }),
+      ...(this.compactedContextReceipt === undefined ? {} : { compactedContext: this.compactedContextReceipt }),
+      ...(this.pendingCompaction === undefined ? {} : { pendingCompaction: this.pendingCompaction }),
       agentContext,
     };
     // The scope publishes the session this turn belongs to before its first model request.
@@ -206,6 +337,153 @@ export class TurnContext {
     await writeAgentContextOverlay(sidecarPath, sidecar, overlay.agentContext, pending);
   }
 
+  /**
+   * Serve exact-turn fresh reads requested by the OMP extension during compaction.
+   * The worker and host exchange private files under the current turn directory; no
+   * listener or transport capability is exposed to the extension process.
+   */
+  async serveFreshContextReads(signal: AbortSignal): Promise<void> {
+    if (!this.hasSharedContext) return;
+    const sidecarPath = this.sidecarPath;
+    const turnId = this.turnId;
+    if (!sidecarPath || !turnId) return;
+
+    let directory: string;
+    try {
+      directory = freshContextReadPaths(this.sidecarRoot(), turnId, randomUUID()).directory;
+    } catch {
+      console.error("[context] fresh compaction read bridge has an invalid turn identity");
+      return;
+    }
+
+    const scanRequests = async (): Promise<void> => {
+      const entries = await readdir(directory, { withFileTypes: true }).catch((error: unknown) => {
+        if (isContextSidecarObject(error) && error.code === "ENOENT") return [];
+        throw error;
+      });
+      const requests = entries
+        .filter(entry => entry.isFile() && entry.name.endsWith(FRESH_CONTEXT_REQUEST_SUFFIX))
+        .sort((left, right) => left.name.localeCompare(right.name));
+      for (const entry of requests) {
+        if (signal.aborted) break;
+        const requestId = entry.name.slice(0, -FRESH_CONTEXT_REQUEST_SUFFIX.length);
+        try {
+          await this.respondToFreshContextRequest(
+            freshContextReadPaths(this.sidecarRoot(), turnId, requestId),
+            requestId,
+            sidecarPath,
+            turnId,
+            signal,
+          );
+        } catch {
+          if (!signal.aborted) {
+            console.error("[context] fresh compaction read bridge could not serve a request");
+          }
+        }
+      }
+    };
+
+    try {
+      await mkdir(directory, { recursive: true });
+      const watcher = watch(directory, { signal });
+      await scanRequests();
+      for await (const event of watcher) {
+        if (signal.aborted) break;
+        const filename = event.filename?.toString();
+        if (filename === undefined || filename.endsWith(FRESH_CONTEXT_REQUEST_SUFFIX)) {
+          await scanRequests();
+        }
+      }
+    } catch {
+      if (!signal.aborted) console.error("[context] fresh compaction read bridge stopped unexpectedly");
+    } finally {
+      await rm(directory, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  private async respondToFreshContextRequest(
+    paths: FreshContextReadPaths,
+    requestId: string,
+    sidecarPath: string,
+    turnId: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const sidecar = await this.currentTurnSidecar(sidecarPath);
+    const identity = {
+      schemaVersion: FRESH_CONTEXT_READ_SCHEMA_VERSION,
+      requestId,
+      botUid: this.deps.botUid,
+      target: { ...this.deps.target },
+      sessionId: sidecar.sessionId,
+      turnId,
+    } as const;
+    const fail = async (error: string): Promise<void> => {
+      await writeFreshContextReadFile(paths.response, { ...identity, error } satisfies FreshContextReadResponse);
+    };
+
+    try {
+      const request = JSON.parse(await readFile(paths.request, "utf8")) as unknown;
+      if (
+        !isContextSidecarObject(request)
+        || request.schemaVersion !== FRESH_CONTEXT_READ_SCHEMA_VERSION
+        || request.requestId !== requestId
+        || request.botUid !== identity.botUid
+        || request.sessionId !== identity.sessionId
+        || request.turnId !== identity.turnId
+        || !isContextSidecarObject(request.target)
+        || request.target.channelType !== identity.target.channelType
+        || request.target.channelId !== identity.target.channelId
+      ) {
+        await fail("fresh context read identity mismatch");
+        return;
+      }
+    } catch {
+      if (!(await fileExists(paths.cancel))) await fail("fresh context read request is unavailable");
+      return;
+    }
+
+    const requestController = new AbortController();
+    const watcherController = new AbortController();
+    const timeoutSignal = AbortSignal.timeout(FRESH_CONTEXT_READ_TIMEOUT_MS);
+    const readSignal = AbortSignal.any([signal, requestController.signal, timeoutSignal]);
+    let cancelled = false;
+    const cancellationWatch = waitForFile(
+      paths.cancel,
+      AbortSignal.any([signal, watcherController.signal]),
+    ).then(found => {
+      if (found && !signal.aborted) {
+        cancelled = true;
+        requestController.abort(new Error("fresh context read cancelled"));
+      }
+    });
+
+    try {
+      if (await fileExists(paths.cancel)) return;
+      const snapshot = normalizeGroupContext(await waitForAbortable(
+        Promise.resolve().then(() => this.deps.transport.getGroupContext(this.deps.target, readSignal)),
+        readSignal,
+      ));
+      if (cancelled || signal.aborted) return;
+      const current = await this.currentTurnSidecar(sidecarPath);
+      if (current.turnId !== turnId || current.sessionId !== identity.sessionId) {
+        await fail("fresh context read turn changed");
+        return;
+      }
+      if (await fileExists(paths.cancel)) return;
+      await writeFreshContextReadFile(paths.response, { ...identity, snapshot } satisfies FreshContextReadResponse);
+    } catch {
+      if (!cancelled && !signal.aborted && !(await fileExists(paths.cancel))) {
+        console.error("[context] fresh group context read failed; compaction will be cancelled");
+        await fail("fresh group context read failed").catch(() => {});
+      }
+    } finally {
+      watcherController.abort();
+      requestController.abort();
+      await cancellationWatch;
+      await rm(paths.request, { force: true }).catch(() => {});
+    }
+  }
+
   private async currentTurnSidecar(sidecarPath: string): Promise<ContextSidecar> {
     const sidecar = await readContextSidecar(sidecarPath);
     if (
@@ -222,9 +500,9 @@ export class TurnContext {
 
   /**
    * 任务普通成功分支的结算：`needsCommit && !localOnly` 时校验 prepared receipt 与 marker
-   * CAS，随后无论是否提交都清理本回合的 sidecar。`sessionId` 必须是当时 worker 的会话，不是
-   * `prepare` 缓存下来的那个；本地命令回合（无 agent 生成，不会写 prepared receipt）跳过提交
-   * 但仍清理 sidecar。取消/中断/失败路径不调用本方法，sidecar 保留待重放。
+   * CAS。结算后保留会话 snapshot sidecar，供同一 binding 的后续普通 turn 稳定复用。
+   * `sessionId` 必须是当时 worker 的会话；本地命令回合不结算。取消/失败路径不调用本方法，
+   * pending sidecar 留给同一 session 重放。
    */
   async complete(sessionId: string, localOnly: boolean): Promise<void> {
     if (this.needsCommit && !localOnly) {
@@ -234,35 +512,44 @@ export class TurnContext {
         throw new Error("群说明注入状态缺失，未提交");
       }
       const sidecar = await readContextSidecar(sidecarPath);
-      if (
-        sidecar.marker.phase !== "pending"
-        || sidecar.botUid !== this.deps.botUid
-        || sidecar.sessionId !== sessionId
-        || sidecar.target.channelType !== this.deps.target.channelType
-        || sidecar.target.channelId !== this.deps.target.channelId
-        || sidecar.snapshot.version !== injection.snapshot.version
-        || sidecar.turnId !== this.turnId
-        || sidecar.attemptId !== injection.attemptId
-        || !sidecar.prepared
-        || !preparedReceiptMatches(sidecar, sidecar.prepared)
-      ) {
-        throw new Error("群说明注入未获得匹配的 prepared receipt，未提交");
-      }
-      if (!this.deps.store.commitContextInjection(
-        this.deps.botUid,
-        this.deps.target,
-        sessionId,
-        injection.snapshot.version,
-        injection.attemptId,
-      )) {
-        throw new Error("群说明 marker CAS 提交失败，保留待重放状态");
+      const compacted = sidecar.compactedContext;
+      if (compacted && compacted.snapshot.version >= injection.snapshot.version) {
+        if (
+          sidecar.marker.phase !== "pending"
+          || sidecar.botUid !== this.deps.botUid
+          || sidecar.sessionId !== sessionId
+          || !sameTarget(sidecar.target, this.deps.target)
+          || sidecar.turnId !== this.turnId
+        ) {
+          throw new Error("压缩快照收据与当前会话不匹配");
+        }
+        this.commitCompactedContext(sessionId, compacted.snapshot.version);
+      } else {
+        if (
+          sidecar.marker.phase !== "pending"
+          || sidecar.botUid !== this.deps.botUid
+          || sidecar.sessionId !== sessionId
+          || !sameTarget(sidecar.target, this.deps.target)
+          || sidecar.snapshot.version !== injection.snapshot.version
+          || sidecar.turnId !== this.turnId
+          || sidecar.attemptId !== injection.attemptId
+          || !sidecar.prepared
+          || !preparedReceiptMatches(sidecar, sidecar.prepared)
+        ) {
+          throw new Error("群说明注入未获得匹配的 prepared receipt，未提交");
+        }
+        if (!this.deps.store.commitContextInjection(
+          this.deps.botUid,
+          this.deps.target,
+          sessionId,
+          injection.snapshot.version,
+          injection.attemptId,
+        )) {
+          throw new Error("群说明 marker CAS 提交失败，保留待重放状态");
+        }
       }
     }
     if (this.sidecarPath) {
-      const sidecar = await readContextSidecar(this.sidecarPath).catch(() => undefined);
-      if (sidecar?.turnId === this.turnId) {
-        await removeContextSidecar(this.sidecarPath).catch(() => {});
-      }
       this.sidecarPath = undefined;
       this.turnId = undefined;
     }

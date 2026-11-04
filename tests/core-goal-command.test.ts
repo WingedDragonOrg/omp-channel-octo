@@ -134,7 +134,7 @@ test("/goal set runs a structured create, and live controls show and preserve th
       goalStarted.resolve();
       const appended = await waitForAppend();
       steered.resolve(appended);
-      emit({ type: "steer_consumed", text: appended.text, atMs: Date.now() });
+      emit({ type: "steer_consumed", text: appended.text, originalText: appended.text, atMs: Date.now() });
       await settleGoal.promise;
       return { goal, state: { enabled: true, mode: "active", goal } };
     };

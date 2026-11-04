@@ -22,6 +22,7 @@ import type {
 } from "../contracts.ts";
 import { RESUME_CONTINUATION_PROMPT, TaskStartupError, WorkerGoalError, taskStartupError } from "../contracts.ts";
 import { loadValidatedSessionState, type ProjectSessionState } from "../session/project-session.ts";
+import { formatAgentGuidance } from "../session/agent-context.ts";
 import {
 	RpcCommand,
 	RpcFrame,
@@ -261,6 +262,7 @@ class RpcWorker implements OmpWorker {
 	#streaming = false;
 	#activeTools = new Map<string, HostTool>();
 	#hostCalls = new Map<string, HostCall>();
+	#pendingSteerReceipts: Array<{ text: string }> = [];
 	#sessionFile = "";
 	#sessionId = "";
 	/**
@@ -951,8 +953,16 @@ class RpcWorker implements OmpWorker {
 		if (typeof text !== "string" || text.trim().length === 0) {
 			throw new Error("OMP steering text must be a non-empty string");
 		}
-		const response = await this.#request({ type: "steer", message: text }, DEFAULT_REQUEST_TIMEOUT_MS);
-		this.#assertSuccess(response, "steer");
+		const receipt = { text };
+		this.#pendingSteerReceipts.push(receipt);
+		try {
+			const response = await this.#request({ type: "steer", message: text }, DEFAULT_REQUEST_TIMEOUT_MS);
+			this.#assertSuccess(response, "steer");
+		} catch (error) {
+			const index = this.#pendingSteerReceipts.indexOf(receipt);
+			if (index >= 0) this.#pendingSteerReceipts.splice(index, 1);
+			throw error;
+		}
 	}
 
 	async abortTurn(): Promise<void> {
@@ -1575,7 +1585,19 @@ class RpcWorker implements OmpWorker {
 					this.#activeTools.get(toolName)?.onResultAccepted?.(toolCallId);
 				}
 			}
-			emitWorkerEvent(active, frame, this.#subagentFrames);
+			const message = frame.message;
+			let projectedFrame = frame;
+			if (
+				frame.type === "message_start"
+				&& isRecord(message)
+				&& message.role === "user"
+				&& message.steering === true
+				&& message.attribution !== "agent"
+			) {
+				const receipt = this.#pendingSteerReceipts.shift();
+				if (receipt) projectedFrame = { ...frame, message: { ...message, originalText: receipt.text } };
+			}
+			emitWorkerEvent(active, projectedFrame, this.#subagentFrames);
 		} catch (error) {
 			this.#rejectPrompt(active, asError(error, "OMP event callback failed"));
 		}
@@ -1718,6 +1740,16 @@ class OmpWorkerFactory implements WorkerFactory {
 			"--session-dir",
 			sessionDir,
 		];
+		if (options.contextScope) {
+			command.push(
+				"--append-system-prompt",
+				formatAgentGuidance(
+					options.contextScope.botUid,
+					options.contextScope.target,
+					options.contextScope.cliReady,
+				),
+			);
+		}
 		if (options.model) command.push("--model", options.model);
 		if (options.sessionFile) command.push("--resume", resolve(options.sessionFile));
 		else if (forkSourceState) command.push("--fork", forkSourceState.sessionFile);

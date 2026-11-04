@@ -112,7 +112,7 @@ test("a steered message reports the moment it joins the running turn", async () 
       if (text !== "first task") return;
       started.release();
       const appended = await waitForAppend();
-      emit({ type: "steer_consumed", text: appended.text, atMs: Date.now() });
+      emit({ type: "steer_consumed", text: appended.text, originalText: appended.text, atMs: Date.now() });
     },
   });
   try {

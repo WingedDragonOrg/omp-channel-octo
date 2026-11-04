@@ -729,6 +729,25 @@ describe("Octo text send and target context", () => {
     expect(currentFixture.getLatestEditedText(receipt.messageId!)).toBeUndefined();
   });
 
+  test("aborts an in-flight group context request through its AbortSignal", async () => {
+    fixture = await createOctoProtocolFixture({ groupContextDelayMs: 100 });
+    transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
+    await transport.initialize();
+    const currentFixture = fixture;
+    const abort = new AbortController();
+    const pending = transport.getGroupContext({ channelId: "aborted-context", channelType: 2 }, abort.signal);
+    await waitForFixture(
+      () => currentFixture.groupContextRequests.length === 1 ? true : undefined,
+      1_000,
+      "getGroupContext request did not reach the protocol fixture",
+    );
+    abort.abort();
+    await expect(pending).rejects.toThrow(/abort/i);
+    await delayed(120);
+    expect(currentFixture.groupContextRequests).toHaveLength(1);
+  });
+
+
   test("resolves DM, group, and thread context through their actual REST paths", async () => {
     const groupId = "group/中文 & name";
     const threadId = `${groupId}____thread/42`;

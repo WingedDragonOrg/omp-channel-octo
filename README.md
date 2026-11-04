@@ -170,11 +170,17 @@ Git 行数是 **`HEAD → 当前工作树` 的 tracked 净变化**，显示 `+N/
 
 审查指令要求只读，不自动修改文件或执行 stage、commit、merge、push、部署；这只是给审查助手的行为提示，不是沙箱。OMP 仍按宿主现有授权使用工具，因此不要把 `/review` 当作权限隔离或安全边界。
 
-群或子区的新任务执行时，服务直接读取当前聊天的成员信息；运行中追加 steering 时重新读取。10 人及以下向助手提供名称和 UID，更多成员时提供人数和查询入口。成员信息读取失败时，任务不会启动；steering 不会并入，已运行的任务继续。`/retry` 保持 OMP 原生重试语义，不重新读取成员。
+群或子区的新任务执行时，服务直接读取当前聊天的成员信息；运行中追加 steering 时重新读取。10 人及以下提供名称和 UID，更多成员时提供人数和查询入口。快照随对应用户输入保存：首次一次，之后只在语义变化时追加；名单顺序变化不算变动。已进入历史的快照保持原位置，未消费的 steering 不提前生效。成员读取失败时新任务不启动、steering 不并入，已有任务继续。原生 `/retry` 和重启续接保留历史，不重新读取成员或重放原始输入。
+
+大群通过规范化名单指纹识别人数不变的换人或改名，仍不内联完整名单。原生 slash 命令的完整正文保持不变。
 
 助手可以在普通回复中使用结构化 mention 点名成员，完整的 mention 和后续正文在同一条消息中流式更新；代码示例和普通 `@名字` 文本不会自动点名。正文超过单条消息长度限制时按既有规则分段。
 
 安装并配置 `octo-cli` 后，助手可按当前 Bot 的权限使用 Loop、Docs、Drive、HTML、消息、文件、邮件和 Marketplace 等能力；它会通过 CLI 的 `skills`、`schema` 和帮助按需发现具体操作。
+
+聊天身份、mention、Memory 维护和 CLI 发现指引固定放在 system；普通回合、工具续调、原生 retry 与重启续接使用相同位置和内容，CLI 真实就绪状态变化除外。worker 内非绑定的 task/eval session 不自动获得聊天专属上下文。
+
+GROUP.md / THREAD.md（包括固定 Memory 区段）在新 session 和 compact 边界读取当前聊天最新内容。普通回合沿用已加载说明，`/move` 和重启不触发新 session 刷新。需要及时查看更新时，助手可调用现有 `description-read`；工具结果追加到对话，写前读取凭据规则保持不变。`description-write` 持久写入与会话刷新分开，compact 读取失败会取消压缩并保留已有记忆。详见[当前事实与上下文稳定性规格](docs/specs/2026-11-04-group-thread-current-facts-design.md)。
 
 ### Loop workspace 与任务子区
 
@@ -191,6 +197,8 @@ owner 在已开通主群执行 `/bind loop <选择器>`。UUID 直接验证；�
 `/fork [子区名称]` 与独立 `fork` 宿主工具（仅可选 `name`）只从当前聊天的精确持久绑定分叉。主群创建所属子区，子区创建同父群的同级子区。源回合运行中也立即使用受管理的 OMP `--fork` 进程读取已落盘历史；准备进程退出确认后才发布新绑定，新子区等待实际新消息再 `--resume`。未落盘的首轮、失效绑定或未知进程结果明确失败，不自动创建空会话。
 
 新旧 session 独立推进，文件共用同一目录，不新建 Git worktree。新子区不复制源工作区归属、模型显式覆盖、待答问题、队列、goal 续跑授权或上下文注入回执。模型按新子区自身显式设置、父群子区默认、OMP 自行决定的顺序解析。已知部分结果保留；远端创建结果不明时不再次创建。
+
+fork 目标保留原生分叉历史及显式业务正文；发送给模型时排除来源聊天自动注入的说明和成员后缀，加载目标聊天自己的说明与成员快照。
 
 `/tan <用户请求>` 在沿用目录的 fork 子区执行请求：子区显示进度、提问和结果，源聊天收到派发回执。默认 `listen=merge`；可在子区设为 `task` 以按既有策略回传终态。目标任务在子区用 `/cancel` 取消；准备期间源聊天 `/cancel` 同时取消该聊天当前任务及分叉准备。该命令由 channel 实现，独立 session 共用文件，任何文件修改对双方可见。详细契约见 `docs/specs/2026-11-04-tan-fork-task-design.md`。
 
@@ -363,14 +371,17 @@ bun test
 
 测试覆盖权限、持久化、流式投递、重启恢复、工作区和 RPC 生命周期；HTTP/WebSocket 与真实子进程夹具不调用模型。默认 transport 夹具的 Bot ID 按测试进程隔离；显式 Bot ID 仍用于同身份互斥与恢复验证。
 
-目标与 BTW 生命周期另有显式真实 OMP 验收，使用隔离的配置/会话、有限 localhost 模型替身和本地 Octo fixture，不需要模型凭据，也不连接常驻 Bot：
+上下文、目标与 BTW 另有显式真实 OMP 验收，使用隔离的配置/会话、有限 localhost 模型替身和本地 Octo fixture，不需要模型凭据，也不连接常驻 Bot：
 
 ```sh
 bun tests/benchmarks/goal.ts
 # 或 OMP_REAL_COMMAND=/绝对路径/omp bun tests/benchmarks/goal.ts
 bun tests/benchmarks/btw.ts
+bun tests/benchmarks/context.ts
 bun tests/benchmarks/restart.ts
 ```
+
+`context.ts` 捕获实际 provider 请求，比较固定 system 与消息前缀，验证成员输入归属、retry/恢复、compact fresh read、主动 reread 及 task/eval 隔离。它证明接线和上下文内容，不测量真实 provider cache 命中率；失败时保留并输出临时诊断目录，成功后清理。
 
 涉及执行卡片布局的改动还需运行真实预览，并在 Octo 客户端检查：
 

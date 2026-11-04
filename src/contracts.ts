@@ -181,7 +181,8 @@ export interface ChannelTransport {
   downloadAttachment(request: AttachmentDownload): Promise<number>;
   /** Best-effort Octo server-side transcription of a saved audio file; `null` when unavailable. */
   transcribeAudio(path: string, signal?: AbortSignal): Promise<string | null>;
-  getGroupContext(target: ChatTarget): Promise<GroupContext | null>;
+  /** Fetches current group/thread context; `signal` cancels the bounded HTTP request. */
+  getGroupContext(target: ChatTarget, signal?: AbortSignal): Promise<GroupContext | null>;
   updateGroupContext(
     target: ChatTarget,
     content: string,
@@ -365,6 +366,9 @@ export interface TextEvent {
  */
 export interface SteerConsumedEvent {
   type: "steer_consumed";
+  /** The user text before OMP input hooks added persistent context to the native message. */
+  originalText: string;
+  /** The exact user body OMP persisted and passed to the provider, including input-hook context. */
   text: string;
   atMs: number;
 }
@@ -504,6 +508,8 @@ export interface WorkerContextScope {
   sidecarRoot: string;
   botUid: string;
   target: ChatTarget;
+  /** Whether this bot's configured octo-cli identity is ready. */
+  cliReady: boolean;
 }
 
 export interface WorkerOptions {

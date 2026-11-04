@@ -218,6 +218,8 @@ export interface OctoProtocolFixtureOptions {
   groupContextPutStatuses?: Record<string, number>;
   /** Versions returned from successful context updates. */
   groupContextPutVersions?: Record<string, number>;
+  /** Delay before responding to group or thread context GETs, in milliseconds. */
+  groupContextDelayMs?: number;
   /** Status override for bot group/thread management routes, keyed by `${METHOD} ${pathname}`. */
   managementStatuses?: Record<string, number>;
   /** Raw response body for bot group/thread management routes, keyed by `${METHOD} ${pathname}`. */
@@ -1232,6 +1234,8 @@ export class OctoProtocolFixture {
         writeJson(response, status, { error: "group context failure" });
         return;
       }
+      const responseDelay = this.options.groupContextDelayMs ?? 0;
+      if (responseDelay > 0) await sleep(responseDelay);
       const rawBody = this.groupContextBodies.get(target);
       if (rawBody !== undefined) {
         writeJson(response, 200, rawBody);

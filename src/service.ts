@@ -1797,14 +1797,15 @@ class CoreService implements ChannelService {
   }
   private noteSteerConsumed(runtime: RuntimeTask, event: SteerConsumedEvent): void {
     const delivered = runtime.steerDeliveries.shift();
+    const originalText = event.originalText;
     if (delivered === undefined) {
       console.error(`[steer] 消费事件没有对应投递 task=${runtime.taskId}`);
-    } else if (delivered.text !== event.text) {
+    } else if (delivered.text !== originalText) {
       console.error(`[steer] 消费顺序与投递不一致 task=${runtime.taskId}`);
     }
     if (delivered?.silent) return;
-    console.error(`[steer] 已并入当前回合 task=${runtime.taskId} chars=${event.text.length}`);
-    this.outbox.enqueueText(runtime.target, receiptText("已并入当前回合", event.text), null);
+    console.error(`[steer] 已并入当前回合 task=${runtime.taskId} chars=${originalText.length}`);
+    this.outbox.enqueueText(runtime.target, receiptText("已并入当前回合", originalText), null);
   }
 
   private async deliverSteeringMessage(
@@ -1833,12 +1834,10 @@ class CoreService implements ChannelService {
     let contextStaged = false;
     if (isGroupTarget(runtime.target)) {
       try {
-        const guideInDeveloper = runtime.agentContext?.guideInDeveloper ?? false;
         const nextContext: AgentContext = isNativeRetryPrompt(text)
-          ? { cliReady: this.cliIdentityReady, guideInDeveloper }
+          ? { cliReady: this.cliIdentityReady }
           : {
               cliReady: this.cliIdentityReady,
-              guideInDeveloper,
               memberSnapshot: await this.fetchMemberSnapshot(
                 runtime.target,
                 runtime.cancelController.signal,
@@ -1878,10 +1877,7 @@ class CoreService implements ChannelService {
           this.store.completeCommand(claim);
           return true;
         }
-        const noMembers: AgentContext = {
-          cliReady: this.cliIdentityReady,
-          guideInDeveloper: runtime.agentContext?.guideInDeveloper ?? false,
-        };
+        const noMembers: AgentContext = { cliReady: this.cliIdentityReady };
         await runtime.turnContext.updateAgentContext(noMembers).catch(() => {});
         runtime.agentContext = noMembers;
         this.store.completeCommand(claim);
@@ -1913,10 +1909,7 @@ class CoreService implements ChannelService {
     }
 
     if (contextStaged || contextUpdated) {
-      const restored: AgentContext = previousContext ?? {
-        cliReady: this.cliIdentityReady,
-        guideInDeveloper: runtime.agentContext?.guideInDeveloper ?? false,
-      };
+      const restored: AgentContext = previousContext ?? { cliReady: this.cliIdentityReady };
       if (contextStaged) {
         await runtime.turnContext.discardStagedAgentContext(message.messageId).catch(() => {});
       } else {
@@ -6361,6 +6354,7 @@ class CoreService implements ChannelService {
       stateDir: this.options.config.stateDir,
       botUid: this.bot!.uid,
       target,
+      cliReady: this.cliIdentityReady,
     });
     const runtime: RuntimeTask = {
       taskId,
@@ -6405,7 +6399,7 @@ class CoreService implements ChannelService {
     runtime.rollProgressCard = () => progress.roll();
 
     try {
-      const threadContext = await turnContext.load();
+      const threadContext = await turnContext.load(task.sessionId);
       if (this.options.config.decisions?.enabled === true && target.channelType === 5) {
         const threadName = this.store.getThreadListen(this.bot!.uid, target)?.threadName;
         const description = threadContext?.content ?? "";
@@ -6417,15 +6411,11 @@ class CoreService implements ChannelService {
         return;
       }
       startupPhase = "members";
-      const guideInDeveloper = resuming || isNativeRetryPrompt(task.text);
-      let agentContext: AgentContext = {
-        cliReady: this.cliIdentityReady,
-        guideInDeveloper,
-      };
-      if (!guideInDeveloper && isGroupTarget(target)) {
+      const skipMemberSnapshot = resuming || isNativeRetryPrompt(task.text);
+      let agentContext: AgentContext = { cliReady: this.cliIdentityReady };
+      if (!skipMemberSnapshot && isGroupTarget(target)) {
         agentContext = {
           cliReady: this.cliIdentityReady,
-          guideInDeveloper,
           memberSnapshot: await this.fetchMemberSnapshot(target, runtime.cancelController.signal),
         };
       }
@@ -6532,6 +6522,13 @@ class CoreService implements ChannelService {
         tools: createHostTools(this.hostToolHost(), task),
         ...(contextInjection === undefined ? {} : { contextInjection }),
       };
+      const freshReadController = new AbortController();
+      const freshReadSignal = AbortSignal.any([
+        freshReadController.signal,
+        runtime.cancelController.signal,
+        this.shutdownController.signal,
+      ]);
+      const freshReadBridge = turnContext.serveFreshContextReads(freshReadSignal);
       const resumeStreamPrefix = resuming ? `resume:${randomUUID()}:` : "";
       const pendingGoalUpdates: WorkerGoal[] = [];
       const latestGoalProgress: { value: WorkerGoal | null } = { value: null };
@@ -6668,6 +6665,8 @@ class CoreService implements ChannelService {
         }
       } finally {
         runtime.promptInFlight = false;
+        freshReadController.abort();
+        await freshReadBridge;
         if (historyTurn) this.history.commitTurn(target, verified.sessionId, historyTurn);
       }
       if (

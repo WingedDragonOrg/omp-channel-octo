@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ChatTarget } from "../contracts.ts";
 import { threadParentGroupId, threadShortId } from "../threads/thread-target.ts";
 
@@ -14,13 +15,12 @@ export type AgentMemberSnapshot = {
   count: number;
   members?: AgentMember[];
   queryAction?: "octo_management.group-members" | "octo_management.thread-members";
+  rosterFingerprint?: string;
 };
 
-/** Per-turn extension data; member rosters stay out of the persistent OMP conversation. */
+/** Per-turn sidecar data used to produce persistent user-input context. */
 export type AgentContext = {
   cliReady: boolean;
-  /** Native retry/resume skips before_agent_start, so its next model request gets a developer guide. */
-  guideInDeveloper: boolean;
   memberSnapshot?: AgentMemberSnapshot;
 };
 
@@ -49,13 +49,10 @@ export function agentContextFromUnknown(value: unknown): AgentContext {
     throw new Error("context sidecar agent context is invalid");
   }
   const record = value as Record<string, unknown>;
-  if (typeof record.cliReady !== "boolean" || typeof record.guideInDeveloper !== "boolean") {
+  if (typeof record.cliReady !== "boolean") {
     throw new Error("context sidecar agent context is invalid");
   }
-  const common = {
-    cliReady: record.cliReady,
-    guideInDeveloper: record.guideInDeveloper,
-  };
+  const common = { cliReady: record.cliReady };
   if (record.memberSnapshot === undefined) return common;
 
   const source = record.memberSnapshot;
@@ -83,11 +80,19 @@ export function agentContextFromUnknown(value: unknown): AgentContext {
   ) {
     throw new Error("context sidecar member query action is invalid");
   }
+  let rosterFingerprint: string | undefined;
+  if (snapshot.rosterFingerprint !== undefined) {
+    if (typeof snapshot.rosterFingerprint !== "string" || snapshot.rosterFingerprint.length === 0) {
+      throw new Error("context sidecar member fingerprint is invalid");
+    }
+    rosterFingerprint = snapshot.rosterFingerprint;
+  }
   return {
     ...common,
     memberSnapshot: {
       count,
       queryAction: snapshot.queryAction,
+      ...(rosterFingerprint === undefined ? {} : { rosterFingerprint }),
     },
   };
 }
@@ -96,11 +101,15 @@ export function memberSnapshotFor(target: ChatTarget, members: readonly AgentMem
   if (members.length <= MAX_INLINE_MEMBERS) {
     return { count: members.length, members: members.map(({ uid, name }) => ({ uid, name })) };
   }
+  const canonicalRoster = members
+    .map(({ uid, name }) => ({ uid, name }))
+    .sort((left, right) => left.uid < right.uid ? -1 : left.uid > right.uid ? 1 : left.name.localeCompare(right.name));
   return {
     count: members.length,
     queryAction: target.channelType === 5
       ? "octo_management.thread-members"
       : "octo_management.group-members",
+    rosterFingerprint: createHash("sha256").update(JSON.stringify(canonicalRoster)).digest("hex"),
   };
 }
 

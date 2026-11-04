@@ -39,6 +39,8 @@ export interface ContextSidecar {
   previousVersion?: number;
   prepared?: ContextPreparedReceipt;
   agentContext?: AgentContext;
+  compactedContext?: CompactedContextReceipt;
+  pendingCompaction?: PendingCompactionContext;
 }
 
 export interface StagedAgentContext {
@@ -72,6 +74,59 @@ export interface BoundContextSession {
   botUid: string;
   target: ChatTarget;
   sessionId: string;
+}
+const FRESH_CONTEXT_READ_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+export const FRESH_CONTEXT_READ_SCHEMA_VERSION = 1 as const;
+
+export interface FreshContextReadIdentity {
+  schemaVersion: typeof FRESH_CONTEXT_READ_SCHEMA_VERSION;
+  requestId: string;
+  botUid: string;
+  target: ChatTarget;
+  sessionId: string;
+  turnId: string;
+}
+export interface CompactedContextReceipt extends FreshContextReadIdentity {
+  attemptId: string;
+  snapshot: GroupContext;
+}
+export interface PendingCompactionContext extends CompactedContextReceipt {
+  baseLeafId: string | null;
+}
+
+export type FreshContextReadResponse = FreshContextReadIdentity & (
+  | { snapshot: GroupContext; error?: never }
+  | { error: string; snapshot?: never }
+);
+
+export interface FreshContextReadPaths {
+  directory: string;
+  request: string;
+  response: string;
+  cancel: string;
+}
+
+export function freshContextReadPaths(
+  sidecarRoot: string,
+  turnId: string,
+  requestId: string,
+): FreshContextReadPaths {
+  if (!FRESH_CONTEXT_READ_UUID_PATTERN.test(turnId) || !FRESH_CONTEXT_READ_UUID_PATTERN.test(requestId)) {
+    throw new Error("fresh context read identity is invalid");
+  }
+  const directory = join(sidecarRoot, "fresh-context", turnId);
+  const prefix = join(directory, requestId);
+  return {
+    directory,
+    request: `${prefix}.request.json`,
+    response: `${prefix}.response.json`,
+    cancel: `${prefix}.cancel`,
+  };
+}
+
+export async function writeFreshContextReadFile(path: string, value: unknown): Promise<void> {
+  await atomicWriteJson(path, value);
 }
 
 export function isContextSidecarObject(value: unknown): value is Record<string, unknown> {
@@ -159,6 +214,36 @@ function preparedFromUnknown(value: unknown): ContextPreparedReceipt {
     ...(preparedAt === undefined ? {} : { preparedAt }),
   };
 }
+export function compactedContextFromUnknown(value: unknown): CompactedContextReceipt {
+  if (!isContextSidecarObject(value) || value.schemaVersion !== FRESH_CONTEXT_READ_SCHEMA_VERSION) {
+    throw new Error("context sidecar compacted snapshot is invalid");
+  }
+  const requestId = requiredNonEmptyString(value.requestId, "compaction requestId");
+  const turnId = requiredNonEmptyString(value.turnId, "compaction turnId");
+  if (!FRESH_CONTEXT_READ_UUID_PATTERN.test(requestId) || !FRESH_CONTEXT_READ_UUID_PATTERN.test(turnId)) {
+    throw new Error("context sidecar compacted snapshot identity is invalid");
+  }
+  return {
+    schemaVersion: FRESH_CONTEXT_READ_SCHEMA_VERSION,
+    requestId,
+    botUid: requiredNonEmptyString(value.botUid, "compaction botUid"),
+    target: targetFromUnknown(value.target, "compaction target"),
+    sessionId: requiredNonEmptyString(value.sessionId, "compaction sessionId"),
+    turnId,
+    attemptId: requiredNonEmptyString(value.attemptId, "compaction attemptId"),
+    snapshot: snapshotFromUnknown(value.snapshot),
+  };
+}
+
+function pendingCompactionFromUnknown(value: unknown): PendingCompactionContext {
+  const compacted = compactedContextFromUnknown(value);
+  if (!isContextSidecarObject(value)
+    || (value.baseLeafId !== null && (typeof value.baseLeafId !== "string" || value.baseLeafId.length === 0))) {
+    throw new Error("context sidecar pending compaction identity is invalid");
+  }
+  return { ...compacted, baseLeafId: value.baseLeafId as string | null };
+}
+
 
 function assertSidecarIdentity(sidecar: ContextSidecar): void {
   if (sidecar.schemaVersion !== CONTEXT_SIDECAR_SCHEMA_VERSION) {
@@ -191,6 +276,28 @@ function assertSidecarIdentity(sidecar: ContextSidecar): void {
       throw new Error("context sidecar prepared receipt does not match its identity");
     }
   }
+  if (sidecar.compactedContext !== undefined) {
+    const compacted = compactedContextFromUnknown(sidecar.compactedContext);
+    if (
+      compacted.botUid !== sidecar.botUid
+      || compacted.sessionId !== sidecar.sessionId
+      || compacted.target.channelType !== target.channelType
+      || compacted.target.channelId !== target.channelId
+    ) {
+      throw new Error("context sidecar compacted snapshot scope mismatch");
+    }
+  }
+  if (sidecar.pendingCompaction !== undefined) {
+    const pending = pendingCompactionFromUnknown(sidecar.pendingCompaction);
+    if (
+      pending.botUid !== sidecar.botUid
+      || pending.sessionId !== sidecar.sessionId
+      || pending.target.channelType !== target.channelType
+      || pending.target.channelId !== target.channelId
+    ) {
+      throw new Error("context sidecar pending compaction scope mismatch");
+    }
+  }
 }
 
 function sidecarForValidation(value: unknown): ContextSidecar {
@@ -202,6 +309,12 @@ function sidecarForValidation(value: unknown): ContextSidecar {
   const agentContext = value.agentContext === undefined
     ? undefined
     : agentContextFromUnknown(value.agentContext);
+  const compactedContext = value.compactedContext === undefined
+    ? undefined
+    : compactedContextFromUnknown(value.compactedContext);
+  const pendingCompaction = value.pendingCompaction === undefined
+    ? undefined
+    : pendingCompactionFromUnknown(value.pendingCompaction);
   const sidecar: ContextSidecar = {
     schemaVersion: value.schemaVersion as typeof CONTEXT_SIDECAR_SCHEMA_VERSION,
     botUid: requiredNonEmptyString(value.botUid, "botUid"),
@@ -215,6 +328,8 @@ function sidecarForValidation(value: unknown): ContextSidecar {
     ...(value.previousVersion === undefined ? {} : { previousVersion: safeVersion(value.previousVersion, "previous version") }),
     ...(prepared === undefined ? {} : { prepared }),
     ...(agentContext === undefined ? {} : { agentContext }),
+    ...(compactedContext === undefined ? {} : { compactedContext }),
+    ...(pendingCompaction === undefined ? {} : { pendingCompaction }),
   };
   assertSidecarIdentity(sidecar);
   return sidecar;
@@ -500,6 +615,63 @@ export async function writePreparedReceipt(
   const updated: ContextSidecar = { ...current, prepared: next };
   await writeContextSidecarFile(path, updated);
   return next;
+}
+export async function writeCompactedContextReceipt(
+  path: string,
+  value: unknown,
+): Promise<void> {
+  const current = await readContextSidecar(path);
+  const compactedContext = compactedContextFromUnknown(value);
+  if (
+    compactedContext.botUid !== current.botUid
+    || compactedContext.sessionId !== current.sessionId
+    || compactedContext.target.channelType !== current.target.channelType
+    || compactedContext.target.channelId !== current.target.channelId
+  ) {
+    throw new Error("compaction receipt does not match the context sidecar scope");
+  }
+  const { pendingCompaction, ...rest } = current;
+  await writeContextSidecarFile(
+    path,
+    pendingCompaction?.requestId === compactedContext.requestId
+      ? { ...rest, compactedContext }
+      : { ...current, compactedContext },
+  );
+}
+
+export async function writePendingCompaction(
+  path: string,
+  value: PendingCompactionContext,
+): Promise<void> {
+  const current = await readContextSidecar(path);
+  const pendingCompaction = pendingCompactionFromUnknown(value);
+  if (
+    pendingCompaction.botUid !== current.botUid
+    || pendingCompaction.sessionId !== current.sessionId
+    || pendingCompaction.target.channelType !== current.target.channelType
+    || pendingCompaction.target.channelId !== current.target.channelId
+  ) {
+    throw new Error("pending compaction does not match the context sidecar scope");
+  }
+  await writeContextSidecarFile(path, { ...current, pendingCompaction });
+}
+
+export async function commitPendingCompaction(
+  path: string,
+  value: PendingCompactionContext,
+): Promise<void> {
+  const current = await readContextSidecar(path);
+  const pending = current.pendingCompaction;
+  if (
+    !pending
+    || pending.requestId !== value.requestId
+    || pending.turnId !== value.turnId
+    || pending.baseLeafId !== value.baseLeafId
+  ) {
+    throw new Error("pending compaction changed before commit");
+  }
+  const { pendingCompaction: _pendingCompaction, ...rest } = current;
+  await writeContextSidecarFile(path, { ...rest, compactedContext: value });
 }
 
 

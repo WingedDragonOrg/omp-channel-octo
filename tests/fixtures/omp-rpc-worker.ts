@@ -2408,11 +2408,12 @@ function handleCommand(command: Frame): void {
 		clearTimeout(promptTimer);
 		promptTimer = undefined;
 		const steered = typeof command.message === "string" ? command.message : "";
+		const persistedSteerText = `${steered}\n\nMEMBER_CONTEXT_SUFFIX_V1`;
 		// Mirrors OMP: the queue drains at the next injection boundary, the message enters the
 		// transcript, and only then does the model turn run.
 		const steerMessage = {
 			role: "user",
-			content: [{ type: "text", text: steered }],
+			content: [{ type: "text", text: persistedSteerText }],
 			steering: true,
 			attribution: "user",
 			timestamp: Date.now(),

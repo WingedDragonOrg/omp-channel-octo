@@ -621,14 +621,14 @@ export class OctoTransport implements ChannelTransport {
     }
   }
 
-  async getGroupContext(target: ChatTarget): Promise<GroupContext | null> {
+  async getGroupContext(target: ChatTarget, signal?: AbortSignal): Promise<GroupContext | null> {
     validateTarget(target);
     if (target.channelType === 1) return null;
     const response = await requestWithTimeout(
       apiUrl(this.apiBase, contextPath(target.channelId, target.channelType)),
       { method: "GET", headers: authHeaders(this.botToken) },
       "group context",
-      undefined,
+      signal,
       MAX_GROUP_CONTEXT_BYTES,
     );
     if (response.status === 404) {
