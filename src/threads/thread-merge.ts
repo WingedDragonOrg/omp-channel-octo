@@ -1,6 +1,7 @@
 import { throwIfAborted } from "../abort.ts";
 import type {
   ChatTarget,
+  HostMergeOutcome,
   WorktreeMergeLifecycle,
   WorktreeMergeOutcome,
   WorktreeMergePlan,
@@ -34,13 +35,14 @@ export interface ThreadMergeHost {
     cwd: string,
     sourceId: string | undefined,
     resourceCwds: readonly string[],
+    archiveGeneration: number,
   ) => WorktreeMergeLifecycle;
   readonly planThreadArchive: (
     target: ChatTarget,
     groupId: string,
     shortId: string,
     generation: number,
-  ) => void;
+  ) => boolean | void;
   /** Generation captured by the command turn; an intervening inbound prevents stale archival. */
   readonly archiveGeneration: () => number;
   /**
@@ -75,9 +77,12 @@ export async function mergeThreadWorkspace(
   const binding = host.store.getBinding(host.botUid, target);
   const hasStableSourceId = typeof host.sourceId === "string" && host.sourceId.length > 0;
   const replayLifecycle = hasStableSourceId
-    ? host.worktreeMergeLifecycle?.(target, binding?.cwd ?? "", host.sourceId, [])
+    ? host.worktreeMergeLifecycle?.(target, binding?.cwd ?? "", host.sourceId, [], archiveGeneration)
     : undefined;
-  const replayOutcome = (outcome: WorktreeMergeOutcome): WorktreeMergeSummary & { archive?: "scheduled" } => {
+  const replayOutcome = (outcome: HostMergeOutcome): WorktreeMergeSummary & { archive?: "scheduled" } => {
+    if (outcome.kind === "not-started") {
+      throw new Error(outcome.diagnostic);
+    }
     if (outcome.kind === "execution-failed") {
       throw new WorktreeMergeExecutionError(outcome.exitCode, outcome.diagnostic);
     }
@@ -99,8 +104,12 @@ export async function mergeThreadWorkspace(
       }
     }
     if (outcome.summary.removed) {
-      host.planThreadArchive(target, groupId, shortId, archiveGeneration);
-      return { ...outcome.summary, archive: "scheduled" };
+      const replayGeneration = replayLifecycle?.archiveGeneration === undefined
+        ? archiveGeneration
+        : replayLifecycle.archiveGeneration;
+      if (replayGeneration === null) return outcome.summary;
+      const scheduled = host.planThreadArchive(target, groupId, shortId, replayGeneration);
+      return scheduled === false ? outcome.summary : { ...outcome.summary, archive: "scheduled" };
     }
     return outcome.summary;
   };
@@ -162,7 +171,7 @@ export async function mergeThreadWorkspace(
   if (signal !== undefined) throwIfAborted(signal);
 
   const lifecycle = hasStableSourceId
-    ? host.worktreeMergeLifecycle?.(target, binding.cwd, host.sourceId, plan.cwds)
+    ? host.worktreeMergeLifecycle?.(target, binding.cwd, host.sourceId, plan.cwds, archiveGeneration)
     : undefined;
   if (lifecycle?.existingOutcome !== undefined) return replayOutcome(lifecycle.existingOutcome);
   let confirmedExit = false;
@@ -195,10 +204,13 @@ export async function mergeThreadWorkspace(
       };
       host.store.saveThreadWorkspace(updated);
     }
+    let archiveScheduled: boolean | void = false;
     if (summary.removed) {
-      host.planThreadArchive(target, groupId, shortId, archiveGeneration);
+      archiveScheduled = host.planThreadArchive(target, groupId, shortId, archiveGeneration);
     }
-    return summary.removed ? { ...summary, archive: "scheduled" } : summary;
+    return summary.removed && archiveScheduled !== false
+      ? { ...summary, archive: "scheduled" }
+      : summary;
   } catch (error) {
     if (error instanceof WorktreeMergeExecutionError && confirmedExit) {
       if (lifecycle) {

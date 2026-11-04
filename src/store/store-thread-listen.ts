@@ -54,6 +54,41 @@ export function setThreadListen(
   return stored;
 }
 
+export function getThreadArchiveGeneration(
+  db: Database,
+  botUid: string,
+  target: ChatTarget,
+): number {
+  if (target.channelType !== 5) throw new Error("thread archive generations require a thread target");
+  const row = query(db,
+    "SELECT generation FROM thread_archive_generations WHERE bot_uid = ? AND channel_type = 5 AND channel_id = ?",
+    [botUid, target.channelId],
+  )[0];
+  const generation = row?.generation ?? 0;
+  if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0) {
+    throw new Error("invalid persisted thread archive generation");
+  }
+  return generation;
+}
+
+export function advanceThreadArchiveGeneration(
+  db: Database,
+  botUid: string,
+  target: ChatTarget,
+): number {
+  if (target.channelType !== 5 || botUid.length === 0 || target.channelId.length === 0) {
+    throw new Error("invalid thread archive generation target");
+  }
+  run(db,
+    `INSERT INTO thread_archive_generations(bot_uid, channel_type, channel_id, generation)
+     VALUES(?, 5, ?, 1)
+     ON CONFLICT(bot_uid, channel_type, channel_id)
+     DO UPDATE SET generation = generation + 1`,
+    [botUid, target.channelId],
+  );
+  return getThreadArchiveGeneration(db, botUid, target);
+}
+
 export function beginThreadMerge(db: Database, botUid: string, target: ChatTarget): void {
   if (target.channelType !== 5) throw new Error("thread merge intent requires a thread target");
   transaction(db, () => {

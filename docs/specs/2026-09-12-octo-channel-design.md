@@ -53,7 +53,7 @@
 | 目录 | `/new [目录]`、`/reset [目录]`；省略目录按目标默认目录解析（DM/群沿用当前绑定，首次 `~/tmp`） | 每次 fresh 会话都有确定工作目标 |
 | 线程目录 | CommunityTopic 线程尚无已验证会话时，默认目录取父群当前绑定 cwd；线程首次成功建立会话即固定，与父群解耦 | 线程默认落在父群项目上；cwd 可共享，session 与共享说明仍按聊天目标隔离 |
 | 线程隔离 | `create-thread` 支持 `projects:[{name,repo,base?}]`、`layout` 与简短 `background`；多项目由 agent 显式选择 shared（一个非仓库入口内多个隔离 worktree）或 separate（每项目一个 thread/worktree），单项目保留 `worktree_name`。宿主准备实际工作区、持久化绑定并写入 THREAD.md 后才报告 ready、允许派发 | 工作区与项目来源明确，任务只来自后续派发正文；详细 SDD 见 `2026-09-17-thread-worktrunk-design.md` |
-| 工作区合并 | 单项目/separate 子区的 `/thread merge` 由宿主直接执行默认 pipeline，不按工作区资源限制并发；成功清理工作树和分支、回执送达后归档；零 agent 任务。只有实际合并执行失败才交给本聊天 agent 修复，再经 host `thread-merge` 重试。shared 固定拒绝且不创建任务 | 正常路径不启动模型，资格拒绝与执行失败分离 |
+| 工作区合并 | 单项目/separate 子区的 `/thread merge` 由宿主直接执行默认 pipeline，不按工作区资源限制并发；持久 lease 后可 ACK，运行中展示独立可编辑进度卡且同聊天查询不等待；成功清理工作树和分支、回执与终态卡确认排空后归档；新入站持久取消旧归档计划；零 agent 任务。只有实际合并执行失败才交给本聊天 agent 修复，再经 host `thread-merge` 重试。shared 固定拒绝且不创建任务 | 正常路径不启动模型，资格拒绝与执行失败分离 |
 | 工作区清理 | `thread-delete` 在服务端删除成功后按持久资源归属清理，不依赖活动 cwd；有可用 wt 时 `wt remove`，否则 `git worktree remove`。占用中、未确认创建、身份不符或脏 worktree 保留，显式 force 才丢弃脏改动，入口只删除空目录 | 显式换目录不遗失原资源归属，也不误删用户目录或未知文件 |
 | 清理并归档 | owner 在目标子区执行 `/thread remove [--force]`；按持久归属清理 single/separate/shared worktree 和分支，全部确认完成且回执/正文/终态卡排空后归档；正常路径零 agent 任务。默认保护 dirty 和未合并提交，force 明确授权丢弃两者；部分失败保留残留记录、不归档 | 只处置已验证资源，不合并、不删除聊天记录；未知进程与未知业务结果均封锁原资源组 |
 | 子区回传 | 子区持久策略 `listen=off|merge|task`，默认 merge，仅实际合并成功回传创建方聊天；task 额外回传派发任务四种终态；off 静默。合并失败及修复失败始终在子区处理。通知按接收聊天追加模式交付且不回答 pending ask | 单一子区策略、稳定事件去重；普通任务不打扰父会话 |
@@ -81,7 +81,7 @@
 
 `/new`、`/move` 的候选 worker 通过 `withStoppedWorker` 运行：scope 验证会话、确认进程停止并完成台账更新后才交付结果，调用方随后持久化绑定并发送回执。停止未确认或台账更新失败不会交付成功结果；操作失败仍执行关闭，关闭中的台账错误优先返回，否则保留原操作错误。聊天/会话租约覆盖整个 scope 和绑定提交。
 
-`commands/thread-commands.ts` 负责 `/thread` 的任务交接及 `/thread merge` 的宿主优先编排，命令去重仍在服务入口完成。命令与工具复用 `threads/thread-merge.ts` 的合并核心；只有真实 merge 执行失败生成稳定身份的修复输入。`threads/thread-archive.ts` 独占待归档集合和停止唤醒信号；新授权入站取消排定，归档等待指定成功回执 `sent`、进度卡 tail 与聊天 outbox 排空。出站退避期间持续等待，不能以等待超时替代排空；保持瞬时归档失败重试与停止放弃契约。
+`commands/thread-commands.ts` 负责 `/thread` 的任务交接及 `/thread merge` 的宿主优先编排，命令去重仍在服务入口完成。命令与工具复用 `threads/thread-merge.ts` 的合并核心；只有真实 merge 执行失败生成稳定身份的修复输入。`threads/thread-archive.ts` 独占待归档集合和停止唤醒信号；新授权入站持久递增线程归档代次并取消排定，重启恢复只恢复 lease 捕获代次仍有效的计划；归档等待指定成功回执 `sent`、进度卡 tail 与聊天 outbox 排空。卡片发送结果未知时禁止重发，且不把本地超时视为远端已排空。出站退避期间持续等待，不能以等待超时替代排空；保持瞬时归档失败重试与停止放弃契约。
 
 `/thread remove` 与 `thread-delete` 的持久资源清理由 `threads/thread-workspace-cleanup.ts` 独占，调用方显式选择分支策略。remove 的每个 worktree/branch 步骤复用 `workspace/worktrunk.ts` 的受管进程与 watchdog，并在 `host_merge_leases` 以 `operation_kind=thread-remove` 记录原完整资源组、步骤、进程身份及结果；旧行默认为 merge，两个结果命名空间独立。只有已知业务 outcome 可在启动时补发回执并排定归档，`exited` 但无 outcome 仍属未知，不重做 Git。缺失目录仍保留调度资源键，只对现存 cwd 探测 Git root。
 
@@ -339,7 +339,7 @@ channel 在工具进度之上补两块由权威实验状态驱动的只读呈现
 #### 隔离工作区收尾
 
 
-`/thread merge` 是子区中的宿主合并入口：`/thread` 参数去首尾空白后首词为 `merge`（后为行尾或非字母数字、下划线、连字符分隔符，`merge-fix` 不算）即进入该路径。宿主验证子区、隔离绑定、持久资源身份与 wt 能力，按聊天和 session 顺序直接执行 wt 默认暂存/提交/squash/rebase/fast-forward/删除 pipeline，不按工作树资源限制并发。正常路径不启动 worker、模型或 agent 任务；结果通过持久 outbox 送达，已有进度卡输出排空后归档子区，cwd 被删除不影响这一路径。只有已实际执行的 wt merge 非零退出才把脱敏有界诊断、工作区、原命令与 owner 尾随补充说明交给本聊天 agent 修复，再经同一 host `thread-merge` 核心重试；资格拒绝、取消或结果未知不派修复。命令 claim 保留，接管输入身份稳定，重复投递与重启不重跑成功合并或重复创建修复任务；Git 与 SQLite 间结果不明时停止自动重放。等待和执行响应取消、中断及停机。详细 SDD 和交付验收见 `2026-09-17-thread-worktrunk-design.md`。
+`/thread merge` 是子区中的宿主合并入口：`/thread` 参数去首尾空白后首词为 `merge`（后为行尾或非字母数字、下划线、连字符分隔符，`merge-fix` 不算）即进入该路径。宿主验证子区、隔离绑定、持久资源身份与 wt 能力，按聊天和 session 顺序直接执行 wt 默认暂存/提交/squash/rebase/fast-forward/删除 pipeline，不按工作树资源限制并发。持久 lease 后即确认受理；同聊天的查询/控制入站可在 merge 运行期间处理，不创建 worker、模型或 agent 任务。每个命令身份使用独立进度卡记录可证实阶段、耗时与终态，不重发创建结果未知的卡片。结果经持久 outbox 送达，卡片 I/O 不阻塞 merge 结果回执；只有回执送达、相关进度卡终态确认排空和聊天 outbox 排空后才归档子区，cwd 被删除不影响这一路径。卡片发送结果未知不得当作远端已排空；新入站持久递增归档代次，重启只恢复仍与 lease 代次相同的归档计划。只有已实际执行的 wt merge 非零退出才把脱敏有界诊断、工作区、原命令与 owner 尾随补充说明交给本聊天 agent 修复，再经同一 host `thread-merge` 核心重试；资格拒绝、取消或结果未知不派修复。命令 claim 保留，接管输入身份稳定，重复投递与重启不重跑成功合并或重复创建修复任务；Git 与 SQLite 间结果不明时停止自动重放。等待和执行响应取消、中断及停机。详细 SDD 和交付验收见 `2026-09-17-thread-worktrunk-design.md`。
 
 shared 工作区先按持久资源记录识别，并直接回复「当前为多项目工作区，不支持 /thread merge。」；上述合并资格、宿主执行与 wt 探测仅适用于单项目/separate。
 

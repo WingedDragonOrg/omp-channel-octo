@@ -160,12 +160,19 @@ function threadMergeReceipt(summary: WorktreeMergeSummary & { archive?: "schedul
   return `子区合并成功：${summary.branch} → ${summary.target}；${workspace}${archive}。`;
 }
 
+function threadMergeNotStartedReceipt(diagnostic: string): string {
+  const detail = safeDisplayText(diagnostic, 200);
+  return detail === undefined
+    ? "子区合并未启动，未执行合并；不会自动重试。"
+    : `子区合并未启动，未执行合并；不会自动重试：${detail}`;
+}
+
 /**
  * `/thread` 命令可触及的状态端口：绑定/所有权资格、命令 claim、隔离合并执行、稳定回执与归档，
  * 以及常规任务接管。宿主合并的聊天与会话调度由 `CoreService` 持有。
  */
 export interface ThreadCommandsDeps {
-  readonly store: Pick<ChannelStore, "getBinding" | "getThreadWorkspace" | "getThreadForkByTarget" | "getTaskByMessageId" | "getCommandClaimState" | "completeCommand" | "releaseClaim" | "getHostRemovalLeaseBySourceId">;
+  readonly store: Pick<ChannelStore, "getBinding" | "getThreadWorkspace" | "getThreadForkByTarget" | "getTaskByMessageId" | "getCommandClaimState" | "completeCommand" | "releaseClaim" | "getHostRemovalLeaseBySourceId" | "getHostMergeLeaseBySourceId" | "getOutbox">;
   /** Read or change the group default using the same serialized model-config path as `/switch`. */
   readonly handleThreadModel: (message: InboundMessage, argument: string) => Promise<void>;
   /** Ensures creation provenance/default policy before a merge-intent mutation. */
@@ -186,6 +193,7 @@ export interface ThreadCommandsDeps {
     receiptOutboxId: string,
     archiveGeneration: number,
     operatorNote: string,
+    onAccepted?: () => void,
   ) => Promise<WorktreeMergeSummary & { archive?: "scheduled" }>;
   /** Execute owned local cleanup under CoreService's session, directory and process leases. */
   readonly executeHostRemoval: (
@@ -206,7 +214,12 @@ export interface ThreadCommandsDeps {
     archiveGeneration?: number,
   ) => void;
   /** 启动恢复成功结果时，重建严格 receipt barrier 后的归档排定。 */
-  readonly recoverMergeArchive: (target: InboundMessage, receiptOutboxId: string) => void;
+  readonly recoverMergeArchive: (
+    target: InboundMessage,
+    receiptOutboxId: string,
+    sourceId: string,
+    archiveGeneration: number | null,
+  ) => boolean | void;
   /** 以 strict receipt barrier 异步启动已经排定的归档。 */
   readonly runThreadArchive: (target: InboundMessage) => void;
   /**
@@ -245,7 +258,11 @@ export class ThreadCommands {
    * turn, otherwise it becomes a durable task (`queue` mode included) that waits behind the run.
    * Only groups grow threads, so DMs and threads themselves are refused.
    */
-  async handle(message: InboundMessage, argument: string): Promise<void> {
+  async handle(
+    message: InboundMessage,
+    argument: string,
+    onHostMergeAccepted?: () => void,
+  ): Promise<void> {
     const modelArgument = readThreadModelArgument(argument);
     if (modelArgument !== undefined) {
       await this.deps.handleThreadModel(message, modelArgument);
@@ -253,7 +270,7 @@ export class ThreadCommands {
     }
     const mergeNote = readThreadMergeNote(argument);
     if (mergeNote !== undefined) {
-      await this.handleThreadMergeCommand(message, mergeNote);
+      await this.handleThreadMergeCommand(message, mergeNote, onHostMergeAccepted);
       return;
     }
     const removeForce = readThreadRemoveForce(argument);
@@ -307,11 +324,28 @@ export class ThreadCommands {
     if (outcome.kind === "succeeded") {
       if (lease.commandText === null) throw new Error("host merge success recovery is missing its original command");
       const receiptId = lease.receiptOutboxId ?? mergeReceiptId(lease.botUid, target, lease.sourceId);
-      this.deps.enqueueMergeReceipt(target, receiptId, threadMergeReceipt({
+      const archiveScheduled = outcome.summary.removed
+        ? this.deps.recoverMergeArchive(target, receiptId, lease.sourceId, lease.archiveGeneration)
+        : false;
+      const generatedReceipt = threadMergeReceipt({
         ...outcome.summary,
-        ...(outcome.summary.removed ? { archive: "scheduled" as const } : {}),
-      }));
-      if (outcome.summary.removed) this.deps.recoverMergeArchive(target, receiptId);
+        ...(archiveScheduled !== false ? { archive: "scheduled" as const } : {}),
+      });
+      const existingReceipt = this.deps.store.getOutbox(receiptId);
+      const receiptText = existingReceipt?.botUid === lease.botUid
+        && existingReceipt.channelType === target.channelType
+        && existingReceipt.channelId === target.channelId
+        && existingReceipt.kind === "text"
+        ? existingReceipt.text ?? generatedReceipt
+        : generatedReceipt;
+      this.deps.enqueueMergeReceipt(target, receiptId, receiptText);
+      this.completeRecoveredThreadCommand(lease.botUid, target);
+      this.deps.settleHostMerge(target, lease.sourceId);
+      return;
+    }
+    if (outcome.kind === "not-started") {
+      const receiptId = lease.receiptOutboxId ?? mergeReceiptId(lease.botUid, target, lease.sourceId);
+      this.deps.enqueueMergeReceipt(target, receiptId, threadMergeNotStartedReceipt(outcome.diagnostic));
       this.completeRecoveredThreadCommand(lease.botUid, target);
       this.deps.settleHostMerge(target, lease.sourceId);
       return;
@@ -466,7 +500,11 @@ export class ThreadCommands {
    * `/thread merge`: host-first；资格拒绝只回复，不接任务。实际 wt pipeline 成功后回稳定 outbox
    * receipt；只有 shared core 明确标记为执行失败时，才用稳定合成消息创建一次修复 task。
    */
-  private async handleThreadMergeCommand(message: InboundMessage, mergeNote: string): Promise<void> {
+  private async handleThreadMergeCommand(
+    message: InboundMessage,
+    mergeNote: string,
+    onHostMergeAccepted?: () => void,
+  ): Promise<void> {
     if (message.channelType !== 5) {
       await this.deps.enqueueText(message, THREAD_MERGE_THREAD_ONLY_TEXT, null);
       return;
@@ -514,9 +552,24 @@ export class ThreadCommands {
           receiptOutboxId,
           archiveGeneration,
           note,
+          onHostMergeAccepted,
         );
       } catch (error) {
         if (this.deps.stopping()) return;
+        const botUid = this.deps.botUid();
+        const nonStart = botUid === undefined
+          ? null
+          : this.deps.store.getHostMergeLeaseBySourceId(botUid, message, message.messageId);
+        if (nonStart?.outcome?.kind === "not-started") {
+          this.deps.enqueueMergeReceipt(
+            message,
+            nonStart.receiptOutboxId ?? receiptOutboxId,
+            threadMergeNotStartedReceipt(nonStart.outcome.diagnostic),
+          );
+          if (botUid !== undefined) this.completeRecoveredThreadCommand(botUid, message);
+          this.deps.settleHostMerge(message, message.messageId);
+          return;
+        }
         if (error instanceof WorktreeMergeExecutionError) {
           await this.acceptMergeRepairTask({
             message,

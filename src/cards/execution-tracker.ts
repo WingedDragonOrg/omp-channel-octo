@@ -8,6 +8,7 @@ import { safeDisplayText } from "./execution-text.ts";
 import { sanitizeCommitContent, type CommitContent } from "./commit-content.ts";
 import { sanitizeResearchSnapshot, type ResearchSnapshot, type ResearchUpdateEvent } from "../research/index.ts";
 
+import type { HostMergeProgressPhase } from "../contracts.ts";
 export type ExecutionState = "running" | "completed" | "failed" | "cancelled";
 export type ExecutionToolState = "running" | "succeeded" | "failed" | "cancelled";
 export type ExecutionErrorCategory =
@@ -193,6 +194,11 @@ export interface ExecutionSnapshot {
   readonly research?: ResearchSnapshot;
   /** Native commit progress; absent for ordinary OMP turns. */
   readonly commit?: ExecutionCommitSnapshot;
+  /** Independent host-first `/thread merge` presentation; never tied to an OMP task row. */
+  readonly hostMerge?: {
+    readonly phase: HostMergeProgressPhase;
+    readonly result?: string;
+  };
 }
 
 export interface ExecutionTracker {

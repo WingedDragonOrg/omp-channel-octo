@@ -442,10 +442,28 @@ export type WorktreeMergeOutcome =
   | { kind: "succeeded"; summary: WorktreeMergeSummary }
   | { kind: "execution-failed"; exitCode: number; diagnostic: string };
 
+/** Host-side terminal outcome for a merge command, including a confirmed non-start. */
+export type HostMergeOutcome =
+  | WorktreeMergeOutcome
+  | { kind: "not-started"; diagnostic: string };
+
+/** Persisted presentation phase for one independent host-first thread merge card. */
+export type HostMergeProgressPhase =
+  | "preparing"
+  | "process-started"
+  | "process-exited"
+  | "succeeded"
+  | "execution-failed"
+  | "not-started"
+  | "cancelled"
+  | "unknown";
+
 /** Durable lifecycle callbacks for the single wt merge command (never for probes/create/remove). */
 export interface WorktreeMergeLifecycle {
   /** Previously persisted result for this exact source; callers replay it without re-running wt. */
-  readonly existingOutcome?: WorktreeMergeOutcome;
+  readonly existingOutcome?: HostMergeOutcome;
+  /** Persistent inbound generation captured when this merge was accepted; null disables recovery archive. */
+  readonly archiveGeneration?: number | null;
   /** Persist an intent before spawning the guarded wt process. */
   beforeSpawn(cwd: string): void;
   /** Persist the verified command process identity before it is allowed to run. */

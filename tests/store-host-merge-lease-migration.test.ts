@@ -122,6 +122,7 @@ test("host merge outcome survives restart until delivery settles the lease", asy
         senderId: "owner-1",
         messageSeq: 23,
         receiptOutboxId: "stable-merge-receipt",
+        archiveGeneration: 9,
       });
       store.recordHostMergeProcess("host-merge-operation", {
         pid: 43001,
@@ -151,7 +152,7 @@ test("host merge outcome survives restart until delivery settles the lease", asy
         pgid: 43001,
         processIdentity: "pid=43001;start=Wed Jun 10 12:00:00 2026",
         resourceCwds: ["/work/merge-thread", "/work/target-checkout"],
-        outcome: { kind: "succeeded", summary: { branch: "thread-branch", removed: true, commit: "actual-target-commit" } },
+        archiveGeneration: 9,
       }]);
     } finally {
       store.close();
@@ -171,6 +172,7 @@ test("host merge outcome survives restart until delivery settles the lease", asy
         messageSeq: 23,
         receiptOutboxId: "stable-merge-receipt",
         outcome: { kind: "succeeded", summary: { target: "main", commit: "actual-target-commit" } },
+        archiveGeneration: 9,
       });
       restarted.settleHostMergeLease("host-merge-operation");
       expect(restarted.listHostMergeLeases("bot-merge")).toEqual([]);
@@ -193,7 +195,7 @@ test("host merge outcome survives restart until delivery settles the lease", asy
     await rm(root, { recursive: true, force: true });
   }
 });
-test("a confirmed pre-execution process exit can release a running lease, but unknown cannot", async () => {
+test("a confirmed pre-execution process exit persists its result, but unknown cannot", async () => {
   const root = await mkdtemp(join(tmpdir(), "omp-channel-octo-host-merge-not-spawned-"));
   try {
     const store = await openChannelStore(root);
@@ -211,7 +213,15 @@ test("a confirmed pre-execution process exit can release a running lease, but un
         pgid: 43002,
         identity: "pid=43002;start=Wed Jun 10 12:00:00 2026",
       });
-      store.completeHostMergeLease("parked-host-merge", "not-spawned");
+      store.completeHostMergeLease("parked-host-merge", {
+        kind: "not-spawned",
+        diagnostic: "confirmed not started",
+      });
+      expect(store.listHostMergeLeases("bot-parked")).toMatchObject([{
+        phase: "exited",
+        outcome: { kind: "not-started", diagnostic: "confirmed not started" },
+      }]);
+      store.settleHostMergeLease("parked-host-merge");
       expect(store.listHostMergeLeases("bot-parked")).toEqual([]);
 
       store.reserveHostMergeLease({
@@ -222,11 +232,42 @@ test("a confirmed pre-execution process exit can release a running lease, but un
         cwd: "/work/parked-thread",
         resourceCwds: ["/work/parked-thread"],
       });
+      store.recordHostMergeProcess("unknown-host-merge", {
+        pid: 43003,
+        pgid: 43003,
+        identity: "pid=43003;start=Wed Jun 10 12:01:00 2026",
+      });
       store.markHostMergeLeaseUnknown("unknown-host-merge");
-      expect(() => store.completeHostMergeLease("unknown-host-merge", "not-spawned")).toThrow();
+      expect(() => store.completeHostMergeLease("unknown-host-merge", {
+        kind: "not-spawned",
+        diagnostic: "confirmed not started",
+      })).toThrow();
       expect(store.listHostMergeLeases("bot-parked")).toMatchObject([{ phase: "unknown" }]);
     } finally {
       store.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+test("thread archive generations persist inbound invalidation across restart", async () => {
+  const root = await mkdtemp(join(tmpdir(), "omp-channel-octo-thread-archive-generation-"));
+  const target = { channelType: 5 as const, channelId: "group-generation____thread" };
+  try {
+    const store = await openChannelStore(root);
+    try {
+      expect(store.getThreadArchiveGeneration("bot-generation", target)).toBe(0);
+      expect(store.advanceThreadArchiveGeneration("bot-generation", target)).toBe(1);
+    } finally {
+      store.close();
+    }
+
+    const restarted = await openChannelStore(root);
+    try {
+      expect(restarted.getThreadArchiveGeneration("bot-generation", target)).toBe(1);
+      expect(restarted.advanceThreadArchiveGeneration("bot-generation", target)).toBe(2);
+    } finally {
+      restarted.close();
     }
   } finally {
     await rm(root, { recursive: true, force: true });

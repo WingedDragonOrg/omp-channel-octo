@@ -4,6 +4,7 @@
  */
 
 import type { ExecutionSnapshot, ExecutionTodoPhase, ExecutionTodoTask, ExecutionToolSnapshot } from "./execution-tracker.ts";
+import { safeDisplayText } from "./execution-text.ts";
 import {
   TOGGLE_ACTION,
   capabilitiesAllowCard,
@@ -433,11 +434,61 @@ function trimTodos(
   return { visible, omitted };
 }
 
+type HostMergePhase = NonNullable<ExecutionSnapshot["hostMerge"]>["phase"];
+
+const HOST_MERGE_PHASE_LABELS: Record<HostMergePhase, string> = {
+  preparing: "正在准备并校验工作区",
+  "process-started": "合并启动器进程组已确认，等待合并结果",
+  "process-exited": "合并进程组已退出，正在确认结果",
+  succeeded: "合并成功",
+  "execution-failed": "合并执行失败",
+  "not-started": "合并未启动",
+  cancelled: "合并已取消",
+  unknown: "合并结果未知",
+};
+
+function buildHostMergeCard(snapshot: ExecutionSnapshot, capabilities: ExecutionCardCapabilities): ExecutionCardResult | null {
+  const limits = resolveCardLimits(capabilities);
+  const hostMerge = snapshot.hostMerge;
+  if (!limits || !hostMerge) return null;
+  const active = hostMerge.phase === "preparing"
+    || hostMerge.phase === "process-started"
+    || hostMerge.phase === "process-exited";
+  const color = active ? "Accent" : hostMerge.phase === "succeeded"
+    ? "Good"
+    : hostMerge.phase === "cancelled" || hostMerge.phase === "not-started"
+      ? "Default"
+      : "Attention";
+  const result = safeDisplayText(hostMerge.result, 400);
+  const body = [
+    makeTextBlock(`线程合并 · ${HOST_MERGE_PHASE_LABELS[hostMerge.phase]}`, {
+      weight: "Bolder",
+      size: "Medium",
+      color,
+    }),
+    makeTextBlock(`耗时：${formatDuration(snapshot.elapsedMs)}`, { spacing: "Small" }),
+    ...(result === undefined ? [] : [makeTextBlock(result, { spacing: "Small" })]),
+  ];
+  const plain = body
+    .map(node => typeof node.text === "string" ? node.text : "")
+    .filter(Boolean)
+    .join("\n");
+  const card: AdaptiveCard = {
+    $schema: ADAPTIVE_CARD_SCHEMA,
+    type: "AdaptiveCard",
+    version: "1.5",
+    body,
+    metadata: { octo_layout: "agent_progress_v1" },
+  };
+  return cardWithinLimits(card, plain, limits) ? { card, plain } : null;
+}
+
 export function buildExecutionCard(
   snapshot: ExecutionSnapshot,
   capabilities: ExecutionCardCapabilities,
 ): ExecutionCardResult | null {
   if (!capabilitiesAllowCard(capabilities)) return null;
+  if (snapshot.hostMerge) return buildHostMergeCard(snapshot, capabilities);
   const limits = resolveCardLimits(capabilities);
   if (!limits) return null;
   const totalTools = snapshot.tools.length;

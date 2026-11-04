@@ -2,7 +2,7 @@
  * 持久层的记录类型：每张表在 TypeScript 侧的形状，被 store 门面与各领域模块共用。
  */
 
-import type { ChatAppendMode, ChatExecutionState, ChatTarget, TextMention, ThreadListenLevel, ThreadSummary, WorkerGoal, WorkerGoalRun, WorkerProcess, WorktreeMergeOutcome, WorktreeRemovalStep } from "../contracts.ts";
+import type { ChatAppendMode, ChatExecutionState, ChatTarget, HostMergeOutcome, HostMergeProgressPhase, TextMention, ThreadListenLevel, ThreadSummary, WorkerGoal, WorkerGoalRun, WorkerProcess, WorktreeRemovalStep } from "../contracts.ts";
 
 export interface BindingRecord extends ChatTarget {
   botUid: string;
@@ -197,6 +197,31 @@ export interface TaskRestartRecovery {
   goalStopped: GoalStoppedRecovery[];
 }
 
+/** Progress-card delivery for a host merge, independent of any task or task-owned progress row. */
+
+export type HostMergeProgressDeliveryState = "ready" | "attempted" | "unknown" | "unavailable" | "bound";
+export interface HostMergeProgressCardRecord extends ChatTarget {
+  botUid: string;
+  sourceId: string;
+  clientMsgNo: string;
+  messageId: string | null;
+  deliveryState: HostMergeProgressDeliveryState;
+  lastSeq: number;
+  phase: HostMergeProgressPhase;
+  startedAt: number;
+  endedAt: number | null;
+  result: string | null;
+  updatedAt: number;
+}
+
+export interface HostMergeProgressCardInput {
+  botUid: string;
+  target: ChatTarget;
+  sourceId: string;
+  clientMsgNo: string;
+  startedAt: number;
+}
+
 /**
  * The last progress-card frame the server accepted for a task. Card identity only exists in the
  * process that observed the run, so this row lets the next process submit one terminal edit
@@ -336,9 +361,10 @@ export interface HostMergeLeaseRecord extends ChatTarget {
   commandText: string | null;
   operatorNote: string | null;
   senderId: string | null;
-  messageSeq: number | null;
   receiptOutboxId: string | null;
-  outcome: WorktreeMergeOutcome | null;
+  messageSeq: number | null;
+  archiveGeneration: number | null;
+  outcome: HostMergeOutcome | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -355,6 +381,7 @@ export interface HostMergeLeaseInput {
   senderId?: string;
   messageSeq?: number;
   receiptOutboxId?: string;
+  archiveGeneration?: number | null;
 }
 
 export type HostThreadRemovalOutcome =

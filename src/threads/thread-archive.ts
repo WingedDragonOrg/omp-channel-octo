@@ -47,10 +47,12 @@ export interface ThreadArchiveDeps {
   readonly stopping: () => boolean;
 }
 
+type ThreadArchiveRunOutcome = "finished" | "cancelled" | "stopped" | "skipped";
+
 interface ActiveThreadArchive {
   readonly pending: PendingThreadArchive;
   readonly controller: AbortController;
-  readonly operation: Promise<void>;
+  readonly operation: Promise<ThreadArchiveRunOutcome>;
 }
 
 function pause(ms: number, signal: AbortSignal): Promise<void> {
@@ -64,6 +66,22 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) finish();
   else signal.addEventListener("abort", finish, { once: true });
   return completion.promise;
+}
+
+async function waitForProgressTail(progressTail: Promise<void>, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return false;
+  const completion = Promise.withResolvers<boolean>();
+  const onAbort = (): void => completion.resolve(false);
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    const drained = await Promise.race([
+      progressTail.then(() => true, () => true),
+      completion.promise,
+    ]);
+    return drained && !signal.aborted;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 export class ThreadArchiveScheduler {
@@ -81,6 +99,14 @@ export class ThreadArchiveScheduler {
   /** 当前聊天已授权入站代次；merge 等待期间发生的新输入会使旧计划失效。 */
   generation(target: ChatTarget): number {
     return this.generations.get(targetKey(target)) ?? 0;
+  }
+
+  syncGeneration(target: ChatTarget, generation: number): void {
+    if (!Number.isSafeInteger(generation) || generation < 0) {
+      throw new Error("invalid thread archive generation");
+    }
+    const key = targetKey(target);
+    this.generations.set(key, Math.max(this.generations.get(key) ?? 0, generation));
   }
 
   /** 记下发起聊天快照；旧代的 merge 完成不得覆盖新入站对归档的取消。 */
@@ -107,9 +133,11 @@ export class ThreadArchiveScheduler {
   }
 
   /** 已授权的新入站取消当前代次的计划与在途归档请求。 */
-  cancel(target: ChatTarget): void {
+  cancel(target: ChatTarget, generation?: number): void {
     const key = targetKey(target);
-    this.generations.set(key, this.generation(target) + 1);
+    const next = generation ?? this.generation(target) + 1;
+    if (!Number.isSafeInteger(next) || next < this.generation(target)) return;
+    this.generations.set(key, next);
     this.pendingThreadArchives.delete(key);
     this.activeRuns.get(key)?.controller.abort(new Error("thread archive cancelled by new inbound"));
   }
@@ -126,25 +154,32 @@ export class ThreadArchiveScheduler {
    * 回执已进入 `sent`（`dead`、未知或缺行都 fail closed），再调用 archiveThread。
    */
   async run(target: ChatTarget, progressTail: Promise<void>): Promise<void> {
+    await this.runWithOutcome(target, progressTail);
+  }
+
+  /** Like run, but identifies whether a durable owner may consume its recovery lease. */
+  async runWithOutcome(
+    target: ChatTarget,
+    progressTail: Promise<void>,
+  ): Promise<ThreadArchiveRunOutcome> {
     const key = targetKey(target);
     const pending = this.pendingThreadArchives.get(key);
-    if (!pending || this.deps.stopping()) return;
+    if (!pending) return "skipped";
+    if (this.deps.stopping()) return "stopped";
     const active = this.activeRuns.get(key);
     if (active) {
-      if (active.pending === pending) {
-        await active.operation;
-        return;
-      }
+      if (active.pending === pending) return active.operation;
       active.controller.abort(new Error("thread archive plan replaced"));
-      await active.operation.catch(() => {});
-      return this.run(target, progressTail);
+      await active.operation.catch(() => "cancelled" as const);
+      if (this.deps.stopping()) return "stopped";
+      return this.runWithOutcome(target, progressTail);
     }
     const controller = new AbortController();
     const operation = this.runPending(key, pending, progressTail, controller.signal);
     const current = { pending, controller, operation };
     this.activeRuns.set(key, current);
     try {
-      await operation;
+      return await operation;
     } finally {
       if (this.activeRuns.get(key) === current) this.activeRuns.delete(key);
     }
@@ -155,25 +190,38 @@ export class ThreadArchiveScheduler {
     pending: PendingThreadArchive,
     progressTail: Promise<void>,
     signal: AbortSignal,
-  ): Promise<void> {
+  ): Promise<ThreadArchiveRunOutcome> {
     try {
-      await progressTail.catch(() => {});
-      if (!this.isCurrent(key, pending, signal)) return;
+      if (!await waitForProgressTail(progressTail, signal)) {
+        return this.deps.stopping() ? "stopped" : "cancelled";
+      }
+      if (!this.isCurrent(key, pending, signal)) {
+        return this.deps.stopping() ? "stopped" : "cancelled";
+      }
       await this.drainChatOutbox(pending.target, signal);
-      if (!this.isCurrent(key, pending, signal)) return;
+      if (!this.isCurrent(key, pending, signal)) {
+        return this.deps.stopping() ? "stopped" : "cancelled";
+      }
       if (pending.receiptOutboxIds !== undefined) {
         const delivered = await this.waitForReceipt(key, pending, signal);
-        if (!delivered || !this.isCurrent(key, pending, signal)) return;
+        if (!delivered || !this.isCurrent(key, pending, signal)) {
+          return this.deps.stopping() ? "stopped" : "cancelled";
+        }
       }
       const outcome = await this.archivePendingThread(key, pending, signal);
       if (outcome === "archived") {
         console.error(`[thread-archive] 已归档子区 ${pending.shortId} target=${key}`);
+        return "finished";
       }
+      return this.deps.stopping() ? "stopped" : "cancelled";
     } catch (error) {
-      if (!this.isCurrent(key, pending, signal)) return;
+      if (!this.isCurrent(key, pending, signal)) {
+        return this.deps.stopping() ? "stopped" : "cancelled";
+      }
       const reason = failureText(error, "归档失败");
       console.error(`[thread-archive] 归档失败 target=${key} short=${pending.shortId}：${reason}`);
       this.deps.outbox.enqueueText(pending.target, `归档失败：${reason}`, null);
+      return "finished";
     } finally {
       if (this.pendingThreadArchives.get(key) === pending) this.pendingThreadArchives.delete(key);
     }

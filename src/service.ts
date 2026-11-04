@@ -4,6 +4,7 @@ import { modelPolicyDescription } from "./commands/model-switch.ts";
 import { formatGoalSession, goalErrorText, GOAL_USAGE, parseGoalCommand } from "./commands/goal-command.ts";
 import { CONFIG_CARD_ACTION_PREFIX, createConfigMenuDesk, type ConfigMenuDesk } from "./commands/command-cards.ts";
 import { ProgressCards, type TaskProgress } from "./cards/progress-cards.ts";
+import { HostMergeProgressCards, type HostMergeProgressSession } from "./cards/host-merge-progress.ts";
 import { buildStatusCard } from "./cards/status-card.ts";
 import type { CommitContent } from "./cards/commit-content.ts";
 import { COMMIT_RESULT_UNKNOWN, type ExecutionEvent } from "./cards/execution-tracker.ts";
@@ -376,6 +377,7 @@ class CoreService implements ChannelService {
   private readonly authorization: ChatAuthorization;
   private readonly materializer: InboundMaterializer;
   private readonly progressCards: ProgressCards;
+  private readonly hostMergeProgressCards: HostMergeProgressCards;
   private readonly sessions: SessionLifecycle;
   /** 任务排定与按 cwd 的租约：队列、等待回执与目录链都由它独占。 */
   private readonly scheduler: TaskScheduler;
@@ -417,9 +419,12 @@ class CoreService implements ChannelService {
     readonly target: ChatTarget;
     readonly groupId: string;
     readonly shortId: string;
+    readonly sourceId?: string;
     readonly generation: number;
     readonly receiptOutboxIds: readonly string[];
   }>();
+  /** A scheduled merge archive keeps its durable outcome lease until the barrier settles. */
+  private readonly activeHostMergeArchives = new Map<string, string>();
   /** Startup-recovered archives stay staged until progress-card recovery and transport readiness. */
   private readonly recoveredHostMergeArchiveTargets = new Set<string>();
   private readonly commitOperationsByTask = new Map<string, CommitOperation>();
@@ -524,6 +529,15 @@ class CoreService implements ChannelService {
         const job = this.store.getReviewJob(id);
         return job?.state === "accepted" || job?.state === "running";
       },
+    });
+    this.hostMergeProgressCards = new HostMergeProgressCards({
+      store: this.store,
+      transport: options.transport,
+      botUid: () => this.bot?.uid,
+      stopping: () => this.stopping,
+      trackOperation: operation => this.operationSet(operation),
+      trackTail: (target, operationId, getTail) => this.trackProgressTail(target, operationId, getTail),
+      releaseTail: (target, operationId, tail) => this.releaseProgressTail(target, operationId, tail),
     });
     // 排定与租约的所有者先于 SessionLifecycle 构造：会话侧的命令租约经端口落到这里。它的
     // reconcileBinding/runTask 回调只在任务真正执行时解引用 `this.sessions`（构造时不解引用，
@@ -673,10 +687,10 @@ class CoreService implements ChannelService {
       archiveForkThread: (message, mode) => this.archiveForkThread(message, mode),
       botUid: () => this.bot?.uid,
       ...(options.worktrees === undefined ? {} : { worktrees: options.worktrees }),
-      archiveGeneration: target => this.threadArchives.generation(target),
+      archiveGeneration: target => this.currentThreadArchiveGeneration(target),
       stopping: () => this.stopping,
-      executeHostMerge: (message, binding, receiptOutboxId, archiveGeneration, operatorNote) =>
-        this.executeHostThreadMerge(message, binding, receiptOutboxId, archiveGeneration, operatorNote),
+      executeHostMerge: (message, binding, receiptOutboxId, archiveGeneration, operatorNote, onAccepted) =>
+        this.executeHostThreadMerge(message, binding, receiptOutboxId, archiveGeneration, operatorNote, onAccepted),
       executeHostRemoval: (message, ownership, force, receiptOutboxId) =>
         this.executeHostThreadRemoval(message, ownership, force, receiptOutboxId),
       enqueueMergeReceipt: (target, id, text) => this.enqueueThreadMergeReceipt(target, id, text),
@@ -685,8 +699,8 @@ class CoreService implements ChannelService {
       settleHostRemoval: (target, sourceId) => this.settleHostRemovalForSource(target, sourceId),
       recoverRemovalArchive: (target, receiptOutboxId, archiveGeneration) =>
         this.recoverHostRemovalArchive(target, receiptOutboxId, archiveGeneration),
-      recoverMergeArchive: (target, receiptOutboxId) =>
-        this.recoverHostMergeArchive(target, receiptOutboxId),
+      recoverMergeArchive: (target, receiptOutboxId, sourceId, archiveGeneration) =>
+        this.recoverHostMergeArchive(target, receiptOutboxId, sourceId, archiveGeneration),
       runThreadArchive: target => this.runThreadArchive(target),
       materialize: (message, text) => this.materializer.materialize(message, text),
       commandClaim: (message, name) => this.commandClaim(message, name),
@@ -839,17 +853,14 @@ class CoreService implements ChannelService {
       if (configuredOwner) {
         this.store.setOwnerId(identity.uid, configuredOwner);
       }
-      // Known host merge outcomes are never re-run. Failed command outcomes restore repair tasks
-      // before the restart snapshot; successful notices are delivered after recovered work is staged.
-      // Unknown or outcome-less rows remain fail-closed, with exact process-group recovery first.
+      // Never re-run a host merge. Reconcile its independent card after process recovery has
+      // established known/unknown outcomes, then restore failed outcomes as repair tasks.
       const successfulHostMergeRecoveries: HostMergeLeaseRecord[] = [];
+      const failedHostMergeRecoveries: HostMergeLeaseRecord[] = [];
       for (const lease of this.store.listHostMergeLeases(identity.uid)) {
         if (lease.outcome !== null) {
-          if (lease.outcome.kind === "succeeded") {
-            successfulHostMergeRecoveries.push(lease);
-          } else if (lease.commandText !== null) {
-            await this.threadCommands.recoverHostMergeOutcome(lease);
-          }
+          if (lease.outcome.kind === "succeeded") successfulHostMergeRecoveries.push(lease);
+          else if (lease.commandText !== null) failedHostMergeRecoveries.push(lease);
           continue;
         }
         const processIdentity = this.hostMergeProcessIdentity(lease);
@@ -865,6 +876,13 @@ class CoreService implements ChannelService {
           }
         }
         this.store.markHostMergeLeaseUnknown(lease.id);
+      }
+      await this.hostMergeProgressCards.recover(
+        identity.uid,
+        this.store.listHostMergeLeases(identity.uid),
+      );
+      for (const lease of failedHostMergeRecoveries) {
+        await this.threadCommands.recoverHostMergeOutcome(lease);
       }
       for (const lease of this.store.listHostRemovalLeases(identity.uid)) {
         if (lease.outcome !== null) {
@@ -1014,10 +1032,13 @@ class CoreService implements ChannelService {
         if (this.stopping) throw new Error("channel 正在停止");
         const outcome = lease.outcome;
         if (outcome?.kind !== "succeeded") continue;
+        const target: ChatTarget = { channelId: lease.channelId, channelType: 5 };
+        const archiveScheduled = outcome.summary.removed
+          && this.hostMergeArchiveGenerationForRecovery(lease, target) !== undefined;
         await this.persistThreadMergeSuccess(
-          { channelId: lease.channelId, channelType: 5 },
+          target,
           outcome.summary,
-          outcome.summary.removed ? "scheduled" : "not-scheduled",
+          archiveScheduled ? "scheduled" : "not-scheduled",
           lease.sourceId,
         );
       }
@@ -1083,6 +1104,7 @@ class CoreService implements ChannelService {
     this.abortAllThreadForks(new Error("channel stopping"));
     this.abortAllForkArchiveWaits(new Error("channel stopping"));
     this.abortAllThreadMerges(new Error("channel stopping"));
+    this.hostMergeProgressCards.stop();
     this.abortAllThreadRemovals(new Error("channel stopping"));
     this.threadArchives.stop();
     this.pendingHostMergeArchives.clear();
@@ -2687,6 +2709,7 @@ class CoreService implements ChannelService {
     if (!this.store.claimCommand(claim)) return;
     const forkCommandKey = action === "fork" ? this.threadMergeCommandKey(message) : null;
     if (forkCommandKey !== null) this.forkCommandTargets.set(forkCommandKey, { ...message });
+    let threadCommandDetached = false;
     try {
       this.cancelThreadArchives(message);
       if (
@@ -2697,7 +2720,13 @@ class CoreService implements ChannelService {
         this.store.completeCommand(claim);
         return;
       }
-      const restartRequested = await this.builtinHandlers[action](message, argument);
+      let restartRequested: boolean | void = undefined;
+      if (action === "thread") {
+        threadCommandDetached = await this.dispatchThreadCommand(message, argument);
+        if (threadCommandDetached) return;
+      } else {
+        restartRequested = await this.builtinHandlers[action](message, argument);
+      }
       const commandKey = this.threadMergeCommandKey(message);
       if (
         forkCommandKey !== null
@@ -2717,16 +2746,66 @@ class CoreService implements ChannelService {
       const detail = safeDisplayText(error instanceof Error ? error.message : String(error), 180);
       throw new Error(detail === undefined ? "命令未能持久完成。" : `命令未能持久完成：${detail}`);
     } finally {
-      if (
+      if (!threadCommandDetached && (
         this.finishThreadMergeCommand(message)
         || this.finishThreadRemovalCommand(message)
-      ) this.serviceRestart.maybeRunDeferred();
-      if (action === "thread") this.completeForkArchiveCommand(message);
+      )) this.serviceRestart.maybeRunDeferred();
+      if (action === "thread" && !threadCommandDetached) this.completeForkArchiveCommand(message);
       if (forkCommandKey !== null) {
         this.forkCommandTargets.delete(forkCommandKey);
         this.serviceRestart.maybeRunDeferred();
       }
     }
+  }
+
+  private async dispatchThreadCommand(message: InboundMessage, argument: string): Promise<boolean> {
+    const accepted = Promise.withResolvers<void>();
+    const operation = this.threadCommands.handle(message, argument, () => accepted.resolve());
+    const completion = operation.then(
+      () => ({ kind: "completed" as const }),
+      error => ({ kind: "failed" as const, error }),
+    );
+    const result = await Promise.race([
+      completion,
+      accepted.promise.then(() => ({ kind: "accepted" as const })),
+    ]);
+    if (result.kind === "failed") throw result.error;
+    if (result.kind === "completed") return false;
+
+    const background = completion
+      .then(async outcome => {
+        if (outcome.kind === "failed") {
+          const detail = safeDisplayText(
+            outcome.error instanceof Error ? outcome.error.message : String(outcome.error),
+            180,
+          );
+          await this.outbox.enqueueText(
+            message,
+            `合并已受理，但后续处理未能完成：${detail ?? "请核对目标分支与工作区。"}`,
+            null,
+          );
+        }
+        const commandKey = this.threadMergeCommandKey(message);
+        if (
+          this.threadMergeControllersByCommand.has(commandKey)
+          || this.threadRemovalControllersByCommand.has(commandKey)
+        ) {
+          await this.outbox.flush(message);
+        }
+      })
+      .catch(error => {
+        console.error(
+          `[thread command] 已受理操作的后台收尾失败：${safeErrorMessage(error, "background command cleanup failed")}`,
+        );
+      })
+      .finally(() => {
+        if (
+          this.finishThreadMergeCommand(message)
+          || this.finishThreadRemovalCommand(message)
+        ) this.serviceRestart.maybeRunDeferred();
+      });
+    this.operationSet(background);
+    return true;
   }
 
   /**
@@ -4291,8 +4370,34 @@ class CoreService implements ChannelService {
       for (const controller of controllers) controller.abort(reason);
     }
   }
+  private currentThreadArchiveGeneration(target: ChatTarget): number {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) throw new Error("Bot 身份未注册，无法读取子区归档代次");
+    const generation = this.store.getThreadArchiveGeneration(botUid, target);
+    this.threadArchives.syncGeneration(target, generation);
+    return generation;
+  }
+
   private cancelThreadArchives(target: InboundMessage): void {
-    this.threadArchives.cancel(target);
+    try {
+      if (target.channelType === 5) {
+        const botUid = this.bot?.uid;
+        if (botUid === undefined) throw new Error("Bot 身份未注册，无法持久化子区归档取消");
+        const generation = this.store.advanceThreadArchiveGeneration(botUid, target);
+        this.threadArchives.syncGeneration(target, generation);
+        this.threadArchives.cancel(target, generation);
+      } else {
+        this.threadArchives.cancel(target);
+      }
+    } catch (error) {
+      try {
+        this.threadArchives.cancel(target);
+      } catch {
+        // Preserve the storage failure; the durable inbound handler must not claim cancellation succeeded.
+      }
+      this.abortForkArchiveWaits(target, new Error("new inbound"));
+      throw error;
+    }
     this.abortForkArchiveWaits(target, new Error("new inbound"));
   }
 
@@ -5051,11 +5156,17 @@ class CoreService implements ChannelService {
       readonly senderId: string;
       readonly messageSeq: number;
       readonly receiptOutboxId: string;
+      readonly archiveGeneration?: number;
     },
     commandBeforeSpawn?: () => void,
+    progress?: HostMergeProgressSession,
+    signal?: AbortSignal,
+    accepted?: () => void,
+    archiveGeneration?: number,
   ): WorktreeMergeLifecycle {
     const botUid = this.bot?.uid;
     if (botUid === undefined) throw new Error("Bot 身份未注册，无法合并子区工作区");
+    const capturedArchiveGeneration = archiveGeneration ?? commandContext?.archiveGeneration ?? null;
     const existing = sourceId === undefined
       ? null
       : this.store.getHostMergeLeaseBySourceId(botUid, target, sourceId);
@@ -5063,6 +5174,7 @@ class CoreService implements ChannelService {
       if (existing.outcome !== null) {
         return {
           existingOutcome: existing.outcome,
+          archiveGeneration: existing.archiveGeneration,
           beforeSpawn: () => { throw new Error("known host merge outcomes must be replayed without spawning"); },
           onSpawn: () => { throw new Error("known host merge outcomes must not spawn"); },
           onConfirmedExit: () => { throw new Error("known host merge outcomes already exited"); },
@@ -5073,6 +5185,7 @@ class CoreService implements ChannelService {
         };
       }
       return {
+        archiveGeneration: existing.archiveGeneration,
         beforeSpawn: () => { throw new Error("an unresolved host merge lease blocks this source id"); },
         onSpawn: () => { throw new Error("an unresolved host merge lease cannot spawn again"); },
         onConfirmedExit: () => { throw new Error("an unresolved host merge lease must be recovered first"); },
@@ -5090,6 +5203,7 @@ class CoreService implements ChannelService {
     let confirmedExit = false;
     let outcomePersisted = false;
     return {
+      archiveGeneration: capturedArchiveGeneration,
       beforeSpawn: (spawnCwd) => {
         if (this.stopping) throw new Error("channel 正在停止");
         if (spawnCwd !== cwd || target.channelType !== 5) {
@@ -5109,26 +5223,31 @@ class CoreService implements ChannelService {
           cwd,
           resourceCwds: plannedResources,
           ...commandContext,
+          archiveGeneration: capturedArchiveGeneration,
         });
         reserved = true;
         this.store.beginThreadMerge(botUid, target);
+        accepted?.();
       },
       onSpawn: (identity) => {
         if (!reserved || identity.cwd !== cwd) {
           throw new Error("host merge process spawned without its durable reservation");
         }
         this.store.recordHostMergeProcess(id, identity);
+        progress?.processStarted();
       },
       onConfirmedExit: () => {
         if (!reserved) throw new Error("host merge process exited without its durable reservation");
         this.store.markHostMergeProcessExited(id);
         confirmedExit = true;
+        progress?.processExited();
       },
       complete: (outcome: WorktreeMergeOutcome) => {
         if (!reserved) throw new Error("host merge outcome has no durable reservation");
         if (!confirmedExit) throw new Error("host merge outcome cannot be persisted before confirmed process exit");
         this.store.persistHostMergeOutcome(id, outcome);
         outcomePersisted = true;
+        progress?.finishFromOutcome(outcome);
       },
       settle: () => {
         if (!reserved) return;
@@ -5137,12 +5256,17 @@ class CoreService implements ChannelService {
       },
       onNotSpawned: () => {
         if (!reserved) return;
-        this.store.completeHostMergeLease(id, "not-spawned");
-        reserved = false;
+        const diagnostic = "Worktrunk merge was confirmed not to have started; it will not be replayed automatically.";
+        this.store.completeHostMergeLease(id, { kind: "not-spawned", diagnostic });
+        outcomePersisted = true;
+        progress?.finishFromOutcome({ kind: "not-started", diagnostic });
       },
       onUnknown: () => {
         if (!reserved || outcomePersisted) return;
         this.store.markHostMergeLeaseUnknown(id);
+        progress?.unknown(signal?.aborted
+          ? "取消后 Worktrunk merge 的最终结果无法确认；不会自动重放，请先核对目标分支与工作区。"
+          : undefined);
       },
     };
   }
@@ -5153,9 +5277,11 @@ class CoreService implements ChannelService {
     receiptOutboxId: string,
     archiveGeneration: number,
     operatorNote: string,
+    onAccepted?: () => void,
   ): Promise<WorktreeMergeSummary & { archive?: "scheduled" }> {
     const botUid = this.bot?.uid;
     if (botUid === undefined) throw new Error("Bot 身份未注册，无法合并子区工作区");
+    const progress = this.hostMergeProgressCards.start(message, message.messageId);
     const targetKeyValue = targetKey(message);
     const controller = new AbortController();
     const controllers = this.threadMergeControllers.get(targetKeyValue) ?? new Set<AbortController>();
@@ -5169,8 +5295,9 @@ class CoreService implements ChannelService {
 
     let reservation: DestructiveCommandReservation | undefined;
     let lease: SessionLease | undefined;
+    let prior: HostMergeLeaseRecord | null = null;
     try {
-      const prior = this.store.getHostMergeLeaseBySourceId(botUid, message, message.messageId);
+      prior = this.store.getHostMergeLeaseBySourceId(botUid, message, message.messageId);
       let plan: WorktreeMergePlan | undefined;
       let resourceCwds: readonly string[];
       if (prior?.outcome !== undefined && prior.outcome !== null) {
@@ -5210,6 +5337,7 @@ class CoreService implements ChannelService {
           senderId: message.senderId,
           messageSeq: message.messageSeq,
           receiptOutboxId,
+          archiveGeneration,
         },
         () => {
           const current = this.store.getBinding(botUid, message);
@@ -5223,6 +5351,9 @@ class CoreService implements ChannelService {
           }
           this.store.completeCommand(this.commandClaim(message, "thread"));
         },
+        progress,
+        controller.signal,
+        onAccepted,
       );
 
       if (reservation !== undefined) {
@@ -5241,13 +5372,21 @@ class CoreService implements ChannelService {
         worktreeMergeLifecycle: () => lifecycle,
         archiveGeneration: () => archiveGeneration,
         planThreadArchive: (target, groupId, shortId, generation) => {
+          const currentGeneration = this.currentThreadArchiveGeneration(target);
+          if (
+            generation !== archiveGeneration
+            || currentGeneration !== generation
+            || this.threadArchives.generation(target) !== generation
+          ) return false;
           this.pendingHostMergeArchives.set(targetKey(target), {
             target: { ...target },
             groupId,
             shortId,
+            sourceId: message.messageId,
             generation,
             receiptOutboxIds: [receiptOutboxId],
           });
+          return true;
         },
       };
       let summary: WorktreeMergeSummary & { archive?: "scheduled" };
@@ -5258,8 +5397,16 @@ class CoreService implements ChannelService {
         this.pendingHostMergeArchives.delete(targetKeyValue);
         throw error;
       }
+      progress.finishFromOutcome({ kind: "succeeded", summary });
+      if (
+        summary.archive === "scheduled"
+        && this.currentThreadArchiveGeneration(message) !== archiveGeneration
+      ) {
+        this.pendingHostMergeArchives.delete(targetKeyValue);
+        delete summary.archive;
+      }
       // The command's message ID is the stable operation identity shared with recovery. The
-      // publisher is the only owner of the success event; failures never reach it.
+      // publisher is the only owner of the success event; progress-card I/O is an archive barrier.
       await this.publishThreadMergeSuccess(
         message,
         summary,
@@ -5267,6 +5414,45 @@ class CoreService implements ChannelService {
         message.messageId,
       );
       return summary;
+    } catch (error) {
+      let durableOutcome = prior?.outcome ?? null;
+      try {
+        durableOutcome = this.store.getHostMergeLeaseBySourceId(botUid, message, message.messageId)?.outcome ?? durableOutcome;
+      } catch (lookupError) {
+        console.error(
+          `[thread-merge] 无法读取持久结果 target=${targetKey(message)}：`
+          + safeErrorMessage(lookupError, "merge outcome lookup failed"),
+        );
+      }
+      if (durableOutcome !== null) {
+        try {
+          progress.finishFromOutcome(durableOutcome);
+        } catch (progressError) {
+          console.error(
+            `[thread-merge-progress] 无法持久化已知结果 target=${targetKey(message)}：`
+            + safeErrorMessage(progressError, "terminal progress persistence failed"),
+          );
+        }
+      } else if (
+        progress.phase === "preparing"
+        || progress.phase === "process-started"
+        || progress.phase === "process-exited"
+      ) {
+        if (prior !== null) {
+          progress.unknown();
+        } else if (progress.phase === "preparing") {
+          if (controller.signal.aborted) progress.cancelled();
+          else {
+            const reason = safeDisplayText(error instanceof Error ? error.message : "", 240);
+            progress.notStarted(reason ?? "Worktrunk merge 尚未启动；未执行合并。");
+          }
+        } else {
+          progress.unknown(controller.signal.aborted
+            ? "取消后 Worktrunk merge 的最终结果无法确认；不会自动重放，请先核对目标分支与工作区。"
+            : undefined);
+        }
+      }
+      throw error;
     } finally {
       reservation?.release();
       lease?.complete();
@@ -5539,13 +5725,56 @@ class CoreService implements ChannelService {
     void this.outbox.flush(target).catch(() => {});
   }
 
-  private settleHostMergeForSource(target: ChatTarget, sourceId: string): void {
-    const botUid = this.bot?.uid;
-    if (botUid === undefined) throw new Error("Bot 身份未注册，无法结算 host merge。");
-    const lease = this.store.getHostMergeLeaseBySourceId(botUid, target, sourceId);
-    if (!lease) throw new Error("host merge outcome lease disappeared before durable delivery");
-    if (lease.outcome === null) throw new Error("host merge cannot settle before a known outcome is durable");
-    this.store.settleHostMergeLease(lease.id);
+  private settleHostMergeForSource(
+    target: ChatTarget,
+    sourceId: string,
+    archiveBarrierFinished = false,
+  ): void {
+    if (this.stopping && !archiveBarrierFinished) return;
+    const key = targetKey(target);
+    if (
+      this.pendingHostMergeArchives.get(key)?.sourceId === sourceId
+      || this.activeHostMergeArchives.get(key) === sourceId
+      || this.recoveredHostMergeArchiveTargets.has(key)
+    ) return;
+    try {
+      if (!archiveBarrierFinished) {
+        const progressTail = this.progressTails.get(key)?.get(`host-merge:${sourceId}`);
+        if (progressTail !== undefined) {
+          void Promise.resolve()
+            .then(progressTail)
+            .then(
+              () => this.settleHostMergeForSource(target, sourceId, true),
+              (error: unknown) => {
+                console.error(
+                  `[thread-merge] 进度卡屏障未完成 target=${key}：`
+                  + safeErrorMessage(error, "merge progress barrier failed"),
+                );
+              },
+            );
+          return;
+        }
+      }
+      const botUid = this.bot?.uid;
+      if (botUid === undefined) return;
+      const lease = this.store.getHostMergeLeaseBySourceId(botUid, target, sourceId);
+      if (!lease || lease.outcome === null) return;
+      const progress = this.store.getHostMergeProgressCard(botUid, target, sourceId);
+      if (progress !== null) {
+        const expectedPhase = lease.outcome.kind === "succeeded"
+          ? "succeeded"
+          : lease.outcome.kind === "not-started"
+            ? "not-started"
+            : "execution-failed";
+        if (progress.phase !== expectedPhase || progress.endedAt === null) return;
+      }
+      this.store.settleHostMergeLease(lease.id);
+    } catch (error) {
+      console.error(
+        `[thread-merge] 无法结算已知结果 target=${key}：`
+        + safeErrorMessage(error, "merge lease settlement failed"),
+      );
+    }
   }
 
   private settleHostRemovalForSource(target: ChatTarget, sourceId: string): void {
@@ -5565,12 +5794,15 @@ class CoreService implements ChannelService {
     const groupId = threadParentGroupId(target.channelId);
     const shortId = threadShortId(target.channelId);
     if (groupId === null || shortId === null) throw new Error("cannot recover archive for an invalid thread target");
+    const currentGeneration = this.currentThreadArchiveGeneration(target);
+    const generation = archiveGeneration ?? currentGeneration;
+    if (generation !== currentGeneration) return;
     const outcome = this.store.getHostRemovalLeaseBySourceId(this.bot!.uid, target, target.messageId)!.outcome!;
     this.pendingHostMergeArchives.set(targetKey(target), {
       target: { ...target },
       groupId,
       shortId,
-      generation: archiveGeneration ?? this.threadArchives.generation(target),
+      generation,
       receiptOutboxIds: this.removalReceiptParts(receiptOutboxId, outcome.receiptText).map(part => part.id),
     });
     if (archiveGeneration === undefined) {
@@ -5578,7 +5810,34 @@ class CoreService implements ChannelService {
     }
   }
 
-  private recoverHostMergeArchive(target: InboundMessage, receiptOutboxId: string): void {
+  private hostMergeArchiveGenerationForRecovery(
+    lease: HostMergeLeaseRecord,
+    target: ChatTarget,
+  ): number | undefined {
+    if (
+      lease.commandText === null
+      || lease.outcome?.kind !== "succeeded"
+      || !lease.outcome.summary.removed
+    ) return undefined;
+    const currentGeneration = this.currentThreadArchiveGeneration(target);
+    if (lease.archiveGeneration === null) {
+      return currentGeneration === 0 ? currentGeneration : undefined;
+    }
+    return lease.archiveGeneration === currentGeneration ? currentGeneration : undefined;
+  }
+
+  private recoverHostMergeArchive(
+    target: InboundMessage,
+    receiptOutboxId: string,
+    sourceId: string,
+    archiveGeneration: number | null,
+  ): boolean {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) throw new Error("Bot 身份未注册，无法恢复子区归档");
+    const lease = this.store.getHostMergeLeaseBySourceId(botUid, target, sourceId);
+    if (!lease || lease.archiveGeneration !== archiveGeneration) return false;
+    const generation = this.hostMergeArchiveGenerationForRecovery(lease, target);
+    if (generation === undefined) return false;
     const groupId = threadParentGroupId(target.channelId);
     const shortId = threadShortId(target.channelId);
     if (groupId === null || shortId === null) throw new Error("cannot recover archive for an invalid thread target");
@@ -5586,11 +5845,14 @@ class CoreService implements ChannelService {
       target: { ...target },
       groupId,
       shortId,
-      generation: this.threadArchives.generation(target),
+      sourceId,
+      generation,
       receiptOutboxIds: [receiptOutboxId],
     });
     this.recoveredHostMergeArchiveTargets.add(targetKey(target));
+    return true;
   }
+
 
   /** Release durable-outcome archive plans only after cards and the transport are ready. */
   private releaseRecoveredHostMergeArchives(): void {
@@ -5701,22 +5963,56 @@ class CoreService implements ChannelService {
   private runThreadArchive(target: ChatTarget): Promise<void> {
     const key = targetKey(target);
     const pending = this.pendingHostMergeArchives.get(key);
+    let mergeSourceId: string | undefined;
+    let generationRejected = false;
     if (pending) {
       this.pendingHostMergeArchives.delete(key);
-      this.threadArchives.schedule(
-        pending.target,
-        pending.groupId,
-        pending.shortId,
-        pending.generation,
-        pending.receiptOutboxIds,
-      );
+      mergeSourceId = pending.sourceId;
+      const generation = this.currentThreadArchiveGeneration(target);
+      if (generation === pending.generation && this.threadArchives.generation(target) === generation) {
+        this.threadArchives.schedule(
+          pending.target,
+          pending.groupId,
+          pending.shortId,
+          pending.generation,
+          pending.receiptOutboxIds,
+        );
+      } else {
+        generationRejected = true;
+        this.recoveredHostMergeArchiveTargets.delete(key);
+      }
     }
     const progressTail = Promise.allSettled(
       [...(this.progressTails.get(key)?.values() ?? [])].map((getTail) => getTail()),
     ).then(() => {});
-    const operation = this.threadArchives.run(target, progressTail);
-    this.operationSet(operation);
-    return operation;
+    if (mergeSourceId === undefined) {
+      const operation = this.threadArchives.run(target, progressTail);
+      this.operationSet(operation);
+      return operation;
+    }
+    this.activeHostMergeArchives.set(key, mergeSourceId);
+    const operation = this.threadArchives.runWithOutcome(target, progressTail);
+    const tracked = operation.then(
+      (outcome) => {
+        if (this.activeHostMergeArchives.get(key) === mergeSourceId) {
+          this.activeHostMergeArchives.delete(key);
+        }
+        if (outcome !== "stopped" || generationRejected) {
+          this.settleHostMergeForSource(target, mergeSourceId, true);
+        }
+      },
+      (error: unknown) => {
+        if (this.activeHostMergeArchives.get(key) === mergeSourceId) {
+          this.activeHostMergeArchives.delete(key);
+        }
+        console.error(
+          `[thread-archive] 宿主合并归档屏障未完成 target=${key}：`
+          + safeErrorMessage(error, "host merge archive barrier failed"),
+        );
+      },
+    );
+    this.operationSet(tracked);
+    return tracked;
   }
 
 
@@ -5859,15 +6155,36 @@ class CoreService implements ChannelService {
       ...(this.loopController === undefined ? {} : { loop: this.loopController.threads }),
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
       flushTarget: (target) => this.outbox.flush(target),
-      planThreadArchive: (target, groupId, shortId, generation) =>
-        this.threadArchives.schedule(target, groupId, shortId, generation),
+      planThreadArchive: (target, groupId, shortId, generation) => {
+        const currentGeneration = target.channelType === 5
+          ? this.currentThreadArchiveGeneration(target)
+          : this.threadArchives.generation(target);
+        const capturedGeneration = generation ?? currentGeneration;
+        if (
+          capturedGeneration !== currentGeneration
+          || this.threadArchives.generation(target) !== capturedGeneration
+        ) return false;
+        this.threadArchives.schedule(target, groupId, shortId, capturedGeneration);
+        return this.threadArchives.generation(target) === capturedGeneration;
+      },
       publishThreadMergeSuccess: (target, summary, archive, operationId) =>
         this.publishThreadMergeSuccess(target, summary, archive, operationId),
       replayThreadMergeSuccess: (target, operationId) =>
         this.replayThreadMergeSuccess(target, operationId),
-      threadArchiveGeneration: (target) => this.threadArchives.generation(target),
-      worktreeMergeLifecycle: (target, cwd, sourceId, resourceCwds) =>
-        this.createHostMergeLifecycle(target, cwd, sourceId, resourceCwds),
+      threadArchiveGeneration: (target) => this.currentThreadArchiveGeneration(target),
+      worktreeMergeLifecycle: (target, cwd, sourceId, resourceCwds, archiveGeneration) =>
+        this.createHostMergeLifecycle(
+          target,
+          cwd,
+          sourceId,
+          resourceCwds,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          archiveGeneration,
+        ),
       tryAcquireDestructiveResources: (cwds, task) =>
         this.scheduler.tryAcquireDestructiveResources(cwds, task),
       threadReferences: (target) => this.store.getThreadReferences(botUid, target),

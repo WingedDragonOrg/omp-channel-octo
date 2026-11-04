@@ -799,6 +799,7 @@ test("a recovered removal receipt stays behind terminal-card drain and never ret
         supported: command.supported,
         kind: "command",
       })).toBe(true);
+      store.advanceThreadArchiveGeneration(original.bot.uid, target);
       store.enqueueOutbox({
         id: "remove-recovery-body",
         botUid: original.bot.uid,

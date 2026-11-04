@@ -224,6 +224,13 @@ export function applySchema(db: Database): void {
       merge_pending INTEGER NOT NULL DEFAULT 0 CHECK(merge_pending IN (0, 1)),
       PRIMARY KEY(bot_uid, channel_id)
     );
+    CREATE TABLE IF NOT EXISTS thread_archive_generations (
+      bot_uid TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type = 5),
+      channel_id TEXT NOT NULL,
+      generation INTEGER NOT NULL CHECK(generation >= 0),
+      PRIMARY KEY(bot_uid, channel_type, channel_id)
+    );
     CREATE TABLE IF NOT EXISTS thread_merge_events (
       id TEXT PRIMARY KEY NOT NULL,
       bot_uid TEXT NOT NULL,
@@ -427,9 +434,10 @@ export function applySchema(db: Database): void {
       sender_id TEXT,
       message_seq INTEGER,
       receipt_outbox_id TEXT,
+      archive_generation INTEGER,
+      not_started_text TEXT,
       outcome_kind TEXT CHECK(outcome_kind IS NULL OR outcome_kind IN ('succeeded', 'execution-failed')),
       outcome_json TEXT,
-      removal_step TEXT CHECK(removal_step IS NULL OR removal_step IN ('worktree', 'branch')),
       removal_resources_json TEXT,
       removal_outcome_json TEXT,
       created_at INTEGER NOT NULL,
@@ -439,6 +447,27 @@ export function applySchema(db: Database): void {
       ON host_merge_leases(bot_uid, cwd, phase);
     CREATE INDEX IF NOT EXISTS host_merge_leases_source
       ON host_merge_leases(bot_uid, channel_type, channel_id, source_id, created_at);
+    CREATE TABLE IF NOT EXISTS host_merge_progress_cards (
+      bot_uid TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type = 5),
+      channel_id TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      client_msg_no TEXT NOT NULL,
+      message_id TEXT,
+      delivery_state TEXT NOT NULL DEFAULT 'ready' CHECK(delivery_state IN ('ready', 'attempted', 'unknown', 'unavailable', 'bound')),
+      last_seq INTEGER NOT NULL DEFAULT 0 CHECK(last_seq >= 0),
+      phase TEXT NOT NULL CHECK(phase IN (
+        'preparing', 'process-started', 'process-exited', 'succeeded',
+        'execution-failed', 'not-started', 'cancelled', 'unknown'
+      )),
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER,
+      result_text TEXT,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(bot_uid, channel_type, channel_id, source_id)
+    );
+    CREATE INDEX IF NOT EXISTS host_merge_progress_cards_recovery
+      ON host_merge_progress_cards(bot_uid, updated_at);
     CREATE TABLE IF NOT EXISTS session_context_ledger (
       bot_uid TEXT NOT NULL,
       channel_type INTEGER NOT NULL CHECK(channel_type IN (2, 5)),
@@ -610,12 +639,15 @@ export function applySchema(db: Database): void {
     "ALTER TABLE host_merge_leases ADD COLUMN sender_id TEXT",
     "ALTER TABLE host_merge_leases ADD COLUMN message_seq INTEGER",
     "ALTER TABLE host_merge_leases ADD COLUMN receipt_outbox_id TEXT",
+    "ALTER TABLE host_merge_leases ADD COLUMN archive_generation INTEGER",
+    "ALTER TABLE host_merge_leases ADD COLUMN not_started_text TEXT",
     "ALTER TABLE host_merge_leases ADD COLUMN outcome_kind TEXT",
     "ALTER TABLE host_merge_leases ADD COLUMN outcome_json TEXT",
     "ALTER TABLE host_merge_leases ADD COLUMN operation_kind TEXT NOT NULL DEFAULT 'merge' CHECK(operation_kind IN ('merge', 'thread-remove'))",
     "ALTER TABLE host_merge_leases ADD COLUMN removal_step TEXT CHECK(removal_step IS NULL OR removal_step IN ('worktree', 'branch'))",
     "ALTER TABLE host_merge_leases ADD COLUMN removal_resources_json TEXT",
     "ALTER TABLE host_merge_leases ADD COLUMN removal_outcome_json TEXT",
+    "ALTER TABLE host_merge_progress_cards ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'unknown' CHECK(delivery_state IN ('ready', 'attempted', 'unknown', 'unavailable', 'bound'))",
     "ALTER TABLE watches ADD COLUMN process_unknown INTEGER NOT NULL DEFAULT 0 CHECK(process_unknown IN (0, 1))",
   ]) {
     try {
@@ -624,6 +656,7 @@ export function applySchema(db: Database): void {
       if (!String(error).includes("duplicate column")) throw error;
     }
   }
+  db.exec("UPDATE host_merge_progress_cards SET delivery_state = 'bound' WHERE delivery_state = 'unknown' AND message_id IS NOT NULL");
   migrateWorkerLedgerNullableSessionFile(db);
   migrateThreadForkPreparationStarted(db);
   db.exec(

@@ -79,6 +79,7 @@ export interface HostToolHost {
     cwd: string,
     sourceId: string | undefined,
     resourceCwds: readonly string[],
+    archiveGeneration: number,
   ) => WorktreeMergeLifecycle;
   readonly store: Pick<
     ChannelStore,
@@ -128,7 +129,7 @@ export interface HostToolHost {
    * `thread-archive`（以及默认 pipeline 的 `thread-merge` 收尾）：把一次子区归档排定到该聊天
    * 本回合输出排空之后执行——任何发进子区的消息都会把归档子区解档，所以工具内不即时归档。
    */
-  planThreadArchive(target: ChatTarget, groupId: string, shortId: string, generation?: number): void;
+  planThreadArchive(target: ChatTarget, groupId: string, shortId: string, generation?: number): boolean | void;
   publishThreadMergeSuccess(
     target: ChatTarget,
     summary: WorktreeMergeSummary,
@@ -1417,12 +1418,13 @@ async function runManagementTool(
             ...(host.worktreeMergeLifecycle === undefined
               ? {}
               : {
-                  worktreeMergeLifecycle: (mergeTarget, cwd, sourceId, resourceCwds) => {
+                  worktreeMergeLifecycle: (mergeTarget, cwd, sourceId, resourceCwds, archiveGeneration) => {
                     const lifecycle = host.worktreeMergeLifecycle!(
                       mergeTarget,
                       cwd,
                       sourceId,
                       resourceCwds,
+                      archiveGeneration,
                     );
                     onWorktreeMergeLifecycle?.(lifecycle);
                     return lifecycle;

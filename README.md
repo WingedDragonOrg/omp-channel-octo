@@ -116,7 +116,7 @@ oco run --config ~/.oco/config/config.json
 | `/thread <任务>` | 在群内交由助手按项目与耦合程度创建隔离子区，工作区和背景就绪后派发任务。 |
 | `/bind loop <url\|workspace_id\|workspace_name\|workspace_slug>` | 在已开通主群绑定 Loop workspace；名称或 slug 完整匹配，存在歧义时使用 ID。 |
 | `/thread model [选择器\|clear]` | 主群查询、设置或清除所属子区默认模型；只影响子区下一次 worker 启动，主群自身模型不变。 |
-| `/thread merge [补充说明]` | 单项目及 separate 子区合并并清理工作区；shared 多项目拒绝。沿用目录的 fork 子区仅归档 Octo，保留本地资源。 |
+| `/thread merge [补充说明]` | 单项目及 separate 子区由宿主合并，独立进度卡展示已确认阶段、耗时和结果；成功回执与终态卡投递后归档。shared 多项目拒绝。沿用目录的 fork 子区仅归档 Octo，保留本地资源。 |
 | `/thread remove [--force]` | 清理当前子区持久拥有的 worktree 与分支后归档；默认保护 dirty 和未合并提交，force 授权丢弃。沿用目录的 fork 子区仅归档 Octo。 |
 | `/queue <文本>` | 显式追加一个排队任务。 |
 | `/mode [steer\|queue]` | 查看或设置新消息的追加方式，默认 `steer`。 |

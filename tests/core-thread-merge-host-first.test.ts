@@ -25,6 +25,31 @@ import { ThreadArchiveScheduler } from "../src/threads/thread-archive.ts";
 import { ThreadCommands } from "../src/commands/thread-commands.ts";
 import { createExecutionTracker, encodeExecutionSnapshot } from "../src/cards/execution-tracker.ts";
 
+async function waitForHostMergeOutcome(
+  store: Awaited<ReturnType<typeof openChannelStore>>,
+  botUid: string,
+  target: { readonly channelType: 5; readonly channelId: string },
+  sourceId: string,
+  kind: "succeeded" | "execution-failed",
+) {
+  const deadline = performance.now() + 2_000;
+  while (performance.now() < deadline) {
+    const lease = store.getHostMergeLeaseBySourceId(botUid, target, sourceId);
+    if (lease?.outcome?.kind === kind) return lease;
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+  throw new Error(`host merge ${kind} outcome was not persisted`);
+}
+async function waitForSentText(transport: FakeTransport, prefix: string): Promise<void> {
+  const deadline = performance.now() + 2_000;
+  while (performance.now() < deadline) {
+    if (transport.sent.some(({ text }) => text.startsWith(prefix))) return;
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+  throw new Error(`expected outbound text was not sent: ${prefix}`);
+}
+
+
 // The merge itself is host-owned; the default listen receipt is delivered in the creator chat.
 test("/thread merge runs in the host and emits one default merge-listen notice", async () => {
   const harness = await createCoreHarness();
@@ -79,6 +104,242 @@ test("/thread merge runs in the host and emits one default merge-listen notice",
     await closeCoreHarness(harness);
   }
 });
+
+test("/thread merge updates an independent running progress card before the merge settles", async () => {
+  const mergeStarted = Promise.withResolvers<void>();
+  const releaseMerge = Promise.withResolvers<void>();
+  const processExitedEditStarted = Promise.withResolvers<void>();
+  const releaseProcessExitedEdit = Promise.withResolvers<void>();
+  const harness = await createCoreHarness();
+  const thread = { channelId: "group-allowed____merge-progress", channelType: 5 as const };
+  const workspace = join(harness.root, "workspace");
+  await mkdir(workspace);
+  const store = await openChannelStore(harness.stateDir);
+  let merge: Promise<void> | undefined;
+  vi.useFakeTimers();
+  let mergeSettled = false;
+  let mergeAcknowledged = false;
+  try {
+    store.ensureBinding({
+      botUid: harness.bot.uid,
+      ...thread,
+      cwd: workspace,
+      sessionId: "merge-progress-session",
+      sessionFile: null,
+      cwdPinned: true,
+    });
+    harness.transport.reviewProgressCardSupported = true;
+    const worktrees = harness.worktreePort;
+    if (!worktrees) throw new Error("expected worktree port");
+    const mergeWorktree = worktrees.merge.bind(worktrees);
+    worktrees.merge = async (request, signal) => {
+      const { lifecycle, ...mergeRequest } = request;
+      lifecycle?.beforeSpawn(request.cwd);
+      lifecycle?.onSpawn({
+        pid: 0x7fff_ffff,
+        pgid: 0x7fff_ffff,
+        identity: "pid=2147483647;start=fixture",
+        cwd: request.cwd,
+      });
+      mergeStarted.resolve();
+      await releaseMerge.promise;
+      const summary = await mergeWorktree(mergeRequest, signal);
+      lifecycle?.onConfirmedExit();
+      mergeSettled = true;
+      return summary;
+    };
+
+    const mergeCommand = harness.service.handleInbound(inbound({
+      ...thread,
+      messageId: "merge-progress-command",
+      text: "/thread merge",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    merge = mergeCommand;
+    void mergeCommand.then(
+      () => { mergeAcknowledged = true; },
+      () => {},
+    );
+    await mergeStarted.promise;
+    for (let step = 0; step < 8; step += 1) await Promise.resolve();
+    expect(mergeAcknowledged).toBe(true);
+    expect(mergeSettled).toBe(false);
+
+    const card = harness.transport.reviewProgressCards.find(({ target }) =>
+      target.channelType === thread.channelType && target.channelId === thread.channelId);
+    expect(card).toBeDefined();
+    if (!card) throw new Error("thread merge progress card was not created");
+    expect(card.progress.state).toBe("running");
+    expect(card.progress.endedAtMs).toBeNull();
+    expect(card.progress.hostMerge).toBeDefined();
+
+    vi.advanceTimersByTime(10_000);
+    for (let step = 0; step < 8; step += 1) await Promise.resolve();
+    const elapsedUpdate = harness.transport.reviewProgressCardEdits.find(edit =>
+      edit.messageId === card.messageId
+      && edit.progress.state === "running"
+      && edit.progress.elapsedMs > card.progress.elapsedMs
+      && edit.progress.hostMerge !== undefined);
+    expect(elapsedUpdate).toBeDefined();
+    if (!elapsedUpdate) throw new Error("thread merge progress card did not update elapsed time");
+    expect(elapsedUpdate.target).toEqual(thread);
+    expect(elapsedUpdate.progress.endedAtMs).toBeNull();
+    expect(mergeSettled).toBe(false);
+    expect(harness.transport.reviewProgressCardEdits.some(edit =>
+      edit.messageId === card.messageId && edit.progress.state !== "running")).toBe(false);
+    let archiveBeforeTerminalCard = false;
+    const archiveThread = harness.transport.archiveThread.bind(harness.transport);
+    harness.transport.archiveThread = async (groupId: string, shortId: string, signal?: AbortSignal) => {
+      archiveBeforeTerminalCard ||= !harness.transport.reviewProgressCardEdits.some(edit =>
+        edit.messageId === card.messageId
+        && edit.progress.hostMerge !== undefined
+        && edit.progress.state !== "running");
+      await archiveThread(groupId, shortId, signal);
+    };
+    const editProgressCard = harness.transport.editProgressCard.bind(harness.transport);
+    harness.transport.editProgressCard = async (target, messageId, progress, cardSeq, signal) => {
+      if (progress.hostMerge?.phase === "process-exited") {
+        processExitedEditStarted.resolve();
+        await releaseProcessExitedEdit.promise;
+      }
+      await editProgressCard(target, messageId, progress, cardSeq, signal);
+    };
+
+    releaseMerge.resolve();
+    await processExitedEditStarted.promise;
+    await merge;
+    expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
+    releaseProcessExitedEdit.resolve();
+    vi.advanceTimersByTime(0);
+    await harness.transport.waitForManagementCalls(({ action }) => action === "thread-archive");
+    expect(archiveBeforeTerminalCard).toBe(false);
+    const terminalCard = harness.transport.reviewProgressCardEdits.find(edit =>
+      edit.messageId === card.messageId && edit.progress.hostMerge?.phase === "succeeded");
+    expect(terminalCard).toBeDefined();
+    if (!terminalCard) throw new Error("thread merge progress card did not record its result");
+    expect(terminalCard.progress.endedAtMs).not.toBeNull();
+    expect(terminalCard.progress.hostMerge?.result).toContain("fixture-branch");
+  } finally {
+    releaseMerge.resolve();
+    releaseProcessExitedEdit.resolve();
+    if (merge !== undefined) await Promise.allSettled([merge]);
+    vi.useRealTimers();
+    store.close();
+    await closeCoreHarness(harness);
+  }
+});
+test("/status responds while /thread merge is still running", async () => {
+  const mergeStarted = Promise.withResolvers<void>();
+  const releaseMerge = Promise.withResolvers<void>();
+  const harness = await createCoreHarness();
+  const thread = { channelId: "group-allowed____merge-progress-status", channelType: 5 as const };
+  const workspace = join(harness.root, "workspace");
+  await mkdir(workspace);
+  const store = await openChannelStore(harness.stateDir);
+  let merge: Promise<void> | undefined;
+  let status: Promise<void> | undefined;
+  let mergeSettled = false;
+  let mergeAcknowledged = false;
+  try {
+    store.ensureBinding({
+      botUid: harness.bot.uid,
+      ...thread,
+      cwd: workspace,
+      sessionId: "merge-progress-status-session",
+      sessionFile: null,
+      cwdPinned: true,
+    });
+    const worktrees = harness.worktreePort;
+    if (!worktrees) throw new Error("expected worktree port");
+    const mergeWorktree = worktrees.merge.bind(worktrees);
+    worktrees.merge = async (request, signal) => {
+      const { lifecycle, ...mergeRequest } = request;
+      lifecycle?.beforeSpawn(request.cwd);
+      lifecycle?.onSpawn({
+        pid: 0x7fff_fffe,
+        pgid: 0x7fff_fffe,
+        identity: "pid=2147483646;start=fixture",
+        cwd: request.cwd,
+      });
+      mergeStarted.resolve();
+      await releaseMerge.promise;
+      const summary = await mergeWorktree(mergeRequest, signal);
+      lifecycle?.onConfirmedExit();
+      mergeSettled = true;
+      return summary;
+    };
+
+    const mergeCommand = harness.service.handleInbound(inbound({
+      ...thread,
+      messageId: "merge-progress-status-command",
+      text: "/thread merge",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    merge = mergeCommand;
+    void mergeCommand.then(
+      () => { mergeAcknowledged = true; },
+      () => {},
+    );
+    await mergeStarted.promise;
+    for (let step = 0; step < 8; step += 1) await Promise.resolve();
+    expect(mergeAcknowledged).toBe(true);
+    expect(mergeSettled).toBe(false);
+
+    status = harness.service.handleInbound(inbound({
+      ...thread,
+      messageId: "merge-progress-status-query",
+      text: "/status",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const statusReturned = await Promise.race([
+      status.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timeout = setTimeout(() => resolve(false), 1_000);
+      }),
+    ]);
+    if (timeout !== undefined) clearTimeout(timeout);
+    expect(statusReturned).toBe(true);
+    expect(mergeSettled).toBe(false);
+  } finally {
+    releaseMerge.resolve();
+    await Promise.allSettled([
+      ...(merge === undefined ? [] : [merge]),
+      ...(status === undefined ? [] : [status]),
+    ]);
+    store.close();
+    await closeCoreHarness(harness);
+  }
+});
+test("host merge progress storage rejects an invalid persisted end timestamp", async () => {
+  const harness = await createCoreHarness();
+  const target = { channelId: "group-allowed____merge-progress-invalid-time", channelType: 5 as const };
+  const sourceId = "merge-progress-invalid-time";
+  const store = await openChannelStore(harness.stateDir);
+  const corrupt = new Database(join(harness.stateDir, "channel.sqlite"));
+  try {
+    store.reserveHostMergeProgressCard({
+      botUid: harness.bot.uid,
+      target,
+      sourceId,
+      clientMsgNo: "thread-merge-invalid-end-timestamp",
+      startedAt: Date.now(),
+    });
+    corrupt.query(`
+      UPDATE host_merge_progress_cards
+      SET ended_at = -1
+      WHERE bot_uid = ? AND channel_type = 5 AND channel_id = ? AND source_id = ?
+    `).run(harness.bot.uid, target.channelId, sourceId);
+    expect(() => store.getHostMergeProgressCard(harness.bot.uid, target, sourceId))
+      .toThrow("invalid host merge progress end timestamp");
+  } finally {
+    corrupt.close();
+    store.close();
+    await closeCoreHarness(harness);
+  }
+});
+
+
 test("/thread merge with listen=off consumes success without creating a parent task", async () => {
   const harness = await createCoreHarness();
   const thread = { channelId: "group-allowed____host-first-off", channelType: 5 as const };
@@ -514,6 +775,115 @@ test("startup recovers unresolved host merge leases and resumes queued work", as
   }
 });
 
+test("a progress-card terminal persistence failure does not replace a completed merge outcome", async () => {
+  const harness = await createCoreHarness();
+  const thread = { channelId: "group-allowed____merge-card-persistence-failure", channelType: 5 as const };
+  const workspace = join(harness.root, "workspace");
+  const store = await openChannelStore(harness.stateDir);
+  const fault = new Database(join(harness.stateDir, "channel.sqlite"));
+  try {
+    await mkdir(workspace);
+    store.ensureBinding({
+      botUid: harness.bot.uid,
+      ...thread,
+      cwd: workspace,
+      sessionId: "merge-card-persistence-failure-session",
+      sessionFile: null,
+      cwdPinned: true,
+    });
+    harness.transport.reviewProgressCardSupported = true;
+    fault.exec(`
+      CREATE TRIGGER fail_terminal_host_merge_progress
+      BEFORE UPDATE OF phase ON host_merge_progress_cards
+      WHEN NEW.phase = 'succeeded'
+      BEGIN SELECT RAISE(ABORT, 'terminal progress persistence fault'); END;
+    `);
+    const message = inbound({
+      ...thread,
+      messageId: "merge-card-persistence-failure-command",
+      text: "/thread merge",
+      mentionedUserIds: [harness.bot.uid],
+    });
+
+    await harness.service.handleInbound(message);
+    await waitForSentText(harness.transport, "子区合并成功：");
+
+    expect(harness.worktrees?.merges).toHaveLength(1);
+    expect(harness.transport.sent.some(({ target, text }) =>
+      target.channelId === thread.channelId && text.startsWith("子区合并成功："),
+    )).toBe(true);
+    expect(harness.transport.sent.some(({ target, text }) =>
+      target.channelId === thread.channelId && text.startsWith("合并未完成"),
+    )).toBe(false);
+    await harness.transport.waitForManagementCalls(({ action }) => action === "thread-archive");
+  } finally {
+    fault.exec("DROP TRIGGER IF EXISTS fail_terminal_host_merge_progress");
+    fault.close();
+    store.close();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a progress-card terminal persistence failure still accepts the merge repair task", async () => {
+  const worktrees = new FakeWorktrees("unused");
+  worktrees.mergeFailure = new WorktreeMergeExecutionError(1, "terminal-card failure fixture");
+  const harness = await createCoreHarness({ worktreePort: worktrees });
+  const thread = { channelId: "group-allowed____merge-card-repair", channelType: 5 as const };
+  const workspace = join(harness.root, "workspace");
+  const store = await openChannelStore(harness.stateDir);
+  const fault = new Database(join(harness.stateDir, "channel.sqlite"));
+  try {
+    await mkdir(workspace);
+    store.ensureBinding({
+      botUid: harness.bot.uid,
+      ...thread,
+      cwd: workspace,
+      sessionId: "merge-card-repair-session",
+      sessionFile: null,
+      cwdPinned: true,
+    });
+    harness.transport.reviewProgressCardSupported = true;
+    fault.exec(`
+      CREATE TRIGGER fail_failed_host_merge_progress
+      BEFORE UPDATE OF phase ON host_merge_progress_cards
+      WHEN NEW.phase = 'execution-failed'
+      BEGIN SELECT RAISE(ABORT, 'terminal progress persistence fault'); END;
+    `);
+    await harness.service.handleInbound(inbound({
+      ...thread,
+      messageId: "merge-card-repair-command",
+      text: "/thread merge, keep the repair note",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+
+    await harness.workers.waitForPromptCount(1);
+    expect(worktrees.merges).toHaveLength(1);
+    expect(store.getLatestTask(harness.bot.uid, thread)).toMatchObject({
+      messageId: "thread-merge-repair:merge-card-repair-command",
+      text: expect.stringContaining("keep the repair note"),
+    });
+    const lease = store.getHostMergeLeaseBySourceId(
+      harness.bot.uid,
+      thread,
+      "merge-card-repair-command",
+    );
+    if (lease === null) {
+      expect(store.getHostMergeProgressCard(
+        harness.bot.uid,
+        thread,
+        "merge-card-repair-command",
+      )).toBeNull();
+    } else {
+      expect(lease).toMatchObject({ outcome: { kind: "execution-failed" } });
+    }
+  } finally {
+    fault.exec("DROP TRIGGER IF EXISTS fail_failed_host_merge_progress");
+    fault.close();
+    store.close();
+    await closeCoreHarness(harness);
+  }
+});
+
 test("startup with a removed workspace waits for card recovery before replaying a delivered merge archive", async () => {
   const original = await createCoreHarness();
   const thread = { channelId: "group-allowed____merge-card-recovery", channelType: 5 as const };
@@ -566,7 +936,7 @@ test("startup with a removed workspace waits for card recovery before replaying 
         cwd: workspace,
         resourceCwds: [workspace],
         commandText: "/thread merge",
-        senderId: "owner-1",
+        archiveGeneration: null,
         receiptOutboxId,
       });
       store.recordHostMergeProcess("merge-card-recovery-lease", {
@@ -585,6 +955,13 @@ test("startup with a removed workspace waits for card recovery before replaying 
           committed: true,
           removed: true,
         },
+      });
+      store.reserveHostMergeProgressCard({
+        botUid: original.bot.uid,
+        target: thread,
+        sourceId: "merge-card-recovery-command",
+        clientMsgNo: "thread-merge-ready-card-recovery",
+        startedAt: Date.now(),
       });
       store.enqueueOutbox({
         id: receiptOutboxId,
@@ -622,6 +999,16 @@ test("startup with a removed workspace waits for card recovery before replaying 
     });
     startup = start;
     await transport.recoveryEditStarted.promise;
+    const recoveringStore = await openChannelStore(original.stateDir);
+    try {
+      expect(recoveringStore.getHostMergeLeaseBySourceId(
+        original.bot.uid,
+        thread,
+        "merge-card-recovery-command",
+      )).not.toBeNull();
+    } finally {
+      recoveringStore.close();
+    }
     expect(transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
 
     transport.releaseRecoveryEdit.resolve();
@@ -644,6 +1031,91 @@ test("startup with a removed workspace waits for card recovery before replaying 
     } else {
       await rm(original.root, { recursive: true, force: true });
     }
+  }
+});
+test("startup does not restore a merge archive cancelled by a newer inbound", async () => {
+  const original = await createCoreHarness();
+  const thread = { channelId: "group-allowed____merge-archive-cancelled", channelType: 5 as const };
+  const sourceId = "merge-archive-cancelled-command";
+  const receiptOutboxId = "merge-archive-cancelled-receipt";
+  let originalStopped = false;
+  let restarted: Awaited<ReturnType<typeof createCoreHarness>> | undefined;
+  try {
+    await closeCoreHarness(original, { remove: false });
+    originalStopped = true;
+    const store = await openChannelStore(original.stateDir);
+    try {
+      const target = {
+        channelType: thread.channelType,
+        channelId: thread.channelId,
+      };
+      const command = {
+        botUid: original.bot.uid,
+        target,
+        messageId: sourceId,
+        senderId: "owner-1",
+        text: "/thread merge",
+        supported: true,
+        kind: "command" as const,
+      };
+      expect(store.claimCommand(command)).toBe(true);
+      store.reserveHostMergeLease({
+        id: "merge-archive-cancelled-lease",
+        botUid: original.bot.uid,
+        target,
+        sourceId,
+        cwd: join(original.root, "workspace"),
+        resourceCwds: [join(original.root, "workspace")],
+        commandText: command.text,
+        senderId: command.senderId,
+        receiptOutboxId,
+        archiveGeneration: 0,
+      });
+      store.recordHostMergeProcess("merge-archive-cancelled-lease", {
+        pid: 43_012,
+        pgid: 43_012,
+        identity: "pid=43012;start=Wed Jun 10 12:00:00 2026",
+      });
+      store.markHostMergeProcessExited("merge-archive-cancelled-lease");
+      store.persistHostMergeOutcome("merge-archive-cancelled-lease", {
+        kind: "succeeded",
+        summary: {
+          branch: "fixture-branch",
+          target: "main",
+          squashed: true,
+          rebased: true,
+          committed: true,
+          removed: true,
+        },
+      });
+      store.advanceThreadArchiveGeneration(original.bot.uid, target);
+    } finally {
+      store.close();
+    }
+
+    const transport = new FakeTransport({ bot: original.bot });
+    restarted = await createCoreHarness({
+      root: original.root,
+      bot: original.bot,
+      transport,
+    });
+    await waitForSentText(transport, "子区合并成功");
+    const recoveredStore = await openChannelStore(restarted.stateDir);
+    try {
+      expect(recoveredStore.getHostMergeLeaseBySourceId(original.bot.uid, thread, sourceId)).toBeNull();
+      expect(recoveredStore.getThreadArchiveGeneration(original.bot.uid, thread)).toBe(1);
+      expect(
+        recoveredStore.listThreadMergeEvents(original.bot.uid)
+          .find(event => event.channelId === thread.channelId),
+      ).toMatchObject({ removed: true, archive: "not-scheduled" });
+    } finally {
+      recoveredStore.close();
+    }
+    expect(restarted.worktrees?.merges).toEqual([]);
+  } finally {
+    if (restarted) await closeCoreHarness(restarted);
+    else if (!originalStopped) await closeCoreHarness(original);
+    else await rm(original.root, { recursive: true, force: true });
   }
 });
 
@@ -1493,7 +1965,15 @@ test("a success-receipt persistence failure recovers delivery without rerunning 
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
     });
-    await expect(harness.service.handleInbound(message)).rejects.toThrow();
+    await harness.service.handleInbound(message);
+    await waitForHostMergeOutcome(
+      store,
+      harness.bot.uid,
+      thread,
+      message.messageId,
+      "succeeded",
+    );
+    await waitForSentText(harness.transport, "合并已受理，但后续处理未能完成：");
     fault.exec("DROP TRIGGER fail_merge_receipt");
     expect(harness.worktrees?.merges).toHaveLength(1);
     expect(store.listHostMergeLeases(harness.bot.uid)).toMatchObject([{
@@ -1540,6 +2020,7 @@ test("a repair-task persistence failure recovers the same repair without rerunni
   const fault = new Database(join(harness.stateDir, "channel.sqlite"));
   let stopped = false;
   let restarted: Awaited<ReturnType<typeof createCoreHarness>> | undefined;
+  const terminalCardEdited = Promise.withResolvers<void>();
   try {
     await mkdir(workspace);
     store.ensureBinding({
@@ -1550,6 +2031,12 @@ test("a repair-task persistence failure recovers the same repair without rerunni
       sessionFile: null,
       cwdPinned: true,
     });
+    harness.transport.reviewProgressCardSupported = true;
+    const editProgressCard = harness.transport.editProgressCard.bind(harness.transport);
+    harness.transport.editProgressCard = async (target, messageId, progress, cardSeq, signal) => {
+      await editProgressCard(target, messageId, progress, cardSeq, signal);
+      if (progress.hostMerge?.phase === "execution-failed") terminalCardEdited.resolve();
+    };
     fault.exec(`
       CREATE TRIGGER fail_merge_repair BEFORE INSERT ON tasks
       WHEN NEW.message_id = 'thread-merge-repair:merge-repair-recovery-command'
@@ -1561,7 +2048,28 @@ test("a repair-task persistence failure recovers the same repair without rerunni
       text: "/thread merge, preserve repair recovery note",
       mentionedUserIds: [harness.bot.uid],
     });
-    await expect(harness.service.handleInbound(message)).rejects.toThrow();
+    await harness.service.handleInbound(message);
+    await waitForHostMergeOutcome(
+      store,
+      harness.bot.uid,
+      thread,
+      message.messageId,
+      "execution-failed",
+    );
+    await waitForSentText(harness.transport, "合并已受理，但后续处理未能完成：");
+    await terminalCardEdited.promise;
+    for (let step = 0; step < 200 && store.getHostMergeProgressCard(
+      harness.bot.uid,
+      thread,
+      message.messageId,
+    ) !== null; step += 1) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    expect(store.getHostMergeProgressCard(
+      harness.bot.uid,
+      thread,
+      message.messageId,
+    )).toBeNull();
     fault.exec("DROP TRIGGER fail_merge_repair");
     expect(initialWorktrees.merges).toHaveLength(1);
     expect(store.listHostMergeLeases(harness.bot.uid)).toMatchObject([{

@@ -6,8 +6,8 @@
 import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { ChatAppendMode, ChatTarget, ThreadListenLevel, WorkerGoal, WorktreeMergeOutcome } from "../contracts.ts";
-import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadForkInput, ThreadForkRecord, ThreadListenRecord, ThreadMergeEventRecord, HostMergeLeaseRecord, HostMergeLeaseInput, HostRemovalLeaseInput, HostRemovalLeaseRecord, HostThreadRemovalOutcome, ReviewJobRecord } from "./store-records.ts";
+import type { ChatAppendMode, ChatTarget, HostMergeProgressPhase, ThreadListenLevel, WorkerGoal, WorktreeMergeOutcome } from "../contracts.ts";
+import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadForkInput, ThreadForkRecord, ThreadListenRecord, ThreadMergeEventRecord, HostMergeLeaseRecord, HostMergeLeaseInput, HostMergeProgressCardInput, HostMergeProgressCardRecord, HostRemovalLeaseInput, HostRemovalLeaseRecord, HostThreadRemovalOutcome, ReviewJobRecord } from "./store-records.ts";
 import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopThreadCreation, LoopWorkspace } from "../loop/types.ts";
 import type { SessionContextSnapshotRecord } from "./store-records.ts";
 import type { TanOperation } from "./store-records.ts";
@@ -22,14 +22,14 @@ import { acceptCommitTask, acceptTask, cancelQueued, claimCommand, clearRestartN
 import { bindGoalTaskSession, clearGoalSession, finishGoalTaskProgress, getGoalSession, getGoalTask, isGoalTaskResuming, markGoalTaskAccepted, markGoalTaskAgentAccepted, markGoalTaskDispatched, saveGoalSessionProgress, stopGoalContinuation, updateGoalTaskProgress } from "./store-goals.ts";
 import { clearProgressCard, listProgressCards, recordProgressCardAttempt, saveProgressCard } from "./store-cards.ts";
 import { getWorkerLedger, listWorkerLedger, markWorkerStopped, recordWorker } from "./store-workers.ts";
-import { beginHostRemovalStep, completeHostMergeLease, getHostMergeLeaseBySourceId, getHostRemovalLeaseBySourceId, listHostMergeLeases, listHostRemovalLeases, markHostMergeLeaseUnknown, markHostMergeProcessExited, markHostRemovalLeaseUnknown, markHostRemovalProcessExited, persistHostMergeOutcome, persistHostRemovalOutcome, recordHostMergeProcess, recordHostRemovalProcess, releaseHostRemovalLease, reserveHostMergeLease, reserveHostRemovalLease, settleHostMergeLease, settleHostRemovalLease, type HostMergeLeaseCompletion } from "./store-host-merges.ts";
+import { beginHostRemovalStep, bindHostMergeProgressCardMessage, clearHostMergeProgressCard, completeHostMergeLease, getHostMergeLeaseBySourceId, getHostMergeProgressCard, getHostRemovalLeaseBySourceId, listHostMergeLeases, listHostMergeProgressCards, listHostRemovalLeases, markHostMergeLeaseUnknown, markHostMergeProcessExited, markHostMergeProgressCardAttempted, markHostMergeProgressCardUnavailable, markHostMergeProgressCardUnknown, markHostRemovalLeaseUnknown, markHostRemovalProcessExited, persistHostMergeOutcome, persistHostRemovalOutcome, recordHostMergeProcess, recordHostMergeProgressCardAttempt, recordHostRemovalProcess, releaseHostRemovalLease, reserveHostMergeLease, reserveHostMergeProgressCard, reserveHostRemovalLease, settleHostMergeLease, settleHostRemovalLease, updateHostMergeProgressCard, type HostMergeLeaseCompletion } from "./store-host-merges.ts";
 import { advanceHistoryLedger, clearContextLedger, commitContextInjection, commitHistoryInjection, getContextLedger, getHistoryLedger, prepareContextInjection, prepareHistoryInjection, pruneHistoryLedger } from "./store-ledgers.ts";
 import { acknowledgeTextOutbox, beginTextCreate, bindTextOutbox, commitTextStream, countPendingOutbox, countUnknownOutbox, enqueueOutbox, failTextOutbox, getBotEventCursor, getOutbox, listPendingOutbox, listPendingOutboxTargets, listTextStream, markOutboxDead, markOutboxFailure, markOutboxSent, setBotEventCursor, updateTextOutbox } from "./store-outbox.ts";
 import { answerClosedQuestion, answerQuestion, answerQuestions, cancelQuestion, cancelQuestions, cancelTaskQuestions, createQuestion, getQuestion, listPendingQuestions, listQuestionsByCard, listTaskQuestions, markQuestionsSettled, pendingQuestionIds, reserveQuestionCardSeq, setQuestionCard, setQuestionsCard, updateQuestionPayloads } from "./store-questions.ts";
 import { acceptChatGrantOperation, getChatGrantOperation, getChatGrantOperationByEvent, listPendingChatGrantOperations, markChatGrantConfigMirror, markChatGrantResultDelivered, nextChatGrantCardEditSeq } from "./store-grants.ts";
 import { addThreadWorkspaceIntentChannel, completeThreadWorkspaceIntent, failThreadWorkspaceIntent, getThreadWorkspace, getThreadWorkspaceIntent, isThreadWorkspaceIntentBlocked, isWorkspaceDirectoryOwned, listThreadWorkspaceIntents, listThreadWorkspaces, saveThreadWorkspace, saveThreadWorkspaceIntent, saveThreadWorkspaces, workspaceDirectories } from "./store-workspaces.ts";
 import { completeThreadFork, getThreadFork, getThreadForkByTarget, listThreadForks, saveThreadFork } from "./store-forks.ts";
-import { beginThreadMerge, claimThreadMergeDispatchIntent, ensureThreadListen, getThreadListen, getThreadMergeEvent, isThreadMergeEventPending, listPendingThreadMergeEvents, listThreadMergeEvents, markThreadMergeEventDelivered, saveThreadMergeEvent, setThreadListen } from "./store-thread-listen.ts";
+import { advanceThreadArchiveGeneration, beginThreadMerge, claimThreadMergeDispatchIntent, ensureThreadListen, getThreadArchiveGeneration, getThreadListen, getThreadMergeEvent, isThreadMergeEventPending, listPendingThreadMergeEvents, listThreadMergeEvents, markThreadMergeEventDelivered, saveThreadMergeEvent, setThreadListen } from "./store-thread-listen.ts";
 import { addThreadReferences, deleteThreadReferences, getThreadReferences, isThreadReferencesDeleted } from "./store-references.ts";
 import * as storeWatch from "./store-watch.ts";
 import type { WatchCheckCompletion, WatchCreateResult, WatchListItem, WatchRecord } from "../watch/types.ts";
@@ -250,7 +250,15 @@ export class ChannelStore {
   }
 
   beginThreadMerge(botUid: string, target: ChatTarget): void {
+
     beginThreadMerge(this.db, botUid, target);
+  }
+  getThreadArchiveGeneration(botUid: string, target: ChatTarget): number {
+    return getThreadArchiveGeneration(this.db, botUid, target);
+  }
+
+  advanceThreadArchiveGeneration(botUid: string, target: ChatTarget): number {
+    return advanceThreadArchiveGeneration(this.db, botUid, target);
   }
 
   saveThreadMergeEvent(record: ThreadMergeEventRecord): void {
@@ -704,6 +712,58 @@ export class ChannelStore {
 
   listHostMergeLeases(botUid: string): HostMergeLeaseRecord[] {
     return listHostMergeLeases(this.db, botUid);
+  }
+
+  reserveHostMergeProgressCard(input: HostMergeProgressCardInput): HostMergeProgressCardRecord {
+    return reserveHostMergeProgressCard(this.db, input);
+  }
+
+  getHostMergeProgressCard(botUid: string, target: ChatTarget, sourceId: string): HostMergeProgressCardRecord | null {
+    return getHostMergeProgressCard(this.db, botUid, target, sourceId);
+  }
+
+  listHostMergeProgressCards(botUid: string): HostMergeProgressCardRecord[] {
+    return listHostMergeProgressCards(this.db, botUid);
+  }
+
+  updateHostMergeProgressCard(
+    botUid: string,
+    target: ChatTarget,
+    sourceId: string,
+    phase: HostMergeProgressPhase,
+    endedAt: number | null,
+    result: string | null,
+  ): void {
+    updateHostMergeProgressCard(this.db, botUid, target, sourceId, phase, endedAt, result);
+  }
+
+  markHostMergeProgressCardAttempted(botUid: string, target: ChatTarget, sourceId: string): void {
+    markHostMergeProgressCardAttempted(this.db, botUid, target, sourceId);
+  }
+
+  markHostMergeProgressCardUnknown(botUid: string, target: ChatTarget, sourceId: string): void {
+    markHostMergeProgressCardUnknown(this.db, botUid, target, sourceId);
+  }
+
+  markHostMergeProgressCardUnavailable(botUid: string, target: ChatTarget, sourceId: string): void {
+    markHostMergeProgressCardUnavailable(this.db, botUid, target, sourceId);
+  }
+
+  bindHostMergeProgressCardMessage(
+    botUid: string,
+    target: ChatTarget,
+    sourceId: string,
+    messageId: string,
+  ): string {
+    return bindHostMergeProgressCardMessage(this.db, botUid, target, sourceId, messageId);
+  }
+
+  recordHostMergeProgressCardAttempt(botUid: string, target: ChatTarget, sourceId: string): number {
+    return recordHostMergeProgressCardAttempt(this.db, botUid, target, sourceId);
+  }
+
+  clearHostMergeProgressCard(botUid: string, target: ChatTarget, sourceId: string): void {
+    clearHostMergeProgressCard(this.db, botUid, target, sourceId);
   }
 
   reserveHostRemovalLease(input: HostRemovalLeaseInput): void {

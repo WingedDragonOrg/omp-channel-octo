@@ -1,16 +1,18 @@
 import { Database } from "bun:sqlite";
 import { isAbsolute } from "node:path";
-import type { ChatTarget, WorktreeMergeOutcome, WorktreeRemovalStep } from "../contracts.ts";
+import type { ChatTarget, HostMergeOutcome, HostMergeProgressPhase, WorktreeMergeOutcome, WorktreeRemovalStep } from "../contracts.ts";
 import type {
   HostMergeLeaseInput,
   HostMergeLeaseRecord,
+  HostMergeProgressCardInput,
+  HostMergeProgressCardRecord,
   HostRemovalLeaseInput,
   HostRemovalLeaseRecord,
   HostThreadRemovalOutcome,
 } from "./store-records.ts";
 import { asNullableString, asString, query, run } from "./store-schema.ts";
 
-export type HostMergeLeaseCompletion = "not-spawned";
+export type HostMergeLeaseCompletion = { kind: "not-spawned"; diagnostic: string };
 
 function nullablePositiveInteger(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
@@ -19,9 +21,15 @@ function nullableSafeInteger(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
-function outcome(row: Record<string, unknown>): WorktreeMergeOutcome | null {
+function outcome(row: Record<string, unknown>): HostMergeOutcome | null {
+  const notStarted = asNullableString(row.not_started_text);
   const kind = asString(row.outcome_kind);
   const encoded = asString(row.outcome_json);
+  if (notStarted !== null) {
+    return notStarted.length > 0 && kind.length === 0 && encoded.length === 0
+      ? { kind: "not-started", diagnostic: notStarted }
+      : null;
+  }
   if (kind.length === 0 || encoded.length === 0) return null;
   let parsed: unknown;
   try {
@@ -105,6 +113,7 @@ function decodeHostMergeLease(row: Record<string, unknown>): HostMergeLeaseRecor
     senderId: asNullableString(row.sender_id),
     messageSeq: nullableSafeInteger(row.message_seq),
     receiptOutboxId: asNullableString(row.receipt_outbox_id),
+    archiveGeneration: nullableSafeInteger(row.archive_generation),
     outcome: outcome(row),
     createdAt: Number(row.created_at ?? 0),
     updatedAt: Number(row.updated_at ?? 0),
@@ -170,6 +179,67 @@ function decodeHostRemovalLease(row: Record<string, unknown>): HostRemovalLeaseR
   };
 }
 
+function mergeProgressPhase(value: unknown): HostMergeProgressPhase {
+  switch (value) {
+    case "preparing":
+    case "process-started":
+    case "process-exited":
+    case "succeeded":
+    case "execution-failed":
+    case "not-started":
+    case "cancelled":
+    case "unknown":
+      return value;
+    default:
+      throw new Error("invalid host merge progress phase");
+  }
+}
+
+function decodeHostMergeProgressCard(row: Record<string, unknown>): HostMergeProgressCardRecord {
+  if (Number(row.channel_type) !== 5) throw new Error("invalid host merge progress target");
+  const startedAt = nullableSafeInteger(row.started_at);
+  const lastSeq = nullableSafeInteger(row.last_seq);
+  const updatedAt = nullableSafeInteger(row.updated_at);
+  const phase = mergeProgressPhase(row.phase);
+  const endedAt = nullableSafeInteger(row.ended_at);
+  if (row.ended_at !== null && endedAt === null) {
+    throw new Error("invalid host merge progress end timestamp");
+  }
+  const active = phase === "preparing" || phase === "process-started" || phase === "process-exited";
+  if (
+    startedAt === null
+    || lastSeq === null
+    || updatedAt === null
+    || (active && endedAt !== null)
+    || (!active && endedAt === null)
+  ) {
+    throw new Error("invalid host merge progress timestamps, state, or sequence");
+  }
+  const deliveryState = row.delivery_state;
+  if (!["ready", "attempted", "unknown", "unavailable", "bound"].includes(String(deliveryState))) {
+    throw new Error("invalid host merge progress delivery state");
+  }
+  const messageId = asNullableString(row.message_id);
+  if ((deliveryState === "bound") !== (messageId !== null && messageId.length > 0)) {
+    throw new Error("host merge progress message binding is inconsistent");
+  }
+  return {
+    botUid: asString(row.bot_uid),
+    channelType: 5,
+    channelId: asString(row.channel_id),
+    sourceId: asString(row.source_id),
+    clientMsgNo: asString(row.client_msg_no),
+    messageId,
+    deliveryState: deliveryState as HostMergeProgressCardRecord["deliveryState"],
+    lastSeq,
+    phase,
+    startedAt,
+    endedAt,
+    result: asNullableString(row.result_text),
+    updatedAt,
+  };
+}
+
 /** Insert the fail-closed reservation before the worktrunk merge process is spawned. */
 export function reserveHostMergeLease(db: Database, input: HostMergeLeaseInput): void {
   if (
@@ -184,6 +254,7 @@ export function reserveHostMergeLease(db: Database, input: HostMergeLeaseInput):
     || input.resourceCwds.some((path) => typeof path !== "string" || path.length === 0 || !isAbsolute(path))
     || !input.resourceCwds.includes(input.cwd)
     || (input.messageSeq !== undefined && (!Number.isSafeInteger(input.messageSeq) || input.messageSeq < 0))
+    || (input.archiveGeneration !== undefined && input.archiveGeneration !== null && (!Number.isSafeInteger(input.archiveGeneration) || input.archiveGeneration < 0))
   ) {
     throw new Error("invalid host merge lease identity or resource paths");
   }
@@ -198,9 +269,9 @@ export function reserveHostMergeLease(db: Database, input: HostMergeLeaseInput):
   run(db,
     `INSERT INTO host_merge_leases(
        id, bot_uid, channel_type, channel_id, source_id, cwd, resource_cwds, phase, pid, pgid, process_identity,
-       source_text, operator_note, sender_id, message_seq, receipt_outbox_id, outcome_kind, outcome_json,
-       created_at, updated_at
-     ) VALUES(?, ?, 5, ?, ?, ?, ?, 'starting', NULL, NULL, NULL, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
+       source_text, operator_note, sender_id, message_seq, receipt_outbox_id, archive_generation,
+       not_started_text, outcome_kind, outcome_json, created_at, updated_at
+     ) VALUES(?, ?, 5, ?, ?, ?, ?, 'starting', NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)`,
     [
       input.id,
       input.botUid,
@@ -213,6 +284,7 @@ export function reserveHostMergeLease(db: Database, input: HostMergeLeaseInput):
       input.senderId ?? null,
       input.messageSeq ?? null,
       input.receiptOutboxId ?? null,
+      input.archiveGeneration ?? null,
       now,
       now,
     ],
@@ -239,7 +311,7 @@ export function recordHostMergeProcess(
 /** Keep the row after a confirmed process exit until its known outcome is durably settled. */
 export function markHostMergeProcessExited(db: Database, id: string): void {
   const result = run(db,
-    "UPDATE host_merge_leases SET phase = 'exited', updated_at = ? WHERE id = ? AND operation_kind = 'merge' AND phase = 'running' AND outcome_json IS NULL",
+    "UPDATE host_merge_leases SET phase = 'exited', updated_at = ? WHERE id = ? AND operation_kind = 'merge' AND phase = 'running' AND outcome_json IS NULL AND not_started_text IS NULL",
     [Date.now(), id],
   );
   if (result.changes !== 1) throw new Error("host merge process exit did not match a running lease");
@@ -248,7 +320,7 @@ export function markHostMergeProcessExited(db: Database, id: string): void {
 /** Mark any ambiguous outcome as permanently blocking until operator intervention. */
 export function markHostMergeLeaseUnknown(db: Database, id: string): void {
   const result = run(db,
-    "UPDATE host_merge_leases SET phase = 'unknown', updated_at = ? WHERE id = ? AND operation_kind = 'merge' AND outcome_json IS NULL",
+    "UPDATE host_merge_leases SET phase = 'unknown', updated_at = ? WHERE id = ? AND operation_kind = 'merge' AND outcome_json IS NULL AND not_started_text IS NULL",
     [Date.now(), id],
   );
   if (result.changes !== 1) throw new Error("host merge lease disappeared or already has a known outcome");
@@ -259,17 +331,22 @@ export function persistHostMergeOutcome(db: Database, id: string, value: Worktre
   const result = run(db,
     `UPDATE host_merge_leases
      SET outcome_kind = ?, outcome_json = ?, updated_at = ?
-     WHERE id = ? AND operation_kind = 'merge' AND phase = 'exited' AND outcome_json IS NULL`,
+     WHERE id = ? AND operation_kind = 'merge' AND phase = 'exited' AND outcome_json IS NULL AND not_started_text IS NULL`,
     [value.kind, JSON.stringify(value), Date.now(), id],
   );
   if (result.changes !== 1) throw new Error("host merge outcome is not attached to a confirmed exit");
 }
 
 export function completeHostMergeLease(db: Database, id: string, completion: HostMergeLeaseCompletion): void {
-  if (completion !== "not-spawned") throw new Error("unknown host merge lease completion");
+  if (completion.kind !== "not-spawned" || completion.diagnostic.trim().length === 0) {
+    throw new Error("invalid host merge non-start outcome");
+  }
   const result = run(db,
-    "DELETE FROM host_merge_leases WHERE id = ? AND operation_kind = 'merge' AND phase IN ('starting', 'running') AND outcome_json IS NULL",
-    [id],
+    `UPDATE host_merge_leases
+     SET phase = 'exited', not_started_text = ?, updated_at = ?
+     WHERE id = ? AND operation_kind = 'merge' AND phase IN ('starting', 'running')
+       AND outcome_json IS NULL AND not_started_text IS NULL`,
+    [completion.diagnostic, Date.now(), id],
   );
   if (result.changes !== 1) throw new Error("host merge lease is not a proven non-execution");
 }
@@ -280,10 +357,14 @@ export function settleHostMergeLease(db: Database, id: string): void {
   if (phase(row.phase) !== "exited" || outcome(row) === null) {
     throw new Error("host merge result is not durably settleable");
   }
+  const notStarted = asNullableString(row.not_started_text);
+  const outcomeKind = asNullableString(row.outcome_kind);
+  const outcomeJson = asNullableString(row.outcome_json);
   const result = run(db,
     `DELETE FROM host_merge_leases
-     WHERE id = ? AND operation_kind = 'merge' AND phase = 'exited' AND outcome_kind = ? AND outcome_json = ?`,
-    [id, asString(row.outcome_kind), asString(row.outcome_json)],
+     WHERE id = ? AND operation_kind = 'merge' AND phase = 'exited'
+       AND not_started_text IS ? AND outcome_kind IS ? AND outcome_json IS ?`,
+    [id, notStarted, outcomeKind, outcomeJson],
   );
   if (result.changes !== 1 && query(db, "SELECT 1 FROM host_merge_leases WHERE id = ? AND operation_kind = 'merge'", [id]).length > 0) {
     throw new Error("host merge result changed before settlement");
@@ -309,6 +390,195 @@ export function getHostMergeLeaseBySourceId(
 export function listHostMergeLeases(db: Database, botUid: string): HostMergeLeaseRecord[] {
   return query(db, "SELECT * FROM host_merge_leases WHERE bot_uid = ? AND operation_kind = 'merge' ORDER BY created_at, id", [botUid])
     .map(decodeHostMergeLease);
+}
+
+/** Reserve independent progress delivery; this row intentionally has no task identity or foreign key. */
+export function reserveHostMergeProgressCard(
+  db: Database,
+  input: HostMergeProgressCardInput,
+): HostMergeProgressCardRecord {
+  if (
+    input.target.channelType !== 5
+    || input.botUid.length === 0
+    || input.target.channelId.length === 0
+    || input.sourceId.length === 0
+    || input.clientMsgNo.length === 0
+    || !Number.isSafeInteger(input.startedAt)
+    || input.startedAt < 0
+  ) {
+    throw new Error("invalid host merge progress card identity");
+  }
+  run(db,
+    `INSERT INTO host_merge_progress_cards(
+       bot_uid, channel_type, channel_id, source_id, client_msg_no, message_id, delivery_state, last_seq,
+       phase, started_at, ended_at, result_text, updated_at
+     ) VALUES(?, 5, ?, ?, ?, NULL, 'ready', 0, 'preparing', ?, NULL, NULL, ?)
+     ON CONFLICT(bot_uid, channel_type, channel_id, source_id) DO NOTHING`,
+    [input.botUid, input.target.channelId, input.sourceId, input.clientMsgNo, input.startedAt, Date.now()],
+  );
+  const existing = getHostMergeProgressCard(db, input.botUid, input.target, input.sourceId);
+  if (!existing || existing.clientMsgNo !== input.clientMsgNo) {
+    throw new Error("host merge progress card identity changed");
+  }
+  return existing;
+}
+
+export function getHostMergeProgressCard(
+  db: Database,
+  botUid: string,
+  target: ChatTarget,
+  sourceId: string,
+): HostMergeProgressCardRecord | null {
+  if (target.channelType !== 5) return null;
+  const row = query(db,
+    `SELECT * FROM host_merge_progress_cards
+     WHERE bot_uid = ? AND channel_type = 5 AND channel_id = ? AND source_id = ?`,
+    [botUid, target.channelId, sourceId],
+  )[0];
+  return row ? decodeHostMergeProgressCard(row) : null;
+}
+
+export function listHostMergeProgressCards(
+  db: Database,
+  botUid: string,
+): HostMergeProgressCardRecord[] {
+  return query(db,
+    "SELECT * FROM host_merge_progress_cards WHERE bot_uid = ? ORDER BY updated_at, source_id",
+    [botUid],
+  ).map(decodeHostMergeProgressCard);
+}
+
+export function updateHostMergeProgressCard(
+  db: Database,
+  botUid: string,
+  target: ChatTarget,
+  sourceId: string,
+  phase: HostMergeProgressPhase,
+  endedAt: number | null,
+  result: string | null,
+): void {
+  const validPhase = mergeProgressPhase(phase);
+  const active = validPhase === "preparing" || validPhase === "process-started" || validPhase === "process-exited";
+  if (
+    target.channelType !== 5
+    || (endedAt !== null && (!Number.isSafeInteger(endedAt) || endedAt < 0))
+    || (active && endedAt !== null)
+    || (!active && endedAt === null)
+    || (result !== null && typeof result !== "string")
+  ) {
+    throw new Error("invalid host merge progress state");
+  }
+  const update = run(db,
+    `UPDATE host_merge_progress_cards
+     SET phase = ?, ended_at = ?, result_text = ?, updated_at = ?
+     WHERE bot_uid = ? AND channel_type = 5 AND channel_id = ? AND source_id = ?`,
+    [validPhase, endedAt, result, Date.now(), botUid, target.channelId, sourceId],
+  );
+  if (update.changes !== 1) throw new Error("host merge progress card disappeared");
+}
+
+export function markHostMergeProgressCardAttempted(
+  db: Database,
+  botUid: string,
+  target: ChatTarget,
+  sourceId: string,
+): void {
+  if (target.channelType !== 5) throw new Error("invalid host merge progress card target");
+  const update = run(db,
+    `UPDATE host_merge_progress_cards SET delivery_state = 'attempted', updated_at = ?
+     WHERE bot_uid = ? AND channel_type = 5 AND channel_id = ? AND source_id = ? AND delivery_state = 'ready'`,
+    [Date.now(), botUid, target.channelId, sourceId],
+  );
+  if (update.changes !== 1) throw new Error("host merge progress card is not ready for its first send");
+}
+
+export function markHostMergeProgressCardUnknown(
+  db: Database,
+  botUid: string,
+  target: ChatTarget,
+  sourceId: string,
+): void {
+  if (target.channelType !== 5) throw new Error("invalid host merge progress card target");
+  const update = run(db,
+    `UPDATE host_merge_progress_cards SET delivery_state = 'unknown', updated_at = ?
+     WHERE bot_uid = ? AND channel_type = 5 AND channel_id = ? AND source_id = ? AND delivery_state = 'attempted'`,
+    [Date.now(), botUid, target.channelId, sourceId],
+  );
+  if (update.changes === 0 && getHostMergeProgressCard(db, botUid, target, sourceId)?.deliveryState !== "unknown") {
+    throw new Error("host merge progress card could not be marked unknown");
+  }
+}
+
+export function markHostMergeProgressCardUnavailable(
+  db: Database,
+  botUid: string,
+  target: ChatTarget,
+  sourceId: string,
+): void {
+  if (target.channelType !== 5) throw new Error("invalid host merge progress card target");
+  const update = run(db,
+    `UPDATE host_merge_progress_cards SET delivery_state = 'unavailable', updated_at = ?
+     WHERE bot_uid = ? AND channel_type = 5 AND channel_id = ? AND source_id = ? AND delivery_state = 'attempted'`,
+    [Date.now(), botUid, target.channelId, sourceId],
+  );
+  if (update.changes === 0 && getHostMergeProgressCard(db, botUid, target, sourceId)?.deliveryState !== "unavailable") {
+    throw new Error("host merge progress card could not be marked unavailable");
+  }
+}
+
+export function bindHostMergeProgressCardMessage(
+  db: Database,
+  botUid: string,
+  target: ChatTarget,
+  sourceId: string,
+  messageId: string,
+): string {
+  if (target.channelType !== 5 || messageId.length === 0) {
+    throw new Error("invalid host merge progress card message identity");
+  }
+  run(db,
+    `UPDATE host_merge_progress_cards
+     SET message_id = COALESCE(message_id, ?), delivery_state = 'bound', updated_at = ?
+     WHERE bot_uid = ? AND channel_type = 5 AND channel_id = ? AND source_id = ?
+       AND delivery_state IN ('attempted', 'unknown', 'bound') AND (message_id IS NULL OR message_id = ?)`,
+    [messageId, Date.now(), botUid, target.channelId, sourceId, messageId],
+  );
+  const record = getHostMergeProgressCard(db, botUid, target, sourceId);
+  if (!record?.messageId || record.messageId !== messageId) {
+    throw new Error("host merge progress message identity changed");
+  }
+  return record.messageId;
+}
+
+export function recordHostMergeProgressCardAttempt(
+  db: Database,
+  botUid: string,
+  target: ChatTarget,
+  sourceId: string,
+): number {
+  if (target.channelType !== 5) throw new Error("invalid host merge progress card target");
+  const update = run(db,
+    `UPDATE host_merge_progress_cards SET last_seq = last_seq + 1, updated_at = ?
+     WHERE bot_uid = ? AND channel_type = 5 AND channel_id = ? AND source_id = ? AND message_id IS NOT NULL AND delivery_state = 'bound'`,
+    [Date.now(), botUid, target.channelId, sourceId],
+  );
+  if (update.changes !== 1) throw new Error("host merge progress card is not bound to a message");
+  const record = getHostMergeProgressCard(db, botUid, target, sourceId);
+  if (!record) throw new Error("host merge progress card disappeared");
+  return record.lastSeq;
+}
+
+export function clearHostMergeProgressCard(
+  db: Database,
+  botUid: string,
+  target: ChatTarget,
+  sourceId: string,
+): void {
+  if (target.channelType !== 5) return;
+  run(db,
+    "DELETE FROM host_merge_progress_cards WHERE bot_uid = ? AND channel_type = 5 AND channel_id = ? AND source_id = ?",
+    [botUid, target.channelId, sourceId],
+  );
 }
 
 /** Reserve the same managed-process ledger for one owner-triggered local workspace removal. */
