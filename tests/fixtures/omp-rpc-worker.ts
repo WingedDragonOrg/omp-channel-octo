@@ -15,6 +15,7 @@ type Scenario =
 	| "compaction-abort-before-start"
 	| "compaction-abort-start-race"
 	| "compaction-auto"
+	| "compaction-fallback"
 	| "compaction-manual"
 	| "compaction-manual-inline"
 	| "compaction-no-start"
@@ -1839,6 +1840,21 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		emit({ type: "agent_start" });
 		emit({ type: "manual_compaction_start" });
 		emit({ type: "manual_compaction_start" });
+		emit({ type: "agent_end", messages: [], willContinue: false });
+		return;
+	}
+	if (scenario === "compaction-fallback") {
+		emit({ type: "agent_start" });
+		emit({ type: "auto_compaction_start", reason: "threshold", action: "remote" });
+		emit({
+			type: "auto_compaction_end", action: "remote", aborted: false, willRetry: false,
+			errorMessage: "Auto-compaction failed: fixture failure; trying the next preferred compaction method.",
+		});
+		emit({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
+		emit({
+			type: "auto_compaction_end", action: "context-full", aborted: false, willRetry: false,
+			result: { summary: "fixture-private-compaction-summary" },
+		});
 		emit({ type: "agent_end", messages: [], willContinue: false });
 		return;
 	}

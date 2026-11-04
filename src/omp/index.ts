@@ -52,8 +52,6 @@ import {
 	HostCall,
 	PendingResponse,
 	PromptRun,
-	compactionNoticeFromCommandOutput,
-	compactionNoticeFromFrame,
 	emitWorkerEvent,
 	describeUiFailure,
 	hostResult,
@@ -905,7 +903,6 @@ class RpcWorker implements OmpWorker {
 			nextTurnId: 0,
 			activeTurnId: undefined,
 			research: new ResearchTracker(),
-			compactions: new Map(),
 			manualCompact,
 			manualCompactStarted: false,
 			manualCompactEnded: false,
@@ -1226,19 +1223,20 @@ class RpcWorker implements OmpWorker {
 			if (active?.manualCompact) {
 				// Native compact output can include provider-controlled error details.
 				// It has no request id, so suppress raw output for every compact builtin.
-				if (!active.settled) {
-					const notice = compactionNoticeFromCommandOutput(active, frame);
-					if (notice) {
-						try {
-							active.onEvent(notice);
-						} catch (error) {
-							this.#rejectPrompt(active, asError(error, "OMP event callback failed"));
-							return;
-						}
-						if (active.manualCompact && active.localCompletionRequested) {
-							this.#completeLocalCommand(active);
-						}
-					}
+				if (
+					!active.settled
+					&& !active.manualCompactCommandOutputSeen
+					&& !active.manualCompactStarted
+					&& !active.manualCompactEnded
+					&& typeof frame.text === "string"
+					&& (
+						(frame.text.startsWith("/compact ") && frame.text.includes(" does not take focus instructions"))
+						|| frame.text.startsWith("Compaction failed:")
+						|| frame.text.startsWith("Compaction complete.")
+					)
+				) {
+					active.manualCompactCommandOutputSeen = true;
+					if (active.localCompletionRequested) this.#completeLocalCommand(active);
 				}
 				return;
 			}
@@ -1259,42 +1257,20 @@ class RpcWorker implements OmpWorker {
 			if (active && !active.settled) this.#handleGoalUpdated(active, frame);
 			return;
 		}
-		if (
-			frame.type === "manual_compaction_start"
-			|| frame.type === "manual_compaction_end"
-			|| frame.type === "auto_compaction_start"
-			|| frame.type === "auto_compaction_end"
-		) {
-			if (!active || active.settled) return;
-			// RPC session events normally carry no session id because the worker is
-			// subscribed to its bound session. If one is supplied, never project a
-			// lifecycle frame from another session into this task.
+		if (frame.type === "manual_compaction_start" || frame.type === "manual_compaction_end") {
+			if (!active || active.settled || !active.manualCompact) return;
 			if (typeof frame.sessionId === "string" && frame.sessionId !== this.#sessionId) return;
-			try {
-				const transition = compactionNoticeFromFrame(active, frame);
-				if (!transition) return;
-				if (transition.kind === "manual" && active.manualCompact) {
-					if (transition.phase === "start") {
-						active.manualCompactStarted = true;
-						active.manualCompactAbortAcknowledged = false;
-					} else {
-						active.manualCompactEnded = true;
-					}
-				}
-				active.onEvent(transition.event);
-				if (
-					transition.kind === "manual"
-					&& transition.phase === "end"
-					&& active.manualCompact
-					&& active.localCompletionRequested
-				) {
-					this.#completeLocalCommand(active);
-				}
-			} catch (error) {
-				this.#rejectPrompt(active, asError(error, "OMP event callback failed"));
+			if (frame.type === "manual_compaction_start") {
+				if (active.manualCompactStarted) return;
+				active.manualCompactStarted = true;
+				active.manualCompactAbortAcknowledged = false;
+			} else if (active.manualCompactStarted && !active.manualCompactEnded) {
+				active.manualCompactEnded = true;
+				if (active.localCompletionRequested) this.#completeLocalCommand(active);
 			}
 			return;
 		}
+		if (frame.type === "auto_compaction_start" || frame.type === "auto_compaction_end") return;
 		if (!active || active.settled) return;
 		if (frame.type === "session_settled") {
 			if (!active.waitForSessionSettled) return;

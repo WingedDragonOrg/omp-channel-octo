@@ -675,7 +675,7 @@ process.exit(await child.exited);
   nextRemotePhase = "manual";
   await send("/compact remote");
   await wait(
-    "Manual /compact remote did not acknowledge, announce its native start, and reach the held loopback compactor before the RPC ACK deadline",
+    "Manual /compact remote did not acknowledge and reach the held loopback compactor",
     async () => {
       const frames = (await nativeWire()).slice(manualWireStart);
       const request = findPromptRequest(frames, "/compact remote");
@@ -686,8 +686,7 @@ process.exit(await child.exited);
         && ack.success === true
         && ack.agentInvoked === false
         && start?.mode === "remote"
-        && remoteRequests.some(remote => remote.phase === "manual")
-        && findNotice(manualNoticeStart, isStartNotice) >= 0;
+        && remoteRequests.some(remote => remote.phase === "manual");
     },
     22_000,
   );
@@ -696,18 +695,16 @@ process.exit(await child.exited);
   const manualAck = findPromptAck(manualFramesAtHold, manualPromptFrame)!;
   const manualStartEvent = compactionEvent(manualFramesAtHold, "manual_compaction_start")!;
   const manualRemote = remoteRequests.find(remote => remote.phase === "manual")!;
-  const manualStartNoticeIndex = findNotice(manualNoticeStart, isStartNotice);
   assert.equal(manualStartEvent.mode, "remote", "Native OMP did not honor the explicit /compact remote mode");
   assert.equal(manualAck.agentInvoked, false, "The native /compact command was not acknowledged as local-only");
   assert.equal(compactionEvent(manualFramesAtHold, "manual_compaction_end"), undefined,
     "Manual compaction emitted an end event while its remote summary was still blocked");
-  assert.equal(findNotice(manualNoticeStart, isSuccessNotice), -1,
-    "Channel announced successful manual compaction before the remote result committed");
+  assert.equal(findNotice(manualNoticeStart, isStartNotice), -1);
+  assert.equal(findNotice(manualNoticeStart, isSuccessNotice), -1);
   assert.equal((await compactionEntries(sessionFile)).length, 0,
     "A speculative summary was mistaken for a committed manual compaction entry");
   assert.ok(activeWorkerCount(seedSession.binding.session_id) > 0,
     "Local /compact acknowledgement closed the channel's real OMP worker before native compaction finished");
-  const manualStartText = messageText(fixture.sentMessages[manualStartNoticeIndex]!);
   console.log("CASE manual-remote-pending " + JSON.stringify({
     command: manualPromptFrame.message,
     promptSequence: manualPromptFrame.sequence,
@@ -717,9 +714,7 @@ process.exit(await child.exited);
     startAtMs: manualStartEvent.atMs,
     ackBeforeStart: manualAck.sequence < manualStartEvent.sequence,
     remoteRequestAtMs: manualRemote.atMs,
-    startNotice: manualStartText.slice(0, 180),
     workerStillOwned: true,
-    completionNoticeBeforeRemoteResult: false,
     committedEntryBeforeRemoteResult: false,
   }));
 
@@ -767,12 +762,11 @@ process.exit(await child.exited);
     "FIXTURE_MANUAL_REMOTE_COMPACTION_RESULT",
   )!;
   assert.ok(manualEndForwarded.atMs >= manualEndHeld.atMs, "Manual end frame forwarding preceded its native event");
-  await wait("Channel did not announce the committed manual remote compaction", () => findNotice(manualNoticeStart, isSuccessNotice) >= 0, 15_000);
   await waitForWorkerCleanup();
   await rm(manualEndHoldPath, { force: true });
   await rm(manualEndReleasePath, { force: true });
-  const manualCompletionIndex = findNotice(manualNoticeStart, isSuccessNotice);
-  assert.ok(manualCompletionIndex >= 0);
+  assert.equal(findNotice(manualNoticeStart, isStartNotice), -1);
+  assert.equal(findNotice(manualNoticeStart, isSuccessNotice), -1);
   console.log("CASE manual-remote-committed " + JSON.stringify({
     endSequence: manualEndHeld.sequence,
     nativeEndAtMs: manualEndHeld.atMs,
@@ -781,7 +775,6 @@ process.exit(await child.exited);
     resultSummary: manualEndHeld.resultSummary,
     persistedCompactionEntries: afterManualCommit.length,
     persistedMethod: afterManualCommit[0]?.method,
-    completionNotice: messageText(fixture.sentMessages[manualCompletionIndex]!).slice(0, 180),
   }));
 
   // Lower the threshold enough to trigger on real prompt pressure while keeping fixed system and
@@ -801,13 +794,9 @@ process.exit(await child.exited);
     async () => {
       const frames = (await nativeWire()).slice(autoWireStart);
       const start = latestAutomaticPassStart(frames);
-      const starts = frames.filter(frame =>
-        frame.direction === "omp" && frame.type === "auto_compaction_start",
-      );
       return !!start
         && start.action === "remote"
-        && remoteRequests.some(remote => remote.phase === "automatic")
-        && noticeIndexes(autoNoticeStart, isStartNotice).length >= starts.length;
+        && remoteRequests.some(remote => remote.phase === "automatic");
     },
     30_000,
   );
@@ -831,7 +820,6 @@ process.exit(await child.exited);
     "An uncommitted automatic summary changed the persisted session history");
   assert.ok(activeWorkerCount(seedSession.binding.session_id) > 0,
     "Automatic compaction lost the channel's OMP worker while its real summary was pending");
-  const autoStartNoticeIndex = noticeIndexes(autoNoticeStart, isStartNotice).at(-1)!;
   console.log("CASE automatic-remote-pending " + JSON.stringify({
     triggerMessageId: autoMessage,
     startSequence: autoStartEvent.sequence,
@@ -840,9 +828,7 @@ process.exit(await child.exited);
     action: autoStartEvent.action,
     skippedAutomaticAttempts: skippedAutoEnds.length,
     remoteRequestAtMs: automaticRemote.atMs,
-    startNotice: messageText(fixture.sentMessages[autoStartNoticeIndex]!).slice(0, 180),
     speculativeCompactionDisabled: true,
-    completionNoticeBeforeNativeResult: false,
   }));
 
   automaticRemote.gate.resolve();
@@ -889,11 +875,10 @@ process.exit(await child.exited);
     "FIXTURE_AUTOMATIC_REMOTE_COMPACTION_RESULT",
   )!;
   assert.ok(autoEndForwarded.atMs >= autoEndHeld.atMs, "Automatic end frame forwarding preceded its native event");
-  await wait("Channel did not announce committed automatic remote compaction", () => findNotice(autoNoticeStart, isSuccessNotice) >= 0, 15_000);
-  const autoCompletionIndex = findNotice(autoNoticeStart, isSuccessNotice);
-  assert.ok(autoCompletionIndex >= 0);
   await waitForTask(autoMessage, "AUTOMATIC_COMPACTION_TRIGGER_REPLY");
   await waitForWorkerCleanup();
+  assert.equal(findNotice(autoNoticeStart, isStartNotice), -1);
+  assert.equal(findNotice(autoNoticeStart, isSuccessNotice), -1);
   await rm(automaticEndHoldPath, { force: true });
   await rm(automaticEndReleasePath, { force: true });
   console.log("CASE automatic-remote-committed " + JSON.stringify({
@@ -904,7 +889,6 @@ process.exit(await child.exited);
     resultSummary: autoEndHeld.resultSummary,
     persistedCompactionEntries: afterAutoCommit.length,
     persistedMethod: afterAutoCommit[1]?.method,
-    completionNotice: messageText(fixture.sentMessages[autoCompletionIndex]!).slice(0, 180),
   }));
 
   assert.equal(modelError, undefined);
@@ -927,7 +911,7 @@ process.exit(await child.exited);
     loopbackProviderRequests: providerRequests.length,
     manualRemoteCompaction: true,
     automaticRemoteCompaction: true,
-    nativeResultsObservedBeforeSuccessNotices: true,
+    compactionNotifications: false,
     persistedCompactionEntries: 2,
     encryptedLocalOctoFixture: true,
     residentServiceTouched: false,

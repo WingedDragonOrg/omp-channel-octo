@@ -1385,31 +1385,19 @@ describe("OMP RPC worker", () => {
 		});
 	});
 
-	test("surfaces a native manual compaction start as one safe worker notice", async () => {
+	test("keeps native manual compaction lifecycle silent", async () => {
 		await withHarness("compaction-start", async harness => {
 			const events: WorkerEvent[] = [];
 			await harness.worker.prompt("start work", event => events.push(event));
-
-			const notices = events.filter(
-				(event): event is Extract<WorkerEvent, { type: "notice" }> => event.type === "notice",
-			);
-			expect(notices.map(({ text, level }) => ({ text, level }))).toEqual([
-				{ text: "上下文压缩已开始", level: "info" },
-			]);
+			expect(events.filter(event => event.type === "notice")).toEqual([]);
 		});
 	});
-	test("suppresses untrusted output from native inline compact while retaining lifecycle notices", async () => {
+	test("suppresses untrusted output from native inline compact", async () => {
 		await withHarness("compaction-manual-inline", async harness => {
 			const events: WorkerEvent[] = [];
 			await harness.worker.prompt("/compact", event => events.push(event));
 
-			const notices = events.filter(
-				(event): event is Extract<WorkerEvent, { type: "notice" }> => event.type === "notice",
-			);
-			expect(notices.map(({ text, level }) => ({ text, level }))).toEqual([
-				{ text: "上下文压缩已开始", level: "info" },
-				{ text: "上下文压缩已完成", level: "info" },
-			]);
+			expect(events.filter(event => event.type === "notice")).toEqual([]);
 			expect(events.filter(event => event.type === "local_command")).toEqual([{ type: "local_command" }]);
 			expect(JSON.stringify(events)).not.toContain("fixture-private-compaction-summary");
 			expect(JSON.stringify(events)).not.toContain("fixture-private-command-output");
@@ -1436,19 +1424,13 @@ describe("OMP RPC worker", () => {
 				}),
 			);
 			expect(settled).toBe(false);
-			await waitUntil(() => events.some(event => event.type === "notice" && event.text === "上下文压缩已开始"));
+			await waitUntil(async () => (await readLog(harness.logPath)).some(entry =>
+				entry.kind === "out" && (entry.frame as Record<string, unknown> | undefined)?.type === "manual_compaction_start"));
 			expect(settled).toBe(false);
 			expect(events.filter(event => event.type === "local_command")).toEqual([]);
 			await prompt;
 
-			const notices = events.filter(
-				(event): event is Extract<WorkerEvent, { type: "notice" }> => event.type === "notice",
-			);
-			expect(notices.map(({ text, level }) => ({ text, level }))).toEqual([
-				{ text: "上下文压缩已开始", level: "info" },
-				{ text: "上下文压缩已完成", level: "info" },
-			]);
-			expect(new Set(notices.map(event => event.messageId)).size).toBe(2);
+			expect(events.filter(event => event.type === "notice")).toEqual([]);
 			expect(events.filter(event => event.type === "local_command")).toEqual([{ type: "local_command" }]);
 			expect(events.filter(event => event.type === "prompt_accepted")).toEqual([]);
 			expect(JSON.stringify(events)).not.toContain("fixture-private-compaction-summary");
@@ -1458,14 +1440,12 @@ describe("OMP RPC worker", () => {
 			const softPrompt = harness.worker.prompt("/compact:soft preserve the important decisions", event => softEvents.push(event)).then(() => {
 				softSettled = true;
 			});
-			await waitUntil(() => softEvents.some(event => event.type === "notice" && event.text === "上下文压缩已开始"));
+			await waitUntil(async () => (await readLog(harness.logPath)).filter(entry =>
+				entry.kind === "out" && (entry.frame as Record<string, unknown> | undefined)?.type === "manual_compaction_start").length >= 2);
 			expect(softSettled).toBe(false);
 			expect(softEvents.filter(event => event.type === "local_command")).toEqual([]);
 			await softPrompt;
-			expect(softEvents.filter(event => event.type === "notice").map(event => event.type === "notice" ? event.text : "")).toEqual([
-				"上下文压缩已开始",
-				"上下文压缩已完成",
-			]);
+			expect(softEvents.filter(event => event.type === "notice")).toEqual([]);
 			expect(softEvents.filter(event => event.type === "local_command")).toEqual([{ type: "local_command" }]);
 
 			const snapEvents: WorkerEvent[] = [];
@@ -1473,14 +1453,12 @@ describe("OMP RPC worker", () => {
 			const snapPrompt = harness.worker.prompt("/compact snapcompact", event => snapEvents.push(event)).then(() => {
 				snapSettled = true;
 			});
-			await waitUntil(() => snapEvents.some(event => event.type === "notice" && event.text === "上下文压缩已开始"));
+			await waitUntil(async () => (await readLog(harness.logPath)).filter(entry =>
+				entry.kind === "out" && (entry.frame as Record<string, unknown> | undefined)?.type === "manual_compaction_start").length >= 3);
 			expect(snapSettled).toBe(false);
 			expect(snapEvents.filter(event => event.type === "local_command")).toEqual([]);
 			await snapPrompt;
-			expect(snapEvents.filter(event => event.type === "notice").map(event => event.type === "notice" ? event.text : "")).toEqual([
-				"上下文压缩已开始",
-				"上下文压缩已完成",
-			]);
+			expect(snapEvents.filter(event => event.type === "notice")).toEqual([]);
 			expect(snapEvents.filter(event => event.type === "local_command")).toEqual([{ type: "local_command" }]);
 
 			const followingEvents: WorkerEvent[] = [];
@@ -1490,29 +1468,24 @@ describe("OMP RPC worker", () => {
 		});
 	});
 
-	test("reports distinct automatic compactions once using only their native outcomes", async () => {
+	test("keeps automatic compaction fallback silent", async () => {
+		await withHarness("compaction-fallback", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("run automatic compaction", event => events.push(event));
+			expect(events.filter(event => event.type === "notice")).toEqual([]);
+		});
+	});
+
+	test("keeps distinct automatic compactions and their outcomes silent", async () => {
 		await withHarness("compaction-auto", async harness => {
 			const events: WorkerEvent[] = [];
 			await harness.worker.prompt("run automatic compactions", event => events.push(event));
 
-			const notices = events.filter(
-				(event): event is Extract<WorkerEvent, { type: "notice" }> => event.type === "notice",
-			);
-			expect(notices.map(({ text, level }) => ({ text, level }))).toEqual([
-				{ text: "上下文自动压缩已开始", level: "info" },
-				{ text: "上下文自动压缩已完成", level: "info" },
-				{ text: "上下文自动压缩已开始", level: "info" },
-				{ text: "上下文自动压缩已跳过", level: "warning" },
-				{ text: "上下文自动压缩已开始", level: "info" },
-				{ text: "上下文自动压缩已取消", level: "warning" },
-				{ text: "上下文自动压缩已开始", level: "info" },
-				{ text: "上下文自动压缩未成功", level: "error" },
-			]);
-			expect(new Set(notices.map(event => event.messageId)).size).toBe(8);
+			expect(events.filter(event => event.type === "notice")).toEqual([]);
 			expect(events.filter(event => event.type === "prompt_accepted")).toEqual([{ type: "prompt_accepted" }]);
 			expect(events.filter(event => event.type === "local_command")).toEqual([]);
-			expect(JSON.stringify(notices)).not.toContain("fixture-private-compaction-summary");
-			expect(JSON.stringify(notices)).not.toContain("fixture-private-compaction-error");
+			expect(JSON.stringify(events)).not.toContain("fixture-private-compaction-summary");
+			expect(JSON.stringify(events)).not.toContain("fixture-private-compaction-error");
 		});
 	});
 
@@ -1522,7 +1495,6 @@ describe("OMP RPC worker", () => {
 			await harness.worker.prompt("/compact remote", event => events.push(event));
 
 			expect(events).toEqual([
-				{ type: "notice", messageId: expect.any(String), text: "上下文压缩未成功", level: "error" },
 				{ type: "local_command" },
 			]);
 			expect(JSON.stringify(events)).not.toContain("fixture-private-native-error");
@@ -1535,7 +1507,6 @@ describe("OMP RPC worker", () => {
 			await harness.worker.prompt("/compact snapcompact focus instructions", event => events.push(event));
 
 			expect(events).toEqual([
-				{ type: "notice", messageId: expect.any(String), text: "上下文压缩参数无效", level: "error" },
 				{ type: "local_command" },
 			]);
 			expect(JSON.stringify(events)).not.toContain("does not take focus instructions");
@@ -1548,7 +1519,6 @@ describe("OMP RPC worker", () => {
 			await harness.worker.prompt("/compact remote", event => events.push(event));
 
 			expect(events).toEqual([
-				{ type: "notice", messageId: expect.any(String), text: "上下文压缩结果未确认", level: "warning" },
 				{ type: "local_command" },
 			]);
 			expect(JSON.stringify(events)).not.toContain("fixture-private-command-output");
@@ -1584,7 +1554,8 @@ describe("OMP RPC worker", () => {
 				(await readLog(harness.logPath)).some(entry => entry.kind === "prompt" && entry.message === "/compact remote"),
 			);
 			await harness.worker.abortTurn();
-			await waitUntil(() => events.some(event => event.type === "notice" && event.text === "上下文压缩已开始"));
+			await waitUntil(async () => (await readLog(harness.logPath)).some(entry =>
+				entry.kind === "out" && (entry.frame as Record<string, unknown> | undefined)?.type === "manual_compaction_start"));
 			await waitUntil(async () =>
 				(await readLog(harness.logPath)).some(entry => {
 					const frame = entry.frame as Record<string, unknown> | undefined;
@@ -1599,10 +1570,7 @@ describe("OMP RPC worker", () => {
 			expect(settled).toBe(false);
 			expect(events.filter(event => event.type === "local_command")).toEqual([]);
 			await prompt;
-			expect(events.filter(event => event.type === "notice").map(event => event.type === "notice" ? event.text : "")).toEqual([
-				"上下文压缩已开始",
-				"上下文压缩已取消",
-			]);
+			expect(events.filter(event => event.type === "notice")).toEqual([]);
 			expect(events.filter(event => event.type === "local_command")).toEqual([{ type: "local_command" }]);
 		});
 
@@ -1612,12 +1580,11 @@ describe("OMP RPC worker", () => {
 				() => "resolved",
 				() => "rejected",
 			);
-			await waitUntil(() => events.some(event => event.type === "notice" && event.text === "上下文压缩已开始"));
+			await waitUntil(async () => (await readLog(harness.logPath)).some(entry =>
+				entry.kind === "out" && (entry.frame as Record<string, unknown> | undefined)?.type === "manual_compaction_start"));
 			expect(await harness.worker.stop()).toBe(true);
 			expect(await prompt).toBe("rejected");
-			expect(events.filter(event => event.type === "notice").map(event => event.type === "notice" ? event.text : "")).toEqual([
-				"上下文压缩已开始",
-			]);
+			expect(events.filter(event => event.type === "notice")).toEqual([]);
 		});
 	});
 

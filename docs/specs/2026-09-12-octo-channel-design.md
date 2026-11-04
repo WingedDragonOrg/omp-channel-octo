@@ -455,17 +455,13 @@ worker ready 后协商协议版本；本地实现保持 OMP v18.1.18 兼容的 R
 按需启动 worker；同一持久会话只能被一个 worker 写入。新会话只通过 fresh RPC `new_session` 创建并立即落盘；对已有绑定，恢复前先按 session ID 与 `previousSessionFiles` breadcrumb 在 native roots 中寻找并验证唯一外移候选，找到后持久化重绑；扫描或验证失败则保留原绑定并报告失败，不能用“最近会话”替代精确身份。恢复 worker 时仅传入已经确认存在且准确的 session 文件和保存的目录。正常退出释放 worker。
 OMP extension 在 worker 启动时由固定路径自动加载；sidecar 根路径通过宿主显式 allowlist 的非秘密 worker 输入传给 extension，sidecar 在真实 session ID 确认后、第一次 `prompt` 前原子发布，extension 在生命周期回调中按该 ID 精确读取并写入 `prepared` receipt。绑定 session 指针在该 turn 的第一次 `prompt` 前发布，并作为该作用域的当前 session 保留；worker 进程内由 OMP 打开的 subagent 或 eval 子会话因此不会被当作 channel turn，extension 不按 cwd、全局路径或模糊 session 猜测身份。宿主必须能观察 matching receipt 和 prompt acceptance，并以 attempt ID 做单调 CAS；worker 停止、重启、恢复和 compaction 不得绕过 `pending`/`committed` 判定。宿主不向 extension 暴露 Octo 认证凭证，extension 不得按 cwd、全局路径或模糊 session 查找 sidecar。
 
-#### 会话压缩通知
+#### 会话压缩
 
-- **目标与范围**：当前绑定 session 的手动和自动压缩在原聊天显示开始和结果，沿用任务通知与 durable outbox；不改变 `/compact` 首行分派、压缩算法、摘要或共享说明合同。
-- **原生边界**：安装的 OMP RPC 从当前 `session.subscribe` 转发 `manual_compaction_start/end` 与 `auto_compaction_start/end`。手动开始在原生活动回合中止后发出，自动开始在压缩控制器建立后发出；投机摘要预计算不代表压缩开始或完成。只有匹配的结束事件携带原生成功结果且未取消时才能报告完成；取消、跳过、错误及未确认结果不得冒充成功。不得输出原生错误正文、摘要或 prompt。
-- **归属与投递**：只将绑定 worker 的当前任务内生命周期投影为安全有界文本，使用同任务的 bot、聊天和 session；非绑定子 session 事件不得广播。每次压缩的重复开始与结束帧至多各产生一条通知，不把通知当作 assistant 产出、待答答案、任务或授权。同步写入既有 outbox 后异步投递，网络慢或失败不阻塞 RPC 帧消费、压缩、任务结果或停机；复用原有有限重试和恢复机制。
-- **中断与恢复**：取消、worker 退出或服务停止时未观察到原生成功结果，不发完成通知；不为通知重放已接受的输入或重新执行压缩。持久出站项按既有稳定身份恢复，新的 worker 输出使用独立命名空间。原生提供可信的压缩方法或数值时方可展示；否则省略，不使用历史 status 快照推测。
-- **验收**：先观察缺失行为的失败回归，再覆盖手动及自动生命周期、重复帧、失败/取消、非绑定 session、慢或失败投递与恢复。使用真实安装 OMP、隔离 profile/session、有限 localhost 模型和本地 Octo 夹具执行 `/compact remote`，验证开始通知先于压缩完成、成功通知晚于原生成功且 session 文件存在已提交的 compaction entry；执行相关 RPC/core 回归、typecheck、全量测试与离线 restart benchmark。
+手动和自动压缩的生命周期不产生聊天通知；任务的普通输出、错误及取消处理保持原有行为。压缩算法、模型选择、`/compact` 首行分派以及共享说明合同不变。
 
-**离线验收记录**：安装版 OMP 配合隔离 profile/session、有限 localhost 模型与加密本地 Octo 夹具，实际执行手动 `/compact remote` 及阈值触发的自动 remote 压缩。手动 ACK 先于原生 start；在远端摘要被阻塞时，开始通知已到达、worker 仍归属原任务、尚无 compaction entry 或完成通知。两次原生 end/result 均在 session 文件提交后出现；在 end 帧被夹具暂缓投递时没有完成通知，放行后才收到对应完成通知，最终 session 有两条 remote compaction entry。自动路径另观察到一次 skipped，未作为成功。该验收关闭投机摘要。离线 restart benchmark 的 graceful/SIGKILL 场景均无 session overlap 或重复副作用。
+OMP 的 `/compact` 本地命令可能先返回 ACK，再在后台完成压缩。worker 持有当前任务直至匹配的原生手动压缩结束，或已核实的无 start 终态命令输出、取消或停止；不透传可能包含 provider 内容的命令输出。自动压缩生命周期不改变任务的收尾方式。session 上下文刷新仍须以已提交的原生 compaction entry 为依据。
 
-OMP 当前将 `/compact` 本地命令后台运行并先返回 ACK；worker 持有当前任务直至原生结束。若操作在 start 之前结束，只有已核实的原生命令终态文本用于收尾，文本内容不透传、不用作成功证据。上游若更改这些终态文本而又不提供 start/end，当前 worker 需要通过取消或停止结束；不能推测成功。
+验收使用隔离 RPC 子进程覆盖自动方法切换和独立轮次、手动多种模式、无 start、取消及停止，并验证均无压缩通知；离线真实 OMP 配合有限 localhost 模型和本地 Octo 夹具验证手动和自动压缩提交、worker 生命周期及正常输出。
 
 `WorkerEvent` 的正文事件为稳定的本地 `messageId`、累计正文快照和 `final` 标记；上游没有原生 ID 时由 adapter 生成。每个 assistant message 独立维护 stream，可流式投递的正文首次非空时立即创建正文消息，后续累计快照只编辑同一个远端 message ID；结构化 mention 也在同一流中增量更新，不同 assistant message 不合并。`final=true` 是该消息的权威结束快照，允许比此前更短或为空；已有远端消息必须编辑到最终空文本，尚未创建且从未有可投递正文的空最终事件不发送空白新消息。
 
