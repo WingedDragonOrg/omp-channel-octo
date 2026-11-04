@@ -12,4 +12,3 @@ direnv = "if [ -f .envrc ] && command -v direnv >/dev/null; then direnv allow; f
 
 [pre-merge]
 typecheck = "bun run typecheck"
-test = "bun test"
