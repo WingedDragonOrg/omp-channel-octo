@@ -110,7 +110,11 @@ export interface InboundMaterializerDeps {
 export class InboundMaterializer {
   constructor(private readonly deps: InboundMaterializerDeps) {}
 
-  async materialize(message: InboundMessage, text = message.text): Promise<string | null> {
+  async materialize(
+    message: InboundMessage,
+    text = message.text,
+    operationSignal?: AbortSignal,
+  ): Promise<string | null> {
     this.deps.throwIfStopping();
     const quotedText = message.quoted?.text.trim() ?? "";
     const association = this.associatedAttachments(message);
@@ -170,10 +174,17 @@ export class InboundMaterializer {
           AbortSignal.timeout(ATTACHMENT_DOWNLOAD_TIMEOUT_MS),
           budget.signal,
           this.deps.shutdownSignal,
+          ...(operationSignal === undefined ? [] : [operationSignal]),
         ]);
         let bytes = await existingFileSize(path);
+        if (operationSignal?.aborted) {
+          throw operationSignal.reason instanceof Error ? operationSignal.reason : new Error("inbound operation aborted");
+        }
         this.deps.throwIfStopping();
         if (bytes === null) {
+          // This path was absent before the download, so own it for cleanup even if cancellation
+          // races a successful write before the transport promise settles.
+          created.push(path);
           try {
             bytes = await this.deps.transport.downloadAttachment({
               url: attachment.url,
@@ -181,17 +192,22 @@ export class InboundMaterializer {
               maxBytes: attachmentConfig.maxBytes,
               signal,
             });
+            if (operationSignal?.aborted) {
+              throw operationSignal.reason instanceof Error ? operationSignal.reason : new Error("inbound operation aborted");
+            }
           } catch (error) {
             if (error instanceof AttachmentError && error.reason === "oversize") throw error;
             // 停机中止先于预算/超时判定：被中断的取回不是附件失败，不发拒绝文案。
             if (this.deps.shutdownSignal.aborted) throw new InboundShutdownError();
             // 单条 60 秒超时与整条 120 秒预算都会中止同一条 signal；只有预算耗尽按「超限」回复。
+            if (operationSignal?.aborted) {
+              throw operationSignal.reason instanceof Error ? operationSignal.reason : new Error("inbound operation aborted");
+            }
             if (budget.signal.aborted) throw new AttachmentError("budget", "attachment budget exhausted");
             if (signal.aborted) throw new AttachmentError("timeout", "attachment download timed out");
             if (error instanceof AttachmentError) throw error;
             throw new AttachmentError("failed", "attachment download failed");
           }
-          created.push(path);
         }
         files.push({
           path,
@@ -200,10 +216,15 @@ export class InboundMaterializer {
           bytes,
           durationSeconds: attachment.durationSeconds,
           transcription:
-            attachment.kind === "audio" ? await this.transcribeInboundAudio(path, budget.signal) : null,
+            attachment.kind === "audio"
+              ? await this.transcribeInboundAudio(path, budget.signal, operationSignal)
+              : null,
         });
       }
       this.deps.throwIfStopping();
+      if (operationSignal?.aborted) {
+        throw operationSignal.reason instanceof Error ? operationSignal.reason : new Error("inbound operation aborted");
+      }
       const promptText = composePromptText(
         associated ? withSystemNote(text, association.note) : text,
         files,
@@ -228,6 +249,10 @@ export class InboundMaterializer {
         // 同一消息重启后可重新接收；取消错误上抛，传输层不会 ACK。
         this.deps.store.releaseClaim(claim);
         throw error instanceof InboundShutdownError ? error : new InboundShutdownError();
+      }
+      if (operationSignal?.aborted) {
+        this.deps.store.releaseClaim(claim);
+        throw operationSignal.reason instanceof Error ? operationSignal.reason : new Error("inbound operation aborted");
       }
       const reason: AttachmentFailureReason = error instanceof AttachmentError ? error.reason : "failed";
       if (associated) {
@@ -296,18 +321,25 @@ export class InboundMaterializer {
    * 语音转写是 best-effort：普通失败、空文本甚至单条转写超时都降级为无转写，任务照常接受；
    * 只有整条消息的下载预算被耗尽才按超限失败处理。
    */
-  private async transcribeInboundAudio(path: string, budgetSignal: AbortSignal): Promise<string | null> {
+  private async transcribeInboundAudio(
+    path: string,
+    budgetSignal: AbortSignal,
+    operationSignal?: AbortSignal,
+  ): Promise<string | null> {
     const signal = AbortSignal.any([
       AbortSignal.timeout(ATTACHMENT_DOWNLOAD_TIMEOUT_MS),
       budgetSignal,
       this.deps.shutdownSignal,
+      ...(operationSignal === undefined ? [] : [operationSignal]),
     ]);
     try {
       const transcription = await this.deps.transport.transcribeAudio(path, signal);
       return transcription !== null && transcription.trim().length > 0 ? transcription : null;
     } catch {
-      // 停机中止不能降级成「无转写」后继续组装：被中断的入站以有界取消上抛。
       if (this.deps.shutdownSignal.aborted) throw new InboundShutdownError();
+      if (operationSignal?.aborted) {
+        throw operationSignal.reason instanceof Error ? operationSignal.reason : new Error("inbound operation aborted");
+      }
       if (budgetSignal.aborted) {
         throw new AttachmentError("budget", "attachment budget exhausted during transcription");
       }

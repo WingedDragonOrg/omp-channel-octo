@@ -1,6 +1,6 @@
 /**
  * `ChannelStore` 门面：SQLite 之上的一层持久化 API。物理形状与 db 辅助在 `store-schema.ts`，
- * 记录类型在 `store-records.ts`，各领域读写分布在 `store-chats/grants/tasks/cards/workers/ledgers/outbox/questions/references.ts`。
+ * 记录类型在 `store-records.ts`，各领域读写分布在 `store-chats/grants/tasks/tan/cards/workers/ledgers/outbox/questions/references.ts`。
  */
 
 import { Database } from "bun:sqlite";
@@ -10,6 +10,8 @@ import type { ChatAppendMode, ChatTarget, ThreadListenLevel, WorkerGoal, Worktre
 import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadForkInput, ThreadForkRecord, ThreadListenRecord, ThreadMergeEventRecord, HostMergeLeaseRecord, HostMergeLeaseInput, HostRemovalLeaseInput, HostRemovalLeaseRecord, HostThreadRemovalOutcome } from "./store-records.ts";
 import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopThreadCreation, LoopWorkspace } from "../loop/types.ts";
 import type { SessionContextSnapshotRecord } from "./store-records.ts";
+import type { TanOperation } from "./store-records.ts";
+export type { OutboxInsert, TanOperation } from "./store-records.ts";
 import {
   getSessionContextSnapshot as readSessionContextSnapshot,
   saveSessionContextSnapshot as writeSessionContextSnapshot,
@@ -33,6 +35,7 @@ import * as storeWatch from "./store-watch.ts";
 import type { WatchCheckCompletion, WatchCreateResult, WatchListItem, WatchRecord } from "../watch/types.ts";
 import type { ThreadReference, ThreadReferences } from "../references/types.ts";
 import { bindLoopTask, bindLoopWorkspace, claimLoopInputIntent, commitLoopScan, completeLoopThreadCreation, getLoopBinding, getLoopInput, getLoopTaskRoute, getLoopThreadCreation, isLoopInputObserved, listLoopBindings, listLoopInputs, listLoopThreadCreations, listLoopThreadTasks, markLoopInputDelivered, markLoopInputFault, markLoopInputPending, markLoopInputUnknown, markLoopThreadCreationUnknown, prepareLoopInput, recordLoopThreadAllocated, reserveLoopThreadCreation } from "./store-loop.ts";
+import { acceptTanOperation, acceptTanTask, cancelTanOperation, finishTanOperation, finishTanOperationWithOutbox, getTanOperation, listCancelledTanOperations, listPendingTanOperations, reclaimTanCommand } from "./store-tan.ts";
 
 export class ChannelStore {
   private readonly db: Database;
@@ -279,6 +282,48 @@ export class ChannelStore {
 
   acceptTask(claim: InboundClaim, task: TaskRecord, goalRequest?: GoalTaskRequest): boolean {
     return acceptTask(this.db, claim, task, goalRequest);
+  }
+
+  reclaimTanCommand(claim: InboundClaim): boolean {
+    return reclaimTanCommand(this.db, claim);
+  }
+
+  acceptTanOperation(claim: InboundClaim, operation: TanOperation): boolean {
+    return acceptTanOperation(this.db, claim, operation);
+  }
+
+  getTanOperation(botUid: string, id: string): TanOperation | null {
+    return getTanOperation(this.db, botUid, id);
+  }
+
+  listPendingTanOperations(botUid: string): TanOperation[] {
+    return listPendingTanOperations(this.db, botUid);
+  }
+
+  listCancelledTanOperations(botUid: string): TanOperation[] {
+    return listCancelledTanOperations(this.db, botUid);
+  }
+
+  finishTanOperation(botUid: string, id: string): void {
+    finishTanOperation(this.db, botUid, id);
+  }
+
+  finishTanOperationWithOutbox(
+    botUid: string,
+    id: string,
+    phase: "failed" | "cancelled",
+    error: string,
+    records: readonly OutboxInsert[],
+  ): boolean {
+    return finishTanOperationWithOutbox(this.db, botUid, id, phase, error, records);
+  }
+
+  cancelTanOperation(botUid: string, id: string): boolean {
+    return cancelTanOperation(this.db, botUid, id);
+  }
+
+  acceptTanTask(claim: InboundClaim, operationId: string, task: TaskRecord): boolean {
+    return acceptTanTask(this.db, claim, operationId, task);
   }
 
   suppressTaskRelay(taskId: string): void {

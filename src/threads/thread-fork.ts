@@ -7,7 +7,7 @@ import { OctoError } from "../octo/error.ts";
 import { isTransientServerFailure } from "../errors.ts";
 import { loadValidatedSessionState } from "../session/project-session.ts";
 import type { ChannelStore } from "../store/index.ts";
-import type { TaskRecord, ThreadForkRecord, WorkerLedgerRecord } from "../store/store-records.ts";
+import type { TaskRecord, TanOperation, ThreadForkRecord, WorkerLedgerRecord } from "../store/store-records.ts";
 import type { DestructiveResourceLease, TaskScheduler } from "../tasks/task-scheduler.ts";
 import { targetKey, taskTarget } from "../target.ts";
 import { openTrackedWorker } from "../runtime/worker-lease.ts";
@@ -79,6 +79,57 @@ export class ThreadForkController {
     return this.start(message, `command:${message.messageId}`, requestedName);
   }
 
+  /** Stable operation key shared by `/fork` and `/tan` for the same command message. */
+  commandOperationId(message: InboundMessage): string {
+    if (!this.sourceLocation(message)) throw new Error("/tan 仅支持已授权主群或有效子区");
+    const botUid = this.deps.botUid();
+    if (botUid === undefined) throw new Error("Bot 身份未注册，无法分叉会话");
+    return this.operationId(botUid, message, `command:${message.messageId}`);
+  }
+
+  async tan(operation: TanOperation): Promise<ThreadForkRecord> {
+    const botUid = this.deps.botUid();
+    if (botUid === undefined || botUid !== operation.botUid) {
+      throw new Error("Bot 身份不可用，无法恢复 TAN 分叉");
+    }
+    const target = {
+      channelType: operation.sourceChannelType,
+      channelId: operation.sourceChannelId,
+    };
+    const sourceLocation = this.sourceLocation(target);
+    if (!sourceLocation) throw new Error("/tan 仅支持主群或有效子区");
+    if (
+      operation.id !== this.operationId(botUid, target, `command:${operation.messageId}`)
+    ) {
+      throw new Error("TAN operation identity does not match its captured source");
+    }
+    const capturedSource: ForkSource = {
+      target: sourceLocation.target,
+      groupId: sourceLocation.groupId,
+      sessionId: operation.sourceSessionId,
+      sessionFile: operation.sourceSessionFile,
+      cwd: operation.cwd,
+    };
+    const current = this.active.get(operation.id);
+    if (current) {
+      await current.operation;
+    } else {
+      await this.runActive<string>(operation.id, target, undefined, signal =>
+        this.runById(botUid, sourceLocation, operation.id, undefined, signal, capturedSource));
+    }
+    const record = this.deps.store.getThreadFork(botUid, operation.id);
+    if (
+      record === null
+      || record.phase !== "ready"
+      || record.sourceSessionId !== capturedSource.sessionId
+      || record.sourceSessionFile !== capturedSource.sessionFile
+      || record.cwd !== await canonicalExistingDirectory(capturedSource.cwd)
+    ) {
+      throw new Error(record?.error ?? "TAN 分叉未能发布为 ready");
+    }
+    return record;
+  }
+
   tool(
     task: TaskRecord,
     args: Record<string, unknown>,
@@ -120,18 +171,37 @@ export class ThreadForkController {
   }
 
   /** Must run after every existing worker-ledger recovery and before queued tasks are staged. */
-  async recoverStartup(botUid: string): Promise<void> {
+  async recoverStartup(botUid: string, tanOperationIds: ReadonlySet<string> = new Set()): Promise<void> {
     for (const record of this.deps.store.listThreadForks(botUid)) {
+      const isTan = tanOperationIds.has(record.id);
       if (record.phase === "preparing") {
         const recovered = await this.recoverPreparing(
           record,
           this.deps.store.getWorkerLedger(botUid, this.ledgerId(record)) ?? undefined,
         );
-        if (recovered.phase === "prepared") this.terminalizePrepared(recovered);
+        if (recovered.phase === "prepared") {
+          if (isTan) {
+            const active = this.runActive(record.id, {
+              channelType: record.sourceChannelType,
+              channelId: record.sourceChannelId,
+            }, undefined, signal => this.continueAfterPreparation(recovered, signal));
+            await active.catch(() => {});
+          } else {
+            this.terminalizePrepared(recovered);
+          }
+        }
         continue;
       }
       if (record.phase === "prepared") {
-        this.terminalizePrepared(record);
+        if (isTan) {
+          const active = this.runActive(record.id, {
+            channelType: record.sourceChannelType,
+            channelId: record.sourceChannelId,
+          }, undefined, signal => this.continueAfterPreparation(record, signal));
+          await active.catch(() => {});
+        } else {
+          this.terminalizePrepared(record);
+        }
         continue;
       }
       if (record.phase === "creating") {
@@ -170,6 +240,7 @@ export class ThreadForkController {
       this.runById(botUid, source, id, requestedName, signal));
   }
 
+
   private runActive<T>(
     id: string,
     target: ChatTarget,
@@ -207,6 +278,7 @@ export class ThreadForkController {
     id: string,
     requestedName: string | undefined,
     signal: AbortSignal,
+    capturedSource?: ForkSource,
   ): Promise<string> {
     this.throwIfAborted(signal);
     // The durable identity lookup precedes source-binding validation: a redelivery after /new must
@@ -219,6 +291,16 @@ export class ThreadForkController {
         || existing.groupId !== sourceLocation.groupId
       ) {
         throw new Error("fork operation identity does not match its captured source");
+      }
+      if (
+        capturedSource !== undefined
+        && (
+          existing.sourceSessionId !== capturedSource.sessionId
+          || existing.sourceSessionFile !== capturedSource.sessionFile
+          || existing.cwd !== await canonicalExistingDirectory(capturedSource.cwd)
+        )
+      ) {
+        throw new Error("TAN source snapshot does not match its durable fork operation");
       }
       if (requestedName !== undefined && this.validateName(requestedName) !== existing.name) {
         throw new Error("同一分叉操作的子区名称不能更改");
@@ -233,7 +315,12 @@ export class ThreadForkController {
     }
 
     const requested = requestedName === undefined ? undefined : this.validateName(requestedName);
-    const source = await this.resolveSource(sourceLocation.target, sourceLocation.groupId);
+    const source = capturedSource === undefined
+      ? await this.resolveSource(sourceLocation.target, sourceLocation.groupId)
+      : {
+          ...capturedSource,
+          cwd: await canonicalExistingDirectory(capturedSource.cwd),
+        };
     this.throwIfAborted(signal);
     const name = requested ?? await this.defaultName(source, signal);
     this.throwIfAborted(signal);

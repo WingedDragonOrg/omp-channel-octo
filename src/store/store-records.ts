@@ -50,6 +50,28 @@ export interface InboundClaim {
 
 export type CommandClaimState = "pending" | "completed" | "failed";
 
+export type TanOperationPhase = "pending" | "done" | "failed" | "cancelled";
+
+/**
+ * A durably accepted `/tan` request. The source identity is an immutable snapshot: recovery must
+ * never substitute a newer binding or materialized body for the operation that won deduplication.
+ */
+export interface TanOperation {
+  /** Full source-scoped operation ID produced by the shared thread-fork identity function. */
+  id: string;
+  botUid: string;
+  sourceChannelType: 2 | 5;
+  sourceChannelId: string;
+  messageId: string;
+  senderId: string;
+  text: string;
+  sourceSessionId: string;
+  sourceSessionFile: string;
+  cwd: string;
+  phase: TanOperationPhase;
+  error: string | null;
+}
+
 /**
  * 用户/服务已下达的停止意图：`interrupt` 停止当前回合，`question_timeout` 是等待回答超时导致的停轮。
  * 意图在动手之前先落库，进程被 SIGKILL 时它是「这一回合是被叫停的」唯一证据，重启恢复据此落终态而

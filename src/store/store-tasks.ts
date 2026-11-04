@@ -27,33 +27,45 @@ export function getCommandClaimState(
 }
 
 export function acceptTask(db: Database, claim: InboundClaim, task: TaskRecord, goalRequest?: GoalTaskRequest): boolean {
-  return transaction(db, () => {
-    if (goalRequest && hasActiveGoalTask(db, task.botUid, task, task.sessionId)) return false;
-    const existing = query(db,
-      `SELECT 1 FROM inbound WHERE bot_uid = ? AND channel_type = ? AND channel_id = ? AND message_id = ?`,
-      [claim.botUid, claim.target.channelType, claim.target.channelId, claim.messageId],
-    )[0];
-    if (existing) return false;
-    const now = Date.now();
-    run(db,
-      `INSERT INTO inbound(bot_uid, channel_type, channel_id, message_id, sender_id, text, supported, kind, task_id, accepted_at)
-       VALUES(?, ?, ?, ?, ?, ?, ?, 'task', ?, ?)`,
-      [
-        claim.botUid,
-        claim.target.channelType,
-        claim.target.channelId,
-        claim.messageId,
-        claim.senderId,
-        claim.text,
-        claim.supported ? 1 : 0,
-        task.id,
-        now,
-      ],
-    );
-    insertTask(db, task, now);
-    if (goalRequest) insertGoalTask(db, task, goalRequest);
-    return true;
-  });
+  return transaction(db, () => acceptTaskInTransaction(db, claim, task, goalRequest));
+}
+
+/**
+ * Domain-internal task acceptance for a caller that already owns the SQLite transaction. Keeping
+ * the insertion primitive here preserves ordinary task semantics without changing transaction().
+ */
+export function acceptTaskInTransaction(
+  db: Database,
+  claim: InboundClaim,
+  task: TaskRecord,
+  goalRequest?: GoalTaskRequest,
+): boolean {
+  if (!db.inTransaction) throw new Error("task acceptance requires an active transaction");
+  if (goalRequest && hasActiveGoalTask(db, task.botUid, task, task.sessionId)) return false;
+  const existing = query(db,
+    `SELECT 1 FROM inbound WHERE bot_uid = ? AND channel_type = ? AND channel_id = ? AND message_id = ?`,
+    [claim.botUid, claim.target.channelType, claim.target.channelId, claim.messageId],
+  )[0];
+  if (existing) return false;
+  const now = Date.now();
+  run(db,
+    `INSERT INTO inbound(bot_uid, channel_type, channel_id, message_id, sender_id, text, supported, kind, task_id, accepted_at)
+     VALUES(?, ?, ?, ?, ?, ?, ?, 'task', ?, ?)`,
+    [
+      claim.botUid,
+      claim.target.channelType,
+      claim.target.channelId,
+      claim.messageId,
+      claim.senderId,
+      claim.text,
+      claim.supported ? 1 : 0,
+      task.id,
+      now,
+    ],
+  );
+  insertTask(db, task, now);
+  if (goalRequest) insertGoalTask(db, task, goalRequest);
+  return true;
 }
 
 /** Suppress one task's completion relay without changing its thread's merge policy. */

@@ -20,6 +20,8 @@
 
 包含主群/子区已落盘上下文即时分叉：owner-only `/fork [子区名称]` 和独立 `fork` 宿主工具共用原生 CLI `--fork`，沿用 cwd、建立独立 session 并绑定同父群新子区。详细契约见 `docs/specs/2026-11-03-thread-fork-design.md`。
 
+包含 owner-only `/tan <用户请求>`：在同父群创建继承当前已落盘会话的独立 fork 子区，并将物化请求作为目标子区的任务执行；源任务继续，文件目录共享。持久接受、取消、恢复及子区结果契约见 `docs/specs/2026-11-04-tan-fork-task-design.md`。
+
 包含可选外部决策服务驱动的子区 PR/MR 引用绑定：operator 显式配置共用 Decisions 服务的协议、模型和密钥后，仅从已受理的当前子区可见正文识别候选，以必要有界上下文判断是否为直接工作对象；高概率结果去重持久化到本地 `thread-info.references`，不改 Octo/Fleet。判断异步尽力而为，已绑定引用跨重启保留，未完成判断不恢复或补扫。详细契约见 `docs/specs/2026-11-04-thread-pr-mr-reference-binding-design.md`。
 
 包含 owner-only `/bind loop <url|workspace_id|workspace_name|workspace_slug>` 的 workspace 感知：仅扫描显式绑定 ID，以完整分页快照比较业务变化；只为当前负责人 Octo UID 精确命中 channel owner/Bot，或已有明确 task—子区关联的任务产生 agent 输入。首次整理及未关联的关注任务交主群，明确关联的任务变化直达子区；其余任务仅更新快照。thread 工具通过 `task_id` 创建或维护来源关联，执行结果按既有 listen 策略回传。权限、持久去重、未知接受及创建保护、隔离验收见 `docs/specs/2026-11-04-loop-workspace-task-awareness-design.md`。
@@ -223,6 +225,7 @@ channel 支持下列命令，`/help` 展示用法；`/retry` 经 OMP 原生命�
 | `/reset [目录]` | 与 `/new` 使用相同的目录解析，但明确重置为 fresh 会话；原会话历史文件保留；与 `/new` 共用创建路径，成功回执同式（含实际模型），会话切换时间同样记录 |
 | `/move <目录>` | 调用当前会话的 OMP 原生 `/move`，校验刷新后的 session state，沿用同一 session ID、历史和附件 |
 | `/fork [子区名称]` | 从当前主群/子区精确持久绑定即时 native fork，创建同父群新子区并绑定独立 session，共用 cwd；源回合继续，新子区等待实际新消息再 resume |
+| `/tan <用户请求>` | 即时分叉当前主群/子区已落盘会话，在同父群独立子区执行请求；结果与进度在子区，目录共享 |
 | `/watch [list\|<id>\|stop <id\|all>]` | owner-only 宿主控制当前聊天的持久 watch；查看、停止不调用模型，不回答 pending ask。订阅默认 5 分钟检查、6 小时到期，显式停止独立于源任务取消或会话切换 |
 | `/thread <任务>` | 交给助手处理：助手自行确定子区名称与 `worktree_name`，新建带独立 git worktree 的 CommunityTopic 子区并把任务派发进去（派发正文按 SDD 格式写；清晰到可直接生成 SDD 的需求直接开工，否则发起会话只做够派发的最少澄清、剩余澄清由子区按 SDD 格式进行）；只在群聊中可用 |
 | `/thread model [选择器\|clear]` | 仅 owner 在主群查询/设置/清除所属子区默认模型；原生 fresh probe 解析成功后持久化，主群自身模型不变；下次子区 worker 启动生效，不切换运行中会话 |

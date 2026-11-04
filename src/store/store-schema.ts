@@ -1,6 +1,6 @@
 /**
  * SQLite 的物理形状：建表 DDL、列迁移、行解码、带 db 句柄的查询辅助，以及 `openChannelStore`。
- * 领域读写分布在 `store-chats/grants/tasks/cards/workers/delivery/ledgers/outbox/questions/references`，门面在 `index.ts`。
+ * 领域读写分布在 `store-chats/grants/tasks/tan/cards/workers/delivery/ledgers/outbox/questions/references`，门面在 `index.ts`。
  */
 
 import { Database } from "bun:sqlite";
@@ -192,6 +192,26 @@ export function applySchema(db: Database): void {
       ON thread_forks(bot_uid, thread_channel_id) WHERE thread_channel_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS thread_forks_bot
       ON thread_forks(bot_uid, created_at, id);
+    CREATE TABLE IF NOT EXISTS tan_operations (
+      bot_uid TEXT NOT NULL,
+      id TEXT NOT NULL,
+      source_channel_type INTEGER NOT NULL CHECK(source_channel_type IN (2, 5)),
+      source_channel_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      sender_id TEXT NOT NULL,
+      text TEXT NOT NULL,
+      source_session_id TEXT NOT NULL,
+      source_session_file TEXT NOT NULL,
+      cwd TEXT NOT NULL,
+      phase TEXT NOT NULL CHECK(phase IN ('pending', 'done', 'failed', 'cancelled')),
+      error TEXT,
+      accepted_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(bot_uid, id),
+      UNIQUE(bot_uid, source_channel_type, source_channel_id, message_id)
+    );
+    CREATE INDEX IF NOT EXISTS tan_operations_pending
+      ON tan_operations(bot_uid, phase, accepted_at, id);
     CREATE INDEX IF NOT EXISTS thread_workspace_intent_group
       ON thread_workspace_intents(bot_uid, group_id, status);
     CREATE TABLE IF NOT EXISTS thread_listens (

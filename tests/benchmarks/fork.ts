@@ -43,7 +43,7 @@ const modelRequests: ModelRequest[] = [];
 const scripts = new Map<string, ModelStep[]>();
 const modelCallCounts = new Map<string, number>();
 const gates: Gate[] = [];
-const metric = { commandGroup: 0, commandThread: 0, toolGroup: 0, toolThread: 0, archiveMerge: 0, archiveRemove: 0 };
+const metric = { commandGroup: 0, commandThread: 0, toolGroup: 0, toolThread: 0, tan: 0, archiveMerge: 0, archiveRemove: 0 };
 let fixture: OctoProtocolFixture | undefined;
 let modelPort = 0;
 let stopModel: (() => void) | undefined;
@@ -349,7 +349,7 @@ function messageContains(target: Target, marker: string, since: number): boolean
 
 async function launch(): Promise<void> {
   const configPath = join(root, "config.json");
-  const groups = cases.map(testCase => `fork-smoke-${testCase.id}`);
+  const groups = [...cases.map(testCase => `fork-smoke-${testCase.id}`), tanGroupId];
   await writeFile(configPath, JSON.stringify({
     apiUrl: fixture!.apiUrl,
     botToken: fixture!.botToken,
@@ -418,7 +418,13 @@ async function waitForRemoteThread(groupId: string, name: string): Promise<Fixtu
 }
 
 
-async function prepEvidence(sourceFile: string, targetFile: string, forkTarget: Target, toolCallId?: string): Promise<{
+async function prepEvidence(
+  sourceFile: string,
+  targetFile: string,
+  forkTarget: Target,
+  toolCallId?: string,
+  expectTargetPrompt = false,
+): Promise<{
   prep: AuditRow;
   prepExit: AuditRow;
   audit: AuditRow[];
@@ -441,6 +447,7 @@ async function prepEvidence(sourceFile: string, targetFile: string, forkTarget: 
   assert.ok(prepExitIndex >= 0, "Fork preparation has no confirmed real OMP process exit");
   const prepExit = audit[prepExitIndex]!;
   const forkRecord = await sqliteFork(forkTarget);
+  const targetStarts = audit.filter(row => row.kind === "spawn" && row.args?.some((arg, index) => arg === "--resume" && row.args?.[index + 1] === targetFile));
   assert.ok(forkRecord, "Fork preparation record is missing");
   assert.equal(forkRecord.phase, "ready", "Target was published before its durable fork record was ready");
   const sessionDirIndex = args.indexOf("--session-dir");
@@ -454,8 +461,11 @@ async function prepEvidence(sourceFile: string, targetFile: string, forkTarget: 
     0,
     "Fork preparation dispatched a user prompt to OMP",
   );
-  const targetStarts = audit.filter(row => row.kind === "spawn" && row.args?.some((arg, index) => arg === "--resume" && row.args?.[index + 1] === targetFile));
-  assert.equal(targetStarts.length, 0, "Fork target worker auto-started before the next user message");
+  assert.equal(
+    targetStarts.length,
+    expectTargetPrompt ? 1 : 0,
+    expectTargetPrompt ? "Fork target did not start for its accepted request" : "Fork target worker auto-started before the next user message",
+  );
 
   if (toolCallId !== undefined) {
     const calls = audit.filter(row => row.kind === "wire" && row.direction === "from-omp"
@@ -488,6 +498,19 @@ function targetResumeEvidence(targetFile: string, prepExit: AuditRow): AuditRow 
   const targetArgs = targetStart.args!;
   assert.equal(targetArgs[targetArgs.indexOf("--resume") + 1], targetFile);
   return targetStart;
+}
+
+async function waitForTargetWorkerAndOutputDrain(target: Target, sessionId: string, ompPid: number): Promise<void> {
+  await wait(`Target session ${sessionId} did not stop and drain its output`, () => {
+    const ledger = db!.query(
+      "SELECT COUNT(*) AS total, SUM(CASE WHEN state != 'stopped' THEN 1 ELSE 0 END) AS active FROM worker_ledger WHERE bot_uid = ? AND session_id = ?",
+    ).get(fixture!.botUid, sessionId) as { total: number; active: number | null };
+    const outbox = db!.query(
+      "SELECT COUNT(*) AS count FROM outbox WHERE bot_uid = ? AND channel_type = ? AND channel_id = ? AND state IN ('pending', 'unknown')",
+    ).get(fixture!.botUid, target.channelType, target.channelId) as { count: number };
+    const ompOutputDrained = rows(auditPath).some(row => row.kind === "exit" && row.pid === ompPid);
+    return ledger.total > 0 && (ledger.active ?? 0) === 0 && outbox.count === 0 && ompOutputDrained;
+  });
 }
 
 
@@ -699,11 +722,13 @@ async function exercise(testCase: Case, gitBefore: { branch: string; worktrees: 
     task(targetMessageId)?.state === "completed" && messageContains(target, targetReply, targetStartMessages),
   );
   const targetBytesPath = targetBinding.session_file!;
+  const targetStart = targetResumeEvidence(targetBytesPath, prep.prepExit);
+  assert.ok(targetStart.pid, "Target resume omitted the real OMP process PID");
+  await waitForTargetWorkerAndOutputDrain(target, targetBinding.session_id, targetStart.pid);
   const forkBytes = await readFile(targetBytesPath);
   const forkDigest = await digest(targetBytesPath);
   assert.deepEqual(binding(source), sourceHeldBinding, "Target conversation changed source chat/session identity");
   assert.equal(await digest(sourceSessionFile), sourceDigest, "Independent target conversation changed source session bytes");
-  targetResumeEvidence(targetBytesPath, prep.prepExit);
   assert.equal((await readFile(sourceSessionFile)).equals(sourceBytes), true, "Source session file bytes changed while its response gate was held");
   await assertNoWorkspaceResources(target, gitBefore);
 
@@ -729,6 +754,158 @@ async function exercise(testCase: Case, gitBefore: { branch: string; worktrees: 
   if (testCase.kind === "command") metric[testCase.sourceKind === "group" ? "commandGroup" : "commandThread"] += 1;
   else metric[testCase.sourceKind === "group" ? "toolGroup" : "toolThread"] += 1;
 }
+
+const tanGroupId = "fork-smoke-tan-command";
+
+async function exerciseTan(gitBefore: { branch: string; worktrees: string }): Promise<void> {
+  const source: Target = { channelType: 2, channelId: tanGroupId };
+  const canonicalRepo = await realpath(repo);
+  const sourceAtStart = await sourceBinding(source, canonicalRepo);
+  const priorToken = "FORK_PRIOR_TOKEN_tan-command";
+  const priorLabel = "prior-tan-command";
+  const priorReply = "PRIOR_SAVED_tan-command";
+  const heldLabel = "held-tan-command";
+  const heldReply = "SOURCE_DONE_tan-command";
+  const targetLabel = "target-tan-command";
+  const targetReply = "TAN_TARGET_DONE";
+  const targetRequestText = `FORK_SMOKE_TASK:${targetLabel} TAN_TARGET_REQUEST_ONLY`;
+  const tanCommand = `/tan ${targetRequestText}`;
+  scripts.set(priorLabel, [{ kind: "text", text: priorReply }]);
+
+  const priorStart = fixture!.sentMessages.length;
+  const priorMessageId = send(source, `FORK_SMOKE_TASK:${priorLabel} ${priorToken}`);
+  await wait("The /tan source history turn did not finish", () =>
+    task(priorMessageId)?.state === "completed" && messageContains(source, priorReply, priorStart),
+  );
+  const afterPrior = binding(source)!;
+  assert.equal(afterPrior.session_id, sourceAtStart.session_id, "/tan source history unexpectedly changed session identity");
+  assert.ok(afterPrior.session_file, "/tan source history did not persist a real session file");
+  assert.ok((await readFile(afterPrior.session_file, "utf8")).includes(priorToken), "Unique /tan source history token was not persisted");
+
+  const heldGate = gate();
+  scripts.set(heldLabel, [{ kind: "text", text: heldReply, hold: heldGate }]);
+  const heldStart = fixture!.sentMessages.length;
+  const heldMessageId = send(source, `FORK_SMOKE_TASK:${heldLabel} SOURCE_HELD_tan-command`);
+  await wait("The /tan source round did not enter its held model request", () =>
+    modelRequests.some(request => request.label === heldLabel),
+  );
+  await waitTask(heldMessageId, "started");
+
+  const sourceHeldBinding = binding(source)!;
+  assert.deepEqual(sourceHeldBinding, afterPrior, "/tan changed source binding before creating the target");
+  assert.ok(sourceHeldBinding.session_file);
+  const sourceBytes = await readFile(sourceHeldBinding.session_file);
+  const sourceDigest = await digest(sourceHeldBinding.session_file);
+  assert.ok(sourceBytes.includes(Buffer.from(priorToken)), "The held /tan source session lost its persisted history");
+  const sourceSessionFile = sourceHeldBinding.session_file;
+  const sourceSessionId = sourceHeldBinding.session_id;
+  const sourceMessageStart = fixture!.sentMessages.length;
+  const modelCountBeforeTan = modelRequests.length;
+  const managementStart = fixture!.managementRequests.length;
+  const existingThreads = await threadRequest(tanGroupId, "GET");
+  const existingShortIds = new Set(existingThreads.map(thread => thread.short_id));
+  const targetGate = gate();
+  scripts.set(targetLabel, [{ kind: "text", text: targetReply, hold: targetGate }]);
+
+  const tanMessageId = send(source, tanCommand);
+  await wait("The /tan command did not create a target and dispatch its request", () =>
+    fixture!.managementRequests.slice(managementStart).some(request =>
+      request.method === "POST" && request.path === `/v1/bot/groups/${tanGroupId}/threads`,
+    )
+      && modelRequests.some(request => request.label === targetLabel),
+  );
+
+  const remoteThreads = await threadRequest(tanGroupId, "GET");
+  const newThreads = remoteThreads.filter(thread => !existingShortIds.has(thread.short_id));
+  assert.equal(newThreads.length, 1, "/tan did not create exactly one target thread");
+  const { target, thread, binding: targetBinding } = await bindTarget(newThreads[0]!.name, tanGroupId, sourceHeldBinding);
+  assert.equal(thread.short_id, newThreads[0]!.short_id);
+  assert.equal(thread.group_no, tanGroupId, "/tan target was not created under its source group");
+  assert.notEqual(target.channelId, source.channelId, "/tan reused the source channel");
+  assert.equal(await digest(sourceSessionFile), sourceDigest, "/tan preparation modified the held source session file");
+  assert.deepEqual(binding(source), sourceHeldBinding, "/tan preparation modified the source chat binding");
+  assert.equal((await sqliteFork(target))?.phase, "ready", "/tan target was not backed by a ready durable fork record");
+  await assertNoWorkspaceResources(target, gitBefore);
+
+  const operation = await sqliteFork(target);
+  assert.equal(operation?.sourceSessionId, sourceSessionId, "/tan fork record captured a different source session id");
+  assert.equal(operation?.sourceSessionFile, sourceSessionFile, "/tan fork record captured a different source session file");
+  assert.equal(operation?.cwd, canonicalRepo, "/tan fork record changed the source cwd");
+  assert.equal(operation?.sessionId, targetBinding.session_id, "/tan fork record and target binding session ids disagree");
+  assert.equal(operation?.sessionFile, targetBinding.session_file, "/tan fork record and target binding session files disagree");
+  assert.equal(operation?.thread?.channelId, target.channelId, "/tan fork record and target thread disagree");
+
+  const targetRequest = modelRequests.find(request => request.label === targetLabel);
+  assert.ok(targetRequest, "/tan target never reached the finite local model");
+  const targetPrompt = JSON.stringify(targetRequest.body.messages ?? targetRequest.body);
+  assert.ok(targetPrompt.includes(priorToken), "/tan target prompt did not inherit the persisted source history");
+  assert.ok(targetPrompt.includes(targetRequestText), "/tan target prompt omitted the exact materialized user request");
+  assert.ok(!targetPrompt.includes(tanCommand), "The target model received the raw /tan command instead of its request");
+
+  const targetTaskRows = db!.query(
+    "SELECT message_id, text FROM tasks WHERE bot_uid = ? AND channel_type = ? AND channel_id = ?",
+  ).all(fixture!.botUid, target.channelType, target.channelId) as Array<{ message_id: string; text: string }>;
+  assert.equal(targetTaskRows.length, 1, "/tan did not durably accept exactly one target task");
+  const targetTask = targetTaskRows[0]!;
+  assert.equal(targetTask.text, targetRequestText, "/tan target task did not contain only the materialized user request");
+  await waitTask(targetTask.message_id, "started");
+  const prep = await prepEvidence(sourceSessionFile, targetBinding.session_file!, target, undefined, true);
+
+  const prepStartTime = prep.prep.at;
+  const prepStopTime = prep.prepExit.at;
+  assert.equal(
+    modelRequests.some(request => request.at >= prepStartTime && request.at < prepStopTime),
+    false,
+    "A /tan target model request occurred while native OMP preparation was active",
+  );
+  targetResumeEvidence(targetBinding.session_file!, prep.prepExit);
+  assert.ok(prep.prepExit.at < targetRequest.at, "/tan target model request started before preparation exit was confirmed");
+  assert.equal(
+    modelRequests.slice(modelCountBeforeTan).some(request => JSON.stringify(request.body.messages ?? request.body).includes(tanCommand)),
+    false,
+    "The source or target model received the raw /tan command",
+  );
+
+  await wait("The source /tan ingress waited for the held target task instead of completing", () =>
+    inbound(tanMessageId)?.command_state === "completed"
+      && task(targetTask.message_id)?.state === "started"
+      && messageContains(source, thread.short_id, sourceMessageStart),
+  );
+  assert.deepEqual(inbound(tanMessageId), { kind: "command", command_state: "completed" }, "/tan was not completed as a local command");
+  assert.equal(task(tanMessageId), null, "/tan created a source model task");
+  assert.equal(targetGate.released, false, "Target task completed before proving /tan ingress was independent of it");
+  assert.equal(task(heldMessageId)?.state, "started", "The source task did not remain held while the target started");
+  assert.deepEqual(binding(source), sourceHeldBinding, "/tan dispatch changed the source binding");
+  assert.equal(await digest(sourceSessionFile), sourceDigest, "/tan dispatch changed the held source session bytes");
+
+  targetGate.resolve();
+  const targetStartMessages = fixture!.sentMessages.length;
+  await wait("The /tan target did not finish after its model gate was released", () =>
+    task(targetTask.message_id)?.state === "completed" && messageContains(target, targetReply, targetStartMessages),
+  );
+  assert.deepEqual(binding(source), sourceHeldBinding, "The completed /tan target changed the source binding");
+  assert.equal(await digest(sourceSessionFile), sourceDigest, "The completed /tan target changed the source session bytes");
+  assert.equal(task(heldMessageId)?.state, "started", "The source task completed before its held model gate was released");
+  assert.equal(heldGate.released, false, "The source model gate was released before the target completed");
+
+  const sent = fixture!.sentMessages.slice(sourceMessageStart).filter(message =>
+    message.body.channel_id === source.channelId || message.body.channel_id === target.channelId,
+  );
+  assert.ok(sent.every(message => !sentText(message).includes(tanCommand)), "A source or target receipt echoed the raw /tan command");
+  heldGate.resolve();
+  await wait("The held /tan source turn did not finish after releasing its model gate", () =>
+    task(heldMessageId)?.state === "completed" && messageContains(source, heldReply, heldStart),
+  );
+  assert.deepEqual(binding(source), sourceHeldBinding, "The /tan source session identity changed after its held turn completed");
+  assert.ok((await readFile(sourceSessionFile, "utf8")).includes(priorToken), "/tan source history disappeared after completion");
+  assert.equal(
+    modelRequests.length,
+    modelCountBeforeTan + 1,
+    "The raw /tan command triggered an extra source or target model request",
+  );
+  metric.tan += 1;
+}
+
 
 const cases: Case[] = [
   { id: "command-group", kind: "command", sourceKind: "group", archive: "merge" },
@@ -882,13 +1059,14 @@ try {
   const gitBefore = await setup();
   await launch();
   for (const testCase of cases) await exercise(testCase, gitBefore);
+  await exerciseTan(gitBefore);
 
   assert.equal(modelError, undefined);
-  assert.equal(modelRequests.length, 14, "The finite four-path workload made an unexpected number of model requests");
+  assert.equal(modelRequests.length, 17, "The finite four-path plus /tan workload made an unexpected number of model requests");
   for (const [label, remaining] of scripts) assert.equal(remaining.length, 0, `Finite script ${label} was not fully consumed`);
-  assert.deepEqual(metric, { commandGroup: 1, commandThread: 1, toolGroup: 1, toolThread: 1, archiveMerge: 1, archiveRemove: 1 });
-  assert.equal(rows(auditPath).filter(row => row.kind === "spawn" && row.args?.includes("--fork")).length, 4,
-    "Expected one exact native OMP fork process per command/tool and group/thread path");
+  assert.deepEqual(metric, { commandGroup: 1, commandThread: 1, toolGroup: 1, toolThread: 1, tan: 1, archiveMerge: 1, archiveRemove: 1 });
+  assert.equal(rows(auditPath).filter(row => row.kind === "spawn" && row.args?.includes("--fork")).length, 5,
+    "Expected one exact native OMP fork process per existing path and /tan");
   assert.equal(rows(auditPath).filter(row => row.kind === "spawn" && row.args?.includes("--fork")
     && !rows(auditPath).some(exitRow => exitRow.kind === "exit" && exitRow.pid === row.pid)).length, 0,
   "At least one real OMP fork preparation lacked a confirmed child-process exit");
@@ -923,10 +1101,11 @@ try {
   console.log(`METRIC fork_command_thread=${metric.commandThread}`);
   console.log(`METRIC fork_tool_group=${metric.toolGroup}`);
   console.log(`METRIC fork_tool_thread=${metric.toolThread}`);
-  console.log(`METRIC fork_target_real_resumes=${metric.commandGroup + metric.commandThread + metric.toolGroup + metric.toolThread}`);
-  console.log(`METRIC fork_preparation_stop_before_resume=4`);
+  console.log(`METRIC tan_auto_prompt_dispatches=${metric.tan}`);
+  console.log(`METRIC fork_target_real_resumes=${metric.commandGroup + metric.commandThread + metric.toolGroup + metric.toolThread + metric.tan}`);
+  console.log(`METRIC fork_preparation_stop_before_resume=5`);
   console.log(`METRIC fork_preparation_prompt_dispatches=0`);
-  console.log(`METRIC fork_auto_prompt_dispatches=0`);
+  console.log(`METRIC fork_existing_paths_auto_prompt_dispatches=0`);
   console.log(`METRIC fork_source_session_identity_or_held_bytes_changes=0`);
   console.log(`METRIC fork_archive_only_merge=${metric.archiveMerge}`);
   console.log(`METRIC fork_archive_only_remove=${metric.archiveRemove}`);

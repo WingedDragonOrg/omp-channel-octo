@@ -78,6 +78,8 @@ import type {
   HostRemovalLeaseRecord,
   HostThreadRemovalOutcome,
   InboundClaim,
+  OutboxInsert,
+  TanOperation,
   TaskRecord,
   ThreadListenRecord,
   ThreadMergeEventRecord,
@@ -146,6 +148,7 @@ const COMMAND_HELP = [
   "",
   "子区",
   "/fork [子区名称] · 分叉当前会话历史到同父群新子区",
+  "/tan <用户请求> · 分叉当前会话并在新子区独立执行",
   "/thread <任务> · 新建隔离子区并派发任务（群聊可用）",
   "/thread model [选择器|clear] · owner 在主群设置、查询或清除子区默认模型",
   "/thread merge · 合并隔离工作区；沿用目录的分叉子区仅归档",
@@ -376,6 +379,13 @@ class CoreService implements ChannelService {
   /** Fork command lifetime remains active through result delivery and durable claim completion. */
   private readonly forkCommandTargets = new Map<string, ChatTarget>();
   /** Fork archive waits and receipt-gated runs avoid the target cwd/Git resource locks. */
+  /** Per-message TAN ingress guard: same-process redelivery shares one materialization/download. */
+  private readonly tanInboundOperations = new Map<
+    string,
+    { target: ChatTarget; controller: AbortController; operation: Promise<void> }
+  >();
+  /** Durable TAN handoffs stay tracked after the inbound ACK and through target task acceptance. */
+  private readonly tanDispatchOperations = new Map<string, Promise<void>>();
   private readonly forkArchiveControllers = new Map<string, Set<AbortController>>();
   private readonly forkArchiveStates = new Map<
     AbortController,
@@ -674,6 +684,8 @@ class CoreService implements ChannelService {
         || this.threadRemovalControllers.size > 0
         || this.threadForks.running
         || this.forkCommandTargets.size > 0
+        || this.tanInboundOperations.size > 0
+        || this.tanDispatchOperations.size > 0
         || this.forkArchiveControllers.size > 0,
       restart: options.restart,
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
@@ -861,7 +873,13 @@ class CoreService implements ChannelService {
           if (ledger.moveTargetCwd) this.blockedDirectories.add(ledger.moveTargetCwd);
         }
       }
-      await this.threadForks.recoverStartup(identity.uid);
+      const pendingTanOperations = this.store.listPendingTanOperations(identity.uid);
+      await this.threadForks.recoverStartup(
+        identity.uid,
+        new Set(pendingTanOperations.map(operation => operation.id)),
+      );
+      this.recoverCancelledTanReceipts(identity.uid);
+      this.recoverAcceptedTanReceipts(identity.uid);
       await this.loopController?.recover();
       // 旧版重启通报已随续接机制移除：遗留行静默清理，绝不再投递。
       this.serviceRestart.consumeStartupNotices(identity.uid);
@@ -933,6 +951,10 @@ class CoreService implements ChannelService {
           this.outbox.flushAll();
         },
       );
+      for (const operation of pendingTanOperations) {
+        const latest = this.store.getTanOperation(identity.uid, operation.id);
+        if (latest?.phase === "pending") this.startTanDispatch(latest);
+      }
       if (this.stopping) throw new Error("channel 正在停止");
       await this.chatGrants.recoverPending(identity.uid);
       this.outbox.flushAll();
@@ -1119,7 +1141,11 @@ class CoreService implements ChannelService {
     await operation;
   }
 
-  private async processInbound(message: InboundMessage): Promise<void> {
+  private processInbound(message: InboundMessage): Promise<void> {
+    return this.processInboundCore(message);
+  }
+
+  private async processInboundCore(message: InboundMessage): Promise<void> {
     // A message that arrives during shutdown is never accepted: reject so the transport does not
     // ACK it; the same message is redelivered after restart.
     this.throwIfStopping();
@@ -1201,6 +1227,10 @@ class CoreService implements ChannelService {
       return;
     }
     const command = isCommand(text) ? parseCommand(text) : null;
+    if (command?.name === "tan") {
+      await this.handleTanInbound(message, command.argument);
+      return;
+    }
     if (command) {
       const action = resolveBuiltinAction(command.name);
       if (action !== undefined) {
@@ -1322,6 +1352,25 @@ class CoreService implements ChannelService {
           `${task.sessionId}.jsonl`,
         ),
       };
+    }
+    if (task?.messageId.startsWith("dispatch:tan:")) {
+      const operationId = task.messageId.slice("dispatch:tan:".length);
+      const operation = this.store.getTanOperation(task.botUid, operationId);
+      const fork = this.store.getThreadFork(task.botUid, operationId);
+      if (
+        operation?.phase !== "done"
+        || fork?.phase !== "ready"
+        || fork.thread?.channelId !== target.channelId
+        || fork.sessionId === null
+        || fork.sessionFile === null
+        || !binding
+        || binding.sessionId !== fork.sessionId
+        || binding.sessionFile !== fork.sessionFile
+        || binding.cwd !== fork.cwd
+        || task.sessionId !== fork.sessionId
+        || task.cwd !== fork.cwd
+      ) return null;
+      return binding;
     }
     if (await this.threadWorkspaceIncomplete(target)) return binding;
     if (
@@ -1897,6 +1946,455 @@ class CoreService implements ChannelService {
     }
     await this.outbox.enqueueText(message, result, null);
   }
+  private async handleTanInbound(message: InboundMessage, argument: string): Promise<void> {
+    const key = `${targetKey(message)}\0${message.messageId}`;
+    const current = this.tanInboundOperations.get(key);
+    if (current) {
+      await current.operation;
+      return;
+    }
+    const controller = new AbortController();
+    const operation = this.handleTanCommand(message, argument, controller.signal);
+    const active = {
+      target: { channelType: message.channelType, channelId: message.channelId },
+      controller,
+      operation,
+    };
+    this.tanInboundOperations.set(key, active);
+    const cleanup = (): void => {
+      if (this.tanInboundOperations.get(key) === active) this.tanInboundOperations.delete(key);
+      this.serviceRestart.maybeRunDeferred();
+    };
+    void operation.then(cleanup, cleanup);
+    await operation;
+  }
+
+  private async handleTanCommand(
+    message: InboundMessage,
+    argument: string,
+    operationSignal?: AbortSignal,
+  ): Promise<void> {
+    const bot = this.bot;
+    if (!bot) return;
+    const commandClaim = this.commandClaim(message, "tan");
+    let operationId: string;
+    try {
+      operationId = this.threadForks.commandOperationId(message);
+    } catch {
+      if (!this.claimTanCommand(commandClaim)) return;
+      await this.outbox.enqueueText(message, "用法：/tan <用户请求>；仅支持已授权主群或有效子区。", null);
+      this.store.completeCommand(commandClaim);
+      return;
+    }
+    const existing = this.store.getTanOperation(bot.uid, operationId);
+    if (existing !== null) {
+      if (existing.phase === "pending") this.startTanDispatch(existing);
+      return;
+    }
+    if (argument.trim().length === 0) {
+      if (!this.claimTanCommand(commandClaim)) return;
+      await this.outbox.enqueueText(message, "用法：/tan <用户请求>；在当前会话分叉并于新子区独立执行。", null);
+      this.store.completeCommand(commandClaim);
+      return;
+    }
+    const state = this.store.getCommandClaimState(bot.uid, message, message.messageId);
+    if (state === "completed") return;
+    if (state === "pending" && !this.store.reclaimTanCommand(commandClaim)) return;
+    const source = this.store.getBinding(bot.uid, message);
+    if (!source?.sessionId || !source.sessionFile || source.cwd.length === 0) {
+      if (!this.claimTanCommand(commandClaim)) return;
+      await this.outbox.enqueueText(message, "当前聊天没有可验证的持久 session 文件，未接受 /tan。", null);
+      this.store.completeCommand(commandClaim);
+      return;
+    }
+    if (await this.refuseIncompleteThreadWorkspace(message)) return;
+    if (operationSignal?.aborted) {
+      this.completeCancelledTanCommand(commandClaim);
+      return;
+    }
+    const rejectChangedSource = async (): Promise<void> => {
+      if (!this.claimTanCommand(commandClaim)) return;
+      await this.outbox.enqueueText(message, "源会话在 /tan 处理中已变化；为避免从新绑定或旧快照分叉，本次未接受。", null);
+      this.store.completeCommand(commandClaim);
+    };
+    let capturedCwd: string;
+    try {
+      capturedCwd = await canonicalExistingDirectory(source.cwd);
+    } catch {
+      if (!this.claimTanCommand(commandClaim)) return;
+      await this.outbox.enqueueText(message, "当前聊天工作目录无法验证，未接受 /tan。", null);
+      this.store.completeCommand(commandClaim);
+      return;
+    }
+    const sourceAfterCapture = this.store.getBinding(bot.uid, message);
+    if (
+      sourceAfterCapture === null
+      || sourceAfterCapture.sessionId !== source.sessionId
+      || sourceAfterCapture.sessionFile !== source.sessionFile
+      || sourceAfterCapture.cwd !== source.cwd
+    ) {
+      await rejectChangedSource();
+      return;
+    }
+    const captured = {
+      botUid: bot.uid,
+      sourceChannelType: message.channelType as 2 | 5,
+      sourceChannelId: message.channelId,
+      messageId: message.messageId,
+      senderId: message.senderId,
+      sourceSessionId: source.sessionId,
+      sourceSessionFile: source.sessionFile,
+      cwd: capturedCwd,
+    };
+    let materialized: string | null;
+    try {
+      materialized = await this.withMessageTyping(message, () =>
+        this.materializer.materialize(message, argument, operationSignal));
+    } catch (error) {
+      if (operationSignal?.aborted) {
+        this.completeCancelledTanCommand(commandClaim);
+        return;
+      }
+      throw error;
+    }
+    if (operationSignal?.aborted) {
+      this.completeCancelledTanCommand(commandClaim);
+      return;
+    }
+    if (materialized === null) return;
+    const sourceBeforeAcceptance = this.store.getBinding(bot.uid, message);
+    if (
+      sourceBeforeAcceptance === null
+      || sourceBeforeAcceptance.sessionId !== source.sessionId
+      || sourceBeforeAcceptance.sessionFile !== source.sessionFile
+      || sourceBeforeAcceptance.cwd !== source.cwd
+    ) {
+      await rejectChangedSource();
+      return;
+    }
+    let sourceCwdAtAcceptance: string;
+    try {
+      sourceCwdAtAcceptance = await canonicalExistingDirectory(sourceBeforeAcceptance.cwd);
+    } catch {
+      await rejectChangedSource();
+      return;
+    }
+    const sourceAtAcceptance = this.store.getBinding(bot.uid, message);
+    if (
+      sourceAtAcceptance === null
+      || sourceAtAcceptance.sessionId !== source.sessionId
+      || sourceAtAcceptance.sessionFile !== source.sessionFile
+      || sourceAtAcceptance.cwd !== sourceBeforeAcceptance.cwd
+      || sourceCwdAtAcceptance !== captured.cwd
+    ) {
+      await rejectChangedSource();
+      return;
+    }
+    if (operationSignal?.aborted) {
+      this.completeCancelledTanCommand(commandClaim);
+      return;
+    }
+    this.throwIfStopping();
+    const operation: TanOperation = {
+      id: operationId,
+      ...captured,
+      text: materialized,
+      phase: "pending",
+      error: null,
+    };
+    if (!this.store.claimCommand(commandClaim)) return;
+    let accepted = false;
+    try {
+      accepted = this.store.acceptTanOperation(commandClaim, operation);
+    } catch {
+      if (this.store.getTanOperation(bot.uid, operationId) === null) {
+        this.store.failCommand(commandClaim);
+      }
+      throw new Error("本地状态盘写入失败，/tan 未接受。");
+    }
+    if (!accepted) return;
+    this.cancelThreadArchives(message);
+    this.startTanDispatch(operation);
+  }
+
+  private claimTanCommand(claim: InboundClaim): boolean {
+    const state = this.store.getCommandClaimState(claim.botUid, claim.target, claim.messageId);
+    if (state === "completed") return false;
+    if (state === "pending" && !this.store.reclaimTanCommand(claim)) return false;
+    return this.store.claimCommand(claim);
+  }
+
+  private completeCancelledTanCommand(claim: InboundClaim): void {
+    const state = this.store.getCommandClaimState(claim.botUid, claim.target, claim.messageId);
+    if (state === "completed") return;
+    if (state === "pending" && !this.store.reclaimTanCommand(claim)) {
+      throw new Error("取消 /tan 时无法安全回收待处理 claim；消息保持未确认以免自动复活。");
+    }
+    if (!this.store.claimCommand(claim)) {
+      if (this.store.getCommandClaimState(claim.botUid, claim.target, claim.messageId) === "completed") return;
+      throw new Error("取消 /tan 时无法持久化终态 claim；消息保持未确认以免自动复活。");
+    }
+    this.store.completeCommand(claim);
+  }
+
+  private startTanDispatch(operation: TanOperation): void {
+    const current = this.tanDispatchOperations.get(operation.id);
+    if (current) return;
+    const work = this.runTanDispatch(operation);
+    const tracked = work.catch(error => {
+      console.error(
+        `[tan] 派发操作未完成 id=${operation.id}：${safeErrorMessage(error, "handoff failed")}`,
+      );
+    }).finally(() => {
+      if (this.tanDispatchOperations.get(operation.id) === tracked) {
+        this.tanDispatchOperations.delete(operation.id);
+      }
+      this.serviceRestart.maybeRunDeferred();
+    });
+    this.tanDispatchOperations.set(operation.id, tracked);
+    this.operationSet(tracked);
+  }
+
+  private async runTanDispatch(operation: TanOperation): Promise<void> {
+    await this.startupGate.promise;
+    if (this.stopping) return;
+    const latest = this.store.getTanOperation(operation.botUid, operation.id);
+    if (latest?.phase === "cancelled") {
+      this.finalizeCancelledTanOperation(latest);
+      return;
+    }
+    if (latest?.phase !== "pending") return;
+    try {
+      const fork = await this.threadForks.tan(operation);
+      if (this.stopping) return;
+      const currentOperation = this.store.getTanOperation(operation.botUid, operation.id);
+      if (currentOperation?.phase === "cancelled") {
+        this.finalizeCancelledTanOperation(currentOperation);
+        return;
+      }
+      if (currentOperation?.phase !== "pending") return;
+      if (fork.phase !== "ready" || fork.thread === null) {
+        throw new Error("TAN 分叉尚未 ready；未接受目标任务。");
+      }
+      const target: ChatTarget = { channelType: 5, channelId: fork.thread.channelId };
+      const dispatchMessageId = `dispatch:tan:${operation.id}`;
+      const existingTask = this.store.getTaskByMessageId(operation.botUid, target, dispatchMessageId);
+      if (existingTask !== null) {
+        const existingBinding = this.store.getBinding(operation.botUid, target);
+        if (
+          fork.sessionId === null
+          || fork.sessionFile === null
+          || existingTask.sessionId !== fork.sessionId
+          || existingTask.cwd !== fork.cwd
+          || !existingBinding
+          || existingBinding.sessionId !== fork.sessionId
+          || existingBinding.sessionFile !== fork.sessionFile
+          || existingBinding.cwd !== fork.cwd
+        ) {
+          throw new Error("已有目标任务的持久 session 与 ready fork 不匹配；未接受或交接任务。");
+        }
+        this.store.finishTanOperation(operation.botUid, operation.id);
+        if (this.store.getTanOperation(operation.botUid, operation.id)?.phase !== "done") return;
+        this.enqueueTanOutbox(
+          operation,
+          `子区 ${fork.thread.name}（${fork.thread.shortId}）已有持久派发任务 ${dispatchMessageId}；不会重复接受。`,
+        );
+        return;
+      }
+      const binding = this.store.getBinding(operation.botUid, target);
+      if (
+        fork.sessionId === null
+        || fork.sessionFile === null
+        || !binding
+        || binding.sessionId !== fork.sessionId
+        || binding.sessionFile !== fork.sessionFile
+        || binding.cwd !== fork.cwd
+      ) {
+        throw new Error("目标子区 ready binding 与分叉 session 身份不一致；未接受任务。");
+      }
+      const message: InboundMessage = {
+        ...target,
+        messageId: dispatchMessageId,
+        senderId: operation.senderId,
+        text: operation.text,
+        mentionedUserIds: [],
+        attachments: [],
+        quoted: null,
+        supported: true,
+        messageSeq: 0,
+        messageTimestamp: Date.now(),
+      };
+      const acceptGuard = (): boolean => {
+        const pending = this.store.getTanOperation(operation.botUid, operation.id);
+        const currentFork = this.store.getThreadFork(operation.botUid, operation.id);
+        const currentBinding = this.store.getBinding(operation.botUid, target);
+        return pending?.phase === "pending"
+          && currentFork?.phase === "ready"
+          && currentFork.thread?.channelId === target.channelId
+          && currentFork.sessionId === fork.sessionId
+          && currentFork.sessionFile === fork.sessionFile
+          && currentFork.cwd === fork.cwd
+          && currentBinding?.sessionId === fork.sessionId
+          && currentBinding.sessionFile === fork.sessionFile
+          && currentBinding.cwd === fork.cwd;
+      };
+      const accepted = await this.acceptTask(
+        message,
+        operation.text,
+        false,
+        undefined,
+        fork.sessionId,
+        acceptGuard,
+        true,
+        false,
+        undefined,
+        true,
+        operation.id,
+      );
+      if (!accepted) {
+        const current = this.store.getTanOperation(operation.botUid, operation.id);
+        if (current?.phase === "cancelled") this.finalizeCancelledTanOperation(current);
+        else throw new Error("目标子区绑定在派发前已变更；为避免切换 session，本次未接受任务。");
+        return;
+      }
+      this.enqueueTanOutbox(
+        operation,
+        `已在子区 ${fork.thread!.name}（${fork.thread!.shortId}）登记独立任务 ${dispatchMessageId}；子区按既有 listen 策略处理结果。`,
+      );
+    } catch (error) {
+      const current = this.store.getTanOperation(operation.botUid, operation.id);
+      if (current?.phase === "cancelled") {
+        this.finalizeCancelledTanOperation(current);
+        return;
+      }
+      if (this.stopping || current?.phase !== "pending") return;
+      const detail = safeDisplayText(
+        error instanceof Error ? error.message : String(error),
+        1000,
+      ) ?? "操作结果保持安全状态；不会重新创建未知远端子区。";
+      const sourceTarget: ChatTarget = {
+        channelType: operation.sourceChannelType,
+        channelId: operation.sourceChannelId,
+      };
+      const records = this.tanOutboxRecords(
+        operation,
+        "failure",
+        `TAN 分叉任务未能派发：${detail}`,
+      );
+      if (this.store.finishTanOperationWithOutbox(operation.botUid, operation.id, "failed", detail, records)) {
+        void this.outbox.flush(sourceTarget).catch(() => {});
+      }
+    }
+  }
+
+  private tanOutboxRecords(
+    operation: TanOperation,
+    kind: "dispatch" | "failure" | "cancel-result",
+    text: string,
+  ): OutboxInsert[] {
+    const target: ChatTarget = {
+      channelType: operation.sourceChannelType,
+      channelId: operation.sourceChannelId,
+    };
+    return splitUtf8(text).map((chunk, index) => {
+      const id = `tan:${operation.id}:${kind}:${index}`;
+      return {
+        id,
+        botUid: operation.botUid,
+        channelId: target.channelId,
+        channelType: target.channelType,
+        taskId: null,
+        kind: "text",
+        text: chunk,
+        path: null,
+        fileKind: null,
+        clientMsgNo: id,
+      };
+    });
+  }
+
+  private enqueueTanOutbox(operation: TanOperation, text: string): void {
+    const target: ChatTarget = {
+      channelType: operation.sourceChannelType,
+      channelId: operation.sourceChannelId,
+    };
+    for (const record of this.tanOutboxRecords(operation, "dispatch", text)) {
+      if (this.store.getOutbox(record.id) !== null) continue;
+      this.store.enqueueOutbox(record);
+    }
+    void this.outbox.flush(target).catch(() => {});
+  }
+
+  private finalizeCancelledTanOperation(operation: TanOperation): void {
+    const current = this.store.getTanOperation(operation.botUid, operation.id);
+    if (current?.phase !== "cancelled") return;
+    const fork = this.store.getThreadFork(operation.botUid, operation.id);
+    const task = fork?.thread
+      ? this.store.getTaskByMessageId(
+          operation.botUid,
+          { channelType: 5, channelId: fork.thread.channelId },
+          `dispatch:tan:${operation.id}`,
+        )
+      : null;
+    const thread = fork?.thread;
+    const knownThread = thread === null || thread === undefined
+      ? ""
+      : `远端子区 ${thread.name}（${thread.shortId}）`;
+    let report: string;
+    if (current.error !== null) {
+      report = current.error;
+    } else if (fork === null) {
+      report = "TAN 已取消；尚无持久化分叉记录，未接受目标任务。不会自动重试或重建。";
+    } else if (task !== null) {
+      report = `TAN 已取消，但目标任务记录 ${task.messageId} 已存在；不会再次派发。请核对该任务状态。`;
+    } else if (fork.phase === "preparing") {
+      report = `TAN 已取消；分叉准备状态仍未确认${fork.error ? `（${safeDisplayText(fork.error, 300) ?? "状态未知"}）` : ""}。不会创建远端子区或启动目标任务；未确认停止的准备进程会继续受到工作目录封锁。`;
+    } else if (fork.phase === "prepared") {
+      report = "TAN 已取消；分叉准备已完成，但远端子区尚未创建；不会继续创建或启动目标任务。";
+    } else if (fork.phase === "creating") {
+      report = `TAN 已取消；远端子区创建结果未知${knownThread ? `（${knownThread}）` : ""}，不会重试创建或启动目标任务。`;
+    } else if (fork.phase === "remote-created") {
+      report = `TAN 已取消；${knownThread || "远端子区"}已创建但尚未完成本地绑定，不会启动目标任务。`;
+    } else if (fork.phase === "ready") {
+      report = `TAN 已取消；${knownThread || "远端子区"}已 ready，但目标任务未接受，不会启动目标任务。`;
+    } else {
+      report = `TAN 已取消；分叉未能完成${knownThread ? `，已知 ${knownThread}` : ""}${fork.error ? `（${safeDisplayText(fork.error, 300) ?? "结果未知"}）` : ""}。不会自动重试或启动目标任务。`;
+    }
+    const records = this.tanOutboxRecords(current, "cancel-result", report);
+    this.store.finishTanOperationWithOutbox(
+      operation.botUid,
+      operation.id,
+      "cancelled",
+      report,
+      records,
+    );
+    void this.outbox.flush({
+      channelType: operation.sourceChannelType,
+      channelId: operation.sourceChannelId,
+    }).catch(() => {});
+  }
+
+  private recoverCancelledTanReceipts(botUid: string): void {
+    for (const operation of this.store.listCancelledTanOperations(botUid)) {
+      this.finalizeCancelledTanOperation(operation);
+    }
+  }
+
+  private recoverAcceptedTanReceipts(botUid: string): void {
+    for (const fork of this.store.listThreadForks(botUid)) {
+      if (fork.phase !== "ready" || fork.thread === null) continue;
+      const operation = this.store.getTanOperation(botUid, fork.id);
+      if (operation === null || operation.phase !== "done") continue;
+      const target: ChatTarget = { channelType: 5, channelId: fork.thread.channelId };
+      const dispatchMessageId = `dispatch:tan:${fork.id}`;
+      if (this.store.getTaskByMessageId(botUid, target, dispatchMessageId) === null) continue;
+      this.enqueueTanOutbox(
+        operation,
+        `已在子区 ${fork.thread.name}（${fork.thread.shortId}）登记独立任务 ${dispatchMessageId}；子区按既有 listen 策略处理结果。`,
+      );
+    }
+  }
+
 
   private trackForkOperation<T>(operation: Promise<T>, checkDeferredRestartOnSettle = false): Promise<T> {
     this.operationSet(operation.then(() => {}, () => {}));
@@ -3589,12 +4087,31 @@ class CoreService implements ChannelService {
 
   private async handleCancel(target: ChatTarget): Promise<void> {
     const binding = this.store.getBinding(this.bot!.uid, target);
-    const btwOperation = this.btwOperationsByTarget.get(targetKey(target));
+    const targetKeyValue = targetKey(target);
+    const tanInbound = [...this.tanInboundOperations.values()]
+      .filter(operation => targetKey(operation.target) === targetKeyValue);
+    for (const operation of tanInbound) operation.controller.abort(new Error("TAN cancelled"));
+    const tanInboundSettled = Promise.all(tanInbound.map(operation => operation.operation));
+    const cancelledTanOperations: TanOperation[] = [];
+    for (const operation of this.store.listPendingTanOperations(this.bot!.uid)) {
+      if (
+        operation.sourceChannelType === target.channelType
+        && operation.sourceChannelId === target.channelId
+        && this.store.cancelTanOperation(this.bot!.uid, operation.id)
+      ) {
+        cancelledTanOperations.push(operation);
+      }
+    }
+    const tanCancelled = cancelledTanOperations.length > 0;
+    const btwOperation = this.btwOperationsByTarget.get(targetKeyValue);
     btwOperation?.controller.abort(new Error("BTW cancelled"));
     if (binding) this.invalidateGoalResumeChecks(target, binding.sessionId);
     const mergeCancelled = this.abortThreadMerges(target, new Error("thread merge cancelled"));
     const removalCancelled = this.abortThreadRemovals(target, new Error("thread removal cancelled"));
     const forkCancelled = this.threadForks.abortTarget(target, new Error("fork cancelled"));
+    const tanDispatchSettled = Promise.all(cancelledTanOperations
+      .map(operation => this.tanDispatchOperations.get(operation.id))
+      .filter((operation): operation is Promise<void> => operation !== undefined));
     const archiveCancelled = this.abortForkArchiveWaits(target, new Error("fork archive cancelled"));
     const queued = this.store.cancelQueued(this.bot!.uid, target);
     const queuedCommit = this.commitOperationsByTarget.get(targetKey(target));
@@ -3606,7 +4123,7 @@ class CoreService implements ChannelService {
     for (const taskId of queued) this.questions.cancelForTask(taskId, "cancelled");
     for (const taskId of queued) await this.notifyThreadOutcome(taskId);
     this.questions.cancelForTarget(target);
-    let active = btwOperation !== undefined;
+    let active = btwOperation !== undefined || tanCancelled || tanInbound.length > 0;
     let commitStopUnconfirmed = false;
     let completedCommit: CommitOperation | undefined;
     const commitOperation = this.commitOperationsByTarget.get(targetKey(target));
@@ -3649,11 +4166,14 @@ class CoreService implements ChannelService {
       this.store.markCancelled(runtime.taskId);
     }
     if (btwOperation) await btwOperation.done.catch(() => {});
+    if (tanInbound.length > 0) await tanInboundSettled;
+    if (cancelledTanOperations.length > 0) await tanDispatchSettled;
+    for (const operation of cancelledTanOperations) this.finalizeCancelledTanOperation(operation);
     const response = commitStopUnconfirmed
       ? "无法确认提交进程已停止；排队任务已清除，工作树仍受保护。"
       : completedCommit?.result !== undefined
         ? `当前提交已完成，无法取消或回滚；HEAD=${this.shortHead(completedCommit.result.headAfter)}。`
-        : queued.length > 0 || active || mergeCancelled || removalCancelled || forkCancelled || archiveCancelled
+        : queued.length > 0 || active || mergeCancelled || removalCancelled || forkCancelled || archiveCancelled || tanCancelled
           ? DEFAULT_CANCELLED_TEXT
           : "当前没有可取消的任务。";
     await this.outbox.enqueueText(target, response, null);
@@ -3958,6 +4478,7 @@ class CoreService implements ChannelService {
     observeReferences = false,
     beforeAccept?: () => boolean,
     silentFailure = false,
+    tanOperationId?: string,
   ): Promise<boolean> {
     if (message.channelType === 5 && threadShortId(message.channelId) !== null) {
       await this.ensureThreadListen(message);
@@ -4042,7 +4563,9 @@ class CoreService implements ChannelService {
     // Measured before acceptance so the new task's own row cannot count itself as the work it waits for.
     const startsBehind = this.scheduler.hasBlockingWork(message, task.cwd);
     try {
-      accepted = this.store.acceptTask(this.taskClaim(message), task, goalRequest);
+      accepted = tanOperationId === undefined
+        ? this.store.acceptTask(this.taskClaim(message), task, goalRequest)
+        : this.store.acceptTanTask(this.taskClaim(message), tanOperationId, task);
     } catch {
       throw new Error("本地状态盘写入失败，任务未接收。");
     }
@@ -5314,6 +5837,16 @@ class CoreService implements ChannelService {
     if (!persistedTask || persistedTask.state !== "queued") return;
     const target = taskTarget(persistedTask);
     const isWatchWakeTask = persistedTask.messageId.startsWith(WATCH_WAKE_PREFIX);
+    const tanOperationId = persistedTask.messageId.startsWith("dispatch:tan:")
+      ? persistedTask.messageId.slice("dispatch:tan:".length)
+      : null;
+    const isTanDispatch = tanOperationId !== null;
+    const tanFork = tanOperationId === null
+      ? null
+      : this.store.getThreadFork(persistedTask.botUid, tanOperationId);
+    const tanOperation = tanOperationId === null
+      ? null
+      : this.store.getTanOperation(persistedTask.botUid, tanOperationId);
     const goalTask = this.store.getGoalTask(taskId);
     if (persistedTask.text === "/commit" && this.store.isCommitTask(taskId)) {
       await this.runCommitTask(taskId, expectedCwd);
@@ -5336,6 +5869,30 @@ class CoreService implements ChannelService {
     const bindingAtStart = goalTask
       ? this.store.getBinding(this.bot!.uid, target)
       : await this.reconcileTaskBinding(taskId, target, this.store.getBinding(this.bot!.uid, target));
+    if (isTanDispatch && (
+      tanOperation?.phase !== "done"
+      || tanFork?.phase !== "ready"
+      || tanFork.thread?.channelId !== target.channelId
+      || tanFork.sessionId === null
+      || tanFork.sessionFile === null
+      || !bindingAtStart
+      || bindingAtStart.sessionId !== tanFork.sessionId
+      || bindingAtStart.sessionFile !== tanFork.sessionFile
+      || bindingAtStart.cwd !== tanFork.cwd
+      || persistedTask.sessionId !== tanFork.sessionId
+      || persistedTask.cwd !== tanFork.cwd
+    )) {
+      this.scheduler.takeWaitingReceipt(taskId);
+      this.store.markFailed(taskId, "TAN 目标 binding/session 身份已变化，拒绝切换或重放请求。");
+      this.typingLeases.release(target, `task:${taskId}`);
+      await this.outbox.enqueueText(
+        target,
+        "TAN 目标子区绑定 session 身份已变化；为避免在其他会话执行，本次任务已拒绝。",
+        taskId,
+      );
+      await this.notifyThreadOutcome(taskId);
+      return;
+    }
     if (goalTask && (
       !bindingAtStart
       || bindingAtStart.sessionId !== goalTask.sessionId
@@ -5517,6 +6074,17 @@ class CoreService implements ChannelService {
       if (isWatchWakeTask && verified.sessionId !== persistedTask.sessionId) {
         throw new TaskStartupError("session-invalid", "watch 唤醒受理后的会话身份已变化，拒绝切换会话。");
       }
+      if (
+        isTanDispatch
+        && (
+          tanFork === null
+          || verified.sessionId !== tanFork.sessionId
+          || verified.sessionFile !== tanFork.sessionFile
+          || verified.sessionId !== persistedTask.sessionId
+        )
+      ) {
+        throw new TaskStartupError("session-invalid", "TAN worker did not open the exact persisted fork session");
+      }
       if (goalTask && bindingAtStart?.sessionFile === null) {
         if (!verified.sessionFile) {
           throw new WorkerGoalError("invalid-response", "Fresh goal session did not expose its exact session file");
@@ -5525,7 +6093,7 @@ class CoreService implements ChannelService {
         goalSessionId = verified.sessionId;
       } else if (goalTask && verified.sessionId !== goalSessionId) {
         throw new WorkerGoalError("identity-mismatch", "Worker session changed before goal dispatch");
-      } else if (!goalTask && !isWatchWakeTask) {
+      } else if (!goalTask && !isWatchWakeTask && !isTanDispatch) {
         this.store.updateBindingSession(
           this.bot!.uid,
           target,
@@ -5537,7 +6105,9 @@ class CoreService implements ChannelService {
       // 的注入事务照常发布——会话侧车正是为「原生续跑回合」准备的（`context` 钩子补灌），
       // 上一进程未结算的 pending 事务在这里被接手，成功的续跑回合照常提交。
       contextInjection = await turnContext.prepare(verified.sessionId, agentContext);
-      const historyTurn = goalTask || resuming ? null : await this.history.prepareTurn(task, target, verified.sessionId);
+      const historyTurn = goalTask || resuming || isTanDispatch
+        ? null
+        : await this.history.prepareTurn(task, target, verified.sessionId);
       const promptContext: PromptContext = {
         tools: createHostTools(this.hostToolHost(), task),
         ...(contextInjection === undefined ? {} : { contextInjection }),
@@ -5648,13 +6218,53 @@ class CoreService implements ChannelService {
               return;
             }
           }
+          if (isTanDispatch) {
+            const currentBinding = this.store.getBinding(this.bot!.uid, target);
+            if (
+              tanFork === null
+              || tanFork.phase !== "ready"
+              || tanFork.thread?.channelId !== target.channelId
+              || tanFork.sessionId !== verified.sessionId
+              || tanFork.sessionFile !== verified.sessionFile
+              || !currentBinding
+              || currentBinding.sessionId !== tanFork.sessionId
+              || currentBinding.sessionFile !== tanFork.sessionFile
+              || currentBinding.cwd !== tanFork.cwd
+              || persistedTask.sessionId !== tanFork.sessionId
+              || persistedTask.cwd !== tanFork.cwd
+            ) {
+              throw new TaskStartupError(
+                "session-invalid",
+                "TAN binding changed before prompt dispatch; refusing to switch sessions",
+              );
+            }
+          }
           this.store.markTaskPromptStarted(taskId, verified.sessionId);
           runtime.promptInFlight = true;
-          await worker.prompt(historyTurn?.text ?? task.text, consumeEvent, promptContext);
+          const prompt = isTanDispatch
+            ? (/^\s*\/\S+/u.test(task.text) ? `用户请求：\n${task.text}` : task.text)
+            : (historyTurn?.text ?? task.text);
+          await worker.prompt(prompt, consumeEvent, promptContext);
         }
       } finally {
         runtime.promptInFlight = false;
         if (historyTurn) this.history.commitTurn(target, verified.sessionId, historyTurn);
+      }
+      if (
+        isTanDispatch
+        && !resuming
+        && !runtime.cancelRequested
+        && runtime.stopCause === null
+        && !runtime.suspended
+        && !this.stopping
+        && !this.store.isTaskResuming(taskId)
+      ) {
+        const notice = "TAN prompt 未返回 OMP 的 prompt_accepted 回执；任务是否进入分叉会话无法确认，已标记为未知且不会自动重放。";
+        this.outbox.enqueueText(target, notice, taskId);
+        this.store.markInterrupted(taskId, notice);
+        progress.finish("failed");
+        await this.notifyThreadOutcome(taskId);
+        return;
       }
       if (runtime.cancelRequested) {
         this.store.markCancelled(taskId);
