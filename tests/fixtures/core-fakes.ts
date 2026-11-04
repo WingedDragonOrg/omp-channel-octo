@@ -58,6 +58,7 @@ import type {
   WorktrunkProbe,
 } from "../../src/contracts";
 import type { LoopReadPort, LoopTask, LoopWorkspace } from "../../src/loop/types.ts";
+import type { WatchCollector, WatchJudge } from "../../src/watch/types.ts";
 import { RESUME_CONTINUATION_PROMPT } from "../../src/contracts";
 import { AttachmentError } from "../../src/inbound/attachments";
 import {
@@ -1825,6 +1826,12 @@ export interface CoreHarnessOptions {
   groupHistory?: GroupHistoryConfig;
   /** `ask` wait configuration; absent means the service default (6-hour timeout). */
   ask?: AskConfig;
+  decisions?: CoreServiceConfig["decisions"];
+  /** Optional watch switch; defaults to the Decisions enablement. */
+  watch?: CoreServiceConfig["watch"];
+  /** Injectable watch runner/judge for real CoreService integration tests. */
+  watchCollector?: WatchCollector;
+  watchJudge?: WatchJudge;
   /** Extra command handlers, e.g. an observing handler that still runs a prompt. */
   commandHandlers?: readonly ChannelCommandHandler[];
   restart?: RestartPort;
@@ -1871,6 +1878,8 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
     homeDir: root,
     ...(options.attachments === undefined ? {} : { attachments: options.attachments }),
     ...(options.groupHistory === undefined ? {} : { groupHistory: options.groupHistory }),
+    ...(options.decisions === undefined ? {} : { decisions: options.decisions }),
+    ...(options.watch === undefined ? {} : { watch: options.watch }),
     ...(options.ask === undefined ? {} : { ask: options.ask }),
   } as CoreServiceConfig;
   const service = await createChannelService({
@@ -1880,6 +1889,8 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
     workerFactory: workers,
     ...(worktreePort === undefined ? {} : { worktrees: worktreePort }),
     ...(options.commandHandlers === undefined ? {} : { commandHandlers: options.commandHandlers }),
+    ...(options.watchCollector === undefined ? {} : { watchCollector: options.watchCollector }),
+    ...(options.watchJudge === undefined ? {} : { watchJudge: options.watchJudge }),
     ...(options.restart === undefined ? {} : { restart: options.restart }),
     ...(options.cliCredentials === undefined ? {} : { cliCredentials: options.cliCredentials }),
     ...(options.allowlistWriteback === undefined ? {} : { allowlistWriteback: options.allowlistWriteback }),

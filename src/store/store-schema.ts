@@ -458,6 +458,49 @@ export function applySchema(db: Database): void {
       PRIMARY KEY(bot_uid, action_id),
       UNIQUE(bot_uid, event_id)
     );
+    CREATE TABLE IF NOT EXISTS watches (
+      id TEXT PRIMARY KEY NOT NULL,
+      bot_uid TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
+      channel_id TEXT NOT NULL,
+      source_task_id TEXT NOT NULL,
+      creation_key TEXT NOT NULL,
+      spec_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      deadline_at INTEGER NOT NULL,
+      next_at INTEGER NOT NULL,
+      checks INTEGER NOT NULL CHECK(checks >= 0),
+      max_checks INTEGER NOT NULL CHECK(max_checks > 0),
+      generation INTEGER NOT NULL CHECK(generation >= 0),
+      failures INTEGER NOT NULL CHECK(failures >= 0),
+      state TEXT NOT NULL CHECK(state IN ('waiting', 'checking', 'matched', 'failed', 'expired', 'stopped', 'deleted', 'unknown')),
+      latest_json TEXT,
+      matched_evidence TEXT,
+      process_json TEXT,
+      process_unknown INTEGER NOT NULL DEFAULT 0 CHECK(process_unknown IN (0, 1)),
+      wake_task_id TEXT,
+      wake_status TEXT NOT NULL CHECK(wake_status IN ('none', 'queued', 'accepted', 'dispatched', 'cancelled', 'failed')),
+      stop_reason TEXT,
+      matched_at INTEGER,
+      UNIQUE(bot_uid, source_task_id, creation_key)
+    );
+    CREATE TABLE IF NOT EXISTS watch_chat_tombstones (
+      bot_uid TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
+      channel_id TEXT NOT NULL,
+      deleted_at INTEGER NOT NULL,
+      PRIMARY KEY(bot_uid, channel_type, channel_id)
+    );
+    CREATE TABLE IF NOT EXISTS watch_match_events (
+      message_id TEXT PRIMARY KEY NOT NULL,
+      watch_id TEXT NOT NULL UNIQUE,
+      bot_uid TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
+      channel_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS watches_due ON watches(state, next_at, deadline_at);
+    CREATE INDEX IF NOT EXISTS watches_bot_chat ON watches(bot_uid, channel_type, channel_id, created_at, id);
     CREATE INDEX IF NOT EXISTS chat_grant_operations_recovery
       ON chat_grant_operations(bot_uid, config_mirror_state, result_state, accepted_at, event_id);
   `);
@@ -509,6 +552,7 @@ export function applySchema(db: Database): void {
     "ALTER TABLE host_merge_leases ADD COLUMN removal_step TEXT CHECK(removal_step IS NULL OR removal_step IN ('worktree', 'branch'))",
     "ALTER TABLE host_merge_leases ADD COLUMN removal_resources_json TEXT",
     "ALTER TABLE host_merge_leases ADD COLUMN removal_outcome_json TEXT",
+    "ALTER TABLE watches ADD COLUMN process_unknown INTEGER NOT NULL DEFAULT 0 CHECK(process_unknown IN (0, 1))",
   ]) {
     try {
       db.exec(statement);

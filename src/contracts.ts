@@ -3,6 +3,7 @@ import type { CommitContent } from "./cards/commit-content.ts";
 import type { ProjectSessionState } from "./session/project-session.ts";
 import type { DecisionsConfig, DecisionFetch } from "./references/types.ts";
 import type { LoopReadPort } from "./loop/types.ts";
+import type { WatchCollector, WatchJudge } from "./watch/types.ts";
 
 export interface ChatTarget {
   channelId: string;
@@ -782,8 +783,11 @@ export interface CoreServiceConfig {
   attachments?: AttachmentConfig;
   /** `ask` wait behavior; omitting it uses `DEFAULT_ASK_TIMEOUT_MS`. */
   ask?: AskConfig;
-  /** Optional external classifier used only for local thread PR/MR reference binding. */
+  /** Shared Decisions connection for reference classification and semantic watches. */
   decisions?: DecisionsConfig;
+  /** Optional watch switch; omitted means follow enabled Decisions. */
+  watch?: { enabled: boolean };
+
 }
 
 export interface AttachmentConfig {
@@ -847,6 +851,9 @@ export interface ChannelServiceOptions {
   commandHandlers?: readonly ChannelCommandHandler[];
   /** HTTP seam for the explicitly configured reference decision provider. */
   decisionsFetch?: DecisionFetch;
+  /** Injectable collector and judge seams for offline watch integration tests. */
+  watchCollector?: WatchCollector;
+  watchJudge?: WatchJudge;
   /**
    * Supervisor restart port, present only when the host detected the process supervisor that
    * runs this channel. `request` asks that supervisor to restart the program, which stops this

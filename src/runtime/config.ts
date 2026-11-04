@@ -58,6 +58,7 @@ const CONFIG_KEYS: Record<string, true> = {
   attachments: true,
   ask: true,
   decisions: true,
+  watch: true,
 };
 const TOKEN_ENV_PATTERN = /^(?:OCTO_|OMP_CHANNEL_OCTO_)[A-Za-z_][A-Za-z0-9_]*$/u;
 /** Bot uids reach the filesystem as directory names; only the server's alphabet is allowed. */
@@ -260,35 +261,36 @@ function parseAsk(value: unknown): AskConfig {
 }
 
 function parseDecisions(value: unknown, env: NodeJS.ProcessEnv): DecisionsConfig | undefined {
+  const field = "decisions";
   if (value === undefined) return undefined;
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw configError("decisions 必须是 JSON 对象");
+    throw configError(`${field} 必须是 JSON 对象`);
   }
   const document = value as Record<string, unknown>;
   for (const key of Object.keys(document)) {
     if (!["enabled", "protocol", "baseUrl", "model", "apiKeyEnv"].includes(key)) {
-      throw configError(`不支持字段 decisions.${key}`);
+      throw configError(`不支持字段 ${field}.${key}`);
     }
   }
 
   const enabled = document.enabled === undefined ? false : document.enabled;
-  if (typeof enabled !== "boolean") throw configError("decisions.enabled 必须是布尔值");
+  if (typeof enabled !== "boolean") throw configError(`${field}.enabled 必须是布尔值`);
   if (!enabled) return { enabled: false };
 
-  const protocol = requireString(document.protocol, "decisions.protocol");
+  const protocol = requireString(document.protocol, `${field}.protocol`);
   if (protocol !== "typesafe-systemone" && protocol !== "openai-decisions") {
-    throw configError("decisions.protocol 必须是 typesafe-systemone 或 openai-decisions");
+    throw configError(`${field}.protocol 必须是 typesafe-systemone 或 openai-decisions`);
   }
 
-  const baseUrl = requireString(document.baseUrl, "decisions.baseUrl");
+  const baseUrl = requireString(document.baseUrl, `${field}.baseUrl`);
   let parsedBaseUrl: URL;
   try {
     parsedBaseUrl = new URL(baseUrl);
   } catch {
-    throw configError("decisions.baseUrl 必须是有效 HTTPS URL");
+    throw configError(`${field}.baseUrl 必须是有效 HTTPS URL`);
   }
   if (parsedBaseUrl.protocol !== "https:") {
-    throw configError("decisions.baseUrl 必须使用 HTTPS 协议");
+    throw configError(`${field}.baseUrl 必须使用 HTTPS 协议`);
   }
   const authority = /^https:\/\/([^/?#]*)/iu.exec(baseUrl)?.[1];
   if (
@@ -297,19 +299,19 @@ function parseDecisions(value: unknown, env: NodeJS.ProcessEnv): DecisionsConfig
     || parsedBaseUrl.username !== ""
     || parsedBaseUrl.password !== ""
   ) {
-    throw configError("decisions.baseUrl 不得包含内嵌凭证");
+    throw configError(`${field}.baseUrl 不得包含内嵌凭证`);
   }
   if (parsedBaseUrl.search || parsedBaseUrl.hash || baseUrl.includes("?") || baseUrl.includes("#")) {
-    throw configError("decisions.baseUrl 不得包含 query 或 fragment");
+    throw configError(`${field}.baseUrl 不得包含 query 或 fragment`);
   }
   if (/(?:^|\/)v1\/(?:systemone|decisions)\/?$/iu.test(parsedBaseUrl.pathname)) {
-    throw configError("decisions.baseUrl 不得包含协议 endpoint 后缀");
+    throw configError(`${field}.baseUrl 不得包含协议 endpoint 后缀`);
   }
 
-  const model = requireString(document.model, "decisions.model");
-  const apiKeyEnv = requireString(document.apiKeyEnv, "decisions.apiKeyEnv");
+  const model = requireString(document.model, `${field}.model`);
+  const apiKeyEnv = requireString(document.apiKeyEnv, `${field}.apiKeyEnv`);
   if (!DECISIONS_ENV_PATTERN.test(apiKeyEnv)) {
-    throw configError("decisions.apiKeyEnv 必须使用 OMP_CHANNEL_OCTO_ 前缀");
+    throw configError(`${field}.apiKeyEnv 必须使用 OMP_CHANNEL_OCTO_ 前缀`);
   }
   const apiKey = requireString(env[apiKeyEnv], `环境变量 ${apiKeyEnv}`);
   const resolved: EnabledDecisionsConfig = {
@@ -321,6 +323,20 @@ function parseDecisions(value: unknown, env: NodeJS.ProcessEnv): DecisionsConfig
     apiKey,
   };
   return resolved;
+}
+
+function parseWatch(value: unknown, decisionsEnabled: boolean): { enabled: boolean } {
+  if (value === undefined) return { enabled: decisionsEnabled };
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw configError("watch 必须是 JSON 对象");
+  }
+  for (const key of Object.keys(value)) {
+    if (key !== "enabled") throw configError(`不支持字段 watch.${key}`);
+  }
+  const enabled = "enabled" in value ? value.enabled : decisionsEnabled;
+  if (typeof enabled !== "boolean") throw configError("watch.enabled 必须是布尔值");
+  if (enabled && !decisionsEnabled) throw configError("watch.enabled 需要启用 decisions");
+  return { enabled };
 }
 
 export function parseConfig(input: unknown, options: ConfigParseOptions = {}): AppConfig {
@@ -376,7 +392,9 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
   const groupHistory = parseGroupHistory(document.groupHistory);
   const attachments = parseAttachments(document.attachments);
   const ask = parseAsk(document.ask);
-  const decisions = parseDecisions(document.decisions, options.env ?? process.env);
+  const environment = options.env ?? process.env;
+  const decisions = parseDecisions(document.decisions, environment);
+  const watch = parseWatch(document.watch, decisions?.enabled === true);
 
   return {
     apiUrl,
@@ -400,6 +418,7 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
     attachments,
     ask,
     ...(decisions === undefined ? {} : { decisions }),
+    watch,
   };
 }
 
@@ -466,5 +485,6 @@ export function toCoreConfig(config: AppConfig): CoreServiceConfig {
     attachments: { ...config.attachments },
     ask: { ...config.ask },
     ...(config.decisions === undefined ? {} : { decisions: { ...config.decisions } }),
+    watch: { enabled: config.watch?.enabled ?? (config.decisions?.enabled === true) },
   };
 }

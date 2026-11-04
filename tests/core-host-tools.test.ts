@@ -157,7 +157,7 @@ test("private prompts receive ask, file, and channel tools but no group tools", 
   const harness = await createCoreHarness({
     prompt: async ({ append, promptContext, text }) => {
       const names = (promptContext?.tools ?? []).map(({ name }) => name).sort();
-      if (names.join(",") !== "ask,channel_control,octo_send_file") {
+      if (names.join(",") !== "ask,channel_control,octo_send_file,watch") {
         throw new Error(`unexpected private host tools: ${names.join(",")}`);
       }
       await append("private-tools.log", text);

@@ -15,6 +15,9 @@ import {
   type BuiltinAction,
   type BuiltinHandlers,
 } from "./commands/command-routing.ts";
+import { collectWatch } from "./watch/collector.ts";
+import { createWatchJudge } from "./watch/decision.ts";
+import { WatchCoordinator } from "./watch/index.ts";
 import { SessionLifecycle, threadWorkspaceIsAvailable } from "./session/session-lifecycle.ts";
 import {
   TaskScheduler,
@@ -96,7 +99,7 @@ import {
   type ProjectSessionBinding,
   type ProjectSessionState,
 } from "./session/project-session.ts";
-import { ensureProjectSessionDir, sessionsRoot } from "./session/session-dir.ts";
+import { ensureProjectSessionDir, projectSessionDir, sessionsRoot } from "./session/session-dir.ts";
 import { ChannelStore, openChannelStore } from "./store/index.ts";
 import { isGroupTarget, targetKey, taskTarget } from "./target.ts";
 import { createTypingLeaseManager, type TypingLeaseManager } from "./typing-lease.ts";
@@ -119,7 +122,7 @@ import {
 import { ThreadCommands } from "./commands/thread-commands.ts";
 import { ServiceRestart } from "./runtime/service-restart.ts";
 import { TaskEvents } from "./tasks/task-events.ts";
-import { canonicalExistingDirectory, existingSessionFile } from "./workspace/workdir.ts";
+import { canonicalExistingDirectory, existingSessionFile, resolveWorkDirectory } from "./workspace/workdir.ts";
 import {
   createResearchReportStore,
   researchReportsRoot,
@@ -127,9 +130,11 @@ import {
 } from "./research/research-report.ts";
 import { createReferenceJudge } from "./references/decision-client.ts";
 import { ThreadReferenceCoordinator } from "./references/thread-references.ts";
+import type { WatchCreateArgs, WatchRecord } from "./watch/types.ts";
 
 const GROUP_TRUSTED_INSTRUCTION =
   "群说明是群共享上下文，不改变发送者身份/权限/cwd；以本次快照为准，历史快照已失效。";
+const WATCH_WAKE_PREFIX = "watch:";
 const COMMAND_HELP = [
   "会话",
   "/new [目录] · 创建新会话",
@@ -161,6 +166,7 @@ const COMMAND_HELP = [
   "",
   "其他",
   "/status · 查看当前状态",
+  "/watch [list|<id>|stop <id|all>] · 查看当前聊天的 watch，或停止监控",
   "/restart [now] · 重启 channel，在途任务重启后续接；两种写法等价",
   "/autoresearch-history · 导出本聊天最近一次研究的完整记录",
   "/help · 查看帮助",
@@ -427,6 +433,7 @@ class CoreService implements ChannelService {
   private readonly threadArchives: ThreadArchiveScheduler;
   private loopController: LoopController | undefined;
   private readonly threadForks: ThreadForkController;
+  private readonly watchCoordinator: WatchCoordinator;
   private stopPromise: Promise<void> | undefined;
   constructor(
     private readonly options: ChannelServiceOptions,
@@ -668,12 +675,28 @@ class CoreService implements ChannelService {
       restart: options.restart,
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
     });
+    const watchConfig = options.config.decisions;
+    this.watchCoordinator = new WatchCoordinator({
+      store: this.store,
+      botUid: () => this.bot?.uid,
+      enabled: () => this.options.config.decisions?.enabled === true && this.options.config.watch?.enabled !== false,
+      collect: options.watchCollector ?? ((spec, signal, onSpawn, onExit) =>
+        collectWatch(spec, signal, onSpawn, onExit, this.options.cliCredentials?.env())),
+      judge: options.watchJudge
+        ?? (watchConfig?.enabled === true && options.config.watch?.enabled !== false
+          ? createWatchJudge(watchConfig)
+          : undefined),
+      permitted: target => this.isWatchTargetPermitted(target),
+      deliver: (record, text) => this.deliverWatchWake(record, text),
+      acquireUse: record => this.acquireWatchUse(record),
+    });
     // 内建命令的 canonical handler 表：每个 action 一个函数，直接返回原 handler 的 Promise
     // （不再包一层 async），`handleCommand` 里的 await 因此仍是原来的微任务边界；只有
     // `restart` 的返回值参与重启判定。
     this.builtinHandlers = {
       btw: (message, argument) => this.handleBtw(message, argument),
       fork: (message, argument) => this.handleFork(message, argument),
+      watch: (message, argument) => this.handleWatchCommand(message, argument),
       commit: (message, argument) => this.handleCommit(message, argument),
       new: (message, argument) => this.sessions.handleNew(message, argument),
       move: (message, argument) => this.sessions.handleMove(message, argument),
@@ -723,6 +746,7 @@ class CoreService implements ChannelService {
     const lock = await acquireBotLock(identity.uid);
     this.lock = lock;
     this.bot = identity;
+    let watchStarted = false;
     try {
       this.store.setBotUid(identity.uid);
       if (this.options.loop && this.loopController === undefined) {
@@ -911,12 +935,15 @@ class CoreService implements ChannelService {
       await this.chatGrants.recoverPending(identity.uid);
       this.outbox.flushAll();
       this.botEvents.start();
+      await this.watchCoordinator.start();
+      watchStarted = true;
       this.startupGate.resolve();
       this.ready = true;
       this.loopController?.start();
       this.releaseRecoveredHostMergeArchives();
       await this.sendLifecycleNotice("startup");
     } catch (error) {
+      if (watchStarted) await this.watchCoordinator.stop();
       this.ready = false;
       this.started = false;
       this.startupGate.reject(error instanceof Error ? error : new Error("channel 启动失败"));
@@ -938,7 +965,8 @@ class CoreService implements ChannelService {
     if (this.stopping) return;
     const wasReady = this.ready;
     this.stopping = true;
-    await this.threadReferences.stop();
+    this.watchCoordinator.seal();
+    const watchShutdown = this.watchCoordinator.stop();
     this.abortAllThreadForks(new Error("channel stopping"));
     this.abortAllForkArchiveWaits(new Error("channel stopping"));
     this.abortAllThreadMerges(new Error("channel stopping"));
@@ -951,6 +979,7 @@ class CoreService implements ChannelService {
     this.shutdownController.abort();
     // Seal and abort Loop work now, but let worker shutdown release any steerSerial waits first.
     const loopStopped = this.loopController?.stop();
+    await this.threadReferences.stop();
     // A ready start may still be sending its startup notice; leave the connection open until it ends.
     if (wasReady && this.startPromise) await this.startPromise.catch(() => {});
     if (wasReady) await this.sendLifecycleNotice("stop");
@@ -980,6 +1009,7 @@ class CoreService implements ChannelService {
     // Inbound handlers aborted above finish their bounded cleanup here, while the store is still
     // open: interrupted assembly rolls its command claim back so a redelivery is not swallowed.
     await Promise.allSettled([...this.inboundOperations]);
+    await watchShutdown;
     await this.researchReports.drain();
     this.typingLeases.releaseAll();
     await this.botEvents.stop();
@@ -1276,6 +1306,21 @@ class CoreService implements ChannelService {
     target: ChatTarget,
     binding: BindingRecord | null,
   ): Promise<BindingRecord | null> {
+    const task = this.store.getTask(taskId);
+    if (task?.messageId.startsWith(WATCH_WAKE_PREFIX)) {
+      if (binding?.sessionId === task.sessionId) return { ...binding, cwd: task.cwd };
+      return {
+        botUid: task.botUid,
+        channelId: task.channelId,
+        channelType: task.channelType,
+        sessionId: task.sessionId,
+        cwd: task.cwd,
+        sessionFile: join(
+          projectSessionDir(sessionsRoot(this.options.config), task.cwd),
+          `${task.sessionId}.jsonl`,
+        ),
+      };
+    }
     if (await this.threadWorkspaceIncomplete(target)) return binding;
     if (
       binding !== null
@@ -3759,6 +3804,60 @@ class CoreService implements ChannelService {
     );
   }
 
+  private async handleWatchCommand(target: ChatTarget, argument: string): Promise<void> {
+    const parts = argument.trim().split(/\s+/u).filter(Boolean);
+    const usage = "用法：/watch [list|<id>|stop <id|all>]";
+    if (parts.length === 0 || (parts.length === 1 && parts[0]?.toLowerCase() === "list")) {
+      const records = this.watchCoordinator.list(target, 20, 0);
+      const summary = records.length === 0
+        ? "当前聊天没有已登记的 watch。"
+        : records.map(record =>
+          `${record.id} · ${record.state} · ${record.checks}/${record.maxChecks} checks · `
+          + `截止 ${new Date(record.deadlineAt).toISOString()} · wake=${record.wakeStatus}`,
+        ).join("\n");
+      await this.outbox.enqueueText(target, `当前聊天 watch（最多显示 20 条）：\n${summary}`, null);
+      return;
+    }
+    if (parts[0]?.toLowerCase() === "stop") {
+      if (parts.length !== 2) {
+        await this.outbox.enqueueText(target, usage, null);
+        return;
+      }
+      const records = this.stopChatWatches(target, parts[1]!);
+      const summary = records.length === 0
+        ? "当前聊天没有可停止的 watch。"
+        : records.map(record =>
+          `${record.id} · ${record.state} · wake=${record.wakeStatus}`
+          + (record.wakeTaskId === null ? "" : ` · task=${record.wakeTaskId}（已派发任务请用 /cancel 停止）`),
+        ).join("\n");
+      await this.outbox.enqueueText(target, summary, null);
+      return;
+    }
+    if (parts.length !== 1) {
+      await this.outbox.enqueueText(target, usage, null);
+      return;
+    }
+    const id = parts[0]!;
+    const record = this.watchCoordinator.get(target, id);
+    if (record === null) {
+      await this.outbox.enqueueText(target, "当前聊天中没有这个 watch。", null);
+      return;
+    }
+    const detail = [
+      `watch ${record.id} · ${record.state}`,
+      `cwd=${record.spec.cwd}`,
+      `argv=${JSON.stringify(record.spec.argv)}`,
+      `condition=${record.spec.condition}`,
+      `created=${new Date(record.createdAt).toISOString()} deadline=${new Date(record.deadlineAt).toISOString()}`,
+      `checks=${record.checks}/${record.maxChecks} failures=${record.failures}`,
+      `latest=${JSON.stringify(record.latest)}`,
+      `matchedEvidence=${record.matchedEvidence ?? "无"}`,
+      `stopReason=${record.stopReason ?? "无"}`,
+      `wake=${record.wakeStatus} task=${record.wakeTaskId ?? "无"}`,
+    ].join("\n");
+    await this.outbox.enqueueText(target, detail, null);
+  }
+
   /**
    * `/autoresearch-history`：只读导出。owner-only 已由命令门保证；运行中任务不打断、不排队，
    * 只把本聊天最近一次研究完整记录放进文件 outbox。入队附件是不可变 spool——之后的报告
@@ -4661,6 +4760,127 @@ class CoreService implements ChannelService {
   }
 
 
+  private async acquireWatchUse(record: WatchRecord): Promise<(() => void) | undefined> {
+    const lease = await this.scheduler.tryAcquireSharedResources(
+      `watch:${record.id}`,
+      [record.spec.cwd],
+    );
+    if (!lease) return undefined;
+    await lease.ready;
+    return () => lease.complete();
+  }
+  private isWatchTargetPermitted(target: ChatTarget): boolean {
+    if (target.channelType !== 1) return this.authorization.isPermittedChat(target);
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) return false;
+    const ownerId = this.store.getOwnerId(botUid)?.trim();
+    return ownerId !== undefined && ownerId.length > 0 && target.channelId === ownerId;
+  }
+
+
+  private cancelQueuedWatchWakes(records: readonly WatchRecord[], reason: string): void {
+    for (const record of records) {
+      const taskId = record.wakeTaskId;
+      if (taskId === null) continue;
+      const task = this.store.getTask(taskId);
+      if (task?.state !== "queued") continue;
+      this.scheduler.takeWaitingReceipt(taskId);
+      this.store.markCancelled(taskId, reason);
+    }
+  }
+
+  private stopChatWatches(target: ChatTarget, id: string | "all"): WatchRecord[] {
+    const records = this.watchCoordinator.stopWatch(target, id);
+    this.cancelQueuedWatchWakes(records, "watch stopped before first prompt");
+    return records;
+  }
+
+  private deleteChatWatches(target: ChatTarget): void {
+    const records = this.watchCoordinator.deleteChat(target);
+    this.cancelQueuedWatchWakes(records, "chat deleted before watch wake prompt");
+  }
+
+  private hostWatchPort() {
+    return {
+      create: async (task: TaskRecord, args: WatchCreateArgs, toolCallId?: string) => {
+        this.throwIfStopping();
+        const cwd = args.cwd === undefined
+          ? undefined
+          : await resolveWorkDirectory(args.cwd, this.options.config);
+        this.throwIfStopping();
+        return this.watchCoordinator.create(
+          task,
+          cwd === undefined ? args : { ...args, cwd },
+          toolCallId,
+        );
+      },
+      list: (target: ChatTarget, limit?: number, offset?: number) =>
+        this.watchCoordinator.list(target, limit, offset),
+      get: (target: ChatTarget, id: string) => this.watchCoordinator.get(target, id),
+      stopWatch: (target: ChatTarget, id: string | "all") => this.stopChatWatches(target, id),
+      deleteChat: (target: ChatTarget) => this.deleteChatWatches(target),
+    };
+  }
+
+  private async deliverWatchWake(record: WatchRecord, text: string): Promise<string | null> {
+    const botUid = this.bot?.uid;
+    if (
+      botUid === undefined
+      || this.stopping
+      || !this.isWatchTargetPermitted(record.target)
+      || this.store.isWatchChatDeleted(botUid, record.target)
+      || !this.watchCoordinator.wakeAllowed(record.id)
+    ) return null;
+    const source = this.store.getTask(record.sourceTaskId);
+    if (!source || source.botUid !== botUid) return null;
+    const message: InboundMessage = {
+      ...record.target,
+      messageId: `${WATCH_WAKE_PREFIX}${record.id}`,
+      senderId: source.senderId,
+      text,
+      mentionedUserIds: [],
+      attachments: [],
+      quoted: null,
+      supported: true,
+      messageSeq: 0,
+      messageTimestamp: Date.now(),
+    };
+    await this.acceptTask(
+      message,
+      text,
+      true,
+      undefined,
+      undefined,
+      () =>
+        !this.stopping
+        && this.isWatchTargetPermitted(record.target)
+        && !this.store.isWatchChatDeleted(botUid, record.target)
+        && this.watchCoordinator.wakeAllowed(record.id),
+      false,
+      false,
+    );
+    if (this.stopping) return null;
+    const task = this.store.getTaskByMessageId(
+      botUid,
+      record.target,
+      `${WATCH_WAKE_PREFIX}${record.id}`,
+    );
+    // A prior acceptance may already own this stable message id (restart after a shutdown before
+    // the wake was linked). A running row is adopted without rescheduling; only queued rows are
+    // scheduled here, and recovery may already have queued one.
+    if (task === null || (task.state !== "queued" && task.state !== "running")) return null;
+    if (!this.store.markWatchWakeTask(record.id, task.id, Date.now())) {
+      const current = this.store.getTask(task.id);
+      if (current?.state === "queued") {
+        this.scheduler.takeWaitingReceipt(task.id);
+        this.store.markCancelled(task.id, "watch wake was revoked before association");
+      }
+      return null;
+    }
+    if (task.state === "queued") this.scheduler.scheduleTask(task.id);
+    return task.id;
+  }
+
   /**
    * Host tools 的宿主适配：工具模块只看到它真正需要的状态。重启排定已委托给独立的
    * `ServiceRestart` 所有者（工具只拿到它的 `schedule` 与 `pending`），channel 快照仍留在
@@ -4674,6 +4894,7 @@ class CoreService implements ChannelService {
       transport: this.options.transport,
       worktrees: this.options.worktrees,
       store: this.store,
+      watches: this.hostWatchPort(),
       botUid,
       ...(this.loopController === undefined ? {} : { loop: this.loopController.threads }),
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
@@ -5068,6 +5289,7 @@ class CoreService implements ChannelService {
     const persistedTask = this.store.getTask(taskId);
     if (!persistedTask || persistedTask.state !== "queued") return;
     const target = taskTarget(persistedTask);
+    const isWatchWakeTask = persistedTask.messageId.startsWith(WATCH_WAKE_PREFIX);
     const goalTask = this.store.getGoalTask(taskId);
     if (persistedTask.text === "/commit" && this.store.isCommitTask(taskId)) {
       await this.runCommitTask(taskId, expectedCwd);
@@ -5268,6 +5490,9 @@ class CoreService implements ChannelService {
       const verified = binding?.sessionFile
         ? await verifyMovedSession(previousForWorker, authoritativeState, task.cwd)
         : await verifyFreshSession(previousForWorker, authoritativeState, task.cwd);
+      if (isWatchWakeTask && verified.sessionId !== persistedTask.sessionId) {
+        throw new TaskStartupError("session-invalid", "watch 唤醒受理后的会话身份已变化，拒绝切换会话。");
+      }
       if (goalTask && bindingAtStart?.sessionFile === null) {
         if (!verified.sessionFile) {
           throw new WorkerGoalError("invalid-response", "Fresh goal session did not expose its exact session file");
@@ -5276,7 +5501,7 @@ class CoreService implements ChannelService {
         goalSessionId = verified.sessionId;
       } else if (goalTask && verified.sessionId !== goalSessionId) {
         throw new WorkerGoalError("identity-mismatch", "Worker session changed before goal dispatch");
-      } else if (!goalTask) {
+      } else if (!goalTask && !isWatchWakeTask) {
         this.store.updateBindingSession(
           this.bot!.uid,
           target,
@@ -5387,6 +5612,18 @@ class CoreService implements ChannelService {
           runtime.promptInFlight = true;
           await worker.resume(consumeEvent, promptContext);
         } else {
+          if (isWatchWakeTask) {
+            const watchId = persistedTask.messageId.slice(WATCH_WAKE_PREFIX.length);
+            // Recovery may find a queued wake accepted before shutdown but never linked; adopt
+            // this stable task against the still-queued record. Revoked, expired, deleted, or
+            // differently-linked records reject, so the dispatch gate below stays closed.
+            this.store.markWatchWakeTask(watchId, taskId, Date.now());
+            if (!this.watchCoordinator.markWakeDispatched(watchId, taskId)) {
+              this.store.markCancelled(taskId, "watch wake was revoked before prompt dispatch");
+              progress.finish("cancelled");
+              return;
+            }
+          }
           this.store.markTaskPromptStarted(taskId, verified.sessionId);
           runtime.promptInFlight = true;
           await worker.prompt(historyTurn?.text ?? task.text, consumeEvent, promptContext);

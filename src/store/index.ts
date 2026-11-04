@@ -24,6 +24,8 @@ import { addThreadWorkspaceIntentChannel, completeThreadWorkspaceIntent, failThr
 import { completeThreadFork, getThreadFork, getThreadForkByTarget, listThreadForks, saveThreadFork } from "./store-forks.ts";
 import { beginThreadMerge, claimThreadMergeDispatchIntent, ensureThreadListen, getThreadListen, getThreadMergeEvent, isThreadMergeEventPending, listPendingThreadMergeEvents, listThreadMergeEvents, markThreadMergeEventDelivered, saveThreadMergeEvent, setThreadListen } from "./store-thread-listen.ts";
 import { addThreadReferences, deleteThreadReferences, getThreadReferences, isThreadReferencesDeleted } from "./store-references.ts";
+import * as storeWatch from "./store-watch.ts";
+import type { WatchCheckCompletion, WatchCreateResult, WatchListItem, WatchRecord } from "../watch/types.ts";
 import type { ThreadReference, ThreadReferences } from "../references/types.ts";
 import { bindLoopTask, bindLoopWorkspace, claimLoopInputIntent, commitLoopScan, completeLoopThreadCreation, getLoopBinding, getLoopInput, getLoopTaskRoute, getLoopThreadCreation, isLoopInputObserved, listLoopBindings, listLoopInputs, listLoopThreadCreations, listLoopThreadTasks, markLoopInputDelivered, markLoopInputFault, markLoopInputPending, markLoopInputUnknown, markLoopThreadCreationUnknown, prepareLoopInput, recordLoopThreadAllocated, reserveLoopThreadCreation } from "./store-loop.ts";
 
@@ -894,6 +896,86 @@ export class ChannelStore {
 
   listTaskQuestions(taskId: string): QuestionRecord[] {
     return listTaskQuestions(this.db, taskId);
+  }
+
+  createWatch(record: WatchRecord): WatchCreateResult {
+    return storeWatch.createWatch(this.db, record);
+  }
+
+  claimDueWatches(now: number, limit = 2, botUid?: string): WatchRecord[] {
+    return storeWatch.claimDueWatches(this.db, now, limit, botUid);
+  }
+
+  setWatchProcess(id: string, generation: number, process: WatchRecord["process"]): boolean {
+    return storeWatch.setWatchProcess(this.db, id, generation, process);
+  }
+
+  finishWatchCheck(id: string, generation: number, completion: WatchCheckCompletion, finishedAt: number): WatchRecord | null {
+    return storeWatch.finishWatchCheck(this.db, id, generation, completion, finishedAt);
+  }
+
+  stopWatches(botUid: string, target: ChatTarget, id: string | "all", now: number, reason: string): WatchRecord[] {
+    return storeWatch.stopWatches(this.db, botUid, target, id, now, reason);
+  }
+
+  wakeAllowed(id: string, now: number): boolean {
+    return storeWatch.wakeAllowed(this.db, id, now);
+  }
+
+  markWatchWakeTask(id: string, taskId: string, now?: number): boolean {
+    return storeWatch.markWatchWakeTask(this.db, id, taskId, now);
+  }
+
+  markWatchWakeDispatched(id: string, taskId: string, now: number): boolean {
+    return storeWatch.markWatchWakeDispatched(this.db, id, taskId, now);
+  }
+
+  markWatchWakeFailed(id: string, reason: string): boolean {
+    return storeWatch.markWatchWakeFailed(this.db, id, reason);
+  }
+
+  deleteWatchChat(botUid: string, target: ChatTarget, now: number): void {
+    storeWatch.deleteWatchChat(this.db, botUid, target, now);
+  }
+
+  isWatchChatDeleted(botUid: string, target: ChatTarget): boolean {
+    return storeWatch.isWatchChatDeleted(this.db, botUid, target);
+  }
+
+  getWatch(botUid: string, id: string): WatchRecord | null {
+    return storeWatch.getWatch(this.db, botUid, id);
+  }
+
+  listWatches(botUid: string, target: ChatTarget, limit: number, offset: number): WatchListItem[] {
+    return storeWatch.listWatches(this.db, botUid, target, limit, offset);
+  }
+
+  listWatchRecords(botUid?: string): WatchRecord[] {
+    return storeWatch.listWatchRecords(this.db, botUid);
+  }
+
+  listActiveWatchRecords(botUid?: string): WatchRecord[] {
+    return storeWatch.listActiveWatchRecords(this.db, botUid);
+  }
+
+  listWatchProcessRecords(botUid?: string): WatchRecord[] {
+    return storeWatch.listWatchProcessRecords(this.db, botUid);
+  }
+
+  markWatchUnknown(id: string, generation: number, reason: string, now: number): boolean {
+    return storeWatch.markWatchUnknown(this.db, id, generation, reason, now);
+  }
+
+  recoverWatchProcess(id: string, generation: number, now: number): WatchRecord | null {
+    return storeWatch.recoverWatchProcess(this.db, id, generation, now);
+  }
+
+  expireWatchRecords(now: number): void {
+    storeWatch.expireWatchRecords(this.db, now);
+  }
+
+  getWatchMatchEvent(id: string): storeWatch.WatchMatchEvent | null {
+    return storeWatch.getWatchMatchEvent(this.db, id);
   }
 
   getBotEventCursor(botUid: string): number {

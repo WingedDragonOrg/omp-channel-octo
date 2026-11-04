@@ -75,18 +75,28 @@ export interface CommandResult {
   timedOut: boolean;
   aborted: boolean;
   executionStarted: boolean;
+  /** Present only when a configured byte budget was exceeded while draining output. */
+  outputExceeded?: boolean;
 }
 
 export interface RunCommandOptions {
   timeoutMs: number;
   signal?: AbortSignal;
   cwd?: string;
+  /** Environment for the child process; callers that run OMP commands must use workerEnv(). */
+  env?: Record<string, string>;
   /** Establish a guarded process group and parent-death watchdog before running the command. */
   parentDeathWatchdog?: boolean;
+  /** Test seam for the parent-death watchdog spawn; production uses the real watchdog script. */
+  watchdogSpawn?: () => RpcChild;
   /** Label for guarded-process diagnostics; defaults to the historical merge wording. */
   operation?: string;
   /** Capture at most this much text per output stream while still draining it to EOF. */
   maxOutputChars?: number;
+  /** Called immediately when either configured byte budget is crossed. */
+  onOutputExceeded?: () => void;
+  /** Capture at most this many raw bytes per stream while still draining it to EOF. */
+  maxOutputBytes?: { stdout: number; stderr: number };
   lifecycle?: WorktreeRemovalLifecycle;
   /** A successful wt cleanup must finish its real filesystem work before the process group settles. */
   waitForBackgroundCleanup?: {
@@ -99,6 +109,7 @@ type ProcessCompletion = {
   stdout: string;
   stderr: string;
   exitCode: number;
+  outputExceeded?: boolean;
 };
 
 async function readToEnd(
@@ -119,6 +130,33 @@ async function readToEnd(
     chunks.push(visible);
     captured += visible.length;
   }
+}
+type BoundedOutput = { text: string; exceeded: boolean };
+
+async function readBytesToEnd(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  maxBytes: number,
+  onExceeded?: () => void,
+): Promise<BoundedOutput> {
+  const bytes = new Uint8Array(maxBytes);
+  let captured = 0;
+  let exceeded = false;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    const available = Math.max(0, maxBytes - captured);
+    const copied = Math.min(available, value.byteLength);
+    if (copied > 0) {
+      bytes.set(value.subarray(0, copied), captured);
+      captured += copied;
+    }
+    if (copied < value.byteLength && !exceeded) {
+      exceeded = true;
+      onExceeded?.();
+    }
+  }
+  return { text: new TextDecoder().decode(bytes.subarray(0, captured)), exceeded };
 }
 
 async function within<T>(
@@ -205,6 +243,7 @@ export async function runCommand(
       stderr: "pipe",
       detached,
       ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+      ...(options.env === undefined ? {} : { env: options.env }),
     });
   } catch {
     if (guarded) options.lifecycle?.onNotSpawned();
@@ -213,13 +252,22 @@ export async function runCommand(
 
   const stdoutReader = child.stdout.getReader();
   const stderrReader = child.stderr.getReader();
-  const stdoutPromise = readToEnd(stdoutReader, options.maxOutputChars);
-  const stderrPromise = readToEnd(stderrReader, options.maxOutputChars);
+  const stdoutPromise = options.maxOutputBytes === undefined
+    ? readToEnd(stdoutReader, options.maxOutputChars).then((text) => ({ text, exceeded: false }))
+    : readBytesToEnd(stdoutReader, options.maxOutputBytes.stdout, options.onOutputExceeded);
+  const stderrPromise = options.maxOutputBytes === undefined
+    ? readToEnd(stderrReader, options.maxOutputChars).then((text) => ({ text, exceeded: false }))
+    : readBytesToEnd(stderrReader, options.maxOutputBytes.stderr, options.onOutputExceeded);
   const completion: Promise<ProcessCompletion> = Promise.all([
     stdoutPromise,
     stderrPromise,
     child.exited,
-  ]).then(([stdout, stderr, exitCode]) => ({ stdout, stderr, exitCode }));
+  ]).then(([stdout, stderr, exitCode]) => ({
+    stdout: stdout.text,
+    stderr: stderr.text,
+    exitCode,
+    ...(stdout.exceeded || stderr.exceeded ? { outputExceeded: true } : {}),
+  }));
   void completion.catch(() => {});
 
   let watchdog: RpcChild | undefined;
@@ -289,12 +337,18 @@ export async function runCommand(
       await stopBeforeStart(snapshot?.pgid === child.pid);
       throw new Error(`${operation} 进程身份无法确认`);
     }
+    try {
+      options.lifecycle?.onSpawn(processIdentity(child.pid, snapshot.pgid, snapshot.identity, options.cwd ?? ""));
+    } catch (error) {
+      await stopBeforeStart(true);
+      throw error;
+    }
     const watchdogStart = await createWatchdog(
       child.pid,
       snapshot.pgid,
       parent.identity,
       WORKTRUNK_TIMEOUT_DEFAULTS.probeMs,
-      undefined,
+      options.watchdogSpawn,
       COMMAND_GROUP_STOP_MS,
       false, // wt may leave legitimate cleanup children after its leader exits.
     );
@@ -303,12 +357,6 @@ export async function runCommand(
       throw new Error(`${operation} 进程监护不可用`);
     }
     watchdog = watchdogStart.watchdog;
-    try {
-      options.lifecycle?.onSpawn(processIdentity(child.pid, snapshot.pgid, snapshot.identity, options.cwd ?? ""));
-    } catch (error) {
-      await stopBeforeStart(true);
-      throw error;
-    }
     if (signalIsAborted(options.signal)) {
       await stopBeforeStart(true);
       throw new Error(`${operation} 已取消`);

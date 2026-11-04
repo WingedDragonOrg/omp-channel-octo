@@ -22,6 +22,7 @@ import { isTransientServerFailure } from "./errors.ts";
 import type { ChannelStore } from "./store/index.ts";
 import type { TaskRecord } from "./store/store-records.ts";
 import type { ThreadWorkspaceRecord } from "./store/store-records.ts";
+import type { WatchCreateArgs, WatchCreateResult, WatchListItem, WatchRecord } from "./watch/types.ts";
 import type { DestructiveResourceLease } from "./tasks/task-scheduler.ts";
 import { threadWorkspaceIsAvailable } from "./session/session-lifecycle.ts";
 import {
@@ -43,6 +44,14 @@ import {
 } from "./threads/thread-workspace-cleanup.ts";
 import { LoopThreadBindings } from "./loop/thread-bindings.ts";
 import type { LoopTaskKey, LoopTaskRoute, LoopThreadCreation } from "./loop/types.ts";
+/** The small chat-scoped watch surface consumed by host tools. */
+interface HostWatchPort {
+  create(task: TaskRecord, args: WatchCreateArgs, toolCallId?: string): Promise<WatchCreateResult>;
+  list(target: ChatTarget, limit?: number, offset?: number): WatchListItem[];
+  get(target: ChatTarget, id: string): WatchRecord | null;
+  stopWatch(target: ChatTarget, id: string | "all"): WatchRecord[];
+  deleteChat(target: ChatTarget): void;
+}
 /**
  * Host tools need only the channel capabilities they actually use. The service passes this port
  * while keeping task scheduling, session migration and outbound delivery internals private.
@@ -127,6 +136,7 @@ export interface HostToolHost {
     operationId: string,
   ): Promise<void>;
   replayThreadMergeSuccess(target: ChatTarget, operationId: string): Promise<string | null>;
+  readonly watches: HostWatchPort;
   /** Delivers through the destination chat's steer-or-task path; an optional guard is checked at acceptance. */
   deliverToChat(message: InboundMessage, deliveryGuard?: () => boolean): Promise<"steered" | "queued">;
   /**
@@ -178,6 +188,7 @@ const MANAGEMENT_BASE_ACTIONS = [
 const MANAGEMENT_DISPATCH_ACTION = "thread-dispatch";
 /** Synthetic inbound id prefix: a dispatched task must not dispatch further. */
 const DISPATCH_MESSAGE_PREFIX = "dispatch:";
+const WATCH_WAKE_MESSAGE_PREFIX = "watch:";
 const MAX_MANAGEMENT_MEMBERS = 200;
 const MAX_MANAGEMENT_THREADS = 50;
 const MAX_MANAGEMENT_NAME_CHARS = 200;
@@ -674,6 +685,142 @@ async function runLoopTaskThreadCreate(
 }
 
 
+function watchString(
+  args: Record<string, unknown>,
+  field: string,
+  required = false,
+): string | undefined {
+  const value = args[field];
+  if (value === undefined && !required) return undefined;
+  if (typeof value !== "string" || (required && value.trim().length === 0)) {
+    throw new Error(`${field} must be a non-empty string`);
+  }
+  return value;
+}
+
+function watchNumber(args: Record<string, unknown>, field: string): number | undefined {
+  const value = args[field];
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${field} must be a finite number`);
+  }
+  return value;
+}
+
+function createWatchTool(host: HostToolHost, task: TaskRecord, target: ChatTarget): HostTool {
+  return {
+    name: "watch",
+    description:
+      "管理当前聊天的语义 watch。仅在本次用户任务明确要求持续关注某个完成条件时 create；明确退出码、字段或事件可确定的场景应直接检查而不要用 watch。不要因链接出现、工作未结束或 watch 唤醒自行创建；watch 唤醒任务禁止创建后继 watch。脚本按已授权本机命令执行，可能有副作用。watch 配置关闭时仍可 list/get/stop。",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["create", "list", "get", "stop"] },
+        script: { type: "string", description: "固定 shell 脚本文本；与 command 二选一。" },
+        command: { type: "string", description: "程序路径或名称；与 script 二选一。" },
+        args: { type: "array", items: { type: "string" }, description: "command 的字面 argv，不会拼接成 shell 文本。" },
+        cwd: { type: "string", description: "采集工作目录；默认当前任务绑定目录。" },
+        condition: { type: "string", description: "用户明确提出的语义完成条件。" },
+        interval: { type: "number", description: "检查间隔秒数；默认 300，最短 60。" },
+        timeout: { type: "number", description: "总期限秒数；默认 21600，最大 86400。" },
+        id: { type: "string", description: "get/stop 的当前聊天 watch ID；stop 可用 all。" },
+        limit: { type: "integer", description: "list 每页上限，默认 20，最大 50。" },
+        offset: { type: "integer", description: "list 页码偏移，默认 0。" },
+      },
+      required: ["action"],
+      additionalProperties: false,
+    },
+    execute: async (args, signal, toolCallId) => {
+      throwIfAborted(signal);
+      const action = watchString(args, "action", true);
+      if (action === "create") {
+        if (task.messageId.startsWith(WATCH_WAKE_MESSAGE_PREFIX)) {
+          throw new Error("watch wake tasks cannot create another watch");
+        }
+        if (toolCallId === undefined || toolCallId.trim().length === 0) {
+          throw new Error("watch creation requires a native tool call identity");
+        }
+        const script = watchString(args, "script");
+        const command = watchString(args, "command");
+        if ((script === undefined) === (command === undefined)) {
+          throw new Error("exactly one of script or command is required");
+        }
+        const rawArgs = args.args;
+        if (rawArgs !== undefined && (
+          !Array.isArray(rawArgs) || rawArgs.some(value => typeof value !== "string")
+        )) {
+          throw new Error("args must be an array of strings");
+        }
+        const cwd = watchString(args, "cwd");
+        const interval = watchNumber(args, "interval");
+        const timeout = watchNumber(args, "timeout");
+        const createArgs: WatchCreateArgs = {
+          condition: watchString(args, "condition", true)!,
+          ...(script === undefined ? {} : { script }),
+          ...(command === undefined ? {} : { command }),
+          ...(rawArgs === undefined ? {} : { args: rawArgs as string[] }),
+          ...(cwd === undefined ? {} : { cwd }),
+          ...(interval === undefined ? {} : { interval }),
+          ...(timeout === undefined ? {} : { timeout }),
+        };
+        const result = await host.watches.create(task, createArgs, toolCallId);
+        if (result.record === null) {
+          throw new Error(result.kind === "quota-chat"
+            ? "当前聊天已达到有效 watch 配额"
+            : result.kind === "quota-bot"
+              ? "当前 Bot 已达到有效 watch 配额"
+              : "当前聊天已删除，不能创建 watch");
+        }
+        const record = result.record;
+        return JSON.stringify({
+          id: record.id,
+          chat: record.target,
+          created_at: new Date(record.createdAt).toISOString(),
+          deadline_at: new Date(record.deadlineAt).toISOString(),
+          interval_seconds: record.spec.intervalMs / 1_000,
+          max_checks: record.maxChecks,
+          state: record.state,
+        });
+      }
+      if (action === "list") {
+        const requestedLimit = watchNumber(args, "limit") ?? 20;
+        const offset = watchNumber(args, "offset") ?? 0;
+        if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 50) {
+          throw new Error("limit must be an integer between 1 and 50");
+        }
+        if (!Number.isInteger(offset) || offset < 0) {
+          throw new Error("offset must be a non-negative integer");
+        }
+        return JSON.stringify({
+          watches: host.watches.list(target, requestedLimit, offset),
+          limit: requestedLimit,
+          offset,
+        });
+      }
+      if (action === "get") {
+        const id = watchString(args, "id", true)!;
+        const record = host.watches.get(target, id);
+        if (record === null) throw new Error("watch not found in current chat");
+        return JSON.stringify(record);
+      }
+      if (action === "stop") {
+        const id = watchString(args, "id", true)!;
+        const stopped = host.watches.stopWatch(target, id);
+        return JSON.stringify({
+          watches: stopped.map(record => ({
+            id: record.id,
+            state: record.state,
+            wake_status: record.wakeStatus,
+            wake_task_id: record.wakeTaskId,
+            stop_reason: record.stopReason,
+          })),
+        });
+      }
+      throw new Error("action must be create, list, get or stop");
+    },
+  };
+}
+
 export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[] {
   const target = taskTarget(task);
   const fileTool: HostTool = {
@@ -777,17 +924,20 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
     execute: async (args, signal, toolCallId) => host.forkSession(task, args, signal, toolCallId),
   };
   const channelTool = createChannelTool(host);
+  const watchTool = createWatchTool(host, task, target);
   const parentGroupId =
     target.channelType === 2
       ? target.channelId
       : target.channelType === 5
         ? threadParentGroupId(target.channelId)
         : null;
-  if (parentGroupId === null) return [channelTool, fileTool, askTool];
+  if (parentGroupId === null) return [channelTool, fileTool, askTool, watchTool];
   const currentShortId =
     target.channelType === 5 ? threadShortId(target.channelId) : null;
-  // A task that was itself dispatched must not dispatch further: depth stays one.
-  const dispatchable = !task.messageId.startsWith(DISPATCH_MESSAGE_PREFIX);
+  // Dispatched tasks and watch wakes cannot dispatch further work.
+  const dispatchable =
+    !task.messageId.startsWith(DISPATCH_MESSAGE_PREFIX)
+    && !task.messageId.startsWith(WATCH_WAKE_MESSAGE_PREFIX);
   const actions = dispatchable
     ? [...MANAGEMENT_BASE_ACTIONS, MANAGEMENT_DISPATCH_ACTION]
     : [...MANAGEMENT_BASE_ACTIONS];
@@ -901,7 +1051,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
       pendingMergeLifecycles.delete(toolCallId);
     },
   };
-  return [channelTool, managementTool, fileTool, askTool, forkTool];
+  return [channelTool, managementTool, fileTool, askTool, forkTool, watchTool];
 }
 
 /**
@@ -1217,7 +1367,12 @@ async function runManagementTool(
       const shortId = threadId();
       const force = optionalBoolean("force") ?? false;
       await deleteThread(host, groupId, shortId, signal);
-      host.deleteThreadReferences({ channelId: threadChannelId(groupId, shortId), channelType: 5 });
+      const deletedTarget: ChatTarget = {
+        channelId: threadChannelId(groupId, shortId),
+        channelType: 5,
+      };
+      host.watches.deleteChat(deletedTarget);
+      host.deleteThreadReferences(deletedTarget);
       const cleaned = await cleanupThreadWorkspace(host, task, groupId, shortId, force, signal);
       return cleaned === null
         ? `已删除线程 ${shortId}`
