@@ -242,6 +242,11 @@ export class TaskScheduler {
     return Promise.allSettled([...this.taskOperations]);
   }
 
+  /** Waits only for this scheduled task, including release of its scheduler session lease. */
+  waitForTaskSettlement(taskId: string): Promise<void> {
+    return this.scheduledTasks.get(taskId)?.catch(() => {}) ?? Promise.resolve();
+  }
+
   /**
    * Install a FIFO intent before asynchronous root probes, then acquire exclusive ownership only
    * after earlier work and reservations clear. Later tasks cannot cross the intent meanwhile.

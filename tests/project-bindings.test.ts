@@ -106,6 +106,9 @@ class DelayedStopWorker implements OmpWorker {
       ? this.inner.resume(onEvent)
       : this.inner.resume(onEvent, context);
   }
+  btw(question: string, signal?: AbortSignal): Promise<string> {
+    return this.inner.btw(question, signal);
+  }
   goal(op: "get" | "pause" | "drop"): Promise<WorkerGoalResult> {
     return this.inner.goal(op);
   }
@@ -193,6 +196,9 @@ class StopFalseWorker implements OmpWorker {
     return context === undefined
       ? this.inner.resume(onEvent)
       : this.inner.resume(onEvent, context);
+  }
+  btw(question: string, signal?: AbortSignal): Promise<string> {
+    return this.inner.btw(question, signal);
   }
   goal(op: "get" | "pause" | "drop"): Promise<WorkerGoalResult> {
     return this.inner.goal(op);
@@ -283,6 +289,9 @@ class CommandSessionWorker implements OmpWorker {
     } else {
       await this.inner.resume(onEvent, context);
     }
+  }
+  btw(question: string, signal?: AbortSignal): Promise<string> {
+    return this.inner.btw(question, signal);
   }
   goal(op: "get" | "pause" | "drop"): Promise<WorkerGoalResult> {
     return this.inner.goal(op);

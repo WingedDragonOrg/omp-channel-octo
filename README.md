@@ -12,6 +12,7 @@
 - **执行反馈**：展示工具、待办和子代理进度；支持交互问答卡片，也可直接用文字作答。卡片能力取决于 Octo 部署，卡片失败不阻断正文。
 - **原生命令与通知**：未注册的 OMP slash 命令（如 `/autoresearch`）按独立任务原样转交 OMP 会话；扩展通知按级别标签独立投递，离线排队且跨服务重启可达。
 - **持续目标**：`/goal` 通过原生结构化 RPC 管理目标；支持创建时 token 预算、跨回合续跑、暂停恢复及在途目标的重启续接。
+- **旁路问答**：`/btw <问题>` 通过原生 RPC 读取当前聊天会话上下文，主任务运行时立即发起，问题与完整答案独立投递。
 - **群组上下文**：注入群与子区说明、增量聊天历史，按会话记录已读取的位置。
 - **成员与点名**：每条新任务和 steering 获取当前群或子区成员信息；普通回复可生成结构化 @成员提醒。
 - **隔离子区**：为子区创建 git worktree，派发任务，并通过 Worktrunk 合并和清理工作区。
@@ -124,6 +125,7 @@ oco run --config ~/.oco/config/config.json
 | `/goal set [--budget N] <目标>` | 创建目标并持续执行；`N` 为正整数 token 预算。 |
 | `/goal pause`、`/goal resume`、`/goal drop` | 暂停后续续跑、恢复或删除目标。 |
 | `/goal budget` | 查看预算；当前原生 RPC 仅支持创建时设置预算。 |
+| `/btw <问题>` | 在当前聊天原会话上发起一次旁路问答；主任务继续，独立展示问题与答案。 |
 | `/retry` | 由 OMP 重试当前会话上次失败或中止的回合；忙时作为独立任务排队。没有可重试回合时返回 OMP 提示。 |
 | `/commit` | 用 OMP 原生 commit 提交当前绑定的单仓库、单 worktree 工作区；同一张进度卡持续更新原生阶段及最终 HEAD 结果。资源忙碌时拒绝。 |
 | `/commit stop` | 停止本聊天当前提交；确认进程组退出后报告停止结果。已产生的提交保留，不影响其他聊天或无关任务。 |
@@ -141,6 +143,8 @@ oco run --config ~/.oco/config/config.json
 未注册的 `/xxx` 输入连同参数原样转交该聊天的 OMP 会话，由 OMP 分派命令或处理正文。权限与上表一致：私聊限 owner，群内成员不能执行 slash 命令。这类输入作为独立任务排队，不并入正在运行的回合。需要立刻停止当前工作时，先 `/cancel`（同时清除该聊天的排队消息），再发送目标命令。
 
 `/retry` 沿用当前绑定的 OMP 会话，由 OMP 决定可重试的回合与恢复方式。命令回执（如 `Retrying the last failed turn.`、`Nothing to retry.`）以 `OMP：` 通知独立投递，生成内容照常流式返回。若当前回合仍在运行，可先 `/interrupt`，再发送 `/retry`；执行时以 OMP 会话当时的状态为准。
+
+`/btw` 需要已有绑定的 OMP 会话。忙时直接使用该聊天的活 worker；空闲时精确打开原 session，回答后停止受管 worker。一次只运行一个旁路问题，主任务先完成仍会等已启动的旁路结束再释放会话。回答只使用原生权威终态，完整文本沿既有规则分段；不进入主任务输出、主 session 消息历史或 pending ask。`/cancel`、`/interrupt` 和服务停止会中止旁路；在途旁路不跨服务重启自动重放。
 
 `/commit` 必须已有明确的聊天目录绑定。shared、多仓库或多 worktree 工作区不支持；separate 的每个单项目子区以及正常单项目 linked worktree 可以使用。判断依据是持久工作区归属，而非背景说明或源仓库的 linked worktree 总数。命令不接受额外提交参数，不推送；停止或服务中断不回滚已发生的 Git 修改。已发出的提交在重启后不自动再次执行，结果不确定时先核对 Git 状态再决定是否发起新提交。
 
@@ -341,11 +345,12 @@ bun test
 
 测试覆盖权限、持久化、流式投递、重启恢复、工作区和 RPC 生命周期；HTTP/WebSocket 与真实子进程夹具不调用模型。
 
-目标生命周期另有显式真实 OMP 验收，使用隔离的配置/会话、localhost 模型替身和本地 Octo fixture，不需要模型凭据，也不连接常驻 Bot：
+目标与 BTW 生命周期另有显式真实 OMP 验收，使用隔离的配置/会话、有限 localhost 模型替身和本地 Octo fixture，不需要模型凭据，也不连接常驻 Bot：
 
 ```sh
 bun tests/benchmarks/goal.ts
 # 或 OMP_REAL_COMMAND=/绝对路径/omp bun tests/benchmarks/goal.ts
+bun tests/benchmarks/btw.ts
 bun tests/benchmarks/restart.ts
 ```
 

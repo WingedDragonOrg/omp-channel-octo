@@ -151,6 +151,22 @@ launchctl bootout "gui/$(id -u)/com.omp.channel-octo"
 
 入站记录绑定原始聊天、发送者、消息 ID、会话 ID 和目录；之后回复只使用该记录，不读取可变的“当前聊天”。群和线程输出对成员可见，不发送完整工具原始结果、模型思考或系统上下文；发送助手可见正文与真实工具执行的简短进度。进度不作为普通聊天文字，而是在首次真实工具进度时懒建同一张可编辑卡，后续按最新状态编辑；卡片不可用或状态接口故障不得阻断正文。助手正文仍可能包含用户明确要求的文件内容，不承诺自动识别所有敏感信息。
 
+### 原生 BTW 旁路问答 SDD（2026-11-04）
+
+**目标与入口。** owner-only `/btw <问题>` 使用 OMP 18.16.0 的原生 `{type:"btw",question}`，读取当前聊天会话上下文。权限沿用 owner、允许列表和 mention 门禁，命令沿用 durable claim 去重；不创建普通 task、不 steering、不消费 pending ask。空参数返回用法，没有已绑定原会话明确拒绝。
+
+**协议边界。** `OmpWorker.btw(question, signal?): Promise<string>` 独占本 worker 的一个旁路请求。`btw_record` / `btw_delta` 不进入主 WorkerEvent；忽略 delta，只在同一 record 的 `complete` 终态返回权威 `answer`。启动响应只用于关联 record ID，不能当作答案。处理 running 早于 response、快速终态、其他 record、重复终态、原生拒绝、进程退出及取消竞态；error/cancelled/interrupted 不展示部分答案为成功。AbortSignal 通过原生 `btw_cancel` 撤销已发起的旁路，关闭/崩溃须结算 waiter。
+
+**会话与生命周期。** 主任务运行时直接使用精确绑定的活 worker，不取得另一个 session lease、不排在主 prompt 后。主 prompt 先结束时，worker、chat/session lease 和资源使用保护保持至已启动 BTW 结算；旁路失败不能改变主任务结果。空闲时取得现有 chat/session lease，打开绑定的原 sessionFile，核验 session ID/file/cwd，沿用受管进程、watchdog 和 ledger，结束后确认停止再释放 lease。没有原文件不新建会话；会话切换、commit/merge/remove 的既有占用保护保持生效。停止/取消须中断旁路并释放 waiter、worker 和 lease，不自动重放在途 BTW。
+
+主任务尚在准备 worker、未进入原生 prompt 时返回忙碌提示，不把 BTW 排在整条任务之后。已完成 prompt 的任务仍在释放 worker/session lease 时，只等待该 taskId 的调度收尾；随后仍须核对请求时的原绑定，绑定已切换则拒绝，不读取替代会话。
+
+**回答投递。** 每次 BTW 以独立文本消息展示问题与完整权威答案，使用现有 durable outbox、UTF-8 安全分段及有限错误展示；与主任务消息 ID 和 task 输出完全分离，不写主任务 result、不作为 ask 回答。原生 BTW 可保存自己的 sidecar，但答案不进入主 session 消息历史。不增加 follow-up、历史列表、话题或 branch 操作。
+
+**验收。** 先观察 core/RPC 失败回归，再实现：held 主任务期间独立答案先到；主 prompt 先结束不杀 BTW；失败不伤主任务；pending ask 不变；空闲精确会话、空参数、缺失绑定、重复命令、并发 BTW、原生失败、取消/停止/崩溃均有明确结果且无资源泄漏。运行定向 core/RPC、typecheck、全量测试、既有 restart benchmark。隔离 profile/session＋有限 localhost 模型＋本地加密 Octo 夹具执行真实 OMP 烟测，核对 BTW 不写主消息历史；不注册/重启常驻 bot、不调用付费模型，模型质量和真实客户端视觉不由本地夹具证明。
+
+**隔离验收证据。** `bun run typecheck` 通过；独立 TMPDIR 下的全量 `bun test` 为 1491 pass、0 fail（111 文件、9020 条断言）。core/RPC 回归先观察缺失行为失败，另两条启动阶段和会话替换竞态也先复现再修复。`bun tests/benchmarks/btw.ts` 使用安装的真实 OMP、有限 localhost 模型及本地加密 Octo 完成 8 次模型请求：held 主任务旁路先答、主任务先结束仍保活、空闲精确原会话、14,419 字节答案完整分段、重复命令去重和停机原生取消均通过；主 session 历史内旁路答案为 0，剩余受管 worker 为 0。既有 restart benchmark 的 graceful/SIGKILL 两场景通过，恢复任务 2、恢复排队任务 2，会话重叠、重复副作用和中断通知均为 0。展示采用文本，真实 Octo 客户端视觉未验证；本地模型替身只证明协议、投递与生命周期，不证明模型质量。验收未注册或重启常驻 bot，未调用付费模型，未提交、推送、合并或部署。
+
 ### 原生代码提交命令 SDD
 
 **目标与范围**：owner 通过 `/commit` 提交当前聊天绑定的单仓库、单 worktree 工作区，通过 `/commit stop` 停止该聊天当前的提交操作。只提供这两种写法；其他参数返回用法。提交由已安装 OMP 的原生 commit 路径完成，channel 不用普通模型请求替代提交，也不自行生成 Git commit。命令不推送。

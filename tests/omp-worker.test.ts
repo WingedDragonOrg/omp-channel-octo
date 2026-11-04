@@ -16,6 +16,7 @@ import type {
 	WorkerProcess,
 } from "../src/contracts.ts";
 import type { RpcChild } from "../src/omp/process.ts";
+import { isRecord } from "../src/omp/rpc.ts";
 import { FakeWorkerFactory } from "./fixtures/core-fakes";
 
 const fixturePath = resolve(import.meta.dir, "fixtures/omp-rpc-worker.ts");
@@ -91,6 +92,7 @@ async function withHarness<T>(
 		cliEnv?: () => Record<string, string> | undefined;
 		model?: string;
 		goalContinuation?: boolean;
+		btwScenario?: string;
 		userConfig?: string;
 		/** Leaves the native tool-call identity off the frame, like a legacy host_tool_call. */
 		hostToolNoCallId?: boolean;
@@ -117,6 +119,7 @@ async function withHarness<T>(
 		conflictingSessionDir,
 		"--fixture-scenario",
 		scenario,
+		...(options.btwScenario === undefined ? [] : ["--fixture-btw-scenario", options.btwScenario]),
 		"--fixture-log",
 		logPath,
 		"--fixture-marker",
@@ -202,6 +205,30 @@ function rpcCommands(entries: LogEntry[], type: string): LogEntry[] {
 			: [];
 	});
 }
+
+
+
+function rpcOutputFrames(entries: LogEntry[]): LogEntry[] {
+	return entries.flatMap(entry => {
+		const frame = entry.frame;
+		return entry.kind === "out" && frame && typeof frame === "object" && !Array.isArray(frame)
+			? [frame as LogEntry]
+			: [];
+	});
+}
+function matchesBtwRecord(frame: LogEntry, predicate: (record: LogEntry) => boolean): boolean {
+	const record = frame.record;
+	return frame.type === "btw_record" && isRecord(record) && predicate(record);
+}
+
+async function waitForBtwResponse(logPath: string): Promise<void> {
+	await waitUntil(async () =>
+		rpcOutputFrames(await readLog(logPath)).some(
+			frame => frame.type === "response" && frame.command === "btw" && frame.success === true,
+		),
+	);
+}
+
 
 function goalOps(entries: LogEntry[]): unknown[] {
 	return rpcCommands(entries, "goal").map(command => command.op);
@@ -2534,6 +2561,309 @@ describe("OMP RPC worker", () => {
 			await waitForProcessExit(harness.spawned!.pid);
 			expect(processIsAlive(harness.spawned!.pid)).toBe(false);
 		});
+	});
+	test("does not settle BTW from its acknowledgement and waits for the complete record answer", async () => {
+		await withHarness(
+			"normal",
+			async harness => {
+				let settled = false;
+				const result = harness.worker.btw("what is the fixture answer?")
+					.then(answer => {
+						settled = true;
+						return answer;
+					})
+					.catch(error => {
+						settled = true;
+						throw error;
+					});
+
+				await waitForBtwResponse(harness.logPath);
+				expect(settled).toBe(false);
+				const frames = rpcOutputFrames(await readLog(harness.logPath));
+				const runningIndex = frames.findIndex(
+					frame => matchesBtwRecord(frame, record => record.status === "running"),
+				);
+				const responseIndex = frames.findIndex(
+					frame => frame.type === "response" && frame.command === "btw" && frame.success === true,
+				);
+				expect(runningIndex).toBeGreaterThanOrEqual(0);
+				expect(runningIndex).toBeLessThan(responseIndex);
+				await expect(result).resolves.toBe("fixture delayed authoritative answer");
+				expect(rpcCommands(await readLog(harness.logPath), "btw")).toMatchObject([
+					{ type: "btw", question: "what is the fixture answer?" },
+				]);
+			},
+			{ btwScenario: "btw-delayed" },
+		);
+	});
+
+	test("uses a complete BTW record that arrives before the initial response", async () => {
+		await withHarness(
+			"normal",
+			async harness => {
+				await expect(harness.worker.btw("complete before response")).resolves.toBe(
+					"fixture terminal-before-response answer",
+				);
+
+				const frames = rpcOutputFrames(await readLog(harness.logPath));
+				const terminalIndex = frames.findIndex(frame =>
+					matchesBtwRecord(
+						frame,
+						record =>
+							record.id === "fixture-btw-1" &&
+							record.status === "complete" &&
+							record.answer === "fixture terminal-before-response answer",
+					),
+				);
+				const responseIndex = frames.findIndex(
+					frame => frame.type === "response" && frame.command === "btw" && frame.success === true,
+				);
+				expect(terminalIndex).toBeGreaterThanOrEqual(0);
+				expect(terminalIndex).toBeLessThan(responseIndex);
+			},
+			{ btwScenario: "btw-terminal-before-response" },
+		);
+	});
+
+	test("aborting BTW before the initial response keeps its record correlated through cancellation", async () => {
+		await withHarness(
+			"normal",
+			async harness => {
+				const controller = new AbortController();
+				const first = harness.worker.btw("abort before start acknowledgement", controller.signal);
+				void first.catch(() => {});
+
+				await waitUntil(async () => {
+					const frames = rpcOutputFrames(await readLog(harness.logPath));
+					return (
+						frames.some(frame =>
+							matchesBtwRecord(
+								frame,
+								record => record.id === "fixture-btw-1" && record.status === "running",
+							),
+						) &&
+						!frames.some(frame => frame.type === "response" && frame.command === "btw")
+					);
+				});
+				controller.abort();
+
+				const cancelGatePath = `${harness.logPath}.btw-cancel`;
+				await waitUntil(async () => {
+					const entries = await readLog(harness.logPath);
+					return (
+						existsSync(cancelGatePath) &&
+						rpcCommands(entries, "btw_cancel").some(command => command.recordId === "fixture-btw-1")
+					);
+				});
+				const gatedEntries = await readLog(harness.logPath);
+				expect(rpcCommands(gatedEntries, "btw")).toHaveLength(1);
+				expect(
+					rpcOutputFrames(gatedEntries).some(
+						frame => frame.type === "response" && frame.command === "btw",
+					),
+				).toBe(false);
+
+				await rm(cancelGatePath, { force: true });
+				await expect(first).rejects.toThrow();
+				await expect(harness.worker.btw("after cancellation closed")).resolves.toBe(
+					"fixture answer to: after cancellation closed",
+				);
+
+				const entries = await readLog(harness.logPath);
+				expect(rpcCommands(entries, "btw").map(command => command.question)).toEqual([
+					"abort before start acknowledgement",
+					"after cancellation closed",
+				]);
+				expect(rpcCommands(entries, "btw_cancel")).toMatchObject([
+					{ type: "btw_cancel", recordId: "fixture-btw-1" },
+				]);
+				const frames = rpcOutputFrames(entries);
+				expect(
+					frames.some(
+						frame =>
+							frame.type === "response" &&
+							frame.command === "btw" &&
+							frame.success === false,
+					),
+				).toBe(true);
+				expect(
+					frames.some(frame =>
+						matchesBtwRecord(
+							frame,
+							record => record.id === "fixture-btw-1" && record.status === "cancelled",
+						),
+					),
+				).toBe(true);
+			},
+			{ btwScenario: "btw-abort-before-response" },
+		);
+	});
+	test("returns a fast authoritative BTW answer without adding it to the active worker event stream", async () => {
+		await withHarness(
+			"steer",
+			async harness => {
+				const events: WorkerEvent[] = [];
+				const prompt = harness.worker.prompt("start work", event => events.push(event));
+				await waitUntil(() => events.some(event => event.type === "text" && event.text === "fixture first turn"));
+
+				let answer: string;
+				try {
+					answer = await harness.worker.btw("ask beside the current turn");
+				} finally {
+					await harness.worker.steer("finish the primary turn");
+					await prompt;
+				}
+				expect(answer).toBe("fixture full authoritative answer");
+
+				const visibleText = events.flatMap(event => (event.type === "text" ? [event.text] : []));
+				expect(visibleText.join("")).not.toContain(answer);
+				expect(visibleText.some(text => text.includes("partial BTW preview"))).toBe(false);
+				expect(events.map(event => String(event.type))).not.toContain("btw_record");
+				expect(events.map(event => String(event.type))).not.toContain("btw_delta");
+				expect(rpcCommands(await readLog(harness.logPath), "btw")).toMatchObject([
+					{ type: "btw", question: "ask beside the current turn" },
+				]);
+			},
+			{ btwScenario: "btw-fast" },
+		);
+	});
+
+	test("ignores unrelated and repeated BTW terminal records while a later question is pending", async () => {
+		await withHarness(
+			"normal",
+			async harness => {
+				await expect(harness.worker.btw("first question")).resolves.toBe("fixture answer to: first question");
+				await expect(harness.worker.btw("second question")).resolves.toBe("fixture answer to: second question");
+
+				const frames = rpcOutputFrames(await readLog(harness.logPath));
+				expect(
+					frames.some(frame =>
+						matchesBtwRecord(
+							frame,
+							record => record.id === "fixture-btw-unrelated" && record.status === "complete",
+						),
+					),
+				).toBe(true);
+				expect(
+					frames.some(
+						frame =>
+							matchesBtwRecord(
+								frame,
+								record => record.id === "fixture-btw-1" && record.answer === "stale duplicate terminal",
+							),
+					),
+				).toBe(true);
+				expect(rpcCommands(await readLog(harness.logPath), "btw").map(command => command.question)).toEqual([
+					"first question",
+					"second question",
+				]);
+			},
+			{ btwScenario: "btw-isolation" },
+		);
+	});
+
+	test("rejects a native BTW busy response instead of returning an answer", async () => {
+		await withHarness(
+			"normal",
+			async harness => {
+				await expect(harness.worker.btw("a busy question")).rejects.toThrow();
+				expect(rpcCommands(await readLog(harness.logPath), "btw")).toHaveLength(1);
+			},
+			{ btwScenario: "btw-busy" },
+		);
+	});
+
+	test("rejects a native terminal BTW failure even after partial answer text", async () => {
+		await withHarness(
+			"normal",
+			async harness => {
+				await expect(harness.worker.btw("a question that fails")).rejects.toThrow();
+				const frames = rpcOutputFrames(await readLog(harness.logPath));
+				expect(
+					frames.some(
+						frame =>
+							matchesBtwRecord(
+								frame,
+								record =>
+									record.status === "error" &&
+									record.answer === "partial answer must not be returned",
+							),
+					),
+				).toBe(true);
+			},
+			{ btwScenario: "btw-native-error" },
+		);
+	});
+	test("rejects an interrupted BTW record instead of returning its partial answer", async () => {
+		await withHarness(
+			"normal",
+			async harness => {
+				await expect(harness.worker.btw("an interrupted question")).rejects.toThrow();
+				expect(
+					rpcOutputFrames(await readLog(harness.logPath)).some(
+						frame =>
+							matchesBtwRecord(
+								frame,
+								record =>
+									record.status === "interrupted" &&
+									record.answer === "interrupted partial answer",
+							),
+					),
+				).toBe(true);
+			},
+			{ btwScenario: "btw-interrupted" },
+		);
+	});
+
+	test("aborting an in-flight BTW sends native cancellation and rejects a racing late completion", async () => {
+		await withHarness(
+			"normal",
+			async harness => {
+				const controller = new AbortController();
+				const pending = harness.worker.btw("cancel this side question", controller.signal);
+				void pending.catch(() => {});
+				await waitForBtwResponse(harness.logPath);
+				controller.abort();
+
+				await expect(pending).rejects.toThrow();
+				const commands = rpcCommands(await readLog(harness.logPath), "btw_cancel");
+				expect(commands).toHaveLength(1);
+				expect(commands[0]).toMatchObject({ type: "btw_cancel", recordId: "fixture-btw-1" });
+			},
+			{ btwScenario: "btw-abort-race" },
+		);
+	});
+
+	test("stopping the RPC child rejects its pending BTW waiter", async () => {
+		await withHarness(
+			"normal",
+			async harness => {
+				const pending = harness.worker.btw("wait until worker shutdown");
+				void pending.catch(() => {});
+				await waitForBtwResponse(harness.logPath);
+				await harness.worker.stop();
+
+				await expect(pending).rejects.toThrow();
+				expect(rpcCommands(await readLog(harness.logPath), "btw")).toHaveLength(1);
+				await waitForProcessExit(harness.spawned!.pid);
+			},
+			{ btwScenario: "btw-hang" },
+		);
+	});
+
+	test("a crashed RPC child rejects its pending BTW waiter", async () => {
+		await withHarness(
+			"normal",
+			async harness => {
+				const pending = harness.worker.btw("wait until worker crash");
+				void pending.catch(() => {});
+				await waitForBtwResponse(harness.logPath);
+				await waitForProcessExit(harness.spawned!.pid);
+
+				await expect(pending).rejects.toThrow();
+			},
+			{ btwScenario: "btw-crash" },
+		);
 	});
 });
 

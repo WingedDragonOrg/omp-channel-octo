@@ -148,6 +148,7 @@ const COMMAND_HELP = [
   "/mode [steer|queue] · 查看或设置新消息的追加方式",
   "/goal [show|set [--budget N] <目标>|pause|resume|drop|budget [N|off]] · 管理本会话的原生目标",
   "/retry · 重试当前会话上次失败或中止的回合，忙时排队",
+  "/btw <问题> · 在当前绑定会话旁路提问",
   "/interrupt · 中断当前回合，保留排队消息",
   "/cancel（/stop） · 取消当前任务并清除排队消息",
   "/commit · 提交当前绑定项目",
@@ -173,6 +174,10 @@ const MODE_CARD_CHOICES: readonly { title: string; value: string }[] = [
 ];
 const QUEUE_USAGE = "用法：/queue <文本>；把该消息排到当前任务之后执行。";
 const COMMIT_USAGE = "用法：/commit（提交当前项目）或 /commit stop（停止当前聊天的提交）。";
+const BTW_USAGE = "用法：/btw <问题>；在当前绑定会话旁路提问，不注入主任务。";
+const BTW_BUSY_TEXT = "当前聊天已有 BTW 旁路问题正在处理，未重复启动。";
+const BTW_FAILURE_TEXT = "BTW 旁路问题未能完成，当前主任务不受影响。";
+const BTW_INTERRUPTED_TEXT = "已中断当前 BTW 旁路问题。";
 const DEFAULT_INTERRUPTED_TEXT = "已中断当前回合；已排队的消息会继续执行。";
 const DEFAULT_INTERRUPT_REJECTED_TEXT = "中断请求未被 OMP 接受，当前回合仍在运行。";
 const DEFAULT_INTERRUPT_IDLE_TEXT =
@@ -226,6 +231,10 @@ type RuntimeTask = {
   suspended: boolean;
   /** True only while this task's OMP prompt is in flight, so appended messages have a target. */
   promptInFlight: boolean;
+  /** Blocks new session operations while task cleanup waits for active BTW requests. */
+  closing: boolean;
+  /** Active side questions sharing this worker; cleanup must retain its lease until they settle. */
+  btwOperations: Set<Promise<void>>;
   /**
    * Why the running turn was asked to stop: `/interrupt`, or an `ask` wait that timed out.
    * `null` means no stop request is in effect.
@@ -243,6 +252,11 @@ type RuntimeTask = {
   stopText?: () => void;
   /** Closes the progress card of the round that just ended; a steered message starts a new round. */
   rollProgressCard?: () => void;
+};
+
+type BtwOperation = {
+  controller: AbortController;
+  done: Promise<void>;
 };
 
 class GoalDirectoryBusyError extends Error {
@@ -339,6 +353,8 @@ class CoreService implements ChannelService {
   /** Shutdown cancellation source for inbound I/O (downloads, transcription, mention-pref lookups). */
   private readonly shutdownController = new AbortController();
   private readonly runtimes = new Map<string, RuntimeTask>();
+  /** One in-flight native BTW per chat; its controller is shared with cancel/interrupt/shutdown. */
+  private readonly btwOperationsByTarget = new Map<string, BtwOperation>();
   /** In-flight native-state reads invalidated by a later explicit goal stop. */
   private readonly goalResumeChecks = new Map<string, { generation: number; active: number }>();
   /** Active host-first thread merges: /cancel, /interrupt and stop abort waits and wt execution. */
@@ -642,6 +658,7 @@ class CoreService implements ChannelService {
       // OMP runtime, native commit, thread operations, fork preparation and fork command receipts share the restart view.
       hasRunning: () =>
         this.runtimes.size > 0
+        || this.btwOperationsByTarget.size > 0
         || this.commitOperationsByTask.size > 0
         || this.threadMergeControllers.size > 0
         || this.threadRemovalControllers.size > 0
@@ -655,6 +672,7 @@ class CoreService implements ChannelService {
     // （不再包一层 async），`handleCommand` 里的 await 因此仍是原来的微任务边界；只有
     // `restart` 的返回值参与重启判定。
     this.builtinHandlers = {
+      btw: (message, argument) => this.handleBtw(message, argument),
       fork: (message, argument) => this.handleFork(message, argument),
       commit: (message, argument) => this.handleCommit(message, argument),
       new: (message, argument) => this.sessions.handleNew(message, argument),
@@ -941,9 +959,11 @@ class CoreService implements ChannelService {
       // 停机不是用户的 /cancel：只挂起。任务行保留 prompt 标记，由新进程按续接语义恢复；
       // 遗留提问保持 pending（beginRecovery 重挂），因此这里不再 durably 取消它们。
       runtime.suspended = true;
+      runtime.closing = true;
       runtime.stopText?.();
       runtime.stopActivity?.();
       this.questions.rejectForTask(runtime.taskId, new Error("channel stopping"));
+      if (runtime.btwOperations.size > 0) await Promise.allSettled([...runtime.btwOperations]);
       if (runtime.lease) {
         await runtime.lease.close().catch(() => false);
       }
@@ -1473,6 +1493,13 @@ class CoreService implements ChannelService {
     return true;
   }
 
+  private runtimeForTarget(target: ChatTarget): RuntimeTask | undefined {
+    const key = targetKey(target);
+    for (const runtime of this.runtimes.values()) {
+      if (targetKey(runtime.target) === key) return runtime;
+    }
+    return undefined;
+  }
   private hasRuntime(target: ChatTarget): boolean {
     const key = targetKey(target);
     for (const runtime of this.runtimes.values()) {
@@ -2074,6 +2101,8 @@ class CoreService implements ChannelService {
    * without stopping the worker, so a steered or queued message still gets its turn.
    */
   private async handleInterrupt(target: ChatTarget): Promise<void> {
+    const btwOperation = this.btwOperationsByTarget.get(targetKey(target));
+    btwOperation?.controller.abort(new Error("BTW interrupted"));
     const mergeCancelled = this.abortThreadMerges(target, new Error("thread merge interrupted"));
     const removalCancelled = this.abortThreadRemovals(target, new Error("thread removal interrupted"));
     const forkCancelled = this.threadForks.abortTarget(target, new Error("fork interrupted"));
@@ -2091,6 +2120,11 @@ class CoreService implements ChannelService {
     }
     const runtime = this.runningRuntime(target);
     if (!runtime?.lease) {
+      if (btwOperation) {
+        await btwOperation.done.catch(() => {});
+        this.outbox.enqueueText(target, BTW_INTERRUPTED_TEXT, null);
+        return;
+      }
       await this.outbox.enqueueText(
         target,
         hostOperationCancelled
@@ -2139,9 +2173,13 @@ class CoreService implements ChannelService {
     if (binding) this.invalidateGoalResumeChecks(runtime.target, binding.sessionId);
     runtime.stopCause = "question";
     runtime.workAfterStop = false;
+    runtime.closing = true;
     this.store.markTaskStopIntent(taskId, "question_timeout", cancelQuestionIds);
     const lease = runtime.lease;
-    void lease.worker.abortTurn().catch(() => {}).finally(() => lease.close().catch(() => false));
+    void lease.worker.abortTurn().catch(() => {}).finally(async () => {
+      if (runtime.btwOperations.size > 0) await Promise.allSettled([...runtime.btwOperations]);
+      await lease.close().catch(() => false);
+    });
   }
 
   /**
@@ -2577,12 +2615,25 @@ class CoreService implements ChannelService {
       }
       return operation(live, binding);
     }
+    return this.withBoundSessionWorker(target, binding, worker => operation(worker, binding));
+  }
 
+  /** Opens only the current binding's existing session under its session and worker ledger leases. */
+  private async withBoundSessionWorker<T>(
+    target: ChatTarget,
+    binding: BindingRecord,
+    operation: (worker: WorkerSession) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const botUid = this.bot?.uid;
+    if (!botUid) throw new Error("Bot identity unavailable");
+    if (signal?.aborted) throw signal.reason ?? new Error("旁路问题已取消");
     const sessionLease = await this.scheduler.tryAcquireCommandSession(target, [binding.cwd]);
     if (!sessionLease) throw new GoalDirectoryBusyError();
     let tracked: TrackedWorker | undefined;
     try {
       await sessionLease.ready;
+      if (signal?.aborted) throw signal.reason ?? new Error("旁路问题已取消");
       const current = this.store.getBinding(botUid, target);
       if (
         !current
@@ -2593,9 +2644,10 @@ class CoreService implements ChannelService {
       }
       if (!binding.sessionFile) throw new Error("当前绑定尚无可控制的 OMP 会话文件。");
       const sessionFile = await existingSessionFile(binding.sessionFile);
-      if (!sessionFile) throw new WorkerGoalError("identity-mismatch", "绑定的原生目标会话文件不存在");
+      if (!sessionFile) throw new WorkerGoalError("identity-mismatch", "绑定的 OMP 会话文件不存在");
       const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.options.config), binding.cwd);
       const model = this.store.resolveChatModel(botUid, target).model;
+      if (signal?.aborted) throw signal.reason ?? new Error("旁路问题已取消");
       tracked = await openTrackedWorker({
         workerFactory: this.options.workerFactory,
         store: this.store,
@@ -2608,12 +2660,13 @@ class CoreService implements ChannelService {
         },
         blockDirectory: cwd => this.blockedDirectories.add(cwd),
       });
+      if (signal?.aborted) throw signal.reason ?? new Error("旁路问题已取消");
       const state = await tracked.worker.refreshState();
       const verified = await verifyMovedSession(binding, state, binding.cwd);
       if (verified.sessionId !== binding.sessionId || verified.sessionFile !== sessionFile) {
         throw new WorkerGoalError("identity-mismatch", "打开的 OMP 会话与绑定身份不一致");
       }
-      return await operation(tracked.worker, binding);
+      return await operation(tracked.worker);
     } finally {
       try {
         if (tracked && !(await tracked.close())) {
@@ -2623,6 +2676,133 @@ class CoreService implements ChannelService {
         sessionLease.complete();
       }
     }
+  }
+
+  private runtimeForBtw(target: ChatTarget): RuntimeTask | undefined {
+    const runtime = this.runningRuntime(target);
+    if (!runtime?.lease || runtime.closing || runtime.cancelRequested) return undefined;
+    return runtime;
+  }
+
+  private async handleBtw(message: InboundMessage, argument: string): Promise<void> {
+    const question = argument.trim();
+    if (!question) {
+      this.outbox.enqueueText(message, BTW_USAGE, null);
+      return;
+    }
+    const botUid = this.bot?.uid;
+    if (!botUid) throw new Error("Bot identity unavailable");
+    const binding = this.store.getBinding(botUid, message);
+    if (!binding) {
+      this.outbox.enqueueText(message, "当前聊天没有已绑定的 OMP 会话，无法旁路提问。", null);
+      return;
+    }
+    const key = targetKey(message);
+    if (this.btwOperationsByTarget.has(key)) {
+      this.outbox.enqueueText(message, BTW_BUSY_TEXT, null);
+      return;
+    }
+    const taskRuntime = this.runtimeForTarget(message);
+    const runtime = this.runtimeForBtw(message);
+    if (runtime && runtime.lease?.worker.sessionId !== binding.sessionId) {
+      this.outbox.enqueueText(message, BTW_FAILURE_TEXT, null);
+      return;
+    }
+    const pendingRuntime = runtime ? undefined : taskRuntime;
+    if (pendingRuntime && !pendingRuntime.closing) {
+      this.outbox.enqueueText(message, BTW_BUSY_TEXT, null);
+      return;
+    }
+    if (!runtime && !pendingRuntime && !binding.sessionFile) {
+      this.outbox.enqueueText(message, "当前绑定没有可复用的 OMP 会话文件，无法旁路提问。", null);
+      return;
+    }
+
+    const controller = new AbortController();
+    const signal = AbortSignal.any([
+      this.shutdownController.signal,
+      controller.signal,
+      ...((runtime ?? pendingRuntime) ? [(runtime ?? pendingRuntime)!.cancelController.signal] : []),
+    ]);
+    const completion = Promise.withResolvers<void>();
+    const done = completion.promise;
+    const operation: BtwOperation = { controller, done };
+    this.btwOperationsByTarget.set(key, operation);
+    runtime?.btwOperations.add(done);
+    void this.performBtw(message, question, binding, runtime, pendingRuntime, signal).then(
+      completion.resolve,
+      completion.reject,
+    );
+    try {
+      await done;
+    } finally {
+      if (this.btwOperationsByTarget.get(key) === operation) this.btwOperationsByTarget.delete(key);
+      runtime?.btwOperations.delete(done);
+      this.serviceRestart.maybeRunDeferred();
+    }
+  }
+
+  private async performBtw(
+    message: InboundMessage,
+    question: string,
+    binding: BindingRecord,
+    runtime: RuntimeTask | undefined,
+    pendingRuntime: RuntimeTask | undefined,
+    signal: AbortSignal,
+  ): Promise<void> {
+    let answer: string;
+    try {
+      if (signal.aborted || this.stopping) return;
+      if (pendingRuntime) {
+        await waitWithAbort(this.scheduler.waitForTaskSettlement(pendingRuntime.taskId), signal);
+        const botUid = this.bot?.uid;
+        if (!botUid) throw new Error("Bot identity unavailable");
+        const current = this.store.getBinding(botUid, message);
+        if (!current) {
+          this.outbox.enqueueText(message, "当前聊天没有已绑定的 OMP 会话，无法旁路提问。", null);
+          return;
+        }
+        if (!current.sessionFile) {
+          this.outbox.enqueueText(message, "当前绑定没有可复用的 OMP 会话文件，无法旁路提问。", null);
+          return;
+        }
+        if (
+          current.sessionId !== binding.sessionId
+          || current.sessionFile !== binding.sessionFile
+          || current.cwd !== binding.cwd
+        ) {
+          throw new WorkerGoalError("identity-mismatch", "等待收尾期间会话绑定已发生变化");
+        }
+      }
+      if (runtime) {
+        const worker = runtime.lease?.worker;
+        if (!worker || runtime.closing || runtime.cancelRequested) {
+          this.outbox.enqueueText(message, BTW_BUSY_TEXT, null);
+          return;
+        }
+        if (worker.sessionId !== binding.sessionId) {
+          throw new WorkerGoalError("identity-mismatch", "当前绑定会话与运行中的会话不一致");
+        }
+        answer = await worker.btw(question, signal);
+      } else {
+        answer = await this.withBoundSessionWorker(
+          message,
+          binding,
+          worker => worker.btw(question, signal),
+          signal,
+        );
+      }
+    } catch (error) {
+      if (signal.aborted || this.stopping) return;
+      this.outbox.enqueueText(
+        message,
+        error instanceof GoalDirectoryBusyError ? BTW_BUSY_TEXT : BTW_FAILURE_TEXT,
+        null,
+      );
+      return;
+    }
+    if (signal.aborted || this.stopping) return;
+    this.outbox.enqueueText(message, `BTW 问题：${question}\n\nBTW 答案：${answer}`, null);
   }
 
   private async handleGoal(message: InboundMessage, argument: string): Promise<void> {
@@ -3362,6 +3542,8 @@ class CoreService implements ChannelService {
 
   private async handleCancel(target: ChatTarget): Promise<void> {
     const binding = this.store.getBinding(this.bot!.uid, target);
+    const btwOperation = this.btwOperationsByTarget.get(targetKey(target));
+    btwOperation?.controller.abort(new Error("BTW cancelled"));
     if (binding) this.invalidateGoalResumeChecks(target, binding.sessionId);
     const mergeCancelled = this.abortThreadMerges(target, new Error("thread merge cancelled"));
     const removalCancelled = this.abortThreadRemovals(target, new Error("thread removal cancelled"));
@@ -3377,7 +3559,7 @@ class CoreService implements ChannelService {
     for (const taskId of queued) this.questions.cancelForTask(taskId, "cancelled");
     for (const taskId of queued) await this.notifyThreadOutcome(taskId);
     this.questions.cancelForTarget(target);
-    let active = false;
+    let active = btwOperation !== undefined;
     let commitStopUnconfirmed = false;
     let completedCommit: CommitOperation | undefined;
     const commitOperation = this.commitOperationsByTarget.get(targetKey(target));
@@ -3403,16 +3585,23 @@ class CoreService implements ChannelService {
       if (targetKey(runtime.target) !== targetKey(target)) continue;
       active = true;
       runtime.cancelRequested = true;
+      runtime.closing = true;
       runtime.cancelController.abort(new Error("task cancelled"));
       runtime.stopText?.();
       runtime.stopActivity?.();
       runtime.cancelReplySent = true;
       if (runtime.lease) {
-        void runtime.lease.close().catch(() => false);
+        const lease = runtime.lease;
+        if (runtime.btwOperations.size > 0) {
+          void Promise.allSettled([...runtime.btwOperations]).then(() => lease.close().catch(() => false));
+        } else {
+          void lease.close().catch(() => false);
+        }
       }
       this.questions.rejectForTask(runtime.taskId, new Error("task cancelled"));
       this.store.markCancelled(runtime.taskId);
     }
+    if (btwOperation) await btwOperation.done.catch(() => {});
     const response = commitStopUnconfirmed
       ? "无法确认提交进程已停止；排队任务已清除，工作树仍受保护。"
       : completedCommit?.result !== undefined
@@ -4955,6 +5144,8 @@ class CoreService implements ChannelService {
       isGoalTask: goalTask !== null,
       target,
       cwd: task.cwd,
+      closing: false,
+      btwOperations: new Set(),
       cancelRequested: false,
       cancelController: new AbortController(),
       cancelReplySent: false,
@@ -5062,6 +5253,8 @@ class CoreService implements ChannelService {
       });
       const worker = runtime.lease.worker;
       if (runtime.cancelRequested || this.stopping) {
+        runtime.closing = true;
+        if (runtime.btwOperations.size > 0) await Promise.allSettled([...runtime.btwOperations]);
         await runtime.lease.close();
         if (runtime.cancelRequested) this.store.markCancelled(taskId);
         return;
@@ -5315,10 +5508,12 @@ class CoreService implements ChannelService {
         await this.outbox.enqueueText(runtime.target, failure.notice, taskId);
       }
     } finally {
+      runtime.closing = true;
       progress.stop(!progress.finished);
       this.releaseProgressTail(target, taskId, progress.tail);
       this.typingLeases.release(runtime.target, `task:${taskId}`);
       this.questions.rejectForTask(taskId, new Error("task finished"));
+      if (runtime.btwOperations.size > 0) await Promise.allSettled([...runtime.btwOperations]);
       if (runtime.lease) await runtime.lease.close();
       this.outbox.releaseIfIdle(taskId);
       // Deregister before a creator-chat notice so a shared directory does not queue behind this run.

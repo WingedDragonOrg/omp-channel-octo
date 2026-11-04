@@ -85,6 +85,7 @@ async function withHarness<T>(
     sessionFile,
     sessionId,
     prompt: async () => {},
+    btw: async () => "fixture side answer",
     resume: async () => {},
     goal: async (): Promise<WorkerGoalResult> => ({ goal: null, state: null }),
     runGoal: async (_request: WorkerGoalRun): Promise<WorkerGoalResult> => ({ goal: null, state: null }),

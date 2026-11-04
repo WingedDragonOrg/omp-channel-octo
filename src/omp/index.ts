@@ -206,6 +206,26 @@ function startupAbortError(signal: AbortSignal): Error {
 	return signal.reason instanceof Error ? signal.reason : new Error("OMP worker startup aborted");
 }
 
+type ActiveBtw = {
+	question: string;
+	requestId: string | undefined;
+	recordId: string | undefined;
+	responseSettled: boolean;
+	responseSucceeded: boolean;
+	responseError: Error | undefined;
+	terminal: boolean;
+	terminalAnswer: string | undefined;
+	terminalError: Error | undefined;
+	cancelRequestSent: boolean;
+	cancelResponseSettled: boolean;
+	cancelError: Error | undefined;
+	abortError: Error | undefined;
+	settled: boolean;
+	resolve: (answer: string) => void;
+	reject: (error: Error) => void;
+	abortListener: (() => void) | undefined;
+};
+
 class RpcWorker implements OmpWorker {
 	#child: RpcChild;
 	#watchdog: RpcChild | undefined;
@@ -234,6 +254,7 @@ class RpcWorker implements OmpWorker {
 	#suppressCommandOutput = false;
 	#pending = new Map<string, PendingResponse>();
 	#activePrompt: PromptRun | undefined;
+	#activeBtw: ActiveBtw | undefined;
 	/** True after prompt acceptance or during an agent turn; false between turns and at settlement. */
 	#streaming = false;
 	#activeTools = new Map<string, HostTool>();
@@ -458,6 +479,64 @@ class RpcWorker implements OmpWorker {
 
 	async prompt(text: string, onEvent: (event: WorkerEvent) => void, context?: PromptContext): Promise<void> {
 		await this.#dispatchPrompt(text, onEvent, context, false);
+	}
+
+	btw(question: string, signal?: AbortSignal): Promise<string> {
+		if (this.#closed || this.#stopping) return Promise.reject(new Error("OMP worker is not running"));
+		if (this.#activeBtw) return Promise.reject(new Error("OMP worker already has a BTW question in progress"));
+		if (signal?.aborted) {
+			return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error("OMP BTW was aborted"));
+		}
+
+		const completion = Promise.withResolvers<string>();
+		const run: ActiveBtw = {
+			question,
+			requestId: undefined,
+			recordId: undefined,
+			responseSettled: false,
+			responseSucceeded: false,
+			responseError: undefined,
+			terminal: false,
+			terminalAnswer: undefined,
+			terminalError: undefined,
+			cancelRequestSent: false,
+			cancelResponseSettled: false,
+			cancelError: undefined,
+			abortError: undefined,
+			settled: false,
+			resolve: completion.resolve,
+			reject: completion.reject,
+			abortListener: undefined,
+		};
+		this.#activeBtw = run;
+		if (signal) {
+			run.abortListener = () =>
+				this.#abortBtw(
+					run,
+					signal.reason instanceof Error ? signal.reason : new Error("OMP BTW was aborted"),
+				);
+			signal.addEventListener("abort", run.abortListener, { once: true });
+			if (signal.aborted) run.abortListener();
+		}
+
+		void this.#request(
+			{ type: "btw", question },
+			DEFAULT_REQUEST_TIMEOUT_MS,
+			requestId => {
+				run.requestId = requestId;
+			},
+		)
+			.then(
+				response => {
+					if (!run.responseSettled) this.#handleBtwStartResponse(run, response);
+				},
+				error => this.#handleBtwStartFailure(run, asError(error, "OMP BTW request failed")),
+			)
+			.catch(error => this.#failBtw(run, asError(error, "OMP BTW request failed")));
+
+		return completion.promise.finally(() => {
+			if (signal && run.abortListener) signal.removeEventListener("abort", run.abortListener);
+		});
 	}
 
 	/**
@@ -839,6 +918,7 @@ class RpcWorker implements OmpWorker {
 
 	async #stopInternal(): Promise<boolean> {
 		this.#stopping = true;
+		if (this.#activeBtw) this.#failBtw(this.#activeBtw, new Error("OMP worker stopped"));
 		this.#abortHostCalls(new Error("worker stopped"));
 		const active = this.#activePrompt;
 		if (active) this.#rejectPrompt(active, new Error("OMP prompt cancelled"));
@@ -995,6 +1075,11 @@ class RpcWorker implements OmpWorker {
 			this.#handleResponse(frame);
 			return;
 		}
+		if (frame.type === "btw_record") {
+			this.#handleBtwRecord(frame);
+			return;
+		}
+		if (frame.type === "btw_delta") return;
 		if (frame.type === "extension_ui_request") {
 			this.#handleUiRequest(frame);
 			return;
@@ -1083,6 +1168,191 @@ class RpcWorker implements OmpWorker {
 		this.#emitWorkerEvent(active, frame);
 	}
 
+	#handleBtwStartResponse(run: ActiveBtw, frame: RpcFrame): void {
+		if (this.#activeBtw !== run || run.responseSettled) return;
+		run.responseSettled = true;
+		if (frame.command !== "btw") {
+			run.responseError = new Error("OMP BTW response acknowledged a different command");
+			run.terminal = true;
+			run.terminalError = run.responseError;
+			this.#maybeSettleBtw(run);
+			this.#releaseBtw(run);
+			return;
+		}
+		if (frame.success !== true) {
+			run.responseError = errorFromResponse(frame, "btw");
+			run.terminal = true;
+			run.terminalError = run.responseError;
+			this.#maybeSettleBtw(run);
+			this.#releaseBtw(run);
+			return;
+		}
+		const data = frame.data;
+		const record = isRecord(data) && isRecord(data.record) ? data.record : undefined;
+		if (!record || typeof record.id !== "string" || record.id.length === 0) {
+			run.responseError = new Error("OMP BTW response did not contain a record ID");
+			run.terminal = true;
+			run.terminalError = run.responseError;
+			this.#maybeSettleBtw(run);
+			this.#releaseBtw(run);
+			return;
+		}
+		if (run.recordId !== undefined && run.recordId !== record.id) {
+			run.responseError = new Error("OMP BTW record ID changed during startup");
+			run.terminal = true;
+			run.terminalError = run.responseError;
+			this.#maybeSettleBtw(run);
+			this.#releaseBtw(run);
+			return;
+		}
+		run.recordId = record.id;
+		run.responseSucceeded = true;
+		if (run.abortError) this.#sendBtwCancel(run);
+		this.#maybeSettleBtw(run);
+		this.#releaseBtw(run);
+	}
+
+	#handleBtwStartFailure(run: ActiveBtw, error: Error): void {
+		if (this.#activeBtw !== run || run.responseSettled) return;
+		run.responseSettled = true;
+		run.responseError = error;
+		run.terminal = true;
+		run.terminalError = error;
+		this.#maybeSettleBtw(run);
+		this.#releaseBtw(run);
+	}
+
+	#handleBtwRecord(frame: RpcFrame): void {
+		const run = this.#activeBtw;
+		if (!run || !isRecord(frame.record)) return;
+		const record = frame.record;
+		if (typeof record.id !== "string" || record.id.length === 0) return;
+		if (
+			run.recordId === undefined &&
+			record.status === "running" &&
+			record.question === run.question
+		) {
+			run.recordId = record.id;
+			if (run.abortError) this.#sendBtwCancel(run);
+		}
+		if (record.id !== run.recordId || run.terminal || record.status === "running") return;
+		run.terminal = true;
+		if (record.status === "complete") {
+			if (typeof record.answer === "string") run.terminalAnswer = record.answer;
+			else run.terminalError = new Error("OMP BTW completion did not contain an answer");
+		} else if (
+			record.status === "cancelled" ||
+			record.status === "error" ||
+			record.status === "interrupted"
+		) {
+			run.terminalError =
+				typeof record.error === "string" && record.error.length > 0
+					? new Error(record.error)
+					: new Error(`OMP BTW ended with status ${record.status}`);
+		} else {
+			run.terminalError = new Error("OMP BTW returned an invalid terminal record");
+		}
+		this.#maybeSettleBtw(run);
+		this.#releaseBtw(run);
+	}
+
+	#abortBtw(run: ActiveBtw, error: Error): void {
+		if (this.#activeBtw !== run || run.terminal || run.abortError) return;
+		run.abortError = error;
+		if (run.recordId) this.#sendBtwCancel(run);
+	}
+
+	#sendBtwCancel(run: ActiveBtw): void {
+		if (
+			this.#activeBtw !== run ||
+			run.cancelRequestSent ||
+			!run.recordId ||
+			run.terminal ||
+			this.#closed ||
+			this.#stopping
+		) {
+			return;
+		}
+		run.cancelRequestSent = true;
+		void this.#request(
+			{ type: "btw_cancel", recordId: run.recordId },
+			Math.min(1_000, this.#cancelTimeoutMs),
+		)
+			.then(
+				response => {
+					if (this.#activeBtw !== run) return;
+					run.cancelResponseSettled = true;
+					if (response.success !== true) {
+						run.cancelError = errorFromResponse(response, "btw_cancel");
+					} else if (!isRecord(response.data) || typeof response.data.cancelled !== "boolean") {
+						run.cancelError = new Error("OMP BTW cancellation returned an invalid response");
+					}
+					this.#maybeSettleBtw(run);
+					this.#releaseBtw(run);
+				},
+				error => {
+					if (this.#activeBtw !== run) return;
+					run.cancelResponseSettled = true;
+					run.cancelError = asError(error, "OMP BTW cancellation failed");
+					if (!run.settled) {
+						run.settled = true;
+						run.reject(run.cancelError);
+					}
+					this.#releaseBtw(run);
+				},
+			)
+			.catch(error => this.#failBtw(run, asError(error, "OMP BTW cancellation failed")));
+	}
+
+	#maybeSettleBtw(run: ActiveBtw): void {
+		if (
+			this.#activeBtw !== run ||
+			run.settled ||
+			!run.responseSettled ||
+			!run.terminal ||
+			(run.cancelRequestSent && !run.cancelResponseSettled)
+		) {
+			return;
+		}
+		const error =
+			run.cancelError ??
+			(!run.responseSucceeded ? run.responseError : undefined) ??
+			run.abortError ??
+			run.terminalError;
+		if (error) {
+			run.settled = true;
+			run.reject(error);
+			return;
+		}
+		if (typeof run.terminalAnswer !== "string") {
+			run.settled = true;
+			run.reject(new Error("OMP BTW completed without an answer"));
+			return;
+		}
+		run.settled = true;
+		run.resolve(run.terminalAnswer);
+	}
+
+	#releaseBtw(run: ActiveBtw): void {
+		if (
+			this.#activeBtw === run &&
+			run.responseSettled &&
+			run.terminal &&
+			(!run.cancelRequestSent || run.cancelResponseSettled)
+		) {
+			this.#activeBtw = undefined;
+		}
+	}
+
+	#failBtw(run: ActiveBtw, error: Error): void {
+		if (this.#activeBtw !== run) return;
+		if (!run.settled) {
+			run.settled = true;
+			run.reject(error);
+		}
+		this.#activeBtw = undefined;
+	}
+
 	#handleGoalUpdated(active: PromptRun, frame: RpcFrame): void {
 		try {
 			if (!("goal" in frame)) throw workerGoalError("invalid-response", "OMP goal_updated omitted its goal field");
@@ -1096,6 +1366,8 @@ class RpcWorker implements OmpWorker {
 
 	#handleResponse(frame: RpcFrame): void {
 		const id = typeof frame.id === "string" ? frame.id : undefined;
+		const activeBtw = this.#activeBtw;
+		if (id && activeBtw && activeBtw.requestId === id) this.#handleBtwStartResponse(activeBtw, frame);
 		if (id) {
 			const pending = this.#pending.get(id);
 			if (pending) {
@@ -1297,6 +1569,7 @@ class RpcWorker implements OmpWorker {
 		this.#rejectPending(error);
 		this.#abortHostCalls(error);
 		if (this.#activePrompt) this.#rejectPrompt(this.#activePrompt, error);
+		if (this.#activeBtw) this.#failBtw(this.#activeBtw, error);
 		void this.stop();
 	}
 }

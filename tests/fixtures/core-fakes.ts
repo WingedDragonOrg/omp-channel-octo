@@ -1044,6 +1044,16 @@ export interface FakeGoalRunRecord {
   promptContext: PromptContext | undefined;
 }
 
+export interface FakeBtwRunContext {
+  readonly question: string;
+  readonly sessionId: string;
+  readonly sessionFile: string;
+  readonly cwd: string;
+  readonly signal: AbortSignal | undefined;
+}
+
+export type FakeBtwHandler = (context: FakeBtwRunContext) => Promise<string> | string;
+
 interface FixtureGoalState {
   value: WorkerGoalResult;
 }
@@ -1099,6 +1109,8 @@ class FixtureWorker implements OmpWorker {
   abortCalls = 0;
   /** Selectors this session was asked to switch to, in order — the native `/switch` dispatches. */
   readonly switchDispatches: string[] = [];
+  /** Steering attempts visible at the worker boundary. */
+  readonly steerCalls: string[] = [];
   /** Native goal RPC controls requested in this session. */
   readonly goalOperations: Array<"get" | "pause" | "drop"> = [];
 
@@ -1129,6 +1141,8 @@ class FixtureWorker implements OmpWorker {
     private readonly waitBeforeStop: (sessionId: string) => Promise<void>,
     private readonly steerFailure: () => Error | undefined,
     private readonly beforeSteer: (text: string) => Promise<void>,
+    private readonly btwHandler: FakeBtwHandler,
+    private readonly recordBtw: (record: FakeBtwRunContext) => void,
   ) {
     this.sessionFile = options.sessionFile ?? join(options.sessionDir, `${sessionId}.session`);
     let persistedSessionId: string | undefined;
@@ -1206,6 +1220,17 @@ class FixtureWorker implements OmpWorker {
     };
     this.goalState.value = fakeGoalResult(goal);
     return this.goalState.value;
+  }
+  async btw(question: string, signal?: AbortSignal): Promise<string> {
+    const record: FakeBtwRunContext = {
+      question,
+      sessionId: this.sessionId,
+      sessionFile: this.sessionFile,
+      cwd: this.currentCwd,
+      signal,
+    };
+    this.recordBtw(record);
+    return this.btwHandler(record);
   }
 
   async runGoal(
@@ -1379,6 +1404,7 @@ class FixtureWorker implements OmpWorker {
       throw new Error("fixture worker is not streaming a turn");
     }
     if (this.stopped) throw new Error("fixture worker is stopped");
+    this.steerCalls.push(text);
     this.appendedMessages.push({
       text,
       sessionId: this.sessionId,
@@ -1451,8 +1477,11 @@ export class FakeWorkerFactory implements WorkerFactory {
   /** Options every creation was asked for, in call order, for model and target assertions. */
   readonly creations: WorkerOptions[] = [];
   readonly goalRuns: FakeGoalRunRecord[] = [];
+  readonly btwCalls: FakeBtwRunContext[] = [];
   /** A narrow shutdown seam for tests that need to hold the lease cleanup window open. */
   stopHandler: ((sessionId: string) => void | Promise<void>) | undefined = undefined;
+  /** Holds worker creation to exercise commands received before a task's first prompt. */
+  beforeCreate: (() => Promise<void>) | undefined;
   beforeSteer: ((text: string) => Promise<void>) | undefined;
   /** The native structured-goal behavior a test asks this fixture to perform. */
   goalHandler: FakeGoalHandler = async ({ request, current, emit, sessionId }) => {
@@ -1485,6 +1514,7 @@ export class FakeWorkerFactory implements WorkerFactory {
     emit({ type: "prompt_accepted" });
     return fakeGoalResult(goal);
   };
+  btwHandler: FakeBtwHandler = async ({ question }) => `Fixture BTW answer: ${question}`;
   private readonly goalRunWaiters: Array<{
     count: number;
     resolve: () => void;
@@ -1553,6 +1583,7 @@ export class FakeWorkerFactory implements WorkerFactory {
   async create(options: WorkerOptions): Promise<OmpWorker> {
     this.creations.push(options);
     if (this.createFailure) throw this.createFailure;
+    await this.beforeCreate?.();
     const worker = new FixtureWorker(
       options,
       this.promptHandler,
@@ -1581,6 +1612,10 @@ export class FakeWorkerFactory implements WorkerFactory {
       },
       async (text) => {
         await this.beforeSteer?.(text);
+      },
+      (context) => this.btwHandler(context),
+      (record) => {
+        this.btwCalls.push(record);
       },
     );
     this.workers.push(worker);

@@ -653,6 +653,8 @@ export interface OmpWorker {
     onEvent: (event: WorkerEvent) => void,
     context?: PromptContext,
   ): Promise<void>;
+  /** Runs an OMP-native side question without emitting its BTW frames into the main worker event stream. */
+  btw(question: string, signal?: AbortSignal): Promise<string>;
   /**
    * Resume the bound session's interrupted turn after a worker restart, without replaying the
    * original request: `/retry` is dispatched in the already-selected session, and OMP continues

@@ -39,6 +39,7 @@ class RefusingSteerFactory extends FakeWorkerFactory {
       },
       prompt: (text: string, onEvent: (event: WorkerEvent) => void, context?: PromptContext) =>
         context === undefined ? worker.prompt(text, onEvent) : worker.prompt(text, onEvent, context),
+      btw: (question: string, signal?: AbortSignal) => worker.btw(question, signal),
       resume: (onEvent: (event: WorkerEvent) => void, context?: PromptContext) =>
         context === undefined ? worker.resume(onEvent) : worker.resume(onEvent, context),
       goal: (op: "get" | "pause" | "drop"): Promise<WorkerGoalResult> => worker.goal(op),

@@ -219,6 +219,7 @@ if (argv[0] === "--fixture-descendant") {
 }
 
 const scenario = (flag("--fixture-scenario") ?? "normal") as Scenario;
+const btwScenario = flag("--fixture-btw-scenario") ?? scenario;
 const cwdArg = flag("--cwd") ? resolve(flag("--cwd")!) : process.cwd();
 const sessionDir = resolve(flag("--session-dir") ?? dirname(flag("--fixture-log") ?? cwdArg));
 const resumeArg = flag("--resume") ?? flag("--session");
@@ -318,6 +319,10 @@ let streaming = false;
  */
 let staleReplayId: string | undefined;
 let retryAvailable = true;
+let btwRequestCount = 0;
+let lastCompletedBtwRecord: Frame | undefined;
+const btwQuestions = new Map<string, string>();
+const btwStartCommandIds = new Map<string, string>();
 /** Subagent subscription level the fixture last accepted; lifecycle frames follow it. */
 let subagentSubscription = "off";
 type FixtureGoalStatus = "active" | "paused" | "budget-limited" | "complete" | "dropped";
@@ -2105,6 +2110,183 @@ function handleGoalCommand(id: string | undefined, command: Frame): void {
 	failure(id, "goal", "Invalid goal operation", "invalid_goal_operation");
 }
 
+function makeBtwRecord(
+	id: string,
+	question: string,
+	status: "running" | "complete" | "cancelled" | "error" | "interrupted",
+	answer = "",
+	error?: string,
+): Frame {
+	const timestamp = 1_800_000_000_000 + btwRequestCount;
+	return {
+		id,
+		question,
+		answer,
+		status,
+		createdAt: timestamp,
+		updatedAt: timestamp,
+		leafId: "fixture-session-leaf",
+		...(error === undefined ? {} : { error }),
+	};
+}
+
+function startBtw(commandId: string | undefined, question: string, recordId: string): void {
+	btwQuestions.set(recordId, question);
+	const record = makeBtwRecord(recordId, question, "running");
+	emitFrames([
+		{ type: "btw_record", record },
+		{ type: "response", id: commandId, command: "btw", success: true, data: { record } },
+	]);
+}
+
+function finishBtw(recordId: string, question: string, answer: string): Frame {
+	const record = makeBtwRecord(recordId, question, "complete", answer);
+	lastCompletedBtwRecord = record;
+	emit({ type: "btw_record", record });
+	return record;
+}
+
+function handleBtwCommand(commandId: string | undefined, command: Frame): void {
+	const question = typeof command.question === "string" ? command.question : "";
+	if (btwScenario === "btw-busy") {
+		failure(commandId, "btw", "A /btw question is still running; cancel it first", "btw_busy");
+		return;
+	}
+
+	const sequence = ++btwRequestCount;
+	const recordId = `fixture-btw-${sequence}`;
+	if (btwScenario === "btw-terminal-before-response") {
+		btwQuestions.set(recordId, question);
+		const running = makeBtwRecord(recordId, question, "running");
+		const complete = makeBtwRecord(
+			recordId,
+			question,
+			"complete",
+			"fixture terminal-before-response answer",
+		);
+		emitFrames([
+			{ type: "btw_record", record: running },
+			{ type: "btw_delta", recordId, delta: "terminal preview before response" },
+			{ type: "btw_record", record: complete },
+			{ type: "response", id: commandId, command: "btw", success: true, data: { record: running } },
+		]);
+		return;
+	}
+	if (btwScenario === "btw-abort-before-response" && sequence === 1) {
+		btwQuestions.set(recordId, question);
+		if (commandId) btwStartCommandIds.set(recordId, commandId);
+		emit({ type: "btw_record", record: makeBtwRecord(recordId, question, "running") });
+		return;
+	}
+	startBtw(commandId, question, recordId);
+
+	if (btwScenario === "btw-abort-before-response") {
+		setTimeout(() => finishBtw(recordId, question, `fixture answer to: ${question}`), 0);
+		return;
+	}
+
+	if (btwScenario === "btw-fast") {
+		emit({ type: "btw_delta", recordId, delta: "partial BTW preview" });
+		setTimeout(() => finishBtw(recordId, question, "fixture full authoritative answer"), 0);
+		return;
+	}
+	if (btwScenario === "btw-delayed") {
+		setTimeout(() => {
+			emit({ type: "btw_delta", recordId, delta: "partial BTW preview" });
+			finishBtw(recordId, question, "fixture delayed authoritative answer");
+		}, 120);
+		return;
+	}
+	if (btwScenario === "btw-isolation") {
+		if (sequence === 1) {
+			setTimeout(() => {
+				emit({
+					type: "btw_record",
+					record: makeBtwRecord("fixture-btw-unrelated", "unrelated question", "complete", "unrelated answer"),
+				});
+				finishBtw(recordId, question, `fixture answer to: ${question}`);
+			}, 0);
+			return;
+		}
+		if (sequence === 2 && lastCompletedBtwRecord) {
+			emit({
+				type: "btw_record",
+				record: { ...lastCompletedBtwRecord, answer: "stale duplicate terminal" },
+			});
+		}
+		setTimeout(() => finishBtw(recordId, question, `fixture answer to: ${question}`), 0);
+		return;
+	}
+	if (btwScenario === "btw-native-error") {
+		emit({ type: "btw_delta", recordId, delta: "partial answer must not be returned" });
+		emit({
+			type: "btw_record",
+			record: makeBtwRecord(
+				recordId,
+				question,
+				"error",
+				"partial answer must not be returned",
+				"fixture native BTW provider failure",
+			),
+		});
+		return;
+	}
+	if (btwScenario === "btw-interrupted") {
+		emit({ type: "btw_delta", recordId, delta: "interrupted partial answer" });
+		emit({
+			type: "btw_record",
+			record: makeBtwRecord(recordId, question, "interrupted", "interrupted partial answer"),
+		});
+		return;
+	}
+	if (btwScenario === "btw-abort-race") {
+		emit({ type: "btw_delta", recordId, delta: "fixture partial BTW preview" });
+		return;
+	}
+	if (btwScenario === "btw-hang") return;
+	if (btwScenario === "btw-crash") {
+		setTimeout(() => process.exit(71), 35);
+		return;
+	}
+	failure(commandId, "btw", `fixture does not implement BTW scenario ${btwScenario}`, "fixture_btw_scenario");
+}
+
+async function handleBtwCancel(commandId: string | undefined, command: Frame): Promise<void> {
+	const recordId = typeof command.recordId === "string" ? command.recordId : "";
+	if (
+		btwScenario === "btw-abort-before-response" &&
+		recordId &&
+		btwQuestions.has(recordId) &&
+		btwStartCommandIds.has(recordId)
+	) {
+		const logPath = flag("--fixture-log");
+		if (!logPath) throw new Error("pre-response abort fixture needs its log path");
+		await holdFixtureGate(`${logPath}.btw-cancel`);
+		const question = btwQuestions.get(recordId)!;
+		emit({ type: "btw_record", record: makeBtwRecord(recordId, question, "cancelled") });
+		response(commandId, "btw_cancel", { cancelled: true });
+		failure(
+			btwStartCommandIds.get(recordId),
+			"btw",
+			"fixture BTW was cancelled before its start response",
+			"btw_cancelled",
+		);
+		return;
+	}
+	if (btwScenario !== "btw-abort-race" || !recordId || !btwQuestions.has(recordId)) {
+		response(commandId, "btw_cancel", { cancelled: false });
+		return;
+	}
+	const question = btwQuestions.get(recordId)!;
+	const cancelled = makeBtwRecord(recordId, question, "cancelled", "fixture partial BTW preview");
+	const lateCompletion = makeBtwRecord(recordId, question, "complete", "late answer after cancellation");
+	emitFrames([
+		{ type: "btw_record", record: cancelled },
+		{ type: "btw_record", record: lateCompletion },
+		{ type: "response", id: commandId, command: "btw_cancel", success: true, data: { cancelled: true } },
+	]);
+}
+
 function handleCommand(command: Frame): void {
 	appendLog({ kind: "command", command });
 	const id = typeof command.id === "string" ? command.id : undefined;
@@ -2195,6 +2377,14 @@ function handleCommand(command: Frame): void {
 			return;
 		}
 		completeHostToolTurn(command);
+		return;
+	}
+	if (type === "btw") {
+		handleBtwCommand(id, command);
+		return;
+	}
+	if (type === "btw_cancel") {
+		void handleBtwCancel(id, command);
 		return;
 	}
 	if (type === "prompt") {

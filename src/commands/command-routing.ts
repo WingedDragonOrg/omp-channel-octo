@@ -54,9 +54,8 @@ export function parseCommand(text: string): { name: string; argument: string } |
  * 内建命令名 → canonical action 的唯一别名表：`new`/`reset` 与 `cancel`/`stop` 是仅有的
  * 同义写法，其余命令名与自身同名。
  *
- * 原生 OMP 命令（如 `/retry`）刻意不进表：表里没有的名字既不是内建、也不一定已注册，会按
- * 普通任务经唯一组装点交给 OMP，由 OMP 自己的命令分派处理；把原生命令收进来就等于从 OMP
- * 手里抢走它。
+ * 直接走 OMP prompt 分派的命令（如 `/retry`）不进表，保持普通任务的唯一组装路径。
+ * `/btw`、`/goal` 等由 channel 明确管理生命周期的结构化 RPC 入口则作为内建命令处理。
  */
 const BUILTIN_ALIASES = {
   new: "new",
@@ -71,6 +70,7 @@ const BUILTIN_ALIASES = {
   status: "status",
   help: "help",
   goal: "goal",
+  btw: "btw",
   restart: "restart",
   mode: "mode",
   queue: "queue",
