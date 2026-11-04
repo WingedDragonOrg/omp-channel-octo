@@ -182,6 +182,8 @@ Git 行数是 **`HEAD → 当前工作树` 的 tracked 净变化**，显示 `+N/
 
 GROUP.md / THREAD.md（包括固定 Memory 区段）在新 session 和 compact 边界读取当前聊天最新内容。普通回合沿用已加载说明，`/move` 和重启不触发新 session 刷新。需要及时查看更新时，助手可调用现有 `description-read`；工具结果追加到对话，写前读取凭据规则保持不变。`description-write` 持久写入与会话刷新分开，compact 读取失败会取消压缩并保留已有记忆。详见[当前事实与上下文稳定性规格](docs/specs/2026-11-04-group-thread-current-facts-design.md)。
 
+当前会话的手动 `/compact remote` 和自动压缩会在聊天中通知开始及原生确认的结果；压缩取消、跳过或失败时不会显示完成。通知只针对该聊天绑定的会话，投递使用既有消息队列。
+
 ### Loop workspace 与任务子区
 
 owner 在已开通主群执行 `/bind loop <选择器>`。UUID 直接验证；名称或裸 slug 通过当前 Bot 的授权 workspace 列表完整分页精确匹配，多个 workspace 匹配时拒绝歧义；支持与当前 API 部署同源的 `/fleet/<workspace-slug>/issues/<identifier>` 和 `/fleet/<workspace-slug>/projects/<project-id>` 链接。回执显示实际 workspace ID 和绑定群。重复绑定同一 workspace 保留关联并检查当前变化，显式绑定其他 workspace 切换该群的感知范围。

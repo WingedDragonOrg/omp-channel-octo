@@ -52,8 +52,10 @@ import {
 	HostCall,
 	PendingResponse,
 	PromptRun,
-	describeUiFailure,
+	compactionNoticeFromCommandOutput,
+	compactionNoticeFromFrame,
 	emitWorkerEvent,
+	describeUiFailure,
 	hostResult,
 	modelErrorFromFrame,
 	noticeEventFromFrame,
@@ -868,7 +870,11 @@ class RpcWorker implements OmpWorker {
 		}
 	}
 
-	#createPromptRun(onEvent: (event: WorkerEvent) => void, goalRun: boolean): PromptRun {
+	#createPromptRun(
+		onEvent: (event: WorkerEvent) => void,
+		goalRun: boolean,
+		manualCompact = false,
+	): PromptRun {
 		const completion = Promise.withResolvers<void>();
 		void completion.promise.catch(() => {});
 		return {
@@ -899,6 +905,13 @@ class RpcWorker implements OmpWorker {
 			nextTurnId: 0,
 			activeTurnId: undefined,
 			research: new ResearchTracker(),
+			compactions: new Map(),
+			manualCompact,
+			manualCompactStarted: false,
+			manualCompactEnded: false,
+			manualCompactCommandOutputSeen: false,
+			manualCompactAbortAcknowledged: false,
+			localCompletionRequested: false,
 		};
 	}
 	async #dispatchPrompt(
@@ -910,7 +923,13 @@ class RpcWorker implements OmpWorker {
 		if (this.#closed) throw new Error("OMP worker is not running");
 		if (this.#activePrompt) throw new Error("OMP worker already has a prompt in progress");
 		if (typeof text !== "string") throw new Error("OMP prompt text must be a string");
-		const run = this.#createPromptRun(onEvent, false);
+		const firstLineEnd = text.search(/[\r\n]/u);
+		const promptFirstLine = (firstLineEnd < 0 ? text : text.slice(0, firstLineEnd)).trimStart();
+		const run = this.#createPromptRun(
+			onEvent,
+			false,
+			/^\/compact(?:[\s:]|$)/iu.test(promptFirstLine),
+		);
 		this.#activePrompt = run;
 		this.#suppressCommandOutput = internalCommandOutput;
 		try {
@@ -970,6 +989,16 @@ class RpcWorker implements OmpWorker {
 		if (this.#closed) throw new Error("OMP worker is not running");
 		const response = await this.#request({ type: "abort" }, Math.min(1_000, this.#cancelTimeoutMs));
 		this.#assertSuccess(response, "abort");
+		const active = this.#activePrompt;
+		if (
+			active?.manualCompact
+			&& !active.manualCompactStarted
+			&& !active.manualCompactEnded
+			&& !active.settled
+		) {
+			active.manualCompactAbortAcknowledged = true;
+			if (active.localCompletionRequested) this.#completeLocalCommand(active);
+		}
 	}
 
 	async stop(): Promise<boolean> {
@@ -1194,6 +1223,25 @@ class RpcWorker implements OmpWorker {
 		}
 		if (frame.type === "command_output") {
 			const active = this.#activePrompt;
+			if (active?.manualCompact) {
+				// Native compact output can include provider-controlled error details.
+				// It has no request id, so suppress raw output for every compact builtin.
+				if (!active.settled) {
+					const notice = compactionNoticeFromCommandOutput(active, frame);
+					if (notice) {
+						try {
+							active.onEvent(notice);
+						} catch (error) {
+							this.#rejectPrompt(active, asError(error, "OMP event callback failed"));
+							return;
+						}
+						if (active.manualCompact && active.localCompletionRequested) {
+							this.#completeLocalCommand(active);
+						}
+					}
+				}
+				return;
+			}
 			// Native builtins output before acknowledging their prompt. Frames have no request
 			// id, so only collect during this prompt's dispatch, not a mid-turn /switch probe.
 			// `resume`'s internal `/retry` dispatch suppresses the receipt: it is control
@@ -1209,6 +1257,42 @@ class RpcWorker implements OmpWorker {
 		const active = this.#activePrompt;
 		if (frame.type === "goal_updated") {
 			if (active && !active.settled) this.#handleGoalUpdated(active, frame);
+			return;
+		}
+		if (
+			frame.type === "manual_compaction_start"
+			|| frame.type === "manual_compaction_end"
+			|| frame.type === "auto_compaction_start"
+			|| frame.type === "auto_compaction_end"
+		) {
+			if (!active || active.settled) return;
+			// RPC session events normally carry no session id because the worker is
+			// subscribed to its bound session. If one is supplied, never project a
+			// lifecycle frame from another session into this task.
+			if (typeof frame.sessionId === "string" && frame.sessionId !== this.#sessionId) return;
+			try {
+				const transition = compactionNoticeFromFrame(active, frame);
+				if (!transition) return;
+				if (transition.kind === "manual" && active.manualCompact) {
+					if (transition.phase === "start") {
+						active.manualCompactStarted = true;
+						active.manualCompactAbortAcknowledged = false;
+					} else {
+						active.manualCompactEnded = true;
+					}
+				}
+				active.onEvent(transition.event);
+				if (
+					transition.kind === "manual"
+					&& transition.phase === "end"
+					&& active.manualCompact
+					&& active.localCompletionRequested
+				) {
+					this.#completeLocalCommand(active);
+				}
+			} catch (error) {
+				this.#rejectPrompt(active, asError(error, "OMP event callback failed"));
+			}
 			return;
 		}
 		if (!active || active.settled) return;
@@ -1232,6 +1316,9 @@ class RpcWorker implements OmpWorker {
 			return;
 		}
 		if (frame.type === "agent_end") {
+			// A native compact command completes at its matching lifecycle end, not
+			// through an unrelated trailing agent_end frame.
+			if (active.manualCompact && !active.agentInvoked) return;
 			if (typeof frame.isTerminal === "boolean" || typeof frame.yielded === "boolean") {
 				active.waitForSessionSettled = true;
 			}
@@ -1636,6 +1723,18 @@ class RpcWorker implements OmpWorker {
 	 */
 	#completeLocalCommand(run: PromptRun): void {
 		if (run.settled) return;
+		if (run.manualCompact) {
+			run.localCompletionRequested = true;
+			// The native command returns locally while compaction continues in the background.
+			this.#streaming = false;
+			if (
+				!run.manualCompactEnded
+				&& !run.manualCompactCommandOutputSeen
+				&& !run.manualCompactAbortAcknowledged
+			) {
+				return;
+			}
+		}
 		try {
 			run.onEvent({ type: "local_command" });
 		} catch (error) {

@@ -1385,6 +1385,242 @@ describe("OMP RPC worker", () => {
 		});
 	});
 
+	test("surfaces a native manual compaction start as one safe worker notice", async () => {
+		await withHarness("compaction-start", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("start work", event => events.push(event));
+
+			const notices = events.filter(
+				(event): event is Extract<WorkerEvent, { type: "notice" }> => event.type === "notice",
+			);
+			expect(notices.map(({ text, level }) => ({ text, level }))).toEqual([
+				{ text: "上下文压缩已开始", level: "info" },
+			]);
+		});
+	});
+	test("suppresses untrusted output from native inline compact while retaining lifecycle notices", async () => {
+		await withHarness("compaction-manual-inline", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("/compact", event => events.push(event));
+
+			const notices = events.filter(
+				(event): event is Extract<WorkerEvent, { type: "notice" }> => event.type === "notice",
+			);
+			expect(notices.map(({ text, level }) => ({ text, level }))).toEqual([
+				{ text: "上下文压缩已开始", level: "info" },
+				{ text: "上下文压缩已完成", level: "info" },
+			]);
+			expect(events.filter(event => event.type === "local_command")).toEqual([{ type: "local_command" }]);
+			expect(JSON.stringify(events)).not.toContain("fixture-private-compaction-summary");
+			expect(JSON.stringify(events)).not.toContain("fixture-private-command-output");
+		});
+	});
+
+	test("waits for native compaction across modes and focus instructions", async () => {
+		await withHarness("compaction-manual", async harness => {
+			const events: WorkerEvent[] = [];
+			let settled = false;
+			const prompt = harness.worker.prompt("/compact remote preserve the important decisions", event => events.push(event)).then(() => {
+				settled = true;
+			});
+
+			await waitUntil(async () =>
+				(await readLog(harness.logPath)).some(entry => {
+					const frame = entry.frame as Record<string, unknown> | undefined;
+					return entry.kind === "out"
+						&& frame?.type === "response"
+						&& frame.command === "prompt"
+						&& typeof frame.data === "object"
+						&& frame.data !== null
+						&& (frame.data as Record<string, unknown>).agentInvoked === false;
+				}),
+			);
+			expect(settled).toBe(false);
+			await waitUntil(() => events.some(event => event.type === "notice" && event.text === "上下文压缩已开始"));
+			expect(settled).toBe(false);
+			expect(events.filter(event => event.type === "local_command")).toEqual([]);
+			await prompt;
+
+			const notices = events.filter(
+				(event): event is Extract<WorkerEvent, { type: "notice" }> => event.type === "notice",
+			);
+			expect(notices.map(({ text, level }) => ({ text, level }))).toEqual([
+				{ text: "上下文压缩已开始", level: "info" },
+				{ text: "上下文压缩已完成", level: "info" },
+			]);
+			expect(new Set(notices.map(event => event.messageId)).size).toBe(2);
+			expect(events.filter(event => event.type === "local_command")).toEqual([{ type: "local_command" }]);
+			expect(events.filter(event => event.type === "prompt_accepted")).toEqual([]);
+			expect(JSON.stringify(events)).not.toContain("fixture-private-compaction-summary");
+			expect(JSON.stringify(events)).not.toContain("fixture-private-command-output");
+			const softEvents: WorkerEvent[] = [];
+			let softSettled = false;
+			const softPrompt = harness.worker.prompt("/compact:soft preserve the important decisions", event => softEvents.push(event)).then(() => {
+				softSettled = true;
+			});
+			await waitUntil(() => softEvents.some(event => event.type === "notice" && event.text === "上下文压缩已开始"));
+			expect(softSettled).toBe(false);
+			expect(softEvents.filter(event => event.type === "local_command")).toEqual([]);
+			await softPrompt;
+			expect(softEvents.filter(event => event.type === "notice").map(event => event.type === "notice" ? event.text : "")).toEqual([
+				"上下文压缩已开始",
+				"上下文压缩已完成",
+			]);
+			expect(softEvents.filter(event => event.type === "local_command")).toEqual([{ type: "local_command" }]);
+
+			const snapEvents: WorkerEvent[] = [];
+			let snapSettled = false;
+			const snapPrompt = harness.worker.prompt("/compact snapcompact", event => snapEvents.push(event)).then(() => {
+				snapSettled = true;
+			});
+			await waitUntil(() => snapEvents.some(event => event.type === "notice" && event.text === "上下文压缩已开始"));
+			expect(snapSettled).toBe(false);
+			expect(snapEvents.filter(event => event.type === "local_command")).toEqual([]);
+			await snapPrompt;
+			expect(snapEvents.filter(event => event.type === "notice").map(event => event.type === "notice" ? event.text : "")).toEqual([
+				"上下文压缩已开始",
+				"上下文压缩已完成",
+			]);
+			expect(snapEvents.filter(event => event.type === "local_command")).toEqual([{ type: "local_command" }]);
+
+			const followingEvents: WorkerEvent[] = [];
+			await harness.worker.prompt("ordinary prompt\n/compact remote is not the first-line command", event => followingEvents.push(event));
+			expect(followingEvents.filter(event => event.type === "prompt_accepted")).toEqual([{ type: "prompt_accepted" }]);
+			expect(followingEvents.some(event => event.type === "text")).toBe(true);
+		});
+	});
+
+	test("reports distinct automatic compactions once using only their native outcomes", async () => {
+		await withHarness("compaction-auto", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("run automatic compactions", event => events.push(event));
+
+			const notices = events.filter(
+				(event): event is Extract<WorkerEvent, { type: "notice" }> => event.type === "notice",
+			);
+			expect(notices.map(({ text, level }) => ({ text, level }))).toEqual([
+				{ text: "上下文自动压缩已开始", level: "info" },
+				{ text: "上下文自动压缩已完成", level: "info" },
+				{ text: "上下文自动压缩已开始", level: "info" },
+				{ text: "上下文自动压缩已跳过", level: "warning" },
+				{ text: "上下文自动压缩已开始", level: "info" },
+				{ text: "上下文自动压缩已取消", level: "warning" },
+				{ text: "上下文自动压缩已开始", level: "info" },
+				{ text: "上下文自动压缩未成功", level: "error" },
+			]);
+			expect(new Set(notices.map(event => event.messageId)).size).toBe(8);
+			expect(events.filter(event => event.type === "prompt_accepted")).toEqual([{ type: "prompt_accepted" }]);
+			expect(events.filter(event => event.type === "local_command")).toEqual([]);
+			expect(JSON.stringify(notices)).not.toContain("fixture-private-compaction-summary");
+			expect(JSON.stringify(notices)).not.toContain("fixture-private-compaction-error");
+		});
+	});
+
+	test("settles a no-start native compact refusal without exposing command output", async () => {
+		await withHarness("compaction-no-start", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("/compact remote", event => events.push(event));
+
+			expect(events).toEqual([
+				{ type: "notice", messageId: expect.any(String), text: "上下文压缩未成功", level: "error" },
+				{ type: "local_command" },
+			]);
+			expect(JSON.stringify(events)).not.toContain("fixture-private-native-error");
+		});
+	});
+
+	test("settles native compact usage errors without waiting for compaction events", async () => {
+		await withHarness("compaction-invalid-usage", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("/compact snapcompact focus instructions", event => events.push(event));
+
+			expect(events).toEqual([
+				{ type: "notice", messageId: expect.any(String), text: "上下文压缩参数无效", level: "error" },
+				{ type: "local_command" },
+			]);
+			expect(JSON.stringify(events)).not.toContain("does not take focus instructions");
+		});
+	});
+
+	test("does not report success from native command output without a native result", async () => {
+		await withHarness("compaction-output-without-result", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("/compact remote", event => events.push(event));
+
+			expect(events).toEqual([
+				{ type: "notice", messageId: expect.any(String), text: "上下文压缩结果未确认", level: "warning" },
+				{ type: "local_command" },
+			]);
+			expect(JSON.stringify(events)).not.toContain("fixture-private-command-output");
+		});
+	});
+
+	test("does not hang a compact cancelled before start or invent a result when stopped", async () => {
+		await withHarness("compaction-abort-before-start", async harness => {
+			const events: WorkerEvent[] = [];
+			let settled = false;
+			const prompt = harness.worker.prompt("/compact remote", event => events.push(event)).then(() => {
+				settled = true;
+			});
+			await waitUntil(async () =>
+				(await readLog(harness.logPath)).some(entry => {
+					const frame = entry.frame as Record<string, unknown> | undefined;
+					return entry.kind === "out" && frame?.type === "response" && frame.command === "prompt";
+				}),
+			);
+			expect(settled).toBe(false);
+			await harness.worker.abortTurn();
+			await prompt;
+			expect(events).toEqual([{ type: "local_command" }]);
+		});
+
+		await withHarness("compaction-abort-start-race", async harness => {
+			const events: WorkerEvent[] = [];
+			let settled = false;
+			const prompt = harness.worker.prompt("/compact remote", event => events.push(event)).then(() => {
+				settled = true;
+			});
+			await waitUntil(async () =>
+				(await readLog(harness.logPath)).some(entry => entry.kind === "prompt" && entry.message === "/compact remote"),
+			);
+			await harness.worker.abortTurn();
+			await waitUntil(() => events.some(event => event.type === "notice" && event.text === "上下文压缩已开始"));
+			await waitUntil(async () =>
+				(await readLog(harness.logPath)).some(entry => {
+					const frame = entry.frame as Record<string, unknown> | undefined;
+					return entry.kind === "out"
+						&& frame?.type === "response"
+						&& frame.command === "prompt"
+						&& typeof frame.data === "object"
+						&& frame.data !== null
+						&& (frame.data as Record<string, unknown>).agentInvoked === false;
+				}),
+			);
+			expect(settled).toBe(false);
+			expect(events.filter(event => event.type === "local_command")).toEqual([]);
+			await prompt;
+			expect(events.filter(event => event.type === "notice").map(event => event.type === "notice" ? event.text : "")).toEqual([
+				"上下文压缩已开始",
+				"上下文压缩已取消",
+			]);
+			expect(events.filter(event => event.type === "local_command")).toEqual([{ type: "local_command" }]);
+		});
+
+		await withHarness("compaction-stop-after-start", async harness => {
+			const events: WorkerEvent[] = [];
+			const prompt = harness.worker.prompt("/compact remote", event => events.push(event)).then(
+				() => "resolved",
+				() => "rejected",
+			);
+			await waitUntil(() => events.some(event => event.type === "notice" && event.text === "上下文压缩已开始"));
+			expect(await harness.worker.stop()).toBe(true);
+			expect(await prompt).toBe("rejected");
+			expect(events.filter(event => event.type === "notice").map(event => event.type === "notice" ? event.text : "")).toEqual([
+				"上下文压缩已开始",
+			]);
+		});
+	});
+
 	test("surfaces /autoresearch notify frames as levelled worker notice events with preserved ids", async () => {
 		await withHarness("autoresearch", async harness => {
 			const events: WorkerEvent[] = [];

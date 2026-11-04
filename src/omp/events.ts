@@ -3,11 +3,19 @@
  * 运行里的 assistant 消息身份、工具摘要与 todo 明细。这里不写协议,也不做卡片布局。
  */
 
+import { randomUUID } from "node:crypto";
 import type { WorkerEvent, WorkerNoticeEvent } from "../contracts.ts";
 import type { ExecutionEvent, ExecutionTodoPhase, TodoOperation, TodoStatus } from "../cards/execution-tracker.ts";
 import type { ResearchTracker } from "../research/index.ts";
 import { isRecord, type RpcFrame } from "./rpc.ts";
 
+export type CompactionKind = "manual" | "auto";
+
+export type CompactionNoticeTransition = {
+	kind: CompactionKind;
+	phase: "start" | "end";
+	event: WorkerNoticeEvent;
+};
 export type PendingResponse = {
 	resolve: (frame: RpcFrame) => void;
 	reject: (error: Error) => void;
@@ -66,6 +74,15 @@ export type PromptRun = {
 	activeTurnId: string | number | undefined;
 	/** The prompt-scoped research stream: per-prompt cache, never shared across runs. */
 	research: ResearchTracker;
+	/** Per-run operation identities; duplicate starts and unmatched/duplicate ends are ignored. */
+	compactions: Map<CompactionKind, string>;
+	/** A native `/compact` invocation, whose output may contain provider-controlled errors. */
+	manualCompact: boolean;
+	manualCompactStarted: boolean;
+	manualCompactEnded: boolean;
+	manualCompactCommandOutputSeen: boolean;
+	manualCompactAbortAcknowledged: boolean;
+	localCompletionRequested: boolean;
 };
 
 export function hostResult(text: string): RpcFrame {
@@ -472,6 +489,113 @@ export function noticeEventFromFrame(frame: RpcFrame): WorkerNoticeEvent | undef
 	if (text.length === 0) return undefined;
 	const level = frame.notifyType === "warning" || frame.notifyType === "error" ? frame.notifyType : "info";
 	return { type: "notice", messageId: frame.id, text: truncateNoticeText(text), level };
+}
+
+/**
+ * Convert one native compaction lifecycle frame into a fixed, safe notice. Native payload fields
+ * (summary, focus, method, error text and token counts) are never rendered. A result is success
+ * only when the native end explicitly says `aborted: false` and includes its committed result.
+ */
+export function compactionNoticeFromFrame(
+	active: PromptRun,
+	frame: RpcFrame,
+): CompactionNoticeTransition | undefined {
+	let kind: CompactionKind;
+	let phase: "start" | "end";
+	switch (frame.type) {
+		case "manual_compaction_start":
+			kind = "manual";
+			phase = "start";
+			break;
+		case "manual_compaction_end":
+			kind = "manual";
+			phase = "end";
+			break;
+		case "auto_compaction_start":
+			kind = "auto";
+			phase = "start";
+			break;
+		case "auto_compaction_end":
+			kind = "auto";
+			phase = "end";
+			break;
+		default:
+			return undefined;
+	}
+
+	const label = kind === "auto" ? "上下文自动压缩" : "上下文压缩";
+	if (phase === "start") {
+		if (active.compactions.has(kind)) return undefined;
+		const operationId = randomUUID();
+		active.compactions.set(kind, operationId);
+		return {
+			kind,
+			phase,
+			event: {
+				type: "notice",
+				messageId: `omp-compaction:${operationId}:start`,
+				text: `${label}已开始`,
+				level: "info",
+			},
+		};
+	}
+
+	const operationId = active.compactions.get(kind);
+	if (!operationId) return undefined;
+	active.compactions.delete(kind);
+	const text = frame.aborted === true
+		? `${label}已取消`
+		: frame.skipped === true
+			? `${label}已跳过`
+			: frame.aborted === false && isRecord(frame.result)
+				? `${label}已完成`
+				: typeof frame.errorMessage === "string" || frame.willRetry === true
+					? `${label}未成功`
+					: `${label}结果未确认`;
+	const level = frame.aborted === true || frame.skipped === true
+		? "warning"
+		: frame.aborted === false && isRecord(frame.result)
+			? "info"
+			: typeof frame.errorMessage === "string" || frame.willRetry === true
+				? "error"
+				: "warning";
+	return {
+		kind,
+		phase,
+		event: {
+			type: "notice",
+			messageId: `omp-compaction:${operationId}:end`,
+			text,
+			level,
+		},
+	};
+}
+
+/** Fixed native command_output prefix: report only a safe terminal status, never its raw text. */
+export function compactionNoticeFromCommandOutput(
+	active: PromptRun,
+	frame: RpcFrame,
+): WorkerNoticeEvent | undefined {
+	if (
+		!active.manualCompact
+		|| active.manualCompactCommandOutputSeen
+		|| active.manualCompactStarted
+		|| active.manualCompactEnded
+		|| typeof frame.text !== "string"
+	) {
+		return undefined;
+	}
+	const usage = frame.text.startsWith("/compact ")
+		&& frame.text.includes(" does not take focus instructions");
+	const failed = frame.text.startsWith("Compaction failed:");
+	if (!failed && !usage && !frame.text.startsWith("Compaction complete.")) return undefined;
+	active.manualCompactCommandOutputSeen = true;
+	return {
+		type: "notice",
+		messageId: `omp-compaction:${randomUUID()}:end`,
+		text: usage ? "上下文压缩参数无效" : failed ? "上下文压缩未成功" : "上下文压缩结果未确认",
+		level: usage || failed ? "error" : "warning",
+	};
 }
 
 export function describeUiFailure(method: string): Error {

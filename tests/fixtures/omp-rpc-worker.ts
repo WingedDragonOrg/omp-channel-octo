@@ -12,6 +12,16 @@ import { dirname, join, resolve } from "node:path";
 type Frame = Record<string, unknown>;
 
 type Scenario =
+	| "compaction-abort-before-start"
+	| "compaction-abort-start-race"
+	| "compaction-auto"
+	| "compaction-manual"
+	| "compaction-manual-inline"
+	| "compaction-no-start"
+	| "compaction-invalid-usage"
+	| "compaction-output-without-result"
+	| "compaction-start"
+	| "compaction-stop-after-start"
 	| "normal"
 	| "fork"
 	| "fork-not-ready"
@@ -1655,6 +1665,85 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		setTimeout(() => emit({ type: "prompt_result", id, agentInvoked: false }), 1);
 		return;
 	}
+	if (scenario === "compaction-manual-inline" && message === "/compact") {
+		emit({ type: "manual_compaction_start", sessionId });
+		emit({ type: "manual_compaction_start", sessionId });
+		const result = {
+			type: "manual_compaction_end",
+			sessionId,
+			aborted: false,
+			result: { summary: "fixture-private-compaction-summary" },
+		};
+		emit(result);
+		emit(result);
+		emit({ type: "command_output", text: "Compaction complete. fixture-private-command-output" });
+		response(id, "prompt", { agentInvoked: false });
+		return;
+	}
+	const firstLineEnd = message.search(/[\r\n]/u);
+	const compactFirstLine = (firstLineEnd < 0 ? message : message.slice(0, firstLineEnd)).trimStart();
+	if (scenario === "compaction-manual" && /^\/compact(?:[\s:]|$)/iu.test(compactFirstLine)) {
+		response(id, "prompt", { agentInvoked: false });
+		setTimeout(() => {
+			// The wrong session is not part of this worker's subscribed session.
+			emit({ type: "manual_compaction_start", sessionId: "fixture-other-session" });
+			emit({ type: "manual_compaction_start", sessionId });
+			emit({ type: "manual_compaction_start", sessionId });
+			setTimeout(() => {
+				emit({
+					type: "manual_compaction_end",
+					sessionId,
+					aborted: false,
+					result: { summary: "fixture-private-compaction-summary" },
+				});
+				emit({
+					type: "manual_compaction_end",
+					sessionId,
+					aborted: false,
+					result: { summary: "fixture-private-compaction-summary" },
+				});
+				emit({ type: "command_output", text: "Compaction complete. fixture-private-command-output" });
+			}, 25);
+		}, 25);
+		return;
+	}
+	if (scenario === "compaction-invalid-usage") {
+		emit({
+			type: "command_output",
+			text: "/compact snapcompact does not take focus instructions (it archives history without an LLM summary).",
+		});
+		response(id, "prompt", { agentInvoked: false });
+		return;
+	}
+	if (scenario === "compaction-no-start") {
+		emit({ type: "command_output", text: "Compaction failed: fixture-private-native-error" });
+		response(id, "prompt", { agentInvoked: false });
+		return;
+	}
+	if (scenario === "compaction-output-without-result") {
+		response(id, "prompt", { agentInvoked: false });
+		setTimeout(() => emit({ type: "command_output", text: "Compaction complete. fixture-private-command-output" }), 25);
+		return;
+	}
+	if (scenario === "compaction-abort-start-race") {
+		setTimeout(() => {
+			emit({ type: "manual_compaction_start", sessionId });
+			setTimeout(() => {
+				response(id, "prompt", { agentInvoked: false });
+				setTimeout(() => {
+					emit({ type: "manual_compaction_end", sessionId, aborted: true });
+				}, 125);
+			}, 25);
+		}, 75);
+		return;
+	}
+	if (scenario === "compaction-abort-before-start" || scenario === "compaction-stop-after-start") {
+		response(id, "prompt", { agentInvoked: false });
+		if (scenario === "compaction-stop-after-start") {
+			setTimeout(() => emit({ type: "manual_compaction_start", sessionId }), 25);
+		}
+		return;
+	}
 
 	if (scenario === "autoresearch") {
 		// The extension's local-only commands: the ack goes out first, its notify frames
@@ -1746,6 +1835,72 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 	}
 	response(id, "prompt", { agentInvoked: true });
 	streaming = true;
+	if (scenario === "compaction-start") {
+		emit({ type: "agent_start" });
+		emit({ type: "manual_compaction_start" });
+		emit({ type: "manual_compaction_start" });
+		emit({ type: "agent_end", messages: [], willContinue: false });
+		return;
+	}
+	if (scenario === "compaction-auto") {
+		emit({ type: "agent_start" });
+		const successStart = { type: "auto_compaction_start", reason: "threshold", action: "context-full" };
+		emit(successStart);
+		emit(successStart);
+		const successEnd = {
+			type: "auto_compaction_end",
+			action: "context-full",
+			aborted: false,
+			willRetry: false,
+			result: { summary: "fixture-private-compaction-summary" },
+		};
+		emit(successEnd);
+		emit(successEnd);
+
+		const skippedStart = { type: "auto_compaction_start", reason: "idle", action: "remote" };
+		emit(skippedStart);
+		emit(skippedStart);
+		const skippedEnd = {
+			type: "auto_compaction_end",
+			action: "remote",
+			aborted: false,
+			willRetry: false,
+			skipped: true,
+			errorMessage: "fixture-private-compaction-error",
+		};
+		emit(skippedEnd);
+		emit(skippedEnd);
+
+		const abortedStart = { type: "auto_compaction_start", reason: "overflow", action: "handoff" };
+		emit(abortedStart);
+		emit(abortedStart);
+		const abortedEnd = {
+			type: "auto_compaction_end",
+			action: "handoff",
+			aborted: true,
+			willRetry: false,
+			result: { summary: "fixture-private-compaction-summary" },
+			errorMessage: "fixture-private-compaction-error",
+		};
+		emit(abortedEnd);
+		emit(abortedEnd);
+
+		const failedStart = { type: "auto_compaction_start", reason: "incomplete", action: "shake" };
+		emit(failedStart);
+		emit(failedStart);
+		const failedEnd = {
+			type: "auto_compaction_end",
+			action: "shake",
+			aborted: false,
+			willRetry: false,
+			errorMessage: "fixture-private-compaction-error",
+		};
+		emit(failedEnd);
+		emit(failedEnd);
+		emit({ type: "auto_compaction_end", action: "context-full", aborted: false, result: { summary: "orphan result" } });
+		emit({ type: "agent_end", messages: [], willContinue: false });
+		return;
+	}
 	if (scenario === "session-settled") {
 		promptTimer = setTimeout(() => void emitSessionSettledScenario(id), 35);
 		return;
