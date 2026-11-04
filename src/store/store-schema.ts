@@ -283,6 +283,34 @@ export function applySchema(db: Database): void {
       stop_intent TEXT,
       relay_suppressed INTEGER NOT NULL DEFAULT 0 CHECK(relay_suppressed IN (0, 1))
     );
+    CREATE TABLE IF NOT EXISTS review_jobs (
+      id TEXT PRIMARY KEY NOT NULL,
+      bot_uid TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
+      channel_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      sender_id TEXT NOT NULL,
+      focus TEXT NOT NULL,
+      projects_json TEXT NOT NULL,
+      cwd TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      session_file TEXT,
+      state TEXT NOT NULL CHECK(state IN ('accepted', 'running', 'completed', 'failed', 'stopped')),
+      dispatch_started INTEGER NOT NULL DEFAULT 0 CHECK(dispatch_started IN (0, 1)),
+      prompt_accepted INTEGER NOT NULL DEFAULT 0 CHECK(prompt_accepted IN (0, 1)),
+      stop_requested INTEGER NOT NULL DEFAULT 0 CHECK(stop_requested IN (0, 1)),
+      recovery_reported INTEGER NOT NULL DEFAULT 0 CHECK(recovery_reported IN (0, 1)),
+      accepted_at INTEGER NOT NULL,
+      started_at INTEGER,
+      finished_at INTEGER,
+      result_text TEXT,
+      error_text TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS review_jobs_message
+      ON review_jobs(bot_uid, channel_type, channel_id, message_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS review_jobs_one_active_chat
+      ON review_jobs(bot_uid, channel_type, channel_id)
+      WHERE state IN ('accepted', 'running');
     CREATE TABLE IF NOT EXISTS goal_sessions (
       bot_uid TEXT NOT NULL,
       channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),

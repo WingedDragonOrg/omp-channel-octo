@@ -7,7 +7,7 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ChatAppendMode, ChatTarget, ThreadListenLevel, WorkerGoal, WorktreeMergeOutcome } from "../contracts.ts";
-import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadForkInput, ThreadForkRecord, ThreadListenRecord, ThreadMergeEventRecord, HostMergeLeaseRecord, HostMergeLeaseInput, HostRemovalLeaseInput, HostRemovalLeaseRecord, HostThreadRemovalOutcome } from "./store-records.ts";
+import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadForkInput, ThreadForkRecord, ThreadListenRecord, ThreadMergeEventRecord, HostMergeLeaseRecord, HostMergeLeaseInput, HostRemovalLeaseInput, HostRemovalLeaseRecord, HostThreadRemovalOutcome, ReviewJobRecord } from "./store-records.ts";
 import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopThreadCreation, LoopWorkspace } from "../loop/types.ts";
 import type { SessionContextSnapshotRecord } from "./store-records.ts";
 import type { TanOperation } from "./store-records.ts";
@@ -36,6 +36,7 @@ import type { WatchCheckCompletion, WatchCreateResult, WatchListItem, WatchRecor
 import type { ThreadReference, ThreadReferences } from "../references/types.ts";
 import { bindLoopTask, bindLoopWorkspace, claimLoopInputIntent, commitLoopScan, completeLoopThreadCreation, getLoopBinding, getLoopInput, getLoopTaskRoute, getLoopThreadCreation, isLoopInputObserved, listLoopBindings, listLoopInputs, listLoopThreadCreations, listLoopThreadTasks, markLoopInputDelivered, markLoopInputFault, markLoopInputPending, markLoopInputUnknown, markLoopThreadCreationUnknown, prepareLoopInput, recordLoopThreadAllocated, reserveLoopThreadCreation } from "./store-loop.ts";
 import { acceptTanOperation, acceptTanTask, cancelTanOperation, finishTanOperation, finishTanOperationWithOutbox, getTanOperation, listCancelledTanOperations, listPendingTanOperations, reclaimTanCommand } from "./store-tan.ts";
+import { acceptReviewJob, bindReviewSession, getActiveReviewJob, getReviewJob, listRecoverableReviewJobs, listTerminalReviewJobs, markReviewCompleted, markReviewDispatchStarted, markReviewFailed, markReviewPromptAccepted, markReviewStarted, markReviewStopped, persistReviewRecoveryNotices, prepareReviewJobsForRestart, releaseOrphanedReviewClaims, requestReviewStop, requestReviewStopForClaim } from "./store-reviews.ts";
 
 export class ChannelStore {
   private readonly db: Database;
@@ -551,6 +552,77 @@ export class ChannelStore {
 
   isTaskResuming(taskId: string): boolean {
     return isTaskResuming(this.db, taskId);
+  }
+
+  acceptReviewJob(claim: InboundClaim, job: ReviewJobRecord): boolean {
+    return acceptReviewJob(this.db, claim, job);
+  }
+
+  getActiveReviewJob(botUid: string, target: ChatTarget): ReviewJobRecord | null {
+    return getActiveReviewJob(this.db, botUid, target);
+  }
+
+  getReviewJob(id: string): ReviewJobRecord | null {
+    return getReviewJob(this.db, id);
+  }
+
+  listRecoverableReviewJobs(botUid: string): ReviewJobRecord[] {
+    return listRecoverableReviewJobs(this.db, botUid);
+  }
+
+  listTerminalReviewJobs(botUid: string): ReviewJobRecord[] {
+    return listTerminalReviewJobs(this.db, botUid);
+  }
+
+  prepareReviewJobsForRestart(botUid: string) {
+    return prepareReviewJobsForRestart(this.db, botUid);
+  }
+
+  persistReviewRecoveryNotices(
+    botUid: string,
+    entries: readonly { job: ReviewJobRecord; text: string; kind: "uncertain" | "stopped" }[],
+  ): void {
+    persistReviewRecoveryNotices(this.db, botUid, entries);
+  }
+
+  markReviewStarted(id: string): boolean {
+    return markReviewStarted(this.db, id);
+  }
+
+  bindReviewSession(id: string, sessionId: string, sessionFile: string): void {
+    bindReviewSession(this.db, id, sessionId, sessionFile);
+  }
+
+  markReviewDispatchStarted(id: string): void {
+    markReviewDispatchStarted(this.db, id);
+  }
+
+  markReviewPromptAccepted(id: string): void {
+    markReviewPromptAccepted(this.db, id);
+  }
+
+  requestReviewStop(id: string): boolean {
+    return requestReviewStop(this.db, id);
+  }
+
+  requestReviewStopForClaim(claim: InboundClaim, id: string): boolean {
+    return requestReviewStopForClaim(this.db, claim, id);
+  }
+
+  markReviewCompleted(id: string, text: string | null): void {
+    markReviewCompleted(this.db, id, text);
+  }
+
+  markReviewFailed(id: string, error: string): void {
+    markReviewFailed(this.db, id, error);
+  }
+
+  markReviewStopped(id: string): void {
+    markReviewStopped(this.db, id);
+  }
+
+  releaseOrphanedReviewClaims(botUid: string): void {
+    releaseOrphanedReviewClaims(this.db, botUid);
   }
 
   /**

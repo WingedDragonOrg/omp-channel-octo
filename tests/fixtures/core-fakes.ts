@@ -118,6 +118,19 @@ export interface CardEdit {
   frame: CardFrame;
   cardSeq: number;
 }
+export interface SentProgressCard {
+  target: ChatTarget;
+  progress: ProgressCard;
+  clientMsgNo: string;
+  messageId: string;
+}
+
+export interface ProgressCardEdit {
+  target: ChatTarget;
+  messageId: string;
+  progress: ProgressCard;
+  cardSeq: number;
+}
 
 /** One `card_action` event exactly as the Bot event queue delivers it. */
 export function cardActionEvent(eventId: number, action: BotCardAction): BotEvent {
@@ -161,7 +174,14 @@ const THREAD_STATUS_ARCHIVED = 2;
 export class FakeTransport implements ChannelTransport {
   readonly attempts: TransportAttempt[] = [];
   readonly sent: SentMessage[] = [];
-  /** Cards stay opt-in so the text-only path is what every other test exercises. */
+  /** Progress cards opt in independently so review lifecycle card tests exercise the real progress API. */
+  reviewProgressCardSupported = false;
+  readonly reviewProgressCards: SentProgressCard[] = [];
+  reviewProgressCardSendAttempts = 0;
+  readonly reviewProgressCardEdits: ProgressCardEdit[] = [];
+  reviewProgressCardSendFailure: Error | undefined;
+  reviewProgressCardEditFailure: Error | undefined;
+  /** Card actions remain opt-in for other tests. */
   cardSupported = false;
   readonly sentCards: SentCard[] = [];
   readonly cardEdits: CardEdit[] = [];
@@ -669,24 +689,42 @@ export class FakeTransport implements ChannelTransport {
   }
 
   async sendProgressCard(
-    _target: ChatTarget,
-    _progress: ProgressCard,
-    _clientMsgNo: string,
+    target: ChatTarget,
+    progress: ProgressCard,
+    clientMsgNo: string,
     signal?: AbortSignal,
   ): Promise<SendReceipt | null> {
     if (signal?.aborted) throw new Error("fixture progress card aborted");
-    return null;
+    this.reviewProgressCardSendAttempts += 1;
+    if (!this.reviewProgressCardSupported) return null;
+    if (this.reviewProgressCardSendFailure) throw this.reviewProgressCardSendFailure;
+    const messageId = `review-progress-card-${this.reviewProgressCards.length + 1}`;
+    this.reviewProgressCards.push({
+      target: { ...target },
+      progress,
+      clientMsgNo,
+      messageId,
+    });
+    return { messageId };
   }
 
   async editProgressCard(
-    _target: ChatTarget,
-    _messageId: string,
-    _progress: ProgressCard,
-    _cardSeq: number,
+    target: ChatTarget,
+    messageId: string,
+    progress: ProgressCard,
+    cardSeq: number,
     signal?: AbortSignal,
   ): Promise<void> {
     if (signal?.aborted) throw new Error("fixture progress card edit aborted");
+    if (this.reviewProgressCardEditFailure) throw this.reviewProgressCardEditFailure;
+    this.reviewProgressCardEdits.push({
+      target: { ...target },
+      messageId,
+      progress,
+      cardSeq,
+    });
   }
+
 
   async sendCard(
     target: ChatTarget,

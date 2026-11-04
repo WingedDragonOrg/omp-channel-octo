@@ -66,6 +66,7 @@ const BUILTIN_ALIASES = {
   fork: "fork",
   cancel: "cancel",
   stop: "cancel",
+  review: "review",
   commit: "commit",
   status: "status",
   help: "help",

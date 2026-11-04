@@ -98,6 +98,27 @@ export interface TaskRecord extends ChatTarget {
   relaySuppressed: boolean;
 }
 
+export type ReviewJobState = "accepted" | "running" | "completed" | "failed" | "stopped";
+
+/** A `/review` run is deliberately not a chat task: it owns a fresh session and an independent lane. */
+export interface ReviewJobRecord extends ChatTarget {
+  id: string;
+  botUid: string;
+  messageId: string;
+  senderId: string;
+  focus: string;
+  projects: readonly { name: string; path: string }[];
+  cwd: string;
+  sessionId: string;
+  sessionFile: string | null;
+  state: ReviewJobState;
+  dispatchStarted: boolean;
+  promptAccepted: boolean;
+  stopRequested: boolean;
+  resultText: string | null;
+  errorText: string | null;
+}
+
 export interface ThreadListenRecord {
   botUid: string;
   channelId: string;

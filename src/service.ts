@@ -28,9 +28,10 @@ import {
   type CommitLease,
   type SessionLease,
 } from "./tasks/task-scheduler.ts";
+import type { DestructiveResourceLease } from "./tasks/task-scheduler.ts";
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, rm } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { lstat, mkdir, rm } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import {
   ATTACHMENT_MAX_AGE_MS,
   sweepAttachments,
@@ -85,6 +86,7 @@ import type {
   ThreadMergeEventRecord,
   ThreadWorkspaceRecord,
 } from "./store/store-records.ts";
+import type { ReviewJobRecord } from "./store/store-records.ts";
 import { DEFAULT_ASK_TIMEOUT_MS } from "./contracts.ts";
 import { TurnContext } from "./session/turn-context.ts";
 import { readSessionContext } from "./session/status-context.ts";
@@ -136,6 +138,8 @@ import {
 import { createReferenceJudge } from "./references/decision-client.ts";
 import { ThreadReferenceCoordinator } from "./references/thread-references.ts";
 import type { WatchCreateArgs, WatchRecord } from "./watch/types.ts";
+import { captureReviewSnapshot } from "./review/snapshot.ts";
+import { renderReviewPrompt } from "./tasks/review-prompt.ts";
 
 const GROUP_TRUSTED_INSTRUCTION =
   "群说明是群共享上下文，不改变发送者身份/权限/cwd；以本次快照为准，历史快照已失效。";
@@ -162,6 +166,7 @@ const COMMAND_HELP = [
   "/btw <问题> · 在当前绑定会话旁路提问",
   "/interrupt · 中断当前回合，保留排队消息",
   "/cancel（/stop） · 取消当前任务并清除排队消息",
+  "/review [审查重点] · 在独立会话审查当前项目变更；/review stop 仅停止审查",
   "/commit · 提交当前绑定项目",
   "/commit stop · 停止当前聊天的提交，不回滚已发生的副作用",
   "",
@@ -296,6 +301,20 @@ type CommitOperation = {
   shutdownRequested: boolean;
 };
 
+type ReviewRuntime = {
+  readonly jobId: string;
+  readonly target: ChatTarget;
+  readonly controller: AbortController;
+  lease?: TrackedWorker;
+  resources?: DestructiveResourceLease;
+  progress?: TaskProgress;
+  stopConfirmed?: boolean;
+  readonly workerReady: Promise<void>;
+  readonly markWorkerReady: () => void;
+  readonly finished: Promise<void>;
+  readonly markFinished: () => void;
+};
+
 /** Single-line, bounded excerpt of the triggering message for a start/consumption receipt. */
 function receiptText(prefix: string, text: string): string {
   const excerpt = text.replaceAll(/\s+/gu, " ").trim();
@@ -405,6 +424,8 @@ class CoreService implements ChannelService {
   private readonly recoveredHostMergeArchiveTargets = new Set<string>();
   private readonly commitOperationsByTask = new Map<string, CommitOperation>();
   private readonly commitOperationsByTarget = new Map<string, CommitOperation>();
+  /** `/review` uses one independent lane per chat; it is never part of the ordinary chat FIFO. */
+  private readonly reviewRuntimes = new Map<string, ReviewRuntime>();
   private readonly blockedDirectories = new Set<string>();
   /** 问题与问答卡：等待者、卡片代次与问题行的所有者。 */
   /** 出站投递：文字、流式编辑与文件共用的队列。 */
@@ -499,6 +520,10 @@ class CoreService implements ChannelService {
       botUid: () => this.bot?.uid,
       stopping: () => this.stopping,
       trackOperation: (operation) => this.operationSet(operation),
+      isReviewResuming: id => {
+        const job = this.store.getReviewJob(id);
+        return job?.state === "accepted" || job?.state === "running";
+      },
     });
     // 排定与租约的所有者先于 SessionLifecycle 构造：会话侧的命令租约经端口落到这里。它的
     // reconcileBinding/runTask 回调只在任务真正执行时解引用 `this.sessions`（构造时不解引用，
@@ -680,6 +705,7 @@ class CoreService implements ChannelService {
         this.runtimes.size > 0
         || this.btwOperationsByTarget.size > 0
         || this.commitOperationsByTask.size > 0
+        || this.reviewRuntimes.size > 0
         || this.threadMergeControllers.size > 0
         || this.threadRemovalControllers.size > 0
         || this.threadForks.running
@@ -712,6 +738,7 @@ class CoreService implements ChannelService {
       btw: (message, argument) => this.handleBtw(message, argument),
       fork: (message, argument) => this.handleFork(message, argument),
       watch: (message, argument) => this.handleWatchCommand(message, argument),
+      review: (message, argument) => this.handleReview(message, argument),
       commit: (message, argument) => this.handleCommit(message, argument),
       new: (message, argument) => this.sessions.handleNew(message, argument),
       move: (message, argument) => this.sessions.handleMove(message, argument),
@@ -764,6 +791,7 @@ class CoreService implements ChannelService {
     let watchStarted = false;
     try {
       this.store.setBotUid(identity.uid);
+      this.store.releaseOrphanedReviewClaims(identity.uid);
       if (this.options.loop && this.loopController === undefined) {
         this.loopController = new LoopController({
           store: this.store,
@@ -866,11 +894,40 @@ class CoreService implements ChannelService {
       // 目录保持 block——它的任务留在队列继续挡住同目录的新写者（runTask 原样放过）。
       for (const ledger of this.store.listWorkerLedger(identity.uid)) {
         const stopped = await this.options.workerFactory.recover(ledger);
+        const review = this.store.getReviewJob(ledger.id);
         if (stopped) {
           this.store.markWorkerStopped(ledger.id);
+          const preservesAcceptedSession = review !== null
+            && review.state === "running"
+            && review.dispatchStarted
+            && review.promptAccepted
+            && !review.stopRequested;
+          if (review !== null && !preservesAcceptedSession) {
+            await rm(
+              join(projectSessionDir(sessionsRoot(this.options.config), review.cwd), "reviews", review.id),
+              { recursive: true, force: true },
+            ).catch(() => {});
+          }
         } else {
           this.blockedDirectories.add(ledger.cwd);
           if (ledger.moveTargetCwd) this.blockedDirectories.add(ledger.moveTargetCwd);
+          if (review !== null) {
+            for (const project of review.projects) this.blockedDirectories.add(project.path);
+          }
+        }
+      }
+      for (const review of this.store.listRecoverableReviewJobs(identity.uid)) {
+        const ledger = this.store.getWorkerLedger(identity.uid, review.id);
+        const processConfirmed = ledger === null || ledger.state === "stopped";
+        const preservesAcceptedSession = review.state === "running"
+          && review.dispatchStarted
+          && review.promptAccepted
+          && !review.stopRequested;
+        if (processConfirmed && !preservesAcceptedSession) {
+          await rm(
+            join(projectSessionDir(sessionsRoot(this.options.config), review.cwd), "reviews", review.id),
+            { recursive: true, force: true },
+          ).catch(() => {});
         }
       }
       const pendingTanOperations = this.store.listPendingTanOperations(identity.uid);
@@ -880,6 +937,15 @@ class CoreService implements ChannelService {
       );
       this.recoverCancelledTanReceipts(identity.uid);
       this.recoverAcceptedTanReceipts(identity.uid);
+      for (const review of this.store.listTerminalReviewJobs(identity.uid)) {
+        const ledger = this.store.getWorkerLedger(identity.uid, review.id);
+        if (ledger === null || ledger.state === "stopped") {
+          await rm(
+            join(projectSessionDir(sessionsRoot(this.options.config), review.cwd), "reviews", review.id),
+            { recursive: true, force: true },
+          ).catch(() => {});
+        }
+      }
       await this.loopController?.recover();
       // 旧版重启通报已随续接机制移除：遗留行静默清理，绝不再投递。
       this.serviceRestart.consumeStartupNotices(identity.uid);
@@ -889,6 +955,16 @@ class CoreService implements ChannelService {
         interrupt: INTERRUPT_REASON_TEXT,
         question_timeout: QUESTION_TIMEOUT_REASON_TEXT,
       });
+      const reviewRecovery = this.store.prepareReviewJobsForRestart(identity.uid);
+      for (const review of [...reviewRecovery.stopped, ...reviewRecovery.uncertain]) {
+        const ledger = this.store.getWorkerLedger(identity.uid, review.id);
+        if (ledger === null || ledger.state === "stopped") {
+          await rm(
+            join(projectSessionDir(sessionsRoot(this.options.config), review.cwd), "reviews", review.id),
+            { recursive: true, force: true },
+          ).catch(() => {});
+        }
+      }
       await this.progressCards.recover();
       // 续接任务重挂提问的快照必须在开放入站之前一次性建好：此后到达的答复由快照认领、交给
       // 续跑的原 ask 消费，不会因「此刻没有在跑的回合」被当成新输入再唤醒一个任务。恢复任务
@@ -922,6 +998,18 @@ class CoreService implements ChannelService {
         );
         await this.notifyThreadOutcome(task.id);
       }
+      this.store.persistReviewRecoveryNotices(identity.uid, [
+        ...reviewRecovery.uncertain.map(job => ({
+          job,
+          kind: "uncertain" as const,
+          text: "独立代码审查未自动恢复：无法确认原 prompt 是否已被 OMP 接受，因此不会重复发送。",
+        })),
+        ...reviewRecovery.stopped.map(job => ({
+          job,
+          kind: "stopped" as const,
+          text: "独立代码审查已按重启前的停止意图结束。",
+        })),
+      ]);
       for (const lease of successfulHostMergeRecoveries) {
         if (this.stopping) throw new Error("channel 正在停止");
         const outcome = lease.outcome;
@@ -964,6 +1052,7 @@ class CoreService implements ChannelService {
       this.startupGate.resolve();
       this.ready = true;
       this.loopController?.start();
+      for (const job of reviewRecovery.runnable) this.operationSet(this.runReview(job));
       this.releaseRecoveredHostMergeArchives();
       await this.sendLifecycleNotice("startup");
     } catch (error) {
@@ -1001,6 +1090,9 @@ class CoreService implements ChannelService {
     this.started = false;
     // Seal inbound processing and abort its I/O before any lifecycle send or worker shutdown.
     this.shutdownController.abort();
+    for (const runtime of this.reviewRuntimes.values()) {
+      runtime.controller.abort(new Error("channel stopping"));
+    }
     // Seal and abort Loop work now, but let worker shutdown release any steerSerial waits first.
     const loopStopped = this.loopController?.stop();
     await this.threadReferences.stop();
@@ -1020,6 +1112,9 @@ class CoreService implements ChannelService {
       if (runtime.lease) {
         await runtime.lease.close().catch(() => false);
       }
+    }
+    for (const runtime of this.reviewRuntimes.values()) {
+      await runtime.lease?.close().catch(() => false);
     }
     for (const operation of [...this.commitOperationsByTask.values()]) {
       operation.shutdownRequested = true;
@@ -4363,6 +4458,331 @@ class CoreService implements ChannelService {
       await this.outbox.enqueueText(target, frame.plain, null);
     }
   }
+  private async reviewProjects(
+    target: ChatTarget,
+    binding: BindingRecord,
+  ): Promise<readonly { name: string; path: string }[]> {
+    const workspace = target.channelType === 5
+      ? this.store.getThreadWorkspace(this.bot!.uid, target)
+      : null;
+    if (workspace !== null) {
+      const related = new Set(this.store.workspaceDirectories(binding.cwd));
+      const bindingUsesWorkspace = binding.cwdPinned === true
+        || (workspace.entryPath !== null && related.has(workspace.entryPath))
+        || workspace.projects.some(project => project.path !== null && related.has(project.path));
+      if (!bindingUsesWorkspace) return [{ name: basename(binding.cwd), path: binding.cwd }];
+      if (!await threadWorkspaceIsAvailable(workspace)) return [];
+      const available = workspace.projects.map(project => ({ name: project.name, path: project.path! }));
+      if (workspace.layout === "shared") return available;
+      const current = available.find(project => resourcePathsRelated(project.path, binding.cwd));
+      return current === undefined ? [] : [current];
+    }
+    return [{ name: basename(binding.cwd), path: binding.cwd }];
+  }
+
+  private async handleReview(message: InboundMessage, argument: string): Promise<void> {
+    const bot = this.bot;
+    if (!bot) return;
+    if (argument.trim().toLowerCase() === "stop") {
+      const active = this.store.getActiveReviewJob(bot.uid, message);
+      if (active === null) {
+        await this.outbox.enqueueText(message, "当前聊天没有正在进行的审查。", null);
+        return;
+      }
+      if (!this.store.requestReviewStopForClaim(this.commandClaim(message, "review"), active.id)) {
+        await this.outbox.enqueueText(message, "独立代码审查已结束，无需停止。", null);
+        return;
+      }
+      const runtime = this.reviewRuntimes.get(targetKey(message));
+      runtime?.controller.abort(new Error("review stopped by user"));
+      await this.outbox.enqueueText(message, "已受理独立代码审查停止请求；主任务不受影响。", null);
+      const stopOperation = (async () => {
+        if (runtime?.jobId === active.id) {
+          await runtime.workerReady;
+          await runtime.lease?.worker.abortTurn().catch(() => {});
+          if (runtime.lease !== undefined) {
+            runtime.stopConfirmed = await runtime.lease.close(true).catch(() => false);
+          }
+          await runtime.finished;
+        }
+        const persistedLedger = this.store.getWorkerLedger(bot.uid, active.id);
+        const confirmed = runtime?.jobId === active.id
+          ? runtime.stopConfirmed === true
+          : persistedLedger === null || persistedLedger.state === "stopped";
+        if (confirmed) {
+          this.store.markReviewStopped(active.id);
+          this.store.persistReviewRecoveryNotices(bot.uid, [{
+            job: active,
+            kind: "stopped",
+            text: "已停止当前聊天的独立代码审查；主任务不受影响。",
+          }]);
+          this.outbox.flush(message);
+        } else {
+          for (const project of active.projects) this.blockedDirectories.add(project.path);
+          await this.outbox.enqueueText(
+            message,
+            "无法确认独立代码审查 worker 已退出；项目资源保持阻塞，主任务不受影响。",
+            null,
+          );
+        }
+      })();
+      this.operationSet(stopOperation.catch(() => {}));
+      return;
+    }
+    if (this.store.getActiveReviewJob(bot.uid, message) !== null || this.reviewRuntimes.has(targetKey(message))) {
+      await this.outbox.enqueueText(message, "当前聊天已有代码审查进行中，请等待完成或使用 /review stop。", null);
+      return;
+    }
+    const binding = this.store.getBinding(bot.uid, message);
+    if (binding === null) {
+      await this.outbox.enqueueText(message, "当前聊天尚未绑定项目，无法启动代码审查。", null);
+      return;
+    }
+    const projects = await this.reviewProjects(message, binding);
+    if (projects.length === 0) {
+      await this.outbox.enqueueText(message, "当前工作区没有可确认的 ready 项目，未启动代码审查。", null);
+      return;
+    }
+    const job: ReviewJobRecord = {
+      id: randomUUID(), botUid: bot.uid, channelId: message.channelId, channelType: message.channelType,
+      messageId: message.messageId, senderId: message.senderId, focus: argument.trim(), projects,
+      cwd: binding.cwd, sessionId: randomUUID(), sessionFile: null, state: "accepted",
+      dispatchStarted: false, promptAccepted: false, stopRequested: false, resultText: null, errorText: null,
+    };
+    if (this.reviewRuntimes.has(targetKey(message))) {
+      await this.outbox.enqueueText(message, "当前聊天的上一轮代码审查仍在收尾，请稍后重试。", null);
+      return;
+    }
+    if (!this.store.acceptReviewJob(this.commandClaim(message, "review"), job)) {
+      await this.outbox.enqueueText(message, "当前聊天已有代码审查进行中，请等待完成或使用 /review stop。", null);
+      return;
+    }
+    this.operationSet(this.runReview(job));
+  }
+
+  private async runReview(initial: ReviewJobRecord): Promise<void> {
+    let job = this.store.getReviewJob(initial.id) ?? initial;
+    if (job.state !== "accepted" && job.state !== "running") return;
+    const target: ChatTarget = { channelId: job.channelId, channelType: job.channelType };
+    const key = targetKey(target);
+    const existingRuntime = this.reviewRuntimes.get(key);
+    if (existingRuntime !== undefined && existingRuntime.jobId !== job.id) return;
+    const workerReady = Promise.withResolvers<void>();
+    const finished = Promise.withResolvers<void>();
+    const runtime: ReviewRuntime = {
+      jobId: job.id,
+      target,
+      controller: new AbortController(),
+      workerReady: workerReady.promise,
+      markWorkerReady: workerReady.resolve,
+      finished: finished.promise,
+      markFinished: finished.resolve,
+    };
+    this.reviewRuntimes.set(key, runtime);
+    let progress: TaskProgress | undefined;
+    let textDelivery: { stop(): void } | undefined;
+    let stoppedConfirmed = false;
+    let outcome: "completed" | "failed" | "stopped" | null = null;
+    let outcomeText: string | null = null;
+    let chatBackground: string | null = null;
+    try {
+      if (this.stopping) return;
+      if (job.stopRequested) {
+        outcome = "stopped";
+        return;
+      }
+      if (job.state === "accepted" && !this.store.markReviewStarted(job.id)) return;
+      job = this.store.getReviewJob(job.id) ?? job;
+      textDelivery = this.outbox.registerTask(job.id);
+      progress = this.progressCards.startTask(job.id, target);
+      progress.beginLifecycle();
+      runtime.progress = progress;
+      this.trackProgressTail(target, job.id, () => progress!.tail);
+      await this.outbox.enqueueText(
+        target,
+        "已受理独立代码审查，正在核实变更并运行审查；主任务不受影响。",
+        job.id,
+      );
+      if (target.channelType !== 1) {
+        try {
+          const context = await this.options.transport.getGroupContext(target);
+          chatBackground = context?.present ? context.content : null;
+        } catch {
+          if (this.stopping) return;
+          if (runtime.controller.signal.aborted || this.store.getReviewJob(job.id)?.stopRequested) {
+            outcome = "stopped";
+            return;
+          }
+          outcome = "failed";
+          outcomeText = "无法读取必要聊天背景，代码审查未启动。";
+          await this.outbox.enqueueText(target, outcomeText, job.id);
+          return;
+        }
+      }
+      if (this.stopping) return;
+      if (runtime.controller.signal.aborted) { outcome = "stopped"; return; }
+      const resources = await this.scheduler.tryAcquireSharedResources(
+        `review:${job.id}`,
+        job.projects.map(project => project.path),
+      );
+      if (resources !== undefined) runtime.resources = resources;
+      if (this.stopping) return;
+      if (runtime.controller.signal.aborted || this.store.getReviewJob(job.id)?.stopRequested) {
+        outcome = "stopped";
+        return;
+      }
+      if (resources === undefined) {
+        outcome = "failed";
+        outcomeText = "review resources are blocked by a destructive or unconfirmed operation";
+        await this.outbox.enqueueText(target, "代码审查未启动：项目资源正被破坏性操作占用或旧进程退出未确认。", job.id);
+        return;
+      }
+      const resuming = job.dispatchStarted && job.promptAccepted && job.sessionFile !== null;
+      const reviewSessionDir = join(projectSessionDir(sessionsRoot(this.options.config), job.cwd), "reviews", job.id);
+      await mkdir(reviewSessionDir, { recursive: true, mode: 0o700 });
+      const sessionDir = reviewSessionDir;
+      if (this.stopping) return;
+      if (runtime.controller.signal.aborted) { outcome = "stopped"; return; }
+      const model = this.store.resolveChatModel(job.botUid, target).model;
+      runtime.lease = await openTrackedWorker({
+        workerFactory: this.options.workerFactory,
+        store: this.store,
+        worker: {
+          cwd: job.cwd,
+          sessionDir,
+          ...(resuming ? { sessionFile: job.sessionFile! } : {}),
+          ...(model === null ? {} : { model }),
+          signal: runtime.controller.signal,
+        },
+        ledger: {
+          id: job.id, botUid: job.botUid, sessionId: job.sessionId,
+          sessionFile: job.sessionFile ?? join(sessionDir, `${job.sessionId}.jsonl`),
+        },
+        blockDirectory: cwd => this.blockedDirectories.add(cwd),
+      });
+      runtime.markWorkerReady();
+      if (this.stopping) return;
+      if (runtime.controller.signal.aborted) { outcome = "stopped"; return; }
+      const worker = runtime.lease.worker;
+      const state = await worker.refreshState();
+      if (!resuming) {
+        const verified = await verifyFreshSession(
+          { sessionId: job.sessionId, cwd: job.cwd, sessionFile: null },
+          state,
+          job.cwd,
+        );
+        this.store.bindReviewSession(job.id, verified.sessionId, verified.sessionFile!);
+        job = this.store.getReviewJob(job.id) ?? job;
+      } else {
+        await verifyMovedSession(
+          { sessionId: job.sessionId, cwd: job.cwd, sessionFile: job.sessionFile },
+          state,
+          job.cwd,
+        );
+      }
+      if (this.stopping) return;
+      if (runtime.controller.signal.aborted || this.store.getReviewJob(job.id)?.stopRequested) {
+        outcome = "stopped";
+        return;
+      }
+      // The independent lifecycle card already started at durable review execution above.
+      const events = new TaskEvents({
+        target, taskId: job.id,
+        control: { cancelRequested: false, stopCause: null, workAfterStop: false },
+        stopping: () => this.stopping,
+        parseAssistantMentions: false,
+        outbox: this.outbox,
+        progress,
+        persistResearchReport: () => {},
+        steerConsumed: () => {},
+        discardStopIntent: () => {},
+      });
+      const consume = (event: WorkerEvent): void => {
+        if (event.type === "prompt_accepted") {
+          this.store.markReviewPromptAccepted(job.id);
+          return;
+        }
+        if (runtime.controller.signal.aborted || this.store.getReviewJob(job.id)?.stopRequested) return;
+        if (event.type === "goal_accepted" || event.type === "goal_updated") return;
+        events.onEvent(event);
+      };
+      if (resuming) {
+        await worker.resume(consume);
+      } else {
+        const snapshot = await captureReviewSnapshot(job.projects, runtime.controller.signal);
+        const background = chatBackground;
+        if (this.stopping) return;
+        if (runtime.controller.signal.aborted || this.store.getReviewJob(job.id)?.stopRequested) {
+          outcome = "stopped";
+          return;
+        }
+        this.store.markReviewDispatchStarted(job.id);
+        await worker.prompt(renderReviewPrompt(snapshot, job.focus, background), consume);
+      }
+      if (this.stopping) return;
+      if (runtime.controller.signal.aborted || this.store.getReviewJob(job.id)?.stopRequested) {
+        outcome = "stopped";
+        return;
+      }
+      const result = events.resultText;
+      if (result === null || result.trim().length === 0) throw new Error("review worker completed without a text result");
+      outcome = "completed";
+      outcomeText = result;
+    } catch (error) {
+      if (this.stopping) return;
+      const stopped = runtime.controller.signal.aborted || this.store.getReviewJob(job.id)?.stopRequested;
+      if (stopped) {
+        outcome = "stopped";
+      } else {
+        outcome = "failed";
+        outcomeText = safeErrorMessage(error, "review failed");
+        await this.outbox.enqueueText(
+          target,
+          outcomeText.includes("必要聊天背景") ? outcomeText : "独立代码审查失败；主任务、绑定和主会话均未修改。",
+          job.id,
+        );
+      }
+    } finally {
+      runtime.markWorkerReady();
+      const ledger = this.store.getWorkerLedger(job.botUid, job.id);
+      stoppedConfirmed = runtime.stopConfirmed
+        ?? (runtime.lease
+          ? await runtime.lease.close(true).catch(() => false)
+          : ledger === null || ledger.state === "stopped");
+      runtime.stopConfirmed = stoppedConfirmed;
+      if (!stoppedConfirmed) {
+        for (const project of job.projects) this.blockedDirectories.add(project.path);
+        this.blockedDirectories.add(job.cwd);
+      } else if (outcome === "stopped") {
+        this.store.markReviewStopped(job.id);
+        progress?.finish("cancelled");
+      } else if (outcome === "failed") {
+        this.store.markReviewFailed(job.id, outcomeText ?? "review failed");
+        progress?.finish("failed");
+      } else if (outcome === "completed") {
+        this.store.markReviewCompleted(job.id, outcomeText);
+        progress?.finish("completed");
+      }
+      if (this.store.getReviewJob(job.id)?.state === "stopped") textDelivery?.stop();
+      else this.outbox.forgetTask(job.id);
+      if (progress) {
+        progress.stop(!progress.finished);
+        await progress.tail.catch(() => {});
+        this.releaseProgressTail(target, job.id, progress.tail);
+      }
+      runtime.resources?.complete();
+      if (stoppedConfirmed && !this.stopping && outcome !== null) {
+        await rm(
+          join(projectSessionDir(sessionsRoot(this.options.config), job.cwd), "reviews", job.id),
+          { recursive: true, force: true },
+        ).catch(() => {});
+      }
+      if (this.reviewRuntimes.get(key) === runtime) this.reviewRuntimes.delete(key);
+      runtime.markFinished();
+      this.serviceRestart.maybeRunDeferred();
+    }
+  }
+
 
   private async handleWatchCommand(target: ChatTarget, argument: string): Promise<void> {
     const parts = argument.trim().split(/\s+/u).filter(Boolean);

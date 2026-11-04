@@ -218,7 +218,10 @@ export interface ProgressCardsDeps {
     | "getTask"
     /** 该 task 是否会被本进程续接：决定遗留卡片是接管还是补发终态。 */
     | "isTaskResuming"
+    | "getReviewJob"
   >;
+  /** Review jobs are independent from chat tasks but use the same card transport and persistence. */
+  readonly isReviewResuming?: (taskId: string) => boolean;
   readonly transport: Pick<ChannelTransport, "sendProgressCard" | "editProgressCard">;
   /** 卡片行以 bot 身份为键；未就绪（未 start）即整个域 no-op。 */
   readonly botUid: () => string | undefined;
@@ -249,7 +252,7 @@ export class ProgressCards {
   /** 一轮 task 一个 owner；`runTask` 建，`finally` 里 `stop`。 */
   startTask(taskId: string, target: ChatTarget): TaskProgress {
     const recovered = this.recovered.get(taskId);
-    if (recovered === undefined && !this.deps.store.isTaskResuming(taskId)) {
+    if (recovered === undefined && !this.deps.store.isTaskResuming(taskId) && !this.deps.isReviewResuming?.(taskId)) {
       return new TaskProgress(this.deps, taskId, target);
     }
     this.recovered.delete(taskId);
@@ -278,7 +281,7 @@ export class ProgressCards {
     const withRows = new Set<string>();
     for (const card of this.deps.store.listProgressCards(botUid)) {
       withRows.add(card.taskId);
-      if (this.deps.store.isTaskResuming(card.taskId)) {
+      if (this.deps.store.isTaskResuming(card.taskId) || this.deps.isReviewResuming?.(card.taskId)) {
         const rounds = toResume.get(card.taskId);
         if (rounds === undefined) toResume.set(card.taskId, [card]);
         else rounds.push(card);
@@ -326,11 +329,11 @@ export class ProgressCards {
     for (const taskId of withRows) {
       if (this.recovered.has(taskId)) continue;
       const task = this.deps.store.getTask(taskId);
+      const review = this.deps.store.getReviewJob(taskId);
       const active = task !== null
-        && task.state !== "completed"
-        && task.state !== "failed"
-        && task.state !== "cancelled"
-        && task.state !== "interrupted";
+        ? task.state !== "completed" && task.state !== "failed"
+          && task.state !== "cancelled" && task.state !== "interrupted"
+        : review?.state === "accepted" || review?.state === "running";
       if (active) this.recovered.set(taskId, null);
     }
   }
@@ -346,9 +349,10 @@ export class ProgressCards {
     state?: Exclude<ExecutionState, "running">,
   ): ExecutionSnapshot | null {
     const task = this.deps.store.getTask(card.taskId);
-    const verdict = state ?? (task?.state === "completed"
+    const review = this.deps.store.getReviewJob(card.taskId);
+    const verdict = state ?? (task?.state === "completed" || review?.state === "completed"
       ? "completed"
-      : task?.state === "failed"
+      : task?.state === "failed" || review?.state === "failed"
         ? "failed"
         : "cancelled");
     const snapshot = restoreExecutionSnapshot(card.snapshot, { state: verdict, atMs: Date.now() });
@@ -493,6 +497,12 @@ export class TaskProgress {
     this.track(event, this.round.tracker.apply(event));
   }
 
+  /** Opens a card from a real host-owned lifecycle start, without inventing a tool or percentage. */
+  beginLifecycle(): void {
+    const lifecycle = { type: "turn_start", turnId: this.taskId, atMs: Date.now() } as const;
+    this.track(lifecycle, this.round.tracker.snapshot(lifecycle.atMs), true);
+  }
+
   /** 终态帧：入队后本轮不再编辑，`stop` 也不再 abort 它。 */
   finish(state: Exclude<ProgressCard["state"], "running">): void {
     this.stopCommitHeartbeat();
@@ -555,13 +565,14 @@ export class TaskProgress {
     if (abortProgress) this.progressAbort.abort();
   }
 
-  private track(event: WorkerEvent, progress: ProgressCard): void {
+  private track(event: WorkerEvent, progress: ProgressCard, forceStart = false): void {
     const current = this.round;
     current.latest = progress;
     if (current.retired) return;
     if (current.finished && progress.state !== "running") return;
     current.version += 1;
-    const startsCard = event.type === "tool_start" ||
+    const startsCard = forceStart ||
+      event.type === "tool_start" ||
       event.type === "tool_end" ||
       event.type === "todo_update" ||
       event.type === "research_update" ||
@@ -724,6 +735,15 @@ export class TaskProgress {
     } catch (error) {
       const reason = error instanceof Error ? error.message : "unknown error";
       if (!running) {
+        if (!round.degraded && isEdgeRefusal(error)) {
+          round.degraded = true;
+          console.error(
+            `[progress-card] 终态卡片正文被网关拒绝，改用不带步骤摘要的形态重试`
+            + ` target=${targetKey(this.target)} seq=${cardSeq}`,
+          );
+          await this.editProgress(round);
+          return;
+        }
         round.disabled = true;
         if (!round.retired) {
           clearTimeout(this.timer);
