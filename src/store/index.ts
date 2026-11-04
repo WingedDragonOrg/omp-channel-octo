@@ -9,6 +9,11 @@ import { dirname } from "node:path";
 import type { ChatAppendMode, ChatTarget, ThreadListenLevel, WorkerGoal, WorktreeMergeOutcome } from "../contracts.ts";
 import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadForkInput, ThreadForkRecord, ThreadListenRecord, ThreadMergeEventRecord, HostMergeLeaseRecord, HostMergeLeaseInput, HostRemovalLeaseInput, HostRemovalLeaseRecord, HostThreadRemovalOutcome } from "./store-records.ts";
 import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopThreadCreation, LoopWorkspace } from "../loop/types.ts";
+import type { SessionContextSnapshotRecord } from "./store-records.ts";
+import {
+  getSessionContextSnapshot as readSessionContextSnapshot,
+  saveSessionContextSnapshot as writeSessionContextSnapshot,
+} from "./store-session-context.ts";
 import { applySchema } from "./store-schema.ts";
 import { claimOwnerEnrollment, clearChatModel, clearThreadModel, ensureBinding, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, getThreadModel, grantAllowedChat, hasOwnerEnrollment, listAllowedChats, resolveChatModel, setBotUid, setChatMode, setChatModel, setOwnerId, setThreadModel, updateBindingSession } from "./store-chats.ts";
 import { acceptCommitTask, acceptTask, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, getTaskByMessageId, isCommitTask, isTaskResuming, listQueuedTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim, suppressTaskRelay } from "./store-tasks.ts";
@@ -129,6 +134,14 @@ export class ChannelStore {
 
   getBinding(botUid: string, target: ChatTarget): BindingRecord | null {
     return getBinding(this.db, botUid, target);
+  }
+
+  saveSessionContextSnapshot(snapshot: SessionContextSnapshotRecord): void {
+    writeSessionContextSnapshot(this.db, snapshot);
+  }
+
+  getSessionContextSnapshot(botUid: string, target: ChatTarget): SessionContextSnapshotRecord | null {
+    return readSessionContextSnapshot(this.db, botUid, target);
   }
 
   saveThreadWorkspace(record: ThreadWorkspaceRecord): void {

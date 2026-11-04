@@ -127,6 +127,22 @@ export function applySchema(db: Database): void {
       updated_at INTEGER NOT NULL,
       PRIMARY KEY(bot_uid, channel_type, channel_id)
     );
+    CREATE TABLE IF NOT EXISTS session_context_snapshots (
+      bot_uid TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
+      channel_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      session_file TEXT NOT NULL,
+      cwd TEXT NOT NULL,
+      used_tokens REAL CHECK(used_tokens >= 0),
+      context_window REAL CHECK(context_window > 0),
+      percent REAL CHECK(percent >= 0),
+      model TEXT,
+      observed_at INTEGER NOT NULL,
+      file_size INTEGER NOT NULL CHECK(file_size >= 0),
+      file_mtime_ms REAL NOT NULL,
+      PRIMARY KEY(bot_uid, channel_type, channel_id)
+    );
     CREATE TABLE IF NOT EXISTS thread_workspaces (
       bot_uid TEXT NOT NULL,
       channel_type INTEGER NOT NULL CHECK(channel_type = 5),

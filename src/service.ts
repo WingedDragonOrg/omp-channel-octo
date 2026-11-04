@@ -1,9 +1,10 @@
 import { GroupHistoryCoordinator } from "./inbound/history-coordinator.ts";
 import { ModelSwitchController } from "./commands/model-controller.ts";
-import { modelPolicyDescription, modelWithLevel } from "./commands/model-switch.ts";
+import { modelPolicyDescription } from "./commands/model-switch.ts";
 import { formatGoalSession, goalErrorText, GOAL_USAGE, parseGoalCommand } from "./commands/goal-command.ts";
 import { CONFIG_CARD_ACTION_PREFIX, createConfigMenuDesk, type ConfigMenuDesk } from "./commands/command-cards.ts";
 import { ProgressCards, type TaskProgress } from "./cards/progress-cards.ts";
+import { buildStatusCard } from "./cards/status-card.ts";
 import type { CommitContent } from "./cards/commit-content.ts";
 import { COMMIT_RESULT_UNKNOWN, type ExecutionEvent } from "./cards/execution-tracker.ts";
 import { CHAT_GRANT_ACTION_PREFIX } from "./cards/chat-grant-card.ts";
@@ -81,6 +82,8 @@ import type {
 } from "./store/store-records.ts";
 import { DEFAULT_ASK_TIMEOUT_MS } from "./contracts.ts";
 import { TurnContext } from "./session/turn-context.ts";
+import { readSessionContext } from "./session/status-context.ts";
+import { readWorkspaceChanges } from "./workspace/git-status.ts";
 import { memberSnapshotFor, normalizeAgentMembers, type AgentContext, type AgentMemberSnapshot } from "./session/agent-context.ts";
 import { threadShortId, threadParentGroupId } from "./threads/thread-target.ts";
 import { createBotEventLoop, type BotEventLoop } from "./bot-events.ts";
@@ -3724,14 +3727,15 @@ class CoreService implements ChannelService {
 
 
   private async handleStatus(target: ChatTarget): Promise<void> {
+    const botUid = this.bot!.uid;
     const current = await this.status(target);
-    const taskState = current.state;
-    const session = current.sessionId ?? "无";
-    const cwd = current.cwd ?? "无";
+    const binding = this.store.getBinding(botUid, target);
+    const workspace = this.store.getThreadWorkspace(botUid, target);
+    const references = this.store.getThreadReferences(botUid, target);
     const goal = current.sessionId
-      ? this.store.getGoalSession(this.bot!.uid, target, current.sessionId)
+      ? this.store.getGoalSession(botUid, target, current.sessionId)
       : null;
-    const policy = this.store.resolveChatModel(this.bot!.uid, target);
+    const policy = this.store.resolveChatModel(botUid, target);
     const targetKeyValue = targetKey(target);
     const forkState = this.threadForks.runningTargets().includes(targetKeyValue)
       ? "fork-preparing"
@@ -3741,22 +3745,59 @@ class CoreService implements ChannelService {
           ? "fork-archive"
           : null;
     const live = this.liveWorker(target);
-    let liveModel = "无运行中会话";
-    if (live) {
-      try {
-        const catalog = await live.models();
-        liveModel = catalog.current === null
-          ? "未知（OMP 未报告）"
-          : modelWithLevel(catalog.current, catalog.level);
-      } catch {
-        liveModel = "未知（OMP 查询失败）";
-      }
+    const contextBinding = binding === null
+      ? null
+      : {
+          botUid,
+          channelType: target.channelType,
+          channelId: target.channelId,
+          sessionId: binding.sessionId,
+          sessionFile: binding.sessionFile,
+          cwd: binding.cwd,
+        };
+    const [context, repositories] = await Promise.all([
+      readSessionContext(contextBinding, live, this.shutdownController.signal, this.store),
+      readWorkspaceChanges(current.cwd, workspace, this.shutdownController.signal),
+    ]);
+    const liveModel = live
+      ? context.source === "live" && context.model !== null
+        ? context.model
+        : "未知（OMP未报告/查询失败）"
+      : "无运行中会话";
+    const frame = buildStatusCard({
+      status: current,
+      operation: forkState,
+      goal: goal?.status ?? "none",
+      modelPolicy: modelPolicyDescription(policy.model, policy.source),
+      liveModel,
+      context,
+      repositories,
+      references,
+    });
+    const timeout = AbortSignal.timeout(10_000);
+    const sendSignal = AbortSignal.any([this.shutdownController.signal, timeout]);
+    const aborted = Promise.withResolvers<never>();
+    const onAbort = (): void => aborted.reject(sendSignal.reason ?? new Error("status card send timed out"));
+    if (sendSignal.aborted) onAbort();
+    else sendSignal.addEventListener("abort", onAbort, { once: true });
+    let receipt: Awaited<ReturnType<ChannelServiceOptions["transport"]["sendCard"]>> = null;
+    try {
+      receipt = await Promise.race([
+        this.options.transport.sendCard(target, frame, randomUUID(), sendSignal),
+        aborted.promise,
+      ]);
+    } catch {
+      // Unsupported or failed card delivery uses the same text frame through the durable outbox.
+    } finally {
+      sendSignal.removeEventListener("abort", onAbort);
     }
-    await this.outbox.enqueueText(
-      target,
-      `session=${session}\ncwd=${cwd}\nstate=${taskState}${forkState === null ? "" : `\noperation=${forkState}`}\ngoal=${goal?.status ?? "none"}\nmode=${current.mode}\nmodel=${modelPolicyDescription(policy.model, policy.source)}（下次启动策略）\nliveModel=${liveModel}\nqueued=${current.queued}\noutbox=${current.outbox}\nunknown=${current.unknownOutbox}`,
-      null,
-    );
+    if (
+      !receipt?.messageId?.trim()
+      && !this.stopping
+      && !this.shutdownController.signal.aborted
+    ) {
+      await this.outbox.enqueueText(target, frame.plain, null);
+    }
   }
 
   /**
@@ -5514,6 +5555,28 @@ class CoreService implements ChannelService {
       this.typingLeases.release(runtime.target, `task:${taskId}`);
       this.questions.rejectForTask(taskId, new Error("task finished"));
       if (runtime.btwOperations.size > 0) await Promise.allSettled([...runtime.btwOperations]);
+      if (runtime.lease && !this.stopping && !this.shutdownController.signal.aborted && !runtime.cancelRequested) {
+        const worker = runtime.lease.worker;
+        const binding = this.store.getBinding(this.bot!.uid, runtime.target);
+        if (
+          binding !== null
+          && binding.sessionId === worker.sessionId
+          && binding.cwd === runtime.cwd
+        ) {
+          try {
+            await readSessionContext({
+              botUid: this.bot!.uid,
+              channelType: runtime.target.channelType,
+              channelId: runtime.target.channelId,
+              sessionId: binding.sessionId,
+              sessionFile: binding.sessionFile,
+              cwd: binding.cwd,
+            }, worker, this.shutdownController.signal, this.store);
+          } catch {
+            // A final context snapshot must never replace task settlement.
+          }
+        }
+      }
       if (runtime.lease) await runtime.lease.close();
       this.outbox.releaseIfIdle(taskId);
       // Deregister before a creator-chat notice so a shared directory does not queue behind this run.

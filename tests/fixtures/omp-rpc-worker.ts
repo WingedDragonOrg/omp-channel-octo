@@ -79,7 +79,9 @@ type Scenario =
 	| "research"
 	| "research-malformed"
 	| "research-higher"
-	| "no-models";
+	| "no-models"
+	| "context-partial"
+	| "model-window-only";
 
 const argv = process.argv.slice(2);
 
@@ -2312,7 +2314,7 @@ function handleCommand(command: Frame): void {
 	}
 	if (type === "get_state") {
 		response(id, type, {
-			model: { ...currentModel, name: currentModel.id },
+			model: { ...currentModel, name: currentModel.id, contextWindow: 8192 },
 			thinkingLevel: currentLevel ?? "off",
 			isStreaming: streaming,
 			isSettled: sessionIsSettled,
@@ -2325,6 +2327,11 @@ function handleCommand(command: Frame): void {
 			fastModeEnabled: false,
 			fastModeActive: false,
 			tokensPerSecond: null,
+			contextUsage: scenario === "model-window-only"
+				? {}
+				: scenario === "context-partial"
+					? { tokens: 4096, contextWindow: 8192 }
+					: { tokens: 4096, contextWindow: 8192, percent: 50 },
 			messageCount: 0,
 			queuedMessageCount: 0,
 			todoPhases: [],

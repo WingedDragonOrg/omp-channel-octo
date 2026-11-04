@@ -512,6 +512,71 @@ describe("OMP RPC worker", () => {
 			{ model: "deepminer/tencent/glm-5.3" },
 		);
 	});
+	test("reads the native context estimate while a prompt is active without dispatching another prompt", async () => {
+		await withHarness("interrupt-hang", async harness => {
+			let promptSettled = false;
+			const heldPrompt = harness.worker.prompt("hold context for status", () => {}).then(
+				() => {
+					promptSettled = true;
+				},
+				() => {
+					promptSettled = true;
+				},
+			);
+			await waitUntil(async () => (await readLog(harness.logPath)).some(entry => entry.kind === "prompt"));
+
+			const context = await Promise.race([
+				harness.worker.contextUsage(),
+				Bun.sleep(1_000).then(() => {
+					throw new Error("live get_state did not return while the prompt was held");
+				}),
+			]);
+
+			expect(context).toEqual({
+				sessionId: harness.worker.sessionId,
+				sessionFile: harness.worker.sessionFile,
+				tokens: 4_096,
+				contextWindow: 8_192,
+				percent: 50,
+				model: "fixture/default:xhigh",
+			});
+			expect(promptSettled).toBe(false);
+			const entries = await readLog(harness.logPath);
+			expect(commandTypes(entries).filter(type => type === "get_state")).toHaveLength(2);
+			expect(entries.filter(entry => entry.kind === "prompt")).toHaveLength(1);
+
+			await harness.worker.stop();
+			await heldPrompt;
+		});
+	});
+
+	test("preserves available native context fields when OMP omits part of the estimate", async () => {
+		await withHarness("context-partial", async harness => {
+			const context = await harness.worker.contextUsage();
+
+			expect(context).toEqual({
+				sessionId: harness.worker.sessionId,
+				sessionFile: harness.worker.sessionFile,
+				tokens: 4_096,
+				contextWindow: 8_192,
+				percent: null,
+				model: "fixture/default:xhigh",
+			});
+		});
+	});
+
+	test("keeps model contextWindow when OMP omits every contextUsage metric", async () => {
+		await withHarness("model-window-only", async harness => {
+			expect(await harness.worker.contextUsage()).toEqual({
+				sessionId: harness.worker.sessionId,
+				sessionFile: harness.worker.sessionFile,
+				tokens: null,
+				contextWindow: 8_192,
+				percent: null,
+				model: "fixture/default:xhigh",
+			});
+		});
+	});
 
 	test("keeps --model together with --resume so a resumed turn keeps the chat's model", async () => {
 		await withHarness(

@@ -41,6 +41,7 @@ import type {
   ThreadWorkspace,
   ThreadWorkspaceRequest,
   WorkerEvent,
+  WorkerContextUsage,
   WorkerGoal,
   WorkerGoalResult,
   WorkerGoalRun,
@@ -1105,6 +1106,7 @@ class FixtureWorker implements OmpWorker {
   readonly sessionFile: string;
   readonly sessionId: string;
   stopped = false;
+  contextUsageReads = 0;
   /** How often the host asked this turn to abort (`/interrupt`, `/cancel`, a question stop). */
   abortCalls = 0;
   /** Selectors this session was asked to switch to, in order — the native `/switch` dispatches. */
@@ -1143,6 +1145,7 @@ class FixtureWorker implements OmpWorker {
     private readonly beforeSteer: (text: string) => Promise<void>,
     private readonly btwHandler: FakeBtwHandler,
     private readonly recordBtw: (record: FakeBtwRunContext) => void,
+    private readonly contextUsageFor: () => Omit<WorkerContextUsage, "sessionId" | "sessionFile">,
   ) {
     this.sessionFile = options.sessionFile ?? join(options.sessionDir, `${sessionId}.session`);
     let persistedSessionId: string | undefined;
@@ -1199,6 +1202,21 @@ class FixtureWorker implements OmpWorker {
       current: this.switchedModel?.model ?? this.options.model ?? catalog.current,
       level: this.switchedModel?.level ?? catalog.level,
       available: catalog.available.map(model => ({ ...model })),
+    };
+  }
+
+  async contextUsage(signal?: AbortSignal): Promise<WorkerContextUsage> {
+    signal?.throwIfAborted();
+    this.contextUsageReads += 1;
+    const sample = this.contextUsageFor();
+    const catalog = this.catalog();
+    const currentModel = this.switchedModel?.model ?? this.options.model ?? catalog.current;
+    const level = this.switchedModel?.level ?? catalog.level;
+    return {
+      ...sample,
+      model: sample.model ?? `${currentModel}${level === null ? "" : `:${level}`}`,
+      sessionId: this.sessionId,
+      sessionFile: this.sessionFile,
     };
   }
 
@@ -1545,6 +1563,12 @@ export class FakeWorkerFactory implements WorkerFactory {
   createFailure: Error | undefined;
   /** When set, every worker's `models()` rejects with this error, mirroring a dead RPC worker. */
   modelsFailure: Error | undefined;
+  contextUsage: Omit<WorkerContextUsage, "sessionId" | "sessionFile"> = {
+    tokens: 4_096,
+    contextWindow: 8_192,
+    percent: 50,
+    model: null,
+  };
   /** When set, the next attempted worker steer rejects before appending its message. */
   steerFailure: Error | undefined;
   /**
@@ -1617,6 +1641,7 @@ export class FakeWorkerFactory implements WorkerFactory {
       (record) => {
         this.btwCalls.push(record);
       },
+      () => this.contextUsage,
     );
     this.workers.push(worker);
     return worker;

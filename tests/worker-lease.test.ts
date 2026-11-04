@@ -92,6 +92,14 @@ async function withHarness<T>(
     steer: async () => {},
     abortTurn: async () => {},
     refreshState: async () => ({ sessionId, sessionFile, cwd }),
+    contextUsage: async () => ({
+      sessionId,
+      sessionFile,
+      tokens: 4_096,
+      contextWindow: 8_192,
+      percent: 50,
+      model: "fixture/default",
+    }),
     models: async () => ({ current: null, level: null, available: [] }),
     switchModel: async () => ({ ok: false }),
     stop: async () => {

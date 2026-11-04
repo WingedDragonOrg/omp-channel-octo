@@ -21,6 +21,23 @@ export interface BindingRecord extends ChatTarget {
   sessionSwitchedAt?: number | null;
 }
 
+/** Latest OMP-native context estimate for one bot/chat, tied to the exact persisted session file. */
+export interface SessionContextSnapshotRecord extends ChatTarget {
+  botUid: string;
+  sessionId: string;
+  sessionFile: string;
+  cwd: string;
+  usedTokens: number | null;
+  contextWindow: number | null;
+  percent: number | null;
+  model: string | null;
+  /** Response receipt time, not the session JSONL timestamp. */
+  observedAt: string;
+  /** JSONL fingerprint taken before the live get_state request. */
+  fileSize: number;
+  fileMtimeMs: number;
+}
+
 export interface InboundClaim {
   botUid: string;
   target: ChatTarget;

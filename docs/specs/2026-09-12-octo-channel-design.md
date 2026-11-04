@@ -236,7 +236,7 @@ channel 支持下列命令，`/help` 展示用法；`/retry` 经 OMP 原生命�
 | `/commit stop` | 即时停止本聊天当前提交，确认进程清理后报告结果；不停止无关任务、不回滚已完成提交 |
 | `/interrupt` | 中止当前聊天的运行中回合，保留已排队消息与它后面的排队任务；不终止 worker |
 | `/cancel`（`/stop` 同义） | 取消当前聊天正在执行的任务，并清除该聊天待执行消息 |
-| `/status` | 返回当前会话、目录、追加模式和运行/排队/中断状态 |
+| `/status` | 只读状态卡：当前会话、cwd、任务/队列/待答问题、实际模型与启动策略、当前 context 占用、逐项目 Git 净变更及已有 PR/MR 引用；卡片不可用时同源文本回退 |
 | `/restart [now]` | 通过检测出的守护进程重启 channel；允许在途及排队任务存在，旧 worker 确认退出后沿原会话续接任务，再执行队列；两种写法行为一致 |
 | `/autoresearch-history` | 只读导出：把本聊天最近一次研究运行的完整记录作为文件经既有 outbox 投递；随发随执行，不打断、不并入也不排队在运行中的任务之后；没有研究记录时只回一句短提示 |
 | `/help` | 按会话、子区、任务、模型和其他分类展示命令用法 |
@@ -258,6 +258,30 @@ channel 支持下列命令，`/help` 展示用法；`/retry` 经 OMP 原生命�
 主群 `/thread model [选择器|clear]` 统一管理所属子区默认。空参数查询；未设置明确「不指定，由 OMP 自行决定」。设置始终经 fresh probe 原生解析，不使用父群 live worker、不改变父群 `/switch` 模型；`clear` 仅删除默认，不解析为模型名，不删除子区显式覆盖。数据保存在增量创建的 `thread_models`，主键 `(bot_uid, group_id)`，旧聊天配置不复制。仅 owner 主群可用；DM/子区明确拒绝。精确 `model` 首词加空白/结束才路由控制命令，`model-fix` 等保留任务意图，`merge` 行为不变。沿用 durable claim，pending ask 不被回答、附件不下载，修改默认不污染 `/switch` 菜单。
 
 有效启动策略由状态层统一解析：本聊天显式 `/switch` > 所属主群专用子区默认 > 不传 `model`。主群自己的模型从不成为继承来源。普通任务及恢复、goal 执行/控制、commit、`/new`、`/reset`、`/move` 均在 worker 启动时读取该策略；无值时完全省略参数，resume 会话模型处理交给 OMP。默认变更动态作用于已有和新子区的下一次启动，不中断/批量切换 live 会话。子区 `/switch default` 只删自身覆盖、重新继承；无父群默认时由 OMP 自行决定。回执与 `/switch`、`/status` 区分运行中的实际模型与下一次启动策略。配置按 bot/主群隔离，跨重启保留。详细 SDD 与验收见 `2026-09-17-switch-model-command-design.md`。
+
+#### `/status` 上下文与仓库状态卡 SDD（2026-11-04）
+
+- **目标与范围**：owner 在当前聊天查询既有会话、cwd、任务状态、操作、目标、追加模式、实际模型与下次启动策略、队列、待投递/未知投递和待答问题，并查看当前绑定 session 的 context 占用和工作区 Git 净变更。仅增加只读状态卡，不增加交互动作，不改变进度卡。
+- **数据所有权**：OMP worker 层负责原生只读 RPC 的解码与当前 session 身份；`session/status-context.ts` 负责选择活会话与绑定 session 的持久数据、区分来源和时效。`workspace/git-status.ts` 负责只读 Git 查询与持久 workspace/project 到实际 worktree 的映射。`cards/status-card.ts` 纯渲染卡片及同源文本。服务只编排已有状态与这两类查询、投递和停机取消。
+- **上下文不变量**：OMP 18.16.0 的 `get_state.data.contextUsage` 原生返回 `tokens/contextWindow/percent`，同一响应的 `model` 提供实际模型；不转发响应中的 system prompt。运行中只查询当前精确绑定的活 worker，不等待主任务结束、不发 prompt/steer、不创建第二个 worker。活查询及正常任务结束、worker 停止前将最后观测保存到 channel SQLite 的精确 bot/聊天/session/file 快照；空闲核验真实绑定文件后读取这份快照，标注记录时间和「非实时」。旧会话没有快照时明确未知，不启动 fresh probe。已用上下文、模型上下文上限和有依据的比例独立于整段会话累计 input/output/cache token 消耗；外部文件变化及压缩后的历史不得声称当前占用。模型启动策略不充作该历史模型的真实上限。
+- **主指标**：卡片优先显示当前 context 的「已用量 / 模型上限 · 占用比例」，如 `121k / 200k · 60%`；数值取原生 `contextUsage` 的占用估算，不展示会话累计用量作为此指标。来源、记录时间和历史/未知含义紧贴指标，历史不能以实时主指标的样式冒充当前值。
+- **Git 口径**：以当前 worktree 的 `HEAD` 到工作树的 tracked 净变化计算 `+N/-N`，不相加 staged 与 unstaged，因此同一行只计最终净变化。发现 Git root 后统一查询整棵工作树，绑定 cwd 位于子目录时也不漏掉根目录或其他项目路径；命令级固定 `diff.relative=false`。无提交仓库使用空树基线并标注。未跟踪文件只列文件数并明确未计入行数，二进制只列文件数而不伪造行数。non-Git 正常显示无仓库统计；查询失败或受限显示不可用而非零。查询禁用 external diff/textconv 和仓库 fsmonitor hook，不暂存、提交或改配置。
+- **项目身份**：从当前聊天持久 workspace 记录识别 single/separate/shared；逐项目使用记录中的真实 worktree 路径和项目名，shared 入口不作仓库、不查询父群来源 repo。路径未就绪或已丢失按该项目报告不可用。没有 workspace 记录时仅查询当前绑定 cwd；显式切换 cwd 不改变持久资源归属。
+- **关联引用**：读取现有 `getThreadReferences(botUid, target)` 的本子区持久 PR/MR canonical URL，以类型和链接显示；不为状态查询识别新引用、扫描远端或读取其他子区。引用均为空时，卡片与文本完全省略 reference 区域，不显示空标题或占位。
+- **并发、授权与投递**：沿用 owner、allowlist、mention 和命令持久去重，在 pending ask 和任务 steering 之前处理；不消费回答、不取得普通目录排他锁。OMP/Git 查询有界并响应停机，Git 不获得写权限。使用既有 `sendCard` 的 `octo/v1` 能力/信封限制；卡片只依赖 TextBlock。发送不支持、超限或失败时，同源状态文字进入既有 outbox。安全显示沿用凭据脱敏与有界字段，不输出原始协议或 Git 错误正文。
+- **验收计划**：实施前观察缺失行为回归失败；覆盖运行中 held task/ask、空闲原 session、缺失/陈旧/压缩边界、卡片回退、owner/去重、多项目身份和真实临时 Git 的 staged/unstaged 净差。实施后执行专项 RPC/命令/卡片回归、`bun run typecheck`、`bun test`；真实安装 OMP 配合有限 localhost 模型及本地 Octo 协议夹具，验证及时只读查询、任务继续和原 session 不被替换。真实 builder 输出以浏览器渲染并记录桌面/窄屏证据。验收不注册或重启常驻 Bot，不调用真实模型，不修改 Loop/Fleet 业务数据；真实客户端渲染检查仅向本子区投递标明固定示例数据的状态卡。
+
+**已观测验收证据**
+
+- 真实 builder 的 live、persisted、stale、未知 context、未知上限、shared＋引用六种状态，分别以 440px/340px 渲染，共 12 次；渲染错误与横向溢出均为 0。最大样本为 23 个节点、3 层深度、完整信封 3480 字节。
+- 当前 Bot 使用既有凭据投递一张固定示例卡（消息 `2117881590603223040`），未重新注册。真实 Octo Web 客户端显示 `121k / 200k · 60.5%`、两项目差异和两个正确 PR/MR 链接；实测卡片宽 442px、高约 514px、子元素横向溢出 0。截图只保留卡片区域，示例不代表当前 session 数值。
+- 对状态库的只读一致性副本运行应用迁移两次，原有 27 张表、13310 行的字段和内容摘要全部保留，新增 context 快照表，`integrity_check=ok`；私有副本已删除。
+- 隔离 restart benchmark 的 graceful/SIGKILL 均恢复原任务与队列，重复副作用、会话重叠和中断通知均为 0。
+- 实施前已观察状态卡、逐项目 Git、PR/MR 引用及模型上限缺失的失败回归；最终使用独立临时目录串行执行：专项 227 项通过，`bun run typecheck` 通过，全量 1511 项通过（116 个文件、9096 条断言）。
+- `bun tests/benchmarks/status.ts` 使用已安装 OMP、有限 localhost 模型及本地加密 Octo 夹具：held 任务期间状态读取不创建或停止 worker、不改变 session，随后任务继续完成；持久快照逐字段匹配最后一条原生 `get_state`，空闲状态标为 persisted，模型请求总数为 1。
+- 实际客户端像素验收覆盖 Octo Web；340px 窄屏验收使用本地 renderer。原生移动客户端未做像素验收。context 数值是 OMP 的当前占用估算，空闲快照始终标明最后记录与非实时，不承诺 provider 精确计量。
+
+
 
 #### `/switch` provider 目录与 100 模型展示 SDD（2026-11-03）
 

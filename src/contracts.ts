@@ -558,6 +558,20 @@ export type WorkerModelSwitch =
   | { ok: true; model: string; level: string | null }
   | { ok: false };
 
+/**
+ * OMP's native point-in-time context estimate. `tokens` is current estimated context occupancy,
+ * not cumulative provider input/output/cache usage. Each measurement is independently nullable;
+ * `model` is the canonical provider/id with OMP's optional thinking-level suffix.
+ */
+export interface WorkerContextUsage {
+  sessionId: string;
+  sessionFile: string;
+  tokens: number | null;
+  contextWindow: number | null;
+  percent: number | null;
+  model: string | null;
+}
+
 export interface HostTool {
   name: string;
   description: string;
@@ -648,6 +662,7 @@ export const RESUME_CONTINUATION_PROMPT =
 export interface OmpWorker {
   readonly sessionFile: string;
   readonly sessionId: string;
+  refreshState(): Promise<ProjectSessionState>;
   prompt(
     text: string,
     onEvent: (event: WorkerEvent) => void,
@@ -683,7 +698,8 @@ export interface OmpWorker {
   steer(text: string): Promise<void>;
   /** Aborts the current OMP turn without clearing its queued messages or killing the worker. */
   abortTurn(): Promise<void>;
-  refreshState(): Promise<ProjectSessionState>;
+  /** Reads one non-prompting native context estimate within two seconds and honors cancellation. */
+  contextUsage(signal?: AbortSignal): Promise<WorkerContextUsage>;
   /** Reads the live session's model and the models OMP currently offers, without prompting. */
   models(): Promise<WorkerModelCatalog>;
   /**

@@ -13,7 +13,12 @@ import {
 
 function sentText(message: FixtureSentMessage): string {
   const payload = message.body.payload;
-  if (!payload || typeof payload !== "object" || !("content" in payload)) return "";
+  if (!payload || typeof payload !== "object") return "";
+  if ("type" in payload && payload.type === 17 && "plain" in payload) {
+    const plain: unknown = payload.plain;
+    return typeof plain === "string" ? plain : "";
+  }
+  if (!("content" in payload)) return "";
   const content: unknown = payload.content;
   return typeof content === "string" ? content : "";
 }
@@ -244,10 +249,6 @@ test("real CLI sends lifecycle notices to configured owner around /status and SI
     expect(statusReply.body).toMatchObject({
       channel_id: configuredOwnerId,
       channel_type: 1,
-      payload: {
-        type: 1,
-        content: expect.stringContaining("state=none"),
-      },
     });
 
     spawned.kill("SIGTERM");

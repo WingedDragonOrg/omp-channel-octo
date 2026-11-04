@@ -363,6 +363,12 @@ export class OctoTransport implements ChannelTransport {
     validateTarget(target);
     const capabilities = await this.cardCapabilitiesFor(signal);
     if (!capabilities || !cardProfileSupported(capabilities, frame.profile)) return null;
+    if (frame.profile === "octo/v1" && (
+      capabilities.cardVersion !== CARD_VERSION
+      || (capabilities.elements !== undefined && !capabilities.elements.includes("TextBlock"))
+    )) {
+      return null;
+    }
     const content = cardFrameEnvelope(frame, capabilities);
     if (!content) return null;
     return this.sendMessage(target, content, clientMsgNo, signal);

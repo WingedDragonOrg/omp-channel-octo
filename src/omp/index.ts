@@ -13,6 +13,7 @@ import type {
 	WorkerGoalResult,
 	WorkerGoalRun,
 	WorkerGoalStatus,
+	WorkerContextUsage,
 	WorkerModelCatalog,
 	WorkerModelInfo,
 	WorkerModelSwitch,
@@ -187,6 +188,7 @@ type WorkerFactoryOptions = {
 const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 const DEFAULT_CANCEL_TIMEOUT_MS = 10_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const CONTEXT_USAGE_TIMEOUT_MS = 2_000;
 const PASSIVE_UI_METHODS: Record<string, true> = {
 	setStatus: true,
 	setWidget: true,
@@ -411,6 +413,58 @@ class RpcWorker implements OmpWorker {
 		this.#sessionId = loaded.state.sessionId;
 		return loaded.state;
 	}
+	/**
+	 * Return OMP's current in-memory context estimate for this worker. This is one read-only
+	 * `get_state` request; it never starts or steers an agent turn.
+	 */
+	async contextUsage(signal?: AbortSignal): Promise<WorkerContextUsage> {
+		if (this.#closed) throw new Error("OMP worker is not running");
+		const stateResponse = await this.#request({ type: "get_state" }, CONTEXT_USAGE_TIMEOUT_MS, undefined, signal);
+		this.#assertSuccess(stateResponse, "get_state");
+		const state = stateResponse.data;
+		if (
+			!isRecord(state) ||
+			typeof state.sessionId !== "string" ||
+			state.sessionId.length === 0 ||
+			typeof state.sessionFile !== "string" ||
+			state.sessionFile.length === 0
+		) {
+			throw new Error("OMP RPC get_state did not return a session file and session ID");
+		}
+		const rawUsage = isRecord(state.contextUsage) ? state.contextUsage : undefined;
+		const tokens = typeof rawUsage?.tokens === "number" && Number.isFinite(rawUsage.tokens) && rawUsage.tokens >= 0
+			? rawUsage.tokens
+			: null;
+		const modelState = isRecord(state.model) ? state.model : undefined;
+		const contextWindow =
+			typeof rawUsage?.contextWindow === "number" && Number.isFinite(rawUsage.contextWindow) && rawUsage.contextWindow > 0
+				? rawUsage.contextWindow
+				: typeof modelState?.contextWindow === "number" && Number.isFinite(modelState.contextWindow) && modelState.contextWindow > 0
+					? modelState.contextWindow
+					: null;
+		const percent =
+			typeof rawUsage?.percent === "number" && Number.isFinite(rawUsage.percent) && rawUsage.percent >= 0
+				? rawUsage.percent
+				: null;
+		const level = modelLevel(state);
+		const model =
+			modelState &&
+			typeof modelState.provider === "string" &&
+			modelState.provider.length > 0 &&
+			typeof modelState.id === "string" &&
+			modelState.id.length > 0
+				? `${modelState.provider}/${modelState.id}${level === null ? "" : `:${level}`}`
+				: null;
+		return {
+			sessionId: state.sessionId,
+			sessionFile: state.sessionFile,
+			tokens,
+			contextWindow,
+			percent,
+			model,
+		};
+	}
+
 
 	/**
 	 * The live session's model plus everything OMP currently offers. No prompt is involved, so a
@@ -971,23 +1025,55 @@ class RpcWorker implements OmpWorker {
 		if (frame.success !== true) throw errorFromResponse(frame, command);
 	}
 
-	async #request(command: RpcCommand, timeoutMs: number, onId?: (id: string) => void): Promise<RpcFrame> {
+	async #request(
+		command: RpcCommand,
+		timeoutMs: number,
+		onId?: (id: string) => void,
+		signal?: AbortSignal,
+	): Promise<RpcFrame> {
 		if (this.#closed) throw new Error("OMP worker is not running");
+		if (signal?.aborted) {
+			throw signal.reason instanceof Error ? signal.reason : new Error(`OMP RPC ${command.type} aborted`);
+		}
 		const id = `omp-${++this.#requestCounter}`;
 		onId?.(id);
 		const frame = { ...command, id };
 		return new Promise<RpcFrame>((resolve, reject) => {
+			let onAbort: (() => void) | undefined;
+			const cleanup = (): void => {
+				if (onAbort) signal?.removeEventListener("abort", onAbort);
+			};
+			const settleResolve = (value: RpcFrame): void => {
+				cleanup();
+				resolve(value);
+			};
+			const settleReject = (error: Error): void => {
+				cleanup();
+				reject(error);
+			};
 			const timer = setTimeout(() => {
 				this.#pending.delete(id);
-				reject(new Error(`Timed out waiting for OMP RPC ${command.type}`));
+				settleReject(new Error(`Timed out waiting for OMP RPC ${command.type}`));
 			}, timeoutMs);
-			this.#pending.set(id, { resolve, reject, timer });
+			this.#pending.set(id, { resolve: settleResolve, reject: settleReject, timer });
+			if (signal) {
+				onAbort = () => {
+					if (!this.#pending.delete(id)) return;
+					clearTimeout(timer);
+					settleReject(signal.reason instanceof Error ? signal.reason : new Error(`OMP RPC ${command.type} aborted`));
+				};
+				signal.addEventListener("abort", onAbort, { once: true });
+				if (signal.aborted) {
+					onAbort();
+					return;
+				}
+			}
 			try {
 				this.#writeFrame(frame);
 			} catch (error) {
 				clearTimeout(timer);
 				this.#pending.delete(id);
-				reject(asError(error, `Could not send OMP RPC ${command.type}`));
+				settleReject(asError(error, `Could not send OMP RPC ${command.type}`));
 			}
 		});
 	}

@@ -13,6 +13,7 @@ import type {
   WorkerModelCatalog,
   WorkerModelSwitch,
   WorkerOptions,
+  WorkerContextUsage,
 } from "../src/contracts";
 import {
   findMovedSession,
@@ -139,6 +140,10 @@ class DelayedStopWorker implements OmpWorker {
     return this.inner.models();
   }
 
+  contextUsage(signal?: AbortSignal): Promise<WorkerContextUsage> {
+    return this.inner.contextUsage(signal);
+  }
+
   switchModel(selector: string): Promise<WorkerModelSwitch> {
     return this.inner.switchModel(selector);
   }
@@ -228,6 +233,10 @@ class StopFalseWorker implements OmpWorker {
 
   models(): Promise<WorkerModelCatalog> {
     return this.inner.models();
+  }
+
+  contextUsage(signal?: AbortSignal): Promise<WorkerContextUsage> {
+    return this.inner.contextUsage(signal);
   }
 
   switchModel(selector: string): Promise<WorkerModelSwitch> {
@@ -323,6 +332,10 @@ class CommandSessionWorker implements OmpWorker {
 
   async models(): Promise<WorkerModelCatalog> {
     return this.inner.models();
+  }
+
+  contextUsage(signal?: AbortSignal): Promise<WorkerContextUsage> {
+    return this.inner.contextUsage(signal);
   }
 
   async switchModel(selector: string): Promise<WorkerModelSwitch> {

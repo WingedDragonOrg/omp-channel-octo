@@ -56,6 +56,7 @@ class RefusingSteerFactory extends FakeWorkerFactory {
       },
       abortTurn: () => worker.abortTurn(),
       refreshState: () => worker.refreshState(),
+      contextUsage: (signal?: AbortSignal) => worker.contextUsage(signal),
       models: () => worker.models(),
       switchModel: (selector: string) => worker.switchModel(selector),
       stop: () => worker.stop(),

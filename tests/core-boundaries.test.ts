@@ -11,6 +11,7 @@ import type {
   OmpWorker,
   PromptContext,
   WorkerEvent,
+  WorkerContextUsage,
   WorkerGoalResult,
   WorkerGoalRun,
   WorkerFactory,
@@ -99,6 +100,10 @@ class WorkerProxy implements OmpWorker {
 
   models(): Promise<WorkerModelCatalog> {
     return this.inner.models();
+  }
+
+  contextUsage(signal?: AbortSignal): Promise<WorkerContextUsage> {
+    return this.inner.contextUsage(signal);
   }
 
   switchModel(selector: string): Promise<WorkerModelSwitch> {
