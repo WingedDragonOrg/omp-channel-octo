@@ -71,7 +71,7 @@ const irrelevantTaskInputs = [
   otherTaskId, unassignedTaskId, "LOOP_SMOKE_OTHER", "LOOP_SMOKE_OTHER_DESCRIPTION",
   unassignedTitle, "LOOP_SMOKE_UNASSIGNED_DESCRIPTION",
 ];
-const workspace = { workspace_id: workspaceId, name: "Loop acceptance", slug: "loop-acceptance" };
+const workspace = { id: workspaceId, name: "Loop acceptance", slug: "loop-acceptance" };
 
 function completion(text: string, tool?: Record<string, unknown>): Response {
   const delta = tool ? { role: "assistant", tool_calls: [{ index: 0, ...tool }] } : { role: "assistant", content: text };

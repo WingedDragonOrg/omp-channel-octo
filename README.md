@@ -113,7 +113,7 @@ oco run --config ~/.oco/config/config.json
 | `/move <目录>` | 通过 OMP 原生迁移保留当前会话 ID、历史与附件。 |
 | `/fork [子区名称]` | 即时将当前主群/子区的已落盘上下文分叉到同父群的新子区；独立 session，共用当前目录，源任务继续。 |
 | `/thread <任务>` | 在群内交由助手按项目与耦合程度创建隔离子区，工作区和背景就绪后派发任务。 |
-| `/bind loop <url\|workspace_id\|workspace_name>` | 在已开通主群绑定 Loop workspace；名称完整匹配，重名时要求使用 ID 或同源 Loop 深链接。 |
+| `/bind loop <url\|workspace_id\|workspace_name\|workspace_slug>` | 在已开通主群绑定 Loop workspace；名称或 slug 完整匹配，存在歧义时使用 ID。 |
 | `/thread model [选择器\|clear]` | 主群查询、设置或清除所属子区默认模型；只影响子区下一次 worker 启动，主群自身模型不变。 |
 | `/thread merge [补充说明]` | 单项目及 separate 子区合并并清理工作区；shared 多项目拒绝。沿用目录的 fork 子区仅归档 Octo，保留本地资源。 |
 | `/thread remove [--force]` | 清理当前子区持久拥有的 worktree 与分支后归档；默认保护 dirty 和未合并提交，force 授权丢弃。沿用目录的 fork 子区仅归档 Octo。 |
@@ -168,7 +168,7 @@ Git 行数是 **`HEAD → 当前工作树` 的 tracked 净变化**，显示 `+N/
 
 ### Loop workspace 与任务子区
 
-owner 在已开通主群执行 `/bind loop <选择器>`。UUID 直接验证；名称通过当前 Bot 的授权 workspace 列表完整分页解析；支持与当前 API 部署同源的 `/fleet/<workspace-slug>/issues/<identifier>` 和 `/fleet/<workspace-slug>/projects/<project-id>` 链接。回执显示实际 workspace ID 和绑定群。重复绑定同一 workspace 保留关联并检查当前变化，显式绑定其他 workspace 切换该群的感知范围。
+owner 在已开通主群执行 `/bind loop <选择器>`。UUID 直接验证；名称或裸 slug 通过当前 Bot 的授权 workspace 列表完整分页精确匹配，多个 workspace 匹配时拒绝歧义；支持与当前 API 部署同源的 `/fleet/<workspace-slug>/issues/<identifier>` 和 `/fleet/<workspace-slug>/projects/<project-id>` 链接。回执显示实际 workspace ID 和绑定群。重复绑定同一 workspace 保留关联并检查当前变化，显式绑定其他 workspace 切换该群的感知范围。
 
 绑定 workspace 仍按全部任务分页读取并推进快照；agent 输入只包含已有当前任务—子区关联的 task，或 `assignee_type=member` 且非空 `assignee_octo_uid` 等于当前持久化 channel owner UID / Bot UID 的 task。这里比较 Octo UID，不能将 Fleet `assignee_id` UUID 当成 Octo UID。首次 baseline 与增量使用同一门槛；其他人指派及未分配且无路由的 task 只更新快照，不启动或 steering agent。已关联 task 即使改派也继续直达原子区。owner 的人工交办和显式 `thread-bind` 沿原路径；agent 可为收到的任务复用子区、更新关联或建区派发。`octo_management create-thread` 可携带 `task_id`，`thread-bind` 显式调整关联，`thread-dispatch` 携带同一 `task_id` 校验来源；`thread-info` 和 `list-threads` 显示关联。任务描述有界预览，截断时按提示读取完整详情。
 

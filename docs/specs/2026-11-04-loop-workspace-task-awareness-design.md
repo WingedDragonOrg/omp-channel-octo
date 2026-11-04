@@ -13,7 +13,7 @@
 
 | 项目 | 决策 |
 | --- | --- |
-| 入口 | owner-only 内建命令 `/bind loop <url\|workspace_id\|workspace_name>` |
+| 入口 | owner-only 内建命令 `/bind loop <url\|workspace_id\|workspace_name\|workspace_slug>` |
 | 扫描范围 | 仅扫描持久绑定的 workspace ID；名称和 slug 的发现仅发生在绑定解析时 |
 | 初次绑定 | 提交覆盖 workspace 全部任务的首次快照；仅对符合路由/成员指派门槛的任务交付 baseline，零符合任务不启动空 baseline agent |
 | 自动动作 | 符合交付门槛的任务由对应 agent 处理；主群 agent 可沿已有流程复用子区、维护关联、新建子区并派发 |
@@ -49,7 +49,9 @@
 
 1. UUID：直接读取同一 ID 的 workspace，校验实际访问权限。
 2. URL：只解析与当前 Octo API 部署同源的已知 Loop 深链接路径，从上述任务/项目链接提取 workspace slug，经完整授权列表唯一解析到 ID，再读取 workspace 验证。链接用于提取 workspace，不绑定链接中的单个任务或 Loop project；不请求任意 URL，不从无 workspace 身份的 `/loop` 推测当前选择。
-3. 名称：分页读取当前 Bot 可访问的全部 workspace，按完整名称精确匹配；零匹配报未找到，多个匹配报重名并列出候选 ID，要求改用 ID 或链接。列表未完整读取不得宣布唯一或提交绑定。slug 同样要求唯一匹配。
+3. 名称或裸 slug：分页读取当前 Bot 可访问的全部 workspace，同时按完整名称及 slug 精确匹配，以不同 workspace ID 去重；零匹配报未找到，多个 ID（包括名称与另一 workspace 的 slug 冲突）报歧义并列出候选 ID。列表未完整读取不得宣布唯一或提交绑定。
+
+列表记录以 `workspace_id` 为身份，详情以 `id` 为身份；兼容既有详情 `workspace_id` 形状。若记录同时包含两个身份字段，均须为有效 UUID 且一致；详情身份还须与请求 ID 一致。只接受服务端返回的 workspace ID，不从 slug 推导 UUID。当前 Octo Server Project 派生 workspace 使用该 Project UUID；Loop 业务项目的 `project_id` 是独立身份。
 
 确认 ID 指解析、验证并在成功回执展示最终 ID，不增加第二次交互确认。成功回执包含主群、workspace 名称和 ID；持久化以 ID 为准，名称变更不改变目标。
 

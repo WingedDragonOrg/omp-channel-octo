@@ -22,7 +22,7 @@
 
 包含可选外部决策服务驱动的子区 PR/MR 引用绑定：operator 显式配置共用 Decisions 服务的协议、模型和密钥后，仅从已受理的当前子区可见正文识别候选，以必要有界上下文判断是否为直接工作对象；高概率结果去重持久化到本地 `thread-info.references`，不改 Octo/Fleet。判断异步尽力而为，已绑定引用跨重启保留，未完成判断不恢复或补扫。详细契约见 `docs/specs/2026-11-04-thread-pr-mr-reference-binding-design.md`。
 
-包含 owner-only `/bind loop <url|workspace_id|workspace_name>` 的 workspace 感知：仅扫描显式绑定 ID，以完整分页快照比较业务变化；只为当前负责人 Octo UID 精确命中 channel owner/Bot，或已有明确 task—子区关联的任务产生 agent 输入。首次整理及未关联的关注任务交主群，明确关联的任务变化直达子区；其余任务仅更新快照。thread 工具通过 `task_id` 创建或维护来源关联，执行结果按既有 listen 策略回传。权限、持久去重、未知接受及创建保护、隔离验收见 `docs/specs/2026-11-04-loop-workspace-task-awareness-design.md`。
+包含 owner-only `/bind loop <url|workspace_id|workspace_name|workspace_slug>` 的 workspace 感知：仅扫描显式绑定 ID，以完整分页快照比较业务变化；只为当前负责人 Octo UID 精确命中 channel owner/Bot，或已有明确 task—子区关联的任务产生 agent 输入。首次整理及未关联的关注任务交主群，明确关联的任务变化直达子区；其余任务仅更新快照。thread 工具通过 `task_id` 创建或维护来源关联，执行结果按既有 listen 策略回传。权限、持久去重、未知接受及创建保护、隔离验收见 `docs/specs/2026-11-04-loop-workspace-task-awareness-design.md`。
 
 群与子区当前事实清单使用当前 GROUP.md / THREAD.md 中的固定 `### Memory Start ###` / `### Memory End ###` 区段。agent 先通过已有 `octo_management.description-read` 读取完整说明，只修改该区段并保留区段外原文，再经 `description-write` 写回；宿主要求本任务先显式读取，并在写前重新核对正文与版本，说明变化时拒绝并要求重读。群与子区分别使用自己的说明，沿用现有版本快照与 compaction 注入。完整合同与验收见 `docs/specs/2026-11-04-group-thread-current-facts-design.md`。
 

@@ -69,6 +69,16 @@ function workspaceRecord(
     updated_at: "2026-01-01T00:00:00Z",
   };
 }
+function workspaceDetailRecord(
+  workspaceId: string,
+  name: string,
+  slug: string,
+): Record<string, unknown> {
+  const record = workspaceRecord(workspaceId, name, slug);
+  delete record.workspace_id;
+  record.id = workspaceId;
+  return record;
+}
 
 function taskRecord(taskId: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -162,6 +172,144 @@ describe("Loop REST read port", () => {
         assert.equal(request.accept, "application/vnd.octo+json");
         assert.equal(request.url.searchParams.has("token"), false);
       }
+    } finally {
+      fixture.stop();
+    }
+  });
+
+  it("resolves UUID, name, bare slug, and same-origin deep links using workspace_id list rows and id details", async () => {
+    const workspace = workspaceRecord(WORKSPACE_ID, "Platform Ops", "platform-ops");
+    const detail = workspaceDetailRecord(WORKSPACE_ID, "Platform Ops", "platform-ops");
+    const fixture = startApiFixture((_request, url) => {
+      if (url.pathname === "/fleet/api/v1/workspaces") return pageEnvelope([workspace], 1, 1);
+      if (url.pathname === `/fleet/api/v1/workspaces/${WORKSPACE_ID}`) return workspaceEnvelope(detail);
+      return Response.json({ error: { code: "NOT_FOUND", message: "not found" } }, { status: 404 });
+    });
+
+    try {
+      const port = createLoopReadPort({ apiUrl: fixture.apiUrl, botToken: TOKEN });
+      const expected = {
+        workspaceId: WORKSPACE_ID,
+        name: "Platform Ops",
+        slug: "platform-ops",
+      };
+      for (const selector of [
+        WORKSPACE_ID,
+        "Platform Ops",
+        "platform-ops",
+        `${fixture.apiUrl}/fleet/platform-ops/issues/LOOP-12`,
+      ]) {
+        assert.deepEqual(await port.resolveWorkspace(selector), expected);
+      }
+      assert.deepEqual(fixture.requests.map(({ url }) => url.pathname), [
+        `/fleet/api/v1/workspaces/${WORKSPACE_ID}`,
+        "/fleet/api/v1/workspaces",
+        `/fleet/api/v1/workspaces/${WORKSPACE_ID}`,
+        "/fleet/api/v1/workspaces",
+        `/fleet/api/v1/workspaces/${WORKSPACE_ID}`,
+        "/fleet/api/v1/workspaces",
+        `/fleet/api/v1/workspaces/${WORKSPACE_ID}`,
+      ]);
+    } finally {
+      fixture.stop();
+    }
+  });
+
+  it("accepts matching id and legacy workspace_id identities in workspace details", async () => {
+    const detail = {
+      ...workspaceDetailRecord(WORKSPACE_ID, "Platform Ops", "platform-ops"),
+      workspace_id: WORKSPACE_ID,
+    };
+    const fixture = startApiFixture((_request, url) => {
+      if (url.pathname === `/fleet/api/v1/workspaces/${WORKSPACE_ID}`) return workspaceEnvelope(detail);
+      return Response.json({ error: { code: "NOT_FOUND", message: "not found" } }, { status: 404 });
+    });
+
+    try {
+      const port = createLoopReadPort({ apiUrl: fixture.apiUrl, botToken: TOKEN });
+      assert.deepEqual(await port.resolveWorkspace(WORKSPACE_ID), {
+        workspaceId: WORKSPACE_ID,
+        name: "Platform Ops",
+        slug: "platform-ops",
+      });
+    } finally {
+      fixture.stop();
+    }
+  });
+
+  it("rejects workspace details with a wrong or conflicting identity, or no identity", async () => {
+    const details = [
+      workspaceDetailRecord(OTHER_WORKSPACE_ID, "Platform Ops", "platform-ops"),
+      workspaceRecord(OTHER_WORKSPACE_ID, "Platform Ops", "platform-ops"),
+      {
+        ...workspaceDetailRecord(WORKSPACE_ID, "Platform Ops", "platform-ops"),
+        workspace_id: OTHER_WORKSPACE_ID,
+      },
+      { name: "Platform Ops", slug: "platform-ops" },
+    ];
+
+    for (const detail of details) {
+      const fixture = startApiFixture((_request, url) => {
+        if (url.pathname === `/fleet/api/v1/workspaces/${WORKSPACE_ID}`) return workspaceEnvelope(detail);
+        return Response.json({ error: { code: "NOT_FOUND", message: "not found" } }, { status: 404 });
+      });
+
+      try {
+        const port = createLoopReadPort({ apiUrl: fixture.apiUrl, botToken: TOKEN });
+        await assert.rejects(port.resolveWorkspace(WORKSPACE_ID));
+        assert.equal(fixture.requests.length, 1);
+      } finally {
+        fixture.stop();
+      }
+    }
+  });
+
+  it("rejects a workspace list row whose identity fields conflict", async () => {
+    const row = { ...workspaceRecord(WORKSPACE_ID, "Platform Ops", "platform-ops"), id: OTHER_WORKSPACE_ID };
+    const fixture = startApiFixture((_request, url) => url.pathname === "/fleet/api/v1/workspaces"
+      ? pageEnvelope([row], 1, 1)
+      : workspaceEnvelope(workspaceDetailRecord(WORKSPACE_ID, "Platform Ops", "platform-ops")));
+    try {
+      const port = createLoopReadPort({ apiUrl: fixture.apiUrl, botToken: TOKEN });
+      await assert.rejects(port.resolveWorkspace("Platform Ops"), /invalid.*schema/i);
+    } finally {
+      fixture.stop();
+    }
+  });
+
+  it("rejects a selector matching one workspace name and another workspace slug", async () => {
+    const first = workspaceRecord(WORKSPACE_ID, "Shared selector", "first-workspace");
+    const second = workspaceRecord(OTHER_WORKSPACE_ID, "Other workspace", "Shared selector");
+    const fixture = startApiFixture((_request, url) => {
+      if (url.pathname === "/fleet/api/v1/workspaces") return pageEnvelope([first, second], 1, 2);
+      return Response.json({ error: { code: "NOT_FOUND", message: "not found" } }, { status: 404 });
+    });
+
+    try {
+      const port = createLoopReadPort({ apiUrl: fixture.apiUrl, botToken: TOKEN });
+      await assert.rejects(port.resolveWorkspace("Shared selector"), (error: unknown) => {
+        assert.match(String(error), /multiple|duplicate|ambiguous/i);
+        assert.match(String(error), new RegExp(WORKSPACE_ID));
+        assert.match(String(error), new RegExp(OTHER_WORKSPACE_ID));
+        return true;
+      });
+      assert.deepEqual(fixture.requests.map(({ url }) => url.pathname), ["/fleet/api/v1/workspaces"]);
+    } finally {
+      fixture.stop();
+    }
+  });
+
+  it("rejects an unknown workspace selector after reading the authorized list", async () => {
+    const workspace = workspaceRecord(WORKSPACE_ID, "Platform Ops", "platform-ops");
+    const fixture = startApiFixture((_request, url) => {
+      if (url.pathname === "/fleet/api/v1/workspaces") return pageEnvelope([workspace], 1, 1);
+      return Response.json({ error: { code: "NOT_FOUND", message: "not found" } }, { status: 404 });
+    });
+
+    try {
+      const port = createLoopReadPort({ apiUrl: fixture.apiUrl, botToken: TOKEN });
+      await assert.rejects(port.resolveWorkspace("Unknown workspace"));
+      assert.deepEqual(fixture.requests.map(({ url }) => url.pathname), ["/fleet/api/v1/workspaces"]);
     } finally {
       fixture.stop();
     }

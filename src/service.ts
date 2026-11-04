@@ -1916,7 +1916,7 @@ class CoreService implements ChannelService {
     if (selector.length === 0) {
       await this.outbox.enqueueText(
         message,
-        "用法：/bind loop <Loop workspace 名称、ID 或同源 Fleet issue/project 链接>",
+        "用法：/bind loop <Loop workspace 名称、slug、ID 或同源 Fleet issue/project 链接>",
         null,
       );
       return;

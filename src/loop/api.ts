@@ -135,8 +135,26 @@ async function readAllPages(
 }
 
 function workspaceFromRecord(record: JsonRecord, expectedId?: string): LoopWorkspace {
-  const workspaceId = requiredUuid(record.workspace_id, "workspace");
-  if (expectedId !== undefined && !sameUuid(workspaceId, expectedId)) return invalidResponse("workspace");
+  let workspaceId: string;
+  if (expectedId === undefined) {
+    workspaceId = requiredUuid(record.workspace_id, "workspace");
+    if (Object.hasOwn(record, "id") && !sameUuid(requiredUuid(record.id, "workspace"), workspaceId)) {
+      return invalidResponse("workspace");
+    }
+  } else {
+    const hasId = Object.hasOwn(record, "id");
+    const hasWorkspaceId = Object.hasOwn(record, "workspace_id");
+    if (!hasId && !hasWorkspaceId) return invalidResponse("workspace");
+
+    const recordId = hasId ? requiredUuid(record.id, "workspace") : undefined;
+    const legacyId = hasWorkspaceId ? requiredUuid(record.workspace_id, "workspace") : undefined;
+    if (recordId !== undefined && legacyId !== undefined && !sameUuid(recordId, legacyId)) {
+      return invalidResponse("workspace");
+    }
+    const detailId = recordId ?? legacyId;
+    if (detailId === undefined || !sameUuid(detailId, expectedId)) return invalidResponse("workspace");
+    workspaceId = detailId;
+  }
   return {
     workspaceId,
     name: requiredText(record.name, "workspace"),
@@ -292,18 +310,24 @@ export function createLoopReadPort({ apiUrl, botToken }: { apiUrl: string; botTo
     return [...workspaces.values()];
   }
 
-  async function resolveByNameOrSlug(
-    value: string,
-    field: "name" | "slug",
-    signal?: AbortSignal,
-  ): Promise<LoopWorkspace> {
-    const matches = (await listWorkspaces(signal)).filter((workspace) => workspace[field] === value);
+  async function readUniqueWorkspaceMatch(matches: LoopWorkspace[], signal?: AbortSignal): Promise<LoopWorkspace> {
     if (matches.length === 0) throw new OctoError("Loop workspace was not found", { permanent: true });
     if (matches.length > 1) {
       const ids = matches.map(({ workspaceId }) => workspaceId).join(", ");
       throw new OctoError(`Loop workspace selector is ambiguous; candidate IDs: ${ids}`, { permanent: true });
     }
     return readWorkspace(matches[0]!.workspaceId, signal);
+  }
+
+  async function resolveByNameOrSlug(value: string, signal?: AbortSignal): Promise<LoopWorkspace> {
+    const matches = (await listWorkspaces(signal))
+      .filter((workspace) => workspace.name === value || workspace.slug === value);
+    return readUniqueWorkspaceMatch(matches, signal);
+  }
+
+  async function resolveBySlug(value: string, signal?: AbortSignal): Promise<LoopWorkspace> {
+    const matches = (await listWorkspaces(signal)).filter((workspace) => workspace.slug === value);
+    return readUniqueWorkspaceMatch(matches, signal);
   }
 
   async function readTask(workspaceId: string, taskId: string, signal?: AbortSignal): Promise<LoopTask> {
@@ -359,12 +383,12 @@ export function createLoopReadPort({ apiUrl, botToken }: { apiUrl: string; botTo
     if (UUID_PATTERN.test(value)) return readWorkspace(value, signal);
     if (/^[a-z][a-z0-9+.-]*:\/\//iu.test(value)) {
       const slug = workspaceSlugFromDeepLink(value, apiOrigin);
-      return resolveByNameOrSlug(slug, "slug", signal);
+      return resolveBySlug(slug, signal);
     }
     if (value.startsWith("/") || value.startsWith("\\")) {
       throw new OctoError("Loop workspace selector is invalid", { permanent: true });
     }
-    return resolveByNameOrSlug(value, "name", signal);
+    return resolveByNameOrSlug(value, signal);
   }
 
   return { resolveWorkspace, listTasks, getTask: readTask };
