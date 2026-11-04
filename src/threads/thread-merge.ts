@@ -11,7 +11,6 @@ import type {
 import { threadWorkspaceIsAvailable } from "../session/session-lifecycle.ts";
 import type { ChannelStore } from "../store/index.ts";
 import type { ThreadWorkspaceRecord } from "../store/store-records.ts";
-import type { DestructiveResourceLease } from "../tasks/task-scheduler.ts";
 import { threadParentGroupId, threadShortId } from "./thread-target.ts";
 import { WorktreeMergeExecutionError, worktrunkUnavailableText } from "../workspace/worktrunk.ts";
 
@@ -45,12 +44,11 @@ export interface ThreadMergeHost {
   /** Generation captured by the command turn; an intervening inbound prevents stale archival. */
   readonly archiveGeneration: () => number;
   /**
-   * Optional caller preflight after qualification, ownership checks and destructive resource
-   * acquisition, before the merge port runs: host tools persist listen provenance here. Merge
-   * suppression belongs to WorktreeMergeLifecycle.beforeSpawn, after worktree identity validation.
+   * Optional caller preflight after qualification and ownership checks, before the merge port runs:
+   * host tools persist listen provenance here. Merge suppression belongs to
+   * WorktreeMergeLifecycle.beforeSpawn, after worktree identity validation.
    */
   readonly beforeMerge?: () => void;
-  readonly tryAcquireResources: (cwds: readonly string[]) => Promise<DestructiveResourceLease | undefined>;
 }
 
 /**
@@ -152,83 +150,76 @@ export async function mergeThreadWorkspace(
   const plan = preplanned ?? await worktrees.planMerge(request, signal);
   request.target = plan.target;
 
-  const lease = await host.tryAcquireResources(plan.cwds);
-  if (!lease) throw new Error("隔离工作区正被其他任务使用，无法合并");
-  try {
-    await lease.ready;
-    if (signal !== undefined) throwIfAborted(signal);
-    const currentPlan = await worktrees.planMerge(request, signal);
-    if (
-      currentPlan.target !== plan.target
-      || currentPlan.cwds.length !== plan.cwds.length
-      || currentPlan.cwds.some((cwd, index) => cwd !== plan.cwds[index])
-    ) {
-      throw new Error("执行合并前工作区目标已变化，未执行合并。");
-    }
-    if (signal !== undefined) throwIfAborted(signal);
+  if (signal !== undefined) throwIfAborted(signal);
+  const currentPlan = await worktrees.planMerge(request, signal);
+  if (
+    currentPlan.target !== plan.target
+    || currentPlan.cwds.length !== plan.cwds.length
+    || currentPlan.cwds.some((cwd, index) => cwd !== plan.cwds[index])
+  ) {
+    throw new Error("执行合并前工作区目标已变化，未执行合并。");
+  }
+  if (signal !== undefined) throwIfAborted(signal);
 
-    const lifecycle = hasStableSourceId
-      ? host.worktreeMergeLifecycle?.(target, binding.cwd, host.sourceId, plan.cwds)
-      : undefined;
-    if (lifecycle?.existingOutcome !== undefined) return replayOutcome(lifecycle.existingOutcome);
-    let confirmedExit = false;
-    let outcomePersisted = false;
+  const lifecycle = hasStableSourceId
+    ? host.worktreeMergeLifecycle?.(target, binding.cwd, host.sourceId, plan.cwds)
+    : undefined;
+  if (lifecycle?.existingOutcome !== undefined) return replayOutcome(lifecycle.existingOutcome);
+  let confirmedExit = false;
+  let outcomePersisted = false;
+  if (lifecycle) {
+    request.lifecycle = {
+      ...lifecycle,
+      onConfirmedExit: () => {
+        lifecycle.onConfirmedExit();
+        confirmedExit = true;
+      },
+    };
+  }
+  host.beforeMerge?.();
+  try {
+    const summary = await worktrees.merge(request, signal);
+    const outcome: WorktreeMergeOutcome = { kind: "succeeded", summary };
     if (lifecycle) {
-      request.lifecycle = {
-        ...lifecycle,
-        onConfirmedExit: () => {
-          lifecycle.onConfirmedExit();
-          confirmedExit = true;
-        },
+      lifecycle.complete(outcome);
+      outcomePersisted = true;
+    }
+    if (summary.removed && ownership !== null) {
+      const updated: ThreadWorkspaceRecord = {
+        ...ownership,
+        projects: ownership.projects.map((project, index) =>
+          index === ownedProjectIndex
+            ? { ...project, created: false, path: null, branch: null }
+            : project,
+        ),
       };
+      host.store.saveThreadWorkspace(updated);
     }
-    host.beforeMerge?.();
-    try {
-      const summary = await worktrees.merge(request, signal);
-      const outcome: WorktreeMergeOutcome = { kind: "succeeded", summary };
+    if (summary.removed) {
+      host.planThreadArchive(target, groupId, shortId, archiveGeneration);
+    }
+    return summary.removed ? { ...summary, archive: "scheduled" } : summary;
+  } catch (error) {
+    if (error instanceof WorktreeMergeExecutionError && confirmedExit) {
       if (lifecycle) {
-        lifecycle.complete(outcome);
-        outcomePersisted = true;
-      }
-      if (summary.removed && ownership !== null) {
-        const updated: ThreadWorkspaceRecord = {
-          ...ownership,
-          projects: ownership.projects.map((project, index) =>
-            index === ownedProjectIndex
-              ? { ...project, created: false, path: null, branch: null }
-              : project,
-          ),
-        };
-        host.store.saveThreadWorkspace(updated);
-      }
-      if (summary.removed) {
-        host.planThreadArchive(target, groupId, shortId, archiveGeneration);
-      }
-      return summary.removed ? { ...summary, archive: "scheduled" } : summary;
-    } catch (error) {
-      if (error instanceof WorktreeMergeExecutionError && confirmedExit) {
-        if (lifecycle) {
+        try {
+          lifecycle.complete({
+            kind: "execution-failed",
+            exitCode: error.exitCode,
+            diagnostic: error.diagnostic,
+          });
+        } catch (persistError) {
           try {
-            lifecycle.complete({
-              kind: "execution-failed",
-              exitCode: error.exitCode,
-              diagnostic: error.diagnostic,
-            });
-          } catch (persistError) {
-            try {
-              lifecycle.onUnknown();
-            } catch {
-              // The unknown transition fails closed in memory before its store write.
-            }
-            throw persistError;
+            lifecycle.onUnknown();
+          } catch {
+            // Preserve the original persistence failure.
           }
+          throw persistError;
         }
-      } else if (!outcomePersisted) {
-        lifecycle?.onUnknown();
       }
-      throw error;
+    } else if (!outcomePersisted) {
+      lifecycle?.onUnknown();
     }
-  } finally {
-    lease.complete();
+    throw error;
   }
 }

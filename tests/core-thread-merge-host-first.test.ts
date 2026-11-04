@@ -387,7 +387,7 @@ test("startup recovers a known host merge outcome through one listen event", asy
   }
 });
 
-test("startup recovers and blocks unresolved host merge leases before queued work runs", async () => {
+test("startup recovers unresolved host merge leases and resumes queued work", async () => {
   const original = await createCoreHarness();
   const recoveryStarted = Promise.withResolvers<void>();
   const releaseRecovery = Promise.withResolvers<void>();
@@ -398,6 +398,7 @@ test("startup recovers and blocks unresolved host merge leases before queued wor
   const thread = { channelId: "group-allowed____merge-recovery", channelType: 5 as const };
   const workspace = join(original.root, "workspace");
   const taskId = "merge-recovery-queued-task";
+  const text = "resume queued work after unknown merge recovery";
   const processIdentity: WorktreeMergeProcessIdentity = {
     pid: 43001,
     pgid: 43001,
@@ -430,7 +431,6 @@ test("startup recovers and blocks unresolved host merge leases before queued wor
         cwdPinned: true,
       });
       const messageId = "merge-recovery-task-message";
-      const text = "must stay queued while merge result is unknown";
       expect(setup.acceptTask(
         {
           botUid: original.bot.uid,
@@ -483,21 +483,15 @@ test("startup recovers and blocks unresolved host merge leases before queued wor
     });
     startup = start;
     await recoveryStarted.promise;
-    const startedBeforeRecoveryFinished = await Promise.race([
-      workerStarted.promise.then(() => true),
-      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 25)),
-    ]);
-    expect(startedBeforeRecoveryFinished).toBe(false);
     releaseRecovery.resolve();
     restarted = await start;
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    await restarted.service.stop();
+    await workerStarted.promise;
 
     expect(worktrees.recovered).toEqual([processIdentity]);
-    expect(restarted.workers.prompts).toEqual([]);
+    expect(restarted.workers.prompts.map(({ text: promptText }) => promptText)).toEqual([text]);
     const recoveredStore = await openChannelStore(restarted.stateDir);
     try {
-      expect(recoveredStore.getTask(taskId)?.state).toBe("queued");
+      expect(recoveredStore.getTask(taskId)?.state).not.toBe("queued");
       expect(recoveredStore.listHostMergeLeases(original.bot.uid)).toMatchObject([
         { id: "unresolved-host-merge", phase: "unknown", cwd: workspace },
       ]);
@@ -653,7 +647,7 @@ test("startup with a removed workspace waits for card recovery before replaying 
   }
 });
 
-test("startup kills a real detached merge process group before blocking queued work", async () => {
+test("startup kills unresolved merge processes, resumes queued work, and does not replay", async () => {
   const original = await createCoreHarness();
   const recoveryStarted = Promise.withResolvers<void>();
   const releaseRecovery = Promise.withResolvers<void>();
@@ -661,6 +655,7 @@ test("startup kills a real detached merge process group before blocking queued w
   const thread = { channelId: "group-allowed____merge-real-recovery", channelType: 5 as const };
   const workspace = join(original.root, "workspace");
   const taskId = "merge-real-recovery-queued-task";
+  const text = "queued work after exact process recovery";
   let child: ChildProcess | undefined;
   let restarted: Awaited<ReturnType<typeof createCoreHarness>> | undefined;
   let startup: ReturnType<typeof createCoreHarness> | undefined;
@@ -702,7 +697,6 @@ test("startup kills a real detached merge process group before blocking queued w
         cwdPinned: true,
       });
       const messageId = "merge-real-recovery-task-message";
-      const text = "must remain queued after exact process recovery";
       expect(setup.acceptTask(
         {
           botUid: original.bot.uid,
@@ -774,16 +768,16 @@ test("startup kills a real detached merge process group before blocking queued w
     expect(workers.prompts).toEqual([]);
     releaseRecovery.resolve();
     restarted = await start;
-    await restarted.service.stop();
+    await workers.waitForPromptCount(1);
 
     expect(recovered).toEqual([processIdentity]);
     expect(await queryProcess(processIdentity.pid)).toBeUndefined();
     expect(groupAlive(processIdentity.pgid)).toBe(false);
     expect(mergeCalls).toBe(0);
-    expect(workers.prompts).toEqual([]);
+    expect(workers.prompts.map(({ text: promptText }) => promptText)).toEqual([text]);
     const recoveredStore = await openChannelStore(restarted.stateDir);
     try {
-      expect(recoveredStore.getTask(taskId)?.state).toBe("queued");
+      expect(recoveredStore.getTask(taskId)?.state).not.toBe("queued");
       expect(recoveredStore.listHostMergeLeases(original.bot.uid)).toMatchObject([
         { id: "real-unresolved-host-merge", phase: "unknown", cwd: workspace },
       ]);
@@ -1031,11 +1025,13 @@ test("/thread merge waits for the previous task's terminal progress-card edit", 
   }
 });
 
-test("/thread merge waits for queued cross-chat work in a project subdirectory without holding its lease", async () => {
+test("/thread merge runs concurrently with queued cross-chat project work", async () => {
   const firstStarted = Promise.withResolvers<void>();
   const secondStarted = Promise.withResolvers<void>();
   const releaseFirst = Promise.withResolvers<void>();
   const releaseSecond = Promise.withResolvers<void>();
+  const mergeStarted = Promise.withResolvers<void>();
+  const releaseMerge = Promise.withResolvers<void>();
   const harness = await createCoreHarness({
     prompt: async ({ text }) => {
       if (text === "first project task") {
@@ -1054,6 +1050,7 @@ test("/thread merge waits for queued cross-chat work in a project subdirectory w
   const group = { channelId: "group-allowed", channelType: 2 as const };
   await mkdir(nested, { recursive: true });
   const store = await openChannelStore(harness.stateDir);
+  let merge: Promise<void> | undefined;
   try {
     store.ensureBinding({
       botUid: harness.bot.uid,
@@ -1087,6 +1084,14 @@ test("/thread merge waits for queued cross-chat work in a project subdirectory w
       }],
       error: null,
     });
+    const worktrees = harness.worktreePort;
+    if (!worktrees) throw new Error("expected worktree port");
+    const mergeWorktree = worktrees.merge.bind(worktrees);
+    worktrees.merge = async (request, signal) => {
+      mergeStarted.resolve();
+      await releaseMerge.promise;
+      return mergeWorktree(request, signal);
+    };
     await harness.service.handleInbound(inbound({
       ...group,
       messageId: "cross-chat-first-task",
@@ -1097,32 +1102,26 @@ test("/thread merge waits for queued cross-chat work in a project subdirectory w
     await harness.service.handleInbound(inbound({
       ...group,
       messageId: "cross-chat-queued-task",
-      text: "queued project task",
+      text: "/queue queued project task",
       mentionedUserIds: [harness.bot.uid],
     }));
-    const merge = harness.service.handleInbound(inbound({
+    expect(store.getLatestTask(harness.bot.uid, group)).toMatchObject({
+      messageId: "cross-chat-queued-task",
+      state: "queued",
+    });
+
+    merge = harness.service.handleInbound(inbound({
       ...thread,
       messageId: "cross-chat-merge-command",
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
     }));
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const turn = Promise.withResolvers<void>();
-      setImmediate(turn.resolve);
-      await turn.promise;
-    }
-    expect(harness.worktrees?.merges).toEqual([]);
-
+    await mergeStarted.promise;
     releaseFirst.resolve();
     await secondStarted.promise;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const turn = Promise.withResolvers<void>();
-      setImmediate(turn.resolve);
-      await turn.promise;
-    }
-    expect(harness.worktrees?.merges).toEqual([]);
 
     releaseSecond.resolve();
+    releaseMerge.resolve();
     await merge;
     await harness.transport.waitForManagementCalls(({ action }) => action === "thread-archive");
     expect(harness.worktrees?.merges).toHaveLength(1);
@@ -1140,6 +1139,8 @@ test("/thread merge waits for queued cross-chat work in a project subdirectory w
   } finally {
     releaseFirst.resolve();
     releaseSecond.resolve();
+    releaseMerge.resolve();
+    if (merge !== undefined) await Promise.allSettled([merge]);
     store.close();
     await closeCoreHarness(harness);
   }
@@ -1989,30 +1990,20 @@ test("service stop aborts an in-progress host merge without archive or repair ta
   }
 });
 
-test("a merge root reservation queues later steering from another chat", async () => {
+test("a merge does not block steering from another chat into a running workspace task", async () => {
   const writerStarted = Promise.withResolvers<void>();
   const mergeStarted = Promise.withResolvers<void>();
   const releaseWriter = Promise.withResolvers<void>();
   const releaseMerge = Promise.withResolvers<void>();
   const sequence: string[] = [];
   let appendedMessages: () => string[] = () => [];
-  let readRunningTargets!: () => Promise<string[]>;
-  const controlSignal = new AbortController().signal;
   const harness = await createCoreHarness({
-    prompt: async ({ text, appended, promptContext }) => {
-      if (text === "writer before root merge") {
-        sequence.push("writer");
-        appendedMessages = () => appended().map(message => message.text);
-        const control = promptContext!.tools!.find(tool => tool.name === "channel_control")!;
-        readRunningTargets = async () => {
-          const status = JSON.parse(await control.execute({ action: "status" }, controlSignal));
-          return status.running_targets;
-        };
-        writerStarted.resolve();
-        await releaseWriter.promise;
-      } else if (text === "late writer after root merge") {
-        sequence.push("late");
-      }
+    prompt: async ({ text, appended }) => {
+      if (text !== "writer before root merge") return;
+      sequence.push("writer");
+      appendedMessages = () => appended().map(message => message.text);
+      writerStarted.resolve();
+      await releaseWriter.promise;
     },
   });
   const thread = { channelId: "group-allowed____merge-root-steering", channelType: 5 as const };
@@ -2066,38 +2057,27 @@ test("a merge root reservation queues later steering from another chat", async (
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
     }));
-    const mergeTargetKey = `5:${thread.channelId}`;
-    const deadline = performance.now() + 3_000;
-    let runningTargets = await readRunningTargets();
-    while (!runningTargets.includes(mergeTargetKey) && performance.now() < deadline) {
-      const next = Promise.withResolvers<void>();
-      setImmediate(next.resolve);
-      await next.promise;
-      runningTargets = await readRunningTargets();
-    }
-    expect(runningTargets).toContain(mergeTargetKey);
+    await mergeStarted.promise;
     await harness.service.handleInbound(inbound({
       ...writer,
       messageId: "late-writer-after-root-merge",
       text: "late writer after root merge",
     }));
-    expect(appendedMessages()).toEqual([]);
-    expect(store.getLatestTask(harness.bot.uid, writer)?.state).toBe("queued");
+    expect(appendedMessages()).toEqual(["late writer after root merge"]);
+    expect(store.getLatestTask(harness.bot.uid, writer)).toMatchObject({ state: "running" });
+    expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["writer before root merge"]);
 
     releaseWriter.resolve();
-    await mergeStarted.promise;
-    expect(sequence).toEqual(["writer", "merge"]);
     releaseMerge.resolve();
     await merge;
-    await harness.workers.waitForPromptCount(2);
     await waitForStatus(harness.service, writer, status => status.state === "completed");
-    expect(sequence).toEqual(["writer", "merge", "late"]);
+    expect(sequence).toEqual(["writer", "merge"]);
     expect(harness.worktrees!.merges).toHaveLength(1);
     expect(harness.worktrees!.merges[0]).toMatchObject({ cwd: workspace });
   } finally {
     releaseWriter.resolve();
     releaseMerge.resolve();
-    await merge;
+    if (merge !== undefined) await Promise.allSettled([merge]);
     store.close();
     await closeCoreHarness(harness);
   }

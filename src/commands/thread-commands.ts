@@ -162,7 +162,7 @@ function threadMergeReceipt(summary: WorktreeMergeSummary & { archive?: "schedul
 
 /**
  * `/thread` 命令可触及的状态端口：绑定/所有权资格、命令 claim、隔离合并执行、稳定回执与归档，
- * 以及常规任务接管。宿主合并的调度与目录租约由 `CoreService` 持有。
+ * 以及常规任务接管。宿主合并的聊天与会话调度由 `CoreService` 持有。
  */
 export interface ThreadCommandsDeps {
   readonly store: Pick<ChannelStore, "getBinding" | "getThreadWorkspace" | "getThreadForkByTarget" | "getTaskByMessageId" | "getCommandClaimState" | "completeCommand" | "releaseClaim" | "getHostRemovalLeaseBySourceId">;

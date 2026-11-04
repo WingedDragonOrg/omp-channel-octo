@@ -30,7 +30,7 @@ import {
 } from "./tasks/task-scheduler.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, rm } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import {
   ATTACHMENT_MAX_AGE_MS,
   sweepAttachments,
@@ -812,7 +812,6 @@ class CoreService implements ChannelService {
           }
           continue;
         }
-        for (const resourceCwd of lease.resourceCwds) this.blockedDirectories.add(resourceCwd);
         const processIdentity = this.hostMergeProcessIdentity(lease);
         if (processIdentity && this.options.worktrees?.recoverMergeProcess) {
           let stopped = false;
@@ -822,7 +821,7 @@ class CoreService implements ChannelService {
             console.error(`[thread merge recovery] 无法确认旧 worktrunk 进程组已停止 cwd=${lease.cwd}: ${safeErrorMessage(error, "process recovery failed")}`);
           }
           if (!stopped) {
-            console.error(`[thread merge recovery] 旧 worktrunk 进程组仍未确认停止，目录保持封锁 cwd=${lease.cwd}`);
+            console.error(`[thread merge recovery] 旧 worktrunk 进程组仍未确认停止 cwd=${lease.cwd}`);
           }
         }
         this.store.markHostMergeLeaseUnknown(lease.id);
@@ -4068,9 +4067,6 @@ class CoreService implements ChannelService {
     if (botUid === undefined) throw new Error("Bot 身份未注册，无法合并子区工作区");
     for (;;) {
       if (signal.aborted) throw threadMergeAbortError(signal);
-      if (this.isWorkspaceDirectoryBlocked(expectedBinding.cwd)) {
-        throw new Error("隔离工作区仍被未确认的 worker 或 host merge 占用，无法安全合并。");
-      }
       const current = this.store.getBinding(botUid, target);
       if (
         !current
@@ -4148,7 +4144,6 @@ class CoreService implements ChannelService {
         settle: () => this.store.settleHostMergeLease(existing.id),
         onNotSpawned: () => {},
         onUnknown: () => {
-          for (const resourceCwd of existing.resourceCwds) this.blockedDirectories.add(resourceCwd);
           if (existing.phase !== "unknown") this.store.markHostMergeLeaseUnknown(existing.id);
         },
       };
@@ -4211,7 +4206,6 @@ class CoreService implements ChannelService {
       },
       onUnknown: () => {
         if (!reserved || outcomePersisted) return;
-        for (const resourceCwd of plannedResources) this.blockedDirectories.add(resourceCwd);
         this.store.markHostMergeLeaseUnknown(id);
       },
     };
@@ -4246,7 +4240,8 @@ class CoreService implements ChannelService {
       if (prior?.outcome !== undefined && prior.outcome !== null) {
         resourceCwds = prior.resourceCwds;
       } else {
-        reservation = this.scheduler.reserveDestructiveCommandSession(message, [expectedBinding.cwd]);
+        // Merge commands serialize only this chat/session; worktree resources are not reserved.
+        reservation = this.scheduler.reserveDestructiveCommandSession(message, []);
         const worktrees = this.options.worktrees;
         if (!worktrees) throw new Error("本部署未配置隔离工作区能力");
         const request: WorktreeMergeRequest = { cwd: expectedBinding.cwd };
@@ -4266,7 +4261,6 @@ class CoreService implements ChannelService {
         }
         plan = await worktrees.planMerge(request, controller.signal);
         resourceCwds = plan.cwds;
-        reservation.extend(resourceCwds);
       }
 
       const lifecycle = this.createHostMergeLifecycle(
@@ -4303,7 +4297,6 @@ class CoreService implements ChannelService {
           controller.signal,
         );
       }
-      const coveredResources = new Set(resourceCwds.map((cwd) => resolve(cwd)));
       const host: ThreadMergeHost = {
         botUid,
         store: this.store,
@@ -4319,16 +4312,6 @@ class CoreService implements ChannelService {
             generation,
             receiptOutboxIds: [receiptOutboxId],
           });
-        },
-        tryAcquireResources: async (cwds) => {
-          const requestedResources = cwds.map((cwd) => resolve(cwd));
-          if (
-            requestedResources.length === 0
-            || requestedResources.some((cwd) => !coveredResources.has(cwd))
-          ) {
-            return undefined;
-          }
-          return { ready: Promise.resolve(), complete: () => {} };
         },
       };
       let summary: WorktreeMergeSummary & { archive?: "scheduled" };

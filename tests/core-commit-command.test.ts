@@ -1882,7 +1882,7 @@ test("commit stop releases a pending host merge only after native commit settlem
   }
 });
 
-test("a running host merge blocks another chat's commit in the same linked worktree", async () => {
+test("a host merge and another chat's commit can run on the same linked worktree", async () => {
   const { harness, commits } = await createCommitHarness();
   const mergeTarget = { channelType: 5 as const, channelId: "group-a____host-merge-before-commit" };
   const commitTarget = { channelType: 1 as const, channelId: "dm-commit-during-host-merge" };
@@ -1894,7 +1894,7 @@ test("a running host merge blocks another chat's commit in the same linked workt
     const workspace = await addLinkedWorktree(repo, join(harness.root, "commit-during-host-merge"), "commit-during-host-merge");
     const child = join(workspace, "src");
     await mkdir(child);
-    // Legacy pinned bindings have no persistent project group; the Git-root lease must protect them.
+    // The merge does not reserve the linked worktree against the independent commit.
     await bind(harness, mergeTarget, workspace, true);
     await bind(harness, commitTarget, child);
     const worktrees = harness.worktreePort!;
@@ -1908,9 +1908,8 @@ test("a running host merge blocks another chat's commit in the same linked workt
     merge = send(harness, mergeTarget, "host-merge-before-commit", "/thread merge");
     await waitUntil(() => mergeStarted, "host merge run");
     await send(harness, commitTarget, "commit-during-host-merge", "/commit");
-    await waitForReply(harness, commitTarget, (text) => text.includes("忙"));
-    expect(commits.calls).toEqual([]);
-    expect(await latestTask(harness, commitTarget)).toBeNull();
+    await waitUntil(() => commits.calls[0]?.runCalls === 1, "commit during host merge");
+    await waitForStatus(harness.service, commitTarget, (status) => status.state === "completed");
 
     finishMerge.resolve();
     await merge;

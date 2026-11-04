@@ -1434,7 +1434,6 @@ async function runManagementTool(
             archiveGeneration: () => host.threadArchiveGeneration(workspaceTarget),
             planThreadArchive: (archiveTarget, archiveGroupId, shortId, generation) =>
               host.planThreadArchive(archiveTarget, archiveGroupId, shortId, generation),
-            tryAcquireResources: (cwds) => host.tryAcquireDestructiveResources(cwds, task),
           },
           workspaceTarget,
           mergeRequest(),

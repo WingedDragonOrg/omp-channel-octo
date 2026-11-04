@@ -14,7 +14,6 @@ import {
   createCoreHarness,
   FakeWorktrees,
   inbound,
-  waitForStatus,
   type CoreHarness,
   type CoreHarnessOptions,
 } from "./fixtures/core-fakes";
@@ -35,6 +34,7 @@ class PlannedFakeWorktrees extends FakeWorktrees {
   readonly planRequests: WorktreeMergeRequest[] = [];
   failAfterSpawn = false;
   mergeCalls = 0;
+  mergeGate: (() => Promise<void>) | undefined;
 
   constructor(root: string, private readonly planFor: MergePlanFactory) {
     super(root);
@@ -47,6 +47,7 @@ class PlannedFakeWorktrees extends FakeWorktrees {
 
   override async merge(request: WorktreeMergeRequest): Promise<WorktreeMergeSummary> {
     this.mergeCalls += 1;
+    await this.mergeGate?.();
     if (this.failAfterSpawn) {
       const { lifecycle, ...recordedRequest } = request;
       this.merges.push(recordedRequest);
@@ -62,6 +63,24 @@ class PlannedFakeWorktrees extends FakeWorktrees {
     }
     return super.merge(request);
   }
+}
+
+interface HeldPrompt {
+  readonly started: Promise<void>;
+  readonly release: Promise<void>;
+  readonly markStarted: () => void;
+  readonly finish: () => void;
+}
+
+function createHeldPrompt(): HeldPrompt {
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  return {
+    started: started.promise,
+    release: release.promise,
+    markStarted: started.resolve,
+    finish: release.resolve,
+  };
 }
 
 async function createPlannedHarness(
@@ -109,88 +128,120 @@ async function ensureBinding(
   });
 }
 
-async function letScheduledWorkAdvance(): Promise<void> {
-  for (let turn = 0; turn < 8; turn += 1) {
-    const next = Promise.withResolvers<void>();
-    setImmediate(next.resolve);
-    await next.promise;
-  }
-}
 
-test("host /thread merge waits for its source and checked-out target while unrelated work continues", async () => {
-  const parentStarted = Promise.withResolvers<void>();
-  const releaseParent = Promise.withResolvers<void>();
-  const thirdStarted = Promise.withResolvers<void>();
-  const target = { channelId: "group-allowed", channelType: 2 as const };
-  const source = { channelId: "group-allowed____target-lock", channelType: 5 as const };
-  const third = { channelId: "group-a", channelType: 2 as const };
+test("host /thread merge overlaps ordinary tasks on its source and target checkouts", async () => {
+  const taskTexts = [
+    "source task before slash merge",
+    "target task before slash merge",
+    "source task during slash merge",
+    "target task during slash merge",
+    "independent task during slash merge",
+  ];
+  const heldTasks = new Map<string, HeldPrompt>();
+  for (const text of taskTexts) heldTasks.set(text, createHeldPrompt());
+  const mergeStarted = Promise.withResolvers<void>();
+  const releaseMerge = Promise.withResolvers<void>();
+  const targetBefore = { channelId: "group-allowed", channelType: 2 as const };
+  const targetDuring = { channelId: "group-a", channelType: 2 as const };
+  const independent = { channelId: "group-b", channelType: 2 as const };
+  const source = { channelId: "group-allowed____slash-merge-source", channelType: 5 as const };
+  const sourceBefore = { channelId: "group-allowed____source-task-before", channelType: 5 as const };
+  const sourceDuring = { channelId: "group-allowed____source-task-during", channelType: 5 as const };
   const fixture = await createPlannedHarness(
     (root) => targetPlan(join(root, "target-checkout")),
     async ({ text }) => {
-      if (text === "hold target checkout") {
-        parentStarted.resolve();
-        await releaseParent.promise;
-      } else if (text === "unrelated third-worktree task") {
-        thirdStarted.resolve();
-      }
+      const held = heldTasks.get(text);
+      if (!held) return;
+      held.markStarted();
+      await held.release;
     },
   );
   const { harness, root, worktrees } = fixture;
   const store = await openChannelStore(harness.stateDir);
   const targetCheckout = join(root, "target-checkout");
   const sourceWorktree = join(root, "source-worktree");
-  const thirdWorktree = join(root, "third-worktree");
+  const independentWorktree = join(root, "independent-worktree");
+  const taskDeliveries: Promise<void>[] = [];
+  let merge: Promise<void> | undefined;
+
+  const startTask = (target: ChatTarget, messageId: string, text: string): void => {
+    taskDeliveries.push(harness.service.handleInbound(inbound({
+      ...target,
+      messageId,
+      text,
+      mentionedUserIds: [harness.bot.uid],
+    })));
+  };
 
   try {
-    await ensureBinding(store, harness.bot.uid, target, targetCheckout, "target-session", true);
-    await ensureBinding(store, harness.bot.uid, source, sourceWorktree, "source-session", true);
-    await ensureBinding(store, harness.bot.uid, third, thirdWorktree, "third-session", true);
+    worktrees.mergeGate = async () => {
+      mergeStarted.resolve();
+      await releaseMerge.promise;
+    };
+    await ensureBinding(store, harness.bot.uid, targetBefore, targetCheckout, "slash-target-before", true);
+    await ensureBinding(store, harness.bot.uid, targetDuring, targetCheckout, "slash-target-during", true);
+    await ensureBinding(store, harness.bot.uid, independent, independentWorktree, "slash-independent", true);
+    await ensureBinding(store, harness.bot.uid, source, sourceWorktree, "slash-merge-source", true);
+    await ensureBinding(store, harness.bot.uid, sourceBefore, sourceWorktree, "slash-source-before", true);
+    await ensureBinding(store, harness.bot.uid, sourceDuring, sourceWorktree, "slash-source-during", true);
 
-    await harness.service.handleInbound(inbound({
-      ...target,
-      messageId: "target-checkout-holder",
-      text: "hold target checkout",
-      mentionedUserIds: [harness.bot.uid],
-    }));
-    await parentStarted.promise;
+    startTask(sourceBefore, "slash-source-task-before", taskTexts[0]!);
+    startTask(targetBefore, "slash-target-task-before", taskTexts[1]!);
+    await Promise.all([
+      heldTasks.get(taskTexts[0]!)!.started,
+      heldTasks.get(taskTexts[1]!)!.started,
+    ]);
 
-    const merge = harness.service.handleInbound(inbound({
+    merge = harness.service.handleInbound(inbound({
       ...source,
-      messageId: "target-lock-command",
+      messageId: "slash-merge-with-active-tasks",
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
     }));
-    await letScheduledWorkAdvance();
-    expect(worktrees.mergeCalls).toBe(0);
-
-    await harness.service.handleInbound(inbound({
-      ...third,
-      messageId: "third-worktree-task",
-      text: "unrelated third-worktree task",
-      mentionedUserIds: [harness.bot.uid],
-    }));
-    await thirdStarted.promise;
-    expect(worktrees.mergeCalls).toBe(0);
-
-    releaseParent.resolve();
-    await merge;
+    await mergeStarted.promise;
     expect(worktrees.mergeCalls).toBe(1);
+
+    startTask(sourceDuring, "slash-source-task-during", taskTexts[2]!);
+    startTask(targetDuring, "slash-target-task-during", taskTexts[3]!);
+    startTask(independent, "slash-independent-task-during", taskTexts[4]!);
+    await Promise.all([
+      heldTasks.get(taskTexts[2]!)!.started,
+      heldTasks.get(taskTexts[3]!)!.started,
+      heldTasks.get(taskTexts[4]!)!.started,
+    ]);
+
+    for (const held of heldTasks.values()) held.finish();
+    releaseMerge.resolve();
+    await Promise.all([...taskDeliveries, merge]);
     expect(worktrees.merges).toHaveLength(1);
     expect(worktrees.merges[0]).toMatchObject({ cwd: sourceWorktree, target: "main" });
   } finally {
-    releaseParent.resolve();
+    for (const held of heldTasks.values()) held.finish();
+    releaseMerge.resolve();
+    await Promise.allSettled([...taskDeliveries, ...(merge === undefined ? [] : [merge])]);
     store.close();
     await closeCoreHarness(harness);
   }
 });
 
-test("host-tool merge reports target contention without merging and succeeds once after release", async () => {
-  const parentStarted = Promise.withResolvers<void>();
-  const releaseParent = Promise.withResolvers<void>();
-  const firstToolFinished = Promise.withResolvers<string>();
-  const retryToolFinished = Promise.withResolvers<string>();
-  const target = { channelId: "group-allowed", channelType: 2 as const };
-  const source = { channelId: "group-allowed____tool-target-lock", channelType: 5 as const };
+
+test("host-tool thread merge overlaps ordinary tasks on its source and target checkouts", async () => {
+  const taskTexts = [
+    "source task before host-tool merge",
+    "target task before host-tool merge",
+    "source task during host-tool merge",
+    "target task during host-tool merge",
+  ];
+  const heldTasks = new Map<string, HeldPrompt>();
+  for (const text of taskTexts) heldTasks.set(text, createHeldPrompt());
+  const mergeStarted = Promise.withResolvers<void>();
+  const releaseMerge = Promise.withResolvers<void>();
+  const toolFinished = Promise.withResolvers<string>();
+  const targetBefore = { channelId: "group-allowed", channelType: 2 as const };
+  const targetDuring = { channelId: "group-a", channelType: 2 as const };
+  const source = { channelId: "group-allowed____tool-merge-source", channelType: 5 as const };
+  const sourceBefore = { channelId: "group-allowed____tool-source-before", channelType: 5 as const };
+  const sourceDuring = { channelId: "group-allowed____tool-source-during", channelType: 5 as const };
   const fixture = await createPlannedHarness(
     (root) => async (request) => ({
       target: request.target ?? "main",
@@ -205,74 +256,198 @@ test("host-tool merge reports target contention without merging and succeeds onc
       ],
     }),
     async ({ text, promptContext }) => {
-      if (text === "hold target checkout") {
-        parentStarted.resolve();
-        await releaseParent.promise;
+      const held = heldTasks.get(text);
+      if (held) {
+        held.markStarted();
+        await held.release;
         return;
       }
-      if (text !== "attempt merge while target is held" && text !== "retry merge after release") return;
+      if (text !== "invoke host-tool merge") return;
       const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
       if (!management) throw new Error("management tool missing in child thread");
       const result = await management.execute(
         { action: "thread-merge", target: "refs/heads/release-1", remove: false },
         new AbortController().signal,
-        text === "attempt merge while target is held" ? "held-target-merge" : "released-target-merge",
+        "host-tool-overlap",
       ).then(
         (value) => `resolved:${value}`,
         (error: Error) => `rejected:${error.message}`,
       );
-      if (text === "attempt merge while target is held") firstToolFinished.resolve(result);
-      else retryToolFinished.resolve(result);
+      toolFinished.resolve(result);
     },
   );
   const { harness, root, worktrees } = fixture;
   const store = await openChannelStore(harness.stateDir);
   const targetCheckout = join(root, "release-target-checkout");
   const sourceWorktree = join(root, "source-worktree");
+  const taskDeliveries: Promise<void>[] = [];
+  let mergeTask: Promise<void> | undefined;
+  const startTask = (target: ChatTarget, messageId: string, text: string): void => {
+    taskDeliveries.push(harness.service.handleInbound(inbound({
+      ...target,
+      messageId,
+      text,
+      mentionedUserIds: [harness.bot.uid],
+    })));
+  };
 
   try {
-    await ensureBinding(store, harness.bot.uid, target, targetCheckout, "tool-target-session", true);
-    await ensureBinding(store, harness.bot.uid, source, sourceWorktree, "tool-source-session", true);
-    await harness.service.handleInbound(inbound({
-      ...target,
-      messageId: "tool-target-holder",
-      text: "hold target checkout",
-      mentionedUserIds: [harness.bot.uid],
-    }));
-    await parentStarted.promise;
+    worktrees.mergeGate = async () => {
+      mergeStarted.resolve();
+      await releaseMerge.promise;
+    };
+    await ensureBinding(store, harness.bot.uid, targetBefore, targetCheckout, "tool-target-before", true);
+    await ensureBinding(store, harness.bot.uid, targetDuring, targetCheckout, "tool-target-during", true);
+    await ensureBinding(store, harness.bot.uid, source, sourceWorktree, "tool-merge-source", true);
+    await ensureBinding(store, harness.bot.uid, sourceBefore, sourceWorktree, "tool-source-before", true);
+    await ensureBinding(store, harness.bot.uid, sourceDuring, sourceWorktree, "tool-source-during", true);
 
-    await harness.service.handleInbound(inbound({
-      ...source,
-      messageId: "tool-merge-while-held",
-      text: "attempt merge while target is held",
-      mentionedUserIds: [harness.bot.uid],
-    }));
-    const busy = await firstToolFinished.promise;
-    expect(busy).toContain("rejected:");
-    expect(busy).toContain("正被其他任务使用");
-    expect(worktrees.mergeCalls).toBe(0);
+    startTask(sourceBefore, "tool-source-task-before", taskTexts[0]!);
+    startTask(targetBefore, "tool-target-task-before", taskTexts[1]!);
+    await Promise.all([
+      heldTasks.get(taskTexts[0]!)!.started,
+      heldTasks.get(taskTexts[1]!)!.started,
+    ]);
 
-    releaseParent.resolve();
-    await waitForStatus(harness.service, target, (status) => status.state === "completed");
-    await harness.service.handleInbound(inbound({
+    mergeTask = harness.service.handleInbound(inbound({
       ...source,
-      messageId: "tool-merge-after-release",
-      text: "retry merge after release",
+      messageId: "tool-merge-with-active-tasks",
+      text: "invoke host-tool merge",
       mentionedUserIds: [harness.bot.uid],
     }));
-    const retried = await retryToolFinished.promise;
-    expect(retried).toContain("resolved:");
+    await mergeStarted.promise;
     expect(worktrees.mergeCalls).toBe(1);
+
+    startTask(sourceDuring, "tool-source-task-during", taskTexts[2]!);
+    startTask(targetDuring, "tool-target-task-during", taskTexts[3]!);
+    await Promise.all([
+      heldTasks.get(taskTexts[2]!)!.started,
+      heldTasks.get(taskTexts[3]!)!.started,
+    ]);
+
+    for (const held of heldTasks.values()) held.finish();
+    releaseMerge.resolve();
+    await Promise.all(taskDeliveries);
+    await mergeTask;
+    expect(await toolFinished.promise).toContain("resolved:");
+    expect(worktrees.merges).toHaveLength(1);
     expect(worktrees.merges[0]).toMatchObject({
       cwd: sourceWorktree,
       target: "refs/heads/release-1",
     });
   } finally {
-    releaseParent.resolve();
+    for (const held of heldTasks.values()) held.finish();
+    releaseMerge.resolve();
+    await Promise.allSettled([
+      ...taskDeliveries,
+      ...(mergeTask === undefined ? [] : [mergeTask]),
+    ]);
     store.close();
     await closeCoreHarness(harness);
   }
 });
+test("/thread remove can run on the source and target while /thread merge is executing", async () => {
+  const mergeStarted = Promise.withResolvers<void>();
+  const releaseMerge = Promise.withResolvers<void>();
+  const source = { channelId: "group-allowed____merge-during-remove", channelType: 5 as const };
+  const removeSource = { channelId: "group-allowed____remove-source-during-merge", channelType: 5 as const };
+  const removeTarget = { channelId: "group-allowed____remove-target-during-merge", channelType: 5 as const };
+  const fixture = await createPlannedHarness(
+    (root) => targetPlan(join(root, "target-checkout")),
+    async () => {},
+  );
+  const { harness, root, worktrees } = fixture;
+  const store = await openChannelStore(harness.stateDir);
+  const sourceWorktree = join(root, "source-worktree");
+  const targetCheckout = join(root, "target-checkout");
+  const sourceRemovalRepo = join(root, "source-removal-repo");
+  const targetRemovalRepo = join(root, "target-removal-repo");
+  let merge: Promise<void> | undefined;
+
+  try {
+    worktrees.mergeGate = async () => {
+      mergeStarted.resolve();
+      await releaseMerge.promise;
+    };
+    await ensureBinding(store, harness.bot.uid, source, sourceWorktree, "merge-source", true);
+    await ensureBinding(store, harness.bot.uid, removeSource, sourceWorktree, "remove-source", true);
+    await ensureBinding(store, harness.bot.uid, removeTarget, targetCheckout, "remove-target", true);
+    await Promise.all([
+      mkdir(sourceRemovalRepo, { recursive: true }),
+      mkdir(targetRemovalRepo, { recursive: true }),
+    ]);
+    store.saveThreadWorkspace({
+      botUid: harness.bot.uid,
+      channelType: 5,
+      channelId: removeSource.channelId,
+      layout: "single",
+      status: "ready",
+      entryPath: null,
+      projects: [{
+        name: "merge source checkout",
+        repo: sourceRemovalRepo,
+        path: sourceWorktree,
+        branch: "merge-source",
+        created: true,
+      }],
+      error: null,
+    });
+    store.saveThreadWorkspace({
+      botUid: harness.bot.uid,
+      channelType: 5,
+      channelId: removeTarget.channelId,
+      layout: "single",
+      status: "ready",
+      entryPath: null,
+      projects: [{
+        name: "merge target checkout",
+        repo: targetRemovalRepo,
+        path: targetCheckout,
+        branch: "merge-target",
+        created: true,
+      }],
+      error: null,
+    });
+
+    merge = harness.service.handleInbound(inbound({
+      ...source,
+      messageId: "merge-while-removing-resources",
+      text: "/thread merge",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    await mergeStarted.promise;
+    expect(worktrees.mergeCalls).toBe(1);
+
+    await Promise.all([
+      harness.service.handleInbound(inbound({
+        ...removeSource,
+        messageId: "remove-source-during-merge",
+        text: "/thread remove",
+        mentionedUserIds: [harness.bot.uid],
+      })),
+      harness.service.handleInbound(inbound({
+        ...removeTarget,
+        messageId: "remove-target-during-merge",
+        text: "/thread remove",
+        mentionedUserIds: [harness.bot.uid],
+      })),
+    ]);
+    expect(worktrees.removals).toHaveLength(2);
+    expect(worktrees.removals.map(({ path }) => path).sort()).toEqual(
+      [sourceWorktree, targetCheckout].sort(),
+    );
+
+    releaseMerge.resolve();
+    await merge;
+    expect(worktrees.merges).toHaveLength(1);
+  } finally {
+    releaseMerge.resolve();
+    if (merge !== undefined) await Promise.allSettled([merge]);
+    store.close();
+    await closeCoreHarness(harness);
+  }
+});
+
 
 test("host-tool merge refuses a changed target checkout after acquiring its planned resources", async () => {
   const toolFinished = Promise.withResolvers<string>();
@@ -327,14 +502,10 @@ test("host-tool merge refuses a changed target checkout after acquiring its plan
     await closeCoreHarness(harness);
   }
 });
-test("unknown host-tool merge blocks and preserves both checkout paths across restart", async () => {
+test("unknown host-tool merge state persists across restart without blocking tasks or replaying", async () => {
   const mergeFinished = Promise.withResolvers<string>();
   const targetStarted = Promise.withResolvers<void>();
   const thirdStarted = Promise.withResolvers<void>();
-  let targetDidStart = false;
-  void targetStarted.promise.then(() => {
-    targetDidStart = true;
-  });
   const target = { channelId: "group-allowed", channelType: 2 as const };
   const source = { channelId: "group-allowed____unknown-target-lease", channelType: 5 as const };
   const third = { channelId: "group-a", channelType: 2 as const };
@@ -413,10 +584,10 @@ test("unknown host-tool merge blocks and preserves both checkout paths across re
       text: "unrelated third-worktree task after recovery",
       mentionedUserIds: [restarted.bot.uid],
     }));
-    await thirdStarted.promise;
-    await letScheduledWorkAdvance();
-    expect(targetDidStart).toBe(false);
-    expect(store.getLatestTask(restarted.bot.uid, target)?.state).toBe("queued");
+    await Promise.all([targetStarted.promise, thirdStarted.promise]);
+    const finalLease = store.listHostMergeLeases(restarted.bot.uid)[0];
+    expect(finalLease?.phase).toBe("unknown");
+    expect(finalLease?.resourceCwds).toEqual([sourceWorktree, targetCheckout]);
     expect(worktrees.mergeCalls).toBe(1);
   } finally {
     store?.close();

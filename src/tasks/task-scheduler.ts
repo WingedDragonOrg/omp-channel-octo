@@ -637,8 +637,7 @@ export class TaskScheduler {
   }
 
   /**
-   * Install a destructive FIFO barrier before waiting for accepted work. Later tasks that use one
-   * of these explicit paths or canonical roots wait; ordinary session reservations never do this.
+   * Install an ordered session barrier; non-empty cwd lists also protect their paths and repository roots.
    */
   reserveDestructiveCommandSession(
     target: ChatTarget,
@@ -1117,6 +1116,7 @@ export class TaskScheduler {
     if (!this.commandReservations.has(reservation)) return undefined;
     const sessionKey = this.sessionKey(reservation.target, this.bindingFor(reservation.target));
     const paths = this.resourcePaths(reservation.resourcePaths);
+    const hasResources = paths.length > 0 || reservation.repositoryCwds.length > 0;
     const locallyUnavailable = (roots: ReadonlySet<string>): boolean =>
       !this.commandReservations.has(reservation)
       || sessionKey !== this.sessionKey(reservation.target, this.bindingFor(reservation.target))
@@ -1144,29 +1144,42 @@ export class TaskScheduler {
       || this.hasQueuedWork(reservation.target, sessionKey, reservation.order)
       || paths.some((path) => this.deps.isDirectoryBlocked(path))
       || this.hasActiveResourceConflict(paths, roots);
-    if (reservation.resourcePaths.length === 0) return undefined;
-    const roots = await this.repositoryRoots(reservation.repositoryCwds);
+    const roots = hasResources
+      ? await this.repositoryRoots(reservation.repositoryCwds)
+      : new Set<string>();
     if (locallyUnavailable(roots)) return undefined;
-    if (await this.hasConflictingResourceReservation(paths, roots, reservation.order, reservation)) {
+    if (
+      hasResources
+      && await this.hasConflictingResourceReservation(paths, roots, reservation.order, reservation)
+    ) {
       return undefined;
     }
-    if (await this.hasEarlierQueuedResourceUse(paths, roots, reservation.order)) return undefined;
-    if (await this.repositoriesAreBlocked(roots)) {
+    if (hasResources && await this.hasEarlierQueuedResourceUse(paths, roots, reservation.order)) {
+      return undefined;
+    }
+    if (hasResources && await this.repositoriesAreBlocked(roots)) {
       throw new Error("该 Git 工作树仍有无法确认停止的 worker，无法安全合并。");
     }
     if (locallyUnavailable(roots)) return undefined;
 
-    const resourceLease = this.reserveExclusiveResources(
-      roots,
-      paths,
-      `destructive:${targetKey(reservation.target)}:${reservation.order}`,
-    );
-    if (!resourceLease) return undefined;
+    const resourceLease = hasResources
+      ? this.reserveExclusiveResources(
+        roots,
+        paths,
+        `destructive:${targetKey(reservation.target)}:${reservation.order}`,
+      )
+      : undefined;
+    if (hasResources && !resourceLease) return undefined;
     let transferred = false;
     try {
       if (
-        await this.hasEarlierQueuedResourceUse(paths, roots, reservation.order)
-        || await this.repositoriesAreBlocked(roots)
+        (
+          hasResources
+          && (
+            await this.hasEarlierQueuedResourceUse(paths, roots, reservation.order)
+            || await this.repositoriesAreBlocked(roots)
+          )
+        )
         || unavailableAfterReserve(roots)
       ) {
         return undefined;
@@ -1180,11 +1193,11 @@ export class TaskScheduler {
           if (completed) return;
           completed = true;
           sessionLease.complete();
-          resourceLease.complete();
+          resourceLease?.complete();
         },
       };
     } finally {
-      if (!transferred) resourceLease.complete();
+      if (!transferred) resourceLease?.complete();
     }
   }
 
