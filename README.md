@@ -349,7 +349,7 @@ bun run typecheck
 bun test
 ```
 
-测试覆盖权限、持久化、流式投递、重启恢复、工作区和 RPC 生命周期；HTTP/WebSocket 与真实子进程夹具不调用模型。
+测试覆盖权限、持久化、流式投递、重启恢复、工作区和 RPC 生命周期；HTTP/WebSocket 与真实子进程夹具不调用模型。默认 transport 夹具的 Bot ID 按测试进程隔离；显式 Bot ID 仍用于同身份互斥与恢复验证。
 
 目标与 BTW 生命周期另有显式真实 OMP 验收，使用隔离的配置/会话、有限 localhost 模型替身和本地 Octo fixture，不需要模型凭据，也不连接常驻 Bot：
 

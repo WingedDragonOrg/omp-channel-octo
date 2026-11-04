@@ -255,7 +255,7 @@ export class FakeTransport implements ChannelTransport {
   private archiveFailures: Error[] = [];
   private nextThreadId = 1;
   constructor(options: FakeTransportOptions = {}) {
-    this.bot = options.bot ?? { uid: "bot-fixture", name: "Fixture Bot" };
+    this.bot = options.bot ?? { uid: `bot-fixture-${process.pid}`, name: "Fixture Bot" };
     this.online = options.online ?? true;
     this.startOnline = options.startOnline ?? true;
   }

@@ -132,6 +132,7 @@
 
 - native fork、store、命令/工具、仅归档及重启边界均有 TDD 回归，覆盖退出确认、派发意图、已派发但无 ledger、HTTP 503 分配不明、部分结果回执与回执送达前的延期重启保护。fork 专项为 57 pass、0 fail；`bun run typecheck` 通过。
 - 全量 `bun test --timeout 30000` 为 1,340 pass、0 fail，覆盖 97 个文件、8,318 条断言；真实 Git/进程集成测试使用 30 秒单测预算，未跳过用例。
+- native fork 的真实子进程夹具使用 5 秒启动预算，完整源身份与 tracked close/ledger 用例使用 10 秒总预算；保留源文件内容、会话身份、取消时限、进程退出及台账收尾断言。
 - `bun tests/benchmarks/fork.ts` 使用安装版真实 OMP、完整 channel CLI、临时 profile、loopback 有限模型和本地加密 Octo fixture，四条主群/子区 × 命令/工具路径均通过。4 次目标真实 resume 读取继承历史，4 个准备进程均先退出确认，准备 prompt 和自动派发均为 0；源身份及 held 期间文件字节变动为 0。2 次原生 fork 工具调用，共 14 个有限模型请求。
 - fork 子区 `/thread merge`、`/thread remove` 各执行一次真实 channel→Octo fixture 归档路径；子区记录与历史保留，无 DELETE，source/target session 文件、共用目录和 Git 分支不变，无伪合并事件。
 - `bun tests/benchmarks/restart.ts` 的 graceful/SIGKILL 场景均通过：恢复 accepted 与 queued 任务各 2 个，session overlap、重复副作用和中断通知均为 0。

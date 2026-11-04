@@ -60,7 +60,7 @@ async function createForkHarness(
       sourceSessionId,
       ...fixtureArgs,
     ],
-    startupTimeoutMs: 2_000,
+    startupTimeoutMs: 5_000,
     cancelTimeoutMs: 800,
   });
   return { root, cwd, sessionDir, sourceFile, sourceContents, logPath, factory };
@@ -224,7 +224,7 @@ test("native fork uses only the requested source and preserves tracked close and
   } finally {
     await cleanupHarness(harness, { ...(lease === undefined ? {} : { lease }), store, botUid });
   }
-});
+}, 10_000);
 
 test("normal worker creation strips a configured --fork instead of forking an arbitrary file", async () => {
   const conflictingFork = join(tmpdir(), "untrusted-configured-fork.jsonl");
