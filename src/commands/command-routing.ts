@@ -75,6 +75,7 @@ const BUILTIN_ALIASES = {
   mode: "mode",
   queue: "queue",
   interrupt: "interrupt",
+  watch: "watch",
   switch: "switch",
   "autoresearch-history": "autoresearch-history",
 } as const;

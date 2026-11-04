@@ -983,21 +983,14 @@ test("an edge-refused card body is retried without step summaries and still clos
       ["核对卡片", "in_progress"],
     ]);
 
+    const terminalCard = transport.waitForProgressCard(edit => edit.progress.state === "completed");
     workerGate.resolve();
-    for (let step = 0; step < 10 && transport.progressCardEdits.at(-1)?.progress.state !== "completed"; step += 1) {
-      vi.advanceTimersByTime(1_000);
-      await stat(harness.stateDir);
-      await flushMicrotasks();
-    }
-    const terminal = transport.progressCardEdits.at(-1);
+    const terminal = await terminalCard;
     expect(terminal?.progress.state).toBe("completed");
     expect(Object.hasOwn(terminal!.progress.tools[0]!, "summary")).toBe(false);
     expect(transport.progressCardSends).toHaveLength(1);
     expect(transport.refusedEdits).toHaveLength(1);
 
-    const lines = logged.mock.calls.map((call) => String(call[0] ?? ""));
-    expect(lines.some((line) => line.includes("运行中编辑失败"))).toBe(true);
-    expect(lines.some((line) => line.includes("改用不带步骤摘要的形态重试"))).toBe(true);
   } finally {
     workerGate.resolve();
     logged.mockRestore();

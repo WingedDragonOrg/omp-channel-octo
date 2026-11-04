@@ -158,7 +158,7 @@
 
 ## Operator 配置与协议接入
 
-新增可选 `decisions` 配置块；省略或 `enabled=false` 时不构造客户端、不捕获额外上下文、不发起请求。启用后仅服务本规格的子区引用用途。
+可选 `decisions` 配置块提供引用识别与语义 watch 共用的 protocol、HTTPS endpoint、model 和 key；省略或 `enabled=false` 时均不发起决策请求。启用 `decisions` 时 watch 默认启用，仍只在用户显式创建订阅后采集与判定；`watch.enabled=false` 可关闭 watch 而保留引用识别。引用识别仅外传本规格规定的有界当前子区证据，watch 仅外传其条件和有界采集 stdout，详见 `docs/specs/2026-11-04-bounded-stoppable-watch-design.md`。
 
 字段：
 
@@ -170,7 +170,7 @@
 | `model` | 对应 endpoint 的真实模型 ID，必填；不套用 OMP provider/model selector 语法 |
 | `apiKeyEnv` | 显式环境变量名，要求 `OMP_CHANNEL_OCTO_` 前缀；只由宿主读取，不传入 worker/watchdog，不加入 CLI 环境 allowlist |
 
-只提供环境变量密钥来源，不引入第二套账号发现。配置非法或启用时密钥缺失按既有配置错误处理；不在启动时发起收费推理验证。运行中 provider 不可达仅影响引用判断，不导致聊天服务退出。
+密钥统一从 Decisions 指定的宿主环境变量读取。配置非法或启用时密钥缺失按既有配置错误处理；不在启动时发起收费推理验证。运行中 provider 不可达不导致聊天服务退出：引用判断按本规格尽力而为，watch 按其有界失败状态收尾。
 
 - Typesafe SDK 显式提供 baseURL、defaultModel、apiKey；`retry.maxRetries=0`、`logLevel=off`、`compression=false`，避免 SDK 默认重试、环境日志选项与运行时压缩差异改变合同。实施仅引入该实际使用的依赖。
 - OpenAI 发送原生 JSON，使用 choice 数组与 `input`；共享业务上下文按文本/JSON 数据编码，不加入消息中隐藏的工具内容。

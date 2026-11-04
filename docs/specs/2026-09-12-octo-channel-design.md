@@ -20,10 +20,13 @@
 
 包含主群/子区已落盘上下文即时分叉：owner-only `/fork [子区名称]` 和独立 `fork` 宿主工具共用原生 CLI `--fork`，沿用 cwd、建立独立 session 并绑定同父群新子区。详细契约见 `docs/specs/2026-11-03-thread-fork-design.md`。
 
-包含可选外部决策服务驱动的子区 PR/MR 引用绑定：operator 显式配置协议、模型和独立密钥后，仅从已受理的当前子区可见正文识别候选，以必要有界上下文判断是否为直接工作对象；高概率结果去重持久化到本地 `thread-info.references`，不改 Octo/Fleet。判断异步尽力而为，已绑定引用跨重启保留，未完成判断不恢复或补扫。详细契约见 `docs/specs/2026-11-04-thread-pr-mr-reference-binding-design.md`。
+包含可选外部决策服务驱动的子区 PR/MR 引用绑定：operator 显式配置共用 Decisions 服务的协议、模型和密钥后，仅从已受理的当前子区可见正文识别候选，以必要有界上下文判断是否为直接工作对象；高概率结果去重持久化到本地 `thread-info.references`，不改 Octo/Fleet。判断异步尽力而为，已绑定引用跨重启保留，未完成判断不恢复或补扫。详细契约见 `docs/specs/2026-11-04-thread-pr-mr-reference-binding-design.md`。
+
 包含 owner-only `/bind loop <url|workspace_id|workspace_name>` 的 workspace 感知：仅扫描显式绑定 ID，以完整分页快照比较业务变化；只为当前负责人 Octo UID 精确命中 channel owner/Bot，或已有明确 task—子区关联的任务产生 agent 输入。首次整理及未关联的关注任务交主群，明确关联的任务变化直达子区；其余任务仅更新快照。thread 工具通过 `task_id` 创建或维护来源关联，执行结果按既有 listen 策略回传。权限、持久去重、未知接受及创建保护、隔离验收见 `docs/specs/2026-11-04-loop-workspace-task-awareness-design.md`。
 
 群与子区当前事实清单使用当前 GROUP.md / THREAD.md 中的固定 `### Memory Start ###` / `### Memory End ###` 区段。agent 先通过已有 `octo_management.description-read` 读取完整说明，只修改该区段并保留区段外原文，再经 `description-write` 写回；宿主要求本任务先显式读取，并在写前重新核对正文与版本，说明变化时拒绝并要求重读。群与子区分别使用自己的说明，沿用现有版本快照与 compaction 注入。完整合同与验收见 `docs/specs/2026-11-04-group-thread-current-facts-design.md`。
+
+包含显式请求驱动的有界语义 `watch`：宿主持久保存采集器、完成条件、间隔和截止时间，独立于原 OMP worker 周期检查；单次命中生成归属聊天的独立排队输入。启用 `decisions` 时 watch 默认启用，并与引用识别共用 protocol、endpoint、model 和 key；可用 `watch.enabled=false` 单独关闭。客观状态、退出或事件条件使用程序机制。完整授权、预算、停止与恢复契约见 `docs/specs/2026-11-04-bounded-stoppable-watch-design.md`。
 
 不包含终端会话接管、多用户服务、通用网络 Agent gateway、文档评论任务、服务端通用 bot_task、群历史归档与检索、出站附件之外的通用文件托管和交互 callback 系统。channel 仅提供由 OMP host tool 明确发起的出站图片/文件发送，以及由能力 profile 明确启用的 Octo raw type17 `octo/v1` AdaptiveCard 1.5 进度展示和 `octo/v2` 交互问答卡片；交互卡片的上行只使用该 Bot 自己的事件队列（`/v1/bot/events` 轮询与 ack），不注册回调地址、不实现通用 callback 或审批流。收到的入站消息按已确认的类型表提取内容，贴纸、系统与 CMD 等没有内容的类型明确告知，不作为成功执行。范围以个人 IM 交互为准，不继承参考适配器的其他任务入口。
 
@@ -220,6 +223,7 @@ channel 支持下列命令，`/help` 展示用法；`/retry` 经 OMP 原生命�
 | `/reset [目录]` | 与 `/new` 使用相同的目录解析，但明确重置为 fresh 会话；原会话历史文件保留；与 `/new` 共用创建路径，成功回执同式（含实际模型），会话切换时间同样记录 |
 | `/move <目录>` | 调用当前会话的 OMP 原生 `/move`，校验刷新后的 session state，沿用同一 session ID、历史和附件 |
 | `/fork [子区名称]` | 从当前主群/子区精确持久绑定即时 native fork，创建同父群新子区并绑定独立 session，共用 cwd；源回合继续，新子区等待实际新消息再 resume |
+| `/watch [list\|<id>\|stop <id\|all>]` | owner-only 宿主控制当前聊天的持久 watch；查看、停止不调用模型，不回答 pending ask。订阅默认 5 分钟检查、6 小时到期，显式停止独立于源任务取消或会话切换 |
 | `/thread <任务>` | 交给助手处理：助手自行确定子区名称与 `worktree_name`，新建带独立 git worktree 的 CommunityTopic 子区并把任务派发进去（派发正文按 SDD 格式写；清晰到可直接生成 SDD 的需求直接开工，否则发起会话只做够派发的最少澄清、剩余澄清由子区按 SDD 格式进行）；只在群聊中可用 |
 | `/thread model [选择器\|clear]` | 仅 owner 在主群查询/设置/清除所属子区默认模型；原生 fresh probe 解析成功后持久化，主群自身模型不变；下次子区 worker 启动生效，不切换运行中会话 |
 | `/thread merge` | 沿用目录的 ready fork 子区仅归档 Octo。普通隔离 worktree 子区由宿主独占执行 wt 合并/清理，成功零 agent 任务、回执送达后归档；仅实际执行失败交给本聊天 agent 修复。尾随文字作为 owner 上下文，不拼入 shell |
@@ -402,6 +406,8 @@ shared 多项目工作区的 `/thread merge` 固定回复「当前为多项目�
 群和线程还提供独立 `fork` 宿主工具，参数只有可选 `name`，与 `/fork` 使用同一持久流程；不通过 `octo_management create-thread` 创建空会话来替代分叉。
 
 所有任务都获得固定目标与 cwd 的 `ask`、`octo_send_file` 工具，以及控制 channel 自身的 `channel_control`；群和线程额外获得复合工具 `octo_management`。`channel_control` 的 `restart` 排定一次 channel 重启：它在本回合结束后、且 channel 没有运行中或排队任务时才让检测出的守护进程重启自己，重启后按持久任务状态恢复；因此在自己的回合里改完代码即可让新实现生效（自迭代），既不打断正在投递的回复，也不需要外部脚本或延迟作业。未检测到守护进程时明确回复未检测到且不猜测重启机制。`status` 返回进程 PID、运行中的会话目标、排队任务数、被阻塞目录数与是否已排定重启，供重启前后核对。文件工具的相对路径按任务 cwd 解析，绝对路径可指向本地其他文件，系统不提供目录沙箱保证；发送前复制到 stateDir spool；outbox 保存稳定 client message ID，断线重试不重跑任务。文件永久失败标记 dead 并报告，但不得阻塞后续文字 outbox。
+
+所有已授权任务还获得当前聊天限定的 `watch` 宿主工具，提供 create/list/get/stop。create 仅用于用户显式要求的语义条件观察；源 wake 不能自动创建后继订阅。采集脚本沿用可信本机执行边界，不构成只读沙箱；宿主不保持 OMP worker 等待，命中不作为问题答案或当前回合 steering。启用 `decisions` 默认同时启用 watch，并复用当前连接、模型和密钥；`watch` 配置只保留可选的 enabled 开关。实现与验收按 watch SDD 维护。
 
 `ask` 创建带持久化 ID 的问题后暂停当前任务，并给出一段包含问题正文、编号选项（如有）和回复规则的文本。只要该聊天存在待回答的问题，owner 或已开通群/子区内的成员在该聊天的下一条非命令文本即被当作答案：只有一个待答问题时它就是该问题的答案——合法选项编号按该问题单选/多选的数量和范围校验，其他文本原样作为自填答案返回给模型；一次 ask 的多个问题同时待答时，这条文本作为整组答案，同一文本写入该组每个仍未作答的问题（逐题按各自规则解释：编号在范围内取编号、否则原样），该 ask 立即在所有问题上返回而不逐题等待，已作答的问题不重复写入。命令仍然优先。不提供默认答案；无待回答问题、不同聊天与重复投递的回复都不作为答案，其中无待回答问题时的文本按普通任务输入处理。等待超时不再是过期：等待超过配置的 `ask.timeoutMs`（默认 6 小时，允许 30 分钟到 7 天）时，问题行保持 pending、卡片保持可提交，等待中的回合像被取消的 tool call 一样停住（任务记为 interrupted，不向聊天发送任何提示）；owner 或成员之后的答复照常记录为答案，并作为该会话的新回合输入投递（正文写明所答问题与还原后的答案）——运行中的回合按该聊天的追加模式并入，否则成为 durable 任务——agent 在同一 session 继续。同一次 ask 的整组问题共用创建时开始的计时，整组一起停住。显式取消封闭该聊天的问题；停机保留问题行与卡片。问题关闭后收到的卡片提交按关闭原因分流：只有「不是用户明确停止、也不属于 `/new`/`/reset` 切换前的旧会话」的关闭才按迟到答复接受——先按行 compare-and-set 记为 answered（含提交人，同一提交只落一次，事件重投与重启重放因此静默），再把「原问题＋还原后的答案＋提交人」作为该聊天的新输入投递（运行中的回合按追加模式并入，否则成为 durable 任务，恰好一次唤醒）；它不恢复原任务、不重放原 prompt，也不作为该聊天另一张待答问题的答案。关闭原因是用户明确停止（`/cancel`、`/interrupt`，含重启恢复里结算这两种意图的行）或该问题提出于最后一次 `/new`/`/reset` 之前时，提交照旧只回一次「该问题已失效，本次点击未作为答案。」提示、不落答案；已记录答案的问题再收到的提交保持静默，既不覆盖答案也不投递。关闭原因随行持久化（`questions.closed_reason`：`cancelled`/`interrupted`/`ended`；迁移前的旧行与 `expired` 旧值按 `ended` 处理）。每轮 ask 持久化原生 `toolCallId`、调用组身份与 `settled_at`：恢复后同一调用重放返回原答案及 `answeredBy`；未交付的一组可由续跑中对应 ask 整组认领，包括全部已答复但结果尚未交付的情形；新调用不复用已交付历史。恢复窗口内的答复由认领方消费，不另建唤醒任务；任务收束时关闭未认领的待答行，已答复但未认领的内容补投一次。问答卡每次编辑前在 SQLite 原子预留 `card_seq`，跨重启递增；旧行未知序号仅首次使用保守高水位初始化。
 

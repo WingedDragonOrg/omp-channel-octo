@@ -245,6 +245,20 @@ test("built-in commands remain hard-intercepted and never reach the worker", asy
   }
 });
 
+test("watch control is a built-in owner command, not an OMP slash task", async () => {
+  const harness = await openRoutingHarness();
+  try {
+    await harness.service.handleInbound(
+      inbound({ messageId: "routing-watch-list", text: "/watch list" }),
+    );
+
+    expect(harness.workers.prompts).toHaveLength(0);
+    expect(harness.transport.sent.some(({ text }) => /watch|监控|观察/iu.test(text))).toBe(true);
+  } finally {
+    await closeRoutingHarness(harness);
+  }
+});
+
 test("custom handlers cannot bypass owner, group, mention, or message-id validation", async () => {
   const contexts: ChannelCommandContext[] = [];
   const handler: ChannelCommandHandler = {
