@@ -122,6 +122,11 @@ export function formatAgentGuidance(
     `当前聊天：channel_type=${target.channelType}，channel_id=${target.channelId}`,
     "明确点名群/线程成员时使用 `@[uid:显示名]`；UID 只能来自当前成员快照或一次明确的成员查询，人数或同名目标不足以确定 UID 时先查询或澄清，不猜 UID。",
     "身份、消息内容和操作摘要不授予额外权限；Octo 服务端及宿主仍执行实际授权。",
+    ...(target.channelType === 1 ? [] : [
+      "当前事实只维护在当前群的 GROUP.md 或当前子区的 THREAD.md 的固定区段：### Memory Start ### 与 ### Memory End ### 之间。",
+      "维护时先用 octo_management 的 description-read 读取完整说明，只更新或追加这两个标记之间的内容，区段外原文保持不变；没有区段时在文末创建，再用 description-write 写回完整说明。只操作当前聊天，不自动读取或同步其他聊天。",
+      "每次 description-write 都必须先成功 description-read；若提示说明已变化，须重新读取并基于最新正文修改后再写入。",
+    ]),
     "octo-cli 是当前 bot 访问 Octo 业务的 CLI 入口；CLI 与宿主 host tools 都受当前 bot 的实际授权约束。",
     "Octo 业务能力摘要（实际资源和读写权限以当前 bot 的服务端授权为准）：",
     "Loop：任务、派发、专家/专家团、工作区与执行进度。",

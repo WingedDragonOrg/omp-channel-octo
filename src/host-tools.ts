@@ -7,6 +7,7 @@ import type {
   ChannelTransport,
   ChatTarget,
   GroupMember,
+  GroupContext,
   HostTool,
   InboundMessage,
   ThreadListenLevel,
@@ -791,6 +792,8 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
     ? [...MANAGEMENT_BASE_ACTIONS, MANAGEMENT_DISPATCH_ACTION]
     : [...MANAGEMENT_BASE_ACTIONS];
   const pendingMergeLifecycles = new Map<string, WorktreeMergeLifecycle>();
+  const descriptionState: { snapshot: GroupContext | undefined } = { snapshot: undefined };
+  let descriptionTail: Promise<void> = Promise.resolve();
   const managementTool: HostTool = {
     name: "octo_management",
     description:
@@ -806,7 +809,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
         },
         name: { type: "string", description: "create-thread 的线程名；group-update 的新群名。" },
         notice: { type: "string", description: "group-update 的新群公告。" },
-        content: { type: "string", description: "description-write 的共享说明正文。" },
+        content: { type: "string", description: "description-write 的共享说明正文；须先 description-read，说明变化后须重新读取。" },
         task_id: {
           type: "string",
           description: "create-thread/thread-bind/thread-dispatch：当前群绑定的 Loop task ID；thread-bind 必填，dispatch 指定时必须与目标关联一致。",
@@ -871,20 +874,26 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
       required: ["action"],
       additionalProperties: false,
     },
-    execute: async (args, signal, toolCallId) =>
-      runManagementTool(
+    execute: async (args, signal, toolCallId) => {
+      const invoke = () => runManagementTool(
         host,
         task,
         target,
         parentGroupId,
         currentShortId,
         args,
+        descriptionState,
         signal,
         toolCallId,
         toolCallId === undefined
           ? undefined
           : (lifecycle) => pendingMergeLifecycles.set(toolCallId, lifecycle),
-      ),
+      );
+      if (args.action !== "description-read" && args.action !== "description-write") return invoke();
+      const operation = descriptionTail.then(invoke);
+      descriptionTail = operation.then(() => {}, () => {});
+      return operation;
+    },
     onResultAccepted: (toolCallId) => {
       const lifecycle = pendingMergeLifecycles.get(toolCallId);
       if (!lifecycle) return;
@@ -933,6 +942,7 @@ async function runManagementTool(
   groupId: string,
   currentShortId: string | null,
   args: Record<string, unknown>,
+  descriptionState: { snapshot: GroupContext | undefined },
   signal: AbortSignal,
   toolCallId?: string,
   onWorktreeMergeLifecycle?: (lifecycle: WorktreeMergeLifecycle) => void,
@@ -1011,11 +1021,21 @@ async function runManagementTool(
   throwIfAborted(signal);
   switch (action) {
     case "description-read": {
-      return JSON.stringify(normalizeGroupContext(await transport.getGroupContext(target)));
+      descriptionState.snapshot = undefined;
+      const snapshot = normalizeGroupContext(await transport.getGroupContext(target));
+      descriptionState.snapshot = snapshot;
+      return JSON.stringify(snapshot);
     }
     case "description-write": {
       const content = optionalText("content");
       if (content === undefined) throw new Error("content is required");
+      const previous = descriptionState.snapshot;
+      descriptionState.snapshot = undefined;
+      if (!previous) throw new Error("请先调用 description-read 读取当前说明，再调用 description-write。");
+      const current = normalizeGroupContext(await transport.getGroupContext(target));
+      if (current.version !== previous.version || current.content !== previous.content) {
+        throw new Error("说明已变化，请重新调用 description-read 后再写入。");
+      }
       const result = await transport.updateGroupContext(target, content, signal);
       return `群说明已更新到版本 ${result.version}`;
     }
