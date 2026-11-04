@@ -8,14 +8,14 @@
 
 - off：不自动回传。
 - merge：仅宿主实际完成合并后回传一次。
-- task：派发产生独立任务时，完成、失败、取消、中断可回传；合并成功也回传。
+- task：派发或 Loop 变化在子区产生独立任务时，完成、失败、取消、中断可回传；合并成功也回传。
 - 任意档位均不回传合并失败及其修复失败。停机挂起不是任务终态。
 
 ## 工具契约
 
 `create-thread` 增加 `listen`（默认 merge），包括 single/shared/separate 与普通子区；separate 每个创建结果各自保存策略及同一创建方目标。`thread-listen` 使用既有 thread-* 定位方式，带 listen 修改，不带时查询。`thread-info` 同时报告策略。修改策略不修改创建方目标。
 
-`thread-dispatch` 不再接受 notify。派发仍复用权限、深度限制、durable 接受、追加模式和收据；只有独立派发任务有自己的终态通知，steering 部分没有独立终态。已有任务级登记不参与决策。
+`thread-dispatch` 不再接受 notify。派发仍复用权限、深度限制、durable 接受、追加模式和收据；独立派发任务及直接送达子区的 Loop 独立任务有自己的终态通知，steering 部分没有独立终态。Loop 变化本身只送关联子区；此处订阅的是执行结果，不是变更镜像。已有任务级登记不参与决策。
 
 ## 持久化及迁移
 
@@ -23,7 +23,7 @@
 
 移除 tasks 的 relay_channel_type / relay_channel_id / relay_thread_name 与 TaskRelayTarget。迁移事务先为已有子区建立 merge 策略，再删除旧列。已知旧回传目标仅作为历史来源信息迁移，不保留旧开关；缺少创建方记录的旧子区使用其真实父群。普通已有子区可在首次访问时按真实父群建立默认策略。旧 notify=true 在途任务统一遵循 merge。
 
-任务新增 relaySuppressed 标记；不再携带通知开关或目标。派发身份由既有 dispatch: 消息 ID 判断。
+任务新增 relaySuppressed 标记；不再携带通知开关或目标。派发身份由既有 dispatch: 消息 ID 判断，Loop 独立输入由 loop: 身份识别；两者在子区终态时共用策略及合并抑制。
 
 ## 合并事件单一归属与失败隔离
 
@@ -45,7 +45,7 @@ CoreService 持有实际交付：通知使用持久 owner 身份、messageSeq=0�
 
 1. 默认创建和旧数据库迁移后普通派发的所有终态无父聊天消息、任务或 steering，含旧 notify=true 在途任务。
 2. merge 仅真实合并成功回传一次；失败及后续修复失败均留在子区。
-3. off 不回传；task 覆盖派发四种终态与合并成功，合并任务及修复任务无旁路。
+3. off 不回传；task 覆盖派发或 Loop 直达子区独立任务的四种终态与合并成功，合并任务及修复任务无旁路。
 4. create-thread/listen、thread-listen 查询修改和 thread-info 持久有效，跨重启保持，旧 notify 路径全部迁出。
 5. shared 默认静默，task 派发有效，合并仍拒绝。
 6. 内容有界且保留来源语义，ask、权限、去重、追加模式和归档顺序不变。

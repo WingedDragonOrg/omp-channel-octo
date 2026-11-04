@@ -547,6 +547,83 @@ export function applySchema(db: Database): void {
     "CREATE INDEX IF NOT EXISTS questions_card ON questions(bot_uid, channel_type, channel_id, card_message_id)",
   );
   migrateProgressCards(db);
+  migrateLoopStorage(db);
+}
+
+function migrateLoopStorage(db: Database): void {
+  transaction(db, () => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS loop_bindings (
+        bot_uid TEXT NOT NULL,
+        group_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        workspace_name TEXT NOT NULL,
+        workspace_slug TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version >= 1),
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(bot_uid, group_id)
+      );
+      CREATE TABLE IF NOT EXISTS loop_task_snapshots (
+        bot_uid TEXT NOT NULL,
+        group_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        task_json TEXT NOT NULL,
+        business_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(bot_uid, group_id, workspace_id, task_id)
+      );
+      CREATE TABLE IF NOT EXISTS loop_inputs (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT NOT NULL UNIQUE,
+        bot_uid TEXT NOT NULL,
+        group_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        binding_version INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('baseline', 'created', 'updated')),
+        task_id TEXT,
+        tasks_json TEXT NOT NULL,
+        previous_json TEXT,
+        state TEXT NOT NULL CHECK(state IN ('pending', 'intent', 'delivered', 'unknown', 'superseded')),
+        target_channel_type INTEGER CHECK(target_channel_type IN (1, 2, 5)),
+        target_channel_id TEXT,
+        fault_notified INTEGER NOT NULL DEFAULT 0 CHECK(fault_notified IN (0, 1)),
+        created_at INTEGER NOT NULL,
+        CHECK((target_channel_type IS NULL) = (target_channel_id IS NULL))
+      );
+      CREATE INDEX IF NOT EXISTS loop_inputs_bot_sequence
+        ON loop_inputs(bot_uid, sequence);
+      CREATE INDEX IF NOT EXISTS loop_inputs_group_state
+        ON loop_inputs(bot_uid, group_id, workspace_id, state, sequence);
+      CREATE TABLE IF NOT EXISTS loop_task_routes (
+        bot_uid TEXT NOT NULL,
+        group_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        thread_channel_id TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version >= 1),
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(bot_uid, group_id, workspace_id, task_id)
+      );
+      CREATE INDEX IF NOT EXISTS loop_task_routes_thread
+        ON loop_task_routes(bot_uid, group_id, thread_channel_id, task_id);
+      CREATE TABLE IF NOT EXISTS loop_thread_creations (
+        bot_uid TEXT NOT NULL,
+        group_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        operation_id TEXT NOT NULL,
+        binding_version INTEGER NOT NULL CHECK(binding_version >= 1),
+        route_version INTEGER NOT NULL CHECK(route_version >= 0),
+        state TEXT NOT NULL CHECK(state IN ('reserved', 'allocated', 'ready', 'unknown', 'superseded')),
+        thread_channel_id TEXT,
+        error TEXT,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(bot_uid, group_id, workspace_id, task_id),
+        UNIQUE(bot_uid, operation_id)
+      );
+    `);
+  });
 }
 
 function migrateWorkerLedgerNullableSessionFile(db: Database): void {

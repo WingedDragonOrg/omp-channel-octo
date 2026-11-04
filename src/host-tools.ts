@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { copyFile, mkdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
 import { throwIfAborted } from "./abort.ts";
@@ -27,6 +27,7 @@ import {
   createThreadWorkspaceBatch,
   validateThreadCreation,
   type ThreadWorkspaceBatchResult,
+  type ValidatedThreadCreation,
 } from "./workspace/thread-workspaces.ts";
 import { taskTarget } from "./target.ts";
 import { threadChannelId, threadParentGroupId, threadShortId } from "./threads/thread-target.ts";
@@ -39,6 +40,8 @@ import {
   cleanupOwnedThreadWorkspace as cleanupOwnedWorkspace,
   threadWorkspaceCleanupPaths,
 } from "./threads/thread-workspace-cleanup.ts";
+import { LoopThreadBindings } from "./loop/thread-bindings.ts";
+import type { LoopTaskKey, LoopTaskRoute, LoopThreadCreation } from "./loop/types.ts";
 /**
  * Host tools need only the channel capabilities they actually use. The service passes this port
  * while keeping task scheduling, session migration and outbound delivery internals private.
@@ -88,12 +91,21 @@ export interface HostToolHost {
     | "setThreadListen"
     | "suppressTaskRelay"
     | "listThreadWorkspaces"
+    | "getLoopBinding"
+    | "getLoopTaskRoute"
+    | "bindLoopTask"
+    | "listLoopThreadTasks"
+    | "getLoopThreadCreation"
+    | "recordLoopThreadAllocated"
+    | "completeLoopThreadCreation"
+    | "markLoopThreadCreationUnknown"
   >;
   tryAcquireDestructiveResources(
     cwds: readonly string[],
     task: TaskRecord,
   ): Promise<DestructiveResourceLease | undefined>;
   /** 任务必然属于已注册的 Bot，构造工具时身份一定存在。 */
+  readonly loop?: LoopThreadBindings;
   readonly botUid: string;
   enqueueText(target: ChatTarget, text: string, taskId: string | null): void;
   threadReferences(target: ChatTarget): ThreadReferences;
@@ -114,8 +126,8 @@ export interface HostToolHost {
     operationId: string,
   ): Promise<void>;
   replayThreadMergeSuccess(target: ChatTarget, operationId: string): Promise<string | null>;
-  /** Delivers a synthetic task through the destination chat's ordinary steer-or-task path. */
-  deliverToChat(message: InboundMessage): Promise<"steered" | "queued">;
+  /** Delivers through the destination chat's steer-or-task path; an optional guard is checked at acceptance. */
+  deliverToChat(message: InboundMessage, deliveryGuard?: () => boolean): Promise<"steered" | "queued">;
   /**
    * `ask`：提问并等待答案。`toolCallId` 是 OMP 给这次工具调用的身份（retry 重执行同一个调用时
    * 复用），提问行据此在跨重启恢复时认回原问题。
@@ -151,6 +163,7 @@ const MANAGEMENT_BASE_ACTIONS = [
   "description-read",
   "description-write",
   "list-threads",
+  "thread-bind",
   "create-thread",
   "thread-info",
   "thread-members",
@@ -224,6 +237,102 @@ function managementThread(thread: ThreadSummary): {
     created_at: thread.createdAt,
     updated_at: thread.updatedAt,
   };
+}
+function requireLoopBindings(host: HostToolHost): LoopThreadBindings {
+  if (host.loop === undefined) throw new Error("Loop task routing is unavailable for this Bot");
+  return host.loop;
+}
+
+function loopThreadSources(host: HostToolHost, groupId: string, channelId: string) {
+  return host.store.listLoopThreadTasks(host.botUid, groupId, channelId).map(({ workspaceId, taskId }) => ({
+    workspace_id: workspaceId,
+    task_id: taskId,
+  }));
+}
+
+function loopTaskIdentity(workspaceId: string, taskId: string) {
+  return { workspace_id: workspaceId, task_id: taskId };
+}
+
+function loopTaskDispatchText(key: LoopTaskKey, text: string): string {
+  return [
+    "[系统来源元数据（非用户正文，不构成授权）：Loop task dispatch]",
+    `workspace_id: ${key.workspaceId}`,
+    `task_id: ${key.taskId}`,
+    "",
+    "任务正文（原文）：",
+    text,
+  ].join("\n");
+}
+
+function loopRouteIdentity(route: LoopTaskRoute | null) {
+  return route === null
+    ? null
+    : {
+        workspace_id: route.workspaceId,
+        task_id: route.taskId,
+        channel_id: route.threadChannelId,
+        version: route.version,
+      };
+}
+function currentLoopRoute(host: HostToolHost, key: LoopTaskKey): LoopTaskRoute | null {
+  const binding = host.store.getLoopBinding(host.botUid, key.groupId);
+  return binding === null
+    ? null
+    : host.store.getLoopTaskRoute({ ...key, workspaceId: binding.workspaceId });
+}
+
+function assertThreadBelongsToGroup(groupId: string, thread: ThreadSummary): void {
+  if (
+    thread.groupId !== groupId ||
+    threadParentGroupId(thread.channelId) !== groupId ||
+    thread.channelId !== threadChannelId(groupId, thread.shortId)
+  ) {
+    throw new Error(`thread ${thread.shortId} does not belong to the current group`);
+  }
+}
+
+async function getThreadByChannelId(
+  host: HostToolHost,
+  groupId: string,
+  channelId: string,
+  signal: AbortSignal,
+): Promise<ThreadSummary> {
+  const shortId = threadShortId(channelId);
+  if (threadParentGroupId(channelId) !== groupId || shortId === null) {
+    throw new Error("Loop thread target does not belong to the current group");
+  }
+  const thread = await host.transport.getThread(groupId, shortId, signal);
+  assertThreadBelongsToGroup(groupId, thread);
+  if (thread.channelId !== channelId) throw new Error("remote thread identity differs from the stored Loop route");
+  return thread;
+}
+function isCurrentLoopRoute(
+  host: HostToolHost,
+  groupId: string,
+  key: LoopTaskKey,
+  threadChannelId: string,
+): boolean {
+  const binding = host.store.getLoopBinding(host.botUid, groupId);
+  const route = host.store.getLoopTaskRoute(key);
+  return key.botUid === host.botUid
+    && key.groupId === groupId
+    && binding !== null
+    && binding.workspaceId === key.workspaceId
+    && route !== null
+    && route.threadChannelId === threadChannelId;
+}
+
+function assertCurrentLoopRoute(
+  host: HostToolHost,
+  groupId: string,
+  key: LoopTaskKey,
+  threadChannelId: string,
+): void {
+  requireLoopBindings(host);
+  if (!isCurrentLoopRoute(host, groupId, key, threadChannelId)) {
+    throw new Error("Loop task route changed or no longer targets this thread");
+  }
 }
 function isThreadListenLevel(value: string): value is ThreadListenLevel {
   return value === "off" || value === "merge" || value === "task";
@@ -330,6 +439,239 @@ function threadWorkspaceCreationResult(
   }
   return result;
 }
+function loopThreadPartialResult(
+  host: HostToolHost,
+  key: LoopTaskKey,
+  creation: LoopThreadCreation,
+  thread?: ThreadSummary,
+  attemptError?: string,
+): Record<string, unknown> {
+  return {
+    ...(thread === undefined ? {} : managementThread(thread)),
+    ready: false,
+    loop_task: loopTaskIdentity(key.workspaceId, key.taskId),
+    creation_state: creation.state,
+    allocated_channel_id: creation.threadChannelId ?? thread?.channelId ?? null,
+    route_bound: false,
+    current_workspace_id: host.store.getLoopBinding(host.botUid, key.groupId)?.workspaceId ?? null,
+    current_route: loopRouteIdentity(currentLoopRoute(host, key)),
+    ...(creation.error === null ? {} : { error: creation.error }),
+    ...(attemptError === undefined ? {} : { attempt_error: attemptError }),
+  };
+}
+
+async function reportExistingLoopCreation(
+  host: HostToolHost,
+  groupId: string,
+  key: LoopTaskKey,
+  creation: LoopThreadCreation,
+  signal: AbortSignal,
+): Promise<string> {
+  let thread: ThreadSummary | undefined;
+  let lookupError: string | undefined;
+  if (creation.threadChannelId !== null) {
+    try {
+      thread = await getThreadByChannelId(host, groupId, creation.threadChannelId, signal);
+    } catch (error) {
+      lookupError = boundedManagementError(error, "无法核对已分配线程");
+    }
+  }
+  return JSON.stringify({
+    ...loopThreadPartialResult(host, key, creation, thread),
+    ...(lookupError === undefined ? {} : { thread_lookup_error: lookupError }),
+    reconciliation_required: true,
+  });
+}
+
+async function reportExistingLoopRoute(
+  host: HostToolHost,
+  target: ChatTarget,
+  groupId: string,
+  key: LoopTaskKey,
+  route: LoopTaskRoute,
+  signal: AbortSignal,
+): Promise<string> {
+  const thread = await getThreadByChannelId(host, groupId, route.threadChannelId, signal);
+  const policy = ensureThreadListen(host, thread, target);
+  const creation = host.store.getLoopThreadCreation(key);
+  const incompleteCreation = creation !== null
+    && creation.state !== "ready"
+    && creation.threadChannelId !== null
+    && creation.threadChannelId !== route.threadChannelId;
+  return JSON.stringify({
+    ...managementThread(thread),
+    listen: policy.listen,
+    ready: true,
+    reused_existing: true,
+    loop_task: loopTaskIdentity(key.workspaceId, key.taskId),
+    route_bound: true,
+    ...(incompleteCreation && creation !== null
+      ? {
+          reconciliation_required: true,
+          superseded_creation: {
+            state: creation.state,
+            allocated_channel_id: creation.threadChannelId,
+          },
+        }
+      : {}),
+  });
+}
+
+async function runLoopTaskThreadCreate(
+  host: HostToolHost,
+  task: TaskRecord,
+  target: ChatTarget,
+  groupId: string,
+  key: LoopTaskKey,
+  name: string,
+  creation: ValidatedThreadCreation,
+  signal: AbortSignal,
+  toolCallId: string | undefined,
+): Promise<string> {
+  const loop = requireLoopBindings(host);
+  const active = loop.activeCreation(key);
+  if (active !== null) return (await active) as string;
+  const currentRoute = host.store.getLoopTaskRoute(key);
+  if (currentRoute !== null) {
+    return reportExistingLoopRoute(host, target, groupId, key, currentRoute, signal);
+  }
+  const previousCreation = host.store.getLoopThreadCreation(key);
+  if (previousCreation !== null) {
+    return reportExistingLoopCreation(host, groupId, key, previousCreation, signal);
+  }
+
+  const operationId = JSON.stringify([task.id, toolCallId ?? task.id]);
+  try {
+    return await loop.runCreation(key, operationId, async (reservation) => {
+      if (creation.workspace === null) {
+        let thread: ThreadSummary | undefined;
+        try {
+          thread = await host.transport.createThread(groupId, name, signal);
+          host.store.recordLoopThreadAllocated(key, reservation.operationId, thread.channelId);
+          assertThreadBelongsToGroup(groupId, thread);
+          const policy = ensureThreadListen(host, thread, target, creation.listen);
+          if (creation.background !== undefined) {
+            await host.transport.updateGroupContext(
+              { channelId: thread.channelId, channelType: 5 },
+              `用途：${creation.background}`,
+              signal,
+            );
+          }
+          const routeBound = host.store.completeLoopThreadCreation(key, reservation.operationId);
+          const latest = host.store.getLoopThreadCreation(key);
+          if (!routeBound || latest === null) {
+            return JSON.stringify(
+              latest === null
+                ? {
+                    ...managementThread(thread),
+                    ready: false,
+                    loop_task: loopTaskIdentity(key.workspaceId, key.taskId),
+                    route_bound: false,
+                    current_workspace_id: host.store.getLoopBinding(host.botUid, key.groupId)?.workspaceId ?? null,
+                    current_route: loopRouteIdentity(currentLoopRoute(host, key)),
+                  }
+                : loopThreadPartialResult(host, key, latest, thread),
+            );
+          }
+          return JSON.stringify({
+            ...managementThread(thread),
+            listen: policy.listen,
+            ready: true,
+            route_bound: true,
+            loop_task: loopTaskIdentity(key.workspaceId, key.taskId),
+          });
+        } catch (error) {
+          const detail = boundedManagementError(error, "Loop task 子区准备失败");
+          let latest = host.store.getLoopThreadCreation(key);
+          if (latest?.operationId === reservation.operationId && latest.state === "reserved") {
+            host.store.markLoopThreadCreationUnknown(key, reservation.operationId, detail);
+            latest = host.store.getLoopThreadCreation(key);
+          }
+          if (latest !== null) {
+            return JSON.stringify(loopThreadPartialResult(host, key, latest, thread, detail));
+          }
+          throw error;
+        }
+      }
+
+      let batch: ThreadWorkspaceBatchResult;
+      try {
+        batch = await createThreadWorkspaceBatch(
+          host,
+          groupId,
+          name,
+          creation.workspace,
+          signal,
+          (thread) => {
+            host.store.recordLoopThreadAllocated(key, reservation.operationId, thread.channelId);
+            ensureThreadListen(host, thread, target, creation.listen);
+          },
+        );
+      } catch (error) {
+        const detail = boundedManagementError(error, "Loop task 隔离工作区准备失败");
+        let latest = host.store.getLoopThreadCreation(key);
+        if (latest?.state === "reserved") {
+          host.store.markLoopThreadCreationUnknown(key, reservation.operationId, detail);
+          latest = host.store.getLoopThreadCreation(key);
+        }
+        if (latest !== null) {
+          return JSON.stringify(loopThreadPartialResult(host, key, latest, undefined, detail));
+        }
+        throw error;
+      }
+
+      const outcome = batch.threads[0];
+      let latest = host.store.getLoopThreadCreation(key);
+      let allocationError: string | undefined;
+      if (outcome !== undefined && latest?.state === "reserved") {
+        try {
+          host.store.recordLoopThreadAllocated(key, reservation.operationId, outcome.thread.channelId);
+          latest = host.store.getLoopThreadCreation(key);
+        } catch (error) {
+          allocationError = boundedManagementError(error, "无法持久化已分配线程身份");
+        }
+      }
+      if (latest?.state === "reserved") {
+        const detail = allocationError ?? batch.error ?? outcome?.error ?? "远端线程分配结果未确认";
+        host.store.markLoopThreadCreationUnknown(key, reservation.operationId, detail);
+        latest = host.store.getLoopThreadCreation(key);
+      }
+      let routeBound = false;
+      if (batch.ready && outcome?.record.status === "ready" && latest?.state === "allocated") {
+        routeBound = host.store.completeLoopThreadCreation(key, reservation.operationId);
+        latest = host.store.getLoopThreadCreation(key);
+      }
+      const result = threadWorkspaceCreationResult(batch, creation.listen);
+      return JSON.stringify({
+        ...result,
+        ready: routeBound,
+        resource_ready: batch.ready,
+        loop_task: loopTaskIdentity(key.workspaceId, key.taskId),
+        creation_state: latest?.state ?? "unknown",
+        allocated_channel_id: latest?.threadChannelId ?? outcome?.thread.channelId ?? null,
+        route_bound: routeBound,
+        current_workspace_id: host.store.getLoopBinding(host.botUid, key.groupId)?.workspaceId ?? null,
+        current_route: loopRouteIdentity(currentLoopRoute(host, key)),
+      });
+    });
+  } catch (error) {
+    const route = host.store.getLoopTaskRoute(key);
+    if (route !== null) {
+      return reportExistingLoopRoute(host, target, groupId, key, route, signal);
+    }
+    let latest = host.store.getLoopThreadCreation(key);
+    if (latest?.operationId === operationId && latest.state === "reserved") {
+      const detail = boundedManagementError(error, "Loop task thread creation did not finish");
+      host.store.markLoopThreadCreationUnknown(key, operationId, detail);
+      latest = host.store.getLoopThreadCreation(key);
+    }
+    if (latest !== null) {
+      return reportExistingLoopCreation(host, groupId, key, latest, signal);
+    }
+    throw error;
+  }
+}
+
 
 export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[] {
   const target = taskTarget(task);
@@ -452,7 +794,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
   const managementTool: HostTool = {
     name: "octo_management",
     description:
-      "管理当前群/线程：读取与管理群信息、共享说明和 thread。create-thread 的显式 projects（包括 single）必须提供完整任务 worktree_name；每项 projects[].name 独立生成稳定项目目录 slug，必须是互不冲突的 ASCII 名称。名称不翻译、不截断，无法规范化或发生冲突时请改用明确限定名（如 admin-web、customer-web）。单项目省略 layout 表示 single，多项目明确选择 shared 或 separate。background 只描述用途与实际路径；listen 与派发/合并策略按各字段说明。",
+      "管理当前群/线程：读取与管理群信息、共享说明和 thread。create-thread 的显式 projects（包括 single）必须提供完整任务 worktree_name；每项 projects[].name 独立生成稳定项目目录 slug，必须是互不冲突的 ASCII 名称。名称不翻译、不截断，无法规范化或发生冲突时请改用明确限定名（如 admin-web、customer-web）。单项目省略 layout 表示 single，多项目明确选择 shared 或 separate。background 只描述用途与实际路径；listen 与派发/合并策略按各字段说明。create-thread 可选 task_id 将新线程创建并关联当前 Loop task；thread-bind 可显式改绑 task_id。thread-dispatch 的 task_id 必须已经关联到目标子区。task_id 不指定 workspace，所有动作仅作用于本群当前绑定 workspace。",
     parameters: {
       type: "object",
       properties: {
@@ -465,6 +807,10 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
         name: { type: "string", description: "create-thread 的线程名；group-update 的新群名。" },
         notice: { type: "string", description: "group-update 的新群公告。" },
         content: { type: "string", description: "description-write 的共享说明正文。" },
+        task_id: {
+          type: "string",
+          description: "create-thread/thread-bind/thread-dispatch：当前群绑定的 Loop task ID；thread-bind 必填，dispatch 指定时必须与目标关联一致。",
+        },
         text: { type: "string", description: "thread-dispatch 要派发的任务正文。" },
         force: {
           type: "boolean",
@@ -710,52 +1056,108 @@ async function runManagementTool(
       const threads = await transport.listThreads(groupId, signal);
       const visible = threads.slice(0, MAX_MANAGEMENT_THREADS);
       return JSON.stringify({
-        threads: visible.map(managementThread),
+        threads: visible.map((thread) => ({
+          ...managementThread(thread),
+          loop_tasks: loopThreadSources(host, groupId, thread.channelId),
+        })),
         count: threads.length,
         truncated: threads.length > visible.length,
       });
     }
     case "create-thread": {
       const name = namedText("name", MAX_MANAGEMENT_NAME_CHARS);
-      const creation = await validateThreadCreation(args, task.cwd, worktreeName(), signal);
-      if (creation.workspace === null) {
-        const thread = await transport.createThread(groupId, name, signal);
-        const policy = ensureThreadListen(host, thread, target, creation.listen);
-        if (creation.background !== undefined) {
-          try {
-            await transport.updateGroupContext(
-              { channelId: thread.channelId, channelType: 5 },
-              `用途：${creation.background}`,
-              signal,
-            );
-          } catch (error) {
-            return JSON.stringify({
-              ...managementThread(thread),
-              listen: policy.listen,
-              background_error: boundedManagementError(error, "线程说明写入失败"),
-            });
+      const taskId = optionalText("task_id")?.trim();
+      if (taskId === undefined) {
+        const creation = await validateThreadCreation(args, task.cwd, worktreeName(), signal);
+        if (creation.workspace === null) {
+          const thread = await transport.createThread(groupId, name, signal);
+          const policy = ensureThreadListen(host, thread, target, creation.listen);
+          if (creation.background !== undefined) {
+            try {
+              await transport.updateGroupContext(
+                { channelId: thread.channelId, channelType: 5 },
+                `用途：${creation.background}`,
+                signal,
+              );
+            } catch (error) {
+              return JSON.stringify({
+                ...managementThread(thread),
+                listen: policy.listen,
+                background_error: boundedManagementError(error, "线程说明写入失败"),
+              });
+            }
           }
+          return JSON.stringify({ ...managementThread(thread), listen: policy.listen });
         }
-        return JSON.stringify({ ...managementThread(thread), listen: policy.listen });
+        const result = await createThreadWorkspaceBatch(
+          host,
+          groupId,
+          name,
+          creation.workspace,
+          signal,
+          (thread) => ensureThreadListen(host, thread, target, creation.listen),
+        );
+        return JSON.stringify(threadWorkspaceCreationResult(result, creation.listen));
       }
-      const result = await createThreadWorkspaceBatch(
+      if (taskId.length === 0) throw new Error("task_id is required");
+      const loop = requireLoopBindings(host);
+      if (args.layout === "separate" && Array.isArray(args.projects) && args.projects.length > 1) {
+        throw new Error("task_id cannot create multiple separate threads; create one target and bind it explicitly");
+      }
+      const { key } = await loop.resolveTask(groupId, taskId, signal);
+      const active = loop.activeCreation(key);
+      if (active !== null) return (await active) as string;
+      const currentRoute = host.store.getLoopTaskRoute(key);
+      if (currentRoute !== null) {
+        return reportExistingLoopRoute(host, target, groupId, key, currentRoute, signal);
+      }
+      const previousCreation = host.store.getLoopThreadCreation(key);
+      if (previousCreation !== null) {
+        return reportExistingLoopCreation(host, groupId, key, previousCreation, signal);
+      }
+      const creationArgs = { ...args };
+      delete creationArgs.task_id;
+      const creation = await validateThreadCreation(creationArgs, task.cwd, worktreeName(), signal);
+      return runLoopTaskThreadCreate(
         host,
+        task,
+        target,
         groupId,
+        key,
         name,
-        creation.workspace,
+        creation,
         signal,
-        (thread) => ensureThreadListen(host, thread, target, creation.listen),
+        toolCallId,
       );
-      return JSON.stringify(threadWorkspaceCreationResult(result, creation.listen));
+    }
+    case "thread-bind": {
+      const loop = requireLoopBindings(host);
+      const taskId = optionalText("task_id")?.trim();
+      if (taskId === undefined || taskId.length === 0) throw new Error("task_id is required");
+      const { key } = await loop.resolveTask(groupId, taskId, signal);
+      const thread = await transport.getThread(groupId, threadId(), signal);
+      assertThreadBelongsToGroup(groupId, thread);
+      const previous = host.store.getLoopTaskRoute(key);
+      const route = host.store.bindLoopTask(key, thread.channelId);
+      return JSON.stringify({
+        workspace_id: key.workspaceId,
+        task_id: key.taskId,
+        previous_thread_channel_id: previous?.threadChannelId ?? null,
+        thread_channel_id: route.threadChannelId,
+        version: route.version,
+        changed: previous?.threadChannelId !== route.threadChannelId,
+      });
     }
     case "thread-info": {
       const thread = await transport.getThread(groupId, threadId(), signal);
+      assertThreadBelongsToGroup(groupId, thread);
       const policy = ensureThreadListen(host, thread);
       const threadTarget: ChatTarget = { channelId: thread.channelId, channelType: 5 };
       return JSON.stringify({
         ...managementThread(thread),
         listen: policy.listen,
         references: host.threadReferences(threadTarget),
+        loop_tasks: loopThreadSources(host, groupId, thread.channelId),
       });
     }
     case "thread-listen": {
@@ -885,8 +1287,28 @@ async function runManagementTool(
         throw new Error("dispatched tasks cannot dispatch further");
       }
       const shortId = threadId();
-      const text = namedText("text", MAX_MANAGEMENT_TASK_CHARS);
-      return dispatchThreadTask(host, task, target, groupId, shortId, text, signal);
+      const rawText = optionalText("text");
+      if (rawText === undefined) throw new Error("text is required");
+      const normalizedText = rawText.trim();
+      if (normalizedText.length === 0) throw new Error("text is required");
+      if (normalizedText.length > MAX_MANAGEMENT_TASK_CHARS) {
+        throw new Error(`text must be at most ${MAX_MANAGEMENT_TASK_CHARS} characters`);
+      }
+      const taskId = optionalText("task_id")?.trim();
+      const text = taskId === undefined ? normalizedText : rawText;
+      let sourceKey: LoopTaskKey | undefined;
+      if (taskId !== undefined) {
+        if (taskId.length === 0) throw new Error("task_id must not be empty");
+        const loop = requireLoopBindings(host);
+        const resolved = await loop.resolveTask(groupId, taskId, signal);
+        const route = host.store.getLoopTaskRoute(resolved.key);
+        const requestedChannelId = threadChannelId(groupId, shortId);
+        if (route === null || route.threadChannelId !== requestedChannelId) {
+          throw new Error("task_id is not currently associated with the requested thread");
+        }
+        sourceKey = resolved.key;
+      }
+      return dispatchThreadTask(host, task, target, groupId, shortId, text, signal, sourceKey, toolCallId);
     }
     default: {
       throw new Error(`unknown action: ${action}`);
@@ -1012,6 +1434,9 @@ async function dispatchTaskToThread(
   host: HostToolHost,
   thread: ThreadSummary,
   text: string,
+  sourceKey?: LoopTaskKey,
+  deliveryGuard?: () => boolean,
+  stableMessageId?: string,
 ): Promise<{ messageId: string; delivery: "steered" | "queued" }> {
   const ownerId = host.store.getOwnerId(host.botUid)?.trim() ?? "";
   if (ownerId.length === 0) {
@@ -1019,20 +1444,23 @@ async function dispatchTaskToThread(
   }
   const threadTarget: ChatTarget = { channelId: thread.channelId, channelType: 5 };
   host.enqueueText(threadTarget, `来自群会话的派发任务：\n\n${text}`, null);
-  const messageId = `${DISPATCH_MESSAGE_PREFIX}${randomUUID()}`;
-  const delivery = await host.deliverToChat({
+  const messageId = stableMessageId ?? `${DISPATCH_MESSAGE_PREFIX}${randomUUID()}`;
+  const message: InboundMessage = {
     channelId: threadTarget.channelId,
     channelType: 5,
     messageId,
     senderId: ownerId,
-    text,
+    text: sourceKey === undefined ? text : loopTaskDispatchText(sourceKey, text),
     mentionedUserIds: [host.botUid],
     attachments: [],
     quoted: null,
     supported: true,
     messageSeq: 0,
     messageTimestamp: Date.now(),
-  });
+  };
+  const delivery = deliveryGuard === undefined
+    ? await host.deliverToChat(message)
+    : await host.deliverToChat(message, deliveryGuard);
   return { messageId, delivery };
 }
 /**
@@ -1047,8 +1475,13 @@ async function dispatchThreadTask(
   shortId: string,
   text: string,
   signal: AbortSignal,
+  sourceKey?: LoopTaskKey,
+  toolCallId?: string,
 ): Promise<string> {
   const threadTarget: ChatTarget = { channelId: threadChannelId(groupId, shortId), channelType: 5 };
+  if (sourceKey !== undefined) {
+    assertCurrentLoopRoute(host, groupId, sourceKey, threadTarget.channelId);
+  }
   if (host.store.isThreadWorkspaceIntentBlocked(host.botUid, threadTarget)) {
     throw new Error("子区工作区未就绪，未派发任务。");
   }
@@ -1079,11 +1512,27 @@ async function dispatchThreadTask(
     }
   }
   const thread = await host.transport.getThread(groupId, shortId, signal);
-  if (thread.groupId.length > 0 && thread.groupId !== groupId) {
+  if (sourceKey !== undefined) {
+    assertThreadBelongsToGroup(groupId, thread);
+    if (thread.channelId !== threadTarget.channelId) {
+      throw new Error("Loop task route points to a different remote thread");
+    }
+    assertCurrentLoopRoute(host, groupId, sourceKey, threadTarget.channelId);
+  } else if (thread.groupId.length > 0 && thread.groupId !== groupId) {
     throw new Error(`thread ${shortId} does not belong to the current group`);
   }
   ensureThreadListen(host, thread);
-  const { messageId, delivery } = await dispatchTaskToThread(host, thread, text);
+  if (sourceKey !== undefined) {
+    assertCurrentLoopRoute(host, groupId, sourceKey, threadTarget.channelId);
+  }
+  const deliveryKey = sourceKey;
+  const deliveryGuard = deliveryKey === undefined
+    ? undefined
+    : () => isCurrentLoopRoute(host, groupId, deliveryKey, threadTarget.channelId);
+  const stableMessageId = sourceKey === undefined || toolCallId === undefined
+    ? undefined
+    : `${DISPATCH_MESSAGE_PREFIX}loop-${createHash("sha256").update(JSON.stringify([task.id, toolCallId])).digest("hex")}`;
+  const { messageId, delivery } = await dispatchTaskToThread(host, thread, text, sourceKey, deliveryGuard, stableMessageId);
   host.enqueueText(
     target,
     delivery === "steered"
@@ -1097,6 +1546,11 @@ async function dispatchThreadTask(
     short_id: shortId,
     channel_id: thread.channelId,
     message_id: messageId,
-    task_id: task.id,
+    ...(sourceKey === undefined
+      ? { task_id: task.id }
+      : {
+          channel_task_id: task.id,
+          loop_task: loopTaskIdentity(sourceKey.workspaceId, sourceKey.taskId),
+        }),
   });
 }

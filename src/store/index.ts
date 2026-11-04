@@ -8,6 +8,7 @@ import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ChatAppendMode, ChatTarget, ThreadListenLevel, WorkerGoal, WorktreeMergeOutcome } from "../contracts.ts";
 import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadForkInput, ThreadForkRecord, ThreadListenRecord, ThreadMergeEventRecord, HostMergeLeaseRecord, HostMergeLeaseInput, HostRemovalLeaseInput, HostRemovalLeaseRecord, HostThreadRemovalOutcome } from "./store-records.ts";
+import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopThreadCreation, LoopWorkspace } from "../loop/types.ts";
 import { applySchema } from "./store-schema.ts";
 import { claimOwnerEnrollment, clearChatModel, clearThreadModel, ensureBinding, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, getThreadModel, grantAllowedChat, hasOwnerEnrollment, listAllowedChats, resolveChatModel, setBotUid, setChatMode, setChatModel, setOwnerId, setThreadModel, updateBindingSession } from "./store-chats.ts";
 import { acceptCommitTask, acceptTask, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, getTaskByMessageId, isCommitTask, isTaskResuming, listQueuedTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim, suppressTaskRelay } from "./store-tasks.ts";
@@ -24,6 +25,7 @@ import { completeThreadFork, getThreadFork, getThreadForkByTarget, listThreadFor
 import { beginThreadMerge, claimThreadMergeDispatchIntent, ensureThreadListen, getThreadListen, getThreadMergeEvent, isThreadMergeEventPending, listPendingThreadMergeEvents, listThreadMergeEvents, markThreadMergeEventDelivered, saveThreadMergeEvent, setThreadListen } from "./store-thread-listen.ts";
 import { addThreadReferences, deleteThreadReferences, getThreadReferences, isThreadReferencesDeleted } from "./store-references.ts";
 import type { ThreadReference, ThreadReferences } from "../references/types.ts";
+import { bindLoopTask, bindLoopWorkspace, claimLoopInputIntent, commitLoopScan, completeLoopThreadCreation, getLoopBinding, getLoopInput, getLoopTaskRoute, getLoopThreadCreation, isLoopInputObserved, listLoopBindings, listLoopInputs, listLoopThreadCreations, listLoopThreadTasks, markLoopInputDelivered, markLoopInputFault, markLoopInputPending, markLoopInputUnknown, markLoopThreadCreationUnknown, prepareLoopInput, recordLoopThreadAllocated, reserveLoopThreadCreation } from "./store-loop.ts";
 
 export class ChannelStore {
   private readonly db: Database;
@@ -902,6 +904,100 @@ export class ChannelStore {
 
   setBotEventCursor(botUid: string, eventId: number): void {
     setBotEventCursor(this.db, botUid, eventId);
+  }
+
+  getLoopBinding(botUid: string, groupId: string): LoopBinding | null {
+    return getLoopBinding(this.db, botUid, groupId);
+  }
+
+  listLoopBindings(botUid: string): LoopBinding[] {
+    return listLoopBindings(this.db, botUid);
+  }
+
+  bindLoopWorkspace(
+    botUid: string,
+    groupId: string,
+    workspace: LoopWorkspace,
+    tasks: readonly LoopTask[],
+  ): { binding: LoopBinding; changed: boolean } {
+    return bindLoopWorkspace(this.db, botUid, groupId, workspace, tasks);
+  }
+
+  commitLoopScan(binding: LoopBinding, tasks: readonly LoopTask[]): boolean {
+    return commitLoopScan(this.db, binding, tasks);
+  }
+
+  listLoopInputs(botUid: string): LoopInput[] {
+    return listLoopInputs(this.db, botUid);
+  }
+
+  getLoopInput(id: string): LoopInput | null {
+    return getLoopInput(this.db, id);
+  }
+
+  prepareLoopInput(id: string): LoopInput | null {
+    return prepareLoopInput(this.db, id);
+  }
+
+  isLoopInputObserved(input: LoopInput): boolean {
+    return isLoopInputObserved(this.db, input);
+  }
+
+
+  claimLoopInputIntent(id: string, target: ChatTarget): boolean {
+    return claimLoopInputIntent(this.db, id, target);
+  }
+
+  markLoopInputDelivered(id: string): void {
+    markLoopInputDelivered(this.db, id);
+  }
+
+  markLoopInputPending(id: string): void {
+    markLoopInputPending(this.db, id);
+  }
+
+  markLoopInputUnknown(id: string): void {
+    markLoopInputUnknown(this.db, id);
+  }
+
+  markLoopInputFault(id: string, notified: boolean): boolean {
+    return markLoopInputFault(this.db, id, notified);
+  }
+
+  getLoopTaskRoute(key: LoopTaskKey): LoopTaskRoute | null {
+    return getLoopTaskRoute(this.db, key);
+  }
+
+  bindLoopTask(key: LoopTaskKey, threadChannelId: string): LoopTaskRoute {
+    return bindLoopTask(this.db, key, threadChannelId);
+  }
+
+  listLoopThreadTasks(botUid: string, groupId: string, threadChannelId: string): LoopTaskRoute[] {
+    return listLoopThreadTasks(this.db, botUid, groupId, threadChannelId);
+  }
+
+  getLoopThreadCreation(key: LoopTaskKey): LoopThreadCreation | null {
+    return getLoopThreadCreation(this.db, key);
+  }
+
+  reserveLoopThreadCreation(key: LoopTaskKey, operationId: string): LoopThreadCreation {
+    return reserveLoopThreadCreation(this.db, key, operationId);
+  }
+
+  recordLoopThreadAllocated(key: LoopTaskKey, operationId: string, threadChannelId: string): void {
+    recordLoopThreadAllocated(this.db, key, operationId, threadChannelId);
+  }
+
+  completeLoopThreadCreation(key: LoopTaskKey, operationId: string): boolean {
+    return completeLoopThreadCreation(this.db, key, operationId);
+  }
+
+  markLoopThreadCreationUnknown(key: LoopTaskKey, operationId: string, error: string): void {
+    markLoopThreadCreationUnknown(this.db, key, operationId, error);
+  }
+
+  listLoopThreadCreations(botUid: string): LoopThreadCreation[] {
+    return listLoopThreadCreations(this.db, botUid);
   }
 }
 

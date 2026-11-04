@@ -16,6 +16,7 @@
 - **成员与点名**：每条新任务和 steering 获取当前群或子区成员信息；普通回复可生成结构化 @成员提醒。
 - **隔离子区**：为子区创建 git worktree，派发任务，并通过 Worktrunk 合并和清理工作区。
 - **PR/MR 引用**：显式启用外部决策服务后，判断子区对话里的直接工作对象，并将去重后的 PR/MR 链接持久保存到宿主 `thread-info.references`。
+- **Loop 任务感知**：全量快照绑定 workspace；仅已有子区路由或 owner/Bot 的 member 指派 task 进入 agent，其他无路由任务只推进快照；已关联变化直达子区。
 - **恢复与投递**：SQLite 持久化任务、问题及出站队列；重连后恢复投递，已开始的任务不会因重启自动重跑。
 
 ## 安全边界
@@ -111,6 +112,7 @@ oco run --config ~/.oco/config/config.json
 | `/move <目录>` | 通过 OMP 原生迁移保留当前会话 ID、历史与附件。 |
 | `/fork [子区名称]` | 即时将当前主群/子区的已落盘上下文分叉到同父群的新子区；独立 session，共用当前目录，源任务继续。 |
 | `/thread <任务>` | 在群内交由助手按项目与耦合程度创建隔离子区，工作区和背景就绪后派发任务。 |
+| `/bind loop <url\|workspace_id\|workspace_name>` | 在已开通主群绑定 Loop workspace；名称完整匹配，重名时要求使用 ID 或同源 Loop 深链接。 |
 | `/thread model [选择器\|clear]` | 主群查询、设置或清除所属子区默认模型；只影响子区下一次 worker 启动，主群自身模型不变。 |
 | `/thread merge [补充说明]` | 单项目及 separate 子区合并并清理工作区；shared 多项目拒绝。沿用目录的 fork 子区仅归档 Octo，保留本地资源。 |
 | `/thread remove [--force]` | 清理当前子区持久拥有的 worktree 与分支后归档；默认保护 dirty 和未合并提交，force 授权丢弃。沿用目录的 fork 子区仅归档 Octo。 |
@@ -153,6 +155,16 @@ oco run --config ~/.oco/config/config.json
 助手可以在普通回复中使用结构化 mention 点名成员，完整的 mention 和后续正文在同一条消息中流式更新；代码示例和普通 `@名字` 文本不会自动点名。正文超过单条消息长度限制时按既有规则分段。
 
 安装并配置 `octo-cli` 后，助手可按当前 Bot 的权限使用 Loop、Docs、Drive、HTML、消息、文件、邮件和 Marketplace 等能力；它会通过 CLI 的 `skills`、`schema` 和帮助按需发现具体操作。
+
+### Loop workspace 与任务子区
+
+owner 在已开通主群执行 `/bind loop <选择器>`。UUID 直接验证；名称通过当前 Bot 的授权 workspace 列表完整分页解析；支持与当前 API 部署同源的 `/fleet/<workspace-slug>/issues/<identifier>` 和 `/fleet/<workspace-slug>/projects/<project-id>` 链接。回执显示实际 workspace ID 和绑定群。重复绑定同一 workspace 保留关联并检查当前变化，显式绑定其他 workspace 切换该群的感知范围。
+
+绑定 workspace 仍按全部任务分页读取并推进快照；agent 输入只包含已有当前任务—子区关联的 task，或 `assignee_type=member` 且非空 `assignee_octo_uid` 等于当前持久化 channel owner UID / Bot UID 的 task。这里比较 Octo UID，不能将 Fleet `assignee_id` UUID 当成 Octo UID。首次 baseline 与增量使用同一门槛；其他人指派及未分配且无路由的 task 只更新快照，不启动或 steering agent。已关联 task 即使改派也继续直达原子区。owner 的人工交办和显式 `thread-bind` 沿原路径；agent 可为收到的任务复用子区、更新关联或建区派发。`octo_management create-thread` 可携带 `task_id`，`thread-bind` 显式调整关联，`thread-dispatch` 携带同一 `task_id` 校验来源；`thread-info` 和 `list-threads` 显示关联。任务描述有界预览，截断时按提示读取完整详情。
+
+服务默认每 60 秒只扫描已绑定 workspace。已有子区的任务变化直接交给子区 agent；主群通过原有 `listen=off|merge|task` 或子区主动通知获知工作进展。澄清由 agent 选择在主群或子区进行，Loop 输入保持独立于待回答的 ask。
+
+这是一项 Bot 授权范围内的 REST 状态感知能力；分配、状态、评论等 Loop 写回需要独立授权。扫描失败保持上次成功基线，未知创建或接受结果保留核对状态。轮询可漏掉两次读取之间已撤回的中间变化，不提供逐事件不丢承诺。详细契约与隔离验收见 [Loop 任务感知规格](docs/specs/2026-11-04-loop-workspace-task-awareness-design.md)。
 
 ### 会话分叉
 

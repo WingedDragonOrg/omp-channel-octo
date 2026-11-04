@@ -6,6 +6,7 @@ import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:pa
 import { createOctoTransport } from "./octo/index.ts";
 import { createOctoCliCredentialProvisioner } from "./runtime/octo-cli.ts";
 import { createWorkerFactory } from "./omp/index.ts";
+import { createLoopReadPort } from "./loop/api.ts";
 import {
   DEFAULT_CONFIG_PATH,
   ensureStateDirectory,
@@ -285,6 +286,7 @@ async function runService(
       config: toCoreConfig(config),
       transport,
       workerFactory,
+      loop: createLoopReadPort({ apiUrl: config.apiUrl, botToken: config.botToken }),
       worktrees: createWorktreePort({ command: ompCommand }),
       cliCredentials,
       // Only a config that came from a file can be written back; a hand-built config has no path.

@@ -57,6 +57,7 @@ import type {
   WorktreeRemovalRequest,
   WorktrunkProbe,
 } from "../../src/contracts";
+import type { LoopReadPort, LoopTask, LoopWorkspace } from "../../src/loop/types.ts";
 import { RESUME_CONTINUATION_PROMPT } from "../../src/contracts";
 import { AttachmentError } from "../../src/inbound/attachments";
 import {
@@ -246,6 +247,7 @@ export class FakeTransport implements ChannelTransport {
   private readonly groupMembers = new Map<string, GroupMember[]>();
   private readonly threads = new Map<string, ThreadSummary[]>();
   private readonly threadMembers = new Map<string, GroupMember[]>();
+  beforeGetThread: ((groupId: string, shortId: string, signal?: AbortSignal) => Promise<void>) | undefined;
   private managementFailure: Error | undefined;
   private managementFailures: Error[] = [];
   /** 排定归档的失败注入：按调用顺序消费一个错误，随后恢复成功。 */
@@ -487,6 +489,7 @@ export class FakeTransport implements ChannelTransport {
 
   async getThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<ThreadSummary> {
     this.recordManagement("thread-info", groupId, shortId, signal);
+    await this.beforeGetThread?.(groupId, shortId, signal);
     const thread = (this.threads.get(groupId) ?? []).find((entry) => entry.shortId === shortId);
     if (!thread) throw new Error(`fixture thread ${shortId} is not known`);
     return { ...thread };
@@ -1103,6 +1106,7 @@ class FixtureWorker implements OmpWorker {
   private currentCwd: string;
   private switchedModel: { model: string; level: string | null } | undefined;
   private readonly stopCallbacks = new Set<() => void>();
+  private readonly steerStopWaiters = new Set<(error: Error) => void>();
   private promptInFlight = false;
   private goalRunInFlight = false;
   private abortSignaled = false;
@@ -1124,6 +1128,7 @@ class FixtureWorker implements OmpWorker {
     private readonly recordGoalRun: (record: FakeGoalRunRecord) => void,
     private readonly waitBeforeStop: (sessionId: string) => Promise<void>,
     private readonly steerFailure: () => Error | undefined,
+    private readonly beforeSteer: (text: string) => Promise<void>,
   ) {
     this.sessionFile = options.sessionFile ?? join(options.sessionDir, `${sessionId}.session`);
     let persistedSessionId: string | undefined;
@@ -1367,13 +1372,13 @@ class FixtureWorker implements OmpWorker {
     );
     if (localOnly) await this.prompt(RESUME_CONTINUATION_PROMPT, onEvent, promptContext);
   }
-
   async steer(text: string): Promise<void> {
     const failure = this.steerFailure();
     if (failure) throw failure;
     if (!this.promptInFlight && !this.goalRunInFlight) {
       throw new Error("fixture worker is not streaming a turn");
     }
+    if (this.stopped) throw new Error("fixture worker is stopped");
     this.appendedMessages.push({
       text,
       sessionId: this.sessionId,
@@ -1383,6 +1388,17 @@ class FixtureWorker implements OmpWorker {
       const waiter = this.appendWaiters.shift()!;
       const record = this.appendedMessages[this.appendCursor++]!;
       waiter(record);
+    }
+    let rejectStopped!: (error: Error) => void;
+    const stopped = new Promise<never>((_resolve, reject) => {
+      rejectStopped = reject;
+    });
+    const onStopped = (error: Error): void => rejectStopped(error);
+    this.steerStopWaiters.add(onStopped);
+    try {
+      await Promise.race([this.beforeSteer(text), stopped]);
+    } finally {
+      this.steerStopWaiters.delete(onStopped);
     }
   }
 
@@ -1416,6 +1432,8 @@ class FixtureWorker implements OmpWorker {
   async stop(): Promise<boolean> {
     await this.waitBeforeStop(this.sessionId);
     this.stopped = true;
+    for (const reject of this.steerStopWaiters) reject(new Error("fixture worker stopped during steer"));
+    this.steerStopWaiters.clear();
     for (const callback of this.stopCallbacks) {
       callback();
     }
@@ -1435,6 +1453,7 @@ export class FakeWorkerFactory implements WorkerFactory {
   readonly goalRuns: FakeGoalRunRecord[] = [];
   /** A narrow shutdown seam for tests that need to hold the lease cleanup window open. */
   stopHandler: ((sessionId: string) => void | Promise<void>) | undefined = undefined;
+  beforeSteer: ((text: string) => Promise<void>) | undefined;
   /** The native structured-goal behavior a test asks this fixture to perform. */
   goalHandler: FakeGoalHandler = async ({ request, current, emit, sessionId }) => {
     if (request.op === "create") {
@@ -1560,6 +1579,9 @@ export class FakeWorkerFactory implements WorkerFactory {
         this.steerFailure = undefined;
         return failure;
       },
+      async (text) => {
+        await this.beforeSteer?.(text);
+      },
     );
     this.workers.push(worker);
     return worker;
@@ -1617,6 +1639,7 @@ export interface CoreHarness {
   readonly workers: FakeWorkerFactory;
   readonly worktrees: FakeWorktrees | undefined;
   readonly worktreePort: WorktreePort | undefined;
+  readonly loop: LoopReadPort | undefined;
   readonly service: ChannelService;
 }
 
@@ -1703,6 +1726,50 @@ export class FakeWorktrees implements WorktreePort {
     return this.probe;
   }
 }
+export class FakeLoopReadPort implements LoopReadPort {
+  readonly workspaces = new Map<string, LoopWorkspace>();
+  readonly tasks = new Map<string, LoopTask[]>();
+  readonly resolutionCalls: string[] = [];
+  readonly taskListCalls: string[] = [];
+  readonly taskDetailCalls: Array<{ workspaceId: string; taskId: string }> = [];
+  resolveFailure: Error | undefined;
+  listFailure: Error | undefined;
+  beforeListTasks: ((workspaceId: string, signal?: AbortSignal) => Promise<void>) | undefined;
+  afterListTasksSnapshot: ((workspaceId: string, tasks: readonly LoopTask[]) => Promise<void>) | undefined;
+
+  async resolveWorkspace(selector: string, signal?: AbortSignal): Promise<LoopWorkspace> {
+    if (signal?.aborted) throw signal.reason ?? new Error("fixture Loop read aborted");
+    this.resolutionCalls.push(selector);
+    if (this.resolveFailure) throw this.resolveFailure;
+    const matches = [...this.workspaces.values()].filter((workspace) =>
+      workspace.workspaceId === selector || workspace.name === selector || workspace.slug === selector);
+    if (matches.length !== 1) {
+      throw new Error(matches.length === 0 ? "fixture workspace not found" : "fixture workspace ambiguous");
+    }
+    return { ...matches[0]! };
+  }
+
+  async listTasks(workspaceId: string, signal?: AbortSignal): Promise<LoopTask[]> {
+    if (signal?.aborted) throw signal.reason ?? new Error("fixture Loop read aborted");
+    this.taskListCalls.push(workspaceId);
+    await this.beforeListTasks?.(workspaceId, signal);
+    if (signal?.aborted) throw signal.reason ?? new Error("fixture Loop read aborted");
+    if (this.listFailure) throw this.listFailure;
+    const snapshot = (this.tasks.get(workspaceId) ?? []).map((task) => ({ ...task }));
+    await this.afterListTasksSnapshot?.(workspaceId, snapshot);
+    return snapshot;
+  }
+
+  async getTask(workspaceId: string, taskId: string, signal?: AbortSignal): Promise<LoopTask> {
+    if (signal?.aborted) throw signal.reason ?? new Error("fixture Loop read aborted");
+    this.taskDetailCalls.push({ workspaceId, taskId });
+    const task = this.tasks.get(workspaceId)?.find((candidate) => candidate.taskId === taskId);
+    if (!task) throw new Error("fixture task not found");
+    return { ...task };
+  }
+}
+
+
 
 export interface CoreHarnessOptions {
   root?: string;
@@ -1734,6 +1801,7 @@ export interface CoreHarnessOptions {
   cliCredentials?: CliCredentialPort;
   /** Allowlist mirror into the config file; absent means a hand-built config with no path. */
   allowlistWriteback?: AllowlistWriteback;
+  loop?: LoopReadPort;
 }
 
 export async function createCoreHarness(options: CoreHarnessOptions = {}): Promise<CoreHarness> {
@@ -1773,6 +1841,7 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
   const service = await createChannelService({
     config,
     transport,
+    ...(options.loop === undefined ? {} : { loop: options.loop }),
     workerFactory: workers,
     ...(worktreePort === undefined ? {} : { worktrees: worktreePort }),
     ...(options.commandHandlers === undefined ? {} : { commandHandlers: options.commandHandlers }),
@@ -1790,6 +1859,7 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
     workers,
     worktrees: worktreePort instanceof FakeWorktrees ? worktreePort : undefined,
     worktreePort,
+    loop: options.loop,
     service,
   };
 }

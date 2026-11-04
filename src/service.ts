@@ -35,6 +35,8 @@ import { ChatAuthorization } from "./inbound/chat-authorization.ts";
 import { createChatGrantDesk, type ChatGrantDesk } from "./inbound/chat-grants.ts";
 import { acquireBotLock, assertBotLockFree, type LockHandle } from "./runtime/bot-lock.ts";
 import { openTrackedCommit, openTrackedWorker, type TrackedCommit, type TrackedWorker, type WorkerSession } from "./runtime/worker-lease.ts";
+import { LoopController, type LoopDeliveryOutcome } from "./loop/controller.ts";
+import type { LoopBinding, LoopInput } from "./loop/types.ts";
 import { TaskStartupError, WorkerGoalError } from "./contracts.ts";
 import type {
   BotIdentity,
@@ -232,7 +234,7 @@ type RuntimeTask = {
   /** Set when the run produced events after the stop request, i.e. the turn really continued. */
   workAfterStop: boolean;
   /** Steered messages not yet observed as consumed, in delivery order (OMP's queue is FIFO). */
-  steerDeliveries: { text: string }[];
+  steerDeliveries: { text: string; silent?: boolean }[];
   /** Serializes each member lookup, sidecar publication and worker delivery in input order. */
   steerSerial: Promise<void>;
   turnContext: TurnContext;
@@ -407,6 +409,7 @@ class CoreService implements ChannelService {
   private readonly threadCommands: ThreadCommands;
   /** 子区归档排定的所有者：排定 map 与停止信号都在它内部，服务只负责接线与调用。 */
   private readonly threadArchives: ThreadArchiveScheduler;
+  private loopController: LoopController | undefined;
   private readonly threadForks: ThreadForkController;
   private stopPromise: Promise<void> | undefined;
   constructor(
@@ -656,6 +659,7 @@ class CoreService implements ChannelService {
       commit: (message, argument) => this.handleCommit(message, argument),
       new: (message, argument) => this.sessions.handleNew(message, argument),
       move: (message, argument) => this.sessions.handleMove(message, argument),
+      bind: (message, argument) => this.handleLoopBind(message, argument),
       thread: (message, argument) => this.threadCommands.handle(message, argument),
       cancel: message => this.handleCancel(message),
       interrupt: message => this.handleInterrupt(message),
@@ -703,6 +707,29 @@ class CoreService implements ChannelService {
     this.bot = identity;
     try {
       this.store.setBotUid(identity.uid);
+      if (this.options.loop && this.loopController === undefined) {
+        this.loopController = new LoopController({
+          store: this.store,
+          read: this.options.loop,
+          botUid: identity.uid,
+          validateTarget: (binding, target, signal) =>
+            this.validateLoopTarget(binding, target, signal),
+          deliver: (input, binding, target, text, guard, beforeWorkerSteer, beforeTaskAccept, onWorkerSteerAccepted) =>
+            this.deliverLoopInput(
+              input,
+              binding,
+              target,
+              text,
+              guard,
+              beforeWorkerSteer,
+              beforeTaskAccept,
+              onWorkerSteerAccepted,
+            ),
+          isStopping: () => this.stopping,
+          notifyFault: (groupId) => this.notifyLoopRouteFault(groupId),
+        });
+      }
+      if (this.stopping) throw new Error("channel 正在停止");
       this.cliIdentityReady = false;
       const cliCredentials = this.options.cliCredentials;
       if (cliCredentials) {
@@ -791,6 +818,7 @@ class CoreService implements ChannelService {
         }
       }
       await this.threadForks.recoverStartup(identity.uid);
+      await this.loopController?.recover();
       // 旧版重启通报已随续接机制移除：遗留行静默清理，绝不再投递。
       this.serviceRestart.consumeStartupNotices(identity.uid);
       // started→queued（prompt 标记随行保留）由存储域一次性完成；先补发遗留卡片终态，恢复
@@ -867,6 +895,7 @@ class CoreService implements ChannelService {
       this.botEvents.start();
       this.startupGate.resolve();
       this.ready = true;
+      this.loopController?.start();
       this.releaseRecoveredHostMergeArchives();
       await this.sendLifecycleNotice("startup");
     } catch (error) {
@@ -902,6 +931,8 @@ class CoreService implements ChannelService {
     this.started = false;
     // Seal inbound processing and abort its I/O before any lifecycle send or worker shutdown.
     this.shutdownController.abort();
+    // Seal and abort Loop work now, but let worker shutdown release any steerSerial waits first.
+    const loopStopped = this.loopController?.stop();
     // A ready start may still be sending its startup notice; leave the connection open until it ends.
     if (wasReady && this.startPromise) await this.startPromise.catch(() => {});
     if (wasReady) await this.sendLifecycleNotice("stop");
@@ -935,6 +966,7 @@ class CoreService implements ChannelService {
     this.questions.stop();
     this.outbox.stopTimers();
     await this.outbox.settle();
+    await loopStopped;
     await this.options.transport.stop().catch(() => {});
     // A start still in preparation or awaiting CONNACK must unwind before its store is closed.
     if (this.startPromise) await this.startPromise.catch(() => {});
@@ -1383,7 +1415,9 @@ class CoreService implements ChannelService {
     target: ChatTarget,
     requireBinding = false,
   ): Promise<boolean> {
-    if (target.channelType !== 5 || this.bot === undefined) return false;
+    if (target.channelType !== 5) return false;
+    if (this.loopController?.threads.isTargetBlocked(target)) return true;
+    if (this.bot === undefined) return false;
     try {
       const parentGroupId = threadParentGroupId(target.channelId);
       if (parentGroupId !== null) {
@@ -1430,9 +1464,12 @@ class CoreService implements ChannelService {
     }
   }
 
-  private async refuseIncompleteThreadWorkspace(target: ChatTarget): Promise<boolean> {
+  private async refuseIncompleteThreadWorkspace(
+    target: ChatTarget,
+    notify = true,
+  ): Promise<boolean> {
     if (!await this.threadWorkspaceIncomplete(target)) return false;
-    await this.outbox.enqueueText(target, THREAD_WORKSPACE_UNAVAILABLE_TEXT, null);
+    if (notify) await this.outbox.enqueueText(target, THREAD_WORKSPACE_UNAVAILABLE_TEXT, null);
     return true;
   }
 
@@ -1521,14 +1558,17 @@ class CoreService implements ChannelService {
     text: string,
     deliveryGuard?: () => boolean,
     beforeWorkerSteer?: () => boolean,
+    systemInput = false,
+    onWorkerSteerAccepted?: () => void,
   ): Promise<boolean> {
     if (!this.canDeliverSteer(runtime) || !runtime.lease || (deliveryGuard && !deliveryGuard())) return false;
     if (beforeWorkerSteer && !beforeWorkerSteer()) return false;
-    const delivery = { text };
+    const delivery = { text, silent: systemInput };
     runtime.steerDeliveries.push(delivery);
     if (runtime.steerDeliveries.length > MAX_PENDING_STEERS) runtime.steerDeliveries.shift();
     try {
       await runtime.lease.worker.steer(text);
+      onWorkerSteerAccepted?.();
       runtime.rollProgressCard?.();
       return true;
     } catch {
@@ -1544,6 +1584,7 @@ class CoreService implements ChannelService {
     } else if (delivered.text !== event.text) {
       console.error(`[steer] 消费顺序与投递不一致 task=${runtime.taskId}`);
     }
+    if (delivered?.silent) return;
     console.error(`[steer] 已并入当前回合 task=${runtime.taskId} chars=${event.text.length}`);
     this.outbox.enqueueText(runtime.target, receiptText("已并入当前回合", event.text), null);
   }
@@ -1556,10 +1597,13 @@ class CoreService implements ChannelService {
     deliveryGuard?: () => boolean,
     beforeWorkerSteer?: () => boolean,
     observeReferences = false,
+    systemInput = false,
+    onWorkerSteerAccepted?: () => void,
   ): Promise<boolean> {
     if (!this.canDeliverSteer(runtime) || (deliveryGuard && !deliveryGuard())) {
       if (runtime.cancelRequested) {
-        this.store.completeCommand(claim);
+        if (systemInput || deliveryGuard !== undefined) this.store.releaseClaim(claim);
+        else this.store.completeCommand(claim);
         return true;
       }
       this.store.releaseClaim(claim);
@@ -1584,7 +1628,8 @@ class CoreService implements ChannelService {
             };
         if (!this.canDeliverSteer(runtime) || (deliveryGuard && !deliveryGuard())) {
           if (runtime.cancelRequested) {
-            this.store.completeCommand(claim);
+            if (systemInput || deliveryGuard !== undefined) this.store.releaseClaim(claim);
+            else this.store.completeCommand(claim);
             return true;
           }
           this.store.releaseClaim(claim);
@@ -1599,6 +1644,10 @@ class CoreService implements ChannelService {
         }
         runtime.agentContext = nextContext;
       } catch {
+        if (runtime.cancelRequested && (systemInput || deliveryGuard !== undefined)) {
+          this.store.releaseClaim(claim);
+          return true;
+        }
         if (deliveryGuard) {
           this.store.releaseClaim(claim);
           return false;
@@ -1622,11 +1671,26 @@ class CoreService implements ChannelService {
         return true;
       }
     }
+    let workerSteerAttempted = false;
+    const beginWorkerSteer = beforeWorkerSteer === undefined
+      ? undefined
+      : (): boolean => {
+          if (!beforeWorkerSteer()) return false;
+          workerSteerAttempted = true;
+          return true;
+        };
 
-    if (await this.deliverSteer(runtime, text, deliveryGuard, beforeWorkerSteer)) {
+    if (await this.deliverSteer(
+      runtime,
+      text,
+      deliveryGuard,
+      beginWorkerSteer,
+      systemInput,
+      onWorkerSteerAccepted,
+    )) {
       this.store.completeCommand(claim);
       if (observeReferences) this.observeUserReference(message, runtime.taskId);
-      this.history.recordSteered(message, runtime.lease?.worker.sessionId ?? "");
+      if (!systemInput) this.history.recordSteered(message, runtime.lease?.worker.sessionId ?? "");
       return true;
     }
 
@@ -1642,24 +1706,23 @@ class CoreService implements ChannelService {
       }
       runtime.agentContext = restored;
     }
+    if (deliveryGuard !== undefined && workerSteerAttempted && !systemInput) return false;
     if (this.stopping) {
       this.store.releaseClaim(claim);
       return true;
     }
     if (runtime.cancelRequested) {
-      this.store.completeCommand(claim);
+      if (systemInput || deliveryGuard !== undefined) this.store.releaseClaim(claim);
+      else this.store.completeCommand(claim);
       return true;
     }
     this.store.releaseClaim(claim);
     return false;
   }
-
   /**
-   * In `steer` mode a message that arrives while its chat runs an OMP prompt is injected into that turn
-   * instead of starting a second task.
-   * Member lookups and staged snapshots follow serialized input order; the extension exposes a
-   * snapshot only after OMP includes its steering message in model context. A member-read failure
-   * is consumed without changing the running prompt.
+   * In `steer` mode a message that arrives while its chat already runs an OMP prompt is injected
+   * into that turn instead of starting a second task. Member lookups and staged snapshots follow
+   * serialized input order; system inputs keep their delivery receipt internal.
    */
   private async appendToRunningTask(
     message: InboundMessage,
@@ -1667,9 +1730,11 @@ class CoreService implements ChannelService {
     deliveryGuard?: () => boolean,
     beforeWorkerSteer?: () => boolean,
     observeReferences = false,
+    systemInput = false,
+    onWorkerSteerAccepted?: () => void,
   ): Promise<boolean> {
     this.throwIfStopping();
-    if (await this.refuseIncompleteThreadWorkspace(message)) return true;
+    if (await this.refuseIncompleteThreadWorkspace(message, !systemInput)) return true;
     if (this.store.getChatMode(this.bot!.uid, message) !== "steer") return false;
     const runtime = this.runningRuntime(message);
     if (!runtime || runtime.stopCause === "question") return false;
@@ -1679,7 +1744,17 @@ class CoreService implements ChannelService {
     if (!this.store.claimCommand(claim)) return true;
     this.cancelThreadArchives(message);
     const delivery = runtime.steerSerial.then(() =>
-      this.deliverSteeringMessage(runtime, message, text, claim, deliveryGuard, beforeWorkerSteer, observeReferences));
+      this.deliverSteeringMessage(
+        runtime,
+        message,
+        text,
+        claim,
+        deliveryGuard,
+        beforeWorkerSteer,
+        observeReferences,
+        systemInput,
+        onWorkerSteerAccepted,
+      ));
     runtime.steerSerial = delivery.then(() => {}, () => {});
     return await delivery;
   }
@@ -1756,6 +1831,191 @@ class CoreService implements ChannelService {
       : operation;
 
   }
+  private async handleLoopBind(message: InboundMessage, argument: string): Promise<void> {
+    if (message.channelType !== 2) {
+      await this.outbox.enqueueText(message, "/bind loop 只能在已允许的主群中使用。", null);
+      return;
+    }
+    const match = /^loop(?:\s+([\s\S]*))?$/iu.exec(argument.trim());
+    const selector = match?.[1]?.trim() ?? "";
+    if (selector.length === 0) {
+      await this.outbox.enqueueText(
+        message,
+        "用法：/bind loop <Loop workspace 名称、ID 或同源 Fleet issue/project 链接>",
+        null,
+      );
+      return;
+    }
+    const controller = this.loopController;
+    if (controller === undefined) {
+      await this.outbox.enqueueText(message, "Loop 读取功能未配置；无法绑定 workspace。", null);
+      return;
+    }
+    try {
+      const result = await controller.bind(message.channelId, selector, this.shutdownController.signal);
+      if (this.stopping) return;
+      const action = result.changed ? "已绑定" : "绑定已存在，并已扫描变化";
+      await this.outbox.enqueueText(
+        message,
+        `主群 ${message.channelId} 的 Loop workspace ${action}：${result.binding.name} (ID ${result.binding.workspaceId})。`,
+        null,
+      );
+    } catch (error) {
+      if (this.stopping) return;
+      const detail = safeDisplayText(error instanceof Error ? error.message : String(error), 160);
+      const suffix = detail === undefined ? "" : `：${detail}`;
+      await this.outbox.enqueueText(
+        message,
+        `Loop workspace 读取或绑定失败；现有绑定及基线未更改${suffix}`,
+        null,
+      );
+    }
+  }
+
+
+  private async validateLoopTarget(
+    binding: LoopBinding,
+    target: ChatTarget,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const botUid = this.bot?.uid;
+    const ownerId = botUid === undefined ? "" : this.store.getOwnerId(botUid)?.trim() ?? "";
+    const groupTarget: ChatTarget = { channelType: 2, channelId: binding.groupId };
+    const currentBinding = this.store.getLoopBinding(binding.botUid, binding.groupId);
+    if (
+      botUid !== binding.botUid
+      || ownerId.length === 0
+      || currentBinding === null
+      || currentBinding.workspaceId !== binding.workspaceId
+      || currentBinding.version !== binding.version
+      || !this.authorization.isPermittedChat(groupTarget)
+      || !this.authorization.isPermittedChat(target)
+    ) {
+      throw new Error("Loop 目标群或 workspace 已不再可用。");
+    }
+    if (target.channelType === 2) {
+      if (target.channelId !== binding.groupId) throw new Error("Loop 输入目标不是绑定的主群。");
+      return;
+    }
+    const parentGroupId = threadParentGroupId(target.channelId);
+    const shortId = threadShortId(target.channelId);
+    if (target.channelType !== 5 || parentGroupId !== binding.groupId || shortId === null) {
+      throw new Error("Loop 子区不属于当前绑定主群。");
+    }
+    const thread = await this.options.transport.getThread(binding.groupId, shortId, signal);
+    if (
+      thread.groupId !== binding.groupId
+      || thread.channelId !== target.channelId
+      || (thread.status !== 1 && thread.status !== 2)
+      || await this.threadWorkspaceIncomplete(target)
+    ) {
+      throw new Error("Loop 子区或工作区当前不可用。");
+    }
+  }
+
+  private async notifyLoopRouteFault(groupId: string): Promise<void> {
+    const botUid = this.bot?.uid;
+    if (this.stopping || botUid === undefined || !this.store.getOwnerId(botUid)?.trim()) return;
+    const target: ChatTarget = { channelType: 2, channelId: groupId };
+    if (!this.authorization.isPermittedChat(target)) return;
+    await this.outbox.enqueueText(
+      target,
+      "Loop 关联子区暂不可用；相关变化已保留，恢复后会继续交付。",
+      null,
+    );
+  }
+
+  private async deliverLoopInput(
+    input: LoopInput,
+    binding: LoopBinding,
+    target: ChatTarget,
+    text: string,
+    guard: () => boolean,
+    beforeWorkerSteer: () => boolean,
+    beforeTaskAccept: () => boolean,
+    onWorkerSteerAccepted: () => void,
+  ): Promise<LoopDeliveryOutcome> {
+    const botUid = this.bot?.uid;
+    const ownerId = botUid === undefined ? "" : this.store.getOwnerId(botUid)?.trim() ?? "";
+    if (botUid === undefined || botUid !== input.botUid || ownerId.length === 0) return "not-accepted";
+    const groupTarget: ChatTarget = { channelType: 2, channelId: input.groupId };
+    const authorized = (): boolean => {
+      const currentBinding = this.store.getLoopBinding(botUid, input.groupId);
+      return !this.stopping
+        && this.bot?.uid === botUid
+        && this.store.getOwnerId(botUid)?.trim() === ownerId
+        && currentBinding !== null
+        && currentBinding.workspaceId === binding.workspaceId
+        && currentBinding.version === binding.version
+        && this.authorization.isPermittedChat(groupTarget)
+        && this.authorization.isPermittedChat(target)
+        && guard();
+    };
+    const steeringGuard = (): boolean =>
+      this.store.pendingQuestionIds(botUid, target).length === 0 && authorized();
+    const message: InboundMessage = {
+      ...target,
+      messageId: `loop:${input.id}`,
+      senderId: ownerId,
+      text,
+      mentionedUserIds: [botUid],
+      attachments: [],
+      quoted: null,
+      supported: true,
+      messageSeq: 0,
+      messageTimestamp: Date.now(),
+    };
+    if (!authorized()) return "not-accepted";
+    const claimSteerIntent = (): boolean => steeringGuard() && beforeWorkerSteer();
+    const claimAcceptIntent = (): boolean => authorized() && beforeTaskAccept();
+    if (this.store.pendingQuestionIds(botUid, target).length === 0) {
+      let steerIntentClaimed = false;
+      let workerSteerAccepted = false;
+      const steered = await this.appendToRunningTask(
+        message,
+        text,
+        steeringGuard,
+        () => {
+          steerIntentClaimed = claimSteerIntent();
+          return steerIntentClaimed;
+        },
+        false,
+        true,
+        () => {
+          workerSteerAccepted = true;
+          onWorkerSteerAccepted();
+        },
+      );
+      if (workerSteerAccepted) return "accepted";
+      const task = this.store.getTaskByMessageId(botUid, target, message.messageId);
+      const commandState = this.store.getCommandClaimState(botUid, target, message.messageId);
+      if (task !== null || commandState === "completed") {
+        if (!steerIntentClaimed) claimAcceptIntent();
+        return "accepted";
+      }
+      if (commandState === "pending") {
+        if (!steerIntentClaimed) claimAcceptIntent();
+        return "unknown";
+      }
+      if (steerIntentClaimed) return "unknown";
+      if (steered) return "not-accepted";
+    }
+    if (!authorized()) return "not-accepted";
+    const accepted = await this.acceptTask(
+      message,
+      text,
+      false,
+      undefined,
+      undefined,
+      authorized,
+      true,
+      false,
+      claimAcceptIntent,
+      true,
+    );
+    return accepted ? "accepted" : "not-accepted";
+  }
+
   private async handleCommand(
     message: InboundMessage,
     name: string,
@@ -1915,7 +2175,7 @@ class CoreService implements ChannelService {
     }
   }
 
-  /** Dispatched tasks notify only at task level; the durable policy owns recipient provenance. */
+  /** Independent Loop and dispatched tasks notify only at task level; durable policy owns recipients. */
   private async notifyThreadOutcome(taskId: string): Promise<void> {
     try {
       if (this.stopping) return;
@@ -1925,7 +2185,7 @@ class CoreService implements ChannelService {
       if (
         !task
         || task.channelType !== 5
-        || !task.messageId.startsWith("dispatch:")
+        || (!task.messageId.startsWith("dispatch:") && !task.messageId.startsWith("loop:"))
         || task.relaySuppressed
       ) {
         return;
@@ -1968,7 +2228,7 @@ class CoreService implements ChannelService {
           && this.bot?.uid === botUid
           && this.store.getOwnerId(botUid)?.trim() === ownerId
           && currentTask !== null
-          && currentTask.messageId.startsWith("dispatch:")
+          && (currentTask.messageId.startsWith("dispatch:") || currentTask.messageId.startsWith("loop:"))
           && !currentTask.relaySuppressed
           && currentTask.state === task.state
           && currentPolicy?.listen === "task"
@@ -3368,11 +3628,13 @@ class CoreService implements ChannelService {
     acceptGuard?: () => boolean,
     schedule = true,
     observeReferences = false,
+    beforeAccept?: () => boolean,
+    silentFailure = false,
   ): Promise<boolean> {
     if (message.channelType === 5 && threadShortId(message.channelId) !== null) {
       await this.ensureThreadListen(message);
     }
-    if (await this.refuseIncompleteThreadWorkspace(message)) return false;
+    if (await this.refuseIncompleteThreadWorkspace(message, !silentFailure)) return false;
     this.throwIfStopping();
     let binding = expectedSessionId === undefined
       ? await this.sessions.reconcileExternalBinding(
@@ -3387,7 +3649,9 @@ class CoreService implements ChannelService {
       try {
         cwd = await this.sessions.defaultWorkDirectory(message);
       } catch {
-        await this.outbox.enqueueText(message, "无法创建默认会话目录，未接收任务。", null);
+        if (!silentFailure) {
+          await this.outbox.enqueueText(message, "无法创建默认会话目录，未接收任务。", null);
+        }
         return false;
       }
       binding = {
@@ -3425,6 +3689,8 @@ class CoreService implements ChannelService {
     // Shutdown can land during the binding probes above; never persist an acceptance from a
     // redeliverable message.
     this.throwIfStopping();
+    if (acceptGuard && !acceptGuard()) return false;
+    if (beforeAccept && !beforeAccept()) return false;
     const task: TaskRecord = {
       id: randomUUID(),
       botUid: this.bot!.uid,
@@ -4220,6 +4486,7 @@ class CoreService implements ChannelService {
       worktrees: this.options.worktrees,
       store: this.store,
       botUid,
+      ...(this.loopController === undefined ? {} : { loop: this.loopController.threads }),
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
       flushTarget: (target) => this.outbox.flush(target),
       planThreadArchive: (target, groupId, shortId, generation) =>
@@ -4235,13 +4502,66 @@ class CoreService implements ChannelService {
         this.scheduler.tryAcquireDestructiveResources(cwds, task),
       threadReferences: (target) => this.store.getThreadReferences(botUid, target),
       deleteThreadReferences: (target) => this.threadReferences.deleteThread(target),
-      deliverToChat: async (message) => {
+      deliverToChat: async (message, deliveryGuard) => {
+        const assertDeliveryGuard = (): void => {
+          if (deliveryGuard !== undefined && !deliveryGuard()) {
+            throw new Error("Loop task route changed before delivery; task was not accepted.");
+          }
+        };
+        assertDeliveryGuard();
         if (await this.threadWorkspaceIncomplete(message)) {
           throw new Error("子区工作区未就绪，未派发任务。");
         }
-        if (await this.appendToRunningTask(message, message.text, undefined, undefined, true)) return "steered";
-        await this.acceptTask(message, message.text, true, undefined, undefined, undefined, true, true);
-        return "queued";
+        assertDeliveryGuard();
+        if (deliveryGuard === undefined) {
+          if (await this.appendToRunningTask(message, message.text, undefined, undefined, true)) return "steered";
+          await this.acceptTask(message, message.text, true, undefined, undefined, undefined, true, true);
+          return "queued";
+        }
+
+        let workerSteerAttempted = false;
+        let workerSteerAccepted = false;
+        const beforeWorkerSteer = (): boolean => {
+          if (!deliveryGuard()) return false;
+          workerSteerAttempted = true;
+          return true;
+        };
+        const steered = await this.appendToRunningTask(
+          message,
+          message.text,
+          deliveryGuard,
+          beforeWorkerSteer,
+          true,
+          false,
+          () => { workerSteerAccepted = true; },
+        );
+        if (workerSteerAccepted) return "steered";
+        const acceptedTask = this.store.getTaskByMessageId(botUid, message, message.messageId);
+        const commandState = this.store.getCommandClaimState(botUid, message, message.messageId);
+        if (acceptedTask !== null) return "queued";
+        if (commandState === "completed") return "steered";
+        assertDeliveryGuard();
+        if (workerSteerAttempted || steered || commandState === "pending") {
+          throw new Error("Loop task delivery outcome is uncertain; refusing a duplicate.");
+        }
+
+        const accepted = await this.acceptTask(
+          message,
+          message.text,
+          true,
+          undefined,
+          undefined,
+          deliveryGuard,
+          true,
+          true,
+        );
+        if (accepted) return "queued";
+        assertDeliveryGuard();
+        if (this.store.getTaskByMessageId(botUid, message, message.messageId) !== null) return "queued";
+        if (this.store.getCommandClaimState(botUid, message, message.messageId) === "completed") {
+          return "steered";
+        }
+        throw new Error("Loop task delivery was not accepted.");
       },
       askQuestions: (task, target, args, signal, toolCallId) =>
         this.questions.askQuestions(task, target, args, signal, toolCallId),

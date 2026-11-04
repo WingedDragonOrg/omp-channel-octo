@@ -2,6 +2,7 @@ import type { ExecutionEvent, ExecutionSnapshot } from "./cards/execution-tracke
 import type { CommitContent } from "./cards/commit-content.ts";
 import type { ProjectSessionState } from "./session/project-session.ts";
 import type { DecisionsConfig, DecisionFetch } from "./references/types.ts";
+import type { LoopReadPort } from "./loop/types.ts";
 
 export interface ChatTarget {
   channelId: string;
@@ -867,6 +868,8 @@ export interface ChannelServiceOptions {
    * and a failure there only costs that mirror.
    */
   allowlistWriteback?: AllowlistWriteback;
+  /** Authenticated Loop reads for group workspace binding and polling. */
+  loop?: LoopReadPort;
 }
 
 export interface AllowlistWriteback {

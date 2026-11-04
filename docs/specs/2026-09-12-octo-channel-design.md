@@ -21,6 +21,7 @@
 包含主群/子区已落盘上下文即时分叉：owner-only `/fork [子区名称]` 和独立 `fork` 宿主工具共用原生 CLI `--fork`，沿用 cwd、建立独立 session 并绑定同父群新子区。详细契约见 `docs/specs/2026-11-03-thread-fork-design.md`。
 
 包含可选外部决策服务驱动的子区 PR/MR 引用绑定：operator 显式配置协议、模型和独立密钥后，仅从已受理的当前子区可见正文识别候选，以必要有界上下文判断是否为直接工作对象；高概率结果去重持久化到本地 `thread-info.references`，不改 Octo/Fleet。判断异步尽力而为，已绑定引用跨重启保留，未完成判断不恢复或补扫。详细契约见 `docs/specs/2026-11-04-thread-pr-mr-reference-binding-design.md`。
+包含 owner-only `/bind loop <url|workspace_id|workspace_name>` 的 workspace 感知：仅扫描显式绑定 ID，以完整分页快照比较业务变化；只为当前负责人 Octo UID 精确命中 channel owner/Bot，或已有明确 task—子区关联的任务产生 agent 输入。首次整理及未关联的关注任务交主群，明确关联的任务变化直达子区；其余任务仅更新快照。thread 工具通过 `task_id` 创建或维护来源关联，执行结果按既有 listen 策略回传。权限、持久去重、未知接受及创建保护、隔离验收见 `docs/specs/2026-11-04-loop-workspace-task-awareness-design.md`。
 
 不包含终端会话接管、多用户服务、通用网络 Agent gateway、文档评论任务、服务端通用 bot_task、群历史归档与检索、出站附件之外的通用文件托管和交互 callback 系统。channel 仅提供由 OMP host tool 明确发起的出站图片/文件发送，以及由能力 profile 明确启用的 Octo raw type17 `octo/v1` AdaptiveCard 1.5 进度展示和 `octo/v2` 交互问答卡片；交互卡片的上行只使用该 Bot 自己的事件队列（`/v1/bot/events` 轮询与 ack），不注册回调地址、不实现通用 callback 或审批流。收到的入站消息按已确认的类型表提取内容，贴纸、系统与 CMD 等没有内容的类型明确告知，不作为成功执行。范围以个人 IM 交互为准，不继承参考适配器的其他任务入口。
 
