@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createServer, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { mkdtemp, open as openFile, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -126,13 +126,14 @@ function attachment(
 async function expectAttachmentFailure(
   attempt: Promise<unknown>,
   reason: AttachmentError["reason"],
-): Promise<void> {
+): Promise<AttachmentError> {
   const error = await attempt.then(
     () => undefined,
     (thrown: unknown) => thrown,
   );
   expect(error).toBeInstanceOf(AttachmentError);
   expect((error as AttachmentError).reason).toBe(reason);
+  return error as AttachmentError;
 }
 
 /**
@@ -154,6 +155,30 @@ async function startStreamingServer(totalBytes: number): Promise<string> {
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("streaming test server has no TCP port");
   return `http://127.0.0.1:${address.port}/stream`;
+}
+
+async function startAttachmentServer(
+  handler: (request: IncomingMessage, response: ServerResponse) => void,
+): Promise<string> {
+  const server = createServer(handler);
+  server.on("error", () => undefined);
+  streamingServer = server;
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("attachment test server has no TCP port");
+  return `http://127.0.0.1:${address.port}/attachment`;
+}
+
+function createDownloadOnlyTransport(downloadUrl: string): ChannelTransport {
+  const created = createOctoTransport({
+    apiUrl: new URL(downloadUrl).origin,
+    botToken: "download-test-token",
+  });
+  transport = created;
+  return created;
 }
 
 describe("Octo inbound message content", () => {
@@ -700,6 +725,176 @@ describe("Octo inbound attachment download", () => {
     );
 
     expect(await readdir(directory)).toEqual([]);
+  });
+
+  // Use the platform clock: fake timers cannot drive the real fetch/HTTP socket path.
+  test("retries temporary HTTP statuses and publishes the complete attachment", async () => {
+    const requestTimes: number[] = [];
+    const methods: string[] = [];
+    const authorization: Array<string | string[] | undefined> = [];
+    const bytes = Buffer.from("complete attachment after transient responses", "utf8");
+    const downloadUrl = await startAttachmentServer((request, response) => {
+      requestTimes.push(performance.now());
+      methods.push(request.method ?? "");
+      authorization.push(request.headers.authorization);
+      if (requestTimes.length === 1) {
+        response.writeHead(408).end();
+      } else if (requestTimes.length === 2) {
+        response.writeHead(429).end();
+      } else {
+        response.writeHead(200, { "content-length": String(bytes.byteLength) }).end(bytes);
+      }
+    });
+    const channel = createDownloadOnlyTransport(downloadUrl);
+    temporaryDirectory = await mkdtemp(join(tmpdir(), "octo-download-retry-"));
+    const target = join(temporaryDirectory, "complete.bin");
+
+    expect(await channel.downloadAttachment({ url: downloadUrl, path: target, maxBytes: 1_024 }))
+      .toBe(bytes.byteLength);
+    expect((await readFile(target)).equals(bytes)).toBe(true);
+    expect(methods).toEqual(["GET", "GET", "GET"]);
+    expect(authorization).toEqual([undefined, undefined, undefined]);
+    expect(requestTimes).toHaveLength(3);
+    expect(requestTimes[1]! - requestTimes[0]!).toBeGreaterThanOrEqual(175);
+    expect(requestTimes[2]! - requestTimes[1]!).toBeGreaterThanOrEqual(375);
+    expect(await readdir(temporaryDirectory)).toEqual(["complete.bin"]);
+  });
+
+  test("retries connection and response-stream interruptions before publishing", async () => {
+    const attempts: number[] = [];
+    const bytes = Buffer.from("recovered full response body", "utf8");
+    let destinationExistsBeforeSuccessfulResponse = false;
+    const downloadUrl = await startAttachmentServer(async (request, response) => {
+      attempts.push(attempts.length + 1);
+      if (attempts.length === 1) {
+        request.socket.destroy();
+      } else if (attempts.length === 2) {
+        response.writeHead(200, { "content-length": String(bytes.byteLength) });
+        response.write(bytes.subarray(0, 7), () => response.destroy());
+      } else {
+        destinationExistsBeforeSuccessfulResponse = await stat(target).then(
+          () => true,
+          () => false,
+        );
+        response.writeHead(200, { "content-length": String(bytes.byteLength) }).end(bytes);
+      }
+    });
+    const channel = createDownloadOnlyTransport(downloadUrl);
+    temporaryDirectory = await mkdtemp(join(tmpdir(), "octo-download-interruption-"));
+    const target = join(temporaryDirectory, "complete.bin");
+
+    expect(await channel.downloadAttachment({ url: downloadUrl, path: target, maxBytes: 1_024 }))
+      .toBe(bytes.byteLength);
+    expect((await readFile(target)).equals(bytes)).toBe(true);
+    expect(attempts).toEqual([1, 2, 3]);
+    expect(destinationExistsBeforeSuccessfulResponse).toBe(false);
+    expect(await readdir(temporaryDirectory)).toEqual(["complete.bin"]);
+  });
+
+  test("exhausts three transient HTTP responses and removes every partial file", async () => {
+    let attempts = 0;
+    const downloadUrl = await startAttachmentServer((_request, response) => {
+      attempts += 1;
+      response.writeHead(503).end("temporary outage");
+    });
+    const channel = createDownloadOnlyTransport(downloadUrl);
+    temporaryDirectory = await mkdtemp(join(tmpdir(), "octo-download-exhausted-"));
+    const target = join(temporaryDirectory, "failed.bin");
+    const privateUrl = `${downloadUrl}?signature=must-not-appear-in-errors`;
+
+    const error = await expectAttachmentFailure(
+      channel.downloadAttachment({ url: privateUrl, path: target, maxBytes: 1_024 }),
+      "failed",
+    );
+
+    expect(attempts).toBe(3);
+    expect(error.message).not.toContain(privateUrl);
+    expect(await readdir(temporaryDirectory)).toEqual([]);
+  });
+
+  test("does not retry permanent HTTP statuses, oversize responses, or filesystem failures", async () => {
+    const paths: string[] = [];
+    const downloadUrl = await startAttachmentServer((request, response) => {
+      const path = (request.url ?? "").split("?")[0] ?? "";
+      paths.push(path);
+      if (path === "/not-found") {
+        response.writeHead(404).end();
+      } else if (path === "/declared-oversize") {
+        response.writeHead(200, { "content-length": "5" }).end(Buffer.alloc(5));
+      } else if (path === "/streamed-oversize") {
+        response.writeHead(200, { "transfer-encoding": "chunked" }).end(Buffer.alloc(5));
+      } else {
+        response.writeHead(200).end("unexpected request");
+      }
+    });
+    const channel = createDownloadOnlyTransport(downloadUrl);
+    temporaryDirectory = await mkdtemp(join(tmpdir(), "octo-download-nonretry-"));
+    const origin = new URL(downloadUrl).origin;
+    const target = (name: string): string => join(temporaryDirectory!, name);
+
+    await expectAttachmentFailure(
+      channel.downloadAttachment({ url: `${origin}/not-found`, path: target("missing.bin"), maxBytes: 4 }),
+      "failed",
+    );
+    await expectAttachmentFailure(
+      channel.downloadAttachment({
+        url: `${origin}/declared-oversize`,
+        path: target("declared.bin"),
+        maxBytes: 4,
+      }),
+      "oversize",
+    );
+    await expectAttachmentFailure(
+      channel.downloadAttachment({
+        url: `${origin}/streamed-oversize`,
+        path: target("streamed.bin"),
+        maxBytes: 4,
+      }),
+      "oversize",
+    );
+
+    const blocker = join(temporaryDirectory, "not-a-directory");
+    await writeFile(blocker, "file");
+    await expectAttachmentFailure(
+      channel.downloadAttachment({
+        url: `${origin}/must-not-be-requested`,
+        path: join(blocker, "failed.bin"),
+        maxBytes: 1_024,
+      }),
+      "failed",
+    );
+
+    expect(paths).toEqual(["/not-found", "/declared-oversize", "/streamed-oversize"]);
+    expect(await readdir(temporaryDirectory)).toEqual(["not-a-directory"]);
+  });
+
+  test("does not retry after the caller cancels an in-flight download", async () => {
+    let attempts = 0;
+    const requestStarted = Promise.withResolvers<void>();
+    const downloadUrl = await startAttachmentServer((_request, response) => {
+      attempts += 1;
+      response.writeHead(200);
+      response.flushHeaders();
+      response.write("partial");
+      requestStarted.resolve();
+    });
+    const channel = createDownloadOnlyTransport(downloadUrl);
+    temporaryDirectory = await mkdtemp(join(tmpdir(), "octo-download-cancelled-"));
+    const target = join(temporaryDirectory, "cancelled.bin");
+    const controller = new AbortController();
+    const pending = channel.downloadAttachment({
+      url: downloadUrl,
+      path: target,
+      maxBytes: 1_024,
+      signal: controller.signal,
+    });
+
+    await requestStarted.promise;
+    controller.abort();
+    await expectAttachmentFailure(pending, "timeout");
+
+    expect(attempts).toBe(1);
+    expect(await readdir(temporaryDirectory)).toEqual([]);
   });
 
   test("renders a merge-forward nested inside a merge-forward as a placeholder", async () => {

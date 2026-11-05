@@ -1,6 +1,6 @@
 import { createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm, stat, type FileHandle } from "node:fs/promises";
 import { basename, dirname, extname } from "node:path";
 import { Readable } from "node:stream";
 import { WebSocket } from "ws";
@@ -162,6 +162,29 @@ const AUDIO_CONTENT_TYPES: Record<string, string> = {
 };
 /** Transcribing anything larger is pointless and would only buffer a big file in memory. */
 const MAX_TRANSCRIBE_BYTES = 20 * 1024 * 1024;
+const ATTACHMENT_DOWNLOAD_RETRY_DELAYS_MS = [200, 400] as const;
+
+function waitForAttachmentRetry(signal: AbortSignal, delayMs: number): Promise<boolean> {
+  const { promise, resolve } = Promise.withResolvers<boolean>();
+  if (signal.aborted) {
+    resolve(false);
+    return promise;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const finish = (elapsed: boolean): void => {
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    timer = undefined;
+    signal.removeEventListener("abort", onAbort);
+    resolve(elapsed);
+  };
+  const onAbort = (): void => finish(false);
+  timer = setTimeout(() => finish(true), delayMs);
+  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) finish(false);
+  return promise;
+}
+
 /**
  * A dropped or kicked socket reconnects with an exponential backoff that doubles from the base
  * until the cap, jittered downward so several bots kicked at the same moment do not return in
@@ -532,53 +555,129 @@ export class OctoTransport implements ChannelTransport {
     const deadline = requestDeadline(request.signal, ATTACHMENT_DOWNLOAD_TIMEOUT_MS);
     const temporary = `${request.path}.part-${randomBytes(ATTACHMENT_PART_BYTES).toString("hex")}`;
     try {
+      if (deadline.signal.aborted) {
+        throw new AttachmentError("timeout", "Octo attachment download timed out");
+      }
       await mkdir(dirname(request.path), { recursive: true, mode: 0o700 });
-      const response = await fetch(url, { signal: deadline.signal, redirect: "follow" });
-      if (response.status < 200 || response.status >= 300) {
-        throw new AttachmentError("failed", `Octo attachment download answered HTTP ${response.status}`);
-      }
-      const declared = Number(response.headers.get("content-length"));
-      if (Number.isFinite(declared) && declared > request.maxBytes) {
-        throw new AttachmentError(
-          "oversize",
-          `Octo attachment declares ${declared} bytes, over the ${request.maxBytes} byte limit`,
-        );
-      }
-      if (!response.body) throw new AttachmentError("failed", "Octo attachment response has no body");
-      const handle = await open(temporary, "w", 0o600);
-      let written = 0;
-      try {
-        const reader = response.body.getReader();
-        while (true) {
-          const chunk = await reader.read();
-          if (chunk.done) break;
-          written += chunk.value.byteLength;
-          if (written > request.maxBytes) {
-            throw new AttachmentError("oversize", `Octo attachment exceeds the ${request.maxBytes} byte limit`);
+      for (let attempt = 0; attempt <= ATTACHMENT_DOWNLOAD_RETRY_DELAYS_MS.length; attempt += 1) {
+        let retryable = false;
+        let handle: FileHandle | undefined;
+        let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+        try {
+          if (deadline.signal.aborted) {
+            throw new AttachmentError("timeout", "Octo attachment download timed out");
           }
-          let offset = 0;
-          while (offset < chunk.value.byteLength) {
-            const { bytesWritten } = await handle.write(
-              chunk.value,
-              offset,
-              chunk.value.byteLength - offset,
+          let response: Response;
+          try {
+            response = await fetch(url, { signal: deadline.signal, redirect: "follow" });
+          } catch {
+            if (deadline.signal.aborted) {
+              throw new AttachmentError("timeout", "Octo attachment download timed out");
+            }
+            retryable = true;
+            throw new AttachmentError("failed", "Octo attachment request failed");
+          }
+          if (deadline.signal.aborted) {
+            throw new AttachmentError("timeout", "Octo attachment download timed out");
+          }
+          if (response.status < 200 || response.status >= 300) {
+            retryable = response.status === 408
+              || response.status === 429
+              || (response.status >= 500 && response.status <= 599);
+            if (response.body) void response.body.cancel().catch(() => undefined);
+            throw new AttachmentError("failed", `Octo attachment download answered HTTP ${response.status}`);
+          }
+          const lengthHeader = response.headers.get("content-length");
+          const declared = lengthHeader === null ? undefined : Number(lengthHeader);
+          if (declared !== undefined && Number.isFinite(declared) && declared > request.maxBytes) {
+            if (response.body) void response.body.cancel().catch(() => undefined);
+            throw new AttachmentError(
+              "oversize",
+              `Octo attachment declares ${declared} bytes, over the ${request.maxBytes} byte limit`,
             );
-            if (bytesWritten <= 0) throw new AttachmentError("failed", "Octo attachment write stalled");
-            offset += bytesWritten;
+          }
+          if (!response.body) throw new AttachmentError("failed", "Octo attachment response has no body");
+          reader = response.body.getReader();
+          handle = await open(temporary, "w", 0o600);
+          let written = 0;
+          while (true) {
+            if (deadline.signal.aborted) {
+              throw new AttachmentError("timeout", "Octo attachment download timed out");
+            }
+            let chunk: { done: true } | { done: false; value: Uint8Array };
+            try {
+              chunk = await reader.read();
+            } catch {
+              if (deadline.signal.aborted) {
+                throw new AttachmentError("timeout", "Octo attachment download timed out");
+              }
+              retryable = true;
+              throw new AttachmentError("failed", "Octo attachment response stream was interrupted");
+            }
+            if (deadline.signal.aborted) {
+              throw new AttachmentError("timeout", "Octo attachment download timed out");
+            }
+            if (chunk.done) break;
+            written += chunk.value.byteLength;
+            if (written > request.maxBytes) {
+              throw new AttachmentError("oversize", `Octo attachment exceeds the ${request.maxBytes} byte limit`);
+            }
+            let offset = 0;
+            while (offset < chunk.value.byteLength) {
+              const { bytesWritten } = await handle.write(
+                chunk.value,
+                offset,
+                chunk.value.byteLength - offset,
+              );
+              if (bytesWritten <= 0) throw new AttachmentError("failed", "Octo attachment write stalled");
+              offset += bytesWritten;
+            }
+          }
+          await handle.close();
+          handle = undefined;
+          if (deadline.signal.aborted) {
+            throw new AttachmentError("timeout", "Octo attachment download timed out");
+          }
+          // Only a fully read and written file becomes the attachment a task prompt may point at.
+          await rename(temporary, request.path);
+          return written;
+        } catch (error) {
+          if (reader) void reader.cancel().catch(() => undefined);
+          let cleanupFailed = false;
+          if (handle) {
+            try {
+              await handle.close();
+            } catch {
+              cleanupFailed = true;
+            }
+          }
+          try {
+            await rm(temporary, { force: true });
+          } catch {
+            cleanupFailed = true;
+          }
+          if (deadline.signal.aborted) {
+            throw new AttachmentError("timeout", "Octo attachment download timed out");
+          }
+          if (cleanupFailed) {
+            throw new AttachmentError("failed", "Octo attachment download cleanup failed");
+          }
+          if (!retryable || attempt >= ATTACHMENT_DOWNLOAD_RETRY_DELAYS_MS.length) {
+            if (error instanceof AttachmentError) throw error;
+            throw new AttachmentError("failed", "Octo attachment download failed");
+          }
+          const delay = ATTACHMENT_DOWNLOAD_RETRY_DELAYS_MS[attempt];
+          if (delay === undefined || !await waitForAttachmentRetry(deadline.signal, delay)) {
+            throw new AttachmentError("timeout", "Octo attachment download timed out");
           }
         }
-      } finally {
-        await handle.close();
       }
-      // Only a fully written file becomes the attachment a task prompt may point at.
-      await rename(temporary, request.path);
-      return written;
+      throw new AttachmentError("failed", "Octo attachment download failed");
     } catch (error) {
-      await rm(temporary, { force: true }).catch(() => undefined);
-      if (error instanceof AttachmentError) throw error;
       if (deadline.timedOut() || deadline.aborted()) {
         throw new AttachmentError("timeout", "Octo attachment download timed out");
       }
+      if (error instanceof AttachmentError) throw error;
       throw new AttachmentError("failed", "Octo attachment download failed");
     } finally {
       deadline.release();

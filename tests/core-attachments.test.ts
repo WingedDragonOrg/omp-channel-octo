@@ -1,5 +1,6 @@
 import { expect, test, vi } from "bun:test";
 import { Database } from "bun:sqlite";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -22,6 +23,7 @@ import type {
   InboundMessage,
 } from "../src/contracts.ts";
 import { createChannelService } from "../src/service.ts";
+import { OctoTransport } from "../src/octo/index.ts";
 import {
   FakeTransport,
   FakeWorkerFactory,
@@ -131,6 +133,52 @@ async function createAttachmentHarness(
 async function closeAttachmentHarness(harness: AttachmentHarness): Promise<void> {
   await harness.service.stop();
   await rm(harness.root, { recursive: true, force: true });
+}
+
+interface LocalAttachmentServer {
+  readonly url: string;
+  close(): Promise<void>;
+}
+
+async function createLocalAttachmentServer(
+  handler: (request: IncomingMessage, response: ServerResponse) => void,
+): Promise<LocalAttachmentServer> {
+  const server = createServer(handler);
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error): void => reject(error);
+    server.once("error", onError);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", onError);
+      resolve();
+    });
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    server.close();
+    throw new Error("local attachment server did not bind a TCP address");
+  }
+  return {
+    url: `http://127.0.0.1:${address.port}/attachment`,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+        server.closeAllConnections();
+      }),
+  };
+}
+
+/** Keep the CoreService fixture intact while exercising OctoTransport's real HTTP-to-file path. */
+function installRealAttachmentDownloader(harness: AttachmentHarness): void {
+  const octo = new OctoTransport({ apiUrl: "http://127.0.0.1/", botToken: "fixture-only" });
+  const download = octo.downloadAttachment.bind(octo);
+  harness.transport.downloadAttachment = async (request) => {
+    harness.transport.downloadRequests.push({
+      url: request.url,
+      path: request.path,
+      maxBytes: request.maxBytes,
+    });
+    return download(request);
+  };
 }
 
 function attachment(
@@ -1680,5 +1728,269 @@ test("权限门先于命令附件组装：非 owner 的命令消息零下载、�
     expect(taskCount(harness, target)).toBe(0);
   } finally {
     await closeAttachmentHarness(harness);
+  }
+});
+test("真实 HTTP 附件暂时失败后接受完整任务，消息重投不重复下载", async () => {
+  const requests: string[] = [];
+  const server = await createLocalAttachmentServer((request, response) => {
+    requests.push(`${request.method} ${request.url}`);
+    if (requests.length === 1) {
+      response.writeHead(503);
+      response.end();
+      return;
+    }
+    response.writeHead(200, { "Content-Length": String(IMAGE_BYTES.byteLength) });
+    response.end(Buffer.from(IMAGE_BYTES));
+  });
+  const harness = await createAttachmentHarness();
+  installRealAttachmentDownloader(harness);
+  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+  const message = inbound({
+    messageId: "real-http-accepted",
+    ...target,
+    text: "看下这张图",
+    attachments: [attachment(server.url, "image", "local.png", { size: IMAGE_BYTES.byteLength })],
+  });
+  try {
+    await submitAndWaitForIngressHandoff(harness, message);
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+    await waitForStatus(harness.service, target, (status) => status.outbox === 0);
+
+    const path = savedPath(harness, target, message.messageId, 0, "local.png", "image", server.url);
+    const prompt = harness.workers.prompts[0]!.text;
+    const sentAfterFirst = harness.transport.sent.length;
+    expect(requests).toEqual(["GET /attachment", "GET /attachment"]);
+    expect(harness.transport.downloadRequests).toHaveLength(1);
+    expect(harness.workers.prompts).toHaveLength(1);
+    expect(taskCount(harness, target)).toBe(1);
+    expect(prompt).toContain(ATTACHMENT_HEADER);
+    expect(attachmentPathsFromPrompt(prompt)).toEqual([path]);
+    expect(prompt).not.toContain(server.url);
+    await expectSameBytes(path, IMAGE_BYTES);
+
+    await submitAndWaitForIngressHandoff(harness, message);
+    await waitForStatus(harness.service, target, (status) => status.outbox === 0);
+    expect(requests).toEqual(["GET /attachment", "GET /attachment"]);
+    expect(harness.transport.downloadRequests).toHaveLength(1);
+    expect(harness.workers.prompts).toHaveLength(1);
+    expect(taskCount(harness, target)).toBe(1);
+    expect(harness.transport.sent).toHaveLength(sentAfterFirst);
+  } finally {
+    await closeAttachmentHarness(harness);
+    await server.close();
+  }
+});
+
+test("真实 HTTP 引用附件与引用正文一起进入任务提示词", async () => {
+  let requestCount = 0;
+  const server = await createLocalAttachmentServer((_request, response) => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      response.writeHead(503);
+      response.end();
+      return;
+    }
+    response.writeHead(200, { "Content-Length": String(IMAGE_BYTES.byteLength) });
+    response.end(Buffer.from(IMAGE_BYTES));
+  });
+  const harness = await createAttachmentHarness();
+  installRealAttachmentDownloader(harness);
+  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+  const message = inbound({
+    messageId: "real-http-quoted",
+    ...target,
+    text: "请检查这张引用图片",
+    quoted: { senderName: "董振兴", text: "[图片]界面截图" },
+    attachments: [attachment(server.url, "image", "quoted.png", { size: IMAGE_BYTES.byteLength })],
+  });
+  try {
+    await submitAndWaitForIngressHandoff(harness, message);
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+
+    const path = savedPath(harness, target, message.messageId, 0, "quoted.png", "image", server.url);
+    const prompt = harness.workers.prompts[0]!.text;
+    expect(requestCount).toBe(2);
+    expect(harness.transport.downloadRequests).toHaveLength(1);
+    expect(prompt).toContain("请检查这张引用图片");
+    expect(prompt).toContain("[引用 董振兴]\n[图片]界面截图");
+    expect(attachmentPathsFromPrompt(prompt)).toEqual([path]);
+    expect(prompt).not.toContain(server.url);
+    await expectSameBytes(path, IMAGE_BYTES);
+  } finally {
+    await closeAttachmentHarness(harness);
+    await server.close();
+  }
+});
+
+test("真实 HTTP 显式拒绝：不重试、不建任务，清理部分文件且重投不重复回复", async () => {
+  let requestCount = 0;
+  const server = await createLocalAttachmentServer((request, response) => {
+    requestCount += 1;
+    const requestedUrl = new URL(request.url ?? "/", `http://${request.headers.host}`).href;
+    response.writeHead(403);
+    response.end(`denied ${requestedUrl}`);
+  });
+  const harness = await createAttachmentHarness();
+  installRealAttachmentDownloader(harness);
+  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+  const message = inbound({
+    messageId: "real-http-rejected",
+    ...target,
+    text: "看下受限的文件",
+    attachments: [attachment(server.url, "file", "restricted.bin")],
+  });
+  try {
+    await submitAndWaitForIngressHandoff(harness, message);
+    await settleReplies(harness, target, REFUSAL_DOWNLOAD_FAILED);
+
+    expect(requestCount).toBe(1);
+    expect(replyCount(harness, REFUSAL_DOWNLOAD_FAILED)).toBe(1);
+    expect(harness.transport.downloadRequests).toHaveLength(1);
+    expect(harness.workers.prompts).toHaveLength(0);
+    expect(taskCount(harness, target)).toBe(0);
+    expect(existsSync(messageDirectory(harness, message, message.messageId))).toBe(false);
+    expect(harness.transport.sent.map(({ text }) => text).join("\n")).not.toContain(server.url);
+
+    await submitAndWaitForIngressHandoff(harness, message);
+    await settleReplies(harness, target, REFUSAL_DOWNLOAD_FAILED);
+    expect(requestCount).toBe(1);
+    expect(replyCount(harness, REFUSAL_DOWNLOAD_FAILED)).toBe(1);
+  } finally {
+    await closeAttachmentHarness(harness);
+    await server.close();
+  }
+});
+
+test("真实 HTTP 重试耗尽后拒收，重投不再下载且不遗留文件", async () => {
+  let requestCount = 0;
+  const server = await createLocalAttachmentServer((_request, response) => {
+    requestCount += 1;
+    response.writeHead(503);
+    response.end();
+  });
+  const harness = await createAttachmentHarness();
+  installRealAttachmentDownloader(harness);
+  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+  const message = inbound({
+    messageId: "real-http-exhausted",
+    ...target,
+    text: "检查文件",
+    attachments: [attachment(server.url, "file", "unavailable.bin")],
+  });
+  try {
+    await submitAndWaitForIngressHandoff(harness, message);
+    await settleReplies(harness, target, REFUSAL_DOWNLOAD_FAILED);
+    expect(requestCount).toBe(3);
+    expect(taskCount(harness, target)).toBe(0);
+    expect(harness.workers.prompts).toHaveLength(0);
+    expect(existsSync(messageDirectory(harness, message, message.messageId))).toBe(false);
+    await submitAndWaitForIngressHandoff(harness, message);
+    await settleReplies(harness, target, REFUSAL_DOWNLOAD_FAILED);
+    expect(requestCount).toBe(3);
+    expect(replyCount(harness, REFUSAL_DOWNLOAD_FAILED)).toBe(1);
+  } finally {
+    await closeAttachmentHarness(harness);
+    await server.close();
+  }
+});
+
+test("真实 HTTP 隐式关联附件取回失败时继续接受纯文本任务并说明降级", async () => {
+  let requestCount = 0;
+  const server = await createLocalAttachmentServer((request, response) => {
+    requestCount += 1;
+    const requestedUrl = new URL(request.url ?? "/", `http://${request.headers.host}`).href;
+    response.writeHead(503);
+    response.end(`bad request ${requestedUrl}`);
+  });
+  const harness = await createAttachmentHarness({ groupHistory: { enabled: true, maxMessages: 50 } });
+  installRealAttachmentDownloader(harness);
+  const target: ChatTarget = { channelId: "group-allowed", channelType: 2 };
+  const now = Date.now();
+  try {
+    await harness.service.submitInbound(
+      inbound({
+        messageId: "real-http-associated-file",
+        ...target,
+        senderId: "member-zhaoyi",
+        text: "",
+        messageSeq: 360,
+        messageTimestamp: now - 60_000,
+        attachments: [attachment(server.url, "file", "associated.pdf", { size: 42 })],
+      }),
+    );
+    expect(requestCount).toBe(0);
+
+    await submitAndWaitForIngressHandoff(
+      harness,
+      inbound({
+        messageId: "real-http-associated-request",
+        ...target,
+        senderId: "member-zhaoyi",
+        mentionedUserIds: [harness.bot.uid],
+        text: "这个",
+        messageSeq: 362,
+        messageTimestamp: now,
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
+
+    const prompt = harness.workers.prompts[0]!.text;
+    expect(requestCount).toBe(3);
+    expect(harness.workers.prompts).toHaveLength(1);
+    expect(taskCount(harness, target)).toBe(1);
+    expect(prompt).toContain("这个");
+    expect(prompt).toContain("未能取回（下载失败）；本条按纯文本处理");
+    expect(attachmentPathsFromPrompt(prompt)).toHaveLength(0);
+    expect(prompt).not.toContain(server.url);
+    expect(replyCount(harness, REFUSAL_DOWNLOAD_FAILED)).toBe(0);
+  } finally {
+    await closeAttachmentHarness(harness);
+    await server.close();
+  }
+});
+
+test("服务停止中断真实 HTTP 附件下载：不重试、不 ACK、不保留临时文件", async () => {
+  let requestCount = 0;
+  const downloadStarted = gate();
+  const server = await createLocalAttachmentServer((_request, response) => {
+    requestCount += 1;
+    response.writeHead(200);
+    response.write(Buffer.from([1, 2, 3]));
+    downloadStarted.release();
+  });
+  const harness = await createAttachmentHarness();
+  installRealAttachmentDownloader(harness);
+  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+  const message = inbound({
+    messageId: "real-http-stopped",
+    ...target,
+    text: "请读取中断的文件",
+    attachments: [attachment(server.url, "file", "interrupted.bin")],
+  });
+  let stopped = false;
+  try {
+    const receipt = harness.service.receive(message);
+    const ackOutcome = receipt.ackReady.then(
+      () => "fulfilled" as const,
+      () => "rejected" as const,
+    );
+    await downloadStarted.promise;
+    await harness.service.stop();
+    stopped = true;
+
+    expect(await ackOutcome).toBe("rejected");
+    expect(requestCount).toBe(1);
+    expect(harness.transport.downloadRequests).toHaveLength(1);
+    expect(existsSync(messageDirectory(harness, message, message.messageId))).toBe(false);
+    expect(harness.workers.prompts).toHaveLength(0);
+    expect(taskCount(harness, target)).toBe(0);
+    expect(harness.transport.sent.map(({ text }) => text).join("\n")).not.toContain(server.url);
+  } finally {
+    if (stopped) await rm(harness.root, { recursive: true, force: true });
+    else await closeAttachmentHarness(harness);
+    await server.close();
   }
 });

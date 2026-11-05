@@ -512,6 +512,9 @@ typing 的已排定 tick 在服务进入 stopping 后直接回收该租约环，
 ### 持久化、调度与恢复
 
 本地 SQLite 保存聊天绑定、动态允许集合（`allowed_chats`：运行中开通的聊天及其 `granted_by`/`granted_at`）、任务、入站交接/去重键、问题、出站记录、进度卡记录和子区监听策略、创建方目标及持久合并成功事件，OMP 自身保存对话。receive callback 同步返回逐消息 `ackReady` 票据；完整权限门通过前不持久正文。授权后的短交接以 Bot 身份、可信来源类型与稳定来源 ID 唯一标识；媒体输入只有在本地 spool 与组装正文可恢复落盘后才可 ACK。状态盘写入失败时不发送成功 ACK、不启动副作用；ACK 只表示输入已被可靠接管或确定消费，不表示任务、命令、回执发送或归档完成。领域消费与 ingress 状态在同一事务交接给 task、steering、ask、受管 operation 或稳定 outbox；只有 pending command claim 时仍由 ingress 保留恢复责任。每个聊天的追加模式（`steer`/`queue`）持久化在与绑定、任务同一套状态盘中，未写入行时按 `steer` 处理。作为 steering 消费的入站消息同样先 durable claim 再发送 RPC 帧：claim 成功而 OMP 拒绝该帧时释放 claim 并回退为普通排队任务，已 claim 未确认的消息在服务器重投时不会重复注入。
+
+附件下载对 HTTP 408、429、5xx 和连接或响应流中断最多尝试三次，等待 200 ms、400 ms 均计入既有单附件 60 秒及整消息 120 秒预算；永久错误、超限、取消和停机不重试。每次失败清理临时文件，只有完整文件才可发布并交接；显式附件耗尽后拒收，隐式关联耗尽后保留纯文本降级。下载错误不暴露附件 URL 或签名。详细合同见 `docs/specs/2026-09-16-inbound-message-content-design.md`。
+
 共享说明的持久 marker 与 sidecar 状态属于 SQLite 中的 session context ledger，至少记录 `botUid`、真实聊天目标、真实 OMP session ID、当前 server version、`pending`/`committed` 阶段和 injection attempt ID。marker 的提交必须是同 session/目标/version 的 CAS；同一 pending 在重放前沿用其 attempt ID，提交后不得再次接受旧 attempt。新 session 不能继承旧 session marker，外部移动若保持同一真实 session ID 则保留 marker，`/new`/`/reset` 产生新 session 时清空其 marker。sidecar 与 marker 发布、extension 注入确认和 `description-write` 的后续 version 发布均不得以占位 session ID 完成。
 
 任务状态为 queued、started、completed、failed、cancelled、interrupted。开始执行时写 started，真正派发 prompt 前写 `prompt_started=1` 与已验证的 session ID，收到该 prompt 的 `agent_start` 后同步写 `prompt_accepted=1`；本地 slash ACK 不算进入生成。每条 assistant stream 的分段独立持久化 outbox，任务终态保存本次真实 assistant 正文。正常执行及重启恢复按接受顺序、聊天与会话串行；不同会话可以共享目录并行执行，不提供文件写入隔离保证。
