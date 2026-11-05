@@ -523,6 +523,8 @@ export interface ThreadWorkspaceRecord extends ChatTarget {
   layout: ThreadWorkspaceLayout;
   /** Present only for the legacy `worktree_name` API, which retains parent-cwd fallback. */
   legacyWorktreeName?: string;
+  /** Explicitly owned task directory; null for legacy rows or when no task root is owned. */
+  workspaceRoot?: string | null;
   status: ThreadWorkspaceStatus;
   entryPath: string | null;
   projects: ThreadWorkspaceProjectRecord[];

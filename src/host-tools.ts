@@ -27,6 +27,7 @@ import type { DestructiveResourceLease } from "./tasks/task-scheduler.ts";
 import { threadWorkspaceIsAvailable } from "./session/session-lifecycle.ts";
 import {
   createThreadWorkspaceBatch,
+  prepareThreadWorkspaceScope,
   validateThreadCreation,
   type ThreadWorkspaceBatchResult,
   type ValidatedThreadCreation,
@@ -1240,6 +1241,9 @@ async function runManagementTool(
       const taskId = optionalText("task_id")?.trim();
       if (taskId === undefined) {
         const creation = await validateThreadCreation(args, task.cwd, worktreeName(), signal);
+        if (creation.workspace !== null) {
+          await prepareThreadWorkspaceScope(host, groupId, creation.workspace, signal);
+        }
         if (creation.workspace === null) {
           const thread = await transport.createThread(groupId, name, signal);
           const policy = ensureThreadListen(host, thread, target, creation.listen);
@@ -1289,6 +1293,9 @@ async function runManagementTool(
       const creationArgs = { ...args };
       delete creationArgs.task_id;
       const creation = await validateThreadCreation(creationArgs, task.cwd, worktreeName(), signal);
+      if (creation.workspace !== null) {
+        await prepareThreadWorkspaceScope(host, groupId, creation.workspace, signal);
+      }
       return runLoopTaskThreadCreate(
         host,
         task,

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, realpath, stat } from "node:fs/promises";
-import { dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type {
   ChannelTransport,
   ThreadListenLevel,
@@ -22,6 +22,7 @@ const MAX_NORMALIZED_SLUG_CHARS = 100;
 const MAX_BACKGROUND_CHARS = 500;
 const MAX_ERROR_CHARS = 200;
 const INPUT_CHECK_TIMEOUT_MS = 10_000;
+const MAX_SHARED_SCOPE_OUTPUT_BYTES = 256 * 1024;
 const DEFAULT_BACKGROUND = "在所列项目工作区中处理相关工作。";
 const sharedEntryAllocationTails = new Map<string, Promise<void>>();
 type WorkspaceLayout = ThreadWorkspaceRecord["layout"];
@@ -32,6 +33,7 @@ export interface ThreadWorkspaceHost {
   readonly worktrees: WorktreePort | undefined;
   readonly store: Pick<
     ChannelStore,
+    | "getBinding"
     | "ensureBinding"
     | "saveThreadWorkspace"
     | "saveThreadWorkspaces"
@@ -44,6 +46,11 @@ export interface ThreadWorkspaceHost {
   readonly botUid: string;
 }
 
+export interface ThreadWorkspaceScope {
+  bindingCwd: string;
+  name: string;
+}
+
 export interface ThreadWorkspaceCreatePlan {
   layout: WorkspaceLayout;
   projects: Array<Pick<ThreadWorkspaceProjectRecord, "name" | "repo"> & Partial<Pick<ThreadWorkspaceProjectRecord, "base">>>;
@@ -52,6 +59,8 @@ export interface ThreadWorkspaceCreatePlan {
   legacyWorktreeName?: string;
   /** Full normalized task slug shared by every project in this batch. */
   worktreeNameSeed: string;
+  /** Host-derived main-group project scope used only for shared workspace placement. */
+  sharedScope?: ThreadWorkspaceScope;
 }
 
 export interface ValidatedThreadCreation {
@@ -120,6 +129,85 @@ async function canonicalRepository(path: string, signal?: AbortSignal): Promise<
   }
   return realpath(result.stdout.trim());
 }
+
+const NOT_GIT_WORKTREE = /not a git repository|must be run in a work tree/iu;
+
+async function resolveSharedScopeName(
+  host: ThreadWorkspaceHost,
+  groupId: string,
+  signal: AbortSignal,
+  expectedScope?: ThreadWorkspaceScope,
+): Promise<ThreadWorkspaceScope> {
+  const binding = host.store.getBinding(host.botUid, { channelId: groupId, channelType: 2 });
+  if (!binding) {
+    throw new Error("主群尚无持久工作目录绑定，拒绝创建共享工作区");
+  }
+  if (!isAbsolute(binding.cwd)) {
+    throw new Error("主群持久工作目录不是绝对路径，拒绝创建共享工作区");
+  }
+
+  let bindingCwd: string;
+  try {
+    bindingCwd = await realpath(binding.cwd);
+    if (!(await stat(bindingCwd)).isDirectory()) throw new Error("not a directory");
+  } catch {
+    throw new Error("主群持久工作目录不可用，拒绝创建共享工作区");
+  }
+  if (expectedScope !== undefined) {
+    if (bindingCwd !== expectedScope.bindingCwd) {
+      throw new Error("主群工作目录绑定在准备期间已变化，拒绝创建共享工作区");
+    }
+    return expectedScope;
+  }
+
+  const result = await runCommand(
+    ["git", "-C", bindingCwd, "worktree", "list", "--porcelain", "-z"],
+    {
+      timeoutMs: INPUT_CHECK_TIMEOUT_MS,
+      signal,
+      maxOutputBytes: { stdout: MAX_SHARED_SCOPE_OUTPUT_BYTES, stderr: 4_096 },
+    },
+  );
+  if (!result) throw new Error("无法确认主群 Git 作用域，拒绝创建共享工作区");
+  if (result.timedOut) throw new Error("主群 Git 作用域解析超时");
+  if (result.aborted) throw new Error("主群 Git 作用域解析已取消");
+  if (result.outputExceeded) throw new Error("主群 Git 作用域信息过大，拒绝创建共享工作区");
+
+  let scopeRoot = bindingCwd;
+  if (result.exitCode === 0) {
+    const fields = result.stdout.split("\0");
+    const firstWorktreeField = fields.findIndex((field) => field.startsWith("worktree "));
+    if (firstWorktreeField < 0) {
+      throw new Error("无法确认主群 Git 主检出根目录，拒绝创建共享工作区");
+    }
+    const primaryPath = fields[firstWorktreeField]!.slice("worktree ".length);
+    if (!isAbsolute(primaryPath)) {
+      throw new Error("无法确认主群 Git 主检出根目录，拒绝创建共享工作区");
+    }
+    try {
+      scopeRoot = await realpath(primaryPath);
+      if (!(await stat(scopeRoot)).isDirectory()) throw new Error("not a directory");
+    } catch {
+      throw new Error("主群 Git 主检出根目录不可用，拒绝创建共享工作区");
+    }
+  } else if (!NOT_GIT_WORKTREE.test(result.stderr)) {
+    throw new Error("无法确认主群 Git 作用域，拒绝创建共享工作区");
+  }
+
+  const scopeName = basename(scopeRoot).toLowerCase() || "unknown";
+  return { bindingCwd, name: scopeName };
+}
+
+export async function prepareThreadWorkspaceScope(
+  host: ThreadWorkspaceHost,
+  groupId: string,
+  plan: ThreadWorkspaceCreatePlan,
+  signal: AbortSignal,
+): Promise<void> {
+  if (plan.layout !== "shared") return;
+  plan.sharedScope = await resolveSharedScopeName(host, groupId, signal);
+}
+
 
 async function validateSharedWorkspaceParent(
   stateDir: string,
@@ -364,6 +452,7 @@ function workspaceRecord(
     channelType: 5,
     layout,
     status: "preparing",
+    workspaceRoot: null,
     entryPath,
     projects: projects.map((project) => ({ ...project, path: null, branch: null, created: false })),
     ...(legacyWorktreeName === undefined ? {} : { legacyWorktreeName }),
@@ -373,30 +462,54 @@ function workspaceRecord(
 
 function withSharedEntryPlan(
   record: ThreadWorkspaceRecord,
+  workspaceRoot: string | null,
   entryPath: string | null,
+  plannedEntryPath: string | null = entryPath,
 ): ThreadWorkspaceRecord {
   return {
     ...record,
+    workspaceRoot,
     entryPath,
     projects: record.projects.map((project) => ({
       ...project,
-      path: entryPath === null ? null : join(entryPath, projectDirectoryName(project)),
+      path: plannedEntryPath === null ? null : join(plannedEntryPath, projectDirectoryName(project)),
       branch: null,
       created: false,
     })),
   };
 }
 
-
 function errorCode(error: unknown): string | undefined {
   if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
   return typeof error.code === "string" ? error.code : undefined;
+}
+
+async function canonicalReservedPath(path: string): Promise<string> {
+  if (!isAbsolute(path)) throw new Error("持久化的共享工作区路径不是绝对路径");
+  let current = resolve(path);
+  const missingSegments: string[] = [];
+  for (;;) {
+    try {
+      let canonical = await realpath(current);
+      for (let index = missingSegments.length - 1; index >= 0; index -= 1) {
+        canonical = join(canonical, missingSegments[index]!);
+      }
+      return canonical;
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") throw error;
+      const parent = dirname(current);
+      if (parent === current) throw error;
+      missingSegments.push(basename(current));
+      current = parent;
+    }
+  }
 }
 
 async function allocateSharedEntry(
   host: ThreadWorkspaceHost,
   record: ThreadWorkspaceRecord,
   taskSlug: string,
+  scopeName: string,
   signal: AbortSignal,
 ): Promise<string> {
   const stateDir = await realpath(host.stateDir);
@@ -408,11 +521,16 @@ async function allocateSharedEntry(
       throw new Error("共享工作区入口父目录不是规范目录，拒绝创建");
     }
 
-    const reservedPaths = new Set(
-      host.store.listThreadWorkspaces(host.botUid)
-        .filter((workspace) => workspace.channelId !== record.channelId)
-        .flatMap((workspace) => workspace.entryPath === null ? [] : [workspace.entryPath]),
-    );
+    const reservedPaths = new Set<string>();
+    for (const workspace of host.store.listThreadWorkspaces(host.botUid)) {
+      if (workspace.channelId === record.channelId) continue;
+      if (workspace.workspaceRoot !== null && workspace.workspaceRoot !== undefined) {
+        reservedPaths.add(await canonicalReservedPath(workspace.workspaceRoot));
+      }
+      if (workspace.entryPath !== null) {
+        reservedPaths.add(await canonicalReservedPath(workspace.entryPath));
+      }
+    }
     for (let suffix = 1; ; suffix += 1) {
       const name = suffix === 1 ? taskSlug : `${taskSlug}-${suffix}`;
       const candidate = join(parent, name);
@@ -424,22 +542,39 @@ async function allocateSharedEntry(
         if (errorCode(error) !== "ENOENT") throw error;
       }
 
-      const planned = withSharedEntryPlan(record, candidate);
+      const entryPath = join(candidate, scopeName);
+      const planned = withSharedEntryPlan(record, candidate, entryPath);
       host.store.saveThreadWorkspace(planned);
       Object.assign(record, planned);
       try {
         await mkdir(candidate);
-        const canonical = await realpath(candidate);
-        if (canonical !== candidate || !(await stat(canonical)).isDirectory()) {
-          throw new Error("共享工作区入口路径被替换，拒绝使用");
-        }
-        return candidate;
       } catch (error) {
         if (errorCode(error) !== "EEXIST") throw error;
-        const cleared = withSharedEntryPlan(record, null);
+        const cleared = withSharedEntryPlan(record, null, null, null);
         host.store.saveThreadWorkspace(cleared);
         Object.assign(record, cleared);
+        continue;
       }
+
+      const canonicalRoot = await realpath(candidate);
+      if (canonicalRoot !== candidate || !(await stat(canonicalRoot)).isDirectory()) {
+        throw new Error("共享工作区任务根路径被替换，拒绝使用");
+      }
+      try {
+        await mkdir(entryPath);
+      } catch (error) {
+        if (errorCode(error) === "EEXIST") {
+          const rootOnly = withSharedEntryPlan(record, candidate, null, entryPath);
+          host.store.saveThreadWorkspace(rootOnly);
+          Object.assign(record, rootOnly);
+        }
+        throw error;
+      }
+      const canonicalEntry = await realpath(entryPath);
+      if (canonicalEntry !== entryPath || !(await stat(canonicalEntry)).isDirectory()) {
+        throw new Error("共享工作区作用域入口路径被替换，拒绝使用");
+      }
+      return entryPath;
     }
   });
 }
@@ -505,6 +640,9 @@ export async function createThreadWorkspaceBatch(
   signal: AbortSignal,
   onThreadCreated?: (thread: ThreadSummary) => void,
 ): Promise<ThreadWorkspaceBatchResult> {
+  if (plan.layout === "shared" && plan.projects.length === 0) {
+    throw new Error("shared workspace requires at least one project");
+  }
   if (plan.layout === "separate") {
     for (const project of plan.projects) {
       if (`${threadName} - ${project.name}`.length > MAX_THREAD_NAME_CHARS) {
@@ -515,6 +653,9 @@ export async function createThreadWorkspaceBatch(
 
   const stateDir = await realpath(host.stateDir);
   if (plan.layout === "shared") await validateSharedWorkspaceParent(stateDir, signal);
+  const sharedScopeName = plan.layout === "shared"
+    ? (await resolveSharedScopeName(host, groupId, signal, plan.sharedScope)).name
+    : null;
   let entryPath: string | null = null;
   const outcomes: ThreadWorkspaceOutcome[] = [];
   const remoteFailures: ThreadWorkspaceBatchResult["remoteFailures"] = [];
@@ -640,6 +781,7 @@ export async function createThreadWorkspaceBatch(
           host,
           record,
           plan.worktreeNameSeed,
+          sharedScopeName!,
           signal,
         );
         entryPath = sharedEntryPath;

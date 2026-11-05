@@ -45,6 +45,7 @@ function sharedWorkspace(
     layout: "shared",
     status,
     entryPath,
+    workspaceRoot: null,
     projects,
     error,
   };
@@ -107,11 +108,15 @@ test("preparing and failed ownership plus planned/created outcomes survive datab
   const root = await mkdtemp(join(tmpdir(), "omp-channel-octo-workspace-ownership-reopen-"));
   const stateDir = join(root, "state");
   const entryPath = join(root, "thread-workspaces", "batch-17");
+  const workspaceRoot = join(root, "thread-workspaces");
   const plannedPath = join(entryPath, "project-b");
   const createdPath = join(entryPath, "project-a");
-  const preparing = sharedWorkspace("group-a____preparing", entryPath, "preparing", [
-    { name: "project-b", repo: "/repos/project-b", base: "main", path: plannedPath, branch: "thread-project-b", created: false },
-  ]);
+  const preparing = {
+    ...sharedWorkspace("group-a____preparing", entryPath, "preparing", [
+      { name: "project-b", repo: "/repos/project-b", base: "main", path: plannedPath, branch: "thread-project-b", created: false },
+    ]),
+    workspaceRoot,
+  };
   const failed = sharedWorkspace("group-a____failed", entryPath, "failed", [
     { name: "project-a", repo: "/repos/project-a", base: "release", path: createdPath, branch: "thread-project-a", created: true },
     { name: "project-b", repo: "/repos/project-b", base: "main", path: plannedPath, branch: "thread-project-b", created: false },
@@ -143,7 +148,7 @@ test("preparing and failed ownership plus planned/created outcomes survive datab
   }
 });
 
-test("opening a legacy database adds workspace ownership without replacing existing bindings", async () => {
+test("opening a legacy database adds nullable workspace ownership without changing existing records", async () => {
   const root = await mkdtemp(join(tmpdir(), "omp-channel-octo-workspace-ownership-legacy-"));
   const stateDir = join(root, "state");
   await mkdir(stateDir, { recursive: true });
@@ -156,6 +161,10 @@ test("opening a legacy database adds workspace ownership without replacing exist
     sessionFile: null,
     cwdPinned: true,
   };
+  const legacyWorkspace = sharedWorkspace(legacyBinding.channelId, join(root, "legacy-entry"), "preparing", [
+    { name: "legacy-project", repo: "/repos/legacy-project", path: join(root, "legacy-entry", "legacy-project"), branch: "thread-legacy-project", created: false },
+  ]);
+
   const legacyDb = new Database(join(stateDir, "channel.sqlite"));
   try {
     legacyDb.exec(`
@@ -171,6 +180,18 @@ test("opening a legacy database adds workspace ownership without replacing exist
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY(bot_uid, channel_type, channel_id)
+      );
+      CREATE TABLE thread_workspaces (
+        bot_uid TEXT NOT NULL,
+        channel_type INTEGER NOT NULL CHECK(channel_type = 5),
+        channel_id TEXT NOT NULL,
+        layout TEXT NOT NULL CHECK(layout IN ('single', 'shared', 'separate')),
+        status TEXT NOT NULL CHECK(status IN ('preparing', 'ready', 'failed')),
+        entry_path TEXT,
+        projects TEXT NOT NULL,
+        error TEXT,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(bot_uid, channel_id)
       );
     `);
     legacyDb.query(
@@ -188,13 +209,26 @@ test("opening a legacy database adds workspace ownership without replacing exist
       10,
       10,
     );
+    legacyDb.query(
+      `INSERT INTO thread_workspaces(bot_uid, channel_type, channel_id, layout, status, entry_path, projects, error, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      legacyWorkspace.botUid,
+      legacyWorkspace.channelType,
+      legacyWorkspace.channelId,
+      legacyWorkspace.layout,
+      legacyWorkspace.status,
+      legacyWorkspace.entryPath,
+      JSON.stringify(legacyWorkspace.projects),
+      legacyWorkspace.error,
+      10,
+    );
+    const columns = legacyDb.query("PRAGMA table_info(thread_workspaces)").all() as Array<{ name: string }>;
+    expect(columns.map(({ name }) => name)).not.toContain("workspace_root");
   } finally {
     legacyDb.close();
   }
 
-  const workspace = sharedWorkspace(legacyBinding.channelId, join(root, "legacy-entry"), "preparing", [
-    { name: "legacy-project", repo: "/repos/legacy-project", path: join(root, "legacy-entry", "legacy-project"), branch: "thread-legacy-project", created: false },
-  ]);
   try {
     const upgraded = await openChannelStore(stateDir);
     try {
@@ -203,7 +237,7 @@ test("opening a legacy database adds workspace ownership without replacing exist
         cwd: legacyBinding.cwd,
         cwdPinned: true,
       });
-      upgraded.saveThreadWorkspace(workspace);
+      expect(upgraded.getThreadWorkspace(botUid, legacyBinding)).toEqual(legacyWorkspace);
     } finally {
       upgraded.close();
     }
@@ -215,14 +249,42 @@ test("opening a legacy database adds workspace ownership without replacing exist
         cwd: legacyBinding.cwd,
         cwdPinned: true,
       });
-      expect(reopened.getThreadWorkspace(botUid, legacyBinding)).toEqual(workspace);
+      expect(reopened.getThreadWorkspace(botUid, legacyBinding)).toEqual(legacyWorkspace);
     } finally {
       reopened.close();
+    }
+
+    const migratedDb = new Database(join(stateDir, "channel.sqlite"), { readonly: true });
+    try {
+      const columns = migratedDb.query("PRAGMA table_info(thread_workspaces)").all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+      }>;
+      expect(columns.find(({ name }) => name === "workspace_root"))
+        .toMatchObject({ type: "TEXT", notnull: 0 });
+      const storedWorkspace = migratedDb.query(`
+        SELECT layout, status, entry_path, workspace_root, projects, error, updated_at
+        FROM thread_workspaces
+        WHERE bot_uid = ? AND channel_id = ?
+      `).get(botUid, legacyBinding.channelId);
+      expect(storedWorkspace).toEqual({
+        layout: "shared",
+        status: "preparing",
+        entry_path: legacyWorkspace.entryPath,
+        workspace_root: null,
+        projects: JSON.stringify(legacyWorkspace.projects),
+        error: null,
+        updated_at: 10,
+      });
+    } finally {
+      migratedDb.close();
     }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
+
 
 test("workspace directory expansion covers entries, owned projects, subdirectories, and explicit parent bindings by path segments", async () => {
   await withStore(async (store, _stateDir, root) => {

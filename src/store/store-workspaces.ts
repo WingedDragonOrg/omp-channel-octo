@@ -28,13 +28,14 @@ export function saveThreadWorkspaces(db: Database, records: readonly ThreadWorks
       run(
         db,
         `INSERT INTO thread_workspaces(
-           bot_uid, channel_type, channel_id, layout, status, entry_path, projects, legacy_worktree_name, error, updated_at
-         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           bot_uid, channel_type, channel_id, layout, status, entry_path, workspace_root, projects, legacy_worktree_name, error, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(bot_uid, channel_id) DO UPDATE SET
            channel_type = excluded.channel_type,
            layout = excluded.layout,
            status = excluded.status,
            entry_path = excluded.entry_path,
+           workspace_root = excluded.workspace_root,
            projects = excluded.projects,
            legacy_worktree_name = excluded.legacy_worktree_name,
            error = excluded.error,
@@ -46,6 +47,7 @@ export function saveThreadWorkspaces(db: Database, records: readonly ThreadWorks
           record.layout,
           record.status,
           record.entryPath,
+          record.workspaceRoot ?? null,
           JSON.stringify(record.projects),
           record.legacyWorktreeName ?? null,
           record.error,
@@ -63,7 +65,7 @@ export function getThreadWorkspace(
 ): ThreadWorkspaceRecord | null {
   const row = query(
     db,
-    `SELECT bot_uid, channel_type, channel_id, layout, status, entry_path, projects, legacy_worktree_name, error
+    `SELECT bot_uid, channel_type, channel_id, layout, status, entry_path, workspace_root, projects, legacy_worktree_name, error
      FROM thread_workspaces WHERE bot_uid = ? AND channel_type = ? AND channel_id = ?`,
     [botUid, target.channelType, target.channelId],
   )[0];
@@ -73,7 +75,7 @@ export function getThreadWorkspace(
 export function listThreadWorkspaces(db: Database, botUid: string): ThreadWorkspaceRecord[] {
   return query(
     db,
-    `SELECT bot_uid, channel_type, channel_id, layout, status, entry_path, projects, legacy_worktree_name, error
+    `SELECT bot_uid, channel_type, channel_id, layout, status, entry_path, workspace_root, projects, legacy_worktree_name, error
      FROM thread_workspaces WHERE bot_uid = ? ORDER BY channel_id ASC`,
     [botUid],
   ).map(threadWorkspaceFromRow);
@@ -357,15 +359,17 @@ export function workspaceDirectories(db: Database, cwd: string): string[] {
     if (!matchesOwnedResource(cwd, record)) continue;
 
     const entry = record.entryPath;
+    const workspaceRoot = record.workspaceRoot ?? null;
     const projects = record.projects.flatMap((project) => project.path ? [project.path] : []);
     if (entry !== null) directories.add(entry);
+    if (workspaceRoot !== null) directories.add(workspaceRoot);
     for (const projectPath of projects) directories.add(projectPath);
   }
 
   return [...directories];
 }
 
-/** True when cwd is related to any entry or project path owned by a thread workspace. */
+/** True when cwd is related to an owned task root, entry, or project path. */
 export function isWorkspaceDirectoryOwned(db: Database, cwd: string): boolean {
   return listThreadWorkspaceRecords(db).some((record) => matchesOwnedResource(cwd, record));
 }
@@ -373,15 +377,17 @@ export function isWorkspaceDirectoryOwned(db: Database, cwd: string): boolean {
 function listThreadWorkspaceRecords(db: Database): ThreadWorkspaceRecord[] {
   return query(
     db,
-    `SELECT bot_uid, channel_type, channel_id, layout, status, entry_path, projects, legacy_worktree_name, error
+    `SELECT bot_uid, channel_type, channel_id, layout, status, entry_path, workspace_root, projects, legacy_worktree_name, error
      FROM thread_workspaces`,
   ).map(threadWorkspaceFromRow);
 }
 
 function matchesOwnedResource(cwd: string, record: ThreadWorkspaceRecord): boolean {
   const entry = record.entryPath;
+  const workspaceRoot = record.workspaceRoot ?? null;
   const projects = record.projects.flatMap((project) => project.path ? [project.path] : []);
-  return (entry !== null && pathsRelated(cwd, entry))
+  return (workspaceRoot !== null && pathsRelated(cwd, workspaceRoot))
+    || (entry !== null && pathsRelated(cwd, entry))
     || projects.some((projectPath) => pathsRelated(cwd, projectPath));
 }
 
@@ -406,6 +412,7 @@ function threadWorkspaceFromRow(row: Record<string, unknown>): ThreadWorkspaceRe
     layout,
     status,
     entryPath: asNullableString(row.entry_path),
+    workspaceRoot: asNullableString(row.workspace_root),
     projects,
     ...(legacyWorktreeName === null ? {} : { legacyWorktreeName }),
     error: asNullableString(row.error),

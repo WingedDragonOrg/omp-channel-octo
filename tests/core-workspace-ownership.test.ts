@@ -59,6 +59,7 @@ function workspaceRecord(
     layout,
     status,
     entryPath,
+    workspaceRoot: null,
     projects: projects.map(({ name, path, created = true }) => ({
       name,
       repo: `/repos/${name}`,

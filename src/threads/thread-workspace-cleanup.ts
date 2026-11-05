@@ -1,3 +1,4 @@
+import { relative, sep } from "node:path";
 import { lstat, realpath, rmdir } from "node:fs/promises";
 import { safeDisplayText } from "../cards/execution-text.ts";
 import type {
@@ -46,6 +47,7 @@ export function threadWorkspaceCleanupPaths(
     if (deleteBranch && (project.created || project.branch !== null)) paths.push(project.repo);
   }
   if (ownership.entryPath !== null) paths.push(ownership.entryPath);
+  if (ownership.workspaceRoot != null) paths.push(ownership.workspaceRoot);
   return [...new Set(paths)];
 }
 
@@ -79,14 +81,24 @@ export async function cleanupOwnedThreadWorkspace(
 
   try {
     await lease.ready;
-    if (ownership.layout === "shared" && ownership.entryPath !== null) {
-      try {
-        const entry = await lstat(ownership.entryPath);
-        if (entry.isSymbolicLink() || !entry.isDirectory() || await realpath(ownership.entryPath) !== ownership.entryPath) {
-          return { complete: false, unknown: false, messages: ["共享入口已被替换，资源已保留"] };
+    if (ownership.layout === "shared") {
+      const rootPath = ownership.workspaceRoot ?? null;
+      const entryPath = ownership.entryPath;
+      if (rootPath !== null && entryPath !== null && !isDirectChildPath(rootPath, entryPath)) {
+        return { complete: false, unknown: false, messages: ["共享入口不属于已记录的任务目录，资源已保留"] };
+      }
+      const rootState = rootPath === null ? null : await inspectOwnedDirectory(rootPath);
+      if (rootState?.kind === "unsafe") {
+        return { complete: false, unknown: false, messages: [`任务目录已被替换，资源已保留：${rootState.reason}`] };
+      }
+      if (entryPath !== null) {
+        const entryState = await inspectOwnedDirectory(entryPath);
+        if (entryState.kind === "unsafe") {
+          return { complete: false, unknown: false, messages: [`共享入口已被替换，资源已保留：${entryState.reason}`] };
         }
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        if (rootState?.kind === "missing" && entryState.kind === "valid") {
+          return { complete: false, unknown: false, messages: ["任务目录已不存在但入口仍存在，资源已保留"] };
+        }
       }
     }
     for (const project of ownership.projects) {
@@ -164,6 +176,31 @@ export async function cleanupOwnedThreadWorkspace(
         messages.push(`共享入口未清理：${entryResult}`);
       }
     }
+    const rootPath = ownership.workspaceRoot ?? null;
+    if (
+      !stop
+      && !isAborted(signal)
+      && ownership.layout === "shared"
+      && rootPath !== null
+      && ownership.entryPath === null
+      && projectsReleased(ownership)
+    ) {
+      const rootResult = await removeSharedEntry(rootPath, signal);
+      if (rootResult === "removed" || rootResult === "missing") {
+        ownership.workspaceRoot = null;
+        try {
+          store.saveThreadWorkspace(ownership);
+          if (rootResult === "removed") messages.push("任务目录已清理");
+        } catch (error) {
+          ownership.workspaceRoot = rootPath;
+          messages.push(`任务目录状态更新失败：${boundedError(error)}`);
+        }
+      } else if (rootResult === "nonempty") {
+        messages.push("任务目录仍含有未知资源，已保留");
+      } else {
+        messages.push(`任务目录未清理：${rootResult}`);
+      }
+    }
   } catch (error) {
     messages.push(`工作区清理失败：${boundedError(error)}`);
   } finally {
@@ -172,7 +209,7 @@ export async function cleanupOwnedThreadWorkspace(
 
   const complete = ownership.projects.every(project =>
     !project.created && project.path === null && project.branch === null,
-  ) && ownership.entryPath === null;
+  ) && ownership.entryPath === null && (ownership.workspaceRoot ?? null) === null;
   return {
     complete,
     unknown: options.isUnknown?.() === true,
@@ -215,6 +252,35 @@ function projectsReleased(ownership: ThreadWorkspaceRecord): boolean {
     !project.created && project.path === null && project.branch === null,
   );
 }
+type OwnedDirectoryInspection =
+  | { readonly kind: "valid" }
+  | { readonly kind: "missing" }
+  | { readonly kind: "unsafe"; readonly reason: string };
+
+function isDirectChildPath(parent: string, child: string): boolean {
+  const relativePath = relative(parent, child);
+  return relativePath !== ""
+    && relativePath !== ".."
+    && !relativePath.startsWith(`..${sep}`)
+    && !relativePath.includes(sep);
+}
+
+async function inspectOwnedDirectory(path: string): Promise<OwnedDirectoryInspection> {
+  try {
+    const info = await lstat(path);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      return { kind: "unsafe", reason: "不是原有的目录" };
+    }
+    if (await realpath(path) !== path) {
+      return { kind: "unsafe", reason: "路径未规范化或父路径已变化" };
+    }
+    return { kind: "valid" };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
+    return { kind: "unsafe", reason: boundedError(error) };
+  }
+}
+
 
 async function removeSharedEntry(path: string, signal?: AbortSignal): Promise<"removed" | "missing" | "nonempty" | string> {
   try {

@@ -30,7 +30,7 @@ test("legacy shared cleanup removes its empty entry while Git keeps the project 
     await git(repo, "worktree", "add", "-qb", "feature", worktree);
     const record = {
       botUid: "bot", channelType: 5 as const, channelId: "group____topic", layout: "shared" as const,
-      status: "ready" as const, entryPath: entry, error: null,
+      status: "ready" as const, entryPath: entry, workspaceRoot: null, error: null,
       projects: [{ name: "project", repo, path: worktree, branch: "feature", created: true }],
     };
     store.saveThreadWorkspace(record);
@@ -59,7 +59,7 @@ test("cancelled cleanup leaves an empty shared entry in place", async () => {
     await mkdir(entry);
     const ownership = {
       botUid: "bot", channelType: 5 as const, channelId: "group____topic", layout: "shared" as const,
-      status: "failed" as const, entryPath: entry, error: null,
+      status: "failed" as const, entryPath: entry, workspaceRoot: null, error: null,
       projects: [{ name: "removed", repo: root, path: null, branch: null, created: false }],
     };
     store.saveThreadWorkspace(ownership);
@@ -97,7 +97,7 @@ test("legacy cleanup refuses incomplete branch ownership even with force", async
     await writeFile(sentinel, "must survive incomplete ownership\\n");
     const ownership = {
       botUid: "bot", channelType: 5 as const, channelId: "group____incomplete", layout: "single" as const,
-      status: "ready" as const, entryPath: null, error: null,
+      status: "ready" as const, entryPath: null, workspaceRoot: null, error: null,
       projects: [{ name: "project", repo, path, branch: null, created: true }],
     };
     store.saveThreadWorkspace(ownership);
@@ -109,6 +109,82 @@ test("legacy cleanup refuses incomplete branch ownership even with force", async
     expect(existsSync(sentinel)).toBe(true);
     expect(await git(repo, "rev-parse", "refs/heads/other-feature")).toBe(await git(repo, "rev-parse", "HEAD"));
     expect(store.getThreadWorkspace("bot", ownership)?.projects[0]?.path).toBe(path);
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("shared cleanup removes only an empty owned task root and preserves unknown resources", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oco-owned-task-root-")));
+  const store = await openChannelStore(join(root, "state"));
+  const git = async (cwd: string, ...args: string[]): Promise<string> => {
+    const child = Bun.spawn(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+    const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    if (code !== 0) throw new Error(err);
+    return out.trim();
+  };
+  try {
+    const repo = join(root, "source");
+    const workspaces = join(root, "thread-workspaces");
+    const emptyRoot = join(workspaces, "empty-task");
+    const emptyEntry = join(emptyRoot, "scope");
+    const emptyProject = join(emptyEntry, "project");
+    const occupiedRoot = join(workspaces, "occupied-task");
+    const occupiedEntry = join(occupiedRoot, "scope");
+    const occupiedProject = join(occupiedEntry, "project");
+    const unknownFile = join(occupiedRoot, "unrecognized-resource");
+    const foreignFile = join(workspaces, "other-task", "keep");
+    await mkdir(repo);
+    await git(repo, "init", "-qb", "main");
+    await writeFile(join(repo, "base"), "base\n");
+    await git(repo, "add", ".");
+    await git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-qm", "base");
+    await mkdir(emptyEntry, { recursive: true });
+    await mkdir(occupiedEntry, { recursive: true });
+    await mkdir(join(workspaces, "other-task"), { recursive: true });
+    await writeFile(unknownFile, "must survive cleanup\n");
+    await writeFile(foreignFile, "owned by another task\n");
+    await git(repo, "worktree", "add", "-qb", "empty-feature", emptyProject);
+    await git(repo, "worktree", "add", "-qb", "occupied-feature", occupiedProject);
+
+    const emptyOwnership = {
+      botUid: "bot", channelType: 5 as const, channelId: "group____empty", layout: "shared" as const,
+      status: "ready" as const, entryPath: emptyEntry, workspaceRoot: emptyRoot, error: null,
+      projects: [{ name: "project", repo, path: emptyProject, branch: "empty-feature", created: true }],
+    };
+    const occupiedOwnership = {
+      botUid: "bot", channelType: 5 as const, channelId: "group____occupied", layout: "shared" as const,
+      status: "ready" as const, entryPath: occupiedEntry, workspaceRoot: occupiedRoot, error: null,
+      projects: [{ name: "project", repo, path: occupiedProject, branch: "occupied-feature", created: true }],
+    };
+    store.saveThreadWorkspace(emptyOwnership);
+    store.saveThreadWorkspace(occupiedOwnership);
+    const cleanupOptions = {
+      store,
+      worktrees: createWorktreePort({ command: "/no/omp", worktrunkCandidates: [] }),
+      deleteBranch: false, force: false,
+      lease: { ready: Promise.resolve(), complete() {} },
+    };
+
+    const emptyResult = await cleanupOwnedThreadWorkspace({ ...cleanupOptions, ownership: emptyOwnership });
+    expect(emptyResult.complete).toBe(true);
+    expect(existsSync(emptyProject)).toBe(false);
+    expect(existsSync(emptyEntry)).toBe(false);
+    expect(existsSync(emptyRoot)).toBe(false);
+    expect(store.getThreadWorkspace("bot", emptyOwnership)).toMatchObject({
+      entryPath: null, workspaceRoot: null, projects: [{ path: null, branch: null, created: false }],
+    });
+
+    await cleanupOwnedThreadWorkspace({ ...cleanupOptions, ownership: occupiedOwnership });
+    expect(existsSync(occupiedProject)).toBe(false);
+    expect(existsSync(occupiedEntry)).toBe(false);
+    expect(existsSync(occupiedRoot)).toBe(true);
+    expect(await Bun.file(unknownFile).text()).toBe("must survive cleanup\n");
+    expect(store.getThreadWorkspace("bot", occupiedOwnership)).toMatchObject({
+      entryPath: null, workspaceRoot: occupiedRoot, projects: [{ path: null, branch: null, created: false }],
+    });
+    expect(await Bun.file(foreignFile).text()).toBe("owned by another task\n");
   } finally {
     store.close();
     await rm(root, { recursive: true, force: true });

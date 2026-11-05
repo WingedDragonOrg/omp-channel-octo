@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join, relative, sep } from "node:path";
+import { basename, dirname, join, relative, sep } from "node:path";
 import type {
   ChatTarget,
   HostTool,
@@ -218,6 +218,21 @@ async function storedThreadWorkspace(harness: CoreHarness, channelId: string) {
   }
 }
 
+async function storedGroupCwd(harness: CoreHarness): Promise<string | null> {
+  const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+  try {
+    return store.getBinding(harness.bot.uid, GROUP_TARGET)?.cwd ?? null;
+  } finally {
+    store.close();
+  }
+}
+
+async function storedGroupScopeName(harness: CoreHarness): Promise<string> {
+  const cwd = await storedGroupCwd(harness);
+  if (cwd === null) throw new Error("main group has no durable cwd binding");
+  return basename(cwd).toLowerCase();
+}
+
 function toolSignal(): AbortSignal {
   return new AbortController().signal;
 }
@@ -248,6 +263,21 @@ async function sendGroupTask(harness: CoreHarness, messageId: string, text: stri
   }));
 }
 
+async function bindGroupCwd(
+  harness: CoreHarness,
+  messageId: string,
+  cwd: string,
+): Promise<void> {
+  await sendGroupTask(harness, messageId, `/new "${cwd}"`);
+  const status = await waitForStatus(
+    harness.service,
+    GROUP_TARGET,
+    (current) => current.cwd === cwd && current.sessionId !== null,
+  );
+  expect(status.cwd).toBe(cwd);
+  expect(await storedGroupCwd(harness)).toBe(cwd);
+}
+
 async function sendThreadTask(
   harness: CoreHarness,
   channelId: string,
@@ -266,6 +296,41 @@ async function sendThreadTask(
 function isInside(parent: string, path: string): boolean {
   const child = relative(parent, path);
   return child.length > 0 && child !== ".." && !child.startsWith(`..${sep}`);
+}
+
+async function assertScopedSharedWorkspace(
+  harness: CoreHarness,
+  result: SharedOutcome,
+  scopeName: string,
+): Promise<string> {
+  expect(result.layout).toBe("shared");
+  expect(result.ready).toBe(true);
+  if (!result.cwd) throw new Error("shared workspace omitted its scope entry path");
+
+  const workspaceRoot = join(harness.stateDir, "thread-workspaces");
+  expect(isInside(workspaceRoot, result.cwd)).toBe(true);
+  const entrySegments = relative(workspaceRoot, result.cwd).split(sep);
+  expect(entrySegments).toHaveLength(2);
+  expect(entrySegments[1]).toBe(scopeName);
+  expect(basename(result.cwd)).toBe(scopeName);
+  expect(await realpath(result.cwd)).toBe(result.cwd);
+  expect(await isGitRepository(result.cwd)).toBe(false);
+
+  const persisted = await storedThreadWorkspace(harness, result.channel_id);
+  expect(persisted?.status).toBe("ready");
+  expect(persisted?.workspaceRoot).toBe(dirname(result.cwd));
+  expect(persisted?.entryPath).toBe(result.cwd);
+  expect(persisted?.projects.map(({ name, repo, path, branch }) => ({ name, repo, path, branch })))
+    .toEqual(result.projects.map(({ name, repo, path, branch }) => ({ name, repo, path, branch })));
+  expect(result.projects.length).toBeGreaterThan(0);
+  for (const project of result.projects) {
+    if (!project.path) throw new Error(`shared project ${project.name} omitted its worktree path`);
+    expect(project.created).toBe(true);
+    expect(project.path).toBe(join(result.cwd, project.name));
+    expect(await realpath(project.path)).toBe(project.path);
+    expect(await runGit(project.path, ["rev-parse", "--show-toplevel"])).toBe(project.path);
+  }
+  return dirname(result.cwd);
 }
 
 function promptCompletionLatch(): { completion: Promise<void>; complete: () => void } {
@@ -294,6 +359,237 @@ async function finishThreadTask(harness: CoreHarness, channelId: string): Promis
   );
   expect(status.state).toBe("completed");
 }
+
+test("shared workspaces use the primary Git scope name and isolate colliding task entries", async () => {
+  const taskSlug = "independent-authentication-maintenance";
+  const outcomes: SharedOutcome[] = [];
+  let callbackError: string | undefined;
+  let observedGroupCwd: string | undefined;
+  const parentPrompt = promptCompletionLatch();
+  const { harness } = await createWorkspaceHarness(async ({ cwd, promptContext, text }) => {
+    const isParentTask = text === "create same-named shared tasks from the Git binding";
+    try {
+      if (!isParentTask) return;
+      observedGroupCwd = cwd;
+      const management = managementTool(promptContext);
+      outcomes.length = 0;
+      for (const [index, repo] of [firstRepo, secondRepo].entries()) {
+        outcomes.push(JSON.parse(await createThread(management, {
+          name: `Git Scoped Shared Task ${index + 1}`,
+          layout: "shared",
+          worktree_name: taskSlug,
+          projects: [{ name: "shared-service", repo }],
+        })) as SharedOutcome);
+      }
+    } catch (error) {
+      callbackError = error instanceof Error ? error.message : String(error);
+    } finally {
+      if (isParentTask) parentPrompt.complete();
+    }
+  });
+  let mainRepo = "";
+  let groupCwd = "";
+  let firstRepo = "";
+  let secondRepo = "";
+  try {
+    mainRepo = await createRepo(harness.root, "primary-group-scope", "main group repository\n");
+    groupCwd = join(harness.root, "group-checkout-with-a-different-name");
+    await runGit(mainRepo, ["worktree", "add", groupCwd, "-b", "group-scope-checkout", "-q"]);
+    groupCwd = await realpath(groupCwd);
+    firstRepo = await createRepo(harness.root, "first-shared-source", "first source\n");
+    secondRepo = await createRepo(harness.root, "second-shared-source", "second source\n");
+
+    await bindGroupCwd(harness, "bind-primary-git-scope", groupCwd);
+    expect(await isGitRepository(groupCwd)).toBe(true);
+    expect(await runGit(groupCwd, ["rev-parse", "--show-toplevel"])).toBe(groupCwd);
+    expect(basename(groupCwd)).not.toBe(basename(mainRepo));
+
+    await sendGroupTask(harness, "git-scope-shared-create", "create same-named shared tasks from the Git binding");
+    await finishGroupTask(harness, parentPrompt.completion);
+
+    expect(callbackError).toBeUndefined();
+    expect(observedGroupCwd).toBe(groupCwd);
+    expect(await storedGroupCwd(harness)).toBe(groupCwd);
+    expect(outcomes).toHaveLength(2);
+    const taskDirectories: string[] = [];
+    for (const result of outcomes) {
+      taskDirectories.push(await assertScopedSharedWorkspace(harness, result, basename(mainRepo)));
+    }
+    expect(new Set(outcomes.map(({ cwd }) => cwd)).size).toBe(2);
+    expect(new Set(taskDirectories).size).toBe(2);
+    expect(taskDirectories.map((path) => basename(path)).sort()).toEqual([taskSlug, `${taskSlug}-2`].sort());
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("shared workspace uses the bare Git common directory as the parent scope", async () => {
+  let result: SharedOutcome | undefined;
+  let failure: string | undefined;
+  let project = "";
+  const completed = promptCompletionLatch();
+  const { harness } = await createWorkspaceHarness(async ({ promptContext, text }) => {
+    if (text !== "create from bare worktree") return;
+    try {
+      result = JSON.parse(await createThread(managementTool(promptContext), {
+        name: "Bare Scope",
+        layout: "shared",
+        worktree_name: "bare-scope-task",
+        projects: [{ name: "service", repo: project }],
+      })) as SharedOutcome;
+    } catch (error) {
+      failure = String(error);
+    } finally {
+      completed.complete();
+    }
+  });
+  try {
+    const source = await createRepo(harness.root, "source-bare", "source\n");
+    project = await createRepo(harness.root, "bare-task-project", "project\n");
+    const bare = join(harness.root, "business-domain.git");
+    await runGit(harness.root, ["clone", "--bare", "-q", source, bare]);
+    const checkout = join(harness.root, "different-bare-checkout");
+    await runGit(bare, ["worktree", "add", "-q", "-b", "group-session", checkout]);
+    await bindGroupCwd(harness, "bind-bare-worktree", await realpath(checkout));
+    await sendGroupTask(harness, "create-bare-worktree", "create from bare worktree");
+    await finishGroupTask(harness, completed.completion);
+    expect(failure).toBeUndefined();
+    if (!result) throw new Error("shared workspace was not created");
+    await assertScopedSharedWorkspace(harness, result, "business-domain.git");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("shared workspace matches OMP's scope for a filesystem-root binding", async () => {
+  let result: SharedOutcome | undefined;
+  let failure: string | undefined;
+  let project = "";
+  const completed = promptCompletionLatch();
+  const { harness } = await createWorkspaceHarness(async ({ promptContext, text }) => {
+    if (text !== "create from filesystem root") return;
+    try {
+      result = JSON.parse(await createThread(managementTool(promptContext), {
+        name: "Root Scope",
+        layout: "shared",
+        worktree_name: "filesystem-root-scope",
+        projects: [{ name: "service", repo: project }],
+      })) as SharedOutcome;
+    } catch (error) {
+      failure = String(error);
+    } finally {
+      completed.complete();
+    }
+  });
+  try {
+    project = await createRepo(harness.root, "root-scope-project", "project\n");
+    await bindGroupCwd(harness, "bind-filesystem-root", "/");
+    await sendGroupTask(harness, "create-filesystem-root", "create from filesystem root");
+    await finishGroupTask(harness, completed.completion);
+    expect(failure).toBeUndefined();
+    if (!result) throw new Error("shared workspace was not created");
+    await assertScopedSharedWorkspace(harness, result, "unknown");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("shared workspaces created from a source subarea keep the non-Git parent scope and colliding entries separate", async () => {
+  const taskSlug = "nested-shared-maintenance";
+  let sourceThread: SingleOutcome | undefined;
+  let dispatch: DispatchedOutcome | undefined;
+  const nestedOutcomes: SharedOutcome[] = [];
+  let parentError: string | undefined;
+  let sourceError: string | undefined;
+  let parentTaskCwd: string | undefined;
+  let sourceTaskCwd: string | undefined;
+  const parentPrompt = promptCompletionLatch();
+  const sourcePrompt = promptCompletionLatch();
+  const { harness } = await createWorkspaceHarness(async ({ cwd, promptContext, text }) => {
+    const isParentTask = text === "create a source subarea and nested shared workspaces";
+    const isSourceTask = text === "create shared workspaces from the source subarea";
+    try {
+      if (isParentTask) {
+        parentTaskCwd = cwd;
+        const management = managementTool(promptContext);
+        sourceThread = JSON.parse(await createThread(management, {
+          name: "Git Source Subarea",
+          worktree_name: "source-area-checkout",
+          projects: [{ name: "source-project", repo: sourceRepo }],
+        })) as SingleOutcome;
+        if (!sourceThread.ready || !sourceThread.cwd) {
+          throw new Error("source subarea was not ready with its Git worktree cwd");
+        }
+        dispatch = await dispatchThread(management, sourceThread.short_id, "create shared workspaces from the source subarea");
+      } else if (isSourceTask) {
+        sourceTaskCwd = cwd;
+        const management = managementTool(promptContext);
+        nestedOutcomes.length = 0;
+        for (const [index, repo] of [firstRepo, secondRepo].entries()) {
+          nestedOutcomes.push(JSON.parse(await createThread(management, {
+            name: `Nested Shared Task ${index + 1}`,
+            layout: "shared",
+            worktree_name: taskSlug,
+            projects: [{ name: "nested-service", repo }],
+          })) as SharedOutcome);
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isParentTask) parentError = message;
+      else if (isSourceTask) sourceError = message;
+    } finally {
+      if (isParentTask) parentPrompt.complete();
+      if (isSourceTask) sourcePrompt.complete();
+    }
+  });
+  let groupCwd = "";
+  let sourceRepo = "";
+  let firstRepo = "";
+  let secondRepo = "";
+  try {
+    const groupCwdCandidate = join(harness.root, "plain-main-group-scope");
+    await mkdir(groupCwdCandidate, { recursive: true });
+    groupCwd = await realpath(groupCwdCandidate);
+    sourceRepo = await createRepo(harness.root, "git-source-subarea", "source repository\n");
+    firstRepo = await createRepo(harness.root, "nested-source-one", "nested source one\n");
+    secondRepo = await createRepo(harness.root, "nested-source-two", "nested source two\n");
+    await bindGroupCwd(harness, "bind-plain-group-scope", groupCwd);
+    expect(await isGitRepository(groupCwd)).toBe(false);
+
+    await sendGroupTask(harness, "source-subarea-shared-create", "create a source subarea and nested shared workspaces");
+    await finishGroupTask(harness, parentPrompt.completion);
+    expect(parentError).toBeUndefined();
+    expect(parentTaskCwd).toBe(groupCwd);
+    expect(sourceThread?.ready).toBe(true);
+    expect(dispatch).toMatchObject({
+      dispatched: true,
+      channel_id: sourceThread?.channel_id,
+    });
+    if (!sourceThread?.cwd) throw new Error("source subarea result omitted its Git cwd");
+
+    await harness.workers.waitForPromptCount(2);
+    await sourcePrompt.completion;
+    await finishThreadTask(harness, sourceThread.channel_id);
+    expect(sourceError).toBeUndefined();
+    expect(sourceTaskCwd).toBe(sourceThread.cwd);
+    expect(await realpath(sourceThread.cwd)).toBe(sourceThread.cwd);
+    expect(await runGit(sourceThread.cwd, ["rev-parse", "--show-toplevel"])).toBe(sourceThread.cwd);
+    expect(basename(sourceThread.cwd)).not.toBe(basename(groupCwd));
+    expect(await storedGroupCwd(harness)).toBe(groupCwd);
+
+    expect(nestedOutcomes).toHaveLength(2);
+    const taskDirectories: string[] = [];
+    for (const result of nestedOutcomes) {
+      taskDirectories.push(await assertScopedSharedWorkspace(harness, result, basename(groupCwd)));
+    }
+    expect(new Set(nestedOutcomes.map(({ cwd }) => cwd)).size).toBe(2);
+    expect(new Set(taskDirectories).size).toBe(2);
+    expect(taskDirectories.map((path) => basename(path)).sort()).toEqual([taskSlug, `${taskSlug}-2`].sort());
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
 
 test("shared multi-project thread has one real entry and dispatch reads both actual source repos", async () => {
   let created: SharedOutcome | undefined;
@@ -403,13 +699,15 @@ test("shared multi-project thread has one real entry and dispatch reads both act
 
     expect(created.cwd).not.toBeNull();
     const entry = created.cwd!;
-    expect(basename(entry)).toBe("consolidate-authentication-services");
+    expect(basename(entry)).toBe(await storedGroupScopeName(harness));
+    expect(basename(dirname(entry))).toBe("consolidate-authentication-services");
     expect(await realpath(entry)).toBe(entry);
     expect(isInside(join(harness.stateDir, "thread-workspaces"), entry)).toBe(true);
     expect(await isGitRepository(entry)).toBe(false);
     const persisted = await storedThreadWorkspace(harness, created.channel_id);
     expect(persisted?.status).toBe("ready");
     expect(persisted?.entryPath).toBe(entry);
+    expect(persisted?.workspaceRoot).toBe(dirname(entry));
     expect(persisted?.projects.map(({ name, repo, path, branch }) => ({ name, repo, path, branch })))
       .toEqual(created.projects.map(({ name, repo, path, branch }) => ({ name, repo, path, branch })));
     expect(created.projects).toHaveLength(2);
@@ -872,7 +1170,8 @@ test("shared project paths and branches use task and project names, not project 
       expect(result.ready).toBe(true);
       expect(result.layout).toBe("shared");
       if (!result.cwd) throw new Error("shared workspace omitted its entry path");
-      expect(basename(result.cwd)).toBe(taskSlug);
+      expect(basename(result.cwd)).toBe(await storedGroupScopeName(harness));
+      expect(basename(dirname(result.cwd))).toBe(taskSlug);
       const pathsByDisplayName = result.projects.map((project) => {
         const projectSlug = projectSlugs[project.name];
         if (!projectSlug || !project.path) throw new Error(`unexpected project name: ${project.name}`);
@@ -887,6 +1186,7 @@ test("shared project paths and branches use task and project names, not project 
       ]);
       const persisted = await storedThreadWorkspace(harness, result.channel_id);
       expect(persisted?.entryPath).toBe(result.cwd);
+      expect(persisted?.workspaceRoot).toBe(dirname(result.cwd));
       expect(persisted?.projects.map(({ name, path, branch }) => ({ name, path, branch })))
         .toEqual(result.projects.map(({ name, path, branch }) => ({ name, path, branch })));
       const context = await transport.getGroupContext({ channelId: result.channel_id, channelType: 5 });
@@ -929,7 +1229,8 @@ test("shared projects from the same repository keep independent slugs and suffix
     expect(callbackError).toBeUndefined();
     if (!created?.cwd) throw new Error("same-repository shared workspace was not created");
     expect(created.ready).toBe(true);
-    expect(basename(created.cwd)).toBe(taskSlug);
+    expect(basename(created.cwd)).toBe(await storedGroupScopeName(harness));
+    expect(basename(dirname(created.cwd))).toBe(taskSlug);
     const actualProjects = created.projects.map((project) => ({
       name: project.name,
       repo: project.repo,
@@ -952,6 +1253,7 @@ test("shared projects from the same repository keep independent slugs and suffix
     ]);
     const persisted = await storedThreadWorkspace(harness, created.channel_id);
     expect(persisted?.entryPath).toBe(created.cwd);
+    expect(persisted?.workspaceRoot).toBe(dirname(created.cwd));
     expect(persisted?.projects.map(({ name, repo: projectRepo, path, branch }) => ({
       name,
       repo: projectRepo,
@@ -1101,7 +1403,7 @@ test("invalid project and task slugs explain how to fix names without allocating
   }
 });
 
-test("occupied shared entry names use the full slug plus a suffix without taking the existing directory", async () => {
+test("occupied shared task-root names use the full slug plus a suffix without taking the existing directory", async () => {
   const taskSlug = "task".repeat(25);
   let created: SharedOutcome | undefined;
   let callbackError: string | undefined;
@@ -1129,20 +1431,23 @@ test("occupied shared entry names use the full slug plus a suffix without taking
   try {
     firstRepo = await createRepo(harness.root, "occupied-entry-one", "one\n");
     secondRepo = await createRepo(harness.root, "occupied-entry-two", "two\n");
-    const occupiedEntry = join(harness.stateDir, "thread-workspaces", taskSlug);
-    await mkdir(occupiedEntry, { recursive: true });
-    await writeFile(join(occupiedEntry, "user-owned.txt"), "keep this directory\n", "utf8");
+    const occupiedWorkspaceRoot = join(harness.stateDir, "thread-workspaces", taskSlug);
+    await mkdir(occupiedWorkspaceRoot, { recursive: true });
+    await writeFile(join(occupiedWorkspaceRoot, "user-owned.txt"), "keep this directory\n", "utf8");
 
     await sendGroupTask(harness, "occupied-entry-create", "create beside an occupied task entry");
     await finishGroupTask(harness, parentPrompt.completion);
+    const scopeName = await storedGroupScopeName(harness);
 
     expect(callbackError).toBeUndefined();
     if (!created?.cwd) throw new Error("occupied-entry result did not include the allocated entry");
-    expect(created.cwd).toBe(`${occupiedEntry}-2`);
-    expect(basename(created.cwd)).toBe(`${taskSlug}-2`);
-    expect(basename(created.cwd).length).toBe(102);
-    expect(await readFile(join(occupiedEntry, "user-owned.txt"), "utf8")).toBe("keep this directory\n");
-    expect(await isGitRepository(occupiedEntry)).toBe(false);
+    const allocatedWorkspaceRoot = `${occupiedWorkspaceRoot}-2`;
+    expect(created.cwd).toBe(join(allocatedWorkspaceRoot, scopeName));
+    expect(dirname(created.cwd)).toBe(allocatedWorkspaceRoot);
+    expect(basename(allocatedWorkspaceRoot)).toBe(`${taskSlug}-2`);
+    expect(basename(allocatedWorkspaceRoot).length).toBe(102);
+    expect(await readFile(join(occupiedWorkspaceRoot, "user-owned.txt"), "utf8")).toBe("keep this directory\n");
+    expect(await isGitRepository(occupiedWorkspaceRoot)).toBe(false);
     expect(created.ready).toBe(true);
     expect(created.projects.map(({ name, path, branch }) => ({ name, path: basename(path!), branch })))
       .toEqual([
@@ -1151,6 +1456,7 @@ test("occupied shared entry names use the full slug plus a suffix without taking
       ]);
     const persisted = await storedThreadWorkspace(harness, created.channel_id);
     expect(persisted?.entryPath).toBe(created.cwd);
+    expect(persisted?.workspaceRoot).toBe(allocatedWorkspaceRoot);
     expect(persisted?.projects.map(({ name, path, branch }) => ({ name, path, branch })))
       .toEqual(created.projects.map(({ name, path, branch }) => ({ name, path, branch })));
     const context = await transport.getGroupContext({ channelId: created.channel_id, channelType: 5 });
@@ -1160,9 +1466,10 @@ test("occupied shared entry names use the full slug plus a suffix without taking
   }
 });
 
-test("thread deletion preserves an external empty directory at a planned shared entry path", async () => {
+test("thread deletion preserves an external empty scope entry under a planned shared task root", async () => {
   const taskSlug = "revoke-unowned-entry-plan";
   let created: SharedOutcome | undefined;
+  let occupiedWorkspaceRoot: string | undefined;
   let occupiedEntry: string | undefined;
   let callbackError: string | undefined;
   let deleteResult: string | undefined;
@@ -1194,14 +1501,14 @@ test("thread deletion preserves an external empty directory at a planned shared 
     await mkdir(join(harness.stateDir, "thread-workspaces"), { recursive: true });
     database = new Database(join(harness.stateDir, "channel.sqlite"));
     database.exec(`
-      CREATE TABLE protected_shared_entry_path (path TEXT PRIMARY KEY);
-      CREATE TRIGGER reject_shared_entry_replan
-      BEFORE UPDATE OF entry_path ON thread_workspaces
+      CREATE TABLE protected_shared_workspace_root (path TEXT PRIMARY KEY);
+      CREATE TRIGGER reject_shared_workspace_replan
+      BEFORE UPDATE OF workspace_root ON thread_workspaces
       WHEN EXISTS (
-        SELECT 1 FROM protected_shared_entry_path WHERE path = OLD.entry_path
-      ) AND NEW.entry_path IS NOT OLD.entry_path
+        SELECT 1 FROM protected_shared_workspace_root WHERE path = OLD.workspace_root
+      ) AND NEW.workspace_root IS NOT OLD.workspace_root
       BEGIN
-        SELECT RAISE(ABORT, 'fixture occupied shared entry cannot be replanned');
+        SELECT RAISE(ABORT, 'fixture occupied shared task root cannot be replanned');
       END
     `);
     const collisionDatabase = database;
@@ -1210,11 +1517,13 @@ test("thread deletion preserves an external empty directory at a planned shared 
     const saveThreadWorkspace = candidateStore.saveThreadWorkspace.bind(candidateStore);
     candidateStore.saveThreadWorkspace = (record) => {
       saveThreadWorkspace(record);
-      if (record.entryPath === null || occupiedEntry !== undefined) return;
+      if (record.workspaceRoot == null || record.entryPath === null || occupiedWorkspaceRoot !== undefined) return;
+      occupiedWorkspaceRoot = record.workspaceRoot;
       occupiedEntry = record.entryPath;
       collisionDatabase.query(
-        "INSERT INTO protected_shared_entry_path (path) VALUES (?)",
-      ).run(occupiedEntry);
+        "INSERT INTO protected_shared_workspace_root (path) VALUES (?)",
+      ).run(occupiedWorkspaceRoot);
+      mkdirSync(occupiedWorkspaceRoot);
       mkdirSync(occupiedEntry);
     };
 
@@ -1224,7 +1533,12 @@ test("thread deletion preserves an external empty directory at a planned shared 
     expect(callbackError).toBeUndefined();
     if (!created) throw new Error("thread workspace result was not captured");
     expect(deleteResult).toContain("已删除线程");
-    if (occupiedEntry === undefined) throw new Error("planned shared entry was not intercepted");
+    if (occupiedWorkspaceRoot === undefined || occupiedEntry === undefined) {
+      throw new Error("planned shared task root was not intercepted");
+    }
+    expect(await pathExists(occupiedWorkspaceRoot)).toBe(true);
+    expect(await realpath(occupiedWorkspaceRoot)).toBe(occupiedWorkspaceRoot);
+    expect(await readdir(occupiedWorkspaceRoot)).toEqual([basename(occupiedEntry)]);
     expect(await pathExists(occupiedEntry)).toBe(true);
     expect(await realpath(occupiedEntry)).toBe(occupiedEntry);
     expect(await readdir(occupiedEntry)).toEqual([]);
@@ -1261,6 +1575,11 @@ test("preparing and failed persisted entries reserve their names even when direc
   let repo = "";
   try {
     repo = await createRepo(harness.root, "reserved-entry-source", "origin\n");
+    const groupCwdCandidate = join(harness.root, "reservation-main-group-scope");
+    await mkdir(groupCwdCandidate, { recursive: true });
+    const groupCwd = await realpath(groupCwdCandidate);
+    await bindGroupCwd(harness, "bind-reservation-main-scope", groupCwd);
+    const scopeName = basename(groupCwd).toLowerCase();
     const entryParent = join(harness.stateDir, "thread-workspaces");
     const reserved = [
       { channelId: `${GROUP_ID}____preparing-reservation`, status: "preparing" as const, suffix: "" },
@@ -1269,13 +1588,15 @@ test("preparing and failed persisted entries reserve their names even when direc
     const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
     try {
       for (const reservation of reserved) {
+        const workspaceRoot = join(entryParent, `${taskSlug}${reservation.suffix}`);
         store.saveThreadWorkspace({
           botUid: harness.bot.uid,
           channelType: 5,
           channelId: reservation.channelId,
           layout: "shared",
           status: reservation.status,
-          entryPath: join(entryParent, `${taskSlug}${reservation.suffix}`),
+          workspaceRoot,
+          entryPath: join(workspaceRoot, scopeName),
           projects: [{ name: "admin-web", repo, path: null, branch: null, created: false }],
           error: reservation.status === "failed" ? "previous allocation failed" : null,
         });
@@ -1289,12 +1610,15 @@ test("preparing and failed persisted entries reserve their names even when direc
 
     expect(callbackError).toBeUndefined();
     if (!created?.cwd) throw new Error("reserved-entry result did not include its actual entry");
-    expect(created.cwd).toBe(join(entryParent, `${taskSlug}-3`));
+    expect(created.cwd).toBe(join(entryParent, `${taskSlug}-3`, scopeName));
     expect(created.ready).toBe(true);
     for (const reservation of reserved) {
-      const reservedPath = join(entryParent, `${taskSlug}${reservation.suffix}`);
+      const reservedWorkspaceRoot = join(entryParent, `${taskSlug}${reservation.suffix}`);
+      const reservedPath = join(reservedWorkspaceRoot, scopeName);
+      expect(await pathExists(reservedWorkspaceRoot)).toBe(false);
       expect(await pathExists(reservedPath)).toBe(false);
       const persisted = await storedThreadWorkspace(harness, reservation.channelId);
+      expect(persisted?.workspaceRoot).toBe(reservedWorkspaceRoot);
       expect(persisted?.entryPath).toBe(reservedPath);
       expect(persisted?.status).toBe(reservation.status);
     }
@@ -1331,15 +1655,17 @@ test("concurrent shared creations reserve distinct readable entries and project 
     repo = await createRepo(harness.root, "concurrent-source", "origin\n");
     await sendGroupTask(harness, "concurrent-entry-create", "create two shared workspaces concurrently");
     await finishGroupTask(harness, parentPrompt.completion);
+    const scopeName = await storedGroupScopeName(harness);
 
     expect(callbackError).toBeUndefined();
     expect(created).toHaveLength(2);
     expect(created.every(({ ready }) => ready)).toBe(true);
-    const entries = created.map(({ cwd }) => {
+    const workspaceRoots = created.map(({ cwd }) => {
       if (!cwd) throw new Error("concurrent shared result omitted its entry");
-      return basename(cwd);
+      expect(basename(cwd)).toBe(scopeName);
+      return basename(dirname(cwd));
     }).sort();
-    expect(entries).toEqual([taskSlug, `${taskSlug}-2`]);
+    expect(workspaceRoots).toEqual([taskSlug, `${taskSlug}-2`].sort());
     const branches = created.map(({ projects }) => projects[0]?.branch).sort();
     expect(branches).toEqual([taskSlug, `${taskSlug}-2`]);
     expect(new Set(created.map(({ cwd }) => cwd)).size).toBe(2);
@@ -1351,6 +1677,7 @@ test("concurrent shared creations reserve distinct readable entries and project 
         .toBe(result.projects[0].path);
       const persisted = await storedThreadWorkspace(harness, result.channel_id);
       expect(persisted?.entryPath).toBe(result.cwd);
+      expect(persisted?.workspaceRoot).toBe(dirname(result.cwd));
       expect(persisted?.projects[0]?.path).toBe(result.projects[0].path);
     }
   } finally {
@@ -1420,7 +1747,7 @@ test("an occupied shared project path is preserved while ownership follows the s
   }
 });
 
-test("shared entry allocation skips occupied files and symlinks without replacing them", async () => {
+test("shared task-root allocation skips occupied files and symlinks without replacing them", async () => {
   const cases = [
     { taskSlug: "entry-occupied-by-file", kind: "file" },
     { taskSlug: "entry-occupied-by-symlink", kind: "symlink" },
@@ -1465,6 +1792,7 @@ test("shared entry allocation skips occupied files and symlinks without replacin
 
     await sendGroupTask(harness, "occupied-non-directory-create", "allocate after file and symlink collisions");
     await finishGroupTask(harness, parentPrompt.completion);
+    const scopeName = await storedGroupScopeName(harness);
 
     expect(callbackError).toBeUndefined();
     expect(outcomes).toHaveLength(2);
@@ -1472,7 +1800,8 @@ test("shared entry allocation skips occupied files and symlinks without replacin
       const result = outcomes[index];
       if (!result?.cwd) throw new Error(`occupied ${entry.kind} result omitted its entry`);
       const occupiedPath = join(entryParent, entry.taskSlug);
-      expect(result.cwd).toBe(`${occupiedPath}-2`);
+      const allocatedRoot = `${occupiedPath}-2`;
+      expect(result.cwd).toBe(join(allocatedRoot, scopeName));
       expect(result.ready).toBe(true);
       if (entry.kind === "file") {
         expect(await readFile(occupiedPath, "utf8")).toBe("user-owned file\n");
@@ -1518,11 +1847,16 @@ test("a 100-character project slug is retained in its shared directory name", as
       throw new Error("maximum project slug result omitted its workspace path");
     }
     expect(created.ready).toBe(true);
+    expect(basename(created.cwd)).toBe(await storedGroupScopeName(harness));
+    expect(basename(dirname(created.cwd))).toBe(taskSlug);
     expect(created.projects[0].name).toBe(projectName);
     expect(created.projects[0].path).toBe(join(created.cwd, projectSlug));
     expect(basename(created.projects[0].path)).toHaveLength(100);
     expect(await runGit(created.projects[0].path, ["rev-parse", "--show-toplevel"]))
       .toBe(created.projects[0].path);
+    const persisted = await storedThreadWorkspace(harness, created.channel_id);
+    expect(persisted?.workspaceRoot).toBe(dirname(created.cwd));
+    expect(persisted?.entryPath).toBe(created.cwd);
   } finally {
     await closeCoreHarness(harness);
   }
@@ -1562,6 +1896,8 @@ test("a branch collision changes only the branch, not a shared project's stable 
 
     expect(callbackError).toBeUndefined();
     if (!created?.cwd) throw new Error("branch collision result omitted its shared entry");
+    expect(basename(created.cwd)).toBe(await storedGroupScopeName(harness));
+    expect(basename(dirname(created.cwd))).toBe(taskSlug);
     const first = created.projects.find(({ name }) => name === "Admin Web");
     const second = created.projects.find(({ name }) => name === "Customer Web");
     expect(first).toMatchObject({
@@ -1575,6 +1911,8 @@ test("a branch collision changes only the branch, not a shared project's stable 
       created: true,
     });
     const persisted = await storedThreadWorkspace(harness, created.channel_id);
+    expect(persisted?.workspaceRoot).toBe(dirname(created.cwd));
+    expect(persisted?.entryPath).toBe(created.cwd);
     expect(persisted?.projects.map(({ name, path, branch }) => ({ name, path, branch })))
       .toEqual(created.projects.map(({ name, path, branch }) => ({ name, path, branch })));
     const context = await transport.getGroupContext({ channelId: created.channel_id, channelType: 5 });
@@ -1589,7 +1927,13 @@ test("the actual shared project candidate is persisted before Git creates its wo
   const taskSlug = "persist-worktree-plan-before-create";
   let created: SharedOutcome | undefined;
   let callbackError: string | undefined;
-  let planned: { entryPath: string | null; path: string | null; branch: string | null; created: boolean } | undefined;
+  let planned: {
+    workspaceRoot: string | null;
+    entryPath: string | null;
+    path: string | null;
+    branch: string | null;
+    created: boolean;
+  } | undefined;
   const parentPrompt = promptCompletionLatch();
   let harness!: CoreHarness;
   const setup = await createWorkspaceHarness(async ({ promptContext, text }) => {
@@ -1617,9 +1961,9 @@ test("the actual shared project candidate is persisted before Git creates its wo
             const database = new Database(join(harness.stateDir, "channel.sqlite"));
             try {
               const row = database.query(
-                "SELECT entry_path, projects FROM thread_workspaces WHERE bot_uid = ? AND channel_id = ?",
+                "SELECT workspace_root, entry_path, projects FROM thread_workspaces WHERE bot_uid = ? AND channel_id = ?",
               ).get(harness.bot.uid, `${GROUP_ID}____${request.threadId}`) as
-                | { entry_path: string | null; projects: string }
+                | { workspace_root: string | null; entry_path: string | null; projects: string }
                 | null;
               if (!row) throw new Error("planned worktree ownership was not persisted");
               const [project] = JSON.parse(row.projects) as Array<{
@@ -1628,6 +1972,7 @@ test("the actual shared project candidate is persisted before Git creates its wo
                 created: boolean;
               }>;
               planned = {
+                workspaceRoot: row.workspace_root,
                 entryPath: row.entry_path,
                 path: project?.path ?? null,
                 branch: project?.branch ?? null,
@@ -1657,6 +2002,7 @@ test("the actual shared project candidate is persisted before Git creates its wo
       throw new Error("planned worktree result omitted its actual paths");
     }
     expect(planned).toEqual({
+      workspaceRoot: dirname(created.cwd),
       entryPath: created.cwd,
       path: created.projects[0].path,
       branch: created.projects[0].branch,
@@ -1700,6 +2046,7 @@ test("restart keeps historical UUID entry and numbered project paths unchanged",
         channelId: thread.channelId,
         layout: "shared",
         status: "ready",
+        workspaceRoot: null,
         entryPath: legacyEntry,
         projects: [{
           name: "Admin Web",
@@ -1745,6 +2092,7 @@ test("restart keeps historical UUID entry and numbered project paths unchanged",
     expect(await runGit(legacyProjectPath, ["branch", "--show-current"])).toBe(legacyBranch);
     const persisted = await storedThreadWorkspace(restarted, thread.channelId);
     expect(persisted).toMatchObject({
+      workspaceRoot: null,
       layout: "shared",
       status: "ready",
       entryPath: legacyEntry,
