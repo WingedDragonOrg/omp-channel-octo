@@ -14,7 +14,7 @@ const MAX_CANDIDATE_URL_CODE_POINTS = 2048;
 const MAX_CANDIDATE_EXCERPT_CODE_POINTS = 1000;
 const MAX_SOURCE_VERSIONS_PER_THREAD = 128;
 const MAX_TASK_REQUIREMENTS_PER_THREAD = 128;
-const MIN_WORK_OBJECT_PROBABILITY = 0.95;
+const MIN_WORK_OBJECT_PROBABILITY = 0.75;
 
 interface RecentMessage {
   role: "user" | "assistant";
@@ -360,7 +360,7 @@ export class ThreadReferenceCoordinator {
         answer.choice !== "work_object" ||
         typeof answer.probability !== "number" ||
         !Number.isFinite(answer.probability) ||
-        answer.probability < MIN_WORK_OBJECT_PROBABILITY ||
+        answer.probability <= MIN_WORK_OBJECT_PROBABILITY ||
         answer.probability > 1
       ) {
         continue;

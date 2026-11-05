@@ -216,32 +216,40 @@ test("does not classify slash-prefixed assistant finals as user commands", async
   }
 });
 
-test("requires work-object probability at the threshold and writes only the mapped candidate URL", async () => {
+test("binds direct work above 0.75 but excludes the boundary and unrelated links", async () => {
   const { root, store } = await fixture();
-  const tracked = trackedStore(store);
-  const responses: ReferenceEvidence[] = [];
+  const chat = target("threshold");
+  const candidateUrls = [
+    "https://github.com/acme/service/pull/10",
+    "https://github.com/acme/service/pull/11",
+    "https://gitlab.example/acme/drive/-/merge_requests/75",
+    "https://gitlab.example/acme/docs/-/merge_requests/187",
+    "https://gitlab.example/acme/web/drive/-/merge_requests/62",
+    "https://github.com/acme/service/pull/12",
+  ];
+  const probabilities = [0.75, 0.7501, 0.81, 0.84, 0.89, 0.99];
   const coordinator = new ThreadReferenceCoordinator({
-    store: tracked.api,
+    store,
     botUid: () => botUid,
-    judge: async (evidence) => {
-      responses.push(evidence);
-      const candidate = evidence.candidates[0]!;
-      return [{
-        id: candidate.id,
-        choice: "work_object",
-        confidence: 0.99,
-        probability: responses.length === 1 ? 0.949 : 0.95,
-        url: "https://attacker.example/other/pull/999",
-      } as ReferenceJudgment];
-    },
+    judge: async evidence => evidence.candidates.map((candidate, index) => ({
+      id: candidate.id,
+      choice: index === 5 ? "reference_or_unrelated" : "work_object",
+      confidence: 0.99,
+      probability: probabilities[index]!,
+      url: "https://attacker.example/other/pull/999",
+    } as ReferenceJudgment)),
   });
   try {
-    coordinator.observeUser(target("threshold"), "weak", `Review ${url}`, "task-1");
-    coordinator.observeUser(target("threshold"), "boundary", `Please fix this service PR: ${url}`, "task-1");
-    await tracked.waitForWrite();
-    expect(responses).toHaveLength(2);
-    expect(tracked.writes).toEqual([{ botUid, target: target("threshold"), references: [{ kind: "pr", url }] }]);
-    expect(store.getThreadReferences(botUid, target("threshold"))).toEqual({ mr: [], pr: [url] });
+    coordinator.observeUser(chat, "candidates", `Review ${candidateUrls.join("\n")}`, "task-1");
+    await flushBackgroundWork();
+    expect(store.getThreadReferences(botUid, chat)).toEqual({
+      mr: [
+        "https://gitlab.example/acme/docs/-/merge_requests/187",
+        "https://gitlab.example/acme/drive/-/merge_requests/75",
+        "https://gitlab.example/acme/web/drive/-/merge_requests/62",
+      ],
+      pr: ["https://github.com/acme/service/pull/11"],
+    });
   } finally {
     await coordinator.stop();
     store.close();
