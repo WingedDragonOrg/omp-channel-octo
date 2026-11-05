@@ -166,14 +166,22 @@ export function acceptCommitTask(
   }
 }
 
-/** Only builtin admission converts a command claim into a completed-command task claim. */
+/** Recognizes builtin commits and native commits still owned by an automatic thread merge. */
 export function isCommitTask(db: Database, taskId: string): boolean {
   return query(db,
     `SELECT 1 FROM tasks t
      JOIN inbound i ON i.bot_uid = t.bot_uid AND i.channel_type = t.channel_type
        AND i.channel_id = t.channel_id AND i.message_id = t.message_id
-     WHERE t.id = ? AND t.text = '/commit' AND i.task_id = t.id
-       AND i.kind = 'task' AND i.command_state = 'completed'`,
+     WHERE t.id = ? AND i.task_id = t.id AND i.kind = 'task'
+       AND (
+         (t.text = '/commit' AND i.command_state = 'completed')
+         OR EXISTS (
+           SELECT 1 FROM host_merge_leases h
+           WHERE h.auto_commit_task_id = t.id AND h.operation_kind = 'merge'
+             AND h.auto_commit_state IN ('committing', 'result-known', 'merge-ready')
+             AND h.stop_requested = 0 AND h.outcome_json IS NULL AND h.not_started_text IS NULL
+         )
+       )`,
     [taskId],
   )[0] !== undefined;
 }

@@ -17,6 +17,15 @@ export interface RepositoryChange {
   untrackedFiles: number;
 }
 
+interface RepositoryInspection extends RepositoryChange {
+  hasChanges: boolean;
+}
+
+interface WorkspaceGitState {
+  state: RepositoryChangeState;
+  hasChanges: boolean;
+}
+
 const GIT_STATUS_TOTAL_BUDGET_MS = 8_000;
 const MAX_GIT_OUTPUT_CHARS = 256 * 1024;
 
@@ -32,7 +41,7 @@ interface ParsedNumstat {
   binaryFiles: number;
 }
 
-function unavailable(target: GitTarget): RepositoryChange {
+function unavailable(target: GitTarget): RepositoryInspection {
   return {
     name: target.name,
     path: target.path,
@@ -42,10 +51,11 @@ function unavailable(target: GitTarget): RepositoryChange {
     deleted: 0,
     binaryFiles: 0,
     untrackedFiles: 0,
+    hasChanges: false,
   };
 }
 
-function nonGit(target: GitTarget): RepositoryChange {
+function nonGit(target: GitTarget): RepositoryInspection {
   return {
     name: target.name,
     path: target.path,
@@ -55,6 +65,7 @@ function nonGit(target: GitTarget): RepositoryChange {
     deleted: 0,
     binaryFiles: 0,
     untrackedFiles: 0,
+    hasChanges: false,
   };
 }
 
@@ -165,7 +176,7 @@ async function inspectRepository(
   target: GitTarget,
   signal: AbortSignal,
   deadline: number,
-): Promise<RepositoryChange> {
+): Promise<RepositoryInspection> {
   const { path } = target;
   if (path === null || !isAbsolute(path) || signal.aborted) return unavailable(target);
 
@@ -208,7 +219,7 @@ async function inspectRepository(
     baseRef = emptyTree.stdout.trim();
   }
 
-  const [unmerged, numstat, untracked] = await Promise.all([
+  const [unmerged, numstat, stagedPaths, unstagedPaths, untracked] = await Promise.all([
     runGit(rootPath, ["ls-files", "-u", "-z"], signal, deadline, 1),
     runGit(
       rootPath,
@@ -216,13 +227,27 @@ async function inspectRepository(
       signal,
       deadline,
     ),
+    runGit(
+      rootPath,
+      ["diff", "--cached", "--name-only", "-z", "--no-ext-diff", "--no-textconv", baseRef, "--"],
+      signal,
+      deadline,
+    ),
+    runGit(
+      rootPath,
+      ["diff", "--name-only", "-z", "--no-ext-diff", "--no-textconv", "--"],
+      signal,
+      deadline,
+    ),
     runGit(rootPath, ["ls-files", "--others", "--exclude-standard", "-z"], signal, deadline),
   ]);
 
   if (
-    !completedSuccessfully(unmerged, deadline, 1) ||
-    !completedSuccessfully(numstat, deadline) ||
-    !completedSuccessfully(untracked, deadline)
+    !completedSuccessfully(unmerged, deadline, 1)
+    || !completedSuccessfully(numstat, deadline)
+    || !completedSuccessfully(stagedPaths, deadline)
+    || !completedSuccessfully(unstagedPaths, deadline)
+    || !completedSuccessfully(untracked, deadline)
   ) {
     return unavailable(target);
   }
@@ -238,7 +263,22 @@ async function inspectRepository(
     baseline,
     ...parsed,
     untrackedFiles,
+    hasChanges: stagedPaths.stdout.length > 0
+      || unstagedPaths.stdout.length > 0
+      || untrackedFiles > 0,
   };
+}
+
+async function inspectWorkspace(
+  cwd: string | null,
+  workspace: ThreadWorkspaceRecord | null,
+  signal: AbortSignal,
+): Promise<RepositoryInspection[]> {
+  const deadline = Date.now() + GIT_STATUS_TOTAL_BUDGET_MS;
+  const targets: GitTarget[] = workspace === null
+    ? [{ name: cwd === null ? "当前工作区" : basename(cwd), path: cwd, requireExactRoot: false }]
+    : workspace.projects.map((project) => ({ name: project.name, path: project.path, requireExactRoot: true }));
+  return Promise.all(targets.map((target) => inspectRepository(target, signal, deadline)));
 }
 
 export async function readWorkspaceChanges(
@@ -246,9 +286,45 @@ export async function readWorkspaceChanges(
   workspace: ThreadWorkspaceRecord | null,
   signal: AbortSignal,
 ): Promise<RepositoryChange[]> {
+  const inspections = await inspectWorkspace(cwd, workspace, signal);
+  return inspections.map(({ hasChanges: _hasChanges, ...change }) => change);
+}
+
+export async function readWorkspaceGitState(
+  cwd: string | null,
+  workspace: ThreadWorkspaceRecord | null,
+  signal: AbortSignal,
+): Promise<WorkspaceGitState[]> {
+  const inspections = await inspectWorkspace(cwd, workspace, signal);
+  return inspections.map(({ state, hasChanges }) => ({ state, hasChanges }));
+}
+
+
+export async function readRepositoryHead(
+  cwd: string,
+  signal: AbortSignal,
+): Promise<{ state: "known"; head: string | null } | { state: "unavailable" }> {
+  if (!isAbsolute(cwd) || signal.aborted) return { state: "unavailable" };
   const deadline = Date.now() + GIT_STATUS_TOTAL_BUDGET_MS;
-  const targets: GitTarget[] = workspace === null
-    ? [{ name: cwd === null ? "当前工作区" : basename(cwd), path: cwd, requireExactRoot: false }]
-    : workspace.projects.map((project) => ({ name: project.name, path: project.path, requireExactRoot: true }));
-  return Promise.all(targets.map((target) => inspectRepository(target, signal, deadline)));
+  const result = await runGit(
+    cwd,
+    ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+    signal,
+    deadline,
+  );
+  if (
+    result === null
+    || result.timedOut
+    || result.aborted
+    || Date.now() >= deadline
+    || outputWasCapped(result, MAX_GIT_OUTPUT_CHARS)
+  ) return { state: "unavailable" };
+  if (result.exitCode === 1 && result.stdout.trim().length === 0) {
+    return { state: "known", head: null };
+  }
+  if (result.exitCode !== 0) return { state: "unavailable" };
+  const head = result.stdout.trim();
+  return /^[0-9a-f]{40,64}$/iu.test(head)
+    ? { state: "known", head }
+    : { state: "unavailable" };
 }

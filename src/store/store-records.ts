@@ -391,6 +391,16 @@ export interface HostMergeLeaseRecord extends ChatTarget {
   receiptOutboxId: string | null;
   messageSeq: number | null;
   archiveGeneration: number | null;
+  /** Native commit stage of `/thread merge`; null keeps the direct host-merge contract. */
+  autoCommitTaskId: string | null;
+  autoCommitState: "committing" | "result-known" | "merge-ready" | "merging" | "unknown" | "complete" | null;
+  autoCommitDispatched: boolean;
+  autoCommitResult: {
+    exitCode: number;
+    headBefore: string | null;
+    headAfter: string | null;
+  } | null;
+  stopRequested: boolean;
   outcome: HostMergeOutcome | null;
   createdAt: number;
   updatedAt: number;
@@ -409,7 +419,9 @@ export interface HostMergeLeaseInput {
   messageSeq?: number;
   receiptOutboxId?: string;
   archiveGeneration?: number | null;
+  autoCommitTaskId?: string;
 }
+
 
 export type HostThreadRemovalOutcome =
   | { kind: "complete"; receiptText: string }

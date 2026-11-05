@@ -53,7 +53,7 @@
 | 目录 | `/new [目录]`、`/reset [目录]`；省略目录按目标默认目录解析（DM/群沿用当前绑定，首次 `~/tmp`） | 每次 fresh 会话都有确定工作目标 |
 | 线程目录 | CommunityTopic 线程尚无已验证会话时，默认目录取父群当前绑定 cwd；线程首次成功建立会话即固定，与父群解耦 | 线程默认落在父群项目上；cwd 可共享，session 与共享说明仍按聊天目标隔离 |
 | 线程隔离 | `create-thread` 支持 `projects:[{name,repo,base?}]`、`layout` 与简短 `background`；多项目由 agent 显式选择 shared（一个非仓库入口内多个隔离 worktree）或 separate（每项目一个 thread/worktree），单项目保留 `worktree_name`。宿主准备实际工作区、持久化绑定并写入 THREAD.md 后才报告 ready、允许派发 | 工作区与项目来源明确，任务只来自后续派发正文；详细 SDD 见 `2026-09-17-thread-worktrunk-design.md` |
-| 工作区合并 | 单项目/separate 子区的 `/thread merge` 由宿主直接执行默认 pipeline，不按工作区资源限制并发；持久 lease 后可 ACK，运行中展示独立可编辑进度卡且同聊天查询不等待；成功清理工作树和分支、回执与终态卡确认排空后归档；新入站持久取消旧归档计划；零 agent 任务。只有实际合并执行失败才交给本聊天 agent 修复，再经 host `thread-merge` 重试。shared 固定拒绝且不创建任务 | 正常路径不启动模型，资格拒绝与执行失败分离 |
+| 工作区合并 | 单项目/separate 子区的 `/thread merge` 由宿主按聊天和 session 顺序执行：资格通过且工作树 dirty 时先复用 OMP 原生 commit 及其进度、受管进程、停止与工作树租约，再经验证启动既有 wt 默认 pipeline；clean 路径不创建提交任务。只在提交进程确认退出、退出码为零、HEAD 改变且匹配、工作树干净、绑定及计划未变且未停止时启动 wt。提交失败、停止、无新 HEAD、结果未知、校验失败或重启均不自动合并/重放；未知进程继续封锁原资源。资源排他只覆盖自动提交阶段，不覆盖合并阶段。成功仍由原有结果投递、清理与归档路径完成；仅实际 wt 合并执行失败交给本聊天 agent 修复。shared 固定拒绝且不创建任务，ready fork 仍只归档，直接 host `thread-merge` 语义不变 | 保留提交策略与合并契约；不以 wt 默认 `--stage all` 接收提交后残留改动 |
 | 工作区清理 | `thread-delete` 在服务端删除成功后按持久资源归属清理，不依赖活动 cwd；有可用 wt 时 `wt remove`，否则 `git worktree remove`。占用中、未确认创建、身份不符或脏 worktree 保留，显式 force 才丢弃脏改动，入口只删除空目录 | 显式换目录不遗失原资源归属，也不误删用户目录或未知文件 |
 | 清理并归档 | owner 在目标子区执行 `/thread remove [--force]`；按持久归属清理 single/separate/shared worktree 和分支，全部确认完成且回执/正文/终态卡排空后归档；正常路径零 agent 任务。默认保护 dirty 和未合并提交，force 明确授权丢弃两者；部分失败保留残留记录、不归档 | 只处置已验证资源，不合并、不删除聊天记录；未知进程与未知业务结果均封锁原资源组 |
 | 子区回传 | 子区持久策略 `listen=off|merge|task`，默认 merge，仅实际合并成功回传创建方聊天；task 额外回传派发任务四种终态；off 静默。合并失败及修复失败始终在子区处理。通知按接收聊天追加模式交付且不回答 pending ask | 单一子区策略、稳定事件去重；普通任务不打扰父会话 |
@@ -93,15 +93,15 @@
 
 **职责。** `TaskScheduler` 保留聊天 FIFO、session 独占、命令顺序及关停排空。普通执行不取得工作区资源组排他租约，也不通过较早任务或普通会话命令的 repository 预留重新建立跨聊天目录串行。持久 `thread_workspaces` 继续记录创建状态、入口、项目、来源及分支，供就绪校验和清理使用，不作为普通任务执行锁。
 
-**操作安全。** native commit 与 workspace remove 按实际操作路径及 canonical Git worktree root 检查冲突工作并取得操作期排他；shared 清理按持久记录逐项保护项目及入口，不删除未知资源或递归删除未知文件。force 只授权既定脏改动丢弃，不绕过清理操作的占用和进程安全。`/thread merge` 和 `octo_management thread-merge` 不按 source、target 或其他操作的资源使用限制并发，也不以 merge 资源使用阻挡其他独立工作；同聊天及精确 session 顺序仍适用。Git 和 Worktrunk 的冲突、失败及可能的部分副作用如实报告。
+**操作安全。** native `/commit`、`/thread merge` 的自动提交阶段与 workspace remove 按实际操作路径及 canonical Git worktree root 检查冲突工作并取得操作期排他；自动提交完成后在进入 wt 前释放租约。shared 清理按持久记录逐项保护项目及入口，不删除未知资源或递归删除未知文件。force 只授权既定脏改动丢弃，不绕过清理操作的占用和进程安全。`/thread merge` 的 clean 路径、wt 合并阶段及直接 `octo_management thread-merge` 不按 source、target 或其他操作的资源使用限制并发，也不以 merge 资源使用阻挡其他独立工作；同聊天及精确 session 顺序仍适用。Git 和 Worktrunk 的冲突、失败及可能的部分副作用如实报告。
 
-**操作接口与集成。** `tryAcquireCommandSession` 只负责会话控制；`reserveDestructiveCommandSession` 表示显式破坏操作的 FIFO 意图，`tryAcquireDestructiveResources(cwds, task)` 负责其他需保护资源的 Host Tool 操作期升级。`/thread remove` 使用 `tryAcquireDestructiveCommandSession(target, repositoryCwds, resourcePaths)`：完整持久资源路径参与排他，仅实际存在的路径参与 Git root 探测，占用时立即拒绝、不排队，缺失 worktree 的残留分支仍可清理。merge 命令仅保留聊天/session 顺序，不预留工作区资源。权限、清理归属、来源/分支验证及远端删除策略仍归各自现有模块。
+**操作接口与集成。** `tryAcquireCommandSession` 只负责会话控制；`reserveDestructiveCommandSession` 表示显式破坏操作的 FIFO 意图，`tryAcquireDestructiveResources(cwds, task)` 负责其他需保护资源的 Host Tool 操作期升级。`/thread remove` 使用 `tryAcquireDestructiveCommandSession(target, repositoryCwds, resourcePaths)`：完整持久资源路径参与排他，仅实际存在的路径参与 Git root 探测，占用时立即拒绝、不排队，缺失 worktree 的残留分支仍可清理。`/thread merge` 仅在需要原生提交时使用与 `/commit` 相同的仓库资源排他，并在 merge 前释放；其 clean/merge 阶段和直接 host tool 仅保留聊天/session 顺序，不预留工作区资源。权限、清理归属、来源/分支验证及远端删除策略仍归各自现有模块。
 
 merge 路径由 `WorktreePort.planMerge` 提供 source＋真实 target checkout；默认目标使用 wt 自身的分支解析。执行前复核计划并固定显式 target；目标没有 checkout 时只记录 source，不伪造目录。Git ref CAS 与 index 锁各自保护单次操作，并不使 staging、rebase、hook、checkout 更新及清理成为整体事务。
 
-**生命周期与恢复。** 未确认退出的 worker 不能复用其 session，非 merge 操作继续保留既有保护。merge 的进程身份和结果由台账恢复，同一未知结果不自动重放；merge 记录的路径不限制其他独立工作并发。普通会话命令持有聊天/session 至候选 worker 停止和绑定提交完成；goal 持有至 `session_settled`。取消和 ask 超时确认 worker 退出后才释放会话。重启仍先恢复进程台账，再按原身份续接 accepted 工作，未派发 queued 工作按聊天顺序执行；不重放原 prompt、不把 queued 批量失败、不改写线上任务。
+**生命周期与恢复。** 未确认退出的 worker 不能复用其 session，非 merge 操作继续保留既有保护。merge 的进程身份和结果由台账恢复，同一未知结果不自动重放；自动提交阶段、commit 结果与 merge handoff 记录在同一稳定命令 lease 中，已开始但结果未知的提交重启后封锁资源且不重放，已知提交但 wt 尚未启动时只持久结算为未合并，不猜测或恢复后续 merge；合并阶段仍按原资源契约恢复。普通会话命令持有聊天/session 至候选 worker 停止和绑定提交完成；goal 持有至 `session_settled`。取消和 ask 超时确认 worker 退出后才释放会话。重启仍先恢复进程台账，再按原身份续接 accepted 工作，未派发 queued 工作按聊天顺序执行；不重放原 prompt、不把 queued 批量失败、不改写线上任务。
 
-**验收。** 在隔离夹具验证父→子、子→父、shared 不同项目、入口→项目、相同 cwd、祖先→后代的普通任务并发及聊天 FIFO、同 session 独占、取消、new/move、goal 与恢复。验证 merge 与 source、target 普通工作及其他独立操作双向并发，并保留 commit/remove 的各自保护。真实 RPC 子进程、临时 Git 工作区 smoke 与既有离线 restart benchmark 必须通过；只使用本地协议夹具，不注册真实 bot、不重启或操作常驻服务。
+**验收。** 在隔离夹具验证父→子、子→父、shared 不同项目、入口→项目、相同 cwd、祖先→后代的普通任务并发及聊天 FIFO、同 session 独占、取消、new/move、goal 与恢复。验证 clean merge 与 merge 阶段保持既有双向并发，脏工作树的自动提交阶段与原生提交资源租约冲突保护正确，并保留合并失败修复、结果投递和归档。真实 RPC 子进程、临时 Git 工作区 smoke 与既有离线 restart benchmark 必须通过；只使用本地协议夹具，不注册真实 bot、不重启或操作常驻服务。
 
 **隔离验收证据。**
 
@@ -186,11 +186,11 @@ CLI 不提供结构化提交结果，退出码 0 也可能表示没有改动，�
 
 接纳将已认领的命令行在同一事务内转换为 `text="/commit"` 的 durable task，不释放并重新认领入站消息。原生提交身份由该事务保留的 `inbound.kind=task`、`command_state=completed` 及任务关联确定；`completed` 在此表示命令接纳已转移，不表示 Git 已完成。普通队列或派发正文即使恰为 `/commit`，仍按普通 OMP 任务处理。提交不创建或 prompt 聊天的 RPC 会话；ledger 的会话字段只归因于该任务的原绑定。原生进程先停在 gate，身份、watchdog 与 ledger 登记完成，且任务 `prompt_started=1` 落盘后，才允许 `run()` 释放 gate。该路径永不记录 `prompt_accepted`，因此中途重启按已有 `1/0` 不确定接受路径终结，不进入普通 `/retry` 或同会话 continuation。
 
-Git 写锁以规范化 worktree top-level 为边界，绑定在仓库子目录也占用同一写锁；不同 linked worktree 仍各自独立。普通任务彼此保留既有同 cwd 多会话并行，提交则排斥同工作树的普通任务、持续目标、会话命令及受保护的工作区 Host Tool 写操作；持续目标的租约保留到 `session_settled`。线程 merge 不参与该资源排他，可能与提交交错。退出未确认的 worker 无论绑定在 root 还是子目录，都对受保护操作封锁该工作树。
+Git 写锁以规范化 worktree top-level 为边界，绑定在仓库子目录也占用同一写锁；不同 linked worktree 仍各自独立。普通任务彼此保留既有同 cwd 多会话并行，原生提交及 `/thread merge` 自动提交阶段排斥同工作树的普通任务、持续目标、会话命令及受保护的工作区 Host Tool 写操作；持续目标的租约保留到 `session_settled`。`/thread merge` clean 路径与 wt merge 阶段不参与该资源排他，可能与提交交错，直接 host tool 继续沿用现有契约。退出未确认的 worker 无论绑定在 root 还是子目录，都对受保护操作封锁该工作树。
 
-**停止语义**：`/commit stop` 是即时控制路径，不取得待停止提交持有的执行队列位置。只停止同一聊天对应的提交，不清除无关排队任务，不停止其他聊天或普通任务。停止回执以进程实际退出和提交结果为准；已完成的提交保留，不执行回滚；无活动、重复 stop、完成与停止竞争均不得误报已停止。无法确认退出时保留资源阻塞。
+**停止语义**：`/commit stop` 是即时控制路径，不取得待停止提交持有的执行队列位置。只停止同一聊天对应的原生或 `/thread merge` 自动提交及其后续合并，不清除无关排队任务，不停止其他聊天或普通任务。停止回执以进程实际退出和提交结果为准；已完成的提交保留，不执行回滚；无活动、重复 stop、完成与停止竞争均不得误报已停止。无法确认退出时保留资源阻塞。
 
-既有 `/cancel`（`/stop`）也会取消本聊天的提交，并按原语义清除本聊天的排队任务；`/commit stop` 保留无关队列。`/interrupt` 保持对 OMP 回合（含持续目标）的中断语义，遇到 native commit 时提示使用 `/commit stop`，不对提交或其他会话发送 RPC abort。
+既有 `/cancel`（`/stop`）也会取消本聊天的提交/自动合并，并按原语义清除本聊天的排队任务；`/commit stop` 保留无关队列。`/interrupt` 对原生 `/commit` 保持既有提示“使用 `/commit stop`”的语义；对正在运行的 `/thread merge` 则按既有 merge 中断路径停止该命令及其自动提交，不对原生会话回合发送 RPC abort。
 
 **反馈与验收**：向原聊天反馈启动、提交完成、提交失败或停止结果，错误有界且不转发原始模型/工具日志。行为回归覆盖权限、持久工作区拒绝、正常 linked worktree、资源竞争、持续目标及宿主合并之间的租约、停止边界、创建失败与关闭竞态，以及恢复。延迟重启将原生提交与等待/执行中的宿主合并均计入活动操作，合并回执处理完成后才重新评估空闲状态。真实 smoke 必须通过临时单项目 Git 仓库执行原生提交，核对 HEAD、文件内容及 channel 回执，并用受控运行场景验证 stop 和进程清理；不提交实现仓库、不推送、不部署、不重启常驻服务。
 
@@ -339,7 +339,7 @@ channel 在工具进度之上补两块由权威实验状态驱动的只读呈现
 #### 隔离工作区收尾
 
 
-`/thread merge` 是子区中的宿主合并入口：`/thread` 参数去首尾空白后首词为 `merge`（后为行尾或非字母数字、下划线、连字符分隔符，`merge-fix` 不算）即进入该路径。宿主验证子区、隔离绑定、持久资源身份与 wt 能力，按聊天和 session 顺序直接执行 wt 默认暂存/提交/squash/rebase/fast-forward/删除 pipeline，不按工作树资源限制并发。持久 lease 后即确认受理；同聊天的查询/控制入站可在 merge 运行期间处理，不创建 worker、模型或 agent 任务。每个命令身份使用独立进度卡记录可证实阶段、耗时与终态，不重发创建结果未知的卡片。结果经持久 outbox 送达，卡片 I/O 不阻塞 merge 结果回执；只有回执送达、相关进度卡终态确认排空和聊天 outbox 排空后才归档子区，cwd 被删除不影响这一路径。卡片发送结果未知不得当作远端已排空；新入站持久递增归档代次，重启只恢复仍与 lease 代次相同的归档计划。只有已实际执行的 wt merge 非零退出才把脱敏有界诊断、工作区、原命令与 owner 尾随补充说明交给本聊天 agent 修复，再经同一 host `thread-merge` 核心重试；资格拒绝、取消或结果未知不派修复。命令 claim 保留，接管输入身份稳定，重复投递与重启不重跑成功合并或重复创建修复任务；Git 与 SQLite 间结果不明时停止自动重放。等待和执行响应取消、中断及停机。详细 SDD 和交付验收见 `2026-09-17-thread-worktrunk-design.md`。
+`/thread merge` 是子区中的宿主合并入口：`/thread` 参数去首尾空白后首词为 `merge`（后为行尾或非字母数字、下划线、连字符分隔符，`merge-fix` 不算）即进入该路径。宿主先验证子区、隔离绑定、持久资源身份与 wt 能力，并按聊天和 session 顺序取得执行租约。单项目/separate 工作树存在 staged、unstaged 或未忽略 untracked 改动时，在仅覆盖提交阶段的 canonical Git root 资源租约下运行 OMP 原生 commit，复用原生进度卡、worker ledger、受管进程与 `/commit stop`/`/cancel`；干净路径不创建任务或取得该额外资源租约。提交阶段结果与后续状态使用稳定命令身份和持久记录：仅在进程组确认退出、零退出码、HEAD 改变且重新核验一致、提交后工作树干净、绑定/所有权/合并计划一致且 stop/cancel 未先受理时，才能进入既有 wt 默认暂存/提交/squash/rebase/fast-forward/删除 pipeline。失败、取消、无新 HEAD、结果未知、校验失败及重启后不重放或继续合并；未知进程沿用 worker ledger 并封锁原资源，已知提交但尚未启动 wt 的恢复只记录未合并结果，不猜测后续状态。合并阶段保持原非排他并发语义，不引入工作区排他；直接 host `thread-merge` 仍沿用原契约。持久 merge lease 后可 ACK；同聊天的查询/控制入站可在 commit 或 merge 运行期间处理，不创建额外 RPC/agent 任务。每个命令身份使用独立进度卡记录可证实阶段、耗时与终态，不重发创建结果未知的卡片。结果经持久 outbox 送达，卡片 I/O 不阻塞 merge 结果回执；只有回执送达、相关进度卡终态确认排空和聊天 outbox 排空后才归档子区，cwd 被删除不影响这一路径。只有已实际执行的 wt merge 非零退出才把脱敏有界诊断、工作区、原命令与 owner 尾随补充说明交给本聊天 agent 修复，再经同一 host `thread-merge` 核心重试；资格拒绝、自动提交失败/取消或结果未知不派修复。命令 claim 保留，接管输入身份稳定，重复投递与重启不重跑成功提交/合并或重复创建修复任务；Git 与 SQLite 间结果不明时停止自动重放。等待和执行响应取消、中断及停机。详细 SDD 和交付验收见 `2026-09-17-thread-worktrunk-design.md`。
 
 shared 工作区先按持久资源记录识别，并直接回复「当前为多项目工作区，不支持 /thread merge。」；上述合并资格、宿主执行与 wt 探测仅适用于单项目/separate。
 

@@ -72,6 +72,37 @@ function outcome(row: Record<string, unknown>): HostMergeOutcome | null {
   };
 }
 
+function autoCommitState(value: unknown): HostMergeLeaseRecord["autoCommitState"] {
+  return value === "committing"
+    || value === "result-known"
+    || value === "merge-ready"
+    || value === "merging"
+    || value === "unknown"
+    || value === "complete"
+    ? value
+    : null;
+}
+
+function autoCommitResult(value: unknown): HostMergeLeaseRecord["autoCommitResult"] {
+  if (typeof value !== "string") return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+    const result = parsed as Record<string, unknown>;
+    if (
+      !Number.isSafeInteger(result.exitCode)
+      || !(typeof result.headBefore === "string" || result.headBefore === null)
+      || !(typeof result.headAfter === "string" || result.headAfter === null)
+    ) return null;
+    return {
+      exitCode: result.exitCode as number,
+      headBefore: result.headBefore as string | null,
+      headAfter: result.headAfter as string | null,
+    };
+  } catch {
+    return null;
+  }
+}
 function phase(value: unknown): HostMergeLeaseRecord["phase"] {
   return value === "starting" || value === "running" || value === "exited" ? value : "unknown";
 }
@@ -114,6 +145,11 @@ function decodeHostMergeLease(row: Record<string, unknown>): HostMergeLeaseRecor
     messageSeq: nullableSafeInteger(row.message_seq),
     receiptOutboxId: asNullableString(row.receipt_outbox_id),
     archiveGeneration: nullableSafeInteger(row.archive_generation),
+    autoCommitTaskId: asNullableString(row.auto_commit_task_id),
+    autoCommitState: autoCommitState(row.auto_commit_state),
+    autoCommitDispatched: Number(row.auto_commit_dispatched ?? 1) !== 0,
+    autoCommitResult: autoCommitResult(row.auto_commit_result_json),
+    stopRequested: Number(row.stop_requested ?? 0) !== 0,
     outcome: outcome(row),
     createdAt: Number(row.created_at ?? 0),
     updatedAt: Number(row.updated_at ?? 0),
@@ -240,7 +276,7 @@ function decodeHostMergeProgressCard(row: Record<string, unknown>): HostMergePro
   };
 }
 
-/** Insert the fail-closed reservation before the worktrunk merge process is spawned. */
+/** Insert the fail-closed reservation before a native commit or worktrunk process can start. */
 export function reserveHostMergeLease(db: Database, input: HostMergeLeaseInput): void {
   if (
     input.target.channelType !== 5
@@ -255,6 +291,7 @@ export function reserveHostMergeLease(db: Database, input: HostMergeLeaseInput):
     || !input.resourceCwds.includes(input.cwd)
     || (input.messageSeq !== undefined && (!Number.isSafeInteger(input.messageSeq) || input.messageSeq < 0))
     || (input.archiveGeneration !== undefined && input.archiveGeneration !== null && (!Number.isSafeInteger(input.archiveGeneration) || input.archiveGeneration < 0))
+    || (input.autoCommitTaskId !== undefined && input.autoCommitTaskId.length === 0)
   ) {
     throw new Error("invalid host merge lease identity or resource paths");
   }
@@ -270,8 +307,9 @@ export function reserveHostMergeLease(db: Database, input: HostMergeLeaseInput):
     `INSERT INTO host_merge_leases(
        id, bot_uid, channel_type, channel_id, source_id, cwd, resource_cwds, phase, pid, pgid, process_identity,
        source_text, operator_note, sender_id, message_seq, receipt_outbox_id, archive_generation,
-       not_started_text, outcome_kind, outcome_json, created_at, updated_at
-     ) VALUES(?, ?, 5, ?, ?, ?, ?, 'starting', NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)`,
+       not_started_text, outcome_kind, outcome_json, auto_commit_task_id, auto_commit_state, auto_commit_dispatched,
+       auto_commit_result_json, stop_requested, created_at, updated_at
+     ) VALUES(?, ?, 5, ?, ?, ?, ?, 'starting', NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, 0, NULL, 0, ?, ?)`,
     [
       input.id,
       input.botUid,
@@ -285,10 +323,73 @@ export function reserveHostMergeLease(db: Database, input: HostMergeLeaseInput):
       input.messageSeq ?? null,
       input.receiptOutboxId ?? null,
       input.archiveGeneration ?? null,
+      input.autoCommitTaskId ?? null,
+      input.autoCommitTaskId === undefined ? null : "committing",
       now,
       now,
     ],
   );
+}
+
+export function recordHostMergeAutoCommitResult(
+  db: Database,
+  id: string,
+  result: { exitCode: number; headBefore: string | null; headAfter: string | null },
+): void {
+  if (
+    !Number.isSafeInteger(result.exitCode)
+    || !(typeof result.headBefore === "string" || result.headBefore === null)
+    || !(typeof result.headAfter === "string" || result.headAfter === null)
+  ) {
+    throw new Error("invalid native auto-commit result");
+  }
+  const changed = run(db,
+    `UPDATE host_merge_leases
+     SET auto_commit_state = 'result-known', auto_commit_result_json = ?, updated_at = ?
+     WHERE id = ? AND operation_kind = 'merge' AND auto_commit_state = 'committing'
+       AND auto_commit_dispatched = 1 AND phase = 'starting' AND outcome_json IS NULL AND not_started_text IS NULL`,
+    [JSON.stringify(result), Date.now(), id],
+  );
+  if (changed.changes !== 1) throw new Error("native auto-commit result is not attached to a running lease");
+}
+/** Persist the native commit dispatch boundary before OMP receives its command. */
+export function markHostMergeAutoCommitDispatched(db: Database, id: string): boolean {
+  return run(db,
+    `UPDATE host_merge_leases SET auto_commit_dispatched = 1, updated_at = ?
+     WHERE id = ? AND operation_kind = 'merge' AND auto_commit_task_id IS NOT NULL
+       AND auto_commit_state = 'committing' AND auto_commit_dispatched = 0
+       AND stop_requested = 0 AND phase = 'starting'
+       AND outcome_json IS NULL AND not_started_text IS NULL`,
+    [Date.now(), id],
+  ).changes === 1;
+}
+
+
+export function markHostMergeAutoCommitMergeReady(db: Database, id: string): boolean {
+  return run(db,
+    `UPDATE host_merge_leases SET auto_commit_state = 'merge-ready', updated_at = ?
+     WHERE id = ? AND operation_kind = 'merge' AND auto_commit_state = 'result-known'
+       AND stop_requested = 0 AND phase = 'starting' AND outcome_json IS NULL AND not_started_text IS NULL`,
+    [Date.now(), id],
+  ).changes === 1;
+}
+
+export function beginHostMergeAutoCommitMerge(db: Database, id: string): boolean {
+  return run(db,
+    `UPDATE host_merge_leases SET auto_commit_state = 'merging', updated_at = ?
+     WHERE id = ? AND operation_kind = 'merge' AND auto_commit_state = 'merge-ready'
+       AND stop_requested = 0 AND phase = 'starting' AND outcome_json IS NULL AND not_started_text IS NULL`,
+    [Date.now(), id],
+  ).changes === 1;
+}
+
+export function requestHostMergeStop(db: Database, id: string): boolean {
+  return run(db,
+    `UPDATE host_merge_leases SET stop_requested = 1, updated_at = ?
+     WHERE id = ? AND operation_kind = 'merge' AND auto_commit_task_id IS NOT NULL
+       AND outcome_json IS NULL AND not_started_text IS NULL AND stop_requested = 0`,
+    [Date.now(), id],
+  ).changes === 1;
 }
 
 /** Persist the exact worktrunk process-group identity as soon as spawn succeeds. */
@@ -302,7 +403,8 @@ export function recordHostMergeProcess(
   }
   const result = run(db,
     `UPDATE host_merge_leases SET phase = 'running', pid = ?, pgid = ?, process_identity = ?, updated_at = ?
-     WHERE id = ? AND operation_kind = 'merge' AND phase = 'starting'`,
+     WHERE id = ? AND operation_kind = 'merge' AND phase = 'starting'
+       AND (auto_commit_state IS NULL OR auto_commit_state = 'merging')`,
     [process.pid, process.pgid, process.identity, Date.now(), id],
   );
   if (result.changes !== 1) throw new Error("host merge lease disappeared before process identity was recorded");
@@ -311,7 +413,10 @@ export function recordHostMergeProcess(
 /** Keep the row after a confirmed process exit until its known outcome is durably settled. */
 export function markHostMergeProcessExited(db: Database, id: string): void {
   const result = run(db,
-    "UPDATE host_merge_leases SET phase = 'exited', updated_at = ? WHERE id = ? AND operation_kind = 'merge' AND phase = 'running' AND outcome_json IS NULL AND not_started_text IS NULL",
+    `UPDATE host_merge_leases SET phase = 'exited', updated_at = ?
+     WHERE id = ? AND operation_kind = 'merge' AND phase = 'running'
+       AND (auto_commit_state IS NULL OR auto_commit_state = 'merging')
+       AND outcome_json IS NULL AND not_started_text IS NULL`,
     [Date.now(), id],
   );
   if (result.changes !== 1) throw new Error("host merge process exit did not match a running lease");
@@ -320,7 +425,15 @@ export function markHostMergeProcessExited(db: Database, id: string): void {
 /** Mark any ambiguous outcome as permanently blocking until operator intervention. */
 export function markHostMergeLeaseUnknown(db: Database, id: string): void {
   const result = run(db,
-    "UPDATE host_merge_leases SET phase = 'unknown', updated_at = ? WHERE id = ? AND operation_kind = 'merge' AND outcome_json IS NULL AND not_started_text IS NULL",
+    `UPDATE host_merge_leases
+     SET phase = 'unknown',
+         auto_commit_state = CASE
+           WHEN auto_commit_task_id IS NULL THEN NULL
+           WHEN auto_commit_state = 'merging' THEN 'merging'
+           ELSE 'unknown'
+         END,
+         updated_at = ?
+     WHERE id = ? AND operation_kind = 'merge' AND outcome_json IS NULL AND not_started_text IS NULL`,
     [Date.now(), id],
   );
   if (result.changes !== 1) throw new Error("host merge lease disappeared or already has a known outcome");
@@ -330,8 +443,12 @@ export function markHostMergeLeaseUnknown(db: Database, id: string): void {
 export function persistHostMergeOutcome(db: Database, id: string, value: WorktreeMergeOutcome): void {
   const result = run(db,
     `UPDATE host_merge_leases
-     SET outcome_kind = ?, outcome_json = ?, updated_at = ?
-     WHERE id = ? AND operation_kind = 'merge' AND phase = 'exited' AND outcome_json IS NULL AND not_started_text IS NULL`,
+     SET outcome_kind = ?, outcome_json = ?,
+         auto_commit_state = CASE WHEN auto_commit_task_id IS NULL THEN NULL ELSE 'complete' END,
+         updated_at = ?
+     WHERE id = ? AND operation_kind = 'merge' AND phase = 'exited'
+       AND (auto_commit_state IS NULL OR auto_commit_state = 'merging')
+       AND outcome_json IS NULL AND not_started_text IS NULL`,
     [value.kind, JSON.stringify(value), Date.now(), id],
   );
   if (result.changes !== 1) throw new Error("host merge outcome is not attached to a confirmed exit");
@@ -343,13 +460,26 @@ export function completeHostMergeLease(db: Database, id: string, completion: Hos
   }
   const result = run(db,
     `UPDATE host_merge_leases
-     SET phase = 'exited', not_started_text = ?, updated_at = ?
-     WHERE id = ? AND operation_kind = 'merge' AND phase IN ('starting', 'running')
+     SET phase = 'exited', not_started_text = ?,
+         auto_commit_state = CASE WHEN auto_commit_task_id IS NULL THEN NULL ELSE 'complete' END,
+         updated_at = ?
+     WHERE id = ? AND operation_kind = 'merge' AND (
+       (auto_commit_task_id IS NULL AND phase IN ('starting', 'running'))
+       OR (
+         auto_commit_task_id IS NOT NULL
+         AND phase IN ('starting', 'running', 'unknown')
+         AND (
+           (auto_commit_dispatched = 0 AND auto_commit_state IN ('committing', 'unknown'))
+           OR (auto_commit_dispatched = 1 AND auto_commit_state IN ('result-known', 'merge-ready'))
+         )
+       )
+     )
        AND outcome_json IS NULL AND not_started_text IS NULL`,
     [completion.diagnostic, Date.now(), id],
   );
   if (result.changes !== 1) throw new Error("host merge lease is not a proven non-execution");
 }
+
 
 export function settleHostMergeLease(db: Database, id: string): void {
   const row = query(db, "SELECT * FROM host_merge_leases WHERE id = ? AND operation_kind = 'merge'", [id])[0];

@@ -352,6 +352,50 @@ export class TaskScheduler {
     }
   }
 
+  /** Exclusively protect a host merge's native commit without reserving its later merge stage. */
+  async tryAcquireThreadMergeCommitResources(
+    cwd: string,
+    root: string,
+    order: number,
+    owner: string,
+  ): Promise<DestructiveResourceLease | undefined> {
+    if (!Number.isSafeInteger(order) || order < 1 || owner.length === 0) return undefined;
+    const paths = this.resourcePaths([cwd, root]);
+    const roots = new Set([root]);
+    const unavailable = (): boolean =>
+      this.deps.stopping()
+      || paths.some(path => this.deps.isDirectoryBlocked(path))
+      || this.hasActiveResourceConflict(paths, roots)
+      || this.hasExclusiveResourceConflict(paths, roots);
+    let lease: DestructiveResourceLease | undefined;
+    let transferred = false;
+    try {
+      if (
+        unavailable()
+        || await this.hasConflictingRepositoryReservation(root, order)
+        || await this.hasEarlierQueuedResourceUse(paths, roots, order)
+        || await this.repositoryIsBlocked(root)
+        || unavailable()
+      ) return undefined;
+      lease = this.reserveExclusiveResources(roots, paths, owner);
+      if (!lease) return undefined;
+      if (
+        this.deps.stopping()
+        || paths.some(path => this.deps.isDirectoryBlocked(path))
+        || this.hasActiveResourceConflict(paths, roots)
+        || await this.hasConflictingRepositoryReservation(root, order)
+        || await this.hasEarlierQueuedResourceUse(paths, roots, order)
+        || await this.repositoryIsBlocked(root)
+      ) return undefined;
+      transferred = true;
+      return lease;
+    } catch {
+      return undefined;
+    } finally {
+      if (!transferred) lease?.complete();
+    }
+  }
+
   /** Repository-root reservation for a queued `/commit` recovered before native dispatch. */
   async tryAcquireCommitRepository(root: string, taskId: string): Promise<CommitLease | undefined> {
     const task = this.deps.store.getTask(taskId);

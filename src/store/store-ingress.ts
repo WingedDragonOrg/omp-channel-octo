@@ -232,6 +232,15 @@ function persistCancelIntent(
     if (result.cancelledId !== undefined) cancelledIngressJobIds.add(result.cancelledId);
     if (result.requestedId !== undefined) cancelRequestedIngressJobIds.add(result.requestedId);
   }
+  run(db,
+    `UPDATE host_merge_leases
+     SET stop_requested = 1, updated_at = ?
+     WHERE bot_uid = ? AND channel_type = ? AND channel_id = ?
+       AND operation_kind = 'merge' AND auto_commit_task_id IS NOT NULL
+       AND outcome_json IS NULL AND not_started_text IS NULL AND stop_requested = 0`,
+    [Date.now(), input.botUid, target.channelType, target.channelId],
+  );
+
 
   const cancelledQuestionIds = pendingQuestionIds(db, input.botUid, target);
   cancelQuestions(db, input.botUid, target, "cancelled");

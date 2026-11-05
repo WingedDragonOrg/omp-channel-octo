@@ -107,7 +107,7 @@ import type { ReviewJobRecord } from "./store/store-records.ts";
 import { DEFAULT_ASK_TIMEOUT_MS } from "./contracts.ts";
 import { TurnContext } from "./session/turn-context.ts";
 import { readSessionContext } from "./session/status-context.ts";
-import { readWorkspaceChanges } from "./workspace/git-status.ts";
+import { readRepositoryHead, readWorkspaceChanges, readWorkspaceGitState } from "./workspace/git-status.ts";
 import { memberSnapshotFor, normalizeAgentMembers, type AgentContext, type AgentMemberSnapshot } from "./session/agent-context.ts";
 import { threadShortId, threadParentGroupId } from "./threads/thread-target.ts";
 import { createBotEventLoop, type BotEventLoop } from "./bot-events.ts";
@@ -224,6 +224,7 @@ const MODE_CARD_CHOICES: readonly { title: string; value: string }[] = [
 ];
 const QUEUE_USAGE = "用法：/queue <文本>；把该消息排到当前任务之后执行。";
 const COMMIT_USAGE = "用法：/commit（提交当前项目）或 /commit stop（停止当前聊天的提交）。";
+const THREAD_MERGE_COMMIT_TASK_TEXT = "/thread-merge-native-commit";
 const BTW_USAGE = "用法：/btw <问题>；在当前绑定会话旁路提问，不注入主任务。";
 const BTW_BUSY_TEXT = "当前聊天已有 BTW 旁路问题正在处理，未重复启动。";
 const BTW_FAILURE_TEXT = "BTW 旁路问题未能完成，当前主任务不受影响。";
@@ -324,7 +325,7 @@ type CommitOperation = {
   target: ChatTarget;
   root: string;
   binding: BindingRecord;
-  reservation: CommitLease;
+  reservation: Pick<CommitLease, "complete">;
   done: Promise<void>;
   finish(): void;
   workerReady: Promise<void>;
@@ -335,6 +336,12 @@ type CommitOperation = {
   stopRequested: boolean;
   stopConfirmed?: boolean;
   shutdownRequested: boolean;
+  autoMergeLeaseId?: string;
+  stopFollowing?: () => void;
+  commitRunStarted?: boolean;
+  processConfirmedExit?: boolean;
+  autoCommitPersistenceFailed?: boolean;
+  autoCommitOutcomeUnknown?: boolean;
 };
 
 type ReviewRuntime = {
@@ -1002,10 +1009,99 @@ class CoreService implements ChannelService {
       // established known/unknown outcomes, then restore failed outcomes as repair tasks.
       const successfulHostMergeRecoveries: HostMergeLeaseRecord[] = [];
       const failedHostMergeRecoveries: HostMergeLeaseRecord[] = [];
+      const recoveredAutoCommitWorkerIds = new Set<string>();
       for (const lease of this.store.listHostMergeLeases(identity.uid)) {
         if (lease.outcome !== null) {
           if (lease.outcome.kind === "succeeded") successfulHostMergeRecoveries.push(lease);
           else if (lease.commandText !== null) failedHostMergeRecoveries.push(lease);
+          continue;
+        }
+        if (lease.autoCommitTaskId !== null && lease.autoCommitState !== "merging") {
+          if (
+            (lease.autoCommitState === "result-known" || lease.autoCommitState === "merge-ready")
+            && lease.phase === "starting"
+            && lease.processIdentity === null
+            && lease.autoCommitResult !== null
+          ) {
+            const diagnostic = "服务在提交完成后、Worktrunk merge 启动前重启；已保留提交，不自动继续合并。";
+            try {
+              this.store.completeHostMergeLease(lease.id, { kind: "not-spawned", diagnostic });
+              const recovered = this.store.getHostMergeLeaseBySourceId(
+                identity.uid,
+                { channelType: lease.channelType, channelId: lease.channelId },
+                lease.sourceId,
+              );
+              if (recovered?.outcome !== null && recovered?.outcome !== undefined && recovered.commandText !== null) {
+                failedHostMergeRecoveries.push(recovered);
+              }
+            } catch (error) {
+              this.blockedDirectories.add(lease.cwd);
+              const sourceCwd = lease.resourceCwds[0];
+              if (sourceCwd !== undefined) this.blockedDirectories.add(sourceCwd);
+              const worker = this.store.getWorkerLedger(identity.uid, lease.autoCommitTaskId);
+              if (worker !== null) this.blockedDirectories.add(worker.cwd);
+              console.error(`[thread merge recovery] 无法持久化已知自动提交的未合并结果 cwd=${lease.cwd}: ${safeErrorMessage(error, "auto-commit recovery failed")}`);
+            }
+            continue;
+          }
+          if (
+            !lease.autoCommitDispatched
+            && (lease.autoCommitState === "committing" || lease.autoCommitState === "unknown")
+          ) {
+            const worker = this.store.getWorkerLedger(identity.uid, lease.autoCommitTaskId);
+            let stopped = worker === null || worker.state === "stopped";
+            if (worker !== null && stopped) recoveredAutoCommitWorkerIds.add(worker.id);
+            if (worker !== null && !stopped) {
+              try {
+                stopped = await this.options.workerFactory.recover(worker);
+                if (stopped) {
+                  this.store.markWorkerStopped(worker.id);
+                  recoveredAutoCommitWorkerIds.add(worker.id);
+                }
+              } catch {
+                stopped = false;
+              }
+            }
+            if (stopped) {
+              const diagnostic = "服务在原生提交启动前重启；已确认未执行提交或合并。";
+              try {
+                this.store.completeHostMergeLease(lease.id, { kind: "not-spawned", diagnostic });
+                const recovered = this.store.getHostMergeLeaseBySourceId(
+                  identity.uid,
+                  { channelType: lease.channelType, channelId: lease.channelId },
+                  lease.sourceId,
+                );
+                if (recovered?.outcome !== null && recovered?.outcome !== undefined && recovered.commandText !== null) {
+                  failedHostMergeRecoveries.push(recovered);
+                }
+              } catch (error) {
+                this.blockedDirectories.add(lease.cwd);
+                const sourceCwd = lease.resourceCwds[0];
+                if (sourceCwd !== undefined) this.blockedDirectories.add(sourceCwd);
+                if (worker !== null) this.blockedDirectories.add(worker.cwd);
+                console.error(`[thread merge recovery] 无法持久化未启动的自动提交结果 cwd=${lease.cwd}: ${safeErrorMessage(error, "pre-dispatch recovery failed")}`);
+              }
+            } else {
+              this.blockedDirectories.add(lease.cwd);
+              const sourceCwd = lease.resourceCwds[0];
+              if (sourceCwd !== undefined) this.blockedDirectories.add(sourceCwd);
+              if (worker !== null) this.blockedDirectories.add(worker.cwd);
+              if (lease.autoCommitState !== "unknown" || lease.phase !== "unknown") {
+                this.store.markHostMergeLeaseUnknown(lease.id);
+              }
+              console.error(`[thread merge recovery] 自动提交尚未派发但 worker 停止状态无法确认 cwd=${lease.cwd}；资源保持封锁`);
+            }
+            continue;
+          }
+          this.blockedDirectories.add(lease.cwd);
+          const sourceCwd = lease.resourceCwds[0];
+          if (sourceCwd !== undefined) this.blockedDirectories.add(sourceCwd);
+          const worker = this.store.getWorkerLedger(identity.uid, lease.autoCommitTaskId);
+          if (worker !== null) this.blockedDirectories.add(worker.cwd);
+          if (lease.autoCommitState !== "unknown" || lease.phase !== "unknown") {
+            this.store.markHostMergeLeaseUnknown(lease.id);
+          }
+          console.error(`[thread merge recovery] 自动提交结果或后续状态无法确认 cwd=${lease.cwd}；不会重放并保持资源封锁`);
           continue;
         }
         const processIdentity = this.hostMergeProcessIdentity(lease);
@@ -1057,6 +1153,7 @@ class CoreService implements ChannelService {
       // 重启不丢工作：先把每个遗留 worker 的进程组收干净，再动任何任务状态。无法确认死亡的
       // 目录保持 block——它的任务留在队列继续挡住同目录的新写者（runTask 原样放过）。
       for (const ledger of this.store.listWorkerLedger(identity.uid)) {
+        if (recoveredAutoCommitWorkerIds.has(ledger.id)) continue;
         const stopped = await this.options.workerFactory.recover(ledger);
         const review = this.store.getReviewJob(ledger.id);
         if (stopped) {
@@ -6306,7 +6403,7 @@ class CoreService implements ChannelService {
     target: ChatTarget,
     root: string,
     binding: BindingRecord,
-    reservation: CommitLease,
+    reservation: Pick<CommitLease, "complete">,
   ): CommitOperation {
     const done = Promise.withResolvers<void>();
     const workerReady = Promise.withResolvers<void>();
@@ -6524,6 +6621,18 @@ class CoreService implements ChannelService {
     })();
     return operation.stopPromise;
   }
+  private requestThreadMergeCommitStop(operation: CommitOperation): void {
+    if (operation.autoMergeLeaseId === undefined) return;
+    operation.stopRequested = true;
+    try {
+      this.store.requestHostMergeStop(operation.autoMergeLeaseId);
+    } catch {
+      operation.autoCommitPersistenceFailed = true;
+      this.blockedDirectories.add(operation.root);
+    }
+    operation.stopFollowing?.();
+    void this.stopCommitOperation(operation);
+  }
 
   /**
    * Feeds the same evidence the text receipt uses into the card, then closes it. Nothing here
@@ -6663,6 +6772,27 @@ class CoreService implements ChannelService {
       } else {
         await this.outbox.enqueueText(target, "当前没有正在进行的提交。", null);
       }
+      return;
+    }
+    if (operation.autoMergeLeaseId !== undefined) {
+      this.requestThreadMergeCommitStop(operation);
+      const task = this.store.getTask(operation.taskId);
+      if (task?.state === "running") this.store.markTaskStopIntent(task.id, "cancel");
+      markStopDispatchIntent();
+      const stopped = await this.stopCommitOperation(operation);
+      if (!stopped) {
+        await this.outbox.enqueueText(target, "无法确认提交进程已停止；不会启动后续合并，工作树仍受保护。", null);
+        return;
+      }
+      await operation.done;
+      const result = operation.result;
+      await this.outbox.enqueueText(
+        target,
+        result === undefined
+          ? "已停止自动提交；结果未能确认，不会启动后续合并。"
+          : `${this.commitResultNotice(result, operation.stopRequested && operation.stopConfirmed === true)}自动提交后的合并已取消。`,
+        null,
+      );
       return;
     }
     const completedResult = operation.result;
@@ -6967,12 +7097,21 @@ class CoreService implements ChannelService {
   }
   private abortThreadMerges(target: ChatTarget, reason: Error): boolean {
     const controllers = this.threadMergeControllers.get(targetKey(target));
-    if (!controllers) return false;
+    const operation = this.commitOperationsByTarget.get(targetKey(target));
+    if (operation?.autoMergeLeaseId !== undefined) {
+      this.requestThreadMergeCommitStop(operation);
+    }
+    if (!controllers) return operation?.autoMergeLeaseId !== undefined;
     for (const controller of controllers) controller.abort(reason);
-    return controllers.size > 0;
+    return controllers.size > 0 || operation?.autoMergeLeaseId !== undefined;
   }
 
   private abortAllThreadMerges(reason: Error): void {
+    for (const operation of this.commitOperationsByTarget.values()) {
+      if (operation.autoMergeLeaseId !== undefined) {
+        this.requestThreadMergeCommitStop(operation);
+      }
+    }
     for (const controllers of this.threadMergeControllers.values()) {
       for (const controller of controllers) controller.abort(reason);
     }
@@ -7939,12 +8078,14 @@ class CoreService implements ChannelService {
       readonly messageSeq: number;
       readonly receiptOutboxId: string;
       readonly archiveGeneration?: number;
+      readonly autoCommitTaskId?: string;
     },
     commandBeforeSpawn?: (leaseId: string, persistHostLease: () => boolean) => void,
     progress?: HostMergeProgressSession,
     signal?: AbortSignal,
     accepted?: () => void,
     archiveGeneration?: number,
+    autoCommitDiagnostic?: () => string | undefined,
   ): WorktreeMergeLifecycle {
     const botUid = this.bot?.uid;
     if (botUid === undefined) throw new Error("Bot 身份未注册，无法合并子区工作区");
@@ -7988,7 +8129,8 @@ class CoreService implements ChannelService {
     let acceptedNotified = false;
     const finishNotSpawned = (): void => {
       if (!reserved || outcomePersisted) return;
-      const diagnostic = "Worktrunk merge was confirmed not to have started; it will not be replayed automatically.";
+      const diagnostic = autoCommitDiagnostic?.()
+        ?? "Worktrunk merge was confirmed not to have started; it will not be replayed automatically.";
       this.store.completeHostMergeLease(id, { kind: "not-spawned", diagnostic });
       outcomePersisted = true;
       progress?.finishFromOutcome({ kind: "not-started", diagnostic });
@@ -7997,6 +8139,7 @@ class CoreService implements ChannelService {
       archiveGeneration: capturedArchiveGeneration,
       beforeSpawn: (spawnCwd) => {
         if (this.stopping) throw new Error("channel 正在停止");
+        if (signal?.aborted) throw threadMergeAbortError(signal);
         if (spawnCwd !== cwd || target.channelType !== 5) {
           throw new Error("host merge process identity changed before spawn");
         }
@@ -8024,6 +8167,19 @@ class CoreService implements ChannelService {
         if (commandBeforeSpawn) commandBeforeSpawn(id, persistHostLease);
         else persistHostLease();
         if (!reserved) throw new Error("host merge lease was not persisted before process spawn");
+        if (commandContext?.autoCommitTaskId !== undefined) {
+          const current = this.store.getHostMergeLeaseBySourceId(botUid, target, sourceId);
+          if (
+            current === null
+            || current.autoCommitTaskId !== commandContext.autoCommitTaskId
+            || current.stopRequested
+            || (current.autoCommitState === "merge-ready"
+              && !this.store.beginHostMergeAutoCommitMerge(id))
+            || (current.autoCommitState !== "committing" && current.autoCommitState !== "merge-ready")
+          ) {
+            throw new Error("提交已停止或其持久状态无法确认，未启动 Worktrunk merge。");
+          }
+        }
         if (!acceptedNotified) {
           acceptedNotified = true;
           accepted?.();
@@ -8072,6 +8228,53 @@ class CoreService implements ChannelService {
     };
   }
 
+  private async inspectThreadMergeWorktree(
+    cwd: string,
+    ownership: ThreadWorkspaceRecord | null,
+    signal: AbortSignal,
+  ): Promise<{ dirty: boolean; allGit: boolean }> {
+    const states = await readWorkspaceGitState(cwd, ownership, signal);
+    if (states.some(change => change.state === "unavailable")) {
+      throw new Error("提交前后 Git 工作树状态无法确认；未执行合并。");
+    }
+    return {
+      dirty: states.some(change => change.state === "git" && change.hasChanges),
+      allGit: states.length > 0 && states.every(change => change.state === "git"),
+    };
+  }
+
+  private sameThreadMergePlan(left: WorktreeMergePlan, right: WorktreeMergePlan): boolean {
+    return left.target === right.target
+      && left.cwds.length === right.cwds.length
+      && left.cwds.every((cwd, index) => cwd === right.cwds[index]);
+  }
+
+  private sameThreadMergeOwnership(
+    left: ThreadWorkspaceRecord | null,
+    right: ThreadWorkspaceRecord | null,
+  ): boolean {
+    if (left === null || right === null) return left === right;
+    return left.botUid === right.botUid
+      && left.channelType === right.channelType
+      && left.channelId === right.channelId
+      && left.layout === right.layout
+      && left.legacyWorktreeName === right.legacyWorktreeName
+      && left.status === right.status
+      && left.entryPath === right.entryPath
+      && left.error === right.error
+      && left.projects.length === right.projects.length
+      && left.projects.every((project, index) => {
+        const other = right.projects[index];
+        return other !== undefined
+          && project.name === other.name
+          && project.repo === other.repo
+          && project.base === other.base
+          && project.path === other.path
+          && project.branch === other.branch
+          && project.created === other.created;
+      });
+  }
+
   private async executeHostThreadMerge(
     message: InboundMessage,
     expectedBinding: BindingRecord,
@@ -8104,10 +8307,86 @@ class CoreService implements ChannelService {
     let prior: HostMergeLeaseRecord | null = null;
     let lifecycleForUnstarted: WorktreeMergeLifecycle | undefined;
     let mergeAttempted = false;
+    let plan: WorktreeMergePlan | undefined;
+    let request: WorktreeMergeRequest | undefined;
+    let ownership: ThreadWorkspaceRecord | null = null;
+    let resourceCwds: readonly string[] = [];
+    let autoCommitTaskId: string | undefined;
+    let autoCommitLeaseId: string | undefined;
+    let autoCommitResourceLease: DestructiveResourceLease | undefined;
+    let autoCommitOperation: CommitOperation | undefined;
+    let autoCommitDiagnostic: string | undefined;
+    let autoCommitOutcomeUnknown = false;
+    const recordAutoCommitUnknown = (diagnostic: string): void => {
+      autoCommitOutcomeUnknown = true;
+      autoCommitDiagnostic = diagnostic;
+      this.blockedDirectories.add(expectedBinding.cwd);
+      if (autoCommitOperation !== undefined) this.blockedDirectories.add(autoCommitOperation.root);
+      if (autoCommitLeaseId !== undefined) {
+        try {
+          this.store.markHostMergeLeaseUnknown(autoCommitLeaseId);
+        } catch {
+          // The unresolved durable "committing" row is itself a restart barrier.
+        }
+      }
+      progress.unknown(diagnostic);
+    };
+    const commandContext = (taskId?: string) => ({
+      commandText: safeDisplayText(message.text, 800) ?? "/thread merge",
+      operatorNote: safeDisplayText(operatorNote, 200) ?? "",
+      senderId: message.senderId,
+      messageSeq: message.messageSeq,
+      receiptOutboxId,
+      archiveGeneration,
+      ...(taskId === undefined ? {} : { autoCommitTaskId: taskId }),
+    });
+    const commandBeforeSpawn = (leaseId: string, persistHostLease: () => boolean): void => {
+      const current = this.store.getBinding(botUid, message);
+      if (!current || !this.sameBindingState(expectedBinding, current)) {
+        throw new Error("合并执行前子区绑定已变更，未执行合并。");
+      }
+      if (ingressHooks === undefined) {
+        persistHostLease();
+        this.store.completeCommand(this.commandClaim(message, "thread"));
+        return;
+      }
+      const existing = this.store.getHostMergeLeaseBySourceId(botUid, message, message.messageId);
+      if (existing?.id === leaseId) return;
+      const persist = (): boolean => {
+        if (!ingressHooks.markDispatchIntent(leaseId)) return false;
+        const latest = this.store.getBinding(botUid, message);
+        if (!latest || !this.sameBindingState(expectedBinding, latest)) {
+          throw new Error("合并执行前子区绑定已变更，未执行合并。");
+        }
+        if (!persistHostLease()) return false;
+        const claim = this.commandClaim(message, "thread");
+        this.store.completeCommand(claim);
+        return this.store.getCommandClaimState(botUid, message, message.messageId) === "completed";
+      };
+      if (!ingressHooks.handoffToConsumer?.({ kind: "operation", id: leaseId }, persist)) {
+        throw new Error("Ingress merge host lease handoff could not be persisted");
+      }
+    };
+    const lifecycleFor = (taskId?: string): WorktreeMergeLifecycle =>
+      this.createHostMergeLifecycle(
+        message,
+        expectedBinding.cwd,
+        message.messageId,
+        resourceCwds,
+        commandContext(taskId),
+        commandBeforeSpawn,
+        progress,
+        controller.signal,
+        taskId === undefined ? onAccepted : undefined,
+        archiveGeneration,
+        taskId === undefined ? undefined : () => autoCommitDiagnostic,
+      );
+
     try {
       prior = this.store.getHostMergeLeaseBySourceId(botUid, message, message.messageId);
-      let plan: WorktreeMergePlan | undefined;
-      let resourceCwds: readonly string[];
+      if (prior?.autoCommitTaskId !== null && prior?.autoCommitTaskId !== undefined && prior.outcome === null) {
+        throw new Error("此命令的自动提交或后续合并状态尚未确认；不会重放，请先核对 Git HEAD 与工作区。");
+      }
       if (prior?.outcome !== undefined && prior.outcome !== null) {
         resourceCwds = prior.resourceCwds;
       } else {
@@ -8123,14 +8402,25 @@ class CoreService implements ChannelService {
         }
         const worktrees = this.options.worktrees;
         if (!worktrees) throw new Error("本部署未配置隔离工作区能力");
-        const request: WorktreeMergeRequest = { cwd: expectedBinding.cwd };
-        const ownership = this.store.getThreadWorkspace(botUid, message);
+        ownership = this.store.getThreadWorkspace(botUid, message);
+        if (ownership?.layout === "shared") {
+          throw new Error("当前为多项目工作区，不支持 /thread merge。");
+        }
+        if (this.store.isThreadWorkspaceIntentBlocked(botUid, message)) {
+          throw new Error("当前子区工作区未就绪，无法合并");
+        }
+        if (ownership !== null && !(await threadWorkspaceIsAvailable(ownership))) {
+          throw new Error("当前子区工作区未就绪，无法合并");
+        }
+        if (expectedBinding.cwdPinned !== true) {
+          throw new Error("当前子区未绑定隔离工作区，无法合并");
+        }
+        request = { cwd: expectedBinding.cwd };
         if (ownership !== null) {
-          const project = ownership.projects.find(
-            (candidate) =>
-              candidate.created
-              && candidate.path === expectedBinding.cwd
-              && candidate.branch !== null,
+          const project = ownership.projects.find(candidate =>
+            candidate.created
+            && candidate.path === expectedBinding.cwd
+            && candidate.branch !== null,
           );
           if (!project || project.branch === null) {
             throw new Error("当前子区隔离工作区与持久化所有权不匹配，无法合并");
@@ -8148,55 +8438,8 @@ class CoreService implements ChannelService {
           resourceCwds: [...new Set([...(current?.resourceCwds ?? []), ...resourceCwds])],
         });
       }
-      const lifecycle = this.createHostMergeLifecycle(
-        message,
-        expectedBinding.cwd,
-        message.messageId,
-        resourceCwds,
-        {
-          commandText: safeDisplayText(message.text, 800) ?? "/thread merge",
-          operatorNote: safeDisplayText(operatorNote, 200) ?? "",
-          senderId: message.senderId,
-          messageSeq: message.messageSeq,
-          receiptOutboxId,
-          archiveGeneration,
-        },
-        (leaseId, persistHostLease) => {
-          const current = this.store.getBinding(botUid, message);
-          if (!current || !this.sameBindingState(expectedBinding, current)) {
-            throw new Error("合并执行前子区绑定已变更，未执行合并。");
-          }
-          if (ingressHooks === undefined) {
-            persistHostLease();
-            this.store.completeCommand(this.commandClaim(message, "thread"));
-            return;
-          }
-          const existing = this.store.getHostMergeLeaseBySourceId(botUid, message, message.messageId);
-          if (existing?.id === leaseId) return;
-          const persist = (): boolean => {
-            if (!ingressHooks.markDispatchIntent(leaseId)) return false;
-            const latest = this.store.getBinding(botUid, message);
-            if (!latest || !this.sameBindingState(expectedBinding, latest)) {
-              throw new Error("合并执行前子区绑定已变更，未执行合并。");
-            }
-            if (!persistHostLease()) return false;
-            const claim = this.commandClaim(message, "thread");
-            this.store.completeCommand(claim);
-            return this.store.getCommandClaimState(botUid, message, message.messageId) === "completed";
-          };
-          if (!ingressHooks.handoffToConsumer?.({ kind: "operation", id: leaseId }, persist)) {
-            throw new Error("Ingress merge host lease handoff could not be persisted");
-          }
-        },
-        progress,
-        controller.signal,
-        onAccepted,
-      );
-      lifecycleForUnstarted = lifecycle;
 
       ingressHooks?.checkpoint?.("waiting-session");
-      // Keep the durable ingress checkpoint while older same-session work drains. The merge
-      // ledger and handoff are committed at Worktrunk's actual beforeSpawn boundary.
       if (reservation !== undefined) {
         const acquired = await this.acquireThreadMergeLease(
           message,
@@ -8208,6 +8451,220 @@ class CoreService implements ChannelService {
         lease = acquired.lease;
         expectedBinding = acquired.binding;
       }
+
+      if (prior === null && plan !== undefined && request !== undefined) {
+        const currentBinding = this.store.getBinding(botUid, message);
+        const currentOwnership = this.store.getThreadWorkspace(botUid, message);
+        if (
+          currentBinding === null
+          || !this.sameBindingState(expectedBinding, currentBinding)
+          || !this.sameThreadMergeOwnership(ownership, currentOwnership)
+        ) {
+          throw new Error("合并执行前子区绑定或工作区身份已变化，未执行提交。");
+        }
+        const initialChanges = await this.inspectThreadMergeWorktree(
+          expectedBinding.cwd,
+          ownership,
+          controller.signal,
+        );
+        if (initialChanges.dirty) {
+          const commitWorkspace = await this.resolveCommitWorkspace(message, expectedBinding);
+          if ("error" in commitWorkspace) {
+            autoCommitDiagnostic = commitWorkspace.error;
+            throw new Error(commitWorkspace.error);
+          }
+          if (reservation === undefined) throw new Error("merge session reservation disappeared");
+          autoCommitResourceLease = await this.scheduler.tryAcquireThreadMergeCommitResources(
+            expectedBinding.cwd,
+            commitWorkspace.root,
+            reservation.order,
+            `thread-merge-commit:${message.messageId}`,
+          );
+          if (autoCommitResourceLease === undefined) {
+            autoCommitDiagnostic = "提交工作树资源正忙或受保护；未启动 OMP 提交，也未执行合并。";
+            throw new Error(autoCommitDiagnostic);
+          }
+          const lockedChanges = await this.inspectThreadMergeWorktree(
+            expectedBinding.cwd,
+            ownership,
+            controller.signal,
+          );
+          if (lockedChanges.dirty) {
+            if (controller.signal.aborted) throw new Error("自动提交已取消；未执行合并。");
+            autoCommitTaskId = randomUUID();
+            const lifecycle = lifecycleFor(autoCommitTaskId);
+            lifecycleForUnstarted = lifecycle;
+            try {
+              lifecycle.beforeSpawn(expectedBinding.cwd);
+            } catch (error) {
+              const persistedLease = this.store.getHostMergeLeaseBySourceId(botUid, message, message.messageId);
+              if (persistedLease?.autoCommitTaskId === autoCommitTaskId) {
+                autoCommitLeaseId = persistedLease.id;
+              }
+              throw error;
+            }
+            const persistedLease = this.store.getHostMergeLeaseBySourceId(botUid, message, message.messageId);
+            if (
+              persistedLease === null
+              || persistedLease.autoCommitTaskId !== autoCommitTaskId
+              || persistedLease.autoCommitState !== "committing"
+              || persistedLease.stopRequested
+            ) {
+              autoCommitDiagnostic = "自动提交未能建立可确认的持久状态；未启动合并。";
+              throw new Error(autoCommitDiagnostic);
+            }
+            autoCommitLeaseId = persistedLease.id;
+
+            const taskMessageId = `thread-merge-auto-commit:${message.messageId}`;
+            const claim: InboundClaim = {
+              botUid,
+              target: message,
+              messageId: taskMessageId,
+              senderId: message.senderId,
+              text: THREAD_MERGE_COMMIT_TASK_TEXT,
+              supported: true,
+              kind: "task",
+            };
+            const task: TaskRecord = {
+              id: autoCommitTaskId,
+              botUid,
+              channelType: message.channelType,
+              channelId: message.channelId,
+              messageId: taskMessageId,
+              senderId: message.senderId,
+              text: THREAD_MERGE_COMMIT_TASK_TEXT,
+              sessionId: expectedBinding.sessionId,
+              cwd: expectedBinding.cwd,
+              state: "queued",
+              resultText: null,
+              errorText: null,
+              messageSeq: message.messageSeq,
+              historyEligible: false,
+              relaySuppressed: true,
+            };
+            if (!this.store.acceptTask(claim, task)) {
+              autoCommitDiagnostic = "自动提交任务未能持久受理；未执行合并。";
+              throw new Error(autoCommitDiagnostic);
+            }
+            autoCommitOperation = this.newCommitOperation(
+              autoCommitTaskId,
+              message,
+              commitWorkspace.root,
+              expectedBinding,
+              autoCommitResourceLease,
+            );
+            autoCommitOperation.autoMergeLeaseId = persistedLease.id;
+            autoCommitOperation.stopFollowing = () => controller.abort(new Error("automatic thread merge commit stopped"));
+            if (!this.store.markStarted(autoCommitTaskId)) {
+              autoCommitDiagnostic = "自动提交任务无法进入运行态；未执行合并。";
+              throw new Error(autoCommitDiagnostic);
+            }
+            onAccepted?.();
+            await this.runCommitTask(autoCommitTaskId, expectedBinding.cwd, autoCommitOperation, { preStarted: true });
+
+            if (this.stopping) throw new Error("服务正在停止；自动提交结果不会用于继续合并。");
+            if (autoCommitOperation.autoCommitPersistenceFailed || autoCommitOperation.autoCommitOutcomeUnknown) {
+              recordAutoCommitUnknown(autoCommitOperation.autoCommitOutcomeUnknown
+                ? "自动提交 worker 停止状态无法确认；不会启动合并，相关工作区继续受保护。"
+                : "自动提交结果未能持久确认；不会启动合并，相关工作区继续受保护。");
+              throw new Error(autoCommitDiagnostic);
+            }
+            const taskResult = autoCommitOperation.result;
+            if (autoCommitOperation.commitRunStarted === true
+              && (autoCommitOperation.processConfirmedExit !== true || taskResult === undefined)) {
+              recordAutoCommitUnknown("自动提交进程退出或结果无法确认；不会自动重试或启动合并。");
+              throw new Error(autoCommitDiagnostic);
+            }
+            if (taskResult === undefined || autoCommitOperation.processConfirmedExit !== true) {
+              const taskState = this.store.getTask(autoCommitTaskId)?.state;
+              autoCommitDiagnostic = autoCommitOperation.stopRequested || controller.signal.aborted
+                ? "自动提交已停止或取消；不会启动后续合并。"
+                : `OMP 原生提交未能启动或完成（任务状态：${taskState ?? "未知"}）；未执行合并。`;
+              throw new Error(autoCommitDiagnostic);
+            }
+
+            const durableCommit = this.store.getHostMergeLeaseBySourceId(botUid, message, message.messageId);
+            if (
+              durableCommit === null
+              || durableCommit.id !== autoCommitLeaseId
+              || durableCommit.autoCommitTaskId !== autoCommitTaskId
+              || durableCommit.autoCommitState !== "result-known"
+              || durableCommit.autoCommitResult === null
+              || durableCommit.autoCommitResult.exitCode !== taskResult.exitCode
+              || durableCommit.autoCommitResult.headBefore !== taskResult.headBefore
+              || durableCommit.autoCommitResult.headAfter !== taskResult.headAfter
+            ) {
+              recordAutoCommitUnknown("自动提交结果与持久状态不一致；不会启动合并，相关工作区继续受保护。");
+              throw new Error(autoCommitDiagnostic);
+            }
+            if (
+              durableCommit.stopRequested
+              || autoCommitOperation.stopRequested
+              || controller.signal.aborted
+            ) {
+              autoCommitDiagnostic = "自动提交已停止或取消；不会启动后续合并。";
+              throw new Error(autoCommitDiagnostic);
+            }
+            if (taskResult.exitCode !== 0) {
+              autoCommitDiagnostic = `OMP 原生提交失败（退出码 ${taskResult.exitCode}）；已发生的 Git 副作用保留，未执行合并。`;
+              throw new Error(autoCommitDiagnostic);
+            }
+            if (taskResult.headAfter === null || taskResult.headAfter === taskResult.headBefore) {
+              autoCommitDiagnostic = "OMP 原生提交未产生新的 HEAD；未执行合并。";
+              throw new Error(autoCommitDiagnostic);
+            }
+            const confirmedHead = await readRepositoryHead(commitWorkspace.root, controller.signal);
+            if (confirmedHead.state !== "known" || confirmedHead.head !== taskResult.headAfter) {
+              autoCommitDiagnostic = "提交后 HEAD 无法确认或与 OMP 结果不一致；未执行合并。";
+              throw new Error(autoCommitDiagnostic);
+            }
+
+            const postBinding = this.store.getBinding(botUid, message);
+            const postOwnership = this.store.getThreadWorkspace(botUid, message);
+            if (
+              postBinding === null
+              || !this.sameBindingState(expectedBinding, postBinding)
+              || !this.sameThreadMergeOwnership(ownership, postOwnership)
+            ) {
+              autoCommitDiagnostic = "提交后子区绑定或工作区身份已变化；未执行合并。";
+              throw new Error(autoCommitDiagnostic);
+            }
+            const postCommitWorkspace = await this.resolveCommitWorkspace(message, postBinding);
+            if ("error" in postCommitWorkspace || postCommitWorkspace.root !== commitWorkspace.root) {
+              autoCommitDiagnostic = "提交后 Git 工作树身份无法确认；未执行合并。";
+              throw new Error(autoCommitDiagnostic);
+            }
+            const postPlan = await this.options.worktrees!.planMerge(request, controller.signal);
+            if (!this.sameThreadMergePlan(plan, postPlan)) {
+              autoCommitDiagnostic = "提交后合并计划或目标工作区已变化；未执行合并。";
+              throw new Error(autoCommitDiagnostic);
+            }
+            const postChanges = await this.inspectThreadMergeWorktree(
+              postBinding.cwd,
+              postOwnership,
+              controller.signal,
+            );
+            if (!postChanges.allGit || postChanges.dirty) {
+              autoCommitDiagnostic = "提交后工作树仍有未提交改动或状态无法确认；保留现场，未执行合并。";
+              throw new Error(autoCommitDiagnostic);
+            }
+            if (controller.signal.aborted || this.stopping) {
+              autoCommitDiagnostic = "自动提交后的合并已停止或取消；未启动 Worktrunk。";
+              throw new Error(autoCommitDiagnostic);
+            }
+            if (!this.store.markHostMergeAutoCommitMergeReady(autoCommitLeaseId)) {
+              autoCommitDiagnostic = "自动提交后的合并未能持久授权，或已被停止；未启动 Worktrunk。";
+              throw new Error(autoCommitDiagnostic);
+            }
+          } else {
+            autoCommitResourceLease.complete();
+            autoCommitResourceLease = undefined;
+          }
+        }
+      }
+
+      const lifecycle = lifecycleForUnstarted ?? lifecycleFor(autoCommitTaskId);
+      lifecycleForUnstarted = lifecycle;
       const host: ThreadMergeHost = {
         botUid,
         store: this.store,
@@ -8261,12 +8718,42 @@ class CoreService implements ChannelService {
       );
       return summary;
     } catch (error) {
-      if (!mergeAttempted) {
+      if (autoCommitTaskId !== undefined && autoCommitLeaseId === undefined) {
+        const persistedLease = this.store.getHostMergeLeaseBySourceId(botUid, message, message.messageId);
+        if (persistedLease?.autoCommitTaskId === autoCommitTaskId) autoCommitLeaseId = persistedLease.id;
+      }
+      if (
+        autoCommitLeaseId !== undefined
+        && !autoCommitOutcomeUnknown
+        && autoCommitOperation?.commitRunStarted === true
+        && (autoCommitOperation.processConfirmedExit !== true || autoCommitOperation.result === undefined)
+      ) {
+        recordAutoCommitUnknown("自动提交进程或结果无法确认；不会自动重试或启动合并，相关工作区继续受保护。");
+      }
+      if (
+        !mergeAttempted
+        && !autoCommitOutcomeUnknown
+        && !(this.stopping && autoCommitTaskId !== undefined)
+      ) {
         try {
+          if (autoCommitLeaseId !== undefined && autoCommitDiagnostic === undefined) {
+            autoCommitDiagnostic = safeDisplayText(error instanceof Error ? error.message : "", 240)
+              ?? "OMP 原生提交或其后续验证未通过；未执行合并。";
+          }
           lifecycleForUnstarted?.onNotSpawned();
+          if (
+            lifecycleForUnstarted === undefined
+            && autoCommitLeaseId !== undefined
+            && autoCommitOperation?.commitRunStarted !== true
+          ) {
+            this.store.completeHostMergeLease(autoCommitLeaseId, {
+              kind: "not-spawned",
+              diagnostic: autoCommitDiagnostic ?? "自动提交未启动；未执行合并。",
+            });
+          }
         } catch (outcomeError) {
           try {
-            lifecycleForUnstarted?.onUnknown();
+            if (!autoCommitOutcomeUnknown) lifecycleForUnstarted?.onUnknown();
           } catch {}
           console.error(
             `[thread-merge] 无法持久化未启动结果 target=${targetKey(message)}：`
@@ -8299,6 +8786,8 @@ class CoreService implements ChannelService {
       ) {
         if (prior !== null) {
           progress.unknown();
+        } else if (autoCommitOutcomeUnknown) {
+          progress.unknown(autoCommitDiagnostic);
         } else if (progress.phase === "preparing") {
           if (controller.signal.aborted) progress.cancelled();
           else {
@@ -8313,6 +8802,8 @@ class CoreService implements ChannelService {
       }
       throw error;
     } finally {
+      autoCommitResourceLease?.complete();
+      if (autoCommitOperation !== undefined) this.forgetCommitOperation(autoCommitOperation);
       reservation?.release();
       lease?.complete();
       shutdownSignal.removeEventListener("abort", abortOnShutdown);
@@ -9220,19 +9711,26 @@ class CoreService implements ChannelService {
     taskId: string,
     expectedCwd?: string,
     scheduledOperation?: CommitOperation,
+    options: { preStarted?: boolean } = {},
   ): Promise<void> {
     const persisted = this.store.getTask(taskId);
-    if (!persisted || persisted.state !== "queued") return;
+    const expectedState = options.preStarted ? "running" : "queued";
+    if (!persisted || persisted.state !== expectedState) return;
     const target = taskTarget(persisted);
     let operation = scheduledOperation;
     let acquiredReservation: CommitLease | undefined;
-    let taskStarted = false;
+    let taskStarted = options.preStarted === true;
     let progress: TaskProgress | undefined;
+    const enqueueCommitNotice = (text: string): void => {
+      if (operation?.autoMergeLeaseId === undefined) {
+        this.outbox.enqueueText(target, text, taskId);
+      }
+    };
     try {
       if (this.stopping) return;
       const binding = this.store.getBinding(persisted.botUid, target);
       let current = this.store.getTask(taskId);
-      if (this.stopping || !current || current.state !== "queued") return;
+      if (this.stopping || !current || current.state !== expectedState) return;
       if (
         binding === null
         || binding.cwd !== current.cwd
@@ -9244,32 +9742,32 @@ class CoreService implements ChannelService {
         ))
       ) {
         this.store.markFailed(taskId, "提交绑定在执行前发生变化，未提交。");
-        this.outbox.enqueueText(target, "提交绑定已变化，请重新确认当前项目后重试。", taskId);
+        enqueueCommitNotice("提交绑定已变化，请重新确认当前项目后重试。");
         return;
       }
       const workspace = await this.resolveCommitWorkspace(target, binding);
       current = this.store.getTask(taskId);
-      if (this.stopping || !current || current.state !== "queued") return;
+      if (this.stopping || !current || current.state !== expectedState) return;
       if ("error" in workspace) {
         this.store.markFailed(taskId, workspace.error);
-        this.outbox.enqueueText(target, workspace.error, taskId);
+        enqueueCommitNotice(workspace.error);
         return;
       }
       if (operation && operation.root !== workspace.root) {
         this.store.markFailed(taskId, "提交工作树在调度前发生变化，未执行。");
-        this.outbox.enqueueText(target, "提交工作树已变化，未执行提交。", taskId);
+        enqueueCommitNotice("提交工作树已变化，未执行提交。");
         return;
       }
       if (!operation) {
         acquiredReservation = await this.scheduler.tryAcquireCommitRepository(workspace.root, taskId);
         current = this.store.getTask(taskId);
-        if (this.stopping || !current || current.state !== "queued") return;
+        if (this.stopping || !current || current.state !== expectedState) return;
         if (!acquiredReservation) {
           // A recovered 0/0 commit has not entered the native CLI yet. Keep it queued while an
           // unconfirmed worker still owns this Git worktree; restart will re-evaluate the lease.
           if (await this.isRepositoryBlocked(workspace.root)) return;
           this.store.markFailed(taskId, COMMIT_BUSY_TEXT);
-          this.outbox.enqueueText(target, COMMIT_BUSY_TEXT, taskId);
+          enqueueCommitNotice(COMMIT_BUSY_TEXT);
           return;
         }
         operation = this.newCommitOperation(
@@ -9287,8 +9785,7 @@ class CoreService implements ChannelService {
       if (this.stopping || operation.shutdownRequested || this.isWorkspaceDirectoryBlocked(workspace.root)) {
         return;
       }
-      if (!this.store.markStarted(taskId)) return;
-      taskStarted = true;
+      if (!options.preStarted && !this.store.markStarted(taskId)) return;
       this.typingLeases.acquire(target, `task:${taskId}`);
       this.store.markTaskPromptStarted(taskId, persisted.sessionId);
       progress = this.progressCards.startTask(taskId, target);
@@ -9330,7 +9827,7 @@ class CoreService implements ChannelService {
           : await this.stopCommitProcess(operation);
         if (this.stopping || operation.shutdownRequested) return;
         if (!stopped) {
-          this.outbox.enqueueText(target, "无法确认提交进程已停止；任务保持 fail-closed。", taskId);
+          enqueueCommitNotice("无法确认提交进程已停止；任务保持 fail-closed。");
           return;
         }
         if (operation.stopRequested) {
@@ -9338,7 +9835,7 @@ class CoreService implements ChannelService {
           return;
         }
         this.store.markFailed(taskId, "native commit worker could not be created");
-        this.outbox.enqueueText(target, "提交启动失败，Git 命令未执行。", taskId);
+        enqueueCommitNotice("提交启动失败，Git 命令未执行。");
         return;
       }
       const tracked = operation.tracked;
@@ -9352,14 +9849,46 @@ class CoreService implements ChannelService {
           if (stopped) {
             this.store.markCancelled(taskId, "commit stopped before native execution");
           } else {
-            this.outbox.enqueueText(target, "无法确认提交进程已停止；任务保持 fail-closed。", taskId);
+            enqueueCommitNotice("无法确认提交进程已停止；任务保持 fail-closed。");
           }
         }
         return;
       }
 
+      if (operation.autoMergeLeaseId !== undefined) {
+        let dispatchAuthorized: boolean;
+        try {
+          dispatchAuthorized = this.store.markHostMergeAutoCommitDispatched(operation.autoMergeLeaseId);
+        } catch {
+          operation.autoCommitPersistenceFailed = true;
+          this.blockedDirectories.add(operation.root);
+          const stopped = await this.stopCommitProcess(operation);
+          if (stopped) {
+            this.store.markFailed(taskId, "automatic commit dispatch could not be persisted");
+            this.settleCommitProgress(progress, "failed", COMMIT_RESULT_UNKNOWN);
+          } else {
+            operation.autoCommitOutcomeUnknown = true;
+            this.settleCommitProgress(progress, "failed", COMMIT_RESULT_UNKNOWN);
+            enqueueCommitNotice("无法确认自动提交 worker 已停止；任务保持 fail-closed。");
+          }
+          return;
+        }
+        if (!dispatchAuthorized) {
+          operation.stopRequested = true;
+          const stopped = await this.stopCommitOperation(operation);
+          if (stopped) {
+            this.store.markCancelled(taskId, "commit stopped before native execution");
+          } else {
+            operation.autoCommitOutcomeUnknown = true;
+            this.settleCommitProgress(progress, "failed", COMMIT_RESULT_UNKNOWN);
+            enqueueCommitNotice("无法确认自动提交 worker 已停止；任务保持 fail-closed。");
+          }
+          return;
+        }
+      }
       let result: CommitResult;
       try {
+        operation.commitRunStarted = true;
         const runPromise = tracked.worker.run();
         const shutdownSignal = this.shutdownController.signal;
         let shutdownListener: (() => void) | undefined;
@@ -9382,26 +9911,21 @@ class CoreService implements ChannelService {
         if (this.stopping || operation.shutdownRequested) return;
         if (!stopped) {
           this.settleCommitProgress(progress, "failed", COMMIT_RESULT_UNKNOWN);
-          this.outbox.enqueueText(target, "无法确认提交进程已停止或结果；任务保持 fail-closed。", taskId);
+          enqueueCommitNotice("无法确认提交进程已停止或结果；任务保持 fail-closed。");
           return;
         }
         if (operation.stopRequested) {
           this.store.markCancelled(taskId, "commit stopped without a reported result");
           this.settleCommitProgress(progress, "cancelled", COMMIT_RESULT_UNKNOWN);
-          this.outbox.enqueueText(
-            target,
-            "已停止提交进程，但命令未返回 HEAD 结果；请检查当前 HEAD，且不会自动重试或回滚。",
-            taskId,
-          );
+          enqueueCommitNotice("已停止提交进程，但命令未返回 HEAD 结果；请检查当前 HEAD，且不会自动重试或回滚。");
           return;
         }
         const failure = "native commit worker failed before reporting its result";
         this.store.markFailed(taskId, failure);
         this.settleCommitProgress(progress, "failed", COMMIT_RESULT_UNKNOWN);
-        this.outbox.enqueueText(target, "提交未能返回结果；请检查仓库 HEAD 后再决定是否重试。", taskId);
+        enqueueCommitNotice("提交未能返回结果；请检查仓库 HEAD 后再决定是否重试。");
         return;
       }
-
       const closed = operation.stopRequested
         ? await this.stopCommitOperation(operation)
         : await this.stopCommitProcess(operation);
@@ -9409,12 +9933,21 @@ class CoreService implements ChannelService {
         // Process exit is not confirmed, so neither the task nor the card may claim a stop or a
         // successful result. The card gets only the fixed unknown line.
         this.settleCommitProgress(progress, "failed", COMMIT_RESULT_UNKNOWN, result.content);
-        this.outbox.enqueueText(
-          target,
-          `无法确认提交进程已退出，任务保持 fail-closed；${this.commitResultNotice(result, false)}`,
-          taskId,
-        );
+        enqueueCommitNotice(`无法确认提交进程已退出，任务保持 fail-closed；${this.commitResultNotice(result, false)}`);
         return;
+      }
+      operation.processConfirmedExit = true;
+      if (operation.autoMergeLeaseId !== undefined) {
+        try {
+          this.store.recordHostMergeAutoCommitResult(operation.autoMergeLeaseId, {
+            exitCode: result.exitCode,
+            headBefore: result.headBefore,
+            headAfter: result.headAfter,
+          });
+        } catch {
+          operation.autoCommitPersistenceFailed = true;
+          this.blockedDirectories.add(operation.root);
+        }
       }
       if (this.stopping || operation.shutdownRequested) return;
 
@@ -9423,15 +9956,15 @@ class CoreService implements ChannelService {
       if (stopConfirmed && result.exitCode !== 0) {
         this.store.markCancelled(taskId, "commit stopped");
         this.settleCommitProgress(progress, "cancelled", summary, result.content);
-        this.outbox.enqueueText(target, summary, taskId);
+        enqueueCommitNotice(summary);
       } else if (result.exitCode === 0) {
         this.store.markCompleted(taskId, summary);
         this.settleCommitProgress(progress, "completed", summary, result.content);
-        this.outbox.enqueueText(target, summary, taskId);
+        enqueueCommitNotice(summary);
       } else {
         this.store.markFailed(taskId, summary);
         this.settleCommitProgress(progress, "failed", summary, result.content);
-        this.outbox.enqueueText(target, summary, taskId);
+        enqueueCommitNotice(summary);
       }
     } catch {
       if (this.stopping || operation?.shutdownRequested) return;
@@ -9439,7 +9972,7 @@ class CoreService implements ChannelService {
       const task = this.store.getTask(taskId);
       if (task?.state === "queued" || task?.state === "running") {
         this.store.markFailed(taskId, failure);
-        this.outbox.enqueueText(target, "提交启动失败，无法确认结果；请检查仓库 HEAD 后再决定是否重试。", taskId);
+        enqueueCommitNotice("提交启动失败，无法确认结果；请检查仓库 HEAD 后再决定是否重试。");
       }
     } finally {
       if (progress) {
@@ -9462,8 +9995,13 @@ class CoreService implements ChannelService {
       if (taskStarted || operation !== undefined) {
         this.typingLeases.release(target, `task:${taskId}`);
       }
-      if (operation) this.forgetCommitOperation(operation);
-      else acquiredReservation?.complete();
+      if (operation?.autoMergeLeaseId !== undefined) {
+        operation.reservation.complete();
+      } else if (operation) {
+        this.forgetCommitOperation(operation);
+      } else {
+        acquiredReservation?.complete();
+      }
       this.serviceRestart.maybeRunDeferred();
     }
   }
@@ -9472,6 +10010,12 @@ class CoreService implements ChannelService {
     const persistedTask = this.store.getTask(taskId);
     if (!persistedTask || persistedTask.state !== "queued") return;
     const target = taskTarget(persistedTask);
+    if (persistedTask.text === THREAD_MERGE_COMMIT_TASK_TEXT) {
+      this.scheduler.takeWaitingReceipt(taskId);
+      this.store.markFailed(taskId, "automatic thread-merge commit cannot be replayed after restart");
+      this.typingLeases.release(target, `task:${taskId}`);
+      return;
+    }
     const isWatchWakeTask = persistedTask.messageId.startsWith(WATCH_WAKE_PREFIX);
     const tanOperationId = persistedTask.messageId.startsWith("dispatch:tan:")
       ? persistedTask.messageId.slice("dispatch:tan:".length)

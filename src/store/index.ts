@@ -28,7 +28,7 @@ import { acceptCommitTask, acceptTask, cancelQueued, claimCommand, clearRestartN
 import { bindGoalTaskSession, clearGoalSession, finishGoalTaskProgress, getGoalSession, getGoalTask, isGoalTaskResuming, markGoalTaskAccepted, markGoalTaskAgentAccepted, markGoalTaskDispatched, saveGoalSessionProgress, stopGoalContinuation, updateGoalTaskProgress } from "./store-goals.ts";
 import { clearProgressCard, listProgressCards, recordProgressCardAttempt, saveProgressCard } from "./store-cards.ts";
 import { getWorkerLedger, listWorkerLedger, markWorkerStopped, recordWorker } from "./store-workers.ts";
-import { beginHostRemovalStep, bindHostMergeProgressCardMessage, clearHostMergeProgressCard, completeHostMergeLease, getHostMergeLeaseBySourceId, getHostMergeProgressCard, getHostRemovalLeaseBySourceId, listHostMergeLeases, listHostMergeProgressCards, listHostRemovalLeases, markHostMergeLeaseUnknown, markHostMergeProcessExited, markHostMergeProgressCardAttempted, markHostMergeProgressCardUnavailable, markHostMergeProgressCardUnknown, markHostRemovalLeaseUnknown, markHostRemovalProcessExited, persistHostMergeOutcome, persistHostRemovalOutcome, recordHostMergeProcess, recordHostMergeProgressCardAttempt, recordHostRemovalProcess, releaseHostRemovalLease, reserveHostMergeLease, reserveHostMergeProgressCard, reserveHostRemovalLease, settleHostMergeLease, settleHostRemovalLease, updateHostMergeProgressCard, type HostMergeLeaseCompletion } from "./store-host-merges.ts";
+import { beginHostMergeAutoCommitMerge, beginHostRemovalStep, bindHostMergeProgressCardMessage, clearHostMergeProgressCard, completeHostMergeLease, getHostMergeLeaseBySourceId, getHostMergeProgressCard, getHostRemovalLeaseBySourceId, listHostMergeLeases, listHostMergeProgressCards, listHostRemovalLeases, markHostMergeAutoCommitDispatched, markHostMergeAutoCommitMergeReady, markHostMergeLeaseUnknown, markHostMergeProcessExited, markHostMergeProgressCardAttempted, markHostMergeProgressCardUnavailable, markHostMergeProgressCardUnknown, markHostRemovalLeaseUnknown, markHostRemovalProcessExited, persistHostMergeOutcome, persistHostRemovalOutcome, recordHostMergeAutoCommitResult, recordHostMergeProcess, recordHostMergeProgressCardAttempt, recordHostRemovalProcess, releaseHostRemovalLease, requestHostMergeStop, reserveHostMergeLease, reserveHostMergeProgressCard, reserveHostRemovalLease, settleHostMergeLease, settleHostRemovalLease, updateHostMergeProgressCard, type HostMergeLeaseCompletion } from "./store-host-merges.ts";
 import { advanceHistoryLedger, clearContextLedger, commitContextInjection, commitHistoryInjection, getContextLedger, getHistoryLedger, prepareContextInjection, prepareHistoryInjection, pruneHistoryLedger } from "./store-ledgers.ts";
 import { acknowledgeTextOutbox, beginTextCreate, bindTextOutbox, commitTextStream, countPendingOutbox, countUnknownOutbox, enqueueOutbox, failTextOutbox, getBotEventCursor, getOutbox, listPendingOutbox, listPendingOutboxTargets, listTextStream, markOutboxDead, markOutboxFailure, markOutboxSent, setBotEventCursor, updateTextOutbox } from "./store-outbox.ts";
 import { answerClosedQuestion, answerQuestion, answerQuestions, cancelQuestion, cancelQuestions, cancelTaskQuestions, createQuestion, getQuestion, listPendingQuestions, listQuestionsByCard, listTaskQuestions, markQuestionsSettled, pendingQuestionIds, reserveQuestionCardSeq, setQuestionCard, setQuestionsCard, updateQuestionPayloads } from "./store-questions.ts";
@@ -827,6 +827,29 @@ export class ChannelStore {
   }
   reserveHostMergeLease(input: HostMergeLeaseInput): void {
     reserveHostMergeLease(this.db, input);
+  }
+
+  recordHostMergeAutoCommitResult(
+    id: string,
+    result: { exitCode: number; headBefore: string | null; headAfter: string | null },
+  ): void {
+    recordHostMergeAutoCommitResult(this.db, id, result);
+  }
+  markHostMergeAutoCommitDispatched(id: string): boolean {
+    return markHostMergeAutoCommitDispatched(this.db, id);
+  }
+
+
+  markHostMergeAutoCommitMergeReady(id: string): boolean {
+    return markHostMergeAutoCommitMergeReady(this.db, id);
+  }
+
+  beginHostMergeAutoCommitMerge(id: string): boolean {
+    return beginHostMergeAutoCommitMerge(this.db, id);
+  }
+
+  requestHostMergeStop(id: string): boolean {
+    return requestHostMergeStop(this.db, id);
   }
 
   recordHostMergeProcess(id: string, process: { pid: number; pgid: number; identity: string }): void {
