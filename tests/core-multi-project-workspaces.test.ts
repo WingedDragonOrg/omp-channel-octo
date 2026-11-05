@@ -240,7 +240,7 @@ async function dispatchThread(
 }
 
 async function sendGroupTask(harness: CoreHarness, messageId: string, text: string): Promise<void> {
-  await harness.service.handleInbound(inbound({
+  await harness.service.submitInbound(inbound({
     ...GROUP_TARGET,
     messageId,
     text,
@@ -254,7 +254,7 @@ async function sendThreadTask(
   messageId: string,
   text: string,
 ): Promise<void> {
-  await harness.service.handleInbound(inbound({
+  await harness.service.submitInbound(inbound({
     channelId,
     channelType: 5,
     messageId,
@@ -491,7 +491,7 @@ test("legacy single-thread dispatch preserves parent cwd fallback after its work
   });
   try {
     const sourceRepo = await createRepo(harness.root, "legacy-source", "legacy parent cwd\n");
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...GROUP_TARGET,
       messageId: "legacy-workspace-bind",
       text: `/new ${sourceRepo}`,
@@ -558,13 +558,28 @@ test("thread dispatch follows an explicit cwd rebind after an owned project disa
         if (boundDispatchError === undefined) {
           throw new Error("dispatch was accepted while still bound to a missing shared project");
         }
-        await harness.service.handleInbound(inbound({
+        const reboundTarget = { channelId: result.channel_id, channelType: 5 as const };
+        const rebindMessage = inbound({
           channelId: result.channel_id,
           channelType: 5,
           messageId: "detach-missing-shared-workspace",
           text: `/new ${outsidePath}`,
           mentionedUserIds: [harness.bot.uid],
-        }));
+        });
+        const reboundReceipt = harness.transport.waitForRemoteText(
+          ({ target, text }) =>
+            target.channelId === reboundTarget.channelId &&
+            target.channelType === reboundTarget.channelType &&
+            text.startsWith("已创建会话 ") &&
+            text.includes(`cwd=${outsidePath}`),
+        );
+        await harness.service.submitInbound(rebindMessage);
+        await reboundReceipt;
+        await waitForStatus(
+          harness.service,
+          reboundTarget,
+          (status) => status.cwd === outsidePath && status.sessionId !== null,
+        );
         dispatchOutcome = await dispatchThread(
           management,
           result.short_id,

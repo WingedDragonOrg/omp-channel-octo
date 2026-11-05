@@ -7,6 +7,7 @@ import {
   closeCoreHarness,
   createCoreHarness,
   inbound,
+  submitAndWaitForIngressHandoff,
   waitForStatus,
   type CoreHarness,
   type PromptRecord,
@@ -43,15 +44,13 @@ function deliver(
   messageId: string,
   text: string,
 ): Promise<void> {
-  return harness.service.handleInbound(
-    inbound({
-      messageId,
-      channelId: target.channelId,
-      channelType: target.channelType,
-      text,
-      ...(target.channelType === 1 ? {} : { mentionedUserIds: [harness.bot.uid] }),
-    }),
-  );
+  return submitAndWaitForIngressHandoff(harness, inbound({
+    messageId,
+    channelId: target.channelId,
+    channelType: target.channelType,
+    text,
+    ...(target.channelType === 1 ? {} : { mentionedUserIds: [harness.bot.uid] }),
+  })).then(() => {});
 }
 
 /** Sends a task, waits for completion, and returns the worker prompt that task produced. */

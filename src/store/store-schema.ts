@@ -79,13 +79,18 @@ export function asState(value: unknown): ChatExecutionState {
 
 /** 持久停止意图的读值；未知/空取值为 `null`（调用方按「没有叫停」处理）。 */
 export function asStopIntent(value: unknown): TaskStopIntent | null {
-  return value === "interrupt" || value === "question_timeout" ? value : null;
+  return value === "cancel" || value === "interrupt" || value === "question_timeout" ? value : null;
 }
 
 
 export function applySchema(db: Database): void {
   db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
   db.exec(`
+    CREATE TABLE IF NOT EXISTS scheduler_order_state (
+      singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+      next_order INTEGER NOT NULL CHECK(next_order >= 1)
+    );
+    INSERT OR IGNORE INTO scheduler_order_state(singleton, next_order) VALUES(1, 1);
     CREATE TABLE IF NOT EXISTS meta (
       key TEXT PRIMARY KEY NOT NULL,
       value TEXT NOT NULL
@@ -123,6 +128,7 @@ export function applySchema(db: Database): void {
       session_file TEXT,
       cwd_pinned INTEGER NOT NULL DEFAULT 0,
       session_switched_at INTEGER,
+      session_initialization_json TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       PRIMARY KEY(bot_uid, channel_type, channel_id)
@@ -267,6 +273,33 @@ export function applySchema(db: Database): void {
       task_id TEXT,
       accepted_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS ingress_jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      schedule_order INTEGER NOT NULL DEFAULT 0,
+      bot_uid TEXT NOT NULL,
+      source_kind TEXT NOT NULL CHECK(source_kind IN ('recv', 'bot-event', 'synthetic')),
+      source_id TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
+      channel_id TEXT NOT NULL,
+      message_id TEXT,
+      payload_json TEXT,
+      route_snapshot_json TEXT,
+      prepared_text TEXT,
+      spool_paths_json TEXT NOT NULL DEFAULT '[]',
+      ack_ready INTEGER NOT NULL CHECK(ack_ready IN (0, 1)),
+      lane TEXT NOT NULL CHECK(lane IN ('ordered', 'control')),
+      state TEXT NOT NULL CHECK(state IN ('accepted', 'preparing', 'dispatch-intent', 'handed-off', 'unknown', 'cancelled')),
+      operation_checkpoint_json TEXT,
+      consumer_kind TEXT CHECK(consumer_kind IS NULL OR consumer_kind IN ('task', 'steering', 'ask', 'operation', 'outbox')),
+      consumer_id TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(bot_uid, source_kind, source_id),
+      CHECK((consumer_kind IS NULL) = (consumer_id IS NULL)),
+      CHECK(state != 'cancelled' OR (payload_json IS NULL AND route_snapshot_json IS NULL AND ack_ready = 1))
+    );
+    CREATE INDEX IF NOT EXISTS ingress_jobs_recovery ON ingress_jobs(bot_uid, state, id);
+    CREATE INDEX IF NOT EXISTS ingress_jobs_chat_order ON ingress_jobs(bot_uid, channel_type, channel_id, lane, id);
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY NOT NULL,
       bot_uid TEXT NOT NULL,
@@ -279,6 +312,7 @@ export function applySchema(db: Database): void {
       cwd TEXT NOT NULL,
       state TEXT NOT NULL CHECK(state IN ('queued', 'started', 'completed', 'failed', 'cancelled', 'interrupted')),
       accepted_at INTEGER NOT NULL,
+      schedule_order INTEGER NOT NULL DEFAULT 0,
       started_at INTEGER,
       finished_at INTEGER,
       result_text TEXT,
@@ -624,11 +658,14 @@ export function applySchema(db: Database): void {
     "ALTER TABLE outbox ADD COLUMN stream_final INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE outbox ADD COLUMN create_payload_json TEXT",
     "ALTER TABLE worker_ledger ADD COLUMN move_target_cwd TEXT",
+    "ALTER TABLE ingress_jobs ADD COLUMN schedule_order INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE tasks ADD COLUMN schedule_order INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN message_seq INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN history_eligible INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE tasks ADD COLUMN stop_intent TEXT",
     "ALTER TABLE chats ADD COLUMN cwd_pinned INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE chats ADD COLUMN session_switched_at INTEGER",
+    "ALTER TABLE chats ADD COLUMN session_initialization_json TEXT",
     "ALTER TABLE questions ADD COLUMN card_message_id TEXT",
     "ALTER TABLE questions ADD COLUMN answered_by TEXT",
     "ALTER TABLE questions ADD COLUMN closed_reason TEXT",
@@ -656,6 +693,7 @@ export function applySchema(db: Database): void {
       if (!String(error).includes("duplicate column")) throw error;
     }
   }
+  migrateSchedulerOrder(db);
   db.exec("UPDATE host_merge_progress_cards SET delivery_state = 'bound' WHERE delivery_state = 'unknown' AND message_id IS NOT NULL");
   migrateWorkerLedgerNullableSessionFile(db);
   migrateThreadForkPreparationStarted(db);
@@ -689,6 +727,86 @@ export function applySchema(db: Database): void {
   );
   migrateProgressCards(db);
   migrateLoopStorage(db);
+}
+
+function migrateSchedulerOrder(db: Database): void {
+  transaction(db, () => {
+    const ingressRows = query(db, "SELECT id, created_at, schedule_order FROM ingress_jobs")
+      .map(row => ({
+        id: asNumber(row.id),
+        at: asNumber(row.created_at),
+        order: asNumber(row.schedule_order),
+      }));
+    const taskRows = query(db, "SELECT id, accepted_at, schedule_order FROM tasks")
+      .map(row => ({
+        id: asString(row.id),
+        at: asNumber(row.accepted_at),
+        order: asNumber(row.schedule_order),
+      }));
+    const linkedTasks = new Map<string, number>();
+    for (const row of query(
+      db,
+      `SELECT id, consumer_id FROM ingress_jobs
+       WHERE state = 'handed-off' AND consumer_kind = 'task' AND consumer_id IS NOT NULL
+       ORDER BY id ASC`,
+    )) {
+      const taskId = asString(row.consumer_id);
+      if (!linkedTasks.has(taskId)) linkedTasks.set(taskId, asNumber(row.id));
+    }
+
+    let maximum = 0;
+    for (const row of ingressRows) maximum = Math.max(maximum, row.order);
+    for (const row of taskRows) maximum = Math.max(maximum, row.order);
+    const missing = ingressRows.some(row => row.order === 0)
+      || taskRows.some(row => row.order === 0);
+    if (missing) {
+      const ingressById = new Map(ingressRows.map(row => [row.id, row]));
+      const tasksById = new Map(taskRows.map(row => [row.id, row]));
+      const events = [
+        ...ingressRows
+          .filter(row => row.order === 0)
+          .map(row => ({ kind: "ingress" as const, id: row.id, at: row.at })),
+        ...taskRows
+          .filter(row => row.order === 0 && !linkedTasks.has(row.id))
+          .map(row => ({ kind: "task" as const, id: row.id, at: row.at })),
+      ];
+      events.sort((left, right) =>
+        left.at - right.at
+        || (left.kind === right.kind ? 0 : left.kind === "ingress" ? -1 : 1)
+        || String(left.id).localeCompare(String(right.id)),
+      );
+      let next = maximum === 0 ? 1 : maximum + 1;
+      for (const event of events) {
+        if (event.kind === "ingress") {
+          const row = ingressById.get(event.id);
+          if (row === undefined) continue;
+          row.order = next;
+          run(db, "UPDATE ingress_jobs SET schedule_order = ? WHERE id = ?", [next, event.id]);
+        } else {
+          const row = tasksById.get(event.id);
+          if (row === undefined) continue;
+          row.order = next;
+          run(db, "UPDATE tasks SET schedule_order = ? WHERE id = ?", [next, event.id]);
+        }
+        next += 1;
+      }
+      for (const task of taskRows) {
+        const ingressId = linkedTasks.get(task.id);
+        const ingressOrder = ingressId === undefined ? undefined : ingressById.get(ingressId)?.order;
+        if (ingressOrder !== undefined && task.order !== ingressOrder) {
+          task.order = ingressOrder;
+          run(db, "UPDATE tasks SET schedule_order = ? WHERE id = ?", [ingressOrder, task.id]);
+        }
+      }
+    }
+
+    const current = asNumber(query(db, "SELECT next_order FROM scheduler_order_state WHERE singleton = 1")[0]?.next_order);
+    let maxOrder = 0;
+    for (const row of ingressRows) maxOrder = Math.max(maxOrder, row.order);
+    for (const row of taskRows) maxOrder = Math.max(maxOrder, row.order);
+    const nextOrder = Math.max(current, maxOrder + 1, 1);
+    run(db, "UPDATE scheduler_order_state SET next_order = ? WHERE singleton = 1", [nextOrder]);
+  });
 }
 
 function migrateLoopStorage(db: Database): void {
@@ -918,21 +1036,48 @@ export function run(db: Database, sql: string, values: readonly SqlValue[] = [])
   return { changes: result.changes ?? 0 };
 }
 
+const transactionDepth = new WeakMap<Database, number>();
+let transactionSavepointId = 0;
 export function transaction<T>(db: Database, work: () => T): T {
-  db.exec("BEGIN IMMEDIATE");
+  const depth = transactionDepth.get(db) ?? 0;
+  const savepoint = `store_tx_${++transactionSavepointId}`;
+  db.exec(depth === 0 ? "BEGIN IMMEDIATE" : `SAVEPOINT ${savepoint}`);
+  transactionDepth.set(db, depth + 1);
   try {
     const result = work();
-    db.exec("COMMIT");
+    db.exec(depth === 0 ? "COMMIT" : `RELEASE SAVEPOINT ${savepoint}`);
     return result;
   } catch (error) {
     try {
-      db.exec("ROLLBACK");
+      db.exec(depth === 0 ? "ROLLBACK" : `ROLLBACK TO SAVEPOINT ${savepoint}; RELEASE SAVEPOINT ${savepoint}`);
     } catch {
       // Preserve the original database failure.
     }
     throw error;
+  } finally {
+    if (depth === 0) transactionDepth.delete(db);
+    else transactionDepth.set(db, depth);
   }
 }
+/** Allocates the next token in the durable order domain shared by ingress jobs and tasks. */
+export function allocateScheduleOrder(db: Database): number {
+  return transaction(db, () => {
+    const row = query(db, "SELECT next_order FROM scheduler_order_state WHERE singleton = 1")[0];
+    const order = asNumber(row?.next_order);
+    if (!Number.isSafeInteger(order) || order < 1) {
+      throw new Error("durable scheduler order is unavailable");
+    }
+    if (run(
+      db,
+      "UPDATE scheduler_order_state SET next_order = ? WHERE singleton = 1 AND next_order = ?",
+      [order + 1, order],
+    ).changes !== 1) {
+      throw new Error("durable scheduler order changed unexpectedly");
+    }
+    return order;
+  });
+}
+
 
 export function historyLedgerRow(db: Database, botUid: string, target: ChatTarget, sessionId: string): SqlRow | undefined {
   return query(db,

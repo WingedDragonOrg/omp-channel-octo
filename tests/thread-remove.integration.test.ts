@@ -3,10 +3,17 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, unlink, watch, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openChannelStore } from "../src/store/index.ts";
+import { openChannelStore, type ChannelStore } from "../src/store/index.ts";
+import type { HostRemovalLeaseRecord } from "../src/store/store-records.ts";
 import { createWorktreePort } from "../src/workspace/worktree.ts";
 import { groupAlive } from "../src/omp/process.ts";
-import { closeCoreHarness, createCoreHarness, FakeTransport, inbound } from "./fixtures/core-fakes.ts";
+import {
+  closeCoreHarness,
+  createCoreHarness,
+  FakeTransport,
+  inbound,
+  submitAndWaitForIngressHandoff,
+} from "./fixtures/core-fakes.ts";
 
 class RemovalTransport extends FakeTransport {
   receiptDeliveredBeforeArchive = false;
@@ -42,6 +49,37 @@ async function repository(root: string, name: string): Promise<string> {
   await git(repo, "commit", "-qm", "base");
   return repo;
 }
+async function waitForImmediateTurn(): Promise<void> {
+  const turn = Promise.withResolvers<void>();
+  setImmediate(turn.resolve);
+  await turn.promise;
+}
+
+async function waitForHostRemovalLease(
+  store: ChannelStore,
+  botUid: string,
+  target: { channelId: string; channelType: 5 },
+  sourceId: string,
+  predicate: (lease: HostRemovalLeaseRecord) => boolean,
+): Promise<HostRemovalLeaseRecord> {
+  const deadline = performance.now() + 5_000;
+  let observed = store.getHostRemovalLeaseBySourceId(botUid, target, sourceId);
+  while (performance.now() < deadline) {
+    if (observed !== null && predicate(observed)) return observed;
+    await waitForImmediateTurn();
+    observed = store.getHostRemovalLeaseBySourceId(botUid, target, sourceId);
+  }
+  throw new Error(`host removal lease did not reach expected state for ${sourceId}`);
+}
+
+async function waitForProcessGroupExit(pgid: number): Promise<void> {
+  const deadline = performance.now() + 5_000;
+  while (performance.now() < deadline) {
+    if (!groupAlive(pgid)) return;
+    await waitForImmediateTurn();
+  }
+  throw new Error(`host removal process group ${pgid} remained alive after cancellation`);
+}
 
 // A command routed to the agent, or a force path that leaves the branch, breaks this lifecycle.
 test("real host remove protects unmerged work, then force deletes its branch without merging", async () => {
@@ -68,10 +106,16 @@ test("real host remove protects unmerged work, then force deletes its branch wit
     store.saveThreadWorkspace({ botUid: harness.bot.uid, ...thread, layout: "single",
       status: "ready", entryPath: null, error: null,
       projects: [{ name: "feature", repo, path: worktree, branch: "feature", created: true }] });
-    const send = (id: string, text: string) => harness.service.handleInbound(inbound({
+    const send = (id: string, text: string) => harness.service.submitInbound(inbound({
       ...thread, messageId: id, text, mentionedUserIds: [harness.bot.uid],
     }));
+    const protectedReceipt = harness.transport.waitForRemoteText(({ target: sentTarget, text }) =>
+      sentTarget.channelId === thread.channelId
+      && sentTarget.channelType === thread.channelType
+      && text.includes("--force"),
+    );
     await send("remove-protected", "/thread remove");
+    await protectedReceipt;
     expect(existsSync(worktree)).toBe(true);
     expect(await git(repo, "rev-parse", "refs/heads/feature")).toBe(featureHead);
     expect(harness.transport.managementCalls).toEqual([]);
@@ -79,7 +123,13 @@ test("real host remove protects unmerged work, then force deletes its branch wit
     expect(harness.transport.sent.some(({ text }) => text.includes("--force"))).toBe(true);
 
     await writeFile(join(worktree, "untracked.txt"), "uncommitted work\n");
+    const completeReceipt = harness.transport.waitForRemoteText(({ target: sentTarget, text }) =>
+      sentTarget.channelId === thread.channelId
+      && sentTarget.channelType === thread.channelType
+      && text.startsWith("本地隔离工作区与记录分支清理完成"),
+    );
     await send("remove-forced", "/thread remove --force");
+    expect((await completeReceipt).text).toContain("本地隔离工作区与记录分支清理完成");
     // Filesystem proof before observing the fixture's archive request.
     expect(existsSync(worktree)).toBe(false);
     expect(await git(repo, "branch", "--list", "feature")).toBe("");
@@ -90,7 +140,13 @@ test("real host remove protects unmerged work, then force deletes its branch wit
     expect(store.getLatestTask(harness.bot.uid, thread)).toBeNull();
     expect(store.listThreadMergeEvents(harness.bot.uid)).toEqual([]);
     expect(harness.workers.creations).toEqual([]);
-    await send("remove-forced", "/thread remove --force");
+    const duplicateMessage = inbound({
+      ...thread,
+      messageId: "remove-forced",
+      text: "/thread remove --force",
+      mentionedUserIds: [harness.bot.uid],
+    });
+    await submitAndWaitForIngressHandoff(harness, duplicateMessage);
     expect(harness.transport.managementCalls.filter(call => call.action === "thread-archive")).toHaveLength(1);
     expect(harness.transport.managementCalls.some(call => call.action === "thread-delete")).toBe(false);
   } finally {
@@ -132,10 +188,16 @@ test("real shared remove records missing and removed projects but archives only 
         { name: "a", repo: repoA, path: pathA, branch: "thread-a", created: true },
         { name: "b", repo: repoB, path: pathB, branch: "thread-b", created: true },
       ] });
-    const send = (id: string) => harness.service.handleInbound(inbound({
+    const send = (id: string) => harness.service.submitInbound(inbound({
       ...thread, messageId: id, text: "/thread remove --force", mentionedUserIds: [harness.bot.uid],
     }));
+    const partialReceipt = harness.transport.waitForRemoteText(({ target: sentTarget, text }) =>
+      sentTarget.channelId === thread.channelId
+      && sentTarget.channelType === thread.channelType
+      && text.includes("本地工作区清理未完整完成"),
+    );
     await send("shared-partial");
+    expect((await partialReceipt).text).toContain("本地工作区清理未完整完成");
     expect(existsSync(pathB)).toBe(false);
     expect(await git(repoA, "branch", "--list", "thread-a")).toBe("");
     expect(await git(repoB, "branch", "--list", "thread-b")).toBe("");
@@ -144,7 +206,13 @@ test("real shared remove records missing and removed projects but archives only 
     expect(harness.transport.managementCalls).toEqual([]);
     expect(store.getThreadWorkspace(harness.bot.uid, thread)?.entryPath).toBe(entry);
     await unlink(unknown);
+    const completeReceipt = harness.transport.waitForRemoteText(({ target: sentTarget, text }) =>
+      sentTarget.channelId === thread.channelId
+      && sentTarget.channelType === thread.channelType
+      && text.startsWith("本地隔离工作区与记录分支清理完成"),
+    );
     await send("shared-complete");
+    expect((await completeReceipt).text).toContain("本地隔离工作区与记录分支清理完成");
     expect(existsSync(entry)).toBe(false);
     await harness.transport.waitForManagementCalls(call => call.action === "thread-archive");
     expect(await git(repoA, "rev-parse", "HEAD")).toBe(headA);
@@ -152,6 +220,7 @@ test("real shared remove records missing and removed projects but archives only 
     expect(harness.workers.prompts).toEqual([]);
     expect(store.getLatestTask(harness.bot.uid, thread)).toBeNull();
     expect(store.listThreadMergeEvents(harness.bot.uid)).toEqual([]);
+
   } finally {
     store.close();
     await closeCoreHarness(harness);
@@ -176,6 +245,7 @@ wait
   });
   const store = await openChannelStore(harness.stateDir);
   const thread = { channelType: 5 as const, channelId: "group-allowed____remove-cancel-real" };
+  let pgid: number | undefined;
   try {
     const repo = await repository(root, "source");
     const worktree = join(root, "owned");
@@ -195,16 +265,35 @@ wait
       }
       throw new Error("Removal process did not publish its PID");
     })();
-    const operation = harness.service.handleInbound(inbound({
-      ...thread, messageId: "remove-blocking", text: "/thread remove", mentionedUserIds: [harness.bot.uid],
-    }));
-    const pgid = await started;
-    expect(groupAlive(pgid)).toBe(true);
-    await harness.service.handleInbound(inbound({
+    const removalMessage = inbound({
+      ...thread,
+      messageId: "remove-blocking",
+      text: "/thread remove",
+      mentionedUserIds: [harness.bot.uid],
+    });
+    await harness.service.submitInbound(removalMessage);
+    const removalPgid = await started;
+    pgid = removalPgid;
+    const runningLease = await waitForHostRemovalLease(
+      store,
+      harness.bot.uid,
+      thread,
+      removalMessage.messageId,
+      lease => lease.phase === "running",
+    );
+    expect(runningLease.pgid).toBe(removalPgid);
+    expect(groupAlive(removalPgid)).toBe(true);
+    await harness.service.submitInbound(inbound({
       ...thread, messageId: "cancel-removal", text: "/cancel", mentionedUserIds: [harness.bot.uid],
     }));
-    await operation;
-    expect(groupAlive(pgid)).toBe(false);
+    await waitForProcessGroupExit(removalPgid);
+    await waitForHostRemovalLease(
+      store,
+      harness.bot.uid,
+      thread,
+      removalMessage.messageId,
+      lease => lease.phase === "unknown" || lease.outcome !== null,
+    );
     expect(existsSync(worktree)).toBe(true);
     expect(await git(repo, "rev-parse", "refs/heads/feature")).toBe(mainHead);
     expect(await git(repo, "rev-parse", "HEAD")).toBe(mainHead);
@@ -216,5 +305,12 @@ wait
   } finally {
     store.close();
     await closeCoreHarness(harness);
+    if (pgid !== undefined && groupAlive(pgid)) {
+      try {
+        process.kill(-pgid, "SIGKILL");
+      } catch {
+        // The service may have reaped the process group during teardown.
+      }
+    }
   }
 }, 15_000);

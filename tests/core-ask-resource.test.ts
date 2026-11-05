@@ -21,14 +21,14 @@ test("ask timeout releases a worker that acknowledges abort without ending its t
   const target = { channelType: 1 as const, channelId: "timeout-resource" };
   try {
     vi.useFakeTimers();
-    await harness.service.handleInbound(inbound({ ...target, messageId: "start", text: "ask" }));
+    await harness.service.submitInbound(inbound({ ...target, messageId: "start", text: "ask" }));
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, s => s.pendingQuestionIds.length === 1);
     vi.advanceTimersByTime(40);
     const status = await waitForStatus(harness.service, target, s => s.state === "interrupted");
     expect(status.pendingQuestionIds).toHaveLength(1);
     expect(harness.transport.sent.some(message => message.text.includes("失败"))).toBe(false);
-    await harness.service.handleInbound(inbound({ ...target, messageId: "answer", text: "staging" }));
+    await harness.service.submitInbound(inbound({ ...target, messageId: "answer", text: "staging" }));
     await waitForStatus(harness.service, target, s => s.state === "completed");
     expect(harness.workers.prompts[1]?.sessionId).toBe(harness.workers.prompts[0]?.sessionId);
     expect(await Bun.file(`${harness.root}/tmp/answer.txt`).text()).toContain("staging");

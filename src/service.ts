@@ -2,7 +2,15 @@ import { GroupHistoryCoordinator } from "./inbound/history-coordinator.ts";
 import { ModelSwitchController } from "./commands/model-controller.ts";
 import { modelPolicyDescription } from "./commands/model-switch.ts";
 import { formatGoalSession, goalErrorText, GOAL_USAGE, parseGoalCommand } from "./commands/goal-command.ts";
-import { CONFIG_CARD_ACTION_PREFIX, createConfigMenuDesk, type ConfigMenuDesk } from "./commands/command-cards.ts";
+import {
+  CONFIG_CARD_ACTION_PREFIX,
+  createConfigMenuDesk,
+  ConfigActionSuspendedError,
+  type ConfigActionCheckpoint,
+  type ConfigApplyReservation,
+  type ConfigCardActionSnapshot,
+  type ConfigMenuDesk,
+} from "./commands/command-cards.ts";
 import { ProgressCards, type TaskProgress } from "./cards/progress-cards.ts";
 import { HostMergeProgressCards, type HostMergeProgressSession } from "./cards/host-merge-progress.ts";
 import { buildStatusCard } from "./cards/status-card.ts";
@@ -20,11 +28,16 @@ import {
 import { collectWatch } from "./watch/collector.ts";
 import { createWatchJudge } from "./watch/decision.ts";
 import { WatchCoordinator } from "./watch/index.ts";
-import { SessionLifecycle, threadWorkspaceIsAvailable } from "./session/session-lifecycle.ts";
+import {
+  SessionLifecycle,
+  threadWorkspaceIsAvailable,
+  type SessionCommandIngressHooks,
+} from "./session/session-lifecycle.ts";
 import {
   TaskScheduler,
   resourcePathsRelated,
   type DestructiveCommandReservation,
+  type SessionCommandReservation,
   type CommandSessionBarrier,
   type CommitLease,
   type SessionLease,
@@ -43,8 +56,9 @@ import { acquireBotLock, assertBotLockFree, type LockHandle } from "./runtime/bo
 import { openTrackedCommit, openTrackedWorker, type TrackedCommit, type TrackedWorker, type WorkerSession } from "./runtime/worker-lease.ts";
 import { LoopController, type LoopDeliveryOutcome } from "./loop/controller.ts";
 import type { LoopBinding, LoopInput } from "./loop/types.ts";
-import { TaskStartupError, WorkerGoalError } from "./contracts.ts";
+import { TaskStartupError, WorkerGoalError, WorkerSteerRejectedError } from "./contracts.ts";
 import type {
+  BotCardAction,
   BotIdentity,
   ChannelCommandHandler,
   ChannelService,
@@ -57,6 +71,7 @@ import type {
   ContextInjection,
   PromptContext,
   InboundMessage,
+  InboundReceipt,
   SteerConsumedEvent,
   WorkerEvent,
   WorkerGoal,
@@ -98,6 +113,21 @@ import { createBotEventLoop, type BotEventLoop } from "./bot-events.ts";
 import { createOutboxDelivery, splitUtf8, type Outbox } from "./outbox.ts";
 import { createHostTools, type HostToolHost } from "./host-tools.ts";
 import { InboundMaterializer } from "./inbound/inbound-materializer.ts";
+import {
+  IngressCoordinator,
+  IngressSuspendedError,
+  type IngressAdmission,
+  type IngressDispatch,
+  type IngressClassification,
+  type IngressPreparation,
+} from "./inbound/ingress-coordinator.ts";
+import type {
+  IngressBindingSnapshot,
+  IngressJobRecord,
+  IngressOperationCheckpoint,
+  IngressRoutePurpose,
+} from "./inbound/ingress-types.ts";
+import { recvIngressSourceId } from "./inbound/ingress-types.ts";
 import { InboundShutdownError, safeErrorMessage } from "./errors.ts";
 import { safeDisplayText } from "./cards/execution-text.ts";
 import { classifyStartupFailure, classifyTaskFailure, GENERIC_TASK_FAILURE_NOTICE, type TaskStartupPhase } from "./tasks/task-failure.ts";
@@ -127,7 +157,7 @@ import {
   cleanupOwnedThreadWorkspace,
   threadWorkspaceCleanupPaths,
 } from "./threads/thread-workspace-cleanup.ts";
-import { ThreadCommands } from "./commands/thread-commands.ts";
+import { ThreadCommands, type ThreadCommandIngressHooks } from "./commands/thread-commands.ts";
 import { ServiceRestart } from "./runtime/service-restart.ts";
 import { TaskEvents } from "./tasks/task-events.ts";
 import { canonicalExistingDirectory, existingSessionFile, resolveWorkDirectory } from "./workspace/workdir.ts";
@@ -144,6 +174,7 @@ import { renderReviewPrompt } from "./tasks/review-prompt.ts";
 
 const GROUP_TRUSTED_INSTRUCTION =
   "群说明是群共享上下文，不改变发送者身份/权限/cwd；以本次快照为准，历史快照已失效。";
+const QUESTION_WAKE_STEER_REFUSED = "question wake steer explicitly refused";
 const WATCH_WAKE_PREFIX = "watch:";
 const COMMAND_HELP = [
   "会话",
@@ -262,6 +293,8 @@ type RuntimeTask = {
   workAfterStop: boolean;
   /** Steered messages not yet observed as consumed, in delivery order (OMP's queue is FIFO). */
   steerDeliveries: { text: string; silent?: boolean }[];
+  /** True while an OMP steer RPC is unresolved; cancellation must not close its worker prematurely. */
+  steerCallInFlight: boolean;
   /** Serializes each member lookup, sidecar publication and worker delivery in input order. */
   steerSerial: Promise<void>;
   turnContext: TurnContext;
@@ -367,25 +400,50 @@ async function pauseThreadMergeWait(signal: AbortSignal): Promise<void> {
   if (signal.aborted) throw threadMergeAbortError(signal);
 }
 
+interface PreparedIngressTask {
+  readonly message: InboundMessage;
+  readonly ingressJobId: number;
+  readonly expectedBinding: BindingRecord | null;
+  readonly binding: BindingRecord;
+  readonly task: TaskRecord;
+  readonly claim: InboundClaim;
+  readonly startsBehind: boolean;
+}
+type PreparedGoalStop = {
+  binding: BindingRecord | null;
+  cancelledTaskIds: readonly string[];
+};
+
+type IngressCommandStopEffects = {
+  goal?: PreparedGoalStop;
+  watch?: readonly WatchRecord[];
+  interrupt?: {
+    interruptedTaskIds: readonly string[];
+    hostOperationCancelled: boolean;
+  };
+};
 class CoreService implements ChannelService {
   private readonly history: GroupHistoryCoordinator;
   private readonly models: ModelSwitchController;
   /** `/switch`、`/mode` 配置卡片的进程内会话：绑定、owner 校验、应用串行与有界回收都在它内部。 */
   private readonly configMenus: ConfigMenuDesk;
+  private readonly ingressConfigReservations = new Map<string, ConfigApplyReservation>();
   /** Owner-confirmed unlisted-chat cards and their durable SQLite grant operations. */
   private readonly chatGrants: ChatGrantDesk;
   private readonly authorization: ChatAuthorization;
   private readonly materializer: InboundMaterializer;
+  /** Durable short admission, per-chat ordering and recovery barriers; never a transport chain. */
+  private readonly ingress: IngressCoordinator;
+  /** Service-wide cancellation for materialization, network probes and managed domain operations. */
+  private readonly shutdownController = new AbortController();
   private readonly progressCards: ProgressCards;
   private readonly hostMergeProgressCards: HostMergeProgressCards;
   private readonly sessions: SessionLifecycle;
   /** 任务排定与按 cwd 的租约：队列、等待回执与目录链都由它独占。 */
   private readonly scheduler: TaskScheduler;
-  /** In-flight inbound handlers: stop aborts their I/O and awaits their cleanup before closing the store. */
-  private readonly inboundOperations = new Set<Promise<void>>();
-  /** Shutdown cancellation source for inbound I/O (downloads, transcription, mention-pref lookups). */
-  private readonly shutdownController = new AbortController();
   private readonly runtimes = new Map<string, RuntimeTask>();
+  /** Prevents replayed question-wake effects from racing their own steer/queue decision. */
+  private readonly questionWakeOperations = new Set<string>();
   /** One in-flight native BTW per chat; its controller is shared with cancel/interrupt/shutdown. */
   private readonly btwOperationsByTarget = new Map<string, BtwOperation>();
   /** In-flight native-state reads invalidated by a later explicit goal stop. */
@@ -397,6 +455,24 @@ class CoreService implements ChannelService {
   /** Active owner-triggered removals share the same cancel/stop discipline as host merges. */
   private readonly threadRemovalControllers = new Map<string, Set<AbortController>>();
   private readonly threadRemovalControllersByCommand = new Map<string, AbortController>();
+  /** Waiting ingress-owned thread commands retain their exact scheduler reservation through recovery. */
+  private readonly ingressCommandReservations = new Map<string, {
+    kind: "merge" | "remove";
+    reservation: DestructiveCommandReservation;
+    resourceCwds: readonly string[];
+  }>();
+  /** `/new` and `/move` preserve the exact session/path barrier while waiting or recovering. */
+  private readonly ingressSessionReservations = new Map<string, {
+    kind: "new" | "move";
+    reservation: SessionCommandReservation;
+    resourceCwds: readonly string[];
+  }>();
+  private readonly ingressSessionCommandControllers = new Map<string, Set<AbortController>>();
+  private readonly ingressSessionControllersByCommand = new Map<string, AbortController>();
+  private readonly ingressSessionJobIdsByTarget = new Map<string, Set<number>>();
+  private readonly ingressSessionJobIdsByCommand = new Map<string, number>();
+  /** Service-owned ingress command operations remain joinable by same-chat cancellation. */
+  private readonly ingressCommandOperations = new Map<string, Set<Promise<void>>>();
   /** Fork command lifetime remains active through result delivery and durable claim completion. */
   private readonly forkCommandTargets = new Map<string, ChatTarget>();
   /** Fork archive waits and receipt-gated runs avoid the target cwd/Git resource locks. */
@@ -431,6 +507,7 @@ class CoreService implements ChannelService {
   private readonly commitOperationsByTarget = new Map<string, CommitOperation>();
   /** `/review` uses one independent lane per chat; it is never part of the ordinary chat FIFO. */
   private readonly reviewRuntimes = new Map<string, ReviewRuntime>();
+  private readonly ingressCommitReservations = new Map<number, DestructiveCommandReservation>();
   private readonly blockedDirectories = new Set<string>();
   /** 问题与问答卡：等待者、卡片代次与问题行的所有者。 */
   /** 出站投递：文字、流式编辑与文件共用的队列。 */
@@ -502,6 +579,7 @@ class CoreService implements ChannelService {
         begin: (target, kind) => this.configMenus.begin(target, kind),
         open: (target, view, ticket) => this.configMenus.open(target, view, ticket),
         invalidate: (target, kind) => this.configMenus.invalidate(target, kind),
+        reserveApply: (kind, target, sourceId) => this.configMenus.reserveApply(kind, target, sourceId),
         serialize: (kind, target, work) => this.configMenus.serialize(kind, target, work),
       },
     });
@@ -510,11 +588,19 @@ class CoreService implements ChannelService {
       transport: options.transport,
       botUid: () => this.bot?.uid,
       stopping: () => this.stopping,
-      // 点击时刻重新校验聊天：私聊沿用消息门的 owner 判定（点击者非 owner 时更早被拒），群/子区
-      // 仍须命中允许清单——被移出允许清单的聊天不能让旧卡片继续改配置。
       chatAllowed: target => target.channelType === 1 || this.authorization.isPermittedChat(target),
+      getAcceptedEvent: eventId => {
+        const botUid = this.bot?.uid;
+        return botUid !== undefined && this.store.getIngressJobBySource({
+          botUid,
+          sourceKind: "bot-event",
+          sourceId: String(eventId),
+        }) !== null;
+      },
       shutdownSignal: this.shutdownController.signal,
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
+      acceptAction: (snapshot, action, reservation) =>
+        this.acceptConfigCardAction(snapshot, action, reservation),
       applyChoice: (kind, target, value) => kind === "switch"
         ? this.models.applySwitch(target, value)
         : Promise.resolve(this.applyModeChoice(target, value)),
@@ -622,6 +708,7 @@ class CoreService implements ChannelService {
       commandClaim: (message, name) => this.commandClaim(message, name),
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
       offerUnlistedChat: (message, bot) => this.chatGrants.offer(message, bot),
+      trackOperation: operation => this.operationSet(operation),
     });
     this.materializer = new InboundMaterializer({
       config: this.options.config,
@@ -633,6 +720,7 @@ class CoreService implements ChannelService {
       throwIfStopping: () => this.throwIfStopping(),
       commandClaim: (message, name) => this.commandClaim(message, name),
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
+      getIngressJob: id => this.store.getIngressJob(id),
     });
     this.displayNames = createDisplayNameCache(
       async (uid, signal) => (await this.options.transport.getUserInfo(uid, signal)).name,
@@ -643,16 +731,42 @@ class CoreService implements ChannelService {
       botUid: () => this.bot?.uid,
       stopping: () => this.stopping,
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
-      operationSet: (operation) => this.operationSet(operation),
-      commandClaim: (message, name) => this.commandClaim(message, name),
+      persistWakeTurn: (message, text, sourceId) => this.persistQuestionWakeTurn(message, text, sourceId),
+      publishWakeTurn: taskId => this.publishQuestionWakeTurn(taskId),
+      persistNotice: (message, text, sourceId) => this.persistQuestionNotice(message, text, sourceId),
+      publishNotice: message => this.publishIngressNotice(message),
+      operationSet: operation => this.operationSet(operation),
       askTimeoutMs: () => this.options.config.ask?.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS,
-      displayNames: (uids) => this.displayNames.names(uids),
+      displayNames: uids => this.displayNames.names(uids),
       stopTurnForQuestion: (taskId, cancelQuestionIds) => this.stopTurnForQuestion(taskId, cancelQuestionIds),
       wakeTurn: (target, text) => {
         void this.wakeTurn(target, text);
       },
-      memberAnswerAllowed: (target) => target.channelType !== 1 && this.authorization.isPermittedChat(target),
+      memberAnswerAllowed: target => target.channelType !== 1 && this.authorization.isPermittedChat(target),
       onTextAnswer: (message, taskId) => this.observeUserReference(message, taskId),
+    });
+    this.ingress = new IngressCoordinator({
+      store: this.store,
+      botUid: () => this.bot?.uid,
+      classify: message => this.classifyIngress(message),
+      authorize: (message, signal) => this.authorizeIngress(message, signal),
+      bindingSnapshot: target => this.ingressBindingSnapshot(target),
+      prepare: (message, purpose, signal, job) => this.prepareIngress(message, purpose, signal, job),
+      dispatch: job => this.dispatchIngress(job),
+      markUnknown: job => this.markIngressUnknown(job),
+      awaitDispatchReady: () => this.startupGate.promise,
+      onAccepted: job => {
+        this.reserveIngressConfig(job);
+      },
+      onReliableAccepted: job => {
+        const payload = job.payload;
+        if (payload?.kind === "recv") this.cancelThreadArchives(payload.message);
+      },
+      onCancelled: jobId => {
+        this.releaseIngressCommitReservation(jobId);
+        this.releaseIngressConfigReservation(jobId);
+      },
+      onIdle: () => this.serviceRestart.maybeRunDeferred(),
     });
     this.botEvents = createBotEventLoop({
       store: this.store,
@@ -660,13 +774,17 @@ class CoreService implements ChannelService {
       botUid: () => this.bot?.uid,
       stopping: () => this.stopping,
       // Each card family has its own binding and effect boundary; unknown actions remain ask-card only.
-      onCardAction: (action, eventId) => action.actionId.startsWith(CONFIG_CARD_ACTION_PREFIX)
-        ? this.configMenus.handleAction(action)
-        : action.actionId.startsWith(CHAT_GRANT_ACTION_PREFIX)
-          ? this.chatGrants.handleAction(eventId, action)
-          : this.questions.answerFromCard(action),
+      onCardAction: (action, eventId) => ({
+        ackReady: action.actionId.startsWith(CONFIG_CARD_ACTION_PREFIX)
+          ? this.configMenus.handleAction(action, eventId)
+          : action.actionId.startsWith(CHAT_GRANT_ACTION_PREFIX)
+            ? this.chatGrants.handleAction(eventId, action)
+            : this.questions.answerFromCard(action),
+      }),
       onCardActionRetriesExhausted: (action, eventId) =>
-        this.chatGrants.onRetriesExhausted(eventId, action),
+        action.actionId.startsWith(CHAT_GRANT_ACTION_PREFIX)
+          ? this.chatGrants.onRetriesExhausted(eventId, action)
+          : Promise.resolve("pending"),
     });
     this.threadArchives = new ThreadArchiveScheduler({
       store: this.store,
@@ -689,10 +807,18 @@ class CoreService implements ChannelService {
       ...(options.worktrees === undefined ? {} : { worktrees: options.worktrees }),
       archiveGeneration: target => this.currentThreadArchiveGeneration(target),
       stopping: () => this.stopping,
-      executeHostMerge: (message, binding, receiptOutboxId, archiveGeneration, operatorNote, onAccepted) =>
-        this.executeHostThreadMerge(message, binding, receiptOutboxId, archiveGeneration, operatorNote, onAccepted),
-      executeHostRemoval: (message, ownership, force, receiptOutboxId) =>
-        this.executeHostThreadRemoval(message, ownership, force, receiptOutboxId),
+      executeHostMerge: (message, binding, receiptOutboxId, archiveGeneration, operatorNote, onAccepted, ingressHooks) =>
+        this.executeHostThreadMerge(
+          message,
+          binding,
+          receiptOutboxId,
+          archiveGeneration,
+          operatorNote,
+          onAccepted,
+          ingressHooks,
+        ),
+      executeHostRemoval: (message, ownership, force, receiptOutboxId, ingressHooks) =>
+        this.executeHostThreadRemoval(message, ownership, force, receiptOutboxId, ingressHooks),
       enqueueMergeReceipt: (target, id, text) => this.enqueueThreadMergeReceipt(target, id, text),
       settleHostMerge: (target, sourceId) => this.settleHostMergeForSource(target, sourceId),
       enqueueRemovalReceipt: (target, id, text) => this.enqueueThreadRemovalReceipt(target, id, text),
@@ -726,7 +852,9 @@ class CoreService implements ChannelService {
         || this.forkCommandTargets.size > 0
         || this.tanInboundOperations.size > 0
         || this.tanDispatchOperations.size > 0
-        || this.forkArchiveControllers.size > 0,
+        || this.forkArchiveControllers.size > 0
+        || this.ingress.pendingCount() > 0
+        || (this.bot !== undefined && this.store.countPendingIngressJobs(this.bot.uid) > 0),
       restart: options.restart,
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
     });
@@ -846,8 +974,16 @@ class CoreService implements ChannelService {
           );
         }
       }
-      // 附件目录按 14 天保留期清理；best-effort，清理失败不影响启动。
-      await sweepAttachments(this.options.config.stateDir, ATTACHMENT_MAX_AGE_MS).catch(() => 0);
+      const protectedIngressSpool = new Set([
+        ...this.store.listRecoverableIngressJobs(identity.uid),
+        ...this.store.listUnknownIngressJobs(identity.uid),
+      ].flatMap(job => job.spoolPaths));
+      await sweepAttachments(
+        this.options.config.stateDir,
+        ATTACHMENT_MAX_AGE_MS,
+        Date.now(),
+        protectedIngressSpool,
+      ).catch(() => 0);
       const configuredOwner =
         typeof this.options.config.ownerId === "string" ? this.options.config.ownerId.trim() : "";
       if (configuredOwner) {
@@ -864,16 +1000,17 @@ class CoreService implements ChannelService {
           continue;
         }
         const processIdentity = this.hostMergeProcessIdentity(lease);
+        let stopped = false;
         if (processIdentity && this.options.worktrees?.recoverMergeProcess) {
-          let stopped = false;
           try {
             stopped = await this.options.worktrees.recoverMergeProcess(processIdentity);
           } catch (error) {
             console.error(`[thread merge recovery] 无法确认旧 worktrunk 进程组已停止 cwd=${lease.cwd}: ${safeErrorMessage(error, "process recovery failed")}`);
           }
-          if (!stopped) {
-            console.error(`[thread merge recovery] 旧 worktrunk 进程组仍未确认停止 cwd=${lease.cwd}`);
-          }
+        }
+        if (!stopped) {
+          for (const cwd of lease.resourceCwds) this.blockedDirectories.add(cwd);
+          console.error(`[thread merge recovery] 旧 worktrunk 进程组仍未确认停止 cwd=${lease.cwd}`);
         }
         this.store.markHostMergeLeaseUnknown(lease.id);
       }
@@ -965,11 +1102,15 @@ class CoreService implements ChannelService {
         }
       }
       await this.loopController?.recover();
+      // Rebuild every waiting session/resource barrier before recovered tasks enter scheduler tails.
+      this.restoreIngressThreadReservations(identity.uid);
+      this.ingress.restore(identity.uid, this.store.listUnknownIngressJobs(identity.uid));
       // 旧版重启通报已随续接机制移除：遗留行静默清理，绝不再投递。
       this.serviceRestart.consumeStartupNotices(identity.uid);
       // started→queued（prompt 标记随行保留）由存储域一次性完成；先补发遗留卡片终态，恢复
       // 回合随后接上同一条卡片记录，不与卡片恢复竞争。
       const recovery = this.store.prepareTasksForRestart(identity.uid, {
+        cancel: "用户取消当前任务",
         interrupt: INTERRUPT_REASON_TEXT,
         question_timeout: QUESTION_TIMEOUT_REASON_TEXT,
       });
@@ -993,10 +1134,18 @@ class CoreService implements ChannelService {
       }
       // 恢复任务先占住聊天链与目录序，再让 transport 开始接新入站：任何新消息（含下面的
       // 恢复失败回执与按持久化监听策略恢复的子区通知排在前面；恢复任务仍等启动门放行。
-      for (const task of recovery.queued) this.scheduler.scheduleTask(task.id);
+      const recoveryOrders = new Map<string, number>();
+      for (const task of recovery.queued) {
+        const order = this.store.getTaskScheduleOrder(task.id);
+        if (order === null) throw new Error(`recovered task ${task.id} has no durable schedule order`);
+        recoveryOrders.set(task.id, order);
+      }
+      for (const task of [...recovery.queued].sort(
+        (left, right) => recoveryOrders.get(left.id)! - recoveryOrders.get(right.id)!,
+      )) this.scheduler.scheduleTask(task.id);
       for (const task of recovery.stopped) {
-        // 用户中断的遗留提问记 `interrupted`（迟到提交不可接受）；提问超时停下的行保持可答。
-        if (task.stopIntent !== "question_timeout") this.questions.cancelForTask(task.id, "interrupted");
+        if (task.stopIntent === "cancel") this.questions.cancelForTask(task.id, "cancelled");
+        else if (task.stopIntent !== "question_timeout") this.questions.cancelForTask(task.id, "interrupted");
         await this.notifyThreadOutcome(task.id);
       }
       // 1/0 行（prompt 已落标记、接受状态未知）既不重放也不续接：发送固定恢复失败回执并关闭遗留提问。
@@ -1054,7 +1203,7 @@ class CoreService implements ChannelService {
       if (this.stopping) throw new Error("channel 正在停止");
       this.started = true;
       await this.options.transport.start(
-        (message) => this.handleInbound(message),
+        (message) => this.receive(message),
         () => {
           this.history.resetCoverage();
           this.outbox.flushAll();
@@ -1099,6 +1248,8 @@ class CoreService implements ChannelService {
     if (this.stopping) return;
     const wasReady = this.ready;
     this.stopping = true;
+    // Seal synchronous receive admission before any shutdown work can yield.
+    this.ingress.seal();
     this.watchCoordinator.seal();
     const watchShutdown = this.watchCoordinator.stop();
     this.abortAllThreadForks(new Error("channel stopping"));
@@ -1106,11 +1257,11 @@ class CoreService implements ChannelService {
     this.abortAllThreadMerges(new Error("channel stopping"));
     this.hostMergeProgressCards.stop();
     this.abortAllThreadRemovals(new Error("channel stopping"));
+    this.abortAllIngressSessionOperations(new Error("channel stopping"));
     this.threadArchives.stop();
     this.pendingHostMergeArchives.clear();
     this.recoveredHostMergeArchiveTargets.clear();
     this.started = false;
-    // Seal inbound processing and abort its I/O before any lifecycle send or worker shutdown.
     this.shutdownController.abort();
     for (const runtime of this.reviewRuntimes.values()) {
       runtime.controller.abort(new Error("channel stopping"));
@@ -1147,9 +1298,8 @@ class CoreService implements ChannelService {
     await this.scheduler.settle();
     await this.threadForks.settle();
     await Promise.allSettled([...this.activityOperations]);
-    // Inbound handlers aborted above finish their bounded cleanup here, while the store is still
-    // open: interrupted assembly rolls its command claim back so a redelivery is not swallowed.
-    await Promise.allSettled([...this.inboundOperations]);
+    // Waiting ingress commands may have depended on the worker/session leases released above.
+    await this.ingress.settle();
     await watchShutdown;
     await this.researchReports.drain();
     this.typingLeases.releaseAll();
@@ -1247,45 +1397,111 @@ class CoreService implements ChannelService {
     this.threadReferences.observeAssistant(target, taskId, messageId, text);
   }
 
-  async handleInbound(message: InboundMessage): Promise<void> {
-    // Tracked so `stop` can await the interrupted handler's cleanup before closing the store.
-    const operation = this.processInbound(message);
-    this.inboundOperations.add(operation);
-    const cleanup = () => {
-      this.inboundOperations.delete(operation);
+  receive(message: InboundMessage): InboundReceipt {
+    return this.ingress.receive(message);
+  }
+
+  async submitInbound(message: InboundMessage): Promise<void> {
+    await this.receive(message).ackReady;
+  }
+
+  private classifyIngress(message: InboundMessage): IngressClassification {
+    const text = message.text.trim();
+    const command = isCommand(text) ? parseCommand(text) : null;
+    if (command === null) {
+      return {
+        lane: "ordered",
+        action: null,
+        argument: "",
+        preparesBody: true,
+        sessionBarrier: false,
+        cancelsEarlier: false,
+      };
+    }
+    const builtin = resolveBuiltinAction(command.name);
+    let action: string;
+    let preparesBody = false;
+    if (builtin === "thread" && command.argument.trim().length > 0
+      && !/^(?:model|remove)(?:$|\s)|^merge(?:$|[^\p{L}\p{N}_-])/iu.test(command.argument.trim())) {
+      action = "thread-task";
+      preparesBody = true;
+    } else if (command.name === "tan") {
+      action = "tan";
+      preparesBody = command.argument.trim().length > 0;
+    } else if (builtin !== undefined) {
+      action = builtin;
+      preparesBody = builtin === "queue" && command.argument.trim().length > 0;
+    } else {
+      const handler = this.commandHandlers.get(command.name);
+      action = handler === undefined
+        ? "unknown"
+        : `custom:${command.name}:${handler.intercept ? "intercept" : "observe"}`;
+      preparesBody = true;
+    }
+    const argument = command.argument.trim();
+    const control = action === "cancel"
+      || action === "interrupt"
+      || action === "status"
+      || action === "help"
+      || action === "restart"
+      || action === "autoresearch-history"
+      || ((action === "mode" || action === "switch" || action === "queue") && argument.length === 0)
+      || (action === "commit" && /^stop(?:$|\s)/iu.test(argument))
+      || (action === "goal" && (
+        argument.length === 0
+        || /^budget$/iu.test(argument)
+        || /^(?:show|pause|drop)(?:$|\s)/iu.test(argument)
+      ))
+      || (action === "watch" && (
+        argument.length === 0
+        || /^(?:list|stop)(?:$|\s)/iu.test(argument)
+        || /^[^\s]+$/u.test(argument)
+      ));
+    return {
+      lane: control ? "control" : "ordered",
+      action,
+      argument: command.argument,
+      preparesBody,
+      sessionBarrier: action === "new" || action === "move" || action === "fork",
+      cancelsEarlier: action === "cancel",
     };
-    void operation.then(cleanup, cleanup);
-    await operation;
   }
 
-  private processInbound(message: InboundMessage): Promise<void> {
-    return this.processInboundCore(message);
-  }
-
-  private async processInboundCore(message: InboundMessage): Promise<void> {
-    // A message that arrives during shutdown is never accepted: reject so the transport does not
-    // ACK it; the same message is redelivered after restart.
-    this.throwIfStopping();
-    if (!this.started || !this.bot) return;
-    if (message.messageId.trim().length === 0 || message.senderId.trim().length === 0) return;
+  private async authorizeIngress(
+    message: InboundMessage,
+    signal: AbortSignal,
+  ): Promise<IngressAdmission> {
+    const checkOpen = (): void => {
+      this.throwIfStopping();
+      if (signal.aborted) {
+        throw signal.reason instanceof Error ? signal.reason : new InboundShutdownError();
+      }
+    };
+    checkOpen();
+    if (!this.started || !this.bot) throw new InboundShutdownError();
+    if (message.messageId.trim().length === 0 || message.senderId.trim().length === 0) {
+      return { kind: "consumed" };
+    }
     this.history.record(message);
     const text = message.text.trim();
-    if (this.store.hasOwnerEnrollment(this.bot.uid, message, message.messageId)) return;
+    if (this.store.hasOwnerEnrollment(this.bot.uid, message, message.messageId)) {
+      return { kind: "consumed" };
+    }
     let ownerId = this.store.getOwnerId(this.bot.uid)?.trim() || null;
     if (this.authorization.isOwnerMentionedGrantPassphrase(message, ownerId)) {
       const claimState = this.store.getCommandClaimState(this.bot.uid, message, message.messageId);
-      if (claimState === "pending" || claimState === "completed") return;
+      if (claimState === "pending" || claimState === "completed") return { kind: "consumed" };
       if (claimState === "failed") {
         await this.authorization.retryClaimedOwnerGrant(message, ownerId);
-        return;
+        return { kind: "consumed" };
       }
     }
     if (
-      !ownerId &&
-      message.channelType === 1 &&
-      message.supported &&
-      text.length > 0 &&
-      message.senderId.trim() !== this.bot.uid
+      !ownerId
+      && message.channelType === 1
+      && message.supported
+      && text.length > 0
+      && message.senderId.trim() !== this.bot.uid
     ) {
       const acknowledgement = {
         id: randomUUID(),
@@ -1314,20 +1530,19 @@ class CoreService implements ChannelService {
       }
       if (claimed) {
         this.outbox.flush(message);
-        return;
+        return { kind: "consumed" };
       }
       ownerId = this.store.getOwnerId(this.bot.uid)?.trim() || null;
     }
     const allowed = await this.authorization.isAllowed(message, ownerId);
-    this.throwIfStopping();
+    checkOpen();
     if (!allowed) {
       await this.authorization.handleUnlistedOwnerContact(message, ownerId);
-      return;
+      return { kind: "consumed" };
     }
     if (!message.supported) {
       const claim = this.commandClaim(message, "unsupported");
-      if (!this.store.claimCommand(claim)) return;
-      this.cancelThreadArchives(message);
+      if (!this.store.claimCommand(claim)) return { kind: "consumed" };
       try {
         await this.outbox.enqueueText(message, "不支持的消息类型，不会启动任务。", null);
         this.store.completeCommand(claim);
@@ -1335,57 +1550,1912 @@ class CoreService implements ChannelService {
         this.store.failCommand(claim);
         throw new Error("本地状态盘写入失败，未能记录不支持消息。");
       }
-      return;
+      return { kind: "consumed" };
     }
-    // Members never run commands: the slash text would otherwise be passed to OMP, whose own
-    // builtin dispatch consumes it, so it only earns one throttled notice instead.
     if (isCommand(text) && message.senderId.trim() !== ownerId) {
       await this.authorization.noticeMemberCommand(message);
-      return;
+      return { kind: "consumed" };
     }
-    const command = isCommand(text) ? parseCommand(text) : null;
-    if (command?.name === "tan") {
-      await this.handleTanInbound(message, command.argument);
-      return;
+
+    const classification = this.classifyIngress(message);
+    let purpose: IngressRoutePurpose;
+    if (classification.action !== null) {
+      purpose = { kind: "command", action: classification.action };
+    } else {
+      const route = text.length === 0 ? null : this.questions.captureTextRoute(message);
+      purpose = route?.kind === "questions"
+        ? { kind: "questions", questionIds: route.questionIds }
+        : { kind: "none" };
     }
-    if (command) {
-      const action = resolveBuiltinAction(command.name);
-      if (action !== undefined) {
-        await this.handleCommand(message, command.name, command.argument, action);
-        return;
-      }
-      const handler = this.commandHandlers.get(command.name);
-      if (handler) {
-        if (await this.refuseIncompleteThreadWorkspace(message)) return;
-        if (handler.intercept) {
-          await this.handleInterceptingCommand(message, command, handler);
-        } else {
-          await this.handleObservingCommand(message, command, handler);
-        }
-        return;
-      }
-      if (await this.refuseIncompleteThreadWorkspace(message)) return;
-      // 未注册的 /xxx 不是命令，仍按普通任务走唯一组装点，附件照常取回。
-      await this.withMessageTyping(message, async () => {
-        const slashPrompt = await this.materializer.materialize(message);
-        if (slashPrompt === null) return;
-        this.throwIfStopping();
-        await this.acceptTask(message, slashPrompt);
-      });
-      return;
-    }
-    if (await this.refuseIncompleteThreadWorkspace(message)) return;
-    if (await this.questions.answerPendingQuestion(message, text)) {
-      this.cancelThreadArchives(message);
-      return;
-    }
-    await this.withMessageTyping(message, async() => {
-      const promptText = await this.materializer.materialize(message);
-      if (promptText === null) return;
-      this.throwIfStopping();
-      if (await this.appendToRunningTask(message, promptText, undefined, undefined, true)) return;
-      await this.acceptTask(message, promptText, true, undefined, undefined, undefined, true, true);
+    const checkpoint = classification.action === null ? null : {
+      kind: "command" as const,
+      action: classification.action,
+      argument: classification.argument,
+      phase: classification.action === "cancel"
+        ? "cancel-intent" as const
+        : classification.action === "commit" && classification.argument.trim() === "stop"
+          ? "commit-stop-intent" as const
+          : classification.sessionBarrier || classification.action === "thread"
+            ? "barrier-installed" as const
+            : "admitted" as const,
+      expectedBinding: null,
+    };
+    return {
+      kind: "accepted",
+      purpose,
+      preparesBody: classification.preparesBody && purpose.kind !== "questions",
+      checkpoint,
+    };
+  }
+
+  private ingressBindingSnapshot(target: ChatTarget): IngressBindingSnapshot | null {
+    if (!this.bot) return null;
+    const binding = this.store.getBinding(this.bot.uid, target);
+    return binding === null ? null : {
+      sessionId: binding.sessionId,
+      cwd: binding.cwd,
+      sessionFile: binding.sessionFile,
+      cwdPinned: binding.cwdPinned === true,
+      sessionSwitchedAt: binding.sessionSwitchedAt ?? null,
+    };
+  }
+
+  private sameIngressBindingSnapshot(
+    expected: IngressBindingSnapshot | null,
+    current: IngressBindingSnapshot | null,
+  ): boolean {
+    if (expected === null) return current === null;
+    return current !== null
+      && expected.sessionId === current.sessionId
+      && expected.cwd === current.cwd
+      && expected.sessionFile === current.sessionFile
+      && expected.cwdPinned === current.cwdPinned
+      && expected.sessionSwitchedAt === current.sessionSwitchedAt;
+  }
+
+  private sameBindingState(left: BindingRecord, right: BindingRecord): boolean {
+    const leftInitialization = left.sessionInitialization ?? null;
+    const rightInitialization = right.sessionInitialization ?? null;
+    return left.sessionId === right.sessionId
+      && left.cwd === right.cwd
+      && left.sessionFile === right.sessionFile
+      && (left.cwdPinned === true) === (right.cwdPinned === true)
+      && (left.sessionSwitchedAt ?? null) === (right.sessionSwitchedAt ?? null)
+      && (
+        leftInitialization === null
+          ? rightInitialization === null
+          : rightInitialization !== null
+            && leftInitialization.taskId === rightInitialization.taskId
+            && leftInitialization.fromSessionId === rightInitialization.fromSessionId
+            && leftInitialization.fromCwd === rightInitialization.fromCwd
+            && leftInitialization.fromSessionFile === rightInitialization.fromSessionFile
+            && leftInitialization.fromCwdPinned === rightInitialization.fromCwdPinned
+            && leftInitialization.fromSessionSwitchedAt === rightInitialization.fromSessionSwitchedAt
+      );
+  }
+
+  private hasExactTaskSessionInitialization(
+    job: IngressJobRecord,
+    target: ChatTarget,
+    expected: IngressBindingSnapshot | null,
+    current: BindingRecord,
+  ): boolean {
+    const route = job.routeSnapshot;
+    const provenance = current.sessionInitialization;
+    if (
+      this.bot === undefined
+      || job.botUid !== this.bot.uid
+      || expected === null
+      || expected.cwdPinned !== true
+      || expected.sessionFile !== null
+      || expected.sessionSwitchedAt === undefined
+      || route === null
+      || route === undefined
+      || route.binding === null
+      || !Number.isSafeInteger(route.sessionGeneration)
+      || !this.sameIngressBindingSnapshot(expected, route.binding)
+      || current.channelType !== target.channelType
+      || current.channelId !== target.channelId
+      || current.cwd !== expected.cwd
+      || current.cwdPinned !== true
+      || current.sessionFile === null
+      || current.sessionFile.length === 0
+      || current.sessionId === expected.sessionId
+      || (current.sessionSwitchedAt ?? null) !== expected.sessionSwitchedAt
+      || provenance === null
+      || provenance === undefined
+      || provenance.fromSessionId !== expected.sessionId
+      || provenance.fromCwd !== expected.cwd
+      || provenance.fromSessionFile !== null
+      || provenance.fromCwdPinned !== true
+      || provenance.fromSessionSwitchedAt !== expected.sessionSwitchedAt
+    ) return false;
+
+    const task = this.store.getTask(provenance.taskId);
+    if (
+      task === null
+      || task.botUid !== job.botUid
+      || task.channelType !== target.channelType
+      || task.channelId !== target.channelId
+      || task.cwd !== expected.cwd
+    ) return false;
+    if (task.sessionId !== expected.sessionId && task.sessionId !== current.sessionId) return false;
+
+    const source = this.store.getIngressJobBySource({
+      botUid: task.botUid,
+      sourceKind: "recv",
+      sourceId: recvIngressSourceId(task.channelType, task.channelId, task.messageId),
     });
+    return source !== null
+      && source.id < job.id
+      && source.botUid === job.botUid
+      && source.channelType === target.channelType
+      && source.channelId === target.channelId
+      && source.messageId === task.messageId
+      && source.lane === "ordered"
+      && source.state === "handed-off"
+      && source.consumerKind === "task"
+      && source.consumerId === task.id
+      && source.routeSnapshot !== null
+      && source.routeSnapshot.sessionGeneration === route.sessionGeneration
+      && source.routeSnapshot.barrierJobId === route.barrierJobId
+      && this.sameIngressBindingSnapshot(source.routeSnapshot.binding, expected);
+  }
+
+  private ingressBindingMatches(
+    job: IngressJobRecord,
+    target: ChatTarget,
+    allowTaskSessionInitialization = false,
+  ): boolean {
+    const checkpoint = job.operationCheckpoint?.kind === "command"
+      ? job.operationCheckpoint.expectedBinding
+      : job.routeSnapshot?.binding ?? null;
+    const expected = checkpoint ?? null;
+    const binding = this.bot === undefined ? null : this.store.getBinding(this.bot.uid, target);
+    const current = binding === null ? null : this.ingressBindingSnapshot(target);
+    return this.sameIngressBindingSnapshot(expected, current)
+      || (allowTaskSessionInitialization
+        && binding !== null
+        && this.hasExactTaskSessionInitialization(job, target, expected, binding));
+  }
+  private restoreIngressThreadReservations(botUid: string): void {
+    const hostMergeById = new Map(
+      this.store.listHostMergeLeases(botUid).map(lease => [lease.id, lease] as const),
+    );
+    const hostRemovalById = new Map(
+      this.store.listHostRemovalLeases(botUid).map(lease => [lease.id, lease] as const),
+    );
+    const jobsById = new Map([
+      ...this.store.listRecoverableIngressJobs(botUid),
+      ...this.store.listUnknownIngressJobs(botUid),
+    ].map(job => [job.id, job] as const));
+    const restoreUnmatchedHostLease = (
+      target: ChatTarget,
+      messageId: string,
+      kind: "merge" | "remove",
+      resourceCwds: readonly string[],
+    ): void => {
+      if (kind === "merge") return;
+      // An unmatched host removal keeps its owned resources protected while its process outcome
+      // remains unresolved.
+      for (const cwd of resourceCwds) this.blockedDirectories.add(cwd);
+      try {
+        const reservation = this.scheduler.reserveDestructiveCommandSession(
+          target,
+          resourceCwds,
+          resourceCwds,
+        );
+        this.ingressCommandReservations.set(`${targetKey(target)}\0${messageId}`, {
+          kind,
+          reservation,
+          resourceCwds,
+        });
+      } catch (error) {
+        console.error(
+          `[ingress recovery] cannot retain ${kind} host lease ${messageId}: ${safeErrorMessage(error, "reservation failed")}`,
+        );
+      }
+    };
+    for (const lease of hostMergeById.values()) {
+      if (lease.outcome !== null) continue;
+      const job = this.store.getIngressJobBySource({
+        botUid,
+        sourceKind: "recv",
+        sourceId: JSON.stringify([lease.channelType, lease.channelId, lease.sourceId]),
+      });
+      if (
+        job?.operationCheckpoint?.kind === "command"
+        && job.operationCheckpoint.action === "thread"
+        && /^merge(?:$|[^\p{L}\p{N}_-])/iu.test(job.operationCheckpoint.argument.trim())
+        && job.operationCheckpoint.hostLedgerId === lease.id
+      ) {
+        jobsById.set(job.id, job);
+      } else {
+        restoreUnmatchedHostLease(
+          { channelType: lease.channelType, channelId: lease.channelId },
+          lease.sourceId,
+          "merge",
+          lease.resourceCwds,
+        );
+      }
+    }
+    for (const lease of hostRemovalById.values()) {
+      if (lease.outcome !== null) continue;
+      const job = this.store.getIngressJobBySource({
+        botUid,
+        sourceKind: "recv",
+        sourceId: JSON.stringify([lease.channelType, lease.channelId, lease.sourceId]),
+      });
+      if (
+        job?.operationCheckpoint?.kind === "command"
+        && job.operationCheckpoint.action === "thread"
+        && /^remove(?:$|\s)/iu.test(job.operationCheckpoint.argument.trim())
+        && job.operationCheckpoint.hostLedgerId === lease.id
+      ) {
+        jobsById.set(job.id, job);
+      } else {
+        restoreUnmatchedHostLease(
+          { channelType: lease.channelType, channelId: lease.channelId },
+          lease.sourceId,
+          "remove",
+          lease.resourcePaths,
+        );
+      }
+    }
+    const jobs = [...jobsById.values()].sort((left, right) => left.id - right.id);
+    for (const job of jobs) {
+      const checkpoint = job.operationCheckpoint;
+      if (checkpoint?.kind !== "command") continue;
+      const target: ChatTarget = { channelType: job.channelType, channelId: job.channelId };
+      const commandKey = `${targetKey(target)}\0${job.messageId ?? ""}`;
+      if (checkpoint.action === "new" || checkpoint.action === "move") {
+        const expected = checkpoint.expectedBinding;
+        const linkedWorker = checkpoint.workerLedgerId === `${checkpoint.action}-ingress-${job.id}`
+          ? this.store.getWorkerLedger(botUid, checkpoint.workerLedgerId)
+          : null;
+        const resourceCwds = [...new Set([
+          ...(checkpoint.resourceCwds ?? (expected === null ? [] : [expected.cwd])),
+          ...(linkedWorker === null
+            ? []
+            : [linkedWorker.cwd, ...(linkedWorker.moveTargetCwd === null ? [] : [linkedWorker.moveTargetCwd])]),
+        ])];
+        if (job.state === "dispatch-intent" || job.state === "unknown") {
+          for (const cwd of resourceCwds) this.blockedDirectories.add(cwd);
+        }
+        try {
+          const reservation = this.scheduler.reserveSessionCommand(
+            target,
+            resourceCwds,
+            job.scheduleOrder,
+            job.state === "dispatch-intent" || job.state === "unknown",
+          );
+          this.ingressSessionReservations.set(commandKey, {
+            kind: checkpoint.action,
+            reservation,
+            resourceCwds,
+          });
+        } catch (error) {
+          for (const cwd of resourceCwds) this.blockedDirectories.add(cwd);
+          console.error(
+            `[ingress recovery] cannot reserve ${checkpoint.action} session for job=${job.id}: ${safeErrorMessage(error, "reservation failed")}`,
+          );
+        }
+        continue;
+      }
+      if (checkpoint.action !== "thread") continue;
+      const argument = checkpoint.argument.trim();
+      const isMerge = /^merge(?:$|[^\p{L}\p{N}_-])/iu.test(argument);
+      const isRemove = /^remove(?:$|\s)/iu.test(argument);
+      if (!isMerge && !isRemove) continue;
+      const linkedMerge = checkpoint.hostLedgerId === undefined
+        ? undefined
+        : hostMergeById.get(checkpoint.hostLedgerId);
+      const linkedRemoval = checkpoint.hostLedgerId === undefined
+        ? undefined
+        : hostRemovalById.get(checkpoint.hostLedgerId);
+      let resourceCwds = [...new Set([
+        ...(checkpoint.resourceCwds ?? []),
+        ...(linkedMerge?.resourceCwds ?? []),
+        ...(linkedRemoval?.resourcePaths ?? []),
+      ])];
+      if (resourceCwds.length === 0 && job.state === "accepted" && isRemove) {
+        const ownership = this.store.getThreadWorkspace(botUid, target);
+        resourceCwds = ownership === null ? [] : threadWorkspaceCleanupPaths(ownership, true);
+      }
+      const hostOutcomeUnknown =
+        linkedMerge?.outcome === null
+        || linkedRemoval?.outcome === null;
+      if (job.state === "dispatch-intent" || job.state === "unknown" || hostOutcomeUnknown) {
+        if (isMerge) continue;
+        for (const cwd of resourceCwds) this.blockedDirectories.add(cwd);
+        try {
+          const reservation = this.scheduler.reserveDestructiveCommandSession(
+            target,
+            resourceCwds,
+            resourceCwds,
+            job.scheduleOrder,
+          );
+          this.ingressCommandReservations.set(commandKey, {
+            kind: "remove",
+            reservation,
+            resourceCwds,
+          });
+        } catch (error) {
+          console.error(
+            `[ingress recovery] cannot retain remove barriers for job=${job.id}: ${safeErrorMessage(error, "reservation failed")}`,
+          );
+        }
+        continue;
+      }
+      if (job.state !== "accepted" || (!isMerge && resourceCwds.length === 0)) continue;
+      try {
+        const reservation = this.scheduler.reserveDestructiveCommandSession(
+          target,
+          isMerge ? [] : resourceCwds,
+          [],
+          job.scheduleOrder,
+        );
+        this.ingressCommandReservations.set(commandKey, {
+          kind: isMerge ? "merge" : "remove",
+          reservation,
+          resourceCwds,
+        });
+      } catch (error) {
+        for (const cwd of resourceCwds) this.blockedDirectories.add(cwd);
+        console.error(
+          `[ingress recovery] cannot reserve ${isMerge ? "merge" : "remove"} resources for job=${job.id}: ${safeErrorMessage(error, "reservation failed")}`,
+        );
+      }
+    }
+  }
+
+  private async prepareIngress(
+    message: InboundMessage,
+    purpose: IngressRoutePurpose,
+    signal: AbortSignal,
+    job: IngressJobRecord,
+  ): Promise<IngressPreparation> {
+    let body = message.text;
+    if (purpose.kind === "command") {
+      const command = parseCommand(message.text.trim());
+      if (command === null) throw new Error("Command ingress lost its command text");
+      if (purpose.action === "queue" || purpose.action === "thread-task" || purpose.action === "tan") {
+        body = command.argument.trim();
+      }
+    }
+    const prepared = await this.withMessageTyping(
+      message,
+      () => this.materializer.materializeForIngress(job.id, message, body, signal),
+    );
+    if (prepared.kind === "refused") {
+      const refusalId = this.stableIngressEffectId(
+        job.botUid,
+        job.sourceKind,
+        job.sourceId,
+        "attachment-refusal",
+        0,
+      );
+      return {
+        kind: "consumed",
+        consumer: { kind: "outbox", id: refusalId },
+        persistConsumer: () =>
+          this.persistIngressTextEffect(
+            job.botUid,
+            message,
+            job.sourceKind,
+            job.sourceId,
+            "attachment-refusal",
+            prepared.text,
+          ) === refusalId,
+        publishAfterCommit: () => this.publishIngressNotice(message),
+      };
+    }
+    if (prepared.kind === "consumed") {
+      throw new Error("ingress preparation ended without a durable consumer");
+    }
+    return {
+      kind: "prepared",
+      text: prepared.text,
+      spoolPaths: prepared.spoolPaths,
+    };
+  }
+
+  private stableIngressEffectId(
+    botUid: string,
+    sourceKind: string,
+    sourceId: string,
+    effect: string,
+    index = 0,
+  ): string {
+    const digest = createHash("sha256")
+      .update(JSON.stringify([botUid, sourceKind, sourceId, effect, index]))
+      .digest();
+    digest[6] = ((digest[6] ?? 0) & 0x0f) | 0x50;
+    digest[8] = ((digest[8] ?? 0) & 0x3f) | 0x80;
+    const hex = digest.toString("hex");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+  }
+
+  /** Persists a stable outbox consumer inside the enclosing ingress/answer transaction. */
+  private persistIngressTextEffect(
+    botUid: string,
+    target: ChatTarget,
+    sourceKind: string,
+    sourceId: string,
+    effect: string,
+    text: string,
+  ): string {
+    if (text.length === 0) throw new Error("cannot persist an empty ingress text effect");
+    const chunks = splitUtf8(text);
+    let firstId = "";
+    for (const [index, chunk] of chunks.entries()) {
+      const id = this.stableIngressEffectId(botUid, sourceKind, sourceId, effect, index);
+      if (index === 0) firstId = id;
+      const existing = this.store.getOutbox(id);
+      if (existing !== null) {
+        if (
+          existing.botUid !== botUid
+          || existing.channelType !== target.channelType
+          || existing.channelId !== target.channelId
+          || existing.kind !== "text"
+          || existing.taskId !== null
+          || existing.text !== chunk
+        ) {
+          throw new Error("stable ingress outbox identity conflicts with different content");
+        }
+        continue;
+      }
+      const record: OutboxInsert = {
+        id,
+        botUid,
+        channelType: target.channelType,
+        channelId: target.channelId,
+        taskId: null,
+        kind: "text",
+        text: chunk,
+        path: null,
+        fileKind: null,
+        clientMsgNo: this.stableIngressEffectId(botUid, sourceKind, sourceId, `${effect}:client`, index),
+      };
+      this.store.enqueueOutbox(record);
+    }
+    return firstId;
+  }
+
+  /** These callbacks are run by QuestionDesk inside the same transaction as the question CAS. */
+  private persistQuestionWakeTurn(message: InboundMessage, text: string, sourceId: string): string {
+    const bot = this.bot;
+    if (bot === undefined) throw new Error("Bot identity is unavailable while persisting a question wake");
+    const taskId = this.stableIngressEffectId(bot.uid, "question", sourceId, "wake-task");
+    const messageId = `answer:${taskId}`;
+    const owner = this.store.getOwnerId(bot.uid)?.trim() || bot.uid;
+    const existing = this.store.getTask(taskId);
+    if (existing !== null) {
+      if (
+        existing.botUid !== bot.uid
+        || existing.channelType !== message.channelType
+        || existing.channelId !== message.channelId
+        || existing.messageId !== messageId
+        || existing.text !== text
+      ) {
+        throw new Error("stable question wake identity conflicts with a different task");
+      }
+      return taskId;
+    }
+    const binding = this.store.getBinding(bot.uid, message);
+    if (binding === null) throw new Error("question wake has no durable session binding");
+    const wakeMessage: InboundMessage = {
+      ...message,
+      messageId,
+      senderId: owner,
+      text,
+      attachments: [],
+      quoted: null,
+      supported: true,
+    };
+    const task: TaskRecord = {
+      id: taskId,
+      botUid: bot.uid,
+      channelId: message.channelId,
+      channelType: message.channelType,
+      messageId,
+      senderId: owner,
+      text,
+      sessionId: binding.sessionId,
+      cwd: binding.cwd,
+      state: "queued",
+      resultText: null,
+      errorText: null,
+      messageSeq: message.messageSeq,
+      historyEligible: !isCommand(text),
+      relaySuppressed: false,
+    };
+    if (!this.store.acceptTask(this.taskClaim(wakeMessage), task)) {
+      const duplicate = this.store.getTask(taskId);
+      if (
+        duplicate === null
+        || duplicate.messageId !== messageId
+        || duplicate.text !== text
+        || duplicate.channelType !== message.channelType
+        || duplicate.channelId !== message.channelId
+      ) {
+        throw new Error("question wake task could not be durably accepted");
+      }
+    }
+    return taskId;
+  }
+
+  private persistQuestionWakeFallback(task: TaskRecord): string {
+    const taskId = this.stableIngressEffectId(
+      task.botUid,
+      "question-wake",
+      task.id,
+      "explicit-steer-refusal",
+    );
+    const messageId = `answer-fallback:${taskId}`;
+    const existing = this.store.getTask(taskId);
+    if (existing !== null) {
+      if (
+        existing.botUid !== task.botUid
+        || existing.channelType !== task.channelType
+        || existing.channelId !== task.channelId
+        || existing.sessionId !== task.sessionId
+        || existing.cwd !== task.cwd
+        || existing.text !== task.text
+        || existing.messageId !== messageId
+      ) {
+        throw new Error("stable question-wake fallback identity conflicts with different content");
+      }
+      return taskId;
+    }
+    const target = taskTarget(task);
+    const message: InboundMessage = {
+      ...target,
+      messageId,
+      senderId: task.senderId,
+      text: task.text,
+      mentionedUserIds: [],
+      attachments: [],
+      quoted: null,
+      supported: true,
+      messageSeq: task.messageSeq,
+      messageTimestamp: 0,
+    };
+    const fallback: TaskRecord = {
+      ...task,
+      id: taskId,
+      messageId,
+      state: "queued",
+      resultText: null,
+      errorText: null,
+      relaySuppressed: false,
+    };
+    if (!this.store.acceptTask(this.taskClaim(message), fallback)) {
+      const duplicate = this.store.getTask(taskId);
+      if (
+        duplicate === null
+        || duplicate.messageId !== messageId
+        || duplicate.sessionId !== task.sessionId
+        || duplicate.cwd !== task.cwd
+        || duplicate.text !== task.text
+      ) {
+        throw new Error("explicit question-wake refusal fallback was not durably accepted");
+      }
+    }
+    return taskId;
+  }
+
+  private publishQuestionWakeFallback(task: TaskRecord): void {
+    const fallbackId = this.persistQuestionWakeFallback(task);
+    const fallback = this.store.getTask(fallbackId);
+    if (fallback !== null) this.scheduleQuestionWakeTask(fallback);
+  }
+
+  private recordQuestionWakeSteerRejection(taskId: string): void {
+    this.store.markFailed(taskId, QUESTION_WAKE_STEER_REFUSED);
+    const rejectedTask = this.store.getTask(taskId);
+    if (rejectedTask === null) throw new Error("explicitly refused question-wake task disappeared");
+    this.publishQuestionWakeFallback(rejectedTask);
+  }
+
+  private scheduleQuestionWakeTask(task: TaskRecord): void {
+    if (task.state !== "queued" || this.stopping) return;
+    const target = taskTarget(task);
+    const binding = this.store.getBinding(task.botUid, target);
+    if (binding?.sessionId !== task.sessionId || binding.cwd !== task.cwd) {
+      this.store.markCancelled(task.id, "question wake binding changed; delivery to a different session was suppressed");
+      this.typingLeases.release(target, `task:${task.id}`);
+      return;
+    }
+    this.typingLeases.acquire(target, `task:${task.id}`);
+    if (this.scheduler.hasBlockingWork(target, task.cwd)) this.scheduler.markWaiting(task.id);
+    this.scheduler.scheduleTask(task.id);
+  }
+
+  private publishQuestionWakeTurn(taskId: string): void {
+    const task = this.store.getTask(taskId);
+    if (task === null) throw new Error("durable question wake task disappeared before publication");
+    if (task.state === "failed" && task.errorText === QUESTION_WAKE_STEER_REFUSED) {
+      this.publishQuestionWakeFallback(task);
+      return;
+    }
+    if (task.state !== "queued" || this.stopping || this.questionWakeOperations.has(task.id)) return;
+    this.questionWakeOperations.add(task.id);
+    const operation = this.deliverQuestionWakeTurn(task.id)
+      .catch((error: unknown) => {
+        console.error(`[ask] durable wake remains recoverable task=${task.id}: ${safeErrorMessage(error, "question wake publication failed")}`);
+      })
+      .finally(() => this.questionWakeOperations.delete(task.id));
+    this.operationSet(operation);
+  }
+
+  private async deliverQuestionWakeTurn(taskId: string): Promise<void> {
+    const task = this.store.getTask(taskId);
+    if (task === null || task.state !== "queued" || this.stopping) return;
+    const target = taskTarget(task);
+    const message: InboundMessage = {
+      ...target,
+      // `task.messageId` already belongs to a durable task claim; steering has its own command claim.
+      messageId: `steer:${task.id}`,
+      senderId: task.senderId,
+      text: task.text,
+      mentionedUserIds: [],
+      attachments: [],
+      quoted: null,
+      supported: true,
+      messageSeq: task.messageSeq,
+      messageTimestamp: 0,
+    };
+    this.typingLeases.acquire(target, `task:${task.id}`);
+    if (await this.refuseIncompleteThreadWorkspace(target)) {
+      this.store.markCancelled(task.id, THREAD_WORKSPACE_UNAVAILABLE_TEXT);
+      this.typingLeases.release(target, `task:${task.id}`);
+      return;
+    }
+
+    const runtime = this.runningRuntime(target);
+    let workerSteerAttempted = false;
+    let workerSteerRejected = false;
+    let workerSteerAccepted = false;
+    let delivery: Promise<boolean> | undefined;
+    const ownsExactRunningSession = (): boolean => {
+      const liveTask = this.store.getTask(task.id);
+      const binding = this.store.getBinding(task.botUid, target);
+      return runtime !== undefined
+        && liveTask?.state === "queued"
+        && liveTask.sessionId === task.sessionId
+        && liveTask.cwd === task.cwd
+        && binding?.sessionId === task.sessionId
+        && binding.cwd === task.cwd
+        && runtime.cwd === task.cwd
+        && runtime.lease?.worker.sessionId === task.sessionId
+        && this.runningRuntime(target) === runtime;
+    };
+    const beforeWorkerSteer = (): boolean => {
+      if (!ownsExactRunningSession() || !this.store.markStarted(task.id)) return false;
+      try {
+        this.store.markTaskPromptStarted(task.id, task.sessionId);
+        workerSteerAttempted = true;
+        return true;
+      } catch {
+        this.store.markFailed(task.id, "could not durably record question-wake steer intent");
+        return false;
+      }
+    };
+
+    try {
+      await this.appendToRunningTask(
+        message,
+        task.text,
+        ownsExactRunningSession,
+        beforeWorkerSteer,
+        false,
+        false,
+        () => { workerSteerAccepted = true; },
+        undefined,
+        false,
+        (scheduled) => { delivery = scheduled; },
+        () => {
+          workerSteerRejected = true;
+          try {
+            this.recordQuestionWakeSteerRejection(task.id);
+          } catch (error) {
+            console.error(`[ask] explicit steer refusal fallback remains recoverable task=${task.id}: ${safeErrorMessage(error, "fallback persistence failed")}`);
+          }
+        },
+      );
+      if (delivery !== undefined) await delivery;
+    } catch (error) {
+      if (workerSteerRejected) {
+        this.recordQuestionWakeSteerRejection(task.id);
+        this.typingLeases.release(target, `task:${task.id}`);
+        return;
+      } else if (workerSteerAttempted) {
+        this.store.markInterrupted(task.id, "question-wake steer outcome is unknown; automatic replay was suppressed");
+        this.typingLeases.release(target, `task:${task.id}`);
+        return;
+      }
+      if (this.store.getTask(task.id)?.state !== "queued") {
+        console.error(`[ask] question wake failed task=${task.id}: ${safeErrorMessage(error, "question wake publication failed")}`);
+        return;
+      }
+      if (await this.threadWorkspaceIncomplete(target)) return;
+      this.scheduleQuestionWakeTask(task);
+      return;
+    }
+
+    if (workerSteerAccepted) {
+      try {
+        this.store.markTaskPromptAccepted(task.id);
+        this.store.markCompleted(task.id, null);
+      } catch (error) {
+        console.error(`[ask] accepted wake could not settle its ledger task=${task.id}: ${safeErrorMessage(error, "task settlement failed")}`);
+      } finally {
+        this.typingLeases.release(target, `task:${task.id}`);
+      }
+      return;
+    }
+    if (workerSteerRejected) {
+      this.recordQuestionWakeSteerRejection(task.id);
+      this.typingLeases.release(target, `task:${task.id}`);
+      return;
+    }
+    if (workerSteerAttempted) {
+      this.store.markInterrupted(task.id, "question-wake steer outcome is unknown; automatic replay was suppressed");
+      this.typingLeases.release(target, `task:${task.id}`);
+      return;
+    }
+    const current = this.store.getTask(task.id);
+    if (current?.state !== "queued") {
+      this.typingLeases.release(target, `task:${task.id}`);
+      return;
+    }
+    if (await this.threadWorkspaceIncomplete(target)) {
+      this.store.markCancelled(task.id, THREAD_WORKSPACE_UNAVAILABLE_TEXT);
+      this.typingLeases.release(target, `task:${task.id}`);
+      return;
+    }
+    this.scheduleQuestionWakeTask(current);
+  }
+
+  private persistQuestionNotice(message: InboundMessage, text: string, sourceId: string): string {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) throw new Error("Bot identity is unavailable while persisting a question notice");
+    return this.persistIngressTextEffect(botUid, message, "question", sourceId, "notice", text);
+  }
+
+  private publishIngressNotice(message: InboundMessage): void {
+    this.operationSet(this.outbox.flush(message).catch((error: unknown) => {
+      console.error(`[ingress] durable notice remains queued: ${safeErrorMessage(error, "outbox flush failed")}`);
+    }));
+  }
+
+  private ingressConfigReservationKey(sourceKind: string, sourceId: string): string {
+    return JSON.stringify([sourceKind, sourceId]);
+  }
+
+  private reserveIngressConfig(job: IngressJobRecord): ConfigApplyReservation | undefined {
+    const key = this.ingressConfigReservationKey(job.sourceKind, job.sourceId);
+    const existing = this.ingressConfigReservations.get(key);
+    if (existing !== undefined) return existing;
+
+    let kind: "switch" | "mode" | null = null;
+    let reservationSourceId: string;
+    if (job.sourceKind === "bot-event" && job.payload?.kind === "bot-event") {
+      const accepted = job.payload.acceptedAction;
+      if (accepted === null) return undefined;
+      kind = accepted.kind;
+      reservationSourceId = `bot-event:${job.sourceId}`;
+    } else if (
+      (job.sourceKind === "recv" || job.sourceKind === "synthetic")
+      && (job.payload?.kind === "recv" || job.payload?.kind === "synthetic")
+    ) {
+      const purpose = job.routeSnapshot?.purpose;
+      const action = purpose?.kind === "command" ? purpose.action : null;
+      if (action !== "switch" && action !== "mode") return undefined;
+      const command = parseCommand(job.payload.message.text.trim());
+      if (command === null || command.argument.trim().length === 0) return undefined;
+      kind = action;
+      reservationSourceId = `${job.sourceKind}:${job.sourceId}`;
+    } else {
+      return undefined;
+    }
+    const reservation = this.configMenus.reserveApply(kind, {
+      channelType: job.channelType,
+      channelId: job.channelId,
+    }, reservationSourceId);
+    this.ingressConfigReservations.set(key, reservation);
+    return reservation;
+  }
+
+  private acceptConfigCardAction(
+    snapshot: ConfigCardActionSnapshot,
+    action: BotCardAction,
+    reservation: ConfigApplyReservation,
+  ): "accepted" | "duplicate" | "retry" {
+    const key = this.ingressConfigReservationKey("bot-event", String(snapshot.eventId));
+    const existing = this.ingressConfigReservations.get(key);
+    if (existing === undefined) this.ingressConfigReservations.set(key, reservation);
+    else if (existing !== reservation) {
+      reservation.release();
+      return "retry";
+    }
+    const accepted = this.ingress.acceptBotEvent(action, snapshot.eventId, snapshot);
+    if (accepted === "retry" && this.ingressConfigReservations.get(key) === reservation) {
+      this.ingressConfigReservations.delete(key);
+      reservation.release();
+    }
+    return accepted;
+  }
+
+  private ingressTextEffectDispatch(
+    job: IngressJobRecord,
+    message: InboundMessage,
+    effect: string,
+    text: string,
+  ): IngressDispatch {
+    const consumerId = this.stableIngressEffectId(
+      job.botUid,
+      job.sourceKind,
+      job.sourceId,
+      effect,
+      0,
+    );
+    return {
+      consumer: { kind: "outbox", id: consumerId },
+      persistConsumer: () =>
+        this.persistIngressTextEffect(
+          job.botUid,
+          message,
+          job.sourceKind,
+          job.sourceId,
+          effect,
+          text,
+        ) === consumerId,
+      publishAfterCommit: () => this.publishIngressNotice(message),
+    };
+  }
+  private async dispatchIngress(job: IngressJobRecord): Promise<IngressDispatch> {
+    if (job.payload?.kind === "bot-event") {
+      if (this.stopping) throw new InboundShutdownError();
+      const accepted = job.payload.acceptedAction;
+      if (accepted === null) throw new Error("Bot-event ingress is missing its validated action");
+      const checkpoint = job.operationCheckpoint;
+      if (checkpoint?.kind !== "config-action") {
+        throw new Error("Bot-event ingress has no typed config action checkpoint");
+      }
+      const snapshot: ConfigCardActionSnapshot = { eventId: job.payload.eventId, ...accepted };
+      const reservation = this.reserveIngressConfig(job);
+      if (reservation === undefined) throw new Error("Bot-event config ordering reservation is unavailable");
+      const hooks: ConfigActionCheckpoint = {
+        dispatchIntent: checkpoint.phase === "dispatch-intent",
+        appliedResult: checkpoint.phase === "applied" ? checkpoint.appliedResult : null,
+        markDispatchIntent: () => this.store.markIngressConfigActionDispatchIntent(job.id),
+        markAppliedResult: result => this.store.markIngressConfigActionApplied(job.id, result),
+        markUnknown: _reason => {
+          this.markIngressUnknown(job);
+        },
+      };
+      const operation = this.configMenus.resumeAcceptedAction(snapshot, reservation, hooks);
+      const key = this.ingressConfigReservationKey(job.sourceKind, job.sourceId);
+      const completion = operation.catch((error: unknown) => {
+        if (error instanceof ConfigActionSuspendedError) throw new IngressSuspendedError();
+        throw error;
+      }).finally(() => {
+        if (this.ingressConfigReservations.get(key) === reservation) {
+          this.ingressConfigReservations.delete(key);
+        }
+        reservation.release();
+      });
+      this.operationSet(completion.then(() => {}, () => {}));
+      return {
+        consumer: { kind: "operation", id: `bot-event:${job.payload.eventId}` },
+        completion,
+      };
+    }
+    if (job.payload?.kind !== "recv" && job.payload?.kind !== "synthetic") {
+      throw new Error("Ingress job lost its source payload");
+    }
+    const message = job.payload.message;
+    const purpose = job.routeSnapshot?.purpose;
+    if (purpose === undefined) throw new Error("Ingress job lost its frozen route");
+
+    if (purpose.kind === "questions") {
+      const expected = job.routeSnapshot?.binding ?? null;
+      const live = this.ingressBindingSnapshot(message);
+      const switched = job.routeSnapshot?.barrierJobId !== null
+        && (expected?.sessionId !== live?.sessionId || expected?.cwd !== live?.cwd);
+      const prepared = this.questions.prepareTextSnapshot(
+        message,
+        message.text.trim(),
+        { kind: "questions", questionIds: purpose.questionIds },
+        switched ? "session-switched" : undefined,
+        job.sourceId,
+      );
+      return {
+        consumer: { kind: "ask", id: prepared.consumerId },
+        persistConsumer: () => prepared.persist(),
+        publishAfterCommit: () => {
+          prepared.publishAfterCommit();
+        },
+      };
+    }
+
+    if (purpose.kind === "command") {
+      return this.dispatchIngressCommand(job, message, purpose.action);
+    }
+    if (purpose.kind === "none" || purpose.kind === "ordinary") {
+      const body = job.preparedText;
+      if (body === null) throw new Error("Ordinary ingress job has no prepared body");
+      if (await this.threadWorkspaceIncomplete(message)) {
+        return this.ingressTextEffectDispatch(
+          job,
+          message,
+          "workspace-refusal",
+          THREAD_WORKSPACE_UNAVAILABLE_TEXT,
+        );
+      }
+      const botUid = this.bot?.uid;
+      if (botUid === undefined) throw new Error("Bot identity is unavailable while dispatching ingress");
+      const existingTask = this.store.getTaskByMessageId(botUid, message, message.messageId);
+      if (existingTask !== null) {
+        return {
+          consumer: { kind: "task", id: existingTask.id },
+          persistConsumer: () => true,
+          publishAfterCommit: () => {
+            if (existingTask.state === "queued") {
+              this.typingLeases.acquire(taskTarget(existingTask), `task:${existingTask.id}`);
+              this.scheduler.scheduleTask(existingTask.id);
+            }
+            this.observeUserReference(message, existingTask.id);
+          },
+        };
+      }
+      let steerIntent = false;
+      let steerAccepted = false;
+      let steerRejected = false;
+      let steerTaskId: string | undefined;
+      let steerClaim: InboundClaim | undefined;
+      let steeringDelivery: Promise<boolean> | undefined;
+      const steered = await this.appendToRunningTask(
+        message,
+        body,
+        () => !this.stopping,
+        () => {
+          if (!this.store.markIngressDispatchIntent(job.id)) return false;
+          steerIntent = true;
+          return true;
+        },
+        false,
+        false,
+        taskId => {
+          steerAccepted = true;
+          steerTaskId = taskId;
+        },
+        claim => { steerClaim = claim; },
+        true,
+        delivery => { steeringDelivery = delivery; },
+        () => { steerRejected = true; },
+      );
+      if (this.stopping) throw new InboundShutdownError();
+      if (steered && steeringDelivery !== undefined) {
+        const delivery = steeringDelivery;
+        let completion: IngressDispatch | undefined;
+        let cancellationRefusal = false;
+        const steering = (async (): Promise<void> => {
+          const accepted = await delivery;
+          cancellationRefusal = accepted
+            && !steerAccepted
+            && this.store.isIngressCancellationRequested(job.id);
+          if (steerIntent && !steerAccepted && !steerRejected && !cancellationRefusal) {
+            this.markIngressUnknown(job);
+            throw new Error("steering dispatch outcome is unknown; ingress will not retry it");
+          }
+          if (accepted && steerAccepted) {
+            completion = {
+              consumer: { kind: "steering", id: message.messageId },
+              persistConsumer: () => {
+                if (steerClaim !== undefined) this.store.completeCommand(steerClaim);
+                return true;
+              },
+              publishAfterCommit: () => {
+                if (steerTaskId !== undefined) this.observeUserReference(message, steerTaskId);
+              },
+            };
+            return;
+          }
+          if (
+            accepted
+            && this.store.getCommandClaimState(botUid, message, message.messageId) === "completed"
+          ) {
+            completion = {
+              consumer: { kind: "operation", id: job.sourceId },
+              persistConsumer: () => true,
+            };
+            return;
+          }
+          if ((steerRejected || cancellationRefusal) && this.store.isIngressCancellationRequested(job.id)) {
+            completion = {
+              consumer: { kind: "operation", id: job.sourceId },
+              persistConsumer: () => false,
+            };
+            return;
+          }
+          const prepared = await this.prepareIngressTask(message, body, job.id);
+          if (this.stopping) throw new InboundShutdownError();
+          completion = {
+            consumer: { kind: "task", id: prepared.task.id },
+            persistConsumer: () => this.persistIngressTask(prepared),
+            publishAfterCommit: () => this.publishIngressTask(prepared),
+          };
+        })();
+
+        const settled = steering.then(
+          () => {},
+          () => {},
+        );
+        this.operationSet(settled);
+        return {
+          consumer: { kind: "operation", id: job.sourceId },
+          resolveConsumer: () => completion?.consumer ?? { kind: "operation", id: job.sourceId },
+          persistConsumer: () => completion?.persistConsumer?.() ?? false,
+          publishAfterCommit: () => completion?.publishAfterCommit?.(),
+          cancelOnPersistFailureWhenRequested: () => steerRejected || cancellationRefusal,
+          holdBusinessUntilHandoff: true,
+          completion: steering,
+        };
+      }
+      if (steered) {
+        const claimState = this.store.getCommandClaimState(botUid, message, message.messageId);
+        if (claimState === "completed") {
+          return {
+            consumer: { kind: "steering", id: message.messageId },
+            persistConsumer: () => true,
+          };
+        }
+        if (claimState === "pending") {
+          this.markIngressUnknown(job);
+          throw new Error("an unrelated pending steering claim cannot recover this ingress job");
+        }
+      }
+      const prepared = await this.prepareIngressTask(message, body, job.id);
+      if (this.stopping) throw new InboundShutdownError();
+      return {
+        consumer: { kind: "task", id: prepared.task.id },
+        persistConsumer: () => this.persistIngressTask(prepared),
+        publishAfterCommit: () => this.publishIngressTask(prepared),
+      };
+    }
+    throw new Error("Ingress job has no dispatchable frozen route");
+  }
+  private async dispatchIngressThreadTask(
+    job: IngressJobRecord,
+    message: InboundMessage,
+    body: string,
+  ): Promise<IngressDispatch> {
+    const canContinue = (): boolean => {
+      if (this.stopping) return false;
+      const state = this.store.getIngressJob(job.id)?.state;
+      return state === "accepted" || state === "dispatch-intent";
+    };
+    if (!canContinue()) throw new IngressSuspendedError();
+    if (await this.threadWorkspaceIncomplete(message)) {
+      return this.ingressTextEffectDispatch(
+        job,
+        message,
+        "workspace-refusal",
+        THREAD_WORKSPACE_UNAVAILABLE_TEXT,
+      );
+    }
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) throw new Error("Bot identity is unavailable while dispatching ingress");
+    const existingTask = this.store.getTaskByMessageId(botUid, message, message.messageId);
+    if (existingTask !== null) {
+      return {
+        consumer: { kind: "task", id: existingTask.id },
+        persistConsumer: () => this.store.getTask(existingTask.id) !== null,
+        publishAfterCommit: () => {
+          if (existingTask.state === "queued") {
+            this.typingLeases.acquire(taskTarget(existingTask), `task:${existingTask.id}`);
+            this.scheduler.scheduleTask(existingTask.id);
+          }
+          this.observeUserReference(message, existingTask.id);
+        },
+      };
+    }
+
+    let steerIntent = false;
+    let steerAccepted = false;
+    let steerRejected = false;
+    let steerTaskId: string | undefined;
+    let steerClaim: InboundClaim | undefined;
+    let steeringDelivery: Promise<boolean> | undefined;
+    const steered = await this.appendToRunningTask(
+      message,
+      body,
+      canContinue,
+      () => {
+        const state = this.store.getIngressJob(job.id)?.state;
+        if (state === "dispatch-intent") {
+          steerIntent = true;
+          return true;
+        }
+        if (state !== "accepted" || !this.store.markIngressDispatchIntent(job.id)) return false;
+        steerIntent = true;
+        return true;
+      },
+      false,
+      false,
+      taskId => {
+        steerAccepted = true;
+        steerTaskId = taskId;
+      },
+      claim => { steerClaim = claim; },
+      true,
+      delivery => { steeringDelivery = delivery; },
+      () => { steerRejected = true; },
+    );
+    if (steered && steeringDelivery !== undefined) {
+      const delivery = steeringDelivery;
+      let result: IngressDispatch | undefined;
+      let cancellationRefusal = false;
+      const steering = (async (): Promise<void> => {
+        const accepted = await delivery;
+        if (this.store.getIngressJob(job.id)?.state === "cancelled") {
+          throw new IngressSuspendedError();
+        }
+        cancellationRefusal = accepted
+          && !steerAccepted
+          && this.store.isIngressCancellationRequested(job.id);
+        if (steerIntent && !steerAccepted && !steerRejected && !cancellationRefusal) {
+          this.markIngressUnknown(job);
+          throw new Error("thread-task steering outcome is unknown; ingress will not retry it");
+        }
+        if (accepted && steerAccepted) {
+          result = {
+            consumer: { kind: "steering", id: message.messageId },
+            persistConsumer: () => {
+              if (steerClaim !== undefined) this.store.completeCommand(steerClaim);
+              return true;
+            },
+            publishAfterCommit: () => {
+              if (steerTaskId !== undefined) this.observeUserReference(message, steerTaskId);
+            },
+          };
+          return;
+        }
+        if (
+          accepted
+          && this.store.getCommandClaimState(botUid, message, message.messageId) === "completed"
+        ) {
+          result = {
+            consumer: { kind: "operation", id: job.sourceId },
+            persistConsumer: () => true,
+          };
+          return;
+        }
+        if ((steerRejected || cancellationRefusal) && this.store.isIngressCancellationRequested(job.id)) {
+          result = {
+            consumer: { kind: "operation", id: job.sourceId },
+            persistConsumer: () => false,
+          };
+          return;
+        }
+        if (!canContinue()) throw new IngressSuspendedError();
+        const prepared = await this.prepareIngressTask(message, body, job.id);
+        if (!canContinue()) throw new IngressSuspendedError();
+        result = {
+          consumer: { kind: "task", id: prepared.task.id },
+          persistConsumer: () => this.persistIngressTask(prepared),
+          publishAfterCommit: () => this.publishIngressTask(prepared),
+        };
+      })();
+      const settled = steering.then(() => {}, () => {});
+      this.operationSet(settled);
+      return {
+        consumer: { kind: "operation", id: job.sourceId },
+        resolveConsumer: () => result?.resolveConsumer?.() ?? result?.consumer ?? {
+          kind: "operation",
+          id: job.sourceId,
+        },
+        persistConsumer: () => result?.persistConsumer?.() ?? false,
+        publishAfterCommit: () => result?.publishAfterCommit?.(),
+        cancelOnPersistFailureWhenRequested: () => steerRejected || cancellationRefusal,
+        holdBusinessUntilHandoff: true,
+        completion: steering,
+      };
+    }
+    if (steered) {
+      const claimState = this.store.getCommandClaimState(botUid, message, message.messageId);
+      if (claimState === "completed") {
+        return {
+          consumer: { kind: "steering", id: message.messageId },
+          persistConsumer: () => true,
+        };
+      }
+      if (claimState === "pending") {
+        this.markIngressUnknown(job);
+        throw new Error("an unrelated pending thread-task steering claim cannot recover this ingress job");
+      }
+    }
+    if (!canContinue()) throw new IngressSuspendedError();
+    const prepared = await this.prepareIngressTask(message, body, job.id);
+    if (!canContinue()) throw new IngressSuspendedError();
+    return {
+      consumer: { kind: "task", id: prepared.task.id },
+      persistConsumer: () => this.persistIngressTask(prepared),
+      publishAfterCommit: () => this.publishIngressTask(prepared),
+    };
+  }
+
+
+  private persistIngressReceipt(
+    job: Pick<IngressJobRecord, "id" | "botUid">,
+    target: ChatTarget,
+    text: string,
+  ): void {
+    for (const [index, chunk] of splitUtf8(text).entries()) {
+      const id = `ingress:${job.id}:receipt:${index}`;
+      const existing = this.store.getOutbox(id);
+      if (existing !== null) {
+        if (
+          existing.botUid !== job.botUid
+          || existing.channelType !== target.channelType
+          || existing.channelId !== target.channelId
+          || existing.text !== chunk
+        ) throw new Error("ingress receipt identity conflicts with a different outcome");
+        continue;
+      }
+      this.store.enqueueOutbox({
+        id,
+        botUid: job.botUid,
+        channelType: target.channelType,
+        channelId: target.channelId,
+        taskId: null,
+        kind: "text",
+        text: chunk,
+        path: null,
+        fileKind: null,
+        clientMsgNo: id,
+      });
+    }
+  }
+
+  private markIngressUnknown(job: IngressJobRecord): boolean {
+    const text = "操作结果无法确认，系统不会自动重试；相关资源继续保持保护。";
+    const target: ChatTarget = { channelType: job.channelType, channelId: job.channelId };
+    const payload = job.payload;
+    const message = payload?.kind === "recv" || payload?.kind === "synthetic"
+      ? payload.message
+      : null;
+    const marked = this.store.markIngressUnknown(job.id, () => {
+      if (message !== null) {
+        const command = parseCommand(message.text.trim());
+        if (command !== null) this.store.completeCommand(this.commandClaim(message, command.name));
+      }
+      this.persistIngressReceipt(job, target, text);
+      return true;
+    });
+    if (marked) void this.outbox.flush(message ?? target).catch(() => {});
+    return marked;
+  }
+
+  private dispatchIngressCommand(
+    job: IngressJobRecord,
+    message: InboundMessage,
+    action: string,
+  ): IngressDispatch {
+    const command = parseCommand(message.text.trim());
+    if (command === null) throw new Error("Command ingress lost its command text");
+    const completion = Promise.withResolvers<void>();
+    let result: IngressDispatch = {
+      consumer: { kind: "operation", id: job.sourceId },
+      persistConsumer: () => false,
+    };
+    const ingressHooks = this.installIngressThreadOperation(
+      job,
+      message,
+      command,
+      () => completion.resolve(),
+    );
+    const sessionHooks = this.installIngressSessionOperation(
+      job,
+      message,
+      command,
+      action,
+      () => completion.resolve(),
+    );
+    if ((action === "new" || action === "move") && sessionHooks === undefined) {
+      throw new Error(`ingress ${action} operation has no recoverable session owner`);
+    }
+    const forkIntentReady = action === "fork"
+      ? () => { this.ingress.releaseSessionBarrier(job.id); }
+      : undefined;
+    const operation = this.executeIngressCommand(
+      job,
+      message,
+      action,
+      command,
+      ingressHooks,
+      sessionHooks,
+      forkIntentReady,
+    );
+    const finishOperations = (): void => {
+      if (ingressHooks !== undefined) {
+        const handedOffMerge = command.name === "thread"
+          && /^merge(?:$|[^\p{L}\p{N}_-])/iu.test(command.argument.trim())
+          && this.store.getIngressJob(job.id)?.state === "handed-off"
+          && this.threadMergeControllersByCommand.has(this.threadMergeCommandKey(message));
+        if (!handedOffMerge) this.finishThreadMergeCommand(message);
+        this.finishThreadRemovalCommand(message);
+      }
+      if (sessionHooks !== undefined) this.finishIngressSessionCommand(message);
+    };
+    const settled = operation.then(async dispatch => {
+      result = dispatch;
+      if (dispatch.completion !== undefined) await dispatch.completion;
+      finishOperations();
+      completion.resolve();
+    }).catch(error => {
+      completion.reject(error);
+      finishOperations();
+      if (!(error instanceof IngressSuspendedError)) {
+        console.error(
+          `[ingress command] operation failed action=${action} message=${message.messageId}: ${safeErrorMessage(error, "operation failed")}`,
+        );
+      }
+    });
+    this.operationSet(settled);
+    if (ingressHooks !== undefined || sessionHooks !== undefined) {
+      const targetKeyValue = targetKey(message);
+      const operations = this.ingressCommandOperations.get(targetKeyValue) ?? new Set<Promise<void>>();
+      operations.add(settled);
+      this.ingressCommandOperations.set(targetKeyValue, operations);
+      void settled.then(() => {
+        operations.delete(settled);
+        if (operations.size === 0 && this.ingressCommandOperations.get(targetKeyValue) === operations) {
+          this.ingressCommandOperations.delete(targetKeyValue);
+        }
+      });
+    }
+    return {
+      consumer: result.consumer,
+      resolveConsumer: () => result.resolveConsumer?.() ?? result.consumer,
+      persistConsumer: () => result.persistConsumer?.() ?? false,
+      publishAfterCommit: () => result.publishAfterCommit?.(),
+      cancelOnPersistFailureWhenRequested: () =>
+        result.cancelOnPersistFailureWhenRequested?.() ?? false,
+      holdBusinessUntilHandoff:
+        action === "queue" || action === "thread-task" || action === "unknown",
+      completion: completion.promise,
+    };
+  }
+
+  private installIngressThreadOperation(
+    job: IngressJobRecord,
+    message: InboundMessage,
+    command: { name: string; argument: string },
+    onHandoff: () => void,
+  ): ThreadCommandIngressHooks | undefined {
+    if (message.channelType !== 5 || command.name !== "thread" || this.bot === undefined) return undefined;
+    const argument = command.argument.trim();
+    const isMerge = /^merge(?:$|[^\p{L}\p{N}_-])/iu.test(argument);
+    const isRemove = /^remove(?:$|\s)/iu.test(argument);
+    if (!isMerge && !isRemove) return undefined;
+    if (!this.ingressBindingMatches(job, message, isMerge)) return undefined;
+    const botUid = this.bot.uid;
+    if (this.store.getThreadForkByTarget(botUid, message)?.phase === "ready") return undefined;
+    if (
+      (isMerge && this.store.getHostMergeLeaseBySourceId(botUid, message, message.messageId) !== null)
+      || (isRemove && this.store.getHostRemovalLeaseBySourceId(botUid, message, message.messageId) !== null)
+    ) return undefined;
+
+    let resourceCwds: readonly string[];
+    let repositoryCwds: readonly string[];
+    if (isMerge) {
+      const binding = this.store.getBinding(botUid, message);
+      if (binding === null || binding.cwdPinned !== true) return undefined;
+      resourceCwds = [binding.cwd];
+      repositoryCwds = [];
+    } else {
+      const ownership = this.store.getThreadWorkspace(botUid, message);
+      if (ownership === null) return undefined;
+      resourceCwds = threadWorkspaceCleanupPaths(ownership, true);
+      if (resourceCwds.length === 0) return undefined;
+      repositoryCwds = [];
+    }
+
+    const commandKey = this.threadMergeCommandKey(message);
+    const kind = isMerge ? "merge" : "remove";
+    const existingReservation = this.ingressCommandReservations.get(commandKey);
+    let reservation: DestructiveCommandReservation;
+    if (existingReservation !== undefined && existingReservation.kind === kind) {
+      reservation = existingReservation.reservation;
+      if (isRemove) {
+        reservation.extend(
+          resourceCwds.filter(path => !existingReservation.resourceCwds.includes(path)),
+          repositoryCwds,
+        );
+      }
+      resourceCwds = [...new Set([...existingReservation.resourceCwds, ...resourceCwds])];
+    } else {
+      reservation = this.scheduler.reserveDestructiveCommandSession(
+        message,
+        isMerge ? [] : resourceCwds,
+        isMerge ? [] : repositoryCwds,
+        job.scheduleOrder,
+      );
+    }
+    this.ingressCommandReservations.set(commandKey, { kind, reservation, resourceCwds });
+    const controller = new AbortController();
+    const targetKeyValue = targetKey(message);
+    const controllers = isMerge
+      ? this.threadMergeControllers.get(targetKeyValue) ?? new Set<AbortController>()
+      : this.threadRemovalControllers.get(targetKeyValue) ?? new Set<AbortController>();
+    controllers.add(controller);
+    if (isMerge) {
+      this.threadMergeControllers.set(targetKeyValue, controllers);
+      this.threadMergeControllersByCommand.set(commandKey, controller);
+    } else {
+      this.threadRemovalControllers.set(targetKeyValue, controllers);
+      this.threadRemovalControllersByCommand.set(commandKey, controller);
+    }
+
+    const expectedBinding = job.operationCheckpoint?.kind === "command"
+      ? job.operationCheckpoint.expectedBinding
+      : job.routeSnapshot?.binding ?? null;
+    const saveCheckpoint = (
+      phase: "admitted" | "barrier-installed" | "planning" | "waiting-session" | "waiting-resource",
+    ): void => {
+      const latest = this.store.getIngressJob(job.id);
+      if (latest?.state === "handed-off" || latest?.state === "dispatch-intent") return;
+      const current = this.ingressCommandReservations.get(commandKey);
+      const saved = this.store.saveIngressCheckpoint(job.id, {
+        kind: "command",
+        action: "thread",
+        argument: command.argument,
+        phase,
+        expectedBinding,
+        ...(current === undefined ? {} : { resourceCwds: current.resourceCwds }),
+      });
+      if (!saved) throw new Error("thread operation checkpoint could not be persisted");
+    };
+    try {
+      saveCheckpoint("barrier-installed");
+    } catch (error) {
+      this.finishThreadMergeCommand(message);
+      this.finishThreadRemovalCommand(message);
+      throw error;
+    }
+    return {
+      signal: controller.signal,
+      onReservationInstalled: () => saveCheckpoint("barrier-installed"),
+      checkpoint: phase => saveCheckpoint(phase),
+      acceptsInitialSessionBinding: binding => isMerge
+        && this.hasExactTaskSessionInitialization(job, message, expectedBinding, binding),
+      markDispatchIntent: hostLedgerId => {
+        const latest = this.store.getIngressJob(job.id);
+        const checkpoint = latest?.operationCheckpoint;
+        if (latest?.state === "dispatch-intent") {
+          return checkpoint?.kind === "command" && checkpoint.hostLedgerId === hostLedgerId;
+        }
+        if (
+          latest?.state !== "accepted"
+          || checkpoint?.kind !== "command"
+          || checkpoint.action !== "thread"
+        ) return false;
+        const current = this.ingressCommandReservations.get(commandKey);
+        return this.store.markIngressCommandDispatchIntent(job.id, {
+          ...checkpoint,
+          phase: "dispatch-intent",
+          resourceCwds: [...new Set([
+            ...(checkpoint.resourceCwds ?? []),
+            ...(current?.resourceCwds ?? []),
+          ])],
+          hostLedgerId,
+        });
+      },
+      handoffToConsumer: (consumer, persistConsumer) => {
+        const current = this.store.getIngressJob(job.id);
+        if (current?.state === "handed-off") {
+          onHandoff();
+          return true;
+        }
+        const handedOff = this.store.handoffIngressJob(job.id, consumer, persistConsumer);
+        if (handedOff) onHandoff();
+        return handedOff;
+      },
+    };
+  }
+
+  private installIngressSessionOperation(
+    job: IngressJobRecord,
+    message: InboundMessage,
+    command: { name: string; argument: string },
+    action: string,
+    onHandoff: () => void,
+  ): SessionCommandIngressHooks | undefined {
+    if ((action !== "new" && action !== "move") || this.bot === undefined) return undefined;
+
+    const expectedBinding = job.operationCheckpoint?.kind === "command"
+      ? job.operationCheckpoint.expectedBinding
+      : job.routeSnapshot?.binding ?? null;
+    const commandKey = this.threadMergeCommandKey(message);
+    const target = targetKey(message);
+    const initialResources = job.operationCheckpoint?.kind === "command"
+      ? [...(job.operationCheckpoint.resourceCwds ?? [])]
+      : expectedBinding === null ? [] : [expectedBinding.cwd];
+    const existing = this.ingressSessionReservations.get(commandKey);
+    let reservation: SessionCommandReservation;
+    let resourceCwds: readonly string[];
+    if (existing !== undefined && existing.kind === action) {
+      reservation = existing.reservation;
+      const additions = initialResources.filter(path => !existing.resourceCwds.includes(path));
+      if (additions.length > 0) reservation.extend(additions);
+      resourceCwds = [...new Set([...existing.resourceCwds, ...initialResources])];
+    } else {
+      reservation = this.scheduler.reserveSessionCommand(message, initialResources, job.scheduleOrder);
+      resourceCwds = initialResources;
+    }
+    this.ingressSessionReservations.set(commandKey, { kind: action, reservation, resourceCwds });
+
+    const controller = new AbortController();
+    const controllers = this.ingressSessionCommandControllers.get(target) ?? new Set<AbortController>();
+    controllers.add(controller);
+    this.ingressSessionCommandControllers.set(target, controllers);
+    this.ingressSessionControllersByCommand.set(commandKey, controller);
+    const sessionJobs = this.ingressSessionJobIdsByTarget.get(target) ?? new Set<number>();
+    sessionJobs.add(job.id);
+    this.ingressSessionJobIdsByTarget.set(target, sessionJobs);
+    this.ingressSessionJobIdsByCommand.set(commandKey, job.id);
+
+    const makeCheckpoint = (
+      phase: Extract<IngressOperationCheckpoint, { kind: "command" }>["phase"],
+      paths: readonly string[],
+      workerLedgerId?: string,
+    ): IngressOperationCheckpoint => ({
+      kind: "command",
+      action,
+      argument: command.argument,
+      phase,
+      expectedBinding,
+      resourceCwds: [...new Set(paths)],
+      ...(workerLedgerId === undefined ? {} : { workerLedgerId }),
+    });
+    const saveCheckpoint = (
+      phase: Extract<IngressOperationCheckpoint, { kind: "command" }>["phase"],
+      paths = this.ingressSessionReservations.get(commandKey)?.resourceCwds ?? [],
+    ): boolean => {
+      const latest = this.store.getIngressJob(job.id);
+      if (latest?.state !== "accepted") return false;
+      return this.store.saveIngressCheckpoint(job.id, makeCheckpoint(phase, paths));
+    };
+    if (!saveCheckpoint("barrier-installed")) {
+      this.finishIngressSessionCommand(message);
+      throw new Error("session operation checkpoint could not be persisted");
+    }
+
+    const stableOperationId = `session-command:${job.id}`;
+    const persistReceipt = (text: string): void => this.persistIngressReceipt(job, message, text);
+    const publishReceipt = (clearContext: boolean): void => {
+      if (clearContext) this.threadReferences.resetContext(message);
+      void this.outbox.flush(message).catch(() => {});
+    };
+
+    return {
+      signal: controller.signal,
+      jobId: job.id,
+      workerLedgerId: `${action}-ingress-${job.id}`,
+      stopping: () => this.stopping,
+      matchesExpectedBinding: binding => expectedBinding === null
+        ? binding === null
+        : binding !== null
+          && binding.sessionId === expectedBinding.sessionId
+          && binding.cwd === expectedBinding.cwd
+          && binding.sessionFile === expectedBinding.sessionFile
+          && (binding.cwdPinned === true) === expectedBinding.cwdPinned
+          && (binding.sessionSwitchedAt ?? null) === expectedBinding.sessionSwitchedAt,
+      checkpointWaitingSession: paths => {
+        const current = this.ingressSessionReservations.get(commandKey);
+        if (current === undefined) return false;
+        const additions = paths.filter(path => !current.resourceCwds.includes(path));
+        if (additions.length > 0) current.reservation.extend(additions);
+        const extended = [...new Set([...current.resourceCwds, ...paths])];
+        this.ingressSessionReservations.set(commandKey, { ...current, resourceCwds: extended });
+        return saveCheckpoint("waiting-session", extended);
+      },
+      acquireSessionLease: async paths => {
+        const current = this.ingressSessionReservations.get(commandKey);
+        if (current === undefined || controller.signal.aborted) return undefined;
+        if (paths.some(path => !current.resourceCwds.includes(path))) {
+          throw new Error("session resource reservation does not cover the exact requested paths");
+        }
+        await current.reservation.waitForPrior(controller.signal);
+        if (controller.signal.aborted) return undefined;
+        return current.reservation.tryAcquire();
+      },
+      markDispatchIntent: (workerLedgerId, paths) => {
+        const current = this.ingressSessionReservations.get(commandKey);
+        if (current === undefined || paths.some(path => !current.resourceCwds.includes(path))) return false;
+        return this.store.markIngressCommandDispatchIntent(
+          job.id,
+          makeCheckpoint("dispatch-intent", current.resourceCwds, workerLedgerId),
+        );
+      },
+      handoffOutcome: (binding, text, clearContext) => {
+        const handedOff = this.store.handoffIngressJob(
+          job.id,
+          { kind: "operation", id: stableOperationId },
+          () => {
+            if (binding !== null) {
+              this.store.ensureBinding(binding, { clearSessionInitialization: true });
+              if (clearContext) this.store.clearContextLedger(job.botUid, message);
+            }
+            this.store.completeCommand(this.commandClaim(message, command.name));
+            persistReceipt(text);
+            return true;
+          },
+        );
+        if (handedOff) {
+          publishReceipt(clearContext);
+          onHandoff();
+        }
+        return handedOff;
+      },
+      failUnknown: (text, paths) => {
+        for (const path of paths) this.blockedDirectories.add(path);
+        const marked = this.store.markIngressUnknown(job.id, () => {
+          this.store.completeCommand(this.commandClaim(message, command.name));
+          persistReceipt(text);
+          return true;
+        });
+        if (marked) void this.outbox.flush(message).catch(() => {});
+        return marked;
+      },
+    };
+  }
+
+  private finishIngressSessionCommand(message: InboundMessage): boolean {
+    const commandKey = this.threadMergeCommandKey(message);
+    const entry = this.ingressSessionReservations.get(commandKey);
+    const controller = this.ingressSessionControllersByCommand.get(commandKey);
+    const jobId = this.ingressSessionJobIdsByCommand.get(commandKey);
+    const job = jobId === undefined ? null : this.store.getIngressJob(jobId);
+    const keepProtectedReservation = job?.state === "unknown" || job?.state === "dispatch-intent";
+    this.ingressSessionControllersByCommand.delete(commandKey);
+    this.ingressSessionJobIdsByCommand.delete(commandKey);
+    const key = targetKey(message);
+    if (controller !== undefined) {
+      const controllers = this.ingressSessionCommandControllers.get(key);
+      controllers?.delete(controller);
+      if (controllers?.size === 0) this.ingressSessionCommandControllers.delete(key);
+    }
+    if (jobId !== undefined) {
+      const sessionJobs = this.ingressSessionJobIdsByTarget.get(key);
+      sessionJobs?.delete(jobId);
+      if (sessionJobs?.size === 0) this.ingressSessionJobIdsByTarget.delete(key);
+    }
+    if (entry === undefined) return false;
+    if (keepProtectedReservation) {
+      // The acquired lease releases its admission reservation on completion. Replace it with a
+      // session-only hold so an unknown worker outcome cannot be bypassed by changing the target cwd.
+      const reservation = this.scheduler.reserveSessionCommand(message, [], entry.reservation.order, true);
+      entry.reservation.release();
+      this.ingressSessionReservations.set(commandKey, {
+        kind: entry.kind,
+        reservation,
+        resourceCwds: entry.resourceCwds,
+      });
+      return false;
+    }
+    this.ingressSessionReservations.delete(commandKey);
+    entry.reservation.release();
+    return true;
+  }
+
+  private async executeIngressCommand(
+    job: IngressJobRecord,
+    message: InboundMessage,
+    action: string,
+    command: { name: string; argument: string },
+    ingressHooks?: ThreadCommandIngressHooks,
+    sessionHooks?: SessionCommandIngressHooks,
+    forkIntentReady?: () => void,
+  ): Promise<IngressDispatch> {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) throw new Error("Bot identity is unavailable while dispatching a command");
+    const claim = this.commandClaim(message, command.name);
+    const claimState = this.store.getCommandClaimState(botUid, message, message.messageId);
+    if (claimState === "completed") {
+      const existingTask = this.store.getTaskByMessageId(botUid, message, message.messageId);
+      return {
+        consumer: existingTask === null
+          ? { kind: "operation", id: job.sourceId }
+          : { kind: "task", id: existingTask.id },
+        persistConsumer: () => true,
+      };
+    }
+    if (claimState === "pending" && job.state !== "dispatch-intent") this.store.releaseClaim(claim);
+
+    if (action === "queue" && command.argument.trim().length > 0) {
+      if (await this.threadWorkspaceIncomplete(message)) {
+        return this.ingressTextEffectDispatch(
+          job,
+          message,
+          "workspace-refusal",
+          THREAD_WORKSPACE_UNAVAILABLE_TEXT,
+        );
+      }
+      const body = job.preparedText;
+      if (body === null) throw new Error("Queue ingress has no prepared body");
+      const prepared = await this.prepareIngressTask(message, body, job.id);
+      return {
+        consumer: { kind: "task", id: prepared.task.id },
+        persistConsumer: () => this.persistIngressTask(prepared),
+        publishAfterCommit: () => this.publishIngressTask(prepared),
+      };
+    }
+
+    if (action === "unknown") {
+      if (await this.threadWorkspaceIncomplete(message)) {
+        return this.ingressTextEffectDispatch(
+          job,
+          message,
+          "workspace-refusal",
+          THREAD_WORKSPACE_UNAVAILABLE_TEXT,
+        );
+      }
+      const body = job.preparedText;
+      if (body === null) throw new Error("Unknown command ingress has no prepared body");
+      const prepared = await this.prepareIngressTask(message, body, job.id);
+      return {
+        consumer: { kind: "task", id: prepared.task.id },
+        persistConsumer: () => this.persistIngressTask(prepared),
+        publishAfterCommit: () => this.publishIngressTask(prepared),
+      };
+    }
+
+    if (action === "tan") {
+      await this.handleTanInbound(
+        message,
+        command.argument,
+        job.routeSnapshot?.binding ?? null,
+        job.preparedText ?? undefined,
+      );
+    } else if (action.startsWith("custom:")) {
+      const handler = this.commandHandlers.get(command.name);
+      if (handler === undefined) throw new Error(`Registered command disappeared: ${command.name}`);
+      if (await this.threadWorkspaceIncomplete(message)) {
+        return this.ingressTextEffectDispatch(
+          job,
+          message,
+          "workspace-refusal",
+          THREAD_WORKSPACE_UNAVAILABLE_TEXT,
+        );
+      }
+      const body = job.preparedText;
+      if (body === null) throw new Error("Registered command ingress has no prepared body");
+      if (handler.intercept) {
+        if (job.state === "accepted" && !this.store.markIngressDispatchIntent(job.id)) {
+          throw new Error("custom command dispatch intent could not be persisted");
+        }
+        await this.handleInterceptingCommand(message, command, handler, body);
+      } else {
+        await this.handleObservingCommand(message, command, handler, body);
+      }
+    } else {
+      const builtin = action === "thread-task" ? "thread" : resolveBuiltinAction(command.name);
+      if (builtin === undefined) throw new Error(`Builtin command disappeared: ${command.name}`);
+      const threadArgument = command.argument.trim();
+      const threadMerge = /^merge(?:$|[^\p{L}\p{N}_-])/iu.test(threadArgument);
+      const threadRemove = /^remove(?:$|\s)/iu.test(threadArgument);
+      const readyFork = builtin === "thread"
+        && this.store.getThreadForkByTarget(botUid, message)?.phase === "ready";
+      const existingHostLease = threadMerge
+        ? this.store.getHostMergeLeaseBySourceId(botUid, message, message.messageId)
+        : threadRemove
+          ? this.store.getHostRemovalLeaseBySourceId(botUid, message, message.messageId)
+          : null;
+      if (
+        action === "thread"
+        && (threadMerge || threadRemove)
+        && !readyFork
+        && existingHostLease === null
+        && !this.ingressBindingMatches(job, message, threadMerge)
+      ) {
+        this.finishThreadMergeCommand(message);
+        this.finishThreadRemovalCommand(message);
+        return this.ingressTextEffectDispatch(
+          job,
+          message,
+          "workspace-refusal",
+          THREAD_WORKSPACE_UNAVAILABLE_TEXT,
+        );
+      }
+      if (
+        (builtin === "new" || builtin === "move")
+        && sessionHooks === undefined
+        && !this.ingressBindingMatches(job, message)
+      ) {
+        return this.ingressTextEffectDispatch(
+          job,
+          message,
+          "workspace-refusal",
+          "当前会话绑定已变化，本次会话操作未执行。",
+        );
+      }
+      const controlStopEffects: IngressCommandStopEffects = {};
+      if (builtin === "interrupt") controlStopEffects.interrupt = this.persistIngressInterruptIntent(job, message);
+      if (builtin === "goal") {
+        const parsed = parseGoalCommand(command.argument);
+        if (
+          !("error" in parsed)
+          && (parsed.command.op === "pause" || parsed.command.op === "drop")
+        ) {
+          const prepared = this.persistGoalControlStop(message, parsed.command.op);
+          if (prepared !== undefined) controlStopEffects.goal = prepared;
+        }
+      }
+      if (builtin === "watch") {
+        const parts = command.argument.trim().split(/\s+/u).filter(Boolean);
+        if (parts[0]?.toLowerCase() === "stop" && parts.length === 2) {
+          controlStopEffects.watch = this.stopChatWatches(message, parts[1]!);
+        }
+      }
+      const durableTaskCommand = action === "thread-task"
+        || action === "cancel"
+        || builtin === "new"
+        || builtin === "move"
+        || builtin === "queue"
+        || builtin === "fork"
+        || builtin === "commit";
+      if (
+        !durableTaskCommand
+        && ingressHooks === undefined
+        && sessionHooks === undefined
+        && job.state === "accepted"
+        && !this.store.markIngressDispatchIntent(job.id)
+      ) throw new Error("command dispatch intent could not be persisted");
+      let threadTaskResult: IngressDispatch | undefined;
+      const ingressTaskDispatch = action === "thread-task"
+        ? async (body: string): Promise<void> => {
+            threadTaskResult = await this.dispatchIngressThreadTask(job, message, body);
+          }
+        : undefined;
+      await this.handleCommand(
+        message,
+        command.name,
+        command.argument,
+        builtin,
+        job.preparedText ?? undefined,
+        ingressHooks,
+        sessionHooks,
+        forkIntentReady,
+        action === "fork" ? job.id : undefined,
+        action === "commit" || action === "cancel" ? job.id : undefined,
+        ingressTaskDispatch,
+        controlStopEffects,
+      );
+      if (threadTaskResult !== undefined) return threadTaskResult;
+      const currentJob = this.store.getIngressJob(job.id);
+      if (
+        this.stopping
+        && (ingressHooks !== undefined || sessionHooks !== undefined)
+        && currentJob?.state !== "handed-off"
+      ) throw new IngressSuspendedError();
+    }
+
+    const task = this.store.getTaskByMessageId(botUid, message, message.messageId);
+    if (task !== null) {
+      return {
+        consumer: { kind: "task", id: task.id },
+        persistConsumer: () => this.store.getTask(task.id) !== null,
+      };
+    }
+    return {
+      consumer: { kind: "operation", id: job.sourceId },
+      persistConsumer: () => this.store.getCommandClaimState(botUid, message, message.messageId) === "completed",
+    };
   }
 
   async status(target: ChatTarget): Promise<ChannelStatus> {
@@ -1540,16 +3610,25 @@ class CoreService implements ChannelService {
     for (const path of lease.resourcePaths) this.blockedDirectories.add(path);
   }
 
-  private releaseOrBlockHostRemoval(id: string, resourcePaths: readonly string[]): void {
-    try {
-      this.store.releaseHostRemovalLease(id);
-    } catch {
-      for (const path of resourcePaths) this.blockedDirectories.add(path);
+  private releaseOrBlockHostRemoval(
+    id: string,
+    resourcePaths: readonly string[],
+    removalProcessExited: boolean,
+  ): void {
+    // A confirmed child exit is not a durable operation outcome; keep its lease fail-closed.
+    if (!removalProcessExited) {
       try {
-        this.store.markHostRemovalLeaseUnknown(id);
+        this.store.releaseHostRemovalLease(id);
+        return;
       } catch {
-        // Resource blocks still fail closed if the durable row itself cannot be updated.
+        // A state mismatch below must fail closed rather than discard the lease.
       }
+    }
+    for (const path of resourcePaths) this.blockedDirectories.add(path);
+    try {
+      this.store.markHostRemovalLeaseUnknown(id);
+    } catch {
+      // Resource blocks still fail closed if the durable row itself cannot be updated.
     }
   }
 
@@ -1799,22 +3878,27 @@ class CoreService implements ChannelService {
     deliveryGuard?: () => boolean,
     beforeWorkerSteer?: () => boolean,
     systemInput = false,
-    onWorkerSteerAccepted?: () => void,
+    onWorkerSteerAccepted?: (taskId: string) => void,
+    onWorkerSteerRejected?: () => void,
   ): Promise<boolean> {
     if (!this.canDeliverSteer(runtime) || !runtime.lease || (deliveryGuard && !deliveryGuard())) return false;
     if (beforeWorkerSteer && !beforeWorkerSteer()) return false;
     const delivery = { text, silent: systemInput };
     runtime.steerDeliveries.push(delivery);
     if (runtime.steerDeliveries.length > MAX_PENDING_STEERS) runtime.steerDeliveries.shift();
+    runtime.steerCallInFlight = true;
     try {
       await runtime.lease.worker.steer(text);
-      onWorkerSteerAccepted?.();
+      onWorkerSteerAccepted?.(runtime.taskId);
       runtime.rollProgressCard?.();
       return true;
-    } catch {
+    } catch (error) {
       const index = runtime.steerDeliveries.indexOf(delivery);
       if (index >= 0) runtime.steerDeliveries.splice(index, 1);
+      if (error instanceof WorkerSteerRejectedError) onWorkerSteerRejected?.();
       return false;
+    } finally {
+      runtime.steerCallInFlight = false;
     }
   }
   private noteSteerConsumed(runtime: RuntimeTask, event: SteerConsumedEvent): void {
@@ -1839,7 +3923,9 @@ class CoreService implements ChannelService {
     beforeWorkerSteer?: () => boolean,
     observeReferences = false,
     systemInput = false,
-    onWorkerSteerAccepted?: () => void,
+    onWorkerSteerAccepted?: (taskId: string) => void,
+    deferCommandCompletion?: (claim: InboundClaim) => void,
+    onWorkerSteerRejected?: () => void,
   ): Promise<boolean> {
     if (!this.canDeliverSteer(runtime) || (deliveryGuard && !deliveryGuard())) {
       if (runtime.cancelRequested) {
@@ -1887,13 +3973,13 @@ class CoreService implements ChannelService {
           this.store.releaseClaim(claim);
           return true;
         }
-        if (deliveryGuard) {
-          this.store.releaseClaim(claim);
-          return false;
-        }
         if (this.stopping) {
           this.store.releaseClaim(claim);
           return true;
+        }
+        if (deliveryGuard !== undefined && !deliveryGuard()) {
+          this.store.releaseClaim(claim);
+          return false;
         }
         if (runtime.cancelRequested) {
           this.store.completeCommand(claim);
@@ -1907,6 +3993,7 @@ class CoreService implements ChannelService {
         return true;
       }
     }
+    let workerSteerRejected = false;
     let workerSteerAttempted = false;
     const beginWorkerSteer = beforeWorkerSteer === undefined
       ? undefined
@@ -1923,8 +4010,13 @@ class CoreService implements ChannelService {
       beginWorkerSteer,
       systemInput,
       onWorkerSteerAccepted,
+      () => {
+        workerSteerRejected = true;
+        onWorkerSteerRejected?.();
+      },
     )) {
-      this.store.completeCommand(claim);
+      if (deferCommandCompletion === undefined) this.store.completeCommand(claim);
+      else deferCommandCompletion(claim);
       if (observeReferences) this.observeUserReference(message, runtime.taskId);
       if (!systemInput) this.history.recordSteered(message, runtime.lease?.worker.sessionId ?? "");
       return true;
@@ -1939,7 +4031,10 @@ class CoreService implements ChannelService {
       }
       runtime.agentContext = restored;
     }
-    if (deliveryGuard !== undefined && workerSteerAttempted && !systemInput) return false;
+    if (deliveryGuard !== undefined && workerSteerAttempted && !systemInput) {
+      if (workerSteerRejected) this.store.releaseClaim(claim);
+      return false;
+    }
     if (this.stopping) {
       this.store.releaseClaim(claim);
       return true;
@@ -1964,10 +4059,14 @@ class CoreService implements ChannelService {
     beforeWorkerSteer?: () => boolean,
     observeReferences = false,
     systemInput = false,
-    onWorkerSteerAccepted?: () => void,
+    onWorkerSteerAccepted?: (taskId: string) => void,
+    deferCommandCompletion?: (claim: InboundClaim) => void,
+    skipWorkspaceRefusal = false,
+    onDeliveryScheduled?: (delivery: Promise<boolean>) => void,
+    onWorkerSteerRejected?: () => void,
   ): Promise<boolean> {
     this.throwIfStopping();
-    if (await this.refuseIncompleteThreadWorkspace(message, !systemInput)) return true;
+    if (!skipWorkspaceRefusal && await this.refuseIncompleteThreadWorkspace(message, !systemInput)) return true;
     if (this.store.getChatMode(this.bot!.uid, message) !== "steer") return false;
     const runtime = this.runningRuntime(message);
     if (!runtime || runtime.stopCause === "question") return false;
@@ -1987,8 +4086,14 @@ class CoreService implements ChannelService {
         observeReferences,
         systemInput,
         onWorkerSteerAccepted,
+        deferCommandCompletion,
+        onWorkerSteerRejected,
       ));
     runtime.steerSerial = delivery.then(() => {}, () => {});
+    if (onDeliveryScheduled !== undefined) {
+      onDeliveryScheduled(delivery);
+      return true;
+    }
     return await delivery;
   }
 
@@ -1996,10 +4101,10 @@ class CoreService implements ChannelService {
     message: InboundMessage,
     command: { name: string; argument: string },
     handler: ChannelCommandHandler,
+    preparedBody?: string,
   ): Promise<void> {
-    // handler 拿到的是这条消息的正文，因此正文先经唯一组装点：注册命令同样不吃掉附件。
     await this.withMessageTyping(message, async () => {
-      const body = await this.materializer.materialize(message);
+      const body = preparedBody ?? await this.materializer.materialize(message);
       if (body === null) return;
       this.throwIfStopping();
       const claim = this.commandClaim(message, command.name);
@@ -2023,9 +4128,10 @@ class CoreService implements ChannelService {
     message: InboundMessage,
     command: { name: string; argument: string },
     handler: ChannelCommandHandler,
+    preparedBody?: string,
   ): Promise<void> {
     const body = await this.withMessageTyping(message, async () => {
-      const materialized = await this.materializer.materialize(message);
+      const materialized = preparedBody ?? await this.materializer.materialize(message);
       if (materialized === null) return null;
       return (await this.acceptTask(message, materialized, false)) ? materialized : null;
     });
@@ -2041,22 +4147,42 @@ class CoreService implements ChannelService {
     }
   }
 
-  private async handleFork(message: InboundMessage, argument: string): Promise<void> {
+  private async handleFork(
+    message: InboundMessage,
+    argument: string,
+    onIntentReady?: () => void,
+    receiptJobId?: number,
+  ): Promise<void> {
+    const persistReceipt = (text: string): void => {
+      if (receiptJobId === undefined) {
+        this.outbox.enqueueText(message, text, null);
+        return;
+      }
+      const job = this.store.getIngressJob(receiptJobId);
+      if (job === null) throw new Error("fork ingress job disappeared before its receipt was persisted");
+      this.persistIngressReceipt(job, message, text);
+      void this.outbox.flush(message).catch(() => {});
+    };
     let result: string;
     try {
-      result = await this.trackForkOperation(this.threadForks.command(message, argument));
+      result = await this.trackForkOperation(
+        this.threadForks.command(message, argument, onIntentReady),
+      );
     } catch (error) {
       const detail = safeDisplayText(error instanceof Error ? error.message : String(error), 1000);
-      await this.outbox.enqueueText(
-        message,
-        `分叉未完成：${detail ?? "操作结果保持安全状态。"}`,
-        null,
-      );
+      persistReceipt(`分叉未完成：${detail ?? "操作结果保持安全状态。"}`);
+      await this.outbox.flush(message);
       return;
     }
-    await this.outbox.enqueueText(message, result, null);
+    persistReceipt(result);
+    await this.outbox.flush(message);
   }
-  private async handleTanInbound(message: InboundMessage, argument: string): Promise<void> {
+  private async handleTanInbound(
+    message: InboundMessage,
+    argument: string,
+    sourceBinding: IngressBindingSnapshot | null,
+    preparedArgument?: string,
+  ): Promise<void> {
     const key = `${targetKey(message)}\0${message.messageId}`;
     const current = this.tanInboundOperations.get(key);
     if (current) {
@@ -2064,7 +4190,7 @@ class CoreService implements ChannelService {
       return;
     }
     const controller = new AbortController();
-    const operation = this.handleTanCommand(message, argument, controller.signal);
+    const operation = this.handleTanCommand(message, argument, sourceBinding, controller.signal, preparedArgument);
     const active = {
       target: { channelType: message.channelType, channelId: message.channelId },
       controller,
@@ -2082,7 +4208,9 @@ class CoreService implements ChannelService {
   private async handleTanCommand(
     message: InboundMessage,
     argument: string,
+    sourceBinding: IngressBindingSnapshot | null,
     operationSignal?: AbortSignal,
+    preparedArgument?: string,
   ): Promise<void> {
     const bot = this.bot;
     if (!bot) return;
@@ -2110,23 +4238,29 @@ class CoreService implements ChannelService {
     const state = this.store.getCommandClaimState(bot.uid, message, message.messageId);
     if (state === "completed") return;
     if (state === "pending" && !this.store.reclaimTanCommand(commandClaim)) return;
+    const rejectChangedSource = async (): Promise<void> => {
+      if (!this.claimTanCommand(commandClaim)) return;
+      await this.outbox.enqueueText(message, "源会话在 /tan 处理中已变化；为避免从新绑定或旧快照分叉，本次未接受。", null);
+      this.store.completeCommand(commandClaim);
+    };
     const source = this.store.getBinding(bot.uid, message);
+    const sourceMatchesIngressSnapshot = (): boolean =>
+      this.sameIngressBindingSnapshot(sourceBinding, this.ingressBindingSnapshot(message));
+    if (await this.refuseIncompleteThreadWorkspace(message)) return;
+    if (operationSignal?.aborted) {
+      this.completeCancelledTanCommand(commandClaim);
+      return;
+    }
+    if (!sourceMatchesIngressSnapshot()) {
+      await rejectChangedSource();
+      return;
+    }
     if (!source?.sessionId || !source.sessionFile || source.cwd.length === 0) {
       if (!this.claimTanCommand(commandClaim)) return;
       await this.outbox.enqueueText(message, "当前聊天没有可验证的持久 session 文件，未接受 /tan。", null);
       this.store.completeCommand(commandClaim);
       return;
     }
-    if (await this.refuseIncompleteThreadWorkspace(message)) return;
-    if (operationSignal?.aborted) {
-      this.completeCancelledTanCommand(commandClaim);
-      return;
-    }
-    const rejectChangedSource = async (): Promise<void> => {
-      if (!this.claimTanCommand(commandClaim)) return;
-      await this.outbox.enqueueText(message, "源会话在 /tan 处理中已变化；为避免从新绑定或旧快照分叉，本次未接受。", null);
-      this.store.completeCommand(commandClaim);
-    };
     let capturedCwd: string;
     try {
       capturedCwd = await canonicalExistingDirectory(source.cwd);
@@ -2142,6 +4276,7 @@ class CoreService implements ChannelService {
       || sourceAfterCapture.sessionId !== source.sessionId
       || sourceAfterCapture.sessionFile !== source.sessionFile
       || sourceAfterCapture.cwd !== source.cwd
+      || !sourceMatchesIngressSnapshot()
     ) {
       await rejectChangedSource();
       return;
@@ -2158,8 +4293,10 @@ class CoreService implements ChannelService {
     };
     let materialized: string | null;
     try {
-      materialized = await this.withMessageTyping(message, () =>
-        this.materializer.materialize(message, argument, operationSignal));
+      materialized = preparedArgument === undefined
+        ? await this.withMessageTyping(message, () =>
+          this.materializer.materialize(message, argument, operationSignal))
+        : preparedArgument;
     } catch (error) {
       if (operationSignal?.aborted) {
         this.completeCancelledTanCommand(commandClaim);
@@ -2178,6 +4315,7 @@ class CoreService implements ChannelService {
       || sourceBeforeAcceptance.sessionId !== source.sessionId
       || sourceBeforeAcceptance.sessionFile !== source.sessionFile
       || sourceBeforeAcceptance.cwd !== source.cwd
+      || !sourceMatchesIngressSnapshot()
     ) {
       await rejectChangedSource();
       return;
@@ -2196,6 +4334,7 @@ class CoreService implements ChannelService {
       || sourceAtAcceptance.sessionFile !== source.sessionFile
       || sourceAtAcceptance.cwd !== sourceBeforeAcceptance.cwd
       || sourceCwdAtAcceptance !== captured.cwd
+      || !sourceMatchesIngressSnapshot()
     ) {
       await rejectChangedSource();
       return;
@@ -2653,6 +4792,7 @@ class CoreService implements ChannelService {
     if (this.store.pendingQuestionIds(botUid, target).length === 0) {
       let steerIntentClaimed = false;
       let workerSteerAccepted = false;
+      let steerRejected = false;
       const steered = await this.appendToRunningTask(
         message,
         text,
@@ -2667,6 +4807,10 @@ class CoreService implements ChannelService {
           workerSteerAccepted = true;
           onWorkerSteerAccepted();
         },
+        undefined,
+        false,
+        undefined,
+        () => { steerRejected = true; },
       );
       if (workerSteerAccepted) return "accepted";
       const task = this.store.getTaskByMessageId(botUid, target, message.messageId);
@@ -2679,7 +4823,8 @@ class CoreService implements ChannelService {
         if (!steerIntentClaimed) claimAcceptIntent();
         return "unknown";
       }
-      if (steerIntentClaimed) return "unknown";
+      if (steerIntentClaimed && !steerRejected) return "unknown";
+      if (steerRejected) this.store.markLoopInputPending(input.id);
       if (steered) return "not-accepted";
     }
     if (!authorized()) return "not-accepted";
@@ -2703,6 +4848,14 @@ class CoreService implements ChannelService {
     name: string,
     argument: string,
     action: BuiltinAction,
+    preparedBody?: string,
+    ingressHooks?: ThreadCommandIngressHooks,
+    sessionHooks?: SessionCommandIngressHooks,
+    forkIntentReady?: () => void,
+    forkReceiptId?: number,
+    ingressJobId?: number,
+    ingressTaskDispatch?: (body: string) => Promise<void>,
+    controlStopEffects?: IngressCommandStopEffects,
   ): Promise<void> {
     // 认领仍按键原始命令名（别名在 claim 之后只影响走哪个 handler），认领失败即丢弃。
     const claim = this.commandClaim(message, name);
@@ -2710,8 +4863,8 @@ class CoreService implements ChannelService {
     const forkCommandKey = action === "fork" ? this.threadMergeCommandKey(message) : null;
     if (forkCommandKey !== null) this.forkCommandTargets.set(forkCommandKey, { ...message });
     let threadCommandDetached = false;
+    let ingressTaskDispatched = false;
     try {
-      this.cancelThreadArchives(message);
       if (
         (action === "new" || action === "move")
         && this.store.getThreadForkByTarget(this.bot!.uid, message) !== null
@@ -2721,11 +4874,44 @@ class CoreService implements ChannelService {
         return;
       }
       let restartRequested: boolean | void = undefined;
-      if (action === "thread") {
-        threadCommandDetached = await this.dispatchThreadCommand(message, argument);
+      if (action === "queue" && preparedBody !== undefined) {
+        restartRequested = await this.handleQueue(message, argument, preparedBody);
+      } else if (action === "thread") {
+        threadCommandDetached = await this.dispatchThreadCommand(
+          message,
+          argument,
+          preparedBody,
+          ingressHooks,
+          ingressTaskDispatch === undefined
+            ? undefined
+            : async body => {
+                ingressTaskDispatched = true;
+                await ingressTaskDispatch(body);
+              },
+        );
         if (threadCommandDetached) return;
+      } else if (action === "new" && sessionHooks !== undefined) {
+        restartRequested = await this.sessions.handleNew(message, argument, sessionHooks);
+      } else if (action === "move" && sessionHooks !== undefined) {
+        restartRequested = await this.sessions.handleMove(message, argument, sessionHooks);
+      } else if (action === "fork" && forkIntentReady !== undefined) {
+        restartRequested = await this.handleFork(message, argument, forkIntentReady, forkReceiptId);
+      } else if (action === "cancel" && ingressJobId !== undefined) {
+        restartRequested = await this.handleCancel(message, ingressJobId);
+      } else if (action === "commit" && ingressJobId !== undefined) {
+        restartRequested = await this.handleCommit(message, argument, ingressJobId);
+      } else if (action === "goal" && controlStopEffects?.goal !== undefined) {
+        restartRequested = await this.handleGoal(message, argument, controlStopEffects.goal);
+      } else if (action === "watch" && controlStopEffects?.watch !== undefined) {
+        restartRequested = await this.handleWatchCommand(message, argument, controlStopEffects.watch);
+      } else if (action === "interrupt" && controlStopEffects?.interrupt !== undefined) {
+        restartRequested = await this.handleInterrupt(message, controlStopEffects.interrupt);
       } else {
         restartRequested = await this.builtinHandlers[action](message, argument);
+      }
+      const ingressOperationOwned = ingressHooks !== undefined || sessionHooks !== undefined;
+      if (!(this.stopping && ingressOperationOwned) && !ingressTaskDispatched) {
+        this.store.completeCommand(claim);
       }
       const commandKey = this.threadMergeCommandKey(message);
       if (
@@ -2735,11 +4921,17 @@ class CoreService implements ChannelService {
       ) {
         await this.outbox.flush(message);
       }
-      this.store.completeCommand(claim);
       if (restartRequested === true) {
         await this.serviceRestart.request();
       }
     } catch (error) {
+      if (error instanceof IngressSuspendedError) throw error;
+      if (
+        this.stopping
+        && (ingressHooks !== undefined || sessionHooks !== undefined || ingressTaskDispatched)
+      ) {
+        throw new IngressSuspendedError();
+      }
       if (this.store.getCommandClaimState(claim.botUid, message, message.messageId) === "pending") {
         this.store.failCommand(claim);
       }
@@ -2758,9 +4950,22 @@ class CoreService implements ChannelService {
     }
   }
 
-  private async dispatchThreadCommand(message: InboundMessage, argument: string): Promise<boolean> {
+  private async dispatchThreadCommand(
+    message: InboundMessage,
+    argument: string,
+    preparedRequest?: string,
+    ingressHooks?: ThreadCommandIngressHooks,
+    ingressTaskDispatch?: (body: string) => Promise<void>,
+  ): Promise<boolean> {
     const accepted = Promise.withResolvers<void>();
-    const operation = this.threadCommands.handle(message, argument, () => accepted.resolve());
+    const operation = this.threadCommands.handle(
+      message,
+      argument,
+      preparedRequest,
+      ingressHooks,
+      ingressTaskDispatch,
+      () => accepted.resolve(),
+    );
     const completion = operation.then(
       () => ({ kind: "completed" as const }),
       error => ({ kind: "failed" as const, error }),
@@ -2808,18 +5013,55 @@ class CoreService implements ChannelService {
     return true;
   }
 
+  private persistIngressInterruptIntent(
+    job: IngressJobRecord,
+    target: ChatTarget,
+  ): NonNullable<IngressCommandStopEffects["interrupt"]> {
+    const checkpoint = job.operationCheckpoint;
+    if (checkpoint?.kind !== "command" || checkpoint.action !== "interrupt") {
+      return { interruptedTaskIds: [], hostOperationCancelled: false };
+    }
+    const taskIds = checkpoint.interruptedTaskIds ?? [];
+    const runtime = this.runningRuntime(target);
+    if (
+      runtime?.lease
+      && taskIds.includes(runtime.taskId)
+      && this.store.getTask(runtime.taskId)?.state === "running"
+    ) {
+      const binding = this.store.getBinding(this.bot!.uid, target);
+      if (binding) this.invalidateGoalResumeChecks(target, binding.sessionId);
+      runtime.stopCause = "interrupt";
+      runtime.workAfterStop = false;
+    }
+    return {
+      interruptedTaskIds: taskIds,
+      hostOperationCancelled:
+        (checkpoint.cancelledHostIngressJobIds?.length ?? 0) > 0
+        || (checkpoint.interruptRequestedHostIngressJobIds?.length ?? 0) > 0,
+    };
+  }
+
   /**
    * Aborts the running OMP turn without clearing the messages already queued in that run and
    * without stopping the worker, so a steered or queued message still gets its turn.
    */
-  private async handleInterrupt(target: ChatTarget): Promise<void> {
+  private async handleInterrupt(
+    target: ChatTarget,
+    persistedEffects?: NonNullable<IngressCommandStopEffects["interrupt"]>,
+  ): Promise<void> {
     const btwOperation = this.btwOperationsByTarget.get(targetKey(target));
     btwOperation?.controller.abort(new Error("BTW interrupted"));
     const mergeCancelled = this.abortThreadMerges(target, new Error("thread merge interrupted"));
     const removalCancelled = this.abortThreadRemovals(target, new Error("thread removal interrupted"));
+    const sessionCancelled = this.abortIngressSessionOperations(target, new Error("session command interrupted"));
     const forkCancelled = this.threadForks.abortTarget(target, new Error("fork interrupted"));
     const archiveCancelled = this.abortForkArchiveWaits(target, new Error("fork archive interrupted"));
-    const hostOperationCancelled = mergeCancelled || removalCancelled || forkCancelled || archiveCancelled;
+    const hostOperationCancelled = persistedEffects?.hostOperationCancelled === true
+      || mergeCancelled
+      || removalCancelled
+      || sessionCancelled
+      || forkCancelled
+      || archiveCancelled;
     if (this.commitOperationsByTarget.has(targetKey(target))) {
       await this.outbox.enqueueText(
         target,
@@ -2831,7 +5073,12 @@ class CoreService implements ChannelService {
       return;
     }
     const runtime = this.runningRuntime(target);
-    if (!runtime?.lease) {
+    const runtimeIsTargeted = runtime?.lease !== undefined
+      && (
+        persistedEffects === undefined
+        || persistedEffects.interruptedTaskIds.includes(runtime.taskId)
+      );
+    if (!runtimeIsTargeted || !runtime?.lease) {
       if (btwOperation) {
         await btwOperation.done.catch(() => {});
         this.outbox.enqueueText(target, BTW_INTERRUPTED_TEXT, null);
@@ -2841,7 +5088,9 @@ class CoreService implements ChannelService {
         target,
         hostOperationCancelled
           ? "已请求中止正在等待或执行的子区宿主操作；进程结果若未确认，资源将保持封锁且不会自动重试。"
-          : DEFAULT_INTERRUPT_IDLE_TEXT,
+          : persistedEffects?.interruptedTaskIds.length
+            ? DEFAULT_INTERRUPTED_TEXT
+            : DEFAULT_INTERRUPT_IDLE_TEXT,
         null,
       );
       return;
@@ -2850,9 +5099,9 @@ class CoreService implements ChannelService {
     if (binding) this.invalidateGoalResumeChecks(target, binding.sessionId);
     runtime.stopCause = "interrupt";
     runtime.workAfterStop = false;
-    // 停止意图先落盘再回执：此后任何 abrupt 死亡都不能把用户已经中断的回合当成「可续接」重启
-    // （回合随后又跑出真实工作时，由 task-events 撤回这条意图）。
-    this.store.markTaskStopIntent(runtime.taskId, "interrupt");
+    // The ingress transaction already persisted this intent before ACK. Non-ingress callers retain
+    // the same write-before-abort rule here.
+    if (persistedEffects === undefined) this.store.markTaskStopIntent(runtime.taskId, "interrupt");
     try {
       await runtime.lease.worker.abortTurn();
     } catch {
@@ -3517,7 +5766,11 @@ class CoreService implements ChannelService {
     this.outbox.enqueueText(message, `BTW 问题：${question}\n\nBTW 答案：${answer}`, null);
   }
 
-  private async handleGoal(message: InboundMessage, argument: string): Promise<void> {
+  private async handleGoal(
+    message: InboundMessage,
+    argument: string,
+    preparedStop?: PreparedGoalStop,
+  ): Promise<void> {
     const parsed = parseGoalCommand(argument);
     if ("error" in parsed) {
       await this.outbox.enqueueText(message, parsed.error, null);
@@ -3537,7 +5790,7 @@ class CoreService implements ChannelService {
         return;
       case "pause":
       case "drop":
-        await this.handleGoalControl(message, command.op);
+        await this.handleGoalControl(message, command.op, preparedStop);
         return;
       case "budget-set":
         await this.outbox.enqueueText(
@@ -3786,21 +6039,58 @@ class CoreService implements ChannelService {
     }
   }
 
-  private async handleGoalControl(target: ChatTarget, operation: "pause" | "drop"): Promise<void> {
+  private persistGoalControlStop(
+    target: ChatTarget,
+    operation: "pause" | "drop",
+  ): PreparedGoalStop | undefined {
+    const botUid = this.bot?.uid;
+    if (!botUid) return undefined;
+    const binding = this.store.getBinding(botUid, target);
+    if (binding) this.invalidateGoalResumeChecks(target, binding.sessionId);
+    const cancelledTaskIds = this.store.stopGoalContinuation(
+      botUid,
+      target,
+      binding?.sessionId ?? null,
+      operation,
+    );
+    return { binding, cancelledTaskIds };
+  }
+
+  private async handleGoalControl(
+    target: ChatTarget,
+    operation: "pause" | "drop",
+    preparedStop?: PreparedGoalStop,
+  ): Promise<void> {
     const botUid = this.bot?.uid;
     if (!botUid) return;
-    const binding = this.store.getBinding(botUid, target);
+    const binding = preparedStop !== undefined
+      ? preparedStop.binding
+      : this.store.getBinding(botUid, target);
     if (!binding) {
-      const cancelled = this.store.stopGoalContinuation(botUid, target, null, operation);
+      const cancelled = preparedStop !== undefined
+        ? preparedStop.cancelledTaskIds
+        : this.store.stopGoalContinuation(botUid, target, null, operation);
       await this.cleanupCancelledGoalTasks(target, cancelled);
       await this.outbox.enqueueText(target, "当前聊天没有已绑定的原生目标会话。", null);
       return;
     }
-    this.invalidateGoalResumeChecks(target, binding.sessionId);
+    if (preparedStop === undefined) this.invalidateGoalResumeChecks(target, binding.sessionId);
     try {
-      const cancelled = this.store.stopGoalContinuation(botUid, target, binding.sessionId, operation);
+      const cancelled = preparedStop !== undefined
+        ? preparedStop.cancelledTaskIds
+        : this.store.stopGoalContinuation(botUid, target, binding.sessionId, operation);
       await this.cleanupCancelledGoalTasks(target, cancelled);
-      const result = await this.withGoalWorker(target, async worker => {
+      const result = await this.withGoalWorker(target, async (worker, workerBinding) => {
+        if (
+          preparedStop !== undefined
+          && (
+            workerBinding.sessionId !== binding.sessionId
+            || workerBinding.cwd !== binding.cwd
+            || workerBinding.sessionFile !== binding.sessionFile
+          )
+        ) {
+          throw new WorkerGoalError("identity-mismatch", "控制会话绑定在持久停止意图后发生变化");
+        }
         const pending = this.activeGoalTask(target, binding.sessionId) !== null;
         const prior = this.store.getGoalSession(botUid, target, binding.sessionId);
         const before = await worker.goal("get");
@@ -3962,15 +6252,36 @@ class CoreService implements ChannelService {
     operation.finish();
   }
 
+  private releaseIngressCommitReservation(jobId: number): void {
+    const reservation = this.ingressCommitReservations.get(jobId);
+    if (reservation === undefined) return;
+    this.ingressCommitReservations.delete(jobId);
+    reservation.release();
+  }
+  private releaseIngressConfigReservation(jobId: number): void {
+    const job = this.store.getIngressJob(jobId);
+    if (job === null) return;
+    const key = this.ingressConfigReservationKey(job.sourceKind, job.sourceId);
+    const reservation = this.ingressConfigReservations.get(key);
+    if (reservation === undefined) return;
+    this.ingressConfigReservations.delete(key);
+    reservation.release();
+  }
+
+
   private abandonCommitOperation(operation: CommitOperation): void {
     this.typingLeases.release(operation.target, `task:${operation.taskId}`);
     this.forgetCommitOperation(operation);
     this.serviceRestart.maybeRunDeferred();
   }
 
-  private async handleCommit(message: InboundMessage, argument: string): Promise<void> {
+  private async handleCommit(
+    message: InboundMessage,
+    argument: string,
+    ingressJobId?: number,
+  ): Promise<void> {
     if (argument === "stop") {
-      await this.handleCommitStop(message);
+      await this.handleCommitStop(message, ingressJobId);
       return;
     }
     if (argument.length > 0) {
@@ -3979,6 +6290,9 @@ class CoreService implements ChannelService {
     }
     const botUid = this.bot?.uid;
     if (botUid === undefined) return;
+    const canContinueIngress = (): boolean =>
+      ingressJobId === undefined || this.store.getIngressJob(ingressJobId)?.state === "accepted";
+    if (!canContinueIngress()) return;
     const initialBinding = this.store.getBinding(botUid, message);
     const binding = initialBinding;
     this.throwIfStopping();
@@ -3990,17 +6304,46 @@ class CoreService implements ChannelService {
       );
       return;
     }
-    const commandReservation = this.scheduler.reserveDestructiveCommandSession(message, [binding.cwd]);
-    const workspace = await this.resolveCommitWorkspace(message, binding).catch((error: unknown) => {
+    const scheduleOrder = ingressJobId === undefined
+      ? undefined
+      : this.store.getIngressJob(ingressJobId)?.scheduleOrder;
+    if (ingressJobId !== undefined && (scheduleOrder === undefined || scheduleOrder < 1)) {
+      throw new Error(`commit ingress job ${ingressJobId} has no durable schedule order`);
+    }
+    const commandReservation = this.scheduler.reserveDestructiveCommandSession(
+      message,
+      [binding.cwd],
+      [binding.cwd],
+      scheduleOrder,
+    );
+    if (ingressJobId !== undefined) this.ingressCommitReservations.set(ingressJobId, commandReservation);
+    const releaseCommandReservation = (): void => {
       commandReservation.release();
+      if (ingressJobId !== undefined && this.ingressCommitReservations.get(ingressJobId) === commandReservation) {
+        this.ingressCommitReservations.delete(ingressJobId);
+      }
+    };
+    if (!canContinueIngress()) {
+      releaseCommandReservation();
+      return;
+    }
+    let workspace: { root: string } | { error: string };
+    try {
+      workspace = await this.resolveCommitWorkspace(message, binding);
+    } catch (error) {
+      releaseCommandReservation();
+      if (!canContinueIngress()) return;
       throw error;
-    });
+    }
+    if (!canContinueIngress()) {
+      releaseCommandReservation();
+      return;
+    }
     if ("error" in workspace) {
-      commandReservation.release();
+      releaseCommandReservation();
       await this.outbox.enqueueText(message, workspace.error, null);
       return;
     }
-
     const taskId = randomUUID();
     let reservation: CommitLease | undefined;
     try {
@@ -4012,7 +6355,11 @@ class CoreService implements ChannelService {
         commandReservation.order,
       );
     } finally {
-      commandReservation.release();
+      releaseCommandReservation();
+    }
+    if (!canContinueIngress()) {
+      reservation?.complete();
+      return;
     }
     if (!reservation) {
       await this.outbox.enqueueText(message, COMMIT_BUSY_TEXT, null);
@@ -4050,7 +6397,11 @@ class CoreService implements ChannelService {
     };
     let accepted = false;
     try {
-      accepted = this.store.acceptCommitTask(this.commandClaim(message, "commit"), task);
+      accepted = this.store.acceptCommitTask(
+        this.commandClaim(message, "commit"),
+        task,
+        ingressJobId,
+      );
     } catch {
       this.abandonCommitOperation(operation);
       throw new Error("本地状态盘写入失败，提交任务未接收。");
@@ -4125,13 +6476,74 @@ class CoreService implements ChannelService {
       : `提交失败，退出码 ${result.exitCode}。${heads}。`;
   }
 
-  private async handleCommitStop(target: ChatTarget): Promise<void> {
+  private async handleCommitStop(target: ChatTarget, ingressJobId?: number): Promise<void> {
     const botUid = this.bot?.uid;
     if (botUid === undefined) return;
-    const operation = this.commitOperationsByTarget.get(targetKey(target));
+    const checkpoint = ingressJobId === undefined
+      ? null
+      : this.store.getIngressJob(ingressJobId)?.operationCheckpoint;
+    const stopCheckpoint = checkpoint?.kind === "command"
+      && checkpoint.action === "commit"
+      && checkpoint.phase === "commit-stop-intent"
+      && checkpoint.cancelledCommitIngressJobIds !== undefined
+      && checkpoint.cancelledCommitTaskIds !== undefined
+      && checkpoint.stoppedCommitTaskIds !== undefined
+      ? {
+          cancelledCommitIngressJobIds: checkpoint.cancelledCommitIngressJobIds,
+          cancelledCommitTaskIds: checkpoint.cancelledCommitTaskIds,
+          stoppedCommitTaskIds: checkpoint.stoppedCommitTaskIds,
+        }
+      : null;
+    const affectedTaskIds = stopCheckpoint === null
+      ? null
+      : new Set([
+          ...stopCheckpoint.cancelledCommitTaskIds,
+          ...stopCheckpoint.stoppedCommitTaskIds,
+        ]);
+    if (stopCheckpoint !== null) {
+      for (const taskId of stopCheckpoint.cancelledCommitTaskIds) {
+        this.scheduler.takeWaitingReceipt(taskId);
+        this.questions.cancelForTask(taskId, "cancelled");
+        const queuedOperation = this.commitOperationsByTask.get(taskId);
+        if (queuedOperation !== undefined) this.abandonCommitOperation(queuedOperation);
+      }
+    }
+    const pendingCommit = stopCheckpoint === null
+      ? this.store.listRecoverableIngressJobs(botUid).find(job =>
+          job.id !== ingressJobId
+          && job.channelType === target.channelType
+          && job.channelId === target.channelId
+          && (job.state === "accepted" || job.state === "preparing")
+          && job.operationCheckpoint?.kind === "command"
+          && job.operationCheckpoint.action === "commit"
+          && job.operationCheckpoint.argument.trim().length === 0
+          && this.store.getTaskByMessageId(botUid, target, job.messageId ?? "") === null,
+        )
+      : undefined;
+    let pendingStopped = false;
+    if (pendingCommit !== undefined && this.store.cancelIngressJob(pendingCommit.id)) {
+      this.releaseIngressCommitReservation(pendingCommit.id);
+      const payload = pendingCommit.payload;
+      if (payload?.kind === "recv" || payload?.kind === "synthetic") {
+        this.store.releaseClaim(this.commandClaim(payload.message, "commit"));
+      }
+      pendingStopped = true;
+    }
+    const operationCandidate = this.commitOperationsByTarget.get(targetKey(target));
+    const operation = operationCandidate !== undefined
+      && (affectedTaskIds === null || affectedTaskIds.has(operationCandidate.taskId))
+      ? operationCandidate
+      : undefined;
     const activeTask = operation
       ? this.store.getTask(operation.taskId)
-      : this.store.getActiveTask(botUid, target);
+      : affectedTaskIds === null
+        ? this.store.getActiveTask(botUid, target)
+        : null;
+    const markStopDispatchIntent = (): void => {
+      if (ingressJobId !== undefined && !this.store.markIngressDispatchIntent(ingressJobId)) {
+        throw new Error("commit stop dispatch intent could not be persisted");
+      }
+    };
     if (
       activeTask !== null
       && activeTask.state === "queued"
@@ -4141,15 +6553,33 @@ class CoreService implements ChannelService {
       this.store.markCancelled(activeTask.id, "commit cancelled before start");
       this.questions.cancelForTask(activeTask.id, "cancelled");
       if (operation) this.abandonCommitOperation(operation);
+      markStopDispatchIntent();
       await this.outbox.enqueueText(target, "已停止尚未开始的提交；没有 Git 副作用。", null);
       return;
     }
     if (!operation) {
-      await this.outbox.enqueueText(target, "当前没有正在进行的提交。", null);
+      markStopDispatchIntent();
+      if (stopCheckpoint !== null && stopCheckpoint.stoppedCommitTaskIds.length > 0) {
+        await this.outbox.enqueueText(
+          target,
+          "提交停止意图已持久，但无法确认 Git 结果；请检查 HEAD，不会自动重试或回滚。",
+          null,
+        );
+      } else if (
+        pendingStopped
+        || (stopCheckpoint !== null
+          && (stopCheckpoint.cancelledCommitIngressJobIds.length > 0
+            || stopCheckpoint.cancelledCommitTaskIds.length > 0))
+      ) {
+        await this.outbox.enqueueText(target, "已停止尚未开始的提交；没有 Git 副作用。", null);
+      } else {
+        await this.outbox.enqueueText(target, "当前没有正在进行的提交。", null);
+      }
       return;
     }
     const completedResult = operation.result;
     if (completedResult !== undefined) {
+      markStopDispatchIntent();
       await operation.done;
       await this.outbox.enqueueText(
         target,
@@ -4162,6 +6592,9 @@ class CoreService implements ChannelService {
       return;
     }
 
+    const task = this.store.getTask(operation.taskId);
+    if (task?.state === "running") this.store.markTaskStopIntent(task.id, "cancel");
+    markStopDispatchIntent();
     const stopped = await this.stopCommitOperation(operation);
     if (!stopped) {
       await this.outbox.enqueueText(target, "无法确认提交进程已停止；不会重试或回滚，工作树仍受保护。", null);
@@ -4188,7 +6621,11 @@ class CoreService implements ChannelService {
    * `/queue` is the explicit way to append behind the running task regardless of the chat's mode,
    * so it always takes the durable task path minus the command prefix.
    */
-  private async handleQueue(message: InboundMessage, argument: string): Promise<void> {
+  private async handleQueue(
+    message: InboundMessage,
+    argument: string,
+    preparedBody?: string,
+  ): Promise<void> {
     if (await this.refuseIncompleteThreadWorkspace(message)) return;
     const text = argument.trim();
     if (text.length === 0) {
@@ -4199,7 +6636,7 @@ class CoreService implements ChannelService {
     // 附件（任意类型）与引用块随正文进入排队任务。
     this.store.releaseClaim(this.commandClaim(message, "queue"));
     await this.withMessageTyping(message, async () => {
-      const body = await this.materializer.materialize(message, text);
+      const body = preparedBody ?? await this.materializer.materialize(message, text);
       if (body === null) return;
       await this.acceptTask(message, body);
     });
@@ -4252,7 +6689,28 @@ class CoreService implements ChannelService {
       : "追加模式已设为 queue：运行中的新消息会排到当前回合之后。";
   }
 
-  private async handleCancel(target: ChatTarget): Promise<void> {
+  private async handleCancel(target: ChatTarget, ingressJobId?: number): Promise<void> {
+    const key = targetKey(target);
+    const operationCheckpoint = ingressJobId === undefined
+      ? null
+      : this.store.getIngressJob(ingressJobId)?.operationCheckpoint;
+    const cancelCheckpoint = operationCheckpoint?.kind === "command"
+      && operationCheckpoint.action === "cancel"
+      && operationCheckpoint.phase === "cancel-intent"
+      ? operationCheckpoint
+      : null;
+    const durableCancellation = cancelCheckpoint?.cancelledQueuedTaskIds !== undefined
+      && cancelCheckpoint.stoppedTaskIds !== undefined
+      ? {
+          cancelledIngressJobIds: cancelCheckpoint.cancelledIngressJobIds ?? [],
+          cancelledQueuedTaskIds: cancelCheckpoint.cancelledQueuedTaskIds,
+          stoppedTaskIds: cancelCheckpoint.stoppedTaskIds,
+          cancelledQuestionIds: cancelCheckpoint.cancelledQuestionIds ?? [],
+        }
+      : null;
+    const stopIntentTaskIds = durableCancellation === null
+      ? null
+      : new Set(durableCancellation.stoppedTaskIds);
     const binding = this.store.getBinding(this.bot!.uid, target);
     const targetKeyValue = targetKey(target);
     const tanInbound = [...this.tanInboundOperations.values()]
@@ -4275,26 +6733,93 @@ class CoreService implements ChannelService {
     if (binding) this.invalidateGoalResumeChecks(target, binding.sessionId);
     const mergeCancelled = this.abortThreadMerges(target, new Error("thread merge cancelled"));
     const removalCancelled = this.abortThreadRemovals(target, new Error("thread removal cancelled"));
+    const sessionCancelled = this.abortIngressSessionOperations(target, new Error("session command cancelled"));
     const forkCancelled = this.threadForks.abortTarget(target, new Error("fork cancelled"));
     const tanDispatchSettled = Promise.all(cancelledTanOperations
       .map(operation => this.tanDispatchOperations.get(operation.id))
       .filter((operation): operation is Promise<void> => operation !== undefined));
     const archiveCancelled = this.abortForkArchiveWaits(target, new Error("fork archive cancelled"));
-    const queued = this.store.cancelQueued(this.bot!.uid, target);
-    const queuedCommit = this.commitOperationsByTarget.get(targetKey(target));
+    const sessionJobIds = [...(this.ingressSessionJobIdsByTarget.get(key) ?? [])];
+    const ingressCommands = this.ingressCommandOperations.get(key);
+    const queued = durableCancellation === null
+      ? this.store.cancelQueued(this.bot!.uid, target)
+      : [...durableCancellation.cancelledQueuedTaskIds];
+    const queuedCommit = this.commitOperationsByTarget.get(key);
     if (queuedCommit && queued.includes(queuedCommit.taskId)) {
       this.abandonCommitOperation(queuedCommit);
     }
     for (const taskId of queued) this.scheduler.takeWaitingReceipt(taskId);
-    // The store cancels queued questions with their tasks; settle cards before the chat-level cleanup.
-    for (const taskId of queued) this.questions.cancelForTask(taskId, "cancelled");
-    for (const taskId of queued) await this.notifyThreadOutcome(taskId);
-    this.questions.cancelForTarget(target);
-    let active = btwOperation !== undefined || tanCancelled || tanInbound.length > 0;
+    const commitOperationCandidate = this.commitOperationsByTarget.get(key);
+    const commitOperation = commitOperationCandidate !== undefined
+      && (stopIntentTaskIds === null || stopIntentTaskIds.has(commitOperationCandidate.taskId))
+      ? commitOperationCandidate
+      : undefined;
+    const commitTask = commitOperation ? this.store.getTask(commitOperation.taskId) : undefined;
+    const runtimeTasks = [...this.runtimes.values()].filter(
+      runtime => targetKey(runtime.target) === key
+        && (stopIntentTaskIds === null || stopIntentTaskIds.has(runtime.taskId)),
+    );
+    const activeTaskCandidate = this.store.getActiveTask(this.bot!.uid, target);
+    const activeTask = activeTaskCandidate?.state === "running"
+      && (stopIntentTaskIds === null || stopIntentTaskIds.has(activeTaskCandidate.id))
+      ? activeTaskCandidate
+      : null;
+    const stoppingTaskIds = new Set(runtimeTasks.map(runtime => runtime.taskId));
+    if (activeTask?.state === "running") stoppingTaskIds.add(activeTask.id);
+    if (commitTask?.state === "running") stoppingTaskIds.add(commitTask.id);
+    if (stopIntentTaskIds === null) {
+      for (const taskId of stoppingTaskIds) this.store.markTaskStopIntent(taskId, "cancel");
+    }
+    let active = btwOperation !== undefined || sessionCancelled || tanCancelled || tanInbound.length > 0
+      || runtimeTasks.length > 0
+      || activeTask?.state === "running"
+      || (durableCancellation?.cancelledIngressJobIds.length ?? 0) > 0
+      || (durableCancellation?.stoppedTaskIds.length ?? 0) > 0;
     let commitStopUnconfirmed = false;
     let completedCommit: CommitOperation | undefined;
-    const commitOperation = this.commitOperationsByTarget.get(targetKey(target));
-    const commitTask = commitOperation ? this.store.getTask(commitOperation.taskId) : undefined;
+    if (durableCancellation === null) {
+      for (const taskId of queued) this.questions.cancelForTask(taskId, "cancelled");
+    } else {
+      const cancellationTaskIds = new Set([
+        ...queued,
+        ...durableCancellation.stoppedTaskIds,
+      ]);
+      for (const taskId of cancellationTaskIds) this.questions.cancelForTask(taskId, "cancelled");
+    }
+    if (durableCancellation === null) {
+      this.questions.cancelForTarget(target);
+    } else {
+      this.questions.cancelForTarget(target, durableCancellation.cancelledQuestionIds);
+    }
+    if (ingressJobId !== undefined && !this.store.markIngressDispatchIntent(ingressJobId)) {
+      throw new Error("cancel dispatch intent could not be persisted");
+    }
+    for (const runtime of runtimeTasks) {
+      active = true;
+      runtime.cancelRequested = true;
+      runtime.closing = true;
+      runtime.cancelController.abort(new Error("task cancelled"));
+      runtime.stopText?.();
+      runtime.stopActivity?.();
+      runtime.cancelReplySent = true;
+      if (runtime.lease) {
+        const lease = runtime.lease;
+        void (async () => {
+          if (runtime.btwOperations.size > 0) {
+            await Promise.allSettled([...runtime.btwOperations]);
+          }
+          if (runtime.steerCallInFlight) {
+            await lease.worker.abortTurn().catch(() => {});
+            await runtime.steerSerial;
+          }
+          await lease.close().catch(() => false);
+        })();
+      }
+      this.questions.rejectForTask(runtime.taskId, new Error("task cancelled"));
+    }
+    if (ingressCommands !== undefined) await Promise.allSettled([...ingressCommands]);
+    await this.threadForks.settleTarget(target);
+    for (const taskId of queued) await this.notifyThreadOutcome(taskId);
     if (commitOperation && commitTask?.state === "running") {
       active = true;
       if (commitOperation.result === undefined) {
@@ -4312,34 +6837,41 @@ class CoreService implements ChannelService {
         completedCommit = commitOperation;
       }
     }
-    for (const runtime of this.runtimes.values()) {
-      if (targetKey(runtime.target) !== targetKey(target)) continue;
-      active = true;
-      runtime.cancelRequested = true;
-      runtime.closing = true;
-      runtime.cancelController.abort(new Error("task cancelled"));
-      runtime.stopText?.();
-      runtime.stopActivity?.();
-      runtime.cancelReplySent = true;
-      if (runtime.lease) {
-        const lease = runtime.lease;
-        if (runtime.btwOperations.size > 0) {
-          void Promise.allSettled([...runtime.btwOperations]).then(() => lease.close().catch(() => false));
-        } else {
-          void lease.close().catch(() => false);
-        }
-      }
-      this.questions.rejectForTask(runtime.taskId, new Error("task cancelled"));
-      this.store.markCancelled(runtime.taskId);
-    }
+    for (const runtime of runtimeTasks) this.store.markCancelled(runtime.taskId);
     if (btwOperation) await btwOperation.done.catch(() => {});
     if (tanInbound.length > 0) await tanInboundSettled;
     if (cancelledTanOperations.length > 0) await tanDispatchSettled;
     for (const operation of cancelledTanOperations) this.finalizeCancelledTanOperation(operation);
-    const response = commitStopUnconfirmed
-      ? "无法确认提交进程已停止；排队任务已清除，工作树仍受保护。"
+    const unknownIngressOperation = this.store.listUnknownIngressJobs(this.bot!.uid).some(job => {
+      if (
+        job.channelType !== target.channelType
+        || job.channelId !== target.channelId
+        || job.operationCheckpoint?.kind !== "command"
+      ) return false;
+      const checkpoint = job.operationCheckpoint;
+      return checkpoint.workerLedgerId !== undefined
+        || checkpoint.hostLedgerId !== undefined
+        || (checkpoint.action === "thread" && (
+          /^merge(?:$|[^\p{L}\p{N}_-])/iu.test(checkpoint.argument.trim())
+          || /^remove(?:$|\s)/iu.test(checkpoint.argument.trim())
+        ));
+    });
+    const unknownHostOperation = this.store.listHostMergeLeases(this.bot!.uid).some(lease =>
+      lease.channelType === target.channelType
+      && lease.channelId === target.channelId
+      && lease.outcome === null
+    ) || this.store.listHostRemovalLeases(this.bot!.uid).some(lease =>
+      lease.channelType === target.channelType
+      && lease.channelId === target.channelId
+      && lease.outcome === null
+    );
+    const sessionCompleted = sessionJobIds.some(id => this.store.getIngressJob(id)?.state === "handed-off");
+    const response = commitStopUnconfirmed || unknownHostOperation || unknownIngressOperation
+      ? "无法确认受管操作已完成或停止；相关资源继续保持保护。"
       : completedCommit?.result !== undefined
         ? `当前提交已完成，无法取消或回滚；HEAD=${this.shortHead(completedCommit.result.headAfter)}。`
+        : sessionCompleted && queued.length === 0
+          ? "会话操作已完成，无法取消或回滚。"
         : queued.length > 0 || active || mergeCancelled || removalCancelled || forkCancelled || archiveCancelled || tanCancelled
           ? DEFAULT_CANCELLED_TEXT
           : "当前没有可取消的任务。";
@@ -4378,6 +6910,19 @@ class CoreService implements ChannelService {
     return generation;
   }
 
+
+  private abortIngressSessionOperations(target: ChatTarget, reason: Error): boolean {
+    const controllers = this.ingressSessionCommandControllers.get(targetKey(target));
+    if (!controllers) return false;
+    for (const controller of controllers) controller.abort(reason);
+    return controllers.size > 0;
+  }
+
+  private abortAllIngressSessionOperations(reason: Error): void {
+    for (const controllers of this.ingressSessionCommandControllers.values()) {
+      for (const controller of controllers) controller.abort(reason);
+    }
+  }
   private cancelThreadArchives(target: InboundMessage): void {
     try {
       if (target.channelType === 5) {
@@ -4450,18 +6995,53 @@ class CoreService implements ChannelService {
     return `${targetKey(message)}\0${message.messageId}`;
   }
 
+  private hasUnknownIngressThreadOperation(
+    message: InboundMessage,
+    operation: "merge" | "remove",
+  ): boolean {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) return false;
+    const job = this.store.getIngressJobBySource({
+      botUid,
+      sourceKind: "recv",
+      sourceId: recvIngressSourceId(message.channelType, message.channelId, message.messageId),
+    });
+    const checkpoint = job?.operationCheckpoint;
+    if (
+      job === null
+      || checkpoint?.kind !== "command"
+      || checkpoint.action !== "thread"
+    ) return false;
+    if (checkpoint.hostLedgerId === undefined) return false;
+    return operation === "merge"
+      ? this.store.listHostMergeLeases(botUid).some(lease =>
+        lease.id === checkpoint.hostLedgerId && lease.outcome === null,
+      )
+      : this.store.listHostRemovalLeases(botUid).some(lease =>
+        lease.id === checkpoint.hostLedgerId && lease.outcome === null,
+      );
+  }
+
   private finishThreadMergeCommand(message: InboundMessage): boolean {
     const commandKey = this.threadMergeCommandKey(message);
     const controller = this.threadMergeControllersByCommand.get(commandKey);
-    if (!controller) return false;
-    this.threadMergeControllersByCommand.delete(commandKey);
-    const targetKeyValue = targetKey(message);
-    const controllers = this.threadMergeControllers.get(targetKeyValue);
-    if (controllers) {
-      controllers.delete(controller);
-      if (controllers.size === 0 && this.threadMergeControllers.get(targetKeyValue) === controllers) {
-        this.threadMergeControllers.delete(targetKeyValue);
+    const entry = this.ingressCommandReservations.get(commandKey);
+    const reservation = entry?.kind === "merge" ? entry.reservation : undefined;
+    if (!controller && reservation === undefined) return false;
+    if (controller) {
+      this.threadMergeControllersByCommand.delete(commandKey);
+      const targetKeyValue = targetKey(message);
+      const controllers = this.threadMergeControllers.get(targetKeyValue);
+      if (controllers) {
+        controllers.delete(controller);
+        if (controllers.size === 0 && this.threadMergeControllers.get(targetKeyValue) === controllers) {
+          this.threadMergeControllers.delete(targetKeyValue);
+        }
       }
+    }
+    if (reservation !== undefined && !this.hasUnknownIngressThreadOperation(message, "merge")) {
+      reservation.release();
+      this.ingressCommandReservations.delete(commandKey);
     }
     return true;
   }
@@ -4469,18 +7049,27 @@ class CoreService implements ChannelService {
   private finishThreadRemovalCommand(message: InboundMessage): boolean {
     const commandKey = this.threadMergeCommandKey(message);
     const controller = this.threadRemovalControllersByCommand.get(commandKey);
-    if (!controller) return false;
-    this.threadRemovalControllersByCommand.delete(commandKey);
-    const targetKeyValue = targetKey(message);
-    const controllers = this.threadRemovalControllers.get(targetKeyValue);
-    if (controllers) {
-      controllers.delete(controller);
-      if (controllers.size === 0 && this.threadRemovalControllers.get(targetKeyValue) === controllers) {
-        this.threadRemovalControllers.delete(targetKeyValue);
+    const entry = this.ingressCommandReservations.get(commandKey);
+    const reservation = entry?.kind === "remove" ? entry.reservation : undefined;
+    if (!controller && reservation === undefined) return false;
+    if (controller) {
+      this.threadRemovalControllersByCommand.delete(commandKey);
+      const targetKeyValue = targetKey(message);
+      const controllers = this.threadRemovalControllers.get(targetKeyValue);
+      if (controllers) {
+        controllers.delete(controller);
+        if (controllers.size === 0 && this.threadRemovalControllers.get(targetKeyValue) === controllers) {
+          this.threadRemovalControllers.delete(targetKeyValue);
+        }
       }
+    }
+    if (reservation !== undefined && !this.hasUnknownIngressThreadOperation(message, "remove")) {
+      reservation.release();
+      this.ingressCommandReservations.delete(commandKey);
     }
     return true;
   }
+
 
 
   private async handleStatus(target: ChatTarget): Promise<void> {
@@ -4882,7 +7471,11 @@ class CoreService implements ChannelService {
   }
 
 
-  private async handleWatchCommand(target: ChatTarget, argument: string): Promise<void> {
+  private async handleWatchCommand(
+    target: ChatTarget,
+    argument: string,
+    preStoppedRecords?: readonly WatchRecord[],
+  ): Promise<void> {
     const parts = argument.trim().split(/\s+/u).filter(Boolean);
     const usage = "用法：/watch [list|<id>|stop <id|all>]";
     if (parts.length === 0 || (parts.length === 1 && parts[0]?.toLowerCase() === "list")) {
@@ -4901,7 +7494,7 @@ class CoreService implements ChannelService {
         await this.outbox.enqueueText(target, usage, null);
         return;
       }
-      const records = this.stopChatWatches(target, parts[1]!);
+      const records = preStoppedRecords ?? this.stopChatWatches(target, parts[1]!);
       const summary = records.length === 0
         ? "当前聊天没有可停止的 watch。"
         : records.map(record =>
@@ -4985,6 +7578,108 @@ class CoreService implements ChannelService {
     });
   }
 
+  private async prepareIngressTask(
+    message: InboundMessage,
+    text: string,
+    ingressJobId: number,
+  ): Promise<PreparedIngressTask> {
+    const bot = this.bot;
+    if (bot === undefined) throw new Error("Bot identity is unavailable while preparing an ingress task");
+    if (message.channelType === 5 && threadShortId(message.channelId) !== null) {
+      await this.ensureThreadListen(message);
+    }
+    this.throwIfStopping();
+    let binding = await this.sessions.reconcileExternalBinding(
+      message,
+      this.store.getBinding(bot.uid, message),
+    );
+    let expectedBinding = this.store.getBinding(bot.uid, message);
+    if (binding === null) {
+      const cwd = await this.sessions.defaultWorkDirectory(message);
+      binding = {
+        botUid: bot.uid,
+        channelId: message.channelId,
+        channelType: message.channelType,
+        sessionId: createSessionId(),
+        cwd,
+        sessionFile: null,
+      };
+    } else if (!binding.sessionFile) {
+      const current = binding;
+      const cwd = await this.sessions.defaultWorkDirectory(message).catch(() => current.cwd);
+      if (cwd !== current.cwd) binding = { ...current, cwd };
+    }
+    if (expectedBinding === null && this.store.getBinding(bot.uid, message) !== null) {
+      expectedBinding = this.store.getBinding(bot.uid, message);
+    }
+    if (expectedBinding !== null && binding.sessionId !== expectedBinding.sessionId) {
+      throw new Error("ingress binding changed while preparing its task");
+    }
+    this.throwIfStopping();
+    const task: TaskRecord = {
+      id: randomUUID(),
+      botUid: bot.uid,
+      channelId: message.channelId,
+      channelType: message.channelType,
+      messageId: message.messageId,
+      senderId: message.senderId,
+      text,
+      sessionId: binding.sessionId,
+      cwd: binding.cwd,
+      state: "queued",
+      resultText: null,
+      errorText: null,
+      messageSeq: message.messageSeq,
+      historyEligible: !isCommand(text),
+      relaySuppressed: false,
+    };
+    return {
+      message,
+      ingressJobId,
+      expectedBinding,
+      binding,
+      task,
+      claim: this.taskClaim(message),
+      startsBehind: this.scheduler.hasBlockingWork(message, task.cwd),
+    };
+  }
+
+  /** The task row, binding snapshot and ingress handoff share one SQLite transaction. */
+  private persistIngressTask(prepared: PreparedIngressTask): boolean {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined || botUid !== prepared.task.botUid) return false;
+    if (this.store.isIngressCancellationRequested(prepared.ingressJobId)) return false;
+    const live = this.store.getBinding(botUid, prepared.message);
+    const expected = prepared.expectedBinding;
+    if (expected === null) {
+      if (live !== null) return false;
+    } else if (
+      live === null
+      || live.sessionId !== expected.sessionId
+      || live.cwd !== expected.cwd
+      || live.sessionFile !== expected.sessionFile
+    ) {
+      return false;
+    }
+    if (
+      live === null
+      || live.sessionId !== prepared.binding.sessionId
+      || live.cwd !== prepared.binding.cwd
+      || live.sessionFile !== prepared.binding.sessionFile
+    ) {
+      this.store.ensureBinding(prepared.binding);
+    }
+    return this.store.acceptTask(prepared.claim, prepared.task, undefined, prepared.ingressJobId);
+  }
+
+  private publishIngressTask(prepared: PreparedIngressTask): void {
+    this.observeUserReference(prepared.message, prepared.task.id);
+    this.typingLeases.acquire(prepared.message, `task:${prepared.task.id}`);
+    if (prepared.startsBehind) this.scheduler.markWaiting(prepared.task.id);
+    this.scheduler.scheduleTask(prepared.task.id);
+    this.publishIngressNotice(prepared.message);
+  }
+
   private async acceptTask(
     message: InboundMessage,
     text: string,
@@ -4997,6 +7692,7 @@ class CoreService implements ChannelService {
     beforeAccept?: () => boolean,
     silentFailure = false,
     tanOperationId?: string,
+    persistTask?: (claim: InboundClaim, task: TaskRecord, goalRequest?: GoalTaskRequest) => boolean,
   ): Promise<boolean> {
     if (message.channelType === 5 && threadShortId(message.channelId) !== null) {
       await this.ensureThreadListen(message);
@@ -5081,9 +7777,11 @@ class CoreService implements ChannelService {
     // Measured before acceptance so the new task's own row cannot count itself as the work it waits for.
     const startsBehind = this.scheduler.hasBlockingWork(message, task.cwd);
     try {
-      accepted = tanOperationId === undefined
-        ? this.store.acceptTask(this.taskClaim(message), task, goalRequest)
-        : this.store.acceptTanTask(this.taskClaim(message), tanOperationId, task);
+      accepted = tanOperationId !== undefined
+        ? this.store.acceptTanTask(this.taskClaim(message), tanOperationId, task)
+        : persistTask === undefined
+          ? this.store.acceptTask(this.taskClaim(message), task, goalRequest)
+          : persistTask(this.taskClaim(message), task, goalRequest);
     } catch {
       throw new Error("本地状态盘写入失败，任务未接收。");
     }
@@ -5103,18 +7801,22 @@ class CoreService implements ChannelService {
     expectedBinding: BindingRecord,
     reservation: DestructiveCommandReservation,
     signal: AbortSignal,
-  ): Promise<SessionLease> {
+    acceptsInitialSessionBinding: (binding: BindingRecord) => boolean,
+  ): Promise<{ lease: SessionLease; binding: BindingRecord }> {
     const botUid = this.bot?.uid;
     if (botUid === undefined) throw new Error("Bot 身份未注册，无法合并子区工作区");
+    const validateCurrentBinding = (current: BindingRecord | null): BindingRecord => {
+      if (current !== null && this.sameBindingState(expectedBinding, current)) return current;
+      if (current !== null && acceptsInitialSessionBinding(current)) {
+        expectedBinding = current;
+        return current;
+      }
+      throw new Error("等待合并期间子区绑定已变更，未执行合并。");
+    };
     for (;;) {
       if (signal.aborted) throw threadMergeAbortError(signal);
-      const current = this.store.getBinding(botUid, target);
-      if (
-        !current
-        || current.cwdPinned !== true
-        || current.cwd !== expectedBinding.cwd
-        || current.sessionId !== expectedBinding.sessionId
-      ) {
+      const current = validateCurrentBinding(this.store.getBinding(botUid, target));
+      if (current.cwdPinned !== true || current.cwd !== expectedBinding.cwd) {
         throw new Error("等待合并期间子区绑定已变更，未执行合并。");
       }
       const acquisition = reservation.tryAcquire();
@@ -5126,16 +7828,8 @@ class CoreService implements ChannelService {
         try {
           await waitWithAbort(lease.ready, signal);
           if (signal.aborted) throw threadMergeAbortError(signal);
-          const latest = this.store.getBinding(botUid, target);
-          if (
-            !latest
-            || latest.cwdPinned !== true
-            || latest.cwd !== expectedBinding.cwd
-            || latest.sessionId !== expectedBinding.sessionId
-          ) {
-            throw new Error("等待合并期间子区绑定已变更，未执行合并。");
-          }
-          return lease;
+          const binding = validateCurrentBinding(this.store.getBinding(botUid, target));
+          return { lease, binding };
         } catch (error) {
           lease.complete();
           throw error;
@@ -5158,7 +7852,7 @@ class CoreService implements ChannelService {
       readonly receiptOutboxId: string;
       readonly archiveGeneration?: number;
     },
-    commandBeforeSpawn?: () => void,
+    commandBeforeSpawn?: (leaseId: string, persistHostLease: () => boolean) => void,
     progress?: HostMergeProgressSession,
     signal?: AbortSignal,
     accepted?: () => void,
@@ -5202,6 +7896,15 @@ class CoreService implements ChannelService {
     let reserved = false;
     let confirmedExit = false;
     let outcomePersisted = false;
+    let processStarted = false;
+    let acceptedNotified = false;
+    const finishNotSpawned = (): void => {
+      if (!reserved || outcomePersisted) return;
+      const diagnostic = "Worktrunk merge was confirmed not to have started; it will not be replayed automatically.";
+      this.store.completeHostMergeLease(id, { kind: "not-spawned", diagnostic });
+      outcomePersisted = true;
+      progress?.finishFromOutcome({ kind: "not-started", diagnostic });
+    };
     return {
       archiveGeneration: capturedArchiveGeneration,
       beforeSpawn: (spawnCwd) => {
@@ -5212,25 +7915,36 @@ class CoreService implements ChannelService {
         if (sourceId === undefined || sourceId.length === 0) {
           throw new Error("host merge requires a stable source id");
         }
-        // WorktreePort reaches this boundary after ownership/path validation, so a refusal before it
-        // cannot suppress thread outcomes.
-        commandBeforeSpawn?.();
-        this.store.reserveHostMergeLease({
-          id,
-          botUid,
-          target,
-          sourceId,
-          cwd,
-          resourceCwds: plannedResources,
-          ...commandContext,
-          archiveGeneration: capturedArchiveGeneration,
-        });
-        reserved = true;
-        this.store.beginThreadMerge(botUid, target);
-        accepted?.();
+        // WorktreePort reaches this boundary after ownership/path validation and same-session FIFO
+        // wait; persist the host lease and ingress handoff before spawning the merge process.
+        const persistHostLease = (): boolean => {
+          if (reserved) return true;
+          this.store.reserveHostMergeLease({
+            id,
+            botUid,
+            target,
+            sourceId,
+            cwd,
+            resourceCwds: plannedResources,
+            ...commandContext,
+            archiveGeneration: capturedArchiveGeneration,
+          });
+          this.store.beginThreadMerge(botUid, target);
+          reserved = true;
+          return true;
+        };
+        if (commandBeforeSpawn) commandBeforeSpawn(id, persistHostLease);
+        else persistHostLease();
+        if (!reserved) throw new Error("host merge lease was not persisted before process spawn");
+        if (!acceptedNotified) {
+          acceptedNotified = true;
+          accepted?.();
+        }
       },
       onSpawn: (identity) => {
+        processStarted = true;
         if (!reserved || identity.cwd !== cwd) {
+          for (const path of plannedResources) this.blockedDirectories.add(path);
           throw new Error("host merge process spawned without its durable reservation");
         }
         this.store.recordHostMergeProcess(id, identity);
@@ -5254,15 +7968,14 @@ class CoreService implements ChannelService {
         this.store.settleHostMergeLease(id);
         reserved = false;
       },
-      onNotSpawned: () => {
-        if (!reserved) return;
-        const diagnostic = "Worktrunk merge was confirmed not to have started; it will not be replayed automatically.";
-        this.store.completeHostMergeLease(id, { kind: "not-spawned", diagnostic });
-        outcomePersisted = true;
-        progress?.finishFromOutcome({ kind: "not-started", diagnostic });
-      },
+      onNotSpawned: finishNotSpawned,
       onUnknown: () => {
         if (!reserved || outcomePersisted) return;
+        if (!processStarted) {
+          finishNotSpawned();
+          return;
+        }
+        for (const path of plannedResources) this.blockedDirectories.add(path);
         this.store.markHostMergeLeaseUnknown(id);
         progress?.unknown(signal?.aborted
           ? "取消后 Worktrunk merge 的最终结果无法确认；不会自动重放，请先核对目标分支与工作区。"
@@ -5278,24 +7991,31 @@ class CoreService implements ChannelService {
     archiveGeneration: number,
     operatorNote: string,
     onAccepted?: () => void,
+    ingressHooks?: ThreadCommandIngressHooks,
   ): Promise<WorktreeMergeSummary & { archive?: "scheduled" }> {
     const botUid = this.bot?.uid;
     if (botUid === undefined) throw new Error("Bot 身份未注册，无法合并子区工作区");
     const progress = this.hostMergeProgressCards.start(message, message.messageId);
     const targetKeyValue = targetKey(message);
-    const controller = new AbortController();
-    const controllers = this.threadMergeControllers.get(targetKeyValue) ?? new Set<AbortController>();
-    controllers.add(controller);
-    this.threadMergeControllersByCommand.set(this.threadMergeCommandKey(message), controller);
-    this.threadMergeControllers.set(targetKeyValue, controllers);
+    const commandKey = this.threadMergeCommandKey(message);
+    let controller = this.threadMergeControllersByCommand.get(commandKey);
+    if (controller === undefined) {
+      controller = new AbortController();
+      const controllers = this.threadMergeControllers.get(targetKeyValue) ?? new Set<AbortController>();
+      controllers.add(controller);
+      this.threadMergeControllersByCommand.set(commandKey, controller);
+      this.threadMergeControllers.set(targetKeyValue, controllers);
+    }
     const shutdownSignal = this.shutdownController.signal;
     const abortOnShutdown = (): void => controller.abort(new Error("channel stopping"));
     if (shutdownSignal.aborted) abortOnShutdown();
     else shutdownSignal.addEventListener("abort", abortOnShutdown, { once: true });
 
-    let reservation: DestructiveCommandReservation | undefined;
+    let reservation = this.ingressCommandReservations.get(commandKey)?.reservation;
     let lease: SessionLease | undefined;
     let prior: HostMergeLeaseRecord | null = null;
+    let lifecycleForUnstarted: WorktreeMergeLifecycle | undefined;
+    let mergeAttempted = false;
     try {
       prior = this.store.getHostMergeLeaseBySourceId(botUid, message, message.messageId);
       let plan: WorktreeMergePlan | undefined;
@@ -5304,7 +8024,15 @@ class CoreService implements ChannelService {
         resourceCwds = prior.resourceCwds;
       } else {
         // Merge commands serialize only this chat/session; worktree resources are not reserved.
-        reservation = this.scheduler.reserveDestructiveCommandSession(message, []);
+        if (reservation === undefined) {
+          reservation = this.scheduler.reserveDestructiveCommandSession(message, []);
+          this.ingressCommandReservations.set(commandKey, {
+            kind: "merge",
+            reservation,
+            resourceCwds: [expectedBinding.cwd],
+          });
+          ingressHooks?.onReservationInstalled();
+        }
         const worktrees = this.options.worktrees;
         if (!worktrees) throw new Error("本部署未配置隔离工作区能力");
         const request: WorktreeMergeRequest = { cwd: expectedBinding.cwd };
@@ -5324,8 +8052,14 @@ class CoreService implements ChannelService {
         }
         plan = await worktrees.planMerge(request, controller.signal);
         resourceCwds = plan.cwds;
+        if (reservation === undefined) throw new Error("merge session reservation disappeared");
+        const current = this.ingressCommandReservations.get(commandKey);
+        this.ingressCommandReservations.set(commandKey, {
+          kind: "merge",
+          reservation,
+          resourceCwds: [...new Set([...(current?.resourceCwds ?? []), ...resourceCwds])],
+        });
       }
-
       const lifecycle = this.createHostMergeLifecycle(
         message,
         expectedBinding.cwd,
@@ -5339,30 +8073,52 @@ class CoreService implements ChannelService {
           receiptOutboxId,
           archiveGeneration,
         },
-        () => {
+        (leaseId, persistHostLease) => {
           const current = this.store.getBinding(botUid, message);
-          if (
-            !current
-            || current.cwdPinned !== true
-            || current.cwd !== expectedBinding.cwd
-            || current.sessionId !== expectedBinding.sessionId
-          ) {
+          if (!current || !this.sameBindingState(expectedBinding, current)) {
             throw new Error("合并执行前子区绑定已变更，未执行合并。");
           }
-          this.store.completeCommand(this.commandClaim(message, "thread"));
+          if (ingressHooks === undefined) {
+            persistHostLease();
+            this.store.completeCommand(this.commandClaim(message, "thread"));
+            return;
+          }
+          const existing = this.store.getHostMergeLeaseBySourceId(botUid, message, message.messageId);
+          if (existing?.id === leaseId) return;
+          const persist = (): boolean => {
+            if (!ingressHooks.markDispatchIntent(leaseId)) return false;
+            const latest = this.store.getBinding(botUid, message);
+            if (!latest || !this.sameBindingState(expectedBinding, latest)) {
+              throw new Error("合并执行前子区绑定已变更，未执行合并。");
+            }
+            if (!persistHostLease()) return false;
+            const claim = this.commandClaim(message, "thread");
+            this.store.completeCommand(claim);
+            return this.store.getCommandClaimState(botUid, message, message.messageId) === "completed";
+          };
+          if (!ingressHooks.handoffToConsumer?.({ kind: "operation", id: leaseId }, persist)) {
+            throw new Error("Ingress merge host lease handoff could not be persisted");
+          }
         },
         progress,
         controller.signal,
         onAccepted,
       );
+      lifecycleForUnstarted = lifecycle;
 
+      ingressHooks?.checkpoint?.("waiting-session");
+      // Keep the durable ingress checkpoint while older same-session work drains. The merge
+      // ledger and handoff are committed at Worktrunk's actual beforeSpawn boundary.
       if (reservation !== undefined) {
-        lease = await this.acquireThreadMergeLease(
+        const acquired = await this.acquireThreadMergeLease(
           message,
           expectedBinding,
           reservation,
           controller.signal,
+          binding => ingressHooks?.acceptsInitialSessionBinding(binding) ?? false,
         );
+        lease = acquired.lease;
+        expectedBinding = acquired.binding;
       }
       const host: ThreadMergeHost = {
         botUid,
@@ -5391,12 +8147,14 @@ class CoreService implements ChannelService {
       };
       let summary: WorktreeMergeSummary & { archive?: "scheduled" };
       try {
+        mergeAttempted = true;
         summary = await mergeThreadWorkspace(host, message, {}, controller.signal, plan);
       } catch (error) {
         lifecycle.onUnknown();
         this.pendingHostMergeArchives.delete(targetKeyValue);
         throw error;
       }
+
       progress.finishFromOutcome({ kind: "succeeded", summary });
       if (
         summary.archive === "scheduled"
@@ -5415,6 +8173,19 @@ class CoreService implements ChannelService {
       );
       return summary;
     } catch (error) {
+      if (!mergeAttempted) {
+        try {
+          lifecycleForUnstarted?.onNotSpawned();
+        } catch (outcomeError) {
+          try {
+            lifecycleForUnstarted?.onUnknown();
+          } catch {}
+          console.error(
+            `[thread-merge] 无法持久化未启动结果 target=${targetKey(message)}：`
+            + safeErrorMessage(outcomeError, "non-start outcome persistence failed"),
+          );
+        }
+      }
       let durableOutcome = prior?.outcome ?? null;
       try {
         durableOutcome = this.store.getHostMergeLeaseBySourceId(botUid, message, message.messageId)?.outcome ?? durableOutcome;
@@ -5466,6 +8237,7 @@ class CoreService implements ChannelService {
     ownership: ThreadWorkspaceRecord,
     force: boolean,
     receiptOutboxId: string,
+    ingressHooks?: ThreadCommandIngressHooks,
   ): Promise<HostThreadRemovalOutcome | { kind: "refused"; message: string }> {
     const botUid = this.bot?.uid;
     const worktrees = this.options.worktrees;
@@ -5489,19 +8261,43 @@ class CoreService implements ChannelService {
 
     const targetKeyValue = targetKey(message);
     const commandKey = this.threadMergeCommandKey(message);
-    const controller = new AbortController();
-    const controllers = this.threadRemovalControllers.get(targetKeyValue) ?? new Set<AbortController>();
-    controllers.add(controller);
-    this.threadRemovalControllers.set(targetKeyValue, controllers);
-    this.threadRemovalControllersByCommand.set(commandKey, controller);
+    let controller = this.threadRemovalControllersByCommand.get(commandKey);
+    if (controller === undefined) {
+      controller = new AbortController();
+      const controllers = this.threadRemovalControllers.get(targetKeyValue) ?? new Set<AbortController>();
+      controllers.add(controller);
+      this.threadRemovalControllers.set(targetKeyValue, controllers);
+      this.threadRemovalControllersByCommand.set(commandKey, controller);
+    }
     const shutdownSignal = this.shutdownController.signal;
     const abortOnShutdown = (): void => controller.abort(new Error("channel stopping"));
     if (shutdownSignal.aborted) abortOnShutdown();
     else shutdownSignal.addEventListener("abort", abortOnShutdown, { once: true });
 
+    let reservation = this.ingressCommandReservations.get(commandKey)?.reservation;
+    if (reservation === undefined) {
+      reservation = this.scheduler.reserveDestructiveCommandSession(message, resourcePaths, []);
+      this.ingressCommandReservations.set(commandKey, {
+        kind: "remove",
+        reservation,
+        resourceCwds: resourcePaths,
+      });
+      ingressHooks?.onReservationInstalled();
+    }
+    if (reservation === undefined) throw new Error("remove resource reservation disappeared");
+    const reservationEntry = this.ingressCommandReservations.get(commandKey);
+    if (reservationEntry?.kind === "remove") {
+      reservation.extend(resourcePaths.filter(path => !reservationEntry.resourceCwds.includes(path)), []);
+      this.ingressCommandReservations.set(commandKey, {
+        kind: "remove",
+        reservation,
+        resourceCwds: [...new Set([...reservationEntry.resourceCwds, ...resourcePaths])],
+      });
+    }
     let sessionLease: SessionLease | undefined;
     let reserved = false;
     let operationUnknown = false;
+    let removalProcessExited = false;
     const id = randomUUID();
     const context = {
       id,
@@ -5521,6 +8317,9 @@ class CoreService implements ChannelService {
       // Missing owned paths still need directory leases; only existing paths can be Git-probed.
       const repositoryCwds: string[] = [];
       for (const path of resourcePaths) {
+        if (controller.signal.aborted) {
+          return { kind: "refused", message: "channel 正在停止，未开始本地清理。" };
+        }
         try {
           await lstat(path);
           repositoryCwds.push(path);
@@ -5528,11 +8327,9 @@ class CoreService implements ChannelService {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
       }
-      sessionLease = await this.scheduler.tryAcquireDestructiveCommandSession(
-        message,
-        repositoryCwds,
-        resourcePaths,
-      );
+      reservation.extend([], repositoryCwds);
+      ingressHooks?.checkpoint?.("waiting-session");
+      sessionLease = await reservation.tryAcquire();
       if (!sessionLease) {
         return { kind: "refused", message: "当前子区或其工作区资源正被任务占用；清理命令已立即拒绝，未排队。" };
       }
@@ -5565,10 +8362,25 @@ class CoreService implements ChannelService {
               throw new Error("host removal process identity changed before spawn");
             }
             if (!reserved) {
-              this.store.reserveHostRemovalLease({ ...context, cwd });
+              const persistFirstStep = (): boolean => {
+                if (ingressHooks !== undefined && !ingressHooks.markDispatchIntent(id)) return false;
+                this.store.reserveHostRemovalLease({ ...context, cwd });
+                this.store.beginHostRemovalStep(id, step, cwd);
+                const claim = this.commandClaim(message, "thread");
+                this.store.completeCommand(claim);
+                return this.store.getCommandClaimState(botUid, message, message.messageId) === "completed";
+              };
+              if (ingressHooks !== undefined) {
+                if (!ingressHooks.handoffToConsumer?.({ kind: "operation", id }, persistFirstStep)) {
+                  throw new Error("Ingress removal host lease handoff could not be persisted");
+                }
+              } else if (!persistFirstStep()) {
+                throw new Error("Host removal first step could not be persisted");
+              }
               reserved = true;
+            } else {
+              this.store.beginHostRemovalStep(id, step, cwd);
             }
-            this.store.beginHostRemovalStep(id, step, cwd);
             beforeSpawned = true;
           },
           onSpawn: identity => {
@@ -5591,6 +8403,7 @@ class CoreService implements ChannelService {
             }
             try {
               this.store.markHostRemovalProcessExited(id);
+              removalProcessExited = true;
               processRunning = false;
               beforeSpawned = false;
             } catch (error) {
@@ -5601,10 +8414,12 @@ class CoreService implements ChannelService {
           onNotSpawned: () => {
             if (!reserved || !beforeSpawned) return;
             if (processRunning) this.store.markHostRemovalProcessExited(id);
-            this.store.releaseHostRemovalLease(id);
-            reserved = false;
             beforeSpawned = false;
             processRunning = false;
+            if (!removalProcessExited) {
+              this.store.releaseHostRemovalLease(id);
+              reserved = false;
+            }
           },
           onUnknown: failClosedProcess,
         };
@@ -5628,7 +8443,7 @@ class CoreService implements ChannelService {
         };
       }
       if (this.stopping || controller.signal.aborted) {
-        if (reserved) this.releaseOrBlockHostRemoval(id, resourcePaths);
+        if (reserved) this.releaseOrBlockHostRemoval(id, resourcePaths, removalProcessExited);
         return { kind: "refused", message: "channel 已停止或清理已中止；本次不归档。" };
       }
 
@@ -5649,7 +8464,9 @@ class CoreService implements ChannelService {
       this.store.persistHostRemovalOutcome(id, outcome);
       return outcome;
     } catch (error) {
-      if (reserved && !operationUnknown) this.releaseOrBlockHostRemoval(id, resourcePaths);
+      if (reserved && !operationUnknown) {
+        this.releaseOrBlockHostRemoval(id, resourcePaths, removalProcessExited);
+      }
       const detail = safeDisplayText(safeErrorMessage(error, "清理失败"), 180) ?? "未知错误";
       return {
         kind: "refused",
@@ -5657,6 +8474,7 @@ class CoreService implements ChannelService {
       };
     } finally {
       sessionLease?.complete();
+      reservation?.release();
       shutdownSignal.removeEventListener("abort", abortOnShutdown);
     }
   }
@@ -6688,6 +9506,7 @@ class CoreService implements ChannelService {
       stopCause: null,
       workAfterStop: false,
       steerDeliveries: [],
+      steerCallInFlight: false,
       steerSerial: Promise.resolve(),
       turnContext,
     };
@@ -6821,12 +9640,32 @@ class CoreService implements ChannelService {
       } else if (goalTask && verified.sessionId !== goalSessionId) {
         throw new WorkerGoalError("identity-mismatch", "Worker session changed before goal dispatch");
       } else if (!goalTask && !isWatchWakeTask && !isTanDispatch) {
-        this.store.updateBindingSession(
-          this.bot!.uid,
-          target,
-          verified.sessionId,
-          verified.sessionFile,
-        );
+        if (
+          target.channelType === 5
+          && bindingAtStart?.cwdPinned === true
+          && bindingAtStart.sessionFile === null
+        ) {
+          if (
+            verified.sessionFile === null
+            || !this.store.initializeBindingSessionFromTask(
+              this.bot!.uid,
+              target,
+              taskId,
+              bindingAtStart,
+              verified.sessionId,
+              verified.sessionFile,
+            )
+          ) {
+            throw new TaskStartupError("session-invalid", "初始绑定已变化，拒绝发布新的会话身份。");
+          }
+        } else {
+          this.store.updateBindingSession(
+            this.bot!.uid,
+            target,
+            verified.sessionId,
+            verified.sessionFile,
+          );
+        }
       }
       // 续接不重放原文、也不重灌历史快照：原回合的上下文与会话消息都在会话里；群/子区说明
       // 的注入事务照常发布——会话侧车正是为「原生续跑回合」准备的（`context` 钩子补灌），
@@ -6985,6 +9824,7 @@ class CoreService implements ChannelService {
         freshReadController.abort();
         await freshReadBridge;
         if (historyTurn) this.history.commitTurn(target, verified.sessionId, historyTurn);
+        await runtime.steerSerial;
       }
       if (
         isTanDispatch
@@ -7018,7 +9858,6 @@ class CoreService implements ChannelService {
         if (!questionTimeout) this.questions.cancelForTask(taskId, "interrupted");
         progress.finish("cancelled");
       } else if (!runtime.suspended) {
-        await runtime.steerSerial;
         if (goalTask) {
           let goal = settledGoal;
           let pauseFailure: unknown = null;

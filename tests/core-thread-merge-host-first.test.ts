@@ -4,9 +4,10 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { groupAlive, queryProcess } from "../src/omp/process.ts";
 import { createWorktreePort } from "../src/workspace/worktree.ts";
-import type { WorktreePort } from "../src/contracts.ts";
+import type { InboundMessage, WorktreePort } from "../src/contracts.ts";
 import { join } from "node:path";
-import { openChannelStore } from "../src/store/index.ts";
+import { openChannelStore, type ChannelStore } from "../src/store/index.ts";
+import type { HostMergeLeaseRecord } from "../src/store/store-records.ts";
 import {
   closeCoreHarness,
   createCoreHarness,
@@ -14,6 +15,8 @@ import {
   FakeWorktrees,
   FakeTransport,
   FakeWorkerFactory,
+  readIngressJob,
+  waitForIngressJob,
   waitForStatus,
   type CoreHarness,
   type FakeGoalRunContext,
@@ -49,6 +52,38 @@ async function waitForSentText(transport: FakeTransport, prefix: string): Promis
   throw new Error(`expected outbound text was not sent: ${prefix}`);
 }
 
+async function waitForHostMergeLease(
+  store: ChannelStore,
+  botUid: string,
+  sourceId: string,
+  predicate: (lease: HostMergeLeaseRecord) => boolean,
+): Promise<HostMergeLeaseRecord> {
+  const deadline = performance.now() + 3_000;
+  let observed = store.listHostMergeLeases(botUid).find(candidate => candidate.sourceId === sourceId);
+  while (performance.now() < deadline) {
+    if (observed && predicate(observed)) return observed;
+    const turn = Promise.withResolvers<void>();
+    setImmediate(turn.resolve);
+    await turn.promise;
+    observed = store.listHostMergeLeases(botUid).find(candidate => candidate.sourceId === sourceId);
+  }
+  throw new Error(`host merge lease ${sourceId} did not reach its expected state`);
+}
+
+async function submitMergeUntilPhase(
+  harness: CoreHarness,
+  message: InboundMessage,
+  phase: "planning" | "waiting-session",
+): Promise<void> {
+  await harness.service.submitInbound(message);
+  await waitForIngressJob(harness, message, {
+    predicate: job =>
+      job.operationCheckpoint?.kind === "command"
+      && job.operationCheckpoint.action === "thread"
+      && job.operationCheckpoint.phase === phase,
+    description: `thread merge ingress checkpoint ${phase}`,
+  });
+}
 
 // The merge itself is host-owned; the default listen receipt is delivered in the creator chat.
 test("/thread merge runs in the host and emits one default merge-listen notice", async () => {
@@ -73,11 +108,11 @@ test("/thread merge runs in the host and emits one default merge-listen notice",
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
     });
-    await harness.service.handleInbound(message);
+    await harness.service.submitInbound(message);
     await harness.transport.waitForManagementCalls(({ action }) => action === "thread-archive");
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, parent, status => status.state === "completed");
-    await harness.service.handleInbound(message);
+    await harness.service.submitInbound(message);
     expect(harness.worktrees?.merges).toHaveLength(1);
     expect(harness.worktrees?.merges[0]).toMatchObject({ cwd: workspace });
     expect(store.getLatestTask(harness.bot.uid, thread)).toBeNull();
@@ -149,7 +184,7 @@ test("/thread merge updates an independent running progress card before the merg
       return summary;
     };
 
-    const mergeCommand = harness.service.handleInbound(inbound({
+    const mergeCommand = harness.service.submitInbound(inbound({
       ...thread,
       messageId: "merge-progress-command",
       text: "/thread merge",
@@ -269,7 +304,7 @@ test("/status responds while /thread merge is still running", async () => {
       return summary;
     };
 
-    const mergeCommand = harness.service.handleInbound(inbound({
+    const mergeCommand = harness.service.submitInbound(inbound({
       ...thread,
       messageId: "merge-progress-status-command",
       text: "/thread merge",
@@ -285,12 +320,16 @@ test("/status responds while /thread merge is still running", async () => {
     expect(mergeAcknowledged).toBe(true);
     expect(mergeSettled).toBe(false);
 
-    status = harness.service.handleInbound(inbound({
+    const statusMessage = inbound({
       ...thread,
       messageId: "merge-progress-status-query",
       text: "/status",
       mentionedUserIds: [harness.bot.uid],
-    }));
+    });
+    status = (async () => {
+      await harness.service.submitInbound(statusMessage);
+      await waitForIngressJob(harness, statusMessage);
+    })();
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const statusReturned = await Promise.race([
       status.then(() => true),
@@ -364,7 +403,7 @@ test("/thread merge with listen=off consumes success without creating a parent t
       threadName: "silent merge",
       listen: "off",
     });
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...thread,
       messageId: "host-first-off-success",
       text: "/thread merge",
@@ -413,7 +452,7 @@ test("actual host merge and repair failures stay suppressed from the creator cha
     });
     if (!harness.worktrees) throw new Error("expected fixture worktrees");
     harness.worktrees.mergeFailure = new WorktreeMergeExecutionError(1, "fixture merge failure");
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...thread,
       messageId: "merge-failure-command",
       text: "/thread merge",
@@ -462,7 +501,7 @@ test("/thread merge redelivery after restart does not repeat the completed merge
     } finally {
       setupStore.close();
     }
-    await harness.service.handleInbound(message);
+    await harness.service.submitInbound(message);
     await harness.transport.waitForManagementCalls(({ action }) => action === "thread-archive");
     await closeCoreHarness(harness, { remove: false });
     originalStopped = true;
@@ -470,7 +509,7 @@ test("/thread merge redelivery after restart does not repeat the completed merge
     restarted = await createCoreHarness({ root: harness.root, bot: harness.bot });
     const restartedStore = await openChannelStore(restarted.stateDir);
     try {
-      await restarted.service.handleInbound(message);
+      await restarted.service.submitInbound(message);
       expect(restarted.worktrees?.merges).toEqual([]);
       expect(restartedStore.getLatestTask(restarted.bot.uid, thread)).toBeNull();
       expect(restarted.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
@@ -805,7 +844,7 @@ test("a progress-card terminal persistence failure does not replace a completed 
       mentionedUserIds: [harness.bot.uid],
     });
 
-    await harness.service.handleInbound(message);
+    await harness.service.submitInbound(message);
     await waitForSentText(harness.transport, "子区合并成功：");
 
     expect(harness.worktrees?.merges).toHaveLength(1);
@@ -849,7 +888,7 @@ test("a progress-card terminal persistence failure still accepts the merge repai
       WHEN NEW.phase = 'execution-failed'
       BEGIN SELECT RAISE(ABORT, 'terminal progress persistence fault'); END;
     `);
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...thread,
       messageId: "merge-card-repair-command",
       text: "/thread merge, keep the repair note",
@@ -1301,7 +1340,7 @@ test("/thread merge waits for a running workspace task before acquiring its leas
       sessionFile: null,
       cwdPinned: true,
     });
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...thread,
       messageId: "merge-wait-task",
       text: "existing workspace task",
@@ -1309,22 +1348,18 @@ test("/thread merge waits for a running workspace task before acquiring its leas
     }));
     await started.promise;
 
-    const merge = harness.service.handleInbound(inbound({
+    const mergeMessage = inbound({
       ...thread,
       messageId: "merge-wait-command",
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
-    }));
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const turn = Promise.withResolvers<void>();
-      setImmediate(turn.resolve);
-      await turn.promise;
-    }
+    });
+    await submitMergeUntilPhase(harness, mergeMessage, "waiting-session");
     expect(harness.worktrees?.merges).toEqual([]);
 
     finish.resolve();
-    await merge;
     await harness.transport.waitForManagementCalls(({ action }) => action === "thread-archive");
+    await waitForStatus(harness.service, thread, status => status.state === "completed");
     expect(harness.worktrees?.merges).toHaveLength(1);
     expect(harness.worktrees?.merges[0]).toMatchObject({ cwd: workspace });
     expect(harness.workers.prompts.filter(({ text }) => text === "existing workspace task")).toHaveLength(1);
@@ -1342,8 +1377,6 @@ test("a host merge reservation runs before later same-chat workspace writes", as
   const finishLater = Promise.withResolvers<void>();
   const mergeStarted = Promise.withResolvers<void>();
   const finishMerge = Promise.withResolvers<void>();
-  const mergeTypingSent = Promise.withResolvers<void>();
-  let typingCalls = 0;
   const harness = await createCoreHarness({
     prompt: async ({ text }) => {
       if (text === "earlier workspace write") {
@@ -1368,13 +1401,6 @@ test("a host merge reservation runs before later same-chat workspace writes", as
       sessionFile: null,
       cwdPinned: true,
     });
-    const sendTyping = harness.transport.sendTyping.bind(harness.transport);
-    harness.transport.sendTyping = async (target, signal) => {
-      await sendTyping(target, signal);
-      if (target.channelId === thread.channelId && ++typingCalls === 2) {
-        mergeTypingSent.resolve();
-      }
-    };
     const worktrees = harness.worktreePort;
     if (!worktrees) throw new Error("expected worktree port");
     const mergeWorktree = worktrees.merge.bind(worktrees);
@@ -1383,26 +1409,49 @@ test("a host merge reservation runs before later same-chat workspace writes", as
       await finishMerge.promise;
       return mergeWorktree(request, signal);
     };
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...thread,
       messageId: "merge-reservation-earlier",
       text: "earlier workspace write",
       mentionedUserIds: [harness.bot.uid],
     }));
     await earlierStarted.promise;
-    const merge = harness.service.handleInbound(inbound({
+    const mergeMessage = inbound({
       ...thread,
       messageId: "merge-reservation-command",
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
-    }));
-    await mergeTypingSent.promise;
-    await harness.service.handleInbound(inbound({
+    });
+    await submitMergeUntilPhase(harness, mergeMessage, "waiting-session");
+    const laterMessage = inbound({
       ...thread,
       messageId: "merge-reservation-later",
       text: "later workspace write",
       mentionedUserIds: [harness.bot.uid],
-    }));
+    });
+    await harness.service.submitInbound(laterMessage);
+    const laterIngress = await readIngressJob(
+      { store, botUid: harness.bot.uid },
+      laterMessage,
+    );
+    expect(laterIngress).toMatchObject({ ackReady: true });
+    if (
+      laterIngress === null
+      || (laterIngress.state !== "accepted" && laterIngress.state !== "handed-off")
+    ) {
+      throw new Error("later workspace write was not accepted or handed off");
+    }
+    expect(["accepted", "handed-off"]).toContain(laterIngress.state);
+    if (laterIngress?.state === "handed-off") {
+      expect(laterIngress.consumerKind).toBe("task");
+      const persistedTask = store.getTaskByMessageId(
+        harness.bot.uid,
+        thread,
+        laterMessage.messageId,
+      );
+      expect(persistedTask).toMatchObject({ state: "queued" });
+      expect(laterIngress.consumerId).toBe(persistedTask?.id ?? null);
+    }
 
     finishEarlier.resolve();
     const firstOperation = await Promise.race([
@@ -1411,10 +1460,22 @@ test("a host merge reservation runs before later same-chat workspace writes", as
     ]);
     expect(firstOperation).toBe("merge");
     expect(harness.worktrees?.merges).toEqual([]);
-
     finishMerge.resolve();
-    await merge;
+
+    const laterHandoff = await waitForIngressJob(harness, laterMessage);
+    expect(laterHandoff).toMatchObject({
+      state: "handed-off",
+      consumerKind: "task",
+    });
     await laterStarted.promise;
+    finishLater.resolve();
+    await harness.transport.waitForRemoteText(({ target: sentTarget, text }) =>
+      sentTarget.channelId === thread.channelId
+      && sentTarget.channelType === thread.channelType
+      && text.startsWith("子区合并成功："),
+    );
+    await waitForStatus(harness.service, thread, status => status.state === "completed");
+    expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
     expect(harness.worktrees?.merges).toHaveLength(1);
     expect(harness.worktrees?.merges[0]).toMatchObject({ cwd: workspace });
   } finally {
@@ -1466,29 +1527,28 @@ test("/thread merge waits for the previous task's terminal progress-card edit", 
       }
       await editProgressCard(target, messageId, progress, cardSeq, signal);
     };
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...thread,
       messageId: "merge-progress-tail-task",
       text: "progress-tail task",
       mentionedUserIds: [harness.bot.uid],
     }));
     await taskStarted.promise;
-    const merge = harness.service.handleInbound(inbound({
+    const merge = harness.service.submitInbound(inbound({
       ...thread,
       messageId: "merge-progress-tail-command",
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
     }));
 
+    await merge;
     finishTask.resolve();
     await terminalEditStarted.promise;
-    await merge;
     expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
 
     finishTerminalEdit.resolve();
     await harness.transport.waitForManagementCalls(({ action }) => action === "thread-archive");
-    expect(harness.worktrees?.merges).toHaveLength(1);
-    expect(harness.worktrees?.merges[0]).toMatchObject({ cwd: workspace });
+    await waitForStatus(harness.service, thread, status => status.state === "completed");
   } finally {
     finishTask.resolve();
     finishTerminalEdit.resolve();
@@ -1564,38 +1624,37 @@ test("/thread merge runs concurrently with queued cross-chat project work", asyn
       await releaseMerge.promise;
       return mergeWorktree(request, signal);
     };
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...group,
       messageId: "cross-chat-first-task",
       text: "first project task",
       mentionedUserIds: [harness.bot.uid],
     }));
     await firstStarted.promise;
-    await harness.service.handleInbound(inbound({
+    const queuedMessage = inbound({
       ...group,
       messageId: "cross-chat-queued-task",
       text: "/queue queued project task",
       mentionedUserIds: [harness.bot.uid],
-    }));
-    expect(store.getLatestTask(harness.bot.uid, group)).toMatchObject({
-      messageId: "cross-chat-queued-task",
-      state: "queued",
     });
-
-    merge = harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(queuedMessage);
+    await waitForIngressJob(harness, queuedMessage);
+    const mergeMessage = inbound({
       ...thread,
       messageId: "cross-chat-merge-command",
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
-    }));
+    });
+    merge = harness.service.submitInbound(mergeMessage);
+    await merge;
     await mergeStarted.promise;
     releaseFirst.resolve();
     await secondStarted.promise;
 
     releaseSecond.resolve();
     releaseMerge.resolve();
-    await merge;
     await harness.transport.waitForManagementCalls(({ action }) => action === "thread-archive");
+    await waitForStatus(harness.service, group, status => status.state === "completed");
     expect(harness.worktrees?.merges).toHaveLength(1);
     expect(harness.worktrees?.merges[0]).toMatchObject({
       cwd: project,
@@ -1622,7 +1681,6 @@ test("a merge reservation drains run and queued work before it, then queues late
   const runningStarted = Promise.withResolvers<void>();
   const queuedStarted = Promise.withResolvers<void>();
   const lateStarted = Promise.withResolvers<void>();
-  const mergeReservationStarted = Promise.withResolvers<void>();
   const mergeStarted = Promise.withResolvers<void>();
   const releaseRunning = Promise.withResolvers<void>();
   const releaseQueued = Promise.withResolvers<void>();
@@ -1659,14 +1717,6 @@ test("a merge reservation drains run and queued work before it, then queues late
       sessionFile: null,
       cwdPinned: true,
     });
-    let typingCalls = 0;
-    const sendTyping = harness.transport.sendTyping.bind(harness.transport);
-    harness.transport.sendTyping = async (target, signal) => {
-      await sendTyping(target, signal);
-      if (target.channelId === thread.channelId && ++typingCalls === 3) {
-        mergeReservationStarted.resolve();
-      }
-    };
     const worktrees = harness.worktreePort;
     if (!worktrees) throw new Error("expected worktree port");
     const mergeWorktree = worktrees.merge.bind(worktrees);
@@ -1677,41 +1727,62 @@ test("a merge reservation drains run and queued work before it, then queues late
       return mergeWorktree(request, signal);
     };
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...thread,
       messageId: "merge-ordering-running",
       text: "running before host merge",
       mentionedUserIds: [harness.bot.uid],
     }));
     await runningStarted.promise;
-    await harness.service.handleInbound(inbound({
+    const queuedMessage = inbound({
       ...thread,
       messageId: "merge-ordering-queued",
       text: "/queue queued before host merge",
       mentionedUserIds: [harness.bot.uid],
-    }));
+    });
+    await harness.service.submitInbound(queuedMessage);
+    await waitForIngressJob(harness, queuedMessage);
     expect(store.getLatestTask(harness.bot.uid, thread)).toMatchObject({
       messageId: "merge-ordering-queued",
       state: "queued",
     });
 
-    const command = harness.service.handleInbound(inbound({
+    const mergeMessage = inbound({
       ...thread,
       messageId: "merge-ordering-command",
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
-    }));
-    await mergeReservationStarted.promise;
-    await harness.service.handleInbound(inbound({
+    });
+    await submitMergeUntilPhase(harness, mergeMessage, "waiting-session");
+    const lateMessage = inbound({
       ...thread,
       messageId: "merge-ordering-late",
       text: "late default-steer message",
       mentionedUserIds: [harness.bot.uid],
-    }));
-    expect(store.getLatestTask(harness.bot.uid, thread)).toMatchObject({
-      messageId: "merge-ordering-late",
-      state: "queued",
     });
+    await harness.service.submitInbound(lateMessage);
+    const lateIngress = await readIngressJob(
+      { store, botUid: harness.bot.uid },
+      lateMessage,
+    );
+    expect(lateIngress).toMatchObject({ ackReady: true });
+    if (
+      lateIngress === null
+      || (lateIngress.state !== "accepted" && lateIngress.state !== "handed-off")
+    ) {
+      throw new Error("late default-steer message was not accepted or handed off");
+    }
+    expect(["accepted", "handed-off"]).toContain(lateIngress.state);
+    if (lateIngress?.state === "handed-off") {
+      expect(lateIngress.consumerKind).toBe("task");
+      const persistedTask = store.getTaskByMessageId(
+        harness.bot.uid,
+        thread,
+        lateMessage.messageId,
+      );
+      expect(persistedTask).toMatchObject({ state: "queued" });
+      expect(lateIngress.consumerId).toBe(persistedTask?.id ?? null);
+    }
     expect(runningAppended()).toEqual([]);
 
     releaseRunning.resolve();
@@ -1722,10 +1793,21 @@ test("a merge reservation drains run and queued work before it, then queues late
     await mergeStarted.promise;
     expect(sequence).toEqual(["running", "queued", "merge"]);
     expect(harness.workers.prompts.map(({ text }) => text)).not.toContain("late default-steer message");
-
     releaseMerge.resolve();
-    await command;
+
+    const lateHandoff = await waitForIngressJob(harness, lateMessage);
+    expect(lateHandoff).toMatchObject({
+      state: "handed-off",
+      consumerKind: "task",
+    });
     await lateStarted.promise;
+    await harness.transport.waitForRemoteText(({ target: sentTarget, text }) =>
+      sentTarget.channelId === thread.channelId
+      && sentTarget.channelType === thread.channelType
+      && text.startsWith("子区合并成功："),
+    );
+    await waitForStatus(harness.service, thread, status => status.state === "completed");
+    expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
     expect(sequence).toEqual(["running", "queued", "merge", "late"]);
   } finally {
     releaseRunning.resolve();
@@ -1755,7 +1837,7 @@ test("a host merge reservation waits for an earlier native goal task", async () 
       sessionFile: null,
       cwdPinned: true,
     });
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...thread,
       messageId: "merge-goal-order-prepare",
       text: "prepare workspace session",
@@ -1803,19 +1885,21 @@ test("a host merge reservation waits for an earlier native goal task", async () 
       return mergeWorktree(requestWithoutLifecycle, signal);
     };
 
-    const goalCommand = harness.service.handleInbound(inbound({
+    const goalCommand = harness.service.submitInbound(inbound({
       ...thread,
       messageId: "merge-goal-order-goal",
       text: "/goal set hold the workspace",
       mentionedUserIds: [harness.bot.uid],
     }));
+    await goalCommand;
     await goalStarted.promise;
-    const mergeCommand = harness.service.handleInbound(inbound({
+    const mergeCommand = harness.service.submitInbound(inbound({
       ...thread,
       messageId: "merge-goal-order-command",
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
     }));
+    await mergeCommand;
     for (let attempt = 0; attempt < 10; attempt += 1) {
       const tick = Promise.withResolvers<void>();
       setImmediate(tick.resolve);
@@ -1829,7 +1913,7 @@ test("a host merge reservation waits for an earlier native goal task", async () 
     expect(store.getThreadListen(harness.bot.uid, thread)?.mergePending).toBe(true);
     expect(sequence).toEqual(["goal-started", "goal-finished", "merge-started"]);
     releaseMerge.resolve();
-    await Promise.all([goalCommand, mergeCommand]);
+    await harness.transport.waitForManagementCalls(({ action }) => action === "thread-archive");
   } finally {
     releaseGoal.resolve();
     releaseMerge.resolve();
@@ -1865,22 +1949,29 @@ test("a new authorized message during host merge prevents a later archive schedu
       await releaseMerge.promise;
       return merge(request);
     };
-    const command = harness.service.handleInbound(inbound({
+    const command = harness.service.submitInbound(inbound({
       ...thread,
       messageId: "merge-generation-command",
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
     }));
+    await command;
     await mergeStarted.promise;
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...thread,
       messageId: "merge-generation-new-message",
       text: "work after the merge",
       mentionedUserIds: [harness.bot.uid],
     }));
     releaseMerge.resolve();
-    await command;
+    await harness.transport.waitForRemoteText(
+      ({ target: sentTarget, text }) =>
+        sentTarget.channelId === thread.channelId &&
+        sentTarget.channelType === thread.channelType &&
+        text.startsWith("子区合并成功："),
+    );
     await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, thread, status => status.state === "completed");
 
     expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
     expect(harness.worktrees.merges).toHaveLength(1);
@@ -1921,9 +2012,28 @@ test("a temporary success-receipt delivery failure prevents archive until delive
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
     });
-    await harness.service.handleInbound(message);
+    await harness.service.submitInbound(message);
+    await waitForHostMergeLease(
+      store,
+      harness.bot.uid,
+      message.messageId,
+      lease => lease.phase === "exited" && lease.outcome?.kind === "succeeded",
+    );
+    let successReceiptPending = store.listPendingOutbox(harness.bot.uid, thread).some(
+      ({ text }) => text?.startsWith("子区合并成功：") === true,
+    );
+    const receiptDeadline = performance.now() + 3_000;
+    while (!successReceiptPending && performance.now() < receiptDeadline) {
+      const turn = Promise.withResolvers<void>();
+      setImmediate(turn.resolve);
+      await turn.promise;
+      successReceiptPending = store.listPendingOutbox(harness.bot.uid, thread).some(
+        ({ text }) => text?.startsWith("子区合并成功：") === true,
+      );
+    }
+    expect(successReceiptPending).toBe(true);
     expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
-    await harness.service.handleInbound(message);
+    await harness.service.submitInbound(message);
     expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
 
     await harness.transport.reconnect();
@@ -1965,7 +2075,7 @@ test("a success-receipt persistence failure recovers delivery without rerunning 
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
     });
-    await harness.service.handleInbound(message);
+    await harness.service.submitInbound(message);
     await waitForHostMergeOutcome(
       store,
       harness.bot.uid,
@@ -1994,7 +2104,7 @@ test("a success-receipt persistence failure recovers delivery without rerunning 
     } finally {
       recoveredStore.close();
     }
-    await restarted.service.handleInbound(message);
+    await restarted.service.submitInbound(message);
     expect(restarted.worktrees?.merges).toEqual([]);
   } finally {
     fault.exec("DROP TRIGGER IF EXISTS fail_merge_receipt");
@@ -2048,7 +2158,7 @@ test("a repair-task persistence failure recovers the same repair without rerunni
       text: "/thread merge, preserve repair recovery note",
       mentionedUserIds: [harness.bot.uid],
     });
-    await harness.service.handleInbound(message);
+    await harness.service.submitInbound(message);
     await waitForHostMergeOutcome(
       store,
       harness.bot.uid,
@@ -2082,6 +2192,7 @@ test("a repair-task persistence failure recovers the same repair without rerunni
     stopped = true;
     restarted = await createCoreHarness({ root: harness.root, bot: harness.bot });
     await restarted.workers.waitForPromptCount(1);
+    await waitForStatus(restarted.service, thread, status => status.state === "completed");
     expect(restarted.worktrees?.merges).toEqual([]);
     const recoveredStore = await openChannelStore(restarted.stateDir);
     try {
@@ -2338,7 +2449,7 @@ test("only an actual Worktrunk execution failure creates one stable repair task"
       text: "/thread merge, preserve the original note token=merge-secret-value",
       mentionedUserIds: [harness.bot.uid],
     });
-    await harness.service.handleInbound(command);
+    await harness.service.submitInbound(command);
     await harness.workers.waitForPromptCount(1);
     await harness.transport.waitForManagementCalls(({ action }) => action === "thread-archive");
     const repair = store.getLatestTask(harness.bot.uid, thread);
@@ -2350,7 +2461,7 @@ test("only an actual Worktrunk execution failure creates one stable repair task"
     expect(repair?.text).toContain(workspace);
     expect(fixtureWorktrees.merges).toHaveLength(2);
 
-    await harness.service.handleInbound(command);
+    await harness.service.submitInbound(command);
     expect(fixtureWorktrees.merges).toHaveLength(2);
     expect(store.getLatestTask(harness.bot.uid, thread)?.messageId).toBe(repair?.messageId);
   } finally {
@@ -2376,17 +2487,30 @@ test("an uncertain merge failure is reported without dispatching a repair task",
     });
     if (!harness.worktrees) throw new Error("expected fixture worktrees");
     harness.worktrees.mergeFailure = new Error("execution result unknown");
-    await harness.service.handleInbound(inbound({
+    const message = inbound({
       ...thread,
       messageId: "merge-uncertain-command",
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
-    }));
+    });
+    await harness.service.submitInbound(message);
+    await waitForHostMergeLease(
+      store,
+      harness.bot.uid,
+      message.messageId,
+      lease => lease.phase === "unknown",
+    );
+    const failureReceipt = await harness.transport.waitForRemoteText(
+      ({ target: sentTarget, text }) =>
+        sentTarget.channelId === thread.channelId &&
+        sentTarget.channelType === thread.channelType &&
+        text.includes("execution result unknown"),
+    );
 
     expect(harness.worktrees.merges).toHaveLength(1);
     expect(store.getLatestTask(harness.bot.uid, thread)).toBeNull();
     expect(harness.workers.prompts).toEqual([]);
-    expect(harness.transport.sent.some(({ text }) => text.includes("execution result unknown"))).toBe(true);
+    expect(failureReceipt.text).toContain("execution result unknown");
   } finally {
     store.close();
     await closeCoreHarness(harness);
@@ -2396,6 +2520,7 @@ test("an uncertain merge failure is reported without dispatching a repair task",
 for (const action of ["cancel", "interrupt"] as const) {
   test(`/${action} aborts an in-progress host merge`, async () => {
     const mergeStarted = Promise.withResolvers<void>();
+    const mergeAborted = Promise.withResolvers<void>();
     const harness = await createCoreHarness();
     const thread = { channelId: `group-allowed____merge-${action}`, channelType: 5 as const };
     const workspace = join(harness.root, "workspace");
@@ -2413,29 +2538,65 @@ for (const action of ["cancel", "interrupt"] as const) {
       });
       const worktrees = harness.worktreePort;
       if (!worktrees) throw new Error("expected worktree port");
-      worktrees.merge = async (_request, signal) => {
+      worktrees.merge = async (request, signal) => {
+        const lifecycle = request.lifecycle;
+        if (lifecycle === undefined) throw new Error("merge lifecycle was not forwarded");
+        lifecycle.beforeSpawn(request.cwd);
+        lifecycle.onSpawn({
+          pid: 43_017,
+          pgid: 43_017,
+          identity: "pid=43017;start=fixture-merge",
+          cwd: request.cwd,
+        });
         mergeSignal = signal;
         mergeStarted.resolve();
         if (!signal) throw new Error("merge signal was not forwarded");
         const aborted = Promise.withResolvers<never>();
-        if (signal.aborted) aborted.reject(signal.reason);
-        else signal.addEventListener("abort", () => aborted.reject(signal.reason), { once: true });
+        if (signal.aborted) {
+          mergeAborted.resolve();
+          aborted.reject(signal.reason);
+        } else {
+          signal.addEventListener("abort", () => {
+            mergeAborted.resolve();
+            aborted.reject(signal.reason);
+          }, { once: true });
+        }
         return await aborted.promise;
       };
-      const command = harness.service.handleInbound(inbound({
+      await harness.service.submitInbound(inbound({
         ...thread,
         messageId: `merge-${action}-command`,
         text: "/thread merge",
         mentionedUserIds: [harness.bot.uid],
       }));
       await mergeStarted.promise;
-      await harness.service.handleInbound(inbound({
+      await waitForHostMergeLease(
+        store,
+        harness.bot.uid,
+        `merge-${action}-command`,
+        lease => lease.phase === "running",
+      );
+      const controlReceipt = harness.transport.waitForRemoteText(
+        ({ target: sentTarget, text }) =>
+          sentTarget.channelId === thread.channelId &&
+          sentTarget.channelType === thread.channelType &&
+          (action === "cancel"
+            ? text === "无法确认受管操作已完成或停止；相关资源继续保持保护。"
+            : text === "已请求中止正在等待或执行的子区宿主操作；进程结果若未确认，资源将保持封锁且不会自动重试。"),
+      );
+      await harness.service.submitInbound(inbound({
         ...thread,
         messageId: `merge-${action}-abort`,
         text: `/${action}`,
         mentionedUserIds: [harness.bot.uid],
       }));
-      await command;
+      await Promise.all([mergeAborted.promise, controlReceipt]);
+      await waitForHostMergeLease(
+        store,
+        harness.bot.uid,
+        `merge-${action}-command`,
+        lease => lease.phase === "unknown",
+      );
 
       expect(mergeSignal?.aborted).toBe(true);
       expect(harness.worktrees?.merges).toEqual([]);
@@ -2450,6 +2611,7 @@ for (const action of ["cancel", "interrupt"] as const) {
 
 test("service stop aborts an in-progress host merge without archive or repair task", async () => {
   const mergeStarted = Promise.withResolvers<void>();
+  const mergeAborted = Promise.withResolvers<void>();
   const harness = await createCoreHarness();
   const thread = { channelId: "group-allowed____merge-stop", channelType: 5 as const };
   const workspace = join(harness.root, "workspace");
@@ -2467,26 +2629,53 @@ test("service stop aborts an in-progress host merge without archive or repair ta
     });
     const worktrees = harness.worktreePort;
     if (!worktrees) throw new Error("expected worktree port");
-    worktrees.merge = async (_request, signal) => {
+    worktrees.merge = async (request, signal) => {
+      const lifecycle = request.lifecycle;
+      if (lifecycle === undefined) throw new Error("merge lifecycle was not forwarded");
+      lifecycle.beforeSpawn(request.cwd);
+      lifecycle.onSpawn({
+        pid: 43_017,
+        pgid: 43_017,
+        identity: "pid=43017;start=fixture-merge",
+        cwd: request.cwd,
+      });
       mergeSignal = signal;
       mergeStarted.resolve();
       if (!signal) throw new Error("merge signal was not forwarded");
       const aborted = Promise.withResolvers<never>();
-      if (signal.aborted) aborted.reject(signal.reason);
-      else signal.addEventListener("abort", () => aborted.reject(signal.reason), { once: true });
+      if (signal.aborted) {
+        mergeAborted.resolve();
+        aborted.reject(signal.reason);
+      } else {
+        signal.addEventListener("abort", () => {
+          mergeAborted.resolve();
+          aborted.reject(signal.reason);
+        }, { once: true });
+      }
       return await aborted.promise;
     };
-    const command = harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...thread,
       messageId: "merge-stop-command",
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
     }));
     await mergeStarted.promise;
+    await waitForHostMergeLease(
+      store,
+      harness.bot.uid,
+      "merge-stop-command",
+      lease => lease.phase === "running",
+    );
 
     const stopping = harness.service.stop();
-    await command;
-    await stopping;
+    await Promise.all([stopping, mergeAborted.promise]);
+    await waitForHostMergeLease(
+      store,
+      harness.bot.uid,
+      "merge-stop-command",
+      lease => lease.phase === "unknown",
+    );
 
     expect(mergeSignal?.aborted).toBe(true);
     expect(harness.worktrees?.merges).toEqual([]);
@@ -2553,31 +2742,38 @@ test("a merge does not block steering from another chat into a running workspace
       await releaseMerge.promise;
       return mergeWorktree(request, signal);
     };
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...writer,
       messageId: "writer-before-root-merge",
       text: "writer before root merge",
     }));
     await writerStarted.promise;
-    merge = harness.service.handleInbound(inbound({
+    merge = harness.service.submitInbound(inbound({
       ...thread,
       messageId: "merge-root-steering-command",
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
     }));
+    await merge;
     await mergeStarted.promise;
-    await harness.service.handleInbound(inbound({
+    const lateWriterMessage = inbound({
       ...writer,
       messageId: "late-writer-after-root-merge",
       text: "late writer after root merge",
-    }));
+    });
+    await harness.service.submitInbound(lateWriterMessage);
+    const lateWriterIngress = await waitForIngressJob(harness, lateWriterMessage);
+    expect(lateWriterIngress).toMatchObject({
+      state: "handed-off",
+      consumerKind: "steering",
+    });
     expect(appendedMessages()).toEqual(["late writer after root merge"]);
     expect(store.getLatestTask(harness.bot.uid, writer)).toMatchObject({ state: "running" });
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["writer before root merge"]);
 
     releaseWriter.resolve();
     releaseMerge.resolve();
-    await merge;
+    await harness.transport.waitForManagementCalls(({ action }) => action === "thread-archive");
     await waitForStatus(harness.service, writer, status => status.state === "completed");
     expect(sequence).toEqual(["writer", "merge"]);
     expect(harness.worktrees!.merges).toHaveLength(1);

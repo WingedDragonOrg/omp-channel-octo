@@ -6,8 +6,11 @@ import {
   createCoreHarness,
   inbound,
   readText,
+  waitForIngressJob,
   waitForStatus,
 } from "./fixtures/core-fakes";
+import type { InboundMessage } from "../src/contracts";
+import type { CoreHarness } from "./fixtures/core-fakes";
 
 function sentToChat(
   messages: readonly { target: { channelId: string; channelType: number }; text: string }[],
@@ -16,6 +19,19 @@ function sentToChat(
   return messages.filter(({ target: sentTarget }) =>
     sentTarget.channelId === target.channelId && sentTarget.channelType === target.channelType,
   );
+}
+
+async function submitAndWaitForEnrollmentReply(
+  harness: CoreHarness,
+  message: InboundMessage,
+  senderId: string,
+) {
+  const reply = harness.transport.waitForRemoteText(sent =>
+    sent.target.channelId === message.channelId
+    && sent.target.channelType === message.channelType
+    && sent.text.includes(senderId));
+  await harness.service.submitInbound(message);
+  return await reply;
 }
 
 
@@ -37,8 +53,8 @@ test("only the owner and an explicitly mentioned bot can execute", async () => {
       mentionedUserIds: [harness.bot.uid],
     });
 
-    await harness.service.handleInbound(ownerDm);
-    await harness.service.handleInbound(allowedGroup);
+    await harness.service.submitInbound(ownerDm);
+    await harness.service.submitInbound(allowedGroup);
 
     await waitForStatus(
       harness.service,
@@ -73,7 +89,7 @@ test("an enabled group lets a mentioned member run a task like the owner", async
       text: "member group work",
     });
 
-    await harness.service.handleInbound(member);
+    await harness.service.submitInbound(member);
     await waitForStatus(harness.service, member, (status) => status.state === "completed");
 
     const effects = (await readText(join(harness.root, "tmp", "effects.log"))).trim().split("\n").filter(Boolean);
@@ -131,7 +147,7 @@ test("rejects unmentioned members, unallowed chats, foreign DMs, bots, and unsup
     ];
 
     for (const message of rejected) {
-      await harness.service.handleInbound(message);
+      await harness.service.submitInbound(message);
     }
 
     expect(harness.workers.prompts).toHaveLength(0);
@@ -153,7 +169,7 @@ test("a bare mention runs a normal turn instead of being refused as unsupported"
       mentionedUserIds: [harness.bot.uid],
     });
 
-    await harness.service.handleInbound(bare);
+    await harness.service.submitInbound(bare);
     await waitForStatus(harness.service, bare, (status) => status.state === "completed");
 
     expect(harness.workers.prompts).toHaveLength(1);
@@ -175,7 +191,7 @@ test("an unconfigured bot enrolls on the first supported non-empty DM without ru
     text: "first enrollment",
   });
   try {
-    await harness.service.handleInbound(first);
+    await submitAndWaitForEnrollmentReply(harness, first, "alice");
 
     expect(harness.workers.prompts).toHaveLength(0);
     expect(await readText(join(harness.root, "tmp", "effects.log"))).toBe("");
@@ -199,12 +215,12 @@ test("the enrollment message is durably deduplicated across repost and restart",
     text: "durable enrollment",
   });
   try {
-    await first.service.handleInbound(message);
+    await submitAndWaitForEnrollmentReply(first, message, "alice");
     const confirmations = sentToChat(first.transport.sent, message);
     expect(confirmations).toHaveLength(1);
     expect(confirmations[0]!.text).toContain("alice");
     const firstReplyCount = confirmations.length;
-    await first.service.handleInbound(message);
+    await first.service.submitInbound(message);
 
     expect(first.workers.prompts).toHaveLength(0);
     expect(sentToChat(first.transport.sent, message)).toHaveLength(firstReplyCount);
@@ -219,7 +235,7 @@ test("the enrollment message is durably deduplicated across repost and restart",
     ownerId: null,
   });
   try {
-    await restarted.service.handleInbound(message);
+    await restarted.service.submitInbound(message);
 
     expect(restarted.workers.prompts).toHaveLength(0);
     expect(sentToChat(restarted.transport.sent, message)).toHaveLength(0);
@@ -242,7 +258,7 @@ test("owner enrollment is isolated by bot UID in the durable store", async () =>
     text: "bot A enrollment",
   });
   try {
-    await first.service.handleInbound(firstMessage);
+    await submitAndWaitForEnrollmentReply(first, firstMessage, "alice");
     const firstConfirmations = sentToChat(first.transport.sent, firstMessage);
     expect(firstConfirmations).toHaveLength(1);
     expect(firstConfirmations[0]!.text).toContain("alice");
@@ -264,7 +280,7 @@ test("owner enrollment is isolated by bot UID in the durable store", async () =>
     text: "bot B enrollment",
   });
   try {
-    await second.service.handleInbound(secondMessage);
+    await submitAndWaitForEnrollmentReply(second, secondMessage, "bob");
     const secondConfirmations = sentToChat(second.transport.sent, secondMessage);
     expect(secondConfirmations).toHaveLength(1);
     expect(secondConfirmations[0]!.text).toContain("bob");
@@ -277,7 +293,7 @@ test("owner enrollment is isolated by bot UID in the durable store", async () =>
       senderId: "bob",
       text: "bot B task",
     });
-    await second.service.handleInbound(task);
+    await second.service.submitInbound(task);
     await waitForStatus(second.service, task, (status) => status.state === "completed");
     expect(second.workers.prompts.map(({ text }) => text)).toEqual(["bot B task"]);
   } finally {
@@ -289,24 +305,23 @@ test("the enrolled owner can run later tasks while another DM sender is rejected
   const harness = await createCoreHarness({ ownerId: null });
   const target = { channelId: "dm-enrolled-owner", channelType: 1 as const };
   try {
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "enrollment-owner",
-        ...target,
-        senderId: "alice",
-        text: "enroll me",
-      }),
-    );
+    const enrollment = inbound({
+      messageId: "enrollment-owner",
+      ...target,
+      senderId: "alice",
+      text: "enroll me",
+    });
+    await submitAndWaitForEnrollmentReply(harness, enrollment, "alice");
     const ownerTask = inbound({
       messageId: "enrollment-owner-task",
       ...target,
       senderId: "alice",
       text: "alice task",
     });
-    await harness.service.handleInbound(ownerTask);
+    await harness.service.submitInbound(ownerTask);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "enrollment-other-task",
         ...target,
@@ -382,30 +397,29 @@ test("group, bot, blank, and unsupported messages cannot claim an unconfigured o
       }),
     ];
     for (const message of invalid) {
-      await harness.service.handleInbound(message);
+      await harness.service.submitInbound(message);
     }
 
     expect(harness.workers.prompts).toHaveLength(0);
     expect(await readText(join(harness.root, "tmp", "effects.log"))).toBe("");
 
-    await harness.service.handleInbound(
-      inbound({
-        messageId: "valid-enrollment-after-invalid",
-        ...target,
-        senderId: "alice",
-        text: "valid enrollment",
-      }),
-    );
+    const validEnrollment = inbound({
+      messageId: "valid-enrollment-after-invalid",
+      ...target,
+      senderId: "alice",
+      text: "valid enrollment",
+    });
+    await submitAndWaitForEnrollmentReply(harness, validEnrollment, "alice");
     const ownerTask = inbound({
       messageId: "valid-owner-task-after-invalid",
       ...target,
       senderId: "alice",
       text: "valid owner task",
     });
-    await harness.service.handleInbound(ownerTask);
+    await harness.service.submitInbound(ownerTask);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "invalid-other-after-bind",
         ...target,
@@ -424,24 +438,28 @@ test("two concurrent first DMs produce exactly one durable owner", async () => {
   const aliceTarget = { channelId: "dm-race-alice", channelType: 1 as const };
   const bobTarget = { channelId: "dm-race-bob", channelType: 1 as const };
   try {
+    const aliceEnrollment = inbound({
+      messageId: "race-alice-enrollment",
+      ...aliceTarget,
+      senderId: "alice",
+      text: "alice first",
+    });
+    const bobEnrollment = inbound({
+      messageId: "race-bob-enrollment",
+      ...bobTarget,
+      senderId: "bob",
+      text: "bob first",
+    });
+    const enrollmentReply = harness.transport.waitForRemoteText(({ target, text }) =>
+      (target.channelId === aliceTarget.channelId && target.channelType === aliceTarget.channelType
+        && text.includes("alice"))
+      || (target.channelId === bobTarget.channelId && target.channelType === bobTarget.channelType
+        && text.includes("bob")));
     await Promise.all([
-      harness.service.handleInbound(
-        inbound({
-          messageId: "race-alice-enrollment",
-          ...aliceTarget,
-          senderId: "alice",
-          text: "alice first",
-        }),
-      ),
-      harness.service.handleInbound(
-        inbound({
-          messageId: "race-bob-enrollment",
-          ...bobTarget,
-          senderId: "bob",
-          text: "bob first",
-        }),
-      ),
+      harness.service.submitInbound(aliceEnrollment),
+      harness.service.submitInbound(bobEnrollment),
     ]);
+    await enrollmentReply;
 
     const confirmations = harness.transport.sent.filter(({ target }) =>
       (target.channelId === aliceTarget.channelId && target.channelType === aliceTarget.channelType)
@@ -453,7 +471,7 @@ test("two concurrent first DMs produce exactly one durable owner", async () => {
     expect(confirmations[0]!.text).toContain(winner);
 
     await Promise.all([
-      harness.service.handleInbound(
+      harness.service.submitInbound(
         inbound({
           messageId: "race-alice-followup",
           ...aliceTarget,
@@ -461,7 +479,7 @@ test("two concurrent first DMs produce exactly one durable owner", async () => {
           text: "alice followup",
         }),
       ),
-      harness.service.handleInbound(
+      harness.service.submitInbound(
         inbound({
           messageId: "race-bob-followup",
           ...bobTarget,
@@ -483,7 +501,7 @@ test("an explicit owner takes priority over first-message enrollment", async () 
   const harness = await createCoreHarness({ ownerId: "configured-owner" });
   const target = { channelId: "dm-explicit-owner", channelType: 1 as const };
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "explicit-attacker-first",
         ...target,
@@ -499,20 +517,29 @@ test("an explicit owner takes priority over first-message enrollment", async () 
       senderId: "configured-owner",
       text: "configured owner task",
     });
-    await harness.service.handleInbound(ownerTask);
+    await harness.service.submitInbound(ownerTask);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["configured owner task"]);
   } finally {
     await closeCoreHarness(harness, { remove: false });
   }
 
+  const promptStarted = Promise.withResolvers<void>();
+  const releasePrompt = Promise.withResolvers<void>();
+  const promptFinished = Promise.withResolvers<void>();
   const restarted = await createCoreHarness({
     root: harness.root,
     bot: harness.bot,
     ownerId: null,
+    prompt: async ({ text }) => {
+      if (text !== "configured owner after restart") return;
+      promptStarted.resolve();
+      await releasePrompt.promise;
+      promptFinished.resolve();
+    },
   });
   try {
-    await restarted.service.handleInbound(
+    await restarted.service.submitInbound(
       inbound({
         messageId: "explicit-attacker-after-config-removal",
         ...target,
@@ -528,12 +555,18 @@ test("an explicit owner takes priority over first-message enrollment", async () 
       senderId: "configured-owner",
       text: "configured owner after restart",
     });
-    await restarted.service.handleInbound(ownerTask);
+    await restarted.service.submitInbound(ownerTask);
+    await waitForIngressJob(restarted, ownerTask);
+    await promptStarted.promise;
+    await waitForStatus(restarted.service, target, (status) => status.state === "running");
+    releasePrompt.resolve();
+    await promptFinished.promise;
     await waitForStatus(restarted.service, target, (status) => status.state === "completed");
     expect(restarted.workers.prompts.map(({ text }) => text)).toEqual([
       "configured owner after restart",
     ]);
   } finally {
+    releasePrompt.resolve();
     await closeCoreHarness(restarted);
   }
 });
@@ -557,7 +590,7 @@ test("a failed enrollment confirmation write fails closed and does not consume t
     END;
   `);
   try {
-    await harness.service.handleInbound(message).catch(() => {});
+    await harness.service.submitInbound(message).catch(() => {});
 
     expect(harness.workers.prompts).toHaveLength(0);
     expect(
@@ -569,7 +602,7 @@ test("a failed enrollment confirmation write fails closed and does not consume t
     database.close();
   }
 
-  await harness.service.handleInbound(message);
+  await submitAndWaitForEnrollmentReply(harness, message, "alice");
   const confirmations = sentToChat(harness.transport.sent, message);
   expect(confirmations).toHaveLength(1);
   expect(confirmations[0]!.text).toContain("alice");

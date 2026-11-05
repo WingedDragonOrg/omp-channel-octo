@@ -32,7 +32,7 @@ const textsFor = (harness: CoreHarness, target: ChatTarget): string[] =>
     .map(({ text }) => text);
 
 async function seedSourceTurn(harness: CoreHarness, messageId: string): Promise<string> {
-  await harness.service.handleInbound(ownerMessage(harness, FORK_GROUP, messageId, "seed exact source session"));
+  await harness.service.submitInbound(ownerMessage(harness, FORK_GROUP, messageId, "seed exact source session"));
   await waitForStatus(harness.service, FORK_GROUP, (status) => status.state === "completed");
   const status = await harness.service.status(FORK_GROUP);
   if (!status.sessionId) throw new Error("source session was not persisted");
@@ -69,14 +69,14 @@ test("/tan snapshots a held source and runs the materialized request only in the
   );
   let tanRequest: Promise<void> | undefined;
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       ownerMessage(harness, FORK_GROUP, "tan-held-source-turn", "hold source while tan runs"),
     );
     await waitForForkBoundary(sourceStarted.promise, "held source start");
     const sourceWorker = workers.workers[0]!;
     const sourceBefore = await harness.service.status(FORK_GROUP);
 
-    tanRequest = harness.service.handleInbound(command);
+    tanRequest = harness.service.submitInbound(command);
     await waitForForkBoundary(workers.forkStopStarted.promise, "tan fork preparation stop");
     expect(sourceWorker.stopped).toBe(false);
     expect((await harness.service.status(FORK_GROUP)).sessionId).toBe(sourceBefore.sessionId);
@@ -104,7 +104,7 @@ test("/tan snapshots a held source and runs the materialized request only in the
     expect(textsFor(harness, target)).toContain("target-only result");
     expect(textsFor(harness, FORK_GROUP).join("\n")).toContain("thread-1");
 
-    await harness.service.handleInbound(command);
+    await harness.service.submitInbound(command);
     expect(transport.createAttempts).toBe(1);
     expect(workers.forkAttempts).toHaveLength(1);
     expect(workers.prompts).toHaveLength(2);
@@ -130,17 +130,21 @@ test("/tan is owner-only group/thread control and an empty request only returns 
     await seedBinding(harness, FORK_DM, harness.root, "tan-private-source");
     await seedBinding(harness, unlisted, harness.root, "tan-unlisted-source");
 
-    await harness.service.handleInbound({
+    await harness.service.submitInbound({
       ...ownerMessage(harness, FORK_GROUP, "tan-member", "/tan forbidden member request"),
       senderId: "member-2",
     });
-    await harness.service.handleInbound({
+    await harness.service.submitInbound({
       ...ownerMessage(harness, FORK_GROUP, "tan-no-mention", "/tan missing mention"),
       mentionedUserIds: [],
     });
-    await harness.service.handleInbound(ownerMessage(harness, unlisted, "tan-unlisted", "/tan unlisted"));
-    await harness.service.handleInbound(ownerMessage(harness, FORK_DM, "tan-private", "/tan private"));
-    await harness.service.handleInbound(ownerMessage(harness, FORK_GROUP, "tan-empty", "/tan   "));
+    await harness.service.submitInbound(ownerMessage(harness, unlisted, "tan-unlisted", "/tan unlisted"));
+    await harness.service.submitInbound(ownerMessage(harness, FORK_DM, "tan-private", "/tan private"));
+    await harness.service.submitInbound(ownerMessage(harness, FORK_GROUP, "tan-empty", "/tan   "));
+    await transport.waitForRemoteText((message) =>
+      message.target.channelType === FORK_GROUP.channelType
+      && message.target.channelId === FORK_GROUP.channelId
+      && message.text.includes("/tan <"));
     await waitForStatus(harness.service, FORK_GROUP, (status) => status.outbox === 0);
 
     expect(transport.createAttempts).toBe(0);
@@ -177,14 +181,14 @@ test("/tan does not answer a source pending ask and dispatches a fresh target ta
     allowedGroupIds: [FORK_GROUP.channelId],
   });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       ownerMessage(harness, FORK_GROUP, "tan-pending-ask-source", "open source question"),
     );
     await waitForForkBoundary(sourceAskStarted.promise, "source pending ask");
     const sourceQuestionIds = (await harness.service.status(FORK_GROUP)).pendingQuestionIds;
     expect(sourceQuestionIds).toHaveLength(1);
 
-    await harness.service.handleInbound(ownerMessage(
+    await harness.service.submitInbound(ownerMessage(
       harness,
       FORK_GROUP,
       "tan-while-source-asks",
@@ -239,7 +243,7 @@ test("/tan materializes its argument, quote, and attachment once into the target
   });
   try {
     await seedSourceTurn(harness, "tan-materialized-source");
-    await harness.service.handleInbound(message);
+    await harness.service.submitInbound(message);
     await workers.waitForPromptCount(2);
     const target = targetForFirstThread();
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
@@ -254,7 +258,7 @@ test("/tan materializes its argument, quote, and attachment once into the target
     if (!savedPath) throw new Error("materialized attachment path was absent from target prompt");
     expect(Buffer.from(await readFile(savedPath)).equals(Buffer.from(bytes))).toBe(true);
 
-    await harness.service.handleInbound(message);
+    await harness.service.submitInbound(message);
     expect(transport.downloadRequests).toHaveLength(1);
     expect(transport.createAttempts).toBe(1);
     expect(workers.forkAttempts).toHaveLength(1);
@@ -277,14 +281,14 @@ test("/tan preparation failure is terminal for the duplicate input and leaves th
     const sourceSessionId = await seedSourceTurn(harness, "tan-failure-source");
     workers.failCreateWith(new Error("fixture native fork preparation failed"));
 
-    await harness.service.handleInbound(command);
+    await harness.service.submitInbound(command);
     await transport.waitForRemoteText((message) =>
       message.target.channelType === FORK_GROUP.channelType
       && message.target.channelId === FORK_GROUP.channelId
       && message.text.includes("失败"));
     const creationCountAfterFailure = workers.creations.length;
 
-    await harness.service.handleInbound(command);
+    await harness.service.submitInbound(command);
     await waitForStatus(harness.service, FORK_GROUP, (status) => status.outbox === 0);
 
     expect(workers.creations).toHaveLength(creationCountAfterFailure);
@@ -315,14 +319,14 @@ test("source /cancel aborts in-flight /tan preparation and does not dispatch the
   });
   let tanRequest: Promise<void> | undefined;
   try {
-    await harness.service.handleInbound(ownerMessage(
+    await harness.service.submitInbound(ownerMessage(
       harness,
       FORK_GROUP,
       "tan-cancel-source",
       "hold source for tan cancellation",
     ));
     await waitForForkBoundary(sourceStarted.promise, "tan cancellation source start");
-    tanRequest = harness.service.handleInbound(ownerMessage(
+    tanRequest = harness.service.submitInbound(ownerMessage(
       harness,
       FORK_GROUP,
       "tan-cancel-operation",
@@ -330,7 +334,7 @@ test("source /cancel aborts in-flight /tan preparation and does not dispatch the
     )).catch(() => {});
     await waitForForkBoundary(transport.createThreadStarted.promise, "tan remote create boundary");
 
-    await harness.service.handleInbound(ownerMessage(harness, FORK_GROUP, "tan-cancel-command", "/cancel"));
+    await harness.service.submitInbound(ownerMessage(harness, FORK_GROUP, "tan-cancel-command", "/cancel"));
     transport.releaseCreateThread.resolve();
     await tanRequest;
 
@@ -338,6 +342,10 @@ test("source /cancel aborts in-flight /tan preparation and does not dispatch the
     expect(workers.forkAttempts).toHaveLength(1);
     expect(workers.prompts.map(({ text }) => text)).toEqual(["hold source for tan cancellation"]);
     await waitForStatus(harness.service, FORK_GROUP, (status) => status.state === "cancelled");
+    await transport.waitForRemoteText((message) =>
+      message.target.channelType === FORK_GROUP.channelType
+      && message.target.channelId === FORK_GROUP.channelId
+      && message.text.includes("TAN 已取消"));
   } finally {
     releaseSource.resolve();
     transport.releaseCreateThread.resolve();

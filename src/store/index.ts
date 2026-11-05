@@ -9,16 +9,22 @@ import { dirname } from "node:path";
 import type { ChatAppendMode, ChatTarget, HostMergeProgressPhase, ThreadListenLevel, WorkerGoal, WorktreeMergeOutcome } from "../contracts.ts";
 import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadForkInput, ThreadForkRecord, ThreadListenRecord, ThreadMergeEventRecord, HostMergeLeaseRecord, HostMergeLeaseInput, HostMergeProgressCardInput, HostMergeProgressCardRecord, HostRemovalLeaseInput, HostRemovalLeaseRecord, HostThreadRemovalOutcome, ReviewJobRecord } from "./store-records.ts";
 import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopThreadCreation, LoopWorkspace } from "../loop/types.ts";
-import type { SessionContextSnapshotRecord } from "./store-records.ts";
-import type { TanOperation } from "./store-records.ts";
+import type { SessionContextSnapshotRecord, TanOperation } from "./store-records.ts";
 export type { OutboxInsert, TanOperation } from "./store-records.ts";
 import {
   getSessionContextSnapshot as readSessionContextSnapshot,
   saveSessionContextSnapshot as writeSessionContextSnapshot,
 } from "./store-session-context.ts";
-import { applySchema } from "./store-schema.ts";
-import { claimOwnerEnrollment, clearChatModel, clearThreadModel, ensureBinding, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, getThreadModel, grantAllowedChat, hasOwnerEnrollment, listAllowedChats, resolveChatModel, setBotUid, setChatMode, setChatModel, setOwnerId, setThreadModel, updateBindingSession } from "./store-chats.ts";
-import { acceptCommitTask, acceptTask, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, getTaskByMessageId, isCommitTask, isTaskResuming, listQueuedTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim, suppressTaskRelay } from "./store-tasks.ts";
+import type {
+  IngressConsumer,
+  IngressJobInput,
+  IngressJobRecord,
+  IngressOperationCheckpoint,
+  IngressSourceKey,
+} from "../inbound/ingress-types.ts";
+import { allocateScheduleOrder, applySchema } from "./store-schema.ts";
+import { claimOwnerEnrollment, clearChatModel, clearThreadModel, ensureBinding, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, getThreadModel, grantAllowedChat, hasOwnerEnrollment, initializeBindingSessionFromTask, listAllowedChats, resolveChatModel, setBotUid, setChatMode, setChatModel, setOwnerId, setThreadModel, updateBindingSession } from "./store-chats.ts";
+import { acceptCommitTask, acceptTask, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, getTaskByMessageId, getTaskScheduleOrder, isCommitTask, isTaskResuming, listQueuedTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim, suppressTaskRelay } from "./store-tasks.ts";
 import { bindGoalTaskSession, clearGoalSession, finishGoalTaskProgress, getGoalSession, getGoalTask, isGoalTaskResuming, markGoalTaskAccepted, markGoalTaskAgentAccepted, markGoalTaskDispatched, saveGoalSessionProgress, stopGoalContinuation, updateGoalTaskProgress } from "./store-goals.ts";
 import { clearProgressCard, listProgressCards, recordProgressCardAttempt, saveProgressCard } from "./store-cards.ts";
 import { getWorkerLedger, listWorkerLedger, markWorkerStopped, recordWorker } from "./store-workers.ts";
@@ -37,6 +43,28 @@ import type { ThreadReference, ThreadReferences } from "../references/types.ts";
 import { bindLoopTask, bindLoopWorkspace, claimLoopInputIntent, commitLoopScan, completeLoopThreadCreation, getLoopBinding, getLoopInput, getLoopTaskRoute, getLoopThreadCreation, isLoopInputObserved, listLoopBindings, listLoopInputs, listLoopThreadCreations, listLoopThreadTasks, markLoopInputDelivered, markLoopInputFault, markLoopInputPending, markLoopInputUnknown, markLoopThreadCreationUnknown, prepareLoopInput, recordLoopThreadAllocated, reserveLoopThreadCreation } from "./store-loop.ts";
 import { acceptTanOperation, acceptTanTask, cancelTanOperation, finishTanOperation, finishTanOperationWithOutbox, getTanOperation, listCancelledTanOperations, listPendingTanOperations, reclaimTanCommand } from "./store-tan.ts";
 import { acceptReviewJob, bindReviewSession, getActiveReviewJob, getReviewJob, listRecoverableReviewJobs, listTerminalReviewJobs, markReviewCompleted, markReviewDispatchStarted, markReviewFailed, markReviewPromptAccepted, markReviewStarted, markReviewStopped, persistReviewRecoveryNotices, prepareReviewJobsForRestart, releaseOrphanedReviewClaims, requestReviewStop, requestReviewStopForClaim } from "./store-reviews.ts";
+import {
+  acceptIngressJob,
+  acceptAndHandoffIngressJob,
+  cancelIngressJob,
+  cancelIngressJobAfterCancellationRequest,
+  cancelIngressJobBySource,
+  countPendingIngressJobs,
+  getIngressJob,
+  getIngressJobBySource,
+  handoffIngressJob,
+  isIngressCancellationRequested,
+  listRecoverableIngressJobs,
+  listUnknownIngressJobs,
+  markIngressCommandDispatchIntent,
+  markIngressDispatchIntent,
+  markIngressConfigActionApplied,
+  markIngressConfigActionDispatchIntent,
+  markIngressPrepared,
+  markIngressUnknown,
+  recordIngressWorker,
+  saveIngressCheckpoint,
+} from "./store-ingress.ts";
 
 export class ChannelStore {
   private readonly db: Database;
@@ -134,8 +162,11 @@ export class ChannelStore {
     return nextChatGrantCardEditSeq(this.db, botUid, actionId);
   }
 
-  ensureBinding(binding: BindingRecord): void {
-    ensureBinding(this.db, binding);
+  ensureBinding(
+    binding: BindingRecord,
+    options?: { clearSessionInitialization?: boolean },
+  ): void {
+    ensureBinding(this.db, binding, options);
   }
 
   getBinding(botUid: string, target: ChatTarget): BindingRecord | null {
@@ -289,8 +320,8 @@ export class ChannelStore {
     markThreadMergeEventDelivered(this.db, eventId);
   }
 
-  acceptTask(claim: InboundClaim, task: TaskRecord, goalRequest?: GoalTaskRequest): boolean {
-    return acceptTask(this.db, claim, task, goalRequest);
+  acceptTask(claim: InboundClaim, task: TaskRecord, goalRequest?: GoalTaskRequest, ingressJobId?: number): boolean {
+    return acceptTask(this.db, claim, task, goalRequest, ingressJobId);
   }
 
   reclaimTanCommand(claim: InboundClaim): boolean {
@@ -390,8 +421,8 @@ export class ChannelStore {
     return stopGoalContinuation(this.db, botUid, target, sessionId, intent);
   }
 
-  acceptCommitTask(claim: InboundClaim, task: TaskRecord): boolean {
-    return acceptCommitTask(this.db, claim, task);
+  acceptCommitTask(claim: InboundClaim, task: TaskRecord, ingressJobId?: number): boolean {
+    return acceptCommitTask(this.db, claim, task, ingressJobId);
   }
 
   isCommitTask(taskId: string): boolean {
@@ -411,6 +442,104 @@ export class ChannelStore {
 
   failCommand(claim: InboundClaim): void {
     failCommand(this.db, claim);
+  }
+
+  acceptIngressJob(input: IngressJobInput): { job: IngressJobRecord; created: boolean } {
+    return acceptIngressJob(this.db, input);
+  }
+
+  acceptAndHandoffIngressJob(
+    input: IngressJobInput,
+    consumer: IngressConsumer,
+    persistConsumer: () => boolean,
+  ): boolean {
+    return acceptAndHandoffIngressJob(this.db, input, consumer, persistConsumer);
+  }
+
+  getIngressJob(id: number): IngressJobRecord | null {
+    return getIngressJob(this.db, id);
+  }
+
+  getTaskScheduleOrder(taskId: string): number | null {
+    return getTaskScheduleOrder(this.db, taskId);
+  }
+
+  allocateScheduleOrder(): number {
+    return allocateScheduleOrder(this.db);
+  }
+
+  getIngressJobBySource(key: IngressSourceKey): IngressJobRecord | null {
+    return getIngressJobBySource(this.db, key);
+  }
+
+  listRecoverableIngressJobs(botUid: string): IngressJobRecord[] {
+    return listRecoverableIngressJobs(this.db, botUid);
+  }
+
+  listUnknownIngressJobs(botUid: string): IngressJobRecord[] {
+    return listUnknownIngressJobs(this.db, botUid);
+  }
+
+  countPendingIngressJobs(botUid: string): number {
+    return countPendingIngressJobs(this.db, botUid);
+  }
+
+  markIngressPrepared(id: number, preparedText: string, spoolPaths: readonly string[]): boolean {
+    return markIngressPrepared(this.db, id, preparedText, spoolPaths);
+  }
+
+  saveIngressCheckpoint(id: number, checkpoint: IngressOperationCheckpoint): boolean {
+    return saveIngressCheckpoint(this.db, id, checkpoint);
+  }
+
+  markIngressDispatchIntent(id: number): boolean {
+    return markIngressDispatchIntent(this.db, id);
+  }
+
+  markIngressCommandDispatchIntent(
+    id: number,
+    checkpoint: IngressOperationCheckpoint,
+  ): boolean {
+    return markIngressCommandDispatchIntent(this.db, id, checkpoint);
+  }
+
+  markIngressConfigActionDispatchIntent(id: number): boolean {
+    return markIngressConfigActionDispatchIntent(this.db, id);
+  }
+
+  markIngressConfigActionApplied(id: number, appliedResult: string): boolean {
+    return markIngressConfigActionApplied(this.db, id, appliedResult);
+  }
+
+  markIngressUnknown(id: number, persistUnknownOutcome?: () => boolean): boolean {
+    return markIngressUnknown(this.db, id, persistUnknownOutcome);
+  }
+  isIngressCancellationRequested(id: number): boolean {
+    return isIngressCancellationRequested(this.db, id);
+  }
+
+  cancelIngressJobAfterCancellationRequest(id: number): boolean {
+    return cancelIngressJobAfterCancellationRequest(this.db, id);
+  }
+
+  cancelIngressJob(id: number): boolean {
+    return cancelIngressJob(this.db, id);
+  }
+
+  cancelIngressJobBySource(
+    key: IngressSourceKey,
+    attribution: ChatTarget & { messageId: string },
+    cancellationJobId?: number,
+  ): boolean {
+    return cancelIngressJobBySource(this.db, key, attribution, cancellationJobId);
+  }
+
+  handoffIngressJob(
+    id: number,
+    consumer: IngressConsumer,
+    persistConsumer: () => boolean,
+  ): boolean {
+    return handoffIngressJob(this.db, id, consumer, persistConsumer);
   }
 
   /**
@@ -672,6 +801,11 @@ export class ChannelStore {
     recordWorker(this.db, worker);
   }
 
+  /** Records a spawned session worker only while its exact ingress dispatch-intent still owns it. */
+  recordIngressWorker(jobId: number, worker: WorkerLedgerRecord): boolean {
+    return recordIngressWorker(this.db, jobId, worker);
+  }
+
   listWorkerLedger(botUid: string): WorkerLedgerRecord[] {
     return listWorkerLedger(this.db, botUid);
   }
@@ -811,6 +945,25 @@ export class ChannelStore {
 
   listHostRemovalLeases(botUid: string): HostRemovalLeaseRecord[] {
     return listHostRemovalLeases(this.db, botUid);
+  }
+
+  initializeBindingSessionFromTask(
+    botUid: string,
+    target: ChatTarget,
+    taskId: string,
+    previous: BindingRecord,
+    sessionId: string,
+    sessionFile: string,
+  ): boolean {
+    return initializeBindingSessionFromTask(
+      this.db,
+      botUid,
+      target,
+      taskId,
+      previous,
+      sessionId,
+      sessionFile,
+    );
   }
 
   updateBindingSession(botUid: string, target: ChatTarget, sessionId: string, sessionFile: string | null): void {

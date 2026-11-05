@@ -13,8 +13,12 @@ import {
   closeCoreHarness,
   createCoreHarness,
   inbound,
+  readIngressJob,
+  submitAndWaitForIngressHandoff,
+  waitForIngressJob,
   waitForStatus,
   type FakePrompt,
+  type CoreHarness,
 } from "./fixtures/core-fakes.ts";
 
 /**
@@ -98,6 +102,21 @@ async function waitForEvent(events: string[], name: string): Promise<void> {
   throw new Error(`event ${name} not observed`);
 }
 
+async function submitAndWaitForHandoff(
+  harness: CoreHarness,
+  message: InboundMessage,
+): Promise<void> {
+  await submitAndWaitForIngressHandoff(harness, message);
+}
+
+async function waitForTypingCount(harness: CoreHarness, count: number): Promise<void> {
+  for (let attempt = 0; attempt < 10_000; attempt += 1) {
+    if (harness.transport.typingCalls.length >= count) return;
+    await Promise.resolve();
+  }
+  throw new Error(`transport recorded ${harness.transport.typingCalls.length} of ${count} typing calls`);
+}
+
 test("typing fires at task acceptance, before worker creation", async () => {
   const events: string[] = [];
   const gated = makeGatedPrompt();
@@ -107,7 +126,7 @@ test("typing fires at task acceptance, before worker creation", async () => {
   });
   const chat = inbound({ channelId: "dm-typing-order", text: "do some work" });
   try {
-    await harness.service.handleInbound(chat);
+    await submitAndWaitForHandoff(harness, chat);
     await harness.workers.waitForPromptCount(1);
     const typingIndex = events.indexOf("typing");
     const workerIndex = events.indexOf("worker");
@@ -140,8 +159,10 @@ test("typing renews while an attachment download is still in flight", async () =
     attachments: [imageAttachment(url)],
   });
   try {
-    const handled = harness.service.handleInbound(chat);
+    const handled = harness.service.submitInbound(chat);
     await waitForEvent(events, "download");
+    await waitForTypingCount(harness, 1);
+    expect(await readIngressJob(harness, chat)).toMatchObject({ state: "preparing", ackReady: false });
     expect(events.indexOf("typing")).toBeGreaterThan(0 - 1);
     expect(events.indexOf("typing")).toBeLessThan(events.indexOf("download"));
     expect(transport.typingCalls.length).toBeGreaterThanOrEqual(1);
@@ -152,6 +173,7 @@ test("typing renews while an attachment download is still in flight", async () =
     transport.downloadGate = undefined;
     gate.resolve();
     await handled;
+    await waitForIngressJob(harness, chat);
     await waitForStatus(harness.service, chat, (status) => status.state === "completed");
   } finally {
     gate.resolve();
@@ -174,7 +196,8 @@ test("refused attachments release the message lease with no renewal leak", async
     attachments: Array.from({ length: 9 }, (_, index) => imageAttachment(`https://files.example/${index}.png`)),
   });
   try {
-    await harness.service.handleInbound(chat);
+    await submitAndWaitForHandoff(harness, chat);
+    await waitForTypingCount(harness, 1);
     expect(harness.transport.typingCalls.length).toBeGreaterThanOrEqual(1);
     expect(harness.workers.creations).toHaveLength(0);
     const count = harness.transport.typingCalls.length;
@@ -193,18 +216,22 @@ test("commands, unsupported payloads, and member command notices never type", as
     transport: new OrderTransport(events, { bot: { uid: "bot-quiet", name: "Fixture Bot" } }),
   });
   try {
-    await harness.service.handleInbound(inbound({ channelId: "dm-quiet-a", text: "/status" }));
-    await harness.service.handleInbound({ ...inbound({ channelId: "dm-quiet-b" }), supported: false });
-    await harness.service.handleInbound(
-      inbound({
-        channelType: 2,
-        channelId: "group-allowed",
-        senderId: "member-1",
-        text: "/status",
-        mentionedUserIds: [harness.bot.uid],
-      }),
-    );
-    await harness.service.handleInbound(inbound({ channelId: "dm-quiet-c", text: "/queue" }));
+    const statusCommand = inbound({ channelId: "dm-quiet-a", text: "/status" });
+    await submitAndWaitForHandoff(harness, statusCommand);
+    const unsupported = { ...inbound({ channelId: "dm-quiet-b" }), supported: false };
+    await harness.service.submitInbound(unsupported);
+    expect(await readIngressJob(harness, unsupported)).toBeNull();
+    const memberCommand = inbound({
+      channelType: 2,
+      channelId: "group-allowed",
+      senderId: "member-1",
+      text: "/status",
+      mentionedUserIds: [harness.bot.uid],
+    });
+    await harness.service.submitInbound(memberCommand);
+    expect(await readIngressJob(harness, memberCommand)).toBeNull();
+    await harness.transport.waitForRemoteText(({ text }) => text.includes("仅 owner 可用"));
+    await submitAndWaitForHandoff(harness, inbound({ channelId: "dm-quiet-c", text: "/queue" }));
     expect(harness.transport.typingCalls).toHaveLength(0);
     expect(harness.workers.creations).toHaveLength(0);
   } finally {
@@ -222,16 +249,17 @@ test("a steered message keeps one renewal loop running and it stops at completio
   });
   const chat = inbound({ channelId: "dm-typing-steer", text: "first message" });
   try {
-    await harness.service.handleInbound(chat);
+    await submitAndWaitForHandoff(harness, chat);
     await harness.workers.waitForPromptCount(1);
+    await waitForTypingCount(harness, 1);
     const beforeSteer = harness.transport.typingCalls.length;
     vi.advanceTimersByTime(3_000);
     await Promise.resolve();
     expect(harness.transport.typingCalls).toHaveLength(beforeSteer + 1);
     vi.advanceTimersByTime(1_000);
-    await harness.service.handleInbound({ ...chat, messageId: "steer-2", text: "second message" });
+    await submitAndWaitForHandoff(harness, { ...chat, messageId: "steer-2", text: "second message" });
     // 新消息会清除客户端 typing；已有任务的续期环也必须立即补发，不能等下一 tick。
-    expect(harness.transport.typingCalls).toHaveLength(beforeSteer + 2);
+    await waitForTypingCount(harness, beforeSteer + 2);
     const afterSteer = harness.transport.typingCalls.length;
     vi.advanceTimersByTime(2_000);
     await Promise.resolve();
@@ -263,11 +291,12 @@ test("a queued task stays typed through the wait on exactly one loop until its t
   });
   const chat = inbound({ channelId: "dm-typing-queue", text: "/mode queue" });
   try {
-    await harness.service.handleInbound(chat);
-    await harness.service.handleInbound({ ...chat, messageId: "queue-1", text: "first task" });
+    await submitAndWaitForHandoff(harness, chat);
+    await submitAndWaitForHandoff(harness, { ...chat, messageId: "queue-1", text: "first task" });
     await harness.workers.waitForPromptCount(1);
-    await harness.service.handleInbound({ ...chat, messageId: "queue-2", text: "second task" });
-    expect(harness.transport.typingCalls).toHaveLength(2);
+    await waitForTypingCount(harness, 1);
+    await submitAndWaitForHandoff(harness, { ...chat, messageId: "queue-2", text: "second task" });
+    await waitForTypingCount(harness, 2);
     const waiting = harness.transport.typingCalls.length;
     vi.advanceTimersByTime(3_000);
     await Promise.resolve();
@@ -299,13 +328,15 @@ test("cancelling a queued task releases its lease through the task-state guard",
   });
   const chat = inbound({ channelId: "dm-typing-cancel", text: "/mode queue" });
   try {
-    await harness.service.handleInbound(chat);
-    await harness.service.handleInbound({ ...chat, messageId: "cancel-1", text: "first task" });
+    await submitAndWaitForHandoff(harness, chat);
+    await submitAndWaitForHandoff(harness, { ...chat, messageId: "cancel-1", text: "first task" });
     await harness.workers.waitForPromptCount(1);
-    await harness.service.handleInbound({ ...chat, messageId: "cancel-2", text: "second task" });
+    await waitForTypingCount(harness, 1);
+    await submitAndWaitForHandoff(harness, { ...chat, messageId: "cancel-2", text: "second task" });
+    await waitForTypingCount(harness, 2);
     vi.advanceTimersByTime(3_000);
     await Promise.resolve();
-    await harness.service.handleInbound({ ...chat, messageId: "cancel-3", text: "/cancel" });
+    await submitAndWaitForHandoff(harness, { ...chat, messageId: "cancel-3", text: "/cancel" });
     await waitForStatus(harness.service, chat, (status) => status.state === "cancelled" && status.queued === 0);
     const settled = harness.transport.typingCalls.length;
     // 运行任务的租约在 finally 释放；被取消的排队任务由 tick 兜底回收——不超两个间隔。
@@ -329,8 +360,9 @@ test("a duplicate intercepting command delivery leaves no lease behind", async (
   });
   const chat = inbound({ channelId: "dm-typing-intercept", text: "/probe run" });
   try {
-    await harness.service.handleInbound(chat);
-    await harness.service.handleInbound(chat);
+    await submitAndWaitForHandoff(harness, chat);
+    await submitAndWaitForHandoff(harness, chat);
+    await waitForTypingCount(harness, 1);
     expect(harness.transport.typingCalls.length).toBeGreaterThanOrEqual(1);
     expect(harness.workers.creations).toHaveLength(0);
     const count = harness.transport.typingCalls.length;

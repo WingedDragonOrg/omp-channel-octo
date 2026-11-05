@@ -13,6 +13,9 @@ import {
   FakeTransport,
   FakeWorkerFactory,
   inbound,
+  readIngressJob,
+  submitAndWaitForIngressHandoff,
+  waitForIngressJob,
   waitForStatus,
 } from "./fixtures/core-fakes";
 
@@ -64,6 +67,29 @@ async function closeRoutingHarness(harness: RoutingHarness): Promise<void> {
   await rm(harness.root, { recursive: true, force: true });
 }
 
+function ingressObserver(harness: RoutingHarness) {
+  return {
+    service: harness.service,
+    stateDir: harness.config.stateDir,
+    bot: harness.transport.bot,
+  };
+}
+
+async function submitAndWaitForHandoff(
+  harness: RoutingHarness,
+  message: ReturnType<typeof inbound>,
+): Promise<void> {
+  await submitAndWaitForIngressHandoff(ingressObserver(harness), message);
+}
+
+async function submitWithoutIngress(
+  harness: RoutingHarness,
+  message: ReturnType<typeof inbound>,
+): Promise<void> {
+  await harness.service.submitInbound(message);
+  expect(await readIngressJob(ingressObserver(harness), message)).toBeNull();
+}
+
 test("forwards an unknown slash command to the worker without rewriting its text", async () => {
   const harness = await openRoutingHarness();
   try {
@@ -72,7 +98,7 @@ test("forwards an unknown slash command to the worker without rewriting its text
       text: "  /compact   --from-user  ",
     });
 
-    await harness.service.handleInbound(message);
+    await submitAndWaitForHandoff(harness, message);
     await harness.workers.waitForPromptCount(1);
 
     expect(harness.workers.prompts).toHaveLength(1);
@@ -98,7 +124,7 @@ test("an intercepting handler consumes the command without starting an OMP promp
       text: "/COMPACT --dry-run",
     });
 
-    await harness.service.handleInbound(message);
+    await submitAndWaitForHandoff(harness, message);
 
     expect(contexts).toHaveLength(1);
     expect(contexts[0]).toMatchObject({
@@ -128,7 +154,7 @@ test("a non-intercepting handler observes the command while the worker receives 
       text: "\t/CoMpAcT   --scope local  ",
     });
 
-    await harness.service.handleInbound(message);
+    await submitAndWaitForHandoff(harness, message);
     await harness.workers.waitForPromptCount(1);
 
     expect(contexts).toHaveLength(1);
@@ -160,7 +186,7 @@ test("a failing non-intercepting handler does not block the original prompt", as
       text: " /compact   --keep-spaces ",
     });
 
-    await harness.service.handleInbound(message);
+    await submitAndWaitForHandoff(harness, message);
     await harness.workers.waitForPromptCount(1);
 
     expect(calls).toBe(1);
@@ -186,8 +212,10 @@ test("duplicate delivery invokes a non-intercepting handler and task only once",
       text: "/compact --once",
     });
 
-    await harness.service.handleInbound(message);
-    await harness.service.handleInbound({ ...message });
+    await Promise.all([
+      submitAndWaitForHandoff(harness, message),
+      submitAndWaitForHandoff(harness, { ...message }),
+    ]);
     await harness.workers.waitForPromptCount(1);
 
     expect(contexts).toHaveLength(1);
@@ -198,7 +226,7 @@ test("duplicate delivery invokes a non-intercepting handler and task only once",
   }
 });
 
-test("an intercepting handler failure stays retryable without starting OMP", async () => {
+test("an intercepting handler failure remains unknown and cannot replay an uncertain side effect", async () => {
   let calls = 0;
   const handler: ChannelCommandHandler = {
     name: "compact",
@@ -215,12 +243,18 @@ test("an intercepting handler failure stays retryable without starting OMP", asy
       text: "/compact --retry",
     });
 
-    await harness.service.handleInbound(message).catch(() => undefined);
+    await harness.service.submitInbound(message).catch(() => undefined);
+    await waitForIngressJob(ingressObserver(harness), message, {
+      predicate: job => job.state === "unknown",
+      rejectStates: [],
+      description: "uncertain intercepting-command dispatch",
+    });
     expect(harness.workers.prompts).toHaveLength(0);
 
-    await harness.service.handleInbound({ ...message });
+    await harness.service.submitInbound({ ...message }).catch(() => undefined);
 
-    expect(calls).toBe(2);
+    expect(await readIngressJob(ingressObserver(harness), message)).toMatchObject({ state: "unknown" });
+    expect(calls).toBe(1);
     expect(harness.workers.prompts).toHaveLength(0);
   } finally {
     await closeRoutingHarness(harness);
@@ -230,7 +264,8 @@ test("an intercepting handler failure stays retryable without starting OMP", asy
 test("built-in commands remain hard-intercepted and never reach the worker", async () => {
   const harness = await openRoutingHarness();
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(
+      harness,
       inbound({ messageId: "routing-built-in-status", text: "/STATUS" }),
     );
 
@@ -248,9 +283,9 @@ test("built-in commands remain hard-intercepted and never reach the worker", asy
 test("watch control is a built-in owner command, not an OMP slash task", async () => {
   const harness = await openRoutingHarness();
   try {
-    await harness.service.handleInbound(
-      inbound({ messageId: "routing-watch-list", text: "/watch list" }),
-    );
+    const message = inbound({ messageId: "routing-watch-list", text: "/watch list" });
+    await submitAndWaitForHandoff(harness, message);
+    await harness.transport.waitForRemoteText(({ text }) => /watch|监控|观察/iu.test(text));
 
     expect(harness.workers.prompts).toHaveLength(0);
     expect(harness.transport.sent.some(({ text }) => /watch|监控|观察/iu.test(text))).toBe(true);
@@ -303,7 +338,7 @@ test("custom handlers cannot bypass owner, group, mention, or message-id validat
       }),
     ];
     for (const message of rejected) {
-      await harness.service.handleInbound(message);
+      await submitWithoutIngress(harness, message);
     }
 
     expect(contexts).toHaveLength(0);
@@ -332,12 +367,12 @@ test("a member's command earns one throttled notice and never reaches a handler,
       mentionedUserIds: [harness.transport.bot.uid],
       text: "/compact denied",
     });
-    await harness.service.handleInbound(first);
+    await submitWithoutIngress(harness, first);
     const notice = await harness.transport.waitForRemoteText(({ text }) => text.includes("命令仅 owner 可用"));
     expect(notice.target).toMatchObject({ channelId: "group-allowed", channelType: 2 });
 
     // The window is open for this chat: a second command and a replay of the first stay silent.
-    await harness.service.handleInbound(inbound({
+    await submitWithoutIngress(harness, inbound({
       messageId: "routing-member-command-2",
       channelId: "group-allowed",
       channelType: 2,
@@ -345,7 +380,7 @@ test("a member's command earns one throttled notice and never reaches a handler,
       mentionedUserIds: [harness.transport.bot.uid],
       text: "/status",
     }));
-    await harness.service.handleInbound({ ...first });
+    await submitWithoutIngress(harness, { ...first });
 
     expect(contexts).toHaveLength(0);
     expect(harness.workers.prompts).toHaveLength(0);

@@ -55,8 +55,17 @@ export type DestructiveResourceLease = {
 /** A destructive FIFO intent that blocks later writes while earlier work drains. */
 export interface DestructiveCommandReservation {
   readonly order: number;
-  /** Add exact resource paths to this FIFO intent before its first acquisition attempt. */
+  /** Add exact protected paths and, separately, the subset that can be probed as Git repositories. */
+  extend(cwds: readonly string[], repositoryCwds?: readonly string[]): void;
+  tryAcquire(): Promise<SessionLease | undefined>;
+  release(): void;
+}
+/** Session-only FIFO intent with shared path-use registration for destructive operations. */
+export interface SessionCommandReservation {
+  readonly order: number;
   extend(cwds: readonly string[]): void;
+  /** Wait for earlier known work; uncertain-outcome holds still block acquisition. */
+  waitForPrior(signal: AbortSignal): Promise<void>;
   tryAcquire(): Promise<SessionLease | undefined>;
   release(): void;
 }
@@ -71,6 +80,8 @@ interface CommandReservationRecord {
   readonly order: number;
   readonly target: ChatTarget;
   readonly sessionKeys: readonly string[];
+  /** An uncertain operation must remain a blocker, but a later safety probe must not await it. */
+  readonly uncertainOutcomeHold: boolean;
   resourcePaths: readonly string[];
   repositoryCwds: readonly string[];
   readonly ownerTaskId?: string;
@@ -104,11 +115,13 @@ export interface TaskSchedulerDeps {
   readonly store: Pick<
     ChannelStore,
     | "getTask"
+    | "getTaskScheduleOrder"
+    | "allocateScheduleOrder"
     | "listQueuedTasks"
     | "getBinding"
     | "markFailed"
     | "isCommitTask"
-  >;
+  >
   /** 绑定行与任务行按键的 bot 身份。 */
   readonly botUid: () => string | undefined;
   /** channel 是否正在停止：停止后不再启动排定任务。 */
@@ -166,7 +179,6 @@ export class TaskScheduler {
   /** Scheduling order lets command barriers distinguish earlier work from later task tails. */
   private readonly scheduledOrder = new Map<string, number>();
   private readonly commandReservations = new Set<CommandReservationRecord>();
-  private nextOrder = 0;
   /** Ordinary workers and session-control workers are shared resource users. */
   private readonly activeResourceUsers = new Map<string, ActiveResourceUse>();
   private readonly exclusiveRepositoryRoots = new Map<string, { owner: string; done: Promise<void> }>();
@@ -200,11 +212,12 @@ export class TaskScheduler {
 
   constructor(private readonly deps: TaskSchedulerDeps) {}
 
-  /** 排定一个任务：接在该聊天的任务链之后执行，并进入关停要等的在途集合。 */
+  /** Schedule a task using its durable acceptance-order token. */
   scheduleTask(taskId: string): void {
+    if (this.scheduledTasks.has(taskId)) return;
     const task = this.deps.store.getTask(taskId);
     if (!task) return;
-    const order = ++this.nextOrder;
+    const order = this.taskOrder(taskId);
     this.scheduledOrder.set(taskId, order);
     const target = taskTarget(task);
     const chatKey = targetKey(target);
@@ -220,6 +233,11 @@ export class TaskScheduler {
       this.taskOperations.delete(next);
     };
     void next.then(cleanup, cleanup);
+  }
+  private taskOrder(taskId: string): number {
+    const order = this.scheduledOrder.get(taskId) ?? this.deps.store.getTaskScheduleOrder(taskId);
+    if (order === null) throw new Error(`queued task ${taskId} has no durable schedule order`);
+    return order;
   }
 
   /** 记下「这条任务在忙聊天、忙 session 或排他资源后面等过」：启动时取回，据此补一条启动回执。 */
@@ -457,18 +475,73 @@ export class TaskScheduler {
    * Session controls share actual path/root usage with ordinary workers so destructive operations
    * can drain them. They do not block independent ordinary tasks using the same repository.
    */
-  async tryAcquireCommandSession(
+  tryAcquireCommandSession(
     target: ChatTarget,
     cwds: readonly string[],
   ): Promise<SessionLease | undefined> {
+    return this.reserveSessionCommand(target, cwds).tryAcquire();
+  }
+
+  /**
+   * Reserve a session command across asynchronous ingress preparation without turning its cwd
+   * snapshots into exclusive locks. Once acquired, its paths are registered as shared use so later
+   * destructive operations still wait for or refuse the candidate worker.
+   * An uncertain-outcome hold remains a conflicting reservation but does not delay a later safety
+   * probe that can only be refused.
+   */
+  reserveSessionCommand(
+    target: ChatTarget,
+    cwds: readonly string[],
+    orderHint?: number,
+    uncertainOutcomeHold = false,
+  ): SessionCommandReservation {
     const binding = this.bindingFor(target);
     const sessionKey = this.sessionKey(target, binding);
-    const reservation = this.createCommandReservationRecord(target, cwds);
+    const reservation = this.createCommandReservationRecord(
+      target,
+      [],
+      false,
+      orderHint,
+      undefined,
+      undefined,
+      uncertainOutcomeHold,
+    );
+    let resourceCwds = [...new Set(cwds)];
+    let acquisitionStarted = false;
+    return {
+      order: reservation.order,
+      extend: (additionalCwds) => {
+        if (acquisitionStarted || !this.commandReservations.has(reservation)) {
+          throw new Error("session reservation resources must be extended before acquisition");
+        }
+        resourceCwds = [...new Set([...resourceCwds, ...additionalCwds])];
+      },
+      waitForPrior: signal => {
+        acquisitionStarted = true;
+        return this.waitForPriorSessionWork(reservation, sessionKey, signal, true);
+      },
+      tryAcquire: () => {
+        acquisitionStarted = true;
+        return this.tryAcquireReservedSessionCommand(reservation, sessionKey, resourceCwds);
+      },
+      release: () => reservation.release(),
+    };
+  }
+
+  private async tryAcquireReservedSessionCommand(
+    reservation: CommandReservationRecord,
+    sessionKey: string,
+    cwds: readonly string[],
+  ): Promise<SessionLease | undefined> {
+    if (!this.commandReservations.has(reservation)) return undefined;
+    const target = reservation.target;
     const paths = this.resourcePaths(cwds);
     let sessionLease: SessionLease | undefined;
     let transferred = false;
     const unavailable = (roots: ReadonlySet<string>): boolean =>
       this.deps.stopping()
+      || !this.commandReservations.has(reservation)
+      || this.sessionKey(target, this.bindingFor(target)) !== sessionKey
       || this.hasConflictingReservation(target, sessionKey, reservation.order, reservation)
       || this.hasSessionLeaseFor(target, sessionKey)
       || this.hasQueuedWork(target, sessionKey, reservation.order)
@@ -476,37 +549,36 @@ export class TaskScheduler {
       || this.hasExclusiveResourceConflict(paths, roots);
     try {
       const noRoots = new Set<string>();
-      if (unavailable(noRoots)) return undefined;
-      if (await this.hasConflictingResourceReservation(paths, noRoots, reservation.order, reservation)) {
+      if (
+        unavailable(noRoots)
+        || await this.hasConflictingResourceReservation(paths, noRoots, reservation.order, reservation)
+        || unavailable(noRoots)
+      ) {
         return undefined;
       }
-      if (unavailable(noRoots)) return undefined;
       const roots = await this.repositoryRoots(cwds);
       if (
-        await this.hasConflictingResourceReservation(paths, roots, reservation.order, reservation)
-        || unavailable(roots)
-        || this.sessionKey(target, this.bindingFor(target)) !== sessionKey
+        unavailable(roots)
+        || await this.hasConflictingResourceReservation(paths, roots, reservation.order, reservation)
       ) {
         return undefined;
       }
       for (const root of roots) {
         if (await this.repositoryIsBlocked(root)) return undefined;
       }
-      if (
-        await this.hasConflictingResourceReservation(paths, roots, reservation.order, reservation)
-        || unavailable(roots)
-      ) {
-        return undefined;
-      }
+      if (unavailable(roots)) return undefined;
 
       sessionLease = this.createSessionLease(target, sessionKey);
       const owner = `session-command:${targetKey(target)}:${reservation.order}`;
       const usage: ActiveResourceUse = { paths, roots };
       this.activeResourceUsers.set(owner, usage);
       transferred = true;
+      let completed = false;
       return {
         ready: sessionLease.ready,
         complete: () => {
+          if (completed) return;
+          completed = true;
           if (this.activeResourceUsers.get(owner) === usage) this.activeResourceUsers.delete(owner);
           sessionLease!.complete();
           reservation.release();
@@ -642,17 +714,26 @@ export class TaskScheduler {
   reserveDestructiveCommandSession(
     target: ChatTarget,
     cwds: readonly string[],
+    repositoryCwds: readonly string[] = cwds,
+    orderHint?: number,
   ): DestructiveCommandReservation {
-    const reservation = this.createCommandReservationRecord(target, cwds, true);
+    const reservation = this.createCommandReservationRecord(
+      target,
+      cwds,
+      true,
+      orderHint,
+      undefined,
+      repositoryCwds,
+    );
     let acquisitionStarted = false;
     return {
       order: reservation.order,
-      extend: additionalCwds => {
+      extend: (additionalCwds, additionalRepositoryCwds = additionalCwds) => {
         if (acquisitionStarted || !this.commandReservations.has(reservation)) {
           throw new Error("destructive reservation resources must be extended before acquisition");
         }
         reservation.resourcePaths = [...new Set([...reservation.resourcePaths, ...additionalCwds])];
-        reservation.repositoryCwds = [...new Set([...reservation.repositoryCwds, ...additionalCwds])];
+        reservation.repositoryCwds = [...new Set([...reservation.repositoryCwds, ...additionalRepositoryCwds])];
       },
       tryAcquire: () => {
         acquisitionStarted = true;
@@ -669,18 +750,21 @@ export class TaskScheduler {
     order?: number,
     ownerTaskId?: string,
     repositoryCwds?: readonly string[],
+    uncertainOutcomeHold = false,
   ): CommandReservationRecord {
     const binding = this.bindingFor(target);
     const sessionKey = this.sessionKey(target, binding);
     const completion = Promise.withResolvers<void>();
+    const resolvedOrder = order ?? this.deps.store.allocateScheduleOrder();
     let reservation!: CommandReservationRecord;
     reservation = {
-      order: order ?? ++this.nextOrder,
+      order: resolvedOrder,
       target: { ...target },
       sessionKeys: this.leaseKeys(target, sessionKey),
       resourcePaths: destructive ? [...new Set(cwds)] : [],
       repositoryCwds: destructive ? [...new Set(repositoryCwds ?? cwds)] : [],
       ...(ownerTaskId === undefined ? {} : { ownerTaskId }),
+      uncertainOutcomeHold,
       ready: completion.promise,
       release: () => {
         if (!this.commandReservations.delete(reservation)) return;
@@ -1030,7 +1114,7 @@ export class TaskScheduler {
   ): Promise<boolean> {
     for (const task of this.deps.store.listQueuedTasks()) {
       if (task.id === excludedTaskId) continue;
-      const order = this.scheduledOrder.get(task.id) ?? -1;
+      const order = this.taskOrder(task.id);
       if (order >= beforeOrder) continue;
       try {
         const target = taskTarget(task);
@@ -1234,7 +1318,7 @@ export class TaskScheduler {
     const chatKey = targetKey(target);
     return this.deps.store.listQueuedTasks().some((task) => {
       if (task.id === excludedTaskId) return false;
-      const order = this.scheduledOrder.get(task.id) ?? -1;
+      const order = this.taskOrder(task.id);
       if (beforeOrder !== undefined && order >= beforeOrder) return false;
       const queuedTarget = taskTarget(task);
       return targetKey(queuedTarget) === chatKey
@@ -1246,23 +1330,28 @@ export class TaskScheduler {
     reservation: CommandReservationRecord,
     sessionKey: string,
     signal: AbortSignal,
+    refuseOnUncertainHold = false,
   ): Promise<void> {
     while (this.commandReservations.has(reservation)) {
       if (this.deps.stopping()) throw new Error("channel stopping");
       if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("operation aborted");
-      const earlierReservations = [...this.commandReservations]
-        .filter(candidate =>
-          candidate !== reservation
-          && candidate.order < reservation.order
-          && this.reservationConflicts(candidate, reservation.target, sessionKey),
-        )
-        .map(candidate => candidate.ready);
+      const priorReservations = [...this.commandReservations].filter(candidate =>
+        candidate !== reservation
+        && candidate.order < reservation.order
+        && this.reservationConflicts(candidate, reservation.target, sessionKey),
+      );
+      if (refuseOnUncertainHold && priorReservations.some(candidate => candidate.uncertainOutcomeHold)) return;
+      const earlierReservations = (
+        refuseOnUncertainHold
+          ? priorReservations.filter(candidate => !candidate.uncertainOutcomeHold)
+          : priorReservations
+      ).map(candidate => candidate.ready);
       if (earlierReservations.length > 0) {
         await waitForAbort(Promise.all(earlierReservations).then(() => {}), signal);
         continue;
       }
       const earlier = [...this.scheduledTasks.entries()]
-        .filter(([taskId]) => (this.scheduledOrder.get(taskId) ?? Number.POSITIVE_INFINITY) < reservation.order)
+        .filter(([taskId]) => this.taskOrder(taskId) < reservation.order)
         .filter(([taskId]) => {
           const task = this.deps.store.getTask(taskId);
           if (!task) return false;
@@ -1330,10 +1419,16 @@ export class TaskScheduler {
   ): Promise<Promise<void>[]> {
     const queued = this.deps.store.listQueuedTasks();
     if (!queued.some((candidate) => candidate.id === task.id)) return [];
-    const taskOrder = this.scheduledOrder.get(task.id) ?? Number.POSITIVE_INFINITY;
-    const earlierTasks = queued.filter((candidate) =>
+    const orderByTaskId = new Map<string, number>();
+    for (const candidate of queued) {
+      const order = this.taskOrder(candidate.id);
+      orderByTaskId.set(candidate.id, order);
+    }
+    const taskOrder = orderByTaskId.get(task.id);
+    if (taskOrder === undefined) throw new Error(`queued task ${task.id} has no durable schedule order`);
+    const earlierTasks = queued.filter(candidate =>
       candidate.id !== task.id
-      && (this.scheduledOrder.get(candidate.id) ?? -1) < taskOrder
+      && orderByTaskId.get(candidate.id)! < taskOrder,
     );
     const currentIsCommit = !skipRepositoryOrdering && this.isCommitTask(task);
     const commitOrderingRequired = currentIsCommit || (
@@ -1400,7 +1495,7 @@ export class TaskScheduler {
         const commitTask = this.isCommitTask(reconciledCurrent);
         if (!commitTask && this.deps.isDirectoryBlocked(cwd)) return;
         const sessionKey = this.sessionKey(target, binding);
-        const taskOrder = this.scheduledOrder.get(taskId) ?? Number.POSITIVE_INFINITY;
+        const taskOrder = this.taskOrder(taskId);
         let skipRepositoryOrdering = false;
         try {
           if (!commitTask) {

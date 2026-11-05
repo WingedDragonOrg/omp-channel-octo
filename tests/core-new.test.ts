@@ -7,6 +7,7 @@ import {
   closeCoreHarness,
   createCoreHarness,
   inbound,
+  submitAndWaitForIngressHandoff,
   waitForStatus,
 } from "./fixtures/core-fakes";
 
@@ -14,20 +15,30 @@ test("/new without a path initially uses ~/tmp, then reuses that cwd with a fres
   const harness = await createCoreHarness();
   try {
     const target = { channelId: "dm-owner", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "new-default", ...target, text: "/new" }),
     );
+    const status = await waitForStatus(
+      harness.service,
+      target,
+      (next) => next.cwd === join(harness.root, "tmp") && next.sessionId !== null,
+    );
 
-    const status = await harness.service.status(target);
     expect(status.cwd).toBe(join(harness.root, "tmp"));
     expect(status.sessionId).toEqual(expect.any(String));
     expect(status.state).toBe("idle");
     expect((await stat(join(harness.root, "tmp"))).isDirectory()).toBe(true);
 
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "new-default-refresh", ...target, text: "/new" }),
     );
-    const refreshedStatus = await harness.service.status(target);
+    const refreshedStatus = await waitForStatus(
+      harness.service,
+      target,
+      (next) => next.sessionId !== status.sessionId,
+    );
     expect(refreshedStatus.sessionId).not.toBe(status.sessionId);
     expect(refreshedStatus.cwd).toBe(status.cwd);
   } finally {
@@ -39,7 +50,8 @@ test("/new records the session switch on the binding, and later session writes k
   const harness = await createCoreHarness();
   try {
     const target = { channelId: "dm-owner", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "switch-before-new", ...target, text: "hello" }),
     );
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
@@ -47,16 +59,28 @@ test("/new records the session switch on the binding, and later session writes k
     try {
       // 首次绑定没有这段历史：问题不属于任何一次主动换会话。
       expect(store.getBinding(harness.bot.uid, target)?.sessionSwitchedAt ?? null).toBeNull();
+      const previousSessionId = (await harness.service.status(target)).sessionId;
       const before = Date.now();
-      await harness.service.handleInbound(inbound({ messageId: "switch-new", ...target, text: "/new" }));
+      await submitAndWaitForIngressHandoff(
+        harness,
+        inbound({ messageId: "switch-new", ...target, text: "/new" }),
+      );
+      const switchedStatus = await waitForStatus(
+        harness.service,
+        target,
+        (status) => status.sessionId !== previousSessionId,
+      );
       const switched = store.getBinding(harness.bot.uid, target)?.sessionSwitchedAt ?? null;
+      expect(switchedStatus.sessionId).not.toBe(previousSessionId);
       expect(switched).not.toBeNull();
       expect(switched!).toBeGreaterThanOrEqual(before);
 
       // 之后普通任务重写绑定（同一会话）不得抹掉它。
-      await harness.service.handleInbound(
+      await submitAndWaitForIngressHandoff(
+        harness,
         inbound({ messageId: "switch-after-new", ...target, text: "run this" }),
       );
+      await harness.workers.waitForPromptCount(2);
       await waitForStatus(harness.service, target, (status) => status.state === "completed");
       expect(store.getBinding(harness.bot.uid, target)?.sessionSwitchedAt).toBe(switched);
     } finally {
@@ -73,24 +97,37 @@ test("/new accepts a real quoted directory; invalid paths preserve the prior bin
     const target = { channelId: "dm-owner", channelType: 1 as const };
     const explicitPath = join(harness.root, "work with spaces");
     await mkdir(explicitPath, { recursive: true });
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "new-explicit",
         ...target,
         text: `/new "${explicitPath}"`,
       }),
     );
-    const explicitStatus = await harness.service.status(target);
+    const explicitStatus = await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.cwd === explicitPath && status.sessionId !== null,
+    );
     expect(explicitStatus.cwd).toBe(explicitPath);
 
     const missingPath = join(harness.root, "does-not-exist");
-    await harness.service.handleInbound(
+    const invalidPathReply = harness.transport.waitForRemoteText(
+      ({ target: sentTarget, text }) =>
+        sentTarget.channelId === target.channelId &&
+        sentTarget.channelType === target.channelType &&
+        /目录|路径|不存在|失败|无效/.test(text),
+    );
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "new-missing",
         ...target,
         text: `/new ${missingPath}`,
       }),
     );
+    await invalidPathReply;
     const afterInvalid = await harness.service.status(target);
     expect(afterInvalid.cwd).toBe(explicitPath);
     expect(afterInvalid.sessionId).toBe(explicitStatus.sessionId);
@@ -102,10 +139,15 @@ test("/new accepts a real quoted directory; invalid paths preserve the prior bin
       ),
     ).toBe(true);
 
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "new-reuse-explicit-cwd", ...target, text: "/new" }),
     );
-    const reusedStatus = await harness.service.status(target);
+    const reusedStatus = await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.sessionId !== explicitStatus.sessionId,
+    );
     expect(reusedStatus.cwd).toBe(explicitPath);
     expect(reusedStatus.sessionId).not.toBe(explicitStatus.sessionId);
   } finally {
@@ -125,20 +167,30 @@ test("/new is rejected while the current chat has a running task", async () => {
   });
   try {
     const target = { channelId: "dm-owner", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "new-bind-before-run", ...target, text: "/new" }),
     );
-    const firstTask = harness.service.handleInbound(
+    await waitForStatus(harness.service, target, (status) => status.sessionId !== null);
+    const firstTask = harness.service.submitInbound(
       inbound({ messageId: "new-running-task", ...target, text: "long work" }),
     );
+    await firstTask;
     await harness.workers.waitForPromptCount(1);
-    await harness.service.handleInbound(
+    const busyReply = harness.transport.waitForRemoteText(
+      ({ target: sentTarget, text }) =>
+        sentTarget.channelId === target.channelId &&
+        sentTarget.channelType === target.channelType &&
+        /cancel|取消|忙|运行/.test(text),
+    );
+    await harness.service.submitInbound(
       inbound({
         messageId: "new-while-running",
         ...target,
         text: `/new ${join(harness.root, "another")}`,
       }),
     );
+    await busyReply;
     const status = await harness.service.status(target);
     expect(status.state).toBe("running");
     expect(status.cwd).toBe(join(harness.root, "tmp"));
@@ -161,10 +213,15 @@ test("/new reports the fresh session's actual model next to the session id and c
   const harness = await createCoreHarness();
   try {
     const target = { channelId: "dm-owner", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "new-model-default", ...target, text: "/new" }),
     );
-    const status = await harness.service.status(target);
+    const status = await waitForStatus(harness.service, target, (next) => next.sessionId !== null);
+    await harness.transport.waitForRemoteText(
+      ({ target: sentTarget, text }) =>
+        sentTarget.channelId === target.channelId && text.includes(status.sessionId!),
+    );
     // No chat override: the worker starts without `--model`, so the receipt carries OMP's default.
     expect(harness.transport.sent.at(-1)?.text).toBe(
       `已创建会话 ${status.sessionId}，cwd=${status.cwd}，模型=fixture/default`,
@@ -178,13 +235,23 @@ test("/new after /switch reports the chat model with its thinking level, matchin
   const harness = await createCoreHarness();
   try {
     const target = { channelId: "dm-owner", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "new-switch-first", ...target, text: "/switch fixture/fast:high" }),
     );
-    await harness.service.handleInbound(
+    await harness.transport.waitForRemoteText(
+      ({ target: sentTarget, text }) =>
+        sentTarget.channelId === target.channelId && text.includes("fixture/fast:high"),
+    );
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "new-model-switched", ...target, text: "/new" }),
     );
-    const status = await harness.service.status(target);
+    const status = await waitForStatus(harness.service, target, (next) => next.sessionId !== null);
+    await harness.transport.waitForRemoteText(
+      ({ target: sentTarget, text }) =>
+        sentTarget.channelId === target.channelId && text.includes(status.sessionId!),
+    );
     expect(harness.transport.sent.at(-1)?.text).toBe(
       `已创建会话 ${status.sessionId}，cwd=${status.cwd}，模型=fixture/fast:high`,
     );
@@ -199,10 +266,15 @@ test("/reset shares the creation receipt and reports the model too", async () =>
   const harness = await createCoreHarness();
   try {
     const target = { channelId: "dm-owner", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "reset-model", ...target, text: "/reset" }),
     );
-    const status = await harness.service.status(target);
+    const status = await waitForStatus(harness.service, target, (next) => next.sessionId !== null);
+    await harness.transport.waitForRemoteText(
+      ({ target: sentTarget, text }) =>
+        sentTarget.channelId === target.channelId && text.includes(status.sessionId!),
+    );
     expect(harness.transport.sent.at(-1)?.text).toBe(
       `已创建会话 ${status.sessionId}，cwd=${status.cwd}，模型=fixture/default`,
     );
@@ -221,9 +293,11 @@ test("/new does not replace the binding when worker-ledger finalization fails", 
   try {
     await mkdir(source);
     await mkdir(destination);
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "new-ledger-source", ...target, text: `/new ${source}` }),
     );
+    await waitForStatus(harness.service, target, (status) => status.cwd === source && status.sessionId !== null);
     store = await openChannelStore(harness.stateDir);
     const before = store.getBinding(harness.bot.uid, target);
     expect(before).not.toBeNull();
@@ -237,9 +311,16 @@ test("/new does not replace the binding when worker-ledger finalization fails", 
         SELECT RAISE(FAIL, 'fixture worker-ledger finalization failed');
       END
     `).run();
-    await harness.service.handleInbound(
+    const failureReply = harness.transport.waitForRemoteText(
+      ({ target: sentTarget, text }) =>
+        sentTarget.channelId === target.channelId &&
+        /无法|未能|失败/.test(text) &&
+        !text.includes("已创建会话"),
+    );
+    await harness.service.submitInbound(
       inbound({ messageId: "new-ledger-failure", ...target, text: `/new ${destination}` }),
     );
+    await failureReply;
 
     expect(store.getBinding(harness.bot.uid, target)).toEqual(before);
     expect(harness.transport.sent.at(-1)?.text).toMatch(/无法|未能|失败/);
@@ -259,10 +340,15 @@ test("/new keeps its receipt model-free rather than inventing one when OMP canno
   try {
     const target = { channelId: "dm-owner", channelType: 1 as const };
     harness.workers.failModelsWith(new Error("rpc gone"));
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "new-model-unreachable", ...target, text: "/new" }),
     );
-    const status = await harness.service.status(target);
+    const status = await waitForStatus(harness.service, target, (next) => next.sessionId !== null);
+    await harness.transport.waitForRemoteText(
+      ({ target: sentTarget, text }) =>
+        sentTarget.channelId === target.channelId && text.includes(status.sessionId!),
+    );
     // The session was created; only the model display degrades, to the original receipt.
     expect(status.state).toBe("idle");
     expect(harness.transport.sent.at(-1)?.text).toBe(
@@ -278,10 +364,15 @@ test("/new keeps its receipt model-free when OMP reports no current model", asyn
   try {
     const target = { channelId: "dm-owner", channelType: 1 as const };
     harness.workers.catalog = { current: null, level: null, available: [] };
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "new-model-unknown", ...target, text: "/new" }),
     );
-    const status = await harness.service.status(target);
+    const status = await waitForStatus(harness.service, target, (next) => next.sessionId !== null);
+    await harness.transport.waitForRemoteText(
+      ({ target: sentTarget, text }) =>
+        sentTarget.channelId === target.channelId && text.includes(status.sessionId!),
+    );
     expect(harness.transport.sent.at(-1)?.text).toBe(
       `已创建会话 ${status.sessionId}，cwd=${status.cwd}`,
     );
@@ -312,12 +403,20 @@ test("/new in a shared workspace does not wait for a held task in another projec
       [first, api, "owned-new-api"],
       [second, web, "owned-new-web"],
     ] as const) {
-      await harness.service.handleInbound(inbound({
-        messageId,
-        ...target,
-        text: `/new ${path}`,
-        mentionedUserIds: [harness.bot.uid],
-      }));
+      await submitAndWaitForIngressHandoff(
+        harness,
+        inbound({
+          messageId,
+          ...target,
+          text: `/new ${path}`,
+          mentionedUserIds: [harness.bot.uid],
+        }),
+      );
+      await waitForStatus(
+        harness.service,
+        target,
+        (status) => status.cwd === path && status.sessionId !== null,
+      );
     }
     const store = await openChannelStore(harness.stateDir);
     try {
@@ -337,22 +436,30 @@ test("/new in a shared workspace does not wait for a held task in another projec
       store.close();
     }
 
-    const heldTask = harness.service.handleInbound(inbound({
+    const heldTask = harness.service.submitInbound(inbound({
       messageId: "owned-new-held",
       ...first,
       text: "hold owned project",
       mentionedUserIds: [harness.bot.uid],
     }));
+    await heldTask;
     await heldStarted.promise;
     const previous = await harness.service.status(second);
 
-    await harness.service.handleInbound(inbound({
-      messageId: "owned-new-independent",
-      ...second,
-      text: `/new ${web}`,
-      mentionedUserIds: [harness.bot.uid],
-    }));
-    const renewed = await harness.service.status(second);
+    await submitAndWaitForIngressHandoff(
+      harness,
+      inbound({
+        messageId: "owned-new-independent",
+        ...second,
+        text: `/new ${web}`,
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    const renewed = await waitForStatus(
+      harness.service,
+      second,
+      (status) => status.sessionId !== previous.sessionId,
+    );
     expect(renewed.sessionId).not.toBe(previous.sessionId);
     expect(renewed.cwd).toBe(web);
     expect((await harness.service.status(first)).state).toBe("running");

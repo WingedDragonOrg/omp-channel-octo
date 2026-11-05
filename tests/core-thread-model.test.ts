@@ -1,11 +1,13 @@
 import { expect, test } from "bun:test";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import type { ChatTarget, InboundAttachment } from "../src/contracts";
+import type { ChatTarget, InboundAttachment, InboundMessage } from "../src/contracts";
 import {
   closeCoreHarness,
   createCoreHarness,
   inbound,
+  readIngressJob,
+  submitAndWaitForIngressHandoff,
   waitForStatus,
 } from "./fixtures/core-fakes";
 import type { CoreHarness } from "./fixtures/core-fakes";
@@ -35,6 +37,25 @@ function ownerMessage(
     ...(options.attachments === undefined ? {} : { attachments: options.attachments }),
   });
 }
+async function submitMessage(harness: CoreHarness, message: InboundMessage): Promise<void> {
+  await submitAndWaitForIngressHandoff(harness, message);
+}
+
+async function submitRefusedMessage(harness: CoreHarness, message: InboundMessage): Promise<void> {
+  await harness.service.submitInbound(message);
+  expect(await readIngressJob(harness, message)).toBeNull();
+}
+
+async function waitForReply(
+  harness: CoreHarness,
+  target: ThreadModelTarget,
+  includes: string,
+): Promise<void> {
+  await harness.transport.waitForRemoteText(({ target: sentTarget, text }) =>
+    sentTarget.channelType === target.channelType
+    && sentTarget.channelId === target.channelId
+    && text.includes(includes));
+}
 
 async function send(
   harness: CoreHarness,
@@ -43,7 +64,7 @@ async function send(
   text: string,
   options?: { senderId?: string; attachments?: InboundAttachment[] },
 ): Promise<void> {
-  await harness.service.handleInbound(ownerMessage(harness, target, messageId, text, options));
+  await submitMessage(harness, ownerMessage(harness, target, messageId, text, options));
 }
 
 test("a group thread default is probed fresh without switching the parent session", async () => {
@@ -94,20 +115,24 @@ test("thread model query and clear expose policy without creating probe workers"
   const child = thread("query-default");
   try {
     await send(harness, GROUP, "thread-model-query-empty", "/thread model");
+    await waitForReply(harness, GROUP, "不指定（由 OMP 自行决定）");
     expect(harness.transport.sent.at(-1)?.text).toContain("不指定（由 OMP 自行决定）");
     expect(harness.workers.creations).toHaveLength(0);
 
     await send(harness, GROUP, "thread-model-query-set", "/thread model @fast");
     expect(harness.workers.creations).toHaveLength(1);
     await send(harness, GROUP, "thread-model-query-canonical", "/thread model");
+    await waitForReply(harness, GROUP, "other/fast:max");
     expect(harness.transport.sent.at(-1)?.text).toContain("other/fast:max");
     expect(harness.workers.creations).toHaveLength(1);
 
     await send(harness, child, "thread-model-query-switch", "/switch");
+    await waitForReply(harness, child, "临时探测（不代表恢复会话）");
     const switchReply = harness.transport.sent.at(-1)?.text ?? "";
     expect(switchReply).toContain("临时探测（不代表恢复会话）");
     expect(switchReply).toContain("下次启动策略：other/fast:max（主群子区默认）");
     await send(harness, child, "thread-model-query-status", "/status");
+    await waitForReply(harness, child, "model=other/fast:max");
     const statusReply = harness.transport.sent.at(-1)?.text ?? "";
     expect(statusReply).toContain("model=other/fast:max（主群子区默认）");
     expect(statusReply).toContain("liveModel=无运行中会话");
@@ -117,6 +142,7 @@ test("thread model query and clear expose policy without creating probe workers"
     expect(harness.workers.creations).toHaveLength(creationsBeforeClear);
     expect(harness.workers.workers.flatMap(worker => worker.switchDispatches)).not.toContain("clear");
     await send(harness, GROUP, "thread-model-query-cleared", "/thread model");
+    await waitForReply(harness, GROUP, "不指定（由 OMP 自行决定）");
     expect(harness.transport.sent.at(-1)?.text).toContain("不指定（由 OMP 自行决定）");
     expect(harness.workers.creations).toHaveLength(creationsBeforeClear);
   } finally {
@@ -199,6 +225,7 @@ test("a parent policy update leaves a running child on its live model and report
     expect(liveWorker.switchDispatches).toEqual([]);
     expect((await harness.service.status(child)).state).toBe("running");
     await send(harness, child, "thread-model-before-switch-status", "/status");
+    await waitForReply(harness, child, "下次");
     const beforeSwitchStatus = harness.transport.sent.at(-1)?.text ?? "";
     expect(beforeSwitchStatus).toContain("fixture/fast");
     expect(beforeSwitchStatus).toContain("other/fast");
@@ -208,9 +235,11 @@ test("a parent policy update leaves a running child on its live model and report
     expect(liveWorker.switchDispatches).toEqual(["fixture/default"]);
 
     await send(harness, child, "thread-model-live-status", "/status");
+    await waitForReply(harness, child, "fixture/default");
     const statusReply = harness.transport.sent.at(-1)?.text ?? "";
     expect(statusReply).toContain("fixture/default");
     await send(harness, child, "thread-model-live-query", "/switch");
+    await waitForReply(harness, child, "本聊天");
     const modelReport = harness.transport.sent.at(-1)?.text ?? "";
     expect(modelReport).toContain("fixture/default");
     const nextPolicy = modelReport.split("\n").find(line => /下次|下回合|下一回合|新会话/u.test(line));
@@ -242,22 +271,23 @@ test("thread model commands keep owner and target boundaries; model-fix remains 
     const beforeRejectedCommands = harness.workers.creations.length;
     await send(harness, DM, "thread-model-dm-refused", "/thread model other/fast");
     await send(harness, child, "thread-model-nested-refused", "/thread model other/fast");
-    await send(harness, { channelId: "group-denied", channelType: 2 }, "thread-model-unlisted-refused", "/thread model other/fast");
-    await harness.service.handleInbound(inbound({
+    await submitRefusedMessage(harness, ownerMessage(harness, { channelId: "group-denied", channelType: 2 }, "thread-model-unlisted-refused", "/thread model other/fast"));
+    await submitRefusedMessage(harness, inbound({
       ...GROUP,
       messageId: "thread-model-unmentioned-refused",
       text: "/thread model other/fast",
       mentionedUserIds: [],
     }));
-    await send(harness, GROUP, "thread-model-member-refused", "/thread model other/fast", {
+    await submitRefusedMessage(harness, ownerMessage(harness, GROUP, "thread-model-member-refused", "/thread model other/fast", {
       senderId: "group-member",
-    });
+    }));
     expect(harness.workers.creations).toHaveLength(beforeRejectedCommands);
 
     const promptCount = harness.workers.prompts.length;
     await send(harness, GROUP, "thread-model-empty-selector", "/thread model");
     await send(harness, GROUP, "thread-model-invalid-selector", "/thread model missing-model-selector-7");
     expect(harness.workers.prompts).toHaveLength(promptCount);
+    await waitForReply(harness, GROUP, "missing-model-selector-7");
     expect(harness.transport.sent.at(-1)?.text ?? "").toContain("missing-model-selector-7");
 
     await send(harness, GROUP, "thread-model-fix-intent", "/thread model-fix repair the model selection");
@@ -307,8 +337,8 @@ test("duplicate model setup with a pending question stays a control command and 
       }],
     });
     await Promise.all([
-      harness.service.handleInbound(command),
-      harness.service.handleInbound(command),
+      submitMessage(harness, command),
+      submitMessage(harness, command),
     ]);
 
     expect(harness.workers.creations).toHaveLength(2);

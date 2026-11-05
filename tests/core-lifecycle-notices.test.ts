@@ -10,6 +10,7 @@ import type {
   ChatTarget,
   CoreServiceConfig,
   InboundMessage,
+  InboundReceipt,
   SendReceipt,
 } from "../src/contracts";
 import { createChannelService } from "../src/service";
@@ -186,7 +187,7 @@ class GatedStartTransport extends LifecycleTransport {
   readonly startGate = Promise.withResolvers<void>();
 
   override async start(
-    onMessage: (message: InboundMessage) => Promise<void>,
+    onMessage: (message: InboundMessage) => InboundReceipt,
     onOnline: () => void,
   ): Promise<void> {
     this.startEntered.release();
@@ -500,7 +501,7 @@ test("an unclaimed channel skips the startup notice and the first claim never ba
     await fixture.service.start();
     expect(transport.sends).toHaveLength(0);
 
-    await fixture.service.handleInbound(
+    await fixture.service.submitInbound(
       inbound({
         channelId: "dm-late-owner",
         senderId: "late-owner",
@@ -664,7 +665,7 @@ test("stop notice comes once after inbound closes and before worker stop or tran
   try {
     await fixture.service.start();
     expect(startupNotices(transport)).toHaveLength(1);
-    await fixture.service.handleInbound(
+    await fixture.service.submitInbound(
       inbound({
         channelId: target.channelId,
         senderId: target.channelId,
@@ -797,7 +798,7 @@ test("a stuck outbox head does not delay the startup notice", async () => {
   try {
     await first.service.start();
     // `/status` enqueues a durable reply; staying offline leaves it as the queue head.
-    await first.service.handleInbound(
+    await first.service.submitInbound(
       inbound({
         channelId: "dm-outbox-owner",
         senderId: "owner-outbox",

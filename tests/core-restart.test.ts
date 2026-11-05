@@ -126,7 +126,7 @@ test("a restart without a detected supervisor is refused instead of guessed", as
   const harness = await createCoreHarness();
   const target: ChatTarget = { channelId: "dm-restart-unconfigured", channelType: 1 };
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "restart-unconfigured", ...target, text: "/restart" }),
     );
     await waitForStatus(harness.service, target, (status) => status.outbox === 0);
@@ -141,7 +141,7 @@ test("restart arguments other than now are rejected with usage", async () => {
   const { port, calls } = recordingPort();
   const harness = await createCoreHarness({ restart: port });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "restart-usage", ...target, text: "/restart maybe" }),
     );
     await waitForStatus(harness.service, target, (status) => status.outbox === 0);
@@ -158,9 +158,9 @@ test("a restart is accepted while work is running and never cancels it", async (
   const { port, calls } = recordingPort();
   const harness = await createCoreHarness({ restart: port, prompt: suspendedPrompt });
   try {
-    await harness.service.handleInbound(inbound({ messageId: "restart-busy-task", ...busy, text: "hold" }));
+    await harness.service.submitInbound(inbound({ messageId: "restart-busy-task", ...busy, text: "hold" }));
     await harness.workers.waitForPromptCount(1);
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "restart-while-busy", ...requester, text: "/restart" }),
     );
     await waitForStatus(harness.service, requester, (status) => status.outbox === 0);
@@ -173,7 +173,7 @@ test("a restart is accepted while work is running and never cancels it", async (
     expect(await withStore(harness.root, (store) => store.isTaskResuming(row!.id))).toBe(true);
     expect(textsFor(harness, busy).join("\n")).not.toContain("任务已取消");
     // `now` stays valid syntax and behaves identically.
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "restart-now-again", ...requester, text: "/restart now" }),
     );
     await waitForStatus(harness.service, requester, (status) => status.outbox === 0);
@@ -193,13 +193,13 @@ test("a restart resumes the interrupted turn in its own session without replayin
     },
   });
   try {
-    await first.service.handleInbound(inbound({
+    await first.service.submitInbound(inbound({
       messageId: "resume-thread-model-policy",
       ...group,
       text: "/thread model fixture/fast:high",
       mentionedUserIds: [first.bot.uid],
     }));
-    await first.service.handleInbound(inbound({
+    await first.service.submitInbound(inbound({
       messageId: "resume-running",
       ...target,
       text: "长任务第一步",
@@ -251,7 +251,7 @@ test("a resumed thread without a chat or parent model leaves selection to OMP", 
   const target: ChatTarget = { channelId: "group-b____thread-resume-omp-default", channelType: 5 };
   const first = await createCoreHarness({ prompt: suspendedPrompt });
   try {
-    await first.service.handleInbound(inbound({
+    await first.service.submitInbound(inbound({
       messageId: "resume-omp-default",
       ...target,
       text: "hold this resumable turn",
@@ -281,9 +281,9 @@ test("queued work survives a restart and runs behind the resumed turn", async ()
   const target: ChatTarget = { channelId: "dm-resume-queue", channelType: 1 };
   const first = await createCoreHarness({ prompt: suspendedPrompt });
   try {
-    await first.service.handleInbound(inbound({ messageId: "queue-running", ...target, text: "running step" }));
+    await first.service.submitInbound(inbound({ messageId: "queue-running", ...target, text: "running step" }));
     await first.workers.waitForPromptCount(1);
-    await first.service.handleInbound(
+    await first.service.submitInbound(
       inbound({ messageId: "queue-second", ...target, text: "/queue 排队步骤" }),
     );
     await waitForStatus(first.service, target, (status) => status.queued === 1);
@@ -324,9 +324,9 @@ test("an explicit cancel stays terminal across a restart and is never resumed", 
   const target: ChatTarget = { channelId: "dm-cancel-restart", channelType: 1 };
   const first = await createCoreHarness({ prompt: suspendedPrompt });
   try {
-    await first.service.handleInbound(inbound({ messageId: "cancel-running", ...target, text: "cancel me" }));
+    await first.service.submitInbound(inbound({ messageId: "cancel-running", ...target, text: "cancel me" }));
     await first.workers.waitForPromptCount(1);
-    await first.service.handleInbound(inbound({ messageId: "cancel-command", ...target, text: "/cancel" }));
+    await first.service.submitInbound(inbound({ messageId: "cancel-command", ...target, text: "/cancel" }));
     await waitForStatus(first.service, target, (status) => status.state === "cancelled" && status.outbox === 0);
     expect(textsFor(first, target).join("\n")).toContain("当前任务已取消");
   } finally {
@@ -493,9 +493,9 @@ test("an explicit interrupt stays terminal when the process stops before the tur
     },
   });
   try {
-    await first.service.handleInbound(inbound({ messageId: "interrupt-stop-task", ...target, text: "hold" }));
+    await first.service.submitInbound(inbound({ messageId: "interrupt-stop-task", ...target, text: "hold" }));
     await first.workers.waitForPromptCount(1);
-    await first.service.handleInbound(
+    await first.service.submitInbound(
       inbound({ messageId: "interrupt-stop-command", ...target, text: "/interrupt" }),
     );
     await waitForStatus(first.service, target, (status) => status.outbox === 0);
@@ -531,7 +531,7 @@ test("a resumed group turn keeps its context injection receipt and commits it", 
   let sessionId = "";
   try {
     first.transport.setGroupContext(group, context);
-    await first.service.handleInbound(
+    await first.service.submitInbound(
       inbound({
         messageId: "group-resume-task",
         ...group,
@@ -629,7 +629,7 @@ test("a recovery whose pinned workspace is gone fails closed without rebinding",
     expect(binding?.cwd).toBe(pinnedDir);
     expect(JSON.parse(await readText(sessionFile))).toMatchObject({ id: "session-pinned", cwd: pinnedDir });
 
-    await restarted.service.handleInbound(
+    await restarted.service.submitInbound(
       inbound({ messageId: "pinned-gone-fresh", ...freshTarget, text: "new work" }),
     );
     await waitForStatus(restarted.service, freshTarget, (status) => status.state === "completed" && status.outbox === 0);
@@ -668,7 +668,7 @@ test("an unconfirmed worker death keeps the task queued instead of failing it", 
   const restarted = await createCoreHarness({ root: first.root, bot: first.bot });
   try {
     // The same directory must not accept a second writer while the old group is unconfirmed.
-    await restarted.service.handleInbound(
+    await restarted.service.submitInbound(
       inbound({ messageId: "blocked-later-message", ...later, text: "later work" }),
     );
     await waitForStatus(restarted.service, later, (status) => status.queued === 1);
@@ -745,9 +745,9 @@ test("an accepted interrupt leaves the turn running instead of cancelling the ta
   const target: ChatTarget = { channelId: "dm-interrupt-durable", channelType: 1 };
   const harness = await createCoreHarness({ prompt: suspendedPrompt });
   try {
-    await harness.service.handleInbound(inbound({ messageId: "interrupt-durable-task", ...target, text: "hold" }));
+    await harness.service.submitInbound(inbound({ messageId: "interrupt-durable-task", ...target, text: "hold" }));
     await harness.workers.waitForPromptCount(1);
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "interrupt-durable-command", ...target, text: "/interrupt" }),
     );
     await waitForStatus(harness.service, target, (status) => status.outbox === 0);
@@ -845,7 +845,7 @@ test("an answer to a recovered turn's question is not replayed as new work", asy
   const restarted = await createCoreHarness({ root: first.root, bot: first.bot, prompt: recordingPrompt });
   try {
     await waitForStatus(restarted.service, target, (status) => status.queued === 1);
-    await restarted.service.handleInbound(
+    await restarted.service.submitInbound(
       inbound({ messageId: "recovery-answer-reply", ...target, text: "继续" }),
     );
     // 答复是异步唤醒的：先给这条歧路一段明确的机会去犯错，再断言它没有多出任何任务。
@@ -922,7 +922,7 @@ test("an explicit interrupt drops unclaimed recovery answers instead of waking a
   try {
     // 续跑已派发且活跃，但这一轮还没来得及重新发起那轮 ask。
     await restarted.workers.waitForPromptCount(1);
-    await restarted.service.handleInbound(
+    await restarted.service.submitInbound(
       inbound({ messageId: "interrupt-snapshot-command", ...target, text: "/interrupt" }),
     );
     await waitForStatus(restarted.service, target, (status) => status.state === "interrupted");
@@ -987,7 +987,7 @@ test("cancelling queued recovery work closes its open question card", async () =
   const restarted = await createCoreHarness({ root: first.root, bot: first.bot });
   try {
     await waitForStatus(restarted.service, target, (status) => status.queued === 1);
-    await restarted.service.handleInbound(
+    await restarted.service.submitInbound(
       inbound({ messageId: "cancel-queued-card-command", ...target, text: "/cancel" }),
     );
     // 存储域取消排队任务时已把提问行置 cancelled，聊天级清扫看不到它；卡片必须被逐任务收口，

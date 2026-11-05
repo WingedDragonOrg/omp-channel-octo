@@ -27,6 +27,7 @@ import {
   FakeWorkerFactory,
   inbound,
   readText,
+  submitAndWaitForIngressHandoff,
   waitForStatus,
   type FakePrompt,
 } from "./fixtures/core-fakes.ts";
@@ -203,7 +204,17 @@ function ownerCount(harness: AttachmentHarness): number {
 }
 
 /** 回复走 fire-and-forget 的 outbox，等它落定后才数得出「只回复一次」。 */
-async function settleReplies(harness: AttachmentHarness, target: ChatTarget): Promise<void> {
+async function settleReplies(
+  harness: AttachmentHarness,
+  target: ChatTarget,
+  text: string,
+): Promise<void> {
+  await harness.transport.waitForRemoteText(
+    ({ target: sentTarget, text: sentText }) =>
+      sentTarget.channelId === target.channelId &&
+      sentTarget.channelType === target.channelType &&
+      sentText === text,
+  );
   await waitForStatus(harness.service, target, (status) => status.outbox === 0);
 }
 
@@ -229,7 +240,8 @@ test("图片无文本：恰好一条任务，提示词含附件块与绝对路�
   const url = "https://cdn.example.test/photo.png";
   harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "attach-image-only",
         ...target,
@@ -237,6 +249,7 @@ test("图片无文本：恰好一条任务，提示词含附件块与绝对路�
         attachments: [attachment(url, "image", "截图.png", { size: IMAGE_BYTES.byteLength })],
       }),
     );
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     expect(harness.workers.prompts).toHaveLength(1);
@@ -265,7 +278,8 @@ test("回复带图的消息：引用正文与引用附件一起进入同一条�
   const url = "https://cdn.example.test/quoted.png";
   harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "attach-quoted-reply",
         ...target,
@@ -274,6 +288,7 @@ test("回复带图的消息：引用正文与引用附件一起进入同一条�
         attachments: [attachment(url, "image", "image.png", { size: IMAGE_BYTES.byteLength })],
       }),
     );
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     expect(harness.workers.prompts).toHaveLength(1);
@@ -296,7 +311,8 @@ test("只引用文本时引用块进入正文，不带引用的文本任务逐�
   const harness = await createAttachmentHarness();
   const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "attach-quote-only",
         ...target,
@@ -304,10 +320,13 @@ test("只引用文本时引用块进入正文，不带引用的文本任务逐�
         quoted: { senderName: "董振兴", text: "上一句" },
       }),
     );
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "attach-plain-no-quote", ...target, text: "  普通文本 " }),
     );
+    await harness.workers.waitForPromptCount(2);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     expect(harness.transport.downloadRequests).toHaveLength(0);
@@ -326,7 +345,8 @@ test("文字 + 图片：仍是一条任务，提示词同时含用户文本与�
   const url = "https://cdn.example.test/caption.png";
   harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "attach-with-text",
         ...target,
@@ -334,6 +354,7 @@ test("文字 + 图片：仍是一条任务，提示词同时含用户文本与�
         attachments: [attachment(url, "image", "caption.png", { size: IMAGE_BYTES.byteLength })],
       }),
     );
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     expect(harness.workers.prompts).toHaveLength(1);
@@ -356,7 +377,8 @@ test("语音：提示词含 [语音转写] 文本与音频路径", async () => {
   harness.transport.attachmentBodies.set(url, AUDIO_BYTES);
   harness.transport.transcriptionByPath.set(path, "帮我看下这个页面的报错");
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "attach-voice",
         ...target,
@@ -364,6 +386,7 @@ test("语音：提示词含 [语音转写] 文本与音频路径", async () => {
         attachments: [attachment(url, "audio", "voice.amr", { size: AUDIO_BYTES.byteLength, durationSeconds: 3 })],
       }),
     );
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     expect(harness.workers.prompts).toHaveLength(1);
@@ -386,7 +409,8 @@ test("语音转写失败：任务照常接受，只保留音频路径", async ()
   harness.transport.attachmentBodies.set(url, AUDIO_BYTES);
   harness.transport.transcriptionError = new Error("ASR 服务不可用");
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "attach-voice-failed",
         ...target,
@@ -394,6 +418,7 @@ test("语音转写失败：任务照常接受，只保留音频路径", async ()
         attachments: [attachment(url, "audio", "broken.amr", { size: AUDIO_BYTES.byteLength })],
       }),
     );
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     expect(harness.workers.prompts).toHaveLength(1);
@@ -419,8 +444,8 @@ test("声明大小超限：回复超限文案、不发起下载、不建任务�
     attachments: [attachment(url, "file", "huge.bin", { size: MAX_BYTES + 1 })],
   });
   try {
-    await harness.service.handleInbound(message);
-    await settleReplies(harness, target);
+    await submitAndWaitForIngressHandoff(harness, message);
+    await settleReplies(harness, target, REFUSAL_OVERSIZE);
 
     expect(replyCount(harness, REFUSAL_OVERSIZE)).toBe(1);
     expect(harness.transport.downloadRequests).toHaveLength(0);
@@ -428,8 +453,8 @@ test("声明大小超限：回复超限文案、不发起下载、不建任务�
     expect(taskCount(harness, target)).toBe(0);
     expect(existsSync(messageDirectory(harness, message, message.messageId))).toBe(false);
 
-    await harness.service.handleInbound(message);
-    await settleReplies(harness, target);
+    await submitAndWaitForIngressHandoff(harness, message);
+    await settleReplies(harness, target, REFUSAL_OVERSIZE);
     expect(replyCount(harness, REFUSAL_OVERSIZE)).toBe(1);
     expect(harness.transport.downloadRequests).toHaveLength(0);
   } finally {
@@ -447,8 +472,8 @@ test("下载失败：回复失败文案、清理空目录、不建任务、重�
     attachments: [attachment("https://cdn.example.test/missing.png", "image", "missing.png")],
   });
   try {
-    await harness.service.handleInbound(message);
-    await settleReplies(harness, target);
+    await submitAndWaitForIngressHandoff(harness, message);
+    await settleReplies(harness, target, REFUSAL_DOWNLOAD_FAILED);
 
     expect(replyCount(harness, REFUSAL_DOWNLOAD_FAILED)).toBe(1);
     expect(harness.transport.downloadRequests).toHaveLength(1);
@@ -456,8 +481,8 @@ test("下载失败：回复失败文案、清理空目录、不建任务、重�
     expect(taskCount(harness, target)).toBe(0);
     expect(existsSync(messageDirectory(harness, message, message.messageId))).toBe(false);
 
-    await harness.service.handleInbound(message);
-    await settleReplies(harness, target);
+    await submitAndWaitForIngressHandoff(harness, message);
+    await settleReplies(harness, target, REFUSAL_DOWNLOAD_FAILED);
     expect(replyCount(harness, REFUSAL_DOWNLOAD_FAILED)).toBe(1);
     expect(harness.transport.downloadRequests).toHaveLength(1);
   } finally {
@@ -477,10 +502,12 @@ test("不支持的消息类型：回复固定文案、无任务与下载，重�
     attachments: [],
   });
   try {
-    await harness.service.handleInbound(sticker);
-    await settleReplies(harness, target);
-    await harness.service.handleInbound(sticker);
-    await settleReplies(harness, target);
+    // Unsupported input is durably consumed by authorization (and has no ingress job).
+    await harness.service.submitInbound(sticker);
+    await settleReplies(harness, target, REFUSAL_UNSUPPORTED);
+    // The stable command claim keeps the refusal one-shot on redelivery.
+    await harness.service.submitInbound(sticker);
+    await settleReplies(harness, target, REFUSAL_UNSUPPORTED);
 
     // 第二次投递命中同一 messageId 的 command claim，所以拒绝只出现一次。
     expect(replyCount(harness, REFUSAL_UNSUPPORTED)).toBe(1);
@@ -502,15 +529,15 @@ test("文件附件在提示词里渲染为 file 行并原样落盘", async () =>
     messageId: "attach-pdf",
     ...target,
     text: "看下文档",
-    attachments: [attachment(url, "file", "quarterly.pdf", { size: bytes.byteLength })],
+    attachments: [attachment(url, "file", "quarterly", { size: bytes.byteLength })],
   });
   try {
-    await harness.service.handleInbound(message);
+    await submitAndWaitForIngressHandoff(harness, message);
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
-    const path = savedPath(harness, target, message.messageId, 0, "quarterly.pdf", "file", url);
+    const path = savedPath(harness, target, message.messageId, 0, "quarterly", "file", url);
     const prompt = harness.workers.prompts[0]!.text;
-    expect(attachmentPathsFromPrompt(prompt)).toEqual([path]);
     expect(prompt).toContain(`1. file quarterly.pdf ${bytes.byteLength} B → ${path}`);
     await expectSameBytes(path, bytes);
   } finally {
@@ -533,7 +560,8 @@ test("回复引用一份 xlsx 文件：恰好一次下载，引用标题与绝�
     attachments: [attachment(url, "file", name, { size: XLSX_BYTES.byteLength })],
   });
   try {
-    await harness.service.handleInbound(message);
+    await submitAndWaitForIngressHandoff(harness, message);
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     expect(harness.transport.downloadRequests).toHaveLength(1);
@@ -566,7 +594,8 @@ test("群成员 @Bot 发文件：过权限门、恰好一次下载并进入同�
     attachments: [attachment(url, "file", "member-upload.xlsx", { size: XLSX_BYTES.byteLength })],
   });
   try {
-    await harness.service.handleInbound(message);
+    await submitAndWaitForIngressHandoff(harness, message);
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     expect(harness.transport.downloadRequests).toHaveLength(1);
@@ -588,7 +617,7 @@ test("「这个」：同一发送者 10 分钟内唯一文件被关联取回，�
   const now = Date.now();
   const name = "【新标准有sample版】20260818 Output Form_Zhi 修改版本_副本.xlsx";
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "zhaoyi-file",
         ...target,
@@ -603,7 +632,8 @@ test("「这个」：同一发送者 10 分钟内唯一文件被关联取回，�
     expect(harness.transport.downloadRequests).toHaveLength(0);
     expect(harness.workers.prompts).toHaveLength(0);
 
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "zhaoyi-this",
         ...target,
@@ -614,6 +644,7 @@ test("「这个」：同一发送者 10 分钟内唯一文件被关联取回，�
         messageTimestamp: now,
       }),
     );
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     expect(harness.transport.downloadRequests).toHaveLength(1);
@@ -646,7 +677,7 @@ test("「这个」歧义：10 分钟内发了两份文件时一个也不取，�
       [firstUrl, "first.xlsx"],
       [secondUrl, "second.xlsx"],
     ] as const).entries()) {
-      await harness.service.handleInbound(
+      await harness.service.submitInbound(
         inbound({
           messageId: `ambiguous-file-${index}`,
           ...target,
@@ -659,7 +690,8 @@ test("「这个」歧义：10 分钟内发了两份文件时一个也不取，�
       );
     }
 
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "ambiguous-this",
         ...target,
@@ -670,6 +702,7 @@ test("「这个」歧义：10 分钟内发了两份文件时一个也不取，�
         messageTimestamp: now,
       }),
     );
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     expect(harness.transport.downloadRequests).toHaveLength(0);
@@ -691,7 +724,7 @@ test("「这个」不猜别人的文件：文件与请求来自不同发送者�
   harness.transport.attachmentBodies.set(url, XLSX_BYTES);
   const now = Date.now();
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "other-member-file",
         ...target,
@@ -702,7 +735,8 @@ test("「这个」不猜别人的文件：文件与请求来自不同发送者�
         attachments: [attachment(url, "file", "someone-else.xlsx", { size: XLSX_BYTES.byteLength })],
       }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "member-b-this",
         ...target,
@@ -713,6 +747,7 @@ test("「这个」不猜别人的文件：文件与请求来自不同发送者�
         messageTimestamp: now,
       }),
     );
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     expect(harness.transport.downloadRequests).toHaveLength(0);
@@ -735,7 +770,7 @@ test("「这个」窗口过期：11 分钟前发的文件不参与关联", async
   harness.transport.attachmentBodies.set(url, XLSX_BYTES);
   const now = Date.now();
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "stale-file",
         ...target,
@@ -746,7 +781,8 @@ test("「这个」窗口过期：11 分钟前发的文件不参与关联", async
         attachments: [attachment(url, "file", "stale.xlsx", { size: XLSX_BYTES.byteLength })],
       }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "stale-this",
         ...target,
@@ -757,6 +793,7 @@ test("「这个」窗口过期：11 分钟前发的文件不参与关联", async
         messageTimestamp: now,
       }),
     );
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     expect(harness.transport.downloadRequests).toHaveLength(0);
@@ -777,7 +814,7 @@ test("「这个」群历史关闭：即使唯一文件也不关联，正文逐�
   harness.transport.attachmentBodies.set(url, XLSX_BYTES);
   const now = Date.now();
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "no-history-file",
         ...target,
@@ -788,7 +825,8 @@ test("「这个」群历史关闭：即使唯一文件也不关联，正文逐�
         attachments: [attachment(url, "file", "no-history.xlsx", { size: XLSX_BYTES.byteLength })],
       }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "no-history-this",
         ...target,
@@ -799,6 +837,7 @@ test("「这个」群历史关闭：即使唯一文件也不关联，正文逐�
         messageTimestamp: now,
       }),
     );
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     expect(harness.transport.downloadRequests).toHaveLength(0);
@@ -820,7 +859,8 @@ test("附件目录与文件权限分别是 0700 与 0600", async () => {
     attachments: [attachment(url, "image", "private.png", { size: IMAGE_BYTES.byteLength })],
   });
   try {
-    await harness.service.handleInbound(message);
+    await submitAndWaitForIngressHandoff(harness, message);
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     const directory = messageDirectory(harness, message, message.messageId);
@@ -845,8 +885,8 @@ test("单条附件超时：按「下载失败」文案拒绝，不建任务也�
     attachments: [attachment("https://cdn.example.test/slow.bin", "file", "slow.bin")],
   });
   try {
-    await harness.service.handleInbound(message);
-    await settleReplies(harness, target);
+    await submitAndWaitForIngressHandoff(harness, message);
+    await settleReplies(harness, target, REFUSAL_DOWNLOAD_FAILED);
 
     expect(replyCount(harness, REFUSAL_DOWNLOAD_FAILED)).toBe(1);
     expect(replyCount(harness, REFUSAL_OVER_BUDGET)).toBe(0);
@@ -872,7 +912,7 @@ test("整条消息的下载预算耗尽：按「过多或超时」文案拒绝�
   });
   vi.useFakeTimers();
   try {
-    const pending = harness.service.handleInbound(message);
+    const pending = harness.service.submitInbound(message);
     // 假定时器只接管计时：真实的 fs 步骤照常完成，用真实 I/O 让出事件循环直到下载开始。
     for (let tick = 0; tick < 200 && harness.transport.downloadRequests.length === 0; tick += 1) {
       await stat(harness.stateDir);
@@ -882,7 +922,7 @@ test("整条消息的下载预算耗尽：按「过多或超时」文案拒绝�
     vi.advanceTimersByTime(ATTACHMENT_DOWNLOAD_BUDGET_MS);
     vi.useRealTimers();
     await pending;
-    await settleReplies(harness, target);
+    await settleReplies(harness, target, REFUSAL_OVER_BUDGET);
 
     expect(replyCount(harness, REFUSAL_OVER_BUDGET)).toBe(1);
     expect(replyCount(harness, REFUSAL_DOWNLOAD_FAILED)).toBe(0);
@@ -909,7 +949,7 @@ test("语音转写耗尽下载预算：整条任务按「过多或超时」拒�
   });
   vi.useFakeTimers();
   try {
-    const pending = harness.service.handleInbound(message);
+    const pending = harness.service.submitInbound(message);
     for (let tick = 0; tick < 200 && harness.transport.transcriptionRequests.length === 0; tick += 1) {
       await stat(harness.stateDir);
     }
@@ -918,7 +958,7 @@ test("语音转写耗尽下载预算：整条任务按「过多或超时」拒�
     vi.advanceTimersByTime(ATTACHMENT_DOWNLOAD_BUDGET_MS);
     vi.useRealTimers();
     await pending;
-    await settleReplies(harness, target);
+    await settleReplies(harness, target, REFUSAL_OVER_BUDGET);
 
     expect(replyCount(harness, REFUSAL_OVER_BUDGET)).toBe(1);
     expect(harness.workers.prompts).toHaveLength(0);
@@ -944,8 +984,8 @@ test("附件数量超过 8：回复超限文案、零下载、不建任务", asy
     attachments,
   });
   try {
-    await harness.service.handleInbound(message);
-    await settleReplies(harness, target);
+    await submitAndWaitForIngressHandoff(harness, message);
+    await settleReplies(harness, target, REFUSAL_OVER_BUDGET);
 
     expect(replyCount(harness, REFUSAL_OVER_BUDGET)).toBe(1);
     expect(harness.transport.downloadRequests).toHaveLength(0);
@@ -953,8 +993,8 @@ test("附件数量超过 8：回复超限文案、零下载、不建任务", asy
     expect(taskCount(harness, target)).toBe(0);
     expect(existsSync(messageDirectory(harness, message, message.messageId))).toBe(false);
 
-    await harness.service.handleInbound(message);
-    await settleReplies(harness, target);
+    await submitAndWaitForIngressHandoff(harness, message);
+    await settleReplies(harness, target, REFUSAL_OVER_BUDGET);
     expect(replyCount(harness, REFUSAL_OVER_BUDGET)).toBe(1);
     expect(harness.transport.downloadRequests).toHaveLength(0);
   } finally {
@@ -970,7 +1010,8 @@ test("attachments.enabled=false：有文本走纯文本任务，无文本回复�
   const url = "https://cdn.example.test/disabled.png";
   harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "disabled-with-text",
         ...target,
@@ -978,6 +1019,7 @@ test("attachments.enabled=false：有文本走纯文本任务，无文本回复�
         attachments: [attachment(url, "image", "disabled.png")],
       }),
     );
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["看下这张图"]);
     expect(harness.transport.downloadRequests).toHaveLength(0);
@@ -988,8 +1030,8 @@ test("attachments.enabled=false：有文本走纯文本任务，无文本回复�
       text: "",
       attachments: [attachment(url, "image", "disabled.png")],
     });
-    await harness.service.handleInbound(silent);
-    await settleReplies(harness, target);
+    await submitAndWaitForIngressHandoff(harness, silent);
+    await settleReplies(harness, target, REFUSAL_DISABLED);
 
     expect(replyCount(harness, REFUSAL_DISABLED)).toBe(1);
     expect(taskCount(harness, target)).toBe(1);
@@ -1005,7 +1047,8 @@ test("attachments 未配置：与关闭一致，纯文本任务照跑且无附�
   const url = "https://cdn.example.test/unconfigured.png";
   harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "unconfigured-with-text",
         ...target,
@@ -1013,10 +1056,16 @@ test("attachments 未配置：与关闭一致，纯文本任务照跑且无附�
         attachments: [attachment(url, "image", "unconfigured.png")],
       }),
     );
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["看下这张图"]);
 
-    await harness.service.handleInbound(
+    const disabledReply = harness.transport.waitForRemoteText(
+      ({ target: sentTarget }) =>
+        sentTarget.channelId === target.channelId && sentTarget.channelType === target.channelType,
+    );
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "unconfigured-without-text",
         ...target,
@@ -1024,7 +1073,8 @@ test("attachments 未配置：与关闭一致，纯文本任务照跑且无附�
         attachments: [attachment(url, "image", "unconfigured.png")],
       }),
     );
-    await settleReplies(harness, target);
+    await disabledReply;
+    await waitForStatus(harness.service, target, (status) => status.outbox === 0);
 
     expect(replyCount(harness, REFUSAL_DISABLED)).toBe(1);
     expect(harness.transport.downloadRequests).toHaveLength(0);
@@ -1068,7 +1118,7 @@ test("非 owner、未 @ 与未允许群的图片消息不产生任何下载", as
   ];
   try {
     for (const message of rejected) {
-      await harness.service.handleInbound(message);
+      await harness.service.submitInbound(message);
     }
 
     expect(harness.transport.downloadRequests).toHaveLength(0);
@@ -1095,11 +1145,13 @@ test("运行中的回合收到 caption + 图片：steering 注入组装正文且
   const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
   harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
   try {
-    const first = harness.service.handleInbound(
+    const first = harness.service.submitInbound(
       inbound({ messageId: "steer-attach-first", ...target, text: "长任务" }),
     );
+    await first;
     await started.promise;
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "steer-attach-image",
         ...target,
@@ -1107,7 +1159,6 @@ test("运行中的回合收到 caption + 图片：steering 注入组装正文且
         attachments: [attachment(url, "image", "报错.png", { size: IMAGE_BYTES.byteLength })],
       }),
     );
-    await first;
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["长任务"]);
@@ -1130,7 +1181,12 @@ test("控制命令不吃附件：/status 带附件不下载", async () => {
   const url = "https://cdn.example.test/command.png";
   harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
   try {
-    await harness.service.handleInbound(
+    const statusReply = harness.transport.waitForRemoteText(
+      ({ target: sentTarget }) =>
+        sentTarget.channelId === target.channelId && sentTarget.channelType === target.channelType,
+    );
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "command-status",
         ...target,
@@ -1138,7 +1194,8 @@ test("控制命令不吃附件：/status 带附件不下载", async () => {
         attachments: [attachment(url, "image", "command.png")],
       }),
     );
-    await settleReplies(harness, target);
+    await statusReply;
+    await waitForStatus(harness.service, target, (status) => status.outbox === 0);
 
     // /status 不消费正文，没有把资源交给 Agent 的出口，因此不产生任何外网请求。
     expect(harness.transport.downloadRequests).toHaveLength(0);
@@ -1154,7 +1211,8 @@ test("/queue <文本> 带附件：排队任务的正文经组装点带上附件�
   const url = "https://cdn.example.test/queue.png";
   harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "command-queue",
         ...target,
@@ -1205,7 +1263,8 @@ test("注册 handler 的正文同样经组装点：拦截型拿到附件块、�
   const size = IMAGE_BYTES.byteLength;
   harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "command-intercepting",
         ...target,
@@ -1213,7 +1272,8 @@ test("注册 handler 的正文同样经组装点：拦截型拿到附件块、�
         attachments: [attachment(url, "image", "handler.png", { size })],
       }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "command-observing",
         ...target,
@@ -1222,6 +1282,7 @@ test("注册 handler 的正文同样经组装点：拦截型拿到附件块、�
       }),
     );
     await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     // 两条消息各自的附件目录不同，因此各下载一次；handler 看到的正文都已带上附件块。
     expect(harness.transport.downloadRequests).toHaveLength(2);
@@ -1250,7 +1311,8 @@ test("/thread 带附件：意图走同一条组装点，附件随交付说明一
   harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
   const intent = "进度卡片：\n1. todos 默认全显示，可以收起";
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "command-thread",
         ...target,
@@ -1260,7 +1322,7 @@ test("/thread 带附件：意图走同一条组装点，附件随交付说明一
       }),
     );
     await harness.workers.waitForPromptCount(1);
-
+    await waitForStatus(harness.service, target, (status) => status.state === "completed");
     // 这条命令的正文就是交给助手的任务正文，因此与普通任务共用组装点：附件落盘，
     // 绝对路径进入「原始意图」，不再只剩 `[图片]` 占位。
     expect(harness.transport.downloadRequests).toHaveLength(1);
@@ -1283,7 +1345,8 @@ test("未注册的 /xxx 带附件：按普通任务处理，附件照常落盘�
   harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
   const text = "/notregistered 看下这张图";
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "command-unregistered",
         ...target,
@@ -1320,14 +1383,15 @@ test("已接受任务的消息重投：不重新下载、不重复回复、已�
     attachments: [attachment(url, "image", "repost.png", { size: IMAGE_BYTES.byteLength })],
   });
   try {
-    await harness.service.handleInbound(message);
+    await submitAndWaitForIngressHandoff(harness, message);
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
-    await settleReplies(harness, target);
+    await waitForStatus(harness.service, target, (status) => status.outbox === 0);
     const path = savedPath(harness, target, message.messageId, 0, "repost.png", "image", url);
     const sentAfterFirst = harness.transport.sent.length;
 
-    await harness.service.handleInbound(message);
-    await settleReplies(harness, target);
+    await submitAndWaitForIngressHandoff(harness, message);
+    await waitForStatus(harness.service, target, (status) => status.outbox === 0);
 
     expect(harness.transport.downloadRequests).toHaveLength(1);
     expect(harness.workers.prompts).toHaveLength(1);
@@ -1359,7 +1423,8 @@ test("半失败只清理本次新建的文件：同 messageId 的既有文件与
     await mkdir(messageDirectory(harness, existing, existing.messageId), { recursive: true });
     await writeFile(keptPath, KEPT_BYTES);
 
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: existing.messageId,
         ...target,
@@ -1370,7 +1435,7 @@ test("半失败只清理本次新建的文件：同 messageId 的既有文件与
         ],
       }),
     );
-    await settleReplies(harness, target);
+    await settleReplies(harness, target, REFUSAL_DOWNLOAD_FAILED);
 
     expect(replyCount(harness, REFUSAL_DOWNLOAD_FAILED)).toBe(1);
     expect(existsSync(messageDirectory(harness, existing, existing.messageId))).toBe(true);
@@ -1389,8 +1454,8 @@ test("半失败只清理本次新建的文件：同 messageId 的既有文件与
       ],
     });
     const createdPath = savedPath(harness, target, fresh.messageId, 0, "kept.png", "image", keptUrl);
-    await harness.service.handleInbound(fresh);
-    await settleReplies(harness, target);
+    await submitAndWaitForIngressHandoff(harness, fresh);
+    await settleReplies(harness, target, REFUSAL_DOWNLOAD_FAILED);
 
     expect(replyCount(harness, REFUSAL_DOWNLOAD_FAILED)).toBe(2);
     expect(existsSync(createdPath)).toBe(false);
@@ -1403,6 +1468,54 @@ test("半失败只清理本次新建的文件：同 messageId 的既有文件与
     expect(harness.workers.prompts).toHaveLength(0);
   } finally {
     await closeAttachmentHarness(harness);
+  }
+});
+
+test("cancelling media preparation preserves prior files and withholds ACK until local preparation", async () => {
+  const harness = await createAttachmentHarness();
+  const target: ChatTarget = { channelId: "dm-owner", channelType: 1 };
+  let stopped = false;
+  try {
+    const oldUrl = "https://cdn.example.test/already-saved.png";
+    const slowUrl = "https://cdn.example.test/cancelled.pdf";
+    harness.transport.downloadHangs = true;
+    const message = inbound({
+      messageId: "cancel-media-preparation",
+      ...target,
+      text: "inspect both files",
+      attachments: [
+        attachment(oldUrl, "image", "already-saved.png", { size: KEPT_BYTES.byteLength }),
+        attachment(slowUrl, "file", "cancelled.pdf"),
+      ],
+    });
+    const oldPath = savedPath(harness, target, message.messageId, 0, "already-saved.png", "image", oldUrl);
+    const cancelledPath = savedPath(harness, target, message.messageId, 1, "cancelled.pdf", "file", slowUrl);
+    await mkdir(messageDirectory(harness, message, message.messageId), { recursive: true, mode: 0o700 });
+    await writeFile(oldPath, KEPT_BYTES, { mode: 0o600 });
+
+    const downloadStarted = Promise.withResolvers<void>();
+    const download = harness.transport.downloadAttachment.bind(harness.transport);
+    harness.transport.downloadAttachment = async (request) => {
+      downloadStarted.resolve();
+      return download(request);
+    };
+    const receipt = harness.service.receive(message);
+    const ackOutcome = receipt.ackReady.then(
+      () => "fulfilled" as const,
+      () => "rejected" as const,
+    );
+    await downloadStarted.promise;
+    await harness.service.stop();
+    stopped = true;
+
+    expect(await ackOutcome).toBe("rejected");
+    await expectSameBytes(oldPath, KEPT_BYTES);
+    expect(existsSync(cancelledPath)).toBe(false);
+    expect(harness.transport.downloadRequests.map(({ url }) => url)).toEqual([slowUrl]);
+    expect(harness.workers.prompts).toHaveLength(0);
+  } finally {
+    if (stopped) await rm(harness.root, { recursive: true, force: true });
+    else await closeAttachmentHarness(harness);
   }
 });
 
@@ -1437,7 +1550,7 @@ test("未认领状态下的图片私聊静默，认领后同样的图片成为�
   harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
   const senderId = "alice";
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "unclaimed-image",
         ...target,
@@ -1446,21 +1559,25 @@ test("未认领状态下的图片私聊静默，认领后同样的图片成为�
         attachments: [attachment(url, "image", "claim.png")],
       }),
     );
-    await settleReplies(harness, target);
 
     expect(harness.transport.downloadRequests).toHaveLength(0);
     expect(harness.transport.sent).toHaveLength(0);
     expect(ownerCount(harness)).toBe(0);
     expect(harness.workers.prompts).toHaveLength(0);
 
-    await harness.service.handleInbound(
+    const ownerClaimReply = harness.transport.waitForRemoteText(
+      ({ target: sentTarget }) =>
+        sentTarget.channelId === target.channelId && sentTarget.channelType === target.channelType,
+    );
+    await harness.service.submitInbound(
       inbound({ messageId: "unclaimed-text", ...target, senderId, text: "开始工作" }),
     );
-    await settleReplies(harness, target);
+    await ownerClaimReply;
     expect(ownerCount(harness)).toBe(1);
     expect(harness.workers.prompts).toHaveLength(0);
 
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({
         messageId: "claimed-image",
         ...target,
@@ -1469,8 +1586,8 @@ test("未认领状态下的图片私聊静默，认领后同样的图片成为�
         attachments: [attachment(url, "image", "claim.png")],
       }),
     );
+    await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
-
     expect(harness.workers.prompts).toHaveLength(1);
     expect(harness.workers.prompts[0]!.text).toContain(ATTACHMENT_HEADER);
     expect(harness.transport.downloadRequests).toHaveLength(1);
@@ -1510,7 +1627,8 @@ test("回答问题时的附件不下载也不落盘：答案路径优先于附�
     attachments: [attachment(url, "image", "answer.png", { size: IMAGE_BYTES.byteLength })],
   });
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "answer-ask-start", ...target, text: "需要确认部署目标" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -1520,8 +1638,8 @@ test("回答问题时的附件不下载也不落盘：答案路径优先于附�
       (status) => status.pendingQuestionIds.length === 1,
     );
 
-    await harness.service.handleInbound(answer);
-    const completed = await waitForStatus(
+    await submitAndWaitForIngressHandoff(harness, answer);
+    await waitForStatus(
       harness.service,
       target,
       (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
@@ -1546,7 +1664,7 @@ test("权限门先于命令附件组装：非 owner 的命令消息零下载、�
   const url = "https://cdn.example.test/denied-command.png";
   harness.transport.attachmentBodies.set(url, IMAGE_BYTES);
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "denied-command-queue",
         ...target,

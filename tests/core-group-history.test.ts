@@ -65,7 +65,7 @@ async function deliverGroupMessages(
   target: ChatTarget = GROUP,
 ): Promise<void> {
   for (let seq = from; seq <= to; seq += 1) {
-    await harness.service.handleInbound(memberMessage(seq, `群消息 ${seq}`, target));
+    await harness.service.submitInbound(memberMessage(seq, `群消息 ${seq}`, target));
   }
 }
 
@@ -118,7 +118,7 @@ test("injects the newest maxMessages of the conversation on the first turn", asy
   });
   try {
     await deliverGroupMessages(harness, 1, 7);
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         ...GROUP,
         senderId: harness.bot.uid,
@@ -127,7 +127,7 @@ test("injects the newest maxMessages of the conversation on the first turn", asy
         messageTimestamp: T0 + 8 * 60_000,
       }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         ...GROUP,
         senderId: "member-2",
@@ -138,7 +138,7 @@ test("injects the newest maxMessages of the conversation on the first turn", asy
       }),
     );
 
-    await harness.service.handleInbound(triggerMessage(harness, 10, "@bot 请总结"));
+    await harness.service.submitInbound(triggerMessage(harness, 10, "@bot 请总结"));
     await waitForTask(harness, 1);
 
     const prompt = harness.workers.prompts[0]!.text;
@@ -176,7 +176,7 @@ test("a later turn on the same session only injects what is new", async () => {
   });
   try {
     await deliverGroupMessages(harness, 1, 3);
-    await harness.service.handleInbound(triggerMessage(harness, 4, "@bot 第一轮"));
+    await harness.service.submitInbound(triggerMessage(harness, 4, "@bot 第一轮"));
     await waitForTask(harness, 1);
     const first = harness.workers.prompts[0]!;
     expect(historyLinesOf(first.text)).toEqual([
@@ -186,7 +186,7 @@ test("a later turn on the same session only injects what is new", async () => {
     ]);
 
     await deliverGroupMessages(harness, 5, 6);
-    await harness.service.handleInbound(triggerMessage(harness, 7, "@bot 第二轮"));
+    await harness.service.submitInbound(triggerMessage(harness, 7, "@bot 第二轮"));
     await waitForTask(harness, 2);
 
     const second = harness.workers.prompts[1]!;
@@ -212,11 +212,11 @@ test("keeps the newest maxMessages of an oversized delta and never re-sends the 
   });
   try {
     await deliverGroupMessages(harness, 1, 3);
-    await harness.service.handleInbound(triggerMessage(harness, 4, "@bot 第一轮"));
+    await harness.service.submitInbound(triggerMessage(harness, 4, "@bot 第一轮"));
     await waitForTask(harness, 1);
 
     await deliverGroupMessages(harness, 5, 8);
-    await harness.service.handleInbound(triggerMessage(harness, 9, "@bot 第二轮"));
+    await harness.service.submitInbound(triggerMessage(harness, 9, "@bot 第二轮"));
     await waitForTask(harness, 2);
 
     const second = harness.workers.prompts[1]!.text;
@@ -227,13 +227,13 @@ test("keeps the newest maxMessages of an oversized delta and never re-sends the 
     ]);
 
     // No new messages: no block at all, and the watermark still moves past this turn.
-    await harness.service.handleInbound(triggerMessage(harness, 10, "@bot 无新增"));
+    await harness.service.submitInbound(triggerMessage(harness, 10, "@bot 无新增"));
     await waitForTask(harness, 3);
     expect(harness.workers.prompts[2]!.text).toBe("@bot 无新增");
     expect(historyLinesOf(harness.workers.prompts[2]!.text)).toEqual([]);
 
     await deliverGroupMessages(harness, 11, 11);
-    await harness.service.handleInbound(triggerMessage(harness, 12, "@bot 第三轮"));
+    await harness.service.submitInbound(triggerMessage(harness, 12, "@bot 第三轮"));
     await waitForTask(harness, 4);
     expect(historyLinesOf(harness.workers.prompts[3]!.text)).toEqual([
       expectedLine(11, "群消息 11"),
@@ -251,11 +251,11 @@ test("a /new session re-seeds the newest messages without rewriting the old wate
   });
   try {
     await deliverGroupMessages(harness, 1, 3);
-    await harness.service.handleInbound(triggerMessage(harness, 4, "@bot 第一轮"));
+    await harness.service.submitInbound(triggerMessage(harness, 4, "@bot 第一轮"));
     await waitForTask(harness, 1);
     const oldSession = harness.workers.prompts[0]!.sessionId;
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...GROUP,
       senderId: "owner-1",
       text: "/new",
@@ -267,7 +267,7 @@ test("a /new session re-seeds the newest messages without rewriting the old wate
       { session_id: oldSession, last_seq: 4, previous_seq: null, phase: "committed" },
     ]);
 
-    await harness.service.handleInbound(triggerMessage(harness, 6, "@bot 新会话"));
+    await harness.service.submitInbound(triggerMessage(harness, 6, "@bot 新会话"));
     await waitForTask(harness, 2);
     const seeded = harness.workers.prompts[1]!;
     expect(seeded.sessionId).not.toBe(oldSession);
@@ -301,7 +301,7 @@ test("the first turn asks the server for the newest window", async () => {
     ]);
     // Seq 3 never reached the socket, so only the server can prove what happened.
     await deliverGroupMessages(harness, 1, 2);
-    await harness.service.handleInbound(triggerMessage(harness, 4, "@bot 请处理"));
+    await harness.service.submitInbound(triggerMessage(harness, 4, "@bot 请处理"));
     await waitForTask(harness, 1);
 
     expect(harness.transport.historyCalls).toHaveLength(1);
@@ -337,7 +337,7 @@ test("a trigger without a decoded seq runs without history accounting", async ()
   });
   try {
     await deliverGroupMessages(harness, 1, 2);
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...GROUP,
       senderId: "owner-1",
       text: "@bot 没有 seq",
@@ -359,7 +359,7 @@ test("a gap wider than one server page injects the newest segment only", async (
     allowedGroupIds: GROUP_IDS,
   });
   try {
-    await harness.service.handleInbound(triggerMessage(harness, 1, "@bot 开场"));
+    await harness.service.submitInbound(triggerMessage(harness, 1, "@bot 开场"));
     await waitForTask(harness, 1);
     // An empty candidate range needs no server page at all.
     expect(historyLinesOf(harness.workers.prompts[0]!.text)).toEqual([]);
@@ -374,7 +374,7 @@ test("a gap wider than one server page injects the newest segment only", async (
         timestamp: T0 + (100 + index) * 60_000,
       })),
     );
-    await harness.service.handleInbound(triggerMessage(harness, 300, "@bot 总结"));
+    await harness.service.submitInbound(triggerMessage(harness, 300, "@bot 总结"));
     await waitForTask(harness, 2);
 
     // The page is anchored on the newest end of the gap, not on the oldest one.
@@ -395,8 +395,8 @@ test("a gap wider than one server page injects the newest segment only", async (
     ]);
 
     // Messages older than the page are accounted for and never come back.
-    await harness.service.handleInbound(memberMessage(301, "群消息 301"));
-    await harness.service.handleInbound(triggerMessage(harness, 302, "@bot 继续"));
+    await harness.service.submitInbound(memberMessage(301, "群消息 301"));
+    await harness.service.submitInbound(triggerMessage(harness, 302, "@bot 继续"));
     await waitForTask(harness, 3);
     expect(historyLinesOf(harness.workers.prompts[2]!.text)).toEqual([
       expectedLine(301, "群消息 301"),
@@ -428,7 +428,7 @@ test("a channel restart keeps the watermark and syncs the downtime gap", async (
       { seq: 3, senderId: "member-1", text: "群消息 3", timestamp: T0 + 3 * 60_000 },
       { seq: 4, senderId: "member-1", text: "群消息 4", timestamp: T0 + 4 * 60_000 },
     ]);
-    await first.service.handleInbound(triggerMessage(first, 5, "@bot 第一轮"));
+    await first.service.submitInbound(triggerMessage(first, 5, "@bot 第一轮"));
     await waitForTask(first, 1);
     sessionId = first.workers.prompts[0]!.sessionId;
     expect(first.transport.historyCalls).toHaveLength(0);
@@ -450,7 +450,7 @@ test("a channel restart keeps the watermark and syncs the downtime gap", async (
       { seq: 8, senderId: "member-1", text: "停机消息 8", timestamp: T0 + 8 * 60_000 },
       { seq: 9, senderId: "member-1", text: "停机消息 9", timestamp: T0 + 9 * 60_000 },
     ]);
-    await second.service.handleInbound(triggerMessage(second, 10, "@bot 重启后"));
+    await second.service.submitInbound(triggerMessage(second, 10, "@bot 重启后"));
     await waitForTask(second, 1);
 
     expect(second.workers.prompts[0]!.sessionId).toBe(sessionId);
@@ -493,7 +493,7 @@ test("a live coverage gap falls back to sync for exactly the missing range", asy
 
     // Seq 6 never arrived on the socket, 7..9 did.
     await deliverGroupMessages(harness, 7, 9);
-    await harness.service.handleInbound(triggerMessage(harness, 10, "@bot 第二轮"));
+    await harness.service.submitInbound(triggerMessage(harness, 10, "@bot 第二轮"));
     await waitForTask(harness, 2);
 
     expect(harness.transport.historyCalls).toHaveLength(1);
@@ -521,7 +521,7 @@ test("a failed sync keeps the prompt plain and retries the same range next turn"
   });
   try {
     await deliverGroupMessages(harness, 1, 4);
-    await harness.service.handleInbound(triggerMessage(harness, 5, "@bot 第一轮"));
+    await harness.service.submitInbound(triggerMessage(harness, 5, "@bot 第一轮"));
     await waitForTask(harness, 1);
     const sessionId = harness.workers.prompts[0]!.sessionId;
     const committed = ledgerRows(harness);
@@ -537,7 +537,7 @@ test("a failed sync keeps the prompt plain and retries the same range next turn"
     );
     harness.transport.failGroupHistoryWith(new Error("sync down"));
     await deliverGroupMessages(harness, 8, 9);
-    await harness.service.handleInbound(triggerMessage(harness, 10, "@bot 重试"));
+    await harness.service.submitInbound(triggerMessage(harness, 10, "@bot 重试"));
     await waitForTask(harness, 2);
 
     expect(harness.workers.prompts[1]!.text).toBe("@bot 重试");
@@ -546,7 +546,7 @@ test("a failed sync keeps the prompt plain and retries the same range next turn"
     expect(ledgerRows(harness)).toEqual(committed);
 
     harness.transport.failGroupHistoryWith(undefined);
-    await harness.service.handleInbound(triggerMessage(harness, 11, "@bot 补上"));
+    await harness.service.submitInbound(triggerMessage(harness, 11, "@bot 补上"));
     await waitForTask(harness, 3);
 
     expect(harness.transport.historyCalls).toHaveLength(2);
@@ -578,7 +578,7 @@ test("leaves an explicitly disabled configuration exactly as before", async () =
   });
   try {
     await deliverGroupMessages(harness, 1, 3);
-    await harness.service.handleInbound(triggerMessage(harness, 4, "@bot 请处理"));
+    await harness.service.submitInbound(triggerMessage(harness, 4, "@bot 请处理"));
     await waitForTask(harness, 1);
 
     expect(harness.workers.prompts[0]!.text).toBe("@bot 请处理");
@@ -600,7 +600,7 @@ test("keeps private chats and threads out of each other's history", async () => 
     allowedGroupIds: GROUP_IDS,
   });
   try {
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       channelId: "dm-owner",
       channelType: 1,
       text: "私聊任务",
@@ -612,8 +612,8 @@ test("keeps private chats and threads out of each other's history", async () => 
     expect(ledgerRows(harness)).toEqual([]);
 
     // Neither a member message nor an unmentioned owner message starts a task here.
-    await harness.service.handleInbound(memberMessage(1, "群消息 1"));
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(memberMessage(1, "群消息 1"));
+    await harness.service.submitInbound(inbound({
       ...GROUP,
       senderId: "owner-1",
       text: "没有 @ 的消息",
@@ -623,7 +623,7 @@ test("keeps private chats and threads out of each other's history", async () => 
     expect(harness.workers.prompts).toHaveLength(1);
     expect(ledgerRows(harness)).toEqual([]);
 
-    await harness.service.handleInbound(triggerMessage(harness, 3, "@bot 群任务"));
+    await harness.service.submitInbound(triggerMessage(harness, 3, "@bot 群任务"));
     await waitForTask(harness, 2);
     const groupPrompt = harness.workers.prompts[1]!.text;
     expect(historyLinesOf(groupPrompt)).toEqual([
@@ -632,8 +632,8 @@ test("keeps private chats and threads out of each other's history", async () => 
     ]);
     expect(historyBlockOf(groupPrompt)).not.toContain("私聊任务");
 
-    await harness.service.handleInbound(memberMessage(1, "线程消息 1", THREAD));
-    await harness.service.handleInbound(triggerMessage(harness, 2, "@bot 线程任务", THREAD));
+    await harness.service.submitInbound(memberMessage(1, "线程消息 1", THREAD));
+    await harness.service.submitInbound(triggerMessage(harness, 2, "@bot 线程任务", THREAD));
     await waitForTask(harness, 3, THREAD);
     const threadPrompt = harness.workers.prompts[2]!.text;
     expect(historyLinesOf(threadPrompt)).toEqual([expectedLine(1, "线程消息 1")]);
@@ -655,7 +655,7 @@ test("an explicitly allowed malformed thread target fails closed before member a
     allowedGroupIds: [malformedThread.channelId],
   });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       triggerMessage(harness, 1, "@bot malformed thread task", malformedThread),
     );
     const status = await waitForStatus(
@@ -689,13 +689,13 @@ test("commits history even when the group instructions are unchanged", async () 
       updatedBy: "admin",
     });
     await deliverGroupMessages(harness, 1, 4);
-    await harness.service.handleInbound(triggerMessage(harness, 5, "@bot 第一轮"));
+    await harness.service.submitInbound(triggerMessage(harness, 5, "@bot 第一轮"));
     await waitForTask(harness, 1);
     const sessionId = harness.workers.prompts[0]!.sessionId;
     expect(contextInjectionOf(harness, 0)?.injectionDecision).toBe("initial");
     expect(historyLinesOf(harness.workers.prompts[0]!.text)).toHaveLength(4);
 
-    await harness.service.handleInbound(triggerMessage(harness, 6, "@bot 第二轮"));
+    await harness.service.submitInbound(triggerMessage(harness, 6, "@bot 第二轮"));
     await waitForTask(harness, 2);
     // The unchanged-version turn still commits the history watermark.
     expect(contextInjectionOf(harness, 1)?.injectionDecision).toBe("unchanged");
@@ -705,7 +705,7 @@ test("commits history even when the group instructions are unchanged", async () 
     ]);
 
     await deliverGroupMessages(harness, 7, 8);
-    await harness.service.handleInbound(triggerMessage(harness, 9, "@bot 第三轮"));
+    await harness.service.submitInbound(triggerMessage(harness, 9, "@bot 第三轮"));
     await waitForTask(harness, 3);
     const third = harness.workers.prompts[2]!.text;
     expect(contextInjectionOf(harness, 2)?.injectionDecision).toBe("unchanged");
@@ -737,7 +737,7 @@ test("a history commit failure is logged but never fails the task", async () => 
   let probe: ChannelStore | undefined;
   try {
     await deliverGroupMessages(harness, 1, 2);
-    await harness.service.handleInbound(triggerMessage(harness, 3, "@bot 请处理"));
+    await harness.service.submitInbound(triggerMessage(harness, 3, "@bot 请处理"));
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, GROUP, (status) => status.state === "completed");
 
@@ -747,7 +747,7 @@ test("a history commit failure is logged but never fails the task", async () => 
       probe?.pruneHistoryLedger(harness.bot.uid, GROUP, "no-such-session");
     };
     await deliverGroupMessages(harness, 4, 5);
-    await harness.service.handleInbound(triggerMessage(harness, 6, "@bot 第二轮"));
+    await harness.service.submitInbound(triggerMessage(harness, 6, "@bot 第二轮"));
     await waitForTask(harness, 2);
 
     expect(historyLinesOf(harness.workers.prompts[1]!.text)).toEqual([
@@ -773,7 +773,7 @@ test("commands and observing handlers never inject history", async () => {
   try {
     await deliverGroupMessages(harness, 1, 3);
     for (const [seq, text] of [[4, "/status"], [5, "/help"], [6, "/note"]] as const) {
-      await harness.service.handleInbound(triggerMessage(harness, seq, text));
+      await harness.service.submitInbound(triggerMessage(harness, seq, text));
     }
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, GROUP, (status) => status.state === "completed");
@@ -783,7 +783,7 @@ test("commands and observing handlers never inject history", async () => {
     expect(harness.transport.historyCalls).toHaveLength(0);
     expect(ledgerRows(harness)).toEqual([]);
 
-    await harness.service.handleInbound(triggerMessage(harness, 7, "@bot 普通任务"));
+    await harness.service.submitInbound(triggerMessage(harness, 7, "@bot 普通任务"));
     await waitForTask(harness, 2);
     // Commands did not advance anything: the earlier group text is still history.
     expect(historyLinesOf(harness.workers.prompts[1]!.text)).toEqual([
@@ -806,7 +806,7 @@ test("an unregistered slash task reaches OMP verbatim and stays out of history a
   });
   try {
     await deliverGroupMessages(harness, 1, 3);
-    await harness.service.handleInbound(triggerMessage(harness, 4, "/wtm rm self"));
+    await harness.service.submitInbound(triggerMessage(harness, 4, "/wtm rm self"));
     await waitForTask(harness, 1);
 
     // OMP dispatches its own builtin and plugin commands from the first prompt line, so a
@@ -815,7 +815,7 @@ test("an unregistered slash task reaches OMP verbatim and stays out of history a
     expect(harness.transport.historyCalls).toHaveLength(0);
     expect(ledgerRows(harness)).toEqual([]);
 
-    await harness.service.handleInbound(triggerMessage(harness, 5, "@bot 普通任务"));
+    await harness.service.submitInbound(triggerMessage(harness, 5, "@bot 普通任务"));
     await waitForTask(harness, 2);
     // The slash turn advanced nothing: the group text around it is still history.
     expect(historyLinesOf(harness.workers.prompts[1]!.text)).toEqual([
@@ -835,8 +835,8 @@ test("truncates an oversized history body inside the block budget", async () => 
     allowedGroupIds: GROUP_IDS,
   });
   try {
-    await harness.service.handleInbound(memberMessage(1, "😀".repeat(1500)));
-    await harness.service.handleInbound(triggerMessage(harness, 2, "@bot 请处理"));
+    await harness.service.submitInbound(memberMessage(1, "😀".repeat(1500)));
+    await harness.service.submitInbound(triggerMessage(harness, 2, "@bot 请处理"));
     await waitForTask(harness, 1);
 
     const prompt = harness.workers.prompts[0]!.text;
@@ -861,12 +861,12 @@ test("accounts a steered message so the next turn never sends it back", async ()
   });
   try {
     await deliverGroupMessages(harness, 1, 3);
-    await harness.service.handleInbound(triggerMessage(harness, 4, "@bot 长任务"));
+    await harness.service.submitInbound(triggerMessage(harness, 4, "@bot 长任务"));
     await harness.workers.waitForPromptCount(1);
     const sessionId = harness.workers.prompts[0]!.sessionId;
 
     // The chat is in `steer` mode: the message is injected into the running turn.
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...GROUP,
       senderId: "owner-1",
       text: "补充要求",
@@ -881,7 +881,7 @@ test("accounts a steered message so the next turn never sends it back", async ()
       { session_id: sessionId, last_seq: 6, previous_seq: null, phase: "committed" },
     ]);
 
-    await harness.service.handleInbound(triggerMessage(harness, 7, "@bot 第二轮"));
+    await harness.service.submitInbound(triggerMessage(harness, 7, "@bot 第二轮"));
     await waitForTask(harness, 2);
     const second = harness.workers.prompts[1]!.text;
     expect(second).toBe("@bot 第二轮");
@@ -909,7 +909,7 @@ test("a live image message contributes its caption and attachment marker to hist
   try {
     await deliverGroupMessages(harness, 1, 2);
     // 实时缓冲走同一张类型表：带 caption 的图片按 caption + 附件标记渲染。
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...GROUP,
       senderId: "member-2",
       text: "这是设计稿",
@@ -918,7 +918,7 @@ test("a live image message contributes its caption and attachment marker to hist
       messageTimestamp: T0 + 3 * 60_000,
     }));
     // 无 caption 的图片曾是「只贡献覆盖」；如今「最近的消息」也包括它，按附件标记渲染。
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...GROUP,
       senderId: "member-2",
       text: "",
@@ -927,7 +927,7 @@ test("a live image message contributes its caption and attachment marker to hist
       messageTimestamp: T0 + 4 * 60_000,
     }));
 
-    await harness.service.handleInbound(triggerMessage(harness, 5, "@bot 看下这张图"));
+    await harness.service.submitInbound(triggerMessage(harness, 5, "@bot 看下这张图"));
     await waitForTask(harness, 1);
 
     const prompt = harness.workers.prompts[0]!.text;

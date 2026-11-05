@@ -2,13 +2,14 @@ import { expect, test } from "bun:test";
 import { mkdir } from "node:fs/promises";
 import { join, sep } from "node:path";
 import { openChannelStore, type ChannelStore } from "../src/store/index.ts";
-import type { ChatTarget } from "../src/contracts.ts";
+import type { ChatTarget, InboundMessage } from "../src/contracts.ts";
 import {
   assistantText,
   closeCoreHarness,
   createCoreHarness,
   inbound,
   readText,
+  submitAndWaitForIngressHandoff,
   waitForStatus,
   type CoreHarness,
 } from "./fixtures/core-fakes";
@@ -33,10 +34,8 @@ async function within<T>(promise: Promise<T>, description: string): Promise<T> {
   }
 }
 
-async function nextEventLoopTurn(): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  setImmediate(resolve);
-  await promise;
+async function submitAndWaitForHandoff(harness: CoreHarness, message: InboundMessage): Promise<void> {
+  await submitAndWaitForIngressHandoff(harness, message);
 }
 
 async function waitForReplies(
@@ -100,19 +99,19 @@ test("different sessions in the same normalized directory run concurrently", asy
     await mkdir(join(harness.root, "directory alias"), { recursive: true });
     const equivalentDirectory =
       `${join(harness.root, "directory alias")}${sep}..${sep}shared workdir`;
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "bind-first", ...firstTarget, text: `/new ${sharedDirectory}` }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "bind-second", ...secondTarget, text: `/new ${equivalentDirectory}` }),
     );
 
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "work-first", ...firstTarget, text: "first task" }),
     );
     submitted.push(firstTarget);
     await within(firstStarted.promise, "first task to start");
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "work-second", ...secondTarget, text: "second task" }),
     );
     submitted.push(secondTarget);
@@ -199,8 +198,8 @@ for (const scenario of [
     try {
       await mkdir(paths.src, { recursive: true });
       await mkdir(paths.web, { recursive: true });
-      await harness.service.handleInbound(message(first, "bind-held", `/new ${paths[scenario.first]}`));
-      await harness.service.handleInbound(message(second, "bind-independent", `/new ${paths[scenario.second]}`));
+      await submitAndWaitForHandoff(harness, message(first, "bind-held", `/new ${paths[scenario.first]}`));
+      await submitAndWaitForHandoff(harness, message(second, "bind-independent", `/new ${paths[scenario.second]}`));
       store = await openChannelStore(harness.stateDir);
       store.saveThreadWorkspace({
         botUid: harness.bot.uid,
@@ -214,9 +213,9 @@ for (const scenario of [
         ],
         error: null,
       });
-      await harness.service.handleInbound(message(first, "held-task", "held work"));
+      await submitAndWaitForHandoff(harness, message(first, "held-task", "held work"));
       await within(started.promise, "held worker prompt");
-      await harness.service.handleInbound(message(second, "independent-task", "independent work"));
+      await submitAndWaitForHandoff(harness, message(second, "independent-task", "independent work"));
       await within(secondFinished.promise, "independent worker effects before held worker exits");
       await within(
         waitForStatus(harness.service, second, status => status.state === "completed"),
@@ -255,19 +254,19 @@ test("tasks in one chat remain queued in arrival order", async () => {
   try {
     const sharedDirectory = join(harness.root, "shared workdir");
     await mkdir(sharedDirectory, { recursive: true });
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "queue-bind", ...target, text: `/new ${sharedDirectory}` }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "queue-mode", ...target, text: "/mode queue" }),
     );
 
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "queue-first", ...target, text: "first task" }),
     );
     submitted.push(target);
     await within(firstStarted.promise, "first queued-chat task to start");
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "queue-second", ...target, text: "second task" }),
     );
     submitted.push(target);
@@ -315,10 +314,10 @@ test("different chats bound to the same session do not overlap", async () => {
   try {
     const sharedDirectory = join(harness.root, "shared session workdir");
     await mkdir(sharedDirectory, { recursive: true });
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "session-bind", ...firstTarget, text: `/new ${sharedDirectory}` }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({
         messageId: "session-prime",
         ...firstTarget,
@@ -347,7 +346,7 @@ test("different chats bound to the same session do not overlap", async () => {
       sessionFile: firstBinding.sessionFile,
     });
 
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({
         messageId: "shared-session-first",
         ...firstTarget,
@@ -356,7 +355,7 @@ test("different chats bound to the same session do not overlap", async () => {
     );
     submitted.push(firstTarget);
     await within(firstStarted.promise, "first shared-session task to start");
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({
         messageId: "shared-session-second",
         ...secondTarget,
@@ -365,7 +364,10 @@ test("different chats bound to the same session do not overlap", async () => {
     );
     submitted.push(secondTarget);
 
-    for (let turn = 0; turn < 8; turn += 1) await nextEventLoopTurn();
+    await within(
+      waitForStatus(harness.service, secondTarget, (status) => status.state === "queued"),
+      "second chat task to enter the shared-session queue",
+    );
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual([
       "prime shared session",
       "first shared-session task",

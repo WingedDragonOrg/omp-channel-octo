@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
+import { WorkerSteerRejectedError } from "../src/contracts";
 import type { ChatTarget, GroupMember } from "../src/contracts";
 import {
   contextSidecarPath,
@@ -233,7 +234,7 @@ test("the extension persists 0, 10, and 11 member counts in user input without t
     for (let index = 0; index < lists.length; index += 1) {
       transport.setGroupMembers(GROUP.channelId, lists[index]!);
       const text = `member count task ${index}`;
-      await harness.service.handleInbound(
+      await harness.service.submitInbound(
         inboundFor(bot.uid, GROUP, `agent-context-count-${index}`, text),
       );
       await workers.waitForPromptCount(index + 1);
@@ -284,7 +285,7 @@ test("an empty member name is preserved as data without blocking the group task"
   });
   const harness = await createCoreHarness({ bot, transport, workers });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-context-empty-name", "use the member UID"),
     );
     const status = await waitForStatus(
@@ -329,12 +330,12 @@ test("thread tasks refresh only their thread roster and identify the parent grou
     cliCredentials: readyCredentials(bot.uid),
   });
   try {
-    await harness.service.handleInbound(inboundFor(bot.uid, THREAD, "thread-agent-context-first", "thread task first"));
+    await harness.service.submitInbound(inboundFor(bot.uid, THREAD, "thread-agent-context-first", "thread task first"));
     await workers.waitForPromptCount(1);
     await waitForStatus(harness.service, THREAD, (status) => status.state === "completed");
 
     transport.setThreadMembers("group-allowed", "topic-7", [member("thread-member-new", "Thread member new")]);
-    await harness.service.handleInbound(inboundFor(bot.uid, THREAD, "thread-agent-context-second", "thread task second"));
+    await harness.service.submitInbound(inboundFor(bot.uid, THREAD, "thread-agent-context-second", "thread task second"));
     await workers.waitForPromptCount(2);
     await waitForStatus(harness.service, THREAD, (status) => status.state === "completed");
 
@@ -398,12 +399,12 @@ test("steering preserves earlier member input and appends the newest API snapsho
     cliCredentials: readyCredentials(bot.uid),
   });
   try {
-    const running = harness.service.handleInbound(
+    const running = harness.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-steer-first", "long-running task"),
     );
     await started.promise;
     transport.setGroupMembers(GROUP.channelId, [member("member-new", "New member")]);
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-steer-second", "new steering facts"),
     );
     await running;
@@ -453,13 +454,13 @@ test("a resumed native retry preserves the original member user input without an
     cliCredentials: readyCredentials(bot.uid),
   });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-retry-first", "ordinary task"),
     );
     await workers.waitForPromptCount(1);
     await waitForStatus(harness.service, GROUP, (status) => status.state === "completed");
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-native-retry", "/retry"),
     );
     await workers.waitForPromptCount(2);
@@ -505,7 +506,7 @@ test("restart recovers the consumed member input and steering appends a fresh sn
   });
   let restarted: CoreHarness | undefined;
   try {
-    const running = first.service.handleInbound(
+    const running = first.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-recovery-first", "unfinished task"),
     );
     await first.workers.waitForPromptCount(1);
@@ -558,7 +559,7 @@ test("restart recovers the consumed member input and steering appends a fresh sn
       .toHaveLength(1);
 
     transport.setGroupMembers(GROUP.channelId, [member("member-after-stop", "After stop")]);
-    await restarted.service.handleInbound(
+    await restarted.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-recovery-steer", "new post-recovery facts"),
     );
     await steered.promise;
@@ -598,7 +599,7 @@ test("worker subagent and eval sessions cannot consume bound chat identity or me
   });
   const harness = await createCoreHarness({ bot, transport, workers });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-context-subagent", "main group task"),
     );
     await workers.waitForPromptCount(1);
@@ -630,14 +631,14 @@ test("invalid member API data fails closed instead of reusing a previous member 
   transport.setGroupMembers(GROUP.channelId, [member("member-valid", "Valid member")]);
   const harness = await createCoreHarness({ bot, transport });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-context-valid-before-invalid", "valid first task"),
     );
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, GROUP, (status) => status.state === "completed");
 
     invalidResponse = true;
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-context-invalid-response", "must not start"),
     );
     const status = await waitForStatus(harness.service, GROUP, (next) => next.state === "failed");
@@ -656,17 +657,17 @@ test("an owner command and duplicate delivery do not trigger extra member API re
   const transport = new FakeTransport({ bot });
   const harness = await createCoreHarness({ bot, transport });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-context-status-command", "/status"),
     );
     expect(transport.managementCalls.filter(({ action }) => action === "group-members"))
       .toHaveLength(0);
 
     const task = inboundFor(bot.uid, GROUP, "agent-context-duplicate-task", "one task");
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, GROUP, (status) => status.state === "completed");
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
 
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["one task"]);
     expect(transport.managementCalls.filter(({ action }) => action === "group-members"))
@@ -700,7 +701,7 @@ test("DM receives identity and CLI guidance without reading group members or gro
     },
   });
   try {
-    await harness.service.handleInbound(inboundFor(bot.uid, target, "agent-context-dm", "private task"));
+    await harness.service.submitInbound(inboundFor(bot.uid, target, "agent-context-dm", "private task"));
     await workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
@@ -745,7 +746,7 @@ test("separate chats receive only their own member roster and bound session iden
       [GROUP, "task in group one"],
       [OTHER_GROUP, "task in group two"],
     ].entries()) {
-      await harness.service.handleInbound(
+      await harness.service.submitInbound(
         inboundFor(bot.uid, target as ChatTarget, `agent-isolation-${index}`, text as string),
       );
       await workers.waitForPromptCount(index + 1);
@@ -813,7 +814,7 @@ test("concurrent member refresh and prepared receipt writes preserve both sideca
   let running: Promise<void> | undefined;
   let steering: Promise<void> | undefined;
   try {
-    running = harness.service.handleInbound(
+    running = harness.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-context-sidecar-race-first", "sidecar race base task"),
     );
     const { root, sessionId } = await promptStarted.promise;
@@ -822,7 +823,7 @@ test("concurrent member refresh and prepared receipt writes preserve both sideca
     const { prepared: _prepared, ...withoutPrepared } = existing;
     await writeContextSidecarFile(path, withoutPrepared);
 
-    steering = harness.service.handleInbound(
+    steering = harness.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-context-sidecar-race-steer", "refresh member context"),
     );
     await memberRequest.promise;
@@ -883,19 +884,16 @@ test("successful prompt finalization waits for an in-flight steering delivery", 
   let running: Promise<void> | undefined;
   let steering: Promise<void> | undefined;
   try {
-    running = harness.service.handleInbound(
+    running = harness.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-context-finalize-first", "long-running task"),
     );
     await promptStarted.promise;
 
-    const worker = workers.workers[0]!;
-    const actualSteer = worker.steer.bind(worker);
-    worker.steer = async (text) => {
+    workers.beforeSteer = async () => {
       steerStarted.resolve();
       await acceptSteer.promise;
-      return actualSteer(text);
     };
-    steering = harness.service.handleInbound(
+    steering = harness.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-context-finalize-second", "late steering task"),
     );
     await steerStarted.promise;
@@ -906,12 +904,9 @@ test("successful prompt finalization waits for an in-flight steering delivery", 
     acceptSteer.resolve();
     await steering;
     await running;
-    await workers.waitForPromptCount(2);
     await waitForStatus(harness.service, GROUP, (status) => status.state === "completed");
-    expect(workers.prompts.map(({ text }) => text)).toEqual([
-      "long-running task",
-      "late steering task",
-    ]);
+    expect(workers.prompts.map(({ text }) => text)).toEqual(["long-running task"]);
+    expect(workers.workers[0]!.steerCalls).toEqual(["late steering task"]);
   } finally {
     finishPrompt.resolve();
     acceptSteer.resolve();
@@ -958,7 +953,7 @@ test("an unaccepted steering cannot publish its member snapshot into the running
   let running: Promise<void> | undefined;
   let steering: Promise<void> | undefined;
   try {
-    running = harness.service.handleInbound(
+    running = harness.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-context-rejected-first", "original rejected-steer task"),
     );
     await promptStarted.promise;
@@ -967,12 +962,13 @@ test("an unaccepted steering cannot publish its member snapshot into the running
     ]);
 
     const worker = workers.workers[0]!;
+
     worker.steer = async () => {
       steerStarted.resolve();
       await rejectSteer.promise;
-      throw new Error("fixture rejected steering");
+      throw new WorkerSteerRejectedError("fixture rejected steering");
     };
-    steering = harness.service.handleInbound(
+    steering = harness.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-context-rejected-second", "rejected steering input"),
     );
     await steerStarted.promise;
@@ -998,6 +994,64 @@ test("an unaccepted steering cannot publish its member snapshot into the running
     ]);
   } finally {
     rejectSteer.resolve();
+    finishPrompt.resolve();
+    await Promise.all([steering?.catch(() => {}), running?.catch(() => {})]);
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a timed-out member refresh consumes steering without queueing it", async () => {
+  const bot = { uid: "bot-agent-context-steer-timeout", name: "Steer Timeout Bot" };
+  const transport = new FakeTransport({ bot });
+  transport.setGroupMembers(GROUP.channelId, [member("member-timeout-initial", "Initial member")]);
+  const originalGetGroupMembers = transport.getGroupMembers.bind(transport);
+  const memberRequest = Promise.withResolvers<void>();
+  const memberResponse = Promise.withResolvers<GroupMember[]>();
+  let memberCalls = 0;
+  transport.getGroupMembers = async (groupId, signal) => {
+    if (memberCalls++ === 0) return originalGetGroupMembers(groupId, signal);
+    memberRequest.resolve();
+    return memberResponse.promise;
+  };
+  const promptStarted = Promise.withResolvers<void>();
+  const finishPrompt = Promise.withResolvers<void>();
+  const workers = new FakeWorkerFactory(async ({ text }) => {
+    if (text === "long-running timeout task") {
+      promptStarted.resolve();
+      await finishPrompt.promise;
+    }
+  });
+  const harness = await createCoreHarness({ bot, transport, workers });
+  let running: Promise<void> | undefined;
+  let steering: Promise<void> | undefined;
+  try {
+    running = harness.service.submitInbound(
+      inboundFor(bot.uid, GROUP, "agent-context-timeout-first", "long-running timeout task"),
+    );
+    await promptStarted.promise;
+
+    vi.useFakeTimers();
+    steering = harness.service.submitInbound(
+      inboundFor(bot.uid, GROUP, "agent-context-timeout-second", "timed-out steering input"),
+    );
+    await memberRequest.promise;
+    const failureNotice = transport.waitForRemoteText(({ text }) =>
+      text === "成员信息读取失败，本条消息未并入当前回合。",
+    );
+    vi.advanceTimersByTime(5_000);
+    await failureNotice;
+    vi.useRealTimers();
+
+    expect(workers.prompts.map(({ text }) => text)).toEqual(["long-running timeout task"]);
+    expect((await harness.service.status(GROUP)).state).toBe("running");
+
+    finishPrompt.resolve();
+    await Promise.all([steering, running]);
+    await waitForStatus(harness.service, GROUP, (status) => status.state === "completed");
+    expect(workers.prompts.map(({ text }) => text)).toEqual(["long-running timeout task"]);
+  } finally {
+    vi.useRealTimers();
+    memberResponse.resolve([]);
     finishPrompt.resolve();
     await Promise.all([steering?.catch(() => {}), running?.catch(() => {})]);
     await closeCoreHarness(harness);

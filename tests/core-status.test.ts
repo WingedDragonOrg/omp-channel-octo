@@ -39,7 +39,7 @@ function visibleText(card: SentCard): string {
 async function expectStatusTextFallback(transport: FakeTransport, messageId: string): Promise<void> {
   const harness = await createCoreHarness({ transport });
   try {
-    await harness.service.handleInbound(inbound({ ...OWNER_DM, messageId, text: "/status" }));
+    await harness.service.submitInbound(inbound({ ...OWNER_DM, messageId, text: "/status" }));
     const reply = await transport.waitForRemoteText(({ target, text }) =>
       target.channelType === OWNER_DM.channelType
       && target.channelId === OWNER_DM.channelId
@@ -79,7 +79,7 @@ test("/status answers during a live turn with the current fields and without a p
       model: "fixture/context:think",
     };
     safetyRelease = setTimeout(() => release.resolve(), 2_000);
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...OWNER_DM,
       messageId: "status-live-task",
       text: "hold this turn while status is read",
@@ -87,12 +87,17 @@ test("/status answers during a live turn with the current fields and without a p
     await entered.promise;
     const before = await harness.service.status(OWNER_DM);
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...OWNER_DM,
       messageId: "status-live-command",
       text: "/status",
     }));
 
+    await transport.waitForCardSend(({ target, frame }) =>
+      target.channelType === OWNER_DM.channelType
+      && target.channelId === OWNER_DM.channelId
+      && frame.profile === "octo/v1",
+    );
     const card = onlyStatusCard(transport);
     expect(card.frame.profile).toBe("octo/v1");
     const reply = visibleText(card);
@@ -157,7 +162,7 @@ test("/status preserves pending question ids and does not consume the pending as
     },
   });
   try {
-    await harness.service.handleInbound(inbound({ messageId: "status-ask-task", text: "ask me" }));
+    await harness.service.submitInbound(inbound({ messageId: "status-ask-task", text: "ask me" }));
     await harness.workers.waitForPromptCount(1);
     const pending = await waitForStatus(
       harness.service,
@@ -167,7 +172,8 @@ test("/status preserves pending question ids and does not consume the pending as
     const [questionId] = pending.pendingQuestionIds;
     if (!questionId) throw new Error("pending question id was not recorded");
 
-    await harness.service.handleInbound(inbound({ messageId: "status-during-ask", text: "/status" }));
+    await harness.service.submitInbound(inbound({ messageId: "status-during-ask", text: "/status" }));
+    await transport.waitForCardSend(({ frame }) => frame.profile === "octo/v1");
 
     const reply = visibleText(onlyStatusCard(transport));
     expect(reply).toContain(questionId);
@@ -175,7 +181,7 @@ test("/status preserves pending question ids and does not consume the pending as
     expect(harness.workers.creations).toHaveLength(1);
     expect(harness.workers.prompts).toHaveLength(1);
 
-    await harness.service.handleInbound(inbound({ messageId: "status-answer-ask", text: "production" }));
+    await harness.service.submitInbound(inbound({ messageId: "status-answer-ask", text: "production" }));
     await waitForStatus(harness.service, OWNER_DM, status => status.pendingQuestionIds.length === 0);
   } finally {
     await closeCoreHarness(harness);
@@ -188,7 +194,7 @@ test("/status remains owner-only in an allowed group", async () => {
   const harness = await createCoreHarness({ transport });
   const target = { channelType: 2 as const, channelId: "group-allowed" };
   try {
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...target,
       messageId: "status-from-member",
       senderId: "member-1",
@@ -211,8 +217,9 @@ test("duplicate /status delivery sends one status card", async () => {
   const harness = await createCoreHarness({ transport });
   const message = inbound({ messageId: "status-duplicate", text: "/status" });
   try {
-    await harness.service.handleInbound(message);
-    await harness.service.handleInbound({ ...message });
+    await harness.service.submitInbound(message);
+    await harness.service.submitInbound({ ...message });
+    await transport.waitForCardSend(({ frame }) => frame.profile === "octo/v1");
 
     expect(onlyStatusCard(transport).frame.profile).toBe("octo/v1");
     expect(harness.workers.creations).toHaveLength(0);

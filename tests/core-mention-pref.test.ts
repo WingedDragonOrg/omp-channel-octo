@@ -28,7 +28,7 @@ test("accepts an unmentioned group message once the server reports 免@", async 
       text: "run this without mentioning the bot",
     });
 
-    await harness.service.handleInbound(message);
+    await harness.service.submitInbound(message);
     await waitForStatus(harness.service, message, (status) => status.state === "completed");
 
     expect(harness.workers.prompts.map((prompt) => prompt.text)).toEqual([
@@ -49,7 +49,7 @@ test("keeps requiring an @mention while the group decision is off or unreadable"
       channelType: 2,
       text: "no mention here",
     });
-    await harness.service.handleInbound(closed);
+    await harness.service.submitInbound(closed);
     expect(harness.transport.mentionPrefCalls).toEqual(["group-allowed"]);
 
     harness.transport.failGroupMentionPrefWith(new Error("mention preference unavailable"));
@@ -59,7 +59,7 @@ test("keeps requiring an @mention while the group decision is off or unreadable"
       channelType: 2,
       text: "lookup fails",
     });
-    await harness.service.handleInbound(failed);
+    await harness.service.submitInbound(failed);
 
     expect(harness.workers.prompts).toHaveLength(0);
     expect(sentToChat(harness.transport.sent, closed)).toHaveLength(0);
@@ -93,9 +93,9 @@ test("reuses one 免@ decision per group and skips it for a mentioned message", 
       text: "second unmentioned",
     });
 
-    await harness.service.handleInbound(first);
-    await harness.service.handleInbound(mentioned);
-    await harness.service.handleInbound(second);
+    await harness.service.submitInbound(first);
+    await harness.service.submitInbound(mentioned);
+    await harness.service.submitInbound(second);
     await waitForStatus(harness.service, first, (status) => status.state === "completed");
     await waitForStatus(harness.service, mentioned, (status) => status.state === "completed");
     await waitForStatus(harness.service, second, (status) => status.state === "completed");
@@ -130,9 +130,9 @@ test("never asks for a 免@ decision on a message that is rejected first", async
       text: "direct work",
     });
 
-    await harness.service.handleInbound(otherMember);
-    await harness.service.handleInbound(unlistedGroup);
-    await harness.service.handleInbound(ownerDm);
+    await harness.service.submitInbound(otherMember);
+    await harness.service.submitInbound(unlistedGroup);
+    await harness.service.submitInbound(ownerDm);
     await waitForStatus(harness.service, ownerDm, (status) => status.state === "completed");
 
     expect(harness.transport.mentionPrefCalls).toHaveLength(0);
@@ -160,8 +160,8 @@ test("the 免@ exemption stays the owner's: an unmentioned member's message neve
       text: "member work",
     });
 
-    await harness.service.handleInbound(owner);
-    await harness.service.handleInbound(member);
+    await harness.service.submitInbound(owner);
+    await harness.service.submitInbound(member);
     await waitForStatus(harness.service, owner, (status) => status.state === "completed");
 
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["owner work"]);
@@ -183,7 +183,7 @@ test("uses the parent group's 免@ decision inside a thread", async () => {
       text: "thread work without a mention",
     });
 
-    await harness.service.handleInbound(message);
+    await harness.service.submitInbound(message);
     await waitForStatus(harness.service, message, (status) => status.state === "completed");
 
     expect(harness.transport.mentionPrefCalls).toEqual(["group-allowed"]);

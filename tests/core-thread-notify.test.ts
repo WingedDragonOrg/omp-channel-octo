@@ -94,7 +94,7 @@ test("a task-listening thread relays a fixed completion summary to its creator",
     },
   });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "task-listen-create",
         ...GROUP,
@@ -150,7 +150,7 @@ test("default merge listening keeps a completed dispatch quiet", async () => {
     },
   });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "plain-create",
         ...GROUP,
@@ -226,7 +226,7 @@ test("a successful dispatched merge emits only the merge summary, not a task ter
     },
   });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "dispatch-merge-create",
         ...GROUP,
@@ -320,7 +320,7 @@ test("task notification rechecks policy before steering after an async member lo
   };
   const thread: ChatTarget = { channelId: "", channelType: 5 };
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "steer-policy-race",
         ...GROUP,
@@ -400,7 +400,7 @@ test("task notification rechecks policy before accepting after an async cwd prob
   };
   const thread: ChatTarget = { channelId: "", channelType: 5 };
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "accept-policy-race",
         ...GROUP,
@@ -465,7 +465,7 @@ test("a merge consumed while off does not replay after the policy changes to tas
   const root = first.root;
   let firstClosed = false;
   try {
-    await first.service.handleInbound(
+    await first.service.submitInbound(
       inbound({
         messageId: "off-merge-create",
         ...GROUP,
@@ -482,7 +482,7 @@ test("a merge consumed while off does not replay after the policy changes to tas
       thread,
       (status) => status.cwd === join(root, "worktrees", created.shortId),
     );
-    await first.service.handleInbound(
+    await first.service.submitInbound(
       inbound({
         messageId: "off-merge-run",
         ...thread,
@@ -548,7 +548,7 @@ test("restart retries only merge events whose steer claim never crossed dispatch
   const root = first.root;
   let firstClosed = false;
   try {
-    await first.service.handleInbound(
+    await first.service.submitInbound(
       inbound({
         messageId: "merge-recovery-create",
         ...GROUP,
@@ -702,7 +702,7 @@ test("merge event steering rechecks off policy after the asynchronous member loo
   };
   const thread: ChatTarget = { channelId: "", channelType: 5 };
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "merge-race-create",
         ...GROUP,
@@ -717,7 +717,7 @@ test("merge event steering rechecks off policy after the asynchronous member loo
       thread,
       (status) => status.cwd === join(harness.root, "worktrees", created.shortId),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "merge-race-parent-hold",
         ...GROUP,
@@ -727,7 +727,7 @@ test("merge event steering rechecks off policy after the asynchronous member loo
     );
     await parentStarted.promise;
     blockMemberLookup = true;
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "merge-race-trigger",
         ...thread,
@@ -784,7 +784,7 @@ test("a direct thread task is not reported at task listening level by default", 
     },
   });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "direct-create",
         ...GROUP,
@@ -794,7 +794,7 @@ test("a direct thread task is not reported at task listening level by default", 
     );
     await waitForStatus(harness.service, GROUP, (status) => status.state === "completed");
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "direct-task",
         channelId: created.channelId,
@@ -846,7 +846,7 @@ test("a failed task-level dispatch sends a fixed failure summary", async () => {
     },
   });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "fail-create",
         ...GROUP,
@@ -895,7 +895,7 @@ test("task-level listening reports both cancelled dispatches, queued ones includ
     },
   });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "cancel-create",
         ...GROUP,
@@ -907,14 +907,14 @@ test("task-level listening reports both cancelled dispatches, queued ones includ
     const thread = { channelId: created.channelId, channelType: 5 as const };
 
     // Queue mode keeps the second dispatch behind the running one instead of steering into it.
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "cancel-mode", ...thread, text: "/mode queue", mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "cancel-dispatch", ...GROUP, text: "派发两条", mentionedUserIds: [harness.bot.uid] }),
     );
     await harness.workers.waitForPromptCount(3);
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "cancel-command", ...thread, text: "/cancel", mentionedUserIds: [harness.bot.uid] }),
     );
     await bothSeen.promise;
@@ -955,7 +955,7 @@ test("an interrupted task-level dispatch reports a fixed terminal summary", asyn
     },
   });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "interrupt-create",
         ...GROUP,
@@ -966,7 +966,7 @@ test("an interrupted task-level dispatch reports a fixed terminal summary", asyn
     await harness.workers.waitForPromptCount(2);
 
     const thread = { channelId: created.channelId, channelType: 5 as const };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "interrupt-command", ...thread, text: "/interrupt", mentionedUserIds: [harness.bot.uid] }),
     );
     await noticeSeen.promise;
@@ -1004,7 +1004,7 @@ test("a task notice joins the creator's running turn in steer mode", async () =>
     },
   });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "steer-create",
         ...GROUP,
@@ -1049,7 +1049,7 @@ test("a task notice is never taken as the answer to an open question", async () 
     },
   });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "question-create",
         ...GROUP,
@@ -1113,7 +1113,7 @@ test("a graceful stop never relays its in-flight dispatched tasks", async () => 
     },
   });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "stop-create",
         ...GROUP,
@@ -1168,7 +1168,7 @@ test("queued dispatches resume after restart and emit each task notice once", as
     },
   });
   try {
-    await first.service.handleInbound(
+    await first.service.submitInbound(
       inbound({
         messageId: "restart-create",
         ...GROUP,
@@ -1254,7 +1254,7 @@ test("queued dispatches resume after restart and emit each task notice once", as
     },
   });
   try {
-    await second.service.handleInbound(
+    await second.service.submitInbound(
       inbound({
         messageId: "restart-second",
         ...GROUP,
@@ -1300,7 +1300,7 @@ test("a new thread defaults to merge-only listening, so dispatch completion stay
     },
   });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "default-listen-dispatch",
         ...GROUP,
@@ -1349,7 +1349,7 @@ test("create-thread listen=task relays terminal identity without task or result 
     },
   });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "task-listen-create",
         ...GROUP,

@@ -47,7 +47,7 @@ test("task-aware native dispatch replay executes once while a new call still run
   try {
     store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
     const parent = { channelType: 2 as const, channelId: groupId };
-    await harness.service.handleInbound(inbound({ ...parent, messageId: "native-dispatch-bind", text: `/bind loop ${workspaceId}`, mentionedUserIds: [harness.bot.uid] }));
+    await harness.service.submitInbound(inbound({ ...parent, messageId: "native-dispatch-bind", text: `/bind loop ${workspaceId}`, mentionedUserIds: [harness.bot.uid] }));
     await harness.workers.waitForPromptCount(1);
     const parentStatus = await waitForStatus(harness.service, parent, status => status.state === "completed" || status.state === "failed");
     expect(parentStatus.state).toBe("completed");

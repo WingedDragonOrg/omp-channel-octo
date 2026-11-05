@@ -32,23 +32,23 @@ test("/cancel interrupts the active task and clears queued work immediately", as
   });
   try {
     const target = { channelId: "dm-cancel", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "cancel-bind", ...target, text: "/new" }),
     );
-    const firstAccepted = harness.service.handleInbound(
+    const firstAccepted = harness.service.submitInbound(
       inbound({ messageId: "cancel-first", ...target, text: "first" }),
     );
     await harness.workers.waitForPromptCount(1);
     await stopReadySignal;
 
-    const secondAccepted = harness.service.handleInbound(
+    const secondAccepted = harness.service.submitInbound(
       inbound({ messageId: "cancel-second", ...target, text: "second" }),
     );
-    const thirdAccepted = harness.service.handleInbound(
+    const thirdAccepted = harness.service.submitInbound(
       inbound({ messageId: "cancel-third", ...target, text: "third" }),
     );
     await Promise.all([secondAccepted, thirdAccepted]);
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "cancel-command", ...target, text: "/cancel" }),
     );
     await Promise.all([firstAccepted, onStopSignal]);

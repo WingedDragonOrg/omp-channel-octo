@@ -5,6 +5,7 @@ import {
   createCoreHarness,
   inbound,
   readText,
+  submitAndWaitForIngressHandoff,
   waitForStatus,
 } from "./fixtures/core-fakes";
 
@@ -17,7 +18,7 @@ test("durable inbound dedupe prevents a duplicate side effect after restart", as
     text: "write exactly once",
   });
   try {
-    await first.service.handleInbound(message);
+    await submitAndWaitForIngressHandoff(first, message);
     await first.workers.waitForPromptCount(1);
     await waitForStatus(first.service, message, (status) => status.state === "completed");
     const firstEffects = await readText(join(first.root, "tmp", "effects.log"));
@@ -28,7 +29,7 @@ test("durable inbound dedupe prevents a duplicate side effect after restart", as
 
   const restarted = await createCoreHarness({ root: first.root, bot: first.bot });
   try {
-    await restarted.service.handleInbound(message);
+    await submitAndWaitForIngressHandoff(restarted, message);
     const status = await restarted.service.status(message);
     expect(status.state).toBe("completed");
     expect(restarted.workers.prompts).toHaveLength(0);
@@ -50,7 +51,7 @@ test("a command with the same durable message id is not applied again after rest
   });
   let originalSession: string | null = null;
   try {
-    await first.service.handleInbound(command);
+    await submitAndWaitForIngressHandoff(first, command);
     originalSession = (await first.service.status(target)).sessionId;
   } finally {
     await closeCoreHarness(first, { remove: false });
@@ -58,7 +59,7 @@ test("a command with the same durable message id is not applied again after rest
 
   const restarted = await createCoreHarness({ root: first.root, bot: first.bot });
   try {
-    await restarted.service.handleInbound(command);
+    await submitAndWaitForIngressHandoff(restarted, command);
     const status = await restarted.service.status(target);
     expect(status.sessionId).toBe(originalSession);
     expect(status.cwd).toBe(join(first.root, "tmp"));

@@ -199,7 +199,7 @@ test("CoreService baseline retains every task but accepts only persisted-owner a
   let store: ChannelStore | undefined;
   try {
     store = await openChannelStore(harness.stateDir);
-    await harness.service.handleInbound(bindMessage("baseline-filter"));
+    await harness.service.submitInbound(bindMessage("baseline-filter"));
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(
       harness.service,
@@ -248,7 +248,7 @@ test("unobserved creations stay silent and later owner or Bot assignment deliver
   let store: ChannelStore | undefined;
   try {
     store = await openChannelStore(harness.stateDir);
-    await harness.service.handleInbound(bindMessage("unobserved-baseline"));
+    await harness.service.submitInbound(bindMessage("unobserved-baseline"));
     expect(harness.workers.prompts).toEqual([]);
     expect(persistedInputs(harness.stateDir)).toEqual([]);
     expect(store.getLatestTask(BOT_UID, MAIN_TARGET)).toBeNull();
@@ -258,7 +258,7 @@ test("unobserved creations stay silent and later owner or Bot assignment deliver
       assigneeOctoUid: "another-user",
     });
     loop.tasks.set(WORKSPACE.workspaceId, [firstOther, newOther]);
-    await harness.service.handleInbound(bindMessage("unobserved-created"));
+    await harness.service.submitInbound(bindMessage("unobserved-created"));
     expect(harness.workers.prompts).toEqual([]);
     expect(persistedInputs(harness.stateDir)).toEqual([]);
     expect(store.getLatestTask(BOT_UID, MAIN_TARGET)).toBeNull();
@@ -268,7 +268,7 @@ test("unobserved creations stay silent and later owner or Bot assignment deliver
       assigneeOctoUid: OWNER_UID,
     });
     loop.tasks.set(WORKSPACE.workspaceId, [assignedOwner, newOther]);
-    await harness.service.handleInbound(bindMessage("owner-assignment"));
+    await harness.service.submitInbound(bindMessage("owner-assignment"));
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(
       harness.service,
@@ -281,7 +281,7 @@ test("unobserved creations stay silent and later owner or Bot assignment deliver
       assigneeOctoUid: BOT_UID,
     });
     loop.tasks.set(WORKSPACE.workspaceId, [assignedOwner, assignedBot]);
-    await harness.service.handleInbound(bindMessage("bot-assignment"));
+    await harness.service.submitInbound(bindMessage("bot-assignment"));
     await harness.workers.waitForPromptCount(2);
     await waitForStatus(
       harness.service,
@@ -312,7 +312,7 @@ test("an unassociated task transferred away from the owner stops producing input
   let store: ChannelStore | undefined;
   try {
     store = await openChannelStore(harness.stateDir);
-    await harness.service.handleInbound(bindMessage("transfer-bind"));
+    await harness.service.submitInbound(bindMessage("transfer-bind"));
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(
       harness.service,
@@ -325,11 +325,11 @@ test("an unassociated task transferred away from the owner stops producing input
       assigneeOctoUid: "other-user",
     });
     loop.tasks.set(WORKSPACE.workspaceId, [transferred]);
-    await harness.service.handleInbound(bindMessage("transfer-away"));
+    await harness.service.submitInbound(bindMessage("transfer-away"));
     expect(harness.workers.prompts).toHaveLength(1);
     expect(persistedInputs(harness.stateDir)).toHaveLength(1);
 
-    await harness.service.handleInbound(bindMessage("transfer-away-repeat"));
+    await harness.service.submitInbound(bindMessage("transfer-away-repeat"));
     expect(harness.workers.prompts).toHaveLength(1);
     expect(persistedInputs(harness.stateDir)).toHaveLength(1);
     const database = new Database(join(harness.stateDir, "channel.sqlite"));
@@ -355,7 +355,7 @@ test("a task route keeps changes direct to its child after reassignment or unass
   let store: ChannelStore | undefined;
   try {
     store = await openChannelStore(harness.stateDir);
-    await harness.service.handleInbound(bindMessage("routed-bind"));
+    await harness.service.submitInbound(bindMessage("routed-bind"));
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(
       harness.service,
@@ -376,7 +376,7 @@ test("a task route keeps changes direct to its child after reassignment or unass
       assigneeOctoUid: null,
     });
     loop.tasks.set(WORKSPACE.workspaceId, [noAssignee]);
-    await harness.service.handleInbound(bindMessage("routed-unassigned-update"));
+    await harness.service.submitInbound(bindMessage("routed-unassigned-update"));
     await harness.workers.waitForPromptCount(2);
     const childTarget: ChatTarget = { channelType: 5, channelId: thread.channelId };
     await waitForStatus(
@@ -429,7 +429,7 @@ test("CoreService sends a historical-route baseline task to its child, not the m
     }, []);
     store.bindLoopWorkspace(BOT_UID, GROUP_ID, WORKSPACE, [routedTask, mainTask]);
 
-    await harness.service.handleInbound(bindMessage("existing-route-baseline-drain"));
+    await harness.service.submitInbound(bindMessage("existing-route-baseline-drain"));
     await harness.workers.waitForPromptCount(2);
     const childTarget: ChatTarget = { channelType: 5, channelId: thread.channelId };
     await Promise.all([
@@ -489,7 +489,7 @@ test("unobserved Loop tasks cannot answer or queue behind a pending ask", async 
   let store: ChannelStore | undefined;
   try {
     store = await openChannelStore(harness.stateDir);
-    await harness.service.handleInbound(bindMessage("ask-owner-bind"));
+    await harness.service.submitInbound(bindMessage("ask-owner-bind"));
     await harness.workers.waitForPromptCount(1);
     await askStarted.promise;
     const waiting = await waitForStatus(
@@ -503,7 +503,7 @@ test("unobserved Loop tasks cannot answer or queue behind a pending ask", async 
       assigneeOctoUid: "other-user",
     });
     loop.tasks.set(WORKSPACE.workspaceId, [owned, unrelated]);
-    await harness.service.handleInbound(bindMessage("ask-unrelated-scan"));
+    await harness.service.submitInbound(bindMessage("ask-unrelated-scan"));
     const after = await waitForStatus(
       harness.service,
       MAIN_TARGET,
@@ -590,7 +590,7 @@ test("a recovered pending baseline with no currently observed tasks is supersede
   let recoveredStore: ChannelStore | undefined;
   try {
     recoveredStore = await openChannelStore(recovered.stateDir);
-    await recovered.service.handleInbound(bindMessage("recovered-all-drop-drain"));
+    await recovered.service.submitInbound(bindMessage("recovered-all-drop-drain"));
     expect(recovered.workers.prompts).toEqual([]);
     expect(recoveredStore.getLoopInput(inputId)).toMatchObject({
       state: "superseded",

@@ -6,6 +6,7 @@ import {
   createCoreHarness,
   inbound,
   readText,
+  submitAndWaitForIngressHandoff,
   waitForStatus,
 } from "./fixtures/core-fakes";
 
@@ -47,7 +48,8 @@ test("a plain reply answers the pending question with its option index", async (
   });
   try {
     const target = { channelId: "dm-ask", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "ask-start", ...target, text: "needs an answer" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -66,7 +68,8 @@ test("a plain reply answers the pending question with its option index", async (
     expect(question).toContain("2. production — customer traffic");
     expect(question).toContain("直接回复选项编号作为答案");
 
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "answer-plain-reply", ...target, text: "2" }),
     );
     const completed = await waitForStatus(
@@ -108,7 +111,8 @@ test("a free-form reply is returned as the free-form answer instead of starting 
   });
   try {
     const target = { channelId: "dm-ask-free", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "ask-free-start", ...target, text: "when do we ship?" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -119,7 +123,8 @@ test("a free-form reply is returned as the free-form answer instead of starting 
     );
     const questionId = onlyPendingQuestionId(pending);
 
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "ask-free-reply", ...target, text: "先不发布，等周四" }),
     );
     const completed = await waitForStatus(
@@ -152,7 +157,8 @@ test("an out-of-range option reply leaves the question pending and starts no tas
   });
   try {
     const target = { channelId: "dm-ask-invalid", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "ask-invalid-start", ...target, text: "approve?" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -163,7 +169,8 @@ test("an out-of-range option reply leaves the question pending and starts no tas
     );
     const questionId = onlyPendingQuestionId(pending);
 
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "ask-invalid-reply", ...target, text: "9" }),
     );
     const rejected = await harness.transport.waitForAttempt(({ text }) => text.includes("答案无效"));
@@ -193,7 +200,8 @@ test("a reply in another chat does not answer the pending question", async () =>
   });
   try {
     const target = { channelId: "dm-ask-scope", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "ask-scope-start", ...target, text: "which scope?" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -205,7 +213,8 @@ test("a reply in another chat does not answer the pending question", async () =>
     const questionId = onlyPendingQuestionId(pending);
 
     const other = { channelId: "dm-ask-other", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "ask-scope-other-reply", ...other, text: "backend only" }),
     );
 
@@ -235,7 +244,8 @@ test("/cancel invalidates a pending ask and a later reply is ordinary task input
   });
   try {
     const target = { channelId: "dm-ask-cancel", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "ask-cancel-start", ...target, text: "pending approval" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -245,7 +255,8 @@ test("/cancel invalidates a pending ask and a later reply is ordinary task input
       (status) => status.pendingQuestionIds.length === 1,
     );
 
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "ask-cancel-command", ...target, text: "/cancel" }),
     );
     const cancelled = await waitForStatus(
@@ -255,7 +266,8 @@ test("/cancel invalidates a pending ask and a later reply is ordinary task input
     );
     expect(cancelled.pendingQuestionIds).toHaveLength(0);
 
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "ask-late-reply", ...target, text: "1" }),
     );
     await harness.workers.waitForPromptCount(2);

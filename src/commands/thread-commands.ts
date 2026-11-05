@@ -5,6 +5,10 @@
  */
 import { createHash } from "node:crypto";
 import type { InboundMessage, WorktreeMergeSummary, WorktreePort } from "../contracts.ts";
+import type {
+  IngressConsumer,
+  IngressOperationCheckpoint,
+} from "../inbound/ingress-types.ts";
 import type { Outbox } from "../outbox.ts";
 import type { ChannelStore } from "../store/index.ts";
 import type {
@@ -171,6 +175,19 @@ function threadMergeNotStartedReceipt(diagnostic: string): string {
  * `/thread` 命令可触及的状态端口：绑定/所有权资格、命令 claim、隔离合并执行、稳定回执与归档，
  * 以及常规任务接管。宿主合并的聊天与会话调度由 `CoreService` 持有。
  */
+export interface ThreadCommandIngressHooks {
+  readonly signal?: AbortSignal;
+  readonly onReservationInstalled: () => void;
+  readonly checkpoint?: (
+    phase: Exclude<Extract<IngressOperationCheckpoint, { kind: "command" }>["phase"], "dispatch-intent" | "cancel-intent" | "commit-stop-intent" | "interrupt-intent">,
+  ) => void;
+  readonly markDispatchIntent: (hostLedgerId: string) => boolean;
+  readonly acceptsInitialSessionBinding: (binding: BindingRecord) => boolean;
+  readonly handoffToConsumer?: (
+    consumer: IngressConsumer,
+    persistConsumer: () => boolean,
+  ) => boolean;
+}
 export interface ThreadCommandsDeps {
   readonly store: Pick<ChannelStore, "getBinding" | "getThreadWorkspace" | "getThreadForkByTarget" | "getTaskByMessageId" | "getCommandClaimState" | "completeCommand" | "releaseClaim" | "getHostRemovalLeaseBySourceId" | "getHostMergeLeaseBySourceId" | "getOutbox">;
   /** Read or change the group default using the same serialized model-config path as `/switch`. */
@@ -194,6 +211,7 @@ export interface ThreadCommandsDeps {
     archiveGeneration: number,
     operatorNote: string,
     onAccepted?: () => void,
+    ingressHooks?: ThreadCommandIngressHooks,
   ) => Promise<WorktreeMergeSummary & { archive?: "scheduled" }>;
   /** Execute owned local cleanup under CoreService's session, directory and process leases. */
   readonly executeHostRemoval: (
@@ -201,6 +219,7 @@ export interface ThreadCommandsDeps {
     ownership: ThreadWorkspaceRecord,
     force: boolean,
     receiptOutboxId: string,
+    ingressHooks?: ThreadCommandIngressHooks,
   ) => Promise<HostThreadRemovalOutcome | { kind: "refused"; message: string }>;
   /** 将一条已持久化成功回执入队；id 由命令 sourceId 稳定派生。 */
   readonly enqueueMergeReceipt: (target: InboundMessage, id: string, text: string) => void;
@@ -261,6 +280,9 @@ export class ThreadCommands {
   async handle(
     message: InboundMessage,
     argument: string,
+    preparedRequest?: string,
+    ingressHooks?: ThreadCommandIngressHooks,
+    ingressTaskDispatch?: (body: string) => Promise<void>,
     onHostMergeAccepted?: () => void,
   ): Promise<void> {
     const modelArgument = readThreadModelArgument(argument);
@@ -270,13 +292,13 @@ export class ThreadCommands {
     }
     const mergeNote = readThreadMergeNote(argument);
     if (mergeNote !== undefined) {
-      await this.handleThreadMergeCommand(message, mergeNote, onHostMergeAccepted);
+      await this.handleThreadMergeCommand(message, mergeNote, onHostMergeAccepted, ingressHooks);
       return;
     }
     const removeForce = readThreadRemoveForce(argument);
     if (removeForce !== undefined) {
       if (removeForce === null) await this.deps.enqueueText(message, THREAD_REMOVE_USAGE, null);
-      else await this.handleThreadRemoveCommand(message, removeForce);
+      else await this.handleThreadRemoveCommand(message, removeForce, ingressHooks);
       return;
     }
     if (message.channelType === 5) {
@@ -296,9 +318,13 @@ export class ThreadCommands {
     // （claim + 下载 + 转写 + 附件块），否则随消息发来的图片只剩 `[图片]` 占位。
     this.deps.store.releaseClaim(this.deps.commandClaim(message, "thread"));
     await this.deps.withMessageTyping(message, async () => {
-      const request = await this.deps.materialize(message, intent);
+      const request = preparedRequest ?? await this.deps.materialize(message, intent);
       if (request === null) return;
       const body = threadIntentPrompt(request);
+      if (ingressTaskDispatch !== undefined) {
+        await ingressTaskDispatch(body);
+        return;
+      }
       if (await this.deps.appendToRunningTask(message, body)) return;
       await this.deps.acceptTask(message, body);
     });
@@ -424,7 +450,11 @@ export class ThreadCommands {
     return true;
   }
 
-  private async handleThreadRemoveCommand(message: InboundMessage, force: boolean): Promise<void> {
+  private async handleThreadRemoveCommand(
+    message: InboundMessage,
+    force: boolean,
+    ingressHooks?: ThreadCommandIngressHooks,
+  ): Promise<void> {
     if (message.channelType !== 5) {
       await this.deps.enqueueText(message, THREAD_REMOVE_THREAD_ONLY_TEXT, null);
       return;
@@ -463,6 +493,8 @@ export class ThreadCommands {
       await this.deps.enqueueText(message, THREAD_REMOVE_UNCONFIGURED_TEXT, null);
       return;
     }
+    ingressHooks?.onReservationInstalled();
+    ingressHooks?.checkpoint?.("waiting-resource");
     const receiptOutboxId = removalReceiptId(botUid, message, message.messageId);
     const archiveGeneration = this.deps.archiveGeneration(message);
     let result: HostThreadRemovalOutcome | { kind: "refused"; message: string };
@@ -472,9 +504,10 @@ export class ThreadCommands {
         ownership,
         force,
         receiptOutboxId,
+        ingressHooks,
       );
     } catch (error) {
-      if (this.deps.stopping()) return;
+      if (this.deps.stopping() || ingressHooks?.signal?.aborted) return;
       await this.deps.enqueueText(
         message,
         `本地工作区清理未完成且不会自动重试：${boundedThreadCommandError(error)}。请核对资源后重新执行 /thread remove。`,
@@ -482,7 +515,7 @@ export class ThreadCommands {
       );
       return;
     }
-    if (this.deps.stopping()) return;
+    if (this.deps.stopping() || ingressHooks?.signal?.aborted) return;
     if (result.kind === "refused") {
       await this.deps.enqueueText(message, result.message, null);
       return;
@@ -504,6 +537,7 @@ export class ThreadCommands {
     message: InboundMessage,
     mergeNote: string,
     onHostMergeAccepted?: () => void,
+    ingressHooks?: ThreadCommandIngressHooks,
   ): Promise<void> {
     if (message.channelType !== 5) {
       await this.deps.enqueueText(message, THREAD_MERGE_THREAD_ONLY_TEXT, null);
@@ -529,7 +563,9 @@ export class ThreadCommands {
       await this.deps.enqueueText(message, THREAD_MERGE_NO_WORKSPACE_TEXT, null);
       return;
     }
-    const available = await worktrees.worktrunk();
+    ingressHooks?.onReservationInstalled();
+    ingressHooks?.checkpoint?.("planning");
+    const available = await worktrees.worktrunk(ingressHooks?.signal);
     if (!available.available) {
       await this.deps.enqueueText(
         message,
@@ -553,6 +589,7 @@ export class ThreadCommands {
           archiveGeneration,
           note,
           onHostMergeAccepted,
+          ingressHooks,
         );
       } catch (error) {
         if (this.deps.stopping()) return;
@@ -570,6 +607,7 @@ export class ThreadCommands {
           this.deps.settleHostMerge(message, message.messageId);
           return;
         }
+        if (ingressHooks?.signal?.aborted) return;
         if (error instanceof WorktreeMergeExecutionError) {
           await this.acceptMergeRepairTask({
             message,

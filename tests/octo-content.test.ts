@@ -4,7 +4,7 @@ import { mkdtemp, open as openFile, readFile, readdir, rm, stat, writeFile } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AttachmentError } from "../src/inbound/attachments.ts";
-import type { ChannelTransport, InboundMessage } from "../src/contracts.ts";
+import type { ChannelTransport, InboundMessage, InboundReceipt } from "../src/contracts.ts";
 import { createOctoTransport } from "../src/octo/index.ts";
 import {
   createOctoProtocolFixture,
@@ -15,6 +15,8 @@ import {
 
 /** Every inbound case is a group message; only the encrypted payload varies. */
 const GROUP_CHANNEL = "group-content";
+const READY_RECEIPT: InboundReceipt = { ackReady: Promise.resolve() };
+
 
 let fixture: OctoProtocolFixture | undefined;
 let transport: ChannelTransport | undefined;
@@ -41,7 +43,7 @@ afterEach(async () => {
  * arrive through the real RECV path, so the assertions cover wire decoding too.
  */
 async function startFixtureTransport(
-  onMessage: (message: InboundMessage) => Promise<void>,
+  onMessage: (message: InboundMessage) => InboundReceipt,
 ): Promise<{ current: OctoProtocolFixture; connection: FixtureConnection }> {
   const current = await createOctoProtocolFixture();
   fixture = current;
@@ -157,8 +159,9 @@ async function startStreamingServer(totalBytes: number): Promise<string> {
 describe("Octo inbound message content", () => {
   test("extracts text and attachments for every supported message type", async () => {
     const inbox: InboundMessage[] = [];
-    const { current, connection } = await startFixtureTransport(async (message) => {
+    const { current, connection } = await startFixtureTransport((message) => {
       inbox.push(message);
+      return READY_RECEIPT;
     });
     const asset = (key: string): string => `${current.apiUrl}/fixture-download/${key}`;
     const payloads: Record<string, unknown>[] = [
@@ -288,8 +291,9 @@ describe("Octo inbound message content", () => {
 
   test("bounds a merge-forward by message count and code point budget", async () => {
     const inbox: InboundMessage[] = [];
-    const { current, connection } = await startFixtureTransport(async (message) => {
+    const { current, connection } = await startFixtureTransport((message) => {
       inbox.push(message);
+      return READY_RECEIPT;
     });
     const inner = (index: number, content: string): Record<string, unknown> => ({
       from_uid: `member-${index}`,
@@ -323,8 +327,9 @@ describe("Octo inbound message content", () => {
 
   test("keeps stickers unsupported with no text and no attachments", async () => {
     const inbox: InboundMessage[] = [];
-    const { current, connection } = await startFixtureTransport(async (message) => {
+    const { current, connection } = await startFixtureTransport((message) => {
       inbox.push(message);
+      return READY_RECEIPT;
     });
     const asset = (key: string): string => `${current.apiUrl}/fixture-download/${key}`;
 
@@ -341,8 +346,9 @@ describe("Octo inbound message content", () => {
 
   test("drops attachment URLs that are not absolute http(s) URLs", async () => {
     const inbox: InboundMessage[] = [];
-    const { current, connection } = await startFixtureTransport(async (message) => {
+    const { current, connection } = await startFixtureTransport((message) => {
       inbox.push(message);
+      return READY_RECEIPT;
     });
 
     const messages = await deliverInbound(current, connection, inbox, [
@@ -363,8 +369,9 @@ describe("Octo inbound message content", () => {
 
   test("reads the quoted message of a reply as text plus its own media", async () => {
     const inbox: InboundMessage[] = [];
-    const { current, connection } = await startFixtureTransport(async (message) => {
+    const { current, connection } = await startFixtureTransport((message) => {
       inbox.push(message);
+      return READY_RECEIPT;
     });
     const quotedImage = `${current.apiUrl}/fixture-download/quoted.png`;
 
@@ -451,8 +458,9 @@ describe("Octo inbound message content", () => {
     // type 8 文件块（name/extension/size/绝对 CDN 直链）；type 9 别名同表；相对路径引用来
     // 自客户端降级形态，整条引用不可用。
     const inbox: InboundMessage[] = [];
-    const { current, connection } = await startFixtureTransport(async (message) => {
+    const { current, connection } = await startFixtureTransport((message) => {
       inbox.push(message);
+      return READY_RECEIPT;
     });
     const quotedFile = `${current.apiUrl}/fixture-download/quoted-file.xlsx`;
     const aliasedFile = `${current.apiUrl}/fixture-download/aliased.xlsx`;
@@ -521,8 +529,9 @@ describe("Octo inbound message content", () => {
 
   test("strips the bot mention from extracted text", async () => {
     const inbox: InboundMessage[] = [];
-    const { current, connection } = await startFixtureTransport(async (message) => {
+    const { current, connection } = await startFixtureTransport((message) => {
       inbox.push(message);
+      return READY_RECEIPT;
     });
     const asset = (key: string): string => `${current.apiUrl}/fixture-download/${key}`;
     const mentionToken = `@${current.botName}`;
@@ -695,8 +704,9 @@ describe("Octo inbound attachment download", () => {
 
   test("renders a merge-forward nested inside a merge-forward as a placeholder", async () => {
     const inbox: InboundMessage[] = [];
-    const { current, connection } = await startFixtureTransport(async (message) => {
+    const { current, connection } = await startFixtureTransport((message) => {
       inbox.push(message);
+      return READY_RECEIPT;
     });
 
     const messages = await deliverInbound(current, connection, inbox, [

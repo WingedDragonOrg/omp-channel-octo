@@ -27,9 +27,12 @@ import { openChannelStore, type ChannelStore } from "../src/store";
 import {
   closeCoreHarness,
   createCoreHarness,
+  type CoreHarness,
   FakeWorkerFactory,
   inbound,
+  submitAndWaitForIngressHandoff,
   type FakePrompt,
+  waitForIngressJob,
   waitForStatus,
 } from "./fixtures/core-fakes";
 type RefreshableWorker = OmpWorker & {
@@ -78,6 +81,24 @@ function createGate(label = "gate", timeoutMs?: number): Gate {
     return promise;
   };
   return { promise, release, reject: fail, wait };
+}
+
+type RemoteTextMessage = ReturnType<CoreHarness["transport"]["listRemoteText"]>[number];
+type RemoteTextTarget = Parameters<CoreHarness["transport"]["listRemoteText"]>[0];
+
+async function waitForRemoteTextWithin(
+  harness: CoreHarness,
+  target: RemoteTextTarget,
+  predicate: (message: RemoteTextMessage) => boolean,
+  timeoutMs = 5_000,
+): Promise<RemoteTextMessage> {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    const message = harness.transport.listRemoteText(target).find(predicate);
+    if (message !== undefined) return message;
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+  throw new Error(`remote receipt did not arrive for ${target.channelType}:${target.channelId}`);
 }
 
 
@@ -451,12 +472,14 @@ test("/new without a path reuses the currently bound directory and rotates the s
   const target = { channelId: "dm-project-bindings", channelType: 1 as const };
   const project = await realpath(await mkdtemp(join(harness.root, "project-")));
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "bindings-new-explicit", ...target, text: `/new "${project}"` }),
     );
     const before = await harness.service.status(target);
 
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "bindings-new-reuse", ...target, text: "/new" }),
     );
     const after = await harness.service.status(target);
@@ -473,12 +496,14 @@ test("/reset without a path creates a fresh session in the existing directory", 
   const target = { channelId: "dm-project-reset", channelType: 1 as const };
   const project = await realpath(await mkdtemp(join(harness.root, "project-")));
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "bindings-reset-explicit", ...target, text: `/new ${project}` }),
     );
     const before = await harness.service.status(target);
 
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "bindings-reset-reuse", ...target, text: "/reset" }),
     );
     const after = await harness.service.status(target);
@@ -496,7 +521,8 @@ test("/move keeps the session identity while changing the bound directory", asyn
   const source = await realpath(await mkdtemp(join(harness.root, "source-")));
   const destination = await realpath(await mkdtemp(join(harness.root, "destination-")));
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "bindings-move-source", ...target, text: `/new ${source}` }),
     );
     const before = await harness.service.status(target);
@@ -507,7 +533,8 @@ test("/move keeps the session identity while changing the bound directory", asyn
       const switched = bindings.getBinding(harness.bot.uid, target)?.sessionSwitchedAt ?? null;
       expect(switched).not.toBeNull();
 
-      await harness.service.handleInbound(
+      await submitAndWaitForIngressHandoff(
+        harness,
         inbound({ messageId: "bindings-move-destination", ...target, text: `/move ${destination}` }),
       );
       const after = await harness.service.status(target);
@@ -549,10 +576,12 @@ for (const occupiedDirectory of ["source", "destination"] as const) {
     let store: ChannelStore | undefined;
     let otherTask: Promise<void> | undefined;
     try {
-      await harness.service.handleInbound(
+      await submitAndWaitForIngressHandoff(
+        harness,
         inbound({ messageId: `move-occupied-bind-${occupiedDirectory}`, ...target, text: `/new ${source}` }),
       );
-      await harness.service.handleInbound(
+      await submitAndWaitForIngressHandoff(
+        harness,
         inbound({
           messageId: `move-occupied-other-bind-${occupiedDirectory}`,
           ...otherTarget,
@@ -567,23 +596,33 @@ for (const occupiedDirectory of ["source", "destination"] as const) {
       if (!before?.sessionId || !otherBefore?.sessionId) throw new Error("initial bindings lack session identities");
       expect(before.sessionId).not.toBe(otherBefore.sessionId);
 
-      otherTask = harness.service.handleInbound(
+      otherTask = harness.service.submitInbound(
         inbound({
           messageId: `move-occupied-hold-${occupiedDirectory}`,
           ...otherTarget,
           text: heldTaskText,
         }),
       );
+      await otherTask;
       await taskStarted.wait();
       await waitForStatus(harness.service, otherTarget, status => status.state === "running");
 
-      await harness.service.handleInbound(
-        inbound({
-          messageId: `move-occupied-command-${occupiedDirectory}`,
-          ...target,
-          text: `/move ${destination}`,
-        }),
+      const moveMessage = inbound({
+        messageId: `move-occupied-command-${occupiedDirectory}`,
+        ...target,
+        text: `/move ${destination}`,
+      });
+      await submitAndWaitForIngressHandoff(harness, moveMessage);
+      const moveReceipt = await waitForRemoteTextWithin(
+        harness,
+        target,
+        ({ target: sentTarget, text }) =>
+          sentTarget.channelId === target.channelId
+          && sentTarget.channelType === target.channelType
+          && text.startsWith("已迁移会话 ")
+          && text.includes(`cwd=${destination}`),
       );
+      expect(moveReceipt.text).toContain(`cwd=${destination}`);
 
       const after = store.getBinding(harness.bot.uid, target);
       expect(after?.cwd).toBe(destination);
@@ -595,6 +634,8 @@ for (const occupiedDirectory of ["source", "destination"] as const) {
 
       expect(store.getBinding(harness.bot.uid, otherTarget)?.cwd).toBe(otherCwd);
       expect(store.getLatestTask(harness.bot.uid, otherTarget)?.state).toBe("running");
+      releaseTask.release();
+      await waitForStatus(harness.service, otherTarget, status => status.state === "completed");
     } finally {
       releaseTask.release();
       await otherTask?.catch(() => {});
@@ -623,10 +664,12 @@ test("/new creates an independent session in a directory used by another chat's 
   let store: ChannelStore | undefined;
   let otherTask: Promise<void> | undefined;
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "new-occupied-bind", ...target, text: `/new ${source}` }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "new-occupied-other-bind", ...otherTarget, text: `/new ${destination}` }),
     );
     store = await openChannelStore(harness.stateDir);
@@ -637,15 +680,29 @@ test("/new creates an independent session in a directory used by another chat's 
     if (!before?.sessionId || !otherBefore?.sessionId) throw new Error("initial bindings lack session identities");
     expect(before.sessionId).not.toBe(otherBefore.sessionId);
 
-    otherTask = harness.service.handleInbound(
+    otherTask = harness.service.submitInbound(
       inbound({ messageId: "new-occupied-hold", ...otherTarget, text: heldTaskText }),
     );
+    await otherTask;
     await taskStarted.wait();
     await waitForStatus(harness.service, otherTarget, status => status.state === "running");
 
-    await harness.service.handleInbound(
-      inbound({ messageId: "new-occupied-command", ...target, text: `/new ${destination}` }),
+    const newMessage = inbound({
+      messageId: "new-occupied-command",
+      ...target,
+      text: `/new ${destination}`,
+    });
+    await submitAndWaitForIngressHandoff(harness, newMessage);
+    const newReceipt = await waitForRemoteTextWithin(
+      harness,
+      target,
+      ({ target: sentTarget, text }) =>
+        sentTarget.channelId === target.channelId
+        && sentTarget.channelType === target.channelType
+        && text.startsWith("已创建会话 ")
+        && text.includes(`cwd=${destination}`),
     );
+    expect(newReceipt.text).toContain(`cwd=${destination}`);
 
     const after = store.getBinding(harness.bot.uid, target);
     expect(after?.cwd).toBe(destination);
@@ -658,6 +715,8 @@ test("/new creates an independent session in a directory used by another chat's 
 
     expect(store.getBinding(harness.bot.uid, otherTarget)?.cwd).toBe(destination);
     expect(store.getLatestTask(harness.bot.uid, otherTarget)?.state).toBe("running");
+    releaseTask.release();
+    await waitForStatus(harness.service, otherTarget, status => status.state === "completed");
   } finally {
     releaseTask.release();
     await otherTask?.catch(() => {});
@@ -684,26 +743,37 @@ test("a running task in the current chat still blocks /move", async () => {
   let store: ChannelStore | undefined;
   let runningTask: Promise<void> | undefined;
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "move-current-busy-bind", ...target, text: `/new ${source}` }),
     );
     store = await openChannelStore(harness.stateDir);
     const before = store.getBinding(harness.bot.uid, target);
     expect(before).not.toBeNull();
 
-    runningTask = harness.service.handleInbound(
+    runningTask = harness.service.submitInbound(
       inbound({ messageId: "move-current-busy-hold", ...target, text: heldTaskText }),
     );
+    await runningTask;
     await taskStarted.wait();
     await waitForStatus(harness.service, target, status => status.state === "running");
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "move-current-busy-command", ...target, text: `/move ${destination}` }),
     );
+    const busyReply = harness.transport.waitForRemoteText(
+      ({ target: sentTarget, text }) =>
+        sentTarget.channelId === target.channelId &&
+        sentTarget.channelType === target.channelType &&
+        text === "当前聊天有运行中或排队任务，请先 /cancel。",
+    );
+    await busyReply;
 
     expect(store.getBinding(harness.bot.uid, target)).toEqual(before);
     expect(store.getLatestTask(harness.bot.uid, target)?.state).toBe("running");
     expect(harness.workers.prompts.some(({ text }) => text === `/move ${destination}`)).toBe(false);
+    releaseTask.release();
+    await waitForStatus(harness.service, target, status => status.state === "completed");
   } finally {
     releaseTask.release();
     await runningTask?.catch(() => {});
@@ -719,10 +789,12 @@ test("different chats retain independent project/session bindings", async () => 
   const firstDirectory = await realpath(await mkdtemp(join(harness.root, "first-")));
   const secondDirectory = await realpath(await mkdtemp(join(harness.root, "second-")));
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "bindings-isolated-first", ...first, text: `/new ${firstDirectory}` }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "bindings-isolated-second", ...second, text: `/new ${secondDirectory}` }),
     );
 
@@ -743,12 +815,14 @@ test("a rejected move leaves the prior binding untouched", async () => {
   const source = await realpath(await mkdtemp(join(harness.root, "source-")));
   const missing = join(harness.root, "does-not-exist");
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "bindings-failure-source", ...target, text: `/new ${source}` }),
     );
     const before = await harness.service.status(target);
 
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "bindings-failure-missing", ...target, text: `/move ${missing}` }),
     );
     const after = await harness.service.status(target);
@@ -768,7 +842,8 @@ test("/move does not replace the binding when worker-ledger finalization fails",
   let store: ChannelStore | undefined;
   let failureDb: Database | undefined;
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "move-ledger-source", ...target, text: `/new ${source}` }),
     );
     store = await openChannelStore(harness.stateDir);
@@ -784,13 +859,33 @@ test("/move does not replace the binding when worker-ledger finalization fails",
         SELECT RAISE(FAIL, 'fixture worker-ledger finalization failed');
       END
     `).run();
-    await harness.service.handleInbound(
-      inbound({ messageId: "move-ledger-failure", ...target, text: `/move ${destination}` }),
+    const moveMessage = inbound({
+      messageId: "move-ledger-failure",
+      ...target,
+      text: `/move ${destination}`,
+    });
+    await harness.service.submitInbound(moveMessage);
+    const unknown = await waitForIngressJob(harness, moveMessage, {
+      predicate: job => job.state === "unknown",
+      rejectStates: [],
+      description: "fail-closed worker-ledger finalization outcome",
+    });
+    expect(unknown.operationCheckpoint).toMatchObject({
+      kind: "command",
+      action: "move",
+      phase: "dispatch-intent",
+      resourceCwds: [source, destination],
+    });
+    const failureReceipt = await harness.transport.waitForRemoteText(
+      ({ target: sentTarget, text }) =>
+        sentTarget.channelId === target.channelId &&
+        sentTarget.channelType === target.channelType &&
+        /无法|未能|失败/.test(text),
     );
 
     expect(store.getBinding(harness.bot.uid, target)).toEqual(before);
-    expect(harness.transport.sent.at(-1)?.text).toMatch(/无法|未能|失败/);
-    expect(harness.transport.sent.at(-1)?.text).not.toContain("已迁移会话");
+    expect(failureReceipt.text).toMatch(/无法|未能|失败/);
+    expect(failureReceipt.text).not.toContain("已迁移会话");
   } finally {
     if (failureDb !== undefined) {
       failureDb.query("DROP TRIGGER fail_worker_stop").run();
@@ -838,7 +933,8 @@ for (const commandKind of ["new", "move"] as const) {
     let bindingStore: ChannelStore | undefined;
     let commandSessionId: string | undefined;
     try {
-      await harness.service.handleInbound(
+      await submitAndWaitForIngressHandoff(
+        harness,
         inbound({ messageId: `command-session-bind-${commandKind}`, ...firstTarget, text: `/new ${source}` }),
       );
       const firstBinding = await harness.service.status(firstTarget);
@@ -846,17 +942,19 @@ for (const commandKind of ["new", "move"] as const) {
       bindingStore = await openChannelStore(harness.stateDir);
       const sessionFile = bindingStore.getBinding(harness.bot.uid, firstTarget)?.sessionFile;
       if (!sessionFile) throw new Error("fresh binding did not persist a session file");
-      holdTask = harness.service.handleInbound(
+      holdTask = harness.service.submitInbound(
         inbound({ messageId: `command-session-hold-${commandKind}`, ...firstTarget, text: "command-lease-hold" }),
       );
+      await holdTask;
       await holdStarted.wait();
-      queuedTask = harness.service.handleInbound(
+      queuedTask = submitAndWaitForIngressHandoff(
+        harness,
         inbound({
           messageId: `command-session-queued-${commandKind}`,
           ...firstTarget,
           text: "/queue command-lease-queued",
         }),
-      );
+      ).then(() => {});
       await queuedTask;
       await writeFile(
         sessionFile,
@@ -871,7 +969,8 @@ for (const commandKind of ["new", "move"] as const) {
       );
 
       if (commandKind === "move") {
-        await harness.service.handleInbound(
+        await submitAndWaitForIngressHandoff(
+          harness,
           inbound({
             messageId: `command-session-command-bind-${commandKind}`,
             ...secondTarget,
@@ -885,13 +984,14 @@ for (const commandKind of ["new", "move"] as const) {
       } else {
         workers.configureNew(destination);
       }
-      commandTask = harness.service.handleInbound(
+      commandTask = submitAndWaitForIngressHandoff(
+        harness,
         inbound({
           messageId: `command-session-command-${commandKind}`,
           ...secondTarget,
           text: commandKind === "new" ? `/new ${destination}` : `/move ${destination}`,
         }),
-      );
+      ).then(() => {});
       await workers.commandStarted.wait();
 
       releaseHold.release();
@@ -975,35 +1075,47 @@ test("cancelled queued tasks do not wait on a successor after reconcile resumes"
   let cancelledTask: Promise<void> | undefined;
   let successorTask: Promise<void> | undefined;
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "reconcile-bind-earlier", ...earlierTarget, text: `/new ${source}` }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "reconcile-bind-cancelled", ...cancelledTarget, text: `/new ${source}` }),
     );
-    holdTask = harness.service.handleInbound(
+    holdTask = harness.service.submitInbound(
       inbound({ messageId: "reconcile-hold", ...earlierTarget, text: "reconcile-hold" }),
     );
+    await holdTask;
     await holdStarted.wait();
-    earlierTask = harness.service.handleInbound(
+    earlierTask = harness.service.submitInbound(
       inbound({ messageId: "reconcile-earlier-task", ...earlierTarget, text: "reconcile-earlier-task" }),
     );
     await earlierTask;
-    cancelledTask = harness.service.handleInbound(
+    cancelledTask = harness.service.submitInbound(
       inbound({ messageId: "reconcile-cancelled-task", ...cancelledTarget, text: "reconcile-cancelled-task" }),
     );
     await cancelledTask;
     await workers.reconcileStarted.wait();
-    await harness.service.handleInbound(
+    const cancelReply = harness.transport.waitForRemoteText(
+      ({ target: sentTarget, text }) =>
+        sentTarget.channelId === cancelledTarget.channelId &&
+        sentTarget.channelType === cancelledTarget.channelType &&
+        text === "当前任务已取消；不回滚已发生的副作用。",
+    );
+    await harness.service.submitInbound(
       inbound({ messageId: "reconcile-cancel", ...cancelledTarget, text: "/cancel" }),
     );
-    successorTask = harness.service.handleInbound(
+    await cancelReply;
+    successorTask = harness.service.submitInbound(
       inbound({ messageId: "reconcile-successor", ...cancelledTarget, text: "reconcile-successor" }),
     );
     await successorTask;
     workers.releaseReconcile.release();
     releaseHold.release();
     await successorStarted.wait();
+    await waitForStatus(harness.service, earlierTarget, status => status.state === "completed");
+    await waitForStatus(harness.service, cancelledTarget, status => status.state === "completed");
   } finally {
     workers.releaseReconcile.release();
     releaseHold.release();
@@ -1032,7 +1144,8 @@ test("a queued task follows its session's moved cwd after its chat predecessor",
   const destination = await realpath(await mkdtemp(join(harness.root, "destination-")));
   let firstTask: Promise<void> | undefined;
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "queued-move-bind", ...target, text: `/new ${source}` }),
     );
     const before = await harness.service.status(target);
@@ -1041,11 +1154,13 @@ test("a queued task follows its session's moved cwd after its chat predecessor",
     const sessionFile = beforeStore.getBinding(harness.bot.uid, target)?.sessionFile;
     beforeStore.close();
     if (!sessionFile) throw new Error("fresh binding did not persist a session file");
-    firstTask = harness.service.handleInbound(
+    firstTask = harness.service.submitInbound(
       inbound({ messageId: "queued-move-hold", ...target, text: "hold-x" }),
     );
+    await firstTask;
     await holdStarted.promise;
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "queued-move-a", ...target, text: "/queue queued-a" }),
     );
     await writeFile(
@@ -1059,11 +1174,13 @@ test("a queued task follows its session's moved cwd after its chat predecessor",
       })}\n`,
       "utf8",
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "queued-move-b", ...target, text: "/queue queued-b" }),
     );
     releaseHold.release();
     await harness.workers.waitForPromptCount(3);
+    await waitForStatus(harness.service, target, status => status.state === "completed");
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual([
       "hold-x",
       "queued-a",
@@ -1087,33 +1204,35 @@ test("move stays busy until a cancelled worker confirms stop", async () => {
   const source = await realpath(await mkdtemp(join(harness.root, "source-")));
   const destination = await realpath(await mkdtemp(join(harness.root, "destination-")));
   try {
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "stop-pending-bind", ...target, text: `/new ${source}` }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "stop-pending-task", ...target, text: "long" }),
     );
     await promptStarted.promise;
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "stop-pending-cancel", ...target, text: "/cancel" }),
     );
     await stopStarted.promise;
-    await harness.service.handleInbound(
+    const busyReply = harness.transport.waitForRemoteText(
+      ({ target: sentTarget, text }) =>
+        sentTarget.channelId === target.channelId &&
+        sentTarget.channelType === target.channelType &&
+        text === "当前聊天有运行中或排队任务，请先 /cancel。",
+    );
+    await harness.service.submitInbound(
       inbound({
         messageId: "stop-pending-move",
         ...target,
         text: `/move ${destination}`,
       }),
     );
+    await busyReply;
     const status = await harness.service.status(target);
     expect(status.cwd).toBe(source);
     expect(harness.workers.prompts.some(({ text }) => text.startsWith("/move "))).toBe(false);
-    expect(
-      harness.transport.sent.some(
-        ({ target: sentTarget, text }) =>
-          sentTarget.channelId === target.channelId && /运行中|排队|停止/.test(text),
-      ),
-    ).toBe(true);
     releaseStop.release();
     await waitForStatus(harness.service, target, next => next.state === "cancelled");
   } finally {
@@ -1136,33 +1255,61 @@ test("move stop uncertainty blocks both source and destination across restart", 
   let bindingStore: ChannelStore | undefined;
   try {
     first = await createCoreHarness({ root, bot, workers });
-    await first.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      first,
       inbound({ messageId: "move-stop-bind", ...target, text: `/new ${source}` }),
     );
     bindingStore = await openChannelStore(first.stateDir);
     const before = bindingStore.getBinding(bot.uid, target);
     expect(before).not.toBeNull();
-    await first.service.handleInbound(
+    const moveFailure = first.transport.waitForRemoteText(
+      ({ target: sentTarget, text }) =>
+        sentTarget.channelId === target.channelId &&
+        sentTarget.channelType === target.channelType &&
+        /无法|未能|失败/.test(text),
+    );
+    await first.service.submitInbound(
       inbound({ messageId: "move-stop-command", ...target, text: `/move ${destination}` }),
     );
+    const failureReceipt = await moveFailure;
     expect(bindingStore.getBinding(bot.uid, target)).toEqual(before);
-    expect(first.transport.sent.at(-1)?.text).toMatch(/无法|未能|失败/);
-    expect(first.transport.sent.at(-1)?.text).not.toContain("已迁移会话");
+    expect(failureReceipt.text).toMatch(/无法|未能|失败/);
+    expect(failureReceipt.text).not.toContain("已迁移会话");
     bindingStore.close();
     bindingStore = undefined;
     await closeCoreHarness(first, { remove: false });
     firstClosed = true;
     restarted = await createCoreHarness({ root, bot });
-    await restarted.service.handleInbound(
-      inbound({ messageId: "move-stop-after-restart", ...target, text: "must not run" }),
-    );
-    // An unconfirmed worker keeps both directories blocked: the queued task stays queued and
-    // never runs — it is neither failed nor silently dropped while the process is unverified.
+    const queuedMessage = inbound({
+      messageId: "move-stop-after-restart",
+      ...target,
+      text: "must not run",
+    });
+    await restarted.service.submitInbound(queuedMessage);
+    const blockedIngress = await waitForIngressJob(restarted, queuedMessage, {
+      predicate: job => job.state === "accepted",
+      description: "durable acceptance behind the unknown move reservation",
+      rejectStates: [],
+    });
+    expect(blockedIngress).toMatchObject({
+      state: "accepted",
+      ackReady: true,
+      consumerKind: null,
+      consumerId: null,
+    });
+    // An unconfirmed worker keeps both directories blocked. The new envelope is ACK-ready and
+    // durable, but has no consumer until the unknown session reservation can be resolved.
     await restarted.service.stop();
     expect(restarted.workers.prompts).toEqual([]);
     const store = await openChannelStore(restarted.stateDir);
     try {
-      expect(store.getLatestTask(restarted.bot.uid, target)?.state).toBe("queued");
+      expect(store.getIngressJob(blockedIngress.id)).toMatchObject({
+        state: "accepted",
+        ackReady: true,
+        consumerKind: null,
+        consumerId: null,
+      });
+      expect(store.getLatestTask(restarted.bot.uid, target)).toBeNull();
     } finally {
       store.close();
     }

@@ -38,12 +38,12 @@ test("failed notice sends recover into their original chats without rerunning co
   let restarted: CoreHarness | undefined;
   try {
     transport.online = false;
-    await first.service.handleInbound(inbound({
+    await first.service.submitInbound(inbound({
       channelId: firstTarget.channelId,
       messageId: "compaction-recovery-task-a",
       text: "first recovery task",
     }));
-    await first.service.handleInbound(inbound({
+    await first.service.submitInbound(inbound({
       channelId: secondTarget.channelId,
       messageId: "compaction-recovery-task-b",
       text: "second recovery task",

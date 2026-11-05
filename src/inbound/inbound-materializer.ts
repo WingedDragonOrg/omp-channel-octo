@@ -15,8 +15,9 @@
  * 都是当前状态。
  */
 
-import { mkdir, readdir, rm } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { chmod, mkdir, readdir, rm, stat, rename } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { join } from "node:path";
 import {
   ATTACHMENTS_DISABLED_TEXT,
   ATTACHMENTS_OVER_BUDGET_TEXT,
@@ -33,6 +34,7 @@ import {
   type AttachmentFailureReason,
   type SavedAttachment,
 } from "./attachments.ts";
+import { recvIngressSourceId, type IngressJobRecord } from "./ingress-types.ts";
 import type {
   ChannelTransport,
   CoreServiceConfig,
@@ -84,6 +86,7 @@ function associationFailureNote(
   return `[系统提示] 你刚才发送的${summary}未能取回（${cause}）；本条按纯文本处理，未读取任何文件。如需我查看该文件，请引用那条消息或重新发送。`;
 }
 
+
 /**
  * 组装器可触达的边界，全部由 `CoreService` 注入：它自己的配置切片、入站记录的所有权（命令
  * claim 的抢占与回滚）、传输层的下载与转写、群历史的关联候选，以及停机取消信号与聊天出站
@@ -104,16 +107,85 @@ export interface InboundMaterializerDeps {
   readonly commandClaim: (message: InboundMessage, name: string) => InboundClaim;
   /** 附件被拒时的一次性回复通道；调用方照旧 await 该微任务边界。 */
   readonly enqueueText: Outbox["enqueueText"];
+  /** Validates that this exact preparing ingress row owns the materialization. */
+  readonly getIngressJob?: (id: number) => IngressJobRecord | null;
 }
 
 /** 附件事务的唯一所有者：下载、关联、拒收与失败清理都在这里，`CoreService` 只调用 `materialize`。 */
 export class InboundMaterializer {
   constructor(private readonly deps: InboundMaterializerDeps) {}
+  /** Prepares a durable ingress envelope without claiming a second, message-only command identity. */
+  async materializeForIngress(
+    jobId: number,
+    message: InboundMessage,
+    text = message.text,
+    operationSignal?: AbortSignal,
+  ): Promise<
+    | { readonly kind: "prepared"; readonly text: string; readonly spoolPaths: readonly string[] }
+    | { readonly kind: "refused"; readonly claim: InboundClaim; readonly text: string }
+    | { readonly kind: "consumed" }
+  > {
+    const job = this.deps.getIngressJob?.(jobId);
+    if (
+      job === null
+      || job === undefined
+      || job.state !== "preparing"
+      || job.ackReady
+      || job.sourceKind !== "recv"
+      || job.sourceId !== recvIngressSourceId(message.channelType, message.channelId, message.messageId)
+      || job.messageId !== message.messageId
+      || job.payload?.kind !== "recv"
+      || job.payload.message.channelType !== message.channelType
+      || job.payload.message.channelId !== message.channelId
+      || job.payload.message.messageId !== message.messageId
+    ) {
+      throw new Error("ingress job does not own this attachment preparation");
+    }
+    let refusal: { claim: InboundClaim; text: string } | undefined;
 
+    const createdSpoolPaths: string[] = [];
+    const prepared = await this.materializeInternal(message, text, operationSignal, {
+      ingressOwned: true,
+      ingressJobId: jobId,
+      createdSpoolPaths,
+      deferRefusal: (claim, refusalText) => {
+        refusal = { claim, text: refusalText };
+      },
+    });
+    if (refusal !== undefined) return { kind: "refused", ...refusal };
+    if (prepared === null) return { kind: "consumed" };
+    let spoolPaths: string[];
+    try {
+      spoolPaths = await this.spoolPaths(message);
+    } catch (error) {
+      if (this.deps.getIngressJob?.(jobId)?.state === "cancelled") {
+        await this.cleanupCreatedSpool(message, createdSpoolPaths);
+      }
+      throw error;
+    }
+    if (this.deps.getIngressJob?.(jobId)?.state === "cancelled") {
+      await this.cleanupCreatedSpool(message, createdSpoolPaths);
+    }
+    return { kind: "prepared", text: prepared, spoolPaths };
+  }
   async materialize(
     message: InboundMessage,
     text = message.text,
     operationSignal?: AbortSignal,
+  ): Promise<string | null> {
+    return this.materializeInternal(message, text, operationSignal);
+  }
+
+  private async materializeInternal(
+    message: InboundMessage,
+    text: string,
+    operationSignal: AbortSignal | undefined,
+    options: {
+      ingressOwned?: boolean;
+      ingressJobId?: number;
+      createdSpoolPaths?: string[];
+      deferRefusal?: (claim: InboundClaim, text: string) => void;
+    } = {},
   ): Promise<string | null> {
     this.deps.throwIfStopping();
     const quotedText = message.quoted?.text.trim() ?? "";
@@ -135,33 +207,34 @@ export class InboundMaterializer {
         return composePromptText(text, [], message.quoted);
       }
       const claim = this.deps.commandClaim(message, "attachment");
-      if (!this.deps.store.claimCommand(claim)) return null;
-      await this.refuseAttachments(message, claim, ATTACHMENTS_DISABLED_TEXT);
+      if (!options.ingressOwned && !this.deps.store.claimCommand(claim)) return null;
+      await this.refuseAttachments(message, claim, ATTACHMENTS_DISABLED_TEXT, options.deferRefusal);
       return null;
     }
     const claim = this.deps.commandClaim(message, "attachment");
-    if (!this.deps.store.claimCommand(claim)) return null;
+    if (!options.ingressOwned && !this.deps.store.claimCommand(claim)) return null;
     if (requested.length > MAX_MESSAGE_ATTACHMENTS) {
       if (associated) {
         // 尽力协助失败一律诚实降级，不整条拒收。
-        this.deps.store.releaseClaim(claim);
+        if (!options.ingressOwned) this.deps.store.releaseClaim(claim);
         return composePromptText(
           withSystemNote(text, associationFailureNote("budget", attachmentConfig.maxBytes, association.summary)),
           [],
           message.quoted,
         );
       }
-      await this.refuseAttachments(message, claim, ATTACHMENTS_OVER_BUDGET_TEXT);
+      await this.refuseAttachments(message, claim, ATTACHMENTS_OVER_BUDGET_TEXT, options.deferRefusal);
       return null;
     }
     const directory = attachmentDirectory(this.deps.config.stateDir, message, message.messageId);
     const created: string[] = [];
+    const temporary: string[] = [];
     const budget = new AbortController();
     // 整条消息的下载预算（含转写）：超时就中止在途下载，按超限失败处理。
     const budgetTimer = setTimeout(() => budget.abort(), ATTACHMENT_DOWNLOAD_BUDGET_MS);
     try {
-      // 附件目录由服务创建（0700，与传输层的写入互为幂等），失败清理才有一个确定的所有者。
       await mkdir(directory, { recursive: true, mode: 0o700 });
+      await chmod(directory, 0o700);
       this.deps.throwIfStopping();
       const files: SavedAttachment[] = [];
       for (const [index, attachment] of requested.entries()) {
@@ -169,26 +242,47 @@ export class InboundMaterializer {
         if (attachment.size > attachmentConfig.maxBytes) {
           throw new AttachmentError("oversize", `attachment ${index} exceeds ${attachmentConfig.maxBytes} bytes`);
         }
-        const path = join(directory, safeAttachmentName(attachment.name, index, attachment.kind, attachment.url));
         const signal = AbortSignal.any([
           AbortSignal.timeout(ATTACHMENT_DOWNLOAD_TIMEOUT_MS),
           budget.signal,
           this.deps.shutdownSignal,
           ...(operationSignal === undefined ? [] : [operationSignal]),
         ]);
-        let bytes = await existingFileSize(path);
+        const safeName = safeAttachmentName(attachment.name, index, attachment.kind, attachment.url);
+        const canonicalPath = join(directory, safeName);
+        const displayName = safeName.slice(String(index).length + 1);
+        const key = createHash("sha256")
+          .update(JSON.stringify([
+            options.ingressJobId ?? null,
+            message.channelType,
+            message.channelId,
+            message.messageId,
+            index,
+            attachment.url,
+          ]))
+          .digest("hex")
+          .slice(0, 32);
+        const namePrefix = `.omp-ingress-${key}-`;
+        const canonicalSize = await existingFileSize(canonicalPath);
+        let path: string | undefined = canonicalSize === null ? undefined : canonicalPath;
+        let bytes: number | null = canonicalSize;
         if (operationSignal?.aborted) {
           throw operationSignal.reason instanceof Error ? operationSignal.reason : new Error("inbound operation aborted");
         }
         this.deps.throwIfStopping();
+        // A crash can leave either our transfer target or the transport's own nested .part.
+        // Remove only files under this job+attachment key; never touch existing final assets.
+        for (const name of await readdir(directory)) {
+          if (name.startsWith(namePrefix)) await rm(join(directory, name), { force: true });
+        }
         if (bytes === null) {
-          // This path was absent before the download, so own it for cleanup even if cancellation
-          // races a successful write before the transport promise settles.
-          created.push(path);
+          const temporaryPath = join(directory, `${namePrefix}${randomUUID()}.part`);
+          temporary.push(temporaryPath);
+          let reportedBytes: number;
           try {
-            bytes = await this.deps.transport.downloadAttachment({
+            reportedBytes = await this.deps.transport.downloadAttachment({
               url: attachment.url,
-              path,
+              path: temporaryPath,
               maxBytes: attachmentConfig.maxBytes,
               signal,
             });
@@ -197,7 +291,6 @@ export class InboundMaterializer {
             }
           } catch (error) {
             if (error instanceof AttachmentError && error.reason === "oversize") throw error;
-            // 停机中止先于预算/超时判定：被中断的取回不是附件失败，不发拒绝文案。
             if (this.deps.shutdownSignal.aborted) throw new InboundShutdownError();
             // 单条 60 秒超时与整条 120 秒预算都会中止同一条 signal；只有预算耗尽按「超限」回复。
             if (operationSignal?.aborted) {
@@ -208,11 +301,32 @@ export class InboundMaterializer {
             if (error instanceof AttachmentError) throw error;
             throw new AttachmentError("failed", "attachment download failed");
           }
+          const transfer = await stat(temporaryPath);
+          if (
+            !transfer.isFile()
+            || transfer.size <= 0
+            || transfer.size !== reportedBytes
+            || transfer.size > attachmentConfig.maxBytes
+          ) {
+            throw new AttachmentError("failed", "attachment download was incomplete");
+          }
+          await chmod(temporaryPath, 0o600);
+          this.deps.throwIfStopping();
+          // Rename only a closed, size-checked transfer to the stable user-visible filename.
+          await rename(temporaryPath, canonicalPath);
+          created.push(canonicalPath);
+          options.createdSpoolPaths?.push(canonicalPath);
+          path = canonicalPath;
+          bytes = transfer.size;
         }
+        if (path === undefined || bytes === null) {
+          throw new AttachmentError("failed", "attachment spool was not durably published");
+        }
+        await chmod(path, 0o600);
         files.push({
           path,
           kind: attachment.kind,
-          name: attachment.name.trim().length > 0 ? attachment.name.trim() : basename(path),
+          name: displayName,
           bytes,
           durationSeconds: attachment.durationSeconds,
           transcription:
@@ -230,13 +344,20 @@ export class InboundMaterializer {
         files,
         message.quoted,
       );
-      this.deps.store.releaseClaim(claim);
+      if (!options.ingressOwned) this.deps.store.releaseClaim(claim);
       return promptText;
     } catch (error) {
-      // 失败清理：只删除本次新建的文件，已存在（可能被既有任务引用）的文件保留；目录空了才移除。
-      for (const path of created) {
-        await rm(path, { force: true }).catch(() => {});
-      }
+      // Shutdown leaves a preparing job recoverable, so keep complete published assets for its
+      // next attempt. Explicit cancellation has removed durable ownership and must clean only the
+      // files this attempt created, never files it reused.
+      const currentIngress = options.ingressOwned && options.ingressJobId !== undefined
+        ? this.deps.getIngressJob?.(options.ingressJobId)
+        : null;
+      const retainCompletedSpool = options.ingressOwned
+        && currentIngress?.state !== "cancelled"
+        && (operationSignal?.aborted || this.deps.shutdownSignal.aborted || this.deps.stopping());
+      const cleanupPaths = retainCompletedSpool ? temporary : [...created, ...temporary];
+      for (const path of cleanupPaths) await rm(path, { force: true }).catch(() => {});
       try {
         if ((await readdir(directory)).length === 0) {
           await rm(directory, { recursive: true, force: true });
@@ -244,10 +365,16 @@ export class InboundMaterializer {
       } catch {
         // 目录未落盘或不可读时无需清理。
       }
+      if (operationSignal?.aborted) {
+        if (!options.ingressOwned) this.deps.store.releaseClaim(claim);
+        throw operationSignal.reason instanceof Error
+          ? operationSignal.reason
+          : new Error("inbound preparation cancelled");
+      }
       if (this.deps.stopping()) {
         // 停机中断时任务未接受：不发「附件拒绝」回复、不建任务；命令 claim 随中断回滚，
         // 同一消息重启后可重新接收；取消错误上抛，传输层不会 ACK。
-        this.deps.store.releaseClaim(claim);
+        if (!options.ingressOwned) this.deps.store.releaseClaim(claim);
         throw error instanceof InboundShutdownError ? error : new InboundShutdownError();
       }
       if (operationSignal?.aborted) {
@@ -257,17 +384,53 @@ export class InboundMaterializer {
       const reason: AttachmentFailureReason = error instanceof AttachmentError ? error.reason : "failed";
       if (associated) {
         // 关联尽力协助失败：诚实降级为纯文本说明，而不是整条拒收——用户并未显式提交附件。
-        this.deps.store.releaseClaim(claim);
+        if (!options.ingressOwned) this.deps.store.releaseClaim(claim);
         return composePromptText(
           withSystemNote(text, associationFailureNote(reason, attachmentConfig.maxBytes, association.summary)),
           [],
           message.quoted,
         );
       }
-      await this.refuseAttachments(message, claim, attachmentRefusalText(reason, attachmentConfig.maxBytes));
+      await this.refuseAttachments(
+        message,
+        claim,
+        attachmentRefusalText(reason, attachmentConfig.maxBytes),
+        options.deferRefusal,
+      );
       return null;
     } finally {
       clearTimeout(budgetTimer);
+    }
+  }
+
+  private async cleanupCreatedSpool(message: InboundMessage, paths: readonly string[]): Promise<void> {
+    const directory = attachmentDirectory(this.deps.config.stateDir, message, message.messageId);
+    for (const path of paths) await rm(path, { force: true }).catch(() => {});
+    try {
+      if ((await readdir(directory)).length === 0) {
+        await rm(directory, { recursive: true, force: true });
+      }
+    } catch {
+      // The directory may already be absent or temporarily unreadable.
+    }
+  }
+
+  /** Exact complete local files owned by this message; ingress jobs protect these from sweeping. */
+  async spoolPaths(message: InboundMessage): Promise<string[]> {
+    const directory = attachmentDirectory(this.deps.config.stateDir, message, message.messageId);
+    try {
+      const names = await readdir(directory);
+      return names
+        .filter(name => !name.startsWith(".omp-ingress-"))
+        .map(name => join(directory, name));
+    } catch (error) {
+      if (
+        error !== null
+        && typeof error === "object"
+        && "code" in error
+        && error.code === "ENOENT"
+      ) return [];
+      throw error;
     }
   }
 
@@ -336,6 +499,12 @@ export class InboundMaterializer {
       const transcription = await this.deps.transport.transcribeAudio(path, signal);
       return transcription !== null && transcription.trim().length > 0 ? transcription : null;
     } catch {
+      if (operationSignal?.aborted) {
+        throw operationSignal.reason instanceof Error
+          ? operationSignal.reason
+          : new Error("inbound preparation cancelled");
+      }
+      // 停机中止不能降级成「无转写」后继续组装：被中断的入站以有界取消上抛。
       if (this.deps.shutdownSignal.aborted) throw new InboundShutdownError();
       if (operationSignal?.aborted) {
         throw operationSignal.reason instanceof Error ? operationSignal.reason : new Error("inbound operation aborted");
@@ -347,8 +516,17 @@ export class InboundMaterializer {
     }
   }
 
-  /** 附件拒绝：走既有命令 claim + outbox 通道，只回复一次、不写 task 行。 */
-  private async refuseAttachments(message: InboundMessage, claim: InboundClaim, text: string): Promise<void> {
+  /** Attachment refusal: defer persistence to the ingress handoff when owned by a durable job. */
+  private async refuseAttachments(
+    message: InboundMessage,
+    claim: InboundClaim,
+    text: string,
+    deferRefusal?: (claim: InboundClaim, text: string) => void,
+  ): Promise<void> {
+    if (deferRefusal !== undefined) {
+      deferRefusal(claim, text);
+      return;
+    }
     try {
       await this.deps.enqueueText(message, text, null);
       this.deps.store.completeCommand(claim);

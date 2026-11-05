@@ -495,7 +495,7 @@ test("a live turn stores its card row and clears it once the terminal edit lands
     });
     try {
       const task = inbound({ messageId: "live-card-message", text: "run a tool" });
-      await harness.service.handleInbound(task);
+      await harness.service.submitInbound(task);
       await promptStarted.promise;
 
       const running = await openCards(root, harness.bot.uid);
@@ -942,6 +942,7 @@ test("a resumable task with no surviving card row still opens under a fresh key 
     // 真实启动会在这里先把 started 归一化为 queued；`startTask` 之后直接问 `isTaskResuming`
     // 决定这一轮是否换 key 段，所以恢复期有没有卡片行都不影响结论。
     store.prepareTasksForRestart("bot-resume-rowless", {
+      cancel: "用户取消当前回合",
       interrupt: "用户中断当前回合",
       question_timeout: "等待回答超时，回合已停止",
     });
@@ -1076,7 +1077,7 @@ test("a suspended turn is resumed onto the same card and finishes on it", async 
     },
   });
   try {
-    await first.service.handleInbound(inbound({ messageId: "suspend-card", ...target, text: "开卡后挂起" }));
+    await first.service.submitInbound(inbound({ messageId: "suspend-card", ...target, text: "开卡后挂起" }));
     await first.workers.waitForPromptCount(1);
     // 让服务端已经接受的这一帧真的落进状态盘，再停机：挂起的回合留给下一进程的是这张卡。
     await firstTransport.waitForProgressSend();

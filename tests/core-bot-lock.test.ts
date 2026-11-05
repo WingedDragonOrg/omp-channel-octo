@@ -27,7 +27,7 @@ test("a second instance for the same Bot refuses before it registers the Bot aga
 
     // The instance that owns the lock is untouched and keeps serving its chats.
     const message = inbound({ messageId: "lock-owner-still-serving", channelId: "dm-lock" });
-    await first.service.handleInbound(message);
+    await first.service.submitInbound(message);
     await first.workers.waitForPromptCount(1);
     await waitForStatus(first.service, message, (status) => status.state === "completed");
   } finally {

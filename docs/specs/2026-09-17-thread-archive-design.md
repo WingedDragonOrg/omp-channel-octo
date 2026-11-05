@@ -39,7 +39,7 @@ owner 在目标子区执行 `/thread remove [--force]` 时，宿主按持久归�
 | 归档时机 | 工具内不即时归档，只「排定」；在该聊天任务回合末、回合输出与进度卡终态编辑排空后执行 | 任何消息都会把归档子区解档；即时归档会被紧随其后的回复解档 |
 | 自动归档条件 | `thread-merge` 成功且工作区已删除，或 `/thread remove` 全部记录资源清理确认后排定 | 未清理的资源、部分失败或未知结果留在子区处理 |
 | 排定载体 | `ThreadArchiveScheduler` 的进程内一次性 Map；宿主先持久化稳定回执，再发布携带全部回执 outbox ID 的归档计划 | 单一归档所有者；成功事实不依赖已删除的 cwd |
-| 新消息 | 该聊天的新入站（过权限门禁后）清除该聊天的待归档 | 用户回来了就不归档；避免归档↔解档抖动 |
+| 新消息 | 该聊天的新授权输入在可靠受理时清除待归档；仅通过权限门但尚未建立可恢复受理不算取消完成 | 用户回来了就不归档；取消点与逐消息 ACK 的可靠接管边界一致，避免归档↔解档抖动 |
 | 重试 | 仅瞬时失败（HTTP 5xx，或 bot API 把内部 500 包裹成 400 的 `err.server.bot_api.store_failed`）重试：最多 5 次尝试、尝试间隔 5s；永久 4xx 立即失败；停止时放弃 | 与既有 `deleteThread` 的瞬发失败认知一致（`src/errors.ts` 的 `isTransientServerFailure` 是两处共用的判定）；计时走 `setTimeout`，测试用假定时器推进，不真等 5s 壁钟 |
 | 结果可见性 | 合并结果进工具结果与回复；归档成功只留服务日志（子区状态即证据）；归档失败向发起聊天回一条 ≤200 字符单行说明 | 归档成功后再向子区发消息会把它解档；失败说明只影响收尾，不改变 merge 结果 |
 | 手动 `thread-archive` | 与自动路径共用同一排定/执行器 | 时机语义一致：即时归档同样会被本回合回复解档 |
@@ -63,15 +63,15 @@ owner 在目标子区执行 `/thread remove [--force]` 时，宿主按持久归�
 
 - `ThreadArchiveScheduler` 独占 `pendingThreadArchives: Map<string, PendingThreadArchive>`（键为 `targetKey`，值为聊天目标 + `groupId`/`shortId`）及停止信号。
 - `HostToolHost.planThreadArchive(target, groupId, shortId)` 接线到 `schedule`（写入或覆盖）。
-- `handleInbound`：过权限门禁后调用 `cancel` 清除该聊天的待归档（新消息意味着会话仍在继续）。
-- `runTask` 的 `finally`：在 `notifyThreadOutcome` 之后、`maybeRunDeferredRestart` 之前执行 `threadArchives.run(target, progress.tail)`：
+- 后台 ingress 在新授权输入可靠受理（正文/spool 已可恢复，或确定无需正文准备）时调用 `cancel` 清除该聊天的待归档；同步 receive callback 返回、权限查询刚完成或媒体仍在准备时不冒充已经受理。
+- agent 任务的 `runTask finally` 仍在 `notifyThreadOutcome` 之后、`maybeRunDeferredRestart` 之前触发该聊天归档执行；宿主 merge/remove 则由其受管后台 operation 在 outcome 与稳定回执持久后触发同一执行器。两者都不把归档等待接回 receive callback、`ackReady` 或 `submitInbound`：
   1. 取该聊天的待归档；没有、或服务正在停止则返回。
   2. `await progressTail`（该回合已排队的进度卡操作），再按 100ms 轮询出站队列（`outbox.flush` + `store.countPendingOutbox`），直到没有 `pending`/`unknown` 行；不能用一次 flush 返回或等待超时替代排空。投递退避和有界失败预算仍由 outbox 独占，归档等待不绕过它们。
   3. 每次尝试前确认排定仍在（排空期间的新消息可能已取消它）且服务未在停止；在则按重试策略调用 `transport.archiveThread`。
   4. 结束即清除排定；成功留一条 `[thread-archive] 已归档子区 <shortId> target=<key>` 服务日志；失败留一条 `[thread-archive] 归档失败 …` 服务日志并向发起聊天投一条 `归档失败：<单行 ≤200 字符>`。
 - 服务停止时调用 `stop()` 唤醒重试等待；调度器在 `stopping` 时放弃待归档：不执行、不通知。
-- 宿主 `/thread merge` 或 `/thread remove` 成功无需 agent 任务：命令持久化稳定回执后发布归档计划，服务收集该聊天残留的进度卡 tail 并启动同一执行器；指定回执的每一个分段都必须为 `sent`，任何分段 `dead`、缺行或未知都不能作为完整交付证据。remove 的逐项目实际结果沿既有 3000 UTF-8 bytes 边界分段并在恢复时复用原稳定身份。
-- 已有未结算宿主成功 outcome 的启动恢复在进度卡恢复、transport 启动完成后释放归档计划；回执使用原稳定 ID 和已持久化正文，工作树缺失不阻止结果交付，也不重跑 Git。合并 lease 只在 progress/receipt/archive barrier 完成后结算，服务在 barrier 未完成时重启可据此重建计划。恢复 `/thread remove` 时同步持久化归档代次至调度器；合并事件按恢复时是否能实际排定归档记录 `scheduled` / `not-scheduled`。
+- 宿主 `/thread merge` 或 `/thread remove` 成功无需 agent 任务：命令持久化稳定回执后发布归档计划，服务收集该聊天残留的进度卡 tail 并启动同一执行器；指定回执的每一个分段都必须为 `sent`，任何分段 `dead`、缺行或未知都不能作为完整交付证据。remove 的逐项目实际结果沿既有 3000 UTF-8 bytes 边界分段并在恢复时复用原稳定身份。归档 operation 的等待、重试与结果通知由服务独立拥有；输入 ACK 只证明该命令已可靠受理，不证明 merge/remove、回执发送或归档完成。
+- 已有未结算宿主成功 outcome 的启动恢复在进度卡恢复、transport 启动完成后释放归档计划；回执使用原稳定 ID 和已持久化正文，工作树缺失不阻止结果交付，也不重跑 Git。合并 lease 只在 progress/receipt/archive barrier 完成后结算，服务在 barrier 未完成时重启可据此重建计划。恢复 `/thread remove` 时同步持久化归档代次至调度器；合并事件按恢复时是否能实际排定归档记录 `scheduled` / `not-scheduled`。普通停机仍取消进程内等待，不把归档失败回传父群。
 
 ### 重试语义
 
@@ -85,16 +85,16 @@ owner 在目标子区执行 `/thread remove [--force]` 时，宿主按持久归�
 - 出站处于重试退避：持续等待队列排空；即使指定成功回执已经 `sent`，其他正文未排空也不归档。永久失败/预算耗尽由 outbox 标记 `dead` 后让出队首；成功回执本身为 `dead` 则不归档。
 - 进程在普通计划排定后、执行前重启：通用进程内计划放弃；未结算宿主成功 outcome 仍是恢复锚点，恢复只补做稳定回执和归档，不会再次执行 Git。归档尝试结束（包括有界失败）后 outcome lease 结算；已结算的计划不跨重启恢复。
 - 任务失败/取消/中断：排定照常执行（合并已经发生）。
-- 排空期间或等待重试期间该聊天来新消息/新任务：清除排定，归档不再执行，也不发失败说明。
+- 排空期间或等待重试期间该聊天有新输入完成可靠受理：清除排定，归档不再执行，也不发失败说明；仅同步收到 envelope 或权限查询完成不足以宣称取消成功。
 - 服务停止：等待立即结束、归档放弃（不发说明）。
 
 ## 验收标准
 
 1. `thread-archive` 在群/子区会话按既有门禁可用，子区里省略 `short_id` 即当前线程；输出有界；重复调用只产生一次归档。
 2. `thread-merge` 成功（`removed=true`）后自动排定归档：工具结果分别给出合并结果与归档排定；归档失败仅是发起聊天里一条 ≤200 字符说明，不改变 merge 结果。
-3. 时序：本回合回复（与进度卡终态编辑）先送达、归档后执行（测试直接用夹具断言调用顺序）；回合末窗口内新入站取消排定。
+3. 时序：本回合回复（与进度卡终态编辑）先送达、归档后执行（测试直接用夹具断言调用顺序）；回合末窗口内新授权输入在可靠受理时取消排定，且 receive callback/ACK 不等待归档。
 4. 重试：瞬时失败总计 5 次尝试、间隔 5s（假定时器）；永久失败即刻；停止时放弃。
-5. 已送达成功回执、其后仍有待投递正文的场景：推进超过旧 10 秒窗口仍不归档；正文确认后归档一次，新授权入站或停止则放弃。
+5. 已送达成功回执、其后仍有待投递正文的场景：推进超过旧 10 秒窗口仍不归档；正文确认后归档一次，新授权输入可靠受理或停止则放弃。
 6. `bun run typecheck` 与 `bun test` 通过；主规格与实现一致；真实 Git/worktree + 本地 transport/worker fixture 验证命令、清理、回执、卡片与归档顺序；线上服务端异步消息监听及真实客户端状态另行验证。
 
 ## 验收证据
@@ -112,7 +112,7 @@ owner 在目标子区执行 `/thread remove [--force]` 时，宿主按持久归�
 
 ### 2026-11-03 调查与修复 SDD
 
-- **目标与边界**：默认宿主合并清理工作区后，稳定成功回执、正文和终态卡片先于归档；`remove:false`、失败和资格拒绝不排定。保持新授权入站取消、停止放弃、瞬时错误最多五次尝试及永久错误有界通知；归档仍只由 `ThreadArchiveScheduler` 执行。
+- **目标与边界**：默认宿主合并清理工作区后，稳定成功回执、正文和终态卡片先于归档；`remove:false`、失败和资格拒绝不排定。保持新授权输入在可靠受理时取消、停止放弃、瞬时错误最多五次尝试及永久错误有界通知；归档仍只由 `ThreadArchiveScheduler` 执行，不成为 receive callback、输入 ACK 或 `submitInbound` 的完成条件。
 - **现场事实**：来源子区 `2117451560106594304` 的服务日志在 13:37:39 记录归档调用成功；SQLite 中成功回执在 13:37:39.129 标记 `sent`，前一助手正文最后确认时间为 13:35:45.046，下一条本地 outbox 投递在 14:14:23.030。持久成功事件目标提交为 `551ec0ffec04da25e9e0fd05d7ceee515f6b456a`，归档字段为 `scheduled`，不是最终归档状态。以上能排除“未调用归档”，不能证明客户端持续处于归档状态，也不能把 14:14 的新命令当作此前用户观察的原因。
 - **本地可复现缺口**：旧 `drainChatOutbox` 等待十秒后继续归档，即使仍有 `pending`/`unknown` 正文。回归以真实 SQLite 保存已送达回执和未送达正文，推进十二秒后观察到归档调用，证明指定回执 barrier 不能替代整个聊天排空。此缺口不等于已经证明了现场因果。
 - **实施**：移除排空的超时放行，保留 100ms 轮询、outbox 自身退避/失败预算和调度器取消信号；不新增归档执行器、Git 重试、工作树重建或成功事件。

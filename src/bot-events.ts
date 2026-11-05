@@ -16,14 +16,22 @@ const BOT_EVENT_MAX_ATTEMPTS = 5;
 export type BotEventOutcome = "handled" | "ignored" | "retry" | "pending";
 export type BotEventExhaustionOutcome = "handled" | "pending";
 
+/**
+ * 一条 Bot event 的短受理票据。`ackReady` 只覆盖持久来源去重、授权和领域交接；
+ * 模型、worker、卡片 HTTP 与最终展示由领域后台 operation 持有，绝不能接进游标 ACK。
+ */
+export interface BotEventReceipt {
+  readonly ackReady: Promise<BotEventOutcome>;
+}
+
 /** 一次 Bot 事件队列消费：轮询、应用、确认、推进游标。 */
 export interface BotEventLoopDeps {
   readonly store: ChannelStore;
   readonly transport: ChannelTransport;
   botUid(): string | undefined;
   stopping(): boolean;
-  /** 处理一次卡片点击；抛错按 `retry` 对待，event id 用于持久操作去重。 */
-  onCardAction(action: BotCardAction, eventId: number): Promise<BotEventOutcome>;
+  /** 同步登记一次卡片事件；票据完成于可靠短受理，event id 是持久来源去重键。 */
+  onCardAction(action: BotCardAction, eventId: number): BotEventReceipt;
   /** 处理重试耗尽时恢复已接受操作或投递失败提示；`pending` 继续保留事件且不 ACK。 */
   onCardActionRetriesExhausted?(
     action: BotCardAction,
@@ -59,8 +67,8 @@ function waitFor(ms: number, signal: AbortSignal): Promise<void> {
 
 /**
  * Consumes this Bot's event queue for the life of the process: long poll, apply, acknowledge,
- * advance the cursor. Delivery is at-least-once, so an event whose acknowledgement was lost is
- * replayed and the answer compare-and-set turns the replay into a no-op.
+ * advance the cursor. Delivery is at-least-once; domain handlers must durably deduplicate the
+ * source event before returning an ACK-ready outcome.
  */
 export function createBotEventLoop(deps: BotEventLoopDeps): BotEventLoop {
   const eventAttempts = new Map<number, number>();
@@ -92,9 +100,18 @@ export function createBotEventLoop(deps: BotEventLoopDeps): BotEventLoop {
       if (events === null) return;
       for (const event of events) {
         if (signal.aborted || deps.stopping()) return;
-        const outcome = event.kind === "card_action"
-          ? await deps.onCardAction(event.action, event.eventId).catch((): BotEventOutcome => "retry")
-          : "ignored";
+        // Keep the durable source key on the action for domain handlers behind legacy one-arg adapters.
+        const cardAction = event.kind === "card_action"
+          ? { ...event.action, eventId: event.eventId }
+          : null;
+        let outcome: BotEventOutcome;
+        try {
+          outcome = cardAction === null
+            ? "ignored"
+            : await deps.onCardAction(cardAction, event.eventId).ackReady;
+        } catch {
+          outcome = "retry";
+        }
         if (outcome === "pending") {
           // A durable grant exists; keep its event unacknowledged until mirror/result recovery finishes.
           eventAttempts.delete(event.eventId);

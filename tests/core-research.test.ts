@@ -63,6 +63,22 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<b
   return predicate();
 }
 
+async function waitForSignal(
+  signal: Promise<void>,
+  description: string,
+  timeoutMs = 3_000,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timedOut = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out waiting for ${description}`)), timeoutMs);
+    });
+    await Promise.race([signal, timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 interface ProgressCardSend {
   messageId: string;
   progress: ProgressCard;
@@ -134,10 +150,10 @@ test("research updates start one progress card and update its rounds in place", 
   });
   try {
     const target = { channelId: "dm-research-card", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "research-card-bind", ...target, text: "/new" }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "research-card-task", ...target, text: "run the sweep" }),
     );
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
@@ -210,17 +226,17 @@ test("a steered roll keeps the research band on the next card; a fresh task star
   });
   try {
     const target = { channelId: "dm-research-roll", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "research-roll-bind", ...target, text: "/new" }),
     );
-    const first = harness.service.handleInbound(
+    const first = harness.service.submitInbound(
       inbound({ messageId: "research-roll-task", ...target, text: "research run" }),
     );
-    await started.promise;
+    await waitForSignal(started.promise, "research task start");
     // Barrier one: the research card actually exists before its owner gets steered.
     const cardReady = await waitUntil(() => transport.progressCardSends.length === 1);
     expect(cardReady).toBe(true);
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "research-roll-steer", ...target, text: "more context" }),
     );
     // Barrier two: the roll really happened — the first card closed with a terminal edit.
@@ -232,10 +248,11 @@ test("a steered roll keeps the research band on the next card; a fresh task star
     afterRoll.release();
     await first;
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "research-roll-plain", ...target, text: "independent chore" }),
     );
-    await harness.workers.waitForPromptCount(2);
+    const secondPromptStarted = await waitUntil(() => harness.workers.prompts.length >= 2);
+    expect(secondPromptStarted).toBe(true);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
     await waitUntil(() => transport.progressCardSends.length === 3
       && transport.progressCardSends.every(
@@ -278,18 +295,18 @@ test("/autoresearch-history exports the running chat's latest report without tou
     },
   });
   const deliverTask = async (): Promise<void> => {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "alpha-bind", channelId: "dm-alpha", channelType: 1, text: "/new" }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "alpha-task", channelId: "dm-alpha", channelType: 1, text: "run the study" }),
     );
   };
   try {
     const target = { channelId: "dm-alpha", channelType: 1 as const };
     const task = deliverTask();
-    await emitted.promise;
-    await harness.service.handleInbound(
+    await waitForSignal(emitted.promise, "research result emission");
+    await harness.service.submitInbound(
       inbound({ messageId: "alpha-export", ...target, text: "/autoresearch-history" }),
     );
     const delivered = await waitUntil(() => harness.transport.sentFiles.length === 1);
@@ -317,17 +334,17 @@ test("a redelivered /autoresearch-history ships the report once", async () => {
   });
   try {
     const target = { channelId: "dm-alpha-redeliver", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "redeliver-bind", ...target, text: "/new" }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "redeliver-task", ...target, text: "measure the baseline" }),
     );
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "redeliver-export", ...target, text: "/autoresearch-history" }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "redeliver-export", ...target, text: "/autoresearch-history" }),
     );
     const delivered = await waitUntil(() => harness.transport.sentFiles.length === 1);
@@ -348,16 +365,16 @@ test("members and unrelated chats cannot pull a chat's research report", async (
   });
   try {
     const researchChat = { channelId: "dm-secret-alpha", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "secret-bind", ...researchChat, text: "/new" }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "secret-task", ...researchChat, text: "run the study" }),
     );
     await waitForStatus(harness.service, researchChat, (status) => status.state === "completed");
 
     const group = { channelId: "group-allowed", channelType: 2 as const };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "secret-member",
         ...group,
@@ -367,7 +384,7 @@ test("members and unrelated chats cannot pull a chat's research report", async (
       }),
     );
     const otherChat = { channelId: "dm-secret-other", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "secret-other-export", ...otherChat, text: "/autoresearch-history" }),
     );
 
@@ -403,13 +420,13 @@ test("a chat with no research gets a short hint instead of a model call", async 
   const harness = await createCoreHarness();
   try {
     const target = { channelId: "dm-no-research", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "empty-bind", ...target, text: "/new" }),
     );
     // Let the /new receipt drain so only the export can add a reply afterwards.
     await waitForStatus(harness.service, target, (status) => status.outbox === 0);
     const sentBefore = harness.transport.sent.length;
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "empty-export", ...target, text: "/autoresearch-history" }),
     );
     const hintArrived = await waitUntil(() => harness.transport.sent.length > sentBefore);
@@ -441,10 +458,10 @@ test("a restarted channel still exports the report the previous process persiste
   });
   const target = { channelId: "dm-restart-research", channelType: 1 as const };
   try {
-    await firstHarness.service.handleInbound(
+    await firstHarness.service.submitInbound(
       inbound({ messageId: "persist-bind", ...target, text: "/new" }),
     );
-    await firstHarness.service.handleInbound(
+    await firstHarness.service.submitInbound(
       inbound({ messageId: "persist-task", ...target, text: "survive a restart" }),
     );
     await waitForStatus(firstHarness.service, target, (status) => status.state === "completed");
@@ -454,7 +471,7 @@ test("a restarted channel still exports the report the previous process persiste
 
   const restarted = await createCoreHarness({ root: firstHarness.root, bot: firstHarness.bot });
   try {
-    await restarted.service.handleInbound(
+    await restarted.service.submitInbound(
       inbound({ messageId: "persist-export", ...target, text: "/autoresearch-history" }),
     );
     const delivered = await waitUntil(() => restarted.transport.sentFiles.length === 1);
@@ -480,10 +497,10 @@ test("a report write failure never takes the producing task down", async () => {
     // The reports root is a plain file: every ordered write fails before its first fs step.
     await writeFile(researchReportsRoot(harness.stateDir), "blocked", { mode: 0o600 });
     const target = { channelId: "dm-broken-reports", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "broken-bind", ...target, text: "/new" }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "broken-task", ...target, text: "study with broken storage" }),
     );
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
@@ -533,14 +550,18 @@ test("an enqueued export keeps its bytes when a newer report lands", async () =>
   });
   try {
     const target = { channelId: "dm-spool", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "spool-bind", ...target, text: "/new" }),
     );
-    await harness.service.handleInbound(
+    await waitForStatus(harness.service, target, (status) => status.cwd !== null);
+    const firstPromptCount = harness.workers.prompts.length + 1;
+    await harness.service.submitInbound(
       inbound({ messageId: "spool-first", ...target, text: "first study" }),
     );
-    await waitForStatus(harness.service, target, (status) => status.state === "completed");
-    await harness.service.handleInbound(
+    const firstPromptStarted = await waitUntil(() => harness.workers.prompts.length >= firstPromptCount);
+    expect(firstPromptStarted).toBe(true);
+    await waitForStatus(harness.service, target, (status) => status.state === "completed" && status.queued === 0);
+    await harness.service.submitInbound(
       inbound({ messageId: "spool-export-v1", ...target, text: "/autoresearch-history" }),
     );
     const firstDelivered = await waitUntil(() => harness.transport.sentFiles.length === 1);
@@ -548,11 +569,14 @@ test("an enqueued export keeps its bytes when a newer report lands", async () =>
     const firstExport = harness.transport.sentFiles[0]!;
     expect(await readFile(firstExport.path, "utf8")).toBe(REPORT_V1);
 
-    await harness.service.handleInbound(
+    const secondPromptCount = harness.workers.prompts.length + 1;
+    await harness.service.submitInbound(
       inbound({ messageId: "spool-second", ...target, text: "second study" }),
     );
-    await waitForStatus(harness.service, target, (status) => status.state === "completed");
-    await harness.service.handleInbound(
+    const secondPromptStarted = await waitUntil(() => harness.workers.prompts.length >= secondPromptCount);
+    expect(secondPromptStarted).toBe(true);
+    await waitForStatus(harness.service, target, (status) => status.state === "completed" && status.queued === 0);
+    await harness.service.submitInbound(
       inbound({ messageId: "spool-export-v2", ...target, text: "/autoresearch-history" }),
     );
     const secondDelivered = await waitUntil(() => harness.transport.sentFiles.length === 2);

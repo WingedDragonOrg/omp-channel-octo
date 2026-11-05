@@ -28,6 +28,7 @@ import {
   FakeTransport,
   FakeWorkerFactory,
   inbound,
+  waitForIngressJob,
   waitForStatus,
 } from "./fixtures/core-fakes";
 
@@ -327,26 +328,31 @@ test("same-chat tasks remain FIFO while distinct directories run concurrently", 
     const firstTarget = { channelId: "dm-directory-a", channelType: 1 as const };
     const secondTarget = { channelId: "dm-directory-b", channelType: 1 as const };
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "bind-directory-a", ...firstTarget, text: `/new ${directoryA}` }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "bind-directory-b", ...secondTarget, text: `/new ${directoryB}` }),
     );
 
-    const firstAccepted = harness.service.handleInbound(
+    const firstAccepted = harness.service.submitInbound(
       inbound({ messageId: "directory-a-first", ...firstTarget, text: "directory-a first" }),
     );
     await firstStarted.promise;
-    const secondAccepted = harness.service.handleInbound(
-      inbound({ messageId: "directory-a-second", ...firstTarget, text: "/queue directory-a second" }),
-    );
-    const parallelAccepted = harness.service.handleInbound(
+    const secondMessage = inbound({
+      messageId: "directory-a-second",
+      ...firstTarget,
+      text: "/queue directory-a second",
+    });
+    const secondAccepted = harness.service.submitInbound(secondMessage);
+    const parallelAccepted = harness.service.submitInbound(
       inbound({ messageId: "directory-b-parallel", ...secondTarget, text: "directory-b parallel" }),
     );
     await Promise.all([secondAccepted, parallelAccepted]);
+    await waitForIngressJob(harness, secondMessage, {
+      description: "queued task handoff while the first directory is occupied",
+    });
     await parallelStarted.promise;
-
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual([
       "directory-a first",
       "directory-b parallel",
@@ -374,18 +380,30 @@ test("cancelling during delayed creation never prompts and keeps the directory q
   try {
     const firstTarget = { channelId: "dm-create-cancel-first", channelType: 1 as const };
     const secondTarget = { channelId: "dm-create-cancel-second", channelType: 1 as const };
-    const firstAccepted = harness.service.handleInbound(
+    const firstAccepted = harness.service.submitInbound(
       inbound({ messageId: "create-cancel-first", ...firstTarget, text: "first create" }),
     );
     await workers.createStarted.promise;
 
-    const secondAccepted = harness.service.handleInbound(
-      inbound({ messageId: "create-cancel-second", ...secondTarget, text: "second queued" }),
-    );
+    const secondMessage = inbound({
+      messageId: "create-cancel-second",
+      ...secondTarget,
+      text: "second queued",
+    });
+    const secondAccepted = harness.service.submitInbound(secondMessage);
     await secondAccepted;
-    await harness.service.handleInbound(
-      inbound({ messageId: "create-cancel-command", ...firstTarget, text: "/cancel" }),
-    );
+    await waitForIngressJob(harness, secondMessage, {
+      description: "queued task handoff before cancellation completes",
+    });
+    const cancelMessage = inbound({
+      messageId: "create-cancel-command",
+      ...firstTarget,
+      text: "/cancel",
+    });
+    await harness.service.submitInbound(cancelMessage);
+    await waitForIngressJob(harness, cancelMessage, {
+      description: "cancel intent accepted before releasing delayed worker creation",
+    });
     expect(workers.prompts).toHaveLength(0);
     expect(workers.workers).toHaveLength(0);
 
@@ -420,9 +438,17 @@ test("a recovery failure after acquiring the Bot lock releases it for a later in
     seed = await createBoundaryHarness({ bot, workerFactory: seedWorkers });
     const stateRoot = seed.root;
     root = stateRoot;
-    await seed.service.handleInbound(
-      inbound({ messageId: "seed-unconfirmed-worker", channelId: "dm-seed", text: "/new" }),
-    );
+    const seedMessage = inbound({
+      messageId: "seed-unconfirmed-worker",
+      channelId: "dm-seed",
+      text: "/new",
+    });
+    await seed.service.submitInbound(seedMessage);
+    await waitForIngressJob(seed, seedMessage, {
+      predicate: (job) => job.state === "unknown",
+      rejectStates: [],
+      description: "unconfirmed seed worker outcome before restarting the service",
+    });
     await closeBoundaryHarness(seed, false);
     seed = undefined;
 
@@ -488,7 +514,7 @@ test("a credential provisioning failure does not keep the channel from serving",
   });
   try {
     const message = inbound({ messageId: "provision-failure-still-serves", channelId: "dm-provision" });
-    await harness.service.handleInbound(message);
+    await harness.service.submitInbound(message);
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, message, (status) => status.state === "completed");
   } finally {
@@ -508,7 +534,7 @@ test("concurrent stop calls wait for the worker and reject new work while stoppi
   let secondFinished = false;
   try {
     const target = { channelId: "dm-stop-running", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "stop-running", ...target, text: "running task" }),
     );
     await workers.promptStarted.promise;
@@ -523,7 +549,7 @@ test("concurrent stop calls wait for the worker and reject new work while stoppi
     });
     await workers.stopCalled.promise;
 
-    await expect(harness.service.handleInbound(
+    await expect(harness.service.submitInbound(
       inbound({ messageId: "stop-during-shutdown", ...target, text: "must not spawn" }),
     )).rejects.toThrow();
     expect(workers.workers).toHaveLength(1);
@@ -562,14 +588,21 @@ test("a missing persisted session file fails the task without replacing its bind
   let first: BoundaryHarness | undefined;
   let restarted: BoundaryHarness | undefined;
   try {
-    first = await createBoundaryHarness({ root, bot, workerFactory: firstWorkers });
-    await first.service.handleInbound(
-      inbound({ messageId: "persist-session-binding", ...target, text: "/new" }),
-    );
-    const original = await first.service.status(target);
+    const firstHarness = await createBoundaryHarness({ root, bot, workerFactory: firstWorkers });
+    first = firstHarness;
+    const createSessionMessage = inbound({
+      messageId: "persist-session-binding",
+      ...target,
+      text: "/new",
+    });
+    await firstHarness.service.submitInbound(createSessionMessage);
+    await waitForIngressJob(firstHarness, createSessionMessage, {
+      description: "persisted session binding before deleting its session file",
+    });
+    const original = await firstHarness.service.status(target);
     expect(original.sessionId).toEqual(expect.any(String));
     expect(original.cwd).toEqual(join(root, "tmp"));
-    await closeBoundaryHarness(first, false);
+    await closeBoundaryHarness(firstHarness, false);
     first = undefined;
     await unlink(sessionFile);
 
@@ -581,7 +614,7 @@ test("a missing persisted session file fails the task without replacing its bind
       transport,
       workerFactory: restartedWorkers,
     });
-    await restarted.service.handleInbound(
+    await restarted.service.submitInbound(
       inbound({ messageId: "missing-session-task", ...target, text: "must fail" }),
     );
     await waitForStatus(

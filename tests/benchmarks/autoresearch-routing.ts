@@ -19,6 +19,8 @@ import {
   closeCoreHarness,
   createCoreHarness,
   inbound,
+  readIngressJob,
+  submitAndWaitForIngressHandoff,
   waitForStatus,
 } from "../fixtures/core-fakes.ts";
 import { check, type CheckResult } from "./autoresearch-types.ts";
@@ -46,7 +48,7 @@ function rowCount(stateDir: string, table: "tasks" | "inbound" | "allowed_chats"
 async function caseOwnerDmGoalVerbatim(): Promise<void> {
   const harness = await createCoreHarness({ bot: BOT, ownerId: OWNER });
   try {
-    await harness.service.handleInbound(inbound({
+    await submitAndWaitForIngressHandoff(harness, inbound({
       ...DM,
       messageId: "ar-bench-dm-goal-0001",
       senderId: OWNER,
@@ -92,16 +94,18 @@ async function caseGroupHistoryCommandFirstLine(): Promise<void> {
     ];
     for (const [index, text] of members.entries()) {
       const seq = index + 1;
-      await harness.service.handleInbound(inbound({
+      const memberMessage = inbound({
         ...ENABLED_GROUP,
         messageId: `ar-bench-history-member-${seq}`,
         senderId: MEMBER,
         text,
         messageSeq: seq,
         messageTimestamp: T0 + seq * 60_000,
-      }));
+      });
+      await harness.service.submitInbound(memberMessage);
+      assert.equal(await readIngressJob(harness, memberMessage), null);
     }
-    await harness.service.handleInbound(inbound({
+    await submitAndWaitForIngressHandoff(harness, inbound({
       ...ENABLED_GROUP,
       messageId: "ar-bench-history-command",
       senderId: OWNER,
@@ -119,7 +123,7 @@ async function caseGroupHistoryCommandFirstLine(): Promise<void> {
     assert.equal(harness.transport.historyCalls.length, 0);
 
     // 前提校验：历史确实存在，且 slash 轮没有消费它——下一条普通任务应注入这三条成员消息。
-    await harness.service.handleInbound(inbound({
+    await submitAndWaitForIngressHandoff(harness, inbound({
       ...ENABLED_GROUP,
       messageId: "ar-bench-history-followup",
       senderId: OWNER,
@@ -153,7 +157,7 @@ async function caseMemberClearRejected(): Promise<void> {
     allowedGroupIds: [ENABLED_GROUP.channelId],
   });
   try {
-    await harness.service.handleInbound(inbound({
+    const rejected = inbound({
       ...ENABLED_GROUP,
       messageId: "ar-bench-member-clear-0001",
       senderId: MEMBER,
@@ -161,7 +165,9 @@ async function caseMemberClearRejected(): Promise<void> {
       mentionedUserIds: [BOT.uid],
       messageSeq: 1,
       messageTimestamp: T0 + 60_000,
-    }));
+    });
+    await harness.service.submitInbound(rejected);
+    assert.equal(await readIngressJob(harness, rejected), null);
 
     assert.equal(harness.workers.prompts.length, 0);
     assert.equal(rowCount(harness.stateDir, "tasks"), 0);
@@ -182,8 +188,8 @@ async function caseOwnerRedeliverySingleTask(): Promise<void> {
       text: "/autoresearch",
       messageTimestamp: T0,
     });
-    await harness.service.handleInbound(message);
-    await harness.service.handleInbound({ ...message });
+    await submitAndWaitForIngressHandoff(harness, message);
+    await submitAndWaitForIngressHandoff(harness, { ...message });
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, DM, (status) => status.state === "completed");
 
@@ -203,7 +209,7 @@ async function caseUnlistedGroupNotExecuted(): Promise<void> {
     allowedGroupIds: [ENABLED_GROUP.channelId],
   });
   try {
-    await harness.service.handleInbound(inbound({
+    const rejected = inbound({
       ...UNLISTED_GROUP,
       messageId: "ar-bench-unlisted-0001",
       senderId: OWNER,
@@ -211,7 +217,9 @@ async function caseUnlistedGroupNotExecuted(): Promise<void> {
       mentionedUserIds: [BOT.uid],
       messageSeq: 1,
       messageTimestamp: T0 + 60_000,
-    }));
+    });
+    await harness.service.submitInbound(rejected);
+    assert.equal(await readIngressJob(harness, rejected), null);
 
     assert.equal(harness.workers.prompts.length, 0);
     assert.equal(rowCount(harness.stateDir, "tasks"), 0);

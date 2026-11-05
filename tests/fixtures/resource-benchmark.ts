@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createChannelService } from "../../src/service.ts";
 import { createWorkerFactory } from "../../src/omp/index.ts";
-import { FakeTransport, inbound } from "./core-fakes.ts";
+import {
+  FakeTransport,
+  inbound,
+  submitAndWaitForIngressHandoff,
+} from "./core-fakes.ts";
 
 // Measures channel retention, not the installed OMP runtime's memory footprint.
 // Fixed 3-second observation window, 30 samples; no live transport or model.
@@ -54,7 +58,11 @@ async function sample() {
 let occupancy = 0, rss = 0;
 try {
   await service.start();
-  await service.handleInbound(inbound({ ...target, messageId: "start", text: "ask resource question" }));
+  await submitAndWaitForIngressHandoff(
+    { service, stateDir: join(root, "state"), bot: transport.bot },
+    inbound({ ...target, messageId: "start", text: "ask resource question" }),
+    { timeoutMs: 10_000, description: "resource question task handoff" },
+  );
   await until(async () => (await service.status(target)).pendingQuestionIds.length === 1);
   const before = await service.status(target);
   const started = performance.now();
@@ -67,7 +75,11 @@ try {
   }
   const reply = inbound({ ...target, messageId: "answer", text: "benchmark-answer" });
   const resumed = performance.now();
-  await service.handleInbound(reply);
+  await submitAndWaitForIngressHandoff(
+    { service, stateDir: join(root, "state"), bot: transport.bot },
+    reply,
+    { timeoutMs: 10_000, description: "resource answer handoff" },
+  );
   await until(async () => (await service.status(target)).state === "completed");
   await until(async () => transport.sent.some(x => x.text.includes("benchmark-answer")));
   const resumeMs = performance.now() - resumed;
@@ -76,7 +88,11 @@ try {
   assert.equal(after.pendingQuestionIds.length, 0);
   await until(async () => (await sample()).count === 0);
   const count = pids.length;
-  await service.handleInbound(reply);
+  await submitAndWaitForIngressHandoff(
+    { service, stateDir: join(root, "state"), bot: transport.bot },
+    reply,
+    { timeoutMs: 10_000, description: "duplicate resource answer handoff" },
+  );
   await Bun.sleep(200);
   assert.equal(pids.length, count, "duplicate answer started another worker");
   await service.stop();

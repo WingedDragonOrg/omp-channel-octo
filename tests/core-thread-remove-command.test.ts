@@ -177,11 +177,16 @@ async function waitForAction(
   }
 }
 
-async function nextEventLoopTurn(): Promise<void> {
-  const turn = Promise.withResolvers<void>();
-  setImmediate(turn.resolve);
-  await turn.promise;
+function waitForNextTargetText(harness: CoreHarness, target: ThreadTarget) {
+  const existingMessageIds = new Set(
+    harness.transport.listRemoteText(target).map(message => message.messageId),
+  );
+  return harness.transport.waitForRemoteText(message =>
+    message.target.channelType === target.channelType
+    && message.target.channelId === target.channelId
+    && !existingMessageIds.has(message.messageId));
 }
+
 
 /** The wall-clock bound proves a busy remove command rejects instead of waiting for task settlement. */
 async function settlesWithin(promise: Promise<void>, timeoutMs = 250): Promise<boolean> {
@@ -343,11 +348,10 @@ test("/thread remove cleans persisted ownership once and archives only after its
     observeReceiptBeforeArchive(harness, worktrees, target);
     const command = removalCommand(harness, target, "remove-success-command");
 
-    await harness.service.handleInbound(command);
-    expect(worktrees.requests).toHaveLength(1);
+    await harness.service.submitInbound(command);
     expect(await waitForAction(harness, "thread-archive")).toBe(true);
-    await harness.service.handleInbound(command);
-    await nextEventLoopTurn();
+    expect(worktrees.requests).toHaveLength(1);
+    await harness.service.submitInbound(command);
 
     const request = worktrees.requests[0]! as RecordedRemovalRequest & { deleteBranch?: boolean };
     expect(request.path).toBe(workspace.record.projects[0]!.path!);
@@ -391,10 +395,9 @@ test("/thread remove --force forwards force without changing its owner-only comm
   try {
     const workspace = await seedOwnedWorkspace(harness, target);
     const command = removalCommand(harness, target, "remove-force-command", "--force");
-    await harness.service.handleInbound(command);
-
-    expect(worktrees.requests).toHaveLength(1);
+    await harness.service.submitInbound(command);
     expect(await waitForAction(harness, "thread-archive")).toBe(true);
+    expect(worktrees.requests).toHaveLength(1);
     const request = worktrees.requests[0]! as RecordedRemovalRequest & { deleteBranch?: boolean };
     expect(request.path).toBe(workspace.record.projects[0]!.path!);
     expect(request.repo).toBe(workspace.record.projects[0]!.repo);
@@ -417,9 +420,13 @@ test("/thread remove is owner-only and does not create a task for a group member
   const harness = await createCoreHarness({ worktreePort: worktrees });
   try {
     await seedOwnedWorkspace(harness, target);
-    await harness.service.handleInbound(
-      ownerMessage(harness, target, "remove-not-owner", "/thread remove", "member-2"),
-    );
+    const command = ownerMessage(harness, target, "remove-not-owner", "/thread remove", "member-2");
+    const refusal = harness.transport.waitForRemoteText(message =>
+      message.target.channelType === target.channelType
+      && message.target.channelId === target.channelId
+      && message.text.includes("命令仅 owner 可用"));
+    await harness.service.submitInbound(command);
+    await refusal;
 
     expect(worktrees.requests).toEqual([]);
     expect(harness.transport.sent.some(({ text }) => text.includes("命令仅 owner 可用"))).toBe(true);
@@ -441,8 +448,10 @@ test("a shared entry left nonempty after project cleanup remains owned and is no
     const workspace = await seedOwnedWorkspace(harness, target, { layout: "shared" });
     const marker = join(workspace.entryPath!, "unowned-note.txt");
     await writeFile(marker, "keep this file\n");
-    await harness.service.handleInbound(removalCommand(harness, target, "remove-shared-command"));
-    await nextEventLoopTurn();
+    const command = removalCommand(harness, target, "remove-shared-command");
+    const reply = waitForNextTargetText(harness, target);
+    await harness.service.submitInbound(command);
+    await reply;
 
     expect(worktrees.requests).toHaveLength(1);
     expect(await pathExists(marker)).toBe(true);
@@ -471,7 +480,10 @@ test("a replaced shared entry symlink and its target stay untouched", async () =
     await rm(workspace.entryPath!, { recursive: true, force: true });
     await symlink(sentinel, workspace.entryPath!);
 
-    await harness.service.handleInbound(removalCommand(harness, target, "remove-shared-link-command"));
+    const command = removalCommand(harness, target, "remove-shared-link-command");
+    const refusal = waitForNextTargetText(harness, target);
+    await harness.service.submitInbound(command);
+    await refusal;
 
     expect((await lstat(workspace.entryPath!)).isSymbolicLink()).toBe(true);
     expect(await pathExists(sentinel)).toBe(true);
@@ -492,14 +504,13 @@ test("a rebound thread removes the original owned project, not its current bindi
   try {
     const reboundCwd = join(harness.root, "rebound-thread-cwd");
     const workspace = await seedOwnedWorkspace(harness, target, { bindingCwd: reboundCwd });
-    await harness.service.handleInbound(removalCommand(harness, target, "remove-rebound-command"));
-
+    await harness.service.submitInbound(removalCommand(harness, target, "remove-rebound-command"));
+    expect(await waitForAction(harness, "thread-archive")).toBe(true);
     expect(worktrees.requests).toHaveLength(1);
     expect(worktrees.requests[0]!.path).toBe(workspace.record.projects[0]!.path!);
     expect(worktrees.requests[0]!.path).not.toBe(workspace.bindingCwd);
     expect(await pathExists(workspace.record.projects[0]!.path!)).toBe(false);
     expect(await pathExists(workspace.bindingCwd)).toBe(true);
-    expect(await waitForAction(harness, "thread-archive")).toBe(true);
     await withStore(harness, (store) => {
       expect(store.getThreadWorkspace(harness.bot.uid, target)?.projects[0]).toMatchObject({
         created: false,
@@ -528,15 +539,14 @@ test("a missing owned worktree still reaches branch cleanup instead of the incom
     const missingPath = workspace.record.projects[0]!.path!;
     expect(await pathExists(missingPath)).toBe(false);
 
-    await harness.service.handleInbound(removalCommand(harness, target, "remove-missing-command"));
-
+    await harness.service.submitInbound(removalCommand(harness, target, "remove-missing-command"));
+    expect(await waitForAction(harness, "thread-archive")).toBe(true);
     expect(worktrees.requests).toHaveLength(1);
     expect(worktrees.requests[0]!.path).toBe(missingPath);
     expect(worktrees.requests[0]!.branch).toBe(workspace.record.projects[0]!.branch!);
     expect((worktrees.requests[0] as RecordedRemovalRequest & { deleteBranch?: boolean }).deleteBranch).toBe(true);
     expect(harness.transport.sent.some(({ text }) => text === INCOMPLETE_WORKSPACE_NOTICE)).toBe(false);
     expect(harness.workers.prompts).toEqual([]);
-    expect(await waitForAction(harness, "thread-archive")).toBe(true);
     await withStore(harness, (store) => {
       expect(store.getThreadWorkspace(harness.bot.uid, target)?.projects[0]).toMatchObject({
         created: false,
@@ -560,8 +570,10 @@ test("a missing outcome without confirmed branch state retains ownership and can
   const harness = await createCoreHarness({ worktreePort: worktrees });
   try {
     const workspace = await seedOwnedWorkspace(harness, target, { missingPaths: ["api"] });
-    await harness.service.handleInbound(removalCommand(harness, target, "remove-missing-branch-command"));
-    await nextEventLoopTurn();
+    const command = removalCommand(harness, target, "remove-missing-branch-command");
+    const refusal = waitForNextTargetText(harness, target);
+    await harness.service.submitInbound(command);
+    await refusal;
 
     expect(worktrees.requests).toHaveLength(1);
     expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
@@ -591,8 +603,10 @@ test("a partial branch-removal result retains the original workspace and remaini
   const harness = await createCoreHarness({ worktreePort: worktrees });
   try {
     const workspace = await seedOwnedWorkspace(harness, target);
-    await harness.service.handleInbound(removalCommand(harness, target, "remove-branch-partial"));
-    await nextEventLoopTurn();
+    const firstCommand = removalCommand(harness, target, "remove-branch-partial");
+    const firstReply = waitForNextTargetText(harness, target);
+    await harness.service.submitInbound(firstCommand);
+    await firstReply;
 
     expect(worktrees.requests).toHaveLength(1);
     expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
@@ -604,13 +618,14 @@ test("a partial branch-removal result retains the original workspace and remaini
       });
     });
 
-    await harness.service.handleInbound(removalCommand(harness, target, "remove-branch-retry", "--force"));
+    const retryCommand = removalCommand(harness, target, "remove-branch-retry", "--force");
+    await harness.service.submitInbound(retryCommand);
+    expect(await waitForAction(harness, "thread-archive")).toBe(true);
     expect(worktrees.requests[1]!.path).toBe(workspace.record.projects[0]!.path!);
     expect(worktrees.requests[1]!.repo).toBe(workspace.record.projects[0]!.repo);
     expect(worktrees.requests[1]!.branch).toBe(workspace.record.projects[0]!.branch!);
     expect(worktrees.requests[1]!.force).toBe(true);
     expect((worktrees.requests[1] as RecordedRemovalRequest & { deleteBranch?: boolean }).deleteBranch).toBe(true);
-    expect(await waitForAction(harness, "thread-archive")).toBe(true);
     await withStore(harness, (store) => {
       expect(store.getThreadWorkspace(harness.bot.uid, target)?.projects[0]).toMatchObject({
         created: false,
@@ -634,8 +649,10 @@ test("an unknown removal process blocks later projects and preserves every unres
   const harness = await createCoreHarness({ worktreePort: worktrees });
   try {
     const workspace = await seedOwnedWorkspace(harness, target, { names: ["api", "web"] });
-    await harness.service.handleInbound(removalCommand(harness, target, "remove-unknown-command"));
-    await nextEventLoopTurn();
+    const command = removalCommand(harness, target, "remove-unknown-command");
+    const refusal = waitForNextTargetText(harness, target);
+    await harness.service.submitInbound(command);
+    await refusal;
 
     expect(worktrees.requests).toHaveLength(1);
     expect(await pathExists(workspace.record.projects[0]!.path!)).toBe(true);
@@ -664,8 +681,10 @@ test("an unknown removal process blocks later projects and preserves every unres
       expect(leases[0]?.processIdentity).not.toBeNull();
       expect(store.listHostMergeLeases(harness.bot.uid)).toEqual([]);
     });
-    await harness.service.handleInbound(removalCommand(harness, target, "remove-unknown-retry"));
-    await nextEventLoopTurn();
+    const retry = removalCommand(harness, target, "remove-unknown-retry");
+    const retryRefusal = waitForNextTargetText(harness, target);
+    await harness.service.submitInbound(retry);
+    await retryRefusal;
     expect(worktrees.requests).toHaveLength(1);
     expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
   } finally {
@@ -691,7 +710,7 @@ test("a pending same-thread ask refuses removal immediately even after the bindi
     const reboundCwd = join(harness.root, "remove-busy-rebound-cwd");
     const workspace = await seedOwnedWorkspace(harness, target, { bindingCwd: reboundCwd });
     const task = ownerMessage(harness, target, "remove-busy-ask-task", "hold on an ask");
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await askStarted.promise;
     const waiting = await waitForStatus(
       harness.service,
@@ -699,8 +718,11 @@ test("a pending same-thread ask refuses removal immediately even after the bindi
       (status) => status.pendingQuestionIds.length === 1,
     );
 
-    const remove = harness.service.handleInbound(removalCommand(harness, target, "remove-busy-ask-command"));
+    const removeMessage = removalCommand(harness, target, "remove-busy-ask-command");
+    const refusal = waitForNextTargetText(harness, target);
+    const remove = harness.service.submitInbound(removeMessage);
     expect(await settlesWithin(remove)).toBe(true);
+    await refusal;
     const stillWaiting = await harness.service.status(target);
     expect(stillWaiting.pendingQuestionIds).toEqual(waiting.pendingQuestionIds);
     expect(stillWaiting.queued).toBe(0);
@@ -708,7 +730,7 @@ test("a pending same-thread ask refuses removal immediately even after the bindi
     expect(await pathExists(workspace.record.projects[0]!.path!)).toBe(true);
     expect(harness.workers.prompts).toHaveLength(1);
 
-    await harness.service.handleInbound(ownerMessage(harness, target, "remove-busy-ask-answer", "done"));
+    await harness.service.submitInbound(ownerMessage(harness, target, "remove-busy-ask-answer", "done"));
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
   } finally {
     await closeCoreHarness(harness);
@@ -745,7 +767,7 @@ test("an active subdirectory lease refuses removal without waiting or touching t
       store.close();
     }
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       channelType: 2,
       channelId: "group-b",
       messageId: "remove-subdir-task",
@@ -754,8 +776,11 @@ test("an active subdirectory lease refuses removal without waiting or touching t
       mentionedUserIds: [harness.bot.uid],
     }));
     await started.promise;
-    const remove = harness.service.handleInbound(removalCommand(harness, target, "remove-subdir-command"));
+    const removeMessage = removalCommand(harness, target, "remove-subdir-command");
+    const refusal = waitForNextTargetText(harness, target);
+    const remove = harness.service.submitInbound(removeMessage);
     expect(await settlesWithin(remove)).toBe(true);
+    await refusal;
 
     expect(worktrees.requests).toEqual([]);
     expect(await pathExists(workspace.record.projects[0]!.path!)).toBe(true);
@@ -893,13 +918,16 @@ test("a verified parked process stopped before execution does not block the next
   const harness = await createCoreHarness({ worktreePort: worktrees });
   try {
     const workspace = await seedOwnedWorkspace(harness, target);
-    await harness.service.handleInbound(removalCommand(harness, target, "remove-not-started-first"));
+    const firstCommand = removalCommand(harness, target, "remove-not-started-first");
+    const firstRefusal = waitForNextTargetText(harness, target);
+    await harness.service.submitInbound(firstCommand);
+    await firstRefusal;
     expect(await pathExists(workspace.record.projects[0]!.path!)).toBe(true);
     await withStore(harness, store => expect(store.listHostRemovalLeases(harness.bot.uid)).toEqual([]));
     worktrees.removeBehavior = normal;
-    await harness.service.handleInbound(removalCommand(harness, target, "remove-not-started-retry"));
-    expect(await pathExists(workspace.record.projects[0]!.path!)).toBe(false);
+    await harness.service.submitInbound(removalCommand(harness, target, "remove-not-started-retry"));
     expect(await waitForAction(harness, "thread-archive")).toBe(true);
+    expect(await pathExists(workspace.record.projects[0]!.path!)).toBe(false);
   } finally {
     await closeCoreHarness(harness);
   }
@@ -928,7 +956,10 @@ test("restart retains an exited removal without a business result and blocks a n
     await withStore(restarted, store => expect(store.listHostRemovalLeases(original.bot.uid)).toMatchObject([{
       id: "exited-removal", phase: "unknown", outcome: null,
     }]));
-    await restarted.service.handleInbound(removalCommand(restarted, target, "new-remove-after-exit", "--force"));
+    const blockedCommand = removalCommand(restarted, target, "new-remove-after-exit", "--force");
+    const refusal = waitForNextTargetText(restarted, target);
+    await restarted.service.submitInbound(blockedCommand);
+    await refusal;
     expect(worktrees.requests).toEqual([]);
     expect(await pathExists(workspace.record.projects[0]!.path!)).toBe(true);
     expect(restarted.transport.managementCalls).toEqual([]);
@@ -945,7 +976,7 @@ test("multi-project removal delivers every actual project result within the tran
   try {
     const names = Array.from({ length: 12 }, (_, index) => `project-${index}-${"x".repeat(80)}`);
     await seedOwnedWorkspace(harness, target, { names, layout: "shared" });
-    await harness.service.handleInbound(removalCommand(harness, target, "long-receipt-command"));
+    await harness.service.submitInbound(removalCommand(harness, target, "long-receipt-command"));
     expect(await waitForAction(harness, "thread-archive")).toBe(true);
     const receipt = harness.transport.sent.filter(message => message.target.channelId === target.channelId);
     const full = receipt.map(message => message.text).join("\n");

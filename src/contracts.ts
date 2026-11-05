@@ -169,10 +169,14 @@ export interface DeleteThreadOptions {
   freshConnection?: boolean;
 }
 
+export interface InboundReceipt {
+  ackReady: Promise<void>;
+}
+
 export interface ChannelTransport {
   initialize(): Promise<BotIdentity>;
   start(
-    onMessage: (message: InboundMessage) => Promise<void>,
+    onMessage: (message: InboundMessage) => InboundReceipt,
     onOnline: () => void,
   ): Promise<void>;
   /** Group/thread history page; rejects when the server call fails. */
@@ -675,6 +679,14 @@ export class WorkerGoalError extends Error {
   }
 }
 
+/** A definitive steer refusal; transport failures remain untyped because acceptance may be unknown. */
+export class WorkerSteerRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkerSteerRejectedError";
+  }
+}
+
 /**
  * The bounded instruction `OmpWorker.resume` sends when OMP's own `/retry` reports there is no
  * resumable failed turn — a healthy or missing transcript tail. It continues the interrupted work
@@ -719,7 +731,10 @@ export interface OmpWorker {
     onEvent: (event: WorkerEvent) => void,
     context?: PromptContext,
   ): Promise<WorkerGoalResult>;
-  /** Injects a message into the running OMP turn; fails once no turn is streaming. */
+  /**
+   * Injects a message into the running OMP turn. `WorkerSteerRejectedError` is a definite
+   * non-delivery; other failures may leave the RPC outcome unknown.
+   */
   steer(text: string): Promise<void>;
   /** Aborts the current OMP turn without clearing its queued messages or killing the worker. */
   abortTurn(): Promise<void>;
@@ -1052,8 +1067,10 @@ export interface WorktreePort {
 }
 
 export interface ChannelService {
-  /** Accepts an inbound message after durable dedupe/command handling; task work is asynchronous. */
-  handleInbound(message: InboundMessage): Promise<void>;
+  /** Synchronously registers one delivery and returns its independent durable-admission ticket. */
+  receive(message: InboundMessage): InboundReceipt;
+  /** Waits only until this delivery may be protocol-ACKed; it never waits for business completion. */
+  submitInbound(message: InboundMessage): Promise<void>;
   status(target: ChatTarget): Promise<ChannelStatus>;
   start(): Promise<void>;
   stop(): Promise<void>;

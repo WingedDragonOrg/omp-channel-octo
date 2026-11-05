@@ -8,6 +8,8 @@ import {
   createCoreHarness,
   FakeTransport,
   inbound,
+  readIngressJob,
+  submitAndWaitForIngressHandoff,
   waitForStatus,
   type CoreHarness,
 } from "./fixtures/core-fakes";
@@ -160,20 +162,48 @@ function ownerGroupMessage(overrides: Partial<InboundMessage>): InboundMessage {
   });
 }
 
+function ingressObserver(harness: CoreHarness) {
+  return {
+    service: harness.service,
+    stateDir: harness.stateDir,
+    bot: harness.bot,
+  };
+}
+
+async function submitAndWaitForHandoff(
+  harness: CoreHarness,
+  message: InboundMessage,
+): Promise<void> {
+  await submitAndWaitForIngressHandoff(ingressObserver(harness), message);
+}
+
+async function submitWithoutIngress(
+  harness: CoreHarness,
+  message: InboundMessage,
+): Promise<void> {
+  await harness.service.submitInbound(message);
+  expect(await readIngressJob(ingressObserver(harness), message)).toBeNull();
+}
+
+async function waitForCardCount(harness: CoreHarness, count: number): Promise<void> {
+  await waitForCondition(() => harness.transport.sentCards.length >= count);
+}
+
 test("an owner mention offers an interactive grant without starting a task", async () => {
   const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
   harness.transport.cardSupported = true;
   try {
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "unlisted-card",
       text: "请处理这项任务",
       mentionedUserIds: [harness.bot.uid],
     }));
+    await waitForCardCount(harness, 1);
     expect(harness.transport.sentCards).toHaveLength(1);
     expect(harness.transport.sentCards[0]!.frame.profile).toBe("octo/v2");
     expect(queryRows(harness, "SELECT 1 FROM allowed_chats")).toHaveLength(0);
     expect(harness.workers.prompts).toHaveLength(0);
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "unlisted-card-throttled",
       text: "再次开通",
       mentionedUserIds: [harness.bot.uid],
@@ -191,20 +221,21 @@ test("concurrent unlisted owner mentions share one in-flight onboarding offer", 
   transport.cardSupported = true;
   const harness = await createCoreHarness({ transport, allowedGroupIds: ALLOWED });
   try {
-    const first = harness.service.handleInbound(ownerGroupMessage({
+    const first = submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "unlisted-concurrent-first",
       text: "请处理这项任务",
       mentionedUserIds: [harness.bot.uid],
     }));
     await transport.cardSendStarted.promise;
-    await harness.service.handleInbound(ownerGroupMessage({
+    await first;
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "unlisted-concurrent-second",
       text: "再试一次",
       mentionedUserIds: [harness.bot.uid],
     }));
     expect(transport.sentCards).toHaveLength(0);
     transport.releaseCardSend.resolve();
-    await first;
+    await waitForCardCount(harness, 1);
     expect(transport.sentCards).toHaveLength(1);
     expect(harness.workers.prompts).toHaveLength(0);
   } finally {
@@ -217,7 +248,7 @@ test("an owner mention in an unlisted group gets one throttled notice and never 
   const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
   try {
     const botUid = harness.bot.uid;
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "unlisted-first",
       text: "@Bot 看下这个群",
       mentionedUserIds: [botUid],
@@ -232,29 +263,28 @@ test("an owner mention in an unlisted group gets one throttled notice and never 
     expect(notice.text).toContain("开通本群");
 
     // Still inside the notice window: the same owner @ gets no second reply.
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "unlisted-second",
       text: "@Bot 再试一次",
       mentionedUserIds: [botUid],
     }));
     // Every other rejection path stays exactly as silent as before.
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "unlisted-other-member",
       senderId: "other-user",
       text: "other member tries",
       mentionedUserIds: [botUid],
     }));
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "unlisted-unmentioned",
       text: "owner talks without mentioning",
     }));
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "unlisted-bot-echo",
       senderId: botUid,
       text: "bot echo",
       mentionedUserIds: [botUid],
     }));
-    await settle();
 
     expect(sentToChat(harness, { channelId: DENIED_GROUP, channelType: 2 })).toHaveLength(1);
     expect(harness.workers.prompts).toHaveLength(0);
@@ -275,12 +305,12 @@ test("the owner's passphrase enables the group durably and it survives a restart
   const first = await createCoreHarness({ allowedGroupIds: ALLOWED, allowlistWriteback: writeback });
   const root = first.root;
   try {
-    await first.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(first, ownerGroupMessage({
       messageId: "unlisted-mention-before-grant",
       text: "@Bot 看下这个群",
       mentionedUserIds: [first.bot.uid],
     }));
-    await first.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(first, ownerGroupMessage({
       messageId: "unlisted-grant",
       text: " 开通本群 ",
       mentionedUserIds: [first.bot.uid],
@@ -304,7 +334,7 @@ test("the owner's passphrase enables the group durably and it survives a restart
       text: "现在开始干活",
       mentionedUserIds: [first.bot.uid],
     });
-    await first.service.handleInbound(work);
+    await submitAndWaitForHandoff(first, work);
     await waitForStatus(first.service, work, (status) => status.state === "completed");
     expect(first.workers.prompts.map(({ text }) => text)).toEqual(["现在开始干活"]);
     expect(sentToChat(first, { channelId: DENIED_GROUP, channelType: 2 })
@@ -322,7 +352,7 @@ test("the owner's passphrase enables the group durably and it survives a restart
       text: "重启后继续",
       mentionedUserIds: [second.bot.uid],
     });
-    await second.service.handleInbound(resumed);
+    await submitAndWaitForHandoff(second, resumed);
     await waitForStatus(second.service, resumed, (status) => status.state === "completed");
     expect(second.workers.prompts.map(({ text }) => text)).toEqual(["重启后继续"]);
     expect(queryRows(second, "SELECT 1 FROM allowed_chats")).toHaveLength(1);
@@ -334,22 +364,22 @@ test("the owner's passphrase enables the group durably and it survives a restart
 test("the passphrase only works for the owner, only verbatim, and only with a mention", async () => {
   const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
   try {
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "unlisted-grant-other",
       senderId: "other-user",
       text: "开通本群",
       mentionedUserIds: [harness.bot.uid],
     }));
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "unlisted-grant-unmentioned",
       text: "开通本群",
     }));
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "unlisted-grant-not-exact",
       text: "请帮我开通本群",
       mentionedUserIds: [harness.bot.uid],
     }));
-    await settle();
+    await waitForSent(harness, { channelId: DENIED_GROUP, channelType: 2 }, 1);
 
     // The near-miss got the ordinary notice; nothing granted and no task started.
     const groupReplies = sentToChat(harness, { channelId: DENIED_GROUP, channelType: 2 });
@@ -360,7 +390,7 @@ test("the passphrase only works for the owner, only verbatim, and only with a me
     expect(queryRows(harness, "SELECT 1 FROM tasks")).toHaveLength(0);
 
     // The owner's exact reply still enables the group.
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "unlisted-grant-owner",
       text: "开通本群",
       mentionedUserIds: [harness.bot.uid],
@@ -378,7 +408,7 @@ test("a thread carries its own notice and grant while its parent group stays unl
   const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
   try {
     const botUid = harness.bot.uid;
-    await harness.service.handleInbound(inbound({
+    await submitWithoutIngress(harness, inbound({
       messageId: "unlisted-thread-mention",
       channelId: DENIED_THREAD,
       channelType: 5,
@@ -390,7 +420,7 @@ test("a thread carries its own notice and grant while its parent group stays unl
     expect(threadReplies[0]!.text).toContain("本子区未开通");
     expect(threadReplies[0]!.text).toContain("开通本子区");
 
-    await harness.service.handleInbound(inbound({
+    await submitWithoutIngress(harness, inbound({
       messageId: "unlisted-thread-grant",
       channelId: DENIED_THREAD,
       channelType: 5,
@@ -412,14 +442,14 @@ test("a thread carries its own notice and grant while its parent group stays unl
       text: "子区任务",
       mentionedUserIds: [botUid],
     });
-    await harness.service.handleInbound(threadWork);
+    await submitAndWaitForHandoff(harness, threadWork);
     await waitForStatus(harness.service, threadWork, (status) => status.state === "completed");
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["子区任务"]);
     expect(sentToChat(harness, { channelId: DENIED_THREAD, channelType: 5 })
       .map(({ text }) => text).filter((text) => text.includes("未开通"))).toHaveLength(1);
 
     // Granting the parent group covers its threads, including one that never had its own entry.
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "unlisted-parent-grant",
       text: "开通本群",
       mentionedUserIds: [botUid],
@@ -434,7 +464,7 @@ test("a thread carries its own notice and grant while its parent group stays unl
       text: "另一个子区任务",
       mentionedUserIds: [botUid],
     });
-    await harness.service.handleInbound(sibling);
+    await submitAndWaitForHandoff(harness, sibling);
     await waitForStatus(harness.service, sibling, (status) => status.state === "completed");
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["子区任务", "另一个子区任务"]);
   } finally {
@@ -452,9 +482,8 @@ test("an allowlisted chat runs its message and never sees the notice", async () 
       text: "允许群任务",
       mentionedUserIds: [harness.bot.uid],
     });
-    await harness.service.handleInbound(allowed);
+    await submitAndWaitForHandoff(harness, allowed);
     await waitForStatus(harness.service, allowed, (status) => status.state === "completed");
-    await settle();
 
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["允许群任务"]);
     expect(sentToChat(harness, { channelId: "group-allowed", channelType: 2 })
@@ -470,7 +499,7 @@ test("a failed config write-back keeps the durable grant and says so", async () 
   writeback.failure = new Error("fixture config is read-only");
   const harness = await createCoreHarness({ allowedGroupIds: ALLOWED, allowlistWriteback: writeback });
   try {
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "unlisted-grant-mirror-failure",
       text: "开通本群",
       mentionedUserIds: [harness.bot.uid],
@@ -485,7 +514,7 @@ test("a failed config write-back keeps the durable grant and says so", async () 
       text: "照常干活",
       mentionedUserIds: [harness.bot.uid],
     });
-    await harness.service.handleInbound(work);
+    await submitAndWaitForHandoff(harness, work);
     await waitForStatus(harness.service, work, (status) => status.state === "completed");
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["照常干活"]);
   } finally {
@@ -499,11 +528,12 @@ test("a card grant reports mirror failure without rolling back the durable permi
   const harness = await createCoreHarness({ allowedGroupIds: ALLOWED, allowlistWriteback: writeback });
   harness.transport.cardSupported = true;
   try {
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "unlisted-card-mirror-failure",
       text: "请开通这个群",
       mentionedUserIds: [harness.bot.uid],
     }));
+    await waitForCardCount(harness, 1);
     const card = harness.transport.sentCards[0]!;
     harness.transport.pushBotEvent(cardAction(harness, { eventId: 55 }));
     await harness.transport.waitForCardEdit(() => true);
@@ -526,11 +556,12 @@ test("a failed card edit falls back to one persisted result message before event
   harness.transport.cardSupported = true;
   harness.transport.cardEditFailure = new Error("fixture card edit unavailable");
   try {
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "unlisted-card-edit-failure",
       text: "请开通这个群",
       mentionedUserIds: [harness.bot.uid],
     }));
+    await waitForCardCount(harness, 1);
     harness.transport.pushBotEvent(cardAction(harness, { eventId: 56 }));
     await waitForSent(harness, { channelId: DENIED_GROUP, channelType: 2 }, 1);
     await waitForAck(harness, 56);
@@ -552,11 +583,12 @@ test("only the current owner may approve the card bound to its exact chat and me
   const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
   harness.transport.cardSupported = true;
   try {
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "grant-card-binding",
       text: "请开通这个群",
       mentionedUserIds: [harness.bot.uid],
     }));
+    await waitForCardCount(harness, 1);
     const card = harness.transport.sentCards[0]!;
     expect(card.frame.profile).toBe("octo/v2");
     expect(frameText(card.frame)).toContain("只有 Bot owner 可以确认");
@@ -597,11 +629,12 @@ test("a persisted owner change invalidates every card sent to the previous owner
   const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
   harness.transport.cardSupported = true;
   try {
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "grant-card-owner-change",
       text: "请开通",
       mentionedUserIds: [harness.bot.uid],
     }));
+    await waitForCardCount(harness, 1);
     const store = await openChannelStore(harness.stateDir);
     try {
       store.setOwnerId(harness.bot.uid, "owner-2");
@@ -624,11 +657,12 @@ test("replaying an accepted card click does not repeat its receipt or grant", as
   const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
   harness.transport.cardSupported = true;
   try {
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "grant-card-replay",
       text: "开通这个群",
       mentionedUserIds: [harness.bot.uid],
     }));
+    await waitForCardCount(harness, 1);
     const click = cardAction(harness, { eventId: 61 });
     harness.transport.pushBotEvent(click);
     await harness.transport.waitForCardEdit(() => true);
@@ -651,11 +685,12 @@ test("a durable card grant resumes its pending result after restart before repla
   let click: BotEvent | null = null;
   first.transport.cardSupported = true;
   try {
-    await first.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(first, ownerGroupMessage({
       messageId: "grant-card-recovery",
       text: "开通这个群",
       mentionedUserIds: [first.bot.uid],
     }));
+    await waitForCardCount(first, 1);
     click = cardAction(first, { eventId: 71 });
     first.transport.cardEditFailure = new Error("temporary card edit failure");
     first.transport.setOffline();
@@ -695,11 +730,12 @@ test("an unaccepted old card after restart only asks its owner to mention the bo
   first.transport.cardSupported = true;
   let click: BotEvent | null = null;
   try {
-    await first.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(first, ownerGroupMessage({
       messageId: "grant-card-old",
       text: "请开通",
       mentionedUserIds: [first.bot.uid],
     }));
+    await waitForCardCount(first, 1);
     click = cardAction(first, { eventId: 81 });
   } finally {
     await closeCoreHarness(first, { remove: false });
@@ -728,7 +764,10 @@ test("a failed text-grant claim is reclaimed before the now-authorized phrase ca
       text: "开通本群",
       mentionedUserIds: [harness.bot.uid],
     });
-    await harness.service.handleInbound(original);
+    await submitWithoutIngress(harness, original);
+    await waitForCondition(() =>
+      queryRows(harness, "SELECT 1 FROM inbound WHERE message_id = 'grant-text-failed-claim' AND command_state = 'completed'")
+        .length === 1);
     const database = new Database(join(harness.stateDir, "channel.sqlite"));
     try {
       database.query(
@@ -738,7 +777,10 @@ test("a failed text-grant claim is reclaimed before the now-authorized phrase ca
       database.close();
     }
 
-    await harness.service.handleInbound(original);
+    await submitWithoutIngress(harness, original);
+    await waitForCondition(() =>
+      queryRows(harness, "SELECT 1 FROM inbound WHERE message_id = 'grant-text-failed-claim' AND command_state = 'completed'")
+        .length === 1);
     expect(harness.workers.prompts).toHaveLength(0);
     expect(queryRows(harness, "SELECT kind, command_state FROM inbound WHERE message_id = 'grant-text-failed-claim'"))
       .toEqual([{ kind: "command", command_state: "completed" }]);
@@ -748,7 +790,7 @@ test("a failed text-grant claim is reclaimed before the now-authorized phrase ca
       text: "开通本群",
       mentionedUserIds: [harness.bot.uid],
     });
-    await harness.service.handleInbound(fresh);
+    await submitAndWaitForHandoff(harness, fresh);
     await waitForStatus(harness.service, fresh, (status) => status.state === "completed");
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["开通本群"]);
   } finally {
@@ -764,16 +806,16 @@ test("a redelivered text claim stays a command while a new matching message is o
       text: "开通本群",
       mentionedUserIds: [harness.bot.uid],
     });
-    await harness.service.handleInbound(original);
+    await submitWithoutIngress(harness, original);
     await waitForSent(harness, { channelId: DENIED_GROUP, channelType: 2 }, 1);
-    await harness.service.handleInbound(original);
+    await submitWithoutIngress(harness, original);
 
     const fresh = ownerGroupMessage({
       messageId: "grant-text-new-message",
       text: "开通本群",
       mentionedUserIds: [harness.bot.uid],
     });
-    await harness.service.handleInbound(fresh);
+    await submitAndWaitForHandoff(harness, fresh);
     await waitForStatus(harness.service, fresh, (status) => status.state === "completed");
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["开通本群"]);
     expect(queryRows(harness, "SELECT message_id, kind FROM inbound ORDER BY message_id")).toEqual([
@@ -790,7 +832,7 @@ test("a failed interactive send falls back to the exact text passphrase without 
   harness.transport.cardSupported = true;
   harness.transport.cardSendFailure = new Error("card deployment unavailable");
   try {
-    await harness.service.handleInbound(ownerGroupMessage({
+    await submitWithoutIngress(harness, ownerGroupMessage({
       messageId: "grant-card-fallback",
       text: "请处理这里",
       mentionedUserIds: [harness.bot.uid],
@@ -821,12 +863,14 @@ test("events during card send reject non-owners promptly and bind owner clicks o
   const harness = await createCoreHarness({ transport, allowedGroupIds: ALLOWED });
   let fakeTimers = false;
   try {
-    const inbound = harness.service.handleInbound(ownerGroupMessage({
+    const message = ownerGroupMessage({
       messageId: "grant-card-inflight",
       text: "请开通",
       mentionedUserIds: [harness.bot.uid],
-    }));
+    });
+    const inbound = submitWithoutIngress(harness, message);
     const frame = await transport.cardSendStarted.promise;
+    expect(await readIngressJob(ingressObserver(harness), message)).toBeNull();
     const actionId = actionIdFromFrame(frame);
     const memberClick = cardActionEvent(90, {
       actionId,
@@ -883,14 +927,15 @@ test("a thread card names and grants only its own scope", async () => {
   const harness = await createCoreHarness({ allowedGroupIds: ALLOWED });
   harness.transport.cardSupported = true;
   try {
-    await harness.service.handleInbound(inbound({
+    const message = inbound({
       messageId: "grant-thread-card",
       channelId: DENIED_THREAD,
       channelType: 5,
       text: "请开通子区",
       mentionedUserIds: [harness.bot.uid],
-    }));
-    expect(harness.transport.sentCards).toHaveLength(1);
+    });
+    await submitWithoutIngress(harness, message);
+    await waitForCardCount(harness, 1);
     expect(frameText(harness.transport.sentCards[0]!.frame)).toContain("本子区");
     expect(
       (harness.transport.sentCards[0]!.frame.card["actions"] as Array<{ title: string }>)[0]!.title,

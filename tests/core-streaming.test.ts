@@ -148,7 +148,7 @@ test("assistant snapshots are visible before prompt end and final snapshots are 
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     await waitForTargetRemoteText(transport, task, (message) => message.text === "draft");
 
@@ -224,7 +224,7 @@ test("continuous 100ms assistant deltas still produce a visible edit within one 
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     await waitForTargetRemoteText(transport, task, (message) => message.text === "draft 0");
     for (let index = 0; index < 10; index += 1) {
@@ -267,7 +267,7 @@ test("a final correction arriving while the first create is slow is edited onto 
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     await transport.initialSendStarted.promise;
     transport.releaseInitialSend();
@@ -308,7 +308,7 @@ test("an empty final arriving while the first create is slow clears the accepted
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     await transport.initialSendStarted.promise;
     transport.releaseInitialSend();
@@ -349,7 +349,7 @@ test("an accepted create with a lost receipt recovers by stable client message n
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     await transport.firstSendAccepted.promise;
     await flushPromises();
@@ -395,7 +395,7 @@ test("a final arriving after an unknown create preserves reconciliation and edit
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     await transport.firstSendAccepted.promise;
     const probe = await openChannelStore(harness.stateDir);
@@ -522,7 +522,7 @@ test("an empty final snapshot closes an existing assistant message without sendi
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     await flushPromises();
     vi.advanceTimersByTime(2_000);
@@ -564,7 +564,7 @@ test("two assistant messages with identical text keep independent remote identit
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     await flushPromises();
     vi.advanceTimersByTime(2_000);
@@ -612,7 +612,7 @@ test("a slow assistant edit never overlaps a newer edit and cannot leave an old 
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     await waitForTargetRemoteText(transport, task, (message) => message.text === "base");
     vi.advanceTimersByTime(1_000);
@@ -679,7 +679,7 @@ test("a failed final edit is retried after reconnect along its known remote mess
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     await waitForTargetRemoteText(transport, task, (message) => message.text === partial);
     transport.setOffline();
@@ -737,7 +737,7 @@ test("a restart resumes a failed final edit by remote id and never prompts the c
   const first = await createCoreHarness({ transport, workers: firstWorkers });
   let failedEdit: TextRequest | null = null;
   try {
-    await first.service.handleInbound(task);
+    await first.service.submitInbound(task);
     await first.workers.waitForPromptCount(1);
     await waitForTargetRemoteText(transport, task, (message) => message.text === partial);
     transport.setOffline();
@@ -809,7 +809,7 @@ test("a long UTF-8 snapshot is split at 3000 bytes and a shorter final snapshot 
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     await flushPromises();
     expect(await flushUntilRemoteCount(transport, task, 2)).toBe(true);
@@ -859,7 +859,7 @@ test("a long reply cuts at paragraph breaks and never reshuffles finished segmen
     },
   });
   try {
-    const run = harness.service.handleInbound(task);
+    const run = harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     expect(await flushUntilRemoteCount(transport, task, 3)).toBe(true);
     const settled = transport.listRemoteText(task).map(({ messageId, text }) => ({ messageId, text }));
@@ -912,7 +912,7 @@ test("cancel aborts an in-flight assistant edit promptly and preserves its lates
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     await waitForTargetRemoteText(transport, task, (message) => message.text === partial);
     await flushPromises();
@@ -923,7 +923,7 @@ test("cancel aborts an in-flight assistant edit promptly and preserves its lates
     if (!editStarted) return;
 
     transport.setOffline();
-    const cancel = harness.service.handleInbound(
+    const cancel = harness.service.submitInbound(
       inbound({ messageId: "stream-cancel-command", ...target, text: "/cancel" }),
     );
     const cancelFinishedPromise = Promise.race([
@@ -985,7 +985,7 @@ test("stop aborts an in-flight assistant edit without waiting for the network ga
   });
   let stopPromise: Promise<void> | undefined;
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     const editStarted = await editStartedPromise;
 

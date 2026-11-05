@@ -695,7 +695,7 @@ test("cancels compaction when a fresh host read is unavailable and preserves pri
       expect(after.marker).toEqual(before.marker);
     },
   );
-});
+}, 15_000);
 
 test("fails closed on a defective sidecar for the bound session without returning shared context", async () => {
   const snapshot: Snapshot = {

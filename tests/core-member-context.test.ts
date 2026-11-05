@@ -48,7 +48,7 @@ test("reads the group member API once for every new task, even when a roster is 
     harness.transport.setGroupMembers(GROUP.channelId, []);
     for (let index = 0; index < 2; index += 1) {
       const text = `group task ${index + 1}`;
-      await harness.service.handleInbound(groupInput(harness.bot.uid, `member-task-${index + 1}`, text));
+      await harness.service.submitInbound(groupInput(harness.bot.uid, `member-task-${index + 1}`, text));
       await harness.workers.waitForPromptCount(index + 1);
       await waitForStatus(
         harness.service,
@@ -75,7 +75,7 @@ test("reads each thread task's roster from that thread API rather than the paren
     harness.transport.setThreadMembers("group-allowed", "topic-7", roster(2));
     for (let index = 0; index < 2; index += 1) {
       const text = `thread task ${index + 1}`;
-      await harness.service.handleInbound(
+      await harness.service.submitInbound(
         threadInput(harness.bot.uid, `thread-member-task-${index + 1}`, text),
       );
       await harness.workers.waitForPromptCount(index + 1);
@@ -110,11 +110,11 @@ test("refreshes members for each steering in accepted order without dispatching 
     },
   });
   try {
-    const running = harness.service.handleInbound(
+    const running = harness.service.submitInbound(
       groupInput(harness.bot.uid, "member-steer-first", "long-running group task"),
     );
     await started.promise;
-    const firstSteering = harness.service.handleInbound(
+    const firstSteering = harness.service.submitInbound(
       groupInput(harness.bot.uid, "member-steer-second", "first steering facts"),
     );
     await harness.transport.waitForManagementCalls(
@@ -122,7 +122,7 @@ test("refreshes members for each steering in accepted order without dispatching 
       2,
     );
     harness.transport.setGroupMembers(GROUP.channelId, [roster(1)[0]!]);
-    const secondSteering = harness.service.handleInbound(
+    const secondSteering = harness.service.submitInbound(
       groupInput(harness.bot.uid, "member-steer-third", "second steering facts"),
     );
     await Promise.all([firstSteering, secondSteering, running]);
@@ -149,32 +149,45 @@ test("a failed member refresh consumes the steering input without appending or q
   })();
   const started = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
+  const promptFinished = Promise.withResolvers<void>();
   let appended: string[] = [];
   const workers = new FakeWorkerFactory(async ({ text, appended: getAppended }) => {
     if (text !== "long-running task") return;
     started.resolve();
     await release.promise;
     appended = getAppended().map(({ text: value }) => value);
+    promptFinished.resolve();
   });
   const harness = await createCoreHarness({ transport, workers });
   try {
-    const running = harness.service.handleInbound(
+    const running = harness.service.submitInbound(
       groupInput(harness.bot.uid, "member-steer-failure-first", "long-running task"),
     );
     await started.promise;
     transport.failMemberReads = true;
-    await harness.service.handleInbound(
+    const failureText = "成员信息读取失败，本条消息未并入当前回合。";
+    const failureReceipt = transport.waitForRemoteText(
+      ({ target, text }) =>
+        target.channelId === GROUP.channelId &&
+        target.channelType === GROUP.channelType &&
+        text === failureText,
+    );
+    await harness.service.submitInbound(
       groupInput(harness.bot.uid, "member-steer-failure-second", "must not join or queue"),
     );
+    await failureReceipt;
     release.resolve();
     await running;
-    await waitForStatus(harness.service, GROUP, (status) => status.state === "completed");
+    await promptFinished.promise;
+    await waitForStatus(
+      harness.service,
+      GROUP,
+      (status) => status.state === "completed" && status.queued === 0,
+    );
 
     expect(workers.prompts.map(({ text }) => text)).toEqual(["long-running task"]);
     expect(appended).toEqual([]);
-    expect(transport.sent.map(({ text }) => text)).toContain(
-      "成员信息读取失败，本条消息未并入当前回合。",
-    );
+    expect(transport.sent.map(({ text }) => text)).toContain(failureText);
     expect(transport.sent.map(({ text }) => text).join("\n"))
       .not.toContain("private member-service response");
     expect(transport.managementCalls.filter(({ action }) => action === "group-members"))
@@ -188,13 +201,13 @@ test("a failed member refresh consumes the steering input without appending or q
 test("does not fetch members again when the owner sends native /retry", async () => {
   const harness = await createCoreHarness();
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       groupInput(harness.bot.uid, "member-before-native-retry", "first task"),
     );
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, GROUP, (status) => status.state === "completed");
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       groupInput(harness.bot.uid, "member-native-retry", "/retry"),
     );
     await harness.workers.waitForPromptCount(2);
@@ -220,15 +233,15 @@ test("a queued group task fetches its roster only when it starts executing", asy
   });
   const harness = await createCoreHarness({ workers });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       groupInput(harness.bot.uid, "member-queue-mode", "/mode queue"),
     );
-    const first = harness.service.handleInbound(
+    const first = harness.service.submitInbound(
       groupInput(harness.bot.uid, "member-queue-first", "blocking group task"),
     );
     await started.promise;
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       groupInput(harness.bot.uid, "member-queue-second", "queued group task"),
     );
     await waitForStatus(harness.service, GROUP, (status) => status.queued === 1);
@@ -260,7 +273,7 @@ test("a member API failure fails the new task before prompting and hides the raw
   const privateServerError = "private member endpoint response: token-like-detail";
   try {
     harness.transport.failManagementWith(new Error(privateServerError));
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       groupInput(harness.bot.uid, "member-api-failed", "must not execute"),
     );
 
@@ -322,7 +335,7 @@ test("a hung member API request times out before the task reaches the model", as
   const harness = await createCoreHarness({ transport });
   const logged = vi.spyOn(console, "error").mockImplementation(() => {});
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       groupInput(harness.bot.uid, "member-timeout", "must not start after timeout"),
     );
     await requestAborted.promise;
@@ -370,12 +383,12 @@ test("cancelling during member lookup aborts the request without starting a work
   };
   const harness = await createCoreHarness({ transport });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       groupInput(harness.bot.uid, "member-cancel", "must not start after cancellation"),
     );
     const requestSignal = await requestStarted.promise;
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       groupInput(harness.bot.uid, "member-cancel-command", "/cancel"),
     );
     const status = await waitForStatus(

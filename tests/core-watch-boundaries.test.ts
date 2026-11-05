@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
-import type { PromptContext } from "../src/contracts.ts";
+import type { ChatTarget, PromptContext } from "../src/contracts.ts";
 import { openChannelStore, type ChannelStore } from "../src/store/index.ts";
 import { closeCoreHarness, createCoreHarness, inbound, waitForStatus } from "./fixtures/core-fakes.ts";
+import type { CoreHarness } from "./fixtures/core-fakes.ts";
 
 const target = { channelType: 1 as const, channelId: "owner-1" };
 const watchConfig = { enabled: true as const, protocol: "openai-decisions" as const, baseUrl: "https://watch.example", model: "fixture", apiKeyEnv: "OMP_CHANNEL_OCTO_WATCH_KEY", apiKey: "synthetic-watch-key" };
@@ -16,6 +17,21 @@ async function eventually<T>(read: () => T | null | undefined | false): Promise<
     await turn.promise;
   }
   throw new Error("watch boundary did not settle");
+}
+async function waitForTaskState(
+  harness: CoreHarness,
+  target: ChatTarget,
+  messageId: string,
+  state: "queued" | "running" | "completed" | "cancelled" | "interrupted" | "failed",
+): Promise<void> {
+  const store = await openChannelStore(harness.stateDir);
+  try {
+    await eventually(() =>
+      store.getTaskByMessageId(harness.bot.uid, target, messageId)?.state === state,
+    );
+  } finally {
+    store.close();
+  }
 }
 
 async function register(context: PromptContext | undefined, timeout = 60): Promise<string> {
@@ -43,14 +59,30 @@ test("watch survives /new and its wake uses the new session without replaying so
   });
   let store: ChannelStore | undefined;
   try {
-    await harness.service.handleInbound(inbound({...target,messageId:"session-source",text:"explicit source request"}));
-    await waitForStatus(harness.service,target,status=>status.state === "completed");
-    expect(watchId).not.toBe("");
-    await harness.service.handleInbound(inbound({...target,messageId:"session-new",text:"/new"}));
-    const current = await harness.service.status(target);
-    expect(current.sessionId).not.toBe(sourceSession);
-    collected.resolve({kind:"success",stdout:"A thoughtful resolution and clear next step."});
     store = await openChannelStore(harness.stateDir);
+    await harness.service.submitInbound(inbound({...target,messageId:"session-source",text:"explicit source request"}));
+    await waitForTaskState(harness, target, "session-source", "completed");
+    expect(watchId).not.toBe("");
+    expect(sourceSession).not.toBe("");
+    // A completed task row precedes runtime lease release; /new must wait until the source worker is closed.
+    await eventually(() =>
+      harness.workers.workers.find(worker => worker.sessionId === sourceSession)?.stopped,
+    );
+
+    const previousReplyIds = new Set(
+      harness.transport.listRemoteText(target).map(({ messageId }) => messageId),
+    );
+    await harness.service.submitInbound(inbound({...target,messageId:"session-new",text:"/new"}));
+    const newReceipt = await eventually(() =>
+      harness.transport.listRemoteText(target).find(({ messageId, text }) =>
+        !previousReplyIds.has(messageId) && text.startsWith("已创建会话 "),
+      ),
+    );
+    const current = store.getBinding(harness.bot.uid, target);
+    if (!current) throw new Error("/new did not persist its new binding");
+    expect(current.sessionId).not.toBe(sourceSession);
+    expect(newReceipt.text).toContain(current.sessionId);
+    collected.resolve({kind:"success",stdout:"A thoughtful resolution and clear next step."});
     await eventually(()=>store!.getTaskByMessageId(harness.bot.uid,target,`watch:${watchId}`)?.state === "completed");
     expect(current.sessionId).toBe(wakeSession);
     expect(harness.workers.prompts.filter(prompt=>prompt.text === "explicit source request")).toHaveLength(1);
@@ -78,10 +110,10 @@ test("cancelling the source task preserves its terminal state while the independ
   });
   let store: ChannelStore | undefined;
   try {
-    await harness.service.handleInbound(inbound({...target,messageId:"cancel-source",text:"source to cancel"}));
+    await harness.service.submitInbound(inbound({...target,messageId:"cancel-source",text:"source to cancel"}));
     await sourceReady.promise;
-    await harness.service.handleInbound(inbound({...target,messageId:"cancel-source-control",text:"/cancel"}));
-    await waitForStatus(harness.service,target,status=>status.state === "cancelled");
+    await harness.service.submitInbound(inbound({...target,messageId:"cancel-source-control",text:"/cancel"}));
+    await waitForTaskState(harness, target, "cancel-source", "cancelled");
     store = await openChannelStore(harness.stateDir);
     const source = store.getTaskByMessageId(harness.bot.uid,target,"cancel-source");
     expect(source?.state).toBe("cancelled");
@@ -117,9 +149,9 @@ test("a match queues behind a pending ask without answering it or steering the w
   });
   let store: ChannelStore | undefined;
   try {
-    await harness.service.handleInbound(inbound({...target,messageId:"ask-source",text:"source before ask"}));
-    await waitForStatus(harness.service,target,status=>status.state === "completed");
-    await harness.service.handleInbound(inbound({...target,messageId:"ask-busy",text:"needs owner answer"}));
+    await harness.service.submitInbound(inbound({...target,messageId:"ask-source",text:"source before ask"}));
+    await waitForTaskState(harness, target, "ask-source", "completed");
+    await harness.service.submitInbound(inbound({...target,messageId:"ask-busy",text:"needs owner answer"}));
     const waiting = await waitForStatus(harness.service,target,status=>status.pendingQuestionIds.length === 1);
     store = await openChannelStore(harness.stateDir);
     collected.resolve({kind:"success",stdout:"A thoughtful resolution and clear next step."});
@@ -128,14 +160,14 @@ test("a match queues behind a pending ask without answering it or steering the w
     expect(answered).toBeUndefined();
     expect(appended()).toEqual([]);
     expect(harness.workers.prompts).toHaveLength(2);
-    await harness.service.handleInbound(inbound({...target,messageId:"ask-owner-answer",text:"Use the approved plan."}));
+    await harness.service.submitInbound(inbound({...target,messageId:"ask-owner-answer",text:"Use the approved plan."}));
     await eventually(()=>store!.getTaskByMessageId(harness.bot.uid,target,`watch:${watchId}`)?.state === "completed");
     expect(answered).toContain("Use the approved plan.");
     expect(harness.workers.prompts).toHaveLength(3);
   } finally {
     collected.resolve({kind:"success",stdout:"late"});
     if ((await harness.service.status(target)).pendingQuestionIds.length > 0) {
-      await harness.service.handleInbound(inbound({...target,messageId:"ask-cleanup-answer",text:"Finish fixture."}));
+      await harness.service.submitInbound(inbound({...target,messageId:"ask-cleanup-answer",text:"Finish fixture."}));
     }
     store?.close();
     await closeCoreHarness(harness);
@@ -158,15 +190,17 @@ for (const boundary of ["stop","deadline"] as const) {
     });
     let store: ChannelStore | undefined;
     try {
-      await harness.service.handleInbound(inbound({...target,messageId:`${boundary}-source`,text:"source before queue"}));
-      await waitForStatus(harness.service,target,status=>status.state === "completed");
-      await harness.service.handleInbound(inbound({...target,messageId:`${boundary}-busy`,text:"busy queue owner"}));
+      await harness.service.submitInbound(inbound({...target,messageId:`${boundary}-source`,text:"source before queue"}));
+      await waitForTaskState(harness, target, `${boundary}-source`, "completed");
+      await harness.service.submitInbound(inbound({...target,messageId:`${boundary}-busy`,text:"busy queue owner"}));
       await busyStarted.promise;
       store = await openChannelStore(harness.stateDir);
       collected.resolve({kind:"success",stdout:"A thoughtful resolution and clear next step."});
       await eventually(()=>store!.getTaskByMessageId(harness.bot.uid,target,`watch:${watchId}`)?.state === "queued");
       if (boundary === "stop") {
-        await harness.service.handleInbound(inbound({...target,messageId:"watch-stop-queued",text:`/watch stop ${watchId}`}));
+        const stopMessage = inbound({ ...target, messageId: "watch-stop-queued", text: `/watch stop ${watchId}` });
+        await harness.service.submitInbound(stopMessage);
+        await eventually(() => store!.getWatch(harness.bot.uid, watchId)?.state === "stopped");
       } else {
         await eventually(()=>store!.getWatch(harness.bot.uid,watchId)?.state === "expired");
       }
@@ -203,11 +237,11 @@ test("confirmed remote thread deletion seals an in-flight watch before its late 
   let store: ChannelStore | undefined;
   try {
     harness.transport.setThreads("group-allowed",[{shortId:"watch-delete",groupId:"group-allowed",channelId:thread.channelId,name:"Watched thread",creatorUid:"owner-1",status:1,memberCount:1,messageCount:0,createdAt:"2026-11-04T00:00:00Z",updatedAt:"2026-11-04T00:00:00Z"}]);
-    await harness.service.handleInbound(inbound({...thread,messageId:"delete-source",text:"source before delete",mentionedUserIds:[harness.bot.uid]}));
-    await waitForStatus(harness.service,thread,status=>status.state === "completed");
+    await harness.service.submitInbound(inbound({...thread,messageId:"delete-source",text:"source before delete",mentionedUserIds:[harness.bot.uid]}));
+    await waitForTaskState(harness, thread, "delete-source", "completed");
     await eventually(()=>collectorSignal);
-    await harness.service.handleInbound(inbound({channelType:2,channelId:"group-allowed",messageId:"delete-control",text:"delete watched thread",mentionedUserIds:[harness.bot.uid]}));
-    await waitForStatus(harness.service,{channelType:2,channelId:"group-allowed"},status=>status.state === "completed");
+    await harness.service.submitInbound(inbound({channelType:2,channelId:"group-allowed",messageId:"delete-control",text:"delete watched thread",mentionedUserIds:[harness.bot.uid]}));
+    await waitForTaskState(harness, {channelType:2,channelId:"group-allowed"}, "delete-control", "completed");
     store = await openChannelStore(harness.stateDir);
     expect(store.getWatch(harness.bot.uid,watchId)?.state).toBe("deleted");
     expect(collectorSignal!.aborted).toBe(true);
@@ -244,8 +278,8 @@ test("explicit watch cwd follows existing home and quoting rules and rejects rel
     },
   });
   try {
-    await harness.service.handleInbound(inbound({ ...target, messageId: "watch-cwd-policy", text: "Explicitly watch these reports from the selected directories." }));
-    await waitForStatus(harness.service, target, status => status.state === "completed");
+    await harness.service.submitInbound(inbound({ ...target, messageId: "watch-cwd-policy", text: "Explicitly watch these reports from the selected directories." }));
+    await waitForTaskState(harness, target, "watch-cwd-policy", "completed");
     expect(relativeRejected).toBe(true);
     expect(registeredCwds).toEqual([taskCwd, taskCwd]);
   } finally {

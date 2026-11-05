@@ -75,6 +75,7 @@ export interface ChatAuthorizationDeps {
   readonly shutdownSignal: AbortSignal;
   readonly commandClaim: (message: InboundMessage, name: string) => InboundClaim;
   readonly offerUnlistedChat: (message: InboundMessage, bot: BotIdentity) => Promise<void>;
+  readonly trackOperation: (operation: Promise<void>) => void;
   readonly enqueueText: Outbox["enqueueText"];
 }
 
@@ -148,7 +149,7 @@ export class ChatAuthorization {
       await this.grantUnlistedChat(message);
       return;
     }
-    await this.noticeUnlistedChat(message, bot);
+    this.noticeUnlistedChat(message, bot);
   }
 
   /** Reclaims a previously failed text grant before an already-open chat can route it as work. */
@@ -158,7 +159,7 @@ export class ChatAuthorization {
   }
 
   /** 本群 vs 本子区: throttling is per real chat id, and the card builder owns the copy. */
-  private async noticeUnlistedChat(message: InboundMessage, bot: BotIdentity): Promise<void> {
+  private noticeUnlistedChat(message: InboundMessage, bot: BotIdentity): void {
     const key = targetKey(message);
     const now = Date.now();
     for (const [noticeKey, sentAt] of this.unlistedChatNotices) {
@@ -170,14 +171,14 @@ export class ChatAuthorization {
       const oldest = this.unlistedChatNotices.keys().next().value;
       if (oldest !== undefined) this.unlistedChatNotices.delete(oldest);
     }
-    // Reserve before awaiting the transport so simultaneous owner mentions cannot fan out cards.
+    // Reserve before handing the offer to a service-owned operation, so concurrent mentions do not
+    // block admission on card HTTP or fan out duplicate cards.
     this.unlistedChatNotices.set(key, now);
-    try {
-      await this.deps.offerUnlistedChat(message, bot);
-    } catch (error) {
+    const operation = this.deps.offerUnlistedChat(message, bot).catch(() => {
       if (this.unlistedChatNotices.get(key) === now) this.unlistedChatNotices.delete(key);
-      throw error;
-    }
+      console.error("[authorization] unlisted chat offer failed");
+    });
+    this.deps.trackOperation(operation);
   }
 
   /**

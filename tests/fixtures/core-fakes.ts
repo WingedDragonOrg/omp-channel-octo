@@ -31,6 +31,7 @@ import type {
   HistoryFetch,
   HistoryMessage,
   InboundMessage,
+  InboundReceipt,
   OmpWorker,
   ProgressCard,
   PromptContext,
@@ -62,6 +63,12 @@ import type { LoopReadPort, LoopTask, LoopWorkspace } from "../../src/loop/types
 import type { WatchCollector, WatchJudge } from "../../src/watch/types.ts";
 import { RESUME_CONTINUATION_PROMPT } from "../../src/contracts";
 import { AttachmentError } from "../../src/inbound/attachments";
+import {
+  recvIngressSourceId,
+  type IngressJobRecord,
+  type IngressState,
+} from "../../src/inbound/ingress-types.ts";
+import { openChannelStore, type ChannelStore } from "../../src/store/index.ts";
 import {
   contextSidecarPath,
   normalizeGroupContext,
@@ -260,7 +267,7 @@ export class FakeTransport implements ChannelTransport {
   private readonly remoteTextByClientMsgNo = new Map<string, string>();
   private activeTextRequests = 0;
   private nextRemoteTextId = 1;
-  private onInbound: ((message: InboundMessage) => Promise<void>) | undefined;
+  private onInbound: ((message: InboundMessage) => InboundReceipt) | undefined;
   private onOnline: (() => void) | undefined;
   private failOncePredicate: ((message: SentMessage) => boolean) | undefined;
   private failEditOncePredicate: ((request: TextRequest) => boolean) | undefined;
@@ -287,7 +294,7 @@ export class FakeTransport implements ChannelTransport {
   }
 
   async start(
-    onMessage: (message: InboundMessage) => Promise<void>,
+    onMessage: (message: InboundMessage) => InboundReceipt,
     onOnline: () => void,
   ): Promise<void> {
     this.onInbound = onMessage;
@@ -1024,7 +1031,7 @@ export class FakeTransport implements ChannelTransport {
     if (!this.onInbound) {
       throw new Error("fixture transport is not started");
     }
-    await this.onInbound(message);
+    await this.onInbound(message).ackReady;
   }
 }
 
@@ -2001,6 +2008,144 @@ export function inbound(
     ...overrides,
   };
 }
+export type IngressJobPredicate = (job: IngressJobRecord) => boolean;
+
+export interface WaitForIngressJobOptions {
+  /** Defaults to a complete durable consumer handoff, never merely protocol-ACK readiness. */
+  predicate?: IngressJobPredicate;
+  /** Included in timeout diagnostics when a test is intentionally observing another boundary. */
+  description?: string;
+  timeoutMs?: number;
+  /**
+   * Fail-closed terminal states. Pass `[]` only when the test explicitly intends to observe a
+   * cancellation or unknown outcome with its own predicate.
+   */
+  rejectStates?: readonly IngressState[];
+}
+
+export interface StoredIngressObserver {
+  readonly store: Pick<ChannelStore, "getIngressJobBySource">;
+  readonly botUid: string;
+}
+
+export interface HarnessIngressObserver {
+  readonly stateDir: string;
+  readonly bot: Pick<BotIdentity, "uid">;
+}
+
+export type IngressJobObserver = StoredIngressObserver | HarnessIngressObserver;
+export type IngressSubmissionObserver = IngressJobObserver & {
+  readonly service: Pick<ChannelService, "submitInbound">;
+};
+
+export const DEFAULT_INGRESS_WAIT_TIMEOUT_MS = 3_000;
+
+/** The durable envelope has been atomically replaced by a named domain consumer. */
+export function ingressJobHandedOff(job: IngressJobRecord): boolean {
+  return job.state === "handed-off" && job.consumerKind !== null && job.consumerId !== null;
+}
+
+/** Builds an explicit state predicate for tests that intentionally stop before handoff. */
+export function ingressJobState(...states: readonly IngressState[]): IngressJobPredicate {
+  const expected = new Set(states);
+  return job => expected.has(job.state);
+}
+
+async function withIngressStore<T>(
+  observer: IngressJobObserver,
+  work: (
+    store: Pick<ChannelStore, "getIngressJobBySource">,
+    botUid: string,
+  ) => Promise<T> | T,
+): Promise<T> {
+  if ("store" in observer) return await work(observer.store, observer.botUid);
+  const store = await openChannelStore(observer.stateDir);
+  try {
+    return await work(store, observer.bot.uid);
+  } finally {
+    store.close();
+  }
+}
+
+function ingressSourceKey(botUid: string, message: InboundMessage) {
+  return {
+    botUid,
+    sourceKind: "recv" as const,
+    sourceId: recvIngressSourceId(message.channelType, message.channelId, message.messageId),
+  };
+}
+
+/** Reads only the exact receive job for this bot, chat target, and server message identity. */
+export async function readIngressJob(
+  observer: IngressJobObserver,
+  message: InboundMessage,
+): Promise<IngressJobRecord | null> {
+  return await withIngressStore(observer, (store, botUid) =>
+    store.getIngressJobBySource(ingressSourceKey(botUid, message)));
+}
+
+/**
+ * Polls the real ChannelStore row. By default it waits for durable consumer handoff; `ackReady`,
+ * an admitted/waiting operation, and an absent unauthorized job are deliberately not success.
+ */
+export async function waitForIngressJob(
+  observer: IngressJobObserver,
+  message: InboundMessage,
+  options: WaitForIngressJobOptions = {},
+): Promise<IngressJobRecord> {
+  const predicate = options.predicate ?? ingressJobHandedOff;
+  const rejected = new Set(options.rejectStates ?? ["cancelled", "unknown"]);
+  const timeoutMs = options.timeoutMs ?? DEFAULT_INGRESS_WAIT_TIMEOUT_MS;
+  const description = options.description ?? "durable consumer handoff";
+  return await withIngressStore(observer, async (store, botUid) => {
+    const key = ingressSourceKey(botUid, message);
+    const deadline = performance.now() + timeoutMs;
+    let observed: IngressJobRecord | null = null;
+    while (performance.now() < deadline) {
+      observed = store.getIngressJobBySource(key);
+      if (observed !== null) {
+        if (rejected.has(observed.state)) {
+          throw new Error(
+            `ingress ${message.messageId} reached fail-closed state ${observed.state} while waiting for ${description}`,
+          );
+        }
+        if (predicate(observed)) return observed;
+      }
+      const turn = Promise.withResolvers<void>();
+      setImmediate(turn.resolve);
+      await turn.promise;
+    }
+    const checkpoint = observed?.operationCheckpoint ?? null;
+    const detail = observed === null
+      ? "no persisted job"
+      : [
+        `state=${observed.state}`,
+        `ackReady=${observed.ackReady}`,
+        `consumer=${observed.consumerKind ?? "none"}:${observed.consumerId ?? "none"}`,
+        checkpoint === null ? null : `operation=${checkpoint.kind === "command" ? checkpoint.action : checkpoint.kind}${"phase" in checkpoint ? `:${checkpoint.phase}` : ""}`,
+      ].filter((part): part is string => part !== null).join(" ");
+    throw new Error(
+      `ingress ${message.messageId} did not reach ${description} within ${timeoutMs} ms (${detail})`,
+    );
+  });
+}
+
+/**
+ * Submits through the public receipt boundary, then separately observes the exact durable handoff.
+ * Do not use for an intentionally held operation whose handoff depends on releasing that hold.
+ */
+export async function submitAndWaitForIngressHandoff(
+  observer: IngressSubmissionObserver,
+  message: InboundMessage,
+  options: Omit<WaitForIngressJobOptions, "predicate"> = {},
+): Promise<IngressJobRecord> {
+  await observer.service.submitInbound(message);
+  return await waitForIngressJob(observer, message, {
+    ...options,
+    predicate: ingressJobHandedOff,
+  });
+}
+
 
 export async function waitForStatus(
   service: ChannelService,

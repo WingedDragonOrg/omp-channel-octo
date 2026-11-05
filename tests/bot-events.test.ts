@@ -46,7 +46,7 @@ test("a failed acknowledgement retries from the held cursor and keeps later even
   const transport = new RetryAckTransport({ bot: { uid: "event-bot", name: "Fixture" } });
   const loop = createBotEventLoop({
     store, transport, botUid: () => transport.bot.uid, stopping: () => false,
-    onCardAction: async () => "handled",
+    onCardAction: () => ({ ackReady: Promise.resolve("handled") }),
   });
   vi.useFakeTimers();
   try {
@@ -81,10 +81,10 @@ test("retryable event processing waits for recovery instead of exhausting its bu
   let applied = 0;
   const loop = createBotEventLoop({
     store, transport, botUid: () => transport.bot.uid, stopping: () => false,
-    onCardAction: async () => {
-      if (!available) return "retry";
-      applied++;
-      return "handled";
+    onCardAction: () => {
+      if (!available) return { ackReady: Promise.resolve("retry" as const) };
+      applied += 1;
+      return { ackReady: Promise.resolve("handled" as const) };
     },
   });
   vi.useFakeTimers();
@@ -121,7 +121,7 @@ test("stop during event processing does not wait on an already-aborted retry del
     store, transport, botUid: () => transport.bot.uid, stopping: () => false,
     onCardAction: () => {
       entered.resolve();
-      return completion.promise;
+      return { ackReady: completion.promise };
     },
   });
   let stopped = false;
@@ -181,9 +181,9 @@ test("event retry exhaustion runs the terminal notice before acknowledgement and
     stopping: () => false,
     maxAttempts: 2,
     retryDelayMs: 0,
-    onCardAction: async () => {
+    onCardAction: () => {
       attempts += 1;
-      return "retry";
+      return { ackReady: Promise.resolve("retry") };
     },
     onCardActionRetriesExhausted: async (action, eventId) => {
       expect(action.actionId).toBe(event.action.actionId);
@@ -279,7 +279,7 @@ test("retry exhaustion finishes an already accepted grant before acknowledging i
       stopping: () => false,
       maxAttempts: 2,
       retryDelayMs: 0,
-      onCardAction: async () => "retry",
+      onCardAction: () => ({ ackReady: Promise.resolve("retry") }),
       onCardActionRetriesExhausted: (action, eventId) =>
         desk.onRetriesExhausted(eventId, action),
     });
@@ -351,7 +351,7 @@ test("owner action stays unacknowledged at exhaustion while its card send is sti
       stopping: () => false,
       maxAttempts: 1,
       retryDelayMs: 0,
-      onCardAction: (action, eventId) => desk.handleAction(eventId, action),
+      onCardAction: (action, eventId) => ({ ackReady: desk.handleAction(eventId, action) }),
       onCardActionRetriesExhausted: (action, eventId) =>
         desk.onRetriesExhausted(eventId, action),
     });
@@ -437,7 +437,7 @@ test("an unpersisted onboarding grant gets a failure prompt after bounded event 
       stopping: () => false,
       maxAttempts: 2,
       retryDelayMs: 0,
-      onCardAction: (action, eventId) => desk.handleAction(eventId, action),
+      onCardAction: (action, eventId) => ({ ackReady: desk.handleAction(eventId, action) }),
       onCardActionRetriesExhausted: (action, eventId) => desk.onRetriesExhausted(eventId, action),
     });
     loop.start();

@@ -3,13 +3,21 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ChannelService, ChatTarget } from "../src/contracts.ts";
+import type { ChannelService, ChannelStatus, ChatTarget, InboundMessage } from "../src/contracts.ts";
+import { WorkerSteerRejectedError } from "../src/contracts.ts";
 import { createChannelService } from "../src/service.ts";
 import { parseConfig, toCoreConfig } from "../src/runtime/config.ts";
 import type { DecisionFetch, ThreadReferences } from "../src/references/types.ts";
 import { createOutboxDelivery } from "../src/outbox.ts";
 import { openChannelStore } from "../src/store/index.ts";
-import { assistantText, FakeTransport, FakeWorkerFactory, FakeWorktrees, inbound, waitForStatus } from "./fixtures/core-fakes.ts";
+import {
+  assistantText,
+  FakeTransport,
+  FakeWorkerFactory,
+  FakeWorktrees,
+  inbound,
+  waitForIngressJob,
+} from "./fixtures/core-fakes.ts";
 
 const target = { channelType: 5 as const, channelId: "group-tools____references" };
 const canonical = "https://github.com/example/service/pull/17";
@@ -122,7 +130,102 @@ function decisionsConfig(root: string) {
     },
   };
 }
+async function waitForCondition(
+  predicate: () => boolean | Promise<boolean>,
+  description: string,
+  timeoutMs = 3_000,
+): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    if (await predicate()) return;
+    const turn = Promise.withResolvers<void>();
+    setImmediate(turn.resolve);
+    await turn.promise;
+  }
+  throw new Error(`timed out waiting for ${description}`);
+}
 
+async function waitForSignal(
+  promise: Promise<void>,
+  description: string,
+  timeoutMs = 3_000,
+): Promise<void> {
+  let finished = false;
+  const timedOut = Promise.withResolvers<never>();
+  const deadline = performance.now() + timeoutMs;
+  void (async () => {
+    while (!finished && performance.now() < deadline) {
+      const turn = Promise.withResolvers<void>();
+      setImmediate(turn.resolve);
+      await turn.promise;
+    }
+    if (!finished) timedOut.reject(new Error(`timed out waiting for ${description}`));
+  })();
+  try {
+    await Promise.race([promise, timedOut.promise]);
+  } finally {
+    finished = true;
+  }
+}
+
+async function waitForPromptCount(
+  workers: FakeWorkerFactory,
+  count: number,
+  description: string,
+  timeoutMs = 3_000,
+): Promise<void> {
+  await waitForCondition(() => workers.prompts.length >= count, description, timeoutMs);
+}
+
+async function waitForStatusCondition(
+  service: ChannelService,
+  chatTarget: ChatTarget,
+  predicate: (status: ChannelStatus) => boolean,
+  description: string,
+  timeoutMs = 3_000,
+): Promise<void> {
+  await waitForCondition(async () => predicate(await service.status(chatTarget)), description, timeoutMs);
+}
+
+async function submitAndWaitForTask(
+  service: ChannelService,
+  workers: FakeWorkerFactory,
+  chatTarget: ChatTarget,
+  message: InboundMessage,
+): Promise<void> {
+  const promptCount = workers.prompts.length + 1;
+  await waitForSignal(service.submitInbound(message), `inbound receipt ${message.messageId}`);
+  await waitForPromptCount(workers, promptCount, `prompt for ${message.messageId}`);
+  await waitForStatusCondition(
+    service,
+    chatTarget,
+    status => status.state === "completed" && status.queued === 0,
+    `completion of ${message.messageId}`,
+  );
+}
+
+async function submitAndWaitForNew(
+  service: ChannelService,
+  chatTarget: ChatTarget,
+  message: InboundMessage,
+  cwd: string,
+): Promise<void> {
+  const previous = await service.status(chatTarget);
+  const expectedCwd = await realpath(cwd);
+  await waitForSignal(service.submitInbound(message), `inbound receipt ${message.messageId}`);
+  await waitForStatusCondition(
+    service,
+    chatTarget,
+    status => status.cwd === expectedCwd && status.sessionId !== previous.sessionId,
+    `new binding for ${message.messageId}`,
+  );
+}
+
+/*
+ * /thread-info is observed from a real host-tool call in the worker. Each poll
+ * waits for the exact command's prompt and completion, not merely the handler
+ * receipt from submitInbound.
+ */
 async function waitForThreadInfo(
   service: ChannelService,
   workers: FakeWorkerFactory,
@@ -131,22 +234,36 @@ async function waitForThreadInfo(
   readInfo: () => unknown,
   predicate: (info: unknown) => boolean,
 ): Promise<unknown> {
+  const deadline = performance.now() + 3_500;
   const messagePrefix = randomUUID();
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const promptCount = workers.prompts.length + 1;
-    await service.handleInbound(inbound({
+  for (let attempt = 0; attempt < 100 && performance.now() < deadline; attempt += 1) {
+    const firstNewPrompt = workers.prompts.length;
+    const previousInfo = readInfo();
+    const messageId = `reference-info-${messagePrefix}-${attempt}`;
+    await waitForSignal(service.submitInbound(inbound({
       ...chatTarget,
-      messageId: `reference-info-${messagePrefix}-${attempt}`,
+      messageId,
       text: "/queue show references",
       mentionedUserIds: [botUid],
-    }));
-    await workers.waitForPromptCount(promptCount);
-    await waitForStatus(service, chatTarget, status => status.state === "completed" && status.queued === 0);
+    })), `inbound receipt ${messageId}`, Math.max(1, deadline - performance.now()));
+    await waitForCondition(
+      () => workers.prompts.slice(firstNewPrompt).some(prompt => prompt.text === "show references"),
+      `thread-info prompt ${messageId}`,
+      Math.max(1, deadline - performance.now()),
+    );
+    await waitForStatusCondition(
+      service,
+      chatTarget,
+      status => status.state === "completed" && status.queued === 0,
+      `thread-info completion ${messageId}`,
+      Math.max(1, deadline - performance.now()),
+    );
     const info = readInfo();
-    if (predicate(info)) return info;
+    if (info !== previousInfo && predicate(info)) return info;
   }
-  throw new Error("thread-info did not reach the expected reference state");
+  throw new Error("thread-info did not reach the expected reference state within 3500 ms");
 }
+
 
 test("enabled decisions resolve only the explicitly selected operator credential", () => {
   let failure: unknown;
@@ -203,20 +320,19 @@ for (const protocol of ["openai-decisions", "typesafe-systemone"] as const) {
     const service = await createChannelService(options);
     try {
       await service.start();
-      await service.handleInbound(inbound({
+      await submitAndWaitForNew(service, target, inbound({
         ...target,
         messageId: "bind",
         text: `/new ${root}`,
         mentionedUserIds: [transport.bot.uid],
-      }));
-      await service.handleInbound(inbound({
+      }), root);
+      await submitAndWaitForTask(service, workers, target, inbound({
         ...target,
         messageId: "review",
         text: `Please review this PR for the current service change: ${canonical}/files?token=must-not-leave#diff-1`,
         mentionedUserIds: [transport.bot.uid],
       }));
-      await waitForStatus(service, target, status => status.state === "completed");
-      await received.promise;
+      await waitForSignal(received.promise, "decision request");
       await waitForThreadInfo(
         service,
         workers,
@@ -323,20 +439,27 @@ test("only a durable assistant final enters reference judging, and its full URL 
   });
   try {
     await service.start();
-    await service.handleInbound(inbound({
+    await submitAndWaitForNew(service, target, inbound({
       ...target,
       messageId: "bind-final",
       text: `/new ${root}`,
       mentionedUserIds: [transport.bot.uid],
-    }));
-    await service.handleInbound(inbound({
+    }), root);
+    const finalPromptCount = workers.prompts.length + 1;
+    await waitForSignal(service.submitInbound(inbound({
       ...target,
       messageId: "final-source",
       text: "Please implement the requested service change.",
       mentionedUserIds: [transport.bot.uid],
-    }));
-    await received.promise;
-    await waitForStatus(service, target, status => status.state === "completed");
+    })), "final-source inbound receipt");
+    await waitForPromptCount(workers, finalPromptCount, "final-source worker prompt");
+    await waitForSignal(received.promise, "decision request");
+    await waitForStatusCondition(
+      service,
+      target,
+      status => status.state === "completed" && status.queued === 0,
+      "task completion while decision response is held",
+    );
     expect(providerResponseSent).toBe(false);
     const external = JSON.stringify(requests.map(request => request.body));
     expect(external).toContain(canonical);
@@ -344,8 +467,11 @@ test("only a durable assistant final enters reference judging, and its full URL 
     expect(external).toContain("@Alice");
     expect(external).not.toContain("assistant-private-uid");
     releaseResponse.resolve();
-    await transport.waitForRemoteText(message =>
-      message.target.channelId === target.channelId && message.text.includes(canonical)
+    await waitForCondition(
+      () => transport.sent.some(
+        message => message.target.channelId === target.channelId && message.text.includes(canonical),
+      ),
+      "final reference answer delivery",
     );
     expect(transport.visibleText(target)).toContain("@Alice");
     await waitForThreadInfo(
@@ -435,14 +561,20 @@ test("a plain pending-ask answer is judged once and only after its answer is dur
   });
   try {
     await service.start();
-    await service.handleInbound(inbound({
+    const firstPromptCount = workers.prompts.length + 1;
+    await waitForSignal(service.submitInbound(inbound({
       ...target,
       messageId: "ask-start",
       text: "Start the clarification.",
       mentionedUserIds: [transport.bot.uid],
-    }));
-    await workers.waitForPromptCount(1);
-    await waitForStatus(service, target, status => status.pendingQuestionIds.length === 1);
+    })), "ask-start inbound receipt");
+    await waitForPromptCount(workers, firstPromptCount, "ask-start worker prompt");
+    await waitForStatusCondition(
+      service,
+      target,
+      status => status.pendingQuestionIds.length === 1,
+      "pending clarification question",
+    );
     const answerText = "Please review the linked item for this question.";
     const answerQuote = `Direct work item: ${canonical}`;
     const answer = inbound({
@@ -452,11 +584,17 @@ test("a plain pending-ask answer is judged once and only after its answer is dur
       quoted: { senderName: "answer-quote-private-sender", text: answerQuote },
       mentionedUserIds: [transport.bot.uid],
     });
-    await service.handleInbound(answer);
-    await requested.promise;
-    await waitForStatus(service, target, status => status.state === "completed" && status.pendingQuestionIds.length === 0);
+    await waitForSignal(service.submitInbound(answer), "ask answer inbound receipt");
+    await waitForIngressJob({ stateDir, bot: transport.bot }, answer);
+    await waitForSignal(requested.promise, "ask answer reference judgement");
+    await waitForStatusCondition(
+      service,
+      target,
+      status => status.state === "completed" && status.pendingQuestionIds.length === 0,
+      "completed answered turn",
+    );
     expect(pendingAtRequest).toBe(0);
-    await service.handleInbound(answer);
+    await waitForSignal(service.submitInbound(answer), "duplicate ask answer receipt");
     expect(requests).toHaveLength(1);
     const answerEvidence = evidenceFrom(requests[0]!);
     expect(answerEvidence.task).toBe(
@@ -521,26 +659,26 @@ test("commands, unauthorized input, and link-free turns are excluded; accepted r
   const candidateText = `Review only the active change: ${canonical}`;
   try {
     await service.start();
-    await service.handleInbound(inbound({
+    await submitAndWaitForNew(service, target, inbound({
       ...target,
       messageId: "admission-new",
       text: `/new ${root}`,
       mentionedUserIds: [transport.bot.uid],
-    }));
-    await service.handleInbound(inbound({
+    }), root);
+    await waitForSignal(service.submitInbound(inbound({
       ...target,
       messageId: "unauthorized-reference",
       senderId: "ordinary-member",
       text: unauthorizedText,
       mentionedUserIds: [],
-    }));
-    await service.handleInbound(inbound({
+    })), "unauthorized reference inbound receipt");
+    await waitForSignal(service.submitInbound(inbound({
       ...target,
       messageId: "command-reference",
       text: commandText,
       mentionedUserIds: [transport.bot.uid],
-    }));
-    await service.handleInbound(inbound({
+    })), "status command inbound receipt");
+    await submitAndWaitForTask(service, workers, target, inbound({
       ...target,
       messageId: "link-free-turn",
       text: "Explain the normal service flow.",
@@ -553,8 +691,7 @@ test("commands, unauthorized input, and link-free turns are excluded; accepted r
         durationSeconds: 0,
       }],
     }));
-    await waitForStatus(service, target, status => status.state === "completed");
-    await service.handleInbound(inbound({
+    await submitAndWaitForTask(service, workers, target, inbound({
       ...target,
       messageId: "raw-reference",
       text: candidateText,
@@ -568,8 +705,7 @@ test("commands, unauthorized input, and link-free turns are excluded; accepted r
         durationSeconds: 0,
       }],
     }));
-    await requested.promise;
-    await waitForStatus(service, target, status => status.state === "completed");
+    await waitForSignal(requested.promise, "raw reference decision request");
     await waitForThreadInfo(
       service,
       workers,
@@ -626,7 +762,7 @@ test("a refused steer is judged once as a newly queued user handover", async () 
     }
     emit(assistantText("queued-result", "Queued task complete.", true));
   });
-  workers.failSteerWith(new Error("fixture refused the steer"));
+  workers.failSteerWith(new WorkerSteerRejectedError("fixture refused the steer"));
   const service = await createChannelService({
     config: decisionsConfig(root),
     transport,
@@ -635,24 +771,43 @@ test("a refused steer is judged once as a newly queued user handover", async () 
   });
   try {
     await service.start();
-    await service.handleInbound(inbound({
+    await waitForSignal(service.submitInbound(inbound({
       ...target,
       messageId: "steer-active",
       text: initialText,
       mentionedUserIds: [transport.bot.uid],
-    }));
-    await firstPrompt.promise;
-    await service.handleInbound(inbound({
+    })), "active task inbound receipt");
+    await waitForSignal(firstPrompt.promise, "active task worker prompt");
+    await waitForSignal(service.submitInbound(inbound({
       ...target,
       messageId: "steer-refused-queued",
       text: handoffText,
       mentionedUserIds: [transport.bot.uid],
-    }));
-    expect((await service.status(target)).queued).toBe(1);
-    finishFirst.resolve();
-    await workers.waitForPromptCount(2);
-    await requested.promise;
-    await waitForStatus(service, target, status => status.state === "completed" && status.queued === 0);
+    })), "refused steer inbound receipt");
+    const taskStore = await openChannelStore(stateDir);
+    try {
+      await waitForCondition(
+        () => taskStore.getTaskByMessageId(
+          transport.bot.uid,
+          target,
+          "steer-refused-queued",
+        )?.state === "queued",
+        "refused steer task to be durably queued",
+      );
+      finishFirst.resolve();
+      await waitForPromptCount(workers, 2, "queued handover worker prompt");
+      await waitForSignal(requested.promise, "queued handover reference judgement");
+      await waitForCondition(
+        () => taskStore.getTaskByMessageId(
+          transport.bot.uid,
+          target,
+          "steer-refused-queued",
+        )?.state === "completed",
+        "queued handover task completion",
+      );
+    } finally {
+      taskStore.close();
+    }
     expect(requests).toHaveLength(1);
     const evidence = evidenceFrom(requests[0]!);
     expect(evidence.task).toBe(`Initial accepted requirement:\n${handoffText}`);
@@ -685,10 +840,14 @@ test("a successfully steered visible user message joins the running task evidenc
   });
   const initialText = "work on the current service change";
   const steeredText = `Also review this direct work item: ${canonical}`;
-  const workers = new FakeWorkerFactory(async ({ text, emit, waitForAppend }) => {
+  const workers = new FakeWorkerFactory(async ({ text, emit, waitForAppend, waitForAbort }) => {
     if (text === initialText) {
       firstPrompt.resolve();
-      await waitForAppend();
+      const appended = await Promise.race([
+        waitForAppend().then(() => true),
+        waitForAbort().then(() => false),
+      ]);
+      if (!appended) return;
       emit(assistantText("steered-result", "Steered task complete.", true));
       return;
     }
@@ -702,21 +861,28 @@ test("a successfully steered visible user message joins the running task evidenc
   });
   try {
     await service.start();
-    await service.handleInbound(inbound({
+    await waitForSignal(service.submitInbound(inbound({
       ...target,
       messageId: "steer-start",
       text: initialText,
       mentionedUserIds: [transport.bot.uid],
-    }));
-    await firstPrompt.promise;
-    await service.handleInbound(inbound({
+    })), "steer-start inbound receipt");
+    await waitForSignal(firstPrompt.promise, "steer-start worker prompt");
+    const handover = inbound({
       ...target,
       messageId: "steer-visible-handover",
       text: steeredText,
       mentionedUserIds: [transport.bot.uid],
-    }));
-    await requested.promise;
-    await waitForStatus(service, target, status => status.state === "completed" && status.queued === 0);
+    });
+    await waitForSignal(service.submitInbound(handover), "visible handover inbound receipt");
+    await waitForIngressJob({ stateDir, bot: transport.bot }, handover);
+    await waitForSignal(requested.promise, "steered reference judgement");
+    await waitForStatusCondition(
+      service,
+      target,
+      status => status.state === "completed" && status.queued === 0,
+      "completion of the steered turn",
+    );
     expect(workers.prompts).toHaveLength(1);
     expect(requests).toHaveLength(1);
     const evidence = evidenceFrom(requests[0]!);
@@ -780,17 +946,27 @@ test("thread dispatch judges only the visible handover in the destination thread
   });
   try {
     await service.start();
-    await service.handleInbound(inbound({
+    await waitForSignal(service.submitInbound(inbound({
       ...parent,
       messageId: "dispatch-parent-source",
       text: parentText,
       mentionedUserIds: [transport.bot.uid],
-    }));
-    await dispatched.promise;
-    await workers.waitForPromptCount(2);
-    await requested.promise;
-    await waitForStatus(service, parent, status => status.state === "completed");
-    await waitForStatus(service, child, status => status.state === "completed");
+    })), "dispatch source inbound receipt");
+    await waitForSignal(dispatched.promise, "thread dispatch host-tool effect");
+    await waitForPromptCount(workers, 2, "destination thread worker prompt");
+    await waitForSignal(requested.promise, "destination thread reference judgement");
+    await waitForStatusCondition(
+      service,
+      parent,
+      status => status.state === "completed" && status.queued === 0,
+      "dispatch source task completion",
+    );
+    await waitForStatusCondition(
+      service,
+      child,
+      status => status.state === "completed" && status.queued === 0,
+      "destination thread task completion",
+    );
     const evidence = evidenceFrom(requests[0]!);
     expect(requests).toHaveLength(1);
     expect(evidence.recent).toMatchObject([{ role: "user", text: handoffText }]);
@@ -858,20 +1034,18 @@ test("fresh sessions retain bound references, clear prior context, and keep sibl
   });
   try {
     await service.start();
-    await service.handleInbound(inbound({
+    await submitAndWaitForTask(service, workers, target, inbound({
       ...target,
       messageId: "context-seed",
       text: `Seed the thread context before evaluating a link. ${originMarker}`,
       mentionedUserIds: [transport.bot.uid],
     }));
-    await waitForStatus(service, target, status => status.state === "completed");
-    await service.handleInbound(inbound({
+    await submitAndWaitForTask(service, workers, target, inbound({
       ...target,
       messageId: "old-session-reference",
       text: `Continue the existing task: ${canonical}`,
       mentionedUserIds: [transport.bot.uid],
     }));
-    await waitForStatus(service, target, status => status.state === "completed");
     await waitForThreadInfo(
       service,
       workers,
@@ -883,12 +1057,12 @@ test("fresh sessions retain bound references, clear prior context, and keep sibl
     const firstEvidence = evidenceFrom(requests[0]!);
     expect(JSON.stringify(firstEvidence.recent)).toContain(originMarker);
 
-    await service.handleInbound(inbound({
+    await submitAndWaitForNew(service, target, inbound({
       ...target,
       messageId: "fresh-session",
       text: `/new ${root}`,
       mentionedUserIds: [transport.bot.uid],
-    }));
+    }), root);
     await waitForThreadInfo(
       service,
       workers,
@@ -900,13 +1074,12 @@ test("fresh sessions retain bound references, clear prior context, and keep sibl
         return references !== undefined && references.mr.length === 0 && references.pr.length === 0;
       },
     );
-    await service.handleInbound(inbound({
+    await submitAndWaitForTask(service, workers, target, inbound({
       ...target,
       messageId: "new-session-reference",
       text: `Start the fresh-session work with this item: ${secondCanonical}`,
       mentionedUserIds: [transport.bot.uid],
     }));
-    await waitForStatus(service, target, status => status.state === "completed");
     await waitForThreadInfo(
       service,
       workers,
@@ -1065,14 +1238,13 @@ test("successful thread deletion tombstones references before failing workspace 
   });
   try {
     await service.start();
-    await service.handleInbound(inbound({
+    await submitAndWaitForTask(service, workers, target, inbound({
       ...target,
       messageId: "before-delete-reference",
       text: `Implement this direct service item: ${canonical}`,
       mentionedUserIds: [transport.bot.uid],
     }));
-    await requested.promise;
-    await waitForStatus(service, target, status => status.state === "completed");
+    await waitForSignal(requested.promise, "pre-delete reference judgement");
     await waitForThreadInfo(
       service,
       workers,
@@ -1081,13 +1253,12 @@ test("successful thread deletion tombstones references before failing workspace 
       () => info,
       value => hasThreadReference(value, "pr", canonical),
     );
-    await service.handleInbound(inbound({
+    await submitAndWaitForTask(service, workers, target, inbound({
       ...target,
       messageId: "delete-thread-message",
       text: "delete the thread now",
       mentionedUserIds: [transport.bot.uid],
     }));
-    await waitForStatus(service, target, status => status.state === "completed");
     expect(deletionResult).toContain("已删除线程");
     expect(deletionResult).toContain("清理失败");
     expect(worktrees.removals).toHaveLength(1);
@@ -1135,13 +1306,12 @@ test("thread-info returns stored references even when decisions are disabled", a
   });
   try {
     await service.start();
-    await service.handleInbound(inbound({
+    await submitAndWaitForTask(service, workers, target, inbound({
       ...target,
       messageId: "disabled-thread-info",
       text: "show references",
       mentionedUserIds: [transport.bot.uid],
     }));
-    await waitForStatus(service, target, status => status.state === "completed");
     expect(info).toMatchObject({ references: { mr: [], pr: [canonical] } });
   } finally {
     await service.stop();
@@ -1204,7 +1374,7 @@ test("quoted text retains neutral provenance without sender or quoted attachment
   });
   try {
     await service.start();
-    await service.handleInbound(inbound({
+    await submitAndWaitForTask(service, workers, target, inbound({
       ...target,
       messageId: "quoted-only-candidate",
       text: ownText,
@@ -1218,8 +1388,7 @@ test("quoted text retains neutral provenance without sender or quoted attachment
         durationSeconds: 0,
       }],
     }));
-    await requested.promise;
-    await waitForStatus(service, target, status => status.state === "completed");
+    await waitForSignal(requested.promise, "quoted-text reference decision request");
     expect(requests).toHaveLength(1);
     const evidence = evidenceFrom(requests[0]!);
     expect(evidence.recent).toMatchObject([{

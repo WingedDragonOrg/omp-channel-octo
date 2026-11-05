@@ -2,7 +2,33 @@ import { expect, test } from "bun:test";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { ChannelStore } from "../src/store";
-import { closeCoreHarness, createCoreHarness, inbound, waitForStatus } from "./fixtures/core-fakes";
+import type { ChatTarget, InboundMessage } from "../src/contracts";
+import {
+  closeCoreHarness,
+  createCoreHarness,
+  inbound,
+  submitAndWaitForIngressHandoff,
+  waitForStatus,
+  type CoreHarness,
+} from "./fixtures/core-fakes";
+
+async function submitAndWaitForHandoff(
+  harness: CoreHarness,
+  message: InboundMessage,
+): Promise<void> {
+  await submitAndWaitForIngressHandoff(harness, message);
+}
+
+async function waitForReply(
+  harness: CoreHarness,
+  target: ChatTarget,
+  includes?: string,
+): Promise<void> {
+  await harness.transport.waitForRemoteText(({ target: sentTarget, text }) =>
+    sentTarget.channelType === target.channelType
+    && sentTarget.channelId === target.channelId
+    && (includes === undefined || text.includes(includes)));
+}
 
 /**
  * `/thread <任务>` hands the intent to the assistant: the command itself creates nothing, it turns
@@ -16,7 +42,7 @@ test("/thread turns the message into an instructed task without creating anythin
     const group = { channelId: "group-allowed", channelType: 2 as const };
     const parentCwd = join(harness.root, "project");
     await mkdir(parentCwd, { recursive: true });
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({
         messageId: "thread-bind",
         ...group,
@@ -25,7 +51,7 @@ test("/thread turns the message into an instructed task without creating anythin
       }),
     );
     const intent = "把进度卡片的样式调整得更紧凑，先看一遍现有渲染再改";
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({
         messageId: "thread-intent",
         ...group,
@@ -33,6 +59,7 @@ test("/thread turns the message into an instructed task without creating anythin
         mentionedUserIds: [harness.bot.uid],
       }),
     );
+    await waitForStatus(harness.service, group, (status) => status.state === "completed");
     await harness.workers.waitForPromptCount(1);
 
     // Nothing is created up front: no thread, no workspace, no receipt.
@@ -74,7 +101,7 @@ test("the instructed task sets the sub-thread up with the agent's own names", as
     const group = { channelId: "group-allowed", channelType: 2 as const };
     const parentCwd = join(harness.root, "project");
     await mkdir(parentCwd, { recursive: true });
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({
         messageId: "thread-agent-bind",
         ...group,
@@ -82,7 +109,7 @@ test("the instructed task sets the sub-thread up with the agent's own names", as
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({
         messageId: "thread-agent-run",
         ...group,
@@ -92,6 +119,10 @@ test("the instructed task sets the sub-thread up with the agent's own names", as
     );
     const thread = { channelId: `${group.channelId}____thread-1`, channelType: 5 as const };
     const workspace = join(harness.root, "worktrees", "thread-1");
+    await waitForStatus(harness.service, group, (status) => status.state === "completed");
+    await waitForStatus(harness.service, thread, (status) => status.state === "completed");
+    await waitForReply(harness, thread, "来自群会话的派发任务：");
+    await waitForReply(harness, group, "已在子区 thread-1");
     await harness.workers.waitForPromptCount(2);
 
     // The workspace request carries the agent-chosen name against the group's own directory.
@@ -123,23 +154,26 @@ test("/thread merge refuses non-thread and unbound targets without accepting a t
   try {
     const group = { channelId: "group-allowed", channelType: 2 as const };
     const thread = { channelId: "group-allowed____unbound", channelType: 5 as const };
-    await harness.service.handleInbound(inbound({
+    await submitAndWaitForHandoff(harness, inbound({
       messageId: "merge-outside-group",
       ...group,
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
     }));
-    await harness.service.handleInbound(inbound({
+    await submitAndWaitForHandoff(harness, inbound({
       messageId: "merge-outside-dm",
       text: "/thread merge",
     }));
-    await harness.service.handleInbound(inbound({
+    await submitAndWaitForHandoff(harness, inbound({
       messageId: "merge-unbound-thread",
       ...thread,
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
     }));
 
+    await waitForReply(harness, group, "/thread merge 只在子区中使用。");
+    await waitForReply(harness, { channelType: 1, channelId: "dm-owner" }, "/thread merge 只在子区中使用。");
+    await waitForReply(harness, thread, "当前子区未绑定隔离工作区");
     expect(harness.transport.sent.filter(({ text }) =>
       text === "/thread merge 只在子区中使用。",
     )).toHaveLength(2);
@@ -180,7 +214,7 @@ test("shared sub-thread merge command is notice-only and leaves task listening a
   });
   try {
     const group = { channelId: "group-allowed", channelType: 2 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({
         messageId: "shared-command-create",
         ...group,
@@ -202,7 +236,7 @@ test("shared sub-thread merge command is notice-only and leaves task listening a
         projects: [],
         error: null,
       });
-      await harness.service.handleInbound(
+      await submitAndWaitForHandoff(harness,
         inbound({
           messageId: "shared-command-merge",
           ...thread,
@@ -210,6 +244,7 @@ test("shared sub-thread merge command is notice-only and leaves task listening a
           mentionedUserIds: [harness.bot.uid],
         }),
       );
+      await waitForReply(harness, thread);
       expect(
         harness.transport.sent.filter(({ target }) => (
           target.channelType === 5 && target.channelId === thread.channelId
@@ -234,7 +269,7 @@ test("/thread without a task replies with usage, and DMs and threads are refused
   const harness = await createCoreHarness();
   try {
     const group = { channelId: "group-allowed", channelType: 2 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({
         messageId: "thread-usage",
         ...group,
@@ -242,12 +277,14 @@ test("/thread without a task replies with usage, and DMs and threads are refused
         mentionedUserIds: [harness.bot.uid],
       }),
     );
+    await waitForReply(harness, group, "用法：/thread <任务>");
     expect(harness.transport.sent.some(({ text }) => text.includes("用法：/thread <任务>"))).toBe(true);
 
-    await harness.service.handleInbound(inbound({ messageId: "thread-dm", text: "/thread do it" }));
+    await submitAndWaitForHandoff(harness, inbound({ messageId: "thread-dm", text: "/thread do it" }));
+    await waitForReply(harness, { channelType: 1, channelId: "dm-owner" }, "/thread 需要在群聊中使用。");
     expect(harness.transport.sent.some(({ text }) => text === "/thread 需要在群聊中使用。")).toBe(true);
 
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({
         messageId: "thread-nested",
         channelId: `${group.channelId}____topic-9`,
@@ -255,6 +292,11 @@ test("/thread without a task replies with usage, and DMs and threads are refused
         text: "/thread nested work",
         mentionedUserIds: [harness.bot.uid],
       }),
+    );
+    await waitForReply(
+      harness,
+      { channelType: 5, channelId: `${group.channelId}____topic-9` },
+      "当前会话已是子区，不能再建子区。",
     );
     expect(harness.transport.sent.some(({ text }) => text === "当前会话已是子区，不能再建子区。")).toBe(true);
 
@@ -269,6 +311,7 @@ test("/thread without a task replies with usage, and DMs and threads are refused
 
 test("queue mode keeps the hand-over behind the running turn as its own task", async () => {
   let release: (() => void) | undefined;
+  const started = Promise.withResolvers<void>();
   let promptCount = 0;
   const harness = await createCoreHarness({
     prompt: async ({ onStop }) => {
@@ -277,6 +320,7 @@ test("queue mode keeps the hand-over behind the running turn as its own task", a
       await new Promise<void>((resolve) => {
         release = resolve;
         onStop(resolve);
+        started.resolve();
       });
     },
   });
@@ -284,7 +328,7 @@ test("queue mode keeps the hand-over behind the running turn as its own task", a
     const group = { channelId: "group-allowed", channelType: 2 as const };
     const parentCwd = join(harness.root, "project");
     await mkdir(parentCwd, { recursive: true });
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({
         messageId: "thread-busy-bind",
         ...group,
@@ -292,7 +336,7 @@ test("queue mode keeps the hand-over behind the running turn as its own task", a
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({
         messageId: "thread-busy-mode",
         ...group,
@@ -300,7 +344,7 @@ test("queue mode keeps the hand-over behind the running turn as its own task", a
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({
         messageId: "thread-busy-hold",
         ...group,
@@ -309,7 +353,8 @@ test("queue mode keeps the hand-over behind the running turn as its own task", a
       }),
     );
     await harness.workers.waitForPromptCount(1);
-    await harness.service.handleInbound(
+    await started.promise;
+    await submitAndWaitForHandoff(harness,
       inbound({
         messageId: "thread-busy-run",
         ...group,

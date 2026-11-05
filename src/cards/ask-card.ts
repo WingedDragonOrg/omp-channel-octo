@@ -10,8 +10,8 @@
  * submit. Every option question also carries a free-form field whose value wins over the
  * selection when it is filled.
  *
- * The frame is an ordinary message as well — `plain` is what the text-only path would have sent
- * — and a plain reply in the chat still answers (see `CoreService.answerPendingQuestion`).
+ * The frame is an ordinary message as well — `plain` is what the text-only path would have sent.
+ * A plain reply answers only the exact question ids frozen by `QuestionDesk.captureTextRoute`.
  * Nothing here performs I/O: the builders and the action decoders are pure so both callers stay
  * testable.
  */

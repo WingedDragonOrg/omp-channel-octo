@@ -1,5 +1,5 @@
 import { readdir, rm, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { ChatTarget, InboundAttachmentKind, InboundQuote } from "../contracts.ts";
 
 /** Attachment directories untouched for this long are removed at service start. */
@@ -138,7 +138,13 @@ export function formatBytes(bytes: number): string {
  * Best-effort: a failing entry is logged and skipped so it can neither block startup nor
  * keep the remaining directories from being scanned.
  */
-export async function sweepAttachments(stateDir: string, maxAgeMs: number, now = Date.now()): Promise<number> {
+export async function sweepAttachments(
+  stateDir: string,
+  maxAgeMs: number,
+  now = Date.now(),
+  protectedPaths: ReadonlySet<string> = new Set(),
+): Promise<number> {
+  const protectedDirectories = new Set([...protectedPaths].map(path => dirname(path)));
   const root = attachmentRoot(stateDir);
   let channels: string[];
   try {
@@ -162,7 +168,11 @@ export async function sweepAttachments(stateDir: string, maxAgeMs: number, now =
       const messagePath = join(channelPath, message);
       try {
         const info = await stat(messagePath);
-        if (!info.isDirectory() || now - info.mtimeMs <= maxAgeMs) continue;
+        if (
+          !info.isDirectory()
+          || protectedDirectories.has(messagePath)
+          || now - info.mtimeMs <= maxAgeMs
+        ) continue;
         await rm(messagePath, { recursive: true, force: true });
         removed += 1;
       } catch (error) {

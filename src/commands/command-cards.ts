@@ -3,9 +3,9 @@
  * 独占它的生命周期——发布、绑定远端 messageId、按 owner 与精确绑定校验点击、应用选择、失效与
  * 有界回收。
  *
- * 菜单会话是进程内的临时状态，不落盘、不进数据库：跨重启的旧卡片自然成为「未知会话」，点击
- * 只得到一段有界的重开指引。本模块不复制任何命令语义——应用一次选择经 `applyChoice` 走既有
- * handler 的路径（与文本命令逐字同一回执），卡片只是到同一条路径的另一个入口。
+ * 未点击的菜单会话仍是进程内临时状态：跨重启旧卡只得到重开指引。一次点击通过完整校验后，本模块
+ * 产出可恢复快照并要求入口先持久交接；模型/worker/卡片 HTTP 由 `resumeAcceptedAction` 在事件
+ * ACK 之外执行。本模块不复制命令语义，应用仍经 `applyChoice` 走文本命令的同一路径。
  *
  * 边界：会话总数上限 200、存活 15 分钟；卡片投递与改写各有 10 秒传输预算并与停机信号绑定；
  * 只有持久化 owner 本人的点击有效，非 owner 静默 ack 且不消耗 owner 的卡片；只有本卡发放过的
@@ -24,6 +24,7 @@ import {
 import type { BotCardAction, ChannelTransport, ChatTarget, SendReceipt } from "../contracts.ts";
 import { safeErrorMessage } from "../errors.ts";
 import type { ChannelStore } from "../store/index.ts";
+import type { IngressValidatedConfigAction } from "../inbound/ingress-types.ts";
 import { targetKey } from "../target.ts";
 
 /** 配置卡片 action id 的前缀：Bot 事件消费者按它把配置点击交给本模块，其余交给问答卡。 */
@@ -60,6 +61,39 @@ interface ConfigMenuSession {
   cardSeq: number;
 }
 
+/**
+ * 已校验配置卡动作的可恢复快照。它只含本卡已经发放并核验过的值；eventId 是来源去重键，
+ * messageId/actionId 只用于归因与动作真实性，不能替代 eventId。
+ */
+export type ConfigCardActionSnapshot = IngressValidatedConfigAction & {
+  readonly eventId: number;
+};
+
+export type ConfigCardActionAcceptance = "accepted" | "duplicate" | "retry";
+
+/** One FIFO slot created at durable ingress acceptance and released after application or suspension. */
+export interface ConfigApplyReservation {
+  run(work: () => string | null | Promise<string | null>): Promise<string | null>;
+  release(): void;
+}
+
+/** Per-ingress durable checkpoint operations supplied by the coordinator. */
+export interface ConfigActionCheckpoint {
+  readonly dispatchIntent: boolean;
+  readonly appliedResult: string | null;
+  markDispatchIntent(): boolean;
+  markAppliedResult(result: string): boolean;
+  markUnknown(reason: string): void;
+}
+
+/** Signals that an accepted action was suspended before durable dispatch intent. */
+export class ConfigActionSuspendedError extends Error {
+  constructor() {
+    super("configuration action suspended before dispatch");
+    this.name = "ConfigActionSuspendedError";
+  }
+}
+
 export interface ConfigMenuDeps {
   readonly store: ChannelStore;
   readonly transport: ChannelTransport;
@@ -69,10 +103,21 @@ export interface ConfigMenuDeps {
   stopping(): boolean;
   /** 点击时刻重新校验该聊天是否仍在允许清单内（与消息门共用同一授权）。 */
   chatAllowed(target: ChatTarget): boolean;
+  /** Durable source dedupe: checked before looking up ephemeral menu state or emitting reopen text. */
+  getAcceptedEvent(eventId: number): boolean;
   /**
    * 应用一次卡片取值：与文本命令同一条路径，返回逐字回执文本。抛错由本模块收敛为一行有界提示。
    */
   applyChoice(kind: CommandCardKind, target: ChatTarget, value: string): Promise<string>;
+  /**
+   * 在任何长动作前持久交接已校验快照；duplicate 表示该 event 已有消费者。accepted 的持久记录
+   * 必须保留快照与恢复责任，直到 `resumeAcceptedAction` 返回的 Promise 真正完成。
+   */
+  acceptAction(
+    snapshot: ConfigCardActionSnapshot,
+    action: BotCardAction,
+    reservation: ConfigApplyReservation,
+  ): ConfigCardActionAcceptance;
   /** 结果与指引的文本出口，与既有命令共用同一个 outbox。 */
   enqueueText(target: ChatTarget, text: string, taskId: string | null): void;
   /** 停机信号：卡片投递与改写与它绑定，进程退出不会挂在网络上。 */
@@ -107,6 +152,8 @@ export interface ConfigMenuPort {
   open(target: ChatTarget, view: CommandCardView, ticket: ConfigMenuTicket): Promise<void>;
   /** 让该聊天该类型的当前菜单立即失效（非空文本命令与卡片点击都走到这里）。 */
   invalidate(target: ChatTarget, kind: CommandCardKind): void;
+  /** Reserve the target/kind FIFO slot at ingress acceptance; repeated source IDs return the same slot. */
+  reserveApply(kind: CommandCardKind, target: ChatTarget, sourceId: string): ConfigApplyReservation;
   /**
    * 同一 (聊天, 类型) 的配置应用串行：后到的命令排队在前一个落地之后。轮到本项时重新核对停机、
    * owner 与聊天授权，任一不成立就不再执行 `work`，只回一行有界回执；前一个失败不阻断后一个。
@@ -115,8 +162,14 @@ export interface ConfigMenuPort {
 }
 
 export interface ConfigMenuDesk extends ConfigMenuPort {
-  /** Bot 事件队列的一次 `cfg:` 点击。 */
-  handleAction(action: BotCardAction): Promise<BotEventOutcome>;
+  /** Bot 事件队列的一次 `cfg:` 点击；只等待持久短交接，不等待应用或卡片 HTTP。 */
+  handleAction(action: BotCardAction, eventId: number): Promise<BotEventOutcome>;
+  /** Replays an already-applied result for display, or executes only after durable dispatch intent. */
+  resumeAcceptedAction(
+    snapshot: ConfigCardActionSnapshot,
+    reservation: ConfigApplyReservation,
+    checkpoint: ConfigActionCheckpoint,
+  ): Promise<void>;
 }
 
 /** 本模块发放的 action id 的类型；其他形状（含伪造成 `cfg:` 前缀的）返回 `null`。 */
@@ -140,10 +193,83 @@ export function createConfigMenuDesk(deps: ConfigMenuDeps): ConfigMenuDesk {
   /** (聊天, 类型) → 代次状态：只活在仍有在途请求的时候，票据归还后即回收。 */
   const generations = new Map<string, MenuGeneration>();
   /** (聊天, 类型) → 应用串行链：后到的配置命令在前一个落地之后执行。 */
-  const applies = new Map<string, Promise<unknown>>();
+  /** (聊天, 类型) → reserved application barrier, registered at source acceptance. */
+  const applies = new Map<string, Promise<void>>();
+  const reservations = new Map<string, ConfigApplyReservation>();
+  const pendingTextReservations = new Map<string, ConfigApplyReservation[]>();
+  /** Validated clicks whose durable ingress insert must be retried, even after the menu expires. */
+  const pendingValidatedActions = new Map<number, ConfigCardActionSnapshot>();
 
   function menuKey(target: ChatTarget, kind: CommandCardKind): string {
     return `${targetKey(target)}:${kind}`;
+  }
+
+  function reserveApply(
+    kind: CommandCardKind,
+    target: ChatTarget,
+    sourceId: string,
+  ): ConfigApplyReservation {
+    const key = menuKey(target, kind);
+    const sourceKey = `${key}:${sourceId}`;
+    const existing = reservations.get(sourceKey);
+    if (existing !== undefined) return existing;
+    const calledBot = deps.botUid();
+    const ownerAtAcceptance = calledBot === undefined
+      ? ""
+      : (deps.store.getOwnerId(calledBot) ?? "").trim();
+    const previous = applies.get(key) ?? Promise.resolve();
+    const { promise: slot, resolve: releaseSlot } = Promise.withResolvers<void>();
+    const tail = previous.then(() => slot);
+    applies.set(key, tail);
+    let released = false;
+    let runPromise: Promise<string | null> | null = null;
+    const removePending = (): void => {
+      const queue = pendingTextReservations.get(key);
+      if (queue === undefined) return;
+      const index = queue.indexOf(reservation);
+      if (index >= 0) queue.splice(index, 1);
+      if (queue.length === 0) pendingTextReservations.delete(key);
+    };
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      removePending();
+      releaseSlot();
+      if (reservations.get(sourceKey) === reservation) reservations.delete(sourceKey);
+      if (applies.get(key) === tail) {
+        void tail.then(() => {
+          if (applies.get(key) === tail) applies.delete(key);
+        });
+      }
+    };
+    const reservation: ConfigApplyReservation = {
+      run(work): Promise<string | null> {
+        if (runPromise !== null) return runPromise;
+        if (released) return Promise.resolve(null);
+        removePending();
+        runPromise = previous.then(async () => {
+          if (released) return null;
+          const botUid = deps.botUid();
+          const liveOwner = botUid === undefined ? "" : (deps.store.getOwnerId(botUid) ?? "").trim();
+          if (
+            botUid === undefined ||
+            ownerAtAcceptance.length === 0 ||
+            liveOwner !== ownerAtAcceptance ||
+            !deps.chatAllowed(target)
+          ) return UNAVAILABLE_APPLY_TEXT;
+          return await work();
+        }).finally(release);
+        return runPromise;
+      },
+      release,
+    };
+    reservations.set(sourceKey, reservation);
+    if (!sourceId.startsWith("bot-event:")) {
+      const queue = pendingTextReservations.get(key) ?? [];
+      queue.push(reservation);
+      pendingTextReservations.set(key, queue);
+    }
+    return reservation;
   }
 
   function drop(actionId: string): void {
@@ -218,12 +344,12 @@ export function createConfigMenuDesk(deps: ConfigMenuDeps): ConfigMenuDesk {
     return `未收到本卡片提供的选项，本次没有修改；重新发送 ${KIND_COMMAND[kind]} 可再次打开配置卡片。`;
   }
 
-  function applyFailedText(kind: CommandCardKind): string {
-    return `配置未能应用，请重新发送 ${KIND_COMMAND[kind]} 再试。`;
-  }
 
   /** 终态改写：卡片只承载既有 handler 的逐字回执，没有输入也没有动作。 */
-  async function finishCard(session: ConfigMenuSession, receipt: string): Promise<void> {
+  async function finishCard(
+    session: ConfigMenuSession | ConfigCardActionSnapshot,
+    receipt: string,
+  ): Promise<void> {
     const messageId = session.messageId;
     if (messageId === null) {
       deps.enqueueText(session.target, receipt, null);
@@ -303,78 +429,168 @@ export function createConfigMenuDesk(deps: ConfigMenuDeps): ConfigMenuDesk {
 
   function serialize(kind: CommandCardKind, target: ChatTarget, work: () => string | Promise<string>): Promise<string> {
     const key = menuKey(target, kind);
-    const calledWithBot = deps.stopping() ? undefined : deps.botUid();
-    const ownerUid = calledWithBot === undefined ? "" : (deps.store.getOwnerId(calledWithBot) ?? "").trim();
-    const guarded = (): string | Promise<string> => {
-      // 排队期间世界可能变了：停机、换 owner 或聊天被移出允许清单时不再执行这次应用。
-      const botUid = deps.stopping() ? undefined : deps.botUid();
-      const liveOwner = botUid === undefined ? "" : (deps.store.getOwnerId(botUid) ?? "").trim();
-      if (botUid === undefined || ownerUid.length === 0 || liveOwner !== ownerUid || !deps.chatAllowed(target)) {
-        return UNAVAILABLE_APPLY_TEXT;
-      }
-      return work();
-    };
-    const previous = applies.get(key) ?? Promise.resolve();
-    // 前一个失败不阻断后一个：每次命令都要有自己的回执。
-    const run = previous.then(guarded, guarded);
-    const settled = run.then(() => undefined, () => undefined);
-    applies.set(key, settled);
-    void settled.then(() => {
-      if (applies.get(key) === settled) applies.delete(key);
-    });
-    return run;
+    const reservation = pendingTextReservations.get(key)?.[0]
+      ?? reserveApply(kind, target, `local:${randomUUID()}`);
+    return reservation.run(() => deps.stopping() ? UNAVAILABLE_APPLY_TEXT : work())
+      .then((receipt) => receipt ?? UNAVAILABLE_APPLY_TEXT);
   }
 
-  async function handleAction(action: BotCardAction): Promise<BotEventOutcome> {
+  async function resumeAcceptedAction(
+    snapshot: ConfigCardActionSnapshot,
+    reservation: ConfigApplyReservation,
+    checkpoint: ConfigActionCheckpoint,
+  ): Promise<void> {
+    if (checkpoint.appliedResult !== null) {
+      reservation.release();
+      await finishCard(snapshot, checkpoint.appliedResult);
+      return;
+    }
+    if (checkpoint.dispatchIntent) {
+      reservation.release();
+      checkpoint.markUnknown("配置操作已有 dispatch intent 但没有持久结果；为避免重复应用，不再执行。");
+      return;
+    }
+    let receipt: string | null;
+    try {
+      receipt = await reservation.run(async () => {
+        if (deps.stopping()) throw new ConfigActionSuspendedError();
+        if (!checkpoint.markDispatchIntent()) {
+          checkpoint.markUnknown("配置操作无法持久化 dispatch intent；未执行应用。");
+          return null;
+        }
+        const botUid = deps.stopping() ? undefined : deps.botUid();
+        const liveOwner = botUid === undefined ? "" : (deps.store.getOwnerId(botUid) ?? "").trim();
+        if (liveOwner !== snapshot.ownerUid || !deps.chatAllowed(snapshot.target)) {
+          const unavailable = UNAVAILABLE_APPLY_TEXT;
+          if (!checkpoint.markAppliedResult(unavailable)) {
+            checkpoint.markUnknown("配置拒绝结果未能持久化；不重试操作。");
+            return null;
+          }
+          return unavailable;
+        }
+        let applied: string;
+        try {
+          applied = await deps.applyChoice(snapshot.kind, snapshot.target, snapshot.value);
+        } catch (error) {
+          console.error(
+            `[config-card] apply failed target=${targetKey(snapshot.target)}：${safeErrorMessage(error, "apply failed")}`,
+          );
+          checkpoint.markUnknown("配置应用结果不确定；为避免重复副作用，不再执行。");
+          return null;
+        }
+        if (!checkpoint.markAppliedResult(applied)) {
+          checkpoint.markUnknown("配置已执行但结果未能持久化；为避免重复应用，标记为未知。");
+          return null;
+        }
+        return applied;
+      });
+    } catch (error) {
+      if (error instanceof ConfigActionSuspendedError) throw error;
+      checkpoint.markUnknown(`配置执行阶段异常：${safeErrorMessage(error, "unknown failure")}`);
+      return;
+    }
+    if (receipt !== null) await finishCard(snapshot, receipt);
+  }
+
+
+  async function handleAction(action: BotCardAction, eventId: number): Promise<BotEventOutcome> {
+    // Durable source dedupe precedes every ephemeral menu lookup or retry snapshot.
+    try {
+      if (deps.getAcceptedEvent(eventId)) {
+        pendingValidatedActions.delete(eventId);
+        return "handled";
+      }
+    } catch {
+      return "retry";
+    }
     const botUid = deps.botUid();
     if (botUid === undefined || deps.stopping()) return "retry";
     const kind = configActionKind(action.actionId);
-    if (kind === null) return "ignored";
+    const retained = pendingValidatedActions.get(eventId);
+    if (kind === null) return retained === undefined ? "ignored" : "retry";
     const target: ChatTarget = { channelType: action.channelType, channelId: action.channelId };
     const ownerUid = (deps.store.getOwnerId(botUid) ?? "").trim();
-    // 配置面只归 owner：其他人的点击静默 ack，既不生效也不消耗 owner 的卡片。
-    if (ownerUid.length === 0 || action.operatorUid.trim() !== ownerUid) return "ignored";
-    if (!deps.chatAllowed(target)) return "ignored";
-    const session = lookup(action.actionId);
-    if (session === undefined) {
-      // 未知（重启、跨进程残留、已消费）或过期：只给 owner 一段有界的重开指引。
-      deps.enqueueText(target, reopenText(kind, target), null);
-      return "handled";
+    let snapshot: ConfigCardActionSnapshot;
+    if (retained !== undefined) {
+      if (ownerUid.length === 0 || ownerUid !== retained.ownerUid || !deps.chatAllowed(target)) {
+        pendingValidatedActions.delete(eventId);
+        return "ignored";
+      }
+      if (action.operatorUid.trim() !== ownerUid) return "retry";
+      if (
+        retained.kind !== kind
+        || retained.actionId !== action.actionId
+        || retained.messageId !== action.messageId
+        || retained.target.channelType !== action.channelType
+        || retained.target.channelId !== action.channelId
+        || retained.value !== (action.inputs[COMMAND_INPUT_ID] ?? "")
+      ) return "retry";
+      snapshot = retained;
+    } else {
+      // 配置面只归 owner：其他人的点击静默 ack 且不消耗 owner 的卡片。
+      if (ownerUid.length === 0 || action.operatorUid.trim() !== ownerUid) return "ignored";
+      if (!deps.chatAllowed(target)) return "ignored";
+      const session = lookup(action.actionId);
+      if (session === undefined) {
+        // 未知（重启、跨进程残留、已消费）或过期：只给 owner 一段有界的重开指引。
+        deps.enqueueText(target, reopenText(kind, target), null);
+        return "handled";
+      }
+      // 先核对持久绑定，再谈「发送在途」：串聊天或换 owner 的事件不能借在途状态占住事件队列。
+      if (
+        session.ownerUid !== ownerUid ||
+        session.target.channelType !== action.channelType ||
+        session.target.channelId !== action.channelId
+      ) {
+        // 绑定不符（换 owner、串聊天或伪造）：静默丢弃，不消耗 owner 的卡片。
+        return "ignored";
+      }
+      // 远端回执尚未绑定：保留事件，绑定后再按真实绑定判定（服务端已发布但回执在途的点击）。
+      if (session.messageId === null) return "retry";
+      if (session.messageId !== action.messageId) return "ignored";
+      const value = action.inputs[COMMAND_INPUT_ID] ?? "";
+      if (!session.values.has(value)) {
+        drop(session.actionId);
+        invalidate(target, kind);
+        deps.enqueueText(target, invalidValueText(kind), null);
+        return "handled";
+      }
+      snapshot = {
+        eventId,
+        kind,
+        actionId: session.actionId,
+        messageId: session.messageId,
+        target: { ...session.target },
+        ownerUid,
+        value,
+        cardSeq: session.cardSeq,
+      };
+      pendingValidatedActions.set(eventId, snapshot);
     }
-    // 先核对持久绑定，再谈「发送在途」：串聊天或换 owner 的事件不能借在途状态占住事件队列。
-    if (
-      session.ownerUid !== ownerUid ||
-      session.target.channelType !== action.channelType ||
-      session.target.channelId !== action.channelId
-    ) {
-      // 绑定不符（换 owner、串聊天或伪造）：静默丢弃，不消耗 owner 的卡片。
-      return "ignored";
-    }
-    // 远端回执尚未绑定：保留事件，绑定后再按真实绑定判定（服务端已发布但回执在途的点击）。
-    if (session.messageId === null) return "retry";
-    if (session.messageId !== action.messageId) return "ignored";
-    const value = action.inputs[COMMAND_INPUT_ID] ?? "";
-    // 先失效再应用：重复投递不会在更新的选择之后再次落地；代次前进让在途的旧探测无法在本选择
-    // 之后发布新卡。
-    drop(session.actionId);
-    invalidate(target, kind);
-    if (!session.values.has(value)) {
-      deps.enqueueText(target, invalidValueText(kind), null);
-      return "handled";
-    }
-    let receipt: string;
+    let reservation: ConfigApplyReservation;
     try {
-      receipt = await serialize(kind, target, () => deps.applyChoice(kind, target, value));
-    } catch (error) {
-      console.error(
-        `[config-card] apply failed target=${targetKey(target)}：${safeErrorMessage(error, "apply failed")}`,
-      );
-      deps.enqueueText(target, applyFailedText(kind), null);
-      return "handled";
+      reservation = reserveApply(snapshot.kind, snapshot.target, `bot-event:${eventId}`);
+    } catch {
+      return "retry";
     }
-    await finishCard(session, receipt);
+    let acceptance: ConfigCardActionAcceptance;
+    try {
+      acceptance = deps.acceptAction(snapshot, action, reservation);
+    } catch {
+      reservation.release();
+      return "retry";
+    }
+    if (acceptance === "retry") {
+      reservation.release();
+      return "retry";
+    }
+    pendingValidatedActions.delete(eventId);
+    // 持久交接成功后才消费内存菜单；重投命中 duplicate 不会再执行动作。
+    drop(snapshot.actionId);
+    invalidate(snapshot.target, snapshot.kind);
+    // accepted 快照由 ingress 持有并在回调返回后调度；本事件调用栈不启动或等待长动作。
     return "handled";
   }
 
-  return { begin, open, invalidate, serialize, handleAction };
+  return { begin, open, invalidate, reserveApply, serialize, handleAction, resumeAcceptedAction };
 }

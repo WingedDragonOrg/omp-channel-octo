@@ -17,6 +17,7 @@ import {
   type AnswererNames,
 } from "./cards/ask-card.ts";
 import type { BotEventOutcome } from "./bot-events.ts";
+import type { IngressConsumer, IngressJobInput, IngressRoutePurpose } from "./inbound/ingress-types.ts";
 import type {
   BotCardAction,
   ChannelTransport,
@@ -25,7 +26,7 @@ import type {
 } from "./contracts.ts";
 import { safeErrorMessage } from "./errors.ts";
 import type { ChannelStore } from "./store/index.ts";
-import type { InboundClaim, QuestionCloseReason, QuestionRecord, TaskRecord } from "./store/store-records.ts";
+import type { QuestionCloseReason, QuestionRecord, TaskRecord } from "./store/store-records.ts";
 import { targetKey } from "./target.ts";
 
 /**
@@ -49,6 +50,34 @@ const LATE_WAKE_HEADLINE = "[ask 答复] 该问题的原等待已结束，收到
 
 /** One recorded answer plus who gave it; `answeredBy` is `null` only for rows written before attribution. */
 type QuestionAnswer = { answer: string; answeredBy: string | null };
+type CardEventAnswer = {
+  question: QuestionRecord;
+  answer: string;
+  answeredBy: string;
+};
+
+type CardEventPlan =
+  | {
+      kind: "single";
+      question: QuestionRecord;
+      answer: string;
+      answeredBy: string;
+      late: boolean;
+      generation: number;
+    }
+  | {
+      kind: "set";
+      pending: readonly { id: string; answer: string; answeredBy: string }[];
+      late: readonly CardEventAnswer[];
+      generation: number;
+    };
+
+/** Live waiters need answers only in-process; the ingress consumer stores replayable effect IDs. */
+type CardEventEffects = {
+  wakeTaskIds: string[];
+  questionIds: string[];
+  liveAnswers: Array<{ id: string; answer: string; answeredBy: string }>;
+};
 
 type QuestionWaiter = {
   taskId: string;
@@ -173,10 +202,16 @@ export interface QuestionDeskDeps {
   botUid(): string | undefined;
   stopping(): boolean;
   enqueueText(target: ChatTarget, text: string, taskId: string | null): void;
+  /** Atomically persists an ask continuation as a durable task; never performs worker/RPC work. */
+  persistWakeTurn(message: InboundMessage, text: string, sourceId: string): string;
+  /** Signals a task already committed by persistWakeTurn; post-commit only. */
+  publishWakeTurn(taskId: string): void;
+  /** Atomically persists a stable rejection/invalid-answer receipt in the outbox. */
+  persistNotice(message: InboundMessage, text: string, sourceId: string): string;
+  /** Signals delivery of a notice already committed by persistNotice; post-commit only. */
+  publishNotice(message: InboundMessage): void;
   /** 后台卡片编辑等操作交给服务统一跟踪，停机时等待它们结束。 */
   operationSet(operation: Promise<void>): void;
-  /** 与文本回复路径共用的持久 claim，保证一条消息只作一次答案。 */
-  commandClaim(message: InboundMessage, name: string): InboundClaim;
   /** 提问等待的超时（毫秒），来自配置。 */
   askTimeoutMs(): number;
   /**
@@ -190,7 +225,7 @@ export interface QuestionDeskDeps {
    * 保持待答、迟到答复照旧唤醒；旧的那批不能再复活，否则进程再死一次时会被当成可答问题留给新回合。
    */
   stopTurnForQuestion(taskId: string, cancelQuestionIds: readonly string[]): void;
-  /** 已无等待者的答案（停回合后 owner 才答复）：作为该聊天的新回合输入交付。 */
+  /** 仅为保留现有服务接线；问答续投必须走上方的持久化接口。 */
   wakeTurn(target: ChatTarget, text: string): void;
   /**
    * 成员作答授权：问题所在聊天是否允许非 owner 的成员作答（已开通群/子区；私聊与未开通聊天
@@ -201,9 +236,44 @@ export interface QuestionDeskDeps {
   onTextAnswer?(message: InboundMessage, taskId: string): void;
 }
 
+/** 授权受理时冻结的文字用途；空快照必须显式保存，不能在消费时重查“当前问题”。 */
+export type TextQuestionRouteSnapshot = Extract<
+  IngressRoutePurpose,
+  { kind: "questions" } | { kind: "none" }
+>;
+
+/** 精确快照消费结果；除 `none` 外都表示原文字已被问题路径终结，不能回落成普通任务。 */
+export type TextQuestionConsumeOutcome = "answered" | "closed" | "session-switched" | "none";
+
+export interface PreparedTextQuestionConsumption {
+  /** Stable exact-question consumer identity used by the ingress handoff row. */
+  readonly consumerId: string;
+  /** Stable effects created by persist; retained by the ingress consumer for crash recovery. */
+  readonly effects: {
+    readonly wakeTaskIds: readonly string[];
+    readonly noticeIds: readonly string[];
+  };
+  /** Synchronous store-only phase; safe inside `handoffIngressJob` and throws on storage failure. */
+  persist(): boolean;
+  /** Commit-only publication phase; releases waiters and signals durable effects. */
+  publishAfterCommit(): TextQuestionConsumeOutcome;
+}
+
 export interface QuestionDesk {
-  /** 待回答问题的一条普通回复即答案；没有待回答问题返回 false。 */
-  answerPendingQuestion(message: InboundMessage, text: string): Promise<boolean>;
+  /** 同步冻结受理当刻的精确问题集合，含明确的 none。 */
+  captureTextRoute(target: ChatTarget): TextQuestionRouteSnapshot;
+  /**
+   * Prepares one exact-qid answer handoff. `persist` performs only synchronous question CAS and may
+   * run inside the ingress transaction; callers MUST invoke `publishAfterCommit` only after that
+   * transaction commits. A rollback therefore cannot release a waiter, wake a turn or redraw a card.
+   */
+  prepareTextSnapshot(
+    message: InboundMessage,
+    text: string,
+    snapshot: Extract<TextQuestionRouteSnapshot, { kind: "questions" }>,
+    invalidation?: "session-switched",
+    sourceId?: string,
+  ): PreparedTextQuestionConsumption;
   /**
    * `ask` host tool：提问并等到答案（含卡片与文本回退）。等待超过配置的超时不落状态：
    * 问题保持待答、卡片保持可提交，当前回合被停住；owner 之后的答复唤醒新回合。
@@ -245,8 +315,8 @@ export interface QuestionDesk {
    * 该任务自己的提问。
    */
   cancelForTask(taskId: string, reason: QuestionCloseReason): void;
-  /** 取消一个聊天的问题并封闭其卡片（`/cancel`）。 */
-  cancelForTarget(target: ChatTarget): void;
+  /** Cancel all questions for `/cancel`, or close the exact durable snapshot captured with its intent. */
+  cancelForTarget(target: ChatTarget, questionIds?: readonly string[]): void;
   /** 服务停机：清掉问题计时器。 */
   stop(): void;
 }
@@ -275,49 +345,190 @@ export function createQuestionDesk(deps: QuestionDeskDeps): QuestionDesk {
     }
   }
 
-/**
- * A plain reply in the chat holding the pending question is the answer itself — from the owner
- * or, in an enabled group/thread, from any member the gate already let through: a valid
- * option index selects that option, any other text is returned verbatim as the free-form
- * answer. The sender is recorded as the answerer. Returns false when nothing is pending, so the
- * text stays ordinary task input.
- */
-async function answerPendingQuestion(message: InboundMessage, text: string): Promise<boolean> {
-  if (text.length === 0) return false;
-  const pending = deps.store.listPendingQuestions(currentBotUid(), message);
-  const question = pending[0];
-  if (!question) return false;
-  const answeredBy = message.senderId.trim();
-  const claim = deps.commandClaim(message, "answer");
-  if (!deps.store.claimCommand(claim)) return true;
-  try {
-    if (pending.length > 1) {
-      const answeredQuestion = answerQuestionSetFromText(message, pending, text, answeredBy);
-      deps.store.completeCommand(claim);
-      if (answeredQuestion !== undefined) observeTextAnswer(message, answeredQuestion.taskId);
-      return true;
-    }
-    let normalized: string;
-    try {
-      normalized = normalizeAnswer(question, text);
-    } catch {
-      await deps.enqueueText(message, "答案无效：请回复选项编号或直接输入答案。", null);
-      deps.store.completeCommand(claim);
-      return true;
-    }
-    if (!applyQuestionAnswer(question, normalized, answeredBy)) {
-      await deps.enqueueText(message, "问题已失效，本次回复未作为答案记录。", null);
-      deps.store.completeCommand(claim);
-      return true;
-    }
-    observeTextAnswer(message, question.taskId);
-    deps.store.completeCommand(claim);
-    return true;
-  } catch {
-    deps.store.failCommand(claim);
-    throw new Error("本地状态盘写入失败，未能记录答案。");
+  function captureTextRoute(target: ChatTarget): TextQuestionRouteSnapshot {
+    const questionIds = deps.store.listPendingQuestions(currentBotUid(), target).map(({ id }) => id);
+    return questionIds.length === 0 ? { kind: "none" } : { kind: "questions", questionIds };
   }
-}
+
+  /**
+   * Prepares consumption of frozen qids without querying "the current question". The returned
+   * persist phase owns only SQLite reads/CAS. Every in-memory and network-visible effect is deferred
+   * to publishAfterCommit, so an outer ingress rollback leaves both the question waiter and card UI
+   * untouched.
+   */
+  function prepareTextSnapshot(
+    message: InboundMessage,
+    text: string,
+    snapshot: Extract<TextQuestionRouteSnapshot, { kind: "questions" }>,
+    invalidation?: "session-switched",
+    sourceId?: string,
+  ): PreparedTextQuestionConsumption {
+    const botUid = currentBotUid();
+    const wakeTaskIds: string[] = [];
+    const noticeIds: string[] = [];
+    const stableSourceId = sourceId ?? `${message.channelType}:${message.channelId}:${message.messageId}`;
+    const consumerId = `questions:${JSON.stringify(snapshot.questionIds)}:${stableSourceId}`;
+    let persisted = false;
+    let publishedOutcome: TextQuestionConsumeOutcome | undefined;
+    let rows: QuestionRecord[] = [];
+    let answeredBy = "";
+    let landedIds: string[] = [];
+    let answerById = new Map<string, string>();
+    let lateLanded: Array<{ question: QuestionRecord; answer: string; answeredBy: string }> = [];
+    let rejectedNotice: string | null = null;
+
+    return {
+      consumerId,
+      get effects() {
+        return { wakeTaskIds: [...wakeTaskIds], noticeIds: [...noticeIds] };
+      },
+      persist(): boolean {
+        // Outer handoff rollback also rolls back nested writes: a retry of this prepared object
+        // must repeat every CAS and durable effect insertion instead of trusting an in-memory bit.
+        persisted = false;
+        publishedOutcome = undefined;
+        rows = [];
+        landedIds = [];
+        answerById = new Map<string, string>();
+        lateLanded = [];
+        wakeTaskIds.length = 0;
+        noticeIds.length = 0;
+        rejectedNotice = null;
+        if (snapshot.questionIds.length === 0 || text.length === 0) {
+          persisted = true;
+          return true;
+        }
+        if (invalidation === "session-switched") {
+          rejectedNotice = "问题已因会话切换失效，本次回复未作为答案记录。";
+          noticeIds.push(deps.persistNotice(message, rejectedNotice, `${stableSourceId}:notice`));
+          persisted = true;
+          return true;
+        }
+        rows = snapshot.questionIds
+          .map((id) => deps.store.getQuestion(id))
+          .filter((row): row is QuestionRecord =>
+            row !== null &&
+            row.botUid === botUid &&
+            row.channelType === message.channelType &&
+            row.channelId === message.channelId);
+        answeredBy = message.senderId.trim();
+        const pending = rows.filter(({ state }) => state === "pending");
+        const isFrozenSet = snapshot.questionIds.length > 1;
+        const pendingAnswers: Array<{ id: string; answer: string; answeredBy: string }> = [];
+        for (const question of pending) {
+          try {
+            pendingAnswers.push({ id: question.id, answer: normalizeAnswer(question, text), answeredBy });
+          } catch {
+            if (isFrozenSet) {
+              pendingAnswers.push({ id: question.id, answer: text, answeredBy });
+              continue;
+            }
+            rejectedNotice = "答案无效：请回复选项编号或直接输入答案。";
+            break;
+          }
+        }
+        if (rejectedNotice === null) {
+          landedIds = pendingAnswers.length === 0
+            ? []
+            : deps.store.answerQuestions(botUid, message, pendingAnswers);
+          answerById = new Map(pendingAnswers.map(({ id, answer }) => [id, answer]));
+        }
+
+        const lateCandidates: Array<{ question: QuestionRecord; answer: string; answeredBy: string }> = [];
+        for (const question of rows) {
+          if (landedIds.includes(question.id)) continue;
+          if (question.state === "answered") {
+            rejectedNotice = "问题已失效，本次回复未作为答案记录。";
+            continue;
+          }
+          if (question.state === "pending") continue;
+          const target = { channelType: question.channelType, channelId: question.channelId };
+          if (!lateAccepted(question, target)) {
+            rejectedNotice = "问题已失效，本次回复未作为答案记录。";
+            continue;
+          }
+          try {
+            lateCandidates.push({
+              question,
+              answer: normalizeAnswer(question, text),
+              answeredBy,
+            });
+          } catch {
+            if (isFrozenSet) {
+              lateCandidates.push({ question, answer: text, answeredBy });
+            } else {
+              rejectedNotice = "问题已失效，本次回复未作为答案记录。";
+            }
+          }
+        }
+        lateLanded = landLateAnswers(lateCandidates);
+
+        const wakeEntries: Array<{ question: QuestionRecord; answer: string; answeredBy: string }> = [];
+        for (const id of landedIds) {
+          const question = rows.find(({ id: questionId }) => questionId === id);
+          if (question === undefined || questionWaiters.has(id) || isAwaitingClaim(question)) continue;
+          wakeEntries.push({ question, answer: answerById.get(id) ?? text, answeredBy });
+        }
+        for (const entry of lateLanded) {
+          if (isAwaitingClaim(entry.question)) continue;
+          wakeEntries.push(entry);
+        }
+        const wakeText = formatWakeAnswers(wakeEntries, lateLanded.length > 0
+          ? LATE_WAKE_HEADLINE
+          : TIMEOUT_WAKE_HEADLINE);
+        if (wakeText !== null) {
+          wakeTaskIds.push(deps.persistWakeTurn(message, wakeText, `${stableSourceId}:wake`));
+        }
+        if (rejectedNotice !== null) {
+          noticeIds.push(deps.persistNotice(message, rejectedNotice, `${stableSourceId}:notice`));
+        }
+        persisted = true;
+        return true;
+      },
+      publishAfterCommit(): TextQuestionConsumeOutcome {
+        if (!persisted) throw new Error("question consumption was not persisted");
+        if (publishedOutcome !== undefined) return publishedOutcome;
+        if (snapshot.questionIds.length === 0 || text.length === 0) {
+          publishedOutcome = "none";
+          return publishedOutcome;
+        }
+        if (invalidation === "session-switched") {
+          publishedOutcome = "session-switched";
+          if (noticeIds.length > 0) deps.publishNotice(message);
+          return publishedOutcome;
+        }
+
+        const affected = new Set([...landedIds, ...lateLanded.map(({ question }) => question.id)]);
+        publishedOutcome = affected.size > 0 ? "answered" : "closed";
+        const rowById = new Map(rows.map((row) => [row.id, row]));
+        for (const id of landedIds) {
+          const question = rowById.get(id);
+          if (question !== undefined) releaseQuestion(id, { answer: answerById.get(id) ?? text, answeredBy });
+        }
+        for (const messageId of questionsByCard(rows).keys()) {
+          const fresh = deps.store.listQuestionsByCard(botUid, message, messageId);
+          const first = fresh[0];
+          if (first === undefined) continue;
+          forgetAskGeneration(messageId);
+          if (fresh.length === 1 && first.state === "answered") {
+            rewriteAskCard(first, {
+              kind: "answered",
+              answer: first.answer ?? text,
+              answeredBy: first.answeredBy,
+            });
+          } else if (fresh.every(({ state }) => state !== "pending")) {
+            rewriteAskCardSet(fresh, { kind: "closed", note: null }, null);
+          }
+        }
+        for (const taskId of wakeTaskIds) deps.publishWakeTurn(taskId);
+        if (noticeIds.length > 0) deps.publishNotice(message);
+        const observed = rows.find((question) => affected.has(question.id));
+        if (observed !== undefined) observeTextAnswer(message, observed.taskId);
+        return publishedOutcome;
+      },
+    };
+  }
+
 
 /** 关闭原因对应的卡片说明：用户叫停的两条照旧，生命周期收尾说明「仍可提交」。 */
 function closeNote(reason: QuestionCloseReason): string {
@@ -359,53 +570,6 @@ function closeQuestionCards(botUid: string, questions: readonly QuestionRecord[]
   }
 }
 
-/**
- * One text reply answers a whole multi-question card: it becomes the answer of every question
- * still open — each interpreting it under its own rule — and the ask returns at once instead of
- * waiting for the remaining questions one by one. The answers land as one compare-and-set per
- * row inside one transaction, and each card involved is rewritten once.
- */
-function answerQuestionSetFromText(
-  message: InboundMessage,
-  pending: readonly QuestionRecord[],
-  text: string,
-  answeredBy: string,
-): QuestionRecord | undefined {
-  const botUid = currentBotUid();
-  const answers = pending.map((question) => {
-    let answer = text;
-    try {
-      answer = normalizeAnswer(question, text);
-    } catch {
-      // A numeric reply that does not name this question's options is still an answer as typed.
-    }
-    return { id: question.id, answer, answeredBy };
-  });
-  const landed = deps.store.answerQuestions(botUid, message, answers);
-  const byId = new Map(answers.map(({ id, answer }) => [id, answer]));
-  const byQuestion = new Map(pending.map((question) => [question.id, question]));
-  const speaking: Array<{ question: QuestionRecord; answer: string; answeredBy: string }> = [];
-  for (const id of landed) {
-    const answer = byId.get(id) ?? text;
-    const question = byQuestion.get(id);
-    if (!releaseQuestion(id, { answer, answeredBy }) && question !== undefined) {
-      speaking.push({ question, answer, answeredBy });
-    }
-  }
-  for (const messageId of questionsByCard(pending).keys()) {
-    const rows = deps.store.listQuestionsByCard(botUid, message, messageId);
-    forgetAskGeneration(messageId);
-    const first = rows[0];
-    if (first === undefined) continue;
-    if (rows.length === 1) {
-      rewriteAskCard(first, { kind: "answered", answer: byId.get(first.id) ?? text, answeredBy });
-    } else {
-      rewriteAskCardSet(rows, { kind: "closed", note: null }, null);
-    }
-  }
-  wakeForAnswers(speaking, TIMEOUT_WAKE_HEADLINE);
-  return pending.find(question => landed.includes(question.id));
-}
 
 function normalizeAnswer(question: { payload: string }, answer: string): string {
   const payload = JSON.parse(question.payload) as Record<string, unknown>;
@@ -935,14 +1099,14 @@ function wakeUnclaimedAnswers(taskId: string): void {
   const orphaned: Array<{ question: QuestionRecord; answer: string; answeredBy: string | null }> = [];
   for (const entry of unclaimedEntries(taskId)) {
     const question = deps.store.getQuestion(entry.questionId);
-    if (question?.state === "answered") {
+    // An `ended` answer was already published as late input; it isn't an unclaimed answer from the recovery window.
+    if (question?.state === "answered" && question.closedReason !== "ended") {
       orphaned.push({ question, answer: question.answer ?? "", answeredBy: question.answeredBy });
     }
   }
   if (orphaned.length === 0) return;
-  // 先丢掉快照：这批复述不再有认领方，投递不该再被认领窗口拦下。
-  recoveryQuestions.delete(taskId);
-  wakeForAnswers(orphaned, RESTART_WAKE_HEADLINE);
+  // Keep the recovery snapshot until the durable continuation is committed and published.
+  wakeForAnswers(orphaned, RESTART_WAKE_HEADLINE, true);
 }
 
 /**
@@ -1090,15 +1254,13 @@ function isAwaitingClaim(question: QuestionRecord): boolean {
  * 重启窗口里被快照留给续跑 ask 认领的行不在此列：那次调用已经拿到答案，另起回合只会把同一个
  * 答复投递两次。
  */
-function wakeForAnswers(
+function formatWakeAnswers(
   entries: readonly { question: QuestionRecord; answer: string; answeredBy: string | null }[],
   headline: string,
-): void {
-  const speaking = entries.filter(({ question }) => !isAwaitingClaim(question));
-  const first = speaking[0]?.question;
-  if (first === undefined) return;
+): string | null {
+  if (entries.length === 0) return null;
   const lines = [headline];
-  for (const { question, answer, answeredBy } of speaking) {
+  for (const { question, answer, answeredBy } of entries) {
     const payload = parseQuestionPayload(question);
     const ask = payload === null ? null : askQuestionFromPayload(payload);
     const who = answeredBy?.trim() ?? "";
@@ -1111,7 +1273,38 @@ function wakeForAnswers(
     lines.push(`问题${typeof sourceId === "string" ? `（id=${sourceId}）` : ""}：${ask.question}`);
     lines.push(`答案${attribution}：${askAnswerText(ask, answer)}`);
   }
-  deps.wakeTurn({ channelType: first.channelType, channelId: first.channelId }, lines.join("\n"));
+  return lines.join("\n");
+}
+
+function wakeForAnswers(
+  entries: readonly { question: QuestionRecord; answer: string; answeredBy: string | null }[],
+  headline: string,
+  includeUnclaimedRecovery = false,
+): void {
+  const speaking = includeUnclaimedRecovery
+    ? entries
+    : entries.filter(({ question }) => !isAwaitingClaim(question));
+  const text = formatWakeAnswers(speaking, headline);
+  const first = speaking[0]?.question;
+  if (text === null || first === undefined) return;
+
+  const questionIds = speaking.map(({ question }) => question.id).sort();
+  const sourceId = `ask-answer:${JSON.stringify(questionIds)}`;
+  const message: InboundMessage = {
+    channelType: first.channelType,
+    channelId: first.channelId,
+    messageId: `ask-answer:${first.id}`,
+    senderId: first.answeredBy?.trim() || first.botUid,
+    text,
+    mentionedUserIds: [],
+    attachments: [],
+    quoted: null,
+    supported: true,
+    messageSeq: 0,
+    messageTimestamp: 0,
+  };
+  const taskId = deps.persistWakeTurn(message, text, sourceId);
+  deps.publishWakeTurn(taskId);
 }
 
 /**
@@ -1291,6 +1484,11 @@ async function answerFromCard(action: BotCardAction): Promise<BotEventOutcome> {
     const awaitingReceipt = deps.store.listPendingQuestions(botUid, target)
       .some((question) => sendingQuestions.has(question.id));
     return awaitingReceipt ? "retry" : "ignored";
+  }
+  const eventId = cardEventId(action);
+  if (eventId !== null) {
+    const durableOutcome = answerQuestionCardEvent(action, eventId, botUid, target, rows, operator);
+    if (durableOutcome !== null) return durableOutcome;
   }
   if (rows.length === 1) return answerSingleCardClick(first, action, operator);
   return answerSetCardClick(target, rows, action, operator);
@@ -1495,12 +1693,375 @@ function answerSetCardClick(
   wakeForAnswers(lateLanded, LATE_WAKE_HEADLINE);
   return "handled";
 }
+function cardEventId(action: BotCardAction): number | null {
+  const eventId = (action as BotCardAction & { eventId?: unknown }).eventId;
+  return typeof eventId === "number" && Number.isSafeInteger(eventId) && eventId >= 0
+    ? eventId
+    : null;
+}
 
-  function cancelForTarget(target: ChatTarget): void {
+function cardEventMessage(action: BotCardAction, eventId: number): InboundMessage {
+  return {
+    channelType: action.channelType,
+    channelId: action.channelId,
+    messageId: `card-event:${eventId}`,
+    senderId: action.operatorUid,
+    text: "",
+    mentionedUserIds: [],
+    attachments: [],
+    quoted: null,
+    supported: false,
+    messageSeq: 0,
+    messageTimestamp: 0,
+  };
+}
+
+function encodeCardEventEffects(effects: CardEventEffects): string {
+  return `ask-card-v1:${JSON.stringify({
+    wakeTaskIds: effects.wakeTaskIds,
+    questionIds: effects.questionIds,
+  })}`;
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((id: unknown) => typeof id === "string");
+}
+
+function decodeCardEventEffects(consumerId: string | null): CardEventEffects | null {
+  const prefix = "ask-card-v1:";
+  if (consumerId === null || !consumerId.startsWith(prefix)) return null;
+  try {
+    const parsed: unknown = JSON.parse(consumerId.slice(prefix.length));
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const record = parsed as Record<string, unknown>;
+    if (!isStringArray(record.wakeTaskIds) || !isStringArray(record.questionIds)) return null;
+    return {
+      wakeTaskIds: record.wakeTaskIds,
+      questionIds: record.questionIds,
+      liveAnswers: [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+function cardEventPlan(
+  target: ChatTarget,
+  rows: readonly QuestionRecord[],
+  action: BotCardAction,
+  answeredBy: string,
+): CardEventPlan | null {
+  if (rows.length === 1) {
+    const question = rows[0]!;
+    if (question.state === "pending") {
+      const ref = parseAskActionId(action.actionId);
+      const payload = parseQuestionPayload(question);
+      const ask = payload === null ? null : askQuestionFromPayload(payload);
+      if (ref === null || ask === null) return null;
+      const resolved = resolveAskAnswer(ask, ref, action.inputs);
+      if (resolved.kind !== "answer") return null;
+      try {
+        return {
+          kind: "single",
+          question,
+          answer: normalizeAnswer(question, resolved.answer),
+          answeredBy,
+          late: false,
+          generation: ref.generation,
+        };
+      } catch {
+        return null;
+      }
+    }
+    const ref = parseAskActionId(action.actionId);
+    if (question.state === "answered" || ref === null || !lateAccepted(question, target)) return null;
+    const answer = closedClickAnswer(question, action);
+    return answer === null
+      ? null
+      : { kind: "single", question, answer, answeredBy, late: true, generation: ref.generation };
+  }
+
+  const pending = rows.filter(({ state }) => state === "pending");
+  const closed = rows.filter(({ state }) => state !== "pending" && state !== "answered");
+  if (pending.length === 0 && closed.length === 0) return null;
+  const ref = parseAskActionId(action.actionId);
+  if (ref === null || ref.kind !== "submit") return null;
+  const filled: Array<{ id: string; answer: string; answeredBy: string }> = [];
+  for (const question of pending) {
+    const payload = parseQuestionPayload(question);
+    const ask = payload === null ? null : askQuestionFromPayload(payload);
+    const position = payload === null ? null : questionPosition(payload);
+    if (ask === null || position === null) continue;
+    const answer = resolveAskSetAnswer(ask, position.index, action.inputs);
+    if (answer !== null) filled.push({ id: question.id, answer, answeredBy });
+  }
+  const late: CardEventAnswer[] = [];
+  for (const question of closed) {
+    if (!lateAccepted(question, target)) continue;
+    const payload = parseQuestionPayload(question);
+    const ask = payload === null ? null : askQuestionFromPayload(payload);
+    const position = payload === null ? null : questionPosition(payload);
+    if (ask === null || position === null) continue;
+    const answer = resolveAskSetAnswer(ask, position.index, action.inputs);
+    if (answer !== null) late.push({ question, answer, answeredBy });
+  }
+  return filled.length === 0 && late.length === 0
+    ? null
+    : { kind: "set", pending: filled, late, generation: ref.generation };
+}
+
+function cardEventInput(
+  botUid: string,
+  eventId: number,
+  target: ChatTarget,
+  rows: readonly QuestionRecord[],
+  action: BotCardAction,
+): IngressJobInput {
+  const binding = deps.store.getBinding(botUid, target);
+  const payloadAction: BotCardAction = {
+    messageId: action.messageId,
+    channelType: action.channelType,
+    channelId: action.channelId,
+    actionId: action.actionId,
+    operatorUid: action.operatorUid,
+    inputs: { ...action.inputs },
+  };
+  return {
+    botUid,
+    sourceKind: "bot-event",
+    sourceId: String(eventId),
+    ...target,
+    messageId: action.messageId,
+    payload: { kind: "bot-event", eventId, action: payloadAction, acceptedAction: null },
+    routeSnapshot: {
+      purpose: { kind: "questions", questionIds: rows.map(({ id }) => id) },
+      sessionGeneration: 0,
+      binding: binding === null
+        ? null
+        : { sessionId: binding.sessionId, cwd: binding.cwd, sessionFile: binding.sessionFile },
+      barrierJobId: null,
+    },
+    lane: "control",
+    state: "accepted",
+    ackReady: true,
+    operationCheckpoint: null,
+  };
+}
+
+/** Synchronous store-only phase: the bot-event claim, answer CAS, and wake tasks commit together. */
+function persistCardEventPlan(
+  botUid: string,
+  eventId: number,
+  target: ChatTarget,
+  rows: readonly QuestionRecord[],
+  message: InboundMessage,
+  plan: CardEventPlan,
+): CardEventEffects {
+  const effects: CardEventEffects = { wakeTaskIds: [], questionIds: [], liveAnswers: [] };
+  let lateLanded: CardEventAnswer[] = [];
+  if (plan.kind === "single") {
+    if (plan.late) {
+      lateLanded = landLateAnswers([{
+        question: plan.question,
+        answer: plan.answer,
+        answeredBy: plan.answeredBy,
+      }]);
+      for (const entry of lateLanded) effects.questionIds.push(entry.question.id);
+    } else if (deps.store.answerQuestion(
+      plan.question.id,
+      botUid,
+      plan.question,
+      plan.answer,
+      plan.answeredBy,
+    )) {
+      effects.questionIds.push(plan.question.id);
+      effects.liveAnswers.push({
+        id: plan.question.id,
+        answer: plan.answer,
+        answeredBy: plan.answeredBy,
+      });
+    }
+  } else {
+    const landedIds = plan.pending.length === 0
+      ? []
+      : deps.store.answerQuestions(botUid, target, plan.pending);
+    const answersById = new Map(plan.pending.map((entry) => [entry.id, entry]));
+    for (const id of landedIds) {
+      const answer = answersById.get(id);
+      if (answer === undefined) continue;
+      effects.questionIds.push(id);
+      effects.liveAnswers.push({ id, answer: answer.answer, answeredBy: answer.answeredBy });
+    }
+    lateLanded = landLateAnswers(plan.late);
+    for (const entry of lateLanded) effects.questionIds.push(entry.question.id);
+  }
+
+  const rowById = new Map(rows.map((question) => [question.id, question]));
+  const timeoutEntries: CardEventAnswer[] = [];
+  for (const answer of effects.liveAnswers) {
+    const question = rowById.get(answer.id);
+    if (
+      question !== undefined
+      && !questionWaiters.has(answer.id)
+      && !isAwaitingClaim(question)
+    ) {
+      timeoutEntries.push({ question, answer: answer.answer, answeredBy: answer.answeredBy });
+    }
+  }
+  const lateEntries = lateLanded.filter(({ question }) => !isAwaitingClaim(question));
+  const timeoutText = formatWakeAnswers(timeoutEntries, TIMEOUT_WAKE_HEADLINE);
+  if (timeoutText !== null) {
+    effects.wakeTaskIds.push(
+      deps.persistWakeTurn(message, timeoutText, `card-event:${eventId}:timeout-wake`),
+    );
+  }
+  const lateText = formatWakeAnswers(lateEntries, LATE_WAKE_HEADLINE);
+  if (lateText !== null) {
+    effects.wakeTaskIds.push(
+      deps.persistWakeTurn(message, lateText, `card-event:${eventId}:late-wake`),
+    );
+  }
+  return effects;
+}
+
+function askGenerationAfterReplay(messageId: string, seen: number): number {
+  const generation = Math.max(seen + 1, askCardGeneration.get(messageId) ?? 0);
+  askCardGeneration.set(messageId, generation);
+  return generation;
+}
+
+function publishCardEventEffects(
+  botUid: string,
+  target: ChatTarget,
+  action: BotCardAction,
+  effects: CardEventEffects,
+  generation: number | null,
+  replay: boolean,
+): void {
+  for (const answer of effects.liveAnswers) {
+    releaseQuestion(answer.id, { answer: answer.answer, answeredBy: answer.answeredBy });
+  }
+
+  if (effects.questionIds.length > 0) {
+    const affected = new Set(effects.questionIds);
+    const fresh = deps.store.listQuestionsByCard(botUid, target, action.messageId);
+    if (fresh.length === 1) {
+      const question = fresh[0]!;
+      if (affected.has(question.id) && question.state === "answered") {
+        rewriteAskCard(question, {
+          kind: "answered",
+          answer: question.answer ?? "",
+          answeredBy: question.answeredBy,
+        });
+        forgetAskGeneration(question.cardMessageId);
+      }
+    } else if (fresh.some(({ id }) => affected.has(id))) {
+      if (fresh.some(({ state }) => state === "pending")) {
+        if (generation !== null) {
+          const nextGeneration = replay
+            ? askGenerationAfterReplay(action.messageId, generation)
+            : nextAskGeneration(action.messageId, generation);
+          rewriteAskCardSet(fresh, { kind: "open", generation: nextGeneration }, null);
+        }
+      } else {
+        forgetAskGeneration(action.messageId);
+        rewriteAskCardSet(fresh, { kind: "closed", note: null }, null);
+      }
+    }
+  }
+
+  for (const taskId of effects.wakeTaskIds) deps.publishWakeTurn(taskId);
+}
+
+/** Atomically records the source-event handoff with its answer CAS and durable continuation tasks. */
+function answerQuestionCardEvent(
+  action: BotCardAction,
+  eventId: number,
+  botUid: string,
+  target: ChatTarget,
+  rows: readonly QuestionRecord[],
+  answeredBy: string,
+): BotEventOutcome | null {
+  try {
+    const sourceKey = { botUid, sourceKind: "bot-event" as const, sourceId: String(eventId) };
+    const input = cardEventInput(botUid, eventId, target, rows, action);
+    const prior = deps.store.getIngressJobBySource(sourceKey);
+    if (prior?.state === "handed-off") {
+      const persisted = decodeCardEventEffects(prior.consumerId);
+      if (persisted === null) return "retry";
+      const actionRef = parseAskActionId(action.actionId);
+      publishCardEventEffects(
+        botUid,
+        target,
+        action,
+        persisted,
+        actionRef?.generation ?? null,
+        true,
+      );
+      return "handled";
+    }
+
+    const plan = cardEventPlan(target, rows, action, answeredBy);
+    if (plan === null) return null;
+    const message = cardEventMessage(action, eventId);
+    let effects: CardEventEffects = { wakeTaskIds: [], questionIds: [], liveAnswers: [] };
+    let consumerId = encodeCardEventEffects(effects);
+    let persistRan = false;
+    const consumer: IngressConsumer = {
+      kind: "ask",
+      get id() {
+        return consumerId;
+      },
+    };
+    const accepted = deps.store.acceptAndHandoffIngressJob(input, consumer, () => {
+      persistRan = true;
+      effects = persistCardEventPlan(botUid, eventId, target, rows, message, plan);
+      consumerId = encodeCardEventEffects(effects);
+      return true;
+    });
+    if (!accepted) return "retry";
+    if (!persistRan) {
+      const handedOff = deps.store.getIngressJobBySource(sourceKey);
+      if (handedOff?.state !== "handed-off") return "retry";
+      const persisted = decodeCardEventEffects(handedOff.consumerId);
+      if (persisted === null) return "retry";
+      effects = persisted;
+    }
+    publishCardEventEffects(
+      botUid,
+      target,
+      action,
+      effects,
+      plan.generation,
+      !persistRan,
+    );
+    return "handled";
+  } catch {
+    return "retry";
+  }
+}
+
+  function cancelForTarget(target: ChatTarget, questionIds?: readonly string[]): void {
     const botUid = deps.botUid();
     if (botUid === undefined) return;
-    const openQuestions = deps.store.listPendingQuestions(botUid, target);
-    deps.store.cancelQuestions(botUid, target, "cancelled");
+    const openQuestions = questionIds === undefined
+      ? deps.store.listPendingQuestions(botUid, target)
+      : questionIds.flatMap(id => {
+          const question = deps.store.getQuestion(id);
+          return question !== null
+            && question.botUid === botUid
+            && targetKey(question) === targetKey(target)
+            && (question.state === "pending" || question.state === "cancelled")
+            ? [question]
+            : [];
+        });
+    if (questionIds === undefined) {
+      deps.store.cancelQuestions(botUid, target, "cancelled");
+    } else {
+      for (const question of openQuestions) {
+        if (question.state === "pending") deps.store.cancelQuestion(question.id, "cancelled");
+      }
+    }
     forgetRecoveredTarget(target);
     closeQuestionCards(botUid, openQuestions, CANCELLED_NOTE);
   }
@@ -1557,7 +2118,8 @@ function answerSetCardClick(
   }
 
   return {
-    answerPendingQuestion,
+    captureTextRoute,
+    prepareTextSnapshot,
     askQuestions,
     answerFromCard,
     rejectForTask,

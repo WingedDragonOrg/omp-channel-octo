@@ -76,7 +76,7 @@ test("watch host tool creates, lists, reads, and stops only in its task chat", a
   });
 
   try {
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       messageId: "watch-tool-request",
       ...target,
       text: "请持续关注直到 fixture condition 成立",
@@ -158,7 +158,7 @@ test("a matched watch queues an independent wake and cannot create another watch
   });
 
   try {
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       messageId: "watch-chain-source",
       ...target,
       text: sourceText,
@@ -199,7 +199,7 @@ test("a persisted owner DM watch is revoked before collection after the owner ch
   });
   let restarted: CoreHarness | undefined;
   try {
-    await original.service.handleInbound(inbound({
+    await original.service.submitInbound(inbound({
       ...target,
       messageId: "owner-dm-watch-source",
       senderId: "owner-1",

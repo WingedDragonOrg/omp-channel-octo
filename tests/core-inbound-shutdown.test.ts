@@ -6,6 +6,7 @@ import {
   closeCoreHarness,
   createCoreHarness,
   inbound,
+  waitForStatus,
   type CoreHarness,
 } from "./fixtures/core-fakes.ts";
 
@@ -13,8 +14,8 @@ const MAX_BYTES = 1024 * 1024;
 const FILE_BYTES = new Uint8Array([16, 32, 48, 64, 80, 96, 112, 128]);
 
 /**
- * 停机中断的入站必须以「有界停机/取消」错误拒绝：传输层只有把 handler 兑现为拒绝才不会
- * ACK 这条消息；静默 resolve 等于吞任务。数据库已关闭一类的错误不算有界取消。
+ * 停机中断仍处于准备阶段的入站必须拒绝 ackReady：传输层不能确认一条尚未可靠受理的消息。
+ * 状态盘已关闭一类的错误不算有界取消。
  */
 const SHUTDOWN_FLAVORED = /(stopping|shutdown|停止|正在停止|cancell?ed|aborted?)/iu;
 const DATABASE_CLOSED = /(sqlite|database|closed)/iu;
@@ -97,13 +98,13 @@ test("stop 中止在途附件下载：入站以有界取消拒绝、claim 回滚
   let observed: ObservedInbound | undefined;
   let second: CoreHarness | undefined;
   try {
-    observed = observeInbound(first.service.handleInbound(message));
+    observed = observeInbound(first.service.submitInbound(message));
     await enteredDownload.promise;
     await first.service.stop();
-    // stop 必须等入站清理完（含组装中断与命令 claim 回滚）才关闭状态盘。
+    // stop 必须等未受理入站清理完（含组装中断与命令 claim 回滚）才关闭状态盘。
     expect(observed.outcome()).not.toBeNull();
     const outcome = observed.outcome()!;
-    // 未接受的消息必须拒绝（传输层不能 ACK），且是有界取消而不是数据库已关闭。
+    // 准备阶段尚未可靠受理，因此 ackReady 必须拒绝，且是有界取消而不是数据库已关闭。
     expect(outcome.kind).toBe("rejected");
     const errorText = outcome.error instanceof Error
       ? `${outcome.error.name}: ${outcome.error.message}`
@@ -122,8 +123,13 @@ test("stop 中止在途附件下载：入站以有界取消拒绝、claim 回滚
       attachments: { enabled: true, maxBytes: MAX_BYTES },
     });
     second.transport.attachmentBodies.set(url, FILE_BYTES);
-    await second.service.handleInbound(message);
+    await second.service.submitInbound(message);
     await second.workers.waitForPromptCount(1);
+    await waitForStatus(
+      second.service,
+      { channelId: message.channelId, channelType: message.channelType },
+      (status) => status.state === "completed",
+    );
     expect(second.workers.prompts).toHaveLength(1);
     expect(second.workers.prompts[0]!.text).toContain("report.bin");
   } finally {
@@ -139,9 +145,9 @@ test("stop 中止在途附件下载：入站以有界取消拒绝、claim 回滚
 });
 
 /**
- * 同一生命周期契约的普通入站面：一条不带附件的群消息被免@ 查询（普通入站路径上真实的异
- * 步门禁）挂住时 stop，同样必须先中止并以有界取消拒绝、等清理完再关状态盘。静默 resolve
- * 会让传输层 ACK 掉这条消息；查询返回「需要 @」而悄悄丢弃也是同一类丢失。
+ * 同一生命周期契约的普通入站面：一条不带附件的群消息被免@查询（普通入站路径上真实的异
+ * 步门禁）挂住时 stop，同样必须先中止并拒绝尚未兑现的 ackReady、等清理完再关状态盘。
+ * 查询返回「需要 @」而悄悄丢弃也是同一类丢失。
  */
 test("stop 中止普通入站的异步门禁：有界取消拒绝而非静默 ACK，重启后重投恰好执行一次", async () => {
   const first = await createCoreHarness();
@@ -174,7 +180,7 @@ test("stop 中止普通入站的异步门禁：有界取消拒绝而非静默 AC
   let observed: ObservedInbound | undefined;
   let second: CoreHarness | undefined;
   try {
-    observed = observeInbound(first.service.handleInbound(message));
+    observed = observeInbound(first.service.submitInbound(message));
     await enteredMentionPref.promise;
     await first.service.stop();
     expect(observed.outcome()).not.toBeNull();
@@ -188,12 +194,18 @@ test("stop 中止普通入站的异步门禁：有界取消拒绝而非静默 AC
     expect(sentToChat(first, message)).toHaveLength(0);
     expect(attemptsToChat(first, message)).toHaveLength(0);
 
-    second = await createCoreHarness({ root: first.root });
-    second.transport.setGroupMentionPref("group-allowed", { effective: true });
-    await second.service.handleInbound(message);
-    await second.workers.waitForPromptCount(1);
-    expect(second.workers.prompts).toHaveLength(1);
-    expect(second.workers.prompts[0]!.text).toContain("整理一下群里的要点");
+    const restarted = await createCoreHarness({ root: first.root });
+    second = restarted;
+    restarted.transport.setGroupMentionPref("group-allowed", { effective: true });
+    await restarted.service.submitInbound(message);
+    await restarted.workers.waitForPromptCount(1);
+    await waitForStatus(
+      restarted.service,
+      { channelId: message.channelId, channelType: message.channelType },
+      (status) => status.state === "completed",
+    );
+    expect(restarted.workers.prompts).toHaveLength(1);
+    expect(restarted.workers.prompts[0]!.text).toContain("整理一下群里的要点");
   } finally {
     releaseMentionPref.resolve();
     await observed?.settled;
@@ -214,7 +226,7 @@ test("stop 之后到达的入站立即以有界取消拒绝，不产生任何副
   try {
     await harness.service.stop();
     const observed = observeInbound(
-      harness.service.handleInbound(
+      harness.service.submitInbound(
         inbound({
           channelId: "group-allowed",
           channelType: 2,
@@ -252,7 +264,7 @@ test("a mention decision resolving after stop cannot acknowledge unaccepted inpu
   };
   let observed: ObservedInbound | undefined;
   try {
-    observed = observeInbound(harness.service.handleInbound(inbound({
+    observed = observeInbound(harness.service.submitInbound(inbound({
       channelType: 2,
       channelId: "group-allowed",
       mentionedUserIds: [],
@@ -294,7 +306,7 @@ test("a download resolving during stop cleans the newly materialized file", asyn
   });
   let observed: ObservedInbound | undefined;
   try {
-    observed = observeInbound(harness.service.handleInbound(message));
+    observed = observeInbound(harness.service.submitInbound(message));
     await entered.promise;
     const stopping = harness.service.stop();
     release.resolve();

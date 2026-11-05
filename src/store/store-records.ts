@@ -4,6 +4,15 @@
 
 import type { ChatAppendMode, ChatExecutionState, ChatTarget, HostMergeOutcome, HostMergeProgressPhase, TextMention, ThreadListenLevel, ThreadSummary, WorkerGoal, WorkerGoalRun, WorkerProcess, WorktreeRemovalStep } from "../contracts.ts";
 
+export interface BindingSessionInitialization {
+  taskId: string;
+  fromSessionId: string;
+  fromCwd: string;
+  fromSessionFile: null;
+  fromCwdPinned: true;
+  fromSessionSwitchedAt: number | null;
+}
+
 export interface BindingRecord extends ChatTarget {
   botUid: string;
   sessionId: string;
@@ -19,6 +28,8 @@ export interface BindingRecord extends ChatTarget {
    * 问答卡据此判断关闭问题的迟到提交是否属于切换前的旧会话。`/move` 保持会话身份，不写这里。
    */
   sessionSwitchedAt?: number | null;
+  /** Exact provenance for an initial pinned-thread session update; absent on legacy rows. */
+  sessionInitialization?: BindingSessionInitialization | null;
 }
 
 /** Latest OMP-native context estimate for one bot/chat, tied to the exact persisted session file. */
@@ -73,11 +84,10 @@ export interface TanOperation {
 }
 
 /**
- * 用户/服务已下达的停止意图：`interrupt` 停止当前回合，`question_timeout` 是等待回答超时导致的停轮。
- * 意图在动手之前先落库，进程被 SIGKILL 时它是「这一回合是被叫停的」唯一证据，重启恢复据此落终态而
- * 不是自动续接。`/cancel` 不需要这一列——在线路径在 ACK 之前就已经把任务写成 cancelled。
+ * 持久停止意图：运行任务在执行停止前先落库，进程被 SIGKILL 后也不会重启续跑；`cancel` 同时终止排队任务。
+ * 恢复结果携带原意图，以便区分取消、用户中断和等待回答超时。
  */
-export type TaskStopIntent = "interrupt" | "question_timeout";
+export type TaskStopIntent = "cancel" | "interrupt" | "question_timeout";
 
 export interface TaskRecord extends ChatTarget {
   id: string;
@@ -170,9 +180,8 @@ export interface GoalSessionRecord extends ChatTarget {
 }
 
 /**
- * 启动恢复结算的停止行：任务记录本身（已是 `interrupted` 终态）再加上结算前的持久意图。结算会清列，
- * 所以原因必须随记录一起交回，供服务按原因分流（interrupt 与 question_timeout 对遗留提问的处理不同，
- * 回传通知也用它说明原因）。只在这条恢复记录上带 `stopIntent`，`TaskRecord` 保持原样。
+ * 启动恢复结算的停止行：已按持久停止意图落为 `cancelled` 或 `interrupted` 终态，并携带结算前的意图。
+ * 原因随记录交回，供服务按原因分流；只在这条恢复记录上带 `stopIntent`，`TaskRecord` 保持原样。
  */
 export interface StoppedTaskRecovery extends TaskRecord {
   stopIntent: TaskStopIntent;

@@ -51,6 +51,7 @@ function acceptGoal(store: ChannelStore, id: string, sessionId: string, request:
 }
 
 const stopReasons: Record<TaskStopIntent, string> = {
+  cancel: "cancelled",
   interrupt: "interrupted",
   question_timeout: "ask timed out",
 };

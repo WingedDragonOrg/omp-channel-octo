@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
 import { expect, test, vi } from "bun:test";
 import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -23,6 +24,7 @@ import {
   inbound,
   type CoreHarness,
   type FakePrompt,
+  waitForIngressJob,
   waitForStatus,
 } from "./fixtures/core-fakes.ts";
 
@@ -121,6 +123,10 @@ type ProgressEditHandler = (
 
 /** Records native commit cards so the test reads the real service-issued frames. */
 class CommitProgressTransport extends FakeTransport {
+  constructor() {
+    super({ bot: { uid: `bot-commit-test-${randomUUID()}`, name: "Commit Fixture Bot" } });
+  }
+
   readonly progressSends: RecordedProgressSend[] = [];
   readonly progressEdits: RecordedProgressEdit[] = [];
   progressSendHandler: ProgressSendHandler | undefined;
@@ -310,7 +316,7 @@ async function send(
   text: string,
   senderId = "owner-1",
 ): Promise<void> {
-  await harness.service.handleInbound(ownerMessage(harness, target, messageId, text, senderId));
+  await harness.service.submitInbound(ownerMessage(harness, target, messageId, text, senderId));
 }
 
 async function waitUntil(check: () => boolean | Promise<boolean>, description: string): Promise<void> {
@@ -517,8 +523,8 @@ test("duplicate delivery of one /commit message creates only one durable commit 
     commits.runHandler = async () => runGate.promise;
     const message = ownerMessage(harness, target, "same-commit-delivery", "/commit");
 
-    const first = harness.service.handleInbound(message);
-    const duplicate = harness.service.handleInbound(message);
+    const first = harness.service.submitInbound(message);
+    const duplicate = harness.service.submitInbound(message);
     await waitUntil(() => commits.calls.length === 1 && commits.calls[0]!.runCalls === 1, "single commit run");
     expect(commits.calls).toHaveLength(1);
 
@@ -1071,7 +1077,16 @@ test("/cancel stops the current commit and cancels its queued chat tasks", async
     await send(harness, target, "cancel-commit-start", "/commit");
     await waitUntil(() => commits.calls.length === 1 && commits.calls[0]!.runCalls === 1, "commit run");
     const commitTask = await latestTask(harness, target);
-    await send(harness, target, "cancel-commit-queued-task", "cancel this queued write");
+    const queuedMessage = ownerMessage(
+      harness,
+      target,
+      "cancel-commit-queued-task",
+      "cancel this queued write",
+    );
+    await harness.service.submitInbound(queuedMessage);
+    await waitForIngressJob(harness, queuedMessage, {
+      description: "queued write handoff behind the active native commit",
+    });
     const queuedTask = await latestTask(harness, target);
     expect(commitTask?.text).toBe("/commit");
     expect(queuedTask?.text).toBe("cancel this queued write");
@@ -1872,6 +1887,7 @@ test("commit stop releases a pending host merge only after native commit settlem
     await send(harness, target, "stop-before-host-merge", "/commit stop");
     await merge;
     await waitForStatus(harness.service, target, (status) => status.state === "cancelled" && status.outbox === 0);
+    await waitForReply(harness, target, (text) => text.startsWith("子区合并成功："));
     expect(harness.worktrees!.merges).toHaveLength(1);
     expect(harness.worktrees!.merges[0]).toMatchObject({ cwd: workspace, target: "main" });
     expect(harness.workers.prompts).toEqual([]);

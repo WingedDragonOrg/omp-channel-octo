@@ -46,7 +46,7 @@ test("does not repeat unchanged group context after restoring the same session",
       text: "first group recovery task",
       mentionedUserIds: [bot.uid],
     });
-    await first.service.handleInbound(firstTask);
+    await first.service.submitInbound(firstTask);
     await first.workers.waitForPromptCount(1);
     await waitForStatus(first.service, target, (status) => status.state === "completed");
 
@@ -76,7 +76,7 @@ test("does not repeat unchanged group context after restoring the same session",
       text: "same version recovery follow-up",
       mentionedUserIds: [bot.uid],
     });
-    await restarted.service.handleInbound(secondTask);
+    await restarted.service.submitInbound(secondTask);
     await restarted.workers.waitForPromptCount(1);
     await waitForStatus(restarted.service, target, (status) => status.state === "completed");
 
@@ -119,7 +119,7 @@ test("replays pending group context injection after a prompt failure and restart
       text: "group task whose prompt fails",
       mentionedUserIds: [bot.uid],
     });
-    await first.service.handleInbound(failedTask);
+    await first.service.submitInbound(failedTask);
     await first.workers.waitForPromptCount(1);
     await waitForStatus(first.service, target, (status) => status.state === "failed");
 
@@ -149,7 +149,7 @@ test("replays pending group context injection after a prompt failure and restart
       text: "replay group task after prompt failure",
       mentionedUserIds: [bot.uid],
     });
-    await restarted.service.handleInbound(replayTask);
+    await restarted.service.submitInbound(replayTask);
     await restarted.workers.waitForPromptCount(1);
     await waitForStatus(restarted.service, target, (status) => status.state === "completed");
 

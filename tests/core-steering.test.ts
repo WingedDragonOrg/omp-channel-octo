@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
+import { WorkerSteerRejectedError } from "../src/contracts";
 import type {
+  InboundMessage,
   OmpWorker,
   PromptContext,
   WorkerEvent,
@@ -14,6 +16,8 @@ import {
   FakeWorkerFactory,
   inbound,
   readText,
+  submitAndWaitForIngressHandoff,
+  waitForIngressJob,
   waitForStatus,
 } from "./fixtures/core-fakes";
 import type { CoreHarness } from "./fixtures/core-fakes";
@@ -25,9 +29,25 @@ function gate(): { readonly promise: Promise<void>; release(): void } {
   });
   return { promise, release };
 }
+async function submitAndWaitForHandoff(harness: CoreHarness, message: InboundMessage): Promise<void> {
+  await submitAndWaitForIngressHandoff(harness, message);
+}
 
-/** Models an OMP worker that refuses steering, forcing the durable-task fallback. */
+async function waitForText(
+  harness: CoreHarness,
+  target: { channelType: number; channelId: string },
+  includes: string,
+): Promise<void> {
+  await harness.transport.waitForRemoteText(({ target: sentTarget, text }) =>
+    sentTarget.channelType === target.channelType
+    && sentTarget.channelId === target.channelId
+    && text.includes(includes));
+}
+
+/** Models explicit worker refusal, or an injected ambiguous RPC failure, for steering tests. */
 class RefusingSteerFactory extends FakeWorkerFactory {
+  steerFailure: Error = new WorkerSteerRejectedError("OMP worker is not streaming a turn");
+
   override async create(options: WorkerOptions): Promise<OmpWorker> {
     const worker = await super.create(options);
     return {
@@ -52,7 +72,7 @@ class RefusingSteerFactory extends FakeWorkerFactory {
           ? worker.runGoal(request, onEvent)
           : worker.runGoal(request, onEvent, context),
       steer: async () => {
-        throw new Error("OMP worker is not streaming a turn");
+        throw this.steerFailure;
       },
       abortTurn: () => worker.abortTurn(),
       refreshState: () => worker.refreshState(),
@@ -77,21 +97,20 @@ test("a message during a run steers that turn instead of becoming a task", async
   });
   try {
     const target = { channelId: "dm-steer", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "steer-bind", ...target, text: "/new" }),
     );
-    const first = harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "steer-first", ...target, text: "first task" }),
     );
     await started.promise;
 
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "steer-second", ...target, text: "second note" }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "steer-second", ...target, text: "second note" }),
     );
-    await first;
 
     const status = await waitForStatus(harness.service, target, (next) => next.state === "completed");
     expect(status.state).toBe("completed");
@@ -117,19 +136,19 @@ test("a steered message reports the moment it joins the running turn", async () 
   });
   try {
     const target = { channelId: "dm-steer-receipt", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "receipt-bind", ...target, text: "/new" }),
     );
-    const first = harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "receipt-first", ...target, text: "first task" }),
     );
     await started.promise;
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "receipt-second", ...target, text: "second note with a longer body" }),
     );
-    await first;
     await waitForStatus(harness.service, target, (next) => next.state === "completed");
 
+    await waitForText(harness, target, "已并入当前回合");
     expect(
       harness.transport.sent
         .map(({ text }) => text)
@@ -154,29 +173,34 @@ test("queue mode turns a message during a run into a task that follows it", asyn
   });
   try {
     const target = { channelId: "dm-queue-mode", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "queue-bind", ...target, text: "/new" }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "queue-mode", ...target, text: "/mode queue" }),
     );
     expect((await harness.service.status(target)).mode).toBe("queue");
 
-    const first = harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "queue-first", ...target, text: "hold" }),
     );
     await started.promise;
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "queue-second", ...target, text: "second task" }),
     );
     expect((await harness.service.status(target)).queued).toBe(1);
 
     release.release();
-    await first;
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.queued === 0,
+    );
     await harness.workers.waitForPromptCount(2);
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["hold", "second task"]);
     expect(await readText(join(harness.root, "tmp", "queue.log"))).toBe("start:hold\n");
     // The message that waited for the run gets one start receipt; the immediate one gets none.
+    await waitForText(harness, target, "开始执行排队消息");
     expect(
       harness.transport.sent
         .map(({ text }) => text)
@@ -208,22 +232,26 @@ test("/queue forces a task behind the run even in steer mode", async () => {
   });
   try {
     const target = { channelId: "dm-force-queue", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "force-bind", ...target, text: "/new" }),
     );
-    const first = harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "force-first", ...target, text: "hold" }),
     );
     await started.promise;
 
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "force-queued", ...target, text: "/queue queued note" }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "force-steered", ...target, text: "steered note" }),
     );
     release.release();
-    await first;
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.queued === 0,
+    );
     await harness.workers.waitForPromptCount(2);
 
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["hold", "queued note"]);
@@ -256,7 +284,7 @@ test("/thread joins the running turn in steer mode instead of waiting behind it"
   });
   try {
     const group = { channelId: "group-allowed", channelType: 2 as const };
-    const running = harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({
         messageId: "thread-steer-hold",
         ...group,
@@ -265,7 +293,7 @@ test("/thread joins the running turn in steer mode instead of waiting behind it"
       }),
     );
     await started.promise;
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({
         messageId: "thread-steer-late",
         ...group,
@@ -279,7 +307,6 @@ test("/thread joins the running turn in steer mode instead of waiting behind it"
     await waitForStatus(harness.service, group, (status) => status.state === "completed");
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["hold the group"]);
     expect(await readText(join(harness.root, "tmp", "thread-steer.log"))).toBe("joined:true:true\n");
-    await running;
   } finally {
     await closeCoreHarness(harness);
   }
@@ -297,25 +324,82 @@ test("a refused steer falls back to a durable task instead of dropping the messa
   const harness = await createCoreHarness({ workers });
   try {
     const target = { channelId: "dm-steer-refused", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "refused-bind", ...target, text: "/new" }),
     );
-    const first = harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "refused-first", ...target, text: "hold" }),
     );
     await started.promise;
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "refused-second", ...target, text: "kept as a task" }),
     );
     expect((await harness.service.status(target)).queued).toBe(1);
 
     release.release();
-    await first;
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.queued === 0,
+    );
     await harness.workers.waitForPromptCount(2);
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual([
       "hold",
       "kept as a task",
     ]);
+  } finally {
+    release.release();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("an ambiguous steer outcome remains unknown instead of becoming a second task", async () => {
+  const started = gate();
+  const release = gate();
+  const workers = new RefusingSteerFactory(async ({ text, onStop }) => {
+    if (text !== "hold") return;
+    started.release();
+    onStop(() => release.release());
+    await release.promise;
+  });
+  workers.steerFailure = new Error("RPC response lost after dispatch");
+  const harness = await createCoreHarness({ workers });
+  try {
+    const target = { channelId: "dm-steer-ambiguous", channelType: 1 as const };
+    await submitAndWaitForHandoff(harness,
+      inbound({ messageId: "ambiguous-bind", ...target, text: "/new" }),
+    );
+    await submitAndWaitForHandoff(harness,
+      inbound({ messageId: "ambiguous-first", ...target, text: "hold" }),
+    );
+    await started.promise;
+    const message = inbound({
+      messageId: "ambiguous-second",
+      ...target,
+      text: "must not be duplicated",
+    });
+    await harness.service.submitInbound(message);
+
+    const job = await waitForIngressJob(
+      { stateDir: harness.stateDir, bot: harness.bot },
+      message,
+      {
+        predicate: ingress => ingress.state === "unknown",
+        rejectStates: [],
+        description: "fail-closed ambiguous steering outcome",
+      },
+    );
+    expect(job.state).toBe("unknown");
+    expect((await harness.service.status(target)).queued).toBe(0);
+
+    release.release();
+    await waitForStatus(
+      harness.service,
+      target,
+      status => status.state === "completed" && status.queued === 0,
+    );
+    await harness.workers.waitForPromptCount(1);
+    expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["hold"]);
   } finally {
     release.release();
     await closeCoreHarness(harness);
@@ -334,19 +418,18 @@ test("/interrupt aborts the running turn without stopping the worker", async () 
   });
   try {
     const target = { channelId: "dm-interrupt", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "interrupt-bind", ...target, text: "/new" }),
     );
-    const first = harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "interrupt-run", ...target, text: "long task" }),
     );
     await started.promise;
     expect(harness.workers.workers.at(-1)?.stopped).toBe(false);
 
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "interrupt-command", ...target, text: "/interrupt" }),
     );
-    await first;
 
     const status = await waitForStatus(
       harness.service,
@@ -359,6 +442,7 @@ test("/interrupt aborts the running turn without stopping the worker", async () 
     expect(await readText(join(harness.root, "tmp", "interrupt.log"))).toBe(
       "start:long task\naborted:long task:stopped=false\n",
     );
+    await waitForText(harness, target, "已中断当前回合");
     expect(
       harness.transport.sent.some(({ text }) => text.includes("已中断当前回合")),
     ).toBe(true);
@@ -383,25 +467,30 @@ test("/interrupt keeps queued work running and reports completion when it produc
   });
   try {
     const target = { channelId: "dm-interrupt-queue", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "iq-bind", ...target, text: "/new" }),
     );
-    const first = harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "iq-hold", ...target, text: "hold" }),
     );
     await started.promise;
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "iq-queued", ...target, text: "/queue follow up" }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "iq-interrupt", ...target, text: "/interrupt" }),
     );
-    await first;
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.queued === 0,
+    );
     await harness.workers.waitForPromptCount(2);
 
     const status = await waitForStatus(harness.service, target, (next) => next.state === "completed");
     expect(status.state).toBe("completed");
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["hold", "follow up"]);
+    await waitForText(harness, target, "continued after abort");
     expect(harness.transport.sent.some(({ text }) => text === "continued after abort")).toBe(true);
   } finally {
     await closeCoreHarness(harness);
@@ -412,12 +501,13 @@ test("/interrupt without a running turn reports nothing to interrupt", async () 
   const harness = await createCoreHarness();
   try {
     const target = { channelId: "dm-interrupt-idle", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "idle-bind", ...target, text: "/new" }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "idle-interrupt", ...target, text: "/interrupt" }),
     );
+    await waitForText(harness, target, "没有正在运行的回合");
     expect(
       harness.transport.sent.some(({ text }) => text.includes("没有正在运行的回合")),
     ).toBe(true);
@@ -440,21 +530,20 @@ test("/stop cancels the running task and clears queued work like /cancel", async
   });
   try {
     const target = { channelId: "dm-stop", channelType: 1 as const };
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "stop-bind", ...target, text: "/new" }),
     );
-    const first = harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "stop-hold", ...target, text: "hold" }),
     );
     await started.promise;
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "stop-queued", ...target, text: "/queue queued work" }),
     );
-    await harness.service.handleInbound(
+    await submitAndWaitForHandoff(harness,
       inbound({ messageId: "stop-command", ...target, text: "/stop" }),
     );
     release.release();
-    await first;
 
     const status = await waitForStatus(
       harness.service,
@@ -463,6 +552,7 @@ test("/stop cancels the running task and clears queued work like /cancel", async
     );
     expect(status.state).toBe("cancelled");
     expect(status.queued).toBe(0);
+    await waitForText(harness, target, "已取消");
     expect(harness.workers.prompts).toHaveLength(1);
     expect(harness.transport.sent.some(({ text }) => text.includes("已取消"))).toBe(true);
   } finally {
@@ -479,22 +569,24 @@ test("append mode is per chat and survives a restart", async () => {
   let firstClosed = false;
   try {
     expect((await first.service.status(target)).mode).toBe("steer");
-    await first.service.handleInbound(
+    await submitAndWaitForIngressHandoff(first,
       inbound({ messageId: "mode-bind", ...target, text: "/new" }),
     );
-    await first.service.handleInbound(
+    await submitAndWaitForIngressHandoff(first,
       inbound({ messageId: "mode-set", ...target, text: "/mode queue" }),
     );
-    await first.service.handleInbound(
+    await submitAndWaitForIngressHandoff(first,
       inbound({ messageId: "mode-report", ...target, text: "/mode" }),
     );
-    await first.service.handleInbound(
+    await submitAndWaitForIngressHandoff(first,
       inbound({ messageId: "mode-status", ...target, text: "/status" }),
     );
 
     expect((await first.service.status(target)).mode).toBe("queue");
     expect((await first.service.status(other)).mode).toBe("steer");
+    await waitForText(first, target, "当前追加模式：queue");
     expect(first.transport.sent.some(({ text }) => text.includes("当前追加模式：queue"))).toBe(true);
+    await waitForText(first, target, "mode=queue");
     expect(first.transport.sent.some(({ text }) => text.includes("mode=queue"))).toBe(true);
     await closeCoreHarness(first, { remove: false });
     firstClosed = true;

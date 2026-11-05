@@ -143,7 +143,7 @@ test("ordinary replies convert split member markers as they arrive and keep stre
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     await flushPromises();
     const firstMessage = transport.listRemoteText(task)[0];
@@ -384,7 +384,7 @@ test("ordinary text without a valid member marker keeps the existing create-then
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     const initial = await transport.waitForRemoteText(
       (message) => sameTarget(message.target, task) && message.text === draft,
@@ -451,7 +451,7 @@ test("a restarted outbox resumes a structured mention with the same client messa
       },
     });
     try {
-      await first.service.handleInbound(task);
+      await first.service.submitInbound(task);
       await first.workers.waitForPromptCount(1);
       await waitForStatus(
         first.service,
@@ -512,7 +512,7 @@ test("private replies keep structured member markers as literal text", async () 
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await waitForStatus(
       harness.service,
       task,
@@ -552,7 +552,7 @@ test("a leading complete member marker is delivered immediately and duplicate fi
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     const initial = await transport.waitForRemoteText((message) => sameTarget(message.target, task));
     expect(initial.text).toBe("@林 你好");
@@ -616,7 +616,7 @@ test("a final snapshot that removes a member marker replaces the draft without s
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     const firstMessage = await transport.waitForRemoteText(
       (message) => sameTarget(message.target, task),
@@ -676,7 +676,7 @@ test("an empty final clears an already visible draft without creating a blank me
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     const initial = await transport.waitForRemoteText(
       (message) => sameTarget(message.target, task),
@@ -732,7 +732,7 @@ test("an incomplete member marker does not block another assistant message or le
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await waitForStatus(
       harness.service,
       task,
@@ -782,7 +782,7 @@ test("mention atoms stay intact across the byte limit and oversized markers rema
     },
   });
   try {
-    await harness.service.handleInbound(firstTask);
+    await harness.service.submitInbound(firstTask);
     await waitForStatus(
       harness.service,
       firstTask,
@@ -803,7 +803,7 @@ test("mention atoms stay intact across the byte limit and oversized markers rema
       { text: "🙂", mention: undefined },
     ]);
 
-    await harness.service.handleInbound(secondTask);
+    await harness.service.submitInbound(secondTask);
     await waitForStatus(
       harness.service,
       secondTask,
@@ -1282,7 +1282,7 @@ test("inline-code member markers remain literal before and after a later code-sp
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
     await transport.waitForRemoteText((message) => sameTarget(message.target, task));
     expect(transport.visibleText(task)).toBe(partial);
@@ -1396,7 +1396,7 @@ test("worker notices remain literal while ordinary assistant text carries struct
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await waitForStatus(
       harness.service,
       task,
@@ -1448,7 +1448,7 @@ test("thread mention metadata follows each body edit on one message id", async (
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     const initial = await transport.waitForRemoteText((message) => sameTarget(message.target, task));
     expect(initial.text).toBe("请看 @线程同学");
     expect(deliveriesFor(transport, task).at(-1)).toMatchObject({
@@ -1554,13 +1554,13 @@ test("cancelling with an incomplete member marker never releases its suffix", as
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     const prefixMessage = await transport.waitForRemoteText(
       (message) => sameTarget(message.target, task),
     );
     expect(prefixMessage.text).toBe("ready prefix ");
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       messageId: "cancel-mention-tail-command",
       channelId: task.channelId,
       channelType: task.channelType,
@@ -1595,7 +1595,7 @@ test("an empty final with no previously visible body creates no blank message", 
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await waitForStatus(
       harness.service,
       task,
@@ -1646,7 +1646,7 @@ test("a lost create receipt reconciles the same final mention message without a 
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await transport.waitForRemoteText(
       (message) => sameTarget(message.target, task) && message.text === visibleBody,
     );
@@ -1712,7 +1712,7 @@ test("a final UID-only correction edits the existing mention message", async () 
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await waitForStatus(
       harness.service,
       task,
@@ -1761,7 +1761,7 @@ test("an unregistered slash reply parses ordinary assistant mention output", asy
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await waitForStatus(
       harness.service,
       task,
@@ -1805,7 +1805,7 @@ test("stopping with an incomplete member marker does not release its suffix", as
     },
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     const prefix = await transport.waitForRemoteText(
       (message) => sameTarget(message.target, task),
     );

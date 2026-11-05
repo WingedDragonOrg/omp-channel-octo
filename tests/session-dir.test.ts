@@ -8,7 +8,12 @@ import {
   projectSessionKey,
   sessionsRoot,
 } from "../src/session/session-dir";
-import { closeCoreHarness, createCoreHarness, inbound } from "./fixtures/core-fakes";
+import {
+  closeCoreHarness,
+  createCoreHarness,
+  inbound,
+  submitAndWaitForIngressHandoff,
+} from "./fixtures/core-fakes";
 
 test("项目目录名对同一个 cwd 稳定，同名目录互不混淆", () => {
   const first = join("/workspace", "app");
@@ -50,14 +55,15 @@ test("新建会话与任务都把 worker 的会话落在该项目目录下", asy
     const root = sessionsRoot(harness.config);
     const projectDir = projectSessionDir(root, cwd);
 
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "project-session-dir-new", ...target, text: `/new ${cwd}` }),
     );
     const newWorker = harness.workers.workers.at(-1);
     expect(newWorker).toBeDefined();
     expect(dirname(newWorker!.sessionFile)).toBe(projectDir);
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "project-session-dir-task", ...target, text: "运行一个回合" }),
     );
     await harness.workers.waitForPromptCount(1);

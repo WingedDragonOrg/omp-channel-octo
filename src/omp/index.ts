@@ -20,7 +20,13 @@ import type {
 	WorkerOptions,
 	WorkerProcess,
 } from "../contracts.ts";
-import { RESUME_CONTINUATION_PROMPT, TaskStartupError, WorkerGoalError, taskStartupError } from "../contracts.ts";
+import {
+	RESUME_CONTINUATION_PROMPT,
+	TaskStartupError,
+	WorkerGoalError,
+	WorkerSteerRejectedError,
+	taskStartupError,
+} from "../contracts.ts";
 import { loadValidatedSessionState, type ProjectSessionState } from "../session/project-session.ts";
 import { formatAgentGuidance } from "../session/agent-context.ts";
 import {
@@ -962,17 +968,20 @@ class RpcWorker implements OmpWorker {
 	 * session unsettled for background or goal work; keep that run open but close the turn gate.
 	 */
 	async steer(text: string): Promise<void> {
-		if (this.#closed) throw new Error("OMP worker is not running");
+		if (this.#closed) throw new WorkerSteerRejectedError("OMP worker is not running");
 		if (!this.#activePrompt || !this.#streaming) {
-			throw new Error("OMP worker is not streaming a turn");
+			throw new WorkerSteerRejectedError("OMP worker is not streaming a turn");
 		}
 		if (typeof text !== "string" || text.trim().length === 0) {
-			throw new Error("OMP steering text must be a non-empty string");
+			throw new WorkerSteerRejectedError("OMP steering text must be a non-empty string");
 		}
 		const receipt = { text };
 		this.#pendingSteerReceipts.push(receipt);
 		try {
 			const response = await this.#request({ type: "steer", message: text }, DEFAULT_REQUEST_TIMEOUT_MS);
+			if (response.success === false) {
+				throw new WorkerSteerRejectedError("OMP explicitly rejected steering");
+			}
 			this.#assertSuccess(response, "steer");
 		} catch (error) {
 			const index = this.#pendingSteerReceipts.indexOf(receipt);

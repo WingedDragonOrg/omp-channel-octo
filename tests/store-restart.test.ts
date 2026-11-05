@@ -57,6 +57,7 @@ function accept(store: ChannelStore, task: TaskRecord): void {
 
 /** 恢复结算停止行时的说明文案由调用方提供：这里用可辨识的英文串，证明 store 只负责原样落库。 */
 const stopReasons: Record<TaskStopIntent, string> = {
+  cancel: "turn cancelled by the user",
   interrupt: "turn stopped by the user",
   question_timeout: "turn stopped while waiting for an answer",
 };

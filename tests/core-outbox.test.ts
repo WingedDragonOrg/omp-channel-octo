@@ -79,7 +79,7 @@ test("a completed task is not rerun when an assistant body outbox item is resent
       channelType: 1,
       text: "offline work",
     });
-    await harness.service.handleInbound(message);
+    await harness.service.submitInbound(message);
     await harness.workers.waitForPromptCount(1);
     const completedWithOutbox = await waitForStatus(
       harness.service,
@@ -138,14 +138,14 @@ test("a body that fails once is retried by itself and the next reply follows wit
   try {
     const first = inbound({ messageId: "outbox-first", ...target, text: "first" });
     const second = inbound({ messageId: "outbox-second", ...target, text: "second" });
-    await harness.service.handleInbound(first);
+    await harness.service.submitInbound(first);
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(
       harness.service,
       first,
       (status) => status.state === "completed" && status.outbox > 0,
     );
-    await harness.service.handleInbound(second);
+    await harness.service.submitInbound(second);
     await harness.workers.waitForPromptCount(2);
 
     for (let elapsed = 0; elapsed < 60_000; elapsed += 250) {
@@ -203,7 +203,7 @@ test("a body the server keeps refusing is given up within a bounded budget and n
   try {
     const first = inbound({ messageId: "budget-first", ...target, text: "first" });
     const second = inbound({ messageId: "budget-second", ...target, text: "second" });
-    await harness.service.handleInbound(first);
+    await harness.service.submitInbound(first);
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(
       harness.service,
@@ -212,7 +212,7 @@ test("a body the server keeps refusing is given up within a bounded budget and n
     );
     // The first body is still being retried; the second message arrives behind it and must get
     // its delivery once the refused one is given up — no reconnect, no manual cleanup.
-    await harness.service.handleInbound(second);
+    await harness.service.submitInbound(second);
     await harness.workers.waitForPromptCount(2);
 
     let delivered = false;
@@ -279,7 +279,7 @@ test("a restart delivers the pending outbox the previous process left behind", a
       },
     });
     try {
-      await first.service.handleInbound(message);
+      await first.service.submitInbound(message);
       await first.workers.waitForPromptCount(1);
       await waitForStatus(
         first.service,
@@ -346,11 +346,11 @@ test("offline media remains retryable after repeated unknown attempts and expose
       channelId: "dm-outbox-file",
       text: "send a file",
     });
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ ...target, messageId: "outbox-file-bind", text: `/new ${cwd}` }),
     );
     await waitForStatus(harness.service, target, (status) => status.state === "idle");
-    await harness.service.handleInbound(target);
+    await harness.service.submitInbound(target);
     await harness.workers.waitForPromptCount(1);
     await fileReady;
     transport.setOffline();

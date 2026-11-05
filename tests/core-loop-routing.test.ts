@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import {
@@ -14,7 +14,7 @@ import { LoopController } from "../src/loop/controller.ts";
 import type { InboundMessage } from "../src/contracts.ts";
 import { openChannelStore } from "../src/store/index.ts";
 import type { ChannelStore } from "../src/store/index.ts";
-import type { LoopTask, LoopWorkspace } from "../src/loop/types.ts";
+import type { LoopInput, LoopTask, LoopWorkspace } from "../src/loop/types.ts";
 
 const GROUP_ID = "group-allowed";
 const WORKSPACE: LoopWorkspace = {
@@ -62,6 +62,30 @@ function loopFixture(tasks: LoopTask[] = []): FakeLoopReadPort {
   loop.tasks.set(WORKSPACE.workspaceId, tasks);
   return loop;
 }
+async function waitUntil(predicate: () => boolean, description: string, timeoutMs = 3_000): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    if (predicate()) return;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  throw new Error(`timed out waiting for ${description}`);
+}
+
+async function waitForSignal<T>(
+  signal: Promise<T>,
+  description: string,
+  timeoutMs = 3_000,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timedOut = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out waiting for ${description}`)), timeoutMs);
+    });
+    return await Promise.race([signal, timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 test("an old periodic poll cannot overwrite a newer same-workspace bind snapshot", async () => {
   const root = await mkdtemp(join(tmpdir(), "loop-poll-bind-race-"));
@@ -96,7 +120,7 @@ test("an old periodic poll cannot overwrite a newer same-workspace bind snapshot
       await releasePoll.promise;
     };
     controller.start();
-    await pollEntered.promise;
+    await waitForSignal(pollEntered.promise, "periodic Loop snapshot poll");
 
     loop.tasks.set(WORKSPACE.workspaceId, [task("loop-race-task", "Snapshot B")]);
     const sameWorkspaceBind = controller.bind(GROUP_ID, WORKSPACE.workspaceId);
@@ -150,8 +174,8 @@ test("Loop summaries bound long descriptions without losing task IDs or full sto
   const harness = await createCoreHarness({ loop });
   let raw: Database | undefined;
   try {
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "summary-boundary-bind"));
-    await harness.workers.waitForPromptCount(1);
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "summary-boundary-bind"));
+    await waitUntil(() => harness.workers.prompts.length >= 1, "Loop summary baseline prompt");
     await waitForStatus(
       harness.service,
       { channelType: 2, channelId: GROUP_ID },
@@ -213,8 +237,8 @@ test("Loop summaries bound long descriptions without losing task IDs or full sto
     raw = undefined;
     const updated = { ...detailed, description: "Compact changed detail", updatedAt: "2026-11-05T00:00:00Z" };
     loop.tasks.set(WORKSPACE.workspaceId, [updated, ...inputTasks.slice(1)]);
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "summary-boundary-update"));
-    await harness.workers.waitForPromptCount(2);
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "summary-boundary-update"));
+    await waitUntil(() => harness.workers.prompts.length >= 2, "Loop summary update prompt");
 
     const updateText = harness.workers.prompts[1]?.text ?? "";
     const updateStart = updateText.indexOf("```json\n") + "```json\n".length;
@@ -251,8 +275,8 @@ test("new unassociated tasks reach the main group while linked updates go only t
   const harness = await createCoreHarness({ loop });
   let store: ChannelStore | undefined;
   try {
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "route-bind"));
-    await harness.workers.waitForPromptCount(1);
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "route-bind"));
+    await waitUntil(() => harness.workers.prompts.length >= 1, "initial child-route prompt");
     const thread = await harness.transport.createThread(GROUP_ID, "Task one");
     store = await openChannelStore(harness.stateDir);
     const key = {
@@ -265,8 +289,8 @@ test("new unassociated tasks reach the main group while linked updates go only t
     await harness.transport.archiveThread(GROUP_ID, thread.shortId);
 
     loop.tasks.set(WORKSPACE.workspaceId, [task("loop-task-1", "Updated task")]);
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "route-update"));
-    await harness.workers.waitForPromptCount(2);
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "route-update"));
+    await waitUntil(() => harness.workers.prompts.length >= 2, "child-route update prompt");
     const child = await waitForStatus(
       harness.service,
       { channelType: 5, channelId: thread.channelId },
@@ -281,8 +305,8 @@ test("new unassociated tasks reach the main group while linked updates go only t
       task("loop-task-1", "Updated task"),
       task("loop-task-2", "New unassociated task"),
     ]);
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "route-new-task"));
-    await harness.workers.waitForPromptCount(3);
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "route-new-task"));
+    await waitUntil(() => harness.workers.prompts.length >= 3, "new unassociated task prompt");
     expect(harness.workers.prompts[2]?.text).toContain("New unassociated task");
     expect((await harness.service.status({ channelType: 2, channelId: GROUP_ID })).sessionId)
       .not.toBe(child.sessionId);
@@ -306,13 +330,13 @@ test("a busy Loop destination steers the stable system input instead of creating
     },
   });
   try {
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "busy-bind"));
-    await harness.workers.waitForPromptCount(1);
-    await promptStarted.promise;
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "busy-bind"));
+    await waitUntil(() => harness.workers.prompts.length >= 1, "busy Loop worker prompt");
+    await waitForSignal(promptStarted.promise, "busy Loop worker started");
 
     loop.tasks.set(WORKSPACE.workspaceId, [task("loop-task-busy", "Queued behind active work")]);
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "busy-new-task"));
-    const append = await steered.promise;
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "busy-new-task"));
+    const append = await waitForSignal(steered.promise, "busy Loop steer append");
     const status = await harness.service.status({ channelType: 2, channelId: GROUP_ID });
 
     expect(append).toContain("Queued behind active work");
@@ -324,6 +348,7 @@ test("a busy Loop destination steers the stable system input instead of creating
 });
 
 test("cancelled Loop steer waiting behind steerSerial stays pending without an accepted claim", async () => {
+  vi.useFakeTimers();
   const loop = loopFixture([task("loop-task-cancel-baseline", "Initial cancel work")]);
   const promptStarted = Promise.withResolvers<void>();
   const workerAborted = Promise.withResolvers<void>();
@@ -340,36 +365,36 @@ test("cancelled Loop steer waiting behind steerSerial stays pending without an a
   });
   let store: ChannelStore | undefined;
   try {
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "cancel-loop-bind"));
-    await harness.workers.waitForPromptCount(1);
-    await promptStarted.promise;
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "cancel-loop-bind"));
+    await waitUntil(() => harness.workers.prompts.length >= 1, "cancelled Loop worker prompt");
+    await waitForSignal(promptStarted.promise, "cancelled Loop worker started");
     harness.workers.beforeSteer = async (text) => {
       if (text !== "Ordinary steer before Loop update") return;
       steerEntered.resolve();
       await releaseSteer.promise;
       throw new Error("simulated unknown steer response");
     };
-    const ordinarySteer = harness.service.handleInbound(
+    const ordinarySteer = harness.service.submitInbound(
       groupMessage(harness.bot.uid, "cancel-blocking-steer", "Ordinary steer before Loop update"),
     );
-    await steerEntered.promise;
+    await waitForSignal(steerEntered.promise, "ordinary Loop steer gate entered");
 
     store = await openChannelStore(harness.stateDir);
+    const taskListCallsBeforePoll = loop.taskListCalls.length;
     loop.tasks.set(WORKSPACE.workspaceId, [task("loop-task-cancelled", "Cancelled Loop update")]);
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "cancel-loop-update"));
+    vi.advanceTimersByTime(60_000);
 
-    let loopInput = store.listLoopInputs(harness.bot.uid)
-      .find((input) => input.kind === "created" && input.taskId === "loop-task-cancelled");
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      if (
-        loopInput !== undefined
-        && store.getCommandClaimState(harness.bot.uid, { channelType: 2, channelId: GROUP_ID }, `loop:${loopInput.id}`)
-          === "pending"
-      ) break;
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      loopInput = store.listLoopInputs(harness.bot.uid)
+    let loopInput: LoopInput | undefined;
+    await waitUntil(() => {
+      loopInput = store!.listLoopInputs(harness.bot.uid)
         .find((input) => input.kind === "created" && input.taskId === "loop-task-cancelled");
-    }
+      return loop.taskListCalls.length > taskListCallsBeforePoll
+        && loopInput !== undefined && store!.getCommandClaimState(
+          harness.bot.uid,
+          { channelType: 2, channelId: GROUP_ID },
+          `loop:${loopInput.id}`,
+        ) === "pending";
+    }, "periodic Loop update to remain pending behind the active steering delivery");
     expect(loopInput).toBeDefined();
     expect(store.getCommandClaimState(
       harness.bot.uid,
@@ -377,10 +402,10 @@ test("cancelled Loop steer waiting behind steerSerial stays pending without an a
       `loop:${loopInput!.id}`,
     )).toBe("pending");
 
-    const cancel = harness.service.handleInbound(
+    const cancel = harness.service.submitInbound(
       groupMessage(harness.bot.uid, "cancel-loop-while-steering", "/cancel"),
     );
-    await workerAborted.promise;
+    await waitForSignal(workerAborted.promise, "cancelled Loop worker abort");
     releaseSteer.resolve();
     await Promise.all([ordinarySteer, cancel]);
     await waitForStatus(
@@ -389,14 +414,11 @@ test("cancelled Loop steer waiting behind steerSerial stays pending without an a
       (status) => status.state === "cancelled" && status.queued === 0,
     );
 
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      if (store.getCommandClaimState(
-        harness.bot.uid,
-        { channelType: 2, channelId: GROUP_ID },
-        `loop:${loopInput!.id}`,
-      ) !== "pending") break;
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
+    await waitUntil(() => store!.getCommandClaimState(
+      harness.bot.uid,
+      { channelType: 2, channelId: GROUP_ID },
+      `loop:${loopInput!.id}`,
+    ) !== "pending", "cancel to release the Loop command claim");
     expect(store.getLoopInput(loopInput!.id)?.state).toBe("pending");
     expect(store.getCommandClaimState(
       harness.bot.uid,
@@ -406,8 +428,9 @@ test("cancelled Loop steer waiting behind steerSerial stays pending without an a
     expect(harness.workers.prompts).toHaveLength(1);
   } finally {
     releaseSteer.resolve();
-    store?.close();
+    vi.useRealTimers();
     await closeCoreHarness(harness);
+    store?.close();
   }
 });
 
@@ -446,7 +469,7 @@ test("task-aware child dispatch never falls back to a second task after an uncer
   });
   let store: ChannelStore | undefined;
   try {
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "dispatch-source-bind"));
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "dispatch-source-bind"));
     await waitForStatus(
       harness.service,
       { channelType: 2, channelId: GROUP_ID },
@@ -463,22 +486,22 @@ test("task-aware child dispatch never falls back to a second task after an uncer
       taskId: "loop-task-dispatch",
     }, thread.channelId);
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       channelType: 5,
       channelId: thread.channelId,
       messageId: "dispatch-child-session",
       text: `/new ${harness.root}`,
       mentionedUserIds: [harness.bot.uid],
     }));
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       channelType: 5,
       channelId: thread.channelId,
       messageId: "dispatch-child-hold",
       text: "child hold",
       mentionedUserIds: [harness.bot.uid],
     }));
-    await harness.workers.waitForPromptCount(2);
-    await childStarted.promise;
+    await waitUntil(() => harness.workers.prompts.length >= 2, "child-session prompts");
+    await waitForSignal(childStarted.promise, "child task start");
     harness.workers.beforeSteer = async (text) => {
       if (!text.includes("dispatch body with an uncertain acknowledgement")) return;
       steerEntered.resolve();
@@ -486,12 +509,14 @@ test("task-aware child dispatch never falls back to a second task after an uncer
       throw new Error("simulated lost steer acknowledgement");
     };
 
-    await harness.service.handleInbound(groupMessage(harness.bot.uid, "dispatch-control-task", "dispatch-control"));
-    await harness.workers.waitForPromptCount(3);
-    await steerEntered.promise;
-    expect(await childEffect.promise).toContain("dispatch body with an uncertain acknowledgement");
+    await harness.service.submitInbound(groupMessage(harness.bot.uid, "dispatch-control-task", "dispatch-control"));
+    await waitUntil(() => harness.workers.prompts.length >= 3, "dispatch-control worker prompt");
+    await waitForSignal(steerEntered.promise, "uncertain Loop steer gate entered");
+    expect(await waitForSignal(childEffect.promise, "child dispatch append")).toContain(
+      "dispatch body with an uncertain acknowledgement",
+    );
     releaseSteer.resolve();
-    const result = await dispatchResult.promise;
+    const result = await waitForSignal(dispatchResult.promise, "dispatch-control result");
     await waitForStatus(
       harness.service,
       { channelType: 5, channelId: thread.channelId },
@@ -502,8 +527,8 @@ test("task-aware child dispatch never falls back to a second task after an uncer
     expect(harness.workers.prompts).toHaveLength(3);
   } finally {
     releaseSteer.resolve();
-    store?.close();
     await closeCoreHarness(harness);
+    store?.close();
   }
 });
 
@@ -523,9 +548,9 @@ test("Loop input queues behind a pending ask without answering or steering it", 
     },
   });
   try {
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "ask-bind"));
-    await harness.workers.waitForPromptCount(1);
-    await askStarted.promise;
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "ask-bind"));
+    await waitUntil(() => harness.workers.prompts.length >= 1, "Loop ask worker prompt");
+    await waitForSignal(askStarted.promise, "Loop ask tool start");
     const waiting = await waitForStatus(
       harness.service,
       { channelType: 2, channelId: GROUP_ID },
@@ -536,7 +561,7 @@ test("Loop input queues behind a pending ask without answering or steering it", 
       task("loop-task-ask", "Baseline task"),
       task("loop-task-new-during-ask", "Independent queued Loop input"),
     ]);
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "ask-new-loop-task"));
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "ask-new-loop-task"));
     const after = await waitForStatus(
       harness.service,
       { channelType: 2, channelId: GROUP_ID },
@@ -548,8 +573,8 @@ test("Loop input queues behind a pending ask without answering or steering it", 
     expect(after.queued).toBe(1);
     expect(harness.workers.prompts).toHaveLength(1);
 
-    await harness.service.handleInbound(groupMessage(harness.bot.uid, "ask-answer", "Owner's answer"));
-    await harness.workers.waitForPromptCount(2);
+    await harness.service.submitInbound(groupMessage(harness.bot.uid, "ask-answer", "Owner's answer"));
+    await waitUntil(() => harness.workers.prompts.length >= 2, "Loop task after answer");
     await waitForStatus(
       harness.service,
       { channelType: 2, channelId: GROUP_ID },
@@ -571,37 +596,38 @@ test("a binding replaced during selector reads rejects the stale read result", a
   loop.tasks.set(second.workspaceId, []);
   const harness = await createCoreHarness({ loop });
   let store: ChannelStore | undefined;
+  const releaseRead = Promise.withResolvers<void>();
   try {
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "replace-bind-first"));
-    await harness.workers.waitForPromptCount(1);
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "replace-bind-first"));
+    await waitUntil(() => harness.workers.prompts.length >= 1, "initial replacement-binding prompt");
 
     const readEntered = Promise.withResolvers<void>();
-    const releaseRead = Promise.withResolvers<void>();
     loop.beforeListTasks = async (workspaceId) => {
       if (workspaceId === WORKSPACE.workspaceId) {
         readEntered.resolve();
         await releaseRead.promise;
       }
     };
-    const staleBind = harness.service.handleInbound(bindMessage(harness.bot.uid, "replace-stale", WORKSPACE.workspaceId));
-    await readEntered.promise;
+    const staleBind = harness.service.submitInbound(bindMessage(harness.bot.uid, "replace-stale", WORKSPACE.workspaceId));
+    await waitForSignal(readEntered.promise, "stale selector read");
     loop.beforeListTasks = undefined;
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "replace-current", second.workspaceId));
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "replace-current", second.workspaceId));
     releaseRead.resolve();
     await staleBind;
     store = await openChannelStore(harness.stateDir);
 
     expect(store.getLoopBinding(harness.bot.uid, GROUP_ID)?.workspaceId).toBe(second.workspaceId);
   } finally {
-    store?.close();
+    releaseRead.resolve();
     await closeCoreHarness(harness);
+    store?.close();
   }
 });
 
 test("restart does not replay delivered inputs and later business changes remain observable", async () => {
   const loop = loopFixture([task("loop-task-restart", "Before restart")]);
   const first = await createCoreHarness({ loop });
-  await first.service.handleInbound(bindMessage(first.bot.uid, "restart-bind"));
+  await first.service.submitInbound(bindMessage(first.bot.uid, "restart-bind"));
   await waitForStatus(
     first.service,
     { channelType: 2, channelId: GROUP_ID },
@@ -618,14 +644,14 @@ test("restart does not replay delivered inputs and later business changes remain
     loop.tasks.set(WORKSPACE.workspaceId, [
       task("loop-task-restart", "Before restart", "2026-11-05T00:00:00Z"),
     ]);
-    await second.service.handleInbound(bindMessage(botUid, "restart-timestamp-only"));
+    await second.service.submitInbound(bindMessage(botUid, "restart-timestamp-only"));
     store = await openChannelStore(second.stateDir);
     expect(second.workers.prompts).toEqual([]);
     expect(store.listLoopInputs(botUid).filter((input) => input.kind !== "baseline")).toHaveLength(0);
 
     loop.tasks.set(WORKSPACE.workspaceId, [task("loop-task-restart", "After restart")]);
-    await second.service.handleInbound(bindMessage(botUid, "restart-business-change"));
-    await second.workers.waitForPromptCount(1);
+    await second.service.submitInbound(bindMessage(botUid, "restart-business-change"));
+    await waitUntil(() => second.workers.prompts.length >= 1, "post-restart business-change prompt");
     expect(second.workers.prompts[0]?.text).toContain("After restart");
   } finally {
     store?.close();
@@ -645,7 +671,7 @@ test("stop aborts a Loop selector read before the shared store is closed", async
       else signal?.addEventListener("abort", () => aborted.resolve(), { once: true });
       await aborted.promise;
     };
-    const inboundOperation = harness.service.handleInbound(bindMessage(harness.bot.uid, "stop-loop-read"));
+    const inboundOperation = harness.service.submitInbound(bindMessage(harness.bot.uid, "stop-loop-read"));
     await entered.promise;
     await harness.service.stop();
     await inboundOperation.catch(() => {});
@@ -656,6 +682,7 @@ test("stop aborts a Loop selector read before the shared store is closed", async
 });
 
 test("service shutdown stops the active worker before awaiting a queued Loop steer", async () => {
+  vi.useFakeTimers();
   const loop = loopFixture([task("loop-task-stop-baseline", "Baseline before shutdown")]);
   const promptStarted = Promise.withResolvers<void>();
   const steerEntered = Promise.withResolvers<void>();
@@ -674,42 +701,39 @@ test("service shutdown stops the active worker before awaiting a queued Loop ste
   let shutdown: Promise<void> | undefined;
   try {
     harness.workers.stopHandler = () => workerStopStarted.resolve();
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "stop-steer-bind"));
-    await harness.workers.waitForPromptCount(1);
-    await promptStarted.promise;
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "stop-steer-bind"));
+    await waitUntil(() => harness.workers.prompts.length >= 1, "shutdown-test worker prompt");
+    await waitForSignal(promptStarted.promise, "shutdown-test worker start");
 
     harness.workers.beforeSteer = async (text) => {
       if (text !== "Ordinary steer holds the serial lane") return;
       steerEntered.resolve();
       await releaseSteer.promise;
     };
-    ordinarySteer = harness.service.handleInbound(
+    ordinarySteer = harness.service.submitInbound(
       groupMessage(harness.bot.uid, "stop-steer-blocker", "Ordinary steer holds the serial lane"),
     );
-    await steerEntered.promise;
+    await waitForSignal(steerEntered.promise, "shutdown-test steer gate entered");
 
     store = await openChannelStore(harness.stateDir);
+    const taskListCallsBeforePoll = loop.taskListCalls.length;
     loop.tasks.set(WORKSPACE.workspaceId, [
       task("loop-task-stop-baseline", "Baseline before shutdown"),
       task("loop-task-stop-update", "Loop update queued behind steer"),
     ]);
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "stop-steer-update"));
+    vi.advanceTimersByTime(60_000);
 
-    let input = store.listLoopInputs(harness.bot.uid)
-      .find((item) => item.taskId === "loop-task-stop-update");
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      if (
-        input !== undefined
-        && store.getCommandClaimState(
+    let input: LoopInput | undefined;
+    await waitUntil(() => {
+      input = store!.listLoopInputs(harness.bot.uid)
+        .find((item) => item.taskId === "loop-task-stop-update");
+      return loop.taskListCalls.length > taskListCallsBeforePoll
+        && input !== undefined && store!.getCommandClaimState(
           harness.bot.uid,
           { channelType: 2, channelId: GROUP_ID },
           `loop:${input.id}`,
-        ) === "pending"
-      ) break;
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      input = store.listLoopInputs(harness.bot.uid)
-        .find((item) => item.taskId === "loop-task-stop-update");
-    }
+        ) === "pending";
+    }, "periodic Loop claim to remain pending before shutdown");
     expect(input).toBeDefined();
     expect(store.getCommandClaimState(
       harness.bot.uid,
@@ -724,10 +748,12 @@ test("service shutdown stops the active worker before awaiting a queued Loop ste
     const workerCloseReached = await workerCloseResult.promise;
     clearTimeout(timeout);
     expect(workerCloseReached).toBe(true);
-    await shutdown;
-    await ordinarySteer;
+    releaseSteer.resolve();
+    await waitForSignal(shutdown, "service shutdown completion");
+    await waitForSignal(ordinarySteer, "ordinary steer completion after shutdown");
   } finally {
     releaseSteer.resolve();
+    vi.useRealTimers();
     await Promise.allSettled([
       ...(ordinarySteer === undefined ? [] : [ordinarySteer]),
       ...(shutdown === undefined ? [] : [shutdown]),
@@ -742,10 +768,15 @@ test("one unavailable child fault notifies the main group once across pending ta
   const harness = await createCoreHarness({ loop });
   let store: ChannelStore | undefined;
   try {
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "fault-bind"));
-    await harness.workers.waitForPromptCount(1);
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "fault-bind"));
+    await waitUntil(() => harness.workers.prompts.length >= 1, "initial child-fault prompt");
     const thread = await harness.transport.createThread(GROUP_ID, "Faulted child");
     store = await openChannelStore(harness.stateDir);
+    await waitUntil(
+      () => store!.listLoopInputs(harness.bot.uid)
+        .filter(input => input.workspaceId === WORKSPACE.workspaceId).length === 0,
+      "initial Loop baseline durable handoff",
+    );
     const key = {
       botUid: harness.bot.uid,
       groupId: GROUP_ID,
@@ -756,9 +787,31 @@ test("one unavailable child fault notifies the main group once across pending ta
     harness.transport.failManagementWith(new Error("fixture access denied"));
 
     loop.tasks.set(WORKSPACE.workspaceId, [task("loop-task-fault", "First unavailable update")]);
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "fault-update-1"));
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "fault-update-1"));
+    await waitUntil(() => {
+      const notices = harness.transport.sent.filter(({ target, text }) =>
+        target.channelType === 2
+        && target.channelId === GROUP_ID
+        && text.includes("Loop 关联子区暂不可用"));
+      const firstFault = store!.listLoopInputs(harness.bot.uid).some((input) =>
+        input.taskId === "loop-task-fault"
+        && input.faultNotified
+        && input.tasks.some(({ title }) => title === "First unavailable update"));
+      return notices.length === 1 && firstFault;
+    }, "first Loop update fault and its single notice to persist");
     loop.tasks.set(WORKSPACE.workspaceId, [task("loop-task-fault", "Second unavailable update")]);
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "fault-update-2"));
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "fault-update-2"));
+
+    await waitUntil(() => {
+      const notices = harness.transport.sent.filter(({ target, text }) =>
+        target.channelType === 2
+        && target.channelId === GROUP_ID
+        && text.includes("Loop 关联子区暂不可用"));
+      const inputs = store!.listLoopInputs(harness.bot.uid).filter((input) =>
+        input.workspaceId === WORKSPACE.workspaceId
+        && input.taskId === "loop-task-fault");
+      return notices.length === 1 && inputs.length === 2 && inputs.every((input) => input.faultNotified);
+    }, "both Loop faults and their single notice to persist");
 
     const faultNotices = harness.transport.sent.filter(({ target, text }) =>
       target.channelType === 2
@@ -773,8 +826,8 @@ test("one unavailable child fault notifies the main group once across pending ta
     expect(harness.workers.prompts).toHaveLength(1);
 
     harness.transport.failManagementWith(undefined);
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "fault-retry"));
-    await harness.workers.waitForPromptCount(3);
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "fault-retry"));
+    await waitUntil(() => harness.workers.prompts.length >= 3, "child-fault retry prompt");
     await waitForStatus(
       harness.service,
       { channelType: 5, channelId: thread.channelId },
@@ -782,18 +835,20 @@ test("one unavailable child fault notifies the main group once across pending ta
     );
     expect(harness.workers.prompts).toHaveLength(3);
   } finally {
-    store?.close();
     await closeCoreHarness(harness);
+    store?.close();
   }
 });
 
 test("a route replacement during child validation prevents acceptance by the old child", async () => {
   const loop = loopFixture([task("loop-task-route-race", "Before route change")]);
   const harness = await createCoreHarness({ loop });
+  const validationStarted = Promise.withResolvers<void>();
+  const releaseValidation = Promise.withResolvers<void>();
   let store: ChannelStore | undefined;
   try {
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "route-race-bind"));
-    await harness.workers.waitForPromptCount(1);
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "route-race-bind"));
+    await waitUntil(() => harness.workers.prompts.length >= 1, "initial route-race prompt");
     const oldThread = await harness.transport.createThread(GROUP_ID, "Old route");
     const currentThread = await harness.transport.createThread(GROUP_ID, "Current route");
     store = await openChannelStore(harness.stateDir);
@@ -806,23 +861,21 @@ test("a route replacement during child validation prevents acceptance by the old
     store.bindLoopTask(key, oldThread.channelId);
     loop.tasks.set(WORKSPACE.workspaceId, [task("loop-task-route-race", "Changed during route read")]);
 
-    const validationStarted = Promise.withResolvers<void>();
-    const releaseValidation = Promise.withResolvers<void>();
     harness.transport.beforeGetThread = async (_groupId, shortId) => {
       if (shortId === oldThread.shortId) {
         validationStarted.resolve();
         await releaseValidation.promise;
       }
     };
-    const oldRouteDelivery = harness.service.handleInbound(bindMessage(harness.bot.uid, "route-race-update"));
-    await validationStarted.promise;
+    const oldRouteDelivery = harness.service.submitInbound(bindMessage(harness.bot.uid, "route-race-update"));
+    await waitForSignal(validationStarted.promise, "old child route validation");
     store.bindLoopTask(key, currentThread.channelId);
     releaseValidation.resolve();
     await oldRouteDelivery;
     harness.transport.beforeGetThread = undefined;
 
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "route-race-current"));
-    await harness.workers.waitForPromptCount(2);
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "route-race-current"));
+    await waitUntil(() => harness.workers.prompts.length >= 2, "current-route worker prompt");
     const staleStatus = await harness.service.status({ channelType: 5, channelId: oldThread.channelId });
     const currentStatus = await waitForStatus(
       harness.service,
@@ -835,8 +888,9 @@ test("a route replacement during child validation prevents acceptance by the old
     expect(harness.workers.prompts[1]?.text).toContain("Changed during route read");
     expect(harness.workers.prompts).toHaveLength(2);
   } finally {
-    store?.close();
+    releaseValidation.resolve();
     await closeCoreHarness(harness);
+    store?.close();
   }
 });
 
@@ -845,8 +899,8 @@ test("direct Loop thread tasks use the thread's task-level completion policy", a
   const harness = await createCoreHarness({ loop });
   let store: ChannelStore | undefined;
   try {
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "listen-bind"));
-    await harness.workers.waitForPromptCount(1);
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "listen-bind"));
+    await waitUntil(() => harness.workers.prompts.length >= 1, "initial thread-listen prompt");
     const thread = await harness.transport.createThread(GROUP_ID, "Listen child");
     store = await openChannelStore(harness.stateDir);
     store.bindLoopTask({
@@ -866,8 +920,8 @@ test("direct Loop thread tasks use the thread's task-level completion policy", a
     store.setThreadListen(harness.bot.uid, { channelType: 5, channelId: thread.channelId }, "task");
 
     loop.tasks.set(WORKSPACE.workspaceId, [task("loop-task-listen", "After child work")]);
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "listen-change"));
-    await harness.workers.waitForPromptCount(3);
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "listen-change"));
+    await waitUntil(() => harness.workers.prompts.length >= 3, "updated thread-listen prompt");
     await waitForStatus(
       harness.service,
       { channelType: 5, channelId: thread.channelId },

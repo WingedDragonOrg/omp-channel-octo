@@ -6,7 +6,6 @@ import {
   createCoreHarness,
   FakeLoopReadPort,
   inbound,
-  waitForStatus,
 } from "./fixtures/core-fakes.ts";
 import { openChannelStore } from "../src/store/index.ts";
 import type { ChannelStore } from "../src/store/index.ts";
@@ -58,14 +57,33 @@ function loopFixture(tasks: LoopTask[] = []): FakeLoopReadPort {
   loop.tasks.set(WORKSPACE.workspaceId, tasks);
   return loop;
 }
+async function waitUntil(
+  predicate: () => boolean,
+  description: string,
+  timeoutMs = 3_000,
+): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    if (predicate()) return;
+    const turn = Promise.withResolvers<void>();
+    setImmediate(turn.resolve);
+    await turn.promise;
+  }
+  throw new Error(`timed out waiting for ${description}`);
+}
 
 // A control command outside a main group must never fall through to a model prompt.
 test("Loop binding in a private chat is refused without starting agent work", async () => {
   const harness = await createCoreHarness();
   try {
     const message = inbound({ messageId: "loop-private-bind", text: "/bind loop 8077bebd-3577-486f-b62f-0820f34a855f" });
-    await harness.service.handleInbound(message);
-    await waitForStatus(harness.service, message, (status) => status.state !== "running" && status.queued === 0);
+    await harness.service.submitInbound(message);
+    await waitUntil(
+      () => harness.transport.sent.some(
+        ({ target, text }) => target.channelId === message.channelId && text.includes("主群"),
+      ),
+      "private-chat Loop refusal",
+    );
     expect(harness.workers.prompts).toEqual([]);
     expect(harness.transport.sent.some(({ target, text }) => target.channelId === message.channelId && text.includes("主群"))).toBe(true);
   } finally {
@@ -76,7 +94,14 @@ test("Loop binding in a private chat is refused without starting agent work", as
 test("Loop binding without a configured read port is explicitly refused", async () => {
   const harness = await createCoreHarness();
   try {
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "loop-unconfigured"));
+    const message = bindMessage(harness.bot.uid, "loop-unconfigured");
+    await harness.service.submitInbound(message);
+    await waitUntil(
+      () => harness.transport.sent.some(
+        ({ target, text }) => target.channelId === message.channelId && text.includes("未配置"),
+      ),
+      "unconfigured Loop refusal",
+    );
     expect(harness.workers.prompts).toEqual([]);
     expect(harness.transport.sent.some(({ text }) => text.includes("未配置"))).toBe(true);
   } finally {
@@ -84,13 +109,14 @@ test("Loop binding without a configured read port is explicitly refused", async 
   }
 });
 
+
 test("Loop bind reads the complete selector and delivers the baseline as a main-group task", async () => {
   const loop = loopFixture([task("loop-task-a", "First baseline task"), task("loop-task-b", "Second baseline task")]);
   const harness = await createCoreHarness({ loop });
   let store: ChannelStore | undefined;
   try {
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "loop-bind-baseline", "Product Tasks"));
-    await harness.workers.waitForPromptCount(1);
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "loop-bind-baseline", "Product Tasks"));
+    await waitUntil(() => harness.workers.prompts.length >= 1, "Loop baseline worker prompt");
     store = await openChannelStore(harness.stateDir);
 
     expect(loop.resolutionCalls).toEqual(["Product Tasks"]);
@@ -112,9 +138,9 @@ test("Repeated bind to the same workspace does not publish a second baseline", a
   const harness = await createCoreHarness({ loop: loopFixture([task("loop-bind-once-task", "Initial task")]) });
   let database: Database | undefined;
   try {
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "loop-bind-once"));
-    await harness.workers.waitForPromptCount(1);
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "loop-bind-twice"));
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "loop-bind-once"));
+    await waitUntil(() => harness.workers.prompts.length >= 1, "first Loop bind worker prompt");
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "loop-bind-twice"));
     database = new Database(join(harness.stateDir, "channel.sqlite"), { readonly: true });
 
     const row = database.query(
@@ -140,10 +166,10 @@ test("Failed replacement read leaves the current Loop workspace and baseline unt
   const harness = await createCoreHarness({ loop });
   let store: ChannelStore | undefined;
   try {
-    await harness.service.handleInbound(bindMessage(harness.bot.uid, "loop-bind-current"));
-    await harness.workers.waitForPromptCount(1);
+    await harness.service.submitInbound(bindMessage(harness.bot.uid, "loop-bind-current"));
+    await waitUntil(() => harness.workers.prompts.length >= 1, "current Loop bind worker prompt");
     loop.listFailure = new Error("fixture read failed");
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       bindMessage(harness.bot.uid, "loop-bind-read-failure", replacement.workspaceId),
     );
     store = await openChannelStore(harness.stateDir);

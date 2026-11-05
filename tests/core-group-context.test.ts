@@ -47,7 +47,7 @@ test("keeps a session's loaded shared context until a new session is created", a
       updatedBy: "admin-a",
     });
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "group-context-first",
         ...group,
@@ -67,7 +67,7 @@ test("keeps a session's loaded shared context until a new session is created", a
     expect(scopeRoot).toEqual(expect.any(String));
     expect(firstPrompt?.boundSessionId).toBe(firstPrompt?.sessionId);
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "group-context-unchanged",
         ...group,
@@ -90,7 +90,7 @@ test("keeps a session's loaded shared context until a new session is created", a
       updatedAt: "2026-09-12T00:02:00.000Z",
       updatedBy: "admin-a",
     });
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "group-context-changed",
         ...group,
@@ -106,7 +106,7 @@ test("keeps a session's loaded shared context until a new session is created", a
     expect(changedPrompt?.text).toBe("third group turn");
     expect(harness.transport.groupContextCalls).toEqual([group]);
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "group-context-new-session",
         ...group,
@@ -114,6 +114,7 @@ test("keeps a session's loaded shared context until a new session is created", a
         mentionedUserIds: [harness.bot.uid],
       }),
     );
+    await waitForStatus(harness.service, group, status => status.sessionId !== firstPrompt?.sessionId);
     const newSessionId = (await harness.service.status(group)).sessionId;
     if (!newSessionId) throw new Error("new group session was not created");
     expect(newSessionId).not.toBe(firstPrompt?.sessionId);
@@ -124,7 +125,7 @@ test("keeps a session's loaded shared context until a new session is created", a
       updatedAt: "2026-09-12T00:03:00.000Z",
       updatedBy: "admin-a",
     });
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "group-context-fresh-session",
         ...group,
@@ -162,7 +163,7 @@ test("loads group context once per session and keeps private chats isolated", as
       updatedBy: "admin",
     });
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "group-transport-first",
         ...group,
@@ -173,7 +174,7 @@ test("loads group context once per session and keeps private chats isolated", as
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, group, (status) => status.state === "completed");
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "group-transport-second",
         ...group,
@@ -184,7 +185,7 @@ test("loads group context once per session and keeps private chats isolated", as
     await harness.workers.waitForPromptCount(2);
     await waitForStatus(harness.service, group, (status) => status.state === "completed");
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "private-isolated", ...privateChat, text: "private task" }),
     );
     await harness.workers.waitForPromptCount(3);
@@ -217,7 +218,7 @@ test("a recovered group session does not repeat a committed unchanged snapshot",
       updatedBy: "admin-b",
     });
 
-    await first.service.handleInbound(
+    await first.service.submitInbound(
       inbound({
         messageId: "group-recovery-first",
         ...group,
@@ -243,7 +244,7 @@ test("a recovered group session does not repeat a committed unchanged snapshot",
     const restoredBinding = await recovered.service.status(group);
     expect(restoredBinding.sessionId).toBe(sessionId);
 
-    await recovered.service.handleInbound(
+    await recovered.service.submitInbound(
       inbound({
         messageId: "group-recovery-second",
         ...group,
@@ -273,7 +274,7 @@ test("a group-context read failure fails the task before any worker prompt", asy
   try {
     const group = { channelId: "group-unavailable", channelType: 2 as const };
     harness.transport.failGroupContextWith(new Error("fixture context unavailable"));
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "group-read-failed",
         ...group,
@@ -318,7 +319,7 @@ test("a local-only command completes without a prepared receipt and leaves the c
       updatedBy: "admin",
     });
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "local-only-autoresearch",
         ...group,
@@ -335,7 +336,7 @@ test("a local-only command completes without a prepared receipt and leaves the c
     expect(localStatus.state).toBe("completed");
     expect(workers.prompts[0]?.text).toBe("/autoresearch");
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "after-local-only",
         ...group,
@@ -377,7 +378,7 @@ test("a model turn that produced real events still requires its own prepared rec
       updatedAt: "2026-09-20T00:00:00.000Z",
       updatedBy: "admin",
     });
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "receipt-required-model-turn",
         ...group,

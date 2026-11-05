@@ -112,6 +112,7 @@ import type {
   InboundAttachment,
   InboundAttachmentKind,
   InboundMessage,
+  InboundReceipt,
   InboundQuote,
   SendReceipt,
   TextMention,
@@ -191,12 +192,12 @@ export class OctoTransport implements ChannelTransport {
   private startPromise: Promise<void> | undefined;
   private startResolve: (() => void) | undefined;
   private startReject: ((error: Error) => void) | undefined;
-  private onMessage: ((message: InboundMessage) => Promise<void>) | undefined;
+  private onMessage: ((message: InboundMessage) => InboundReceipt) | undefined;
   private onOnline: (() => void) | undefined;
   private currentSocket: SocketState | undefined;
   private reconnectTimer: NodeJS.Timeout | undefined;
   private reconnectAttempt = 0;
-  private inboundChain: Promise<void> = Promise.resolve();
+  private readonly pendingInboundReceipts = new Set<Promise<void>>();
   private cardCapabilities: ExecutionCardCapabilities | undefined;
 
   constructor(options: OctoTransportOptions) {
@@ -218,7 +219,7 @@ export class OctoTransport implements ChannelTransport {
   }
 
   start(
-    onMessage: (message: InboundMessage) => Promise<void>,
+    onMessage: (message: InboundMessage) => InboundReceipt,
     onOnline: () => void,
   ): Promise<void> {
     if (!this.registration) return Promise.reject(new OctoError("Octo transport must initialize before start"));
@@ -890,6 +891,9 @@ export class OctoTransport implements ChannelTransport {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.onMessage = undefined;
+    this.onOnline = undefined;
+    this.pendingInboundReceipts.clear();
     this.cardCapabilities = undefined;
     this.started = false;
     if (this.reconnectTimer) {
@@ -1238,21 +1242,39 @@ export class OctoTransport implements ChannelTransport {
       );
       const handler = this.onMessage;
       if (!handler) return;
-      this.inboundChain = this.inboundChain.then(async () => {
-        try {
-          await handler(normalized);
-          if (state.socket.readyState === WebSocket.OPEN && this.currentSocket === state) {
-            state.socket.send(encodeRecvAck(messageId, messageSeq));
-          }
-        } catch (error) {
-          this.logger(this.safeError(error, `Octo inbound handler failed for message ${messageId.toString()}`));
-        }
-      });
+      let receipt: InboundReceipt;
+      try {
+        receipt = handler(normalized);
+      } catch (error) {
+        this.logger(this.safeError(error, `Octo inbound handler failed for message ${messageId.toString()}`));
+        return;
+      }
+      this.monitorInboundReceipt(state, messageId, messageSeq, receipt.ackReady);
     } catch (error) {
       const detail = error instanceof OctoError ? error.message : "Octo inbound message is invalid";
       this.logger(header.length > 0 ? `${detail} (${header})` : detail);
     }
   }
+  private monitorInboundReceipt(
+    state: SocketState,
+    messageId: bigint,
+    messageSeq: number,
+    ackReady: Promise<void>,
+  ): void {
+    const monitored = ackReady.then(() => {
+      if (!this.stopped
+        && state.socket.readyState === WebSocket.OPEN
+        && this.currentSocket === state) {
+        state.socket.send(encodeRecvAck(messageId, messageSeq));
+      }
+    }).catch((error: unknown) => {
+      this.logger(this.safeError(error, `Octo inbound receipt failed for message ${messageId.toString()}`));
+    }).finally(() => {
+      this.pendingInboundReceipts.delete(monitored);
+    });
+    this.pendingInboundReceipts.add(monitored);
+  }
+
 
   private closeSocket(state: SocketState): void {
     if (state.closed) return;

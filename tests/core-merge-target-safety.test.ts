@@ -14,6 +14,8 @@ import {
   createCoreHarness,
   FakeWorktrees,
   inbound,
+  waitForIngressJob,
+  waitForStatus,
   type CoreHarness,
   type CoreHarnessOptions,
 } from "./fixtures/core-fakes";
@@ -127,6 +129,35 @@ async function ensureBinding(
     cwdPinned,
   });
 }
+async function waitForSuccessfulHostMerge(
+  store: ChannelStore,
+  botUid: string,
+  target: ChatTarget,
+  sourceId: string,
+): Promise<void> {
+  const deadline = performance.now() + 3_000;
+  while (performance.now() < deadline) {
+    const lease = store.getHostMergeLeaseBySourceId(botUid, target, sourceId);
+    if (lease?.outcome?.kind === "succeeded") return;
+    const turn = Promise.withResolvers<void>();
+    setImmediate(turn.resolve);
+    await turn.promise;
+  }
+  throw new Error(`host merge ${sourceId} did not persist a successful outcome`);
+}
+
+async function waitForRemovalCount(
+  worktrees: PlannedFakeWorktrees,
+  count: number,
+): Promise<void> {
+  const deadline = performance.now() + 3_000;
+  while (worktrees.removals.length < count && performance.now() < deadline) {
+    const turn = Promise.withResolvers<void>();
+    setImmediate(turn.resolve);
+    await turn.promise;
+  }
+  expect(worktrees.removals).toHaveLength(count);
+}
 
 
 test("host /thread merge overlaps ordinary tasks on its source and target checkouts", async () => {
@@ -165,7 +196,7 @@ test("host /thread merge overlaps ordinary tasks on its source and target checko
   let merge: Promise<void> | undefined;
 
   const startTask = (target: ChatTarget, messageId: string, text: string): void => {
-    taskDeliveries.push(harness.service.handleInbound(inbound({
+    taskDeliveries.push(harness.service.submitInbound(inbound({
       ...target,
       messageId,
       text,
@@ -192,14 +223,22 @@ test("host /thread merge overlaps ordinary tasks on its source and target checko
       heldTasks.get(taskTexts[1]!)!.started,
     ]);
 
-    merge = harness.service.handleInbound(inbound({
+    const mergeMessage = inbound({
       ...source,
       messageId: "slash-merge-with-active-tasks",
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
-    }));
+    });
+    merge = harness.service.submitInbound(mergeMessage);
+    await merge;
     await mergeStarted.promise;
     expect(worktrees.mergeCalls).toBe(1);
+    heldTasks.get(taskTexts[0]!)!.finish();
+    heldTasks.get(taskTexts[1]!)!.finish();
+    await Promise.all([
+      waitForStatus(harness.service, sourceBefore, status => status.state === "completed"),
+      waitForStatus(harness.service, targetBefore, status => status.state === "completed"),
+    ]);
 
     startTask(sourceDuring, "slash-source-task-during", taskTexts[2]!);
     startTask(targetDuring, "slash-target-task-during", taskTexts[3]!);
@@ -209,10 +248,18 @@ test("host /thread merge overlaps ordinary tasks on its source and target checko
       heldTasks.get(taskTexts[3]!)!.started,
       heldTasks.get(taskTexts[4]!)!.started,
     ]);
-
     for (const held of heldTasks.values()) held.finish();
     releaseMerge.resolve();
+
     await Promise.all([...taskDeliveries, merge]);
+    await Promise.all([
+      waitForSuccessfulHostMerge(store, harness.bot.uid, source, mergeMessage.messageId),
+      waitForStatus(harness.service, sourceBefore, status => status.state === "completed"),
+      waitForStatus(harness.service, targetBefore, status => status.state === "completed"),
+      waitForStatus(harness.service, sourceDuring, status => status.state === "completed"),
+      waitForStatus(harness.service, targetDuring, status => status.state === "completed"),
+      waitForStatus(harness.service, independent, status => status.state === "completed"),
+    ]);
     expect(worktrees.merges).toHaveLength(1);
     expect(worktrees.merges[0]).toMatchObject({ cwd: sourceWorktree, target: "main" });
   } finally {
@@ -283,7 +330,7 @@ test("host-tool thread merge overlaps ordinary tasks on its source and target ch
   const taskDeliveries: Promise<void>[] = [];
   let mergeTask: Promise<void> | undefined;
   const startTask = (target: ChatTarget, messageId: string, text: string): void => {
-    taskDeliveries.push(harness.service.handleInbound(inbound({
+    taskDeliveries.push(harness.service.submitInbound(inbound({
       ...target,
       messageId,
       text,
@@ -309,14 +356,21 @@ test("host-tool thread merge overlaps ordinary tasks on its source and target ch
       heldTasks.get(taskTexts[1]!)!.started,
     ]);
 
-    mergeTask = harness.service.handleInbound(inbound({
+    mergeTask = harness.service.submitInbound(inbound({
       ...source,
       messageId: "tool-merge-with-active-tasks",
       text: "invoke host-tool merge",
       mentionedUserIds: [harness.bot.uid],
     }));
+    await mergeTask;
     await mergeStarted.promise;
     expect(worktrees.mergeCalls).toBe(1);
+    heldTasks.get(taskTexts[0]!)!.finish();
+    heldTasks.get(taskTexts[1]!)!.finish();
+    await Promise.all([
+      waitForStatus(harness.service, sourceBefore, status => status.state === "completed"),
+      waitForStatus(harness.service, targetBefore, status => status.state === "completed"),
+    ]);
 
     startTask(sourceDuring, "tool-source-task-during", taskTexts[2]!);
     startTask(targetDuring, "tool-target-task-during", taskTexts[3]!);
@@ -324,12 +378,19 @@ test("host-tool thread merge overlaps ordinary tasks on its source and target ch
       heldTasks.get(taskTexts[2]!)!.started,
       heldTasks.get(taskTexts[3]!)!.started,
     ]);
-
     for (const held of heldTasks.values()) held.finish();
     releaseMerge.resolve();
+
     await Promise.all(taskDeliveries);
     await mergeTask;
     expect(await toolFinished.promise).toContain("resolved:");
+    await Promise.all([
+      waitForStatus(harness.service, sourceBefore, status => status.state === "completed"),
+      waitForStatus(harness.service, targetBefore, status => status.state === "completed"),
+      waitForStatus(harness.service, source, status => status.state === "completed"),
+      waitForStatus(harness.service, sourceDuring, status => status.state === "completed"),
+      waitForStatus(harness.service, targetDuring, status => status.state === "completed"),
+    ]);
     expect(worktrees.merges).toHaveLength(1);
     expect(worktrees.merges[0]).toMatchObject({
       cwd: sourceWorktree,
@@ -409,36 +470,56 @@ test("/thread remove can run on the source and target while /thread merge is exe
       error: null,
     });
 
-    merge = harness.service.handleInbound(inbound({
+    const mergeMessage = inbound({
       ...source,
       messageId: "merge-while-removing-resources",
       text: "/thread merge",
       mentionedUserIds: [harness.bot.uid],
-    }));
+    });
+    merge = harness.service.submitInbound(mergeMessage);
+    await merge;
+    await waitForIngressJob(harness, mergeMessage, {
+      predicate: job =>
+        job.operationCheckpoint?.kind === "command"
+        && job.operationCheckpoint.action === "thread"
+        && job.operationCheckpoint.phase === "waiting-session",
+      description: "merge waiting-session checkpoint",
+    });
     await mergeStarted.promise;
     expect(worktrees.mergeCalls).toBe(1);
 
+    const removeSourceMessage = inbound({
+      ...removeSource,
+      messageId: "remove-source-during-merge",
+      text: "/thread remove",
+      mentionedUserIds: [harness.bot.uid],
+    });
+    const removeTargetMessage = inbound({
+      ...removeTarget,
+      messageId: "remove-target-during-merge",
+      text: "/thread remove",
+      mentionedUserIds: [harness.bot.uid],
+    });
     await Promise.all([
-      harness.service.handleInbound(inbound({
-        ...removeSource,
-        messageId: "remove-source-during-merge",
-        text: "/thread remove",
-        mentionedUserIds: [harness.bot.uid],
-      })),
-      harness.service.handleInbound(inbound({
-        ...removeTarget,
-        messageId: "remove-target-during-merge",
-        text: "/thread remove",
-        mentionedUserIds: [harness.bot.uid],
-      })),
+      harness.service.submitInbound(removeSourceMessage),
+      harness.service.submitInbound(removeTargetMessage),
     ]);
-    expect(worktrees.removals).toHaveLength(2);
+    await Promise.all([
+      waitForIngressJob(harness, removeSourceMessage),
+      waitForIngressJob(harness, removeTargetMessage),
+    ]);
+    await waitForRemovalCount(worktrees, 2);
     expect(worktrees.removals.map(({ path }) => path).sort()).toEqual(
       [sourceWorktree, targetCheckout].sort(),
     );
 
     releaseMerge.resolve();
-    await merge;
+    await waitForSuccessfulHostMerge(
+      store,
+      harness.bot.uid,
+      source,
+      mergeMessage.messageId,
+    );
     expect(worktrees.merges).toHaveLength(1);
   } finally {
     releaseMerge.resolve();
@@ -487,7 +568,7 @@ test("host-tool merge refuses a changed target checkout after acquiring its plan
 
   try {
     await ensureBinding(store, harness.bot.uid, source, sourceWorktree, "changing-plan-session", true);
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...source,
       messageId: "changing-target-plan-task",
       text: "merge across a changing plan",
@@ -540,7 +621,7 @@ test("unknown host-tool merge state persists across restart without blocking tas
     await ensureBinding(store, initial.bot.uid, target, targetCheckout, "unknown-target-session", true);
     await ensureBinding(store, initial.bot.uid, source, sourceWorktree, "unknown-source-session", true);
     await ensureBinding(store, initial.bot.uid, third, thirdWorktree, "unknown-third-session", true);
-    await initial.service.handleInbound(inbound({
+    await initial.service.submitInbound(inbound({
       ...source,
       messageId: "unknown-target-merge-task",
       text: "create uncertain merge",
@@ -572,19 +653,24 @@ test("unknown host-tool merge state persists across restart without blocking tas
     expect(recoveredLease?.phase).toBe("unknown");
     expect(recoveredLease?.resourceCwds).toEqual([sourceWorktree, targetCheckout]);
 
-    await restarted.service.handleInbound(inbound({
+    const blockedTargetMessage = inbound({
       ...target,
       messageId: "task-on-unknown-target",
       text: "target task after recovery",
       mentionedUserIds: [restarted.bot.uid],
-    }));
-    await restarted.service.handleInbound(inbound({
+    });
+    await restarted.service.submitInbound(blockedTargetMessage);
+    await waitForIngressJob(restarted, blockedTargetMessage);
+    const unrelatedMessage = inbound({
       ...third,
       messageId: "task-on-unrelated-third-worktree",
       text: "unrelated third-worktree task after recovery",
       mentionedUserIds: [restarted.bot.uid],
-    }));
-    await Promise.all([targetStarted.promise, thirdStarted.promise]);
+    });
+    await restarted.service.submitInbound(unrelatedMessage);
+    await waitForIngressJob(restarted, unrelatedMessage);
+    await thirdStarted.promise;
+    expect(store.getLatestTask(restarted.bot.uid, target)?.state).toBe("queued");
     const finalLease = store.listHostMergeLeases(restarted.bot.uid)[0];
     expect(finalLease?.phase).toBe("unknown");
     expect(finalLease?.resourceCwds).toEqual([sourceWorktree, targetCheckout]);

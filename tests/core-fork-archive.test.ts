@@ -1,5 +1,6 @@
 import { expect, test, vi } from "bun:test";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ChatTarget, ThreadSummary } from "../src/contracts.ts";
 import { openChannelStore } from "../src/store/index.ts";
@@ -10,6 +11,7 @@ import {
   createCoreHarness,
   FakeTransport,
   inbound,
+  waitForIngressJob,
   type CoreHarness,
   waitForStatus,
 } from "./fixtures/core-fakes.ts";
@@ -62,6 +64,28 @@ async function withStore<T>(harness: CoreHarness, work: (store: ChannelStore) =>
   } finally {
     store.close();
   }
+}
+
+function archiveReceiptId(
+  harness: CoreHarness,
+  fork: SeededFork,
+  messageId: string,
+  mode: "merge" | "remove",
+): string {
+  return createHash("sha256")
+    .update(JSON.stringify([
+      "thread-fork-archive",
+      harness.bot.uid,
+      fork.target.channelType,
+      fork.target.channelId,
+      messageId,
+      mode,
+    ]))
+    .digest("hex");
+}
+
+async function yieldRealIo(harness: CoreHarness): Promise<void> {
+  for (let attempt = 0; attempt < 4; attempt += 1) await stat(harness.root);
 }
 
 async function seedFork(
@@ -151,6 +175,23 @@ function archiveCalls(harness: CoreHarness) {
   return harness.transport.managementCalls.filter(call => call.action === "thread-archive");
 }
 
+async function waitForArchiveAttempts(
+  harness: CoreHarness,
+  thread: ThreadSummary,
+  count: number,
+  advanceTimers = false,
+): Promise<void> {
+  const deadline = performance.now() + 5_000;
+  while (performance.now() < deadline) {
+    if (archiveCalls(harness).filter(call =>
+      call.groupId === thread.groupId && call.shortId === thread.shortId,
+    ).length >= count) return;
+    if (advanceTimers) vi.advanceTimersByTime(150);
+    await yieldRealIo(harness);
+  }
+  throw new Error(`thread ${thread.shortId} did not reach ${count} archive attempts`);
+}
+
 function isArchiveOnlyReceiptText(text: string | undefined): boolean {
   return text !== undefined
     && text.includes("归档")
@@ -166,8 +207,76 @@ function hasArchiveOnlyReceipt(harness: CoreHarness, target: ChatTarget): boolea
   );
 }
 
-async function expectArchiveOnlyResult(harness: CoreHarness, fork: SeededFork): Promise<void> {
+function waitForTargetText(
+  harness: CoreHarness,
+  target: ChatTarget,
+  predicate: (text: string) => boolean,
+): Promise<void> {
+  return harness.transport.waitForRemoteText((message) =>
+    message.target.channelType === target.channelType
+    && message.target.channelId === target.channelId
+    && predicate(message.text)).then(() => undefined);
+}
+
+function waitForArchiveOnlyReceipt(harness: CoreHarness, target: ChatTarget): Promise<void> {
+  return waitForTargetText(harness, target, isArchiveOnlyReceiptText);
+}
+
+async function waitForPendingTargetText(
+  harness: CoreHarness,
+  target: ChatTarget,
+  predicate: (text: string) => boolean,
+): Promise<void> {
+  for (let attempt = 0; attempt < 10_000; attempt += 1) {
+    const pending = await withStore(harness, store => store.listPendingOutbox(harness.bot.uid, target));
+    if (pending.some(({ text }) => predicate(text ?? ""))) return;
+    await settleOneTurn();
+  }
+  throw new Error(`outbox text was not persisted for ${target.channelType}:${target.channelId}`);
+}
+
+function waitForPendingArchiveReceipt(harness: CoreHarness, target: ChatTarget): Promise<void> {
+  return waitForPendingTargetText(harness, target, text => isArchiveOnlyReceiptText(text));
+}
+
+async function waitForArchiveReceiptSent(
+  harness: CoreHarness,
+  fork: SeededFork,
+  messageId: string,
+  mode: "merge" | "remove",
+  advanceTimers = false,
+): Promise<string> {
+  const receiptId = archiveReceiptId(harness, fork, messageId, mode);
+  const deadline = performance.now() + 5_000;
+  while (performance.now() < deadline) {
+    const receipt = await withStore(harness, store => store.getOutbox(receiptId));
+    if (receipt?.state === "sent") {
+      expect(receipt).toMatchObject({
+        id: receiptId,
+        botUid: harness.bot.uid,
+        channelType: fork.target.channelType,
+        channelId: fork.target.channelId,
+        kind: "text",
+        state: "sent",
+      });
+      expect(isArchiveOnlyReceiptText(receipt.text ?? undefined)).toBe(true);
+      return receiptId;
+    }
+    if (advanceTimers) vi.advanceTimersByTime(150);
+    await yieldRealIo(harness);
+  }
+  throw new Error(`stable archive receipt ${receiptId} was not sent`);
+}
+
+async function expectArchiveOnlyResult(
+  harness: CoreHarness,
+  fork: SeededFork,
+  messageId: string,
+  mode: "merge" | "remove",
+): Promise<void> {
+  await waitForArchiveOnlyReceipt(harness, fork.target);
   expect(hasArchiveOnlyReceipt(harness, fork.target)).toBe(true);
+  await waitForArchiveReceiptSent(harness, fork, messageId, mode);
   await waitForArchive(harness, fork.thread);
   const remote = await harness.transport.getThread(FORK_GROUP, fork.thread.shortId);
   expect(harness.transport.managementCalls.filter(call => call.action === "thread-delete")).toEqual([]);
@@ -212,8 +321,8 @@ test.each(["merge", "remove"] as const)(
       const fork = await seedFork(harness, `only-${action}`);
       expect(harness.worktreePort).toBeUndefined();
 
-      await harness.service.handleInbound(threadCommand(harness, fork.target, `archive-only-${action}`, action));
-      await expectArchiveOnlyResult(harness, fork);
+      await harness.service.submitInbound(threadCommand(harness, fork.target, `archive-only-${action}`, action));
+      await expectArchiveOnlyResult(harness, fork, `archive-only-${action}`, action);
       expect(archiveCalls(harness)).toHaveLength(1);
     } finally {
       await closeCoreHarness(harness);
@@ -247,8 +356,8 @@ test("archiving a fork never removes its source thread's workspace ownership", a
       });
     });
 
-    await harness.service.handleInbound(threadCommand(harness, fork.target, "source-workspace-fork-remove", "remove"));
-    await expectArchiveOnlyResult(harness, fork);
+    await harness.service.submitInbound(threadCommand(harness, fork.target, "source-workspace-fork-remove", "remove"));
+    await expectArchiveOnlyResult(harness, fork, "source-workspace-fork-remove", "remove");
     expect((await harness.transport.getThread(FORK_GROUP, sourceThread.shortId)).status).toBe(1);
     await withStore(harness, store => {
       expect(store.getThreadWorkspace(harness.bot.uid, sourceTarget)).toMatchObject({
@@ -275,24 +384,24 @@ test.each(["merge", "remove"] as const)(
         await releaseSource.promise;
       },
     });
-    let command: Promise<void> | undefined;
     try {
       const fork = await seedFork(harness, "source-busy");
+      const messageId = `source-busy-${action}`;
       const source = { channelType: 2 as const, channelId: FORK_GROUP };
-      await harness.service.handleInbound(ownerMessage(harness, source, "source-busy-task", "held source turn in shared cwd"));
+      await harness.service.submitInbound(ownerMessage(harness, source, "source-busy-task", "held source turn in shared cwd"));
       await sourceStarted.promise;
 
-      command = harness.service.handleInbound(threadCommand(harness, fork.target, `source-busy-${action}`, action));
+      const command = harness.service.submitInbound(threadCommand(harness, fork.target, messageId, action));
       expect(await settlesBeforeNextTurn(command)).toBe(true);
-      await command;
+      await waitForArchiveOnlyReceipt(harness, fork.target);
       expect(hasArchiveOnlyReceipt(harness, fork.target)).toBe(true);
+      await waitForArchiveReceiptSent(harness, fork, messageId, action);
       await waitForArchive(harness, fork.thread);
       expect(harness.workers.prompts.map(prompt => prompt.text)).toEqual(["held source turn in shared cwd"]);
       expect((await harness.service.status(source)).state).not.toBe("completed");
       expect(archiveCalls(harness)).toHaveLength(1);
     } finally {
       releaseSource.resolve();
-      if (command) await command.catch(() => {});
       await closeCoreHarness(harness);
     }
   },
@@ -315,17 +424,23 @@ test("fork /thread merge waits for earlier active and queued work on its own cha
       }
     },
   });
-  let merge: Promise<void> | undefined;
   try {
     const fork = await seedFork(harness, "merge-own-queue");
+    const mergeMessageId = "fork-merge-own-queue";
+    const mergeMessage = threadCommand(harness, fork.target, mergeMessageId, "merge");
     await withStore(harness, store => store.setChatMode(harness.bot.uid, fork.target, "queue"));
 
-    await harness.service.handleInbound(ownerMessage(harness, fork.target, "fork-first-target-task", "first fork target task"));
+    await harness.service.submitInbound(ownerMessage(harness, fork.target, "fork-first-target-task", "first fork target task"));
     await firstStarted.promise;
-    await harness.service.handleInbound(ownerMessage(harness, fork.target, "fork-queued-target-task", "queued fork target task"));
+    await harness.service.submitInbound(ownerMessage(harness, fork.target, "fork-queued-target-task", "queued fork target task"));
     await waitForStatus(harness.service, fork.target, status => status.queued === 1);
 
-    merge = harness.service.handleInbound(threadCommand(harness, fork.target, "fork-merge-own-queue", "merge"));
+    void harness.service.submitInbound(mergeMessage).catch(() => {});
+    await waitForIngressJob(harness, mergeMessage, {
+      predicate: job => job.state === "dispatch-intent",
+      rejectStates: [],
+      description: "fork merge dispatch intent while source work remains queued",
+    });
     for (let turn = 0; turn < 4; turn += 1) await settleOneTurn();
     expect(archiveCalls(harness)).toEqual([]);
 
@@ -336,8 +451,9 @@ test("fork /thread merge waits for earlier active and queued work on its own cha
 
     releaseSecond.resolve();
     await waitForStatus(harness.service, fork.target, status => status.state === "completed" && status.queued === 0);
-    await merge;
+    await waitForArchiveOnlyReceipt(harness, fork.target);
     expect(hasArchiveOnlyReceipt(harness, fork.target)).toBe(true);
+    await waitForArchiveReceiptSent(harness, fork, mergeMessageId, "merge");
     await waitForArchive(harness, fork.thread);
     expect(harness.workers.prompts.map(prompt => prompt.text)).toEqual([
       "first fork target task",
@@ -347,7 +463,6 @@ test("fork /thread merge waits for earlier active and queued work on its own cha
   } finally {
     releaseFirst.resolve();
     releaseSecond.resolve();
-    if (merge) await merge.catch(() => {});
     await closeCoreHarness(harness);
   }
 });
@@ -372,7 +487,6 @@ test("fork /thread merge archives only after the target's terminal progress-card
       await finishTask.promise;
     },
   });
-  let merge: Promise<void> | undefined;
   try {
     const fork = await seedFork(harness, "merge-card-drain");
     harness.transport.sendProgressCard = async () => ({ messageId: "fork-target-progress-card" });
@@ -392,25 +506,31 @@ test("fork /thread merge archives only after the target's terminal progress-card
       await archiveThread(groupId, shortId, signal);
     };
 
-    await harness.service.handleInbound(ownerMessage(harness, fork.target, "fork-card-task", "fork target progress-card task"));
+    await harness.service.submitInbound(ownerMessage(harness, fork.target, "fork-card-task", "fork target progress-card task"));
     await taskStarted.promise;
-    merge = harness.service.handleInbound(threadCommand(harness, fork.target, "fork-card-merge", "merge"));
+    const mergeMessage = threadCommand(harness, fork.target, "fork-card-merge", "merge");
+    void harness.service.submitInbound(mergeMessage).catch(() => {});
+    await waitForIngressJob(harness, mergeMessage, {
+      predicate: job => job.state === "dispatch-intent",
+      rejectStates: [],
+      description: "fork merge dispatch intent before terminal progress edit",
+    });
     finishTask.resolve();
     await terminalEditStarted.promise;
     for (let turn = 0; turn < 4; turn += 1) await settleOneTurn();
     expect(archiveCalls(harness)).toEqual([]);
 
     finishTerminalEdit.resolve();
-    await merge;
+    await waitForArchiveOnlyReceipt(harness, fork.target);
     expect(hasArchiveOnlyReceipt(harness, fork.target)).toBe(true);
-    expect(archiveBeforeTerminalEdit).toBe(false);
+    await waitForArchiveReceiptSent(harness, fork, "fork-card-merge", "merge");
     await waitForArchive(harness, fork.thread);
+    expect(archiveBeforeTerminalEdit).toBe(false);
     expect(terminalEditFinished).toBe(true);
     expect(archiveCalls(harness)).toHaveLength(1);
   } finally {
     finishTask.resolve();
     finishTerminalEdit.resolve();
-    if (merge) await merge.catch(() => {});
     await closeCoreHarness(harness);
   }
 });
@@ -427,14 +547,14 @@ test("fork /thread remove refuses while its own thread has a running task", asyn
   });
   try {
     const fork = await seedFork(harness, "target-running");
-    await harness.service.handleInbound(ownerMessage(harness, fork.target, "target-running-task", "held fork-thread task"));
+    await harness.service.submitInbound(ownerMessage(harness, fork.target, "target-running-task", "held fork-thread task"));
     await targetStarted.promise;
-    const command = harness.service.handleInbound(threadCommand(harness, fork.target, "target-running-remove", "remove"));
+    const command = harness.service.submitInbound(threadCommand(harness, fork.target, "target-running-remove", "remove"));
 
     expect(await settlesBeforeNextTurn(command)).toBe(true);
-    await command;
     for (let attempt = 0; attempt < 4; attempt += 1) await settleOneTurn();
     expect(archiveCalls(harness)).toEqual([]);
+    await waitForTargetText(harness, fork.target, text => /任务|运行|排队/u.test(text));
     expect((await harness.service.status(fork.target)).state).not.toBe("completed");
     expect(harness.transport.sent.some(({ target, text }) =>
       target.channelId === fork.target.channelId && /任务|运行|排队/u.test(text ?? ""),
@@ -483,11 +603,11 @@ test("fork /thread remove refuses when its own thread has queued work", async ()
       )).toBe(true);
     });
 
-    const command = harness.service.handleInbound(threadCommand(harness, fork.target, "target-queued-remove", "remove"));
+    const command = harness.service.submitInbound(threadCommand(harness, fork.target, "target-queued-remove", "remove"));
     expect(await settlesBeforeNextTurn(command)).toBe(true);
-    await command;
     for (let attempt = 0; attempt < 4; attempt += 1) await settleOneTurn();
     expect(archiveCalls(harness)).toEqual([]);
+    await waitForTargetText(harness, fork.target, text => /任务|运行|排队/u.test(text));
     expect(harness.workers.prompts).toEqual([]);
     expect(harness.transport.sent.some(({ target, text }) =>
       target.channelId === fork.target.channelId && /任务|运行|排队/u.test(text ?? ""),
@@ -504,8 +624,8 @@ test("invalid /thread remove arguments retain usage handling even for a ready fo
   const harness = await createCoreHarness({ worktrees: null });
   try {
     const fork = await seedFork(harness, "invalid-remove");
-    await harness.service.handleInbound(threadCommand(harness, fork.target, "invalid-remove-command", "remove --unknown"));
-
+    await harness.service.submitInbound(threadCommand(harness, fork.target, "invalid-remove-command", "remove --unknown"));
+    await waitForTargetText(harness, fork.target, text => text.startsWith("用法：/thread remove"));
     expect(harness.transport.sent.some(({ target, text }) =>
       target.channelId === fork.target.channelId && text?.startsWith("用法：/thread remove"),
     )).toBe(true);
@@ -520,8 +640,8 @@ test("an incomplete fork record does not take the archive-only path", async () =
   const harness = await createCoreHarness({ worktrees: null });
   try {
     const fork = await seedFork(harness, "incomplete", "creating");
-    await harness.service.handleInbound(threadCommand(harness, fork.target, "incomplete-fork-merge", "merge"));
-
+    await harness.service.submitInbound(threadCommand(harness, fork.target, "incomplete-fork-merge", "merge"));
+    await waitForTargetText(harness, fork.target, text => text.length > 0);
     expect(archiveCalls(harness)).toEqual([]);
     expect(harness.transport.sent.some(({ target }) => target.channelId === fork.target.channelId)).toBe(true);
     expect(await readFile(join(fork.cwd, "shared.txt"), "utf8")).toContain("shared contents");
@@ -535,9 +655,15 @@ test("ordinary threads without fork provenance keep missing-workspace refusals",
   try {
     const thread = await harness.transport.createThread(FORK_GROUP, "ordinary thread");
     const target: ForkTarget = { channelType: 5, channelId: thread.channelId };
-    await harness.service.handleInbound(threadCommand(harness, target, "ordinary-missing-merge", "merge"));
-    await harness.service.handleInbound(threadCommand(harness, target, "ordinary-missing-remove", "remove"));
-
+    const missingMergeReply = waitForTargetText(
+      harness, target, text => text === "当前子区未绑定隔离工作区，/thread merge 不可用。",
+    );
+    const missingRemoveReply = waitForTargetText(
+      harness, target, text => text.startsWith("当前子区没有持久隔离工作区归属"),
+    );
+    await harness.service.submitInbound(threadCommand(harness, target, "ordinary-missing-merge", "merge"));
+    await harness.service.submitInbound(threadCommand(harness, target, "ordinary-missing-remove", "remove"));
+    await Promise.all([missingMergeReply, missingRemoveReply]);
     expect(archiveCalls(harness)).toEqual([]);
     expect(harness.transport.sent.some(({ target: sentTarget, text }) =>
       sentTarget.channelId === target.channelId && text === "当前子区未绑定隔离工作区，/thread merge 不可用。",
@@ -582,7 +708,8 @@ test("fork archive waits for queued target output and its archive-only receipt",
       await archiveThread(groupId, shortId, signal);
     };
 
-    await harness.service.handleInbound(threadCommand(harness, fork.target, "receipt-drain-command", "merge"));
+    await harness.service.submitInbound(threadCommand(harness, fork.target, "receipt-drain-command", "merge"));
+    await waitForPendingArchiveReceipt(harness, fork.target);
     expect(archiveCalls(harness)).toEqual([]);
     expect(harness.transport.sent.filter(({ target }) =>
       target.channelType === fork.target.channelType && target.channelId === fork.target.channelId,
@@ -595,6 +722,7 @@ test("fork archive waits for queued target output and its archive-only receipt",
         && isArchiveOnlyReceiptText(message.text),
     );
     expect(archiveReceipt.text).toContain("归档");
+    await waitForArchiveReceiptSent(harness, fork, "receipt-drain-command", "merge");
     await waitForArchive(harness, fork.thread);
     expect(bothMessagesSentBeforeArchive).toBe(true);
     expect(archiveCalls(harness)).toHaveLength(1);
@@ -608,10 +736,12 @@ test("a new authorized inbound cancels a pending fork archive", async () => {
   try {
     const fork = await seedFork(harness, "cancel-pending");
     harness.transport.setOffline();
-    await harness.service.handleInbound(threadCommand(harness, fork.target, "cancel-pending-command", "remove"));
+    await harness.service.submitInbound(threadCommand(harness, fork.target, "cancel-pending-command", "remove"));
+    await waitForPendingArchiveReceipt(harness, fork.target);
     expect(archiveCalls(harness)).toEqual([]);
 
-    await harness.service.handleInbound(threadCommand(harness, fork.target, "cancel-pending-new-input", "remove invalid"));
+    await harness.service.submitInbound(threadCommand(harness, fork.target, "cancel-pending-new-input", "remove invalid"));
+    await waitForPendingTargetText(harness, fork.target, text => text.includes("用法：/thread remove"));
     await harness.transport.reconnect();
     const firstReply = await harness.transport.waitForRemoteText(message =>
       message.target.channelType === fork.target.channelType
@@ -619,6 +749,7 @@ test("a new authorized inbound cancels a pending fork archive", async () => {
         && isArchiveOnlyReceiptText(message.text),
     );
     expect(firstReply.text).toContain("归档");
+    await waitForArchiveReceiptSent(harness, fork, "cancel-pending-command", "remove");
     await harness.transport.waitForRemoteText(message =>
       message.target.channelId === fork.target.channelId && message.text.includes("用法：/thread remove"),
     );
@@ -639,18 +770,18 @@ test("fork archive retries a transient server failure through the archive schedu
     harness.transport.failArchiveTimes([transient]);
     vi.useFakeTimers();
 
-    await harness.service.handleInbound(threadCommand(harness, fork.target, "transient-retry-command", "merge"));
+    const messageId = "transient-retry-command";
+    await harness.service.submitInbound(threadCommand(harness, fork.target, messageId, "merge"));
+    await waitForArchiveReceiptSent(harness, fork, messageId, "merge", true);
     expect(hasArchiveOnlyReceipt(harness, fork.target)).toBe(true);
-    await harness.transport.waitForManagementCalls(call =>
-      call.action === "thread-archive" && call.shortId === fork.thread.shortId,
-    );
-    for (let turn = 0; turn < 5; turn += 1) await Promise.resolve();
-    vi.advanceTimersByTime(5_000);
-    await harness.transport.waitForManagementCalls(call =>
-      call.action === "thread-archive" && call.shortId === fork.thread.shortId,
-      2,
-    );
-
+    await waitForArchiveAttempts(harness, fork.thread, 1, true);
+    await yieldRealIo(harness);
+    vi.advanceTimersByTime(4_000);
+    await yieldRealIo(harness);
+    expect(archiveCalls(harness)).toHaveLength(1);
+    vi.advanceTimersByTime(1_000);
+    await waitForArchiveAttempts(harness, fork.thread, 2, true);
+    await yieldRealIo(harness);
     expect(archiveCalls(harness)).toHaveLength(2);
     expect((await harness.transport.getThread(FORK_GROUP, fork.thread.shortId)).status).toBe(2);
   } finally {
@@ -677,8 +808,13 @@ test("ready fork provenance survives restart and still selects archive-only hand
       worktrees: null,
     });
 
-    await restarted.service.handleInbound(threadCommand(restarted, fork.target, "restart-ready-remove", "remove"));
+    const archiveMessageId = "restart-ready-remove";
+    await restarted.service.submitInbound(
+      threadCommand(restarted, fork.target, archiveMessageId, "remove"),
+    );
+    await waitForArchiveOnlyReceipt(restarted, fork.target);
     expect(hasArchiveOnlyReceipt(restarted, fork.target)).toBe(true);
+    await waitForArchiveReceiptSent(restarted, fork, archiveMessageId, "remove");
     await waitForArchive(restarted, fork.thread);
     expect(transport.managementCalls.filter(call => call.action === "thread-archive")).toHaveLength(1);
     expect(transport.managementCalls.filter(call => call.action === "thread-delete")).toEqual([]);

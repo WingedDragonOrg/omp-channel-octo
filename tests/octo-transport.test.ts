@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createOctoTransport } from "../src/octo/index";
 import { buildAskCard, buildAskCardSet } from "../src/cards/ask-card";
-import type { ChannelTransport, InboundMessage } from "../src/contracts";
+import type { ChannelTransport, InboundMessage, InboundReceipt } from "../src/contracts";
 import type { ExecutionSnapshot } from "../src/cards/execution-tracker";
 import {
   createOctoProtocolFixture,
@@ -13,6 +13,16 @@ import {
   type OctoProtocolFixture,
   type OctoProtocolFixtureOptions,
 } from "./fixtures/octo-protocol-server";
+
+
+interface ReceiptGate {
+  promise: Promise<void>;
+  resolve: () => void;
+  reject: (reason?: unknown) => void;
+}
+
+const READY_RECEIPT: InboundReceipt = { ackReady: Promise.resolve() };
+
 
 let fixture: OctoProtocolFixture | undefined;
 let transport: ChannelTransport | undefined;
@@ -45,7 +55,7 @@ async function readyConnection(connection: FixtureConnection): Promise<FixtureCo
 
 async function startFixtureTransport(
   options: OctoProtocolFixtureOptions = {},
-  onMessage: (message: InboundMessage) => Promise<void> = async () => {},
+  onMessage: (message: InboundMessage) => InboundReceipt = () => READY_RECEIPT,
 ): Promise<{ connection: FixtureConnection; online: { count: number } }> {
   const currentFixture = await createOctoProtocolFixture(options);
   fixture = currentFixture;
@@ -163,7 +173,7 @@ async function expectProgressCard(profile: Record<string, unknown>): Promise<voi
 }
 
 describe("Octo registration and WuKongIM transport", () => {
-  test("uses the registered ws_url, performs v4 crypto, and ACKs only after the handler resolves", async () => {
+  test("uses the registered ws_url, performs v4 crypto, and ACKs only after the receipt is ready", async () => {
     fixture = await createOctoProtocolFixture({ advertisedWsQuery: "?advertised=registration" });
     transport = createOctoTransport({
       apiUrl: fixture.apiUrl,
@@ -182,13 +192,13 @@ describe("Octo registration and WuKongIM transport", () => {
     });
 
     const received: Array<Record<string, unknown>> = [];
-    const handlerStartedState = Promise.withResolvers<void>();
-    const handlerGate = Promise.withResolvers<void>();
+    const callbackEntered = Promise.withResolvers<void>();
+    const receiptReady = Promise.withResolvers<void>();
     const online = { count: 0 };
-    const startPromise = transport.start(async (message) => {
+    const startPromise = transport.start((message) => {
       received.push(message as unknown as Record<string, unknown>);
-      handlerStartedState.resolve();
-      await handlerGate.promise;
+      callbackEntered.resolve();
+      return { ackReady: receiptReady.promise };
     }, () => {
       online.count += 1;
     });
@@ -208,13 +218,13 @@ describe("Octo registration and WuKongIM transport", () => {
       timestamp: 1_757_656_001,
     }, { fragmentSizes: [1, 2, 3, 5, 8] });
 
-    await handlerStartedState.promise;
+    await callbackEntered.promise;
     expect(connection.recvAcks).toHaveLength(0);
-    handlerGate.resolve();
+    receiptReady.resolve();
     await waitForFixture(
       () => connection.recvAcks.length === 1 ? connection.recvAcks : undefined,
       2_000,
-      "inbound RECVACK was not sent after handler completion",
+      "inbound RECVACK was not sent after the receipt became ready",
     );
 
     expect(received[0]).toMatchObject({
@@ -231,10 +241,159 @@ describe("Octo registration and WuKongIM transport", () => {
       messageSeq: 41,
     });
   });
+
+  test("accepts later encrypted messages independently while the first receipt is held", async () => {
+    fixture = await createOctoProtocolFixture();
+    transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
+    await transport.initialize();
+
+    const receiptGates = new Map<string, ReceiptGate>();
+    const received: InboundMessage[] = [];
+    const startPromise = transport.start((message) => {
+      received.push(message);
+      const gate = Promise.withResolvers<void>();
+      receiptGates.set(message.messageId, gate);
+      return { ackReady: gate.promise };
+    }, () => {});
+    const connection = await fixture.waitForConnection(1);
+    await readyConnection(connection);
+    await startPromise;
+
+    fixture.sendInboundBatch(connection, [
+      {
+        fromUid: fixture.ownerUid,
+        channelId: "group-held",
+        channelType: 2,
+        text: "/thread merge",
+        messageId: "9007199254741101",
+        messageSeq: 101,
+      },
+      {
+        fromUid: fixture.ownerUid,
+        channelId: "group-status",
+        channelType: 2,
+        text: "/status",
+        messageId: "9007199254741102",
+        messageSeq: 102,
+      },
+      {
+        fromUid: fixture.ownerUid,
+        channelId: "group-ordinary",
+        channelType: 2,
+        text: "independent ordinary message",
+        messageId: "9007199254741103",
+        messageSeq: 103,
+      },
+    ], { fragmentSizes: [1, 2, 5, 8] });
+
+    await waitForFixture(
+      () => received.length === 3 ? received : undefined,
+      2_000,
+      "later encrypted messages did not enter the receipt callback",
+    );
+    expect(connection.recvAcks).toHaveLength(0);
+
+    receiptGates.get("9007199254741102")!.resolve();
+    receiptGates.get("9007199254741103")!.resolve();
+    await waitForFixture(
+      () => connection.recvAcks.length === 2 ? connection.recvAcks : undefined,
+      2_000,
+      "independent receipts were not acknowledged",
+    );
+    expect(connection.recvAcks).toEqual([
+      { messageId: "9007199254741102", messageSeq: 102 },
+      { messageId: "9007199254741103", messageSeq: 103 },
+    ]);
+
+    receiptGates.get("9007199254741101")!.resolve();
+    await waitForFixture(
+      () => connection.recvAcks.length === 3 ? connection.recvAcks : undefined,
+      2_000,
+      "held receipt was not acknowledged after becoming ready",
+    );
+    expect(connection.recvAcks[2]).toEqual({
+      messageId: "9007199254741101",
+      messageSeq: 101,
+    });
+  });
+
+  test("does not ACK a rejected encrypted receipt", async () => {
+    const rejected = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    const started = await startFixtureTransport({}, () => {
+      entered.resolve();
+      return { ackReady: rejected.promise };
+    });
+    fixture!.sendInbound(started.connection, {
+      fromUid: fixture!.ownerUid,
+      channelId: "group-rejected",
+      channelType: 2,
+      text: "must be retried",
+      messageId: "9007199254741111",
+      messageSeq: 111,
+    });
+
+    await entered.promise;
+    rejected.reject(new Error("admission failed"));
+    await delayed(20);
+    expect(started.connection.recvAcks).toHaveLength(0);
+  });
+
+  test("does not move a ready receipt from an old connection onto the replacement connection", async () => {
+    const gate = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    const started = await startFixtureTransport({
+      registrationTokens: ["im-token-first", "im-token-second"],
+    }, () => {
+      entered.resolve();
+      return { ackReady: gate.promise };
+    });
+    fixture!.sendInbound(started.connection, {
+      fromUid: fixture!.ownerUid,
+      channelId: "group-old-connection",
+      channelType: 2,
+      text: "old connection delivery",
+      messageId: "9007199254741121",
+      messageSeq: 121,
+    });
+    await entered.promise;
+    fixture!.closeConnection(0);
+    const replacement = await fixture!.waitForConnection(2, 4_500);
+    await readyConnection(replacement);
+
+    gate.resolve();
+    await delayed(20);
+    expect(started.connection.recvAcks).toHaveLength(0);
+    expect(replacement.recvAcks).toHaveLength(0);
+  }, 10_000);
+
+  test("does not ACK a held receipt after transport stop", async () => {
+    const gate = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    const started = await startFixtureTransport({}, () => {
+      entered.resolve();
+      return { ackReady: gate.promise };
+    });
+    fixture!.sendInbound(started.connection, {
+      fromUid: fixture!.ownerUid,
+      channelId: "group-stopped",
+      channelType: 2,
+      text: "stop before admission",
+      messageId: "9007199254741131",
+      messageSeq: 131,
+    });
+    await entered.promise;
+    await transport!.stop();
+
+    gate.resolve();
+    await delayed(20);
+    expect(started.connection.recvAcks).toHaveLength(0);
+  });
   test("normalizes every DM wire channel to the sender and ignores synthetic peers", async () => {
     const received: InboundMessage[] = [];
-    const started = await startFixtureTransport({}, async (message) => {
+    const started = await startFixtureTransport({}, (message) => {
       received.push(message);
+      return READY_RECEIPT;
     });
     const currentFixture = fixture!;
     currentFixture.sendInboundBatch(started.connection, [
@@ -283,7 +442,7 @@ describe("Octo registration and WuKongIM transport", () => {
     await transport.initialize();
 
     let settled = false;
-    const startPromise = transport.start(async () => {}, () => {});
+    const startPromise = transport.start(() => READY_RECEIPT, () => {});
     const observed = startPromise.then(
       () => { settled = true; },
       () => { settled = true; },
@@ -296,8 +455,9 @@ describe("Octo registration and WuKongIM transport", () => {
 
   test("passes structured mention identities through and strips only a verified bot mention", async () => {
     const received: Array<Record<string, unknown>> = [];
-    const started = await startFixtureTransport({}, async (message) => {
+    const started = await startFixtureTransport({}, (message) => {
       received.push(message as unknown as Record<string, unknown>);
+      return READY_RECEIPT;
     });
     const { connection } = started;
     const botPrefix = `@${fixture!.botName}`;
@@ -355,8 +515,9 @@ describe("Octo registration and WuKongIM transport", () => {
 
   test("strips a verified bot mention wherever the client placed it", async () => {
     const received: Array<Record<string, unknown>> = [];
-    const started = await startFixtureTransport({}, async (message) => {
+    const started = await startFixtureTransport({}, (message) => {
       received.push(message as unknown as Record<string, unknown>);
+      return READY_RECEIPT;
     });
     const { connection } = started;
     const botPrefix = `@${fixture!.botName}`;
@@ -432,7 +593,7 @@ describe("Octo registration and WuKongIM transport", () => {
     transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
     await transport.initialize();
     const online = { count: 0 };
-    const startPromise = transport.start(async () => {}, () => {
+    const startPromise = transport.start(() => READY_RECEIPT, () => {
       online.count += 1;
     });
     const first = await fixture.waitForConnection(1);
@@ -464,7 +625,7 @@ describe("Octo registration and WuKongIM transport", () => {
     });
     await transport.initialize();
     const online = { count: 0 };
-    const startPromise = transport.start(async () => {}, () => {
+    const startPromise = transport.start(() => READY_RECEIPT, () => {
       online.count += 1;
     });
     const first = await fixture.waitForConnection(1);
@@ -499,7 +660,7 @@ describe("Octo registration and WuKongIM transport", () => {
     transport = createOctoTransport({ apiUrl: fixture.apiUrl, botToken: fixture.botToken });
     await transport.initialize();
 
-    const startPromise = transport.start(async () => {}, () => {});
+    const startPromise = transport.start(() => READY_RECEIPT, () => {});
     const outcome = await Promise.race([
       startPromise.then(() => "resolved", () => "rejected"),
       delayed(1_000).then(() => "timeout"),
@@ -1849,8 +2010,9 @@ function encodedHistoryPayload(payload: Record<string, unknown>): string {
 describe("Octo group history and inbound sequence metadata", () => {
   test("carries the decoded RECV sequence and server timestamp into InboundMessage", async () => {
     const received: InboundMessage[] = [];
-    const started = await startFixtureTransport({}, async (message) => {
+    const started = await startFixtureTransport({}, (message) => {
       received.push(message);
+      return READY_RECEIPT;
     });
     const currentFixture = fixture!;
     currentFixture.sendInboundBatch(started.connection, [

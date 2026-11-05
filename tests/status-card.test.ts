@@ -63,7 +63,8 @@ test("/status uses an octo/v1 TextBlock-only card and keeps the status receipt f
   transport.cardSupported = true;
   const harness = await createCoreHarness({ transport });
   try {
-    await harness.service.handleInbound(inbound({ messageId: "status-card-shape", text: "/status" }));
+    await harness.service.submitInbound(inbound({ messageId: "status-card-shape", text: "/status" }));
+    await transport.waitForCardSend(({ frame }) => frame.profile === "octo/v1");
 
     const card = statusCard(transport);
     expect(card.frame.profile).toBe("octo/v1");
@@ -180,7 +181,7 @@ test("/status reports Git changes separately for every persisted workspace proje
       error: null,
     });
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...target,
       messageId: "status-projects",
       text: "/status",
@@ -220,19 +221,23 @@ test("/status shows persisted PR/MR URLs only when references exist", async () =
       { kind: "pr", url: "https://github.com/acme/service/pull/42" },
       { kind: "mr", url: "https://gitlab.example/acme/service/-/merge_requests/7" },
     ]);
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...linked,
       messageId: "status-with-references",
       mentionedUserIds: [harness.bot.uid],
       text: "/status",
     }));
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...empty,
       messageId: "status-without-references",
       mentionedUserIds: [harness.bot.uid],
       text: "/status",
     }));
 
+    await Promise.all([
+      transport.waitForCardSend(({ target }) => target.channelId === linked.channelId),
+      transport.waitForCardSend(({ target }) => target.channelId === empty.channelId),
+    ]);
     const linkedCard = transport.sentCards.find(card => card.target.channelId === linked.channelId);
     const emptyCard = transport.sentCards.find(card => card.target.channelId === empty.channelId);
     expect(linkedCard).toBeDefined();

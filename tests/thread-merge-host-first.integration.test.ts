@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -48,6 +49,10 @@ type MergeEvent =
   | { kind: "archive"; shortId: string };
 
 class MergeTracingTransport extends FakeTransport {
+  constructor() {
+    super({ bot: { uid: `bot-thread-merge-${randomUUID()}`, name: "Merge Fixture Bot" } });
+  }
+
   readonly events: MergeEvent[] = [];
 
   override async sendText(
@@ -207,7 +212,7 @@ async function createHarness(
 }
 
 async function sendMerge(harness: CoreHarness, world: MergeWorld): Promise<void> {
-  await harness.service.handleInbound(inbound({
+  await harness.service.submitInbound(inbound({
     ...world.thread,
     messageId: `merge-${world.branch}`,
     text: "/thread merge",
@@ -350,7 +355,7 @@ test("identity and intent refusals reply without mergePending, tasks or notices"
     } finally {
       mismatch.close();
     }
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...world.thread,
       messageId: "merge-repo-mismatch",
       text: "/thread merge",
@@ -373,7 +378,7 @@ test("identity and intent refusals reply without mergePending, tasks or notices"
     } finally {
       blocked.close();
     }
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...blockedThread,
       messageId: "merge-blocked",
       text: "/thread merge",

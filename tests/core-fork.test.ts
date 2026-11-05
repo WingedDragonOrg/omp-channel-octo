@@ -2,7 +2,8 @@ import { expect, test } from "bun:test";
 import { mkdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import type { ChatTarget, PromptContext } from "../src/contracts.ts";
-import { createCoreHarness, closeCoreHarness, readText, waitForStatus, type CoreHarness } from "./fixtures/core-fakes.ts";
+import type { ThreadForkRecord } from "../src/store/store-records.ts";
+import { createCoreHarness, closeCoreHarness, readText, waitForStatus, submitAndWaitForIngressHandoff, waitForIngressJob, type CoreHarness } from "./fixtures/core-fakes.ts";
 import {
   FORK_DM,
   FORK_GROUP,
@@ -26,6 +27,33 @@ const textFor = (harness: CoreHarness, target: ChatTarget): string[] =>
     .filter(({ target: sent }) => sent.channelId === target.channelId && sent.channelType === target.channelType)
     .map(({ text }) => text);
 
+
+async function waitForForkRecord(
+  harness: CoreHarness,
+  predicate: (record: ThreadForkRecord) => boolean,
+): Promise<ThreadForkRecord> {
+  for (let attempt = 0; attempt < 10_000; attempt += 1) {
+    const record = await withStore(harness, store =>
+      store.listThreadForks(harness.bot.uid).find(predicate));
+    if (record !== undefined) return record;
+    const turn = Promise.withResolvers<void>();
+    setImmediate(turn.resolve);
+    await turn.promise;
+  }
+  throw new Error("fork operation did not reach the requested durable state");
+}
+
+async function waitForSentOutbox(harness: CoreHarness, id: string) {
+  for (let attempt = 0; attempt < 10_000; attempt += 1) {
+    const receipt = await withStore(harness, store => store.getOutbox(id));
+    if (receipt?.state === "sent") return receipt;
+    const turn = Promise.withResolvers<void>();
+    setImmediate(turn.resolve);
+    await turn.promise;
+  }
+  throw new Error(`outbox receipt ${id} was not sent`);
+}
+
 function toolsOf(context: PromptContext | undefined) {
   return context?.tools ?? [];
 }
@@ -47,11 +75,9 @@ test("/fork snapshots a held source immediately, then the new thread resumes wit
     workers,
     allowedGroupIds: [FORK_GROUP.channelId],
   });
-  let forkRequest: Promise<void> | undefined;
-  let forkFailed = false;
   let forkError: unknown;
   try {
-    await harness.service.handleInbound(ownerMessage(harness, FORK_GROUP, "fork-held-source", "hold source turn"));
+    await harness.service.submitInbound(ownerMessage(harness, FORK_GROUP, "fork-held-source", "hold source turn"));
     await waitForForkBoundary(sourceStarted.promise, "source turn start");
     const sourceWorker = workers.workers[0]!;
     const sourceSessionId = sourceWorker.sessionId;
@@ -59,8 +85,7 @@ test("/fork snapshots a held source immediately, then the new thread resumes wit
     const sourceBefore = await harness.service.status(FORK_GROUP);
 
     const forkMessage = ownerMessage(harness, FORK_GROUP, "fork-held-command", "/fork incident review");
-    forkRequest = harness.service.handleInbound(forkMessage).catch((error: unknown) => {
-      forkFailed = true;
+    void harness.service.submitInbound(forkMessage).catch((error: unknown) => {
       forkError = error;
     });
     await waitForForkBoundary(workers.forkStopStarted.promise, "native fork worker stop");
@@ -72,8 +97,20 @@ test("/fork snapshots a held source immediately, then the new thread resumes wit
     expect(workers.prompts.map(({ text }) => text)).toEqual(["hold source turn"]);
 
     workers.releaseForkStop.resolve();
-    await forkRequest;
-    if (forkFailed) throw forkError;
+    const handoff = await waitForIngressJob(harness, forkMessage, {
+      predicate: job => job.state === "handed-off",
+      rejectStates: [],
+      description: "durable fork operation handoff",
+    });
+    expect(handoff).toMatchObject({ state: "handed-off", consumerKind: "operation" });
+    const fork = await waitForForkRecord(
+      harness,
+      record => record.sourceChannelType === FORK_GROUP.channelType
+        && record.sourceChannelId === FORK_GROUP.channelId
+        && record.name === "incident review"
+        && record.phase === "ready",
+    );
+    expect(forkError).toBeUndefined();
     expect(transport.createAttempts).toBe(1);
     expect(workers.forkAttempts).toEqual([
       expect.objectContaining({ sourceSessionFile, cwd: sourceBefore.cwd }),
@@ -81,8 +118,7 @@ test("/fork snapshots a held source immediately, then the new thread resumes wit
     expect(sourceWorker.stopped).toBe(false);
     expect(workers.prompts.map(({ text }) => text)).toEqual(["hold source turn"]);
 
-    const fork = await withStore(harness, (store) => store.listThreadForks(harness.bot.uid)[0]);
-    if (!fork?.sessionId || !fork.sessionFile || !fork.thread) {
+    if (!fork.sessionId || !fork.sessionFile || !fork.thread) {
       throw new Error("fork result did not contain a usable target session");
     }
     const forkSessionId = fork.sessionId;
@@ -120,10 +156,17 @@ test("/fork snapshots a held source immediately, then the new thread resumes wit
         listen: "merge",
       });
     });
+    await transport.waitForRemoteText(message =>
+      message.target.channelType === FORK_GROUP.channelType
+      && message.target.channelId === FORK_GROUP.channelId
+      && message.text.includes("目录共享"),
+    );
+    const receipt = await waitForSentOutbox(harness, `ingress:${handoff.id}:receipt:0`);
+    expect(receipt.text).toContain("目录共享");
     expect(textFor(harness, FORK_GROUP).join("\n")).toContain("目录共享");
 
     const targetMessage = ownerMessage(harness, target, "fork-first-target-turn", "read the inherited session");
-    await harness.service.handleInbound(targetMessage);
+    await harness.service.submitInbound(targetMessage);
     await workers.waitForPromptCount(2);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
     expect(workers.creations.at(-1)?.sessionFile).toBe(forkSessionFile);
@@ -133,13 +176,12 @@ test("/fork snapshots a held source immediately, then the new thread resumes wit
     ]);
     expect((await harness.service.status(FORK_GROUP)).sessionId).toBe(sourceSessionId);
 
-    await harness.service.handleInbound(forkMessage);
+    await submitAndWaitForIngressHandoff(harness, forkMessage);
     expect(transport.createAttempts).toBe(1);
     expect(workers.forkAttempts).toHaveLength(1);
   } finally {
     releaseSource.resolve();
     workers.releaseForkStop.resolve();
-    await forkRequest;
     await closeCoreHarness(harness);
   }
 });
@@ -183,7 +225,7 @@ test("the fork tool uses the current thread binding, creates a same-parent sibli
 
   const canonicalCwd = await realpath(cwd);
   try {
-    await harness.service.handleInbound(ownerMessage(harness, sourceThread, "fork-tool-source-turn", "invoke fork tool"));
+    await harness.service.submitInbound(ownerMessage(harness, sourceThread, "fork-tool-source-turn", "invoke fork tool"));
     await waitForStatus(harness.service, sourceThread, (status) => status.state === "completed");
     expect(transport.createAttempts).toBe(1);
     expect(transport.managementCalls.filter(({ action }) => action === "create-thread")).toEqual([
@@ -247,7 +289,7 @@ test("the fork tool uses the current thread binding, creates a same-parent sibli
       updatedAt: "2026-11-03T00:00:00.000Z",
       updatedBy: "owner-1",
     });
-    await harness.service.handleInbound(ownerMessage(harness, target, "fork-tool-target-turn", "read own context"));
+    await harness.service.submitInbound(ownerMessage(harness, target, "fork-tool-target-turn", "read own context"));
     await workers.waitForPromptCount(2);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
     const targetPrompt = workers.prompts.at(-1)!;
@@ -271,16 +313,16 @@ test("/fork is owner-only group/thread control and rejects private or unmentione
   const unlisted = { channelId: "group-fork-unlisted", channelType: 2 as const };
 
   try {
-    await harness.service.handleInbound(ownerMessage(harness, FORK_DM, "fork-dm-command", "/fork private"));
-    await harness.service.handleInbound({
+    await harness.service.submitInbound(ownerMessage(harness, FORK_DM, "fork-dm-command", "/fork private"));
+    await harness.service.submitInbound({
       ...ownerMessage(harness, FORK_GROUP, "fork-member-command", "/fork member"),
       senderId: "member-2",
     });
-    await harness.service.handleInbound({
+    await harness.service.submitInbound({
       ...ownerMessage(harness, FORK_GROUP, "fork-no-mention-command", "/fork no mention"),
       mentionedUserIds: [],
     });
-    await harness.service.handleInbound(ownerMessage(harness, unlisted, "fork-unlisted-command", "/fork unlisted"));
+    await harness.service.submitInbound(ownerMessage(harness, unlisted, "fork-unlisted-command", "/fork unlisted"));
 
     expect(transport.createAttempts).toBe(0);
     expect(workers.forkAttempts).toHaveLength(0);
@@ -302,7 +344,7 @@ test("fork host tool exposes only optional name, requires a native call identity
   });
   const privateHarness = await createCoreHarness({ workers: privateWorkers, transport: new ForkTestTransport() });
   try {
-    await privateHarness.service.handleInbound(ownerMessage(privateHarness, FORK_DM, "fork-dm-tool", "inspect private tools"));
+    await privateHarness.service.submitInbound(ownerMessage(privateHarness, FORK_DM, "fork-dm-tool", "inspect private tools"));
     await waitForStatus(privateHarness.service, FORK_DM, (status) => status.state === "completed");
     expect(privateTools).toHaveLength(1);
     expect(privateTools[0]).not.toContain("fork");
@@ -341,7 +383,7 @@ test("fork host tool exposes only optional name, requires a native call identity
     allowedGroupIds: [FORK_GROUP.channelId],
   });
   try {
-    await harness.service.handleInbound(ownerMessage(harness, FORK_GROUP, "fork-tool-invalid-args", "validate fork args"));
+    await harness.service.submitInbound(ownerMessage(harness, FORK_GROUP, "fork-tool-invalid-args", "validate fork args"));
     await waitForForkBoundary(checked.promise, "fork argument checks");
     await waitForStatus(harness.service, FORK_GROUP, (status) => status.state === "completed");
     expect(transport.createAttempts).toBe(0);
@@ -377,18 +419,26 @@ test("/fork reports actual partial session and thread identities when target bin
   });
 
   try {
-    await harness.service.handleInbound(ownerMessage(harness, FORK_GROUP, "fork-receipt-source", "persist receipt source"));
+    await harness.service.submitInbound(ownerMessage(harness, FORK_GROUP, "fork-receipt-source", "persist receipt source"));
     await waitForStatus(harness.service, FORK_GROUP, (status) => status.state === "completed");
-    await harness.service.handleInbound(ownerMessage(harness, FORK_GROUP, "fork-receipt-conflict", "/fork receipt target"));
-
-    const record = await withStore(harness, (store) => store.listThreadForks(harness.bot.uid)[0]);
-    if (!record?.sessionId || !record.thread) throw new Error("known partial fork identity was not persisted");
-    const receipt = textFor(harness, FORK_GROUP).join("\n");
+    const conflictMessage = ownerMessage(harness, FORK_GROUP, "fork-receipt-conflict", "/fork receipt target");
+    await harness.service.submitInbound(conflictMessage);
+    const record = await waitForForkRecord(
+      harness,
+      candidate => candidate.sourceChannelId === FORK_GROUP.channelId
+        && candidate.phase === "remote-created",
+    );
+    const receipt = await harness.transport.waitForRemoteText(message =>
+      message.target.channelType === FORK_GROUP.channelType
+      && message.target.channelId === FORK_GROUP.channelId
+      && message.text.includes("session_id="),
+    );
+    if (!record.sessionId || !record.thread) throw new Error("known partial fork identity was not persisted");
     expect(record.phase).toBe("remote-created");
-    expect(receipt).toContain(`session_id=${record.sessionId}`);
-    expect(receipt).toContain(`short_id=${record.thread.shortId}`);
-    expect(receipt).toContain(`name=${record.thread.name}`);
-    expect(receipt).toContain(`cwd=${record.cwd}`);
+    expect(receipt.text).toContain(`session_id=${record.sessionId}`);
+    expect(receipt.text).toContain(`short_id=${record.thread.shortId}`);
+    expect(receipt.text).toContain(`name=${record.thread.name}`);
+    expect(receipt.text).toContain(`cwd=${record.cwd}`);
     expect(transport.createAttempts).toBe(1);
   } finally {
     await closeCoreHarness(harness);
@@ -431,7 +481,7 @@ test("a detached fork tool releases a deferred restart after its source turn has
   });
 
   try {
-    await harness.service.handleInbound(ownerMessage(
+    await harness.service.submitInbound(ownerMessage(
       harness,
       FORK_GROUP,
       "fork-tool-deferred-restart-source",
@@ -510,20 +560,18 @@ test("/fork keeps a deferred restart pending until its result is sent and comman
       },
     },
   });
-  let forkCommand: Promise<void> | undefined;
   let forkError: unknown;
   try {
-    await harness.service.handleInbound(ownerMessage(harness, FORK_GROUP, "fork-restart-source", "persist restart source"));
+    await harness.service.submitInbound(ownerMessage(harness, FORK_GROUP, "fork-restart-source", "persist restart source"));
     await waitForStatus(harness.service, FORK_GROUP, (status) => status.state === "completed");
 
-    forkCommand = harness.service.handleInbound(
-      ownerMessage(harness, FORK_GROUP, forkCommandId, "/fork deferred restart"),
-    ).catch((error: unknown) => {
+    const forkCommandMessage = ownerMessage(harness, FORK_GROUP, forkCommandId, "/fork deferred restart");
+    void harness.service.submitInbound(forkCommandMessage).catch((error: unknown) => {
       forkError = error;
     });
     await waitForForkBoundary(workers.forkStopStarted.promise, "held native fork preparation stop");
 
-    await harness.service.handleInbound(ownerMessage(
+    await harness.service.submitInbound(ownerMessage(
       harness,
       FORK_DM,
       "fork-restart-request",
@@ -535,6 +583,15 @@ test("/fork keeps a deferred restart pending until its result is sent and comman
     expect(restartCalls).toHaveLength(0);
 
     workers.releaseForkStop.resolve();
+    await waitForForkRecord(
+      harness,
+      record => record.name === "deferred restart" && record.phase === "ready",
+    );
+    const forkAdmission = await waitForIngressJob(harness, forkCommandMessage, {
+      predicate: job => job.state === "accepted",
+      rejectStates: [],
+      description: "deferred fork admission",
+    });
     await waitForForkBoundary(resultSendStarted.promise, "held fork result delivery");
     expect(restartCalls).toHaveLength(0);
     expect(await withStore(harness, (store) =>
@@ -543,15 +600,19 @@ test("/fork keeps a deferred restart pending until its result is sent and comman
 
     releaseResultSend.resolve();
     await resultSendFinished.promise;
-    await forkCommand;
-    expect(forkError).toBeUndefined();
+    const receipt = await waitForSentOutbox(harness, `ingress:${forkAdmission.id}:receipt:0`);
+    expect(receipt.text).toMatch(/^已创建子区/u);
     await restartRequested.promise;
+    expect(forkError).toBeUndefined();
     expect(restartObservations).toEqual([{ receiptSent: true, claimState: "completed" }]);
     expect(restartCalls).toHaveLength(1);
   } finally {
     workers.releaseForkStop.resolve();
     releaseResultSend.resolve();
-    await forkCommand?.catch(() => {});
+    restartScheduled.resolve();
+    restartRequested.resolve();
+    resultSendStarted.resolve();
+    resultSendFinished.resolve();
     await closeCoreHarness(harness);
   }
 });
@@ -584,21 +645,27 @@ test("a pending source ask remains source-owned while a fork target starts a fre
   });
 
   try {
-    await harness.service.handleInbound(ownerMessage(harness, FORK_GROUP, "fork-pending-ask-source", "ask in source"));
+    await harness.service.submitInbound(ownerMessage(harness, FORK_GROUP, "fork-pending-ask-source", "ask in source"));
     await waitForForkBoundary(sourceAskStarted.promise, "source ask start");
     const sourceQuestion = await harness.service.status(FORK_GROUP);
     expect(sourceQuestion.pendingQuestionIds).toHaveLength(1);
 
-    await harness.service.handleInbound(ownerMessage(harness, FORK_GROUP, "fork-with-source-ask", "/fork independent ask"));
-    const fork = await withStore(harness, (store) => store.listThreadForks(harness.bot.uid)[0]);
-    if (!fork?.sessionId || !fork.thread) throw new Error("fork command did not return a target");
+    const sourceForkMessage = ownerMessage(harness, FORK_GROUP, "fork-with-source-ask", "/fork independent ask");
+    await harness.service.submitInbound(sourceForkMessage);
+    const fork = await waitForForkRecord(
+      harness,
+      record => record.sourceChannelId === FORK_GROUP.channelId
+        && record.name === "independent ask"
+        && record.phase === "ready",
+    );
+    if (!fork.sessionId || !fork.thread) throw new Error("fork command did not return a target");
     const target: ChatTarget & { channelType: 5 } = {
       channelId: fork.thread.channelId,
       channelType: 5,
     };
     expect((await harness.service.status(target)).pendingQuestionIds).toEqual([]);
 
-    await harness.service.handleInbound(ownerMessage(harness, target, "fork-target-not-source-answer", "new target message"));
+    await harness.service.submitInbound(ownerMessage(harness, target, "fork-target-not-source-answer", "new target message"));
     await waitForForkBoundary(targetTurnStarted.promise, "target user turn");
     expect(workers.prompts.at(-1)?.text).toBe("new target message");
     expect(workers.prompts.at(-1)?.sessionId).toBe(fork.sessionId);

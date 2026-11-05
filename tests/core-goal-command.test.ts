@@ -2,7 +2,7 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { expect, test, vi } from "bun:test";
-import { WorkerGoalError } from "../src/contracts";
+import { WorkerGoalError, type ChatTarget } from "../src/contracts";
 import { openChannelStore } from "../src/store";
 import {
   closeCoreHarness,
@@ -19,34 +19,25 @@ function deferred(): { readonly promise: Promise<void>; readonly resolve: () => 
   return { promise, resolve };
 }
 
-async function waitForGoalOrPrompt(
-  harness: CoreHarness,
-  promptCount: number,
-  goalRunCount = 0,
-): Promise<void> {
+async function waitForGoalRunCount(harness: CoreHarness, expectedCount: number): Promise<void> {
   const deadline = performance.now() + 3_000;
   while (performance.now() < deadline) {
-    if (
-      harness.workers.goalRuns.length > goalRunCount
-      || harness.workers.prompts.length > promptCount
-    ) {
-      return;
-    }
+    if (harness.workers.goalRuns.length >= expectedCount) return;
     const next = Promise.withResolvers<void>();
     setImmediate(next.resolve);
     await next.promise;
   }
-  throw new Error("goal command did not reach a worker");
+  throw new Error(`expected ${expectedCount} native goal runs`);
 }
 
 async function prepareBoundSession(harness: CoreHarness): Promise<string> {
-  await harness.service.handleInbound(inbound({
+  await harness.service.submitInbound(inbound({
     ...DM,
     messageId: "goal-prime-session",
     text: "prepare a persistent session",
   }));
   await harness.workers.waitForPromptCount(1);
-  await waitForStatus(harness.service, DM, status => status.state === "completed");
+  await waitForTaskMessageState(harness, "goal-prime-session", "completed");
   const store = await openChannelStore(harness.stateDir);
   try {
     const binding = store.getBinding(harness.bot.uid, DM);
@@ -66,10 +57,27 @@ async function latestTask(harness: CoreHarness) {
   }
 }
 
+async function waitForLatestTaskMessage(harness: CoreHarness, messageId: string) {
+  const store = await openChannelStore(harness.stateDir);
+  try {
+    const deadline = performance.now() + 3_000;
+    while (performance.now() < deadline) {
+      const task = store.getLatestTask(harness.bot.uid, DM);
+      if (task?.messageId === messageId) return task;
+      const next = Promise.withResolvers<void>();
+      setImmediate(next.resolve);
+      await next.promise;
+    }
+    throw new Error(`task ${messageId} was not persisted`);
+  } finally {
+    store.close();
+  }
+}
+
 async function waitForTaskState(
   harness: CoreHarness,
   taskId: string,
-  state: "completed" | "cancelled" | "failed",
+  state: "queued" | "running" | "completed" | "cancelled" | "interrupted" | "failed",
 ): Promise<void> {
   const store = await openChannelStore(harness.stateDir);
   try {
@@ -85,6 +93,45 @@ async function waitForTaskState(
     store.close();
   }
 }
+async function waitForTaskMessageState(
+  harness: CoreHarness,
+  messageId: string,
+  state: "queued" | "running" | "completed" | "cancelled" | "interrupted" | "failed",
+  target: ChatTarget = DM,
+): Promise<void> {
+  const store = await openChannelStore(harness.stateDir);
+  try {
+    const deadline = performance.now() + 3_000;
+    while (performance.now() < deadline) {
+      const task = store.getTaskByMessageId(harness.bot.uid, target, messageId);
+      if (task?.state === state) return;
+      const next = Promise.withResolvers<void>();
+      setImmediate(next.resolve);
+      await next.promise;
+    }
+    throw new Error(`task message ${messageId} did not reach ${state}`);
+  } finally {
+    store.close();
+  }
+}
+async function waitForStoppedGoalWorker(worker: { readonly stopped: boolean }): Promise<void> {
+  const deadline = performance.now() + 3_000;
+  while (performance.now() < deadline) {
+    if (worker.stopped) {
+      // A terminal task row is written before its worker lease closes. Let the close
+      // continuation deregister that runtime before issuing another session command.
+      const next = Promise.withResolvers<void>();
+      setImmediate(next.resolve);
+      await next.promise;
+      return;
+    }
+    const next = Promise.withResolvers<void>();
+    setImmediate(next.resolve);
+    await next.promise;
+  }
+  throw new Error("goal worker lease did not close");
+}
+
 async function waitForSentText(harness: CoreHarness, previousCount: number): Promise<string> {
   const deadline = performance.now() + 3_000;
   while (performance.now() < deadline) {
@@ -97,13 +144,28 @@ async function waitForSentText(harness: CoreHarness, previousCount: number): Pro
   throw new Error("goal command did not send a response");
 }
 
+async function submitCommand(
+  harness: CoreHarness,
+  messageId: string,
+  text: string,
+  target: ChatTarget = DM,
+): Promise<void> {
+  await harness.service.submitInbound(inbound({
+    ...target,
+    messageId,
+    text,
+    ...(target.channelType === 5 ? { mentionedUserIds: [harness.bot.uid] } : {}),
+  }));
+}
+
 async function commandReply(
   harness: CoreHarness,
   messageId: string,
   text: string,
+  target: ChatTarget = DM,
 ): Promise<string> {
   const previousCount = harness.transport.sent.length;
-  await harness.service.handleInbound(inbound({ ...DM, messageId, text }));
+  await submitCommand(harness, messageId, text, target);
   return waitForSentText(harness, previousCount);
 }
 
@@ -139,12 +201,12 @@ test("/goal set runs a structured create, and live controls show and preserve th
       return { goal, state: { enabled: true, mode: "active", goal } };
     };
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-set-structured",
       text: `/goal set --budget 1800 ${objective}`,
     }));
-    await waitForGoalOrPrompt(harness, promptCount);
+    await waitForGoalRunCount(harness, 1);
 
     expect(harness.workers.goalRuns).toHaveLength(1);
     expect(harness.workers.goalRuns[0]).toMatchObject({
@@ -172,7 +234,7 @@ test("/goal set runs a structured create, and live controls show and preserve th
     expect(budgetChange).toContain("不能事后修改");
     expect(harness.workers.goalRuns).toHaveLength(1);
     expect(await commandReply(harness, "goal-status-live", "/status")).toContain("goal=active");
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-live-steer",
       text: "Also add launch dates",
@@ -190,7 +252,8 @@ test("/goal set runs a structured create, and live controls show and preserve th
     expect((await harness.service.status(DM)).state).toBe("running");
 
     settleGoal.resolve();
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    await waitForTaskMessageState(harness, "goal-set-structured", "completed");
+    await waitForStoppedGoalWorker(liveWorker);
     const pausedReport = await commandReply(harness, "goal-show-paused", "/goal show");
     expect(pausedReport).toContain("paused");
 
@@ -248,15 +311,15 @@ test("native goal rounds remain on one durable task until the structured run set
       };
     };
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-set-multiround",
       text: "/goal set Finish the migration",
     }));
-    await waitForGoalOrPrompt(harness, promptCount);
+    await waitForGoalRunCount(harness, 1);
     expect(harness.workers.goalRuns).toHaveLength(1);
     await firstRound.promise;
-    await waitForStatus(harness.service, DM, status => status.state === "running");
+    await waitForTaskMessageState(harness, "goal-set-multiround", "running");
 
     const inFlight = await latestTask(harness);
     expect(inFlight).toMatchObject({
@@ -267,7 +330,7 @@ test("native goal rounds remain on one durable task until the structured run set
     const taskId = inFlight!.id;
 
     settleSecondRound.resolve();
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    await waitForTaskState(harness, taskId, "completed");
 
     const settled = await latestTask(harness);
     expect(settled?.id).toBe(taskId);
@@ -308,12 +371,12 @@ test("goal acceptance arriving after pause never restores continuation authoriza
       return { goal, state: { enabled: true, mode: "active", goal } };
     };
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-late-acceptance",
       text: "/goal set Keep the task paused",
     }));
-    await waitForGoalOrPrompt(harness, promptCount);
+    await waitForGoalRunCount(harness, 1);
     expect(harness.workers.goalRuns).toHaveLength(1);
     await dispatched.promise;
     const liveWorker = harness.workers.workers.at(-1)!;
@@ -324,19 +387,20 @@ test("goal acceptance arriving after pause never restores continuation authoriza
     acceptGoal.resolve();
     await accepted.promise;
     settleGoal.resolve();
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    await waitForTaskMessageState(harness, "goal-late-acceptance", "completed");
+    await waitForStoppedGoalWorker(liveWorker);
 
     const paused = await commandReply(harness, "goal-show-after-late-accept", "/goal show");
     expect(paused).toContain("paused");
     expect(harness.workers.goalRuns).toHaveLength(1);
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "ordinary-after-goal-pause",
       text: "ordinary work after explicit goal stop",
     }));
     await harness.workers.waitForPromptCount(promptCount + 1);
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    await waitForTaskMessageState(harness, "ordinary-after-goal-pause", "completed");
     expect(harness.workers.goalRuns).toHaveLength(1);
   } finally {
     acceptGoal.resolve();
@@ -394,16 +458,16 @@ test("duplicate resume while queued or live reuses one goal task behind ordinary
       };
     };
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-create-paused",
       text: "/goal set Prepare to resume",
     }));
-    await waitForGoalOrPrompt(harness, 1);
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    await waitForGoalRunCount(harness, 1);
+    await waitForTaskMessageState(harness, "goal-create-paused", "completed");
     expect(harness.workers.goalRuns).toHaveLength(1);
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "ordinary-held-for-goal-resume",
       text: "hold ordinary work",
@@ -411,7 +475,8 @@ test("duplicate resume while queued or live reuses one goal task behind ordinary
     await harness.workers.waitForPromptCount(2);
     await ordinaryStarted.promise;
 
-    await harness.service.handleInbound(inbound({ ...DM, messageId: "goal-resume-once", text: "/goal resume" }));
+    await submitCommand(harness, "goal-resume-once", "/goal resume");
+    await waitForLatestTaskMessage(harness, "goal-resume-once");
     expect((await harness.service.status(DM)).queued).toBe(1);
     await commandReply(harness, "goal-resume-queued-duplicate", "/goal resume");
     expect((await harness.service.status(DM)).queued).toBe(1);
@@ -419,7 +484,7 @@ test("duplicate resume while queued or live reuses one goal task behind ordinary
     expect(harness.workers.goalRuns).toHaveLength(1);
 
     releaseOrdinary.resolve();
-    await waitForGoalOrPrompt(harness, 2, 1);
+    await waitForGoalRunCount(harness, 2);
     expect(harness.workers.goalRuns).toHaveLength(2);
     expect(harness.workers.goalRuns[1]?.request).toEqual({ op: "resume" });
     await resumeStarted.promise;
@@ -429,7 +494,7 @@ test("duplicate resume while queued or live reuses one goal task behind ordinary
     expect((await latestTask(harness))?.messageId).toBe("goal-resume-once");
 
     releaseResume.resolve();
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    await waitForTaskMessageState(harness, "goal-resume-once", "completed");
     expect(harness.workers.goalRuns).toHaveLength(2);
     expect(harness.workers.prompts).toHaveLength(2);
   } finally {
@@ -453,16 +518,16 @@ test("pausing cancels queued goal work but leaves ordinary queued tasks intact",
   });
   try {
     await prepareBoundSession(harness);
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-prequeue-create",
       text: "/goal set Preserve a paused goal",
     }));
-    await waitForGoalOrPrompt(harness, 0);
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    await waitForGoalRunCount(harness, 1);
+    await waitForTaskMessageState(harness, "goal-prequeue-create", "completed");
     expect(harness.workers.goalRuns).toHaveLength(1);
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "ordinary-held-before-goal-queue",
       text: "hold ordinary work",
@@ -470,10 +535,10 @@ test("pausing cancels queued goal work but leaves ordinary queued tasks intact",
     await harness.workers.waitForPromptCount(2);
     await ordinaryStarted.promise;
 
-    await harness.service.handleInbound(inbound({ ...DM, messageId: "ordinary-preserved-by-goal-pause", text: "/queue keep this ordinary task" }));
-    const ordinaryTask = await latestTask(harness);
-    await harness.service.handleInbound(inbound({ ...DM, messageId: "goal-resume-queued-before-pause", text: "/goal resume" }));
-    const goalTask = await latestTask(harness);
+    await submitCommand(harness, "ordinary-preserved-by-goal-pause", "/queue keep this ordinary task");
+    const ordinaryTask = await waitForLatestTaskMessage(harness, "ordinary-preserved-by-goal-pause");
+    await submitCommand(harness, "goal-resume-queued-before-pause", "/goal resume");
+    const goalTask = await waitForLatestTaskMessage(harness, "goal-resume-queued-before-pause");
     expect(goalTask?.messageId).toBe("goal-resume-queued-before-pause");
     expect(goalTask?.state).toBe("queued");
 
@@ -506,19 +571,19 @@ test("goal controls isolate sessions sharing an ordinary working directory", asy
   });
   try {
     const sessionId = await prepareBoundSession(harness);
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-busy-create",
       text: "/goal set Keep a goal for busy control",
     }));
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    await waitForTaskMessageState(harness, "goal-busy-create", "completed");
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...targetB,
       messageId: "goal-busy-prime-b",
       text: "create the second session",
     }));
-    await waitForStatus(harness.service, targetB, status => status.state === "completed");
+    await waitForTaskMessageState(harness, "goal-busy-prime-b", "completed", targetB);
     const store = await openChannelStore(harness.stateDir);
     try {
       expect(store.getBinding(harness.bot.uid, DM)?.cwd)
@@ -529,7 +594,7 @@ test("goal controls isolate sessions sharing an ordinary working directory", asy
     }
 
     const promptCount = harness.workers.prompts.length;
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...targetB,
       messageId: "goal-busy-hold",
       text: "hold shared goal directory",
@@ -558,7 +623,7 @@ test("goal controls isolate sessions sharing an ordinary working directory", asy
     }
 
     releaseHold.resolve();
-    await waitForStatus(harness.service, targetB, status => status.state === "completed");
+    await waitForTaskMessageState(harness, "goal-busy-hold", "completed", targetB);
   } finally {
     releaseHold.resolve();
     await closeCoreHarness(harness);
@@ -580,20 +645,20 @@ test("goal control and execution proceed while a sibling session holds the same 
   });
   try {
     const sessionId = await prepareBoundSession(harness);
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-shared-create",
       text: "/goal set Keep a goal in the shared directory",
     }));
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    await waitForTaskMessageState(harness, "goal-shared-create", "completed");
     expect(harness.workers.goalRuns).toHaveLength(1);
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...sibling,
       messageId: "goal-shared-prime-sibling",
       text: "create the sibling session",
     }));
-    await waitForStatus(harness.service, sibling, status => status.state === "completed");
+    await waitForTaskMessageState(harness, "goal-shared-prime-sibling", "completed", sibling);
     const store = await openChannelStore(harness.stateDir);
     try {
       expect(store.getBinding(harness.bot.uid, DM)?.cwd)
@@ -603,17 +668,13 @@ test("goal control and execution proceed while a sibling session holds the same 
       store.close();
     }
 
-    const heldTask = harness.service.handleInbound(inbound({
+    const heldTask = harness.service.submitInbound(inbound({
       ...sibling,
       messageId: "goal-shared-held-task",
       text: "hold shared goal directory",
     }));
     await heldStarted.promise;
-    await harness.service.handleInbound(inbound({
-      ...DM,
-      messageId: "goal-shared-pause",
-      text: "/goal pause",
-    }));
+    await commandReply(harness, "goal-shared-pause", "/goal pause", DM);
     const paused = await openChannelStore(harness.stateDir);
     try {
       expect(paused.getGoalSession(harness.bot.uid, DM, sessionId)).toMatchObject({ status: "paused" });
@@ -635,21 +696,21 @@ test("goal control and execution proceed while a sibling session holds the same 
         state: { enabled: true, mode: "active", goal },
       };
     };
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-shared-resume",
       text: "/goal resume",
     }));
-    await waitForGoalOrPrompt(harness, harness.workers.prompts.length, 1);
+    await waitForGoalRunCount(harness, 2);
     await resumeStarted.promise;
     expect((await harness.service.status(DM)).state).toBe("running");
     expect((await harness.service.status(sibling)).state).toBe("running");
 
     releaseResume.resolve();
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    await waitForTaskMessageState(harness, "goal-shared-resume", "completed");
     releaseHeld.resolve();
     await heldTask;
-    await waitForStatus(harness.service, sibling, status => status.state === "completed");
+    await waitForTaskMessageState(harness, "goal-shared-held-task", "completed", sibling);
   } finally {
     releaseResume.resolve();
     releaseHeld.resolve();
@@ -686,19 +747,14 @@ test("goal control and execution proceed across owned sibling projects while one
       [api, apiPath, "goal-owned-api"],
       [web, webPath, "goal-owned-web"],
     ] as const) {
-      await harness.service.handleInbound(inbound({
-        messageId,
-        ...target,
-        text: `/new ${path}`,
-        mentionedUserIds: [harness.bot.uid],
-      }));
-      await harness.service.handleInbound(inbound({
+      await commandReply(harness, messageId, `/new ${path}`, target);
+      await harness.service.submitInbound(inbound({
         messageId: `${messageId}-prime`,
         ...target,
         text: "prepare owned goal session",
         mentionedUserIds: [harness.bot.uid],
       }));
-      await waitForStatus(harness.service, target, status => status.state === "completed");
+      await waitForTaskMessageState(harness, `${messageId}-prime`, "completed", target);
     }
 
     const store = await openChannelStore(harness.stateDir);
@@ -734,19 +790,14 @@ test("goal control and execution proceed across owned sibling projects while one
       goalStore.close();
     }
 
-    const heldTask = harness.service.handleInbound(inbound({
+    const heldTask = harness.service.submitInbound(inbound({
       messageId: "goal-owned-held-task",
       ...web,
       text: "hold owned project",
       mentionedUserIds: [harness.bot.uid],
     }));
     await heldStarted.promise;
-    await harness.service.handleInbound(inbound({
-      messageId: "goal-owned-pause",
-      ...api,
-      text: "/goal pause",
-      mentionedUserIds: [harness.bot.uid],
-    }));
+    await commandReply(harness, "goal-owned-pause", "/goal pause", api);
     const paused = await openChannelStore(harness.stateDir);
     try {
       expect(paused.getGoalSession(harness.bot.uid, api, sessionId)).toMatchObject({ status: "paused" });
@@ -770,13 +821,13 @@ test("goal control and execution proceed across owned sibling projects while one
         state: { enabled: true, mode: "exiting", goal: completeGoal },
       };
     };
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       messageId: "goal-owned-resume",
       ...api,
       text: "/goal resume",
       mentionedUserIds: [harness.bot.uid],
     }));
-    await waitForGoalOrPrompt(harness, harness.workers.prompts.length);
+    await waitForGoalRunCount(harness, 1);
     await resumeStarted.promise;
     expect((await harness.service.status(api)).state).toBe("running");
     expect((await harness.service.status(web)).state).toBe("running");
@@ -784,7 +835,7 @@ test("goal control and execution proceed across owned sibling projects while one
     releaseResume.resolve();
     releaseHeld.resolve();
     await heldTask;
-    await waitForStatus(harness.service, web, status => status.state === "completed");
+    await waitForTaskMessageState(harness, "goal-owned-held-task", "completed", web);
   } finally {
     releaseResume.resolve();
     releaseHeld.resolve();
@@ -814,7 +865,7 @@ test("/goal is owner-only and a duplicate inbound message cannot start twice", a
   const harness = await createCoreHarness();
   try {
     const sentBeforeDenied = harness.transport.sent.length;
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-denied-non-owner",
       senderId: "not-the-owner",
@@ -829,9 +880,9 @@ test("/goal is owner-only and a duplicate inbound message cannot start twice", a
       messageId: "goal-dedup-owner",
       text: "/goal set execute once",
     });
-    await harness.service.handleInbound(accepted);
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
-    await harness.service.handleInbound(accepted);
+    await harness.service.submitInbound(accepted);
+    await waitForGoalRunCount(harness, 1);
+    await harness.service.submitInbound(accepted);
     expect(harness.workers.goalRuns).toHaveLength(1);
     expect(harness.workers.prompts).toHaveLength(0);
     expect((await latestTask(harness))?.messageId).toBe("goal-dedup-owner");
@@ -891,7 +942,7 @@ test("a queued goal never switches to a replacement binding session", async () =
   try {
     const originalSessionId = await prepareBoundSession(harness);
     const promptCount = harness.workers.prompts.length;
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-session-switch-holder",
       text: "hold before goal start",
@@ -899,12 +950,12 @@ test("a queued goal never switches to a replacement binding session", async () =
     await harness.workers.waitForPromptCount(promptCount + 1);
     await ordinaryStarted.promise;
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-session-switch-queued",
       text: "/goal set Stay in the accepted session",
     }));
-    const queued = await latestTask(harness);
+    const queued = await waitForLatestTaskMessage(harness, "goal-session-switch-queued");
     expect(queued?.state).toBe("queued");
     const store = await openChannelStore(harness.stateDir);
     try {
@@ -951,25 +1002,27 @@ test("native progress may precede acceptance and a null final goal settles from 
       return { goal: completed, state: { enabled: true, mode: "exiting", goal: completed } };
     };
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-terminal-null",
       text: "/goal set Complete before returning a goal object",
     }));
-    await waitForGoalOrPrompt(harness, promptCount);
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    await waitForGoalRunCount(harness, 1);
+    const goalWorker = harness.workers.workers.at(-1)!;
+    await waitForTaskMessageState(harness, "goal-terminal-null", "completed");
+    await waitForStoppedGoalWorker(goalWorker);
 
     const absent = await commandReply(harness, "goal-show-after-native-absence", "/goal show");
     expect(absent).toContain("没有原生目标");
     expect(absent).not.toContain("Complete before returning a goal object");
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-set-after-native-absence",
       text: "/goal set A second goal in the same session",
     }));
-    await waitForGoalOrPrompt(harness, promptCount, 1);
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    await waitForGoalRunCount(harness, 2);
+    await waitForTaskMessageState(harness, "goal-set-after-native-absence", "completed");
     expect(harness.workers.goalRuns).toHaveLength(2);
     expect(harness.workers.goalRuns[1]?.request).toMatchObject({
       op: "create",
@@ -1002,24 +1055,26 @@ test("dropping a native goal clears its current projection for a new goal in the
       emit({ type: "prompt_accepted" });
       return { goal: paused, state: { enabled: true, mode: "exiting", goal: paused } };
     };
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-create-before-drop",
       text: "/goal set First goal before drop",
     }));
-    await waitForGoalOrPrompt(harness, promptCount);
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    await waitForGoalRunCount(harness, 1);
+    const goalWorker = harness.workers.workers.at(-1)!;
+    await waitForTaskMessageState(harness, "goal-create-before-drop", "completed");
+    await waitForStoppedGoalWorker(goalWorker);
     expect(harness.workers.goalRuns).toHaveLength(1);
 
     const drop = await commandReply(harness, "goal-drop-before-recreate", "/goal drop");
     expect(drop).toContain("dropped");
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-create-after-drop",
       text: "/goal set New goal after drop",
     }));
-    await waitForGoalOrPrompt(harness, promptCount, 1);
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    await waitForGoalRunCount(harness, 2);
+    await waitForTaskMessageState(harness, "goal-create-after-drop", "completed");
     expect(harness.workers.goalRuns).toHaveLength(2);
     expect(harness.workers.goalRuns[1]?.request).toMatchObject({
       op: "create",
@@ -1058,7 +1113,7 @@ test("restart recovers the exact native goal and accepts settled absence without
   };
   try {
     const sessionId = await prepareBoundSession(first);
-    await first.service.handleInbound(inbound({
+    await first.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-recover-exact",
       text: "/goal set finish after restart",
@@ -1145,7 +1200,7 @@ test("goal show and pause leave the native ask pending until a plain reply answe
       };
     };
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-ask-start",
       text: "/goal set coordinate the release",
@@ -1172,7 +1227,7 @@ test("goal show and pause leave the native ask pending until a plain reply answe
     expect(harness.workers.goalRuns).toHaveLength(1);
     expect(harness.workers.prompts).toHaveLength(0);
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-ask-answer",
       text: "staging",
@@ -1258,7 +1313,7 @@ test("goal ask timeout revokes recovery while its late reply stays an ordinary s
       return { goal, state: { enabled: true, mode: "active", goal } };
     };
 
-    await first.service.handleInbound(inbound({
+    await first.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-timeout-start",
       text: "/goal set determine the deployment target",
@@ -1293,13 +1348,14 @@ test("goal ask timeout revokes recovery while its late reply stays an ordinary s
       store.close();
     }
 
-    await first.service.handleInbound(inbound({
+    await first.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-timeout-late-answer",
       text: "staging",
     }));
     await waitForStatus(first.service, DM, status => status.state === "completed");
     expect(await latestTask(first)).toMatchObject({
+      messageId: expect.stringMatching(/^answer:/),
       sessionId: goalTask!.sessionId,
       state: "completed",
     });
@@ -1361,29 +1417,25 @@ test("interrupting a live goal revokes restart recovery and preserves ordinary q
       await waitForAbort();
       return { goal, state: { enabled: true, mode: "active", goal } };
     };
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-interrupt-start",
       text: "/goal set preserve deployment state",
     }));
     await goalStarted.promise;
-    const goalTask = await latestTask(harness);
+    const goalTask = await waitForLatestTaskMessage(harness, "goal-interrupt-start");
     expect(goalTask).not.toBeNull();
 
-    await harness.service.handleInbound(inbound({
-      ...DM,
-      messageId: "goal-interrupt-queue",
-      text: "/queue ordinary work after the goal",
-    }));
-    const queuedTask = await latestTask(harness);
+    await submitCommand(harness, "goal-interrupt-queue", "/queue ordinary work after the goal");
+    const queuedTask = await waitForLatestTaskMessage(harness, "goal-interrupt-queue");
     expect(queuedTask?.state).toBe("queued");
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-interrupt-command",
       text: "/interrupt",
     }));
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    await waitForTaskState(harness, queuedTask!.id, "completed");
     const store = await openChannelStore(harness.stateDir);
     try {
       expect(store.getTask(goalTask!.id)?.state).toBe("interrupted");
@@ -1455,13 +1507,13 @@ test("terminal goal cleanup is not a live control target and cannot block the ne
       return { goal, state: { enabled: true, mode: "exiting", goal } };
     };
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-terminal-first",
       text: "/goal set finish the first objective",
     }));
     await stopEntered.promise;
-    const firstTask = await latestTask(harness);
+    const firstTask = await waitForLatestTaskMessage(harness, "goal-terminal-first");
     expect(firstTask?.state).toBe("completed");
     const firstWorker = harness.workers.workers.at(-1);
     expect(firstWorker).toBeDefined();
@@ -1471,12 +1523,12 @@ test("terminal goal cleanup is not a live control target and cannot block the ne
     expect(firstWorker?.goalOperations).not.toContain("drop");
     expect(harness.workers.workers).toHaveLength(1);
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-terminal-second",
       text: "/goal set start the replacement objective",
     }));
-    const queuedReplacement = await latestTask(harness);
+    const queuedReplacement = await waitForLatestTaskMessage(harness, "goal-terminal-second");
     expect(queuedReplacement).toMatchObject({
       sessionId: firstTask!.sessionId,
       state: "queued",
@@ -1493,7 +1545,7 @@ test("terminal goal cleanup is not a live control target and cannot block the ne
     expect(harness.workers.goalRuns).toHaveLength(1);
 
     releaseStop.resolve();
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    await waitForTaskMessageState(harness, "goal-terminal-second", "completed");
     expect(harness.workers.goalRuns).toHaveLength(2);
     expect(harness.workers.goalRuns[1]).toMatchObject({
       request: { op: "create", objective: "start the replacement objective" },
@@ -1543,7 +1595,7 @@ test("resume refreshes an interrupted active cache from the exact native paused 
       return { goal: complete, state: { enabled: true, mode: "exiting", goal: complete } };
     };
 
-    await first.service.handleInbound(inbound({
+    await first.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-stale-active-start",
       text: "/goal set resume the interrupted native goal",
@@ -1552,12 +1604,12 @@ test("resume refreshes an interrupted active cache from the exact native paused 
     const interruptedTask = await latestTask(first);
     expect(interruptedTask).not.toBeNull();
 
-    await first.service.handleInbound(inbound({
+    await first.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-stale-active-interrupt",
       text: "/interrupt",
     }));
-    await waitForStatus(first.service, DM, status => status.state === "interrupted");
+    await waitForTaskState(first, interruptedTask!.id, "interrupted");
     const sessionId = interruptedTask!.sessionId;
     const store = await openChannelStore(first.stateDir);
     try {
@@ -1591,11 +1643,11 @@ test("resume refreshes an interrupted active cache from the exact native paused 
       staleStore.close();
     }
 
-    await commandReply(reopened, "goal-stale-active-resume", "/goal resume");
-    const resumedTask = await latestTask(reopened);
+    await submitCommand(reopened, "goal-stale-active-resume", "/goal resume");
+    const resumedTask = await waitForLatestTaskMessage(reopened, "goal-stale-active-resume");
     expect(resumedTask?.id).not.toBe(interruptedTask!.id);
     expect(resumedTask?.sessionId).toBe(sessionId);
-    await waitForStatus(reopened.service, DM, status => status.state === "completed");
+    await waitForTaskState(reopened, resumedTask!.id, "completed");
     expect(first.workers.goalRuns).toHaveLength(2);
     expect(first.workers.goalRuns[1]).toMatchObject({
       request: { op: "resume" },
@@ -1643,12 +1695,12 @@ test("resume rejects a stale paused projection when the exact native session has
         state: { enabled: true, mode: "exiting", goal: pausedGoal },
       };
     };
-    await first.service.handleInbound(inbound({
+    await first.service.submitInbound(inbound({
       ...DM,
       messageId: "goal-stale-paused-start",
       text: "/goal set goal removed outside the channel",
     }));
-    await waitForStatus(first.service, DM, status => status.state === "completed");
+    await waitForTaskMessageState(first, "goal-stale-paused-start", "completed");
     const originalTask = await latestTask(first);
     expect(originalTask).not.toBeNull();
     const sessionId = originalTask!.sessionId;
@@ -1697,12 +1749,12 @@ test("resume rejects a stale paused projection when the exact native session has
 test("ordinary tasks still complete through the ordinary prompt path", async () => {
   const harness = await createCoreHarness();
   try {
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "ordinary-after-goal-wiring",
       text: "ordinary task remains an ordinary prompt",
     }));
-    await waitForStatus(harness.service, DM, status => status.state === "completed");
+    await waitForTaskMessageState(harness, "ordinary-after-goal-wiring", "completed");
     const task = await latestTask(harness);
     expect(task?.state).toBe("completed");
     expect(harness.workers.prompts).toHaveLength(1);

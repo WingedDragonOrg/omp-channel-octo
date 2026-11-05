@@ -271,12 +271,12 @@ test("review runs in a separate session while the main task is held and /status 
   let statusCommand: Promise<void> | undefined;
   try {
     harness = await createReviewHarness(prompt);
-    primaryCommand = harness.service.handleInbound(inbound({
+    primaryCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId: "review-primary-task",
       text: PRIMARY_INPUT,
     }));
-    await within(primaryCommand, "primary task acceptance");
+    await within(primaryCommand, "primary inbound acknowledgement");
     const primaryPrompt = await within(primaryStarted.promise, "primary fake worker start");
     await waitForPrimaryStatus(harness, "running");
     const mainWorker = harness.workers.workers.find(worker => worker.sessionId === primaryPrompt.sessionId);
@@ -284,12 +284,12 @@ test("review runs in a separate session while the main task is held and /status 
     const bindingBefore = await boundBinding(harness);
 
     const reviewStart = harness.transport.sent.length;
-    reviewCommand = harness.service.handleInbound(inbound({
+    reviewCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId: "review-independent-request",
       text: `/review ${REVIEW_FOCUS}`,
     }));
-    await within(reviewCommand, "review command hand-off while primary is held");
+    await within(reviewCommand, "review inbound acknowledgement while primary is held");
     const reviewPrompt = await within(reviewStarted.promise, "independent review worker start");
     const reviewWorker = harness.workers.workers.find(worker => worker.sessionId === reviewPrompt.sessionId);
 
@@ -305,12 +305,12 @@ test("review runs in a separate session while the main task is held and /status 
     expect(harness.workers.creations.length).toBeGreaterThanOrEqual(2);
 
     const statusStart = harness.transport.sent.length;
-    statusCommand = harness.service.handleInbound(inbound({
+    statusCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId: "review-status-during-run",
       text: "/status",
     }));
-    await within(statusCommand, "/status command while review worker is held");
+    await within(statusCommand, "/status inbound acknowledgement while review worker is held");
     const statusReply = await waitForText(
       harness,
       statusStart,
@@ -391,12 +391,12 @@ test("duplicate review delivery is idempotent, concurrent review is busy, and st
   let stopCommand: Promise<void> | undefined;
   try {
     harness = await createReviewHarness(prompt);
-    primaryCommand = harness.service.handleInbound(inbound({
+    primaryCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId: "review-stop-primary-task",
       text: PRIMARY_INPUT,
     }));
-    await within(primaryCommand, "primary task acceptance");
+    await within(primaryCommand, "primary inbound acknowledgement");
     const primaryPrompt = await within(primaryStarted.promise, "primary fake worker start");
     await waitForPrimaryStatus(harness, "running");
     const mainWorker = harness.workers.workers.find(worker => worker.sessionId === primaryPrompt.sessionId);
@@ -408,8 +408,8 @@ test("duplicate review delivery is idempotent, concurrent review is busy, and st
       messageId: "review-stop-duplicate-input",
       text: `/review ${REVIEW_FOCUS}`,
     });
-    reviewCommand = harness.service.handleInbound(firstReview);
-    await within(reviewCommand, "review command hand-off");
+    reviewCommand = harness.service.submitInbound(firstReview);
+    await within(reviewCommand, "review inbound acknowledgement");
     const reviewPrompt = await within(reviewStarted.promise, "independent review worker start");
     const reviewWorker = harness.workers.workers.find(worker => worker.sessionId === reviewPrompt.sessionId);
     expect(reviewWorker).toBeDefined();
@@ -417,15 +417,15 @@ test("duplicate review delivery is idempotent, concurrent review is busy, and st
 
     const creationsBeforeDuplicates = harness.workers.creations.length;
     const promptsBeforeDuplicates = harness.workers.prompts.length;
-    duplicateCommand = harness.service.handleInbound(firstReview);
-    await within(duplicateCommand, "duplicate review delivery");
+    duplicateCommand = harness.service.submitInbound(firstReview);
+    await within(duplicateCommand, "duplicate review inbound acknowledgement");
     const busyStart = harness.transport.sent.length;
-    concurrentCommand = harness.service.handleInbound(inbound({
+    concurrentCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId: "review-stop-concurrent-input",
       text: "/review a second simultaneous audit",
     }));
-    await within(concurrentCommand, "concurrent review refusal");
+    await within(concurrentCommand, "concurrent review inbound acknowledgement");
     const busyReply = await waitForText(
       harness,
       busyStart,
@@ -437,12 +437,12 @@ test("duplicate review delivery is idempotent, concurrent review is busy, and st
     expect(harness.workers.prompts).toHaveLength(promptsBeforeDuplicates);
 
     const stopStart = harness.transport.sent.length;
-    stopCommand = harness.service.handleInbound(inbound({
+    stopCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId: "review-stop-command",
       text: "/review stop",
     }));
-    await within(stopCommand, "/review stop");
+    await within(stopCommand, "/review stop inbound acknowledgement");
     await waitUntil(() => reviewWorker!.stopped, "review worker stop");
     await waitForText(
       harness,
@@ -553,7 +553,7 @@ test("group review refuses to start when required group context cannot be read",
   const group = { channelId: "group-review-context-failure", channelType: 2 as const };
   const harness = await createCoreHarness({ allowedGroupIds: [group.channelId] });
   try {
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...group,
       messageId: "bind-group-before-review",
       text: "bind this group",
@@ -564,7 +564,7 @@ test("group review refuses to start when required group context cannot be read",
     harness.transport.failGroupContextWith(new Error("group context unavailable"));
     const sentStart = harness.transport.sent.length;
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...group,
       messageId: "review-context-failure",
       text: "/review inspect context boundary",
@@ -760,12 +760,12 @@ test("review progress cards have an independent lifecycle beside a held task and
     harness = await createReviewHarness(prompt);
     harness.transport.reviewProgressCardSupported = true;
 
-    primaryCommand = harness.service.handleInbound(inbound({
+    primaryCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId: "card-primary-held",
       text: primaryText,
     }));
-    await within(primaryCommand, "card primary task acceptance");
+    await within(primaryCommand, "card primary inbound acknowledgement");
     await within(primaryStarted.promise, "card primary worker start");
     const primaryTask = await latestTask(harness);
     expect(primaryTask).not.toBeNull();
@@ -773,12 +773,12 @@ test("review progress cards have an independent lifecycle beside a held task and
     expect(primaryCard.progress.state).toBe("running");
     expect(primaryCard.progress.runId).toBe(primaryTask!.id);
 
-    completedCommand = harness.service.handleInbound(inbound({
+    completedCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId: "card-review-completed",
       text: `/review ${completedFocus}`,
     }));
-    await within(completedCommand, "completed review card acceptance");
+    await within(completedCommand, "completed review card inbound acknowledgement");
     await within(completedReviewStarted.promise, "completed review prompt start");
     const completedCard = await progressCardAt(harness, 1, "review running progress card");
     expect(completedCard.progress.state).toBe("running");
@@ -802,12 +802,12 @@ test("review progress cards have an independent lifecycle beside a held task and
     expect(primaryCard.progress.state).toBe("running");
     await waitForReviewRuntimeCleanup(harness, "card-review-completed", "completed review lane cleanup");
 
-    failedCommand = harness.service.handleInbound(inbound({
+    failedCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId: "card-review-failed",
       text: `/review ${failedFocus}`,
     }));
-    await within(failedCommand, "failed review card acceptance");
+    await within(failedCommand, "failed review card inbound acknowledgement");
     const failedCard = await progressCardAt(harness, 2, "failed review progress card");
     const failedEdit = await waitForProgressCardState(
       harness,
@@ -818,21 +818,21 @@ test("review progress cards have an independent lifecycle beside a held task and
     expect(failedEdit.target).toEqual(DM);
     await waitForReviewRuntimeCleanup(harness, "card-review-failed", "failed review lane cleanup");
 
-    stoppedCommand = harness.service.handleInbound(inbound({
+    stoppedCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId: "card-review-stopped",
       text: `/review ${stoppedFocus}`,
     }));
-    await within(stoppedCommand, "stopped review card acceptance");
+    await within(stoppedCommand, "stopped review card inbound acknowledgement");
     await within(stoppedReviewStarted.promise, "stopped review prompt start");
     const stoppedCard = await progressCardAt(harness, 3, "stopped review progress card");
     expect(stoppedCard.progress.state).toBe("running");
-    stopCommand = harness.service.handleInbound(inbound({
+    stopCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId: "card-review-stop-command",
       text: "/review stop",
     }));
-    await within(stopCommand, "stop review with progress card");
+    await within(stopCommand, "stop review with progress-card inbound acknowledgement");
     const stoppedEdit = await waitForProgressCardState(
       harness,
       stoppedCard.messageId,
@@ -861,12 +861,12 @@ test("review progress cards have an independent lifecycle beside a held task and
     harness.transport.reviewProgressCardSendFailure = new Error("fixture progress card create failed");
     const sendsBeforeFailure = harness.transport.reviewProgressCardSendAttempts;
     const textStart = harness.transport.sent.length;
-    failedCardCommand = harness.service.handleInbound(inbound({
+    failedCardCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId: "card-send-failure-review",
       text: `/review ${failedCardFocus}`,
     }));
-    await within(failedCardCommand, "review with progress-card transport failure");
+    await within(failedCardCommand, "review with progress-card transport-failure inbound acknowledgement");
     await waitForText(
       harness,
       textStart,

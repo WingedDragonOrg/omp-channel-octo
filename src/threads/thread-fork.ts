@@ -74,9 +74,9 @@ export class ThreadForkController {
 
   constructor(private readonly deps: ThreadForkControllerDeps) {}
 
-  command(message: InboundMessage, argument: string): Promise<string> {
+  command(message: InboundMessage, argument: string, onIntentReady?: () => void): Promise<string> {
     const requestedName = argument.trim().length === 0 ? undefined : argument;
-    return this.start(message, `command:${message.messageId}`, requestedName);
+    return this.start(message, `command:${message.messageId}`, requestedName, undefined, onIntentReady);
   }
 
   /** Stable operation key shared by `/fork` and `/tan` for the same command message. */
@@ -162,6 +162,14 @@ export class ThreadForkController {
     return aborted;
   }
 
+  async settleTarget(target: ChatTarget): Promise<void> {
+    const key = targetKey(target);
+    const operations = [...this.active.values()]
+      .filter(operation => targetKey(operation.target) === key)
+      .map(operation => operation.operation);
+    await Promise.allSettled(operations);
+  }
+
   abortAll(reason: Error): void {
     for (const operation of this.active.values()) operation.controller.abort(reason);
   }
@@ -228,6 +236,7 @@ export class ThreadForkController {
     operationKey: string,
     requestedName?: string,
     externalSignal?: AbortSignal,
+    onIntentReady?: () => void,
   ): Promise<string> {
     const botUid = this.deps.botUid();
     if (botUid === undefined) return Promise.reject(new Error("Bot 身份未注册，无法分叉会话"));
@@ -237,7 +246,7 @@ export class ThreadForkController {
     const current = this.active.get(id);
     if (current) return current.operation as Promise<string>;
     return this.runActive<string>(id, target, externalSignal, signal =>
-      this.runById(botUid, source, id, requestedName, signal));
+      this.runById(botUid, source, id, requestedName, signal, undefined, onIntentReady));
   }
 
 
@@ -279,6 +288,7 @@ export class ThreadForkController {
     requestedName: string | undefined,
     signal: AbortSignal,
     capturedSource?: ForkSource,
+    onIntentReady?: () => void,
   ): Promise<string> {
     this.throwIfAborted(signal);
     // The durable identity lookup precedes source-binding validation: a redelivery after /new must
@@ -305,6 +315,7 @@ export class ThreadForkController {
       if (requestedName !== undefined && this.validateName(requestedName) !== existing.name) {
         throw new Error("同一分叉操作的子区名称不能更改");
       }
+      onIntentReady?.();
       return this.continueExisting(existing, signal);
     }
 
@@ -378,6 +389,7 @@ export class ThreadForkController {
       this.releaseSharedLease(id);
       throw new Error(record.error!, { cause: error });
     }
+    onIntentReady?.();
     record = await this.prepare(record, signal);
     return this.continueAfterPreparation(record, signal);
   }

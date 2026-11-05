@@ -2,6 +2,7 @@ import { symlink, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
 import { normalizedMessage, TEXT_MESSAGE_TYPE } from "../src/octo/content.ts";
+import { recvIngressSourceId } from "../src/inbound/ingress-types.ts";
 import type { ChatTarget, OmpWorker, WorkerOptions } from "../src/contracts.ts";
 import {
   closeCoreHarness,
@@ -66,6 +67,19 @@ function slashTanMessage(harness: CoreHarness, messageId: bigint) {
   }, harness.bot.uid, harness.bot.name);
 }
 
+async function waitForCompletedTanClaim(harness: CoreHarness, messageId: string): Promise<void> {
+  const deadline = performance.now() + 1_500;
+  while (performance.now() < deadline) {
+    const state = await withStore(harness, store =>
+      store.getCommandClaimState(harness.bot.uid, FORK_GROUP, messageId));
+    if (state === "completed") return;
+    const next = Promise.withResolvers<void>();
+    setImmediate(next.resolve);
+    await next.promise;
+  }
+  throw new Error(`TAN command claim ${messageId} did not complete`);
+}
+
 
 
 test("slash-leading TAN text stays raw in durable rows and is wrapped only for the first worker prompt", async () => {
@@ -80,7 +94,7 @@ test("slash-leading TAN text stays raw in durable rows and is wrapped only for t
     const { canonicalCwd, aliasCwd } = await seedAliasedBinding(harness, "tan-slash-source-session");
     const message = slashTanMessage(harness, 123n);
     expect(message.text).toBe("/tan /status");
-    await harness.service.handleInbound(message);
+    await harness.service.submitInbound(message);
     await workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, status => status.state === "completed");
 
@@ -120,7 +134,7 @@ test("a restarted queued TAN task gets the same slash-safe worker prompt without
   let restarted: CoreHarness | undefined;
   try {
     await seedBinding(first, FORK_GROUP, first.root, "tan-restart-source-session");
-    await first.service.handleInbound(slashTanMessage(first, 124n));
+    await first.service.submitInbound(slashTanMessage(first, 124n));
     await targetCreateStarted.promise;
 
     const id = await withStore(first, store => {
@@ -165,6 +179,10 @@ test("a restarted queued TAN task gets the same slash-safe worker prompt without
 
 test("TAN refuses a source binding replaced while attachment materialization is in flight", async () => {
   const transport = new ForkTestTransport();
+  transport.attachmentBodies.set(
+    "https://cdn.example.test/tan-source-race.txt",
+    new TextEncoder().encode("race fixture"),
+  );
   const downloadStarted = Promise.withResolvers<void>();
   const releaseDownload = Promise.withResolvers<void>();
   const download = transport.downloadAttachment.bind(transport);
@@ -195,7 +213,8 @@ test("TAN refuses a source binding replaced while attachment materialization is 
   let request: Promise<void> | undefined;
   try {
     await seedBinding(harness, FORK_GROUP, harness.root, "tan-source-race-original");
-    request = harness.service.handleInbound(message);
+    const receipt = harness.service.receive(message);
+    request = receipt.ackReady;
     await downloadStarted.promise;
     const cwd = await realpath(harness.root);
     const replacementSessionId = "tan-source-race-replacement";
@@ -214,6 +233,7 @@ test("TAN refuses a source binding replaced while attachment materialization is 
     });
     releaseDownload.resolve();
     await request;
+    await waitForCompletedTanClaim(harness, message.messageId);
 
     await withStore(harness, store => {
       expect(store.listThreadForks(harness.bot.uid)).toHaveLength(0);
@@ -256,14 +276,18 @@ test("cancel waits for a known remote TAN allocation and durably reports it with
   let restarted: CoreHarness | undefined;
   try {
     await seedBinding(harness, FORK_GROUP, harness.root, "tan-cancel-remote-source");
-    const request = harness.service.handleInbound(slashTanMessage(harness, 126n));
+    const request = harness.service.submitInbound(slashTanMessage(harness, 126n));
     await transport.remoteCreated.promise;
-    const cancellation = harness.service.handleInbound(
+    const cancellation = harness.service.submitInbound(
       ownerMessage(harness, FORK_GROUP, "tan-cancel-remote", "/cancel"),
     );
     await transport.abortObserved.promise;
     transport.releaseReturn.resolve();
     await Promise.all([request, cancellation]);
+    await transport.waitForRemoteText((reply) =>
+      reply.target.channelType === FORK_GROUP.channelType
+      && reply.target.channelId === FORK_GROUP.channelId
+      && reply.text.includes("已创建但尚未完成本地绑定"));
 
     expect(transport.createAttempts).toBe(1);
     await withStore(harness, store => {
@@ -321,12 +345,16 @@ test("cancel during unknown remote-create outcome reports it and restart never r
   let restarted: CoreHarness | undefined;
   try {
     await seedBinding(harness, FORK_GROUP, harness.root, "tan-cancel-unknown-source");
-    const request = harness.service.handleInbound(slashTanMessage(harness, 128n));
+    const request = harness.service.submitInbound(slashTanMessage(harness, 128n));
     await transport.createThreadStarted.promise;
-    const cancellation = harness.service.handleInbound(
+    const cancellation = harness.service.submitInbound(
       ownerMessage(harness, FORK_GROUP, "tan-cancel-unknown", "/cancel"),
     );
     await Promise.all([request, cancellation]);
+    await transport.waitForRemoteText((reply) =>
+      reply.target.channelType === FORK_GROUP.channelType
+      && reply.target.channelId === FORK_GROUP.channelId
+      && reply.text.includes("不会重试创建"));
 
     expect(transport.createAttempts).toBe(1);
     await withStore(harness, store => {
@@ -391,7 +419,7 @@ test("TAN prompt without a prompt_accepted receipt stays unknown instead of comp
   const target = targetFor("thread-1");
   try {
     await seedBinding(harness, FORK_GROUP, harness.root, "tan-unknown-source-session");
-    await harness.service.handleInbound(slashTanMessage(harness, 127n));
+    await harness.service.submitInbound(slashTanMessage(harness, 127n));
     await workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, status => status.state === "interrupted");
 
@@ -413,7 +441,7 @@ test("TAN prompt without a prompt_accepted receipt stays unknown instead of comp
   }
 }, 15_000);
 
-test("mention-normalized TAN materialization is coalesced and cancellation leaves a durable terminal claim", async () => {
+test("mention-normalized TAN materialization is coalesced and its cancellation tombstone survives redelivery and restart", async () => {
   const transport = new ForkTestTransport();
   transport.downloadHangs = true;
   const downloadStarted = Promise.withResolvers<void>();
@@ -427,6 +455,11 @@ test("mention-normalized TAN materialization is coalesced and cancellation leave
     allowedGroupIds: [FORK_GROUP.channelId],
     attachments: { enabled: true, maxBytes: 1024 },
   });
+  const sourceKey = {
+    botUid: harness.bot.uid,
+    sourceKind: "recv" as const,
+    sourceId: recvIngressSourceId(FORK_GROUP.channelType, FORK_GROUP.channelId, "tan-mention-cancel-download"),
+  };
   const message = inbound({
     ...FORK_GROUP,
     messageId: "tan-mention-cancel-download",
@@ -444,27 +477,67 @@ test("mention-normalized TAN materialization is coalesced and cancellation leave
   });
   let first: Promise<void> | undefined;
   let duplicate: Promise<void> | undefined;
+  let restarted: CoreHarness | undefined;
   try {
     await seedBinding(harness, FORK_GROUP, harness.root, "tan-cancel-source-session");
-    const firstRequest = harness.service.handleInbound(message);
+    const firstReceipt = harness.service.receive(message);
+    const firstRequest = firstReceipt.ackReady;
     first = firstRequest;
     await downloadStarted.promise;
     expect(transport.downloadRequests).toHaveLength(1);
 
-    const duplicateRequest = harness.service.handleInbound(message);
+    const duplicateReceipt = harness.service.receive(message);
+    const duplicateRequest = duplicateReceipt.ackReady;
     duplicate = duplicateRequest;
-    await harness.service.handleInbound(ownerMessage(harness, FORK_GROUP, "tan-mention-cancel", "/cancel"));
+    const cancellationReply = transport.waitForRemoteText(reply =>
+      reply.target.channelType === FORK_GROUP.channelType
+      && reply.target.channelId === FORK_GROUP.channelId
+      && reply.text.includes("已取消"));
+    await harness.service.submitInbound(ownerMessage(harness, FORK_GROUP, "tan-mention-cancel", "/cancel"));
     await Promise.all([firstRequest, duplicateRequest]);
+    expect((await cancellationReply).text).toContain("已取消");
 
-    // Redelivery after cancellation is suppressed by the completed command claim, not re-materialized.
-    await harness.service.handleInbound(message);
-    expect(transport.downloadRequests).toHaveLength(1);
     await withStore(harness, store => {
-      expect(store.getCommandClaimState(harness.bot.uid, FORK_GROUP, message.messageId)).toBe("completed");
+      expect(store.getIngressJobBySource(sourceKey)).toMatchObject({
+        state: "cancelled",
+        ackReady: true,
+        payload: null,
+        routeSnapshot: null,
+        preparedText: null,
+        spoolPaths: [],
+      });
       expect(store.listThreadForks(harness.bot.uid)).toHaveLength(0);
+    });
+
+    // An ACK-lost redelivery is consumed by the durable ingress identity, not rematerialized.
+    await harness.service.submitInbound(message);
+    expect(transport.downloadRequests).toHaveLength(1);
+
+    await closeCoreHarness(harness, { remove: false });
+    const restartTransport = new ForkTestTransport({ bot: harness.bot });
+    restarted = await createCoreHarness({
+      root: harness.root,
+      bot: harness.bot,
+      transport: restartTransport,
+      allowedGroupIds: [FORK_GROUP.channelId],
+      attachments: { enabled: true, maxBytes: 1024 },
+    });
+    await restarted.service.submitInbound(message);
+    expect(restartTransport.downloadRequests).toHaveLength(0);
+    expect(restartTransport.createAttempts).toBe(0);
+    await withStore(restarted, store => {
+      expect(store.getIngressJobBySource(sourceKey)).toMatchObject({
+        state: "cancelled",
+        ackReady: true,
+        payload: null,
+        routeSnapshot: null,
+      });
+      expect(store.listThreadForks(harness.bot.uid)).toHaveLength(0);
+      expect(store.listPendingTanOperations(harness.bot.uid)).toHaveLength(0);
     });
   } finally {
     await Promise.allSettled([first, duplicate].filter((value): value is Promise<void> => value !== undefined));
-    await closeCoreHarness(harness);
+    if (restarted) await closeCoreHarness(restarted);
+    else await closeCoreHarness(harness);
   }
 }, 15_000);

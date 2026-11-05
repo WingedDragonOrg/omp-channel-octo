@@ -18,6 +18,7 @@ import {
   FakeTransport,
   FakeWorkerFactory,
   inbound,
+  submitAndWaitForIngressHandoff,
   type CoreHarness,
   waitForStatus,
 } from "./fixtures/core-fakes";
@@ -122,12 +123,50 @@ async function waitForTaskState(root: string, taskId: string, state: TaskRecord[
     for (let attempt = 0; attempt < 10_000; attempt += 1) {
       const task = store.getTask(taskId);
       if (task?.state === state) return task;
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      const next = Promise.withResolvers<void>();
+      setImmediate(next.resolve);
+      await next.promise;
     }
   } finally {
     store.close();
   }
   throw new Error(`task ${taskId} did not reach ${state}`);
+}
+
+async function waitForLatestTask(
+  root: string,
+  botUid: string,
+  target: ChatTarget,
+  predicate: (task: TaskRecord) => boolean,
+): Promise<TaskRecord> {
+  const store = await openChannelStore(join(root, "state"));
+  try {
+    for (let attempt = 0; attempt < 10_000; attempt += 1) {
+      const task = store.getLatestTask(botUid, target);
+      if (task !== null && predicate(task)) return task;
+      const next = Promise.withResolvers<void>();
+      setImmediate(next.resolve);
+      await next.promise;
+    }
+  } finally {
+    store.close();
+  }
+  throw new Error(`latest task for ${target.channelType}:${target.channelId} did not reach expectation`);
+}
+
+function waitForNotice(harness: CoreHarness, target: ChatTarget, text: string) {
+  const earlierRequests = new Set(harness.transport.textRequests);
+  return harness.transport.waitForTextRequest((request) =>
+    !earlierRequests.has(request)
+    && request.operation === "send"
+    && request.text === text
+    && request.target.channelType === target.channelType
+    && request.target.channelId === target.channelId,
+  );
+}
+
+async function expectIngressReceipt(root: string, jobId: number): Promise<void> {
+  expect(await withStore(root, (store) => store.getOutbox(`ingress:${jobId}:receipt:0`))).not.toBeNull();
 }
 
 test("preparing and failed thread ownership blocks inbound work before steering", async () => {
@@ -151,31 +190,54 @@ test("preparing and failed thread ownership blocks inbound work before steering"
     await mkdir(rawProject, { recursive: true });
     const entry = await realpath(rawEntry);
     const project = await realpath(rawProject);
-    await harness.service.handleInbound(ownerMessage(harness, thread, "ownership-new", `/new ${entry}`));
+    const newJob = await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, thread, "ownership-new", `/new ${entry}`),
+    );
+    await expectIngressReceipt(harness.root, newJob.id);
 
     const preparing = workspaceRecord(thread, entry, [{ name: "api", path: project, created: false }], "preparing");
     await withStore(harness.root, (store) => store.saveThreadWorkspace(preparing));
-    await harness.service.handleInbound(ownerMessage(harness, thread, "ownership-preparing", "must not start"));
+    const preparingNotice = waitForNotice(harness, thread, unavailableNotice);
+    await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, thread, "ownership-preparing", "must not start"),
+    );
+    await preparingNotice;
     expect(await withStore(harness.root, (store) => store.getLatestTask(bot.uid, thread))).toBeNull();
 
     const failed = workspaceRecord(thread, entry, [{ name: "api", path: project, created: false }], "failed");
     await withStore(harness.root, (store) => store.saveThreadWorkspace(failed));
-    await harness.service.handleInbound(ownerMessage(harness, thread, "ownership-failed", "must still not start"));
+    const failedNotice = waitForNotice(harness, thread, unavailableNotice);
+    await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, thread, "ownership-failed", "must still not start"),
+    );
+    await failedNotice;
     expect(await withStore(harness.root, (store) => store.getLatestTask(bot.uid, thread))).toBeNull();
 
     const ready = workspaceRecord(thread, entry, [{ name: "api", path: project }]);
     await withStore(harness.root, (store) => store.saveThreadWorkspace(ready));
-    await harness.service.handleInbound(ownerMessage(harness, thread, "ownership-running", "hold turn"));
+    const startJob = await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, thread, "ownership-running", "hold turn"),
+    );
+    if (startJob.consumerKind !== "task" || startJob.consumerId === null) {
+      throw new Error("running workspace input was not durably accepted as a task");
+    }
     await started.promise;
-    const running = await withStore(harness.root, (store) => store.getLatestTask(bot.uid, thread));
-    expect(running?.state).toBe("running");
+    const running = await waitForTaskState(harness.root, startJob.consumerId, "running");
 
     await withStore(harness.root, (store) => store.saveThreadWorkspace({ ...ready, status: "failed" }));
-    await harness.service.handleInbound(ownerMessage(harness, thread, "ownership-steer", "must not steer"));
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    const steerNotice = waitForNotice(harness, thread, unavailableNotice);
+    await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, thread, "ownership-steer", "must not steer"),
+    );
+    await steerNotice;
 
     expect(appendedText).toBeNull();
-    expect(await withStore(harness.root, (store) => store.getLatestTask(bot.uid, thread)?.id)).toBe(running?.id);
+    expect(await withStore(harness.root, (store) => store.getLatestTask(bot.uid, thread)?.id)).toBe(running.id);
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["hold turn"]);
     expect(harness.transport.sent.some(({ text }) => text === unavailableNotice)).toBe(true);
   } finally {
@@ -196,8 +258,15 @@ test("a ready shared owner without a binding bootstraps its first task inside th
       store.saveThreadWorkspace(workspaceRecord(thread, entry, [{ name: "api", path: project }])),
     );
     harness = await createCoreHarness({ root, bot });
-    await harness.service.handleInbound(ownerMessage(harness, thread, "first-workspace-task", "first work"));
-    await waitForStatus(harness.service, thread, (status) => status.state === "completed");
+    const firstJob = await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, thread, "first-workspace-task", "first work"),
+    );
+    if (firstJob.consumerKind !== "task" || firstJob.consumerId === null) {
+      throw new Error("first workspace input was not durably accepted as a task");
+    }
+    const completed = await waitForTaskState(root, firstJob.consumerId, "completed");
+    expect(completed.cwd).toBe(entry);
 
     expect(await withStore(root, (store) => store.getBinding(bot.uid, thread)?.cwd)).toBe(entry);
     expect(await withStore(root, (store) => store.getLatestTask(bot.uid, thread)?.cwd)).toBe(entry);
@@ -289,7 +358,12 @@ test("a missing explicit single-project workspace stays blocked instead of falli
     await rm(projectPath, { recursive: true, force: true });
     harness = await createCoreHarness({ root, bot });
 
-    await harness.service.handleInbound(ownerMessage(harness, target, "explicit-single-missing-inbound", "must stay blocked"));
+    const unavailable = waitForNotice(harness, target, unavailableNotice);
+    await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, target, "explicit-single-missing-inbound", "must stay blocked"),
+    );
+    await unavailable;
 
     expect(await withStore(root, (store) => store.getLatestTask(bot.uid, target))).toBeNull();
     expect(harness.workers.prompts).toHaveLength(0);
@@ -335,7 +409,11 @@ test("/new and /move preserve workspace ownership while explicit cwd changes det
     });
     harness = await createCoreHarness({ root, bot });
 
-    await harness.service.handleInbound(ownerMessage(harness, thread, "retained-new-default", "/new"));
+    const defaultNew = await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, thread, "retained-new-default", "/new"),
+    );
+    await expectIngressReceipt(root, defaultNew.id);
     expect(await withStore(root, (store) => store.getBinding(bot.uid, thread))).toMatchObject({
       cwd: entry,
       cwdPinned: true,
@@ -343,17 +421,21 @@ test("/new and /move preserve workspace ownership while explicit cwd changes det
     expect(await withStore(root, (store) => store.getThreadWorkspace(bot.uid, thread))).toEqual(workspace);
 
     await rm(project, { recursive: true, force: true });
-    await harness.service.handleInbound(
+    const explicitNew = await submitAndWaitForIngressHandoff(
+      harness,
       ownerMessage(harness, thread, "retained-new-explicit", `/new ${canonicalNewCwd}`),
     );
+    await expectIngressReceipt(root, explicitNew.id);
     const explicitNewBinding = await withStore(root, (store) => store.getBinding(bot.uid, thread));
     expect(explicitNewBinding).toMatchObject({ cwd: canonicalNewCwd });
     expect(explicitNewBinding?.cwdPinned).not.toBe(true);
     expect(await withStore(root, (store) => store.getThreadWorkspace(bot.uid, thread))).toEqual(workspace);
 
-    await harness.service.handleInbound(
+    const moved = await submitAndWaitForIngressHandoff(
+      harness,
       ownerMessage(harness, thread, "retained-move-explicit", `/move ${canonicalMovedCwd}`),
     );
+    await expectIngressReceipt(root, moved.id);
     const movedBinding = await withStore(root, (store) => store.getBinding(bot.uid, thread));
     expect(movedBinding).toMatchObject({ cwd: canonicalMovedCwd });
     expect(movedBinding?.cwdPinned).not.toBe(true);
@@ -454,7 +536,11 @@ test("shared /thread merge returns the exact notice without probing or creating 
     const entry = await realpath(rawEntry);
     const api = await realpath(rawApi);
     const web = await realpath(rawWeb);
-    await harness.service.handleInbound(ownerMessage(harness, thread, "shared-merge-bind", `/new ${entry}`));
+    const bindJob = await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, thread, "shared-merge-bind", `/new ${entry}`),
+    );
+    await expectIngressReceipt(harness.root, bindJob.id);
     await withStore(harness.root, (store) =>
       store.saveThreadWorkspace(workspaceRecord(thread, entry, [
         { name: "api", path: api },
@@ -471,7 +557,12 @@ test("shared /thread merge returns the exact notice without probing or creating 
       return originalWorktrunk();
     };
     const promptCount = harness.workers.prompts.length;
-    await harness.service.handleInbound(ownerMessage(harness, thread, "shared-merge-command", "/thread merge"));
+    const notice = waitForNotice(harness, thread, mergeNotice);
+    await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, thread, "shared-merge-command", "/thread merge"),
+    );
+    await notice;
 
     expect(worktrunkCalls).toBe(0);
     expect(harness.workers.prompts).toHaveLength(promptCount);
@@ -514,11 +605,22 @@ test("a failed shared-workspace recovery releases asks so a late card answer wak
         }
       },
     });
-    await first.service.handleInbound(ownerMessage(first, thread, "recovery-bind", `/new ${entry}`));
+    const bindJob = await submitAndWaitForIngressHandoff(
+      first,
+      ownerMessage(first, thread, "recovery-bind", `/new ${entry}`),
+    );
+    await expectIngressReceipt(root, bindJob.id);
     await withStore(root, (store) =>
       store.saveThreadWorkspace(workspaceRecord(thread, entry, [{ name: "api", path: project }])),
     );
-    await first.service.handleInbound(ownerMessage(first, thread, "recovery-ask", "ask before restart"));
+    const recoveryJob = await submitAndWaitForIngressHandoff(
+      first,
+      ownerMessage(first, thread, "recovery-ask", "ask before restart"),
+    );
+    if (recoveryJob.consumerKind !== "task" || recoveryJob.consumerId === null) {
+      throw new Error("recovery ask was not durably accepted as a task");
+    }
+    await waitForTaskState(root, recoveryJob.consumerId, "running");
     await first.workers.waitForPromptCount(1);
     const waiting = await waitForStatus(
       first.service,
@@ -528,10 +630,7 @@ test("a failed shared-workspace recovery releases asks so a late card answer wak
     const questionId = waiting.pendingQuestionIds[0]!;
     const card = firstTransport.sentCards[0];
     if (!card) throw new Error("recovered ask card was not sent");
-    const interruptedTaskId = await withStore(root, (store) =>
-      store.getLatestTask(bot.uid, thread)?.id ?? "",
-    );
-    if (!interruptedTaskId) throw new Error("recovery task row missing");
+    const interruptedTaskId = recoveryJob.consumerId;
 
     await closeCoreHarness(first, { remove: false });
     first = undefined;
@@ -645,14 +744,20 @@ test("a late ask-card wake cannot steer a shared project after one project disap
         }
       },
     });
-    await harness.service.handleInbound(ownerMessage(harness, thread, "late-ask-bind", `/new ${entry}`));
+    const bindJob = await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, thread, "late-ask-bind", `/new ${entry}`),
+    );
+    await expectIngressReceipt(root, bindJob.id);
     await withStore(root, (store) =>
       store.saveThreadWorkspace(
         workspaceRecord(thread, entry, [{ name: "api", path: project }], "ready", caseBot.uid),
       ),
     );
-    await harness.service.handleInbound(ownerMessage(harness, thread, "late-ask-start", "ask before timeout"));
-    await harness.workers.waitForPromptCount(1);
+    await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, thread, "late-ask-start", "ask before timeout"),
+    );
     await waitForStatus(
       harness.service,
       thread,
@@ -662,20 +767,19 @@ test("a late ask-card wake cannot steer a shared project after one project disap
     if (!card) throw new Error("timed-out ask card was not sent");
 
     // Plain text would answer the still-pending ask; use an unregistered slash input to start a separate turn.
-    await harness.service.handleInbound(
+    const holdJob = await submitAndWaitForIngressHandoff(
+      harness,
       ownerMessage(harness, thread, "late-ask-hold", "/hold current turn"),
     );
+    if (holdJob.consumerKind !== "task" || holdJob.consumerId === null) {
+      throw new Error("held shared turn was not durably accepted as a task");
+    }
     await holdStarted.promise;
-    const activeTaskId = await withStore(root, (store) => store.getLatestTask(caseBot.uid, thread)?.id ?? "");
-    if (!activeTaskId) throw new Error("active shared task row missing");
+    await waitForTaskState(root, holdJob.consumerId, "running");
+    const activeTaskId = holdJob.consumerId;
     await rm(projectPath, { recursive: true, force: true });
 
-    const unavailable = transport.waitForTextRequest((request) =>
-      request.operation === "send"
-      && request.text === unavailableNotice
-      && request.target.channelType === thread.channelType
-      && request.target.channelId === thread.channelId,
-    );
+    const unavailable = waitForNotice(harness, thread, unavailableNotice);
     const lateAnswer: BotCardAction = {
       messageId: card.messageId,
       channelType: thread.channelType,
@@ -687,11 +791,20 @@ test("a late ask-card wake cannot steer a shared project after one project disap
     transport.pushBotEvent(cardActionEvent(802, lateAnswer));
     await unavailable;
     await transport.waitForAck(802);
+    const wakeTask = await waitForLatestTask(
+      root,
+      caseBot.uid,
+      thread,
+      (task) => task.id !== activeTaskId && task.messageId.startsWith("answer:"),
+    );
+    const cancelledWake = await waitForTaskState(root, wakeTask.id, "cancelled");
 
     expect(appendedText).toBeNull();
     expect(harness.workers.prompts).toHaveLength(2);
+    expect(cancelledWake.text).toContain("Should the work continue?");
+    expect(cancelledWake.text).toContain("答案（由 owner-1 回复）：1. yes");
     expect(await withStore(root, (store) => store.getTask(activeTaskId)?.state)).toBe("running");
-    expect(await withStore(root, (store) => store.getLatestTask(caseBot.uid, thread)?.id)).toBe(activeTaskId);
+    expect(await withStore(root, (store) => store.getLatestTask(caseBot.uid, thread)?.id)).toBe(wakeTask.id);
   } finally {
     if (harness) await closeCoreHarness(harness);
     else await rm(root, { recursive: true, force: true });
@@ -817,7 +930,12 @@ test("an unmapped preparing workspace intent refuses unknown thread work before 
       error: null,
     };
     await withStore(harness.root, (store) => store.saveThreadWorkspaceIntent(intent));
-    await harness.service.handleInbound(ownerMessage(harness, unknown, "unknown-preparing-inbound", "must stay blocked"));
+    const notice = waitForNotice(harness, unknown, unavailableNotice);
+    await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, unknown, "unknown-preparing-inbound", "must stay blocked"),
+    );
+    await notice;
 
     expect(await withStore(harness.root, (store) => store.getLatestTask(bot.uid, unknown))).toBeNull();
     expect(harness.workers.prompts).toHaveLength(0);
@@ -840,7 +958,11 @@ test("a same-group unmapped intent does not block a legacy thread with an existi
   try {
     harness = await createCoreHarness({ root, bot });
     const legacy: ThreadTarget = { channelId: "group-tools____thread-existing-legacy", channelType: 5 };
-    await harness.service.handleInbound(ownerMessage(harness, legacy, "legacy-intent-bind", `/new ${cwd}`));
+    const bindJob = await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, legacy, "legacy-intent-bind", `/new ${cwd}`),
+    );
+    await expectIngressReceipt(root, bindJob.id);
     await withStore(root, (store) => store.saveThreadWorkspaceIntent({
       id: "intent-unmapped-with-legacy",
       botUid: bot.uid,
@@ -849,7 +971,10 @@ test("a same-group unmapped intent does not block a legacy thread with an existi
       channelIds: [],
     }));
 
-    await harness.service.handleInbound(ownerMessage(harness, legacy, "legacy-intent-task", "keep legacy work available"));
+    await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, legacy, "legacy-intent-task", "keep legacy work available"),
+    );
     await waitForStatus(harness.service, legacy, (status) => status.state === "completed");
 
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["keep legacy work available"]);
@@ -880,13 +1005,25 @@ test("an explicit /new can recover a mapped thread whose ownership row was never
       store.addThreadWorkspaceIntentChannel(bot.uid, "intent-unpersisted-owner", target.channelId);
     });
 
-    await harness.service.handleInbound(ownerMessage(harness, target, "unpersisted-owner-blocked", "wait for ownership"));
+    const notice = waitForNotice(harness, target, unavailableNotice);
+    await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, target, "unpersisted-owner-blocked", "wait for ownership"),
+    );
+    await notice;
     expect(await withStore(root, (store) => store.getLatestTask(bot.uid, target))).toBeNull();
 
-    await harness.service.handleInbound(ownerMessage(harness, target, "unpersisted-owner-new", `/new ${cwd}`));
+    const newJob = await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, target, "unpersisted-owner-new", `/new ${cwd}`),
+    );
+    await expectIngressReceipt(root, newJob.id);
     expect(await withStore(root, (store) => store.getBinding(bot.uid, target))).toMatchObject({ cwd });
 
-    await harness.service.handleInbound(ownerMessage(harness, target, "unpersisted-owner-task", "continue outside unpersisted resources"));
+    await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, target, "unpersisted-owner-task", "continue outside unpersisted resources"),
+    );
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["continue outside unpersisted resources"]);
@@ -915,7 +1052,11 @@ test("a failed mapped workspace can be exited with explicit /new outside its own
   const target: ThreadTarget = { channelId: "group-tools____thread-failed-detach", channelType: 5 };
   try {
     harness = await createCoreHarness({ root, bot });
-    await harness.service.handleInbound(ownerMessage(harness, target, "failed-detach-bind", `/new ${entry}`));
+    const bindJob = await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, target, "failed-detach-bind", `/new ${entry}`),
+    );
+    await expectIngressReceipt(root, bindJob.id);
     const failed = workspaceRecord(target, entry, [
       { name: "api", path: project, created: false },
     ], "failed");
@@ -932,12 +1073,24 @@ test("a failed mapped workspace can be exited with explicit /new outside its own
       store.failThreadWorkspaceIntent(bot.uid, "intent-failed-detach", failed.error);
     });
 
-    await harness.service.handleInbound(ownerMessage(harness, target, "failed-detach-refused", "must be refused first"));
+    const notice = waitForNotice(harness, target, unavailableNotice);
+    await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, target, "failed-detach-refused", "must be refused first"),
+    );
+    await notice;
     expect(await withStore(root, (store) => store.getLatestTask(bot.uid, target))).toBeNull();
     expect(harness.transport.sent.some(({ text }) => text === unavailableNotice)).toBe(true);
 
-    await harness.service.handleInbound(ownerMessage(harness, target, "failed-detach-new", `/new ${outside}`));
-    await harness.service.handleInbound(ownerMessage(harness, target, "failed-detach-task", "work outside failed ownership"));
+    const newJob = await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, target, "failed-detach-new", `/new ${outside}`),
+    );
+    await expectIngressReceipt(root, newJob.id);
+    await submitAndWaitForIngressHandoff(
+      harness,
+      ownerMessage(harness, target, "failed-detach-task", "work outside failed ownership"),
+    );
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["work outside failed ownership"]);

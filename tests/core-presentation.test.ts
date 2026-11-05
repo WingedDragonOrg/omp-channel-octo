@@ -270,7 +270,7 @@ test("a complete assistant text event is one lossless message in its target chat
     text: "render this",
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await waitForStatus(
       harness.service,
       task,
@@ -300,7 +300,7 @@ test("separate assistant text events are delivered as separate messages", async 
     text: "produce two messages",
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await waitForStatus(
       harness.service,
       task,
@@ -342,7 +342,7 @@ test("a task with no assistant text sends no reply to its target chat", async ()
     text: "do silent work",
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await waitForStatus(
       harness.service,
       task,
@@ -398,7 +398,7 @@ test("tool progress uses one editable card, keeps typing alive, and closes compl
     (edit) => edit.progress.state === "completed",
   );
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await promptReady;
     await Promise.resolve();
     expect(transport.progressCardSends).toHaveLength(1);
@@ -497,11 +497,11 @@ test("a steered message closes the current card and the next round opens a new o
   });
   const target = { channelId: "dm-steer-card", channelType: 1 as const };
   try {
-    const running = harness.service.handleInbound(
+    const running = harness.service.submitInbound(
       inbound({ messageId: "steer-card-first", ...target, text: "run the first tool" }),
     );
     await promptReady.promise;
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "steer-card-second", ...target, text: "second note" }),
     );
     await running;
@@ -583,7 +583,7 @@ test("todo phases and tool summaries remain on the terminal completed card", asy
     (edit) => edit.progress.state === "completed",
   );
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await waitForStatus(
       harness.service,
       task,
@@ -645,7 +645,7 @@ test("failed terminal execution events preserve todo phases and error category",
     (edit) => edit.progress.state === "failed",
   );
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await waitForStatus(
       harness.service,
       task,
@@ -692,7 +692,7 @@ test("a running tool card only re-renders on real events and stops at terminal",
   });
   try {
     vi.useFakeTimers();
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await promptStarted.promise;
     await flushMicrotasks();
     expect(transport.progressCardSends).toHaveLength(1);
@@ -758,7 +758,7 @@ test("a terminal progress edit failure is bounded and disposed on service stop",
   });
   let stopped = false;
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await waitForStatus(
       harness.service,
       task,
@@ -811,13 +811,13 @@ test("typing and the progress card are cancelled when an active task is cancelle
   const target = { channelId: "dm-presentation-cancel", channelType: 1 as const };
   try {
     const task = inbound({ messageId: "presentation-cancel-task", ...target, text: "cancel tool" });
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await promptReady;
     await Promise.resolve();
     expect(transport.progressCardSends).toHaveLength(1);
     expect(transport.typingCalls.length).toBeGreaterThanOrEqual(1);
     await transport.typingStarted.promise;
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "presentation-cancel-command", ...target, text: "/cancel" }),
     );
     await waitForStatus(
@@ -861,7 +861,7 @@ test("typing and the progress card are cleaned up when the worker fails", async 
     text: "fail tool",
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await waitForStatus(
       harness.service,
       task,
@@ -903,7 +903,7 @@ test("a progress-card API failure does not block the assistant body", async () =
     text: "tool with unavailable status card",
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await waitForStatus(
       harness.service,
       task,
@@ -950,7 +950,7 @@ test("an edge-refused card body is retried without step summaries and still clos
   });
   try {
     vi.useFakeTimers();
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await promptStarted.promise;
     await flushMicrotasks();
     expect(transport.progressCardSends).toHaveLength(1);
@@ -1012,7 +1012,7 @@ test("typing starts before group context and worker startup and renews", async (
     mentionedUserIds: [transport.bot.uid],
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await transport.contextStarted.promise;
     expect(transport.typingCalls.length).toBeGreaterThanOrEqual(1);
     vi.advanceTimersByTime(3_000);
@@ -1069,14 +1069,14 @@ test("an aborted running card edit still submits the terminal card state", async
   const target = { channelId: "dm-presentation-abort-edit", channelType: 1 as const };
   const task = inbound({ messageId: "presentation-abort-edit-task", ...target, text: "abort edit" });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await workers.waitForPromptCount(1);
     await Promise.resolve();
     await Promise.resolve();
     vi.advanceTimersByTime(800);
     await transport.runningEditStarted.promise;
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "presentation-abort-edit-cancel", ...target, text: "/cancel" }),
     );
     vi.useRealTimers();
@@ -1120,7 +1120,7 @@ test("a notice-only command outcome is delivered to the chat without assistant o
   });
   try {
     try {
-      await harness.service.handleInbound(task);
+      await harness.service.submitInbound(task);
       await waitForStatus(
         harness.service,
         task,
@@ -1178,7 +1178,7 @@ test("assistant text and repeated notices stay separate messages and a replayed 
   });
   try {
     try {
-      await harness.service.handleInbound(task);
+      await harness.service.submitInbound(task);
       await waitForStatus(
         harness.service,
         task,
@@ -1231,7 +1231,7 @@ test("a notice pending in the outbox survives a service restart without rerunnin
       },
     });
     try {
-      await first.service.handleInbound(message);
+      await first.service.submitInbound(message);
       await first.workers.waitForPromptCount(1);
       const stalled = await waitForStatus(
         first.service,
@@ -1280,9 +1280,9 @@ test("a notice arriving after /interrupt is delivered without flipping the turn 
     text: "hold the turn",
   });
   try {
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await harness.workers.waitForPromptCount(1);
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "notice-abort-command",
         channelId: task.channelId,

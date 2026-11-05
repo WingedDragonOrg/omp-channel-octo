@@ -3,10 +3,9 @@ import { Database } from "bun:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { InboundMessage } from "../src/contracts.ts";
 import { createQuestionDesk, type QuestionDeskDeps } from "../src/questions.ts";
 import { openChannelStore } from "../src/store/index.ts";
-import type { InboundClaim, TaskRecord } from "../src/store/store-records.ts";
+import type { TaskRecord } from "../src/store/store-records.ts";
 import { FakeTransport, inbound } from "./fixtures/core-fakes.ts";
 
 const ASK_TIMEOUT_MS = 1_000;
@@ -43,16 +42,11 @@ test("a set ask failing on the second question leaves no orphan, no leaked stop 
     botUid: () => transport.bot.uid,
     stopping: () => false,
     enqueueText: () => {},
+    persistWakeTurn: (_message, _text, sourceId) => sourceId,
+    publishWakeTurn: () => {},
+    persistNotice: (_message, _text, sourceId) => sourceId,
+    publishNotice: () => {},
     operationSet: (operation) => { operations.push(operation); },
-    commandClaim: (message: InboundMessage): InboundClaim => ({
-      botUid: transport.bot.uid,
-      target: message,
-      messageId: message.messageId,
-      senderId: message.senderId,
-      text: message.text,
-      supported: message.supported,
-      kind: "command",
-    }),
     askTimeoutMs: () => ASK_TIMEOUT_MS,
     displayNames: () => Promise.resolve(new Map<string, string>()),
     stopTurnForQuestion: (taskId) => {
@@ -99,15 +93,19 @@ test("a set ask failing on the second question leaves no orphan, no leaked stop 
     vi.advanceTimersByTime(ASK_TIMEOUT_MS * 2);
     expect(stoppedTurns).toEqual([]);
 
-    // 失败之后聊天里没有可回答的问题：普通回复不再被当作答案吞掉。
+    // 失败之后聊天里没有可回答的问题：入口冻结为 none，普通回复不会进入答案消费。
     const orphanReply = inbound({ ...target, text: "1" });
-    expect(await desk.answerPendingQuestion(orphanReply, orphanReply.text)).toBe(false);
+    expect(desk.captureTextRoute(orphanReply)).toEqual({ kind: "none" });
 
     // 移除注入故障：下一次普通整组提问仍能投递、被答复并完整返回全部答案。
     dropSecondQuestionFault(injector);
     const recovered = desk.askQuestions(makeTask("task-recovered"), target, args, new AbortController().signal);
     const reply = inbound({ ...target, messageId: "answer-1", text: "一起回答" });
-    expect(await desk.answerPendingQuestion(reply, reply.text)).toBe(true);
+    const snapshot = desk.captureTextRoute(reply);
+    if (snapshot.kind !== "questions") throw new Error("question snapshot missing");
+    const prepared = desk.prepareTextSnapshot(reply, reply.text, snapshot);
+    expect(prepared.persist()).toBe(true);
+    expect(prepared.publishAfterCommit()).toBe("answered");
     const raw = await recovered;
     const { answers } = JSON.parse(raw) as {
       answers: Array<{ id: string; questionId: string; answer: string; answeredBy: string | null }>;

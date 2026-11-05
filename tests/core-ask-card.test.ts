@@ -1,6 +1,7 @@
 import { expect, test, vi } from "bun:test";
 import { join } from "node:path";
-import type { ChannelStatus, ChatTarget } from "../src/contracts";
+import { WorkerSteerRejectedError, type ChannelStatus, type ChatTarget } from "../src/contracts";
+import { openChannelStore } from "../src/store/index.ts";
 import { cardStats } from "../src/octo/cards";
 import {
   FakeTransport,
@@ -9,8 +10,10 @@ import {
   createCoreHarness,
   inbound,
   readText,
+  submitAndWaitForIngressHandoff,
   waitForStatus,
 } from "./fixtures/core-fakes";
+import type { CoreHarness } from "./fixtures/core-fakes";
 
 function onlyPendingQuestionId(status: ChannelStatus): string {
   const questionId = status.pendingQuestionIds[0];
@@ -28,6 +31,59 @@ function sentToChat(transport: FakeTransport, target: ChatTarget) {
   return transport.sent.filter(({ target: sentTarget }) =>
     sentTarget.channelId === target.channelId && sentTarget.channelType === target.channelType,
   );
+}
+
+async function waitForLatestTask(
+  harness: CoreHarness,
+  target: ChatTarget,
+  state: "queued" | "running" | "completed" | "cancelled" | "interrupted" | "failed",
+  predicate: (task: { messageId: string }) => boolean = () => true,
+) {
+  const store = await openChannelStore(harness.stateDir);
+  try {
+    const deadline = performance.now() + 3_000;
+    while (performance.now() < deadline) {
+      const task = store.getLatestTask(harness.bot.uid, target);
+      if (task?.state === state && predicate(task)) return task;
+      const next = Promise.withResolvers<void>();
+      setImmediate(next.resolve);
+      await next.promise;
+    }
+    throw new Error(`latest task did not reach ${state}`);
+  } finally {
+    store.close();
+  }
+}
+async function waitForTaskMessageState(
+  harness: CoreHarness,
+  target: ChatTarget,
+  messageId: string,
+  state: "queued" | "running" | "completed" | "cancelled" | "interrupted" | "failed",
+): Promise<void> {
+  const store = await openChannelStore(harness.stateDir);
+  try {
+    const deadline = performance.now() + 3_000;
+    while (performance.now() < deadline) {
+      if (store.getTaskByMessageId(harness.bot.uid, target, messageId)?.state === state) return;
+      const next = Promise.withResolvers<void>();
+      setImmediate(next.resolve);
+      await next.promise;
+    }
+    throw new Error(`task ${messageId} did not reach ${state}`);
+  } finally {
+    store.close();
+  }
+}
+
+async function waitForSteerFailureConsumption(harness: CoreHarness): Promise<void> {
+  const deadline = performance.now() + 3_000;
+  while (performance.now() < deadline) {
+    if (harness.workers.steerFailure === undefined) return;
+    const next = Promise.withResolvers<void>();
+    setImmediate(next.resolve);
+    await next.promise;
+  }
+  throw new Error("configured steer failure was not exercised");
 }
 
 
@@ -148,7 +204,7 @@ test("a card click answers the pending question and rewrites the card", async ()
   });
   try {
     const target: ChatTarget = { channelId: "dm-card-click", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "card-click-start", ...target, text: "needs an answer" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -217,7 +273,7 @@ for (const size of [1, 2]) {
     });
     try {
       const target: ChatTarget = { channelType: 1, channelId: `receipt-race-${size}` };
-      await harness.service.handleInbound(inbound({ ...target, text: "ask" }));
+      await harness.service.submitInbound(inbound({ ...target, text: "ask" }));
       await published.promise;
       const card = harness.transport.sentCards[0]!;
       const event = cardActionEvent(91, {
@@ -258,7 +314,7 @@ test("an answered card spells the answerer's name and keeps the uid as identity"
   );
   try {
     const target: ChatTarget = { channelId: "dm-card-name", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "card-name-start", ...target, text: "needs an answer" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -318,7 +374,7 @@ test("a failed name lookup still rewrites the card with the uid", async () => {
   );
   try {
     const target: ChatTarget = { channelId: "dm-card-name-failure", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "card-name-failure-start", ...target, text: "needs an answer" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -368,7 +424,7 @@ test("a set card resolves each answerer's name once, falling back per uid", asyn
   );
   try {
     const target: ChatTarget = { channelId: "group-allowed", channelType: 2 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "set-name-start",
         ...target,
@@ -438,7 +494,7 @@ test("a single-choice selection is recorded only through the card submit", async
   });
   try {
     const target: ChatTarget = { channelId: "dm-card-stack", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "card-stack-start", ...target, text: "needs an answer" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -500,7 +556,7 @@ test("a plain reply answers the card question and rewrites the same card", async
   });
   try {
     const target: ChatTarget = { channelId: "dm-card-text", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "card-text-start", ...target, text: "needs an answer" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -510,7 +566,7 @@ test("a plain reply answers the card question and rewrites the same card", async
       throw new Error("ask card was not sent");
     }
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "card-text-reply", ...target, text: "1" }),
     );
 
@@ -536,7 +592,7 @@ test("a free-form submission answers a question that has no options", async () =
   const harness = await startAskHarness({ id: "release-window", question: "When do we ship?" });
   try {
     const target: ChatTarget = { channelId: "dm-card-free", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "card-free-start", ...target, text: "needs an answer" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -573,7 +629,7 @@ test("an empty submission keeps the question open behind fresh action ids", asyn
   const harness = await startAskHarness({ id: "release-window", question: "When do we ship?" });
   try {
     const target: ChatTarget = { channelId: "dm-card-empty", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "card-empty-start", ...target, text: "needs an answer" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -634,7 +690,7 @@ test("a multi-select submission answers with the selected indexes", async () => 
   });
   try {
     const target: ChatTarget = { channelId: "dm-card-multi", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "card-multi-start", ...target, text: "needs an answer" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -675,7 +731,7 @@ test("a click from anyone but the owner in a DM leaves the question pending", as
   });
   try {
     const target: ChatTarget = { channelId: "dm-card-foreign", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "card-foreign-start", ...target, text: "needs an answer" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -712,7 +768,7 @@ test("a member's click in an enabled group answers the card and records the subm
   });
   try {
     const target: ChatTarget = { channelId: "group-allowed", channelType: 2 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "group-card-start",
         ...target,
@@ -761,7 +817,7 @@ test("a member's click works in a thread of an enabled group", async () => {
   });
   try {
     const target: ChatTarget = { channelId: "group-allowed____thread-1", channelType: 5 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "thread-card-start",
         ...target,
@@ -808,7 +864,7 @@ test("a member's click addressed to another chat cannot answer a question that l
   });
   try {
     const target: ChatTarget = { channelId: "group-allowed", channelType: 2 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "elsewhere-start",
         ...target,
@@ -851,7 +907,7 @@ test("a member's text reply in an enabled group answers the pending question wit
   });
   try {
     const target: ChatTarget = { channelId: "group-allowed", channelType: 2 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "group-text-start",
         ...target,
@@ -862,7 +918,7 @@ test("a member's text reply in an enabled group answers the pending question wit
     await harness.workers.waitForPromptCount(1);
     await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 1);
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "group-text-reply",
         ...target,
@@ -896,7 +952,7 @@ test("a click replay after the reply was recorded stays silent and updates nothi
   });
   try {
     const target: ChatTarget = { channelId: "dm-card-replay", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "card-replay-start", ...target, text: "needs an answer" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -906,7 +962,7 @@ test("a click replay after the reply was recorded stays silent and updates nothi
       throw new Error("ask card was not sent");
     }
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "card-replay-reply", ...target, text: "2" }),
     );
     await waitForStatus(
@@ -951,7 +1007,7 @@ test("a failed card send falls back to the text question", async () => {
     const target: ChatTarget = { channelId: "dm-card-fallback", channelType: 1 };
     harness.transport.cardSendFailure = new Error("card send failed");
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "card-fallback-start", ...target, text: "needs an answer" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -962,7 +1018,7 @@ test("a failed card send falls back to the text question", async () => {
     expect(question).toContain("问题：Which deployment target?");
     expect(question).toContain("直接回复选项编号作为答案");
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "card-fallback-reply", ...target, text: "1" }),
     );
 
@@ -997,7 +1053,7 @@ test("one submit answers every question of a multi-question card", async () => {
   ]);
   try {
     const target: ChatTarget = { channelId: "dm-set-submit", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "set-submit-start", ...target, text: "needs answers" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -1078,7 +1134,7 @@ test("a partial set submission answers what it filled and leaves the rest open",
   ]);
   try {
     const target: ChatTarget = { channelId: "dm-set-partial", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "set-partial-start", ...target, text: "needs answers" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -1147,7 +1203,7 @@ test("a plain reply answers the whole set at once", async () => {
   ]);
   try {
     const target: ChatTarget = { channelId: "dm-set-text", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "set-text-start", ...target, text: "needs answers" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -1157,7 +1213,7 @@ test("a plain reply answers the whole set at once", async () => {
       throw new Error("ask card was not sent");
     }
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "set-text-reply", ...target, text: "1" }),
     );
 
@@ -1191,7 +1247,7 @@ test("a replayed set submission answers nothing twice", async () => {
   ]);
   try {
     const target: ChatTarget = { channelId: "dm-set-replay", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "set-replay-start", ...target, text: "needs answers" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -1255,7 +1311,7 @@ test("a set frame the deployment refuses falls back to one card per question", a
   );
   try {
     const target: ChatTarget = { channelId: "dm-set-fallback", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "set-fallback-start", ...target, text: "needs answers" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -1317,7 +1373,7 @@ test("a set without card support asks in text and one reply answers the rest", a
   );
   try {
     const target: ChatTarget = { channelId: "dm-set-plain", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "set-plain-start", ...target, text: "needs answers" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -1331,7 +1387,7 @@ test("a set without card support asks in text and one reply answers the rest", a
     expect(question.text).toContain("直接回复本消息即作为整组答案");
     expect(sentToChat(harness.transport, target)).toHaveLength(1);
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "set-plain-reply", ...target, text: "production, tonight" }),
     );
 
@@ -1360,7 +1416,7 @@ test("a timed-out question stops the turn and stays pending until the reply wake
   });
   try {
     const target: ChatTarget = { channelId: "dm-ask-timeout", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "ask-timeout-start", ...target, text: "needs an answer" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -1380,7 +1436,7 @@ test("a timed-out question stops the turn and stays pending until the reply wake
       throw new Error("ask card was not sent");
     }
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "ask-timeout-reply", ...target, text: "1" }),
     );
     await harness.workers.waitForPromptCount(2);
@@ -1413,7 +1469,7 @@ test("a card submission after the timeout answers once and wakes the agent", asy
   });
   try {
     const target: ChatTarget = { channelId: "dm-ask-timeout-card", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "ask-timeout-card-start", ...target, text: "needs an answer" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -1492,10 +1548,11 @@ test("a submission on a card the task failure closed becomes the chat's new inpu
   });
   try {
     const target: ChatTarget = { channelId: "dm-ask-closed", channelType: 1 };
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "ask-closed-start", ...target, text: "needs an answer" }),
     );
-    await waitForStatus(harness.service, target, (status) => status.state === "failed");
+    await waitForTaskMessageState(harness, target, "ask-closed-start", "failed");
     const card = harness.transport.sentCards[0];
     if (!card) {
       throw new Error("ask card was not sent");
@@ -1539,6 +1596,7 @@ test("a late submission joins the running turn in steer mode", async () => {
   const transport = new FakeTransport();
   transport.cardSupported = true;
   const running = Promise.withResolvers<void>();
+  const releaseHold = Promise.withResolvers<void>();
   const harness = await createCoreHarness({
     transport,
     prompt: async ({ append, promptContext, text, waitForAppend }) => {
@@ -1550,7 +1608,6 @@ test("a late submission joins the running turn in steer mode", async () => {
       if (!ask) throw new Error("ask host tool missing");
       if (text === "close a question") {
         const published = transport.waitForCardSend(() => true);
-        // 这次回合在提问期间失败：问题按生命周期收尾关闭，卡片留在用户手里。
         void ask
           .execute(
             { questions: [{ id: "release-window", question: "When do we ship?" }] },
@@ -1562,26 +1619,29 @@ test("a late submission joins the running turn in steer mode", async () => {
       }
       await append("steer.log", `start:${text}\n`);
       running.resolve();
-      const appended = await waitForAppend();
-      await append("steer.log", `steered:${appended.text}\n`);
+      const received = await Promise.race([
+        waitForAppend().then((message) => ({ kind: "append" as const, message })),
+        releaseHold.promise.then(() => ({ kind: "release" as const })),
+      ]);
+      if (received.kind === "append") {
+        await append("steer.log", `steered:${received.message.text}\n`);
+      }
       await append("steer.log", `end:${text}\n`);
     },
   });
   try {
     const target: ChatTarget = { channelId: "dm-ask-closed-steer", channelType: 1 };
-    await harness.service.handleInbound(
+    await submitAndWaitForIngressHandoff(
+      harness,
       inbound({ messageId: "ask-closed-steer-first", ...target, text: "close a question" }),
     );
-    await waitForStatus(harness.service, target, (status) => status.state === "failed");
+    await waitForTaskMessageState(harness, target, "ask-closed-steer-first", "failed");
     const card = harness.transport.sentCards[0];
-    if (!card) {
-      throw new Error("ask card was not sent");
-    }
-
-    const holding = harness.service.handleInbound(
-      inbound({ messageId: "ask-closed-steer-second", ...target, text: "long task" }),
-    );
+    if (!card) throw new Error("ask card was not sent");
+    const holdingMessage = inbound({ messageId: "ask-closed-steer-second", ...target, text: "long task" });
+    const holding = harness.service.submitInbound(holdingMessage);
     await running.promise;
+    await waitForTaskMessageState(harness, target, holdingMessage.messageId, "running");
     harness.transport.pushBotEvent(cardActionEvent(61, {
       messageId: card.messageId,
       channelType: 1,
@@ -1591,6 +1651,7 @@ test("a late submission joins the running turn in steer mode", async () => {
       inputs: { ask_text: "ship it tonight" },
     }));
     await harness.transport.waitForAck(61);
+    await waitForTaskMessageState(harness, target, holdingMessage.messageId, "completed");
     await holding;
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
 
@@ -1601,6 +1662,158 @@ test("a late submission joins the running turn in steer mode", async () => {
     expect(log).toContain("答案（由 owner-1 回复）：ship it tonight");
     expect(log).toContain("end:long task");
   } finally {
+    releaseHold.resolve();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("an unknown late-answer steer outcome is persisted without replay or fallback", async () => {
+  const transport = new FakeTransport();
+  transport.cardSupported = true;
+  const running = Promise.withResolvers<void>();
+  const releaseHold = Promise.withResolvers<void>();
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ append, promptContext, text, waitForAppend }) => {
+      if (text.startsWith("[ask 答复]")) return;
+      const ask = promptContext?.tools?.find(({ name }) => name === "ask");
+      if (!ask) throw new Error("ask host tool missing");
+      if (text === "close a question") {
+        const published = transport.waitForCardSend(() => true);
+        void ask.execute(
+          { questions: [{ id: "unknown-steer", question: "Proceed with rollout?" }] },
+          new AbortController().signal,
+        ).catch(() => {});
+        await published;
+        throw new Error("worker exploded");
+      }
+      running.resolve();
+      const received = await Promise.race([
+        waitForAppend().then((message) => ({ kind: "append" as const, message })),
+        releaseHold.promise.then(() => ({ kind: "release" as const })),
+      ]);
+      if (received.kind === "append") await append("steer.log", received.message.text);
+    },
+  });
+  try {
+    const target: ChatTarget = { channelId: "dm-ask-unknown-steer", channelType: 1 };
+    await submitAndWaitForIngressHandoff(
+      harness,
+      inbound({ messageId: "ask-unknown-first", ...target, text: "close a question" }),
+    );
+    await waitForTaskMessageState(harness, target, "ask-unknown-first", "failed");
+    const card = harness.transport.sentCards[0];
+    if (!card) throw new Error("ask card was not sent");
+    const holdingMessage = inbound({ messageId: "ask-unknown-second", ...target, text: "long task" });
+    const holding = harness.service.submitInbound(holdingMessage);
+    await running.promise;
+    await waitForTaskMessageState(harness, target, holdingMessage.messageId, "running");
+    harness.workers.steerFailure = new Error("RPC response lost after dispatch");
+    harness.transport.pushBotEvent(cardActionEvent(62, {
+      messageId: card.messageId,
+      channelType: 1,
+      channelId: target.channelId,
+      actionId: "ask_submit",
+      operatorUid: "owner-1",
+      inputs: { ask_text: "approved" },
+    }));
+    await harness.transport.waitForAck(62);
+    const wake = await waitForLatestTask(
+      harness,
+      target,
+      "interrupted",
+      (task) => task.messageId.startsWith("answer:"),
+    );
+    expect(wake.text).toContain("答案（由 owner-1 回复）：approved");
+
+    releaseHold.resolve();
+    await holding;
+    await waitForTaskMessageState(harness, target, "ask-unknown-second", "completed");
+    const store = await openChannelStore(harness.stateDir);
+    try {
+      expect(store.getLatestTask(harness.bot.uid, target)?.id).toBe(wake.id);
+    } finally {
+      store.close();
+    }
+    expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["close a question", "long task"]);
+  } finally {
+    releaseHold.resolve();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a late-answer task is queued only after an explicit steer refusal", async () => {
+  const transport = new FakeTransport();
+  transport.cardSupported = true;
+  const running = Promise.withResolvers<void>();
+  const releaseHold = Promise.withResolvers<void>();
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ append, promptContext, text, waitForAppend }) => {
+      if (text.startsWith("[ask 答复]")) {
+        await append("fallback.log", text);
+        return;
+      }
+      const ask = promptContext?.tools?.find(({ name }) => name === "ask");
+      if (!ask) throw new Error("ask host tool missing");
+      if (text === "close a question") {
+        const published = transport.waitForCardSend(() => true);
+        void ask.execute(
+          { questions: [{ id: "rejected-steer", question: "Approve migration?" }] },
+          new AbortController().signal,
+        ).catch(() => {});
+        await published;
+        throw new Error("worker exploded");
+      }
+      running.resolve();
+      await Promise.race([
+        waitForAppend(),
+        releaseHold.promise,
+      ]);
+    },
+  });
+  try {
+    const target: ChatTarget = { channelId: "dm-ask-rejected-steer", channelType: 1 };
+    await submitAndWaitForIngressHandoff(
+      harness,
+      inbound({ messageId: "ask-rejected-first", ...target, text: "close a question" }),
+    );
+    await waitForTaskMessageState(harness, target, "ask-rejected-first", "failed");
+    const card = harness.transport.sentCards[0];
+    if (!card) throw new Error("ask card was not sent");
+    const holdingMessage = inbound({ messageId: "ask-rejected-second", ...target, text: "long task" });
+    const holding = harness.service.submitInbound(holdingMessage);
+    await running.promise;
+    await waitForTaskMessageState(harness, target, holdingMessage.messageId, "running");
+    harness.workers.steerFailure = new WorkerSteerRejectedError("OMP worker is not streaming a turn");
+    harness.transport.pushBotEvent(cardActionEvent(63, {
+      messageId: card.messageId,
+      channelType: 1,
+      channelId: target.channelId,
+      actionId: "ask_submit",
+      operatorUid: "owner-1",
+      inputs: { ask_text: "approved" },
+    }));
+    await harness.transport.waitForAck(63);
+    await waitForSteerFailureConsumption(harness);
+    releaseHold.resolve();
+    await holding;
+    await waitForTaskMessageState(harness, target, holdingMessage.messageId, "completed");
+
+    const fallback = await waitForLatestTask(
+      harness,
+      target,
+      "completed",
+      (task) => task.messageId.startsWith("answer-fallback:"),
+    );
+    expect(fallback.text).toContain("答案（由 owner-1 回复）：approved");
+    expect(harness.workers.prompts.map(({ text }) => text)).toEqual([
+      "close a question",
+      "long task",
+      expect.stringContaining("[ask 答复]"),
+    ]);
+  } finally {
+    releaseHold.resolve();
     await closeCoreHarness(harness);
   }
 });
@@ -1616,7 +1829,7 @@ test("a timed-out question set stops the turn once and keeps every row answerabl
   ]);
   try {
     const target: ChatTarget = { channelId: "dm-ask-timeout-set", channelType: 1 };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "ask-timeout-set-start", ...target, text: "needs answers" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -1656,7 +1869,7 @@ test("a timed-out question set stops the turn once and keeps every row answerabl
     );
 
     // 第二题之后用文本作答：同样记录并唤醒，两题都不重复作答。
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "ask-timeout-set-reply", ...target, text: "2" }),
     );
     await harness.workers.waitForPromptCount(3);
@@ -1695,9 +1908,9 @@ test.each(["single", "set"] as const)("text answers before the %s card receipt a
   });
   try {
     const target: ChatTarget = { channelType: 1, channelId: `late-text-${kind}` };
-    await harness.service.handleInbound(inbound({ ...target, text: "ask" }));
+    await submitAndWaitForIngressHandoff(harness, inbound({ ...target, text: "ask" }));
     await published.promise;
-    await harness.service.handleInbound(inbound({ ...target, text: "receipt-answer" }));
+    await submitAndWaitForIngressHandoff(harness, inbound({ ...target, text: "receipt-answer" }));
     receiptGate.resolve();
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
     const edit = harness.transport.cardEdits.at(-1);
@@ -1721,7 +1934,7 @@ test.each(["text", "cancel"] as const)("a partial set keeps earlier answers when
   const harness = await startAskHarness(questions);
   try {
     const target: ChatTarget = { channelType: 1, channelId: `partial-set-${finish}` };
-    await harness.service.handleInbound(inbound({ ...target, text: "ask" }));
+    await harness.service.submitInbound(inbound({ ...target, text: "ask" }));
     await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === questions.length);
     const card = harness.transport.sentCards[0]!;
     harness.transport.pushBotEvent(cardActionEvent(1, {
@@ -1732,7 +1945,7 @@ test.each(["text", "cancel"] as const)("a partial set keeps earlier answers when
       inputs: { ask_text_1: "first-answer" },
     }));
     await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === questions.length - 1);
-    await harness.service.handleInbound(inbound({ ...target, text: finish === "cancel" ? "/cancel" : "second-answer" }));
+    await harness.service.submitInbound(inbound({ ...target, text: finish === "cancel" ? "/cancel" : "second-answer" }));
     await waitForStatus(harness.service, target,
       (status) => status.state === (finish === "cancel" ? "cancelled" : "completed"));
     const edit = harness.transport.cardEdits.at(-1)!;
@@ -1761,9 +1974,9 @@ test("a declined card does not fall back to re-asking an answer recorded during 
   });
   try {
     const target: ChatTarget = { channelType: 1, channelId: "late-declined-card" };
-    await harness.service.handleInbound(inbound({ ...target, text: "ask" }));
+    await submitAndWaitForIngressHandoff(harness, inbound({ ...target, text: "ask" }));
     await sending.promise;
-    await harness.service.handleInbound(inbound({ ...target, text: "recorded-answer" }));
+    await submitAndWaitForIngressHandoff(harness, inbound({ ...target, text: "recorded-answer" }));
     release.resolve();
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
     expect(sentToChat(harness.transport, target)).toHaveLength(0);

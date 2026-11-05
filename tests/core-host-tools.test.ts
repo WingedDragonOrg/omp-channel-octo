@@ -1,5 +1,5 @@
 import { expect, test, vi } from "bun:test";
-import { mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ThreadSummary } from "../src/contracts";
 import { WorktreeMergeExecutionError } from "../src/threads/thread-merge";
@@ -66,6 +66,46 @@ async function yieldRealIo(root: string): Promise<void> {
     await stat(root);
   }
 }
+async function waitUntil(
+  predicate: () => boolean,
+  description: string,
+  timeoutMs = 3_000,
+): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    if (predicate()) return;
+    const turn = Promise.withResolvers<void>();
+    setImmediate(turn.resolve);
+    await turn.promise;
+  }
+  throw new Error(`timed out waiting for ${description}`);
+}
+
+async function waitForPrompts(
+  harness: Awaited<ReturnType<typeof createCoreHarness>>,
+  count: number,
+): Promise<void> {
+  await waitUntil(
+    () => harness.workers.prompts.length >= count,
+    `worker prompt count ${count}`,
+  );
+}
+
+async function waitForSignal<T>(
+  signal: Promise<T>,
+  description: string,
+  timeoutMs = 3_000,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timedOut = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out waiting for ${description}`)), timeoutMs);
+    });
+    return await Promise.race([signal, timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 test("group dispatch freezes scoped management/file tools to the current target and cwd", async () => {
   const harness = await createCoreHarness({
@@ -114,10 +154,10 @@ test("group dispatch freezes scoped management/file tools to the current target 
       status: 1,
       createdAt: "2026-09-12T00:00:00.000Z",
     });
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "tools-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "tools-work",
         ...GROUP_TOOLS,
@@ -125,7 +165,7 @@ test("group dispatch freezes scoped management/file tools to the current target 
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
 
     const updated = await harness.transport.getGroupContext(GROUP_TOOLS);
@@ -171,10 +211,10 @@ test("private prompts receive ask, file, and channel tools but no group tools", 
       updatedAt: null,
       updatedBy: "group-admin",
     });
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "private-no-tools", ...target, text: "private prompt" }),
     );
-    await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
     await waitForStatus(harness.service, target, (status) => status.state === "completed");
     expect(harness.transport.groupContextCalls).toHaveLength(0);
     expect(await readText(join(harness.root, "tmp", "private-tools.log"))).toBe(
@@ -224,10 +264,10 @@ test("thread dispatch resolves management actions to the parent group and curren
         updatedAt: "2026-09-12T00:00:00.000Z",
       },
     ]);
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "thread-bind", ...THREAD_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "thread-work",
         ...THREAD_TOOLS,
@@ -235,7 +275,7 @@ test("thread dispatch resolves management actions to the parent group and curren
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
     await waitForStatus(harness.service, THREAD_TOOLS, (status) => status.state === "completed");
 
     expect(harness.transport.managementCalls).toEqual(
@@ -310,10 +350,10 @@ test("management actions reject bad arguments, bound listings, and surface trans
         joinedAt: "2026-09-12T00:00:00.000Z",
       })),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "management-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "management-work",
         ...GROUP_TOOLS,
@@ -321,7 +361,7 @@ test("management actions reject bad arguments, bound listings, and surface trans
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
 
     const log = await readText(join(cwd, "management.log"));
@@ -368,10 +408,10 @@ test("thread-delete retries a transient store failure on a fresh connection", as
     harness.transport.setThreads("group-tools", [threadRecord("topic-9")]);
     // The shape the real transport reports for the server's transient storage failure: the wire
     // status is a 400, while the body's `store_failed` code says the operation failed internally.
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "delete-retry-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "delete-retry-work",
         ...GROUP_TOOLS,
@@ -379,7 +419,7 @@ test("thread-delete retries a transient store failure on a fresh connection", as
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
 
     expect(await readText(join(cwd, "thread-delete.log"))).toBe("已删除线程 topic-9\n");
@@ -419,10 +459,10 @@ test("thread-delete reports one bounded line when the retry fails too", async ()
     const cwd = join(harness.root, "delete exhausted cwd");
     await mkdir(cwd, { recursive: true });
     harness.transport.setThreads("group-tools", [threadRecord("topic-9")]);
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "delete-exhausted-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "delete-exhausted-work",
         ...GROUP_TOOLS,
@@ -430,7 +470,7 @@ test("thread-delete reports one bounded line when the retry fails too", async ()
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
 
     const lines = (await readText(join(cwd, "thread-delete.log"))).trimEnd().split("\n");
@@ -470,10 +510,10 @@ test("thread-delete does not retry a permanent server rejection", async () => {
     const cwd = join(harness.root, "delete permanent cwd");
     await mkdir(cwd, { recursive: true });
     harness.transport.setThreads("group-tools", [threadRecord("topic-9")]);
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "delete-permanent-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "delete-permanent-work",
         ...GROUP_TOOLS,
@@ -481,7 +521,7 @@ test("thread-delete does not retry a permanent server rejection", async () => {
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
 
     expect(await readText(join(cwd, "thread-delete.log"))).toBe(
@@ -533,10 +573,10 @@ test("thread dispatch queues the task in the target thread and reports it in bot
   try {
     const cwd = join(harness.root, "dispatch cwd");
     await mkdir(cwd, { recursive: true });
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "dispatch-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "dispatch-work",
         ...GROUP_TOOLS,
@@ -544,9 +584,9 @@ test("thread dispatch queues the task in the target thread and reports it in bot
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
-    await harness.workers.waitForPromptCount(2);
+    await waitForPrompts(harness, 2);
     // The fixture mints `thread-1` for the first created thread; the thread chat id is composite.
     const dispatchedChannelId = "group-tools____thread-1";
     await waitForStatus(
@@ -619,26 +659,26 @@ test("a dispatch into a queue-mode thread lands as its own task, never an answer
     await mkdir(groupCwd, { recursive: true });
     await mkdir(threadCwd, { recursive: true });
     harness.transport.setThreads("group-tools", [threadRecord("topic-7")]);
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "queue-group-bind", ...GROUP_TOOLS, text: `/new ${groupCwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "queue-thread-bind", ...THREAD_TOOLS, text: `/new ${threadCwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "queue-thread-mode", ...THREAD_TOOLS, text: "/mode queue", mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "queue-thread-hold", ...THREAD_TOOLS, text: "hold the thread", mentionedUserIds: [harness.bot.uid] }),
     );
-    await threadStarted.promise;
-    await harness.workers.waitForPromptCount(1);
+    await waitForSignal(threadStarted.promise, "queued-thread task start");
+    await waitForPrompts(harness, 1);
     expect((await harness.service.status(THREAD_TOOLS)).pendingQuestionIds).toHaveLength(1);
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "queue-group-work", ...GROUP_TOOLS, text: "handoff into the busy topic", mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.workers.waitForPromptCount(2);
+    await waitForPrompts(harness, 2);
     const management = (harness.workers.prompts[1]?.promptContext?.tools ?? []).find(
       ({ name }) => name === "octo_management",
     );
@@ -709,22 +749,22 @@ test("a dispatch into a running thread joins that turn in steer mode", async () 
     await mkdir(groupCwd, { recursive: true });
     await mkdir(threadCwd, { recursive: true });
     harness.transport.setThreads("group-tools", [threadRecord("topic-7")]);
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "steer-group-bind", ...GROUP_TOOLS, text: `/new ${groupCwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "steer-thread-bind", ...THREAD_TOOLS, text: `/new ${threadCwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    const held = harness.service.handleInbound(
+    const held = harness.service.submitInbound(
       inbound({ messageId: "steer-thread-hold", ...THREAD_TOOLS, text: "hold the thread", mentionedUserIds: [harness.bot.uid] }),
     );
-    await threadStarted.promise;
-    await harness.workers.waitForPromptCount(1);
+    await waitForSignal(threadStarted.promise, "thread steer task start");
+    await waitForPrompts(harness, 1);
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "steer-group-work", ...GROUP_TOOLS, text: "handoff into the running topic", mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.workers.waitForPromptCount(2);
+    await waitForPrompts(harness, 2);
     const management = (harness.workers.prompts[1]?.promptContext?.tools ?? []).find(
       ({ name }) => name === "octo_management",
     );
@@ -778,10 +818,10 @@ test("create-thread worktree_name binds the new thread to a workspace of its own
     if (!worktrees) throw new Error("expected a worktree port in the harness");
     const cwd = join(harness.root, "isolate cwd");
     await mkdir(cwd, { recursive: true });
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "isolate-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "isolate-create",
         ...GROUP_TOOLS,
@@ -789,7 +829,7 @@ test("create-thread worktree_name binds the new thread to a workspace of its own
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
 
     const workspace = join(harness.root, "worktrees", "thread-1");
@@ -801,7 +841,7 @@ test("create-thread worktree_name binds the new thread to a workspace of its own
     );
 
     const thread = { channelId: "group-tools____thread-1", channelType: 5 as const };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "isolate-thread-task",
         ...thread,
@@ -809,7 +849,7 @@ test("create-thread worktree_name binds the new thread to a workspace of its own
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(2);
+    await waitForPrompts(harness, 2);
     await waitForStatus(harness.service, thread, (status) => status.state === "completed");
     expect(harness.workers.prompts[1]?.cwd).toBe(workspace);
     await expect(harness.service.status(thread)).resolves.toMatchObject({ cwd: workspace });
@@ -841,10 +881,10 @@ test("create-thread worktree_name leaves failed workspace non-dispatchable", asy
     worktrees.failure = new Error("目录不是 git 仓库，无法创建隔离工作区：/fixture/non-repo");
     const cwd = join(harness.root, "reused cwd");
     await mkdir(cwd, { recursive: true });
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "isolate-fail-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "isolate-fail-create",
         ...GROUP_TOOLS,
@@ -852,20 +892,28 @@ test("create-thread worktree_name leaves failed workspace non-dispatchable", asy
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
+    await waitUntil(() => harness.workers.prompts.length >= 1, "failed-workspace tool worker prompt");
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
     expect(await readText(join(cwd, "worktree.log"))).toBe(
       "thread-1|none|目录不是 git 仓库，无法创建隔离工作区：/fixture/non-repo\n",
     );
 
     const thread = { channelId: "group-tools____thread-1", channelType: 5 as const };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "isolate-fail-thread",
         ...thread,
         text: "still deliver work",
         mentionedUserIds: [harness.bot.uid],
       }),
+    );
+    await waitUntil(
+      () =>
+        harness.transport.sent.some(
+          ({ target, text }) =>
+            target.channelId === thread.channelId && text === "当前子区工作区未就绪或资源已缺失，未接收任务。",
+        ),
+      "undispatchable-workspace refusal notice",
     );
     expect(harness.workers.prompts).toHaveLength(1);
     expect(harness.transport.sent.some(({ text }) =>
@@ -941,7 +989,7 @@ test("thread-listen query and update persist the policy used by dispatched tasks
     },
   });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "listen-handoff",
         ...GROUP_TOOLS,
@@ -949,7 +997,7 @@ test("thread-listen query and update persist the policy used by dispatched tasks
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await relaySeen.promise;
+    await waitForSignal(relaySeen.promise, "thread merge relay notice");
 
     expect(await readText(join(harness.root, "tmp", "listen.log"))).toBe(
       "merge|task|task|queued\nthread:检查部署状态\ntask-notice\n",
@@ -998,21 +1046,21 @@ test("a steered dispatch keeps using the running thread without creating a compl
     await mkdir(groupCwd, { recursive: true });
     await mkdir(threadCwd, { recursive: true });
     harness.transport.setThreads("group-tools", [threadRecord("topic-7")]);
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "steer-listen-group-bind", ...GROUP_TOOLS, text: `/new ${groupCwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "steer-listen-thread-bind", ...THREAD_TOOLS, text: `/new ${threadCwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    const held = harness.service.handleInbound(
+    const held = harness.service.submitInbound(
       inbound({ messageId: "steer-listen-hold", ...THREAD_TOOLS, text: "hold the thread", mentionedUserIds: [harness.bot.uid] }),
     );
-    await threadStarted.promise;
-    await harness.workers.waitForPromptCount(1);
-    await harness.service.handleInbound(
+    await waitForSignal(threadStarted.promise, "thread-listen steer task start");
+    await waitForPrompts(harness, 1);
+    await harness.service.submitInbound(
       inbound({ messageId: "steer-listen-work", ...GROUP_TOOLS, text: "handoff into the running topic", mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.workers.waitForPromptCount(2);
+    await waitForPrompts(harness, 2);
     const management = (harness.workers.prompts[1]?.promptContext?.tools ?? []).find(
       ({ name }) => name === "octo_management",
     );
@@ -1130,10 +1178,10 @@ test("thread-merge merges the bound workspace through the port and reports wt's 
     if (!worktrees) throw new Error("expected a worktree port in the harness");
     const cwd = join(harness.root, "merge cwd");
     await mkdir(cwd, { recursive: true });
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "merge-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "merge-create",
         ...GROUP_TOOLS,
@@ -1141,13 +1189,13 @@ test("thread-merge merges the bound workspace through the port and reports wt's 
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
 
     const thread = { channelId: "group-tools____thread-1", channelType: 5 as const };
     const workspace = join(harness.root, "worktrees", "thread-1");
     await waitForStatus(harness.service, thread, (status) => status.cwd === workspace);
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "merge-run",
         ...thread,
@@ -1155,10 +1203,10 @@ test("thread-merge merges the bound workspace through the port and reports wt's 
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(2);
+    await waitForPrompts(harness, 2);
     await waitForStatus(harness.service, thread, (status) => status.state === "completed");
-    await mergeNoticeSeen.promise;
-    await harness.service.handleInbound(
+    await waitForSignal(mergeNoticeSeen.promise, "thread merge notice");
+    await harness.service.submitInbound(
       inbound({
         messageId: "merge-run-again",
         ...thread,
@@ -1166,7 +1214,7 @@ test("thread-merge merges the bound workspace through the port and reports wt's 
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await secondMergeFinished.promise;
+    await waitForSignal(secondMergeFinished.promise, "second merge task completion");
     await waitForStatus(harness.service, thread, (status) => status.state === "completed");
     const replayReceipt = log
       .find((line) => line.startsWith("replayed:"))
@@ -1215,7 +1263,7 @@ test("thread-merge merges the bound workspace through the port and reports wt's 
     );
 
     // A bad parameter, and a group that tries to merge, are both rejected with one bounded line.
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "merge-bad-stage",
         ...thread,
@@ -1223,7 +1271,7 @@ test("thread-merge merges the bound workspace through the port and reports wt's 
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(3);
+    await waitForPrompts(harness, 3);
     await waitForStatus(harness.service, thread, (status) => status.state === "completed");
     const qualificationStore = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
     try {
@@ -1233,7 +1281,7 @@ test("thread-merge merges the bound workspace through the port and reports wt's 
     } finally {
       qualificationStore.close();
     }
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "merge-in-group",
         ...GROUP_TOOLS,
@@ -1241,7 +1289,7 @@ test("thread-merge merges the bound workspace through the port and reports wt's 
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(4);
+    await waitForPrompts(harness, 4);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
     expect(log.join("\n")).toContain("rejected:stage must be all, tracked or none");
     expect(log.join("\n")).toContain("rejected:thread-merge 只能在子区中调用");
@@ -1314,10 +1362,10 @@ test("thread-merge reports the port's failure and refuses a thread without a wor
     if (!worktrees) throw new Error("expected a worktree port in the harness");
     const cwd = join(harness.root, "merge failure cwd");
     await mkdir(cwd, { recursive: true });
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "merge-fail-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "merge-fail-create",
         ...GROUP_TOOLS,
@@ -1325,12 +1373,12 @@ test("thread-merge reports the port's failure and refuses a thread without a wor
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
 
     // A thread that never got a workspace cannot merge.
     const unbound = { channelId: "group-tools____topic-8", channelType: 5 as const };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "merge-fail-unbound",
         ...unbound,
@@ -1338,7 +1386,7 @@ test("thread-merge reports the port's failure and refuses a thread without a wor
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(2);
+    await waitForPrompts(harness, 2);
     await waitForStatus(harness.service, unbound, (status) => status.state === "completed");
 
     // A failing wt merge surfaces as one bounded line.
@@ -1349,7 +1397,7 @@ test("thread-merge reports the port's failure and refuses a thread without a wor
       1,
       "Rebase onto main incomplete CONFLICT (content): Merge conflict in shared.txt",
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "merge-fail-dispatch",
         ...GROUP_TOOLS,
@@ -1357,7 +1405,7 @@ test("thread-merge reports the port's failure and refuses a thread without a wor
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(4);
+    await waitForPrompts(harness, 4);
     await waitForStatus(harness.service, thread, (status) => status.state === "completed");
 
     expect(log.join("\n")).toContain("rejected:当前子区未绑定隔离工作区，无法合并");
@@ -1514,7 +1562,7 @@ test("shared direct merge refusal suppresses only its task and preserves later t
     },
   });
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "shared-task-prepare",
         ...GROUP_TOOLS,
@@ -1522,12 +1570,12 @@ test("shared direct merge refusal suppresses only its task and preserves later t
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
-    await mergeAttemptStarted.promise;
+    await waitForSignal(mergeAttemptStarted.promise, "thread merge attempt");
     const thread = { channelId: created.channelId, channelType: 5 as const };
     allowMergeAttempt.resolve();
-    await mergeRefusalFinished.promise;
+    await waitForSignal(mergeRefusalFinished.promise, "thread merge refusal");
     await waitForStatus(harness.service, thread, (status) => status.state === "completed");
     for (let attempt = 0; attempt < 50; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
     expect(notices).toEqual([]);
@@ -1543,7 +1591,7 @@ test("shared direct merge refusal suppresses only its task and preserves later t
       afterRefusal.close();
     }
 
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "shared-task-followup",
         ...GROUP_TOOLS,
@@ -1552,7 +1600,7 @@ test("shared direct merge refusal suppresses only its task and preserves later t
       }),
     );
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
-    await noticeSeen.promise;
+    await waitForSignal(noticeSeen.promise, "thread merge refusal notice");
     await waitForStatus(harness.service, thread, (status) => status.state === "completed");
     expect(notices).toHaveLength(1);
     expect(notices[0]).toContain(thread.channelId);
@@ -1599,10 +1647,10 @@ test("thread-delete removes each deleted thread's bound workspace", async () => 
     if (!worktrees) throw new Error("expected a worktree port in the harness");
     const cwd = join(harness.root, "cleanup cwd");
     await mkdir(cwd, { recursive: true });
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "cleanup-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "cleanup-create",
         ...GROUP_TOOLS,
@@ -1610,11 +1658,11 @@ test("thread-delete removes each deleted thread's bound workspace", async () => 
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
 
     // Persisted repository and branch ownership is passed to the worktree removal port.
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "cleanup-delete-one",
         ...GROUP_TOOLS,
@@ -1622,7 +1670,7 @@ test("thread-delete removes each deleted thread's bound workspace", async () => 
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(2);
+    await waitForPrompts(harness, 2);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
     expect(worktrees.removals).toEqual([
       { path: join(harness.root, "worktrees", "thread-1"), force: false, repo: cwd, branch: "thread-1" },
@@ -1630,7 +1678,7 @@ test("thread-delete removes each deleted thread's bound workspace", async () => 
 
     // Deleting a thread whose workspace is already gone remains successful.
     worktrees.removal = { kind: "missing" };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "cleanup-delete-two",
         ...GROUP_TOOLS,
@@ -1638,7 +1686,7 @@ test("thread-delete removes each deleted thread's bound workspace", async () => 
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(3);
+    await waitForPrompts(harness, 3);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
     expect(worktrees.removals).toEqual([
       { path: join(harness.root, "worktrees", "thread-1"), force: false, repo: cwd, branch: "thread-1" },
@@ -1680,10 +1728,10 @@ test("thread-delete keeps a dirty workspace unless force discards it", async () 
     if (!worktrees) throw new Error("expected a worktree port in the harness");
     const cwd = join(harness.root, "dirty cwd");
     await mkdir(cwd, { recursive: true });
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "dirty-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "dirty-create",
         ...GROUP_TOOLS,
@@ -1691,13 +1739,13 @@ test("thread-delete keeps a dirty workspace unless force discards it", async () 
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
 
     worktrees.removeFailure = new Error(
       "删除隔离工作区失败（退出码 1）：Cannot remove worktree: dirty-one has uncommitted changes",
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "dirty-delete-one",
         ...GROUP_TOOLS,
@@ -1705,7 +1753,7 @@ test("thread-delete keeps a dirty workspace unless force discards it", async () 
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(2);
+    await waitForPrompts(harness, 2);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
 
     expect(worktrees.removals).toEqual([
@@ -1716,7 +1764,7 @@ test("thread-delete keeps a dirty workspace unless force discards it", async () 
     ]);
 
     worktrees.removeFailure = undefined;
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "dirty-delete-two",
         ...GROUP_TOOLS,
@@ -1724,7 +1772,7 @@ test("thread-delete keeps a dirty workspace unless force discards it", async () 
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(3);
+    await waitForPrompts(harness, 3);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
     expect(worktrees.removals).toEqual([
       { path: join(harness.root, "worktrees", "thread-1"), force: false, repo: cwd, branch: "thread-1" },
@@ -1738,6 +1786,7 @@ test("thread-delete keeps a dirty workspace unless force discards it", async () 
 
 test("thread-archive schedules one archive that runs after the turn's reply is delivered", async () => {
   const transport = new ArchiveTracingTransport();
+  const logAppended = Promise.withResolvers<void>();
   const harness = await createCoreHarness({
     transport,
     prompt: async ({ append, emit, promptContext, text }) => {
@@ -1749,16 +1798,24 @@ test("thread-archive schedules one archive that runs after the turn's reply is d
       const second = await management.execute({ action: "thread-archive" }, signal);
       emit(assistantText("archive-reply", "归档前的回复", true));
       await append("thread-archive.log", `${first}\n${second}\n`);
+      logAppended.resolve();
     },
   });
   try {
     const cwd = join(harness.root, "archive cwd");
     await mkdir(cwd, { recursive: true });
+    const priorGroupStatus = await harness.service.status(GROUP_TOOLS);
+    const expectedCwd = await realpath(cwd);
     harness.transport.setThreads("group-tools", [threadRecord("topic-7")]);
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "archive-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await waitForStatus(
+      harness.service,
+      GROUP_TOOLS,
+      status => status.cwd === expectedCwd && status.sessionId !== priorGroupStatus.sessionId,
+    );
+    await harness.service.submitInbound(
       inbound({
         messageId: "archive-run",
         ...THREAD_TOOLS,
@@ -1766,10 +1823,13 @@ test("thread-archive schedules one archive that runs after the turn's reply is d
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
-    await harness.transport.waitForManagementCalls((call) => call.action === "thread-archive");
+    await waitForPrompts(harness, 1);
+    await waitUntil(
+      () => harness.transport.managementCalls.some((call) => call.action === "thread-archive"),
+      "thread archive management call",
+    );
     await waitForStatus(harness.service, THREAD_TOOLS, (status) => status.state === "completed");
-
+    await waitForSignal(logAppended.promise, "archive prompt log append");
     // 子区里省略 short_id 即当前线程；两次调用只排定一次，归档在本回合回复送达之后执行。
     expect(harness.transport.managementCalls.filter((call) => call.action === "thread-archive")).toEqual([
       { action: "thread-archive", groupId: "group-tools", shortId: "topic-7" },
@@ -1821,10 +1881,10 @@ test("a default-pipeline merge schedules the thread's archive beside the merge r
     if (!worktrees) throw new Error("expected a worktree port in the harness");
     const cwd = join(harness.root, "merge archive cwd");
     await mkdir(cwd, { recursive: true });
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "merge-archive-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "merge-archive-create",
         ...GROUP_TOOLS,
@@ -1832,13 +1892,13 @@ test("a default-pipeline merge schedules the thread's archive beside the merge r
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
     await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
 
     const thread = { channelId: "group-tools____thread-1", channelType: 5 as const };
     const workspace = join(harness.root, "worktrees", "thread-1");
     await waitForStatus(harness.service, thread, (status) => status.cwd === workspace);
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "merge-archive-run",
         ...thread,
@@ -1846,8 +1906,11 @@ test("a default-pipeline merge schedules the thread's archive beside the merge r
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(2);
-    await harness.transport.waitForManagementCalls((call) => call.action === "thread-archive");
+    await waitForPrompts(harness, 2);
+    await waitUntil(
+      () => harness.transport.managementCalls.some((call) => call.action === "thread-archive"),
+      "thread archive management call",
+    );
     await waitForStatus(harness.service, thread, (status) => status.state === "completed");
 
     // 合并结果与归档排定分别可见；归档在回复之后、以发起排定的子区为目标执行。
@@ -1888,10 +1951,10 @@ test("a transient archive failure retries five times five seconds apart and ends
       await mkdir(cwd, { recursive: true });
       harness.transport.setThreads("group-tools", [threadRecord("topic-7")]);
       harness.transport.failArchiveTimes(TRANSIENT_ARCHIVE_FAILURES);
-      await harness.service.handleInbound(
+      await harness.service.submitInbound(
         inbound({ messageId: "archive-retry-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
       );
-      await harness.service.handleInbound(
+      await harness.service.submitInbound(
         inbound({
           messageId: "archive-retry-run",
           ...THREAD_TOOLS,
@@ -1899,7 +1962,7 @@ test("a transient archive failure retries five times five seconds apart and ends
           mentionedUserIds: [harness.bot.uid],
         }),
       );
-      await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
       // 第一次尝试不等待计时器：排空与调用走微任务跑完。
       for (let step = 0; step < 200 && archiveCalls() < 1; step += 1) {
         await yieldRealIo(harness.stateDir);
@@ -1963,10 +2026,10 @@ test("thread-archive does not retry a permanent failure and reports one bounded 
       harness.transport.failArchiveTimes([
         Object.assign(new Error("Octo thread archive failed with HTTP 403: 无归档权限。"), { status: 403 }),
       ]);
-      await harness.service.handleInbound(
+      await harness.service.submitInbound(
         inbound({ messageId: "archive-permanent-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
       );
-      await harness.service.handleInbound(
+      await harness.service.submitInbound(
         inbound({
           messageId: "archive-permanent-run",
           ...GROUP_TOOLS,
@@ -1974,7 +2037,7 @@ test("thread-archive does not retry a permanent failure and reports one bounded 
           mentionedUserIds: [harness.bot.uid],
         }),
       );
-      await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
       for (let step = 0; step < 200 && archiveCalls() < 1; step += 1) {
         await yieldRealIo(harness.stateDir);
         if (archiveCalls() >= 1) break;
@@ -2017,10 +2080,10 @@ test("a new message in the same chat cancels the scheduled archive", async () =>
   try {
     const cwd = join(harness.root, "archive cancel cwd");
     await mkdir(cwd, { recursive: true });
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "archive-cancel-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "archive-cancel-run",
         ...THREAD_TOOLS,
@@ -2028,9 +2091,9 @@ test("a new message in the same chat cancels the scheduled archive", async () =>
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
     // 回合仍在运行：owner 的新消息（过权限门禁后）清除排定。
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "archive-cancel-msg",
         ...THREAD_TOOLS,
@@ -2039,7 +2102,7 @@ test("a new message in the same chat cancels the scheduled archive", async () =>
       }),
     );
     // 第二个任务在 chatTails 上串行执行：它开始即证明第一个回合的收尾（含归档检查）已经跑完。
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "archive-cancel-after",
         ...THREAD_TOOLS,
@@ -2047,7 +2110,7 @@ test("a new message in the same chat cancels the scheduled archive", async () =>
         mentionedUserIds: [harness.bot.uid],
       }),
     );
-    await harness.workers.waitForPromptCount(2);
+    await waitForPrompts(harness, 2);
     expect(transport.archiveOrder).toEqual([]);
   } finally {
     await closeCoreHarness(harness);
@@ -2077,10 +2140,10 @@ test("a pending archive is dropped when the channel stops before it runs", async
         Object.assign(new Error("Octo thread archive failed with HTTP 500"), { status: 500 }),
         Object.assign(new Error("Octo thread archive failed with HTTP 500"), { status: 500 }),
       ]);
-      await harness.service.handleInbound(
+      await harness.service.submitInbound(
         inbound({ messageId: "archive-stop-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
       );
-      await harness.service.handleInbound(
+      await harness.service.submitInbound(
         inbound({
           messageId: "archive-stop-run",
           ...THREAD_TOOLS,
@@ -2088,7 +2151,7 @@ test("a pending archive is dropped when the channel stops before it runs", async
           mentionedUserIds: [harness.bot.uid],
         }),
       );
-      await harness.workers.waitForPromptCount(1);
+    await waitForPrompts(harness, 1);
       for (let step = 0; step < 200 && archiveCalls() < 1; step += 1) {
         await yieldRealIo(harness.stateDir);
         if (archiveCalls() >= 1) break;
@@ -2128,8 +2191,8 @@ test("threads inherit the parent group allowlist without their own entry", async
       mentionedUserIds: [harness.bot.uid],
       text: "denied thread work",
     });
-    await harness.service.handleInbound(inherited);
-    await harness.service.handleInbound(denied);
+    await harness.service.submitInbound(inherited);
+    await harness.service.submitInbound(denied);
     await waitForStatus(harness.service, inherited, (status) => status.state === "completed");
 
     expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["inherited thread work"]);
@@ -2172,25 +2235,25 @@ test("channel_control schedules a restart that runs once every chat is idle", as
   });
   try {
     const first = inbound({ messageId: "channel-restart-first", text: "first task" });
-    await harness.service.handleInbound(first);
-    await toolCalled.promise;
+    await harness.service.submitInbound(first);
+    await waitForSignal(toolCalled.promise, "restart tool execution");
     expect(restartResult).toContain("已排定重启");
 
     // Work that is still queued or running keeps the restart pending; it must never fire
     // inside the turn that asked for it.
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "channel-restart-queued", text: "/queue second task" }),
     );
     expect(requests).toHaveLength(0);
 
     releaseFirst.resolve();
     // The chat stays busy while the queued task runs, so the restart must wait for it.
-    await secondStarted.promise;
-    await harness.workers.waitForPromptCount(2);
+    await waitForSignal(secondStarted.promise, "queued task start before restart");
+    await waitForPrompts(harness, 2);
     expect(requests).toHaveLength(0);
 
     releaseSecond.resolve();
-    await harness.workers.waitForPromptCount(2);
+    await waitForPrompts(harness, 2);
     for (let attempt = 0; attempt < 2000 && requests.length === 0; attempt += 1) {
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
@@ -2213,7 +2276,7 @@ test("channel_control without a detected supervisor reports it and schedules not
   });
   try {
     const task = inbound({ messageId: "channel-restart-unconfigured", text: "restart the channel" });
-    await harness.service.handleInbound(task);
+    await harness.service.submitInbound(task);
     await waitForStatus(harness.service, task, (status) => status.state === "completed");
     expect(restartResult).toContain("未检测到守护进程");
   } finally {

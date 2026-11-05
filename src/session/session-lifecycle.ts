@@ -29,7 +29,7 @@ import {
 import { ensureProjectSessionDir, projectSessionDir, sessionsRoot } from "./session-dir.ts";
 import { withStoppedWorker, type WorkerSession } from "../runtime/worker-lease.ts";
 import type { ChannelStore } from "../store/index.ts";
-import type { BindingRecord, ThreadWorkspaceRecord } from "../store/store-records.ts";
+import type { BindingRecord, ThreadWorkspaceRecord, WorkerLedgerRecord } from "../store/store-records.ts";
 import type { SessionLease } from "../tasks/task-scheduler.ts";
 import { threadParentGroupId } from "../threads/thread-target.ts";
 import {
@@ -55,6 +55,7 @@ export interface SessionLifecycleDeps {
     | "resolveChatModel"
     | "clearContextLedger"
     | "recordWorker"
+    | "recordIngressWorker"
     | "markWorkerStopped"
   >;
   readonly workerFactory: WorkerFactory;
@@ -80,6 +81,25 @@ export interface SessionLifecycleDeps {
   readonly enqueueText: Outbox["enqueueText"];
   /** Clears volatile reference evidence after a successfully committed fresh session switch. */
   readonly resetReferenceContext: (target: ChatTarget) => void;
+}
+
+export interface SessionCommandIngressHooks {
+  readonly signal: AbortSignal;
+  readonly jobId: number;
+  readonly workerLedgerId: string;
+  readonly stopping: () => boolean;
+  readonly matchesExpectedBinding: (binding: BindingRecord | null) => boolean;
+  readonly checkpointWaitingSession: (resourceCwds: readonly string[]) => boolean;
+  readonly acquireSessionLease: (resourceCwds: readonly string[]) => Promise<SessionLease | undefined>;
+  readonly markDispatchIntent: (workerLedgerId: string, resourceCwds: readonly string[]) => boolean;
+  /** Atomically persists any binding/context update, stable receipt, command claim and ingress handoff. */
+  readonly handoffOutcome: (
+    binding: BindingRecord | null,
+    text: string,
+    clearContext: boolean,
+  ) => boolean;
+  /** Persists an exact unknown-outcome receipt while retaining the ingress resource checkpoint. */
+  readonly failUnknown: (text: string, resourceCwds: readonly string[]) => boolean;
 }
 
 export async function threadWorkspaceIsAvailable(workspace: ThreadWorkspaceRecord): Promise<boolean> {
@@ -224,13 +244,57 @@ export class SessionLifecycle {
    * 目录起、验证确实带出新会话文件后再停掉；任何一步失败都不会改动现有绑定，确认不了停止的
    * 目录被 block 以便调度避开。回执带上验证后的 cwd 与候选 worker 自报的模型。
    */
-  async handleNew(target: ChatTarget, argument: string): Promise<void> {
+  async handleNew(
+    target: ChatTarget,
+    argument: string,
+    ingress?: SessionCommandIngressHooks,
+  ): Promise<void> {
     const bot = this.deps.bot();
+    const resources: string[] = [];
+    let dispatchIntent = false;
+    const ensureOpen = (): void => {
+      if (ingress?.signal.aborted) {
+        throw ingress.signal.reason instanceof Error ? ingress.signal.reason : new Error("session command aborted");
+      }
+    };
+    const complete = (text: string, binding: BindingRecord | null = null, clearContext = false): void => {
+      if (ingress !== undefined) {
+        if (!ingress.handoffOutcome(binding, text, clearContext)) {
+          throw new Error("session command outcome could not be handed off");
+        }
+        return;
+      }
+      if (binding !== null) {
+        this.deps.store.ensureBinding(binding, { clearSessionInitialization: true });
+        if (clearContext) {
+          this.deps.store.clearContextLedger(binding.botUid, target);
+          this.deps.resetReferenceContext(target);
+        }
+      }
+      this.deps.enqueueText(target, text, null);
+    };
+    const failUnknown = (text: string): void => {
+      if (ingress === undefined) {
+        this.deps.enqueueText(target, text, null);
+        return;
+      }
+      if (ingress.stopping()) throw new Error("session command suspended during shutdown");
+      if (!ingress.failUnknown(text, resources)) {
+        throw new Error("unknown session command outcome could not be persisted");
+      }
+    };
+
+    ensureOpen();
     if (bot && (this.deps.store.getActiveTask(bot.uid, target) || this.deps.hasRuntime(target))) {
-      await this.deps.enqueueText(target, "当前聊天有运行中或排队任务，请先 /cancel。", null);
+      complete("当前聊天有运行中或排队任务，请先 /cancel。");
       return;
     }
     const previous = await this.reconcileExternalBinding(target);
+    ensureOpen();
+    if (ingress !== undefined && !ingress.matchesExpectedBinding(previous)) {
+      complete("当前会话绑定已变化，本次 /new 未执行。");
+      return;
+    }
     const hasExplicitCwd = argument.trim().length > 0;
     let cwd: string;
     try {
@@ -245,24 +309,37 @@ export class SessionLifecycle {
         ? await resolveWorkDirectory(argument, this.deps.config)
         : await this.defaultWorkDirectory(target);
     } catch (error) {
-      await this.deps.enqueueText(target, `目录无效：${safeErrorMessage(error, "无法访问该目录")}`, null);
+      ensureOpen();
+      complete(`目录无效：${safeErrorMessage(error, "无法访问该目录")}`);
       return;
     }
-    const commandLease = await this.deps.tryAcquireCommandSession(target, [cwd]);
+    ensureOpen();
+    resources.push(cwd);
+    if (ingress !== undefined && !ingress.checkpointWaitingSession(resources)) {
+      throw new Error("session command checkpoint could not be persisted");
+    }
+    const commandLease = ingress === undefined
+      ? await this.deps.tryAcquireCommandSession(target, resources)
+      : await ingress.acquireSessionLease(resources);
+    ensureOpen();
     if (!commandLease) {
-      await this.deps.enqueueText(
-        target,
-        "相关会话正在运行，或目标目录存在未确认停止的 worker，请稍后重试。",
-        null,
-      );
+      complete("相关会话正在运行，或目标目录存在未确认停止的 worker，请稍后重试。");
       return;
     }
     try {
       await commandLease.ready;
+      ensureOpen();
       const sessionId = randomUUID();
       const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.deps.config), cwd);
-      const ledgerId = `new-${sessionId}`;
+      const ledgerId = ingress?.workerLedgerId ?? `new-${sessionId}`;
       const ledgerSessionFile = join(sessionDir, `${sessionId}.jsonl`);
+      if (ingress !== undefined) {
+        if (!ingress.markDispatchIntent(ledgerId, resources)) {
+          ensureOpen();
+          throw new Error("session dispatch intent could not be persisted");
+        }
+        dispatchIntent = true;
+      }
       let created: { fresh: ProjectSessionBinding; model: string | null };
       try {
         const model = this.deps.store.resolveChatModel(this.deps.bot()!.uid, target).model;
@@ -281,6 +358,10 @@ export class SessionLifecycle {
               sessionId,
               sessionFile: ledgerSessionFile,
             },
+            ...(ingress === undefined ? {} : {
+              recordWorker: (worker: WorkerLedgerRecord) =>
+                this.deps.store.recordIngressWorker(ingress.jobId, worker),
+            }),
             blockDirectory: this.deps.blockDirectory,
           },
           async worker => {
@@ -294,9 +375,14 @@ export class SessionLifecycle {
             const model = await this.createdSessionModel(worker);
             return { fresh, model };
           },
+          ingress?.signal,
         );
       } catch {
-        await this.deps.enqueueText(target, "无法创建可恢复的 OMP 会话，当前绑定未改变。", null);
+        if (dispatchIntent) {
+          failUnknown("无法确认新会话是否完整创建；相关目录保持保护，本次不会自动重试。");
+        } else {
+          complete("无法创建可恢复的 OMP 会话，当前绑定未改变。");
+        }
         return;
       }
       const binding: BindingRecord = {
@@ -311,21 +397,16 @@ export class SessionLifecycle {
         // 身份，因此不写这里）。切换失败走下面的 catch，绑定与这个时间都不落。
         sessionSwitchedAt: Date.now(),
       };
+      const receipt =
+        `已创建会话 ${binding.sessionId}，cwd=${binding.cwd}${created.model === null ? "" : `，模型=${created.model}`}`;
       try {
-        this.deps.store.ensureBinding(binding);
+        complete(receipt, binding, true);
       } catch {
+        if (dispatchIntent) {
+          failUnknown("新会话已创建但本地绑定结果未能确认；相关目录保持保护，本次不会自动重试。");
+          return;
+        }
         throw new Error("本地状态盘写入失败，会话未切换。");
-      }
-      this.deps.resetReferenceContext(target);
-      try {
-        this.deps.store.clearContextLedger(this.deps.bot()!.uid, target);
-        await this.deps.enqueueText(
-          target,
-          `已创建会话 ${binding.sessionId}，cwd=${binding.cwd}${created.model === null ? "" : `，模型=${created.model}`}`,
-          null,
-        );
-      } catch {
-        await this.deps.enqueueText(target, "无法创建可恢复的 OMP 会话，当前绑定未改变。", null);
       }
     } finally {
       commandLease.complete();
@@ -336,15 +417,55 @@ export class SessionLifecycle {
    * `/move <目录>`：在 worker 出生时将目标 cwd 持久化到台账，用 OMP 原生 `/move` 迁移并验证后，
    * 由 worker scope 确认退出和台账更新，再把迁移结果提交为绑定。失败时源与目标 cwd 都要确认停止。
    */
-  async handleMove(target: ChatTarget, argument: string): Promise<void> {
+  async handleMove(
+    target: ChatTarget,
+    argument: string,
+    ingress?: SessionCommandIngressHooks,
+  ): Promise<void> {
     const bot = this.deps.bot();
+    const resources: string[] = [];
+    let dispatchIntent = false;
+    const ensureOpen = (): void => {
+      if (ingress?.signal.aborted) {
+        throw ingress.signal.reason instanceof Error ? ingress.signal.reason : new Error("session command aborted");
+      }
+    };
+    const complete = (text: string, binding: BindingRecord | null = null): void => {
+      if (ingress !== undefined) {
+        if (!ingress.handoffOutcome(binding, text, false)) {
+          throw new Error("session command outcome could not be handed off");
+        }
+        return;
+      }
+      if (binding !== null) {
+        this.deps.store.ensureBinding(binding, { clearSessionInitialization: true });
+      }
+      this.deps.enqueueText(target, text, null);
+    };
+    const failUnknown = (text: string): void => {
+      if (ingress === undefined) {
+        this.deps.enqueueText(target, text, null);
+        return;
+      }
+      if (ingress.stopping()) throw new Error("session command suspended during shutdown");
+      if (!ingress.failUnknown(text, resources)) {
+        throw new Error("unknown session command outcome could not be persisted");
+      }
+    };
+
+    ensureOpen();
     if (bot && (this.deps.store.getActiveTask(bot.uid, target) || this.deps.hasRuntime(target))) {
-      await this.deps.enqueueText(target, "当前聊天有运行中或排队任务，请先 /cancel。", null);
+      complete("当前聊天有运行中或排队任务，请先 /cancel。");
       return;
     }
     const previous = await this.reconcileExternalBinding(target);
+    ensureOpen();
+    if (ingress !== undefined && !ingress.matchesExpectedBinding(previous)) {
+      complete("当前会话绑定已变化，本次 /move 未执行。");
+      return;
+    }
     if (!previous) {
-      await this.deps.enqueueText(target, "当前聊天没有可迁移的会话，请先 /new。", null);
+      complete("当前聊天没有可迁移的会话，请先 /new。");
       return;
     }
     let cwd: string;
@@ -359,31 +480,45 @@ export class SessionLifecycle {
       }
       cwd = await resolveWorkDirectory(argument, this.deps.config);
     } catch (error) {
-      await this.deps.enqueueText(target, `目录无效：${safeErrorMessage(error, "无法访问该目录")}`, null);
+      ensureOpen();
+      complete(`目录无效：${safeErrorMessage(error, "无法访问该目录")}`);
       return;
     }
+    ensureOpen();
+    resources.push(previous.cwd, cwd);
     if (!previous.sessionFile) {
-      await this.deps.enqueueText(target, "当前绑定没有可恢复的精确会话文件，未迁移。", null);
+      complete("当前绑定没有可恢复的精确会话文件，未迁移。");
       return;
     }
     const sessionFile = await existingSessionFile(previous.sessionFile);
+    ensureOpen();
     if (!sessionFile) {
-      await this.deps.enqueueText(target, "绑定的 OMP 会话文件不存在，未迁移。", null);
+      complete("绑定的 OMP 会话文件不存在，未迁移。");
       return;
     }
-    const commandLease = await this.deps.tryAcquireCommandSession(target, [previous.cwd, cwd]);
+    if (ingress !== undefined && !ingress.checkpointWaitingSession(resources)) {
+      throw new Error("session command checkpoint could not be persisted");
+    }
+    const commandLease = ingress === undefined
+      ? await this.deps.tryAcquireCommandSession(target, resources)
+      : await ingress.acquireSessionLease(resources);
+    ensureOpen();
     if (!commandLease) {
-      await this.deps.enqueueText(
-        target,
-        "相关会话正在运行，或源/目标目录存在未确认停止的 worker，请稍后重试。",
-        null,
-      );
+      complete("相关会话正在运行，或源/目标目录存在未确认停止的 worker，请稍后重试。");
       return;
     }
     try {
       await commandLease.ready;
+      ensureOpen();
       const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.deps.config), cwd);
-      const ledgerId = `move-${randomUUID()}`;
+      const ledgerId = ingress?.workerLedgerId ?? `move-${randomUUID()}`;
+      if (ingress !== undefined) {
+        if (!ingress.markDispatchIntent(ledgerId, resources)) {
+          ensureOpen();
+          throw new Error("session dispatch intent could not be persisted");
+        }
+        dispatchIntent = true;
+      }
       let moved: ProjectSessionBinding;
       try {
         const model = this.deps.store.resolveChatModel(this.deps.bot()!.uid, target).model;
@@ -404,6 +539,10 @@ export class SessionLifecycle {
               sessionFile,
             },
             moveTargetCwd: cwd,
+            ...(ingress === undefined ? {} : {
+              recordWorker: (worker: WorkerLedgerRecord) =>
+                this.deps.store.recordIngressWorker(ingress.jobId, worker),
+            }),
             blockDirectory: this.deps.blockDirectory,
           },
           async worker => {
@@ -411,9 +550,14 @@ export class SessionLifecycle {
             const movedState: ProjectSessionState = await worker.refreshState();
             return verifyMovedSession(previous, movedState, cwd);
           },
+          ingress?.signal,
         );
       } catch {
-        await this.deps.enqueueText(target, "无法验证 OMP 原生 /move，当前绑定未改变。", null);
+        if (dispatchIntent) {
+          failUnknown("无法确认 OMP 原生 /move 是否完成；源与目标目录保持保护，本次不会自动重试。");
+        } else {
+          complete("无法验证 OMP 原生 /move，当前绑定未改变。");
+        }
         return;
       }
       const binding: BindingRecord = {
@@ -425,14 +569,13 @@ export class SessionLifecycle {
         cwdPinned: false,
       };
       try {
-        this.deps.store.ensureBinding(binding);
+        complete(`已迁移会话 ${binding.sessionId}，cwd=${binding.cwd}`, binding);
       } catch {
+        if (dispatchIntent) {
+          failUnknown("OMP 原生 /move 已验证，但本地绑定结果未能提交；源与目标目录保持保护，本次不会自动重试。");
+          return;
+        }
         throw new Error("本地状态盘写入失败，会话未迁移。");
-      }
-      try {
-        await this.deps.enqueueText(target, `已迁移会话 ${binding.sessionId}，cwd=${binding.cwd}`, null);
-      } catch {
-        await this.deps.enqueueText(target, "无法验证 OMP 原生 /move，当前绑定未改变。", null);
       }
     } finally {
       commandLease.complete();

@@ -19,7 +19,11 @@ import { createWorkerFactory } from "../../src/omp/index.ts";
 import { createThreadWorkspaceBatch } from "../../src/workspace/thread-workspaces.ts";
 import { createWorktreePort } from "../../src/workspace/worktree.ts";
 import { openChannelStore } from "../../src/store/index.ts";
-import { FakeTransport, inbound } from "../fixtures/core-fakes.ts";
+import {
+  FakeTransport,
+  inbound,
+  submitAndWaitForIngressHandoff,
+} from "../fixtures/core-fakes.ts";
 
 // Offline acceptance: real installed OMP RPC children talk only to this finite localhost model
 // and the in-memory FakeTransport. Run `bun tests/benchmarks/concurrency.ts` (or set
@@ -265,9 +269,11 @@ async function taskCompleted(messageId: string, label: string): Promise<void> {
   });
 }
 
+// Receipt acceptance is intentionally the only boundary here; every caller below waits for the
+// real task row/model request it needs, so held model gates never block ingress handoff waiting.
 async function submit(target: ChatTarget, label: string): Promise<string> {
   const messageId = `concurrency-${++messageSequence}`;
-  await service!.handleInbound(message(target, messageId, `CONCURRENCY_TASK:${label}`));
+  await service!.submitInbound(message(target, messageId, `CONCURRENCY_TASK:${label}`));
   return messageId;
 }
 
@@ -275,7 +281,11 @@ async function prepareSession(target: ChatTarget, cwd: string): Promise<void> {
   await mkdir(cwd, { recursive: true });
   const messageId = `concurrency-new-${++messageSequence}`;
   const sentBefore = transport!.sent.length;
-  await service!.handleInbound(message(target, messageId, `/new ${cwd}`));
+  await submitAndWaitForIngressHandoff(
+    { service: service!, store: store!, botUid: "bot-concurrency" },
+    message(target, messageId, `/new ${cwd}`),
+    { timeoutMs: 45_000, description: `/new binding handoff for ${target.channelType}:${target.channelId}` },
+  );
   const binding = store!.getBinding("bot-concurrency", target);
   if (binding === null) {
     const replies = transport!.sent.slice(sentBefore).map((sent) => sent.text);

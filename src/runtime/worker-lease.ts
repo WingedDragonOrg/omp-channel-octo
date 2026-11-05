@@ -33,6 +33,7 @@ export interface OpenTrackedWorkerOptions {
   readonly worker: Omit<WorkerOptions, "onSpawn">;
   readonly ledger: Omit<WorkerLedgerRecord, keyof WorkerProcess | "state" | "moveTargetCwd">;
   readonly moveTargetCwd?: string;
+  readonly recordWorker?: (worker: WorkerLedgerRecord) => boolean;
   readonly blockDirectory: (cwd: string) => void;
 }
 
@@ -54,6 +55,7 @@ interface OpenTrackedProcessOptions<TWorker extends StoppableWorker> {
   readonly create: (onSpawn: (process: WorkerProcess) => void) => Promise<TWorker>;
   readonly ledger: Omit<WorkerLedgerRecord, keyof WorkerProcess | "state" | "moveTargetCwd">;
   readonly moveTargetCwd?: string;
+  readonly recordWorker?: (worker: WorkerLedgerRecord) => boolean;
   readonly blockDirectory: (cwd: string) => void;
 }
 
@@ -78,12 +80,19 @@ async function openTrackedProcess<TWorker extends StoppableWorker>(
   try {
     worker = await options.create((processInfo) => {
       spawned = processInfo;
-      options.store.recordWorker({
+      const ledger = {
         ...options.ledger,
         ...processInfo,
         moveTargetCwd: options.moveTargetCwd ?? null,
-        state: "running",
-      });
+        state: "running" as const,
+      };
+      if (options.recordWorker !== undefined) {
+        if (!options.recordWorker(ledger)) {
+          throw new Error("spawned worker does not match its ingress dispatch-intent");
+        }
+      } else {
+        options.store.recordWorker(ledger);
+      }
     });
   } catch (error) {
     if (spawned) {
@@ -141,6 +150,7 @@ export async function openTrackedWorker(options: OpenTrackedWorkerOptions): Prom
     create: (onSpawn) => options.workerFactory.create({ ...options.worker, onSpawn }),
     ledger: options.ledger,
     ...(options.moveTargetCwd === undefined ? {} : { moveTargetCwd: options.moveTargetCwd }),
+    ...(options.recordWorker === undefined ? {} : { recordWorker: options.recordWorker }),
     blockDirectory: options.blockDirectory,
   });
 }
@@ -159,15 +169,48 @@ export async function openTrackedCommit(options: OpenTrackedCommitOptions): Prom
 export async function withStoppedWorker<T>(
   options: OpenTrackedWorkerOptions,
   run: (worker: WorkerSession) => Promise<T>,
+  signal?: AbortSignal,
 ): Promise<T> {
-  const lease = await openTrackedWorker(options);
-  let result: T;
-  try {
-    result = await run(lease.worker);
-  } catch (error) {
-    await lease.close();
-    throw error;
+  const lease = await openTrackedWorker({
+    ...options,
+    worker: signal === undefined ? options.worker : { ...options.worker, signal },
+  });
+  let onAbort: (() => void) | undefined;
+  let abortPromise: Promise<never> | undefined;
+  if (signal !== undefined) {
+    const abort = Promise.withResolvers<never>();
+    abortPromise = abort.promise;
+    onAbort = () => abort.reject(
+      signal.reason instanceof Error ? signal.reason : new Error("worker operation aborted"),
+    );
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
   }
-  if (!(await lease.close())) throw new Error("worker did not stop");
-  return result;
+  const operation = Promise.resolve().then(() => {
+    if (signal?.aborted) {
+      throw signal.reason instanceof Error ? signal.reason : new Error("worker operation aborted");
+    }
+    return run(lease.worker);
+  });
+  try {
+    const result = abortPromise === undefined
+      ? await operation
+      : await Promise.race([operation, abortPromise]);
+    if (signal?.aborted) {
+      throw signal.reason instanceof Error ? signal.reason : new Error("worker operation aborted");
+    }
+    if (!(await lease.close())) throw new Error("worker did not stop");
+    return result;
+  } catch (error) {
+    const stopped = await lease.close(signal?.aborted === true);
+    if (signal?.aborted) {
+      await operation.catch(() => {});
+      if (!stopped) throw new Error("worker did not stop after cancellation");
+    }
+    throw error;
+  } finally {
+    if (signal !== undefined && onAbort !== undefined) {
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
 }

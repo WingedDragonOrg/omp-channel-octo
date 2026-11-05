@@ -17,7 +17,7 @@ async function withManagement(run: (tool: HostTool, transport: FakeTransport) =>
   });
   harness.transport.setGroupContext(target, initial);
   try {
-    await harness.service.handleInbound(inbound({ ...target, messageId: "description-guard", text: "maintain current description", mentionedUserIds: [harness.bot.uid] }));
+    await harness.service.submitInbound(inbound({ ...target, messageId: "description-guard", text: "maintain current description", mentionedUserIds: [harness.bot.uid] }));
     const status = await waitForStatus(harness.service, target, value => value.state === "completed" || value.state === "failed");
     if (failure) throw failure;
     expect(status.state).toBe("completed");

@@ -4,7 +4,7 @@
 
 import { Database } from "bun:sqlite";
 import type { ChatAppendMode, ChatTarget } from "../contracts.ts";
-import type { AllowedChatRecord, BindingRecord, OutboxInsert } from "./store-records.ts";
+import type { AllowedChatRecord, BindingRecord, BindingSessionInitialization, OutboxInsert } from "./store-records.ts";
 import { threadParentGroupId } from "../threads/thread-target.ts";
 import { asNullableString, asNumber, asString, query, run, targetValues, targetWhere, transaction } from "./store-schema.ts";
 import { enqueueOutbox } from "./store-outbox.ts";
@@ -103,14 +103,28 @@ export function listAllowedChats(db: Database, botUid: string): AllowedChatRecor
   }));
 }
 
-export function ensureBinding(db: Database, binding: BindingRecord): void {
+export function ensureBinding(
+  db: Database,
+  binding: BindingRecord,
+  options: { clearSessionInitialization?: boolean } = {},
+): void {
   const now = Date.now();
   transaction(db, () => {
     run(db,
       `INSERT INTO chats(bot_uid, channel_type, channel_id, session_id, cwd, session_file, cwd_pinned,
-                          session_switched_at, created_at, updated_at)
-       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          session_switched_at, session_initialization_json, created_at, updated_at)
+       VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
        ON CONFLICT(bot_uid, channel_type, channel_id) DO UPDATE SET
+         session_initialization_json = CASE
+           WHEN ? = 1
+             OR chats.session_id <> excluded.session_id
+             OR chats.cwd <> excluded.cwd
+             OR chats.session_file IS NOT excluded.session_file
+             OR chats.cwd_pinned <> excluded.cwd_pinned
+             OR excluded.session_switched_at IS NOT NULL
+           THEN NULL
+           ELSE chats.session_initialization_json
+         END,
          session_id = excluded.session_id,
          cwd = excluded.cwd,
          session_file = excluded.session_file,
@@ -125,22 +139,114 @@ export function ensureBinding(db: Database, binding: BindingRecord): void {
         binding.cwd,
         binding.sessionFile,
         binding.cwdPinned === true ? 1 : 0,
-        // 只有真正的主动换会话（`/new`/`/reset`）带这个时间；其余 upsert 传 null，COALESCE 保留旧值。
         binding.sessionSwitchedAt ?? null,
         now,
         now,
+        options.clearSessionInitialization === true ? 1 : 0,
       ],
     );
   });
 }
 
+/** Atomically records which started task initialized an unbound pinned thread session. */
+export function initializeBindingSessionFromTask(
+  db: Database,
+  botUid: string,
+  target: ChatTarget,
+  taskId: string,
+  previous: BindingRecord,
+  sessionId: string,
+  sessionFile: string,
+): boolean {
+  if (
+    target.channelType !== 5
+    || previous.botUid !== botUid
+    || previous.channelType !== target.channelType
+    || previous.channelId !== target.channelId
+    || previous.sessionFile !== null
+    || previous.cwdPinned !== true
+    || sessionId === previous.sessionId
+    || sessionFile.length === 0
+  ) return false;
+
+  const provenance: BindingSessionInitialization = {
+    taskId,
+    fromSessionId: previous.sessionId,
+    fromCwd: previous.cwd,
+    fromSessionFile: null,
+    fromCwdPinned: true,
+    fromSessionSwitchedAt: previous.sessionSwitchedAt ?? null,
+  };
+  return transaction(db, () => {
+    const startedTask = query(
+      db,
+      `SELECT 1 FROM tasks
+       WHERE id = ? AND bot_uid = ? AND channel_type = ? AND channel_id = ?
+         AND session_id = ? AND cwd = ? AND state = 'started'`,
+      [taskId, botUid, target.channelType, target.channelId, previous.sessionId, previous.cwd],
+    )[0];
+    if (startedTask === undefined) return false;
+    return run(
+      db,
+      `UPDATE chats
+       SET session_id = ?, session_file = ?, session_initialization_json = ?, updated_at = ?
+       WHERE bot_uid = ? AND ${targetWhere(target)}
+         AND session_id = ? AND cwd = ? AND session_file IS NULL AND cwd_pinned = 1
+         AND session_switched_at IS ? AND session_initialization_json IS NULL`,
+      [
+        sessionId,
+        sessionFile,
+        JSON.stringify(provenance),
+        Date.now(),
+        botUid,
+        ...targetValues(target),
+        previous.sessionId,
+        previous.cwd,
+        previous.sessionSwitchedAt ?? null,
+      ],
+    ).changes === 1;
+  });
+}
+
+function sessionInitializationFromValue(value: unknown): BindingSessionInitialization | null {
+  const serialized = asNullableString(value);
+  if (serialized === null) return null;
+  try {
+    const parsed: unknown = JSON.parse(serialized);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const provenance = parsed as Partial<BindingSessionInitialization>;
+    const switchedAt = provenance.fromSessionSwitchedAt;
+    if (
+      typeof provenance.taskId !== "string"
+      || typeof provenance.fromSessionId !== "string"
+      || typeof provenance.fromCwd !== "string"
+      || provenance.fromSessionFile !== null
+      || provenance.fromCwdPinned !== true
+      || switchedAt === undefined
+      || (switchedAt !== null && typeof switchedAt !== "number")
+    ) return null;
+    return {
+      taskId: provenance.taskId,
+      fromSessionId: provenance.fromSessionId,
+      fromCwd: provenance.fromCwd,
+      fromSessionFile: null,
+      fromCwdPinned: true,
+      fromSessionSwitchedAt: switchedAt,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function getBinding(db: Database, botUid: string, target: ChatTarget): BindingRecord | null {
   const row = query(db,
-    `SELECT bot_uid, channel_type, channel_id, session_id, cwd, session_file, cwd_pinned, session_switched_at
+    `SELECT bot_uid, channel_type, channel_id, session_id, cwd, session_file, cwd_pinned,
+            session_switched_at, session_initialization_json
      FROM chats WHERE bot_uid = ? AND ${targetWhere(target)}`,
     [botUid, ...targetValues(target)],
   )[0];
   if (!row) return null;
+  const sessionInitialization = sessionInitializationFromValue(row.session_initialization_json);
   return {
     botUid: asString(row.bot_uid),
     channelType: asNumber(row.channel_type) as 1 | 2 | 5,
@@ -152,6 +258,7 @@ export function getBinding(db: Database, botUid: string, target: ChatTarget): Bi
     sessionSwitchedAt: row.session_switched_at === null || row.session_switched_at === undefined
       ? null
       : asNumber(row.session_switched_at),
+    ...(sessionInitialization === null ? {} : { sessionInitialization }),
   };
 }
 
@@ -248,9 +355,22 @@ export function resolveChatModel(
   return { model: null, source: "omp" };
 }
 
-export function updateBindingSession(db: Database, botUid: string, target: ChatTarget, sessionId: string, sessionFile: string | null): void {
+export function updateBindingSession(
+  db: Database,
+  botUid: string,
+  target: ChatTarget,
+  sessionId: string,
+  sessionFile: string | null,
+): void {
   run(db,
-    `UPDATE chats SET session_id = ?, session_file = ?, updated_at = ? WHERE bot_uid = ? AND ${targetWhere(target)}`,
-    [sessionId, sessionFile, Date.now(), botUid, ...targetValues(target)],
+    `UPDATE chats
+     SET session_id = ?, session_file = ?,
+         session_initialization_json = CASE
+           WHEN session_id = ? AND session_file IS ? THEN session_initialization_json
+           ELSE NULL
+         END,
+         updated_at = ?
+     WHERE bot_uid = ? AND ${targetWhere(target)}`,
+    [sessionId, sessionFile, sessionId, sessionFile, Date.now(), botUid, ...targetValues(target)],
   );
 }

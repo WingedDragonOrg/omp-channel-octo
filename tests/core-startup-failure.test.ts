@@ -44,7 +44,7 @@ test("a group-context read failure keeps its own notice and records the real rea
   try {
     const group = { channelId: "group-startup-context", channelType: 2 as const };
     harness.transport.failGroupContextWith(new Error("Octo group context request failed with HTTP 500"));
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "startup-context-failure",
         ...group,
@@ -82,7 +82,7 @@ test("a bound workspace that is gone reports the binding class with its code", a
     harness.workers.failCreateWith(
       new TaskStartupError("cwd-missing", "OMP worker cwd does not exist: /gone/workspace"),
     );
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "startup-binding-failure",
         ...group,
@@ -117,7 +117,7 @@ test("a worker failure in a private chat never reports the group-context wording
   try {
     const direct = { channelId: harness.bot.uid, channelType: 1 as const };
     harness.workers.failCreateWith(new Error("ui.loop-blocked"));
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "startup-private-failure", ...direct, text: "private task" }),
     );
     const status = await waitForStatus(harness.service, direct, (next) => next.state === "failed");
@@ -151,7 +151,7 @@ test("a failure after the worker exists sends the original exception message", a
   const logged = vi.spyOn(console, "error").mockImplementation(() => {});
   try {
     const group = { channelId: "group-startup-runtime", channelType: 2 as const };
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({
         messageId: "task-runtime-failure",
         ...group,

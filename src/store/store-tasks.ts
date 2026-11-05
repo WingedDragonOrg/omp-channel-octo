@@ -6,7 +6,7 @@ import { Database } from "bun:sqlite";
 import type { ChatTarget } from "../contracts.ts";
 import type { CommandClaimState, GoalStoppedRecovery, GoalStopIntent, GoalTaskRequest, InboundClaim, StoppedTaskRecovery, TaskRecord, TaskRestartRecovery, TaskStopIntent } from "./store-records.ts";
 import { getGoalSession, getGoalTask, hasActiveGoalTask, insertGoalTask, revokedGoalTaskIds, stopGoalContinuation, stopGoalContinuationForTask, undispatchedGoalAcceptanceIds } from "./store-goals.ts";
-import { asNumber, asStopIntent, asString, query, run, targetValues, targetWhere, taskFromRow, transaction } from "./store-schema.ts";
+import { allocateScheduleOrder, asNumber, asStopIntent, asString, query, run, targetValues, targetWhere, taskFromRow, transaction } from "./store-schema.ts";
 import { cancelTaskQuestions } from "./store-questions.ts";
 
 /** Returns the persisted command state; task rows and unknown messages return null. */
@@ -26,8 +26,14 @@ export function getCommandClaimState(
   return state === "pending" || state === "completed" || state === "failed" ? state : null;
 }
 
-export function acceptTask(db: Database, claim: InboundClaim, task: TaskRecord, goalRequest?: GoalTaskRequest): boolean {
-  return transaction(db, () => acceptTaskInTransaction(db, claim, task, goalRequest));
+export function acceptTask(
+  db: Database,
+  claim: InboundClaim,
+  task: TaskRecord,
+  goalRequest?: GoalTaskRequest,
+  ingressJobId?: number,
+): boolean {
+  return transaction(db, () => acceptTaskInTransaction(db, claim, task, goalRequest, ingressJobId));
 }
 
 /**
@@ -39,6 +45,7 @@ export function acceptTaskInTransaction(
   claim: InboundClaim,
   task: TaskRecord,
   goalRequest?: GoalTaskRequest,
+  ingressJobId?: number,
 ): boolean {
   if (!db.inTransaction) throw new Error("task acceptance requires an active transaction");
   if (goalRequest && hasActiveGoalTask(db, task.botUid, task, task.sessionId)) return false;
@@ -47,6 +54,10 @@ export function acceptTaskInTransaction(
     [claim.botUid, claim.target.channelType, claim.target.channelId, claim.messageId],
   )[0];
   if (existing) return false;
+  const scheduleOrder = ingressJobId === undefined
+    ? allocateScheduleOrder(db)
+    : getIngressScheduleOrder(db, ingressJobId);
+  if (scheduleOrder === null) return false;
   const now = Date.now();
   run(db,
     `INSERT INTO inbound(bot_uid, channel_type, channel_id, message_id, sender_id, text, supported, kind, task_id, accepted_at)
@@ -63,9 +74,20 @@ export function acceptTaskInTransaction(
       now,
     ],
   );
-  insertTask(db, task, now);
+  insertTask(db, task, now, scheduleOrder);
   if (goalRequest) insertGoalTask(db, task, goalRequest);
   return true;
+}
+
+function getIngressScheduleOrder(db: Database, ingressJobId: number): number | null {
+  const row = query(
+    db,
+    `SELECT schedule_order FROM ingress_jobs
+     WHERE id = ? AND state IN ('accepted', 'preparing', 'dispatch-intent')`,
+    [ingressJobId],
+  )[0];
+  const order = asNumber(row?.schedule_order);
+  return order > 0 ? order : null;
 }
 
 /** Suppress one task's completion relay without changing its thread's merge policy. */
@@ -77,30 +99,71 @@ export function suppressTaskRelay(db: Database, taskId: string): void {
  * Atomically converts an already-claimed builtin command into a durable task. Unlike releasing
  * and re-claiming the inbound row, this leaves no window where redelivery could repeat the effect.
  */
-export function acceptCommitTask(db: Database, claim: InboundClaim, task: TaskRecord): boolean {
-  return transaction(db, () => {
-    const now = Date.now();
-    const converted = run(db,
-      `UPDATE inbound
-       SET sender_id = ?, text = ?, supported = ?, kind = 'task', task_id = ?, command_state = 'completed', accepted_at = ?
-       WHERE bot_uid = ? AND channel_type = ? AND channel_id = ? AND message_id = ?
-         AND kind = 'command' AND command_state = 'pending'`,
-      [
-        claim.senderId,
-        claim.text,
-        claim.supported ? 1 : 0,
-        task.id,
-        now,
-        claim.botUid,
-        claim.target.channelType,
-        claim.target.channelId,
-        claim.messageId,
-      ],
-    ).changes === 1;
-    if (!converted) return false;
-    insertTask(db, task, now);
-    return true;
-  });
+export function acceptCommitTask(
+  db: Database,
+  claim: InboundClaim,
+  task: TaskRecord,
+  ingressJobId?: number,
+): boolean {
+  const ingressHandoffFailed = Symbol("commit-ingress-handoff-failed");
+  try {
+    return transaction(db, () => {
+      let scheduleOrder: number;
+      if (ingressJobId !== undefined) {
+        const ingress = query(db,
+          "SELECT state, ack_ready, schedule_order FROM ingress_jobs WHERE id = ?",
+          [ingressJobId],
+        )[0];
+        if (
+          !ingress
+          || (asString(ingress.state) !== "accepted" && asString(ingress.state) !== "dispatch-intent")
+          || asNumber(ingress.ack_ready) !== 1
+        ) return false;
+        scheduleOrder = asNumber(ingress.schedule_order);
+        if (scheduleOrder < 1) return false;
+      } else {
+        scheduleOrder = allocateScheduleOrder(db);
+      }
+      const now = Date.now();
+      const converted = run(db,
+        `UPDATE inbound
+         SET sender_id = ?, text = ?, supported = ?, kind = 'task', task_id = ?, command_state = 'completed', accepted_at = ?
+         WHERE bot_uid = ? AND channel_type = ? AND channel_id = ? AND message_id = ?
+           AND kind = 'command' AND command_state = 'pending'`,
+        [
+          claim.senderId,
+          claim.text,
+          claim.supported ? 1 : 0,
+          task.id,
+          now,
+          claim.botUid,
+          claim.target.channelType,
+          claim.target.channelId,
+          claim.messageId,
+        ],
+      ).changes === 1;
+      if (!converted) {
+        if (ingressJobId !== undefined) throw ingressHandoffFailed;
+        return false;
+      }
+      insertTask(db, task, now, scheduleOrder);
+      if (ingressJobId !== undefined) {
+        const handedOff = run(db,
+          `UPDATE ingress_jobs
+           SET state = 'handed-off', consumer_kind = 'task', consumer_id = ?, ack_ready = 1,
+               payload_json = NULL, route_snapshot_json = NULL, prepared_text = NULL,
+               spool_paths_json = '[]', operation_checkpoint_json = NULL, updated_at = ?
+           WHERE id = ? AND ack_ready = 1 AND state IN ('accepted', 'dispatch-intent')`,
+          [task.id, now, ingressJobId],
+        ).changes === 1;
+        if (!handedOff) throw ingressHandoffFailed;
+      }
+      return true;
+    });
+  } catch (error) {
+    if (error === ingressHandoffFailed) return false;
+    throw error;
+  }
 }
 
 /** Only builtin admission converts a command claim into a completed-command task claim. */
@@ -116,7 +179,7 @@ export function isCommitTask(db: Database, taskId: string): boolean {
 }
 
 /** Shared insertion for accepted tasks; relay suppression also honors the thread's merge intent. */
-function insertTask(db: Database, task: TaskRecord, acceptedAt: number): void {
+function insertTask(db: Database, task: TaskRecord, acceptedAt: number, scheduleOrder: number): void {
   const mergePending = task.channelType === 5 && asNumber(query(db,
     "SELECT merge_pending FROM thread_listens WHERE bot_uid = ? AND channel_id = ?",
     [task.botUid, task.channelId],
@@ -124,9 +187,9 @@ function insertTask(db: Database, task: TaskRecord, acceptedAt: number): void {
   run(db,
     `INSERT INTO tasks(
        id, bot_uid, channel_type, channel_id, message_id, sender_id, text, session_id, cwd,
-       state, accepted_at, message_seq, history_eligible, relay_suppressed
+       state, accepted_at, schedule_order, message_seq, history_eligible, relay_suppressed
      )
-     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`,
+     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`,
     [
       task.id,
       task.botUid,
@@ -138,6 +201,7 @@ function insertTask(db: Database, task: TaskRecord, acceptedAt: number): void {
       task.sessionId,
       task.cwd,
       acceptedAt,
+      scheduleOrder,
       task.messageSeq,
       task.historyEligible ? 1 : 0,
       task.relaySuppressed || mergePending ? 1 : 0,
@@ -224,6 +288,11 @@ export function getTask(db: Database, taskId: string): TaskRecord | null {
   const row = query(db, "SELECT * FROM tasks WHERE id = ?", [taskId])[0];
   return row ? taskFromRow(row) : null;
 }
+export function getTaskScheduleOrder(db: Database, taskId: string): number | null {
+  const row = query(db, "SELECT schedule_order FROM tasks WHERE id = ?", [taskId])[0];
+  const order = asNumber(row?.schedule_order);
+  return order > 0 ? order : null;
+}
 
 export function getLatestTask(db: Database, botUid: string, target: ChatTarget): TaskRecord | null {
   const row = query(db,
@@ -300,18 +369,19 @@ export function markCancelled(db: Database, taskId: string, errorText = "cancell
 }
 
 /**
- * 停下这一回合。持久停止意图是 `interrupt` 时，任务终态与关闭待答提问在同一事务里完成——用户在
- * 线中断后，遗留提问不能再被点开、迟到的回答不能再唤醒新回合；`question_timeout` 与无意图的
- * 中断路径保持提问可答（迟到答复照在线路径唤醒新回合）。
+ * 停下这一回合。持久停止意图决定遗留提问是否失效；`cancel` 落为 cancelled，`interrupt` 落为
+ * interrupted，`question_timeout` 与无意图的中断路径保持提问可答。
  */
 export function markInterrupted(db: Database, taskId: string, errorText: string): void {
   transaction(db, () => {
     const intent = asStopIntent(query(db, "SELECT stop_intent FROM tasks WHERE id = ?", [taskId])[0]?.stop_intent);
+    const state = intent === "cancel" ? "cancelled" : "interrupted";
     const interrupted = run(db,
-      "UPDATE tasks SET state = 'interrupted', finished_at = ?, error_text = ?, stop_intent = NULL WHERE id = ? AND state IN ('queued', 'started')",
-      [Date.now(), errorText, taskId],
+      "UPDATE tasks SET state = ?, finished_at = ?, error_text = ?, stop_intent = NULL WHERE id = ? AND state IN ('queued', 'started')",
+      [state, Date.now(), errorText, taskId],
     ).changes === 1;
-    if (interrupted && intent === "interrupt") cancelTaskQuestions(db, taskId, "interrupted");
+    if (interrupted && intent === "cancel") cancelTaskQuestions(db, taskId, "cancelled");
+    else if (interrupted && intent === "interrupt") cancelTaskQuestions(db, taskId, "interrupted");
   });
 }
 
@@ -342,7 +412,8 @@ export function markTaskStopIntent(
     if (!written) return false;
     // Goal continuation has an independent durable authorization and must be revoked before abort.
     stopGoalContinuationForTask(db, taskId, intent);
-    if (intent === "interrupt") cancelTaskQuestions(db, taskId, "interrupted");
+    if (intent === "cancel") cancelTaskQuestions(db, taskId, "cancelled");
+    else if (intent === "interrupt") cancelTaskQuestions(db, taskId, "interrupted");
     // 只有 `question_timeout` 用选择集：它按设计保留本回合正在等的提问（B），却必须原子关闭恢复快照里
     // 没人接手的那批遗留题（A），否则被叫停的回合结束后 A 仍可点开、唤醒新回合。逐行校验归属与状态，
     // 借用调用方传来的 id 不能越界取消别的任务或已收场的行。
@@ -402,16 +473,18 @@ export function prepareTasksForRestart(
       if (stopIntent === null) continue;
       const taskId = asString(row.id);
       stopGoalContinuationForTask(db, taskId, stopIntent);
+      const state = stopIntent === "cancel" ? "cancelled" : "interrupted";
       run(db,
-        `UPDATE tasks SET state = 'interrupted', finished_at = ?, error_text = ?, stop_intent = NULL
+        `UPDATE tasks SET state = ?, finished_at = ?, error_text = ?, stop_intent = NULL
          WHERE id = ?`,
-        [Date.now(), reasonTexts[stopIntent], taskId],
+        [state, Date.now(), reasonTexts[stopIntent], taskId],
       );
       const settled = query(db, "SELECT * FROM tasks WHERE id = ?", [taskId])[0];
       if (settled) stopped.push({ ...taskFromRow(settled), stopIntent });
-      if (stopIntent === "interrupt") cancelTaskQuestions(db, taskId, "interrupted");
-    }
+      if (stopIntent === "cancel") cancelTaskQuestions(db, taskId, "cancelled");
+      else if (stopIntent === "interrupt") cancelTaskQuestions(db, taskId, "interrupted");
 
+    }
     const uncertainIdsSet = new Set([
       ...query(db,
         `SELECT id FROM tasks

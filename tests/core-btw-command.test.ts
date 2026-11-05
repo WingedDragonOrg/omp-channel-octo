@@ -8,6 +8,7 @@ import {
   createCoreHarness,
   inbound,
   readText,
+  waitForIngressJob,
   waitForStatus,
 } from "./fixtures/core-fakes";
 import type { CoreHarness, FakeBtwRunContext } from "./fixtures/core-fakes";
@@ -140,7 +141,7 @@ async function prepareBoundSession(
     messageId: `btw-prime-${target.channelId}`,
     text: "create a persistent session for BTW",
   });
-  await harness.service.handleInbound(message);
+  await harness.service.submitInbound(message);
   await harness.workers.waitForPromptCount(promptCount + 1);
   await waitForStatus(harness.service, target, (status) => status.state === "completed");
   return boundSession(harness, target);
@@ -174,7 +175,7 @@ test("BTW answers beside a held task without steering it, consuming ask, or chan
       messageId: "btw-held-task",
       text: "hold the main task on an ask",
     });
-    await harness.service.handleInbound(taskMessage);
+    await harness.service.submitInbound(taskMessage);
     await harness.workers.waitForPromptCount(1);
     const pending = await waitForStatus(
       harness.service,
@@ -185,7 +186,7 @@ test("BTW answers beside a held task without steering it, consuming ask, or chan
     const question = "BTw_ONLY_question: explain the retry boundary";
     const replyStart = sentTo(harness, DM).length;
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "btw-held-question",
       text: `/btw ${question}`,
@@ -208,7 +209,7 @@ test("BTW answers beside a held task without steering it, consuming ask, or chan
       pendingQuestionIds,
     });
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "btw-answer-real-ask",
       text: "continue",
@@ -241,7 +242,7 @@ test("a task can finish its prompt while BTW retains the worker and keeps later 
   let btwCommand: Promise<void> | undefined;
   let newCommand: Promise<void> | undefined;
   try {
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "btw-retain-primary",
       text: "primary task waits for BTW lease",
@@ -249,7 +250,7 @@ test("a task can finish its prompt while BTW retains the worker and keeps later 
     await harness.workers.waitForPromptCount(1);
     const worker = harness.workers.workers[0]!;
     harness.workers.btwHandler = async () => finishBtw.promise;
-    btwCommand = harness.service.handleInbound(inbound({
+    btwCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId: "btw-retain-question",
       text: "/btw finish after the prompt",
@@ -261,7 +262,7 @@ test("a task can finish its prompt while BTW retains the worker and keeps later 
     await waitForStatus(harness.service, DM, (status) => status.state === "completed");
     expect(worker.stopped).toBe(false);
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "btw-followup-queued",
       text: "follow-up waits for the BTW request",
@@ -272,7 +273,7 @@ test("a task can finish its prompt while BTW retains the worker and keeps later 
     const bindingBeforeNew = await boundSession(harness, DM);
     const creationsBeforeNew = harness.workers.creations.length;
     let newCommandSettled = false;
-    newCommand = harness.service.handleInbound(inbound({
+    newCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId: "btw-followup-new",
       text: "/new",
@@ -317,7 +318,7 @@ test("a failed BTW is visible but leaves its main task able to complete", async 
     },
   });
   try {
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "btw-failure-primary",
       text: "main task while native BTW fails",
@@ -327,7 +328,7 @@ test("a failed BTW is visible but leaves its main task able to complete", async 
       throw new Error("private native RPC detail");
     };
     const replyStart = sentTo(harness, DM).length;
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "btw-failure-question",
       text: "/btw ask while the task is held",
@@ -361,7 +362,7 @@ test("idle BTW opens only the currently bound session and does not create a task
     const promptCount = harness.workers.prompts.length;
     const creationCount = harness.workers.creations.length;
     const question = "use exactly the existing session";
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "btw-idle-exact-session",
       text: `/btw ${question}`,
@@ -404,13 +405,13 @@ test("BTW refuses a task that has not reached its first prompt instead of waitin
   let taskCommand: Promise<void> | undefined;
   let btwCommand: Promise<void> | undefined;
   try {
-    taskCommand = harness.service.handleInbound(inbound({
+    taskCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId: "btw-startup-primary",
       text: "task waits while creating its worker",
     }));
     await creationStarted.promise;
-    btwCommand = harness.service.handleInbound(inbound({
+    btwCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId,
       text: `/btw ${question}`,
@@ -449,11 +450,15 @@ test("BTW refuses a replacement session if the binding changes during task clean
   try {
     await prepareBoundSession(harness);
     const originalBinding = await boundBinding(harness, DM);
-    await harness.service.handleInbound(inbound({
+    const replacementMessage = inbound({
       ...DM,
       messageId: "btw-race-create-replacement",
       text: "/new",
-    }));
+    });
+    await harness.service.submitInbound(replacementMessage);
+    await waitForIngressJob(harness, replacementMessage, {
+      description: "replacement /new outcome before the cleanup race",
+    });
     const replacementBinding = await boundBinding(harness, DM);
     const restoreBinding = await openChannelStore(harness.stateDir);
     try {
@@ -468,7 +473,7 @@ test("BTW refuses a replacement session if the binding changes during task clean
       await releaseStop.promise;
     };
     const promptCount = harness.workers.prompts.length;
-    taskCommand = harness.service.handleInbound(inbound({
+    taskCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId: "btw-race-primary",
       text: "finish while cleanup is held",
@@ -480,7 +485,7 @@ test("BTW refuses a replacement session if the binding changes during task clean
     const question = "stay on the originally requested session";
     const messageId = "btw-race-question";
     const replyStart = sentTo(harness, DM).length;
-    btwCommand = harness.service.handleInbound(inbound({
+    btwCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId,
       text: `/btw ${question}`,
@@ -515,7 +520,7 @@ test("BTW refuses a replacement session if the binding changes during task clean
 test("BTW without a binding gives a visible refusal instead of creating a session", async () => {
   const harness = await createCoreHarness();
   try {
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "btw-no-binding",
       text: "/btw answer from the current conversation",
@@ -536,7 +541,7 @@ test("empty BTW argument shows usage without dispatching a worker request", asyn
     await prepareBoundSession(harness);
     const promptCount = harness.workers.prompts.length;
     const replyStart = sentTo(harness, DM).length;
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "btw-empty-argument",
       text: "/btw",
@@ -567,14 +572,14 @@ test("duplicate BTW delivery is ignored and a concurrent BTW is visibly refused"
       text: "/btw first unique question",
     });
     const firstReplyStart = sentTo(harness, DM).length;
-    const firstCommand = harness.service.handleInbound(first);
+    const firstCommand = harness.service.submitInbound(first);
     await waitForBtwCall(harness);
 
-    await harness.service.handleInbound(first);
+    await harness.service.submitInbound(first);
     expect(harness.workers.btwCalls).toHaveLength(1);
 
     const secondReplyStart = sentTo(harness, DM).length;
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...DM,
       messageId: "btw-concurrent-second",
       text: "/btw second unique question",
@@ -611,7 +616,7 @@ test("only an owner in an allowed, mentioned group can invoke BTW", async () => 
     await prepareBoundSession(harness, GROUP);
     const promptCount = harness.workers.prompts.length;
     const question = "allowed owner group question";
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...GROUP,
       messageId: "btw-owner-mentioned-group",
       mentionedUserIds: [harness.bot.uid],
@@ -633,7 +638,7 @@ test("only an owner in an allowed, mentioned group can invoke BTW", async () => 
       text: "/btw member question",
     });
     const memberReplyStart = sentTo(harness, GROUP).length;
-    await harness.service.handleInbound(member);
+    await harness.service.submitInbound(member);
     const ownerNotice = await waitForSentText(
       harness,
       GROUP,
@@ -642,7 +647,7 @@ test("only an owner in an allowed, mentioned group can invoke BTW", async () => 
     );
     expect(ownerNotice).toMatch(/owner|所有者/);
 
-    await harness.service.handleInbound(inbound({
+    await harness.service.submitInbound(inbound({
       ...GROUP,
       messageId: "btw-owner-no-mention",
       text: "/btw not mentioned",
@@ -654,7 +659,7 @@ test("only an owner in an allowed, mentioned group can invoke BTW", async () => 
       mentionedUserIds: [harness.bot.uid],
       text: "/btw unlisted group",
     });
-    await harness.service.handleInbound(deniedGroup);
+    await harness.service.submitInbound(deniedGroup);
 
     expect(harness.workers.btwCalls).toHaveLength(1);
     expect(harness.workers.prompts).toHaveLength(promptCount);
@@ -690,7 +695,7 @@ for (const command of ["/cancel", "/stop", "/interrupt"] as const) {
         throw new Error("native BTW request cancelled");
       };
       const replyStart = sentTo(harness, DM).length;
-      btwCommand = harness.service.handleInbound(inbound({
+      btwCommand = harness.service.submitInbound(inbound({
         ...DM,
         messageId: `btw-cancel-${command}`,
         text: "/btw hold until cancelled",
@@ -699,7 +704,7 @@ for (const command of ["/cancel", "/stop", "/interrupt"] as const) {
       await btwStarted.promise;
       const worker = harness.workers.workers.at(-1)!;
 
-      cancelCommand = harness.service.handleInbound(inbound({
+      cancelCommand = harness.service.submitInbound(inbound({
         ...DM,
         messageId: `btw-cancel-command-${command}`,
         text: command,
@@ -742,7 +747,7 @@ test("service shutdown aborts an idle BTW so inbound work can drain", async () =
       if (!signal.aborted) return "must not be delivered after shutdown";
       throw new Error("native BTW request stopped with the service");
     };
-    btwCommand = harness.service.handleInbound(inbound({
+    btwCommand = harness.service.submitInbound(inbound({
       ...DM,
       messageId: "btw-service-shutdown",
       text: "/btw hold until shutdown",

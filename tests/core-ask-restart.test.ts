@@ -2,10 +2,10 @@ import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
-import type { BotCardAction, ChatTarget } from "../src/contracts";
-import { createQuestionDesk } from "../src/questions";
+import type { BotCardAction, ChatTarget, InboundMessage } from "../src/contracts";
+import { createQuestionDesk, type QuestionDesk } from "../src/questions";
 import { openChannelStore, type ChannelStore } from "../src/store";
-import type { TaskRecord } from "../src/store/store-records.ts";
+import type { InboundClaim, OutboxInsert, TaskRecord } from "../src/store/store-records.ts";
 import {
   FakeTransport,
   type CoreHarness,
@@ -74,7 +74,7 @@ async function interruptAsk(
   let questionIds: string[] = [];
   let cardMessageId: string | null = null;
   try {
-    await harness.service.handleInbound(
+    await harness.service.submitInbound(
       inbound({ messageId: "restart-ask", ...TARGET, text: "ask the owner" }),
     );
     await harness.workers.waitForPromptCount(1);
@@ -95,7 +95,9 @@ async function interruptAsk(
 
 interface DeskRecord {
   readonly texts: Array<{ target: ChatTarget; text: string; taskId: string | null }>;
-  readonly wakes: Array<{ target: ChatTarget; text: string }>;
+  readonly wakes: Array<{ target: ChatTarget; text: string; taskId?: string }>;
+  readonly persistedNotices: Array<{ id: string; messageId: string }>;
+  readonly notices: Array<{ id: string; target: ChatTarget; text: string }>;
   readonly stops: string[];
   /** 每次停回合交出的待取消旧问题行：服务侧本应与停止意图写进同一事务。 */
   readonly stopIntents: Array<{ taskId: string; ids: readonly string[] }>;
@@ -108,7 +110,7 @@ function resumeDesk(
 ) {
   const transport = options.transport ?? new FakeTransport({ bot: { uid: BOT_UID, name: "Fixture Bot" } });
   transport.cardSupported = true;
-  const record: DeskRecord = { texts: [], wakes: [], stops: [], stopIntents: [] };
+  const record: DeskRecord = { texts: [], wakes: [], persistedNotices: [], notices: [], stops: [], stopIntents: [] };
   const desk = createQuestionDesk({
     store,
     transport,
@@ -117,16 +119,107 @@ function resumeDesk(
     enqueueText: (target, text, taskId) => {
       record.texts.push({ target, text, taskId });
     },
+    persistWakeTurn: (message, text, sourceId) => {
+      const taskId = `ask-wake:${sourceId}`;
+      const messageId = `answer:${taskId}`;
+      const senderId = store.getOwnerId(BOT_UID)?.trim() || BOT_UID;
+      const binding = store.getBinding(BOT_UID, message);
+      if (binding === null) throw new Error("question wake has no durable session binding");
+      const task: TaskRecord = {
+        id: taskId,
+        botUid: BOT_UID,
+        channelId: message.channelId,
+        channelType: message.channelType,
+        messageId,
+        senderId,
+        text,
+        sessionId: binding.sessionId,
+        cwd: binding.cwd,
+        state: "queued",
+        resultText: null,
+        errorText: null,
+        messageSeq: message.messageSeq,
+        historyEligible: true,
+        relaySuppressed: false,
+      };
+      const claim: InboundClaim = {
+        botUid: BOT_UID,
+        target: message,
+        messageId,
+        senderId,
+        text,
+        supported: true,
+        kind: "task",
+      };
+      const existing = store.getTask(taskId);
+      if (existing === null && !store.acceptTask(claim, task)) {
+        throw new Error("question wake task could not be durably accepted");
+      }
+      const persisted = store.getTask(taskId);
+      if (
+        persisted === null
+        || persisted.botUid !== BOT_UID
+        || persisted.channelType !== message.channelType
+        || persisted.channelId !== message.channelId
+        || persisted.messageId !== messageId
+        || persisted.text !== text
+      ) {
+        throw new Error("stable question wake identity conflicts with different task");
+      }
+      return taskId;
+    },
+    publishWakeTurn: (taskId) => {
+      const task = store.getTask(taskId);
+      if (task === null) throw new Error("durable question wake task disappeared before publication");
+      record.wakes.push({
+        target: { channelType: task.channelType, channelId: task.channelId },
+        text: task.text,
+        taskId,
+      });
+    },
+    persistNotice: (message, text, sourceId) => {
+      const id = `ask-notice:${sourceId}`;
+      const existing = store.getOutbox(id);
+      if (existing === null) {
+        const notice: OutboxInsert = {
+          id,
+          botUid: BOT_UID,
+          channelType: message.channelType,
+          channelId: message.channelId,
+          taskId: null,
+          kind: "text",
+          text,
+          path: null,
+          fileKind: null,
+          clientMsgNo: `${id}:client`,
+        };
+        store.enqueueOutbox(notice);
+      } else if (
+        existing.botUid !== BOT_UID
+        || existing.channelType !== message.channelType
+        || existing.channelId !== message.channelId
+        || existing.kind !== "text"
+        || existing.taskId !== null
+        || existing.text !== text
+      ) {
+        throw new Error("stable question notice identity conflicts with different content");
+      }
+      record.persistedNotices.push({ id, messageId: message.messageId });
+      return id;
+    },
+    publishNotice: (message) => {
+      for (const effect of record.persistedNotices) {
+        if (effect.messageId !== message.messageId || record.notices.some(({ id }) => id === effect.id)) continue;
+        const notice = store.getOutbox(effect.id);
+        if (notice === null) throw new Error("durable question notice disappeared before publication");
+        record.notices.push({
+          id: notice.id,
+          target: { channelType: notice.channelType, channelId: notice.channelId },
+          text: notice.text ?? "",
+        });
+      }
+    },
     operationSet: () => {},
-    commandClaim: (message) => ({
-      botUid: BOT_UID,
-      target: message,
-      messageId: message.messageId,
-      senderId: message.senderId,
-      text: message.text,
-      supported: message.supported,
-      kind: "command",
-    }),
     askTimeoutMs: () => options.timeoutMs ?? 600_000,
     displayNames: async (uids) => new Map(uids.map((uid) => [uid, uid])),
     stopTurnForQuestion: (taskId, cancelQuestionIds) => {
@@ -139,6 +232,18 @@ function resumeDesk(
     memberAnswerAllowed: () => false,
   });
   return { desk, transport, record };
+}
+
+async function consumeCurrentText(
+  desk: QuestionDesk,
+  message: InboundMessage,
+  text: string,
+): Promise<boolean> {
+  const snapshot = desk.captureTextRoute(message);
+  if (snapshot.kind === "none") return false;
+  const prepared = desk.prepareTextSnapshot(message, text, snapshot);
+  if (!prepared.persist()) return false;
+  return prepared.publishAfterCommit() !== "none";
 }
 
 /** 恢复端的任务行：同一个聊天最后持久接受的那个。 */
@@ -228,7 +333,8 @@ test("恢复端重挂后普通回复即答案，且不另起回合", async () =>
     desk.beginRecovery(task.id);
     const call = desk.askQuestions(task, TARGET, args(SINGLE), new AbortController().signal);
 
-    const answered = await desk.answerPendingQuestion(
+    const answered = await consumeCurrentText(
+      desk,
       inbound({ messageId: "restart-reply", ...TARGET, text: "2" }),
       "2",
     );
@@ -250,7 +356,8 @@ test("停机窗口内的答复由认领方消费，且同一身份只消费一�
     desk.beginRecovery(task.id);
 
     // 续跑的 ask 还没重挂：这条答复不能另起一个回合，它属于即将认领这行的那次调用。
-    const answered = await desk.answerPendingQuestion(
+    const answered = await consumeCurrentText(
+      desk,
       inbound({ messageId: "restart-race", ...TARGET, text: "2" }),
       "2",
     );
@@ -287,13 +394,22 @@ test("停机窗口内的答复在任务收束时补投新回合", async () => {
     const { desk, record } = resumeDesk(store);
     desk.beginRecovery(task.id);
     // 答复在续跑 ask 重挂之前落地：先不另起回合，等认领。
-    await desk.answerPendingQuestion(inbound({ messageId: "restart-orphan", ...TARGET, text: "2" }), "2");
+    await consumeCurrentText(desk, inbound({ messageId: "restart-orphan", ...TARGET, text: "2" }), "2");
     expect(record.wakes).toHaveLength(0);
     // 续跑回合始终没来认领就收束：这时补投，答复与署名都不会丢。
     desk.rejectForTask(task.id, new Error("task finished"));
     expect(record.wakes).toHaveLength(1);
     expect(record.wakes[0]?.text).toContain("production");
     expect(record.wakes[0]?.text).toContain(OWNER);
+    const wakeTaskId = record.wakes[0]?.taskId;
+    expect(wakeTaskId).toBeDefined();
+    expect(store.getTask(wakeTaskId!)).toMatchObject({
+      botUid: BOT_UID,
+      channelType: TARGET.channelType,
+      channelId: TARGET.channelId,
+      text: record.wakes[0]?.text,
+      state: "queued",
+    });
     expect(store.getQuestion(rowId)?.state).toBe("answered");
   });
 });
@@ -301,9 +417,11 @@ test("停机窗口内的答复在任务收束时补投新回合", async () => {
 test("显式 /cancel 的问题在重启后仍是终态，不被认领复活", async () => {
   const interrupted = await interruptAsk(SINGLE, {
     beforeStop: async (harness) => {
-      await harness.service.handleInbound(
+      await harness.service.submitInbound(
         inbound({ messageId: "restart-cancel", ...TARGET, text: "/cancel" }),
       );
+      await harness.transport.waitForCardEdit(({ messageId, frame }) =>
+        messageId === harness.transport.sentCards[0]?.messageId && JSON.stringify(frame.card).includes("任务已取消"));
     },
   });
   await withStore(interrupted, async (store) => {
@@ -568,7 +686,7 @@ test("重复执行认回窗口里的答复后，任务收束时不再补投", as
     const { desk, record } = resumeDesk(store);
     desk.beginRecovery(task.id);
     // 答复在重挂之前落地：先不另起回合，留给这次执行认领。
-    await desk.answerPendingQuestion(inbound({ messageId: "restart-window-replay", ...TARGET, text: "2" }), "2");
+    await consumeCurrentText(desk, inbound({ messageId: "restart-window-replay", ...TARGET, text: "2" }), "2");
     expect(record.wakes).toHaveLength(0);
     const call = desk.askQuestions(task, TARGET, args(SINGLE), new AbortController().signal, "call-window-replay");
     expect(answers(await call)).toEqual([
@@ -594,7 +712,7 @@ test("重复执行的等待超时后，待答行不被收束关闭，迟到答�
     expect(store.getQuestion(rowId)?.state).toBe("pending");
     desk.rejectForTask(task.id, new Error("task finished"));
     expect(store.getQuestion(rowId)?.state).toBe("pending");
-    await desk.answerPendingQuestion(inbound({ messageId: "restart-late-replay", ...TARGET, text: "2" }), "2");
+    await consumeCurrentText(desk, inbound({ messageId: "restart-late-replay", ...TARGET, text: "2" }), "2");
     expect(record.wakes).toHaveLength(1);
   });
 });
@@ -673,7 +791,7 @@ test("重启窗口里被答复后 /cancel：不再补投任何新回合", async 
     const { desk, record } = resumeDesk(store);
     desk.beginRecovery(task.id);
     // 答复在续跑 ask 重挂之前落地（先不另起回合）。
-    await desk.answerPendingQuestion(inbound({ messageId: "restart-cancel-window", ...TARGET, text: "2" }), "2");
+    await consumeCurrentText(desk, inbound({ messageId: "restart-cancel-window", ...TARGET, text: "2" }), "2");
     expect(record.wakes).toHaveLength(0);
     // 显式取消：该聊天的恢复快照全部作废，已答复的行也不该被补投。
     desk.cancelForTarget(TARGET);
@@ -822,6 +940,8 @@ test("提问超时把未认领的旧问题交给服务落库：A 按迟到提交
       .slice(editsBefore)
       .filter(({ messageId }) => messageId === interrupted.cardMessageId);
     expect(aEdits).toEqual([]);
+    // A's ended-row answer already became a late-answer task; the stale recovery snapshot must not wake it again.
+    expect(record.wakes).toEqual([]);
   });
 });
 
@@ -969,7 +1089,8 @@ test("Store 已按终态取消的提问，卡片仍要被收尾关闭", async ()
     const edit = await transport.waitForCardEdit(({ messageId }) => messageId === interrupted.cardMessageId);
     expect(JSON.stringify(edit.frame.card)).toContain("任务已结束");
     // 已取消的行不因任务收尾复活：文字回复不会把自己当成它的答案（卡片提交按迟答复分流）。
-    const answered = await desk.answerPendingQuestion(
+    const answered = await consumeCurrentText(
+      desk,
       inbound({ messageId: "store-cancelled", ...TARGET, text: "2" }),
       "2",
     );
@@ -991,7 +1112,8 @@ test("恢复后没有重发 ask 就收束的任务不留幽灵接收者", async 
     const edit = await transport.waitForCardEdit(({ messageId }) => messageId === interrupted.cardMessageId);
     expect(JSON.stringify(edit.frame.card)).toContain("任务已结束");
     // 下一条用户文本因此不会被当成旧问题的答案。
-    const answered = await desk.answerPendingQuestion(
+    const answered = await consumeCurrentText(
+      desk,
       inbound({ messageId: "restart-ghost", ...TARGET, text: "换一个任务" }),
       "换一个任务",
     );
@@ -1012,7 +1134,7 @@ test("认领后超时的等待保持待答，迟到答复仍唤醒回合", async
     // 超时停住回合后任务收束，但认领过的等待不被关闭：owner 之后的答复唤醒新回合。
     desk.rejectForTask(task.id, new Error("task finished"));
     expect(store.getQuestion(rowId)?.state).toBe("pending");
-    await desk.answerPendingQuestion(inbound({ messageId: "restart-late", ...TARGET, text: "2" }), "2");
+    await consumeCurrentText(desk, inbound({ messageId: "restart-late", ...TARGET, text: "2" }), "2");
     expect(record.wakes).toHaveLength(1);
   });
 });
