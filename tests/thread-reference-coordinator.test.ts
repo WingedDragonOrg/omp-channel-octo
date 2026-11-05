@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { ChatTarget } from "../src/contracts.ts";
 import { ThreadReferenceCoordinator } from "../src/references/thread-references.ts";
 import type { ReferenceEvidence, ReferenceJudgment, ThreadReference } from "../src/references/types.ts";
-import { openChannelStore, type ChannelStore } from "../src/store/index.ts";
+import { openChannelStore, type ChannelStore, type ReferenceHistorySnapshot } from "../src/store/index.ts";
 
 const botUid = "reference-coordinator-bot";
 const url = "https://github.com/acme/service/pull/17";
@@ -66,6 +66,71 @@ async function fixture() {
   const store = await openChannelStore(root);
   return { root, store };
 }
+
+test("freezes accepted evidence before a delayed background load and uses its history snapshot", async () => {
+  const { root, store } = await fixture();
+  const tracked = trackedStore(store);
+  const held = holdJudge();
+  const chat = target("acceptance-snapshot");
+  const contextReadStarted = Promise.withResolvers<void>();
+  const releaseContextRead = Promise.withResolvers<void>();
+  let capturedSnapshot: ReferenceHistorySnapshot | undefined;
+  const historySnapshots: Array<ReferenceHistorySnapshot | undefined> = [];
+  const snapshotStore = {
+    ...tracked.api,
+    captureReferenceHistorySnapshot: (uid: string, target: ChatTarget) => {
+      capturedSnapshot = store.captureReferenceHistorySnapshot(uid, target);
+      return capturedSnapshot;
+    },
+    listReferenceHistory: (
+      _uid: string,
+      _target: ChatTarget,
+      _candidateUrls: readonly string[],
+      snapshot?: ReferenceHistorySnapshot,
+    ) => {
+      historySnapshots.push(snapshot);
+      return [];
+    },
+  };
+  const coordinator = new ThreadReferenceCoordinator({
+    store: snapshotStore,
+    botUid: () => botUid,
+    judge: held.judge,
+    loadThreadContext: async () => {
+      contextReadStarted.resolve();
+      await releaseContextRead.promise;
+      return { description: "The accepted thread background." };
+    },
+  });
+  try {
+    const acceptedText = `ACCEPTED_REQUIREMENT: review the service change using ${url}`;
+    const laterSameTaskText = "LATER_SAME_TASK_ADDENDUM must not alter the already accepted candidate snapshot.";
+    const laterUnrelatedText = "LATER_UNRELATED_TASK must not enter the earlier candidate snapshot.";
+    coordinator.observeUser(chat, "accepted-message", acceptedText, "accepted-task");
+    await contextReadStarted.promise;
+
+    expect(capturedSnapshot).toBeDefined();
+    coordinator.observeUser(chat, "later-same-task-message", laterSameTaskText, "accepted-task");
+    coordinator.observeUser(chat, "later-unrelated-message", laterUnrelatedText, "later-task");
+    releaseContextRead.resolve();
+    await flushBackgroundWork();
+
+    expect(held.calls).toHaveLength(1);
+    const evidence = held.calls[0]!.evidence;
+    expect(evidence.task).toContain("ACCEPTED_REQUIREMENT");
+    expect(evidence.task).not.toContain("LATER_SAME_TASK_ADDENDUM");
+    expect(evidence.task).not.toContain("LATER_UNRELATED_TASK");
+    expect(evidence.recent.map(({ text }) => text)).toEqual([acceptedText]);
+    expect(historySnapshots).toEqual([capturedSnapshot]);
+  } finally {
+    releaseContextRead.resolve();
+    await coordinator.stop();
+    for (const pending of held.pending) pending.resolve([]);
+    await flushBackgroundWork();
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("captures role-preserving sanitized snapshots and does not deduplicate separate messages by URL", async () => {
   const { root, store } = await fixture();

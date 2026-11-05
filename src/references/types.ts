@@ -15,10 +15,18 @@ export interface ReferenceCandidate extends ThreadReference {
   excerpt: string;
 }
 
+export interface MatchedReferenceHistory {
+  candidateId: string;
+  url: string;
+  taskRequirement: string;
+  reportExcerpt: string;
+}
+
 export interface ReferenceEvidence {
   thread: string;
   task: string;
   recent: readonly { role: "user" | "assistant"; text: string }[];
+  matchedHistory?: readonly MatchedReferenceHistory[];
   candidates: readonly ReferenceCandidate[];
 }
 

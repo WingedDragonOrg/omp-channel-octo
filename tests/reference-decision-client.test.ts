@@ -184,6 +184,38 @@ for (const protocol of ["typesafe-systemone", "openai-decisions"] as const) {
   });
 }
 
+test("instructions allow a current follow-up to match a same-thread delivery report without promoting history alone", async () => {
+  const fixture = startFixture(request => Response.json({
+    answers: openAiAnswers(questionNames(request, true)),
+  }));
+  const source = evidence([candidate("candidate-17")]);
+  source.task = "Current status update: the earlier MR is merged; verify its follow-up.";
+  source.matchedHistory = [{
+    candidateId: "candidate-17",
+    url: source.candidates[0]!.url,
+    taskRequirement: "Prior accepted task: implement the service validation change.",
+    reportExcerpt: "Prior final report: implementation delivered in this same thread.",
+  }];
+  const judge = createReferenceJudge(config("openai-decisions", fixture.server.url.origin));
+
+  try {
+    await judge(source, new AbortController().signal);
+    const request = fixture.requests[0];
+    if (request === undefined) throw new Error("decision request did not reach localhost fixture");
+    const questions = bodyObject(request.body).questions;
+    if (!Array.isArray(questions)) throw new Error("native questions were not an array");
+    const instructions = bodyObject(questions[0]).instructions;
+    if (typeof instructions !== "string") throw new Error("candidate question omitted instructions");
+
+    expect(instructions).toContain("current status update");
+    expect(instructions).toContain("same-thread delivery report");
+    expect(instructions).toContain("follow-up");
+    expect(instructions).toContain("historical report or another task's result alone is not current work-object evidence");
+  } finally {
+    fixture.server.stop(true);
+  }
+});
+
 test("malformed, duplicate, refused, unknown and out-of-range answers omit only affected candidates", async () => {
   const ids = ["valid", "duplicate", "refused", "unknown-choice", "invalid-probability", "missing"];
   const fixture = startFixture((request) => {

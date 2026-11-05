@@ -1,5 +1,9 @@
 import { expect, test } from "bun:test";
-import { extractReferenceCandidates, sanitizeReferenceEvidence } from "../src/references/links.ts";
+import {
+  extractReferenceCandidates,
+  matchingReferenceCandidateUrls,
+  sanitizeReferenceEvidence,
+} from "../src/references/links.ts";
 import type { ReferenceEvidence } from "../src/references/types.ts";
 
 test("canonicalizes GitHub and nested GitLab references while stripping URL decoration", () => {
@@ -58,6 +62,24 @@ test("preserves owner and repository path case on self-hosted GitHub-compatible 
   expect(candidates.map(({ url }) => url)).toEqual([
     "https://git.example/Example/Service/pull/17",
   ]);
+});
+
+test("candidate matching scans sanitized text and canonicalizes detail URLs", () => {
+  const candidate = "https://git.example/acme/project/-/merge_requests/42";
+  expect(matchingReferenceCandidateUrls(
+    `https://git.example/acme/project/-/merge_requests/42/diffs?token=hidden`,
+    new Set([candidate]),
+  )).toEqual(new Set([candidate]));
+  expect(matchingReferenceCandidateUrls(
+    `ftp://files.example.invalid/${candidate}`,
+    new Set([candidate]),
+  )).toEqual(new Set());
+});
+
+test("trims long unmatched closing-parenthesis suffixes without losing the URL", () => {
+  const candidate = "https://git.example/acme/project/-/merge_requests/42";
+  const text = `${candidate}${")".repeat(10_000)}`;
+  expect(extractReferenceCandidates(text).map(({ url }) => url)).toEqual([candidate]);
 });
 
 test("sanitizes every evidence field without flattening roles, quotes, or line breaks", () => {

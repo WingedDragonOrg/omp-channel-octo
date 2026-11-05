@@ -67,6 +67,7 @@ import type {
   ChatAppendMode,
   ChatExecutionState,
   ChatTarget,
+  GroupContext,
   CommitResult,
   ContextInjection,
   PromptContext,
@@ -297,6 +298,7 @@ type RuntimeTask = {
   steerCallInFlight: boolean;
   /** Serializes each member lookup, sidecar publication and worker delivery in input order. */
   steerSerial: Promise<void>;
+  turnContextLoad?: Promise<GroupContext | null>;
   turnContext: TurnContext;
   agentContext?: AgentContext;
   stopActivity?: (abortProgress?: boolean) => void;
@@ -514,6 +516,12 @@ class CoreService implements ChannelService {
   private readonly outbox: Outbox;
   private readonly questions: QuestionDesk;
   private readonly threadReferences: ThreadReferenceCoordinator;
+  private readonly referenceContextWaiters = new Map<string, {
+    promise: Promise<GroupContext | null>;
+    resolve: (value: GroupContext | null) => void;
+    reject: (reason?: unknown) => void;
+    consumers: number;
+  }>();
   /** 回答署名的显示名缓存：uid → 人名，有界、失败即回退（署名渲染用，不参与身份判断）。 */
   private readonly displayNames: DisplayNameCache;
   /** Bot 事件队列消费（卡片点击）。 */
@@ -560,6 +568,7 @@ class CoreService implements ChannelService {
     this.threadReferences = new ThreadReferenceCoordinator({
       store: this.store,
       botUid: () => this.bot?.uid,
+      loadThreadContext: (target, taskId, signal) => this.loadReferenceThreadContext(target, taskId, signal),
       ...(options.config.decisions?.enabled === true
         ? { judge: createReferenceJudge(options.config.decisions, options.decisionsFetch) }
         : {}),
@@ -1378,13 +1387,92 @@ class CoreService implements ChannelService {
     if (this.stopping) throw new InboundShutdownError();
   }
 
+  private async loadReferenceThreadContext(
+    target: ChatTarget,
+    taskId: string | undefined,
+    signal: AbortSignal,
+  ): Promise<{ description: string; name?: string } | null> {
+    if (signal.aborted) throw signal.reason ?? new DOMException("Thread context load aborted", "AbortError");
+    const runtime = taskId === undefined ? undefined : this.runtimes.get(taskId);
+    let context: GroupContext | null;
+    if (runtime?.turnContextLoad) {
+      context = await runtime.turnContextLoad;
+    } else {
+      let task: TaskRecord | null = null;
+      if (taskId !== undefined) {
+        try {
+          task = this.store.getTask(taskId);
+        } catch {
+          // A read failure leaves the transport context as the bounded fallback.
+        }
+      }
+      if (
+        taskId !== undefined
+        && task !== null
+        && task.botUid === this.bot?.uid
+        && task.channelType === target.channelType
+        && task.channelId === target.channelId
+        && (task.state === "queued" || task.state === "running")
+      ) {
+        context = await this.waitForReferenceThreadContext(taskId, signal);
+      } else {
+        context = await this.options.transport.getGroupContext(target, signal);
+      }
+    }
+    if (signal.aborted) throw signal.reason ?? new DOMException("Thread context load aborted", "AbortError");
+    let name: string | undefined;
+    const botUid = this.bot?.uid;
+    if (botUid !== undefined) {
+      try {
+        name = this.store.getThreadListen(botUid, target)?.threadName ?? undefined;
+      } catch {
+        // Thread metadata is optional; a background lookup failure must not fail the chat.
+      }
+    }
+    return {
+      description: context?.present ? context.content : "",
+      ...(name === undefined ? {} : { name }),
+    };
+  }
+
+  private async waitForReferenceThreadContext(taskId: string, signal: AbortSignal): Promise<GroupContext | null> {
+    let waiter = this.referenceContextWaiters.get(taskId);
+    if (!waiter) {
+      const deferred = Promise.withResolvers<GroupContext | null>();
+      waiter = { ...deferred, consumers: 0 };
+      this.referenceContextWaiters.set(taskId, waiter);
+    }
+    waiter.consumers += 1;
+    const aborted = Promise.withResolvers<never>();
+    const onAbort = (): void => {
+      aborted.reject(signal.reason ?? new DOMException("Thread context load aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    try {
+      return await Promise.race([waiter.promise, aborted.promise]);
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      waiter.consumers -= 1;
+      if (waiter.consumers === 0 && this.referenceContextWaiters.get(taskId) === waiter) {
+        this.referenceContextWaiters.delete(taskId);
+      }
+    }
+  }
+
   private observeUserReference(message: InboundMessage, taskId: string): void {
     if (this.options.config.decisions?.enabled !== true || message.channelType !== 5) return;
     const quotedText = message.quoted?.text;
     const evidenceText = quotedText && quotedText.length > 0
       ? `[引用]\n${quotedText}\n\n${message.text}`
       : message.text;
-    this.threadReferences.observeUser(message, message.messageId, evidenceText, taskId);
+    this.threadReferences.observeUser(
+      message,
+      message.messageId,
+      evidenceText,
+      taskId,
+      quotedText && quotedText.length > 0 ? message.text : undefined,
+    );
   }
 
   private observeAssistantReference(
@@ -9535,7 +9623,11 @@ class CoreService implements ChannelService {
     runtime.rollProgressCard = () => progress.roll();
 
     try {
-      const threadContext = await turnContext.load(task.sessionId);
+      const contextLoad = turnContext.load(task.sessionId);
+      runtime.turnContextLoad = contextLoad;
+      const waiter = this.referenceContextWaiters.get(taskId);
+      if (waiter) void contextLoad.then(waiter.resolve, waiter.reject);
+      const threadContext = await contextLoad;
       if (this.options.config.decisions?.enabled === true && target.channelType === 5) {
         const threadName = this.store.getThreadListen(this.bot!.uid, target)?.threadName;
         const description = threadContext?.content ?? "";

@@ -7,7 +7,7 @@ import type { ChannelService, ChannelStatus, ChatTarget, InboundMessage } from "
 import { WorkerSteerRejectedError } from "../src/contracts.ts";
 import { createChannelService } from "../src/service.ts";
 import { parseConfig, toCoreConfig } from "../src/runtime/config.ts";
-import type { DecisionFetch, ThreadReferences } from "../src/references/types.ts";
+import type { DecisionFetch, MatchedReferenceHistory, ReferenceEvidence, ThreadReferences } from "../src/references/types.ts";
 import { createOutboxDelivery } from "../src/outbox.ts";
 import { openChannelStore } from "../src/store/index.ts";
 import {
@@ -18,6 +18,8 @@ import {
   inbound,
   waitForIngressJob,
 } from "./fixtures/core-fakes.ts";
+
+type HistoricalDecisionEvidence = ReferenceEvidence & { matchedHistory: readonly MatchedReferenceHistory[] };
 
 const target = { channelType: 5 as const, channelId: "group-tools____references" };
 const canonical = "https://github.com/example/service/pull/17";
@@ -1391,6 +1393,7 @@ test("quoted text retains neutral provenance without sender or quoted attachment
     await waitForSignal(requested.promise, "quoted-text reference decision request");
     expect(requests).toHaveLength(1);
     const evidence = evidenceFrom(requests[0]!);
+    expect(evidence.recent).toHaveLength(1);
     expect(evidence.recent).toMatchObject([{
       role: "user",
       text: `[引用]\n${quoteText}\n\n${ownText}`,
@@ -1417,6 +1420,414 @@ test("quoted text retains neutral provenance without sender or quoted attachment
     expect(info).toMatchObject({ references: { mr: [], pr: [] } });
   } finally {
     await service.stop();
+    server.stop(true);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("reopened reference judging restores exact-MR requirements and complete reports without sibling or near-match history", async () => {
+  const root = await mkdtemp(join(tmpdir(), "oco-reference-history-reopen-"));
+  const stateDir = join(root, "state");
+  await mkdir(stateDir);
+  const sibling = { channelType: 5 as const, channelId: "group-tools____reference-sibling" };
+  const urlA = "https://gitlab.example/group/service/-/merge_requests/41";
+  const urlB = "https://gitlab.example/group/service/-/merge_requests/42";
+  const urlC = "https://gitlab.example/group/service/-/merge_requests/43";
+  const urlD = "https://gitlab.example/group/service/-/merge_requests/44";
+  const similarUrl = "https://gitlab.example/group/service/-/merge_requests/410";
+  const failedDecisionUrl = "https://gitlab.example/group/service/-/merge_requests/99";
+  const noRestartMarker = "NO_RESTART_CANDIDATE_LIST";
+  const postRestartMarker = "POST_RESTART_CANDIDATE_LIST";
+  const initialBackground = "INITIAL_THREAD_BACKGROUND: keep the parser migration compatible.";
+  const postRestartBackground = "POST_RESTART_THREAD_BACKGROUND: the compatibility report is authoritative.";
+  const requirementA = "PRIMARY_REQUIREMENT_41_BEGIN implement nested YAML validation without accepting aliases PRIMARY_REQUIREMENT_41_END";
+  const reportA = `PRIMARY_FULL_REPORT_41_BEGIN checked nested aliases and added regression coverage PRIMARY_FULL_REPORT_41_END ${urlA}/diffs?token=fixture-private-token`;
+  const requirementB = "PRIMARY_REQUIREMENT_42_BEGIN migrate the parser while preserving the public validation contract PRIMARY_REQUIREMENT_42_END";
+  const reportB = `PRIMARY_FULL_REPORT_42_BEGIN verified parser compatibility and recorded the changed contract PRIMARY_FULL_REPORT_42_END ${urlB}/diffs`;
+  const requirementC = "PRIMARY_REQUIREMENT_43_BEGIN add a focused regression around malformed project metadata PRIMARY_REQUIREMENT_43_END";
+  const reportC = `PRIMARY_FULL_REPORT_43_BEGIN exercised malformed metadata and documented the expected behavior PRIMARY_FULL_REPORT_43_END ${urlC}/diffs`;
+  const requirementD = "PRIMARY_REQUIREMENT_44_BEGIN add a focused regression for unsupported project metadata PRIMARY_REQUIREMENT_44_END";
+  const reportD = `PRIMARY_FULL_REPORT_44_BEGIN checked unsupported metadata and preserved the parser contract PRIMARY_FULL_REPORT_44_END ${urlD}/diffs`;
+  const requiredHistoryByUrl: Record<string, {
+    taskRequirement: string;
+    reportStart: string;
+    reportEnd: string;
+    background: string;
+    requestMarker: string;
+  }> = {
+    [urlA]: {
+      taskRequirement: requirementA,
+      reportStart: "PRIMARY_FULL_REPORT_41_BEGIN",
+      reportEnd: "PRIMARY_FULL_REPORT_41_END",
+      background: postRestartBackground,
+      requestMarker: postRestartMarker,
+    },
+    [urlB]: {
+      taskRequirement: requirementB,
+      reportStart: "PRIMARY_FULL_REPORT_42_BEGIN",
+      reportEnd: "PRIMARY_FULL_REPORT_42_END",
+      background: postRestartBackground,
+      requestMarker: postRestartMarker,
+    },
+    [urlC]: {
+      taskRequirement: requirementC,
+      reportStart: "PRIMARY_FULL_REPORT_43_BEGIN",
+      reportEnd: "PRIMARY_FULL_REPORT_43_END",
+      background: postRestartBackground,
+      requestMarker: postRestartMarker,
+    },
+    [urlD]: {
+      taskRequirement: requirementD,
+      reportStart: "PRIMARY_FULL_REPORT_44_BEGIN",
+      reportEnd: "PRIMARY_FULL_REPORT_44_END",
+      background: initialBackground,
+      requestMarker: noRestartMarker,
+    },
+  };
+  const similarRequirement = "SIMILAR_URL_REQUIREMENT_410 must never be attributed to merge request 41";
+  const similarReport = `SIMILAR_URL_REPORT_410 belongs only to the distinct numbered merge request ${similarUrl}`;
+  const siblingRequirement = "SIBLING_ONLY_REQUIREMENT_41 belongs to the neighboring discussion";
+  const siblingReport = `SIBLING_ONLY_REPORT_41 is from another subthread and must stay there ${urlA}`;
+  const unrelatedRequirement = "UNRELATED_TASK_REQUIREMENT must not become evidence for these merge requests";
+  const unrelatedReport = "UNRELATED_TASK_REPORT contains no merge request candidate";
+  const failureStarted = Promise.withResolvers<void>();
+  const releaseFailure = Promise.withResolvers<void>();
+  const failureFinished = Promise.withResolvers<void>();
+  const contextReadStarted = Promise.withResolvers<void>();
+  const releaseContextRead = Promise.withResolvers<void>();
+  const timeline: string[] = [];
+  const requests: Array<{ evidence: HistoricalDecisionEvidence }> = [];
+  const infoByTarget = new Map<string, unknown>();
+  let holdNextPrimaryContextRead = false;
+  let failureResponseSent = false;
+  let firstService: ChannelService | undefined;
+  let restartedService: ChannelService | undefined;
+
+  const transport = referenceTransport("history-reopen");
+  transport.setThreads("group-tools", [
+    threadRecord("references", "Primary reference thread"),
+    threadRecord("reference-sibling", "Sibling reference thread"),
+  ]);
+  transport.setGroupContext(target, { content: initialBackground, version: 1, updatedAt: null, updatedBy: "owner-1" });
+  transport.setGroupContext(sibling, { content: "SIBLING_ONLY_BACKGROUND", version: 1, updatedAt: null, updatedBy: "owner-1" });
+  const realGetGroupContext = transport.getGroupContext.bind(transport);
+  transport.getGroupContext = async readTarget => {
+    const delayed = holdNextPrimaryContextRead
+      && readTarget.channelType === target.channelType
+      && readTarget.channelId === target.channelId;
+    if (delayed) {
+      holdNextPrimaryContextRead = false;
+      timeline.push("context-read-started");
+      contextReadStarted.resolve();
+      await releaseContextRead.promise;
+    }
+    const context = await realGetGroupContext(readTarget);
+    if (delayed) timeline.push("context-read-completed");
+    return context;
+  };
+
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const body = await request.json() as Record<string, unknown>;
+      const evidence = evidenceFrom(body) as unknown as HistoricalDecisionEvidence;
+      const serialized = JSON.stringify(evidence);
+      const currentUserText = evidence.recent
+        .filter(message => message.role === "user")
+        .map(message => message.text)
+        .join("\n");
+      requests.push({ evidence });
+      if (serialized.includes(postRestartMarker)) timeline.push("post-restart-decision-requested");
+
+      if (evidence.candidates.some(candidate => candidate.url === failedDecisionUrl)) {
+        failureStarted.resolve();
+        await releaseFailure.promise;
+        failureResponseSent = true;
+        failureFinished.resolve();
+        return Response.json({ error: "fixture Decision service unavailable" }, { status: 503 });
+      }
+
+      const questions = body.questions as Array<{ name: string }>;
+      return Response.json({
+        model: "fixture-model",
+        answers: questions.map(question => {
+          const candidate = evidence.candidates.find(item => item.id === question.name);
+          const expected = candidate === undefined ? undefined : requiredHistoryByUrl[candidate.url];
+          const relatedHistory = evidence.matchedHistory.find(history =>
+            history.candidateId === question.name && history.url === candidate?.url,
+          );
+          const positive = candidate !== undefined
+            && expected !== undefined
+            && relatedHistory !== undefined
+            && relatedHistory.taskRequirement.includes(expected.taskRequirement)
+            && relatedHistory.reportExcerpt.includes(expected.reportStart)
+            && relatedHistory.reportExcerpt.includes(expected.reportEnd)
+            && relatedHistory.reportExcerpt.includes("[matched candidate URL omitted]")
+            && currentUserText.includes(expected.requestMarker)
+            && serialized.includes(expected.background);
+          const choice = positive ? "work_object" : "insufficient_evidence";
+          return {
+            name: question.name,
+            type: "choice",
+            choice,
+            confidence: positive ? 0.76 : 0.99,
+            probabilities: [
+              { value: "work_object", probability: positive ? 0.76 : 0.005 },
+              { value: "reference_or_unrelated", probability: positive ? 0.12 : 0.005 },
+              { value: "insufficient_evidence", probability: positive ? 0.12 : 0.99 },
+            ],
+          };
+        }),
+      });
+    },
+  });
+
+  const reportByPrompt: Record<string, string> = {
+    [requirementA]: reportA,
+    [requirementB]: reportB,
+    [requirementC]: reportC,
+    [similarRequirement]: similarReport,
+    [unrelatedRequirement]: unrelatedReport,
+    [siblingRequirement]: siblingReport,
+    [requirementD]: reportD,
+  };
+  const createWorkers = (): FakeWorkerFactory => new FakeWorkerFactory(async ({ text, emit, promptContext }) => {
+    if (text === "show references") {
+      const management = promptContext!.tools!.find(tool => tool.name === "octo_management")!;
+      const info: unknown = JSON.parse(await management.execute({ action: "thread-info" }, new AbortController().signal));
+      const channelId = threadInfoChannelId(info);
+      if (channelId === undefined) throw new Error("thread-info omitted its channel id");
+      infoByTarget.set(channelId, info);
+      return;
+    }
+    emit(assistantText(`history-${text}`, reportByPrompt[text] ?? "Fixture task completed.", true));
+  });
+  const createService = (workerFactory: FakeWorkerFactory) => createChannelService({
+    config: decisionsConfig(root),
+    transport,
+    workerFactory,
+    decisionsFetch: decisionFetchFor(server.url.origin),
+  });
+  const submitTask = (
+    service: ChannelService,
+    workers: FakeWorkerFactory,
+    chatTarget: ChatTarget,
+    messageId: string,
+    text: string,
+  ): Promise<void> => submitAndWaitForTask(service, workers, chatTarget, inbound({
+    ...chatTarget,
+    messageId,
+    text,
+    mentionedUserIds: [transport.bot.uid],
+  }));
+  const candidateRequestCount = (url: string): number => requests.filter(({ evidence }) =>
+    evidence.candidates.some(candidate => candidate.url === url),
+  ).length;
+  const waitForCandidateRequest = async (url: string, count: number): Promise<void> => {
+    await waitForCondition(
+      () => candidateRequestCount(url) >= count,
+      `Decision request for ${url} (${count})`,
+    );
+  };
+
+  const firstWorkers = createWorkers();
+  try {
+    const initialService = await createService(firstWorkers);
+    firstService = initialService;
+    await initialService.start();
+    await submitAndWaitForNew(initialService, target, inbound({
+      ...target,
+      messageId: "history-primary-bind",
+      text: `/new ${root}`,
+      mentionedUserIds: [transport.bot.uid],
+    }), root);
+    await submitAndWaitForNew(initialService, sibling, inbound({
+      ...sibling,
+      messageId: "history-sibling-bind",
+      text: `/new ${root}`,
+      mentionedUserIds: [transport.bot.uid],
+    }), root);
+
+    await submitTask(initialService, firstWorkers, target, "history-source-a", requirementA);
+    await waitForCandidateRequest(urlA, 1);
+    await submitTask(initialService, firstWorkers, target, "history-source-b", requirementB);
+    await waitForCandidateRequest(urlB, 1);
+    await submitTask(initialService, firstWorkers, target, "history-source-c", requirementC);
+    await waitForCandidateRequest(urlC, 1);
+    await submitTask(initialService, firstWorkers, target, "history-source-d", requirementD);
+    await waitForCandidateRequest(urlD, 1);
+    await submitTask(initialService, firstWorkers, target, "history-similar-source", similarRequirement);
+    await waitForCandidateRequest(similarUrl, 1);
+    await submitTask(initialService, firstWorkers, target, "history-unrelated-source", unrelatedRequirement);
+    await submitTask(initialService, firstWorkers, sibling, "history-sibling-source", siblingRequirement);
+    await waitForCandidateRequest(urlA, 2);
+
+    const failedMessage = inbound({
+      ...target,
+      messageId: "history-failing-decision",
+      text: `This failure must not block the chat: ${failedDecisionUrl}`,
+      mentionedUserIds: [transport.bot.uid],
+    });
+    await submitAndWaitForTask(initialService, firstWorkers, target, failedMessage);
+    await waitForSignal(failureStarted.promise, "held failing Decision request");
+    expect(failureResponseSent).toBe(false);
+    releaseFailure.resolve();
+    await waitForSignal(failureFinished.promise, "failing Decision response");
+
+    for (let index = 1; index <= 4; index += 1) {
+      await submitTask(initialService, firstWorkers, target, `history-age-before-${index}`, `age-before-${index}`);
+    }
+
+    const noRestartText = `${noRestartMarker}: continue the current thread work using ${urlD}`;
+    await submitTask(initialService, firstWorkers, target, "history-no-restart-candidate", noRestartText);
+    await waitForCandidateRequest(urlD, 2);
+    await waitForThreadInfo(
+      initialService,
+      firstWorkers,
+      target,
+      transport.bot.uid,
+      () => infoByTarget.get(target.channelId),
+      value => threadReferencesFrom(value)?.mr.includes(urlD) === true,
+    );
+    for (let index = 1; index <= 4; index += 1) {
+      await submitTask(initialService, firstWorkers, target, `history-age-after-${index}`, `age-after-${index}`);
+    }
+    await initialService.stop();
+    firstService = undefined;
+
+    const reopenedStore = await openChannelStore(stateDir);
+    try {
+      expect(reopenedStore.getThreadReferences(transport.bot.uid, target)).toEqual({ mr: [urlD], pr: [] });
+    } finally {
+      reopenedStore.close();
+    }
+
+    const restartedWorkers = firstWorkers;
+    const restarted = await createService(restartedWorkers);
+    restartedService = restarted;
+    await restarted.start();
+    await submitAndWaitForNew(restarted, target, inbound({
+      ...target,
+      messageId: "history-primary-rebind",
+      text: `/new ${root}`,
+      mentionedUserIds: [transport.bot.uid],
+    }), root);
+
+    transport.setGroupContext(target, {
+      content: postRestartBackground,
+      version: 2,
+      updatedAt: "2026-11-05T00:00:00.000Z",
+      updatedBy: "owner-1",
+    });
+    holdNextPrimaryContextRead = true;
+    const restartedText = `${postRestartMarker}: please inspect these three merge requests:\n${urlA}\n${urlB}\n${urlC}`;
+    const promptCount = restartedWorkers.prompts.length + 1;
+    timeline.push("post-restart-inbound-submitted");
+    await waitForSignal(restarted.submitInbound(inbound({
+      ...target,
+      messageId: "history-post-restart-list",
+      text: restartedText,
+      mentionedUserIds: [transport.bot.uid],
+    })), "post-restart multi-MR inbound receipt");
+    await waitForSignal(contextReadStarted.promise, "post-restart background read after observation");
+    releaseContextRead.resolve();
+    await waitForPromptCount(restartedWorkers, promptCount, "post-restart multi-MR worker prompt");
+    await waitForStatusCondition(
+      restarted,
+      target,
+      status => status.state === "completed" && status.queued === 0,
+      "post-restart multi-MR task completion",
+    );
+    await waitForCandidateRequest(urlA, 3);
+    await waitForCandidateRequest(urlB, 2);
+    await waitForCandidateRequest(urlC, 2);
+    const postRestartRequest = requests.find(({ evidence }) => JSON.stringify(evidence).includes(postRestartMarker));
+    if (postRestartRequest === undefined) throw new Error("post-restart Decision request was not captured");
+    expect(postRestartRequest.evidence.candidates.map(candidate => candidate.url)).toEqual([urlA, urlB, urlC]);
+    const matchedHistory = postRestartRequest.evidence.matchedHistory;
+    expect(matchedHistory.map(history => history.url).sort()).toEqual([urlA, urlB, urlC].sort());
+    const historyByUrl = new Map(matchedHistory.map(history => [history.url, history]));
+    for (const [url, requirement, reportStart, reportEnd] of [
+      [urlA, requirementA, "PRIMARY_FULL_REPORT_41_BEGIN", "PRIMARY_FULL_REPORT_41_END"],
+      [urlB, requirementB, "PRIMARY_FULL_REPORT_42_BEGIN", "PRIMARY_FULL_REPORT_42_END"],
+      [urlC, requirementC, "PRIMARY_FULL_REPORT_43_BEGIN", "PRIMARY_FULL_REPORT_43_END"],
+    ] as const) {
+      const history = historyByUrl.get(url);
+      const candidate = postRestartRequest.evidence.candidates.find(item => item.url === url);
+      expect(history).toBeDefined();
+      expect(history?.candidateId).toBe(candidate?.id);
+      expect(history?.taskRequirement).toContain(requirement);
+      expect(history?.reportExcerpt).toContain(reportStart);
+      expect(history?.reportExcerpt).toContain(reportEnd);
+      expect(history?.reportExcerpt).toContain("[matched candidate URL omitted]");
+    }
+    const serializedEvidence = JSON.stringify(postRestartRequest.evidence);
+    expect(serializedEvidence).toContain(postRestartBackground);
+    expect(postRestartRequest.evidence.task).not.toContain(similarRequirement);
+    expect(postRestartRequest.evidence.task).not.toContain(similarReport);
+    expect(postRestartRequest.evidence.task).not.toContain(unrelatedRequirement);
+    expect(postRestartRequest.evidence.task).not.toContain(unrelatedReport);
+    expect(postRestartRequest.evidence.task).not.toContain(failedDecisionUrl);
+    for (const [marker, role] of [
+      [similarRequirement, "user"],
+      [similarReport, "assistant"],
+      [unrelatedRequirement, "user"],
+      [unrelatedReport, "assistant"],
+      [failedDecisionUrl, "user"],
+    ] as const) {
+      if (!serializedEvidence.includes(marker)) continue;
+      expect(postRestartRequest.evidence.recent.some(
+        message => message.role === role && message.text.includes(marker),
+      )).toBe(true);
+    }
+    expect(serializedEvidence).not.toContain(siblingRequirement);
+    expect(serializedEvidence).not.toContain(siblingReport);
+    expect(postRestartRequest.evidence.recent.some(
+      message => message.role === "user" && message.text.includes(postRestartMarker),
+    )).toBe(true);
+    const submittedIndex = timeline.indexOf("post-restart-inbound-submitted");
+    const contextStartedIndex = timeline.indexOf("context-read-started");
+    const contextCompletedIndex = timeline.indexOf("context-read-completed");
+    const decisionRequestedIndex = timeline.indexOf("post-restart-decision-requested");
+    expect(submittedIndex).toBeGreaterThanOrEqual(0);
+    expect(contextStartedIndex).toBeGreaterThan(submittedIndex);
+    expect(contextCompletedIndex).toBeGreaterThan(contextStartedIndex);
+    expect(decisionRequestedIndex).toBeGreaterThan(contextCompletedIndex);
+
+    await waitForThreadInfo(
+      restarted,
+      restartedWorkers,
+      target,
+      transport.bot.uid,
+      () => infoByTarget.get(target.channelId),
+      value => {
+        const references = threadReferencesFrom(value)?.mr;
+        return references?.includes(urlA) === true
+          && references.includes(urlB)
+          && references.includes(urlC)
+          && references.includes(urlD);
+      },
+    );
+    await restarted.stop();
+    restartedService = undefined;
+
+    const persistedStore = await openChannelStore(stateDir);
+    try {
+      const references = persistedStore.getThreadReferences(transport.bot.uid, target);
+      expect(references.mr).toHaveLength(4);
+      expect(references.mr).toEqual(expect.arrayContaining([urlA, urlB, urlC, urlD]));
+      expect(references.mr).not.toContain(similarUrl);
+      expect(references.mr).not.toContain(failedDecisionUrl);
+      expect(references.pr).toEqual([]);
+    } finally {
+      persistedStore.close();
+    }
+  } finally {
+    releaseFailure.resolve();
+    releaseContextRead.resolve();
+    await restartedService?.stop();
+    await firstService?.stop();
     server.stop(true);
     await rm(root, { recursive: true, force: true });
   }

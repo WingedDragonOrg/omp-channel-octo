@@ -9,8 +9,8 @@ import { dirname } from "node:path";
 import type { ChatAppendMode, ChatTarget, HostMergeProgressPhase, ThreadListenLevel, WorkerGoal, WorktreeMergeOutcome } from "../contracts.ts";
 import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadForkInput, ThreadForkRecord, ThreadListenRecord, ThreadMergeEventRecord, HostMergeLeaseRecord, HostMergeLeaseInput, HostMergeProgressCardInput, HostMergeProgressCardRecord, HostRemovalLeaseInput, HostRemovalLeaseRecord, HostThreadRemovalOutcome, ReviewJobRecord } from "./store-records.ts";
 import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopThreadCreation, LoopWorkspace } from "../loop/types.ts";
-import type { SessionContextSnapshotRecord, TanOperation } from "./store-records.ts";
-export type { OutboxInsert, TanOperation } from "./store-records.ts";
+import type { SessionContextSnapshotRecord, TanOperation, ReferenceHistoryEntry, ReferenceHistorySnapshot } from "./store-records.ts";
+export type { OutboxInsert, TanOperation, ReferenceHistoryEntry, ReferenceHistorySnapshot } from "./store-records.ts";
 import {
   getSessionContextSnapshot as readSessionContextSnapshot,
   saveSessionContextSnapshot as writeSessionContextSnapshot,
@@ -36,7 +36,7 @@ import { acceptChatGrantOperation, getChatGrantOperation, getChatGrantOperationB
 import { addThreadWorkspaceIntentChannel, completeThreadWorkspaceIntent, failThreadWorkspaceIntent, getThreadWorkspace, getThreadWorkspaceIntent, isThreadWorkspaceIntentBlocked, isWorkspaceDirectoryOwned, listThreadWorkspaceIntents, listThreadWorkspaces, saveThreadWorkspace, saveThreadWorkspaceIntent, saveThreadWorkspaces, workspaceDirectories } from "./store-workspaces.ts";
 import { completeThreadFork, getThreadFork, getThreadForkByTarget, listThreadForks, saveThreadFork } from "./store-forks.ts";
 import { advanceThreadArchiveGeneration, beginThreadMerge, claimThreadMergeDispatchIntent, ensureThreadListen, getThreadArchiveGeneration, getThreadListen, getThreadMergeEvent, isThreadMergeEventPending, listPendingThreadMergeEvents, listThreadMergeEvents, markThreadMergeEventDelivered, saveThreadMergeEvent, setThreadListen } from "./store-thread-listen.ts";
-import { addThreadReferences, deleteThreadReferences, getThreadReferences, isThreadReferencesDeleted } from "./store-references.ts";
+import { addThreadReferences, captureReferenceHistorySnapshot as captureHistorySnapshot, deleteThreadReferences, getThreadReferences, isThreadReferencesDeleted, listReferenceHistory as readReferenceHistory } from "./store-references.ts";
 import * as storeWatch from "./store-watch.ts";
 import type { WatchCheckCompletion, WatchCreateResult, WatchListItem, WatchRecord } from "../watch/types.ts";
 import type { ThreadReference, ThreadReferences } from "../references/types.ts";
@@ -262,6 +262,19 @@ export class ChannelStore {
 
   setThreadListen(botUid: string, target: ChatTarget, listen: ThreadListenLevel): ThreadListenRecord {
     return setThreadListen(this.db, botUid, target, listen);
+  }
+
+  captureReferenceHistorySnapshot(botUid: string, target: ChatTarget): ReferenceHistorySnapshot {
+    return captureHistorySnapshot(this.db, botUid, target);
+  }
+
+  listReferenceHistory(
+    botUid: string,
+    target: ChatTarget,
+    candidateUrls: readonly string[],
+    snapshot?: ReferenceHistorySnapshot,
+  ): ReferenceHistoryEntry[] {
+    return readReferenceHistory(this.db, botUid, target, candidateUrls, snapshot);
   }
 
   getThreadReferences(botUid: string, target: ChatTarget): ThreadReferences {

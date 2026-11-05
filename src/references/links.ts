@@ -42,16 +42,55 @@ export function extractReferenceCandidates(text: string, excludedUrls?: Readonly
   return candidates;
 }
 
+/** Canonicalizes one PR/MR URL using the same rules used by candidate extraction. */
+export function canonicalReferenceUrl(value: string): string | null {
+  if (codePointLength(value) > MAX_URL_CODE_POINTS) return null;
+  return parseReferenceUrl(trimUrlToken(value))?.url ?? null;
+}
+
+/**
+ * Scans the complete text for a candidate reference. Unlike extractReferenceCandidates this does
+ * not cap the number of URLs inspected, so a relevant link later in a long persisted message is
+ * still considered.
+ */
+export function matchingReferenceCandidateUrls(
+  text: string,
+  candidateUrls: ReadonlySet<string>,
+): Set<string> {
+  const matched = new Set<string>();
+  if (text.length === 0 || candidateUrls.size === 0) return matched;
+  const safeText = sanitizeReferenceText(text);
+  for (const match of safeText.matchAll(HTTP_URL_TOKEN)) {
+    const raw = trimUrlToken(match[0]);
+    if (raw.length === 0 || codePointLength(raw) > MAX_URL_CODE_POINTS) continue;
+    const reference = parseReferenceUrl(raw);
+    if (reference && candidateUrls.has(reference.url)) matched.add(reference.url);
+  }
+  return matched;
+}
+
+
 export function sanitizeReferenceEvidence(evidence: ReferenceEvidence): ReferenceEvidence {
   const candidates = evidence.candidates.flatMap((candidate) => {
     const url = sanitizeEvidenceUrl(candidate.url);
     if (!url) return [];
     return [{ ...candidate, url, excerpt: sanitizeReferenceText(candidate.excerpt) }];
   });
+  const matchedHistory = evidence.matchedHistory?.flatMap((record) => {
+    const url = canonicalReferenceUrl(record.url);
+    if (!url) return [];
+    return [{
+      ...record,
+      url,
+      taskRequirement: sanitizeReferenceText(record.taskRequirement),
+      reportExcerpt: sanitizeReferenceText(record.reportExcerpt),
+    }];
+  });
   return {
     thread: sanitizeReferenceText(evidence.thread),
     task: sanitizeReferenceText(evidence.task),
     recent: evidence.recent.map(({ role, text }) => ({ role, text: sanitizeReferenceText(text) })),
+    ...(matchedHistory === undefined ? {} : { matchedHistory }),
     candidates,
   };
 }
@@ -133,15 +172,28 @@ export function sanitizeReferenceText(value: string): string {
 }
 
 function trimUrlToken(value: string): string {
-  let result = value;
-  while (result.length > 0) {
-    const oldLength = result.length;
-    result = result.replace(TRAILING_PUNCTUATION, "");
-    if (result.endsWith(")") && countCharacter(result, ")") > countCharacter(result, "(")) result = result.slice(0, -1);
-    if (result.endsWith("]") || result.endsWith("}") || result.endsWith(">")) result = result.slice(0, -1);
-    if (result.length === oldLength) return result;
+  let openParentheses = 0;
+  let closeParentheses = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] === "(") openParentheses += 1;
+    else if (value[index] === ")") closeParentheses += 1;
   }
-  return result;
+
+  let end = value.length;
+  while (end > 0) {
+    const last = value[end - 1]!;
+    if (TRAILING_PUNCTUATION.test(last) || last === "]" || last === "}" || last === ">") {
+      end -= 1;
+      continue;
+    }
+    if (last === ")" && closeParentheses > openParentheses) {
+      end -= 1;
+      closeParentheses -= 1;
+      continue;
+    }
+    break;
+  }
+  return value.slice(0, end);
 }
 
 function excerptAround(text: string, start: number, end: number): string {
@@ -175,14 +227,9 @@ function sliceCodePoints(value: string, start: number, end: number): string {
   return value.slice(startOffset, endOffset);
 }
 
-function countCharacter(value: string, character: string): number {
-  let count = 0;
-  for (const part of value) if (part === character) count += 1;
-  return count;
-}
-
 function appendMarker(value: string, marker: string, maximum: number): string {
   const remaining = maximum - codePointLength(marker);
   if (remaining <= 0) return sliceCodePoints(marker, 0, maximum);
   return `${sliceCodePoints(value, 0, remaining)}${marker}`;
 }
+

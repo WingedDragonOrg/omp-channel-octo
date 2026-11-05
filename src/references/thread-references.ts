@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import type { ChatTarget } from "../contracts.ts";
-import type { ChannelStore } from "../store/index.ts";
-import { extractReferenceCandidates, sanitizeReferenceEvidence, sanitizeReferenceText } from "./links.ts";
-import type { ReferenceCandidate, ReferenceEvidence, ReferenceJudge, ThreadReference } from "./types.ts";
+import type { ChannelStore, ReferenceHistoryEntry, ReferenceHistorySnapshot } from "../store/index.ts";
+import { canonicalReferenceUrl, extractReferenceCandidates, sanitizeReferenceEvidence, sanitizeReferenceText } from "./links.ts";
+import type { MatchedReferenceHistory, ReferenceCandidate, ReferenceEvidence, ReferenceJudge, ThreadReference } from "./types.ts";
 
 const MAX_ACTIVE_REQUESTS = 2;
 const MAX_WAITING_BATCHES = 100;
@@ -15,10 +15,16 @@ const MAX_CANDIDATE_EXCERPT_CODE_POINTS = 1000;
 const MAX_SOURCE_VERSIONS_PER_THREAD = 128;
 const MAX_TASK_REQUIREMENTS_PER_THREAD = 128;
 const MIN_WORK_OBJECT_PROBABILITY = 0.75;
+const MAX_MATCHED_HISTORY_CODE_POINTS = 4000;
+const THREAD_CONTEXT_LOAD_TIMEOUT_MS = 5_000;
+const REPORT_URL_TOKEN = /https?:\/\/[^\s<>"'`]+/giu;
+const REPORT_URL_MARKER = "[matched candidate URL omitted]";
 
 interface RecentMessage {
   role: "user" | "assistant";
   sourceKey: string;
+  taskId?: string;
+  sourceTextFingerprint?: string;
   text: string;
 }
 
@@ -39,13 +45,23 @@ interface ThreadState {
   recent: RecentMessage[];
   versions: Map<string, SourceVersion>;
 }
+type EvidenceState = Pick<ThreadState, "description" | "name" | "tasks" | "recent">;
+
+interface ReferenceThreadContext {
+  description: string;
+  name?: string;
+}
+
 
 interface ReferenceBatch {
   botUid: string;
   target: ChatTarget;
   targetKey: string;
   sourceKey: string;
+  taskId?: string;
   version: number;
+  evidenceState: EvidenceState;
+  historySnapshot?: ReferenceHistorySnapshot;
   evidence: ReferenceEvidence;
 }
 
@@ -62,13 +78,19 @@ export class ThreadReferenceCoordinator {
   private nextVersion = 0;
 
   constructor(private readonly options: {
-    store: Pick<ChannelStore, "getThreadReferences" | "addThreadReferences" | "isThreadReferencesDeleted" | "deleteThreadReferences">;
+    store: Pick<ChannelStore, "getThreadReferences" | "addThreadReferences" | "isThreadReferencesDeleted" | "deleteThreadReferences">
+      & Partial<Pick<ChannelStore, "captureReferenceHistorySnapshot" | "listReferenceHistory">>;
     botUid: () => string | undefined;
     judge?: ReferenceJudge;
+    loadThreadContext?: (
+      target: ChatTarget,
+      taskId: string | undefined,
+      signal: AbortSignal,
+    ) => Promise<ReferenceThreadContext | null>;
   }) {}
 
-  observeUser(target: ChatTarget, messageId: string, text: string, taskId?: string): void {
-    this.observe("user", target, messageId, text, taskId);
+  observeUser(target: ChatTarget, messageId: string, text: string, taskId?: string, sourceText?: string): void {
+    this.observe("user", target, messageId, text, taskId, sourceText);
   }
 
   observeAssistant(target: ChatTarget, taskId: string, messageId: string, text: string): void {
@@ -124,7 +146,7 @@ export class ThreadReferenceCoordinator {
     this.states.clear();
   }
 
-  private observe(role: "user" | "assistant", target: ChatTarget, messageId: string, text: string, taskId?: string): void {
+  private observe(role: "user" | "assistant", target: ChatTarget, messageId: string, text: string, taskId?: string, sourceText?: string): void {
     if (this.stopped || !this.options.judge || target.channelType !== 5 || target.channelId.length === 0 || messageId.length === 0) return;
     const botUid = this.options.botUid();
     if (!botUid) return;
@@ -157,7 +179,7 @@ export class ThreadReferenceCoordinator {
     this.invalidateOlderVersions(identity.key, sourceKey);
 
     if (role === "user" && text.trimStart().startsWith("/")) return;
-    this.rememberRecent(state, role, sourceKey, text);
+    this.rememberRecent(state, role, sourceKey, text, taskId, sourceText);
     if (role === "user" && taskId) this.rememberRequirement(state, taskId, text);
 
     if (!/https?:\/\//iu.test(text)) return;
@@ -172,23 +194,59 @@ export class ThreadReferenceCoordinator {
       return;
     }
 
+    if (this.waiting.length >= MAX_WAITING_BATCHES) return;
+    let historySnapshot: ReferenceHistorySnapshot | undefined;
+    try {
+      historySnapshot = this.options.store.captureReferenceHistorySnapshot?.(botUid, target);
+    } catch {
+      // The coordinator remains useful without persisted history if a snapshot cannot be captured.
+    }
+    const taskSnapshot = taskId === undefined ? undefined : state.tasks.get(taskId);
+    const evidenceTasks = new Map<string, TaskRequirements>();
+    if (taskId !== undefined && taskSnapshot !== undefined) {
+      evidenceTasks.set(taskId, { initial: taskSnapshot.initial, additions: [...taskSnapshot.additions] });
+    }
+    const evidenceState: EvidenceState = {
+      description: state.description,
+      ...(state.name === undefined ? {} : { name: state.name }),
+      tasks: evidenceTasks,
+      recent: state.recent.map((message) => ({ ...message })),
+    };
     const batch: ReferenceBatch = {
       botUid,
       target: { channelType: target.channelType, channelId: target.channelId },
       targetKey: identity.key,
       sourceKey,
+      ...(taskId === undefined ? {} : { taskId }),
       version,
+      evidenceState,
+      ...(historySnapshot === undefined ? {} : { historySnapshot }),
       evidence,
     };
-    if (this.waiting.length >= MAX_WAITING_BATCHES) return;
     this.waiting.push(batch);
     this.schedulePump();
   }
 
-  private rememberRecent(state: ThreadState, role: "user" | "assistant", sourceKey: string, text: string): void {
+  private rememberRecent(
+    state: ThreadState,
+    role: "user" | "assistant",
+    sourceKey: string,
+    text: string,
+    taskId?: string,
+    sourceText?: string,
+  ): void {
     const existing = state.recent.findIndex((message) => message.sourceKey === sourceKey);
     if (existing >= 0) state.recent.splice(existing, 1);
-    state.recent.push({ role, sourceKey, text: truncateEvidence(text, MAX_RECENT_CODE_POINTS) });
+    const sourceTextFingerprint = sourceText === undefined
+      ? undefined
+      : createHash("sha256").update(sourceText).digest("hex");
+    state.recent.push({
+      role,
+      sourceKey,
+      ...(taskId === undefined ? {} : { taskId }),
+      ...(sourceTextFingerprint === undefined ? {} : { sourceTextFingerprint }),
+      text: truncateEvidence(text, MAX_RECENT_CODE_POINTS),
+    });
     if (state.recent.length > MAX_RECENT_MESSAGES) state.recent.splice(0, state.recent.length - MAX_RECENT_MESSAGES);
   }
 
@@ -217,36 +275,147 @@ export class ThreadReferenceCoordinator {
     if (additional.length > 0) task.additions.push(additional);
   }
 
-  private buildEvidence(state: ThreadState, taskId: string | undefined, candidates: readonly ReferenceCandidate[]): ReferenceEvidence {
+  private buildEvidence(
+    state: EvidenceState,
+    taskId: string | undefined,
+    candidates: readonly ReferenceCandidate[],
+    historyEntries: readonly ReferenceHistoryEntry[] = [],
+    threadContext?: ReferenceThreadContext | null,
+  ): ReferenceEvidence {
     const threadParts: string[] = [];
-    if (state.name) threadParts.push(`Thread name: ${state.name}`);
-    if (state.description) threadParts.push(`Thread description: ${state.description}`);
-    const recent = state.recent.slice(-MAX_RECENT_MESSAGES).map(({ role, text }) => ({ role, text }));
+    const threadName = threadContext?.name ?? state.name;
+    const threadDescription = threadContext === undefined
+      ? state.description
+      : threadContext?.description ?? "";
+    if (threadName) threadParts.push(`Thread name: ${threadName}`);
+    if (threadDescription) threadParts.push(`Thread description: ${threadDescription}`);
+    if (threadContext === null) threadParts.push("Current thread background snapshot is unavailable.");
+    else if (threadContext !== undefined && threadDescription.length === 0) {
+      threadParts.push("Current thread background snapshot has no content.");
+    }
+
+    const recentByContent = new Map<string, ReferenceEvidence["recent"][number]>();
+    const quotedSourceFingerprints = new Set<string>();
+    for (const recentMessage of state.recent) {
+      if (
+        recentMessage.role === "user"
+        && recentMessage.taskId !== undefined
+        && recentMessage.sourceTextFingerprint !== undefined
+      ) {
+        quotedSourceFingerprints.add(JSON.stringify([recentMessage.taskId, recentMessage.sourceTextFingerprint]));
+      }
+    }
+    for (const message of historyEntries.slice(-MAX_RECENT_MESSAGES)) {
+      if (
+        message.role === "user"
+        && message.taskId !== null
+        && quotedSourceFingerprints.has(JSON.stringify([
+          message.taskId,
+          createHash("sha256").update(message.text).digest("hex"),
+        ]))
+      ) {
+        continue;
+      }
+      recentByContent.set(JSON.stringify([message.role, message.text]), { role: message.role, text: message.text });
+    }
+    for (const { role, text } of state.recent.slice(-MAX_RECENT_MESSAGES)) {
+      recentByContent.set(JSON.stringify([role, text]), { role, text });
+    }
+    const recent = [...recentByContent.values()].slice(-MAX_RECENT_MESSAGES);
     const task = taskId === undefined ? undefined : state.tasks.get(taskId);
+    const matchedHistory = this.buildMatchedHistory(historyEntries, candidates, taskId);
     const evidence = sanitizeReferenceEvidence({
-      thread: threadParts.length > 0 ? threadParts.join("\n") : "Thread name and description are unavailable.",
+      thread: threadParts.length > 0 ? threadParts.join("\n") : "Thread name and current background are unavailable.",
       task: task ? this.renderTask(task) : "Accepted task requirement is unavailable.",
       recent,
+      matchedHistory,
       candidates,
     });
 
     let recentRemaining = MAX_RECENT_CODE_POINTS;
     const boundedRecent: Array<ReferenceEvidence["recent"][number]> = [];
-    for (const message of evidence.recent) {
+    for (const message of [...evidence.recent].reverse()) {
       if (recentRemaining <= 0) break;
       const text = truncateEvidence(message.text, recentRemaining);
       if (text.length === 0) continue;
       boundedRecent.push({ role: message.role, text });
       recentRemaining -= codePointLength(text);
     }
+    boundedRecent.reverse();
+
     return {
       thread: truncateEvidence(evidence.thread, MAX_THREAD_CODE_POINTS),
       task: truncateEvidence(evidence.task, MAX_TASK_CODE_POINTS),
       recent: boundedRecent,
+      matchedHistory: this.boundMatchedHistory(evidence.matchedHistory ?? []),
       candidates: evidence.candidates.filter((candidate) => codePointLength(candidate.url) <= MAX_CANDIDATE_URL_CODE_POINTS)
         .map((candidate) => ({ ...candidate, excerpt: truncateEvidence(candidate.excerpt, MAX_CANDIDATE_EXCERPT_CODE_POINTS) })),
     };
   }
+
+  private buildMatchedHistory(
+    entries: readonly ReferenceHistoryEntry[],
+    candidates: readonly ReferenceCandidate[],
+    currentTaskId: string | undefined,
+  ): MatchedReferenceHistory[] {
+    const requirementsByTask = new Map<string, string[]>();
+    for (const entry of entries) {
+      if (entry.role !== "user" || !entry.taskId || entry.taskId === currentTaskId) continue;
+      const requirements = requirementsByTask.get(entry.taskId) ?? [];
+      requirements.push(entry.text);
+      requirementsByTask.set(entry.taskId, requirements);
+    }
+
+    const reportsByCandidate = new Map<string, { taskId: string; excerpt: string }>();
+    for (const entry of entries) {
+      if (entry.role !== "assistant" || !entry.taskId || entry.taskId === currentTaskId) continue;
+      for (const candidate of candidates) {
+        const excerpt = referenceReportExcerpt(entry.text, candidate.url);
+        if (excerpt !== null) reportsByCandidate.set(candidate.id, { taskId: entry.taskId, excerpt });
+      }
+    }
+
+    const matched: MatchedReferenceHistory[] = [];
+    for (const candidate of candidates) {
+      const report = reportsByCandidate.get(candidate.id);
+      if (!report) continue;
+      const requirements = requirementsByTask.get(report.taskId) ?? [];
+      const taskRequirement = requirements.length > 0
+        ? `Historical task user requirements:\n${requirements.map((text, index) =>
+          `${index === 0 ? "Initial" : "Additional"} accepted user requirement:\n${text}`,
+        ).join("\n")}`
+        : "Historical task user requirement is unavailable.";
+      matched.push({
+        candidateId: candidate.id,
+        url: candidate.url,
+        taskRequirement,
+        reportExcerpt: report.excerpt,
+      });
+    }
+    return matched;
+  }
+
+  private boundMatchedHistory(entries: readonly MatchedReferenceHistory[]): MatchedReferenceHistory[] {
+    let remaining = MAX_MATCHED_HISTORY_CODE_POINTS;
+    const bounded: MatchedReferenceHistory[] = [];
+    for (let index = 0; index < entries.length && remaining > 0; index += 1) {
+      const entry = entries[index]!;
+      const share = Math.max(1, Math.floor(remaining / (entries.length - index)));
+      const reportExcerpt = truncateReportExcerpt(
+        entry.reportExcerpt,
+        Math.min(MAX_CANDIDATE_EXCERPT_CODE_POINTS, Math.max(1, Math.floor(share / 2))),
+      );
+      const taskRequirement = truncateEvidence(
+        entry.taskRequirement,
+        Math.min(MAX_TASK_CODE_POINTS, Math.max(0, share - codePointLength(reportExcerpt))),
+      );
+      bounded.push({ ...entry, taskRequirement, reportExcerpt });
+      remaining -= codePointLength(taskRequirement) + codePointLength(reportExcerpt);
+    }
+    return bounded;
+  }
+
+
 
   private renderTask(task: TaskRequirements): string {
     let output = task.initial.length > 0 ? `Initial accepted requirement:\n${task.initial}` : "";
@@ -317,15 +486,61 @@ export class ThreadReferenceCoordinator {
 
   private async run(active: ActiveBatch): Promise<void> {
     try {
-      if (this.stopped || active.controller.signal.aborted || !this.isCurrent(active.batch)) return;
+      const batch = active.batch;
+      if (this.stopped || active.controller.signal.aborted || !this.isCurrent(batch)) return;
       const judge = this.options.judge;
       if (!judge) return;
-      const judgments = await judge(active.batch.evidence, active.controller.signal);
-      if (this.stopped || active.controller.signal.aborted || !this.isCurrent(active.batch)) return;
-      if (this.options.store.isThreadReferencesDeleted(active.batch.botUid, active.batch.target)) return;
 
-      const valid = this.validatedReferences(active.batch.evidence.candidates, judgments);
-      if (valid.length > 0) this.options.store.addThreadReferences(active.batch.botUid, active.batch.target, valid);
+      let threadContext: ReferenceThreadContext | null | undefined;
+      if (this.options.loadThreadContext) {
+        threadContext = null;
+        const timeout = new AbortController();
+        const timer = setTimeout(() => {
+          timeout.abort(new DOMException("Thread background load deadline exceeded", "TimeoutError"));
+        }, THREAD_CONTEXT_LOAD_TIMEOUT_MS);
+        const signal = AbortSignal.any([active.controller.signal, timeout.signal]);
+        try {
+          threadContext = await awaitSignal(
+            Promise.resolve(this.options.loadThreadContext(batch.target, batch.taskId, signal)),
+            signal,
+          );
+          if (threadContext) {
+            this.setThreadContext(batch.target, threadContext.description, threadContext.name);
+          }
+        } catch {
+          // Background context is best-effort; it must never hold a chat event or service shutdown.
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      if (this.stopped || active.controller.signal.aborted || !this.isCurrent(batch)) return;
+
+      let historyEntries: ReferenceHistoryEntry[] = [];
+      if (batch.historySnapshot !== undefined) {
+        try {
+          historyEntries = this.options.store.listReferenceHistory?.(
+            batch.botUid,
+            batch.target,
+            batch.evidence.candidates.map((candidate) => candidate.url),
+            batch.historySnapshot,
+          ) ?? [];
+        } catch {
+          // Missing or unreadable persisted context is evidence absence, not a chat failure.
+        }
+      }
+      const evidence = this.buildEvidence(
+        batch.evidenceState,
+        batch.taskId,
+        batch.evidence.candidates,
+        historyEntries,
+        threadContext,
+      );
+      const judgments = await judge(evidence, active.controller.signal);
+      if (this.stopped || active.controller.signal.aborted || !this.isCurrent(batch)) return;
+      if (this.options.store.isThreadReferencesDeleted(batch.botUid, batch.target)) return;
+
+      const valid = this.validatedReferences(batch.evidence.candidates, judgments);
+      if (valid.length > 0) this.options.store.addThreadReferences(batch.botUid, batch.target, valid);
     } catch {
       // External decision and best-effort local binding must never fail the chat event path.
     } finally {
@@ -370,6 +585,85 @@ export class ThreadReferenceCoordinator {
     }
     return references;
   }
+}
+
+function awaitSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason ?? new DOMException("Reference context load aborted", "AbortError"));
+  const result = Promise.withResolvers<T>();
+  const abort = (): void => {
+    signal.removeEventListener("abort", abort);
+    result.reject(signal.reason ?? new DOMException("Reference context load aborted", "AbortError"));
+  };
+  signal.addEventListener("abort", abort, { once: true });
+  promise.then(
+    (value) => {
+      signal.removeEventListener("abort", abort);
+      result.resolve(value);
+    },
+    (error: unknown) => {
+      signal.removeEventListener("abort", abort);
+      result.reject(error);
+    },
+  );
+  return result.promise;
+}
+
+function referenceReportExcerpt(text: string, candidateUrl: string): string | null {
+  const safeText = sanitizeReferenceText(text);
+  REPORT_URL_TOKEN.lastIndex = 0;
+  for (const match of safeText.matchAll(REPORT_URL_TOKEN)) {
+    if (canonicalReferenceUrl(match[0]) !== candidateUrl) continue;
+    const start = codePointLength(safeText.slice(0, match.index ?? 0));
+    const end = start + codePointLength(match[0]);
+    const markerLength = codePointLength(REPORT_URL_MARKER);
+    const halfWindow = Math.floor((MAX_CANDIDATE_EXCERPT_CODE_POINTS - markerLength) / 2);
+    const before = sliceCodePoints(safeText, Math.max(0, start - halfWindow), start);
+    const after = sliceCodePoints(safeText, end, end + halfWindow);
+    return `${before}${REPORT_URL_MARKER}${after}`;
+  }
+  return null;
+}
+function truncateReportExcerpt(value: string, maximum: number): string {
+  if (maximum <= 0) return "";
+  const sanitized = sanitizeReferenceText(value);
+  const length = codePointLength(sanitized);
+  if (length <= maximum) return sanitized;
+  const markerIndex = sanitized.indexOf(REPORT_URL_MARKER);
+  if (markerIndex < 0) return truncateEvidence(sanitized, maximum);
+
+  const markerLength = codePointLength(REPORT_URL_MARKER);
+  const truncation = "…[truncated]";
+  const truncationLength = codePointLength(truncation);
+  const available = maximum - markerLength - truncationLength * 2;
+  if (available <= 0) return takeCodePoints(truncation, maximum);
+  const markerStart = codePointLength(sanitized.slice(0, markerIndex));
+  const markerEnd = markerStart + markerLength;
+  const beforeBudget = Math.floor(available / 2);
+  const afterBudget = available - beforeBudget;
+  const beforeStart = Math.max(0, markerStart - beforeBudget);
+  const afterEnd = Math.min(length, markerEnd + afterBudget);
+  return `${beforeStart > 0 ? truncation : ""}${sliceCodePoints(sanitized, beforeStart, markerStart)}`
+    + `${REPORT_URL_MARKER}${sliceCodePoints(sanitized, markerEnd, afterEnd)}`
+    + `${afterEnd < length ? truncation : ""}`;
+}
+
+
+function sliceCodePoints(value: string, start: number, end: number): string {
+  let offset = 0;
+  let index = 0;
+  let startOffset = value.length;
+  let endOffset = value.length;
+  for (const character of value) {
+    if (index === start) startOffset = offset;
+    if (index === end) {
+      endOffset = offset;
+      break;
+    }
+    offset += character.length;
+    index += 1;
+  }
+  if (start >= index && start > 0 && startOffset === value.length) return "";
+  return value.slice(startOffset, endOffset);
 }
 
 function codePointLength(value: string): number {

@@ -108,6 +108,24 @@ export interface TaskRecord extends ChatTarget {
   relaySuppressed: boolean;
 }
 
+/** Persisted, user-visible chat history used to restore PR/MR reference context. */
+export interface ReferenceHistoryEntry {
+  role: "user" | "assistant";
+  text: string;
+  taskId: string | null;
+}
+
+/** High-water marks captured before asynchronous reference judging begins. */
+export interface ReferenceHistorySnapshot extends ChatTarget {
+  botUid: string;
+  inboundRowId: number;
+  outboxRowId: number;
+  ingressJobId: number;
+  unfinishedTaskIds: readonly string[];
+  assistantHistoryOverflow: boolean;
+  capturedAt: number;
+}
+
 export type ReviewJobState = "accepted" | "running" | "completed" | "failed" | "stopped";
 
 /** A `/review` run is deliberately not a chat task: it owns a fresh session and an independent lane. */
