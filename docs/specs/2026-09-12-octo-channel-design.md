@@ -113,6 +113,16 @@ merge 路径由 `WorktreePort.planMerge` 提供 source＋真实 target checkout�
 - 对真实数据库的只读一致性快照执行两次应用打开：25 张表、9424 行的所有原列逐行摘要保持一致，新增 `resource_cwds`，`integrity_check=ok`。生产数据库未迁移；快照及演练脚本已删除。
 - 验收未注册真实 bot、未向真实群发消息、未重启常驻服务、未操作线上任务。
 
+#### OMP 启动自主回合与任务输入 SDD（2026-11-05）
+
+OMP 扩展可在 `session_start` 恢复观察并发起自主回合；RPC `ready` 只证明通信就绪，不证明 session 空闲。受理任务时，同一 session 的自主回合与任务输入必须保持顺序，独立 session 仍可并发。任务 prompt 的接受与完成只能归因于该输入自己的原生事件，不能把自主回合的输出、错误或终态记作任务结果。
+
+任务等待期间取消或关闭不得派发未消费的输入；重启沿用已持久化的派发及接受状态，接受状态不明时保持既有 fail-closed 契约，不能重播已接受的 prompt。普通任务、恢复和原生目标继续持有各自的聊天/session 租约直到真实结算，保留 steer、queue 和取消语义。
+
+当前 worker 在派发前未等待 session 已有的自主回合。即使先查询 `get_state.isSettled`，查询与原生 admission 也不是同一原子操作。OMP 18.16 的生命周期帧没有请求或回合身份，无法证明快照之后新启动的自主回合与任务事件的归属。完整契约仍依赖 OMP 提供可关联的原子 admission 和生命周期身份；失败后不得重放可能已接受的 prompt。
+
+验收使用可门控的 RPC 子进程和隔离真实 OMP：启动自主回合保持运行时提交用户任务，验证输入只执行一次、输出归属正确、其他 session 可并发，以及失败、取消和重启边界。真实验收只使用临时 profile/session、localhost 模型和本地扩展，不访问真实业务。
+
 `session/turn-context.ts` 负责精确 session 的说明快照、ledger/sidecar 事务、成员输入准备及宿主 compact 刷新。新 session 读取说明，普通回合复用；真实会话确认后发布 scope，成功时校验 prepared receipt 并 CAS 结算，取消、中断或失败保留已确认上下文与未结算状态。DM 只发布身份作用域，不读取共享说明。`omp/events.ts` 统一折叠 RPC 消息、回合、工具及子代理帧；worker 保留消费方回调异常边界，只拒绝当前 prompt。
 
 `tasks/task-events.ts` 同步消费每任务的投影事件，维护按 messageId 聚合的输出及本地命令标记；prompt 接受回执先由服务入口持久化，不进入投影。通知、本地命令、ask 超时过滤、停止后工作、正文、steer 消费和进度事件的顺序固定。研究报告通过同步端口落盘，执行事件交给 `TaskProgress`。`runtime/service-restart.ts` 负责命令资格、待执行的空闲重启及旧版本通报行的静默清理；命令 claim 完成后才请求宿主重启，任务恢复由服务与状态盘协调。
