@@ -700,6 +700,21 @@ export function markLoopThreadCreationUnknown(db: Database, key: LoopTaskKey, op
     );
   });
 }
+export function releaseLoopThreadCreation(
+  db: Database,
+  key: LoopTaskKey,
+  operationId: string,
+): boolean {
+  assertLoopTaskKey(key);
+  if (!operationId) return false;
+  return transaction(db, () => run(
+    db,
+    `DELETE FROM loop_thread_creations
+     WHERE bot_uid = ? AND group_id = ? AND workspace_id = ? AND task_id = ?
+       AND operation_id = ? AND state = 'reserved' AND thread_channel_id IS NULL`,
+    [...loopTaskKeyValues(key), operationId],
+  ).changes === 1);
+}
 
 export function listLoopThreadCreations(db: Database, botUid: string): LoopThreadCreation[] {
   return query(db,

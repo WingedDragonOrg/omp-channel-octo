@@ -6,7 +6,7 @@
 import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { ChatAppendMode, ChatTarget, HostMergeProgressPhase, ThreadListenLevel, WorkerGoal, WorktreeMergeOutcome } from "../contracts.ts";
+import type { ChatAppendMode, ChatTarget, HostMergeProgressPhase, ThreadListenLevel, ThreadSummary, WorkerGoal, WorktreeMergeOutcome } from "../contracts.ts";
 import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadForkInput, ThreadForkRecord, ThreadListenRecord, ThreadMergeEventRecord, HostMergeLeaseRecord, HostMergeLeaseInput, HostMergeProgressCardInput, HostMergeProgressCardRecord, HostRemovalLeaseInput, HostRemovalLeaseRecord, HostThreadRemovalOutcome, ReviewJobRecord } from "./store-records.ts";
 import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopThreadCreation, LoopWorkspace } from "../loop/types.ts";
 import type { SessionContextSnapshotRecord, TanOperation, ReferenceHistoryEntry, ReferenceHistorySnapshot } from "./store-records.ts";
@@ -24,7 +24,7 @@ import type {
 } from "../inbound/ingress-types.ts";
 import { allocateScheduleOrder, applySchema } from "./store-schema.ts";
 import { claimOwnerEnrollment, clearChatModel, clearThreadModel, ensureBinding, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, getThreadModel, grantAllowedChat, hasOwnerEnrollment, initializeBindingSessionFromTask, listAllowedChats, resolveChatModel, setBotUid, setChatMode, setChatModel, setOwnerId, setThreadModel, updateBindingSession } from "./store-chats.ts";
-import { acceptCommitTask, acceptTask, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, getTaskByMessageId, getTaskScheduleOrder, isCommitTask, isTaskResuming, listQueuedTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim, suppressTaskRelay } from "./store-tasks.ts";
+import { acceptCommitTask, acceptTask, acceptTaskIf, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, getTaskByMessageId, getTaskScheduleOrder, hasTaskStopIntent, isCommitTask, isTaskResuming, listQueuedTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim, suppressTaskRelay } from "./store-tasks.ts";
 import { bindGoalTaskSession, clearGoalSession, finishGoalTaskProgress, getGoalSession, getGoalTask, isGoalTaskResuming, markGoalTaskAccepted, markGoalTaskAgentAccepted, markGoalTaskDispatched, saveGoalSessionProgress, stopGoalContinuation, updateGoalTaskProgress } from "./store-goals.ts";
 import { clearProgressCard, listProgressCards, recordProgressCardAttempt, saveProgressCard } from "./store-cards.ts";
 import { getWorkerLedger, listWorkerLedger, markWorkerStopped, recordWorker } from "./store-workers.ts";
@@ -33,14 +33,14 @@ import { advanceHistoryLedger, clearContextLedger, commitContextInjection, commi
 import { acknowledgeTextOutbox, beginTextCreate, bindTextOutbox, commitTextStream, countPendingOutbox, countUnknownOutbox, enqueueOutbox, failTextOutbox, getBotEventCursor, getOutbox, listPendingOutbox, listPendingOutboxTargets, listTextStream, markOutboxDead, markOutboxFailure, markOutboxSent, setBotEventCursor, updateTextOutbox } from "./store-outbox.ts";
 import { answerClosedQuestion, answerQuestion, answerQuestions, cancelQuestion, cancelQuestions, cancelTaskQuestions, createQuestion, getQuestion, listPendingQuestions, listQuestionsByCard, listTaskQuestions, markQuestionsSettled, pendingQuestionIds, reserveQuestionCardSeq, setQuestionCard, setQuestionsCard, updateQuestionPayloads } from "./store-questions.ts";
 import { acceptChatGrantOperation, getChatGrantOperation, getChatGrantOperationByEvent, listPendingChatGrantOperations, markChatGrantConfigMirror, markChatGrantResultDelivered, nextChatGrantCardEditSeq } from "./store-grants.ts";
-import { addThreadWorkspaceIntentChannel, completeThreadWorkspaceIntent, failThreadWorkspaceIntent, getThreadWorkspace, getThreadWorkspaceIntent, isThreadWorkspaceIntentBlocked, isWorkspaceDirectoryOwned, listThreadWorkspaceIntents, listThreadWorkspaces, saveThreadWorkspace, saveThreadWorkspaceIntent, saveThreadWorkspaces, workspaceDirectories } from "./store-workspaces.ts";
+import { addThreadWorkspaceIntentChannel, completeThreadCreatorIntent, completeThreadWorkspaceIntent, failThreadWorkspaceIntent, getThreadWorkspace, getThreadWorkspaceIntent, isThreadWorkspaceIntentBlocked, isWorkspaceDirectoryOwned, listThreadWorkspaceIntents, listThreadWorkspaces, saveThreadWorkspace, saveThreadWorkspaceIntent, saveThreadWorkspaces, workspaceDirectories } from "./store-workspaces.ts";
 import { completeThreadFork, getThreadFork, getThreadForkByTarget, listThreadForks, saveThreadFork } from "./store-forks.ts";
-import { advanceThreadArchiveGeneration, beginThreadMerge, claimThreadMergeDispatchIntent, ensureThreadListen, getThreadArchiveGeneration, getThreadListen, getThreadMergeEvent, isThreadMergeEventPending, listPendingThreadMergeEvents, listThreadMergeEvents, markThreadMergeEventDelivered, saveThreadMergeEvent, setThreadListen } from "./store-thread-listen.ts";
+import { advanceThreadArchiveGeneration, beginThreadMerge, claimThreadMergeDispatchIntent, ensureThreadListen, getThreadArchiveGeneration, getThreadListen, getThreadMergeEvent, isThreadMergeEventPending, listPendingThreadMergeEvents, listThreadMergeEvents, markThreadMergeEventDelivered, recordCreatedThreadListen, saveThreadMergeEvent, setThreadListen } from "./store-thread-listen.ts";
 import { addThreadReferences, captureReferenceHistorySnapshot as captureHistorySnapshot, deleteThreadReferences, getThreadReferences, isThreadReferencesDeleted, listReferenceHistory as readReferenceHistory } from "./store-references.ts";
 import * as storeWatch from "./store-watch.ts";
 import type { WatchCheckCompletion, WatchCreateResult, WatchListItem, WatchRecord } from "../watch/types.ts";
 import type { ThreadReference, ThreadReferences } from "../references/types.ts";
-import { bindLoopTask, bindLoopWorkspace, claimLoopInputIntent, commitLoopScan, completeLoopThreadCreation, getLoopBinding, getLoopInput, getLoopTaskRoute, getLoopThreadCreation, isLoopInputObserved, listLoopBindings, listLoopInputs, listLoopThreadCreations, listLoopThreadTasks, markLoopInputDelivered, markLoopInputFault, markLoopInputPending, markLoopInputUnknown, markLoopThreadCreationUnknown, prepareLoopInput, recordLoopThreadAllocated, reserveLoopThreadCreation } from "./store-loop.ts";
+import { bindLoopTask, bindLoopWorkspace, claimLoopInputIntent, commitLoopScan, completeLoopThreadCreation, getLoopBinding, getLoopInput, getLoopTaskRoute, getLoopThreadCreation, isLoopInputObserved, listLoopBindings, listLoopInputs, listLoopThreadCreations, listLoopThreadTasks, markLoopInputDelivered, markLoopInputFault, markLoopInputPending, markLoopInputUnknown, markLoopThreadCreationUnknown, prepareLoopInput, recordLoopThreadAllocated, releaseLoopThreadCreation, reserveLoopThreadCreation } from "./store-loop.ts";
 import { acceptTanOperation, acceptTanTask, cancelTanOperation, finishTanOperation, finishTanOperationWithOutbox, getTanOperation, listCancelledTanOperations, listPendingTanOperations, reclaimTanCommand } from "./store-tan.ts";
 import { acceptReviewJob, bindReviewSession, getActiveReviewJob, getReviewJob, listRecoverableReviewJobs, listTerminalReviewJobs, markReviewCompleted, markReviewDispatchStarted, markReviewFailed, markReviewPromptAccepted, markReviewStarted, markReviewStopped, persistReviewRecoveryNotices, prepareReviewJobsForRestart, releaseOrphanedReviewClaims, requestReviewStop, requestReviewStopForClaim } from "./store-reviews.ts";
 import {
@@ -197,14 +197,17 @@ export class ChannelStore {
     return listThreadWorkspaces(this.db, botUid);
   }
 
-  saveThreadWorkspaceIntent(record: ThreadWorkspaceIntentInput): void {
-    saveThreadWorkspaceIntent(this.db, record);
+  saveThreadWorkspaceIntent(record: ThreadWorkspaceIntentInput): boolean {
+    return saveThreadWorkspaceIntent(this.db, record);
   }
 
   addThreadWorkspaceIntentChannel(botUid: string, id: string, channelId: string): void {
     addThreadWorkspaceIntentChannel(this.db, botUid, id, channelId);
   }
 
+  completeThreadCreatorIntent(botUid: string, id: string, thread: ThreadSummary, listen: ThreadListenLevel): void {
+    completeThreadCreatorIntent(this.db, botUid, id, thread, listen);
+  }
   completeThreadWorkspaceIntent(botUid: string, id: string): void {
     completeThreadWorkspaceIntent(this.db, botUid, id);
   }
@@ -255,6 +258,10 @@ export class ChannelStore {
   ensureThreadListen(record: Omit<ThreadListenRecord, "mergePending">): ThreadListenRecord {
     return ensureThreadListen(this.db, record);
   }
+  recordCreatedThreadListen(record: Omit<ThreadListenRecord, "mergePending">): ThreadListenRecord {
+    return recordCreatedThreadListen(this.db, record);
+  }
+
 
   getThreadListen(botUid: string, target: ChatTarget): ThreadListenRecord | null {
     return getThreadListen(this.db, botUid, target);
@@ -336,6 +343,10 @@ export class ChannelStore {
   acceptTask(claim: InboundClaim, task: TaskRecord, goalRequest?: GoalTaskRequest, ingressJobId?: number): boolean {
     return acceptTask(this.db, claim, task, goalRequest, ingressJobId);
   }
+  acceptTaskIf(claim: InboundClaim, task: TaskRecord, guard: () => boolean): boolean {
+    return acceptTaskIf(this.db, claim, task, guard);
+  }
+
 
   reclaimTanCommand(claim: InboundClaim): boolean {
     return reclaimTanCommand(this.db, claim);
@@ -678,6 +689,9 @@ export class ChannelStore {
 
   clearTaskStopIntent(taskId: string): void {
     clearTaskStopIntent(this.db, taskId);
+  }
+  hasTaskStopIntent(taskId: string): boolean {
+    return hasTaskStopIntent(this.db, taskId);
   }
 
   /**
@@ -1455,6 +1469,9 @@ export class ChannelStore {
 
   markLoopThreadCreationUnknown(key: LoopTaskKey, operationId: string, error: string): void {
     markLoopThreadCreationUnknown(this.db, key, operationId, error);
+  }
+  releaseLoopThreadCreation(key: LoopTaskKey, operationId: string): boolean {
+    return releaseLoopThreadCreation(this.db, key, operationId);
   }
 
   listLoopThreadCreations(botUid: string): LoopThreadCreation[] {

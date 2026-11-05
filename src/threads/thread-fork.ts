@@ -376,6 +376,9 @@ export class ThreadForkController {
         id,
         botUid,
         groupId: record.groupId,
+        kind: "workspace",
+        creatorChannelType: record.sourceChannelType,
+        creatorChannelId: record.sourceChannelId,
         status: "preparing",
         channelIds: [],
       });

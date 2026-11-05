@@ -578,11 +578,13 @@ test("markTaskStopIntent 只写在途行，clearTaskStopIntent 无条件清除",
   withStore((store, stateDir) => {
     accept(store, taskFor("m1", "t1"));
     expect(store.markTaskStopIntent("t1", "interrupt")).toBe(true);
+    expect(store.hasTaskStopIntent("t1")).toBe(true);
     expect(readStopIntent(stateDir, "t1")).toBe("interrupt");
     // 再次叫停重新武装：重复写是允许的。
     expect(store.markTaskStopIntent("t1", "question_timeout")).toBe(true);
     expect(readStopIntent(stateDir, "t1")).toBe("question_timeout");
     store.clearTaskStopIntent("t1");
+    expect(store.hasTaskStopIntent("t1")).toBe(false);
     expect(readStopIntent(stateDir, "t1")).toBeNull();
 
     // 终态行静默 no-op：命令处理器与 settle 之间的竞态不抛错。
@@ -591,6 +593,7 @@ test("markTaskStopIntent 只写在途行，clearTaskStopIntent 无条件清除",
     store.markCompleted("t2", "已完成");
     expect(store.markTaskStopIntent("t2", "interrupt")).toBe(false);
     expect(readStopIntent(stateDir, "t2")).toBeNull();
+    expect(store.hasTaskStopIntent("t2")).toBe(false);
   }));
 
 test("completed/failed 终态同事务关闭本任务提问，已答行与邻任务不受影响", () =>

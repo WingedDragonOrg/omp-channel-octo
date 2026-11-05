@@ -3,6 +3,7 @@ import { lstat, mkdir, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type {
   ChannelTransport,
+  ChatTarget,
   ThreadListenLevel,
   ThreadSummary,
   ThreadWorkspaceRequest,
@@ -13,6 +14,8 @@ import type {
   ThreadWorkspaceProjectRecord,
   ThreadWorkspaceRecord,
 } from "../store/store-records.ts";
+import { isTransientServerFailure } from "../errors.ts";
+import { OctoError } from "../octo/error.ts";
 import { runCommand } from "./worktrunk.ts";
 import { worktreeSlug } from "./worktree.ts";
 
@@ -25,6 +28,13 @@ const INPUT_CHECK_TIMEOUT_MS = 10_000;
 const MAX_SHARED_SCOPE_OUTPUT_BYTES = 256 * 1024;
 const DEFAULT_BACKGROUND = "在所列项目工作区中处理相关工作。";
 const sharedEntryAllocationTails = new Map<string, Promise<void>>();
+function definitiveThreadCreateRejection(error: unknown): boolean {
+  return error instanceof OctoError
+    && error.status !== undefined
+    && error.permanent
+    && error.code !== undefined
+    && !isTransientServerFailure(error);
+}
 type WorkspaceLayout = ThreadWorkspaceRecord["layout"];
 
 export interface ThreadWorkspaceHost {
@@ -639,6 +649,7 @@ export async function createThreadWorkspaceBatch(
   plan: ThreadWorkspaceCreatePlan,
   signal: AbortSignal,
   onThreadCreated?: (thread: ThreadSummary) => void,
+  creator: ChatTarget = { channelType: 2, channelId: groupId },
 ): Promise<ThreadWorkspaceBatchResult> {
   if (plan.layout === "shared" && plan.projects.length === 0) {
     throw new Error("shared workspace requires at least one project");
@@ -676,6 +687,8 @@ export async function createThreadWorkspaceBatch(
         id: intentId,
         botUid: host.botUid,
         groupId,
+        creatorChannelType: onThreadCreated === undefined ? null : creator.channelType as 2 | 5,
+        creatorChannelId: onThreadCreated === undefined ? null : creator.channelId,
         status: "preparing",
         channelIds: [],
         error: null,
@@ -693,10 +706,20 @@ export async function createThreadWorkspaceBatch(
       ? `${threadName} - ${projects[0]!.name}`
       : threadName;
     let thread: ThreadSummary;
+    if (signal.aborted) {
+      const detail = "线程创建调用前已取消；未创建远端子区";
+      host.store.failThreadWorkspaceIntent(host.botUid, intentId, detail);
+      for (const failed of projects) {
+        remoteFailures.push({ name: failed.name, repo: failed.repo, error: detail });
+      }
+      break;
+    }
     try {
       thread = await host.transport.createThread(groupId, threadLabel, signal);
     } catch (error) {
       const detail = addFailure(errors, error, "线程创建失败");
+      const definitive = definitiveThreadCreateRejection(error);
+      if (definitive) host.store.failThreadWorkspaceIntent(host.botUid, intentId, detail);
       for (const failed of projects) {
         remoteFailures.push({ name: failed.name, repo: failed.repo, error: detail });
       }
@@ -704,17 +727,14 @@ export async function createThreadWorkspaceBatch(
         remoteFailures.push({
           name: skipped.name,
           repo: skipped.repo,
-          error: "因前序线程创建结果未知，停止批次后续创建",
+          error: definitive
+            ? "因前序线程创建被明确拒绝，停止批次后续创建"
+            : "因前序线程创建结果未知，停止批次后续创建",
         });
       }
       break;
     }
     let listenError: string | undefined;
-    try {
-      onThreadCreated?.(thread);
-    } catch (error) {
-      listenError = addFailure(errors, error, "无法持久化线程监听策略");
-    }
 
     const record = workspaceRecord(
       host.botUid,
@@ -731,14 +751,7 @@ export async function createThreadWorkspaceBatch(
     };
     outcomes.push(outcome);
     records.push(record);
-    if (listenError !== undefined) {
-      outcome.error = listenError;
-      outcome.projectErrors = projects.map(() => listenError);
-      record.status = "failed";
-      record.error = listenError;
-      cannotCreateResources.add(record);
-    }
-    let mayCreateResources = listenError === undefined;
+    let mayCreateResources = true;
     try {
       host.store.addThreadWorkspaceIntentChannel(host.botUid, intentId, thread.channelId);
       mappedIntents.set(thread.channelId, intentId);
@@ -748,6 +761,19 @@ export async function createThreadWorkspaceBatch(
       outcome.projectErrors = projects.map(() => detail);
       cannotCreateResources.add(record);
       mayCreateResources = false;
+    }
+    if (mayCreateResources) {
+      try {
+        onThreadCreated?.(thread);
+      } catch (error) {
+        listenError = addFailure(errors, error, "无法持久化线程监听策略");
+        outcome.error = listenError;
+        outcome.projectErrors = projects.map(() => listenError);
+        record.status = "failed";
+        record.error = listenError;
+        cannotCreateResources.add(record);
+        mayCreateResources = false;
+      }
     }
     try {
       host.store.saveThreadWorkspace(record);

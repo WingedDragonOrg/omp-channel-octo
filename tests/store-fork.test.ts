@@ -245,7 +245,7 @@ test("fork completion fails closed without its matching persisted intent", async
   });
 });
 
-test("fork completion atomically publishes its ready binding, merge listen, and intent", async () => {
+test("fork completion recovers legacy null creator metadata and atomically publishes binding, listen, and intent", async () => {
   await inTemporaryDirectory(async (root) => {
     const store = await openChannelStore(root);
     try {
@@ -290,6 +290,8 @@ test("fork completion atomically publishes its ready binding, merge listen, and 
       expect(store.getThreadWorkspaceIntent(botUid, remoteCreated.id)).toMatchObject({
         id: remoteCreated.id,
         groupId,
+        creatorChannelType: sourceTarget.channelType,
+        creatorChannelId: sourceTarget.channelId,
         status: "complete",
         channelIds: [forkThread.channelId],
         error: null,

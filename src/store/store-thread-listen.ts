@@ -24,6 +24,30 @@ export function ensureThreadListen(
   if (!stored) throw new Error("thread listen policy was not stored");
   return stored;
 }
+/**
+ * A creator known from a successful create operation is authoritative, but may not silently replace
+ * a listen row inserted by an earlier inbound fallback. Comparing and inserting under one write
+ * transaction makes that race fail closed instead of redirecting creator-bound input.
+ */
+export function recordCreatedThreadListen(
+  db: Database,
+  record: Omit<ThreadListenRecord, "mergePending">,
+): ThreadListenRecord {
+  return transaction(db, () => {
+    const existing = threadListen(db, record.botUid, record.channelId);
+    if (
+      existing !== null
+      && (
+        existing.creatorChannelType !== record.creatorChannelType
+        || existing.creatorChannelId !== record.creatorChannelId
+      )
+    ) {
+      throw new Error("thread creator conflicts with an existing listen record; refusing to overwrite");
+    }
+    return ensureThreadListen(db, record);
+  });
+}
+
 
 export function getThreadListen(
   db: Database,

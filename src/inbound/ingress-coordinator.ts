@@ -216,6 +216,33 @@ export class IngressCoordinator {
     return { ackReady: candidate.ack.promise };
   }
 
+  /** Run an internal durable consumer in chat order with already accepted ingress work. */
+  runInBusinessOrder<T>(
+    target: ChatTarget,
+    signal: AbortSignal,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    if (this.sealed) return Promise.reject(new InboundShutdownError());
+    const key = targetKey(target);
+    const prior = this.businessTails.get(key) ?? RESOLVED;
+    const settled = Promise.withResolvers<void>();
+    this.businessTails.set(key, settled.promise);
+    const ordered = (async (): Promise<T> => {
+      try {
+        await this.abortable(prior, signal);
+        if (this.sealed) throw new InboundShutdownError();
+        if (signal.aborted) throw errorFromAbort(signal);
+        return await operation();
+      } finally {
+        await prior;
+        settled.resolve();
+        if (this.businessTails.get(key) === settled.promise) this.businessTails.delete(key);
+      }
+    })();
+    this.track(ordered);
+    return ordered;
+  }
+
   /**
    * The menu has already validated owner, chat, action generation and value. Persist that exact
    * snapshot synchronously so the Bot-event cursor never waits for policy probes or card HTTP.

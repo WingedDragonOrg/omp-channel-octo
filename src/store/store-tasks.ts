@@ -35,6 +35,19 @@ export function acceptTask(
 ): boolean {
   return transaction(db, () => acceptTaskInTransaction(db, claim, task, goalRequest, ingressJobId));
 }
+/** Guard and task/inbound insertion share one IMMEDIATE transaction, closing accept-vs-cancel races. */
+export function acceptTaskIf(
+  db: Database,
+  claim: InboundClaim,
+  task: TaskRecord,
+  guard: () => boolean,
+): boolean {
+  return transaction(db, () => {
+    if (!guard()) return false;
+    return acceptTaskInTransaction(db, claim, task);
+  });
+}
+
 
 /**
  * Domain-internal task acceptance for a caller that already owns the SQLite transaction. Keeping
@@ -443,6 +456,13 @@ function cancelOwnedPendingQuestion(db: Database, taskId: string, id: string): b
 /** 停止意图被真实工作结果覆盖（interrupt 之后这一回合自己跑完了）时清除；无条件清 NULL。 */
 export function clearTaskStopIntent(db: Database, taskId: string): void {
   run(db, "UPDATE tasks SET stop_intent = NULL WHERE id = ?", [taskId]);
+}
+export function hasTaskStopIntent(db: Database, taskId: string): boolean {
+  return query(
+    db,
+    "SELECT 1 FROM tasks WHERE id = ? AND stop_intent IS NOT NULL",
+    [taskId],
+  )[0] !== undefined;
 }
 
 /**

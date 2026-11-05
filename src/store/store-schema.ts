@@ -167,11 +167,15 @@ export function applySchema(db: Database): void {
       id TEXT PRIMARY KEY NOT NULL,
       bot_uid TEXT NOT NULL,
       group_id TEXT NOT NULL,
+      intent_kind TEXT NOT NULL DEFAULT 'workspace' CHECK(intent_kind IN ('workspace', 'thread-create')),
+      creator_channel_type INTEGER CHECK(creator_channel_type IS NULL OR creator_channel_type IN (2, 5)),
+      creator_channel_id TEXT,
       status TEXT NOT NULL CHECK(status IN ('preparing', 'failed', 'complete')),
       channel_ids TEXT NOT NULL,
       error TEXT,
       created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
+      updated_at INTEGER NOT NULL,
+      CHECK((creator_channel_type IS NULL) = (creator_channel_id IS NULL))
     );
     CREATE TABLE IF NOT EXISTS thread_forks (
       id TEXT PRIMARY KEY NOT NULL,
@@ -676,6 +680,9 @@ export function applySchema(db: Database): void {
     "ALTER TABLE questions ADD COLUMN answered_by TEXT",
     "ALTER TABLE questions ADD COLUMN closed_reason TEXT",
     "ALTER TABLE thread_workspaces ADD COLUMN legacy_worktree_name TEXT",
+    "ALTER TABLE thread_workspace_intents ADD COLUMN intent_kind TEXT NOT NULL DEFAULT 'workspace' CHECK(intent_kind IN ('workspace', 'thread-create'))",
+    "ALTER TABLE thread_workspace_intents ADD COLUMN creator_channel_type INTEGER CHECK(creator_channel_type IS NULL OR creator_channel_type IN (2, 5))",
+    "ALTER TABLE thread_workspace_intents ADD COLUMN creator_channel_id TEXT",
     "ALTER TABLE thread_workspaces ADD COLUMN workspace_root TEXT",
     "ALTER TABLE host_merge_leases ADD COLUMN source_text TEXT",
     "ALTER TABLE host_merge_leases ADD COLUMN resource_cwds TEXT",

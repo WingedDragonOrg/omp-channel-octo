@@ -512,6 +512,9 @@ test("thread workspace preparation intents survive reopen and fail closed by exa
         id: preparing.id,
         botUid,
         groupId: "group-a",
+        kind: "workspace",
+        creatorChannelType: null,
+        creatorChannelId: null,
         status: "preparing",
         channelIds: ["group-a____created-thread"],
         error: null,
@@ -584,6 +587,31 @@ test("thread workspace preparation intents survive reopen and fail closed by exa
     await rm(root, { recursive: true, force: true });
   }
 });
+test("a definitively failed thread-create intent does not block unrelated children in its group", async () => {
+  await withStore(async (store) => {
+    store.saveThreadWorkspaceIntent({
+      id: "known-create-rejection",
+      botUid,
+      groupId: "group-a",
+      kind: "thread-create",
+      creatorChannelType: 2,
+      creatorChannelId: "group-a",
+      status: "preparing",
+      channelIds: [],
+    });
+    store.failThreadWorkspaceIntent(botUid, "known-create-rejection", "remote rejected the request");
+
+    expect(store.getThreadWorkspaceIntent(botUid, "known-create-rejection")).toMatchObject({
+      status: "failed",
+      channelIds: [],
+    });
+    expect(store.isThreadWorkspaceIntentBlocked(
+      botUid,
+      { channelType: 5, channelId: "group-a____existing-child" },
+    )).toBe(false);
+  });
+});
+
 
 test("thread workspace intent finalizes after a crash only when every mapped ownership row is terminal", async () => {
   await withStore(async (store) => {

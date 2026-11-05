@@ -19,6 +19,7 @@ import type {
 } from "./contracts.ts";
 import type { ThreadReferences } from "./references/types.ts";
 import { isTransientServerFailure } from "./errors.ts";
+import { OctoError } from "./octo/error.ts";
 import type { ChannelStore } from "./store/index.ts";
 import type { TaskRecord } from "./store/store-records.ts";
 import type { ThreadWorkspaceRecord } from "./store/store-records.ts";
@@ -94,11 +95,14 @@ export interface HostToolHost {
     | "saveThreadWorkspaces"
     | "saveThreadWorkspaceIntent"
     | "addThreadWorkspaceIntentChannel"
+    | "completeThreadCreatorIntent"
     | "completeThreadWorkspaceIntent"
     | "failThreadWorkspaceIntent"
+    | "getThreadWorkspaceIntent"
     | "isThreadWorkspaceIntentBlocked"
     | "workspaceDirectories"
     | "ensureThreadListen"
+    | "recordCreatedThreadListen"
     | "getThreadListen"
     | "setThreadListen"
     | "suppressTaskRelay"
@@ -111,6 +115,7 @@ export interface HostToolHost {
     | "recordLoopThreadAllocated"
     | "completeLoopThreadCreation"
     | "markLoopThreadCreationUnknown"
+    | "releaseLoopThreadCreation"
   >;
   tryAcquireDestructiveResources(
     cwds: readonly string[],
@@ -141,6 +146,9 @@ export interface HostToolHost {
   readonly watches: HostWatchPort;
   /** Delivers through the destination chat's steer-or-task path; an optional guard is checked at acceptance. */
   deliverToChat(message: InboundMessage, deliveryGuard?: () => boolean): Promise<"steered" | "queued">;
+  /** Accepts an explicit child-task input as an independently queued creator task. */
+  sendThreadCreatorInput(task: TaskRecord, text: string, toolCallId: string, signal: AbortSignal): Promise<string>;
+
   /**
    * `ask`：提问并等待答案。`toolCallId` 是 OMP 给这次工具调用的身份（retry 重执行同一个调用时
    * 复用），提问行据此在跨重启恢复时认回原问题。
@@ -186,6 +194,8 @@ const MANAGEMENT_BASE_ACTIONS = [
   "thread-delete",
   "thread-merge",
   "thread-archive",
+  "thread-send-parent",
+
 ] as const;
 const MANAGEMENT_DISPATCH_ACTION = "thread-dispatch";
 /** Synthetic inbound id prefix: a dispatched task must not dispatch further. */
@@ -207,6 +217,13 @@ function truncateForTool(value: string, maxChars: number): string {
 function boundedManagementError(error: unknown, fallback: string): string {
   const detail = (error instanceof Error ? error.message : String(error)).replace(/\s+/gu, " ").trim();
   return (detail.length > 0 ? detail : fallback).slice(0, MAX_MANAGEMENT_ERROR_CHARS);
+}
+function definitiveThreadCreateRejection(error: unknown): boolean {
+  return error instanceof OctoError
+    && error.status !== undefined
+    && error.permanent
+    && error.code !== undefined
+    && !isTransientServerFailure(error);
 }
 
 function managementMembers(members: readonly GroupMember[]): {
@@ -370,6 +387,25 @@ function ensureThreadListen(
     listen,
   });
 }
+function recordCreatedThreadListen(
+  host: HostToolHost,
+  thread: ThreadSummary,
+  creator: ChatTarget,
+  listen: ThreadListenLevel,
+) {
+  if (creator.channelType !== 2 && creator.channelType !== 5) {
+    throw new Error("线程创建方必须是群或子区");
+  }
+  return host.store.recordCreatedThreadListen({
+    botUid: host.botUid,
+    channelId: thread.channelId,
+    creatorChannelType: creator.channelType,
+    creatorChannelId: creator.channelId,
+    threadName: thread.name,
+    listen,
+  });
+}
+
 
 function ensureThreadListenForTarget(host: HostToolHost, target: ChatTarget) {
   if (target.channelType !== 5) throw new Error("thread listen target must be a thread");
@@ -559,11 +595,51 @@ async function runLoopTaskThreadCreate(
     return await loop.runCreation(key, operationId, async (reservation) => {
       if (creation.workspace === null) {
         let thread: ThreadSummary | undefined;
+        let knownNoAllocation = false;
         try {
-          thread = await host.transport.createThread(groupId, name, signal);
+          const creatorIntentId = `thread-create:${createHash("sha256")
+            .update(JSON.stringify([host.botUid, reservation.operationId]))
+            .digest("hex")}`;
+          const intentCreated = host.store.saveThreadWorkspaceIntent({
+            id: creatorIntentId,
+            botUid: host.botUid,
+            groupId,
+            kind: "thread-create",
+            creatorChannelType: target.channelType as 2 | 5,
+            creatorChannelId: target.channelId,
+            status: "preparing",
+            channelIds: [],
+            error: null,
+          });
+          if (!intentCreated) {
+            const existingIntent = host.store.getThreadWorkspaceIntent(host.botUid, creatorIntentId);
+            knownNoAllocation = existingIntent?.status === "failed" && existingIntent.channelIds.length === 0;
+            throw new Error(
+              knownNoAllocation
+                ? "Loop thread creation was definitively rejected before allocation; use a new tool call to retry"
+                : "Loop thread creation intent already exists; reconcile it instead of retrying",
+            );
+          }
+          if (signal.aborted) {
+            host.store.failThreadWorkspaceIntent(host.botUid, creatorIntentId, "线程创建调用前已取消；未创建远端子区");
+            knownNoAllocation = true;
+            throw signal.reason ?? new Error("thread creation was cancelled before the remote call");
+          }
+          try {
+            thread = await host.transport.createThread(groupId, name, signal);
+          } catch (error) {
+            if (definitiveThreadCreateRejection(error)) {
+              knownNoAllocation = true;
+              host.store.failThreadWorkspaceIntent(host.botUid, creatorIntentId, "远端明确拒绝创建子区");
+            }
+            throw error;
+          }
+          host.store.addThreadWorkspaceIntentChannel(host.botUid, creatorIntentId, thread.channelId);
           host.store.recordLoopThreadAllocated(key, reservation.operationId, thread.channelId);
           assertThreadBelongsToGroup(groupId, thread);
-          const policy = ensureThreadListen(host, thread, target, creation.listen);
+          host.store.completeThreadCreatorIntent(host.botUid, creatorIntentId, thread, creation.listen);
+          const policy = host.store.getThreadListen(host.botUid, { channelType: 5, channelId: thread.channelId });
+          if (policy === null) throw new Error("created Loop child has no persisted creator relationship");
           if (creation.background !== undefined) {
             await host.transport.updateGroupContext(
               { channelId: thread.channelId, channelType: 5 },
@@ -598,8 +674,13 @@ async function runLoopTaskThreadCreate(
           const detail = boundedManagementError(error, "Loop task 子区准备失败");
           let latest = host.store.getLoopThreadCreation(key);
           if (latest?.operationId === reservation.operationId && latest.state === "reserved") {
-            host.store.markLoopThreadCreationUnknown(key, reservation.operationId, detail);
-            latest = host.store.getLoopThreadCreation(key);
+            if (knownNoAllocation) {
+              host.store.releaseLoopThreadCreation(key, reservation.operationId);
+              latest = host.store.getLoopThreadCreation(key);
+            } else {
+              host.store.markLoopThreadCreationUnknown(key, reservation.operationId, detail);
+              latest = host.store.getLoopThreadCreation(key);
+            }
           }
           if (latest !== null) {
             return JSON.stringify(loopThreadPartialResult(host, key, latest, thread, detail));
@@ -618,8 +699,9 @@ async function runLoopTaskThreadCreate(
           signal,
           (thread) => {
             host.store.recordLoopThreadAllocated(key, reservation.operationId, thread.channelId);
-            ensureThreadListen(host, thread, target, creation.listen);
+            recordCreatedThreadListen(host, thread, target, creation.listen);
           },
+          target,
         );
       } catch (error) {
         const detail = boundedManagementError(error, "Loop task 隔离工作区准备失败");
@@ -949,7 +1031,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
   const managementTool: HostTool = {
     name: "octo_management",
     description:
-      "管理当前群/线程：读取与管理群信息、共享说明和 thread。create-thread 的显式 projects（包括 single）必须提供完整任务 worktree_name；每项 projects[].name 独立生成稳定项目目录 slug，必须是互不冲突的 ASCII 名称。名称不翻译、不截断，无法规范化或发生冲突时请改用明确限定名（如 admin-web、customer-web）。单项目省略 layout 表示 single，多项目明确选择 shared 或 separate。background 只描述用途与实际路径；listen 与派发/合并策略按各字段说明。create-thread 可选 task_id 将新线程创建并关联当前 Loop task；thread-bind 可显式改绑 task_id。thread-dispatch 的 task_id 必须已经关联到目标子区。task_id 不指定 workspace，所有动作仅作用于本群当前绑定 workspace。",
+      "管理当前群/线程：读取与管理群信息、共享说明和 thread。create-thread 的显式 projects（包括 single）必须提供完整任务 worktree_name；每项 projects[].name 独立生成稳定项目目录 slug，必须是互不冲突的 ASCII 名称。名称不翻译、不截断，无法规范化或发生冲突时请改用明确限定名（如 admin-web、customer-web）。单项目省略 layout 表示 single，多项目明确选择 shared 或 separate。background 只描述用途与实际路径；listen 与派发/合并策略按各字段说明。create-thread 可选 task_id 将新线程创建并关联当前 Loop task；thread-bind 可显式改绑 task_id。thread-dispatch 的 task_id 必须已经关联到目标子区。thread-send-parent 仅从当前子区向其持久创建方提交显式业务输入：始终独立排队，listen=off 仍有效，不表示已处理，也不会充当 ask 回答。task_id 不指定 workspace，所有动作仅作用于本群当前绑定 workspace。",
     parameters: {
       type: "object",
       properties: {
@@ -966,7 +1048,11 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
           type: "string",
           description: "create-thread/thread-bind/thread-dispatch：当前群绑定的 Loop task ID；thread-bind 必填，dispatch 指定时必须与目标关联一致。",
         },
-        text: { type: "string", description: "thread-dispatch 要派发的任务正文。" },
+        text: {
+          type: "string",
+          maxLength: MAX_MANAGEMENT_TASK_CHARS,
+          description: "thread-dispatch 或 thread-send-parent 的任务正文；thread-send-parent 不接受目标参数并始终排队。",
+        },
         force: {
           type: "boolean",
           description:
@@ -1245,8 +1331,75 @@ async function runManagementTool(
           await prepareThreadWorkspaceScope(host, groupId, creation.workspace, signal);
         }
         if (creation.workspace === null) {
-          const thread = await transport.createThread(groupId, name, signal);
-          const policy = ensureThreadListen(host, thread, target, creation.listen);
+          const callIdentity = toolCallId?.trim();
+          const intentSeed = callIdentity === undefined || callIdentity.length === 0
+            ? ["request", task.id, name, creation.listen, creation.background ?? null]
+            : ["tool-call", task.id, callIdentity];
+          const creatorIntentId = `thread-create:${createHash("sha256")
+            .update(JSON.stringify([host.botUid, ...intentSeed]))
+            .digest("hex")}`;
+          const intentCreated = host.store.saveThreadWorkspaceIntent({
+            id: creatorIntentId,
+            botUid: host.botUid,
+            groupId,
+            kind: "thread-create",
+            creatorChannelType: target.channelType as 2 | 5,
+            creatorChannelId: target.channelId,
+            status: "preparing",
+            channelIds: [],
+            error: null,
+          });
+          const intent = host.store.getThreadWorkspaceIntent(host.botUid, creatorIntentId);
+          if (intent === null) throw new Error("thread creation intent was not persisted");
+          if (!intentCreated) {
+            if (intent.status === "failed" && intent.channelIds.length === 0) {
+              throw new Error("previous thread creation was definitively rejected before allocation; use a new tool call to retry");
+            }
+            if (
+              intent.status !== "preparing" && intent.status !== "complete"
+              || intent.channelIds.length !== 1
+            ) {
+              throw new Error("previous thread creation allocation is unknown; reconcile it instead of retrying");
+            }
+            const existingThread = await getThreadByChannelId(host, groupId, intent.channelIds[0]!, signal);
+            assertThreadBelongsToGroup(groupId, existingThread);
+            if (existingThread.name !== name) {
+              throw new Error("thread creation operation identity was replayed with a different name");
+            }
+            host.store.completeThreadCreatorIntent(host.botUid, creatorIntentId, existingThread, creation.listen);
+            const existingPolicy = host.store.getThreadListen(host.botUid, {
+              channelType: 5,
+              channelId: existingThread.channelId,
+            });
+            if (existingPolicy === null) throw new Error("recovered thread has no persisted creator relationship");
+            return JSON.stringify({
+              ...managementThread(existingThread),
+              listen: existingPolicy.listen,
+              reused_existing: true,
+            });
+          }
+
+          if (signal.aborted) {
+            host.store.failThreadWorkspaceIntent(host.botUid, creatorIntentId, "线程创建调用前已取消；未创建远端子区");
+            throw signal.reason ?? new Error("thread creation was cancelled before the remote call");
+          }
+          let thread: ThreadSummary;
+          try {
+            thread = await transport.createThread(groupId, name, signal);
+          } catch (error) {
+            if (definitiveThreadCreateRejection(error)) {
+              host.store.failThreadWorkspaceIntent(host.botUid, creatorIntentId, "远端明确拒绝创建子区");
+            }
+            throw error;
+          }
+          host.store.addThreadWorkspaceIntentChannel(host.botUid, creatorIntentId, thread.channelId);
+          assertThreadBelongsToGroup(groupId, thread);
+          host.store.completeThreadCreatorIntent(host.botUid, creatorIntentId, thread, creation.listen);
+          const policy = host.store.getThreadListen(host.botUid, {
+            channelType: 5,
+            channelId: thread.channelId,
+          });
+          if (policy === null) throw new Error("created thread has no persisted creator relationship");
           if (creation.background !== undefined) {
             try {
               await transport.updateGroupContext(
@@ -1270,7 +1423,8 @@ async function runManagementTool(
           name,
           creation.workspace,
           signal,
-          (thread) => ensureThreadListen(host, thread, target, creation.listen),
+          (thread) => recordCreatedThreadListen(host, thread, target, creation.listen),
+          target,
         );
         return JSON.stringify(threadWorkspaceCreationResult(result, creation.listen));
       }
@@ -1465,6 +1619,28 @@ async function runManagementTool(
       host.planThreadArchive(target, groupId, shortId);
       return `已排定归档子区 ${shortId}：本回合最后一条回复送达后执行`;
     }
+    case "thread-send-parent": {
+      if (target.channelType !== 5 || currentShortId === null) {
+        throw new Error("thread-send-parent 只能在当前子区调用");
+      }
+      for (const key of Object.keys(args)) {
+        if (key !== "action" && key !== "text") {
+          throw new Error(`thread-send-parent 不接受目标或其他参数：${key}`);
+        }
+      }
+      const text = optionalText("text");
+      if (text === undefined || text.trim().length === 0) {
+        throw new Error("thread-send-parent requires non-empty text");
+      }
+      if (text.length > MAX_MANAGEMENT_TASK_CHARS) {
+        throw new Error(`text must be at most ${MAX_MANAGEMENT_TASK_CHARS} characters`);
+      }
+      if (toolCallId === undefined || toolCallId.trim().length === 0) {
+        throw new Error("thread-send-parent requires a native toolCallId");
+      }
+      return host.sendThreadCreatorInput(task, text, toolCallId, signal);
+    }
+
     case "thread-dispatch": {
       if (task.messageId.startsWith(DISPATCH_MESSAGE_PREFIX)) {
         throw new Error("dispatched tasks cannot dispatch further");

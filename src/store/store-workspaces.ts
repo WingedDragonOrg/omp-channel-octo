@@ -1,6 +1,6 @@
 import { relative, isAbsolute, sep } from "node:path";
 import { Database } from "bun:sqlite";
-import type { ChatTarget } from "../contracts.ts";
+import type { ChatTarget, ThreadListenLevel, ThreadSummary } from "../contracts.ts";
 import type {
   ThreadWorkspaceIntentInput,
   ThreadWorkspaceIntentRecord,
@@ -8,6 +8,7 @@ import type {
   ThreadWorkspaceProjectRecord,
   ThreadWorkspaceRecord,
 } from "./store-records.ts";
+import { getThreadListen, recordCreatedThreadListen } from "./store-thread-listen.ts";
 import {
   asNullableString,
   asString,
@@ -15,6 +16,7 @@ import {
   run,
   transaction,
 } from "./store-schema.ts";
+import { threadParentGroupId, threadShortId } from "../threads/thread-target.ts";
 
 export function saveThreadWorkspace(db: Database, record: ThreadWorkspaceRecord): void {
   saveThreadWorkspaces(db, [record]);
@@ -81,29 +83,45 @@ export function listThreadWorkspaces(db: Database, botUid: string): ThreadWorksp
   ).map(threadWorkspaceFromRow);
 }
 
-export function saveThreadWorkspaceIntent(db: Database, record: ThreadWorkspaceIntentInput): void {
-  transaction(db, () => {
+export function saveThreadWorkspaceIntent(db: Database, record: ThreadWorkspaceIntentInput): boolean {
+  const kind = record.kind ?? "workspace";
+  const creatorChannelType = record.creatorChannelType ?? null;
+  const creatorChannelId = record.creatorChannelId ?? null;
+  validateIntentCreator(record.groupId, kind, creatorChannelType, creatorChannelId);
+  return transaction(db, () => {
     const existing = query(
       db,
-      "SELECT bot_uid, group_id FROM thread_workspace_intents WHERE id = ?",
+      `SELECT bot_uid, group_id, intent_kind, creator_channel_type, creator_channel_id
+       FROM thread_workspace_intents WHERE id = ?`,
       [record.id],
     )[0];
     if (existing) {
       if (asString(existing.bot_uid) !== record.botUid || asString(existing.group_id) !== record.groupId) {
         throw new Error("thread workspace intent id belongs to a different owner");
       }
-      return;
+      if (
+        asString(existing.intent_kind) !== kind
+        || nullableChannelType(existing.creator_channel_type) !== creatorChannelType
+        || asNullableString(existing.creator_channel_id) !== creatorChannelId
+      ) {
+        throw new Error("thread workspace intent id belongs to a different creation source");
+      }
+      return false;
     }
     const now = Date.now();
     run(
       db,
       `INSERT INTO thread_workspace_intents(
-         id, bot_uid, group_id, status, channel_ids, error, created_at, updated_at
-       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+         id, bot_uid, group_id, intent_kind, creator_channel_type, creator_channel_id,
+         status, channel_ids, error, created_at, updated_at
+       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         record.id,
         record.botUid,
         record.groupId,
+        kind,
+        creatorChannelType,
+        creatorChannelId,
         record.status,
         JSON.stringify(record.channelIds),
         record.error ?? null,
@@ -111,6 +129,7 @@ export function saveThreadWorkspaceIntent(db: Database, record: ThreadWorkspaceI
         now,
       ],
     );
+    return true;
   });
 }
 
@@ -137,6 +156,57 @@ export function addThreadWorkspaceIntentChannel(db: Database, botUid: string, id
   });
 }
 
+export function completeThreadCreatorIntent(
+  db: Database,
+  botUid: string,
+  id: string,
+  thread: ThreadSummary,
+  listen: ThreadListenLevel,
+): void {
+  transaction(db, () => {
+    const row = query(
+      db,
+      `SELECT id, bot_uid, group_id, intent_kind, creator_channel_type, creator_channel_id,
+              status, channel_ids, error
+       FROM thread_workspace_intents WHERE bot_uid = ? AND id = ?`,
+      [botUid, id],
+    )[0];
+    if (!row) throw new Error("thread creator intent does not exist");
+    const intent = threadWorkspaceIntentFromRow(row);
+    if (intent.kind !== "thread-create" || intent.creatorChannelType === null || intent.creatorChannelId === null) {
+      throw new Error("thread creator intent has no authoritative source");
+    }
+    if (
+      thread.groupId !== intent.groupId
+      || threadParentGroupId(thread.channelId) !== intent.groupId
+      || threadShortId(thread.channelId) === null
+    ) {
+      throw new Error("created thread does not belong to its persisted source group");
+    }
+    if (intent.channelIds.length > 1 || (intent.channelIds.length === 1 && intent.channelIds[0] !== thread.channelId)) {
+      throw new Error("thread creator intent is already associated with a different thread");
+    }
+    if (intent.status !== "preparing" && intent.status !== "complete") {
+      throw new Error("thread creator intent is no longer recoverable");
+    }
+    recordCreatedThreadListen(db, {
+      botUid,
+      channelId: thread.channelId,
+      creatorChannelType: intent.creatorChannelType,
+      creatorChannelId: intent.creatorChannelId,
+      threadName: thread.name,
+      listen,
+    });
+    if (intent.status === "complete") return;
+    run(
+      db,
+      `UPDATE thread_workspace_intents SET status = 'complete', channel_ids = ?, error = NULL, updated_at = ?
+       WHERE bot_uid = ? AND id = ? AND status = 'preparing'`,
+      [JSON.stringify([thread.channelId]), Date.now(), botUid, id],
+    );
+  });
+}
+
 export function completeThreadWorkspaceIntent(db: Database, botUid: string, id: string): void {
   updateThreadWorkspaceIntent(db, botUid, id, "complete", null);
 }
@@ -152,7 +222,8 @@ export function getThreadWorkspaceIntent(
 ): ThreadWorkspaceIntentRecord | null {
   const row = query(
     db,
-    `SELECT id, bot_uid, group_id, status, channel_ids, error
+    `SELECT id, bot_uid, group_id, intent_kind, creator_channel_type, creator_channel_id,
+            status, channel_ids, error
      FROM thread_workspace_intents WHERE bot_uid = ? AND id = ?`,
     [botUid, id],
   )[0];
@@ -166,7 +237,8 @@ export function listThreadWorkspaceIntents(
 ): ThreadWorkspaceIntentRecord[] {
   return query(
     db,
-    `SELECT id, bot_uid, group_id, status, channel_ids, error
+    `SELECT id, bot_uid, group_id, intent_kind, creator_channel_type, creator_channel_id,
+            status, channel_ids, error
      FROM thread_workspace_intents
      WHERE bot_uid = ? AND group_id = ?
      ORDER BY created_at ASC, id ASC`,
@@ -191,6 +263,11 @@ export function isThreadWorkspaceIntentBlocked(db: Database, botUid: string, tar
   const groupId = target.channelId.slice(0, separator);
   const intents = listThreadWorkspaceIntents(db, botUid, groupId)
     .map((intent) => finalizeWorkspaceIntentFromRecords(db, intent));
+  if (intents.some(
+    (intent) => intent.kind === "thread-create"
+      && intent.status === "preparing"
+      && (intent.channelIds.length === 0 || intent.channelIds.includes(target.channelId)),
+  )) return true;
   if (intents.length === 0) return false;
   // Workspace rows govern their own readiness; without a row, an established binding lets an
   // explicit `/new` or `/move` recover when the ownership write for that thread failed.
@@ -216,7 +293,7 @@ function finalizeWorkspaceIntentFromRecords(
   db: Database,
   intent: ThreadWorkspaceIntentRecord,
 ): ThreadWorkspaceIntentRecord {
-  if (intent.status !== "preparing" || intent.channelIds.length === 0) return intent;
+  if (intent.kind !== "workspace" || intent.status !== "preparing" || intent.channelIds.length === 0) return intent;
   // Fork completion publishes its own ready record and intent in one transaction. Workspace rows
   // are not fork-owned evidence, and a read-side recovery must not finalize a fork intent early.
   if (query(db, "SELECT 1 FROM thread_forks WHERE bot_uid = ? AND id = ?", [intent.botUid, intent.id]).length > 0) {
@@ -232,9 +309,22 @@ function finalizeWorkspaceIntentFromRecords(
   )) return intent;
   const failed = workspaces.find((workspace) => workspace?.status === "failed");
   const status = failed ? "failed" : "complete";
+  if (status === "complete" && !threadWorkspaceIntentCreatorRecorded(db, intent)) return intent;
   const error = failed?.error ?? intent.error ?? null;
   updateThreadWorkspaceIntent(db, intent.botUid, intent.id, status, error);
   return { ...intent, status, error };
+}
+function threadWorkspaceIntentCreatorRecorded(
+  db: Database,
+  intent: ThreadWorkspaceIntentRecord,
+): boolean {
+  if (intent.creatorChannelType === null && intent.creatorChannelId === null) return true;
+  if (intent.creatorChannelType === null || intent.creatorChannelId === null) return false;
+  return intent.channelIds.every((channelId) => {
+    const policy = getThreadListen(db, intent.botUid, { channelType: 5, channelId });
+    return policy?.creatorChannelType === intent.creatorChannelType
+      && policy.creatorChannelId === intent.creatorChannelId;
+  });
 }
 
 function updateThreadWorkspaceIntent(
@@ -260,14 +350,31 @@ function updateThreadWorkspaceIntentInTransaction(
 ): void {
   const row = query(
     db,
-    "SELECT status, group_id, channel_ids FROM thread_workspace_intents WHERE bot_uid = ? AND id = ?",
+    `SELECT status, group_id, channel_ids, intent_kind, creator_channel_type, creator_channel_id
+     FROM thread_workspace_intents WHERE bot_uid = ? AND id = ?`,
     [botUid, id],
   )[0];
   if (!row) throw new Error("thread workspace intent does not exist");
   const current = threadWorkspaceIntentStatus(row.status);
+  const intentKind = threadWorkspaceIntentKind(row.intent_kind);
+  const channelIds = threadWorkspaceIntentChannels(row.channel_ids);
+  if (intentKind === "thread-create" && (status !== "failed" || channelIds.length !== 0)) {
+    throw new Error("thread creator intents can only complete with their authoritative listen record");
+  }
   if (current === status) return;
   if (current !== "preparing") throw new Error("thread workspace intent is already finalized");
-  const channelIds = threadWorkspaceIntentChannels(row.channel_ids);
+  const creatorChannelType = nullableChannelType(row.creator_channel_type);
+  const creatorChannelId = asNullableString(row.creator_channel_id);
+  if (
+    status === "complete"
+    && creatorChannelType !== null
+    && (creatorChannelId === null || channelIds.some((channelId) => {
+      const policy = getThreadListen(db, botUid, { channelType: 5, channelId });
+      return policy?.creatorChannelType !== creatorChannelType || policy.creatorChannelId !== creatorChannelId;
+    }))
+  ) {
+    throw new Error("thread workspace intent cannot complete before its creator relation is confirmed");
+  }
   const workspaces = channelIds.map((channelId) =>
     getThreadWorkspace(db, botUid, { channelType: 5, channelId }),
   );
@@ -328,14 +435,58 @@ function readyForkIntentEvidence(
 }
 
 function threadWorkspaceIntentFromRow(row: Record<string, unknown>): ThreadWorkspaceIntentRecord {
+  const kind = threadWorkspaceIntentKind(row.intent_kind);
+  const creatorChannelType = nullableChannelType(row.creator_channel_type);
+  const creatorChannelId = asNullableString(row.creator_channel_id);
+  const groupId = asString(row.group_id);
+  validateIntentCreator(groupId, kind, creatorChannelType, creatorChannelId);
   return {
     id: asString(row.id),
     botUid: asString(row.bot_uid),
-    groupId: asString(row.group_id),
+    groupId,
+    kind,
+    creatorChannelType,
+    creatorChannelId,
     status: threadWorkspaceIntentStatus(row.status),
     channelIds: threadWorkspaceIntentChannels(row.channel_ids),
     error: asNullableString(row.error),
   };
+}
+function threadWorkspaceIntentKind(value: unknown): "workspace" | "thread-create" {
+  if (value !== "workspace" && value !== "thread-create") {
+    throw new Error("invalid thread workspace intent kind in store");
+  }
+  return value;
+}
+
+function nullableChannelType(value: unknown): 2 | 5 | null {
+  if (value === null || value === undefined) return null;
+  if (value === 2 || value === 5) return value;
+  throw new Error("invalid thread creator channel type in store");
+}
+
+function validateIntentCreator(
+  groupId: string,
+  kind: "workspace" | "thread-create",
+  creatorChannelType: 2 | 5 | null,
+  creatorChannelId: string | null,
+): void {
+  if (groupId.length === 0) throw new Error("thread workspace intent requires a parent group");
+  if (creatorChannelId === "") throw new Error("thread workspace intent creator identity cannot be empty");
+  if ((creatorChannelType === null) !== (creatorChannelId === null)) {
+    throw new Error("thread workspace intent creator identity must be complete");
+  }
+  if (kind === "thread-create" && creatorChannelType === null) {
+    throw new Error("thread creator intent requires its source chat identity");
+  }
+  if (creatorChannelType === null || creatorChannelId === null) return;
+  if (
+    creatorChannelType === 2
+      ? creatorChannelId !== groupId
+      : threadParentGroupId(creatorChannelId) !== groupId || threadShortId(creatorChannelId) === null
+  ) {
+    throw new Error("thread workspace intent creator is outside its parent group");
+  }
 }
 
 function threadWorkspaceIntentStatus(value: unknown): ThreadWorkspaceIntentStatus {

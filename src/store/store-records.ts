@@ -544,18 +544,28 @@ export interface ThreadWorkspaceRecord extends ChatTarget {
 }
 
 export type ThreadWorkspaceIntentStatus = "preparing" | "failed" | "complete";
+export type ThreadWorkspaceIntentKind = "workspace" | "thread-create";
 
 export interface ThreadWorkspaceIntentRecord {
   id: string;
   botUid: string;
   groupId: string;
+  kind: ThreadWorkspaceIntentKind;
+  creatorChannelType: 2 | 5 | null;
+  creatorChannelId: string | null;
   status: ThreadWorkspaceIntentStatus;
   channelIds: string[];
   error: string | null;
 }
 
 export type ThreadWorkspaceIntentInput =
-  Omit<ThreadWorkspaceIntentRecord, "error" | "status"> & { status: "preparing"; error?: string | null };
+  Omit<ThreadWorkspaceIntentRecord, "error" | "status" | "kind" | "creatorChannelType" | "creatorChannelId"> & {
+    status: "preparing";
+    error?: string | null;
+    kind?: ThreadWorkspaceIntentKind;
+    creatorChannelType?: 2 | 5 | null;
+    creatorChannelId?: string | null;
+  };
 
 export type ThreadForkPhase =
   | "preparing"

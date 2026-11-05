@@ -3,7 +3,7 @@ import type { ChatTarget, ThreadSummary } from "../contracts.ts";
 import type { BindingRecord, ThreadForkInput, ThreadForkPhase, ThreadForkRecord } from "./store-records.ts";
 import { getBinding } from "./store-chats.ts";
 import { asNullableString, asNumber, asString, query, run, transaction } from "./store-schema.ts";
-import { ensureThreadListen } from "./store-thread-listen.ts";
+import { recordCreatedThreadListen } from "./store-thread-listen.ts";
 import { completeThreadWorkspaceIntentInTransaction, getThreadWorkspaceIntent } from "./store-workspaces.ts";
 
 export function saveThreadFork(db: Database, input: ThreadForkInput): void {
@@ -96,10 +96,26 @@ export function completeThreadFork(db: Database, botUid: string, id: string): Th
     }
 
     const target: ChatTarget = { channelType: 5, channelId: fork.thread.channelId };
-    const intent = getThreadWorkspaceIntent(db, botUid, id);
+    let intent = getThreadWorkspaceIntent(db, botUid, id);
+    if (
+      intent?.kind === "workspace"
+      && intent.creatorChannelType === null
+      && intent.creatorChannelId === null
+    ) {
+      run(
+        db,
+        `UPDATE thread_workspace_intents
+         SET creator_channel_type = ?, creator_channel_id = ?, updated_at = ?
+         WHERE id = ? AND bot_uid = ? AND creator_channel_type IS NULL AND creator_channel_id IS NULL`,
+        [fork.sourceChannelType, fork.sourceChannelId, Date.now(), id, botUid],
+      );
+      intent = getThreadWorkspaceIntent(db, botUid, id);
+    }
     if (
       !intent
       || intent.groupId !== fork.groupId
+      || intent.creatorChannelType !== fork.sourceChannelType
+      || intent.creatorChannelId !== fork.sourceChannelId
       || intent.channelIds.length !== 1
       || intent.channelIds[0] !== target.channelId
       || (intent.status !== "preparing" && intent.status !== "complete")
@@ -118,7 +134,7 @@ export function completeThreadFork(db: Database, botUid: string, id: string): Th
       sessionFile: fork.sessionFile,
       cwd: fork.cwd,
     });
-    const listen = ensureThreadListen(db, {
+    const listen = recordCreatedThreadListen(db, {
       botUid,
       channelId: fork.thread.channelId,
       creatorChannelType: fork.sourceChannelType,

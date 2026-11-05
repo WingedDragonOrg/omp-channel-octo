@@ -649,6 +649,15 @@ test("loop creation reservation is unique, unknown is never reassigned, and stal
         threadChannelId: `${groupId}____unknown-partial`,
         error: "remote response timed out",
       });
+      const rejectedKey = taskKey({ taskId: "loop-task-known-rejection" });
+      const rejected = store.reserveLoopThreadCreation(rejectedKey, "tool-call-known-rejection");
+      expect(store.releaseLoopThreadCreation(rejectedKey, rejected.operationId)).toBe(true);
+      expect(store.getLoopThreadCreation(rejectedKey)).toBeNull();
+      expect(store.reserveLoopThreadCreation(rejectedKey, "tool-call-retry")).toMatchObject({
+        operationId: "tool-call-retry",
+        state: "reserved",
+        threadChannelId: null,
+      });
       expect(store.getLoopThreadCreation(unknownKey)?.operationId).toBe("tool-call-unknown");
     } finally {
       store.close();
