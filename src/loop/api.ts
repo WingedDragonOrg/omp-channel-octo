@@ -286,7 +286,8 @@ export function createLoopReadPort({ apiUrl, botToken }: { apiUrl: string; botTo
       workspaceId,
       signal,
     );
-    return workspaceFromRecord(responseData(response, "workspace"), workspaceId);
+    if (!isJsonRecord(response)) return invalidResponse("workspace");
+    return workspaceFromRecord(response, workspaceId);
   }
 
   async function listWorkspaces(signal?: AbortSignal): Promise<LoopWorkspace[]> {

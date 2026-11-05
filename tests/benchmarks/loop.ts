@@ -145,7 +145,7 @@ const gateway = Bun.serve({
     assert.equal(request.method, "GET", "Awareness must not write Loop state");
     assert.equal(request.headers.get("Authorization"), `Bearer ${fixture.botToken}`);
     assert.equal(request.headers.get("X-Workspace-ID"), workspaceId);
-    if (url.pathname === `/fleet/api/v1/workspaces/${workspaceId}`) return Response.json({ data: workspace });
+    if (url.pathname === `/fleet/api/v1/workspaces/${workspaceId}`) return Response.json(workspace);
     if (url.pathname === "/fleet/api/v1/tasks") {
       const page = Number(url.searchParams.get("page") ?? 1);
       const pageSize = Number(url.searchParams.get("page_size") ?? 20);

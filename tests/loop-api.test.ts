@@ -114,13 +114,13 @@ function pageEnvelope(
   });
 }
 
-function workspaceEnvelope(data: Record<string, unknown>): Response {
+function taskDetailEnvelope(data: Record<string, unknown>): Response {
   return Response.json({ data });
 }
 
 describe("Loop REST read port", () => {
   it("reads a UUID workspace and a task directly without enumerating workspaces", async () => {
-    const workspace = workspaceRecord(WORKSPACE_ID, "Platform Ops", "platform-ops");
+    const workspace = workspaceDetailRecord(WORKSPACE_ID, "Platform Ops", "platform-ops");
     const task = taskRecord(TASK_ID, {
       assignee_type: "member",
       assignee_id: FLEET_MEMBER_UUID,
@@ -128,10 +128,10 @@ describe("Loop REST read port", () => {
     });
     const fixture = startApiFixture((_request, url) => {
       if (url.pathname === `/fleet/api/v1/workspaces/${WORKSPACE_ID}`) {
-        return workspaceEnvelope(workspace);
+        return Response.json(workspace);
       }
       if (url.pathname === `/fleet/api/v1/tasks/${TASK_ID}`) {
-        return workspaceEnvelope(task);
+        return taskDetailEnvelope(task);
       }
       return Response.json({ error: { code: "NOT_FOUND", message: "not found" } }, { status: 404 });
     });
@@ -182,7 +182,7 @@ describe("Loop REST read port", () => {
     const detail = workspaceDetailRecord(WORKSPACE_ID, "Platform Ops", "platform-ops");
     const fixture = startApiFixture((_request, url) => {
       if (url.pathname === "/fleet/api/v1/workspaces") return pageEnvelope([workspace], 1, 1);
-      if (url.pathname === `/fleet/api/v1/workspaces/${WORKSPACE_ID}`) return workspaceEnvelope(detail);
+      if (url.pathname === `/fleet/api/v1/workspaces/${WORKSPACE_ID}`) return Response.json(detail);
       return Response.json({ error: { code: "NOT_FOUND", message: "not found" } }, { status: 404 });
     });
 
@@ -221,7 +221,7 @@ describe("Loop REST read port", () => {
       workspace_id: WORKSPACE_ID,
     };
     const fixture = startApiFixture((_request, url) => {
-      if (url.pathname === `/fleet/api/v1/workspaces/${WORKSPACE_ID}`) return workspaceEnvelope(detail);
+      if (url.pathname === `/fleet/api/v1/workspaces/${WORKSPACE_ID}`) return Response.json(detail);
       return Response.json({ error: { code: "NOT_FOUND", message: "not found" } }, { status: 404 });
     });
 
@@ -237,20 +237,20 @@ describe("Loop REST read port", () => {
     }
   });
 
-  it("rejects workspace details with a wrong or conflicting identity, or no identity", async () => {
+  it("rejects workspace details with a wrong or conflicting identity, missing identity, or invalid fields", async () => {
     const details = [
       workspaceDetailRecord(OTHER_WORKSPACE_ID, "Platform Ops", "platform-ops"),
-      workspaceRecord(OTHER_WORKSPACE_ID, "Platform Ops", "platform-ops"),
       {
         ...workspaceDetailRecord(WORKSPACE_ID, "Platform Ops", "platform-ops"),
         workspace_id: OTHER_WORKSPACE_ID,
       },
       { name: "Platform Ops", slug: "platform-ops" },
+      { ...workspaceDetailRecord(WORKSPACE_ID, "Platform Ops", "platform-ops"), name: 42 },
     ];
 
     for (const detail of details) {
       const fixture = startApiFixture((_request, url) => {
-        if (url.pathname === `/fleet/api/v1/workspaces/${WORKSPACE_ID}`) return workspaceEnvelope(detail);
+        if (url.pathname === `/fleet/api/v1/workspaces/${WORKSPACE_ID}`) return Response.json(detail);
         return Response.json({ error: { code: "NOT_FOUND", message: "not found" } }, { status: 404 });
       });
 
@@ -268,7 +268,7 @@ describe("Loop REST read port", () => {
     const row = { ...workspaceRecord(WORKSPACE_ID, "Platform Ops", "platform-ops"), id: OTHER_WORKSPACE_ID };
     const fixture = startApiFixture((_request, url) => url.pathname === "/fleet/api/v1/workspaces"
       ? pageEnvelope([row], 1, 1)
-      : workspaceEnvelope(workspaceDetailRecord(WORKSPACE_ID, "Platform Ops", "platform-ops")));
+      : Response.json(workspaceDetailRecord(WORKSPACE_ID, "Platform Ops", "platform-ops")));
     try {
       const port = createLoopReadPort({ apiUrl: fixture.apiUrl, botToken: TOKEN });
       await assert.rejects(port.resolveWorkspace("Platform Ops"), /invalid.*schema/i);
@@ -329,7 +329,7 @@ describe("Loop REST read port", () => {
         return pageEnvelope(workspaces.slice((page - 1) * 100, page * 100), page, workspaces.length);
       }
       if (url.pathname === `/fleet/api/v1/workspaces/${OTHER_WORKSPACE_ID}`) {
-        return workspaceEnvelope(workspaces[100]!);
+        return Response.json(workspaceDetailRecord(OTHER_WORKSPACE_ID, "Platform Operations", "platform-ops"));
       }
       return Response.json({ error: { code: "NOT_FOUND", message: "not found" } }, { status: 404 });
     });
@@ -391,7 +391,9 @@ describe("Loop REST read port", () => {
     const workspace = workspaceRecord(WORKSPACE_ID, "Platform Ops", "platform-ops");
     const fixture = startApiFixture((_request, url) => {
       if (url.pathname === "/fleet/api/v1/workspaces") return pageEnvelope([workspace], 1, 1);
-      if (url.pathname === `/fleet/api/v1/workspaces/${WORKSPACE_ID}`) return workspaceEnvelope(workspace);
+      if (url.pathname === `/fleet/api/v1/workspaces/${WORKSPACE_ID}`) {
+        return Response.json(workspaceDetailRecord(WORKSPACE_ID, "Platform Ops", "platform-ops"));
+      }
       return Response.json({ error: { code: "NOT_FOUND", message: "not found" } }, { status: 404 });
     });
 
@@ -500,7 +502,7 @@ describe("Loop REST read port", () => {
     });
     const fixture = startApiFixture((_request, url) => {
       if (url.pathname === "/fleet/api/v1/tasks") return pageEnvelope([listRecord], 1, 1);
-      if (url.pathname === `/fleet/api/v1/tasks/${TASK_ID}`) return workspaceEnvelope(completeRecord);
+      if (url.pathname === `/fleet/api/v1/tasks/${TASK_ID}`) return taskDetailEnvelope(completeRecord);
       return Response.json({ error: { code: "NOT_FOUND", message: "not found" } }, { status: 404 });
     });
 
@@ -529,7 +531,7 @@ describe("Loop REST read port", () => {
     });
     const fixture = startApiFixture((_request, url) => {
       if (url.pathname === "/fleet/api/v1/tasks") return pageEnvelope([listRecord], 1, 1);
-      if (url.pathname === `/fleet/api/v1/tasks/${TASK_ID}`) return workspaceEnvelope(detailRecord);
+      if (url.pathname === `/fleet/api/v1/tasks/${TASK_ID}`) return taskDetailEnvelope(detailRecord);
       return Response.json({ error: { code: "NOT_FOUND", message: "not found" } }, { status: 404 });
     });
 
@@ -551,7 +553,7 @@ describe("Loop REST read port", () => {
   it("rejects a task when assignee_octo_uid is not a nullable string", async () => {
     const invalidTask = taskRecord(TASK_ID, { assignee_octo_uid: 42 });
     const fixture = startApiFixture((_request, url) => {
-      if (url.pathname === `/fleet/api/v1/tasks/${TASK_ID}`) return workspaceEnvelope(invalidTask);
+      if (url.pathname === `/fleet/api/v1/tasks/${TASK_ID}`) return taskDetailEnvelope(invalidTask);
       return Response.json({ error: { code: "NOT_FOUND", message: "not found" } }, { status: 404 });
     });
 

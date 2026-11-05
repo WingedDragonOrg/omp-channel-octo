@@ -137,9 +137,11 @@ function loopTask(): LoopTask {
 }
 
 function pageEnvelope(rows: Record<string, unknown>[], page: number): Response {
+  const pageSize = 100;
+  const start = (page - 1) * pageSize;
   return Response.json({
-    data: rows,
-    pagination: { total: rows.length, page, page_size: 100 },
+    data: rows.slice(start, start + pageSize),
+    pagination: { total: rows.length, page, page_size: pageSize },
   });
 }
 
@@ -166,7 +168,7 @@ function startApiFixture(state: ApiState): ApiFixture {
         const detail = state.workspaceDetails.get(workspaceId);
         return detail === undefined
           ? Response.json({ error: { code: "NOT_FOUND", message: "workspace not found" } }, { status: 404 })
-          : Response.json({ data: detail });
+          : Response.json(detail);
       }
       if (url.pathname === "/fleet/api/v1/tasks") {
         const workspaceId = request.headers.get("x-workspace-id");
@@ -242,14 +244,24 @@ function readPersistedState(store: ChannelStore): PersistedState {
   }
 }
 
-test("LoopController binds a workspace from local HTTP and persists its first task baseline", async () => {
+test("LoopController binds a workspace from local HTTP and persists its paginated task baseline", async () => {
   const state = emptyApiState();
-  const task = taskRecord(WORKSPACE_ID, TASK_ID);
+  const tasks = Array.from({ length: 101 }, (_, index) => {
+    const taskId = index === 0
+      ? TASK_ID
+      : `00000000-0000-4000-8000-${String(101 + index).padStart(12, "0")}`;
+    return taskRecord(WORKSPACE_ID, taskId);
+  });
+  const incompleteTask = tasks[0]!;
+  delete incompleteTask.description;
+  const taskDetail = taskRecord(WORKSPACE_ID, TASK_ID);
+  state.workspaceList = [workspaceListRecord(WORKSPACE_ID, "Platform Ops", "platform-ops")];
   state.workspaceDetails.set(WORKSPACE_ID, workspaceDetailRecord(WORKSPACE_ID, "Platform Ops", "platform-ops"));
-  state.taskLists.set(WORKSPACE_ID, [task]);
+  state.taskLists.set(WORKSPACE_ID, tasks);
+  state.taskDetails.set(TASK_ID, taskDetail);
 
   await withHarness(state, async ({ api, controller, store }) => {
-    const result = await controller.bind(GROUP_ID, WORKSPACE_ID);
+    const result = await controller.bind(GROUP_ID, "Platform Ops");
 
     expect(result.changed).toBe(true);
     expect(result.binding).toMatchObject({
@@ -263,25 +275,37 @@ test("LoopController binds a workspace from local HTTP and persists its first ta
     expect(store.getLoopBinding(BOT_UID, GROUP_ID)?.workspaceId).toBe(WORKSPACE_ID);
 
     const baseline = store.listLoopInputs(BOT_UID).filter((input) => input.kind === "baseline");
-    expect(baseline).toHaveLength(1);
-    expect(baseline[0]).toMatchObject({
-      groupId: GROUP_ID,
-      workspaceId: WORKSPACE_ID,
-      taskId: null,
-      tasks: [loopTask()],
-    });
+    expect(baseline).toHaveLength(6);
+    for (const input of baseline) {
+      expect(input).toMatchObject({
+        groupId: GROUP_ID,
+        workspaceId: WORKSPACE_ID,
+        taskId: null,
+      });
+    }
+    const baselineTasks = baseline.flatMap((input) => input.tasks);
+    expect(baselineTasks).toHaveLength(101);
+    expect(baselineTasks.find(({ taskId }) => taskId === TASK_ID)).toEqual(loopTask());
 
     const persisted = readPersistedState(store);
-    expect(persisted.snapshots).toHaveLength(1);
-    expect(JSON.parse(persisted.snapshots[0]!.task_json)).toEqual(loopTask());
+    expect(persisted.snapshots).toHaveLength(101);
+    expect(JSON.parse(persisted.snapshots.find(({ task_id }) => task_id === TASK_ID)!.task_json)).toEqual(loopTask());
     expect(api.requests.map(({ url }) => url.pathname)).toEqual([
+      "/fleet/api/v1/workspaces",
       `/fleet/api/v1/workspaces/${WORKSPACE_ID}`,
       "/fleet/api/v1/tasks",
+      "/fleet/api/v1/tasks",
+      `/fleet/api/v1/tasks/${TASK_ID}`,
     ]);
+    const taskListRequests = api.requests.filter(({ url }) => url.pathname === "/fleet/api/v1/tasks");
+    expect(taskListRequests.map(({ url }) => url.searchParams.get("page"))).toEqual(["1", "2"]);
+    expect(taskListRequests.map(({ url }) => url.searchParams.get("page_size"))).toEqual(["100", "100"]);
     for (const request of api.requests) {
       expect(request.method).toBe("GET");
       expect(request.authorization).toBe(`Bearer ${API_TOKEN}`);
-      expect(request.workspaceId).toBe(WORKSPACE_ID);
+      expect(request.workspaceId).toBe(
+        request.url.pathname === "/fleet/api/v1/workspaces" ? null : WORKSPACE_ID,
+      );
     }
   });
 });
