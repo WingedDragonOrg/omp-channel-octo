@@ -601,7 +601,7 @@ test("a plain pending-ask answer is judged once and only after its answer is dur
     const answerEvidence = evidenceFrom(requests[0]!);
     expect(answerEvidence.task).toBe(
       `Initial accepted requirement:\nStart the clarification.`
-      + `\nAdditional accepted requirement:\n[引用]\n${answerQuote}\n\n${answerText}`,
+      + `\nAdditional accepted requirement:\n${answerText}`,
     );
     expect(JSON.stringify(answerEvidence)).not.toContain("answer-quote-private-sender");
     await waitForThreadInfo(
@@ -1393,6 +1393,7 @@ test("quoted text retains neutral provenance without sender or quoted attachment
     await waitForSignal(requested.promise, "quoted-text reference decision request");
     expect(requests).toHaveLength(1);
     const evidence = evidenceFrom(requests[0]!);
+    expect(evidence.task).toBe(`Initial accepted requirement:\n${ownText}`);
     expect(evidence.recent).toHaveLength(1);
     expect(evidence.recent).toMatchObject([{
       role: "user",

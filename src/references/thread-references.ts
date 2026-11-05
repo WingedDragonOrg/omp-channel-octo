@@ -180,7 +180,7 @@ export class ThreadReferenceCoordinator {
 
     if (role === "user" && text.trimStart().startsWith("/")) return;
     this.rememberRecent(state, role, sourceKey, text, taskId, sourceText);
-    if (role === "user" && taskId) this.rememberRequirement(state, taskId, text);
+    if (role === "user" && taskId) this.rememberRequirement(state, taskId, sourceText ?? text);
 
     if (!/https?:\/\//iu.test(text)) return;
     let evidence: ReferenceEvidence;
