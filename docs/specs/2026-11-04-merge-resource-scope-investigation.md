@@ -45,9 +45,13 @@
 
 Git ref CAS 和 index lock 分别保护对应单次操作，不能把源工作树自动 stage/commit、squash/rebase、任意 hooks、target checkout/index 更新、目标 ref 推进、worktree/branch 清理与宿主数据库结果视为同一事务。hooks 可以写外部状态，其作用范围取决于具体 hook；本实验未证明任意 hook 外部副作用可回滚。锁只协调受宿主管理的参与者，外部 shell、编辑器和其他进程不受宿主锁约束。
 
-## 已确认方案
+## 当前并发契约（2026-11-06；上文调查与下文隔离验收仍是历史记录）
 
-`octo_management thread-merge` 和 `/thread merge` 不对 source、target 或其他任务和操作实施资源并发限制，也不以合并占用阻挡其他独立工作。合并可以与其他合并、普通任务、commit 或 workspace 清理交错执行；同一聊天和精确 session 的既有顺序与任务身份语义不变。Git 和 Worktrunk 的实际成功、冲突或失败结果照实返回，不承诺流水线原子回滚或自动重试。
+`/thread merge`（包括 slash 命令中的自动 OMP commit 阶段）与 `/thread remove` 不因其他聊天任务、相关目录/仓库活动或未确认 worker/process ledger 等待或拒绝，不以等效路径锁替代。二者继续按当前聊天及精确 session 顺序受理，保留取消与稳定操作身份；merge/remove 仍按持久归属验证目标路径、来源仓库、分支和当前计划，shared/fork 例外行为不变。独立 `/commit` 和 `thread-delete` 的既有资源保护、分支与占用语义完全不变。
+
+没有跨操作资源锁意味着任务或外部进程可能在检查前后改动文件、index、分支 ref、checkout 或 hook 外部状态；`/thread remove` 可能在其他任务仍写入时移除其 worktree，自动 OMP commit 可能纳入并发写入，Git/Worktrunk 可报告冲突或留下部分副作用，任何步骤都不承诺事务回滚。独立 `/commit` 与 `thread-delete` 保留各自现有锁/占用检查，但 `/thread remove` 不参与该资源门禁，因此两种语义不能推导为互斥，二者也可能交错。持久 ledger 是审计/去重/结果交付事实，不是新操作的忙碌门禁；旧退出未知/业务结果未知记录既不证明进程仍存活，也不证明副作用成功或失败。相同稳定 operation 的未知结果永不自动重放、续跑或声称成功；remove 任一步未知时不归档，自动提交/merge 未知时不启动后续阶段。独立新操作不是旧 operation 的恢复，按当前持久归属和真实路径重验后仍可并发，因而可能与旧进程交错。
+
+安全底线仍是只按持久归属选定资源并在副作用前验证实际路径、Git 来源与分支/checkout 身份；不因这类检查建立路径锁。保留同聊天精确 session 顺序、cancel/stop 控制、共享工作区语义和 fork-only archive 分支。
 
 此选择允许同一 source 上的暂存、squash、rebase 和删除与其他文件操作交错，也允许 target checkout/index 更新与其他写入交错；Git ref CAS 和 index 锁不能覆盖任意普通文件写或 hook 外部副作用。不能依据当前是否仅在模型生成判断任务未来不会写。不同目标也可能通过 source 或 hook 共享状态。
 
@@ -55,10 +59,12 @@ Git ref CAS 和 index lock 分别保护对应单次操作，不能把源工作�
 
 ## 验收与实施边界
 
-1. 两个入口均验证 source、target 上普通任务和其他合并或破坏操作在先启动与后启动两种顺序下均不因资源占用等待或拒绝；独立 worktree 和同目录均可并发。验证实际副作用或完成，不只看 started 状态。
-2. 在可控 barrier 的真实 Git/wt 场景覆盖同目标有定义的成功、CAS/冲突或失败结果，不声称必成功；不同目标可并发；checkout/index 与 hook、晚期失败的实际结果可核对。
-3. 覆盖结束、取消、重启与未知结果：保留进程身份和真实结果，未知时不猜测成功或自动重放原操作；不把历史 merge 资源记录变成新操作的并发限制。
-4. 先加失败回归，再做最小实现，同步 `2026-09-12-octo-channel-design.md` 与 `2026-09-17-thread-worktrunk-design.md` 的实际契约及必要的仓库指引；运行相关资源/merge/core 测试、`bun run typecheck`、全量 `bun test`、临时真实 Git smoke 和 `bun tests/benchmarks/restart.ts`。不动其他子区的 inbound 队列改动，不提交、推送、合并或部署。
+1. 两个 merge 入口与 `/thread remove` 均验证其他 chat 任务、source/target checkout、相关目录/Git 活动及旧未知 ledger 不导致资源等待/拒绝或等效锁；行为验证执行/结果，不只观察 started 状态。保留同聊天/session 顺序、取消、权限和工作区归属路径验证。
+2. 在可控 barrier 的真实 Git/wt 场景覆盖同目标成功、CAS/冲突或失败结果，不声称必成功；不同目标可并发；checkout/index、自动提交、hook 与晚期失败的实际结果可核对并记录部分效果风险。
+3. 覆盖结束、取消、重启与旧未知结果：同一 operation 的已知结果去重、未知结果保留且不猜测成功/失败、不自动重放或续跑；历史 ledger 不成为新操作并发门禁。
+4. 确认独立 `/commit` 与 `thread-delete` 仍各自遵守既有资源保护、分支和占用语义；测试只用抛弃式资源，不触碰真实业务状态。
+
+原调查在 2026-11-04 记录的实施计划（仅为历史记录，当前验收见上文）：先加失败回归，再做最小实现，同步 `2026-09-12-octo-channel-design.md` 与 `2026-09-17-thread-worktrunk-design.md` 的实际契约及必要的仓库指引；运行相关资源/merge/core 测试、`bun run typecheck`、全量 `bun test`、临时真实 Git smoke 和 `bun tests/benchmarks/restart.ts`。不动其他子区的 inbound 队列改动，不提交、推送、合并或部署。
 
 ## 隔离验收记录
 

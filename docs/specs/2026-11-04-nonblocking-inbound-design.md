@@ -225,7 +225,7 @@ interface InboundReceipt {
 - 普通文本、附件、`/queue <正文>`、`/thread <任务>`、未知 slash：保留本聊天任务/steering 输入顺序。
 - Worker 明确拒绝 steering（本地未运行/未流式等前置拒绝或 RPC `success: false`）时按原任务路径持久交接；dispatch-intent 后的 transport、timeout 或畸形响应等不确定结果保持 `unknown`，不得再创建任务。
 - `/new`、`/reset`、`/move`：保持会话切换屏障；较晚的普通输入不能越过未完成的切换而误用旧绑定。屏障不挡查询和取消。
-- commit/remove：安装实际资源意图；后续冲突工作不能通过 steering 越过它；无关聊天和无关 worktree 正常运行。merge 保持聊天和精确 session 顺序，不申请工作区资源并发锁。
+- 独立 `/commit` 与 `thread-delete` 保留原有资源保护语义。`/thread remove`、`/thread merge`（包括自动提交）只保留当前聊天与精确 session 顺序，不因其他聊天任务、相关目录/仓库活动或未确认进程账本等待/拒绝，也不以等效路径锁替代；保留取消，并验证持久工作区归属/实际路径。无关聊天和 worktree 工作可并发，Git 冲突与部分效果仍可能发生。
 - fork：源绑定快照与创建意图按顺序取得，后续准备在后台继续；不以完整 fork 生命周期阻塞源聊天普通执行。
 
 ### 6.2 控制入口

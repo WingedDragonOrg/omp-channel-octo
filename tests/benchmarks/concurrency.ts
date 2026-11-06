@@ -570,6 +570,8 @@ exec git -C "$repo" worktree add -q -b "$branch" "$path"
   const activeStore = await openChannelStore(stateDir);
   store = activeStore;
   db = new Database(join(stateDir, "channel.sqlite"), { readonly: true });
+  await prepareSession(groupTarget, parentCwd);
+
 
   const createdThread = await createThreadWorkspaceBatch(
     { stateDir, transport: activeTransport, worktrees, store: activeStore, botUid: bot.uid },
@@ -620,7 +622,6 @@ exec git -C "$repo" worktree add -q -b "$branch" "$path"
   assert.ok(alphaWorktrees.split("\n").includes(`worktree ${alphaPath}`));
   assert.ok(betaWorktrees.split("\n").includes(`worktree ${betaPath}`));
 
-  await prepareSession(groupTarget, parentCwd);
   await prepareSession(activeThreadTarget, entryPath);
   const projectAlphaTarget: ChatTarget = { channelType: 1, channelId: "dm-project-alpha" };
   const projectBetaTarget: ChatTarget = { channelType: 1, channelId: "dm-project-beta" };

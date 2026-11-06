@@ -44,8 +44,8 @@ import {
 } from "./tasks/task-scheduler.ts";
 import type { DestructiveResourceLease } from "./tasks/task-scheduler.ts";
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, rm } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { mkdir, rm } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import {
   ATTACHMENT_MAX_AGE_MS,
   sweepAttachments,
@@ -325,7 +325,7 @@ type CommitOperation = {
   target: ChatTarget;
   root: string;
   binding: BindingRecord;
-  reservation: Pick<CommitLease, "complete">;
+  reservation?: Pick<CommitLease, "complete">;
   done: Promise<void>;
   finish(): void;
   workerReady: Promise<void>;
@@ -384,10 +384,10 @@ function threadMergeAbortError(signal: AbortSignal): Error {
 }
 
 async function waitWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) throw threadMergeAbortError(signal);
   const aborted = Promise.withResolvers<never>();
   const onAbort = (): void => aborted.reject(threadMergeAbortError(signal));
-  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) onAbort();
+  else signal.addEventListener("abort", onAbort, { once: true });
   try {
     return await Promise.race([operation, aborted.promise]);
   } finally {
@@ -395,19 +395,6 @@ async function waitWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Pro
   }
 }
 
-async function pauseThreadMergeWait(signal: AbortSignal): Promise<void> {
-  const completion = Promise.withResolvers<void>();
-  const finish = (): void => {
-    clearTimeout(timer);
-    signal.removeEventListener("abort", finish);
-    completion.resolve();
-  };
-  const timer = setTimeout(finish, 50);
-  if (signal.aborted) finish();
-  else signal.addEventListener("abort", finish, { once: true });
-  await completion.promise;
-  if (signal.aborted) throw threadMergeAbortError(signal);
-}
 
 interface PreparedIngressTask {
   readonly message: InboundMessage;
@@ -467,7 +454,7 @@ class CoreService implements ChannelService {
   /** Waiting ingress-owned thread commands retain their exact scheduler reservation through recovery. */
   private readonly ingressCommandReservations = new Map<string, {
     kind: "merge" | "remove";
-    reservation: DestructiveCommandReservation;
+    reservation: SessionCommandReservation;
     resourceCwds: readonly string[];
   }>();
   /** `/new` and `/move` preserve the exact session/path barrier while waiting or recovering. */
@@ -1035,11 +1022,6 @@ class CoreService implements ChannelService {
                 failedHostMergeRecoveries.push(recovered);
               }
             } catch (error) {
-              this.blockedDirectories.add(lease.cwd);
-              const sourceCwd = lease.resourceCwds[0];
-              if (sourceCwd !== undefined) this.blockedDirectories.add(sourceCwd);
-              const worker = this.store.getWorkerLedger(identity.uid, lease.autoCommitTaskId);
-              if (worker !== null) this.blockedDirectories.add(worker.cwd);
               console.error(`[thread merge recovery] 无法持久化已知自动提交的未合并结果 cwd=${lease.cwd}: ${safeErrorMessage(error, "auto-commit recovery failed")}`);
             }
             continue;
@@ -1049,14 +1031,13 @@ class CoreService implements ChannelService {
             && (lease.autoCommitState === "committing" || lease.autoCommitState === "unknown")
           ) {
             const worker = this.store.getWorkerLedger(identity.uid, lease.autoCommitTaskId);
+            if (worker !== null) recoveredAutoCommitWorkerIds.add(worker.id);
             let stopped = worker === null || worker.state === "stopped";
-            if (worker !== null && stopped) recoveredAutoCommitWorkerIds.add(worker.id);
             if (worker !== null && !stopped) {
               try {
                 stopped = await this.options.workerFactory.recover(worker);
                 if (stopped) {
                   this.store.markWorkerStopped(worker.id);
-                  recoveredAutoCommitWorkerIds.add(worker.id);
                 }
               } catch {
                 stopped = false;
@@ -1075,33 +1056,22 @@ class CoreService implements ChannelService {
                   failedHostMergeRecoveries.push(recovered);
                 }
               } catch (error) {
-                this.blockedDirectories.add(lease.cwd);
-                const sourceCwd = lease.resourceCwds[0];
-                if (sourceCwd !== undefined) this.blockedDirectories.add(sourceCwd);
-                if (worker !== null) this.blockedDirectories.add(worker.cwd);
                 console.error(`[thread merge recovery] 无法持久化未启动的自动提交结果 cwd=${lease.cwd}: ${safeErrorMessage(error, "pre-dispatch recovery failed")}`);
               }
             } else {
-              this.blockedDirectories.add(lease.cwd);
-              const sourceCwd = lease.resourceCwds[0];
-              if (sourceCwd !== undefined) this.blockedDirectories.add(sourceCwd);
-              if (worker !== null) this.blockedDirectories.add(worker.cwd);
               if (lease.autoCommitState !== "unknown" || lease.phase !== "unknown") {
                 this.store.markHostMergeLeaseUnknown(lease.id);
               }
-              console.error(`[thread merge recovery] 自动提交尚未派发但 worker 停止状态无法确认 cwd=${lease.cwd}；资源保持封锁`);
+              this.blockedDirectories.add(lease.cwd);
+              for (const cwd of lease.resourceCwds) this.blockedDirectories.add(cwd);
+              console.error(`[thread merge recovery] 自动提交尚未派发但 worker 停止状态无法确认 cwd=${lease.cwd}；结果保持未知，不重放旧命令，也不阻塞新的 /thread merge 自动提交`);
             }
             continue;
           }
-          this.blockedDirectories.add(lease.cwd);
-          const sourceCwd = lease.resourceCwds[0];
-          if (sourceCwd !== undefined) this.blockedDirectories.add(sourceCwd);
-          const worker = this.store.getWorkerLedger(identity.uid, lease.autoCommitTaskId);
-          if (worker !== null) this.blockedDirectories.add(worker.cwd);
           if (lease.autoCommitState !== "unknown" || lease.phase !== "unknown") {
             this.store.markHostMergeLeaseUnknown(lease.id);
           }
-          console.error(`[thread merge recovery] 自动提交结果或后续状态无法确认 cwd=${lease.cwd}；不会重放并保持资源封锁`);
+          console.error(`[thread merge recovery] 自动提交结果或后续状态无法确认 cwd=${lease.cwd}；不重放旧命令，也不阻塞新的 /thread merge 自动提交`);
           continue;
         }
         const processIdentity = this.hostMergeProcessIdentity(lease);
@@ -1114,8 +1084,9 @@ class CoreService implements ChannelService {
           }
         }
         if (!stopped) {
+          console.error(`[thread merge recovery] 旧 Worktrunk 进程组仍未确认停止 cwd=${lease.cwd}；结果保持未知且不会自动重放`);
+          this.blockedDirectories.add(lease.cwd);
           for (const cwd of lease.resourceCwds) this.blockedDirectories.add(cwd);
-          console.error(`[thread merge recovery] 旧 worktrunk 进程组仍未确认停止 cwd=${lease.cwd}`);
         }
         this.store.markHostMergeLeaseUnknown(lease.id);
       }
@@ -1135,20 +1106,23 @@ class CoreService implements ChannelService {
           }
           continue;
         }
-        this.blockRemovalResources(lease);
         const processIdentity = this.hostRemovalProcessIdentity(lease);
+        let stopped = false;
         if (processIdentity && this.options.worktrees?.recoverMergeProcess) {
-          let stopped = false;
           try {
             stopped = await this.options.worktrees.recoverMergeProcess(processIdentity);
           } catch (error) {
             console.error(`[thread remove recovery] 无法确认旧清理进程组已停止 cwd=${lease.cwd}: ${safeErrorMessage(error, "process recovery failed")}`);
           }
           if (!stopped) {
-            console.error(`[thread remove recovery] 旧清理进程组仍未确认停止，资源保持封锁 cwd=${lease.cwd}`);
+            console.error(`[thread remove recovery] 旧清理进程组仍未确认停止，结果保持未知且不会自动重放 cwd=${lease.cwd}`);
           }
         }
         if (lease.phase !== "unknown") this.store.markHostRemovalLeaseUnknown(lease.id);
+        if (!stopped) {
+          this.blockedDirectories.add(lease.cwd);
+          for (const path of lease.resourcePaths) this.blockedDirectories.add(path);
+        }
       }
       // 重启不丢工作：先把每个遗留 worker 的进程组收干净，再动任何任务状态。无法确认死亡的
       // 目录保持 block——它的任务留在队列继续挡住同目录的新写者（runTask 原样放过）。
@@ -1914,33 +1888,6 @@ class CoreService implements ChannelService {
       ...this.store.listRecoverableIngressJobs(botUid),
       ...this.store.listUnknownIngressJobs(botUid),
     ].map(job => [job.id, job] as const));
-    const restoreUnmatchedHostLease = (
-      target: ChatTarget,
-      messageId: string,
-      kind: "merge" | "remove",
-      resourceCwds: readonly string[],
-    ): void => {
-      if (kind === "merge") return;
-      // An unmatched host removal keeps its owned resources protected while its process outcome
-      // remains unresolved.
-      for (const cwd of resourceCwds) this.blockedDirectories.add(cwd);
-      try {
-        const reservation = this.scheduler.reserveDestructiveCommandSession(
-          target,
-          resourceCwds,
-          resourceCwds,
-        );
-        this.ingressCommandReservations.set(`${targetKey(target)}\0${messageId}`, {
-          kind,
-          reservation,
-          resourceCwds,
-        });
-      } catch (error) {
-        console.error(
-          `[ingress recovery] cannot retain ${kind} host lease ${messageId}: ${safeErrorMessage(error, "reservation failed")}`,
-        );
-      }
-    };
     for (const lease of hostMergeById.values()) {
       if (lease.outcome !== null) continue;
       const job = this.store.getIngressJobBySource({
@@ -1955,13 +1902,6 @@ class CoreService implements ChannelService {
         && job.operationCheckpoint.hostLedgerId === lease.id
       ) {
         jobsById.set(job.id, job);
-      } else {
-        restoreUnmatchedHostLease(
-          { channelType: lease.channelType, channelId: lease.channelId },
-          lease.sourceId,
-          "merge",
-          lease.resourceCwds,
-        );
       }
     }
     for (const lease of hostRemovalById.values()) {
@@ -1978,13 +1918,6 @@ class CoreService implements ChannelService {
         && job.operationCheckpoint.hostLedgerId === lease.id
       ) {
         jobsById.set(job.id, job);
-      } else {
-        restoreUnmatchedHostLease(
-          { channelType: lease.channelType, channelId: lease.channelId },
-          lease.sourceId,
-          "remove",
-          lease.resourcePaths,
-        );
       }
     }
     const jobs = [...jobsById.values()].sort((left, right) => left.id - right.id);
@@ -2050,45 +1983,18 @@ class CoreService implements ChannelService {
       const hostOutcomeUnknown =
         linkedMerge?.outcome === null
         || linkedRemoval?.outcome === null;
-      if (job.state === "dispatch-intent" || job.state === "unknown" || hostOutcomeUnknown) {
-        if (isMerge) continue;
-        for (const cwd of resourceCwds) this.blockedDirectories.add(cwd);
-        try {
-          const reservation = this.scheduler.reserveDestructiveCommandSession(
-            target,
-            resourceCwds,
-            resourceCwds,
-            job.scheduleOrder,
-          );
-          this.ingressCommandReservations.set(commandKey, {
-            kind: "remove",
-            reservation,
-            resourceCwds,
-          });
-        } catch (error) {
-          console.error(
-            `[ingress recovery] cannot retain remove barriers for job=${job.id}: ${safeErrorMessage(error, "reservation failed")}`,
-          );
-        }
-        continue;
-      }
+      if (job.state === "dispatch-intent" || job.state === "unknown" || hostOutcomeUnknown) continue;
       if (job.state !== "accepted" || (!isMerge && resourceCwds.length === 0)) continue;
       try {
-        const reservation = this.scheduler.reserveDestructiveCommandSession(
-          target,
-          isMerge ? [] : resourceCwds,
-          [],
-          job.scheduleOrder,
-        );
+        const reservation = this.scheduler.reserveSessionCommand(target, [], job.scheduleOrder);
         this.ingressCommandReservations.set(commandKey, {
           kind: isMerge ? "merge" : "remove",
           reservation,
           resourceCwds,
         });
       } catch (error) {
-        for (const cwd of resourceCwds) this.blockedDirectories.add(cwd);
         console.error(
-          `[ingress recovery] cannot reserve ${isMerge ? "merge" : "remove"} resources for job=${job.id}: ${safeErrorMessage(error, "reservation failed")}`,
+          `[ingress recovery] cannot reserve ${isMerge ? "merge" : "remove"} session for job=${job.id}: ${safeErrorMessage(error, "reservation failed")}`,
         );
       }
     }
@@ -3007,7 +2913,7 @@ class CoreService implements ChannelService {
   }
 
   private markIngressUnknown(job: IngressJobRecord): boolean {
-    const text = "操作结果无法确认，系统不会自动重试；相关资源继续保持保护。";
+    const text = "操作结果无法确认，系统不会自动重试；请先核对当前状态，再决定是否重试。";
     const target: ChatTarget = { channelType: job.channelType, channelId: job.channelId };
     const payload = job.payload;
     const message = payload?.kind === "recv" || payload?.kind === "synthetic"
@@ -3136,40 +3042,26 @@ class CoreService implements ChannelService {
     ) return undefined;
 
     let resourceCwds: readonly string[];
-    let repositoryCwds: readonly string[];
     if (isMerge) {
       const binding = this.store.getBinding(botUid, message);
       if (binding === null || binding.cwdPinned !== true) return undefined;
       resourceCwds = [binding.cwd];
-      repositoryCwds = [];
     } else {
       const ownership = this.store.getThreadWorkspace(botUid, message);
       if (ownership === null) return undefined;
       resourceCwds = threadWorkspaceCleanupPaths(ownership, true);
       if (resourceCwds.length === 0) return undefined;
-      repositoryCwds = [];
     }
 
     const commandKey = this.threadMergeCommandKey(message);
     const kind = isMerge ? "merge" : "remove";
     const existingReservation = this.ingressCommandReservations.get(commandKey);
-    let reservation: DestructiveCommandReservation;
+    let reservation: SessionCommandReservation;
     if (existingReservation !== undefined && existingReservation.kind === kind) {
       reservation = existingReservation.reservation;
-      if (isRemove) {
-        reservation.extend(
-          resourceCwds.filter(path => !existingReservation.resourceCwds.includes(path)),
-          repositoryCwds,
-        );
-      }
       resourceCwds = [...new Set([...existingReservation.resourceCwds, ...resourceCwds])];
     } else {
-      reservation = this.scheduler.reserveDestructiveCommandSession(
-        message,
-        isMerge ? [] : resourceCwds,
-        isMerge ? [] : repositoryCwds,
-        job.scheduleOrder,
-      );
+      reservation = this.scheduler.reserveSessionCommand(message, [], job.scheduleOrder);
     }
     this.ingressCommandReservations.set(commandKey, { kind, reservation, resourceCwds });
     const controller = new AbortController();
@@ -3790,30 +3682,27 @@ class CoreService implements ChannelService {
     };
   }
 
-  private blockRemovalResources(lease: HostRemovalLeaseRecord): void {
-    this.blockedDirectories.add(lease.cwd);
-    for (const path of lease.resourcePaths) this.blockedDirectories.add(path);
-  }
 
-  private releaseOrBlockHostRemoval(
+  private releaseOrRetainUnknownHostRemoval(
     id: string,
-    resourcePaths: readonly string[],
     removalProcessExited: boolean,
+    resourcePaths: readonly string[],
   ): void {
-    // A confirmed child exit is not a durable operation outcome; keep its lease fail-closed.
     if (!removalProcessExited) {
       try {
         this.store.releaseHostRemovalLease(id);
         return;
       } catch {
-        // A state mismatch below must fail closed rather than discard the lease.
+        // A state mismatch must not discard the unresolved operation record.
       }
     }
-    for (const path of resourcePaths) this.blockedDirectories.add(path);
+    if (!removalProcessExited) {
+      for (const path of resourcePaths) this.blockedDirectories.add(path);
+    }
     try {
       this.store.markHostRemovalLeaseUnknown(id);
     } catch {
-      // Resource blocks still fail closed if the durable row itself cannot be updated.
+      // Preserve the unresolved record; unknown results are never treated as successful.
     }
   }
 
@@ -5272,7 +5161,7 @@ class CoreService implements ChannelService {
       await this.outbox.enqueueText(
         target,
         hostOperationCancelled
-          ? "已请求中止正在等待或执行的子区宿主操作；进程结果若未确认，资源将保持封锁且不会自动重试。"
+          ? "已请求中止正在等待或执行的子区宿主操作；未确认的结果保持未知且不会自动重放，请先核对状态。"
           : persistedEffects?.interruptedTaskIds.length
             ? DEFAULT_INTERRUPTED_TEXT
             : DEFAULT_INTERRUPT_IDLE_TEXT,
@@ -6403,7 +6292,7 @@ class CoreService implements ChannelService {
     target: ChatTarget,
     root: string,
     binding: BindingRecord,
-    reservation: Pick<CommitLease, "complete">,
+    reservation?: Pick<CommitLease, "complete">,
   ): CommitOperation {
     const done = Promise.withResolvers<void>();
     const workerReady = Promise.withResolvers<void>();
@@ -6412,7 +6301,7 @@ class CoreService implements ChannelService {
       target,
       root,
       binding,
-      reservation,
+      ...(reservation === undefined ? {} : { reservation }),
       done: done.promise,
       finish: done.resolve,
       workerReady: workerReady.promise,
@@ -6426,7 +6315,7 @@ class CoreService implements ChannelService {
   }
 
   private forgetCommitOperation(operation: CommitOperation): void {
-    operation.reservation.complete();
+    operation.reservation?.complete();
     operation.markWorkerReady();
     if (this.commitOperationsByTask.get(operation.taskId) === operation) {
       this.commitOperationsByTask.delete(operation.taskId);
@@ -6605,6 +6494,10 @@ class CoreService implements ChannelService {
     this.outbox.enqueueText(message, "开始提交当前项目。", taskId);
   }
 
+  private blockCommitDirectory(_operation: CommitOperation | undefined, cwd: string): void {
+    this.blockedDirectories.add(cwd);
+  }
+
   private stopCommitOperation(operation: CommitOperation): Promise<boolean> {
     operation.stopRequested = true;
     operation.stopPromise ??= (async () => {
@@ -6615,7 +6508,7 @@ class CoreService implements ChannelService {
         return stopped;
       } catch {
         operation.stopConfirmed = false;
-        this.blockedDirectories.add(operation.root);
+        this.blockCommitDirectory(operation, operation.root);
         return false;
       }
     })();
@@ -6628,7 +6521,6 @@ class CoreService implements ChannelService {
       this.store.requestHostMergeStop(operation.autoMergeLeaseId);
     } catch {
       operation.autoCommitPersistenceFailed = true;
-      this.blockedDirectories.add(operation.root);
     }
     operation.stopFollowing?.();
     void this.stopCommitOperation(operation);
@@ -7085,7 +6977,7 @@ class CoreService implements ChannelService {
     );
     const sessionCompleted = sessionJobIds.some(id => this.store.getIngressJob(id)?.state === "handed-off");
     const response = commitStopUnconfirmed || unknownHostOperation || unknownIngressOperation
-      ? "无法确认受管操作已完成或停止；相关资源继续保持保护。"
+      ? "无法确认受管操作已完成或停止；结果保持未知且不会自动重放，请先核对状态。"
       : completedCommit?.result !== undefined
         ? `当前提交已完成，无法取消或回滚；HEAD=${this.shortHead(completedCommit.result.headAfter)}。`
         : sessionCompleted && queued.length === 0
@@ -7222,32 +7114,6 @@ class CoreService implements ChannelService {
     return `${targetKey(message)}\0${message.messageId}`;
   }
 
-  private hasUnknownIngressThreadOperation(
-    message: InboundMessage,
-    operation: "merge" | "remove",
-  ): boolean {
-    const botUid = this.bot?.uid;
-    if (botUid === undefined) return false;
-    const job = this.store.getIngressJobBySource({
-      botUid,
-      sourceKind: "recv",
-      sourceId: recvIngressSourceId(message.channelType, message.channelId, message.messageId),
-    });
-    const checkpoint = job?.operationCheckpoint;
-    if (
-      job === null
-      || checkpoint?.kind !== "command"
-      || checkpoint.action !== "thread"
-    ) return false;
-    if (checkpoint.hostLedgerId === undefined) return false;
-    return operation === "merge"
-      ? this.store.listHostMergeLeases(botUid).some(lease =>
-        lease.id === checkpoint.hostLedgerId && lease.outcome === null,
-      )
-      : this.store.listHostRemovalLeases(botUid).some(lease =>
-        lease.id === checkpoint.hostLedgerId && lease.outcome === null,
-      );
-  }
 
   private finishThreadMergeCommand(message: InboundMessage): boolean {
     const commandKey = this.threadMergeCommandKey(message);
@@ -7266,7 +7132,7 @@ class CoreService implements ChannelService {
         }
       }
     }
-    if (reservation !== undefined && !this.hasUnknownIngressThreadOperation(message, "merge")) {
+    if (reservation !== undefined) {
       reservation.release();
       this.ingressCommandReservations.delete(commandKey);
     }
@@ -7290,7 +7156,7 @@ class CoreService implements ChannelService {
         }
       }
     }
-    if (reservation !== undefined && !this.hasUnknownIngressThreadOperation(message, "remove")) {
+    if (reservation !== undefined) {
       reservation.release();
       this.ingressCommandReservations.delete(commandKey);
     }
@@ -8026,7 +7892,7 @@ class CoreService implements ChannelService {
   private async acquireThreadMergeLease(
     target: ChatTarget,
     expectedBinding: BindingRecord,
-    reservation: DestructiveCommandReservation,
+    reservation: SessionCommandReservation,
     signal: AbortSignal,
     acceptsInitialSessionBinding: (binding: BindingRecord) => boolean,
   ): Promise<{ lease: SessionLease; binding: BindingRecord }> {
@@ -8040,29 +7906,33 @@ class CoreService implements ChannelService {
       }
       throw new Error("等待合并期间子区绑定已变更，未执行合并。");
     };
-    for (;;) {
+    const current = validateCurrentBinding(this.store.getBinding(botUid, target));
+    if (current.cwdPinned !== true || current.cwd !== expectedBinding.cwd) {
+      throw new Error("等待合并期间子区绑定已变更，未执行合并。");
+    }
+    await waitWithAbort(reservation.waitForPrior(signal), signal);
+    if (signal.aborted) throw threadMergeAbortError(signal);
+
+    const afterPriorWork = validateCurrentBinding(this.store.getBinding(botUid, target));
+    if (afterPriorWork.cwdPinned !== true || afterPriorWork.cwd !== expectedBinding.cwd) {
+      throw new Error("等待合并期间子区绑定已变更，未执行合并。");
+    }
+    const acquisition = reservation.tryAcquire();
+    const lease = await waitWithAbort(acquisition, signal).catch((error: unknown) => {
+      void acquisition.then((lateLease) => lateLease?.complete(), () => {});
+      throw error;
+    });
+    if (!lease) {
+      throw new Error("前序会话任务结束后无法取得会话租约，未执行合并。");
+    }
+    try {
+      await waitWithAbort(lease.ready, signal);
       if (signal.aborted) throw threadMergeAbortError(signal);
-      const current = validateCurrentBinding(this.store.getBinding(botUid, target));
-      if (current.cwdPinned !== true || current.cwd !== expectedBinding.cwd) {
-        throw new Error("等待合并期间子区绑定已变更，未执行合并。");
-      }
-      const acquisition = reservation.tryAcquire();
-      const lease = await waitWithAbort(acquisition, signal).catch((error: unknown) => {
-        void acquisition.then((lateLease) => lateLease?.complete(), () => {});
-        throw error;
-      });
-      if (lease) {
-        try {
-          await waitWithAbort(lease.ready, signal);
-          if (signal.aborted) throw threadMergeAbortError(signal);
-          const binding = validateCurrentBinding(this.store.getBinding(botUid, target));
-          return { lease, binding };
-        } catch (error) {
-          lease.complete();
-          throw error;
-        }
-      }
-      await pauseThreadMergeWait(signal);
+      const binding = validateCurrentBinding(this.store.getBinding(botUid, target));
+      return { lease, binding };
+    } catch (error) {
+      lease.complete();
+      throw error;
     }
   }
 
@@ -8188,7 +8058,6 @@ class CoreService implements ChannelService {
       onSpawn: (identity) => {
         processStarted = true;
         if (!reserved || identity.cwd !== cwd) {
-          for (const path of plannedResources) this.blockedDirectories.add(path);
           throw new Error("host merge process spawned without its durable reservation");
         }
         this.store.recordHostMergeProcess(id, identity);
@@ -8219,8 +8088,11 @@ class CoreService implements ChannelService {
           finishNotSpawned();
           return;
         }
-        for (const path of plannedResources) this.blockedDirectories.add(path);
         this.store.markHostMergeLeaseUnknown(id);
+        if (!confirmedExit) {
+          this.blockedDirectories.add(cwd);
+          for (const resourceCwd of plannedResources) this.blockedDirectories.add(resourceCwd);
+        }
         progress?.unknown(signal?.aborted
           ? "取消后 Worktrunk merge 的最终结果无法确认；不会自动重放，请先核对目标分支与工作区。"
           : undefined);
@@ -8313,20 +8185,22 @@ class CoreService implements ChannelService {
     let resourceCwds: readonly string[] = [];
     let autoCommitTaskId: string | undefined;
     let autoCommitLeaseId: string | undefined;
-    let autoCommitResourceLease: DestructiveResourceLease | undefined;
     let autoCommitOperation: CommitOperation | undefined;
     let autoCommitDiagnostic: string | undefined;
     let autoCommitOutcomeUnknown = false;
     const recordAutoCommitUnknown = (diagnostic: string): void => {
       autoCommitOutcomeUnknown = true;
       autoCommitDiagnostic = diagnostic;
-      this.blockedDirectories.add(expectedBinding.cwd);
-      if (autoCommitOperation !== undefined) this.blockedDirectories.add(autoCommitOperation.root);
+      if (autoCommitOperation?.processConfirmedExit !== true) {
+        this.blockedDirectories.add(expectedBinding.cwd);
+        if (autoCommitOperation !== undefined) this.blockedDirectories.add(autoCommitOperation.root);
+        for (const cwd of resourceCwds) this.blockedDirectories.add(cwd);
+      }
       if (autoCommitLeaseId !== undefined) {
         try {
           this.store.markHostMergeLeaseUnknown(autoCommitLeaseId);
         } catch {
-          // The unresolved durable "committing" row is itself a restart barrier.
+          // This durable record prevents replay of the same stable operation.
         }
       }
       progress.unknown(diagnostic);
@@ -8392,7 +8266,7 @@ class CoreService implements ChannelService {
       } else {
         // Merge commands serialize only this chat/session; worktree resources are not reserved.
         if (reservation === undefined) {
-          reservation = this.scheduler.reserveDestructiveCommandSession(message, []);
+          reservation = this.scheduler.reserveSessionCommand(message, []);
           this.ingressCommandReservations.set(commandKey, {
             kind: "merge",
             reservation,
@@ -8429,7 +8303,7 @@ class CoreService implements ChannelService {
           request.branch = project.branch;
         }
         plan = await worktrees.planMerge(request, controller.signal);
-        resourceCwds = plan.cwds;
+        resourceCwds = [...new Set([expectedBinding.cwd, ...plan.cwds])];
         if (reservation === undefined) throw new Error("merge session reservation disappeared");
         const current = this.ingressCommandReservations.get(commandKey);
         this.ingressCommandReservations.set(commandKey, {
@@ -8474,22 +8348,12 @@ class CoreService implements ChannelService {
             throw new Error(commitWorkspace.error);
           }
           if (reservation === undefined) throw new Error("merge session reservation disappeared");
-          autoCommitResourceLease = await this.scheduler.tryAcquireThreadMergeCommitResources(
-            expectedBinding.cwd,
-            commitWorkspace.root,
-            reservation.order,
-            `thread-merge-commit:${message.messageId}`,
-          );
-          if (autoCommitResourceLease === undefined) {
-            autoCommitDiagnostic = "提交工作树资源正忙或受保护；未启动 OMP 提交，也未执行合并。";
-            throw new Error(autoCommitDiagnostic);
-          }
-          const lockedChanges = await this.inspectThreadMergeWorktree(
+          const currentChanges = await this.inspectThreadMergeWorktree(
             expectedBinding.cwd,
             ownership,
             controller.signal,
           );
-          if (lockedChanges.dirty) {
+          if (currentChanges.dirty) {
             if (controller.signal.aborted) throw new Error("自动提交已取消；未执行合并。");
             autoCommitTaskId = randomUUID();
             const lifecycle = lifecycleFor(autoCommitTaskId);
@@ -8551,7 +8415,6 @@ class CoreService implements ChannelService {
               message,
               commitWorkspace.root,
               expectedBinding,
-              autoCommitResourceLease,
             );
             autoCommitOperation.autoMergeLeaseId = persistedLease.id;
             autoCommitOperation.stopFollowing = () => controller.abort(new Error("automatic thread merge commit stopped"));
@@ -8565,8 +8428,8 @@ class CoreService implements ChannelService {
             if (this.stopping) throw new Error("服务正在停止；自动提交结果不会用于继续合并。");
             if (autoCommitOperation.autoCommitPersistenceFailed || autoCommitOperation.autoCommitOutcomeUnknown) {
               recordAutoCommitUnknown(autoCommitOperation.autoCommitOutcomeUnknown
-                ? "自动提交 worker 停止状态无法确认；不会启动合并，相关工作区继续受保护。"
-                : "自动提交结果未能持久确认；不会启动合并，相关工作区继续受保护。");
+                ? "自动提交 worker 停止状态无法确认；不会启动合并，也不会自动重放。"
+                : "自动提交结果未能持久确认；不会启动合并，也不会自动重放。");
               throw new Error(autoCommitDiagnostic);
             }
             const taskResult = autoCommitOperation.result;
@@ -8594,7 +8457,7 @@ class CoreService implements ChannelService {
               || durableCommit.autoCommitResult.headBefore !== taskResult.headBefore
               || durableCommit.autoCommitResult.headAfter !== taskResult.headAfter
             ) {
-              recordAutoCommitUnknown("自动提交结果与持久状态不一致；不会启动合并，相关工作区继续受保护。");
+              recordAutoCommitUnknown("自动提交结果与持久状态不一致；不会启动合并，也不会自动重放。");
               throw new Error(autoCommitDiagnostic);
             }
             if (
@@ -8656,9 +8519,6 @@ class CoreService implements ChannelService {
               autoCommitDiagnostic = "自动提交后的合并未能持久授权，或已被停止；未启动 Worktrunk。";
               throw new Error(autoCommitDiagnostic);
             }
-          } else {
-            autoCommitResourceLease.complete();
-            autoCommitResourceLease = undefined;
           }
         }
       }
@@ -8728,7 +8588,7 @@ class CoreService implements ChannelService {
         && autoCommitOperation?.commitRunStarted === true
         && (autoCommitOperation.processConfirmedExit !== true || autoCommitOperation.result === undefined)
       ) {
-        recordAutoCommitUnknown("自动提交进程或结果无法确认；不会自动重试或启动合并，相关工作区继续受保护。");
+        recordAutoCommitUnknown("自动提交进程或结果无法确认；不会自动重试或启动合并，也不会阻塞新操作。");
       }
       if (
         !mergeAttempted
@@ -8802,7 +8662,6 @@ class CoreService implements ChannelService {
       }
       throw error;
     } finally {
-      autoCommitResourceLease?.complete();
       if (autoCommitOperation !== undefined) this.forgetCommitOperation(autoCommitOperation);
       reservation?.release();
       lease?.complete();
@@ -8831,12 +8690,6 @@ class CoreService implements ChannelService {
     if (anchor === undefined) {
       return { kind: "refused", message: "当前子区没有可追踪的本地工作区资源，未执行清理。" };
     }
-    if (resourcePaths.some(path => this.isWorkspaceDirectoryBlocked(path))) {
-      return {
-        kind: "refused",
-        message: "相关工作区仍受未确认的清理进程封锁；本次未重试，也未归档。",
-      };
-    }
 
     const targetKeyValue = targetKey(message);
     const commandKey = this.threadMergeCommandKey(message);
@@ -8855,7 +8708,7 @@ class CoreService implements ChannelService {
 
     let reservation = this.ingressCommandReservations.get(commandKey)?.reservation;
     if (reservation === undefined) {
-      reservation = this.scheduler.reserveDestructiveCommandSession(message, resourcePaths, []);
+      reservation = this.scheduler.reserveSessionCommand(message, []);
       this.ingressCommandReservations.set(commandKey, {
         kind: "remove",
         reservation,
@@ -8863,10 +8716,9 @@ class CoreService implements ChannelService {
       });
       ingressHooks?.onReservationInstalled();
     }
-    if (reservation === undefined) throw new Error("remove resource reservation disappeared");
+    if (reservation === undefined) throw new Error("remove session reservation disappeared");
     const reservationEntry = this.ingressCommandReservations.get(commandKey);
     if (reservationEntry?.kind === "remove") {
-      reservation.extend(resourcePaths.filter(path => !reservationEntry.resourceCwds.includes(path)), []);
       this.ingressCommandReservations.set(commandKey, {
         kind: "remove",
         reservation,
@@ -8893,24 +8745,10 @@ class CoreService implements ChannelService {
       if (controller.signal.aborted || this.stopping) {
         return { kind: "refused", message: "channel 正在停止，未开始本地清理。" };
       }
-      // Missing owned paths still need directory leases; only existing paths can be Git-probed.
-      const repositoryCwds: string[] = [];
-      for (const path of resourcePaths) {
-        if (controller.signal.aborted) {
-          return { kind: "refused", message: "channel 正在停止，未开始本地清理。" };
-        }
-        try {
-          await lstat(path);
-          repositoryCwds.push(path);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        }
-      }
-      reservation.extend([], repositoryCwds);
       ingressHooks?.checkpoint?.("waiting-session");
       sessionLease = await reservation.tryAcquire();
       if (!sessionLease) {
-        return { kind: "refused", message: "当前子区或其工作区资源正被任务占用；清理命令已立即拒绝，未排队。" };
+        return { kind: "refused", message: "当前子区会话仍有先前任务运行；清理未排队。" };
       }
       const cleanupLease: SessionLease = {
         ready: sessionLease.ready,
@@ -8925,12 +8763,13 @@ class CoreService implements ChannelService {
         const expectedCwd = step === "worktree" ? project.path : project.repo;
         const failClosedProcess = (): void => {
           operationUnknown = true;
+          // Keep the old result unknown; this guard remains only for independent resource users.
           for (const path of resourcePaths) this.blockedDirectories.add(path);
           if (reserved) {
             try {
               this.store.markHostRemovalLeaseUnknown(id);
             } catch {
-              // In-memory directory blocks still protect the running process if persistence also fails.
+              // Preserve the unknown durable record; do not infer process or business outcome.
             }
           }
         };
@@ -9018,11 +8857,11 @@ class CoreService implements ChannelService {
       if (result.unknown || operationUnknown) {
         return {
           kind: "refused",
-          message: "本地清理进程结果未确认；相关资源已封锁，本次不归档且不会自动重试。",
+          message: "本地清理进程结果未确认；不会视为成功，本次不归档且不会自动重放。核对资源状态后可发送新命令重试。",
         };
       }
       if (this.stopping || controller.signal.aborted) {
-        if (reserved) this.releaseOrBlockHostRemoval(id, resourcePaths, removalProcessExited);
+        if (reserved) this.releaseOrRetainUnknownHostRemoval(id, removalProcessExited, resourcePaths);
         return { kind: "refused", message: "channel 已停止或清理已中止；本次不归档。" };
       }
 
@@ -9044,7 +8883,7 @@ class CoreService implements ChannelService {
       return outcome;
     } catch (error) {
       if (reserved && !operationUnknown) {
-        this.releaseOrBlockHostRemoval(id, resourcePaths, removalProcessExited);
+        this.releaseOrRetainUnknownHostRemoval(id, removalProcessExited, resourcePaths);
       }
       const detail = safeDisplayText(safeErrorMessage(error, "清理失败"), 180) ?? "未知错误";
       return {
@@ -10087,35 +9926,42 @@ class CoreService implements ChannelService {
     if (operation.tracked) {
       try {
         const stopped = await operation.tracked.close(true);
-        if (!stopped) this.blockedDirectories.add(operation.root);
+        if (stopped) operation.processConfirmedExit = true;
+        else this.blockCommitDirectory(operation, operation.root);
         return stopped;
       } catch {
-        this.blockedDirectories.add(operation.root);
+        this.blockCommitDirectory(operation, operation.root);
         return false;
       }
     }
     const botUid = this.bot?.uid;
     if (botUid === undefined) {
-      this.blockedDirectories.add(operation.root);
+      this.blockCommitDirectory(operation, operation.root);
       return false;
     }
     try {
       const ledger = this.store.listWorkerLedger(botUid).find((record) => record.id === operation.taskId);
-      if (!ledger) return true;
+      if (!ledger) {
+        operation.processConfirmedExit = true;
+        return true;
+      }
       let stopped = false;
       try {
         stopped = await this.options.workerFactory.recover(ledger);
-        if (stopped) this.store.markWorkerStopped(ledger.id);
+        if (stopped) {
+          operation.processConfirmedExit = true;
+          this.store.markWorkerStopped(ledger.id);
+        }
       } catch {
         stopped = false;
       }
       if (!stopped) {
-        this.blockedDirectories.add(ledger.cwd);
-        this.blockedDirectories.add(operation.root);
+        this.blockCommitDirectory(operation, ledger.cwd);
+        this.blockCommitDirectory(operation, operation.root);
       }
       return stopped;
     } catch {
-      this.blockedDirectories.add(operation.root);
+      this.blockCommitDirectory(operation, operation.root);
       return false;
     }
   }
@@ -10195,7 +10041,8 @@ class CoreService implements ChannelService {
         this.store.markCancelled(taskId, "commit stopped before dispatch");
         return;
       }
-      if (this.stopping || operation.shutdownRequested || this.isWorkspaceDirectoryBlocked(workspace.root)) {
+      if (this.stopping || operation.shutdownRequested
+        || (operation.autoMergeLeaseId === undefined && this.isWorkspaceDirectoryBlocked(workspace.root))) {
         return;
       }
       if (!options.preStarted && !this.store.markStarted(taskId)) return;
@@ -10229,7 +10076,7 @@ class CoreService implements ChannelService {
               sessionId: persisted.sessionId,
               sessionFile: binding.sessionFile ?? "",
             },
-            blockDirectory: (cwd) => this.blockedDirectories.add(cwd),
+            blockDirectory: cwd => this.blockCommitDirectory(operation, cwd),
           });
         } finally {
           operation.markWorkerReady();
@@ -10274,7 +10121,6 @@ class CoreService implements ChannelService {
           dispatchAuthorized = this.store.markHostMergeAutoCommitDispatched(operation.autoMergeLeaseId);
         } catch {
           operation.autoCommitPersistenceFailed = true;
-          this.blockedDirectories.add(operation.root);
           const stopped = await this.stopCommitProcess(operation);
           if (stopped) {
             this.store.markFailed(taskId, "automatic commit dispatch could not be persisted");
@@ -10359,7 +10205,6 @@ class CoreService implements ChannelService {
           });
         } catch {
           operation.autoCommitPersistenceFailed = true;
-          this.blockedDirectories.add(operation.root);
         }
       }
       if (this.stopping || operation.shutdownRequested) return;
@@ -10409,7 +10254,7 @@ class CoreService implements ChannelService {
         this.typingLeases.release(target, `task:${taskId}`);
       }
       if (operation?.autoMergeLeaseId !== undefined) {
-        operation.reservation.complete();
+        operation.reservation?.complete();
       } else if (operation) {
         this.forgetCommitOperation(operation);
       } else {

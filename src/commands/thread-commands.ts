@@ -213,7 +213,7 @@ export interface ThreadCommandsDeps {
     onAccepted?: () => void,
     ingressHooks?: ThreadCommandIngressHooks,
   ) => Promise<WorktreeMergeSummary & { archive?: "scheduled" }>;
-  /** Execute owned local cleanup under CoreService's session, directory and process leases. */
+  /** Execute owned local cleanup under CoreService's exact session order and durable process bookkeeping. */
   readonly executeHostRemoval: (
     message: InboundMessage,
     ownership: ThreadWorkspaceRecord,
@@ -470,7 +470,7 @@ export class ThreadCommands {
       if (existing.outcome === null) {
         await this.deps.enqueueText(
           message,
-          "此前的本地清理进程结果未确认；资源保持封锁，本次不会重试。",
+          "此前的本地清理结果未确认；同一消息不会重放或视为成功。请核对资源状态后用新消息决定是否重试。",
           null,
         );
         return;
@@ -494,7 +494,7 @@ export class ThreadCommands {
       return;
     }
     ingressHooks?.onReservationInstalled();
-    ingressHooks?.checkpoint?.("waiting-resource");
+    ingressHooks?.checkpoint?.("waiting-session");
     const receiptOutboxId = removalReceiptId(botUid, message, message.messageId);
     const archiveGeneration = this.deps.archiveGeneration(message);
     let result: HostThreadRemovalOutcome | { kind: "refused"; message: string };

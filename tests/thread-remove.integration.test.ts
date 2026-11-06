@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, unlink, watch, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, unlink, watch, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { openChannelStore, type ChannelStore } from "../src/store/index.ts";
 import type { HostRemovalLeaseRecord } from "../src/store/store-records.ts";
 import { createWorktreePort } from "../src/workspace/worktree.ts";
@@ -10,6 +10,7 @@ import { groupAlive } from "../src/omp/process.ts";
 import {
   closeCoreHarness,
   createCoreHarness,
+  type CoreHarness,
   FakeTransport,
   inbound,
   submitAndWaitForIngressHandoff,
@@ -78,8 +79,94 @@ async function waitForProcessGroupExit(pgid: number): Promise<void> {
     if (!groupAlive(pgid)) return;
     await waitForImmediateTurn();
   }
-  throw new Error(`host removal process group ${pgid} remained alive after cancellation`);
+  throw new Error(`host removal process group ${pgid} remained alive after cleanup`);
 }
+interface ControlledWorktrunk {
+  readonly command: string;
+  readonly startedPath: string;
+  readonly removedPath: string;
+  readonly releasePath: string;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+async function createControlledWorktrunk(root: string, repo: string, name: string): Promise<ControlledWorktrunk> {
+  const command = join(root, `controlled-wt-${name}`);
+  const startedPath = join(root, `remove-${name}-started`);
+  const removedPath = join(root, `remove-${name}-removed`);
+  const releasePath = join(root, `remove-${name}-release`);
+  await writeFile(command, `#!/bin/sh
+if [ "$1" = "--version" ]; then printf 'wt v0.80.0\\n'; exit 0; fi
+[ "$1" = "remove" ] || exit 64
+target=
+for argument do target="$argument"; done
+[ -n "$target" ] || exit 64
+printf '%s\\n' "$$" > ${shellQuote(startedPath)}
+git -C ${shellQuote(repo)} worktree remove --force "$target" || exit $?
+printf '%s\\n' "$$" > ${shellQuote(removedPath)}
+while [ ! -e ${shellQuote(releasePath)} ]; do sleep 0.05; done
+printf '[{"branch_outcome":"kept"}]\\n'
+`, { mode: 0o700 });
+  return { command, startedPath, removedPath, releasePath };
+}
+
+async function waitForFile(path: string, description: string): Promise<void> {
+  if (existsSync(path)) return;
+  const signal = AbortSignal.timeout(5_000);
+  const watcher = watch(dirname(path), { signal });
+  if (existsSync(path)) return;
+  try {
+    for await (const event of watcher) {
+      if (event.filename?.toString() === basename(path) && existsSync(path)) return;
+    }
+  } catch (error) {
+    if (!signal.aborted) throw error;
+  }
+  throw new Error(`${description} was not created`);
+}
+
+async function waitForProcessMarker(path: string): Promise<number> {
+  await waitForFile(path, "controlled removal process marker");
+  const pid = Number((await readFile(path, "utf8")).trim());
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    throw new Error("controlled removal process published an invalid PID");
+  }
+  return pid;
+}
+
+function withTimeout<T>(promise: Promise<T>, description: string): Promise<T> {
+  const { promise: deadline, reject } = Promise.withResolvers<never>();
+  AbortSignal.timeout(5_000).addEventListener(
+    "abort",
+    () => reject(new Error(`${description} did not finish within 5 seconds`)),
+    { once: true },
+  );
+  return Promise.race([promise, deadline]);
+}
+
+
+async function stopProcessGroup(pgid: number | undefined): Promise<void> {
+  if (pgid === undefined || !groupAlive(pgid)) return;
+  try {
+    await waitForProcessGroupExit(pgid);
+  } catch {
+    try {
+      process.kill(-pgid, "SIGKILL");
+    } catch {
+      // The service may have reaped the process group during teardown.
+    }
+    await waitForProcessGroupExit(pgid);
+  }
+}
+
+async function readProcessMarkerPid(path: string): Promise<number | undefined> {
+  if (!existsSync(path)) return undefined;
+  const pid = Number((await readFile(path, "utf8")).trim());
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+}
+
 
 // A command routed to the agent, or a force path that leaves the branch, breaks this lifecycle.
 test("real host remove protects unmerged work, then force deletes its branch without merging", async () => {
@@ -314,3 +401,188 @@ wait
     }
   }
 }, 15_000);
+test("real host remove succeeds while another chat runs in a sibling worktree", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oco-remove-concurrent-integration-")));
+  let harness: CoreHarness | undefined;
+  let store: ChannelStore | undefined;
+  let controlledWt: ControlledWorktrunk | undefined;
+  let removalPgid: number | undefined;
+  const workerStarted = Promise.withResolvers<void>();
+  const releaseWorker = Promise.withResolvers<void>();
+  const thread = { channelType: 5 as const, channelId: "group-allowed____remove-concurrent" };
+  const otherChat = { channelType: 5 as const, channelId: "group-allowed____remove-active-sibling" };
+  const removalMessageId = "remove-with-sibling-active";
+  try {
+    const repo = await repository(root, "source");
+    const ownedWorktree = join(root, "owned");
+    const activeWorktree = join(root, "active-chat");
+    await git(repo, "worktree", "add", "-qb", "feature", ownedWorktree);
+    await git(repo, "worktree", "add", "-qb", "active-chat", activeWorktree);
+    controlledWt = await createControlledWorktrunk(root, repo, "concurrent");
+    harness = await createCoreHarness({
+      root,
+      prompt: async ({ text }) => {
+        if (text === "hold sibling checkout") {
+          workerStarted.resolve();
+          await releaseWorker.promise;
+        }
+      },
+      worktreePort: createWorktreePort({
+        command: "/no/omp",
+        worktrunkCandidates: [controlledWt.command],
+      }),
+    });
+    store = await openChannelStore(harness.stateDir);
+    store.ensureBinding({ botUid: harness.bot.uid, ...thread, cwd: ownedWorktree,
+      sessionId: "remove-concurrent-session", sessionFile: null, cwdPinned: true });
+    store.saveThreadWorkspace({ botUid: harness.bot.uid, ...thread, layout: "single",
+      status: "ready", entryPath: null, error: null,
+      projects: [{ name: "feature", repo, path: ownedWorktree, branch: "feature", created: true }] });
+    store.ensureBinding({ botUid: harness.bot.uid, ...otherChat, cwd: activeWorktree,
+      sessionId: "remove-active-sibling-session", sessionFile: null, cwdPinned: true });
+
+    await harness.service.submitInbound(inbound({
+      ...otherChat,
+      messageId: "hold-sibling-worker",
+      text: "hold sibling checkout",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    await withTimeout(workerStarted.promise, "sibling worker start");
+    expect((await harness.service.status(otherChat)).state).toBe("running");
+
+    const completeReceipt = withTimeout(
+      harness.transport.waitForRemoteText(({ target, text }) =>
+        target.channelId === thread.channelId
+        && target.channelType === thread.channelType
+        && text.startsWith("本地隔离工作区与记录分支清理完成"),
+      ),
+      "successful remove receipt",
+    );
+    await harness.service.submitInbound(inbound({
+      ...thread,
+      messageId: removalMessageId,
+      text: "/thread remove --force",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    removalPgid = await waitForProcessMarker(controlledWt.startedPath);
+    const runningLease = await waitForHostRemovalLease(
+      store,
+      harness.bot.uid,
+      thread,
+      removalMessageId,
+      lease => lease.phase === "running",
+    );
+    expect(runningLease.pgid).toBe(removalPgid);
+    await waitForFile(controlledWt.removedPath, "real Git worktree removal");
+    expect(existsSync(ownedWorktree)).toBe(false);
+    expect(groupAlive(removalPgid)).toBe(true);
+    expect((await harness.service.status(otherChat)).state).toBe("running");
+
+    await writeFile(controlledWt.releasePath, "release\n");
+    const receipt = await completeReceipt;
+    expect(receipt.text).toContain("本地隔离工作区与记录分支清理完成");
+    expect(await git(repo, "branch", "--list", "feature")).toBe("");
+    expect((await harness.service.status(otherChat)).state).toBe("running");
+    await waitForProcessGroupExit(removalPgid);
+    expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["hold sibling checkout"]);
+  } finally {
+    releaseWorker.resolve();
+    if (controlledWt !== undefined) {
+      await writeFile(controlledWt.releasePath, "release\n");
+      removalPgid ??= await readProcessMarkerPid(controlledWt.startedPath);
+    }
+    await stopProcessGroup(removalPgid);
+    store?.close();
+    if (harness !== undefined) await closeCoreHarness(harness);
+    else await rm(root, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test("real host remove preserves ownership and reports a Git branch checkout conflict after partial cleanup", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oco-remove-git-conflict-integration-")));
+  let harness: CoreHarness | undefined;
+  let store: ChannelStore | undefined;
+  let controlledWt: ControlledWorktrunk | undefined;
+  let removalPgid: number | undefined;
+  const thread = { channelType: 5 as const, channelId: "group-allowed____remove-git-conflict" };
+  const removalMessageId = "remove-with-residual-branch";
+  try {
+    const repo = await repository(root, "source");
+    const ownedWorktree = join(root, "owned");
+    const competingWorktree = join(root, "competing-checkout");
+    await git(repo, "worktree", "add", "-qb", "feature", ownedWorktree);
+    const featureHead = await git(repo, "rev-parse", "refs/heads/feature");
+    controlledWt = await createControlledWorktrunk(root, repo, "git-conflict");
+    harness = await createCoreHarness({
+      root,
+      worktreePort: createWorktreePort({
+        command: "/no/omp",
+        worktrunkCandidates: [controlledWt.command],
+      }),
+    });
+    store = await openChannelStore(harness.stateDir);
+    store.ensureBinding({ botUid: harness.bot.uid, ...thread, cwd: ownedWorktree,
+      sessionId: "remove-git-conflict-session", sessionFile: null, cwdPinned: true });
+    store.saveThreadWorkspace({ botUid: harness.bot.uid, ...thread, layout: "single",
+      status: "ready", entryPath: null, error: null,
+      projects: [{ name: "feature", repo, path: ownedWorktree, branch: "feature", created: true }] });
+
+    const partialReceipt = withTimeout(
+      harness.transport.waitForRemoteText(({ target, text }) =>
+        target.channelId === thread.channelId
+        && target.channelType === thread.channelType
+        && text.startsWith("本地工作区清理未完整完成"),
+      ),
+      "partial remove receipt",
+    );
+    await harness.service.submitInbound(inbound({
+      ...thread,
+      messageId: removalMessageId,
+      text: "/thread remove --force",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    removalPgid = await waitForProcessMarker(controlledWt.startedPath);
+    const runningLease = await waitForHostRemovalLease(
+      store,
+      harness.bot.uid,
+      thread,
+      removalMessageId,
+      lease => lease.phase === "running",
+    );
+    expect(runningLease.pgid).toBe(removalPgid);
+    await waitForFile(controlledWt.removedPath, "real Git worktree removal before conflict");
+    expect(existsSync(ownedWorktree)).toBe(false);
+
+    // Claim the now-free branch while the real removal subprocess is held before its post-removal Git check.
+    await git(repo, "worktree", "add", competingWorktree, "feature");
+    expect(await git(competingWorktree, "rev-parse", "HEAD")).toBe(featureHead);
+    expect(await git(competingWorktree, "branch", "--show-current")).toBe("feature");
+    await writeFile(controlledWt.releasePath, "release\n");
+
+    const receipt = await partialReceipt;
+    expect(receipt.text).toContain("本地工作区清理未完整完成");
+    expect(receipt.text).toContain("本次不归档");
+    expect(receipt.text).toContain("工作区已清理");
+    expect(receipt.text).toContain("分支保留");
+    expect(existsSync(ownedWorktree)).toBe(false);
+    expect(existsSync(competingWorktree)).toBe(true);
+    expect(await git(repo, "rev-parse", "refs/heads/feature")).toBe(featureHead);
+    const retained = store.getThreadWorkspace(harness.bot.uid, thread);
+    expect(retained).toMatchObject({
+      status: "failed",
+      projects: [{ name: "feature", created: true, path: ownedWorktree, branch: "feature" }],
+    });
+    expect(harness.transport.managementCalls).toEqual([]);
+    expect(harness.workers.prompts).toEqual([]);
+    await waitForProcessGroupExit(removalPgid);
+  } finally {
+    if (controlledWt !== undefined) {
+      await writeFile(controlledWt.releasePath, "release\n");
+      removalPgid ??= await readProcessMarkerPid(controlledWt.startedPath);
+    }
+    await stopProcessGroup(removalPgid);
+    store?.close();
+    if (harness !== undefined) await closeCoreHarness(harness);
+    else await rm(root, { recursive: true, force: true });
+  }
+}, 20_000);

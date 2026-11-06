@@ -1,7 +1,8 @@
 /**
  * 任务调度与会话租约的唯一所有者：每个聊天的任务串行链、已排定任务、关停要等的在途
- * 任务、排队等待任务的启动回执，以及按 session / chat key 的租约链都在这里。显式破坏性操作
- * 另持 canonical worktree root 与精确路径的排他租约；普通任务不因 cwd 或 workspace 所有权互锁。
+ * 任务、启动回执，以及按 session / chat key 的租约链都在这里。显式声明路径资源保护的操作
+ * 才另持 canonical worktree root 与精确路径的排他租约；`/thread merge` 与 `/thread remove`
+ * 只保留精确聊天会话顺序，不预留工作区资源。普通任务不因 cwd 或 workspace 所有权互锁。
  *
  * 模块不依赖 `service.ts`：任务行与绑定行的读取、绑定核对、真正的执行入口（`runTask`）、
  * bot 身份与停止态、运行中任务与 blocked 集合、绑定探测、回执与终态通知的投递路径都按原样注入。
@@ -79,7 +80,7 @@ export interface CommandSessionBarrier {
 interface CommandReservationRecord {
   readonly order: number;
   readonly target: ChatTarget;
-  readonly sessionKeys: readonly string[];
+  sessionKeys: readonly string[];
   /** An uncertain operation must remain a blocker, but a later safety probe must not await it. */
   readonly uncertainOutcomeHold: boolean;
   resourcePaths: readonly string[];
@@ -352,49 +353,6 @@ export class TaskScheduler {
     }
   }
 
-  /** Exclusively protect a host merge's native commit without reserving its later merge stage. */
-  async tryAcquireThreadMergeCommitResources(
-    cwd: string,
-    root: string,
-    order: number,
-    owner: string,
-  ): Promise<DestructiveResourceLease | undefined> {
-    if (!Number.isSafeInteger(order) || order < 1 || owner.length === 0) return undefined;
-    const paths = this.resourcePaths([cwd, root]);
-    const roots = new Set([root]);
-    const unavailable = (): boolean =>
-      this.deps.stopping()
-      || paths.some(path => this.deps.isDirectoryBlocked(path))
-      || this.hasActiveResourceConflict(paths, roots)
-      || this.hasExclusiveResourceConflict(paths, roots);
-    let lease: DestructiveResourceLease | undefined;
-    let transferred = false;
-    try {
-      if (
-        unavailable()
-        || await this.hasConflictingRepositoryReservation(root, order)
-        || await this.hasEarlierQueuedResourceUse(paths, roots, order)
-        || await this.repositoryIsBlocked(root)
-        || unavailable()
-      ) return undefined;
-      lease = this.reserveExclusiveResources(roots, paths, owner);
-      if (!lease) return undefined;
-      if (
-        this.deps.stopping()
-        || paths.some(path => this.deps.isDirectoryBlocked(path))
-        || this.hasActiveResourceConflict(paths, roots)
-        || await this.hasConflictingRepositoryReservation(root, order)
-        || await this.hasEarlierQueuedResourceUse(paths, roots, order)
-        || await this.repositoryIsBlocked(root)
-      ) return undefined;
-      transferred = true;
-      return lease;
-    } catch {
-      return undefined;
-    } finally {
-      if (!transferred) lease?.complete();
-    }
-  }
 
   /** Repository-root reservation for a queued `/commit` recovered before native dispatch. */
   async tryAcquireCommitRepository(root: string, taskId: string): Promise<CommitLease | undefined> {
@@ -427,9 +385,6 @@ export class TaskScheduler {
       }
       if (
         this.deps.stopping()
-        || this.hasConflictingReservation(target, this.sessionKey(target, binding), order, reservation)
-        || this.hasSessionLeaseFor(target, this.sessionKey(target, binding), taskId)
-        || this.hasQueuedWork(target, this.sessionKey(target, binding), order, taskId)
         || paths.some((path) => this.deps.isDirectoryBlocked(path))
         || this.hasActiveResourceConflict(paths, roots, taskId)
         || this.hasExclusiveResourceConflict(paths, roots)
@@ -540,7 +495,7 @@ export class TaskScheduler {
     uncertainOutcomeHold = false,
   ): SessionCommandReservation {
     const binding = this.bindingFor(target);
-    const sessionKey = this.sessionKey(target, binding);
+    let sessionKey = this.sessionKey(target, binding);
     const reservation = this.createCommandReservationRecord(
       target,
       [],
@@ -550,6 +505,14 @@ export class TaskScheduler {
       undefined,
       uncertainOutcomeHold,
     );
+    const currentSessionKey = (): string => {
+      const current = this.sessionKey(target, this.bindingFor(target));
+      if (current !== sessionKey) {
+        sessionKey = current;
+        reservation.sessionKeys = this.leaseKeys(target, current);
+      }
+      return sessionKey;
+    };
     let resourceCwds = [...new Set(cwds)];
     let acquisitionStarted = false;
     return {
@@ -562,11 +525,11 @@ export class TaskScheduler {
       },
       waitForPrior: signal => {
         acquisitionStarted = true;
-        return this.waitForPriorSessionWork(reservation, sessionKey, signal, true);
+        return this.waitForPriorSessionWork(reservation, currentSessionKey, signal, true);
       },
       tryAcquire: () => {
         acquisitionStarted = true;
-        return this.tryAcquireReservedSessionCommand(reservation, sessionKey, resourceCwds);
+        return this.tryAcquireReservedSessionCommand(reservation, currentSessionKey(), resourceCwds);
       },
       release: () => reservation.release(),
     };
@@ -1372,17 +1335,18 @@ export class TaskScheduler {
 
   private async waitForPriorSessionWork(
     reservation: CommandReservationRecord,
-    sessionKey: string,
+    sessionKey: string | (() => string),
     signal: AbortSignal,
     refuseOnUncertainHold = false,
   ): Promise<void> {
     while (this.commandReservations.has(reservation)) {
       if (this.deps.stopping()) throw new Error("channel stopping");
       if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("operation aborted");
+      const currentSessionKey = typeof sessionKey === "function" ? sessionKey() : sessionKey;
       const priorReservations = [...this.commandReservations].filter(candidate =>
         candidate !== reservation
         && candidate.order < reservation.order
-        && this.reservationConflicts(candidate, reservation.target, sessionKey),
+        && this.reservationConflicts(candidate, reservation.target, currentSessionKey),
       );
       if (refuseOnUncertainHold && priorReservations.some(candidate => candidate.uncertainOutcomeHold)) return;
       const earlierReservations = (
@@ -1411,7 +1375,7 @@ export class TaskScheduler {
         await waitForAbort(Promise.allSettled(earlier).then(() => {}), signal);
         continue;
       }
-      if (!this.hasQueuedWork(reservation.target, sessionKey, reservation.order)) return;
+      if (!this.hasQueuedWork(reservation.target, currentSessionKey, reservation.order)) return;
       await abortableDelay(50, signal);
     }
     throw new Error("session barrier was released");

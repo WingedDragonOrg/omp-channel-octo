@@ -188,7 +188,7 @@ function waitForNextTargetText(harness: CoreHarness, target: ThreadTarget) {
 }
 
 
-/** The wall-clock bound proves a busy remove command rejects instead of waiting for task settlement. */
+/** The wall-clock bound catches command handling that waits for a pending task to settle. */
 async function settlesWithin(promise: Promise<void>, timeoutMs = 250): Promise<boolean> {
   const timeout = Promise.withResolvers<boolean>();
   const timer = setTimeout(() => timeout.resolve(false), timeoutMs);
@@ -639,9 +639,10 @@ test("a partial branch-removal result retains the original workspace and remaini
   }
 });
 
-test("an unknown removal process blocks later projects and preserves every unresolved owner row", async () => {
+test("an unknown removal process stops that operation without replaying it, but a new command may retry", async () => {
   const target: ThreadTarget = { channelType: 5, channelId: `${REMOVE_GROUP}____remove-unknown` };
   const worktrees = new RecordingWorktrees();
+  const normalRemove = worktrees.removeBehavior;
   worktrees.removeBehavior = async (_request, runProcess) => {
     runProcess("worktree", "unknown");
     throw new Error("removal process exit is unknown");
@@ -681,12 +682,21 @@ test("an unknown removal process blocks later projects and preserves every unres
       expect(leases[0]?.processIdentity).not.toBeNull();
       expect(store.listHostMergeLeases(harness.bot.uid)).toEqual([]);
     });
-    const retry = removalCommand(harness, target, "remove-unknown-retry");
-    const retryRefusal = waitForNextTargetText(harness, target);
-    await harness.service.submitInbound(retry);
-    await retryRefusal;
-    expect(worktrees.requests).toHaveLength(1);
-    expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
+    worktrees.removeBehavior = normalRemove;
+    await harness.service.submitInbound(removalCommand(harness, target, "remove-unknown-retry"));
+    expect(await waitForAction(harness, "thread-archive")).toBe(true);
+    expect(worktrees.requests).toHaveLength(3);
+    expect(await pathExists(workspace.record.projects[0]!.path!)).toBe(false);
+    expect(await pathExists(workspace.record.projects[1]!.path!)).toBe(false);
+    await withStore(harness, store => {
+      expect(store.listHostRemovalLeases(harness.bot.uid)).toEqual([
+        expect.objectContaining({
+          sourceId: "remove-unknown-command",
+          phase: "unknown",
+          outcome: null,
+        }),
+      ]);
+    });
   } finally {
     await closeCoreHarness(harness);
   }
@@ -737,13 +747,18 @@ test("a pending same-thread ask refuses removal immediately even after the bindi
   }
 });
 
-test("an active subdirectory lease refuses removal without waiting or touching the owned worktree", async () => {
+test("an active task in another chat's subdirectory does not block workspace removal", async () => {
   const target: ThreadTarget = { channelType: 5, channelId: `${REMOVE_GROUP}____remove-subdir` };
+  const otherTarget = { channelType: 2 as const, channelId: "group-b" };
   const worktrees = new RecordingWorktrees();
   const started = Promise.withResolvers<void>();
   const stopped = Promise.withResolvers<void>();
+  let taskStopped = false;
   const prompt: FakePrompt = async ({ onStop }) => {
-    onStop(stopped.resolve);
+    onStop(() => {
+      taskStopped = true;
+      stopped.resolve();
+    });
     started.resolve();
     await stopped.promise;
   };
@@ -756,8 +771,7 @@ test("an active subdirectory lease refuses removal without waiting or touching t
     try {
       store.ensureBinding({
         botUid: harness.bot.uid,
-        channelType: 2,
-        channelId: "group-b",
+        ...otherTarget,
         cwd: nestedCwd,
         sessionId: "subdirectory-task-session",
         sessionFile: null,
@@ -768,26 +782,98 @@ test("an active subdirectory lease refuses removal without waiting or touching t
     }
 
     await harness.service.submitInbound(inbound({
-      channelType: 2,
-      channelId: "group-b",
+      ...otherTarget,
       messageId: "remove-subdir-task",
       senderId: "owner-1",
       text: "write inside the nested directory",
       mentionedUserIds: [harness.bot.uid],
     }));
     await started.promise;
-    const removeMessage = removalCommand(harness, target, "remove-subdir-command");
-    const refusal = waitForNextTargetText(harness, target);
-    const remove = harness.service.submitInbound(removeMessage);
-    expect(await settlesWithin(remove)).toBe(true);
-    await refusal;
-
-    expect(worktrees.requests).toEqual([]);
-    expect(await pathExists(workspace.record.projects[0]!.path!)).toBe(true);
     expect(harness.workers.prompts).toHaveLength(1);
-    expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
+
+    const remove = harness.service.submitInbound(removalCommand(harness, target, "remove-subdir-command"));
+    expect(await settlesWithin(remove)).toBe(true);
+    expect(await waitForAction(harness, "thread-archive")).toBe(true);
+
+    expect(worktrees.requests).toHaveLength(1);
+    expect(worktrees.requests[0]?.path).toBe(workspace.record.projects[0]!.path!);
+    expect(await pathExists(workspace.record.projects[0]!.path!)).toBe(false);
+    expect(taskStopped).toBe(false);
+    expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toHaveLength(1);
   } finally {
     await closeCoreHarness(harness);
+  }
+});
+
+test("an unknown merge lease from another thread does not block removal or lose its resources", async () => {
+  const target: ThreadTarget = { channelType: 5, channelId: `${REMOVE_GROUP}____remove-foreign-merge` };
+  const mergeTarget: ThreadTarget = { channelType: 5, channelId: `${REMOVE_GROUP}____merge-owner` };
+  const mergeSourceId = "foreign-unknown-merge-command";
+  const worktrees = new RecordingWorktrees();
+  const original = await createCoreHarness({ worktreePort: worktrees });
+  const workspace = await seedOwnedWorkspace(original, target);
+  const project = workspace.record.projects[0]!;
+  await closeCoreHarness(original, { remove: false });
+  let restarted: CoreHarness | undefined;
+  try {
+    await withStore(original, store => {
+      store.reserveHostMergeLease({
+        id: "foreign-unknown-merge-lease",
+        botUid: original.bot.uid,
+        target: mergeTarget,
+        sourceId: mergeSourceId,
+        cwd: project.repo,
+        resourceCwds: [project.repo],
+        commandText: "/thread merge",
+        operatorNote: "",
+        senderId: "owner-1",
+        messageSeq: 0,
+        receiptOutboxId: "foreign-unknown-merge-receipt",
+      });
+      store.markHostMergeLeaseUnknown("foreign-unknown-merge-lease");
+    });
+
+    restarted = await createCoreHarness({
+      root: original.root,
+      bot: original.bot,
+      worktreePort: worktrees,
+    });
+    const expectedLease = {
+      id: "foreign-unknown-merge-lease",
+      channelId: mergeTarget.channelId,
+      sourceId: mergeSourceId,
+      phase: "unknown",
+      cwd: project.repo,
+      resourceCwds: [project.repo],
+      outcome: null,
+    } as const;
+    await withStore(restarted, store => {
+      expect(store.getHostMergeLeaseBySourceId(original.bot.uid, mergeTarget, mergeSourceId))
+        .toMatchObject(expectedLease);
+    });
+
+    const remove = restarted.service.submitInbound(removalCommand(restarted, target, "remove-foreign-merge"));
+    expect(await settlesWithin(remove)).toBe(true);
+    expect(await waitForAction(restarted, "thread-archive")).toBe(true);
+
+    expect(worktrees.requests).toHaveLength(1);
+    expect(worktrees.requests[0]?.path).toBe(project.path!);
+    expect(await pathExists(project.path!)).toBe(false);
+    expect(await pathExists(project.repo)).toBe(true);
+    expect(restarted.workers.prompts).toEqual([]);
+    await withStore(restarted, store => {
+      expect(store.getHostMergeLeaseBySourceId(original.bot.uid, mergeTarget, mergeSourceId))
+        .toMatchObject(expectedLease);
+      expect(store.getThreadWorkspace(original.bot.uid, target)?.projects[0]).toMatchObject({
+        created: false,
+        path: null,
+        branch: null,
+      });
+      expect(store.listHostRemovalLeases(original.bot.uid)).toEqual([]);
+    });
+  } finally {
+    if (restarted) await closeCoreHarness(restarted);
+    else await rm(original.root, { recursive: true, force: true });
   }
 });
 
@@ -933,7 +1019,7 @@ test("a verified parked process stopped before execution does not block the next
   }
 });
 
-test("restart retains an exited removal without a business result and blocks a new destructive command", async () => {
+test("restart preserves an exited removal's unknown result without blocking a new command", async () => {
   const target: ThreadTarget = { channelType: 5, channelId: `${REMOVE_GROUP}____remove-exited-unknown` };
   const worktrees = new RecordingWorktrees();
   const original = await createCoreHarness({ worktreePort: worktrees });
@@ -956,13 +1042,20 @@ test("restart retains an exited removal without a business result and blocks a n
     await withStore(restarted, store => expect(store.listHostRemovalLeases(original.bot.uid)).toMatchObject([{
       id: "exited-removal", phase: "unknown", outcome: null,
     }]));
-    const blockedCommand = removalCommand(restarted, target, "new-remove-after-exit", "--force");
-    const refusal = waitForNextTargetText(restarted, target);
-    await restarted.service.submitInbound(blockedCommand);
-    await refusal;
-    expect(worktrees.requests).toEqual([]);
-    expect(await pathExists(workspace.record.projects[0]!.path!)).toBe(true);
-    expect(restarted.transport.managementCalls).toEqual([]);
+    const newCommand = removalCommand(restarted, target, "new-remove-after-exit", "--force");
+    await restarted.service.submitInbound(newCommand);
+    expect(await waitForAction(restarted, "thread-archive")).toBe(true);
+    expect(worktrees.requests).toHaveLength(1);
+    expect(worktrees.requests[0]?.path).toBe(workspace.record.projects[0]!.path!);
+    expect(await pathExists(workspace.record.projects[0]!.path!)).toBe(false);
+    expect(restarted.transport.managementCalls.filter(call => call.action === "thread-archive")).toHaveLength(1);
+    await withStore(restarted, store => {
+      expect(store.listHostRemovalLeases(original.bot.uid)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "exited-removal", phase: "unknown", outcome: null }),
+        ]),
+      );
+    });
   } finally {
     if (restarted) await closeCoreHarness(restarted);
     else await rm(original.root, { recursive: true, force: true });

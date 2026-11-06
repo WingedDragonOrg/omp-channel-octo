@@ -1,6 +1,7 @@
 # Channel 会话分叉与子区绑定
 
 日期：2026-11-03
+修订日期：2026-11-06
 
 ## 目标
 
@@ -124,7 +125,7 @@
 
 命令在既有 owner/allowlist 门禁后直接执行，不加入源任务 FIFO；工具的来源固定为调用任务所属聊天的当前精确 binding。子区来源只取持久 channel id 中的父群，目标始终同群。名称只按既有 printable 名称边界验证。
 
-准备进程不取得源 session 的执行租约；其 ledger 和独立输出目录只属于本次操作。准备期间登记共用路径与 canonical worktree root 的共享使用，防止 commit/remove 越过在途准备；merge 不按工作区资源限制并发。这不是普通任务间的目录排他。取消信号覆盖 worker 创建和握手期间，生命周期所有者确认停止并收尾 ledger 后才释放占用，不能只让等待者提前返回。取消/停机终止本次准备与远端 I/O，不因分叉去中断源回合；未确认退出保持既有阻塞。
+准备进程不取得源 session 的执行租约；其 ledger 和独立输出目录只属于本次操作。准备期间登记共用路径与 canonical worktree root 的共享使用，可继续服务于 standalone `/commit` 与 host-tool `thread-delete` 的既有资源保护，但不因在途 fork 准备阻挡 `/thread remove` 或 `/thread merge`，也不形成普通任务间目录排他。merge 不按工作区资源限制并发。取消信号覆盖 worker 创建和握手期间，生命周期所有者确认本次 fork 准备进程停止并收尾自己的 ledger 后才释放其资源使用记录，不能只让等待者提前返回。取消/停机终止本次准备与远端 I/O，不因分叉去中断源回合；未知的旧准备状态只影响该 fork 自身恢复与分配，不成为 remove/merge 的资源门禁。
 
 仅归档命令检查本子区的运行/排队工作，不取得共用 cwd 的 Git 排他，也不等待其他聊天的独立源 session。源模型设置、goal 授权、ask/card、注入账本和 workspace 归属不复制；目标后续 worker 沿现有模型解析及自身上下文路径启动。
 

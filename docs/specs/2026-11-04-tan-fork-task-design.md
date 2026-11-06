@@ -1,6 +1,7 @@
 # Channel `/tan` 独立分叉任务
 
 日期：2026-11-04
+修订日期：2026-11-06
 
 ## 用户契约
 
@@ -8,7 +9,7 @@ owner 在已授权主群或子区发送 `/tan <用户请求>`，channel 截获�
 
 子区显示任务、进度、提问和完整结果；源聊天收到目标子区和派发回执。子区的 listen 初始值为既有默认 `merge`；可使用既有命令改为 `task`，按既有策略回传任务终态。目标任务开始后在目标子区 `/cancel`；源聊天的现有 `/cancel` 在准备阶段同时取消源聊天当前任务和该 fork 准备。源聊天的 pending ask 不消费 `/tan` 或目标任务。子区的 `/thread merge` 和 `/thread remove` 仅归档，保留会话和共享目录。
 
-该命令是 channel 创建可见子区和独立 session 的能力，不声称与 OMP 原生 `/tan` 等价。源与目标共享 cwd 和文件：独立会话不隔离文件系统，双方修改相互可见；不创建 worktree，不复制工作区归属，显式破坏操作继续遵守现有资源保护。
+该命令是 channel 创建可见子区和独立 session 的能力，不声称与 OMP 原生 `/tan` 等价。源与目标共享 cwd 和文件：独立会话不隔离文件系统，双方修改相互可见；不创建 worktree，不复制工作区归属。沿用目录的 fork 子区中 `/thread merge`、`/thread remove` 按上文保持 archive-only；独立 `/commit` 和 host-tool `thread-delete` 仍遵守各自既有资源保护。
 
 ## 入站与持久生命周期
 

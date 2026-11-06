@@ -2581,8 +2581,8 @@ for (const action of ["cancel", "interrupt"] as const) {
           sentTarget.channelId === thread.channelId &&
           sentTarget.channelType === thread.channelType &&
           (action === "cancel"
-            ? text === "无法确认受管操作已完成或停止；相关资源继续保持保护。"
-            : text === "已请求中止正在等待或执行的子区宿主操作；进程结果若未确认，资源将保持封锁且不会自动重试。"),
+            ? text === "无法确认受管操作已完成或停止；结果保持未知且不会自动重放，请先核对状态。"
+            : text === "已请求中止正在等待或执行的子区宿主操作；未确认的结果保持未知且不会自动重放，请先核对状态。"),
       );
       await harness.service.submitInbound(inbound({
         ...thread,

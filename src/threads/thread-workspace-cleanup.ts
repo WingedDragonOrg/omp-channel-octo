@@ -9,10 +9,15 @@ import type {
 } from "../contracts.ts";
 import type { ChannelStore } from "../store/index.ts";
 import type { ThreadWorkspaceRecord } from "../store/store-records.ts";
-import type { DestructiveResourceLease } from "../tasks/task-scheduler.ts";
 
 function isAborted(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
+}
+
+/** Minimal lease contract; each caller supplies the appropriate session or resource scope. */
+export interface ThreadWorkspaceCleanupLease {
+  readonly ready: Promise<void>;
+  complete(): void;
 }
 
 export interface ThreadWorkspaceCleanupOptions {
@@ -21,7 +26,7 @@ export interface ThreadWorkspaceCleanupOptions {
   readonly worktrees: WorktreePort | undefined;
   readonly force: boolean;
   readonly deleteBranch: boolean;
-  readonly lease: DestructiveResourceLease;
+  readonly lease: ThreadWorkspaceCleanupLease;
   readonly signal?: AbortSignal;
   readonly lifecycle?: (
     project: ThreadWorkspaceRecord["projects"][number],
@@ -36,7 +41,7 @@ export interface ThreadWorkspaceCleanupResult {
   readonly messages: readonly string[];
 }
 
-/** Paths whose persisted ownership must be exclusively leased before any cleanup begins. */
+/** Persisted ownership paths that the cleanup operation may touch. */
 export function threadWorkspaceCleanupPaths(
   ownership: ThreadWorkspaceRecord,
   deleteBranch: boolean,
