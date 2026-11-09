@@ -20,10 +20,12 @@ import type {
   IngressJobInput,
   IngressJobRecord,
   IngressOperationCheckpoint,
+  IngressSessionHandoff,
+  IngressSessionRecoveryResult,
   IngressSourceKey,
 } from "../inbound/ingress-types.ts";
 import { allocateScheduleOrder, applySchema } from "./store-schema.ts";
-import { claimOwnerEnrollment, clearChatModel, clearThreadModel, ensureBinding, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, getThreadModel, grantAllowedChat, hasOwnerEnrollment, initializeBindingSessionFromTask, listAllowedChats, resolveChatModel, setBotUid, setChatMode, setChatModel, setOwnerId, setThreadModel, updateBindingSession } from "./store-chats.ts";
+import { claimOwnerEnrollment, clearChatModel, clearThreadModel, ensureBinding, ensureBindingIfMatches, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, getThreadModel, grantAllowedChat, hasOwnerEnrollment, initializeBindingSessionFromTask, listAllowedChats, resolveChatModel, setBotUid, setChatMode, setChatModel, setOwnerId, setThreadModel, updateBindingSession } from "./store-chats.ts";
 import { acceptCommitTask, acceptTask, acceptTaskIf, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, getTaskByMessageId, getTaskScheduleOrder, hasTaskStopIntent, isCommitTask, isTaskResuming, listQueuedTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim, suppressTaskRelay } from "./store-tasks.ts";
 import { bindGoalTaskSession, clearGoalSession, finishGoalTaskProgress, getGoalSession, getGoalTask, isGoalTaskResuming, markGoalTaskAccepted, markGoalTaskAgentAccepted, markGoalTaskDispatched, saveGoalSessionProgress, stopGoalContinuation, updateGoalTaskProgress } from "./store-goals.ts";
 import { clearProgressCard, listProgressCards, recordProgressCardAttempt, saveProgressCard } from "./store-cards.ts";
@@ -52,6 +54,7 @@ import {
   countPendingIngressJobs,
   getIngressJob,
   getIngressJobBySource,
+  ensureBindingIfMatchesIfNoUnresolvedSessionTransition,
   handoffIngressJob,
   isIngressCancellationRequested,
   listRecoverableIngressJobs,
@@ -61,9 +64,13 @@ import {
   markIngressConfigActionApplied,
   markIngressConfigActionDispatchIntent,
   markIngressPrepared,
+  finishIngressRecoveryPreparation,
   markIngressUnknown,
   recordIngressWorker,
   saveIngressCheckpoint,
+  handoffSessionIngressJob,
+  prepareIngressSessionRecovery,
+  cancelIngressJobAfterSessionRecovery,
 } from "./store-ingress.ts";
 
 export class ChannelStore {
@@ -171,6 +178,21 @@ export class ChannelStore {
 
   getBinding(botUid: string, target: ChatTarget): BindingRecord | null {
     return getBinding(this.db, botUid, target);
+  }
+
+  ensureBindingIfMatches(
+    binding: BindingRecord,
+    expected: BindingRecord | null,
+    options?: { clearSessionInitialization?: boolean },
+  ): boolean {
+    return ensureBindingIfMatches(this.db, binding, expected, options);
+  }
+  ensureBindingIfMatchesIfNoUnresolvedSessionTransition(
+    binding: BindingRecord,
+    expected: BindingRecord | null,
+    options?: { clearSessionInitialization?: boolean },
+  ): boolean {
+    return ensureBindingIfMatchesIfNoUnresolvedSessionTransition(this.db, binding, expected, options);
   }
 
   saveSessionContextSnapshot(snapshot: SessionContextSnapshotRecord): void {
@@ -492,6 +514,13 @@ export class ChannelStore {
     return allocateScheduleOrder(this.db);
   }
 
+  prepareIngressSessionRecovery(
+    recoveryJobId: number,
+    barrierJobIds: readonly number[],
+  ): IngressSessionRecoveryResult {
+    return prepareIngressSessionRecovery(this.db, recoveryJobId, barrierJobIds);
+  }
+
   getIngressJobBySource(key: IngressSourceKey): IngressJobRecord | null {
     return getIngressJobBySource(this.db, key);
   }
@@ -510,6 +539,13 @@ export class ChannelStore {
 
   markIngressPrepared(id: number, preparedText: string, spoolPaths: readonly string[]): boolean {
     return markIngressPrepared(this.db, id, preparedText, spoolPaths);
+  }
+  finishIngressRecoveryPreparation(
+    id: number,
+    consumer: IngressConsumer,
+    persistConsumer?: () => boolean,
+  ): boolean {
+    return finishIngressRecoveryPreparation(this.db, id, consumer, persistConsumer);
   }
 
   saveIngressCheckpoint(id: number, checkpoint: IngressOperationCheckpoint): boolean {
@@ -557,13 +593,32 @@ export class ChannelStore {
   ): boolean {
     return cancelIngressJobBySource(this.db, key, attribution, cancellationJobId);
   }
+  cancelIngressJobAfterSessionRecovery(
+    key: IngressSourceKey,
+    target: ChatTarget,
+    messageId: string,
+    barrierJobId: number,
+  ): IngressJobRecord | null {
+    return cancelIngressJobAfterSessionRecovery(this.db, key, target, messageId, barrierJobId);
+  }
+
+
+  handoffSessionIngressJob(
+    id: number,
+    consumer: IngressConsumer,
+    persistConsumer: () => boolean,
+    handoff: IngressSessionHandoff,
+  ): { handedOff: boolean; cancelledJobIds: readonly number[] } {
+    return handoffSessionIngressJob(this.db, id, consumer, persistConsumer, handoff);
+  }
 
   handoffIngressJob(
     id: number,
     consumer: IngressConsumer,
     persistConsumer: () => boolean,
+    preservedCheckpoint?: IngressOperationCheckpoint,
   ): boolean {
-    return handoffIngressJob(this.db, id, consumer, persistConsumer);
+    return handoffIngressJob(this.db, id, consumer, persistConsumer, preservedCheckpoint);
   }
 
   /**

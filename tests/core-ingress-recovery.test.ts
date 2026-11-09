@@ -59,6 +59,14 @@ async function observedState(promise: Promise<unknown>, turns = 4): Promise<"pen
   return state;
 }
 
+async function settleTurns(count = 40): Promise<void> {
+  for (let turn = 0; turn < count; turn += 1) {
+    const next = Promise.withResolvers<void>();
+    setImmediate(next.resolve);
+    await next.promise;
+  }
+}
+
 const suspendedPrompt: FakePrompt = async ({ isStopped, onStop }) => {
   const stopped = Promise.withResolvers<void>();
   onStop(stopped.resolve);
@@ -524,19 +532,31 @@ test("an acknowledged new before dispatch intent restores its barrier before a l
   }
 });
 
-test("an acknowledged new with unknown dispatch retains its barrier before a later ordinary message", async () => {
+test("a stopped worker allows a fresh /new to recover an unknown transition after restart", async () => {
   const firstWorkers = new FakeWorkerFactory();
   const candidateStarted = Promise.withResolvers<void>();
   const releaseCandidate = Promise.withResolvers<void>();
+  const first = await createCoreHarness({ workers: firstWorkers });
+  const target = { channelType: 1 as const, channelId: "dm-ingress-new-recovery" };
+  const cwd = join(first.root, "new-recovery-cwd");
+  await mkdir(cwd, { recursive: true });
+  const initialMessage = inbound({
+    ...target,
+    messageId: "ingress-new-recovery-initial",
+    text: `/new ${cwd}`,
+  });
+  const initial = first.service.receive(initialMessage);
+  await initial.ackReady;
+  const initialStatus = await waitForStatus(first.service, target, status => status.sessionId !== null);
+  const oldSessionId = initialStatus.sessionId;
+  if (oldSessionId === null) throw new Error("initial session was not bound");
+  const oldWorker = firstWorkers.workers[0];
+  if (oldWorker === undefined) throw new Error("initial session worker was not created");
   firstWorkers.beforeCreate = async () => {
     candidateStarted.resolve();
     await releaseCandidate.promise;
     throw new Error("fixture candidate interrupted with the service");
   };
-  const first = await createCoreHarness({ workers: firstWorkers });
-  const target = { channelType: 1 as const, channelId: "dm-ingress-new-recovery" };
-  const cwd = join(first.root, "new-recovery-cwd");
-  await mkdir(cwd, { recursive: true });
   const switchMessage = inbound({
     ...target,
     messageId: "ingress-new-recovery-command",
@@ -554,6 +574,32 @@ test("an acknowledged new with unknown dispatch retains its barrier before a lat
     const switching = first.service.receive(switchMessage);
     await switching.ackReady;
     await candidateStarted.promise;
+    expect(oldWorker.stopped).toBe(true);
+    const candidateStore = await openChannelStore(first.stateDir);
+    try {
+      const switchingJob = candidateStore.getIngressJobBySource({
+        botUid: first.bot.uid,
+        sourceKind: "recv",
+        sourceId: recvIngressSourceId(target.channelType, target.channelId, switchMessage.messageId),
+      });
+      if (switchingJob === null) throw new Error("unknown switch ingress was not persisted");
+      const candidateLedgerId = `new-ingress-${switchingJob.id}`;
+      if (!candidateStore.recordIngressWorker(switchingJob.id, {
+        id: candidateLedgerId,
+        botUid: first.bot.uid,
+        sessionId: "ingress-recovery-candidate-session",
+        sessionFile: join(cwd, "candidate.session"),
+        pid: 4242,
+        pgid: 4242,
+        identity: "fixture-candidate-process",
+        cwd,
+        moveTargetCwd: null,
+        state: "running",
+      })) throw new Error("candidate worker ledger was not linked to the switch");
+      candidateStore.markWorkerStopped(candidateLedgerId);
+    } finally {
+      candidateStore.close();
+    }
     const later = first.service.receive(laterMessage);
     await later.ackReady;
     expect(firstWorkers.prompts).toHaveLength(0);
@@ -563,8 +609,8 @@ test("an acknowledged new with unknown dispatch retains its barrier before a lat
     await stopping;
     firstStopped = true;
 
-    const workers = new FakeWorkerFactory();
-    workers.recovered = true;
+    const workers = firstWorkers;
+    workers.beforeCreate = undefined;
     restarted = await createCoreHarness({ root: first.root, bot: first.bot, workers });
     const store = await openChannelStore(restarted.stateDir);
     try {
@@ -595,8 +641,67 @@ test("an acknowledged new with unknown dispatch retains its barrier before a lat
     } finally {
       store.close();
     }
+    const recovered = restarted;
+    if (recovered === undefined) throw new Error("restart harness was not created");
+    const recoveryMessage = inbound({
+      ...target,
+      messageId: "ingress-new-recovery-explicit",
+      text: `/new ${cwd}`,
+    });
+    const recoveryReceipt = recovered.service.receive(recoveryMessage);
+    await recoveryReceipt.ackReady;
+    const recoveredStatus = await waitForStatus(
+      recovered.service,
+      target,
+      status => status.sessionId !== null && status.sessionId !== oldSessionId,
+    );
+    await settleTurns();
+    const recoveredSessionId = recoveredStatus.sessionId;
+    if (recoveredSessionId === null) throw new Error("recovery did not publish a session");
+    expect(recoveredSessionId).not.toBe(oldSessionId);
+    expect(recoveredStatus.cwd).toBe(cwd);
+
+    const notice = recovered.transport.sent.find(({ target: sentTarget, text }) =>
+      sentTarget.channelType === target.channelType
+      && sentTarget.channelId === target.channelId
+      && (text.includes(laterMessage.messageId) || text.includes(laterMessage.text)));
+    expect(notice).toBeDefined();
+    expect(notice?.text).toMatch(/(?:未|没有|尚未).{0,12}(?:执行|派发)/u);
+    expect(notice?.text).toMatch(/(?:重发|重新发送)/u);
+    expect(notice?.text).toContain("忽略");
+
+    const freshMessage = inbound({
+      ...target,
+      messageId: "ingress-new-recovery-fresh",
+      text: "continue the conversation in the recovered session",
+    });
+    const freshReceipt = recovered.service.receive(freshMessage);
+    await freshReceipt.ackReady;
+    await waitUntil(
+      () => workers.prompts.some(({ text }) => text.includes(freshMessage.text)),
+      "fresh message prompt in recovered session",
+    );
+    const freshPrompt = workers.prompts.find(({ text }) => text.includes(freshMessage.text));
+    expect(freshPrompt).toBeDefined();
+    expect(freshPrompt?.sessionId).toBe(recoveredSessionId);
+    expect(freshPrompt?.cwd).toBe(cwd);
+    expect(workers.prompts.some(({ text }) => text.includes(laterMessage.text))).toBe(false);
+
+    const noticeCount = recovered.transport.sent.filter(({ target: sentTarget, text }) =>
+      sentTarget.channelType === target.channelType
+      && sentTarget.channelId === target.channelId
+      && (text.includes(laterMessage.messageId) || text.includes(laterMessage.text))).length;
+    const promptCount = workers.prompts.length;
+    const duplicate = recovered.service.receive(laterMessage);
+    await duplicate.ackReady;
+    await settleTurns();
+    expect(workers.prompts).toHaveLength(promptCount);
+    expect(recovered.transport.sent.filter(({ target: sentTarget, text }) =>
+      sentTarget.channelType === target.channelType
+      && sentTarget.channelId === target.channelId
+      && (text.includes(laterMessage.messageId) || text.includes(laterMessage.text))))
+      .toHaveLength(noticeCount);
   } finally {
-    releaseCandidate.resolve();
     if (!firstStopped) await first.service.stop().catch(() => {});
     await closeOrRemove(restarted, first.root);
   }

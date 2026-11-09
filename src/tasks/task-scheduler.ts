@@ -65,6 +65,8 @@ export interface DestructiveCommandReservation {
 export interface SessionCommandReservation {
   readonly order: number;
   extend(cwds: readonly string[]): void;
+  /** A recovery may bypass only the exact earlier unknown transition holds it verified stopped. */
+  bypassUncertainPriorOrders(orders: readonly number[]): boolean;
   /** Wait for earlier known work; uncertain-outcome holds still block acquisition. */
   waitForPrior(signal: AbortSignal): Promise<void>;
   tryAcquire(): Promise<SessionLease | undefined>;
@@ -82,6 +84,7 @@ interface CommandReservationRecord {
   readonly target: ChatTarget;
   sessionKeys: readonly string[];
   /** An uncertain operation must remain a blocker, but a later safety probe must not await it. */
+  readonly bypassedUncertainOrders: Set<number>;
   readonly uncertainOutcomeHold: boolean;
   resourcePaths: readonly string[];
   repositoryCwds: readonly string[];
@@ -523,6 +526,20 @@ export class TaskScheduler {
         }
         resourceCwds = [...new Set([...resourceCwds, ...additionalCwds])];
       },
+      bypassUncertainPriorOrders: orders => {
+        if (acquisitionStarted || !this.commandReservations.has(reservation)) return false;
+        const unique = new Set(orders);
+        if (unique.size === 0) return false;
+        const holds = [...this.commandReservations].filter(candidate =>
+          unique.has(candidate.order)
+          && candidate.order < reservation.order
+          && candidate.uncertainOutcomeHold
+          && this.reservationConflicts(candidate, reservation.target, currentSessionKey()),
+        );
+        if (holds.length !== unique.size) return false;
+        for (const order of unique) reservation.bypassedUncertainOrders.add(order);
+        return true;
+      },
       waitForPrior: signal => {
         acquisitionStarted = true;
         return this.waitForPriorSessionWork(reservation, currentSessionKey, signal, true);
@@ -772,6 +789,7 @@ export class TaskScheduler {
       repositoryCwds: destructive ? [...new Set(repositoryCwds ?? cwds)] : [],
       ...(ownerTaskId === undefined ? {} : { ownerTaskId }),
       uncertainOutcomeHold,
+      bypassedUncertainOrders: new Set<number>(),
       ready: completion.promise,
       release: () => {
         if (!this.commandReservations.delete(reservation)) return;
@@ -1043,6 +1061,7 @@ export class TaskScheduler {
     return [...this.commandReservations].some((reservation) =>
       reservation !== excluded
       && (excludedOwnerTaskId === undefined || reservation.ownerTaskId !== excludedOwnerTaskId)
+      && !(reservation.uncertainOutcomeHold && excluded?.bypassedUncertainOrders.has(reservation.order))
       && reservation.order < beforeOrder
       && this.reservationConflicts(reservation, target, sessionKey)
     );
@@ -1343,19 +1362,16 @@ export class TaskScheduler {
       if (this.deps.stopping()) throw new Error("channel stopping");
       if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("operation aborted");
       const currentSessionKey = typeof sessionKey === "function" ? sessionKey() : sessionKey;
-      const priorReservations = [...this.commandReservations].filter(candidate =>
-        candidate !== reservation
-        && candidate.order < reservation.order
-        && this.reservationConflicts(candidate, reservation.target, currentSessionKey),
-      );
-      if (refuseOnUncertainHold && priorReservations.some(candidate => candidate.uncertainOutcomeHold)) return;
-      const earlierReservations = (
-        refuseOnUncertainHold
-          ? priorReservations.filter(candidate => !candidate.uncertainOutcomeHold)
-          : priorReservations
-      ).map(candidate => candidate.ready);
+      const earlierReservations = [...this.commandReservations]
+        .filter(candidate =>
+          candidate !== reservation
+          && candidate.order < reservation.order
+          && !(candidate.uncertainOutcomeHold && reservation.bypassedUncertainOrders.has(candidate.order))
+          && this.reservationConflicts(candidate, reservation.target, currentSessionKey),
+        );
+      if (refuseOnUncertainHold && earlierReservations.some(candidate => candidate.uncertainOutcomeHold)) return;
       if (earlierReservations.length > 0) {
-        await waitForAbort(Promise.all(earlierReservations).then(() => {}), signal);
+        await waitForAbort(Promise.all(earlierReservations.map(candidate => candidate.ready)).then(() => {}), signal);
         continue;
       }
       const earlier = [...this.scheduledTasks.entries()]

@@ -403,7 +403,7 @@ interface PreparedIngressTask {
   readonly binding: BindingRecord;
   readonly task: TaskRecord;
   readonly claim: InboundClaim;
-  readonly startsBehind: boolean;
+  startsBehind: boolean;
 }
 type PreparedGoalStop = {
   binding: BindingRecord | null;
@@ -505,6 +505,7 @@ class CoreService implements ChannelService {
   private readonly reviewRuntimes = new Map<string, ReviewRuntime>();
   private readonly ingressCommitReservations = new Map<number, DestructiveCommandReservation>();
   private readonly blockedDirectories = new Set<string>();
+  private readonly ingressSessionDirectoryBlocks = new Map<number, Set<string>>();
   /** 问题与问答卡：等待者、卡片代次与问题行的所有者。 */
   /** 出站投递：文字、流式编辑与文件共用的队列。 */
   private readonly outbox: Outbox;
@@ -664,7 +665,9 @@ class CoreService implements ChannelService {
       bot: () => this.bot,
       hasRuntime: target => this.hasRuntime(target),
       isDirectoryBlocked: cwd => this.isWorkspaceDirectoryBlocked(cwd),
+      hasUnresolvedSessionTransition: target => this.hasUnresolvedIngressSessionTransition(target),
       blockDirectory: cwd => { this.blockedDirectories.add(cwd); },
+      blockIngressDirectory: (jobId, cwd) => this.blockIngressSessionDirectory(jobId, cwd),
       tryAcquireCommandSession: (target, cwds) => this.scheduler.tryAcquireCommandSession(target, cwds),
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
       resetReferenceContext: target => this.threadReferences.resetContext(target),
@@ -1128,7 +1131,7 @@ class CoreService implements ChannelService {
       // 目录保持 block——它的任务留在队列继续挡住同目录的新写者（runTask 原样放过）。
       for (const ledger of this.store.listWorkerLedger(identity.uid)) {
         if (recoveredAutoCommitWorkerIds.has(ledger.id)) continue;
-        const stopped = await this.options.workerFactory.recover(ledger);
+        const stopped = ledger.state === "stopped" || await this.options.workerFactory.recover(ledger);
         const review = this.store.getReviewJob(ledger.id);
         if (stopped) {
           this.store.markWorkerStopped(ledger.id);
@@ -1144,10 +1147,27 @@ class CoreService implements ChannelService {
             ).catch(() => {});
           }
         } else {
-          this.blockedDirectories.add(ledger.cwd);
-          if (ledger.moveTargetCwd) this.blockedDirectories.add(ledger.moveTargetCwd);
-          if (review !== null) {
-            for (const project of review.projects) this.blockedDirectories.add(project.path);
+          const sessionJob = [
+            ...this.store.listUnknownIngressJobs(identity.uid),
+            ...this.store.listRecoverableIngressJobs(identity.uid),
+          ].find(job => job.operationCheckpoint?.kind === "command"
+            && job.operationCheckpoint.workerLedgerId === ledger.id
+            && (job.operationCheckpoint.action === "new"
+              || job.operationCheckpoint.action === "move"
+              || job.operationCheckpoint.action === "reset"));
+          if (sessionJob !== undefined) {
+            const checkpoint = sessionJob.operationCheckpoint;
+            for (const cwd of new Set([
+              ...(checkpoint?.kind === "command" ? checkpoint.resourceCwds ?? [] : []),
+              ledger.cwd,
+              ...(ledger.moveTargetCwd === null ? [] : [ledger.moveTargetCwd]),
+            ])) this.blockIngressSessionDirectory(sessionJob.id, cwd);
+          } else {
+            this.blockedDirectories.add(ledger.cwd);
+            if (ledger.moveTargetCwd) this.blockedDirectories.add(ledger.moveTargetCwd);
+            if (review !== null) {
+              for (const project of review.projects) this.blockedDirectories.add(project.path);
+            }
           }
         }
       }
@@ -1755,6 +1775,7 @@ class CoreService implements ChannelService {
       cwd: binding.cwd,
       sessionFile: binding.sessionFile,
       cwdPinned: binding.cwdPinned === true,
+      sessionInitialization: binding.sessionInitialization ?? null,
       sessionSwitchedAt: binding.sessionSwitchedAt ?? null,
     };
   }
@@ -1769,7 +1790,9 @@ class CoreService implements ChannelService {
       && expected.cwd === current.cwd
       && expected.sessionFile === current.sessionFile
       && expected.cwdPinned === current.cwdPinned
-      && expected.sessionSwitchedAt === current.sessionSwitchedAt;
+      && expected.sessionSwitchedAt === current.sessionSwitchedAt
+      && JSON.stringify(expected.sessionInitialization ?? null)
+        === JSON.stringify(current.sessionInitialization ?? null);
   }
 
   private sameBindingState(left: BindingRecord, right: BindingRecord): boolean {
@@ -1924,9 +1947,11 @@ class CoreService implements ChannelService {
     for (const job of jobs) {
       const checkpoint = job.operationCheckpoint;
       if (checkpoint?.kind !== "command") continue;
+      if (checkpoint.recoveredByIngressJobId !== undefined && job.state === "unknown") continue;
       const target: ChatTarget = { channelType: job.channelType, channelId: job.channelId };
       const commandKey = `${targetKey(target)}\0${job.messageId ?? ""}`;
       if (checkpoint.action === "new" || checkpoint.action === "move") {
+        if (job.state === "accepted" && this.ingressSessionRecoveryBarrierIds(job).length > 0) continue;
         const expected = checkpoint.expectedBinding;
         const linkedWorker = checkpoint.workerLedgerId === `${checkpoint.action}-ingress-${job.id}`
           ? this.store.getWorkerLedger(botUid, checkpoint.workerLedgerId)
@@ -1938,7 +1963,9 @@ class CoreService implements ChannelService {
             : [linkedWorker.cwd, ...(linkedWorker.moveTargetCwd === null ? [] : [linkedWorker.moveTargetCwd])]),
         ])];
         if (job.state === "dispatch-intent" || job.state === "unknown") {
-          for (const cwd of resourceCwds) this.blockedDirectories.add(cwd);
+          if (linkedWorker?.state !== "stopped") {
+            for (const cwd of resourceCwds) this.blockIngressSessionDirectory(job.id, cwd);
+          }
         }
         try {
           const reservation = this.scheduler.reserveSessionCommand(
@@ -1953,7 +1980,7 @@ class CoreService implements ChannelService {
             resourceCwds,
           });
         } catch (error) {
-          for (const cwd of resourceCwds) this.blockedDirectories.add(cwd);
+          for (const cwd of resourceCwds) this.blockIngressSessionDirectory(job.id, cwd);
           console.error(
             `[ingress recovery] cannot reserve ${checkpoint.action} session for job=${job.id}: ${safeErrorMessage(error, "reservation failed")}`,
           );
@@ -2960,7 +2987,24 @@ class CoreService implements ChannelService {
       throw new Error(`ingress ${action} operation has no recoverable session owner`);
     }
     const forkIntentReady = action === "fork"
-      ? () => { this.ingress.releaseSessionBarrier(job.id); }
+      ? () => {
+          const current = this.store.getIngressJob(job.id);
+          const checkpoint = current?.operationCheckpoint;
+          if (current?.state === "accepted" && checkpoint?.kind === "command" && checkpoint.action === "fork") {
+            if (!this.store.markIngressCommandDispatchIntent(job.id, {
+              ...checkpoint,
+              phase: "dispatch-intent",
+            })) throw new Error("fork dispatch intent could not be persisted");
+          } else if (
+            current?.state !== "dispatch-intent"
+            || checkpoint?.kind !== "command"
+            || checkpoint.action !== "fork"
+            || checkpoint.phase !== "dispatch-intent"
+          ) {
+            throw new Error("fork dispatch intent could not be confirmed");
+          }
+          this.ingress.releaseSessionBarrier(job.id);
+        }
       : undefined;
     const operation = this.executeIngressCommand(
       job,
@@ -3145,6 +3189,117 @@ class CoreService implements ChannelService {
     };
   }
 
+  private ingressSessionRecoveryBarrierIds(job: IngressJobRecord): number[] {
+    const ids = new Set<number>();
+    const visited = new Set<number>();
+    const visit = (id: number): void => {
+      if (visited.has(id)) return;
+      visited.add(id);
+      const barrier = this.store.getIngressJob(id);
+      const checkpoint = barrier?.operationCheckpoint;
+      if (
+        barrier === null
+        || barrier.botUid !== job.botUid
+        || barrier.channelType !== job.channelType
+        || barrier.channelId !== job.channelId
+        || checkpoint?.kind !== "command"
+        || checkpoint.recoveredByIngressJobId !== undefined
+      ) return;
+      const sessionTransition = checkpoint.action === "new"
+        || checkpoint.action === "move"
+        || checkpoint.action === "reset";
+      const undispatchedFork = checkpoint.action === "fork"
+        && barrier.state === "accepted"
+        && checkpoint.phase === "barrier-installed";
+      if (!sessionTransition && !undispatchedFork) return;
+      if (barrier.state === "unknown") {
+        if (!sessionTransition) return;
+        ids.add(id);
+      } else if (barrier.state !== "accepted") return;
+      for (const ancestorId of checkpoint.recoveryBarrierJobIds ?? []) visit(ancestorId);
+      const parentId = barrier.routeSnapshot?.barrierJobId;
+      if (parentId !== null && parentId !== undefined) visit(parentId);
+    };
+    const checkpoint = job.operationCheckpoint;
+    for (const barrierId of checkpoint?.kind === "command" ? checkpoint.recoveryBarrierJobIds ?? [] : []) {
+      visit(barrierId);
+    }
+    const parentId = job.routeSnapshot?.barrierJobId;
+    if (parentId !== null && parentId !== undefined) visit(parentId);
+    return [...ids].sort((left, right) => left - right);
+  }
+  private hasUnresolvedIngressSessionTransition(target: ChatTarget): boolean {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) return false;
+    for (const job of this.store.listUnknownIngressJobs(botUid)) {
+      const checkpoint = job.operationCheckpoint;
+      if (
+        job.channelType === target.channelType
+        && job.channelId === target.channelId
+        && checkpoint?.kind === "command"
+        && (checkpoint.action === "new" || checkpoint.action === "move" || checkpoint.action === "reset")
+        && checkpoint.recoveredByIngressJobId === undefined
+      ) return true;
+    }
+    return false;
+  }
+
+  private ingressSessionHandoffBinding(job: IngressJobRecord): IngressBindingSnapshot | undefined {
+    const barrierId = job.routeSnapshot?.barrierJobId;
+    if (barrierId === null || barrierId === undefined) return undefined;
+    const barrier = this.store.getIngressJob(barrierId);
+    if (
+      barrier === null
+      || barrier.botUid !== job.botUid
+      || barrier.channelType !== job.channelType
+      || barrier.channelId !== job.channelId
+      || barrier.scheduleOrder >= job.scheduleOrder
+    ) return undefined;
+    const checkpoint = barrier.operationCheckpoint;
+    if (
+      barrier.state === "handed-off"
+      && barrier.consumerKind === "operation"
+      && barrier.consumerId === `session-command:${barrier.id}`
+      && checkpoint?.kind === "session-handoff-outcome"
+      && (checkpoint.action === "new" || checkpoint.action === "move")
+    ) return checkpoint.binding;
+    if (
+      barrier.state !== "unknown"
+      || checkpoint?.kind !== "command"
+      || checkpoint.recoveredByIngressJobId === undefined
+      || checkpoint.recoveredBindingSnapshot === undefined
+    ) return undefined;
+    const recovery = this.store.getIngressJob(checkpoint.recoveredByIngressJobId);
+    const outcome = recovery?.operationCheckpoint;
+    if (
+      recovery === null
+      || recovery.botUid !== job.botUid
+      || recovery.channelType !== job.channelType
+      || recovery.channelId !== job.channelId
+      || recovery.scheduleOrder <= barrier.scheduleOrder
+      || recovery.scheduleOrder >= job.scheduleOrder
+      || recovery.state !== "handed-off"
+      || recovery.consumerKind !== "operation"
+      || recovery.consumerId !== `session-command:${recovery.id}`
+      || outcome?.kind !== "session-handoff-outcome"
+      || outcome.action !== "new"
+      || !this.sameIngressBindingSnapshot(checkpoint.recoveredBindingSnapshot, outcome.binding)
+    ) return undefined;
+    return checkpoint.recoveredBindingSnapshot;
+  }
+
+  private releaseRecoveredIngressSessionReservations(jobIds: readonly number[]): void {
+    for (const jobId of jobIds) {
+      const job = this.store.getIngressJob(jobId);
+      if (job === null) continue;
+      const commandKey = `${targetKey({ channelType: job.channelType, channelId: job.channelId })}\0${job.messageId ?? ""}`;
+      const entry = this.ingressSessionReservations.get(commandKey);
+      if (entry === undefined) continue;
+      this.ingressSessionReservations.delete(commandKey);
+      entry.reservation.release();
+    }
+  }
+
   private installIngressSessionOperation(
     job: IngressJobRecord,
     message: InboundMessage,
@@ -3154,14 +3309,44 @@ class CoreService implements ChannelService {
   ): SessionCommandIngressHooks | undefined {
     if ((action !== "new" && action !== "move") || this.bot === undefined) return undefined;
 
-    const expectedBinding = job.operationCheckpoint?.kind === "command"
-      ? job.operationCheckpoint.expectedBinding
-      : job.routeSnapshot?.binding ?? null;
+    const recoveredBinding = this.ingressSessionHandoffBinding(job);
+    const expectedBinding = recoveredBinding
+      ?? (job.operationCheckpoint?.kind === "command"
+        ? job.operationCheckpoint.expectedBinding
+        : job.routeSnapshot?.binding ?? null);
+    const recoveryBarrierJobIds = this.ingressSessionRecoveryBarrierIds(job);
+    const routedBarrierId = job.routeSnapshot?.barrierJobId;
+    const routedBarrier = routedBarrierId == null ? null : this.store.getIngressJob(routedBarrierId);
+    const routedCheckpoint = routedBarrier?.operationCheckpoint;
+    const hasUnresolvedRoutedBarrier = routedBarrier !== null
+      && (routedBarrier.state === "dispatch-intent" || routedBarrier.state === "unknown")
+      && routedCheckpoint?.kind === "command"
+      && routedCheckpoint.recoveredByIngressJobId === undefined
+      && (routedCheckpoint.action === "new" || routedCheckpoint.action === "move" || routedCheckpoint.action === "reset");
+    const hasRecoveryBarrier = recoveryBarrierJobIds.length > 0
+      || hasUnresolvedRoutedBarrier
+      || (job.operationCheckpoint?.kind === "command"
+        && (job.operationCheckpoint.recoveryBarrierJobIds?.length ?? 0) > 0);
     const commandKey = this.threadMergeCommandKey(message);
     const target = targetKey(message);
     const initialResources = job.operationCheckpoint?.kind === "command"
       ? [...(job.operationCheckpoint.resourceCwds ?? [])]
       : expectedBinding === null ? [] : [expectedBinding.cwd];
+    const expectedBindingRecord: BindingRecord | null = expectedBinding === null
+      ? null
+      : {
+          botUid: job.botUid,
+          channelType: message.channelType,
+          channelId: message.channelId,
+          sessionId: expectedBinding.sessionId,
+          cwd: expectedBinding.cwd,
+          sessionFile: expectedBinding.sessionFile,
+          cwdPinned: expectedBinding.cwdPinned === true,
+          sessionSwitchedAt: expectedBinding.sessionSwitchedAt ?? null,
+          ...(expectedBinding.sessionInitialization === undefined
+            ? {}
+            : { sessionInitialization: expectedBinding.sessionInitialization }),
+        };
     const existing = this.ingressSessionReservations.get(commandKey);
     let reservation: SessionCommandReservation;
     let resourceCwds: readonly string[];
@@ -3198,6 +3383,7 @@ class CoreService implements ChannelService {
       expectedBinding,
       resourceCwds: [...new Set(paths)],
       ...(workerLedgerId === undefined ? {} : { workerLedgerId }),
+      ...(recoveryBarrierJobIds.length === 0 ? {} : { recoveryBarrierJobIds }),
     });
     const saveCheckpoint = (
       phase: Extract<IngressOperationCheckpoint, { kind: "command" }>["phase"],
@@ -3231,7 +3417,9 @@ class CoreService implements ChannelService {
           && binding.cwd === expectedBinding.cwd
           && binding.sessionFile === expectedBinding.sessionFile
           && (binding.cwdPinned === true) === expectedBinding.cwdPinned
-          && (binding.sessionSwitchedAt ?? null) === expectedBinding.sessionSwitchedAt,
+          && (binding.sessionSwitchedAt ?? null) === (expectedBinding.sessionSwitchedAt ?? null)
+          && JSON.stringify(binding.sessionInitialization ?? null)
+            === JSON.stringify(expectedBinding.sessionInitialization ?? null),
       checkpointWaitingSession: paths => {
         const current = this.ingressSessionReservations.get(commandKey);
         if (current === undefined) return false;
@@ -3240,6 +3428,71 @@ class CoreService implements ChannelService {
         const extended = [...new Set([...current.resourceCwds, ...paths])];
         this.ingressSessionReservations.set(commandKey, { ...current, resourceCwds: extended });
         return saveCheckpoint("waiting-session", extended);
+      },
+      prepareRecovery: async () => {
+        if (!hasRecoveryBarrier) return { kind: "ready" };
+        if (recoveryBarrierJobIds.length === 0 || action !== "new") {
+          return {
+            kind: "blocked",
+            message: "此前的操作不是可恢复的会话切换；请等待，或发送 /stop、/cancel 后核对状态。",
+          };
+        }
+        const orders: number[] = [];
+        for (const barrierId of recoveryBarrierJobIds) {
+          const barrier = this.store.getIngressJob(barrierId);
+          const checkpoint = barrier?.operationCheckpoint;
+          if (
+            barrier?.state !== "unknown"
+            || checkpoint?.kind !== "command"
+            || (checkpoint.action !== "new" && checkpoint.action !== "move" && checkpoint.action !== "reset")
+            || checkpoint.recoveredByIngressJobId !== undefined
+          ) {
+            return {
+              kind: "stale",
+              message: "此前的会话切换状态已变化；请等待并核对后再重试 /new。",
+            };
+          }
+          const expectedLedgerId = `${checkpoint.action}-ingress-${barrierId}`;
+          const ledger = checkpoint.workerLedgerId === expectedLedgerId
+            ? this.store.getWorkerLedger(job.botUid, expectedLedgerId)
+            : null;
+          if (ledger === null || ledger.state !== "stopped") {
+            return {
+              kind: "blocked",
+              message: "此前会话切换的 worker 尚未确认停止；请等待，或发送 /stop、/cancel，停止确认后再重试 /new。",
+            };
+          }
+          const barrierKey = `${target}\0${barrier.messageId ?? ""}`;
+          const hold = this.ingressSessionReservations.get(barrierKey);
+          if (hold === undefined) {
+            return {
+              kind: "blocked",
+              message: "此前会话切换的保护状态尚未恢复；请等待，或发送 /stop、/cancel 后重试 /new。",
+            };
+          }
+          orders.push(hold.reservation.order);
+        }
+        const current = this.ingressSessionReservations.get(commandKey);
+        if (current === undefined || !current.reservation.bypassUncertainPriorOrders(orders)) {
+          return {
+            kind: "blocked",
+            message: "无法安全接管此前的会话切换；请等待，或发送 /stop、/cancel 后重试 /new。",
+          };
+        }
+        const prepared = this.store.prepareIngressSessionRecovery(job.id, recoveryBarrierJobIds);
+        if (prepared.kind !== "ready") {
+          return prepared.kind === "blocked"
+            ? {
+                kind: "blocked",
+                message: "仍有屏障后的消息处于派发中，无法安全恢复；请等待，或发送 /stop、/cancel 后重试 /new。",
+              }
+            : {
+                kind: "stale",
+                message: "会话绑定或切换状态已变化，本次 /new 未执行。",
+              };
+        }
+        this.releaseIngressSessionDirectories(recoveryBarrierJobIds);
+        return { kind: "ready" };
       },
       acquireSessionLease: async paths => {
         const current = this.ingressSessionReservations.get(commandKey);
@@ -3254,39 +3507,95 @@ class CoreService implements ChannelService {
       markDispatchIntent: (workerLedgerId, paths) => {
         const current = this.ingressSessionReservations.get(commandKey);
         if (current === undefined || paths.some(path => !current.resourceCwds.includes(path))) return false;
-        return this.store.markIngressCommandDispatchIntent(
+        const marked = this.store.markIngressCommandDispatchIntent(
           job.id,
           makeCheckpoint("dispatch-intent", current.resourceCwds, workerLedgerId),
         );
+        if (marked && recoveryBarrierJobIds.length > 0) {
+          this.ingress.promoteRecoverySessionBarrier(job.id);
+        }
+        return marked;
       },
       handoffOutcome: (binding, text, clearContext) => {
-        const handedOff = this.store.handoffIngressJob(
-          job.id,
-          { kind: "operation", id: stableOperationId },
-          () => {
-            if (binding !== null) {
-              this.store.ensureBinding(binding, { clearSessionInitialization: true });
-              if (clearContext) this.store.clearContextLedger(job.botUid, message);
-            }
-            this.store.completeCommand(this.commandClaim(message, command.name));
-            persistReceipt(text);
-            return true;
-          },
-        );
+        const persistOutcome = (bindingAlreadyCommitted = false): boolean => {
+          if (
+            binding !== null
+            && !bindingAlreadyCommitted
+            && !this.store.ensureBindingIfMatches(
+              binding,
+              expectedBindingRecord,
+              { clearSessionInitialization: true },
+            )
+          ) return false;
+          if (binding !== null && clearContext) this.store.clearContextLedger(job.botUid, message);
+          this.store.completeCommand(this.commandClaim(message, command.name));
+          persistReceipt(text);
+          return true;
+        };
+        let handedOff: boolean;
+        let recoveryCommitted = false;
+        let cancelledJobIds: readonly number[] = [];
+        const transitionAction = action === "new" || action === "move" ? action : null;
+        const outcomeCheckpoint: IngressOperationCheckpoint | undefined =
+          binding === null || transitionAction === null
+            ? undefined
+            : {
+                kind: "session-handoff-outcome",
+                action: transitionAction,
+                binding: {
+                  sessionId: binding.sessionId,
+                  cwd: binding.cwd,
+                  sessionFile: binding.sessionFile,
+                  cwdPinned: binding.cwdPinned === true,
+                  sessionSwitchedAt: binding.sessionSwitchedAt ?? null,
+                  sessionInitialization: binding.sessionInitialization ?? null,
+                },
+              };
+        if (binding !== null && action === "new" && recoveryBarrierJobIds.length > 0) {
+          const result = this.store.handoffSessionIngressJob(
+            job.id,
+            { kind: "operation", id: stableOperationId },
+            () => persistOutcome(true),
+            { expectedBinding, binding, barrierJobIds: recoveryBarrierJobIds },
+          );
+          handedOff = result.handedOff;
+          recoveryCommitted = result.handedOff;
+          cancelledJobIds = result.cancelledJobIds;
+        } else {
+          handedOff = this.store.handoffIngressJob(
+            job.id,
+            { kind: "operation", id: stableOperationId },
+            persistOutcome,
+            outcomeCheckpoint,
+          );
+        }
         if (handedOff) {
+          if (recoveryCommitted) {
+            // Only a committed new binding may retire its unknown ancestors.
+            this.ingress.releaseSessionBarrier(job.id);
+            this.ingress.cancelRecoveredIngressJobs(cancelledJobIds);
+            this.ingress.releaseRecoveredSessionBarriers(recoveryBarrierJobIds);
+            this.releaseIngressSessionDirectories(recoveryBarrierJobIds);
+            this.releaseRecoveredIngressSessionReservations(recoveryBarrierJobIds);
+          } else if (recoveryBarrierJobIds.length === 0) {
+            this.ingress.releaseSessionBarrier(job.id);
+          }
           publishReceipt(clearContext);
           onHandoff();
         }
         return handedOff;
       },
       failUnknown: (text, paths) => {
-        for (const path of paths) this.blockedDirectories.add(path);
+        for (const path of paths) this.blockIngressSessionDirectory(job.id, path);
         const marked = this.store.markIngressUnknown(job.id, () => {
           this.store.completeCommand(this.commandClaim(message, command.name));
           persistReceipt(text);
           return true;
         });
-        if (marked) void this.outbox.flush(message).catch(() => {});
+        if (marked) {
+          void this.outbox.flush(message).catch(() => {});
+          onHandoff();
+        }
         return marked;
       },
     };
@@ -3298,6 +3607,22 @@ class CoreService implements ChannelService {
     const controller = this.ingressSessionControllersByCommand.get(commandKey);
     const jobId = this.ingressSessionJobIdsByCommand.get(commandKey);
     const job = jobId === undefined ? null : this.store.getIngressJob(jobId);
+    if (job?.operationCheckpoint?.kind === "command") {
+      for (const barrierId of job.operationCheckpoint.recoveryBarrierJobIds ?? []) {
+        const barrier = this.store.getIngressJob(barrierId);
+        if (
+          barrier?.operationCheckpoint?.kind !== "command"
+          || barrier.operationCheckpoint.recoveredByIngressJobId === job.id
+        ) continue;
+        const paths = new Set([
+          ...(barrier.operationCheckpoint.resourceCwds ?? []),
+          ...(barrier.operationCheckpoint.expectedBinding?.cwd === undefined
+            ? []
+            : [barrier.operationCheckpoint.expectedBinding.cwd]),
+        ]);
+        for (const path of paths) this.blockIngressSessionDirectory(barrierId, path);
+      }
+    }
     const keepProtectedReservation = job?.state === "unknown" || job?.state === "dispatch-intent";
     this.ingressSessionControllersByCommand.delete(commandKey);
     this.ingressSessionJobIdsByCommand.delete(commandKey);
@@ -3706,9 +4031,24 @@ class CoreService implements ChannelService {
     }
   }
 
+  private blockIngressSessionDirectory(jobId: number, cwd: string): void {
+    const paths = this.ingressSessionDirectoryBlocks.get(jobId) ?? new Set<string>();
+    paths.add(cwd);
+    this.ingressSessionDirectoryBlocks.set(jobId, paths);
+  }
+
+  private releaseIngressSessionDirectories(jobIds: readonly number[]): void {
+    for (const jobId of jobIds) this.ingressSessionDirectoryBlocks.delete(jobId);
+  }
+
   private isWorkspaceDirectoryBlocked(cwd: string): boolean {
     for (const blockedCwd of this.blockedDirectories) {
       if (resourcePathsRelated(cwd, blockedCwd)) return true;
+    }
+    for (const paths of this.ingressSessionDirectoryBlocks.values()) {
+      for (const blockedCwd of paths) {
+        if (resourcePathsRelated(cwd, blockedCwd)) return true;
+      }
     }
     return false;
   }
@@ -3869,7 +4209,9 @@ class CoreService implements ChannelService {
   private hasRuntime(target: ChatTarget): boolean {
     const key = targetKey(target);
     for (const runtime of this.runtimes.values()) {
-      if (targetKey(runtime.target) === key) return true;
+      if (targetKey(runtime.target) !== key) continue;
+      const task = this.store.getTask(runtime.taskId);
+      if (task === null || task.state !== "completed") return true;
     }
     return false;
   }
@@ -6952,11 +7294,66 @@ class CoreService implements ChannelService {
     if (tanInbound.length > 0) await tanInboundSettled;
     if (cancelledTanOperations.length > 0) await tanDispatchSettled;
     for (const operation of cancelledTanOperations) this.finalizeCancelledTanOperation(operation);
+    const sessionStopJobs = new Map<number, IngressJobRecord>();
+    for (const job of [
+      ...this.store.listUnknownIngressJobs(this.bot!.uid),
+      ...this.store.listRecoverableIngressJobs(this.bot!.uid),
+    ]) {
+      if (job.channelType !== target.channelType || job.channelId !== target.channelId) continue;
+      const checkpoint = job.operationCheckpoint;
+      if (checkpoint?.kind !== "command"
+        || (checkpoint.action !== "new" && checkpoint.action !== "move" && checkpoint.action !== "reset")
+        || checkpoint.recoveredByIngressJobId !== undefined
+        || checkpoint.workerLedgerId !== `${checkpoint.action}-ingress-${job.id}`) continue;
+      sessionStopJobs.set(job.id, job);
+    }
+    let sessionStopRequested = false;
+    let sessionStopUnconfirmed = false;
+    let sessionStopConfirmed = false;
+    for (const job of sessionStopJobs.values()) {
+      const checkpoint = job.operationCheckpoint;
+      if (checkpoint?.kind !== "command" || checkpoint.workerLedgerId === undefined) continue;
+      for (const path of new Set([
+        ...(checkpoint.resourceCwds ?? []),
+        ...(checkpoint.expectedBinding?.cwd === undefined ? [] : [checkpoint.expectedBinding.cwd]),
+      ])) {
+        this.blockIngressSessionDirectory(job.id, path);
+      }
+      sessionStopRequested = true;
+      const ledger = this.store.getWorkerLedger(this.bot!.uid, checkpoint.workerLedgerId);
+      if (ledger === null) {
+        sessionStopUnconfirmed = true;
+        continue;
+      }
+      let stopped = ledger.state === "stopped";
+      if (!stopped) {
+        try {
+          stopped = await this.options.workerFactory.recover(ledger);
+        } catch {
+          stopped = false;
+        }
+        if (stopped) {
+          try {
+            this.store.markWorkerStopped(ledger.id);
+          } catch {
+            stopped = false;
+          }
+        }
+      }
+      if (stopped) {
+        sessionStopConfirmed = true;
+        this.releaseIngressSessionDirectories([job.id]);
+      } else {
+        sessionStopUnconfirmed = true;
+      }
+    }
     const unknownIngressOperation = this.store.listUnknownIngressJobs(this.bot!.uid).some(job => {
       if (
         job.channelType !== target.channelType
         || job.channelId !== target.channelId
         || job.operationCheckpoint?.kind !== "command"
+        || job.operationCheckpoint.recoveredByIngressJobId !== undefined
+        || sessionStopJobs.has(job.id)
       ) return false;
       const checkpoint = job.operationCheckpoint;
       return checkpoint.workerLedgerId !== undefined
@@ -6978,13 +7375,17 @@ class CoreService implements ChannelService {
     const sessionCompleted = sessionJobIds.some(id => this.store.getIngressJob(id)?.state === "handed-off");
     const response = commitStopUnconfirmed || unknownHostOperation || unknownIngressOperation
       ? "无法确认受管操作已完成或停止；结果保持未知且不会自动重放，请先核对状态。"
-      : completedCommit?.result !== undefined
-        ? `当前提交已完成，无法取消或回滚；HEAD=${this.shortHead(completedCommit.result.headAfter)}。`
-        : sessionCompleted && queued.length === 0
-          ? "会话操作已完成，无法取消或回滚。"
-        : queued.length > 0 || active || mergeCancelled || removalCancelled || forkCancelled || archiveCancelled || tanCancelled
-          ? DEFAULT_CANCELLED_TEXT
-          : "当前没有可取消的任务。";
+      : sessionStopRequested && sessionStopUnconfirmed
+        ? "无法确认旧会话 worker 已停止；原操作仍未知，保护保持不变。请等待或再次 /cancel；确认停止后可用 /new 恢复，旧操作不会重跑。"
+        : sessionStopRequested && sessionStopConfirmed
+          ? "已确认旧会话 worker 停止；原操作结果仍未知且不会重放。可用 /new 新建会话恢复。"
+          : completedCommit?.result !== undefined
+            ? `当前提交已完成，无法取消或回滚；HEAD=${this.shortHead(completedCommit.result.headAfter)}。`
+            : sessionCompleted && queued.length === 0
+              ? "会话操作已完成，无法取消或回滚。"
+              : queued.length > 0 || active || mergeCancelled || removalCancelled || forkCancelled || archiveCancelled || tanCancelled
+                ? DEFAULT_CANCELLED_TEXT
+                : "当前没有可取消的任务。";
     await this.outbox.enqueueText(target, response, null);
   }
   private abortThreadMerges(target: ChatTarget, reason: Error): boolean {
@@ -7743,24 +8144,60 @@ class CoreService implements ChannelService {
     if (botUid === undefined || botUid !== prepared.task.botUid) return false;
     if (this.store.isIngressCancellationRequested(prepared.ingressJobId)) return false;
     const live = this.store.getBinding(botUid, prepared.message);
-    const expected = prepared.expectedBinding;
-    if (expected === null) {
-      if (live !== null) return false;
-    } else if (
-      live === null
-      || live.sessionId !== expected.sessionId
-      || live.cwd !== expected.cwd
-      || live.sessionFile !== expected.sessionFile
-    ) {
-      return false;
+    const expectedSnapshot = prepared.expectedBinding === null
+      ? null
+      : {
+          sessionId: prepared.expectedBinding.sessionId,
+          cwd: prepared.expectedBinding.cwd,
+          sessionFile: prepared.expectedBinding.sessionFile,
+          cwdPinned: prepared.expectedBinding.cwdPinned === true,
+          sessionSwitchedAt: prepared.expectedBinding.sessionSwitchedAt ?? null,
+          sessionInitialization: prepared.expectedBinding.sessionInitialization ?? null,
+        };
+    const liveSnapshot = live === null ? null : {
+      sessionId: live.sessionId,
+      cwd: live.cwd,
+      sessionFile: live.sessionFile,
+      cwdPinned: live.cwdPinned === true,
+      sessionSwitchedAt: live.sessionSwitchedAt ?? null,
+      sessionInitialization: live.sessionInitialization ?? null,
+    };
+    let binding = prepared.binding;
+    if (!this.sameIngressBindingSnapshot(expectedSnapshot, liveSnapshot)) {
+      const ingress = this.store.getIngressJob(prepared.ingressJobId);
+      const route = ingress?.routeSnapshot ?? null;
+      const barrierId = route?.barrierJobId ?? null;
+      const barrier = barrierId === null ? null : this.store.getIngressJob(barrierId);
+      const expectedMatchesRoute = this.sameIngressBindingSnapshot(
+        expectedSnapshot,
+        route?.binding ?? null,
+      );
+      const rebaseAllowed = live !== null
+        && ingress !== null
+        && ingress.state === "accepted"
+        && route !== null
+        && route.purpose.kind !== "questions"
+        && barrierId !== null
+        && route.sessionGeneration === barrierId
+        && expectedMatchesRoute
+        && barrier !== null
+        && barrier.botUid === ingress.botUid
+        && barrier.channelType === ingress.channelType
+        && barrier.channelId === ingress.channelId
+        && barrier.scheduleOrder < ingress.scheduleOrder
+        && barrier.state === "handed-off"
+        && barrier.consumerKind === "operation"
+        && barrier.consumerId === `session-command:${barrier.id}`;
+      if (!rebaseAllowed) return false;
+      binding = live;
+      prepared.task.sessionId = live.sessionId;
+      prepared.task.cwd = live.cwd;
+      prepared.startsBehind = this.scheduler.hasBlockingWork(prepared.message, live.cwd);
     }
-    if (
-      live === null
-      || live.sessionId !== prepared.binding.sessionId
-      || live.cwd !== prepared.binding.cwd
-      || live.sessionFile !== prepared.binding.sessionFile
-    ) {
-      this.store.ensureBinding(prepared.binding);
+    if (live === null || !this.sameBindingState(live, binding)) {
+      if (!this.store.ensureBindingIfMatches(binding, live, { clearSessionInitialization: true })) {
+        return false;
+      }
     }
     return this.store.acceptTask(prepared.claim, prepared.task, undefined, prepared.ingressJobId);
   }
@@ -7819,7 +8256,10 @@ class CoreService implements ChannelService {
         sessionFile: null,
       };
       try {
-        this.store.ensureBinding(binding);
+        if (!this.store.ensureBindingIfMatches(binding, null)) {
+          if (!silentFailure) await this.outbox.enqueueText(message, "会话绑定已变化，未接收任务。", null);
+          return false;
+        }
       } catch {
         throw new Error("本地状态盘写入失败，任务未接收。");
       }
@@ -7829,7 +8269,10 @@ class CoreService implements ChannelService {
       if (cwd !== current.cwd) {
         binding = { ...current, cwd };
         try {
-          this.store.ensureBinding(binding);
+          if (!this.store.ensureBindingIfMatches(binding, current)) {
+            if (!silentFailure) await this.outbox.enqueueText(message, "会话绑定已变化，未接收任务。", null);
+            return false;
+          }
         } catch {
           throw new Error("本地状态盘写入失败，任务未接收。");
         }
@@ -7845,6 +8288,8 @@ class CoreService implements ChannelService {
     // Shutdown can land during the binding probes above; never persist an acceptance from a
     // redeliverable message.
     this.throwIfStopping();
+    const bindingAtAccept = this.store.getBinding(this.bot!.uid, message);
+    if (bindingAtAccept === null || !this.sameBindingState(bindingAtAccept, binding)) return false;
     if (acceptGuard && !acceptGuard()) return false;
     if (beforeAccept && !beforeAccept()) return false;
     const task: TaskRecord = {
@@ -9731,7 +10176,10 @@ class CoreService implements ChannelService {
       }
       // Create an unbound creator session in the same transaction as durable task acceptance.
       if (currentCreatorBinding === null && createCreatorBinding) {
-        this.store.ensureBinding(creatorBinding);
+        if (!this.store.ensureBindingIfMatches(creatorBinding, null)) {
+          guardFailure = "thread-send-parent creator binding changed before acceptance";
+          return false;
+        }
         currentCreatorBinding = this.store.getBinding(botUid, creator);
       }
       if (
@@ -10533,32 +10981,27 @@ class CoreService implements ChannelService {
         goalSessionId = verified.sessionId;
       } else if (goalTask && verified.sessionId !== goalSessionId) {
         throw new WorkerGoalError("identity-mismatch", "Worker session changed before goal dispatch");
-      } else if (!goalTask && !isWatchWakeTask && !isTanDispatch) {
-        if (
-          target.channelType === 5
-          && bindingAtStart?.cwdPinned === true
-          && bindingAtStart.sessionFile === null
-        ) {
-          if (
-            verified.sessionFile === null
-            || !this.store.initializeBindingSessionFromTask(
-              this.bot!.uid,
-              target,
-              taskId,
-              bindingAtStart,
-              verified.sessionId,
-              verified.sessionFile,
-            )
-          ) {
-            throw new TaskStartupError("session-invalid", "初始绑定已变化，拒绝发布新的会话身份。");
-          }
-        } else {
-          this.store.updateBindingSession(
+      } else if (!goalTask && !isWatchWakeTask && !isTanDispatch && bindingAtStart?.sessionFile === null) {
+        if (verified.sessionFile === null) {
+          throw new TaskStartupError("session-invalid", "新建会话未返回可持久化的会话文件。");
+        }
+        if (target.channelType === 5 && bindingAtStart.cwdPinned === true) {
+          if (!this.store.initializeBindingSessionFromTask(
             this.bot!.uid,
             target,
+            taskId,
+            bindingAtStart,
             verified.sessionId,
             verified.sessionFile,
-          );
+          )) {
+            throw new TaskStartupError("session-invalid", "初始绑定已变化，拒绝发布新的会话身份。");
+          }
+        } else if (!this.store.ensureBindingIfMatches({
+          ...bindingAtStart,
+          sessionId: verified.sessionId,
+          sessionFile: verified.sessionFile,
+        }, bindingAtStart, { clearSessionInitialization: true })) {
+          throw new TaskStartupError("session-invalid", "初始绑定已变化，拒绝发布新的会话身份。");
         }
       }
       // 续接不重放原文、也不重灌历史快照：原回合的上下文与会话消息都在会话里；群/子区说明

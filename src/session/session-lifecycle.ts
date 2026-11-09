@@ -51,6 +51,8 @@ export interface SessionLifecycleDeps {
     | "getThreadWorkspace"
     | "workspaceDirectories"
     | "ensureBinding"
+    | "ensureBindingIfMatches"
+    | "ensureBindingIfMatchesIfNoUnresolvedSessionTransition"
     | "getActiveTask"
     | "resolveChatModel"
     | "clearContextLedger"
@@ -66,8 +68,12 @@ export interface SessionLifecycleDeps {
   readonly hasRuntime: (target: ChatTarget) => boolean;
   /** 该 cwd 是否因 worker 无法确认停止而被 block。 */
   readonly isDirectoryBlocked: (cwd: string) => boolean;
+  /** Do not infer a session move while an accepted/unknown ingress transition owns the binding. */
+  readonly hasUnresolvedSessionTransition: (target: ChatTarget) => boolean;
   /** 把该 cwd 标为不可用（worker 无法确认停止时）。 */
   readonly blockDirectory: (cwd: string) => void;
+  /** Worker-stop uncertainty owned by one durable ingress session command. */
+  readonly blockIngressDirectory: (jobId: number, cwd: string) => void;
   /**
    * 为当前聊天的 session（未绑定时按聊天标识）获取命令租约；当命令命中 thread_workspaces 的
    * entry/project 资源组（或绑定已 pin 的工作区）时，同时租下展开后的工作区资源键。普通 cwd 上的
@@ -91,6 +97,9 @@ export interface SessionCommandIngressHooks {
   readonly matchesExpectedBinding: (binding: BindingRecord | null) => boolean;
   readonly checkpointWaitingSession: (resourceCwds: readonly string[]) => boolean;
   readonly acquireSessionLease: (resourceCwds: readonly string[]) => Promise<SessionLease | undefined>;
+  readonly prepareRecovery?: (
+    resourceCwds: readonly string[],
+  ) => Promise<{ kind: "ready" | "blocked" | "stale"; message?: string }>;
   readonly markDispatchIntent: (workerLedgerId: string, resourceCwds: readonly string[]) => boolean;
   /** Atomically persists any binding/context update, stable receipt, command claim and ingress handoff. */
   readonly handoffOutcome: (
@@ -131,6 +140,7 @@ export class SessionLifecycle {
       : this.deps.store.getBinding(this.deps.bot()!.uid, target),
   ): Promise<BindingRecord | null> {
     if (!binding || !binding.sessionFile) return binding;
+    if (this.deps.hasUnresolvedSessionTransition(target)) return binding;
     if (this.deps.isDirectoryBlocked(binding.cwd)) return binding;
     const moved = await findMovedSession(binding, { roots: await this.sessionRootsFor(binding.cwd) });
     if (
@@ -148,7 +158,9 @@ export class SessionLifecycle {
       sessionFile: moved.sessionFile,
     };
     try {
-      this.deps.store.ensureBinding(rebound);
+      if (!this.deps.store.ensureBindingIfMatchesIfNoUnresolvedSessionTransition(rebound, binding)) {
+        return this.deps.store.getBinding(binding.botUid, target);
+      }
     } catch {
       return binding;
     }
@@ -251,6 +263,7 @@ export class SessionLifecycle {
   ): Promise<void> {
     const bot = this.deps.bot();
     const resources: string[] = [];
+    let previous: BindingRecord | null = null;
     let dispatchIntent = false;
     const ensureOpen = (): void => {
       if (ingress?.signal.aborted) {
@@ -265,7 +278,9 @@ export class SessionLifecycle {
         return;
       }
       if (binding !== null) {
-        this.deps.store.ensureBinding(binding, { clearSessionInitialization: true });
+        if (!this.deps.store.ensureBindingIfMatches(binding, previous, { clearSessionInitialization: true })) {
+          throw new Error("会话绑定已变化，拒绝覆盖较新的绑定。");
+        }
         if (clearContext) {
           this.deps.store.clearContextLedger(binding.botUid, target);
           this.deps.resetReferenceContext(target);
@@ -289,7 +304,7 @@ export class SessionLifecycle {
       complete("当前聊天有运行中或排队任务，请先 /cancel。");
       return;
     }
-    const previous = await this.reconcileExternalBinding(target);
+    previous = await this.reconcileExternalBinding(target);
     ensureOpen();
     if (ingress !== undefined && !ingress.matchesExpectedBinding(previous)) {
       complete("当前会话绑定已变化，本次 /new 未执行。");
@@ -318,17 +333,34 @@ export class SessionLifecycle {
     if (ingress !== undefined && !ingress.checkpointWaitingSession(resources)) {
       throw new Error("session command checkpoint could not be persisted");
     }
+    if (ingress !== undefined && ingress.prepareRecovery !== undefined) {
+      const recovery = await ingress.prepareRecovery(resources);
+      ensureOpen();
+      if (recovery.kind !== "ready") {
+        complete(recovery.message ?? "无法确认此前的会话切换已停止；请等待，或发送 /stop、/cancel 后重试 /new。");
+        return;
+      }
+    }
     const commandLease = ingress === undefined
       ? await this.deps.tryAcquireCommandSession(target, resources)
       : await ingress.acquireSessionLease(resources);
     ensureOpen();
     if (!commandLease) {
-      complete("相关会话正在运行，或目标目录存在未确认停止的 worker，请稍后重试。");
+      complete("相关会话仍在运行，或停止状态尚未确认；请等待，或发送 /stop、/cancel 后重试 /new。");
       return;
     }
     try {
       await commandLease.ready;
       ensureOpen();
+      if (
+        ingress !== undefined
+        && !ingress.matchesExpectedBinding(
+          bot === undefined ? null : this.deps.store.getBinding(bot.uid, target),
+        )
+      ) {
+        complete("当前会话绑定已变化，本次 /new 未执行。");
+        return;
+      }
       const sessionId = randomUUID();
       const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.deps.config), cwd);
       const ledgerId = ingress?.workerLedgerId ?? `new-${sessionId}`;
@@ -362,7 +394,9 @@ export class SessionLifecycle {
               recordWorker: (worker: WorkerLedgerRecord) =>
                 this.deps.store.recordIngressWorker(ingress.jobId, worker),
             }),
-            blockDirectory: this.deps.blockDirectory,
+            blockDirectory: cwd => ingress === undefined
+              ? this.deps.blockDirectory(cwd)
+              : this.deps.blockIngressDirectory(ingress.jobId, cwd),
           },
           async worker => {
             const freshState: ProjectSessionState = await worker.refreshState();
@@ -425,6 +459,7 @@ export class SessionLifecycle {
     const bot = this.deps.bot();
     const resources: string[] = [];
     let dispatchIntent = false;
+    let previous: BindingRecord | null = null;
     const ensureOpen = (): void => {
       if (ingress?.signal.aborted) {
         throw ingress.signal.reason instanceof Error ? ingress.signal.reason : new Error("session command aborted");
@@ -438,7 +473,9 @@ export class SessionLifecycle {
         return;
       }
       if (binding !== null) {
-        this.deps.store.ensureBinding(binding, { clearSessionInitialization: true });
+        if (!this.deps.store.ensureBindingIfMatches(binding, previous, { clearSessionInitialization: true })) {
+          throw new Error("会话绑定已变化，拒绝覆盖较新的绑定。");
+        }
       }
       this.deps.enqueueText(target, text, null);
     };
@@ -458,7 +495,7 @@ export class SessionLifecycle {
       complete("当前聊天有运行中或排队任务，请先 /cancel。");
       return;
     }
-    const previous = await this.reconcileExternalBinding(target);
+    previous = await this.reconcileExternalBinding(target);
     ensureOpen();
     if (ingress !== undefined && !ingress.matchesExpectedBinding(previous)) {
       complete("当前会话绑定已变化，本次 /move 未执行。");
@@ -504,12 +541,21 @@ export class SessionLifecycle {
       : await ingress.acquireSessionLease(resources);
     ensureOpen();
     if (!commandLease) {
-      complete("相关会话正在运行，或源/目标目录存在未确认停止的 worker，请稍后重试。");
+      complete("相关会话仍在运行，或停止状态尚未确认；请等待，或发送 /stop、/cancel 后再重试。");
       return;
     }
     try {
       await commandLease.ready;
       ensureOpen();
+      if (
+        ingress !== undefined
+        && !ingress.matchesExpectedBinding(
+          bot === undefined ? null : this.deps.store.getBinding(bot.uid, target),
+        )
+      ) {
+        complete("当前会话绑定已变化，本次 /move 未执行。");
+        return;
+      }
       const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.deps.config), cwd);
       const ledgerId = ingress?.workerLedgerId ?? `move-${randomUUID()}`;
       if (ingress !== undefined) {
@@ -543,7 +589,9 @@ export class SessionLifecycle {
               recordWorker: (worker: WorkerLedgerRecord) =>
                 this.deps.store.recordIngressWorker(ingress.jobId, worker),
             }),
-            blockDirectory: this.deps.blockDirectory,
+            blockDirectory: cwd => ingress === undefined
+              ? this.deps.blockDirectory(cwd)
+              : this.deps.blockIngressDirectory(ingress.jobId, cwd),
           },
           async worker => {
             await worker.prompt(`/move ${cwd}`, () => {});

@@ -88,6 +88,7 @@ export interface HostToolHost {
     | "enqueueOutbox"
     | "getBinding"
     | "ensureBinding"
+    | "ensureBindingIfMatches"
     | "getOwnerId"
     | "getThreadWorkspace"
     | "getThreadForkByTarget"

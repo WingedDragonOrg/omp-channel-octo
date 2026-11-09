@@ -33,6 +33,8 @@ const auditPath = join(root, "wt-audit.tsv");
 const configPath = join(root, "config.json");
 const localAgentDir = join(root, "agent");
 const nativeConfig = join(root, "native.yml");
+const ompWrapperPath = join(bin, "omp-controlled");
+const ompStartGate = join(root, "omp-start-gate");
 const stateDbPath = join(stateDir, "channel.sqlite");
 const ownerGroup = "ingress-fixture-group";
 const children: Bun.Subprocess[] = [];
@@ -90,6 +92,7 @@ interface HostMergeRow {
   resource_cwds: string | null;
 }
 interface TaskRow {
+  session_id: string | null;
   state: string;
   result_text: string | null;
 }
@@ -235,7 +238,7 @@ function hostMergeCount(messageId: string): number {
 }
 
 function taskRow(messageId: string): TaskRow | null {
-  return dbQuery<TaskRow>("SELECT state, result_text FROM tasks WHERE message_id = ?", messageId);
+  return dbQuery<TaskRow>("SELECT session_id, state, result_text FROM tasks WHERE message_id = ?", messageId);
 }
 
 function ackCount(connection: FixtureConnection, messageId: string): number {
@@ -273,9 +276,31 @@ function send(
   return messageId;
 }
 
-function binding(target: ChatTarget): { cwd: string; session_file: string | null; cwd_pinned: number } | null {
+function replay(
+  connection: FixtureConnection,
+  target: ChatTarget,
+  text: string,
+  messageId: string,
+): void {
+  fixture!.sendInbound(connection, {
+    fromUid: fixture!.ownerUid,
+    channelId: target.channelId,
+    channelType: target.channelType,
+    text,
+    messageId,
+    ...(target.channelType === 1 ? {} : { mention: { uids: [fixture!.botUid] } }),
+  });
+}
+
+async function waitReplayAck(connection: FixtureConnection, messageId: string, label: string): Promise<void> {
+  const before = ackCount(connection, messageId);
+  await waitUntil(`${label}: replay RECVACK`, () => ackCount(connection, messageId) > before, 15_000);
+  assert.equal(ackCount(connection, messageId), before + 1, `${label} replay must receive exactly one message-specific ACK`);
+}
+
+function binding(target: ChatTarget): { session_id: string; cwd: string; session_file: string | null; cwd_pinned: number } | null {
   return dbQuery(
-    "SELECT cwd, session_file, cwd_pinned FROM chats WHERE bot_uid = ? AND channel_type = ? AND channel_id = ?",
+    "SELECT session_id, cwd, session_file, cwd_pinned FROM chats WHERE bot_uid = ? AND channel_type = ? AND channel_id = ?",
     fixture!.botUid,
     target.channelType,
     target.channelId,
@@ -486,6 +511,22 @@ async function installLocalFilesAndEnvironment(): Promise<void> {
   await mkdir(gateDir, { recursive: true });
   await mkdir(localAgentDir, { recursive: true });
   await mkdir(join(root, "xdg-config"), { recursive: true });
+  await writeFile(join(root, "real-omp-command"), `${ompCommand}\n`);
+  await writeFile(ompWrapperPath, [
+    "#!/bin/sh",
+    "set -eu",
+    'root=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)',
+    'gate="$root/omp-start-gate"',
+    'if [ -f "$gate.armed" ] && mv "$gate.armed" "$gate.started" 2>/dev/null; then',
+    '  printf "%s\\n" "$$" > "$gate.pid"',
+    '  while [ ! -e "$gate.release" ]; do',
+    '    [ ! -e "$gate.abort" ] || exit 97',
+    "    /bin/sleep 0.05",
+    "  done",
+    "fi",
+    'real_command=$(/bin/cat "$root/real-omp-command")',
+    'exec "$real_command" "$@"',
+  ].join("\n"), { mode: 0o700 });
   await mkdir(join(root, "xdg-cache"), { recursive: true });
   await mkdir(join(root, "xdg-data"), { recursive: true });
   await mkdir(join(root, "worktrunk-config"), { recursive: true });
@@ -539,7 +580,7 @@ async function installLocalFilesAndEnvironment(): Promise<void> {
     allowedGroupIds: [ownerGroup],
     stateDir,
     sessionsDir,
-    ompCommand,
+    ompCommand: ompWrapperPath,
     ompExtraArgs: [
       "--model", "local-ingress/probe",
       "--no-skills", "--no-rules", "--no-context-files", "--no-lsp", "--no-tools",
@@ -738,12 +779,15 @@ async function setupAndRun(): Promise<void> {
   const mediaChat = groupTarget("media-spool");
   const queryChat = groupTarget("independent-query");
   const unknownHolderChat = groupTarget("unknown-holder");
+  const unknownNewChat = groupTarget("unknown-new-recovery");
   const unknownCandidateChat = groupTarget("unknown-candidate");
 
   const queryCwd = join(root, "query-cwd");
   const mediaCwd = join(root, "media-cwd");
   await mkdir(queryCwd, { recursive: true });
   await mkdir(mediaCwd, { recursive: true });
+  const unknownNewCwd = join(root, "unknown-new-recovery-cwd");
+  await mkdir(unknownNewCwd, { recursive: true });
 
   const initialCommitCount = await mainCommitCount();
   assert.equal(initialCommitCount, 1, "fixture main starts with exactly its baseline commit");
@@ -773,6 +817,7 @@ async function setupAndRun(): Promise<void> {
   await mediaSpoolRecoveryFlow(mediaChat, queryChat);
   await cancelSpawnedMergeFlow(active!, cancelSpawnedChat, cancelWaiterChat, queryChat, paths);
   await unknownMergeOutcomeFlow(unknownHolderChat, unknownCandidateChat, paths.get("ingress-unknown-holder")!);
+  await unknownNewRecoveryFlow(unknownNewChat, unknownNewCwd);
 
   assert.equal(
     await mainCommitCount(),
@@ -1291,6 +1336,164 @@ async function unknownMergeOutcomeFlow(holder: ChatTarget, candidate: ChatTarget
   await stopActive("SIGTERM");
 }
 
+async function unknownNewRecoveryFlow(target: ChatTarget, cwd: string): Promise<void> {
+  const initial = await launch();
+  await bindSession(initial.connection, target, cwd, "unknown-new-recovery-initial");
+  const originalBinding = binding(target)!;
+  const queuedMarker = "unknown-new-queued";
+  const originalNewText = `/new ${cwd}`;
+
+  assert.ok(!existsSync(`${ompStartGate}.armed`), "controlled OMP gate must be unarmed before the recovery case");
+  await writeFile(`${ompStartGate}.armed`, "hold\n");
+  const oldNewId = send(initial.connection, target, originalNewText, "unknown-new-original");
+  await waitAck(initial.connection, oldNewId, "unknown /new before SIGKILL");
+  await waitUntil("old /new candidate reached the controlled OMP startup gate", () =>
+    existsSync(`${ompStartGate}.started`) && existsSync(`${ompStartGate}.pid`));
+  const oldWorkerPid = Number(readFileSync(`${ompStartGate}.pid`, "utf8").trim());
+  assert.ok(Number.isSafeInteger(oldWorkerPid) && oldWorkerPid > 0 && isAlive(oldWorkerPid),
+    "the interrupted /new must own a live candidate worker process");
+  const oldWorkerLedger = await waitValue("exact old /new candidate worker ledger", () =>
+    dbQuery<{ id: string; session_id: string; state: string }>(
+      "SELECT id, session_id, state FROM worker_ledger WHERE pid = ?",
+      oldWorkerPid,
+    ));
+  assert.equal(oldWorkerLedger.state, "running", "the interrupted candidate must be a managed live worker");
+  assert.notEqual(oldWorkerLedger.session_id, originalBinding.session_id,
+    "the interrupted /new candidate must already own a distinct session identity");
+  const oldNewJob = await waitValue("old /new dispatch intent", () => {
+    const row = ingressJob(target, oldNewId);
+    return row?.state === "dispatch-intent" ? row : undefined;
+  });
+  assert.equal(Number(oldNewJob.ack_ready), 1, "the dispatched /new must already be durably ACK-ready");
+
+  const queuedId = send(initial.connection, target, `INGRESS_HOLD:${queuedMarker}`, "message-behind-unknown-new");
+  await waitAck(initial.connection, queuedId, "message behind the held /new");
+  assert.equal(taskRow(queuedId), null, "the message behind the unresolved /new must not be handed to a task");
+  assert.equal(modelCallCount(queuedMarker), 0, "the old message must not reach the local model before restart");
+
+  const firstStop = await stopActive("SIGKILL");
+  assert.notEqual(firstStop, 0, "SIGKILL must not be reported as a graceful CLI exit");
+  await waitUntil("old /new candidate worker exited under the parent-death watchdog", () => !isAlive(oldWorkerPid), 15_000);
+  const restarted = await launch();
+  const unknownJob = await waitValue("old /new remains unknown after restart", () => {
+    const row = ingressJob(target, oldNewId);
+    return row?.state === "unknown" ? row : undefined;
+  });
+  assert.equal(Number(unknownJob.ack_ready), 1);
+  assert.deepEqual(binding(target), originalBinding, "recovery must not publish the interrupted candidate as the binding");
+  assert.equal(taskRow(queuedId), null, "startup must not replay the old message as a task");
+  assert.equal(modelCallCount(queuedMarker), 0, "startup must not send the old message to the local model");
+
+  replay(restarted.connection, target, originalNewText, oldNewId);
+  await waitReplayAck(restarted.connection, oldNewId, "duplicate unknown /new");
+  replay(restarted.connection, target, `INGRESS_HOLD:${queuedMarker}`, queuedId);
+  await waitReplayAck(restarted.connection, queuedId, "duplicate blocked message");
+  await Bun.sleep(3_000);
+  assert.equal(ingressJob(target, oldNewId)?.state, "unknown", "redelivery must not make the old /new executable again");
+  assert.deepEqual(binding(target), originalBinding, "redelivery must not change the old binding");
+  assert.equal(taskRow(queuedId), null, "redelivery must not create a task for the old message");
+  assert.equal(modelCallCount(queuedMarker), 0, "redelivery must not send the old message to the model");
+
+  const recoveryStart = fixture!.sentMessages.length;
+  const recoveryId = send(restarted.connection, target, `/new ${cwd}`, "unknown-new-explicit-recovery");
+  await waitAck(restarted.connection, recoveryId, "new /new recovery command");
+  const recoveryReceipt = await waitReply(target, recoveryStart, "successful explicit /new recovery", (text) =>
+    text.startsWith("已创建会话 "));
+  const recoveredBinding = await waitValue("new binding published by explicit /new recovery", () => {
+    const row = binding(target);
+    return row && row.session_id !== originalBinding.session_id && row.session_file ? row : undefined;
+  });
+  assert.notEqual(recoveredBinding.session_id, oldWorkerLedger.session_id,
+    "explicit recovery must not reuse the unknown candidate's session identity");
+  assert.equal(recoveredBinding.cwd, await realpath(cwd));
+  const recoveredSessionFile = recoveredBinding.session_file;
+  assert.ok(recoveredSessionFile, "recovery binding must include its session file");
+  assert.notEqual(recoveredSessionFile, originalBinding.session_file,
+    "explicit recovery must create a session distinct from the pre-interruption session");
+  assert.ok(await Bun.file(recoveredSessionFile).exists(), "recovery binding must reference a real session file");
+  assert.ok(recoveryReceipt.includes(recoveredBinding.session_id), "the success receipt must identify the committed new session");
+
+  let queuedNotice = sentText(target).find((text) => text.includes(queuedId));
+  if (!queuedNotice) {
+    queuedNotice = await waitReply(target, 0, "not-executed notice for the old queued message", (text) => text.includes(queuedId));
+  }
+  assert.match(queuedNotice, /未执行|不会自动执行|尚未执行/u,
+    "the notice must clearly say that the old queued message was not executed");
+  assert.match(queuedNotice, /重新发送|忽略/u, "the notice must leave resending or ignoring to the user");
+  const queuedNoticeCount = () => sentText(target).filter((text) => text.includes(queuedId)).length;
+  assert.equal(queuedNoticeCount(), 1, "one old message must produce exactly one disposition notice");
+  assert.equal(taskRow(queuedId), null, "the disposition notice must not be backed by an auto-executed task");
+  assert.equal(modelCallCount(queuedMarker), 0, "the old message must never reach the local model");
+  assert.equal(ingressJob(target, oldNewId)?.state, "unknown", "successful recovery must preserve the old /new outcome as unknown");
+
+  const newMarker = "unknown-new-recovered-message";
+  const newMessageId = send(restarted.connection, target, `INGRESS_HOLD:${newMarker}`, "message-after-new-recovery");
+  await waitAck(restarted.connection, newMessageId, "message after new /new recovery");
+  await waitTaskCompleted(newMessageId, "message after recovered /new");
+  const newMessageReply = await waitReply(target, recoveryStart, "new-session task reply", (text) =>
+    text.includes(`INGRESS_REPLY:${newMarker}`));
+  const completedTask = taskRow(newMessageId);
+  assert.equal(completedTask?.state, "completed");
+  assert.equal(completedTask?.session_id, recoveredBinding.session_id,
+    "the post-recovery message must execute in the newly committed session");
+  assert.equal(modelCallCount(newMarker), 1, "the post-recovery message must reach the finite local model exactly once");
+  assert.ok(modelRequests.find((request) => request.label === newMarker)?.body.includes(newMarker),
+    "the finite local model request must contain the new message");
+  assert.ok((await readFile(recoveredSessionFile, "utf8")).includes(newMarker),
+    "the new message must be persisted in the recovered session history");
+  assert.equal(modelCallCount(queuedMarker), 0, "the old queued message must remain unexecuted after recovery");
+  assert.equal(taskRow(queuedId), null);
+
+  const secondStop = await stopActive("SIGKILL");
+  assert.notEqual(secondStop, 0);
+  const afterSecondRestart = await launch();
+  assert.deepEqual(binding(target), recoveredBinding, "a second restart must preserve the recovered binding");
+  for (const [messageId, text, label] of [
+    [oldNewId, originalNewText, "unknown /new after second restart"],
+    [queuedId, `INGRESS_HOLD:${queuedMarker}`, "old queued message after second restart"],
+    [newMessageId, `INGRESS_HOLD:${newMarker}`, "completed new message after second restart"],
+  ] as const) {
+    replay(afterSecondRestart.connection, target, text, messageId);
+    await waitReplayAck(afterSecondRestart.connection, messageId, label);
+  }
+  await Bun.sleep(3_000);
+  assert.deepEqual(binding(target), recoveredBinding, "duplicate delivery after restart must not change the recovered binding");
+  assert.equal(ingressJob(target, oldNewId)?.state, "unknown");
+  assert.equal(taskRow(queuedId), null, "old queued input must remain unexecuted after repeated delivery and restart");
+  assert.equal(taskRow(newMessageId)?.state, "completed");
+  assert.equal(taskRow(newMessageId)?.session_id, recoveredBinding.session_id);
+  assert.equal(modelCallCount(queuedMarker), 0);
+  assert.equal(modelCallCount(newMarker), 1, "repeated delivery and restart must not execute the completed message twice");
+  assert.equal(queuedNoticeCount(), 1, "repeated delivery and restart must not duplicate the disposition notice");
+  console.log(`CASE unknown-new-explicit-recovery ${JSON.stringify({
+    oldNewMessageId: oldNewId,
+    queuedMessageId: queuedId,
+    oldWorkerPid,
+    oldCandidateSessionId: oldWorkerLedger.session_id,
+    workerLedgerAfterRecovery: dbQuery<{ state: string }>("SELECT state FROM worker_ledger WHERE pid = ?", oldWorkerPid)?.state,
+    oldWorkerExited: !isAlive(oldWorkerPid),
+    oldNewState: ingressJob(target, oldNewId)?.state,
+    explicitRecoveryMessageId: recoveryId,
+    originalSessionId: originalBinding.session_id,
+    recoveredSessionId: recoveredBinding.session_id,
+    recoveredTask: { messageId: newMessageId, state: taskRow(newMessageId)?.state, sessionId: taskRow(newMessageId)?.session_id },
+    oldQueuedTask: taskRow(queuedId),
+    localModelCalls: { oldQueued: modelCallCount(queuedMarker), recoveredMessage: modelCallCount(newMarker) },
+    noticesForOldMessage: queuedNoticeCount(),
+    ackCounts: {
+      oldNewAfterRestart: ackCount(restarted.connection, oldNewId),
+      queuedAfterRestart: ackCount(restarted.connection, queuedId),
+      oldNewAfterSecondRestart: ackCount(afterSecondRestart.connection, oldNewId),
+      queuedAfterSecondRestart: ackCount(afterSecondRestart.connection, queuedId),
+      completedAfterSecondRestart: ackCount(afterSecondRestart.connection, newMessageId),
+    },
+    recoveryReceipt,
+    newMessageReply,
+    cliRestarts: 2,
+  })}`);
+  await stopActive("SIGTERM");
+}
+
 async function allProcessRows(): Promise<ProcessRow[]> {
   const output = await run(["/bin/ps", "-axo", "pid=,ppid=,pgid=,command="]);
   return output.split("\n").flatMap((line) => {
@@ -1305,6 +1508,7 @@ async function allProcessRows(): Promise<ProcessRow[]> {
 }
 
 async function cleanup(): Promise<void> {
+  await writeFile(`${ompStartGate}.abort`, "stop\n");
   for (const gate of modelGates.values()) gate.resolve();
   mediaGate.resolve();
   if (active?.child.exitCode === null) active.child.kill("SIGTERM");

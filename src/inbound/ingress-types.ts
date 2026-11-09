@@ -1,3 +1,4 @@
+import type { BindingSessionInitialization, BindingRecord } from "../store/store-records.ts";
 import type { BotCardAction, ChatTarget, InboundMessage } from "../contracts.ts";
 
 export type IngressSourceKind = "recv" | "bot-event" | "synthetic";
@@ -28,6 +29,7 @@ export interface IngressBindingSnapshot {
   cwdPinned?: boolean;
   /** Optional only for legacy persisted snapshots; absent means initialization recovery is unsafe. */
   sessionSwitchedAt?: number | null;
+  sessionInitialization?: BindingSessionInitialization | null;
 }
 
 export type IngressRoutePurpose =
@@ -108,10 +110,26 @@ export type IngressOperationCheckpoint =
       cancelledHostIngressJobIds?: readonly number[];
       /** Host operations already in dispatch-intent; their result remains unknown/fail-closed. */
       interruptRequestedHostIngressJobIds?: readonly number[];
+      /** Earlier unknown session transitions this explicit recovery is allowed to supersede. */
+      recoveryBarrierJobIds?: readonly number[];
+      /** Set only by the successful binding/handoff transaction; state remains `unknown`. */
+      recoveredByIngressJobId?: number;
+      /** Exact binding committed by the successful recovery linked above. */
+      recoveredBindingSnapshot?: IngressBindingSnapshot;
+    }
+  | {
+      kind: "session-handoff-outcome";
+      action: "new" | "move";
+      binding: IngressBindingSnapshot;
     }
   | {
       kind: "cancellation-request";
       cancelRequestedByIngressJobIds: readonly number[];
+    }
+  | {
+      kind: "session-recovery-cancellation";
+      barrierJobId: number;
+      recoveryJobId: number;
     }
   | { kind: "config-action"; phase: "accepted" | "dispatch-intent" }
   | { kind: "config-action"; phase: "applied"; appliedResult: string };
@@ -136,6 +154,17 @@ export interface IngressJobInput extends IngressSourceKey, ChatTarget {
   operationCheckpoint: IngressOperationCheckpoint | null;
   /** Earlier accepted-but-not-yet-persisted candidates atomically tombstoned by a control command. */
   cancellationCandidates?: readonly IngressCancellationCandidate[];
+}
+
+export interface IngressSessionRecoveryResult {
+  kind: "ready" | "blocked" | "stale";
+  cancelledJobIds: readonly number[];
+}
+
+export interface IngressSessionHandoff {
+  readonly barrierJobIds: readonly number[];
+  readonly expectedBinding: IngressBindingSnapshot | null;
+  readonly binding: BindingRecord;
 }
 
 export interface IngressJobRecord extends IngressSourceKey, ChatTarget {

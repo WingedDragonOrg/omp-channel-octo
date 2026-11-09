@@ -33,6 +33,11 @@ interface IngressStorePort {
   getIngressJob(id: number): IngressJobRecord | null;
   getIngressJobBySource(key: IngressSourceKey): IngressJobRecord | null;
   listRecoverableIngressJobs(botUid: string): IngressJobRecord[];
+  finishIngressRecoveryPreparation(
+    id: number,
+    consumer: IngressConsumer,
+    persistConsumer?: () => boolean,
+  ): boolean;
   markIngressPrepared(id: number, preparedText: string, spoolPaths: readonly string[]): boolean;
   markIngressDispatchIntent(id: number): boolean;
   markIngressConfigActionDispatchIntent(id: number): boolean;
@@ -44,6 +49,12 @@ interface IngressStorePort {
     attribution: ChatTarget & { messageId: string },
     cancellationJobId?: number,
   ): boolean;
+  cancelIngressJobAfterSessionRecovery(
+    key: IngressSourceKey,
+    target: ChatTarget,
+    messageId: string,
+    barrierJobId: number,
+  ): IngressJobRecord | null;
   handoffIngressJob(
     id: number,
     consumer: IngressConsumer,
@@ -326,6 +337,77 @@ export class IngressCoordinator {
     }
     return false;
   }
+  /** Promote a validated recovery only after its dispatch intent is durable. */
+  promoteRecoverySessionBarrier(jobId: number): boolean {
+    const job = this.deps.store.getIngressJob(jobId);
+    const checkpoint = job?.operationCheckpoint;
+    if (
+      job?.state !== "dispatch-intent"
+      || checkpoint?.kind !== "command"
+      || checkpoint.action !== "new"
+      || (checkpoint.recoveryBarrierJobIds?.length ?? 0) === 0
+    ) return false;
+    for (const candidate of this.candidates.values()) {
+      if (candidate.jobId !== jobId || !candidate.classification.sessionBarrier) continue;
+      const key = targetKey(candidate.target);
+      const current = this.sessionBarriers.get(key);
+      if (current === undefined || current.sequence < candidate.sequence) {
+        this.sessionBarriers.set(key, candidate);
+      }
+      return this.sessionBarriers.get(key) === candidate;
+    }
+    return false;
+  }
+
+  /** Reinstall a queued transition once its prior barrier is resolved and its durable intent can run. */
+  promoteSessionBarrier(jobId: number): boolean {
+    const job = this.deps.store.getIngressJob(jobId);
+    const checkpoint = job?.operationCheckpoint;
+    if (
+      (job?.state !== "accepted" && job?.state !== "dispatch-intent")
+      || checkpoint?.kind !== "command"
+      || (checkpoint.action !== "new" && checkpoint.action !== "move" && checkpoint.action !== "reset")
+    ) return false;
+    for (const candidate of this.candidates.values()) {
+      if (candidate.jobId !== jobId || !candidate.classification.sessionBarrier) continue;
+      const key = targetKey(candidate.target);
+      const current = this.sessionBarriers.get(key);
+      if (current === undefined || current.sequence < candidate.sequence) {
+        this.sessionBarriers.set(key, candidate);
+      }
+      return this.sessionBarriers.get(key) === candidate;
+    }
+    return false;
+  }
+  /** Apply durable session-recovery cancellations to their in-memory ordered candidates. */
+  cancelRecoveredIngressJobs(jobIds: readonly number[]): void {
+    const cancelled = new Set(jobIds);
+    for (const candidate of this.candidates.values()) {
+      if (candidate.jobId === null || !cancelled.has(candidate.jobId)) continue;
+      const job = this.deps.store.getIngressJob(candidate.jobId);
+      if (job?.state === "preparing" && !job.ackReady) continue;
+      candidate.cancelled = true;
+      candidate.retryable = false;
+      candidate.controller.abort(new Error("ingress cancelled by confirmed session recovery"));
+      this.releaseCandidateFences(candidate);
+      this.resolveAck(candidate);
+      this.deps.onCancelled?.(candidate.jobId);
+      if (!candidate.active) this.finishCandidate(candidate);
+    }
+  }
+
+  /** Release only the exact unknown barriers committed by the session-handoff transaction. */
+  releaseRecoveredSessionBarriers(jobIds: readonly number[]): void {
+    const resolved = new Set(jobIds);
+    for (const candidate of this.candidates.values()) {
+      if (candidate.jobId === null || !resolved.has(candidate.jobId)) continue;
+      candidate.barrierUnknown = false;
+      candidate.barrierSettled.resolve();
+      const key = targetKey(candidate.target);
+      if (this.sessionBarriers.get(key) === candidate) this.sessionBarriers.delete(key);
+      if (!candidate.active) this.finishCandidate(candidate);
+    }
+  }
 
   private resumePersisted(job: IngressJobRecord): void {
     if (isTerminal(job)) return;
@@ -356,8 +438,10 @@ export class IngressCoordinator {
   }
 
   private restoreUnknownBarrier(job: IngressJobRecord): void {
+    const checkpoint = job.operationCheckpoint;
+    if (checkpoint?.kind === "command" && checkpoint.recoveredByIngressJobId !== undefined) return;
     const classification = this.persistedClassification(job);
-    if (!classification.sessionBarrier) return;
+    if (!classification.sessionBarrier || classification.action === "fork") return;
     const mapKey = this.sourceMapKey(job);
     if (this.candidates.has(mapKey)) return;
     const candidate = this.createCandidate({
@@ -392,6 +476,40 @@ export class IngressCoordinator {
     };
   }
 
+  private canProbeSessionBarrier(action: string | null, barrier: Candidate | null): boolean {
+    if ((action !== "new" && action !== "reset") || barrier === null) return false;
+    if (barrier.jobId === null) return barrier.barrierUnknown;
+    const visited = new Set<number>();
+    const visit = (jobId: number): boolean => {
+      if (visited.has(jobId)) return false;
+      visited.add(jobId);
+      const job = this.deps.store.getIngressJob(jobId);
+      if (job === null) return false;
+      const checkpoint = job.operationCheckpoint;
+      if (checkpoint?.kind !== "command" || checkpoint.recoveredByIngressJobId !== undefined) {
+        return false;
+      }
+      const sessionTransition = checkpoint.action === "new"
+        || checkpoint.action === "move"
+        || checkpoint.action === "reset";
+      const undispatchedFork = checkpoint.action === "fork"
+        && job.state === "accepted"
+        && checkpoint.phase === "barrier-installed";
+      if (!sessionTransition && !undispatchedFork) return false;
+      if (job.state === "unknown") return sessionTransition;
+      if (job.state === "dispatch-intent") {
+        return sessionTransition && (checkpoint.cancelRequestedByIngressJobIds?.length ?? 0) > 0;
+      }
+      if (job.state !== "accepted") return false;
+      const ancestors = [
+        ...(checkpoint.recoveryBarrierJobIds ?? []),
+        ...(job.routeSnapshot?.barrierJobId == null ? [] : [job.routeSnapshot.barrierJobId]),
+      ];
+      return ancestors.some(visit);
+    };
+    return visit(barrier.jobId);
+  }
+
   private createCandidate(input: {
     key: IngressSourceKey;
     target: ChatTarget;
@@ -409,8 +527,7 @@ export class IngressCoordinator {
     const admissionBefore = ordered ? (this.admissionTails.get(key) ?? RESOLVED) : RESOLVED;
     const businessBefore = ordered ? (this.businessTails.get(key) ?? RESOLVED) : RESOLVED;
     const sessionBarrierBefore = ordered ? (this.sessionBarriers.get(key) ?? null) : null;
-    const probeUnknownBarrier = input.classification.action === "new"
-      && sessionBarrierBefore?.barrierUnknown === true;
+    const probeUnknownBarrier = this.canProbeSessionBarrier(input.classification.action, sessionBarrierBefore);
     const candidate: Candidate = {
       ...input,
       sequence: ++this.sequence,
@@ -433,8 +550,12 @@ export class IngressCoordinator {
     if (ordered) {
       this.admissionTails.set(key, admissionSettled.promise);
       this.businessTails.set(key, businessSettled.promise);
-      // Allow `/new` to report the retained reservation refusal without replacing the unknown barrier.
-      if (input.classification.sessionBarrier && !probeUnknownBarrier) this.sessionBarriers.set(key, candidate);
+      // A waiting transition cannot shadow an already-unknown barrier restored later in the chain.
+      if (
+        input.classification.sessionBarrier
+        && !probeUnknownBarrier
+        && sessionBarrierBefore?.barrierUnknown !== true
+      ) this.sessionBarriers.set(key, candidate);
     }
     return candidate;
   }
@@ -462,6 +583,42 @@ export class IngressCoordinator {
       businessReleased = true;
       candidate.businessSettled.resolve();
     };
+    const cancelBehindRecoveredBarrier = (
+      job: IngressJobRecord | null,
+      message: InboundMessage,
+    ): boolean => {
+      if (candidate.classification.lane !== "ordered" || job === null) return false;
+      const barrierJobId = job.routeSnapshot?.barrierJobId ?? null;
+      if (barrierJobId === null) return false;
+      const barrier = this.deps.store.getIngressJob(barrierJobId);
+      const checkpoint = barrier?.operationCheckpoint;
+      if (
+        checkpoint?.kind !== "command"
+        || checkpoint.recoveredByIngressJobId === undefined
+        || job?.routeSnapshot?.purpose.kind === "questions"
+        || job?.operationCheckpoint?.kind === "session-recovery-cancellation"
+      ) return false;
+      const recovery = this.deps.store.getIngressJob(checkpoint.recoveredByIngressJobId);
+      if (
+        recovery === null
+        || recovery.state !== "handed-off"
+        || (job !== null && job.scheduleOrder >= recovery.scheduleOrder)
+      ) return false;
+      const cancelled = this.deps.store.cancelIngressJobAfterSessionRecovery(
+        candidate.key,
+        candidate.target,
+        message.messageId,
+        barrierJobId,
+      );
+      if (cancelled === null || cancelled.state !== "cancelled") {
+        throw new Error("ingress after a recovered session barrier could not be durably cancelled");
+      }
+      candidate.restoredJob = cancelled;
+      candidate.jobId = cancelled.id;
+      candidate.cancelled = true;
+      this.resolveAck(candidate);
+      return true;
+    };
     try {
       await candidate.admissionBefore;
       if (this.sealed) throw new InboundShutdownError();
@@ -485,6 +642,14 @@ export class IngressCoordinator {
           })
         : undefined;
       let job = candidate.restoredJob ?? this.deps.store.getIngressJobBySource(candidate.key);
+      const persistedMessage = job?.payload?.kind === "recv"
+        ? job.payload.message
+        : job?.payload?.kind === "synthetic"
+          ? job.payload.message
+          : null;
+      const existingMessage = candidate.message ?? persistedMessage;
+      if (job !== null && existingMessage !== null
+        && cancelBehindRecoveredBarrier(job, existingMessage)) return;
       if (job === null) {
         const message = candidate.message;
         if (message === null) throw new Error("recoverable ingress payload is missing its message");
@@ -495,6 +660,7 @@ export class IngressCoordinator {
           this.resolveAck(candidate);
           return;
         }
+        if (cancelBehindRecoveredBarrier(null, message)) return;
         const binding = this.deps.bindingSnapshot(candidate.target);
         const barrierJobId = candidate.sessionBarrierBefore?.jobId ?? null;
         const routeSnapshot: IngressRouteSnapshot = {
@@ -546,11 +712,29 @@ export class IngressCoordinator {
         const purpose = job.routeSnapshot?.purpose;
         if (message === null || purpose === undefined) throw new Error("preparing ingress job lost its durable payload");
         const prepared = await this.deps.prepare(message, purpose, candidate.controller.signal, job);
+        const current = this.deps.store.getIngressJob(job.id);
+        if (
+          prepared.kind === "consumed"
+          && current?.state === "preparing"
+          && current.operationCheckpoint?.kind === "session-recovery-cancellation"
+        ) {
+          if (!this.deps.store.finishIngressRecoveryPreparation(
+            job.id,
+            prepared.consumer,
+            prepared.persistConsumer ?? (() => true),
+          )) throw new Error("cancelled ingress preparation outcome could not be persisted");
+          this.publishAfterCommit(prepared.publishAfterCommit);
+          const settled = this.deps.store.getIngressJob(job.id);
+          if (settled === null) throw new Error("cancelled ingress preparation disappeared");
+          this.deps.onReliableAccepted?.(settled);
+          this.resolveAck(candidate);
+          return;
+        }
         if (prepared.kind === "prepared") {
           if (!this.deps.store.markIngressPrepared(job.id, prepared.text, prepared.spoolPaths)) {
             const changed = this.deps.store.getIngressJob(job.id);
-            if (changed?.state === "cancelled") {
-              this.resolveAck(candidate);
+            if (changed !== null && isTerminal(changed)) {
+              if (changed.ackReady) this.resolveAck(candidate);
               return;
             }
             throw new Error("ingress preparation could not be persisted");
@@ -559,6 +743,7 @@ export class IngressCoordinator {
           if (job === null) throw new Error("prepared ingress job disappeared");
           this.deps.onReliableAccepted?.(job);
           this.resolveAck(candidate);
+          if (isTerminal(job)) return;
         } else {
           const handedOff = this.deps.store.handoffIngressJob(
             job.id,
@@ -573,15 +758,23 @@ export class IngressCoordinator {
         }
       }
 
-      await candidate.businessBefore;
-      const probeUnknownBarrier = candidate.classification.action === "new"
-        && candidate.sessionBarrierBefore?.barrierUnknown === true;
+      const probeUnknownBarrier = this.canProbeSessionBarrier(
+        candidate.classification.action,
+        candidate.sessionBarrierBefore,
+      );
+      if (!probeUnknownBarrier) await candidate.businessBefore;
       if (candidate.sessionBarrierBefore !== null && !probeUnknownBarrier) {
         await this.abortable(
           candidate.sessionBarrierBefore.barrierSettled.promise,
           candidate.controller.signal,
         );
       }
+      if (
+        candidate.sessionBarrierBefore !== null
+        && !probeUnknownBarrier
+        && candidate.classification.sessionBarrier
+        && candidate.jobId !== null
+      ) this.promoteSessionBarrier(candidate.jobId);
       if (candidate.controller.signal.aborted) throw errorFromAbort(candidate.controller.signal);
       await this.deps.awaitDispatchReady();
       if (candidate.controller.signal.aborted) throw errorFromAbort(candidate.controller.signal);
@@ -590,7 +783,7 @@ export class IngressCoordinator {
       if (current === null) return;
       if (isTerminal(current)) {
         if (current.state === "unknown" && candidate.classification.sessionBarrier) {
-          candidate.barrierUnknown = true;
+          this.retainUnknownSessionBarrier(candidate);
         }
         return;
       }
@@ -600,7 +793,7 @@ export class IngressCoordinator {
         if (
           candidate.classification.sessionBarrier
           && (updated?.state === "unknown" || updated?.state === "dispatch-intent")
-        ) candidate.barrierUnknown = true;
+        ) this.retainUnknownSessionBarrier(candidate);
         return;
       }
       if (
@@ -658,7 +851,7 @@ export class IngressCoordinator {
       if (
         candidate.classification.sessionBarrier
         && (afterUnknown?.state === "unknown" || afterUnknown?.state === "dispatch-intent")
-      ) candidate.barrierUnknown = true;
+      ) this.retainUnknownSessionBarrier(candidate);
       if (persisted?.state === "unknown" || afterUnknown?.state === "unknown") return;
       if (
         !candidate.ackSettled
@@ -683,6 +876,16 @@ export class IngressCoordinator {
         releaseBusiness();
         if (!candidate.barrierUnknown) candidate.barrierSettled.resolve();
       }
+    }
+  }
+
+  private retainUnknownSessionBarrier(candidate: Candidate): void {
+    if (candidate.classification.action === "fork") return;
+    candidate.barrierUnknown = true;
+    const key = targetKey(candidate.target);
+    const current = this.sessionBarriers.get(key);
+    if (current === undefined || !current.barrierUnknown || current.sequence < candidate.sequence) {
+      this.sessionBarriers.set(key, candidate);
     }
   }
 

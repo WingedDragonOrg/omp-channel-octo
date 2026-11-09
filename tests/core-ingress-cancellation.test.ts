@@ -14,6 +14,7 @@ import {
   createCoreHarness,
   FakeWorkerFactory,
   inbound,
+  type CoreHarness,
 } from "./fixtures/core-fakes.ts";
 
 function sourceKey(key: IngressSourceKey): string {
@@ -270,8 +271,10 @@ test("ingress idle notification follows durable handoff and candidate removal", 
 function sentText(
   messages: readonly { target: { channelId: string; channelType: number }; text: string }[],
   target: { channelId: string; channelType: number },
+  startIndex = 0,
 ): string {
   return messages
+    .slice(startIndex)
     .filter(({ target: actual }) => actual.channelId === target.channelId && actual.channelType === target.channelType)
     .map(({ text }) => text)
     .join("\n");
@@ -287,6 +290,18 @@ async function waitUntil(check: () => boolean, label: string): Promise<void> {
   }
   throw new Error(`did not observe ${label}`);
 }
+
+type DirectChat = { channelType: 1; channelId: string };
+
+async function bindingFor(harness: CoreHarness, target: DirectChat) {
+  const store = await openChannelStore(harness.stateDir);
+  try {
+    return store.getBinding(harness.bot.uid, target);
+  } finally {
+    store.close();
+  }
+}
+
 
 
 test("control cancel does not abort a dispatched candidate when its cancellation CAS loses", async () => {
@@ -449,55 +464,55 @@ test("control cancel does not abort a dispatched candidate when its cancellation
   }
 });
 
-test("same-chat cancel waits for session worker process-group stop and reports unknown safely", async () => {
+test("cancelled /new stays protected until worker stop is confirmed, then recovers without replay", async () => {
   const workers = new FakeWorkerFactory();
   const candidateStarted = Promise.withResolvers<void>();
   const releaseCandidate = Promise.withResolvers<void>();
   const releaseStop = Promise.withResolvers<void>();
   let stopStarted = false;
   let stopConfirmed = false;
-  workers.beforeCreate = async () => {
-    candidateStarted.resolve();
-    await releaseCandidate.promise;
-  };
-  workers.stopHandler = async () => {
-    stopStarted = true;
-    await releaseStop.promise;
-    stopConfirmed = true;
-  };
   const harness = await createCoreHarness({ workers });
   const target = { channelType: 1 as const, channelId: "dm-ingress-cancel-new" };
   const cwd = join(harness.root, "cancel-new-target");
-  await mkdir(cwd, { recursive: true });
-  const switching = inbound({
-    ...target,
-    messageId: "ingress-cancel-new-operation",
-    text: `/new ${cwd}`,
-  });
 
   try {
+    await mkdir(cwd, { recursive: true });
+    const initialMessage = inbound({
+      ...target,
+      messageId: "ingress-cancel-new-initial-session",
+      text: `/new ${cwd}`,
+    });
+    const initialOutputStart = harness.transport.sent.length;
+    const initial = harness.service.receive(initialMessage);
+    await initial.ackReady;
+    await waitUntil(
+      () => sentText(harness.transport.sent, target, initialOutputStart).includes("已创建会话"),
+      "initial session binding",
+    );
+    const originalBinding = await bindingFor(harness, target);
+    if (originalBinding?.sessionFile === null || originalBinding === null) {
+      throw new Error("initial /new did not create a bound session");
+    }
+    expect((await harness.service.status(target)).sessionId).toBe(originalBinding.sessionId);
+
+    workers.beforeCreate = async () => {
+      candidateStarted.resolve();
+      await releaseCandidate.promise;
+    };
+    workers.stopHandler = async () => {
+      stopStarted = true;
+      await releaseStop.promise;
+      stopConfirmed = true;
+    };
+    const switching = inbound({
+      ...target,
+      messageId: "ingress-cancel-new-operation",
+      text: `/new ${cwd}`,
+    });
+    const switchingOutputStart = harness.transport.sent.length;
     const switchingReceipt = harness.service.receive(switching);
     await switchingReceipt.ackReady;
     await candidateStarted.promise;
-
-    const accepted = await (async () => {
-      const store = await openChannelStore(harness.stateDir);
-      try {
-        const job = store.getIngressJobBySource({
-          botUid: harness.bot.uid,
-          sourceKind: "recv",
-          sourceId: recvIngressSourceId(target.channelType, target.channelId, switching.messageId),
-        });
-        if (job === null) throw new Error("new ingress intent is missing");
-        expect(job.state).toBe("dispatch-intent");
-        expect(job.operationCheckpoint?.kind).toBe("command");
-        if (job.operationCheckpoint?.kind !== "command") throw new Error("new checkpoint is missing");
-        expect(job.operationCheckpoint.workerLedgerId).toBe(`new-ingress-${job.id}`);
-        return job;
-      } finally {
-        store.close();
-      }
-    })();
 
     const cancel = harness.service.receive(inbound({
       ...target,
@@ -505,81 +520,184 @@ test("same-chat cancel waits for session worker process-group stop and reports u
       text: "/cancel",
     }));
     await cancel.ackReady;
-    await waitUntil(() => workers.creations[0]?.signal?.aborted === true, "new worker cancellation");
-    expect(workers.creations[0]?.signal?.aborted).toBe(true);
-
+    await waitUntil(
+      () => workers.creations.at(-1)?.signal?.aborted === true,
+      "new worker cancellation",
+    );
     releaseCandidate.resolve();
-    await waitUntil(() => stopStarted, "cancelled new worker stop");
-    expect(sentText(harness.transport.sent, target)).not.toContain("无法确认受管操作");
+    workers.beforeCreate = undefined;
+    await waitUntil(() => stopStarted, "cancelled new worker process-group stop");
+    const cancelledCandidateSessionId = workers.workers.at(-1)?.sessionId;
+    if (!cancelledCandidateSessionId) throw new Error("cancelled candidate worker did not start");
+
+    const blockedOutputStart = harness.transport.sent.length;
+    const blockedRetry = harness.service.receive(inbound({
+      ...target,
+      messageId: "ingress-new-before-stop-confirmation",
+      text: `/new ${cwd}`,
+    }));
+    await blockedRetry.ackReady;
+    await waitUntil(
+      () => /等待|\/stop|\/cancel/.test(sentText(harness.transport.sent, target, blockedOutputStart)),
+      "wait-or-stop guidance while the worker process group is unconfirmed",
+    );
+    const blockedText = sentText(harness.transport.sent, target, blockedOutputStart);
+    expect(blockedText).toMatch(/等待|\/stop|\/cancel/);
+    expect(blockedText).not.toContain("已创建会话");
+    expect(workers.creations).toHaveLength(2);
+    expect(await bindingFor(harness, target)).toMatchObject({
+      sessionId: originalBinding.sessionId,
+      cwd,
+    });
+    expect((await harness.service.status(target)).sessionId).toBe(originalBinding.sessionId);
+    expect(sentText(harness.transport.sent, target, switchingOutputStart))
+      .not.toContain("无法确认新会话是否完整创建");
+
     releaseStop.resolve();
     await waitUntil(
-      () => sentText(harness.transport.sent, target).includes("无法确认受管操作已完成或停止"),
-      "truthful cancel result after worker stop",
+      () => stopConfirmed
+        && sentText(harness.transport.sent, target, switchingOutputStart)
+          .includes("无法确认新会话是否完整创建"),
+      "unknown result after confirmed worker stop",
     );
-    expect(stopConfirmed).toBe(true);
+    expect(sentText(harness.transport.sent, target, switchingOutputStart)).not.toContain("已创建会话");
+    expect(workers.creations).toHaveLength(2);
+    expect(await bindingFor(harness, target)).toMatchObject({
+      sessionId: originalBinding.sessionId,
+      cwd,
+    });
 
-    const recoveredStore = await openChannelStore(harness.stateDir);
-    try {
-      const unknown = recoveredStore.getIngressJob(accepted.id);
-      expect(unknown?.state).toBe("unknown");
-      expect(unknown?.operationCheckpoint?.kind === "command"
-        ? unknown.operationCheckpoint.workerLedgerId
-        : null).toBe(`new-ingress-${accepted.id}`);
-      expect(recoveredStore.getOutbox(`ingress:${accepted.id}:receipt:0`)?.text)
-        .toContain("无法确认新会话是否完整创建");
-    } finally {
-      recoveredStore.close();
+    const recoveryOutputStart = harness.transport.sent.length;
+    const recovery = harness.service.receive(inbound({
+      ...target,
+      messageId: "ingress-new-after-confirmed-worker-stop",
+      text: `/new ${cwd}`,
+    }));
+    await recovery.ackReady;
+    await waitUntil(
+      () => sentText(harness.transport.sent, target, recoveryOutputStart).includes("已创建会话"),
+      "new independent session after confirmed stop",
+    );
+    const recoveredBinding = await bindingFor(harness, target);
+    if (recoveredBinding?.sessionFile === null || recoveredBinding === null) {
+      throw new Error("recovery /new did not create a bound session");
     }
+    expect(recoveredBinding.cwd).toBe(cwd);
+    expect(recoveredBinding.sessionId).not.toBe(originalBinding.sessionId);
+    expect(recoveredBinding.sessionId).not.toBe(cancelledCandidateSessionId);
+    expect((await harness.service.status(target)).sessionId).toBe(recoveredBinding.sessionId);
+    expect(workers.creations).toHaveLength(3);
 
     const redelivery = harness.service.receive(switching);
     await redelivery.ackReady;
-    expect(workers.creations).toHaveLength(1);
-
-    const retryCwd = join(harness.root, "unblocked-retry-target");
-    await mkdir(retryCwd, { recursive: true });
-    const retryMessage = inbound({
-      ...target,
-      messageId: "ingress-new-after-unknown-worker",
-      text: `/new ${retryCwd}`,
+    expect(workers.creations).toHaveLength(3);
+    expect(await bindingFor(harness, target)).toMatchObject({
+      sessionId: recoveredBinding.sessionId,
+      cwd,
     });
-    const retry = harness.service.receive(retryMessage);
-    await retry.ackReady;
-    await waitUntil(
-      () => sentText(harness.transport.sent, target).includes("目录存在未确认停止的 worker"),
-      "same-session refusal while unknown worker resources remain protected",
-    );
-    expect(workers.creations).toHaveLength(1);
-    const laterMessage = inbound({
-      ...target,
-      messageId: "ingress-ordinary-after-unknown-new",
-      text: "remain behind the unknown session transition",
-    });
-    const later = harness.service.receive(laterMessage);
-    await later.ackReady;
-
-    const finalStore = await openChannelStore(harness.stateDir);
-    try {
-      const refusalJob = finalStore.getIngressJobBySource({
-        botUid: harness.bot.uid,
-        sourceKind: "recv",
-        sourceId: recvIngressSourceId(target.channelType, target.channelId, retryMessage.messageId),
-      });
-      const laterJob = finalStore.getIngressJobBySource({
-        botUid: harness.bot.uid,
-        sourceKind: "recv",
-        sourceId: recvIngressSourceId(target.channelType, target.channelId, laterMessage.messageId),
-      });
-      expect(refusalJob?.state).toBe("handed-off");
-      expect(laterJob).toMatchObject({ state: "accepted", ackReady: true });
-      expect(laterJob?.routeSnapshot?.barrierJobId).toBe(accepted.id);
-    } finally {
-      finalStore.close();
-    }
-    expect(workers.creations).toHaveLength(1);
-    expect(workers.prompts).toHaveLength(0);
   } finally {
     releaseCandidate.resolve();
     releaseStop.resolve();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("failed session worker stop keeps /new protected and never reports recovery success", async () => {
+  const workers = new FakeWorkerFactory();
+  const candidateStarted = Promise.withResolvers<void>();
+  const releaseCandidate = Promise.withResolvers<void>();
+  let stopAttempted = false;
+  const harness = await createCoreHarness({ workers });
+  const target = { channelType: 1 as const, channelId: "dm-ingress-failed-cancel-new" };
+  const cwd = join(harness.root, "failed-cancel-new-target");
+
+  try {
+    await mkdir(cwd, { recursive: true });
+    const initialOutputStart = harness.transport.sent.length;
+    const initial = harness.service.receive(inbound({
+      ...target,
+      messageId: "ingress-failed-cancel-new-initial",
+      text: `/new ${cwd}`,
+    }));
+    await initial.ackReady;
+    await waitUntil(
+      () => sentText(harness.transport.sent, target, initialOutputStart).includes("已创建会话"),
+      "initial session binding before failed stop",
+    );
+    const originalBinding = await bindingFor(harness, target);
+    if (originalBinding?.sessionFile === null || originalBinding === null) {
+      throw new Error("initial /new did not create a bound session");
+    }
+    workers.stopHandler = async () => {
+      stopAttempted = true;
+      throw new Error("fixture process-group exit was not confirmed");
+    };
+
+    workers.beforeCreate = async () => {
+      candidateStarted.resolve();
+      await releaseCandidate.promise;
+    };
+    const switching = inbound({
+      ...target,
+      messageId: "ingress-failed-cancel-new-operation",
+      text: `/new ${cwd}`,
+    });
+    const switchingOutputStart = harness.transport.sent.length;
+    const switchingReceipt = harness.service.receive(switching);
+    await switchingReceipt.ackReady;
+    await candidateStarted.promise;
+    const cancel = harness.service.receive(inbound({
+      ...target,
+      messageId: "ingress-failed-cancel-new-control",
+      text: "/cancel",
+    }));
+    await cancel.ackReady;
+    await waitUntil(
+      () => workers.creations.at(-1)?.signal?.aborted === true,
+      "new worker cancellation before failed stop",
+    );
+
+    releaseCandidate.resolve();
+    workers.beforeCreate = undefined;
+    await waitUntil(() => stopAttempted, "failed worker process-group stop");
+    await waitUntil(
+      () => sentText(harness.transport.sent, target, switchingOutputStart)
+        .includes("无法确认新会话是否完整创建"),
+      "unknown result after failed worker stop",
+    );
+    const unknownText = sentText(harness.transport.sent, target, switchingOutputStart);
+    expect(unknownText).not.toContain("已创建会话");
+
+    const blockedOutputStart = harness.transport.sent.length;
+    const retry = harness.service.receive(inbound({
+      ...target,
+      messageId: "ingress-new-after-failed-worker-stop",
+      text: `/new ${cwd}`,
+    }));
+    await retry.ackReady;
+    await waitUntil(
+      () => /等待|\/stop|\/cancel/.test(sentText(harness.transport.sent, target, blockedOutputStart)),
+      "continued wait-or-stop guidance after failed process-group stop",
+    );
+    const blockedText = sentText(harness.transport.sent, target, blockedOutputStart);
+    expect(blockedText).toMatch(/等待|\/stop|\/cancel/);
+    expect(blockedText).not.toContain("已创建会话");
+    expect(workers.creations).toHaveLength(2);
+    expect(await bindingFor(harness, target)).toMatchObject({
+      sessionId: originalBinding.sessionId,
+      cwd,
+    });
+    expect((await harness.service.status(target)).sessionId).toBe(originalBinding.sessionId);
+
+    const redelivery = harness.service.receive(switching);
+    await redelivery.ackReady;
+    expect(workers.creations).toHaveLength(2);
+    expect(await bindingFor(harness, target)).toMatchObject({
+      sessionId: originalBinding.sessionId,
+      cwd,
+    });
+  } finally {
+    releaseCandidate.resolve();
     await closeCoreHarness(harness);
   }
 });

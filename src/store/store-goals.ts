@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import type { ChatTarget, WorkerGoal } from "../contracts.ts";
 import type { GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, TaskRecord } from "./store-records.ts";
-import { getBinding, initializeBindingSessionFromTask, updateBindingSession } from "./store-chats.ts";
+import { ensureBindingIfMatches, getBinding, initializeBindingSessionFromTask } from "./store-chats.ts";
 import { asNumber, asNullableString, asString, query, run, targetValues, targetWhere, transaction } from "./store-schema.ts";
 import { cancelTaskQuestions } from "./store-questions.ts";
 
@@ -179,7 +179,13 @@ export function bindGoalTaskSession(
         throw new Error(`goal task ${taskId} could not atomically bind its initial thread session`);
       }
     } else {
-      updateBindingSession(db, request.botUid, request, sessionId, sessionFile);
+      if (!ensureBindingIfMatches(db, {
+        ...binding,
+        sessionId,
+        sessionFile,
+      }, binding, { clearSessionInitialization: true })) {
+        throw new Error(`goal task ${taskId} binding changed before session publication`);
+      }
     }
     if (run(db,
       "UPDATE tasks SET session_id = ? WHERE id = ? AND session_id = ? AND state = 'started'",

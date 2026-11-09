@@ -148,6 +148,33 @@ export function ensureBinding(
   });
 }
 
+function sameBinding(left: BindingRecord | null, right: BindingRecord | null): boolean {
+  if (left === null || right === null) return left === right;
+  return left.botUid === right.botUid
+    && left.channelType === right.channelType
+    && left.channelId === right.channelId
+    && left.sessionId === right.sessionId
+    && left.cwd === right.cwd
+    && left.sessionFile === right.sessionFile
+    && (left.cwdPinned === true) === (right.cwdPinned === true)
+    && (left.sessionSwitchedAt ?? null) === (right.sessionSwitchedAt ?? null)
+    && JSON.stringify(left.sessionInitialization ?? null) === JSON.stringify(right.sessionInitialization ?? null);
+}
+
+/** Compare-and-swap for binding writers that may finish after a newer session operation. */
+export function ensureBindingIfMatches(
+  db: Database,
+  binding: BindingRecord,
+  expected: BindingRecord | null,
+  options: { clearSessionInitialization?: boolean } = {},
+): boolean {
+  return transaction(db, () => {
+    if (!sameBinding(getBinding(db, binding.botUid, binding), expected)) return false;
+    ensureBinding(db, binding, options);
+    return true;
+  });
+}
+
 /** Atomically records which started task initialized an unbound pinned thread session. */
 export function initializeBindingSessionFromTask(
   db: Database,

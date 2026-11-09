@@ -1,7 +1,8 @@
 import { Database } from "bun:sqlite";
 import type { ChatTarget } from "../contracts.ts";
-import type { WorkerLedgerRecord } from "./store-records.ts";
+import type { BindingRecord, OutboxInsert, WorkerLedgerRecord } from "./store-records.ts";
 import {
+  type IngressBindingSnapshot,
   type IngressCancellationCandidate,
   type IngressConsumer,
   type IngressJobInput,
@@ -9,11 +10,15 @@ import {
   type IngressOperationCheckpoint,
   type IngressPayload,
   type IngressRouteSnapshot,
+  type IngressSessionHandoff,
+  type IngressSessionRecoveryResult,
   type IngressSourceKey,
   type IngressSourceKind,
   type IngressState,
 } from "../inbound/ingress-types.ts";
 import { allocateScheduleOrder, asNullableString, asNumber, asString, query, run, targetValues, targetWhere, transaction, type SqlRow, type SqlValue } from "./store-schema.ts";
+import { ensureBindingIfMatches, getBinding } from "./store-chats.ts";
+import { enqueueOutbox } from "./store-outbox.ts";
 import { cancelQueued, isCommitTask, markCancelled, markTaskStopIntent } from "./store-tasks.ts";
 import { cancelQuestions, pendingQuestionIds } from "./store-questions.ts";
 import { recordWorker } from "./store-workers.ts";
@@ -548,6 +553,33 @@ export function getIngressJobBySource(db: Database, key: IngressSourceKey): Ingr
   const row = sourceRow(db, key);
   return row ? ingressJobFromRow(row) : null;
 }
+export function ensureBindingIfMatchesIfNoUnresolvedSessionTransition(
+  db: Database,
+  binding: BindingRecord,
+  expected: BindingRecord | null,
+  options: { clearSessionInitialization?: boolean } = {},
+): boolean {
+  return transaction(db, () => {
+    const candidateRows = query(
+      db,
+      `SELECT operation_checkpoint_json FROM ingress_jobs
+       WHERE bot_uid = ? AND channel_type = ? AND channel_id = ?
+         AND state IN ('accepted', 'preparing', 'dispatch-intent', 'unknown')`,
+      [binding.botUid, binding.channelType, binding.channelId],
+    );
+    for (const row of candidateRows) {
+      const checkpoint = parseJson<IngressOperationCheckpoint>(
+        asNullableString(row.operation_checkpoint_json),
+      );
+      if (
+        checkpoint?.kind === "command"
+        && checkpoint.recoveredByIngressJobId === undefined
+        && (checkpoint.action === "new" || checkpoint.action === "move" || checkpoint.action === "reset")
+      ) return false;
+    }
+    return ensureBindingIfMatches(db, binding, expected, options);
+  });
+}
 
 export function listRecoverableIngressJobs(db: Database, botUid: string): IngressJobRecord[] {
   return query(
@@ -583,12 +615,55 @@ export function markIngressPrepared(
   preparedText: string,
   spoolPaths: readonly string[],
 ): boolean {
-  return run(db,
-    `UPDATE ingress_jobs
-     SET prepared_text = ?, spool_paths_json = ?, ack_ready = 1, state = 'accepted', updated_at = ?
-     WHERE id = ? AND state = 'preparing' AND ack_ready = 0`,
-    [preparedText, serialize(spoolPaths), Date.now(), id],
-  ).changes === 1;
+  return transaction(db, () => {
+    const row = jobRow(db, id);
+    if (row === undefined || asString(row.state) !== "preparing" || asNumber(row.ack_ready) !== 0) return false;
+    const checkpoint = parseJson<IngressOperationCheckpoint>(asNullableString(row.operation_checkpoint_json));
+    const recoveryCancelled = checkpoint?.kind === "session-recovery-cancellation";
+    const consumerId = recoveryCancelled ? recoveryNoticeId(id) : null;
+    return run(db,
+      `UPDATE ingress_jobs
+       SET prepared_text = ?, spool_paths_json = ?, ack_ready = 1, state = ?,
+           consumer_kind = ?, consumer_id = ?, updated_at = ?
+       WHERE id = ? AND state = 'preparing' AND ack_ready = 0`,
+      [
+        preparedText,
+        serialize(spoolPaths),
+        recoveryCancelled ? "handed-off" : "accepted",
+        recoveryCancelled ? "outbox" : null,
+        consumerId,
+        Date.now(),
+        id,
+      ],
+    ).changes === 1;
+  });
+}
+
+export function finishIngressRecoveryPreparation(
+  db: Database,
+  id: number,
+  consumer: IngressConsumer,
+  persistConsumer?: () => boolean,
+): boolean {
+  return transaction(db, () => {
+    const row = jobRow(db, id);
+    const checkpoint = row === undefined
+      ? null
+      : parseJson<IngressOperationCheckpoint>(asNullableString(row.operation_checkpoint_json));
+    if (
+      row === undefined
+      || asString(row.state) !== "preparing"
+      || asNumber(row.ack_ready) !== 0
+      || checkpoint?.kind !== "session-recovery-cancellation"
+      || (persistConsumer !== undefined && !persistConsumer())
+    ) return false;
+    return run(db,
+      `UPDATE ingress_jobs
+       SET ack_ready = 1, state = 'handed-off', consumer_kind = ?, consumer_id = ?, updated_at = ?
+       WHERE id = ? AND state = 'preparing' AND ack_ready = 0`,
+      [consumer.kind, consumer.id, Date.now(), id],
+    ).changes === 1;
+  });
 }
 
 export function saveIngressCheckpoint(
@@ -868,6 +943,531 @@ export function cancelIngressJobBySource(
   });
 }
 
+function bindingMatchesSnapshot(
+  binding: BindingRecord | null,
+  botUid: string,
+  target: ChatTarget,
+  snapshot: IngressBindingSnapshot | null,
+): boolean {
+  if (binding === null || snapshot === null) return binding === null && snapshot === null;
+  return binding.botUid === botUid
+    && binding.channelType === target.channelType
+    && binding.channelId === target.channelId
+    && binding.sessionId === snapshot.sessionId
+    && binding.cwd === snapshot.cwd
+    && binding.sessionFile === snapshot.sessionFile
+    && (binding.cwdPinned === true) === (snapshot.cwdPinned === true)
+    && (binding.sessionSwitchedAt ?? null) === (snapshot.sessionSwitchedAt ?? null)
+    && JSON.stringify(binding.sessionInitialization ?? null)
+      === JSON.stringify(snapshot.sessionInitialization ?? null);
+}
+
+function unknownTransitionIsStopped(db: Database, botUid: string, id: number): boolean {
+  const row = jobRow(db, id);
+  if (row === undefined || asString(row.state) !== "unknown" || asString(row.bot_uid) !== botUid) return false;
+  const checkpoint = parseJson<IngressOperationCheckpoint>(asNullableString(row.operation_checkpoint_json));
+  if (
+    checkpoint?.kind !== "command"
+    || checkpoint.recoveredByIngressJobId !== undefined
+    || (checkpoint.action !== "new" && checkpoint.action !== "move" && checkpoint.action !== "reset")
+  ) return false;
+  const ledgerId = `${checkpoint.action}-ingress-${id}`;
+  if (checkpoint.workerLedgerId !== ledgerId) return false;
+  const ledger = query(db, "SELECT state FROM worker_ledger WHERE bot_uid = ? AND id = ?", [botUid, ledgerId])[0];
+  return ledger !== undefined && asString(ledger.state) === "stopped";
+}
+
+function validateRecoveryBarrierChain(
+  db: Database,
+  job: IngressJobRecord,
+  barrierJobIds: readonly number[],
+): boolean {
+  const checkpoint = job.operationCheckpoint;
+  if (checkpoint?.kind !== "command" || (checkpoint.action !== "new" && checkpoint.action !== "reset")) {
+    return false;
+  }
+  const unique = [...new Set(barrierJobIds)];
+  if (unique.length !== barrierJobIds.length) return false;
+  const expected = checkpoint.recoveryBarrierJobIds;
+  if (
+    expected !== undefined
+    && (expected.length !== unique.length || expected.some((id, index) => id !== unique[index]))
+  ) return false;
+  const recoveredIds = new Set<number>();
+  const visited = new Set<number>();
+  let valid = true;
+  const visit = (id: number): void => {
+    if (!valid || visited.has(id)) return;
+    visited.add(id);
+    const row = jobRow(db, id);
+    if (row === undefined) {
+      valid = false;
+      return;
+    }
+    const barrier = ingressJobFromRow(row);
+    const barrierCheckpoint = barrier.operationCheckpoint;
+    if (
+      barrier.botUid !== job.botUid
+      || barrier.channelType !== job.channelType
+      || barrier.channelId !== job.channelId
+    ) {
+      valid = false;
+      return;
+    }
+    if (barrier.state === "handed-off" || barrier.state === "cancelled") return;
+    if (
+      barrierCheckpoint?.kind !== "command"
+      || barrierCheckpoint.recoveredByIngressJobId !== undefined
+    ) {
+      valid = false;
+      return;
+    }
+    const sessionTransition = barrierCheckpoint.action === "new"
+      || barrierCheckpoint.action === "move"
+      || barrierCheckpoint.action === "reset";
+    const undispatchedFork = barrierCheckpoint.action === "fork"
+      && barrier.state === "accepted"
+      && barrierCheckpoint.phase === "barrier-installed";
+    if (!sessionTransition && !undispatchedFork) {
+      valid = false;
+      return;
+    }
+    if (barrier.state === "unknown") {
+      if (!sessionTransition) {
+        valid = false;
+        return;
+      }
+      recoveredIds.add(id);
+    } else if (barrier.state !== "accepted") {
+      valid = false;
+      return;
+    }
+    for (const ancestorId of barrierCheckpoint.recoveryBarrierJobIds ?? []) visit(ancestorId);
+    const parentId = barrier.routeSnapshot?.barrierJobId;
+    if (parentId !== null && parentId !== undefined) visit(parentId);
+  };
+  for (const barrierId of checkpoint.recoveryBarrierJobIds ?? []) visit(barrierId);
+  const routeBarrierId = job.routeSnapshot?.barrierJobId;
+  if (routeBarrierId !== null && routeBarrierId !== undefined) visit(routeBarrierId);
+  const actual = [...recoveredIds].sort((left, right) => left - right);
+  if (
+    !valid
+    || actual.length !== unique.length
+    || actual.some((id, index) => id !== unique[index])
+  ) return false;
+  for (const barrierJobId of unique) {
+    if (!unknownTransitionIsStopped(db, job.botUid, barrierJobId)) return false;
+  }
+  return true;
+}
+
+function recoveryNoticeId(jobId: number): string {
+  return `ingress-session-recovery:${jobId}:not-executed`;
+}
+
+function recoveryNotice(db: Database, row: SqlRow): void {
+  const messageId = asNullableString(row.message_id);
+  const jobId = asNumber(row.id);
+  const id = recoveryNoticeId(jobId);
+  if (query(db, "SELECT 1 FROM outbox WHERE id = ?", [id])[0] !== undefined) return;
+  const notice: OutboxInsert = {
+    id,
+    botUid: asString(row.bot_uid),
+    channelType: asNumber(row.channel_type) as ChatTarget["channelType"],
+    channelId: asString(row.channel_id),
+    taskId: null,
+    kind: "text",
+    text: messageId === null
+      ? `待处理消息（入站项 #${jobId}）未执行：此前的会话切换结果未知；如仍需处理，请重新发送，否则可忽略。`
+      : `消息 ${messageId} 未执行：此前的会话切换结果未知；如仍需处理，请重新发送，否则可忽略。`,
+    path: null,
+    fileKind: null,
+    clientMsgNo: id,
+  };
+  enqueueOutbox(db, notice);
+}
+function recoveryLineageRoot(
+  db: Database,
+  id: number,
+  botUid: string,
+  target: ChatTarget,
+  recoveryBarrierIds: ReadonlySet<number>,
+  rowsById: ReadonlyMap<number, SqlRow>,
+  visited: Set<number> = new Set(),
+): number | null {
+  if (recoveryBarrierIds.has(id)) return id;
+  if (visited.has(id)) return null;
+  visited.add(id);
+  const row = rowsById.get(id) ?? jobRow(db, id);
+  if (
+    row === undefined
+    || asString(row.bot_uid) !== botUid
+    || asNumber(row.channel_type) !== target.channelType
+    || asString(row.channel_id) !== target.channelId
+  ) return null;
+  const job = ingressJobFromRow(row);
+  const parents = [
+    ...(job.operationCheckpoint?.kind === "command"
+      ? job.operationCheckpoint.recoveryBarrierJobIds ?? []
+      : []),
+    ...(job.routeSnapshot?.barrierJobId == null ? [] : [job.routeSnapshot.barrierJobId]),
+  ];
+  for (const parent of parents) {
+    const root = recoveryLineageRoot(db, parent, botUid, target, recoveryBarrierIds, rowsById, visited);
+    if (root !== null) return root;
+  }
+  return null;
+}
+
+function recoveryAffectedIngressRows(
+  db: Database,
+  rows: readonly SqlRow[],
+  botUid: string,
+  target: ChatTarget,
+  barrierJobIds: readonly number[],
+): Array<{ row: SqlRow; barrierJobId: number }> {
+  const roots = new Set(barrierJobIds);
+  const rowsById = new Map(rows.map(row => [asNumber(row.id), row]));
+  const affected: Array<{ row: SqlRow; barrierJobId: number }> = [];
+  for (const row of rows) {
+    if (roots.has(asNumber(row.id))) continue;
+    const route = parseJson<IngressRouteSnapshot>(asNullableString(row.route_snapshot_json));
+    if (route?.purpose.kind === "questions") continue;
+    const barrierJobId = route?.barrierJobId;
+    if (
+      barrierJobId === null
+      || barrierJobId === undefined
+      || recoveryLineageRoot(db, barrierJobId, botUid, target, roots, rowsById) === null
+    ) continue;
+    affected.push({ row, barrierJobId });
+  }
+  return affected;
+}
+
+
+function cancelIngressForSessionRecovery(
+  db: Database,
+  row: SqlRow,
+  recoveryJobId: number,
+  barrierJobId: number,
+): boolean {
+  const state = asString(row.state);
+  const preparing = state === "preparing";
+  const ackReady = asNumber(row.ack_ready) === 1;
+  if ((state !== "accepted" && !preparing) || preparing === ackReady) return false;
+  const id = asNumber(row.id);
+  const checkpoint: IngressOperationCheckpoint = {
+    kind: "session-recovery-cancellation",
+    barrierJobId,
+    recoveryJobId,
+  };
+  const changed = run(
+    db,
+    `UPDATE ingress_jobs
+     SET ack_ready = ?, state = ?, operation_checkpoint_json = ?, consumer_kind = ?, consumer_id = ?, updated_at = ?
+     WHERE id = ? AND state = ? AND ack_ready = ?`,
+    [
+      ackReady ? 1 : 0,
+      preparing ? "preparing" : "handed-off",
+      serialize(checkpoint),
+      preparing ? null : "outbox",
+      preparing ? null : recoveryNoticeId(id),
+      Date.now(),
+      id,
+      state,
+      ackReady ? 1 : 0,
+    ],
+  ).changes === 1;
+  if (changed) recoveryNotice(db, row);
+  return changed;
+}
+export function cancelIngressJobAfterSessionRecovery(
+  db: Database,
+  key: IngressSourceKey,
+  target: ChatTarget,
+  messageId: string,
+  barrierJobId: number,
+): IngressJobRecord | null {
+  return transaction(db, () => {
+    const barrierRow = jobRow(db, barrierJobId);
+    if (
+      barrierRow === undefined
+      || asString(barrierRow.bot_uid) !== key.botUid
+      || asNumber(barrierRow.channel_type) !== target.channelType
+      || asString(barrierRow.channel_id) !== target.channelId
+      || asString(barrierRow.state) !== "unknown"
+    ) return null;
+    const barrierCheckpoint = parseJson<IngressOperationCheckpoint>(
+      asNullableString(barrierRow.operation_checkpoint_json),
+    );
+    if (
+      barrierCheckpoint?.kind !== "command"
+      || (barrierCheckpoint.action !== "new"
+        && barrierCheckpoint.action !== "move"
+        && barrierCheckpoint.action !== "reset")
+      || barrierCheckpoint.recoveredByIngressJobId === undefined
+    ) return null;
+    const barrierLedgerId = `${barrierCheckpoint.action}-ingress-${barrierJobId}`;
+    const worker = query(
+      db,
+      "SELECT state FROM worker_ledger WHERE bot_uid = ? AND id = ?",
+      [key.botUid, barrierLedgerId],
+    )[0];
+    if (
+      barrierCheckpoint.workerLedgerId !== barrierLedgerId
+      || worker === undefined
+      || asString(worker.state) !== "stopped"
+    ) return null;
+    const recoveryRow = jobRow(db, barrierCheckpoint.recoveredByIngressJobId);
+    if (
+      recoveryRow === undefined
+      || asString(recoveryRow.bot_uid) !== key.botUid
+      || asNumber(recoveryRow.channel_type) !== target.channelType
+      || asString(recoveryRow.channel_id) !== target.channelId
+      || asString(recoveryRow.state) !== "handed-off"
+    ) return null;
+
+    const existing = sourceRow(db, key);
+    if (
+      existing === undefined
+      || asNumber(existing.channel_type) !== target.channelType
+      || asString(existing.channel_id) !== target.channelId
+      || asNullableString(existing.message_id) !== messageId
+      || asString(existing.lane) !== "ordered"
+      || asNumber(existing.schedule_order) >= asNumber(recoveryRow.schedule_order)
+    ) return null;
+    const route = parseJson<IngressRouteSnapshot>(asNullableString(existing.route_snapshot_json));
+    if (route?.purpose.kind === "questions") return null;
+    const state = asString(existing.state);
+    if (state === "cancelled") return ingressJobFromRow(existing);
+    if (
+      (state !== "accepted" && state !== "preparing")
+      || route?.barrierJobId !== barrierJobId
+      || !cancelIngressForSessionRecovery(
+        db,
+        existing,
+        barrierCheckpoint.recoveredByIngressJobId,
+        barrierJobId,
+      )
+    ) return null;
+    const cancelled = jobRow(db, asNumber(existing.id));
+    return cancelled === undefined ? null : ingressJobFromRow(cancelled);
+  });
+}
+
+function prepareIngressSessionRecoveryInTransaction(
+  db: Database,
+  recoveryJobId: number,
+  barrierJobIds: readonly number[],
+): IngressSessionRecoveryResult {
+  const row = jobRow(db, recoveryJobId);
+  if (row === undefined) return { kind: "stale", cancelledJobIds: [] };
+  const job = ingressJobFromRow(row);
+  const checkpoint = job.operationCheckpoint;
+  if (
+    job.state !== "accepted"
+    || checkpoint?.kind !== "command"
+    || checkpoint.phase !== "waiting-session"
+    || !validateRecoveryBarrierChain(db, job, barrierJobIds)
+  ) return { kind: "stale", cancelledJobIds: [] };
+  const target: ChatTarget = { channelType: job.channelType, channelId: job.channelId };
+  if (!bindingMatchesSnapshot(
+    getBinding(db, job.botUid, target),
+    job.botUid,
+    target,
+    checkpoint.expectedBinding,
+  )) return { kind: "stale", cancelledJobIds: [] };
+
+  const lowerBound = Math.min(
+    job.scheduleOrder,
+    ...barrierJobIds.map(barrierId => asNumber(jobRow(db, barrierId)?.schedule_order)),
+  );
+  const rows = query(
+    db,
+    `SELECT * FROM ingress_jobs
+     WHERE bot_uid = ? AND channel_type = ? AND channel_id = ?
+       AND schedule_order > ? AND schedule_order < ?
+       AND state IN ('accepted', 'preparing', 'dispatch-intent', 'unknown', 'cancelled')
+     ORDER BY schedule_order ASC, id ASC`,
+    [job.botUid, target.channelType, target.channelId, lowerBound, job.scheduleOrder],
+  );
+  for (const { row: pending } of recoveryAffectedIngressRows(
+    db,
+    rows,
+    job.botUid,
+    target,
+    barrierJobIds,
+  )) {
+    const state = asString(pending.state);
+    if (state === "dispatch-intent" || state === "unknown") {
+      return { kind: "blocked", cancelledJobIds: [] };
+    }
+  }
+
+  const recoveryCheckpoint: IngressOperationCheckpoint = {
+    ...checkpoint,
+    recoveryBarrierJobIds: [...barrierJobIds],
+  };
+  if (run(
+    db,
+    `UPDATE ingress_jobs SET operation_checkpoint_json = ?, updated_at = ?
+     WHERE id = ? AND state = 'accepted'`,
+    [serialize(recoveryCheckpoint), Date.now(), recoveryJobId],
+  ).changes !== 1) return { kind: "stale", cancelledJobIds: [] };
+  return { kind: "ready", cancelledJobIds: [] };
+}
+
+export function prepareIngressSessionRecovery(
+  db: Database,
+  recoveryJobId: number,
+  barrierJobIds: readonly number[],
+): IngressSessionRecoveryResult {
+  return transaction(db, () => prepareIngressSessionRecoveryInTransaction(db, recoveryJobId, barrierJobIds));
+}
+
+function commitIngressSessionHandoff(
+  db: Database,
+  recoveryJobId: number,
+  handoff: IngressSessionHandoff,
+  cancelledJobIds: Set<number>,
+): boolean {
+  const row = jobRow(db, recoveryJobId);
+  if (row === undefined) return false;
+  const job = ingressJobFromRow(row);
+  if (job.state !== "dispatch-intent") return false;
+  const checkpoint = job.operationCheckpoint;
+  if (
+    checkpoint?.kind !== "command"
+    || (checkpoint.action !== "new" && checkpoint.action !== "reset")
+    || !validateRecoveryBarrierChain(db, job, handoff.barrierJobIds)
+  ) return false;
+  const currentLedgerId = `${checkpoint.action}-ingress-${recoveryJobId}`;
+  if (checkpoint.workerLedgerId !== currentLedgerId) return false;
+  const currentLedger = query(
+    db,
+    "SELECT state FROM worker_ledger WHERE bot_uid = ? AND id = ?",
+    [job.botUid, currentLedgerId],
+  )[0];
+  if (currentLedger === undefined || asString(currentLedger.state) !== "stopped") return false;
+  const target: ChatTarget = { channelType: job.channelType, channelId: job.channelId };
+  if (!bindingMatchesSnapshot(
+    getBinding(db, job.botUid, target),
+    job.botUid,
+    target,
+    handoff.expectedBinding,
+  )) return false;
+  const expectedRecord: BindingRecord | null = handoff.expectedBinding === null
+    ? null
+    : {
+        botUid: job.botUid,
+        ...target,
+        sessionId: handoff.expectedBinding.sessionId,
+        cwd: handoff.expectedBinding.cwd,
+        sessionFile: handoff.expectedBinding.sessionFile,
+        cwdPinned: handoff.expectedBinding.cwdPinned === true,
+        sessionSwitchedAt: handoff.expectedBinding.sessionSwitchedAt ?? null,
+        ...(handoff.expectedBinding.sessionInitialization === undefined
+          ? {}
+          : { sessionInitialization: handoff.expectedBinding.sessionInitialization }),
+      };
+  if (
+    handoff.binding.botUid !== job.botUid
+    || handoff.binding.channelType !== target.channelType
+    || handoff.binding.channelId !== target.channelId
+    || !ensureBindingIfMatches(db, handoff.binding, expectedRecord, { clearSessionInitialization: true })
+  ) return false;
+
+  if (handoff.barrierJobIds.length > 0) {
+    const lowerBound = Math.min(
+      job.scheduleOrder,
+      ...handoff.barrierJobIds.map(barrierId => asNumber(jobRow(db, barrierId)?.schedule_order)),
+    );
+    const pendingRows = query(
+      db,
+      `SELECT * FROM ingress_jobs
+       WHERE bot_uid = ? AND channel_type = ? AND channel_id = ?
+         AND schedule_order > ? AND schedule_order < ?
+         AND state IN ('accepted', 'preparing', 'dispatch-intent', 'unknown', 'cancelled')
+       ORDER BY schedule_order ASC, id ASC`,
+      [job.botUid, target.channelType, target.channelId, lowerBound, job.scheduleOrder],
+    );
+    for (const { row: pending, barrierJobId } of recoveryAffectedIngressRows(
+      db,
+      pendingRows,
+      job.botUid,
+      target,
+      handoff.barrierJobIds,
+    )) {
+      const id = asNumber(pending.id);
+      const state = asString(pending.state);
+      if (state === "dispatch-intent" || state === "unknown") return false;
+      if (state === "accepted" || state === "preparing") {
+        if (cancelIngressForSessionRecovery(db, pending, recoveryJobId, barrierJobId)) {
+          cancelledJobIds.add(id);
+        } else {
+          return false;
+        }
+      }
+    }
+    const recoveredBindingSnapshot: IngressBindingSnapshot = {
+      sessionId: handoff.binding.sessionId,
+      cwd: handoff.binding.cwd,
+      sessionFile: handoff.binding.sessionFile,
+      cwdPinned: handoff.binding.cwdPinned === true,
+      sessionSwitchedAt: handoff.binding.sessionSwitchedAt ?? null,
+      sessionInitialization: handoff.binding.sessionInitialization ?? null,
+    };
+    for (const barrierJobId of handoff.barrierJobIds) {
+      const barrierRow = jobRow(db, barrierJobId);
+      if (barrierRow === undefined) return false;
+      const barrier = ingressJobFromRow(barrierRow);
+      if (barrier.operationCheckpoint?.kind !== "command") return false;
+      const nextCheckpoint: IngressOperationCheckpoint = {
+        ...barrier.operationCheckpoint,
+        recoveredByIngressJobId: recoveryJobId,
+        recoveredBindingSnapshot,
+      };
+      if (run(
+        db,
+        `UPDATE ingress_jobs SET operation_checkpoint_json = ?, updated_at = ?
+         WHERE id = ? AND state = 'unknown'`,
+        [serialize(nextCheckpoint), Date.now(), barrierJobId],
+      ).changes !== 1) return false;
+    }
+  }
+  return true;
+}
+
+export function handoffSessionIngressJob(
+  db: Database,
+  id: number,
+  consumer: IngressConsumer,
+  persistConsumer: () => boolean,
+  handoff: IngressSessionHandoff,
+): { handedOff: boolean; cancelledJobIds: readonly number[] } {
+  const cancelledJobIds = new Set<number>();
+  const binding = handoff.binding;
+  const outcomeCheckpoint: IngressOperationCheckpoint = {
+    kind: "session-handoff-outcome",
+    action: "new",
+    binding: {
+      sessionId: binding.sessionId,
+      cwd: binding.cwd,
+      sessionFile: binding.sessionFile,
+      cwdPinned: binding.cwdPinned === true,
+      sessionSwitchedAt: binding.sessionSwitchedAt ?? null,
+      sessionInitialization: binding.sessionInitialization ?? null,
+    },
+  };
+  const handedOff = handoffIngressJob(
+    db,
+    id,
+    consumer,
+    () => commitIngressSessionHandoff(db, id, handoff, cancelledJobIds) && persistConsumer(),
+    outcomeCheckpoint,
+  );
+  return { handedOff, cancelledJobIds: [...cancelledJobIds] };
+}
 const consumerNotPersisted = Symbol("consumer-not-persisted");
 
 export function handoffIngressJob(
@@ -875,6 +1475,7 @@ export function handoffIngressJob(
   id: number,
   consumer: IngressConsumer,
   persistConsumer: () => boolean,
+  preservedCheckpoint?: IngressOperationCheckpoint,
 ): boolean {
   try {
     return transaction(db, () => {
@@ -884,10 +1485,17 @@ export function handoffIngressJob(
          SET state = 'handed-off', consumer_kind = ?, consumer_id = ?, ack_ready = 1,
              payload_json = NULL,
              route_snapshot_json = CASE WHEN ? = 'task' THEN route_snapshot_json ELSE NULL END,
-             prepared_text = NULL, spool_paths_json = '[]', operation_checkpoint_json = NULL,
+             prepared_text = NULL, spool_paths_json = '[]', operation_checkpoint_json = ?,
              updated_at = ?
          WHERE id = ? AND state IN ('accepted', 'preparing', 'dispatch-intent')`,
-        [consumer.kind, consumer.id, consumer.kind, Date.now(), id],
+        [
+          consumer.kind,
+          consumer.id,
+          consumer.kind,
+          preservedCheckpoint === undefined ? null : serialize(preservedCheckpoint),
+          Date.now(),
+          id,
+        ],
       ).changes === 1;
       if (!committed) throw consumerNotPersisted;
       return true;

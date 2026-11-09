@@ -44,7 +44,7 @@ export interface ThreadWorkspaceHost {
   readonly store: Pick<
     ChannelStore,
     | "getBinding"
-    | "ensureBinding"
+    | "ensureBindingIfMatches"
     | "saveThreadWorkspace"
     | "saveThreadWorkspaces"
     | "saveThreadWorkspaceIntent"
@@ -620,7 +620,7 @@ function ensureThreadBinding(
   thread: ThreadSummary,
   cwd: string,
 ): void {
-  host.store.ensureBinding({
+  if (!host.store.ensureBindingIfMatches({
     botUid: host.botUid,
     channelId: thread.channelId,
     channelType: 5,
@@ -628,7 +628,9 @@ function ensureThreadBinding(
     cwd,
     sessionFile: null,
     cwdPinned: true,
-  });
+  }, null)) {
+    throw new Error(`thread ${thread.channelId} acquired a binding while its workspace was being created`);
+  }
 }
 
 function normalizedFailure(errors: readonly string[]): string | null {
