@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { access, lstat, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type {
   ThreadWorkspace,
@@ -440,21 +440,24 @@ test("/thread remove is owner-only and does not create a task for a group member
   }
 });
 
-test("a shared entry left nonempty after project cleanup remains owned and is not archived", async () => {
+test("a shared entry deletion failure retains ownership and does not archive", async () => {
   const target: ThreadTarget = { channelType: 5, channelId: `${REMOVE_GROUP}____remove-shared` };
   const worktrees = new RecordingWorktrees();
   const harness = await createCoreHarness({ worktreePort: worktrees });
+  let blocked = "";
   try {
     const workspace = await seedOwnedWorkspace(harness, target, { layout: "shared" });
-    const marker = join(workspace.entryPath!, "unowned-note.txt");
-    await writeFile(marker, "keep this file\n");
+    blocked = join(workspace.entryPath!, "blocked");
+    await mkdir(blocked);
+    await writeFile(join(blocked, "note.txt"), "keep this file\n");
+    await chmod(blocked, 0o000);
     const command = removalCommand(harness, target, "remove-shared-command");
     const reply = waitForNextTargetText(harness, target);
     await harness.service.submitInbound(command);
-    await reply;
+    expect((await reply).text).toContain("本地工作区清理未完整完成");
 
     expect(worktrees.requests).toHaveLength(1);
-    expect(await pathExists(marker)).toBe(true);
+    expect(await pathExists(blocked)).toBe(true);
     expect(await pathExists(workspace.entryPath!)).toBe(true);
     expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
     expect(harness.workers.prompts).toEqual([]);
@@ -465,6 +468,7 @@ test("a shared entry left nonempty after project cleanup remains owned and is no
       expect(store.getLatestTask(harness.bot.uid, target)).toBeNull();
     });
   } finally {
+    if (blocked) await chmod(blocked, 0o700);
     await closeCoreHarness(harness);
   }
 });

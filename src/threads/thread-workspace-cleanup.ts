@@ -1,5 +1,5 @@
 import { relative, sep } from "node:path";
-import { lstat, realpath, rmdir } from "node:fs/promises";
+import { lstat, realpath, rm, rmdir } from "node:fs/promises";
 import { safeDisplayText } from "../cards/execution-text.ts";
 import type {
   WorktreePort,
@@ -59,7 +59,7 @@ export function threadWorkspaceCleanupPaths(
 /**
  * The sole persisted-owner cleanup algorithm shared by local `/thread remove` and remote thread-delete.
  * Each known project result is saved before another resource is touched; ambiguous process results
- * stop immediately, and shared entries are only removed with a checked, non-recursive rmdir.
+ * stop immediately. Command cleanup removes the owned shared entry after all projects are released.
  */
 export async function cleanupOwnedThreadWorkspace(
   options: ThreadWorkspaceCleanupOptions,
@@ -165,7 +165,7 @@ export async function cleanupOwnedThreadWorkspace(
 
     if (!stop && !isAborted(signal) && ownership.layout === "shared" && ownership.entryPath !== null && projectsReleased(ownership)) {
       const entryPath = ownership.entryPath;
-      const entryResult = await removeSharedEntry(entryPath, signal);
+      const entryResult = await removeSharedEntry(entryPath, signal, deleteBranch);
       if (entryResult === "removed" || entryResult === "missing") {
         ownership.entryPath = null;
         try {
@@ -287,17 +287,21 @@ async function inspectOwnedDirectory(path: string): Promise<OwnedDirectoryInspec
 }
 
 
-async function removeSharedEntry(path: string, signal?: AbortSignal): Promise<"removed" | "missing" | "nonempty" | string> {
+async function removeSharedEntry(path: string, signal?: AbortSignal, recursive = false): Promise<"removed" | "missing" | "nonempty" | string> {
   try {
     const info = await lstat(path);
     if (info.isSymbolicLink() || !info.isDirectory()) return "共享入口已被替换或不是目录，保留原路径";
     if (await realpath(path) !== path) return "共享入口路径未规范化或父路径已变化，保留原路径";
     if (isAborted(signal)) return "清理已中止，入口保留";
-    await rmdir(path);
+    if (recursive) await rm(path, { recursive: true });
+    else await rmdir(path);
     return "removed";
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return "missing";
+    if (code === "ENOENT") {
+      const state = await inspectOwnedDirectory(path);
+      return state.kind === "missing" ? "missing" : "删除时路径发生变化，保留原路径";
+    }
     if (code === "ENOTEMPTY" || code === "EEXIST") return "nonempty";
     return boundedError(error);
   }

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, rm, unlink, watch, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, watch, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { openChannelStore, type ChannelStore } from "../src/store/index.ts";
@@ -242,11 +242,13 @@ test("real host remove protects unmerged work, then force deletes its branch wit
   }
 });
 
-// Clearing project ownership before rmdir must not hide unknown shared-entry files or old branches.
-test("real shared remove records missing and removed projects but archives only after its entry is empty", async () => {
+// Shared entry content never blocks cleanup once projects and branches are released.
+test.each(["/thread remove", "/thread remove --force"])("real shared %s cleans remaining entry contents and archives", async (command) => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "oco-remove-shared-integration-")));
+  const transport = new RemovalTransport();
   const harness = await createCoreHarness({
     root,
+    transport,
     worktreePort: createWorktreePort({ command: "/no/omp", worktrunkCandidates: [] }),
   });
   const store = await openChannelStore(harness.stateDir);
@@ -263,11 +265,13 @@ test("real shared remove records missing and removed projects but archives only 
     await git(repoA, "worktree", "add", "-qb", "thread-a", pathA);
     await git(repoB, "worktree", "add", "-qb", "thread-b", pathB);
     await git(repoA, "worktree", "remove", pathA);
-    const unknown = join(entry, "owner-note.txt");
-    await writeFile(unknown, "must survive force\n");
+    const unknown = join(entry, "nested", "owner-note.txt");
+    await mkdir(dirname(unknown));
+    await writeFile(unknown, "workspace content\n");
     const detached = join(root, "user-directory");
     await mkdir(detached);
     await writeFile(join(detached, "keep.txt"), "user content\n");
+    await symlink(detached, join(entry, "external-link"));
     store.ensureBinding({ botUid: harness.bot.uid, ...thread, cwd: detached,
       sessionId: "moved-session", sessionFile: null, cwdPinned: false });
     store.saveThreadWorkspace({ botUid: harness.bot.uid, ...thread, layout: "shared",
@@ -275,33 +279,24 @@ test("real shared remove records missing and removed projects but archives only 
         { name: "a", repo: repoA, path: pathA, branch: "thread-a", created: true },
         { name: "b", repo: repoB, path: pathB, branch: "thread-b", created: true },
       ] });
-    const send = (id: string) => harness.service.submitInbound(inbound({
-      ...thread, messageId: id, text: "/thread remove --force", mentionedUserIds: [harness.bot.uid],
+    const send = (id: string, text: string) => harness.service.submitInbound(inbound({
+      ...thread, messageId: id, text, mentionedUserIds: [harness.bot.uid],
     }));
-    const partialReceipt = harness.transport.waitForRemoteText(({ target: sentTarget, text }) =>
-      sentTarget.channelId === thread.channelId
-      && sentTarget.channelType === thread.channelType
-      && text.includes("本地工作区清理未完整完成"),
-    );
-    await send("shared-partial");
-    expect((await partialReceipt).text).toContain("本地工作区清理未完整完成");
-    expect(existsSync(pathB)).toBe(false);
-    expect(await git(repoA, "branch", "--list", "thread-a")).toBe("");
-    expect(await git(repoB, "branch", "--list", "thread-b")).toBe("");
-    expect(existsSync(unknown)).toBe(true);
-    expect(existsSync(join(detached, "keep.txt"))).toBe(true);
-    expect(harness.transport.managementCalls).toEqual([]);
-    expect(store.getThreadWorkspace(harness.bot.uid, thread)?.entryPath).toBe(entry);
-    await unlink(unknown);
     const completeReceipt = harness.transport.waitForRemoteText(({ target: sentTarget, text }) =>
       sentTarget.channelId === thread.channelId
       && sentTarget.channelType === thread.channelType
       && text.startsWith("本地隔离工作区与记录分支清理完成"),
     );
-    await send("shared-complete");
+    await send("shared-complete", command);
     expect((await completeReceipt).text).toContain("本地隔离工作区与记录分支清理完成");
+    expect(existsSync(pathB)).toBe(false);
+    expect(await git(repoA, "branch", "--list", "thread-a")).toBe("");
+    expect(await git(repoB, "branch", "--list", "thread-b")).toBe("");
+    expect(existsSync(join(detached, "keep.txt"))).toBe(true);
+    expect(store.getThreadWorkspace(harness.bot.uid, thread)?.entryPath).toBeNull();
     expect(existsSync(entry)).toBe(false);
     await harness.transport.waitForManagementCalls(call => call.action === "thread-archive");
+    expect(transport.receiptDeliveredBeforeArchive).toBe(true);
     expect(await git(repoA, "rev-parse", "HEAD")).toBe(headA);
     expect(await git(repoB, "rev-parse", "HEAD")).toBe(headB);
     expect(harness.workers.prompts).toEqual([]);
