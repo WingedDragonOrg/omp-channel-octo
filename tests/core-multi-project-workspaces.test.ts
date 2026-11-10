@@ -651,11 +651,60 @@ test("shared multi-project thread has one real entry and dispatch reads both act
           }
         }
         created = result;
+        const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+        try {
+          store.saveThreadWorkspaceIntent({
+            id: "unrelated-unknown-create",
+            botUid: harness.bot.uid,
+            groupId: GROUP_ID,
+            kind: "thread-create",
+            creatorChannelType: 2,
+            creatorChannelId: GROUP_ID,
+            status: "preparing",
+            channelIds: [],
+          });
+          store.saveThreadFork({
+            id: "unrelated-unknown-fork",
+            botUid: harness.bot.uid,
+            sourceChannelType: 2,
+            sourceChannelId: GROUP_ID,
+            sourceSessionId: "source-session",
+            sourceSessionFile: "/fixture/source-session.jsonl",
+            cwd: harness.root,
+            groupId: GROUP_ID,
+            name: "unknown fork",
+            preparationDir: join(harness.stateDir, "fork-preparations", "unrelated-unknown-fork"),
+            preparationStarted: true,
+            phase: "creating",
+            sessionId: "fork-session",
+            sessionFile: "/fixture/fork-session.jsonl",
+            thread: null,
+            error: null,
+          });
+          store.saveThreadWorkspaceIntent({
+            id: "unrelated-unknown-fork",
+            botUid: harness.bot.uid,
+            groupId: GROUP_ID,
+            status: "preparing",
+            channelIds: [],
+          });
+        } finally {
+          store.close();
+        }
         const outcome = await dispatchThread(management, result.short_id, SHARED_DISPATCH);
         if (!outcome.dispatched || outcome.channel_id !== result.channel_id) {
           operationError = "shared thread dispatch did not target the created thread";
           return;
         }
+        await runGit(result.projects[0]!.path!, ["checkout", "-q", "-b", "unexpected-branch"]);
+        let replacedBranchRejected = false;
+        try {
+          await dispatchThread(management, result.short_id, "must not run with mismatched worktree identity");
+        } catch {
+          replacedBranchRejected = true;
+        }
+        await runGit(result.projects[0]!.path!, ["checkout", "-q", "consolidate-authentication-services"]);
+        if (!replacedBranchRejected) throw new Error("dispatch accepted a changed worktree branch");
         dispatched = outcome;
         return;
       }
@@ -2634,5 +2683,93 @@ test("shared workspaces reject a state directory inside a Git worktree before cr
   } finally {
     if (harness) await closeCoreHarness(harness, { remove: false });
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("ready real workspace dispatches after restart while another remote creation remains unknown", async () => {
+  let repo = "";
+  let created: SharedOutcome | undefined;
+  let error: string | undefined;
+  let dispatched: DispatchedOutcome | undefined;
+  let childCwd: string | undefined;
+  const createDone = promptCompletionLatch();
+  const { harness, transport } = await createWorkspaceHarness(async ({ text, promptContext }) => {
+    if (text !== "create restart workspace") return;
+    try {
+      created = JSON.parse(await createThread(managementTool(promptContext), {
+        name: "Restart Workspace",
+        layout: "shared",
+        worktree_name: "restart-workspace",
+        projects: [{ name: "api", repo }],
+      })) as SharedOutcome;
+    } catch (cause) {
+      error = String(cause);
+    } finally {
+      createDone.complete();
+    }
+  });
+  let closed = false;
+  let restarted: CoreHarness | undefined;
+  try {
+    repo = await createRepo(harness.root, "restart-source", "restart fixture\n");
+    await sendGroupTask(harness, "restart-workspace-create", "create restart workspace");
+    await finishGroupTask(harness, createDone.completion);
+    expect(error).toBeUndefined();
+    if (!created?.ready) throw new Error("workspace creation was not ready");
+    const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      store.saveThreadWorkspaceIntent({
+        id: "restart-unidentified-create",
+        botUid: harness.bot.uid,
+        groupId: GROUP_ID,
+        kind: "thread-create",
+        creatorChannelType: 2,
+        creatorChannelId: GROUP_ID,
+        status: "preparing",
+        channelIds: [],
+      });
+    } finally {
+      store.close();
+    }
+    await closeCoreHarness(harness, { remove: false });
+    closed = true;
+    const dispatchDone = promptCompletionLatch();
+    restarted = await createCoreHarness({
+      root: harness.root,
+      bot: harness.bot,
+      transport,
+      allowedGroupIds: [GROUP_ID],
+      ...(harness.worktreePort === undefined ? {} : { worktreePort: harness.worktreePort }),
+      prompt: async ({ text, cwd, promptContext }) => {
+        if (text === "dispatch restart workspace") {
+          try {
+            dispatched = await dispatchThread(managementTool(promptContext), created!.short_id, "run after restart");
+          } catch (cause) {
+            error = String(cause);
+          } finally {
+            dispatchDone.complete();
+          }
+        } else if (text === "run after restart") {
+          childCwd = cwd;
+        }
+      },
+    });
+    await sendGroupTask(restarted, "restart-workspace-dispatch", "dispatch restart workspace");
+    await finishGroupTask(restarted, dispatchDone.completion);
+    expect(error).toBeUndefined();
+    expect(dispatched).toMatchObject({ dispatched: true, channel_id: created.channel_id });
+    await restarted.workers.waitForPromptCount(2);
+    await finishThreadTask(restarted, created.channel_id);
+    expect(childCwd).toBe(created.cwd!);
+    const after = await ChannelStore.open(join(restarted.stateDir, "channel.sqlite"));
+    try {
+      expect(after.getThreadWorkspaceIntent(harness.bot.uid, "restart-unidentified-create")?.status).toBe("preparing");
+    } finally {
+      after.close();
+    }
+  } finally {
+    if (restarted) await closeCoreHarness(restarted, { remove: false });
+    if (!closed) await closeCoreHarness(harness, { remove: false });
+    await rm(harness.root, { recursive: true, force: true });
   }
 });

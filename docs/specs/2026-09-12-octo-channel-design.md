@@ -405,6 +405,8 @@ Mention 规则要求助手使用 `@[uid:显示名]` 表达明确点名，UID 来
 
 `create-thread` 支持 `projects:[{name,repo,base?}]`、`layout`、`background` 与既有 `worktree_name`。单项目可省略 layout；多项目必须显式选择 `shared` 或 `separate`。shared 创建一个 thread，以状态目录下非仓库入口为 cwd，入口内每个项目各有其 repo 派生的隔离 worktree；separate 按每个项目的 repo 分别创建 thread/worktree，返回各自 short id、实际路径、分支与状态。`background` 仅说明创建目的与涉及项目，宿主写入实际成功路径和必要关联子区，不承载任务、SDD 或验收；具体工作严格来自后续派发。既有 `worktree_name` 单仓库路径与命名能力保留，无显式项目时从调用方 cwd 解析源仓库；名称必须含 ASCII 字母或数字。wt 优先、不可用时回退真实 `omp worktree add`，wt 执行失败不静默切换。SQLite 独立保存资源归属和 preparing/ready/failed 状态，每步记录计划与确认结果；整次调用全部工作区、绑定和 THREAD.md 成功才 ready。部分失败返回已完成/失败/未确认资源，保留现场，不自动派发；重启后 preparing/failed 仍不可执行，也不能回落到父目录。普通入站与 thread-dispatch 共用门禁。显式 `/new`、`/move` 只改变当前绑定，不遗失旧资源；shared 缺失项目或入口时停止执行。详细接口、资源租约、失败与验收 SDD 统一见 `2026-09-17-thread-worktrunk-design.md`。
 
+同组存在远端身份未知的创建时，已独立确认归属或绑定的子区不因此被统一拦截；仍绑定工作区的目标须通过完整 ready 记录和 Git 路径、来源仓库及分支身份核验。确切映射到目标的未完成创建仍阻挡，无法归属的子区继续受保护。未知结果保留、不重建，详见 Worktrunk SDD 的状态协调。
+
 新建隔离资源的任务名由 agent 通过 `worktree_name` 提供，显式 projects 时必填。ASCII 小写、单连字符规范化后任务与项目 slug 均限 1–100 字符，不截断单词；超长要求 agent 缩短完整语义。shared 使用 `<stateDir>/thread-workspaces/<唯一任务目录>/<主群作用域名称>` 作为入口，入口内项目目录独立使用项目 slug，各不同仓库分支使用同一完整任务 slug；single/separate 保持 `<repo>.<任务 slug>` 布局。主群作用域取持久绑定 cwd 对应的 Git 主检出根目录名或非 Git cwd 目录名，按 OMP 规则转小写；从子区发起仍读取主群绑定。在有效 Hindsight 配置一致时，相同作用域复用 bank 及项目标签；配置由用户管理。实际任务路径或分支重名才追加 `-2`、`-3`，项目显示名或规范化冲突则创建前要求明确限定名。任务目录与入口均持久记录归属；`/thread remove` 在项目释放后递归清理入口，任务目录仅移除空目录；已有资源和归属不改名。详细边界及验收见既有 Worktrunk SDD。
 
 

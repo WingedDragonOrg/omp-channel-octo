@@ -612,6 +612,47 @@ test("a definitively failed thread-create intent does not block unrelated childr
   });
 });
 
+test("unidentified thread creation does not block an established child after reopen, but its own mapped creation does", async () => {
+  const root = await mkdtemp(join(tmpdir(), "omp-thread-intent-scope-"));
+  const target = { channelType: 5 as const, channelId: "group-a____ready" };
+  try {
+    const first = await openChannelStore(root);
+    first.ensureBinding({
+      botUid,
+      ...target,
+      sessionId: "ready-session",
+      cwd: root,
+      sessionFile: null,
+    });
+    first.saveThreadWorkspaceIntent({
+      id: "unknown-create",
+      botUid,
+      groupId: "group-a",
+      kind: "thread-create",
+      creatorChannelType: 2,
+      creatorChannelId: "group-a",
+      status: "preparing",
+      channelIds: [],
+    });
+    first.close();
+
+    const reopened = await openChannelStore(root);
+    try {
+      expect(reopened.isThreadWorkspaceIntentBlocked(botUid, target)).toBe(false);
+      expect(reopened.isThreadWorkspaceIntentBlocked(botUid, {
+        channelType: 5, channelId: "group-a____unidentified",
+      })).toBe(true);
+      expect(reopened.getThreadWorkspaceIntent(botUid, "unknown-create")?.status).toBe("preparing");
+      reopened.addThreadWorkspaceIntentChannel(botUid, "unknown-create", target.channelId);
+      expect(reopened.isThreadWorkspaceIntentBlocked(botUid, target)).toBe(true);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 
 test("thread workspace intent finalizes after a crash only when every mapped ownership row is terminal", async () => {
   await withStore(async (store) => {

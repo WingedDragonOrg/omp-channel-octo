@@ -25,7 +25,7 @@ import type { TaskRecord } from "./store/store-records.ts";
 import type { ThreadWorkspaceRecord } from "./store/store-records.ts";
 import type { WatchCreateArgs, WatchCreateResult, WatchListItem, WatchRecord } from "./watch/types.ts";
 import type { DestructiveResourceLease } from "./tasks/task-scheduler.ts";
-import { threadWorkspaceIsAvailable } from "./session/session-lifecycle.ts";
+import { threadWorkspaceIdentityMatches, threadWorkspaceIsAvailable } from "./session/session-lifecycle.ts";
 import {
   createThreadWorkspaceBatch,
   prepareThreadWorkspaceScope,
@@ -100,6 +100,7 @@ export interface HostToolHost {
     | "completeThreadWorkspaceIntent"
     | "failThreadWorkspaceIntent"
     | "getThreadWorkspaceIntent"
+    | "listThreadWorkspaceIntents"
     | "isThreadWorkspaceIntentBlocked"
     | "workspaceDirectories"
     | "ensureThreadListen"
@@ -1849,6 +1850,9 @@ async function dispatchThreadTask(
   if (ownership !== null) {
     const binding = host.store.getBinding(host.botUid, threadTarget);
     const workspaceAvailable = await threadWorkspaceIsAvailable(ownership);
+    const unidentifiedCreate = host.store.listThreadWorkspaceIntents(host.botUid, groupId).some(
+      (intent) => intent.status === "preparing" && intent.channelIds.length === 0,
+    );
     const legacyFallback =
       ownership.layout === "single" &&
       ownership.legacyWorktreeName !== undefined &&
@@ -1866,7 +1870,8 @@ async function dispatchThreadTask(
     })();
     if (
       (binding === null && !legacyFallback) ||
-      (bindingUsesWorkspace && !workspaceAvailable && !legacyFallback)
+      (bindingUsesWorkspace && (!workspaceAvailable ||
+        (unidentifiedCreate && !(await threadWorkspaceIdentityMatches(ownership)))) && !legacyFallback)
     ) {
       throw new Error("子区工作区未就绪，未派发任务。");
     }

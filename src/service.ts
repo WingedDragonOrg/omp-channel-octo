@@ -30,6 +30,7 @@ import { createWatchJudge } from "./watch/decision.ts";
 import { WatchCoordinator } from "./watch/index.ts";
 import {
   SessionLifecycle,
+  threadWorkspaceIdentityMatches,
   threadWorkspaceIsAvailable,
   type SessionCommandIngressHooks,
 } from "./session/session-lifecycle.ts";
@@ -4146,20 +4147,6 @@ class CoreService implements ChannelService {
     if (this.bot === undefined) return false;
     try {
       const parentGroupId = threadParentGroupId(target.channelId);
-      if (parentGroupId !== null) {
-        const unknownRemoteFork = this.store.listThreadForks(this.bot.uid).some(record => {
-          if (
-            record.groupId !== parentGroupId
-            || record.thread !== null
-            || (record.phase !== "creating" && record.phase !== "failed")
-          ) {
-            return false;
-          }
-          const intent = this.store.getThreadWorkspaceIntent(this.bot!.uid, record.id);
-          return intent?.status === "preparing" && intent.channelIds.length === 0;
-        });
-        if (unknownRemoteFork) return true;
-      }
       const fork = this.store.getThreadForkByTarget(this.bot.uid, target);
       if (fork !== null && fork.phase !== "ready") return true;
       if (this.store.isThreadWorkspaceIntentBlocked(this.bot.uid, target)) return true;
@@ -4175,7 +4162,10 @@ class CoreService implements ChannelService {
       // Fresh inbound can create a binding inside a ready workspace; a persisted task cannot
       // trust its old cwd without the binding that established it.
       if (binding === null) {
-        return requireBinding || !(await threadWorkspaceIsAvailable(workspace));
+        return requireBinding || !(await threadWorkspaceIsAvailable(workspace)) ||
+          (parentGroupId !== null && this.store.listThreadWorkspaceIntents(this.bot.uid, parentGroupId).some(
+            (intent) => intent.status === "preparing" && intent.channelIds.length === 0,
+          ) && !(await threadWorkspaceIdentityMatches(workspace)));
       }
       const related = new Set(this.store.workspaceDirectories(binding.cwd));
       const stillOwned =
@@ -4183,6 +4173,9 @@ class CoreService implements ChannelService {
         || workspace.projects.some((project) => project.path !== null && related.has(project.path));
       if (!stillOwned) return false;
       if (!(await threadWorkspaceIsAvailable(workspace))) return true;
+      if (parentGroupId !== null && this.store.listThreadWorkspaceIntents(this.bot.uid, parentGroupId).some(
+        (intent) => intent.status === "preparing" && intent.channelIds.length === 0,
+      ) && !(await threadWorkspaceIdentityMatches(workspace))) return true;
       const bindingCwd = await canonicalExistingDirectory(binding.cwd).catch(() => null);
       return bindingCwd !== binding.cwd;
     } catch {

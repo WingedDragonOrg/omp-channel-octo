@@ -108,6 +108,23 @@ async function gitDirectory(
   return realpath(isAbsolute(value) ? value : resolve(cwd, value));
 }
 
+export async function worktreeMatchesOwnership(path: string, repo: string, branch: string): Promise<boolean> {
+  const timeoutMs = 10_000;
+  try {
+    const [topLevel, commonDir, sourceCommonDir, currentBranch] = await Promise.all([
+      gitDirectory(path, "--show-toplevel", timeoutMs),
+      gitDirectory(path, "--git-common-dir", timeoutMs),
+      gitDirectory(repo, "--git-common-dir", timeoutMs),
+      runCommand(["git", "-C", path, "branch", "--show-current"], { timeoutMs }),
+    ]);
+    return topLevel === path && commonDir === sourceCommonDir
+      && currentBranch !== null && !currentBranch.timedOut && !currentBranch.aborted
+      && currentBranch.exitCode === 0 && currentBranch.stdout.trim() === branch;
+  } catch {
+    return false;
+  }
+}
+
 function missingPath(error: unknown): boolean {
   return (
     typeof error === "object" &&

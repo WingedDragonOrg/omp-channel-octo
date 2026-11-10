@@ -266,7 +266,7 @@ export function isThreadWorkspaceIntentBlocked(db: Database, botUid: string, tar
   if (intents.some(
     (intent) => intent.kind === "thread-create"
       && intent.status === "preparing"
-      && (intent.channelIds.length === 0 || intent.channelIds.includes(target.channelId)),
+      && intent.channelIds.includes(target.channelId),
   )) return true;
   if (intents.length === 0) return false;
   // Workspace rows govern their own readiness; without a row, an established binding lets an

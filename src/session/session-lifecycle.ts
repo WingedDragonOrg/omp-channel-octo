@@ -38,6 +38,7 @@ import {
   resolveWorkDirectory,
   stripOuterQuotes,
 } from "../workspace/workdir.ts";
+import { worktreeMatchesOwnership } from "../workspace/worktree.ts";
 
 /**
  * 生命周期可以触及的自有状态之外的一切：持久化的绑定行/worker 台账/聊天模型、命令启动候选
@@ -122,6 +123,14 @@ export async function threadWorkspaceIsAvailable(workspace: ThreadWorkspaceRecor
     if (!project.created || project.path === null || project.branch === null) return false;
     const projectPath = await canonicalExistingDirectory(project.path).catch(() => null);
     if (projectPath !== project.path) return false;
+  }
+  return true;
+}
+
+export async function threadWorkspaceIdentityMatches(workspace: ThreadWorkspaceRecord): Promise<boolean> {
+  for (const project of workspace.projects) {
+    if (project.path === null || project.branch === null ||
+      !(await worktreeMatchesOwnership(project.path, project.repo, project.branch))) return false;
   }
   return true;
 }
