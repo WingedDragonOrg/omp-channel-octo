@@ -14,6 +14,7 @@ import {
 import { ProgressCards, type TaskProgress } from "./cards/progress-cards.ts";
 import { HostMergeProgressCards, type HostMergeProgressSession } from "./cards/host-merge-progress.ts";
 import { buildStatusCard } from "./cards/status-card.ts";
+import { buildContextCard } from "./cards/context-card.ts";
 import type { CommitContent } from "./cards/commit-content.ts";
 import { COMMIT_RESULT_UNKNOWN, type ExecutionEvent } from "./cards/execution-tracker.ts";
 import { CHAT_GRANT_ACTION_PREFIX } from "./cards/chat-grant-card.ts";
@@ -10840,6 +10841,7 @@ class CoreService implements ChannelService {
       control: runtime,
       stopping: () => this.stopping,
       parseAssistantMentions: true,
+      contextCommand: !resuming && task.text.trim() === "/context",
       outbox: this.outbox,
       progress,
       persistResearchReport: report => this.persistResearchReport(target, report),
@@ -11143,6 +11145,28 @@ class CoreService implements ChannelService {
         await freshReadBridge;
         if (historyTurn) this.history.commitTurn(target, verified.sessionId, historyTurn);
         await runtime.steerSerial;
+      }
+      if (events.contextOutput !== undefined && !runtime.cancelRequested && runtime.stopCause === null && !runtime.suspended && !this.stopping) {
+        const signal = AbortSignal.any([this.shutdownController.signal, runtime.cancelController.signal, AbortSignal.timeout(10_000)]);
+        const aborted = Promise.withResolvers<never>();
+        const onAbort = (): void => aborted.reject(signal.reason);
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+        let delivered = false;
+        try {
+          const receipt = await Promise.race([
+            this.options.transport.sendCard(target, buildContextCard(events.contextOutput), `context-${taskId}`, signal),
+            aborted.promise,
+          ]);
+          delivered = Boolean(receipt?.messageId?.trim());
+        } catch {
+          // The send may have reached the server; report failure without sending another card.
+        } finally {
+          signal.removeEventListener("abort", onAbort);
+        }
+        if (!delivered && !runtime.cancelRequested && !this.stopping) {
+          this.outbox.enqueueText(target, "/context 卡片发送失败或送达状态未知。", taskId);
+        }
       }
       if (
         isTanDispatch

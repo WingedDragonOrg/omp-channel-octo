@@ -1220,6 +1220,17 @@ describe("OMP RPC worker", () => {
 		);
 	});
 
+	test("/context removes terminal escape sequences without losing native metrics", async () => {
+		await withHarness("context-card", async harness => {
+			const events: WorkerEvent[] = [];
+			await harness.worker.prompt("/context", event => events.push(event));
+			const notice = events.find(event => event.type === "notice");
+			expect(notice?.text).toContain("3094 tokens");
+			expect(notice?.text).toContain("16217 tokens");
+			expect(notice?.text).not.toMatch(/\x1b|\[38;5;243m|\[39m|\[22m/u);
+		});
+	});
+
 	test("completes a local-only prompt from the ack's agentInvoked false with one local command event", async () => {
 		await withHarness("local", async harness => {
 			const events: WorkerEvent[] = [];

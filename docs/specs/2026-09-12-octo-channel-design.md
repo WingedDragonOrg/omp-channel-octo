@@ -29,6 +29,8 @@
 群与子区当前事实清单使用当前 GROUP.md / THREAD.md 中的固定 `### Memory Start ###` / `### Memory End ###` 区段。agent 先通过已有 `octo_management.description-read` 读取完整说明，只修改该区段并保留区段外原文，再经 `description-write` 写回；宿主要求本任务先显式读取，并在写前重新核对正文与版本，说明变化时拒绝并要求重读。群与子区分别使用自己的说明，沿用现有版本快照与 compaction 注入。完整合同与验收见 `docs/specs/2026-11-04-group-thread-current-facts-design.md`。
 
 包含显式请求驱动的有界语义 `watch`：宿主持久保存采集器、完成条件、间隔和截止时间，独立于原 OMP worker 周期检查；单次命中生成归属聊天的独立排队输入。启用 `decisions` 时 watch 默认启用，并与引用识别共用 protocol、endpoint、model 和 key；可用 `watch.enabled=false` 单独关闭。客观状态、退出或事件条件使用程序机制。完整授权、预算、停止与恢复契约见 `docs/specs/2026-11-04-bounded-stoppable-watch-design.md`。
+原生 `/context` 以独立 `octo/v1` 卡展示 OMP 的上下文占用明细；不支持卡片或发送失败时只发送失败提示，不重试卡片。命令与投递边界见 `docs/specs/2026-11-10-context-command-card-design.md`。
+
 
 不包含终端会话接管、多用户服务、通用网络 Agent gateway、文档评论任务、服务端通用 bot_task、群历史归档与检索、出站附件之外的通用文件托管和交互 callback 系统。channel 仅提供由 OMP host tool 明确发起的出站图片/文件发送，以及由能力 profile 明确启用的 Octo raw type17 `octo/v1` AdaptiveCard 1.5 进度展示和 `octo/v2` 交互问答卡片；交互卡片的上行只使用该 Bot 自己的事件队列（`/v1/bot/events` 轮询与 ack），不注册回调地址、不实现通用 callback 或审批流。收到的入站消息按已确认的类型表提取内容，贴纸、系统与 CMD 等没有内容的类型明确告知，不作为成功执行。范围以个人 IM 交互为准，不继承参考适配器的其他任务入口。
 

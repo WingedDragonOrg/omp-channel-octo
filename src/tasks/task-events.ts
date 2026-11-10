@@ -30,6 +30,8 @@ export interface TaskEventsDeps {
   stopping: () => boolean;
   /** Enable structured mentions for assistant text, independently of notice delivery. */
   parseAssistantMentions: boolean;
+  /** Capture a native /context command output for its standalone card. */
+  contextCommand?: boolean;
   outbox: Pick<Outbox, "enqueueStreamText">;
   progress: Pick<TaskProgress, "apply">;
   /**
@@ -68,6 +70,7 @@ export class TaskEvents {
    * pending，下一个真实生成回合仍以 initial 注入并用真实 receipt 提交。
    */
   private localCommand = false;
+  contextOutput: string | undefined;
 
   constructor(private readonly deps: TaskEventsDeps) {}
 
@@ -77,6 +80,10 @@ export class TaskEvents {
       // 扩展的通知帧（如 /autoresearch 的 enable/off/拒绝原因）是信息性 UI：原样投递到
       // 对应会话、带上级别标签，但它不是回合产出——不进 assistantTexts/resultText、不开
       // 进度卡，也绝不能改 workAfterStop，让 /interrupt 的归因保持诚实。
+      if (this.deps.contextCommand && event.messageId.startsWith("command:")) {
+        this.contextOutput = event.text;
+        return;
+      }
       if (event.messageId.trim().length === 0 || event.text.length === 0) return;
       const label = event.level === "error"
         ? "OMP 错误："

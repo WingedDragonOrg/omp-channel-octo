@@ -20,6 +20,7 @@ import {
   FakeTransport,
   FakeWorkerFactory,
   inbound,
+  submitAndWaitForIngressHandoff,
   waitForStatus,
 } from "./fixtures/core-fakes";
 
@@ -1097,6 +1098,121 @@ test("an aborted running card edit still submits the terminal card state", async
   } finally {
     releaseWorker();
     vi.useRealTimers();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("/context delivers its native metrics in a separate card", async () => {
+  const transport = new PresentationTransport();
+  transport.cardSupported = true;
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ emit }) => {
+      emit(noticeEvent("command:1:1", "Context window: 400000 tokens (8% used)\n  System prompt [░░] 1% 3094 tokens\n  Messages [█░] 4% 16217 tokens", "info"));
+      emit({ type: "local_command" });
+    },
+  });
+  const task = inbound({ messageId: "context-card", channelId: "dm-context-card", text: "/context" });
+  try {
+    await harness.service.submitInbound(task);
+    await waitForStatus(harness.service, task, status => status.state === "completed" && status.outbox === 0);
+    expect(transport.sentCards).toHaveLength(1);
+    const card = JSON.stringify(transport.sentCards[0]!.frame);
+    expect(card).toContain("400000");
+    expect(card).toContain("3094");
+    expect(card).toContain("16217");
+    expect(card).not.toMatch(/[░█\x1b]/u);
+    expect(transport.listRemoteText(task)).toHaveLength(0);
+    expect(transport.progressCardSends).toHaveLength(0);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("/context reports card unavailability without sending command output as text", async () => {
+  const transport = new PresentationTransport();
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ emit }) => {
+      emit(noticeEvent("command:1:1", "Context window: 400000 tokens (8% used)", "info"));
+      emit({ type: "local_command" });
+    },
+  });
+  const task = inbound({ messageId: "context-card-failure", channelId: "dm-context-card-failure", text: "/context" });
+  try {
+    await harness.service.submitInbound(task);
+    await waitForStatus(harness.service, task, status => status.state === "completed" && status.outbox === 0);
+    const messages = transport.listRemoteText(task).map(message => message.text).join("\n");
+    expect(messages).toMatch(/卡片.*失败/u);
+    expect(messages).not.toContain("400000");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("/context reports a card send failure without retrying or exposing native output", async () => {
+  const transport = new PresentationTransport();
+  transport.cardSupported = true;
+  transport.cardSendFailure = new Error("fixture card failure");
+  let attempts = 0;
+  const sendCard = transport.sendCard.bind(transport);
+  transport.sendCard = async (...args) => {
+    attempts++;
+    return sendCard(...args);
+  };
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ emit }) => {
+      emit(noticeEvent("command:1:1", "Context window: 400000 tokens (8% used)", "info"));
+      emit({ type: "local_command" });
+    },
+  });
+  const task = inbound({ messageId: "context-card-send-error", channelId: "dm-context-card-send-error", text: "/context" });
+  try {
+    await harness.service.submitInbound(task);
+    await waitForStatus(harness.service, task, status => status.state === "completed" && status.outbox === 0);
+    expect(attempts).toBe(1);
+    expect(transport.sentCards).toHaveLength(0);
+    const messages = transport.listRemoteText(task).map(message => message.text).join("\n");
+    expect(messages).toMatch(/卡片.*失败/u);
+    expect(messages).not.toContain("400000");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("queued /context waits for the previous task and produces a separate card", async () => {
+  const transport = new PresentationTransport();
+  transport.cardSupported = true;
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const harness = await createCoreHarness({
+    transport,
+    prompt: async ({ text, emit }) => {
+      if (text === "hold") {
+        started.resolve();
+        await release.promise;
+      } else if (text === "/context") {
+        emit(noticeEvent("command:1:1", "Context window: 400000 tokens (8% used)", "info"));
+        emit({ type: "local_command" });
+      }
+    },
+  });
+  const target = { channelId: "dm-context-queued", channelType: 1 as const };
+  try {
+    await submitAndWaitForIngressHandoff(harness, inbound({ ...target, messageId: "context-mode", text: "/mode queue" }));
+    await submitAndWaitForIngressHandoff(harness, inbound({ ...target, messageId: "context-hold", text: "hold" }));
+    await started.promise;
+    await submitAndWaitForIngressHandoff(harness, inbound({ ...target, messageId: "context-queued", text: "/context" }));
+    expect((await harness.service.status(target)).queued).toBe(1);
+    expect(transport.sentCards).toHaveLength(0);
+    release.resolve();
+    await waitForStatus(harness.service, target, status => status.state === "completed" && status.queued === 0 && status.outbox === 0);
+    expect(harness.workers.prompts.map(prompt => prompt.text)).toEqual(["hold", "/context"]);
+    expect(transport.sentCards).toHaveLength(1);
+    expect(transport.sentCards[0]!.frame.plain).toContain("400000");
+  } finally {
+    release.resolve();
     await closeCoreHarness(harness);
   }
 });

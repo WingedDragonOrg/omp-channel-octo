@@ -1,5 +1,6 @@
 import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import type {
 	CommitWorker,
 	CommitWorkerOptions,
@@ -1256,7 +1257,7 @@ class RpcWorker implements OmpWorker {
 			if (active && this.#pending.has(active.requestId) && !this.#suppressCommandOutput) {
 				this.#handleNotice({
 					id: `command:${active.requestId}:${++this.#commandOutputCounter}`,
-					message: frame.text,
+					message: typeof frame.text === "string" ? stripVTControlCharacters(frame.text) : frame.text,
 				});
 			}
 			return;

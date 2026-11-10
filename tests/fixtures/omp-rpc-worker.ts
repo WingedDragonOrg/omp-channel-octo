@@ -12,6 +12,7 @@ import { dirname, join, resolve } from "node:path";
 type Frame = Record<string, unknown>;
 
 type Scenario =
+	| "context-card"
 	| "compaction-abort-before-start"
 	| "compaction-abort-start-race"
 	| "compaction-auto"
@@ -1535,6 +1536,11 @@ function emitResearchHigherScenario(id: string | undefined): void {
 
 async function handlePrompt(id: string | undefined, message: string): Promise<void> {
 	appendLog({ kind: "prompt", id, message });
+	if (scenario === "context-card" && message === "/context") {
+		emit({ type: "command_output", text: "Context window: 400000 tokens (8% used)\n  System prompt [\u001b[38;5;243m░░\u001b[39m] 1% 3094 tokens\n  Messages [\u001b[1m█░\u001b[22m] 4% 16217 tokens" });
+		response(id, "prompt", { agentInvoked: false });
+		return;
+	}
 	if (message.startsWith("/switch")) {
 		// OMP dispatches `/switch` as a builtin: no agent turn, a `command_output` line, and on
 		// success the `config_update` frame that announces the resolved model and level. The
