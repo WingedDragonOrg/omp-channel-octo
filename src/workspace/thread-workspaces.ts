@@ -652,6 +652,7 @@ export async function createThreadWorkspaceBatch(
   signal: AbortSignal,
   onThreadCreated?: (thread: ThreadSummary) => void,
   creator: ChatTarget = { channelType: 2, channelId: groupId },
+  beforeRemoteCreate?: () => Promise<void>,
 ): Promise<ThreadWorkspaceBatchResult> {
   if (plan.layout === "shared" && plan.projects.length === 0) {
     throw new Error("shared workspace requires at least one project");
@@ -715,6 +716,18 @@ export async function createThreadWorkspaceBatch(
         remoteFailures.push({ name: failed.name, repo: failed.repo, error: detail });
       }
       break;
+    }
+    if (beforeRemoteCreate !== undefined) {
+      try {
+        await beforeRemoteCreate();
+      } catch (error) {
+        host.store.failThreadWorkspaceIntent(
+          host.botUid,
+          intentId,
+          boundedError(error, "线程创建前校验失败"),
+        );
+        throw error;
+      }
     }
     try {
       thread = await host.transport.createThread(groupId, threadLabel, signal);

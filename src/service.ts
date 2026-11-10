@@ -5161,9 +5161,9 @@ class CoreService implements ChannelService {
     target: ChatTarget,
     text: string,
     guard: () => boolean,
-    beforeWorkerSteer: () => boolean,
+    _beforeWorkerSteer: () => boolean,
     beforeTaskAccept: () => boolean,
-    onWorkerSteerAccepted: () => void,
+    _onWorkerSteerAccepted: () => void,
   ): Promise<LoopDeliveryOutcome> {
     const botUid = this.bot?.uid;
     const ownerId = botUid === undefined ? "" : this.store.getOwnerId(botUid)?.trim() ?? "";
@@ -5181,8 +5181,6 @@ class CoreService implements ChannelService {
         && this.authorization.isPermittedChat(target)
         && guard();
     };
-    const steeringGuard = (): boolean =>
-      this.store.pendingQuestionIds(botUid, target).length === 0 && authorized();
     const message: InboundMessage = {
       ...target,
       messageId: `loop:${input.id}`,
@@ -5196,47 +5194,7 @@ class CoreService implements ChannelService {
       messageTimestamp: Date.now(),
     };
     if (!authorized()) return "not-accepted";
-    const claimSteerIntent = (): boolean => steeringGuard() && beforeWorkerSteer();
     const claimAcceptIntent = (): boolean => authorized() && beforeTaskAccept();
-    if (this.store.pendingQuestionIds(botUid, target).length === 0) {
-      let steerIntentClaimed = false;
-      let workerSteerAccepted = false;
-      let steerRejected = false;
-      const steered = await this.appendToRunningTask(
-        message,
-        text,
-        steeringGuard,
-        () => {
-          steerIntentClaimed = claimSteerIntent();
-          return steerIntentClaimed;
-        },
-        false,
-        true,
-        () => {
-          workerSteerAccepted = true;
-          onWorkerSteerAccepted();
-        },
-        undefined,
-        false,
-        undefined,
-        () => { steerRejected = true; },
-      );
-      if (workerSteerAccepted) return "accepted";
-      const task = this.store.getTaskByMessageId(botUid, target, message.messageId);
-      const commandState = this.store.getCommandClaimState(botUid, target, message.messageId);
-      if (task !== null || commandState === "completed") {
-        if (!steerIntentClaimed) claimAcceptIntent();
-        return "accepted";
-      }
-      if (commandState === "pending") {
-        if (!steerIntentClaimed) claimAcceptIntent();
-        return "unknown";
-      }
-      if (steerIntentClaimed && !steerRejected) return "unknown";
-      if (steerRejected) this.store.markLoopInputPending(input.id);
-      if (steered) return "not-accepted";
-    }
-    if (!authorized()) return "not-accepted";
     const accepted = await this.acceptTask(
       message,
       text,
@@ -8212,7 +8170,7 @@ class CoreService implements ChannelService {
     acceptGuard?: () => boolean,
     schedule = true,
     observeReferences = false,
-    beforeAccept?: () => boolean,
+    beforeAccept?: () => boolean | Promise<boolean>,
     silentFailure = false,
     tanOperationId?: string,
     persistTask?: (claim: InboundClaim, task: TaskRecord, goalRequest?: GoalTaskRequest) => boolean,
@@ -8284,7 +8242,13 @@ class CoreService implements ChannelService {
     const bindingAtAccept = this.store.getBinding(this.bot!.uid, message);
     if (bindingAtAccept === null || !this.sameBindingState(bindingAtAccept, binding)) return false;
     if (acceptGuard && !acceptGuard()) return false;
-    if (beforeAccept && !beforeAccept()) return false;
+    if (beforeAccept) {
+      const allowed = beforeAccept();
+      if (!(allowed instanceof Promise ? await allowed : allowed)) return false;
+    }
+    this.throwIfStopping();
+    const bindingAfterAcceptCheck = this.store.getBinding(this.bot!.uid, message);
+    if ((acceptGuard && !acceptGuard()) || bindingAfterAcceptCheck === null || !this.sameBindingState(bindingAfterAcceptCheck, binding)) return false;
     const task: TaskRecord = {
       id: randomUUID(),
       botUid: this.bot!.uid,
@@ -10276,7 +10240,7 @@ class CoreService implements ChannelService {
         this.scheduler.tryAcquireDestructiveResources(cwds, task),
       threadReferences: (target) => this.store.getThreadReferences(botUid, target),
       deleteThreadReferences: (target) => this.threadReferences.deleteThread(target),
-      deliverToChat: async (message, deliveryGuard) => {
+      deliverToChat: async (message, deliveryGuard, beforeAccept) => {
         const assertDeliveryGuard = (): void => {
           if (deliveryGuard !== undefined && !deliveryGuard()) {
             throw new Error("Loop task route changed before delivery; task was not accepted.");
@@ -10287,6 +10251,30 @@ class CoreService implements ChannelService {
           throw new Error("子区工作区未就绪，未派发任务。");
         }
         assertDeliveryGuard();
+        if (beforeAccept !== undefined) {
+          const accepted = await this.acceptTask(
+            message,
+            message.text,
+            true,
+            undefined,
+            undefined,
+            deliveryGuard,
+            true,
+            true,
+            async () => {
+              assertDeliveryGuard();
+              await beforeAccept();
+              assertDeliveryGuard();
+              return true;
+            },
+          );
+          if (accepted) return "queued";
+          assertDeliveryGuard();
+          if (this.store.getTaskByMessageId(botUid, message, message.messageId) !== null) {
+            return "queued";
+          }
+          throw new Error("Loop task delivery was not accepted.");
+        }
         if (deliveryGuard === undefined) {
           if (await this.appendToRunningTask(message, message.text, undefined, undefined, true)) return "steered";
           await this.acceptTask(message, message.text, true, undefined, undefined, undefined, true, true);

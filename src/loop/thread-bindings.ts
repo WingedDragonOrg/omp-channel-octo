@@ -9,6 +9,14 @@ import type {
   LoopThreadCreation,
 } from "./types.ts";
 
+export const LOOP_INPUT_MESSAGE_PREFIX = "loop:";
+
+const CLOSED_LOOP_TASK_STATUSES: Readonly<Record<string, true>> = {
+  backlog: true,
+  done: true,
+  cancelled: true,
+};
+
 export interface ResolvedLoopTask {
   binding: LoopBinding;
   key: LoopTaskKey;
@@ -69,6 +77,46 @@ export class LoopThreadBindings {
       key: { botUid: this.botUid, groupId, workspaceId: binding.workspaceId, taskId },
       task,
     };
+  }
+
+  /** Resolves durable Loop provenance and current status before automatic thread work. */
+  async resolveAutomaticTask(
+    messageId: string,
+    target: ChatTarget,
+    groupId: string,
+    taskId: string,
+    signal?: AbortSignal,
+  ): Promise<ResolvedLoopTask> {
+    if (!messageId.startsWith(LOOP_INPUT_MESSAGE_PREFIX)) {
+      throw new Error("automatic Loop input provenance could not be verified");
+    }
+    const inputId = messageId.slice(LOOP_INPUT_MESSAGE_PREFIX.length);
+    const input = inputId.length === 0 ? null : this.store.getLoopInput(inputId);
+    const binding = this.store.getLoopBinding(this.botUid, groupId);
+    if (
+      input === null
+      || input.botUid !== this.botUid
+      || input.groupId !== groupId
+      || input.target === null
+      || input.target.channelType !== target.channelType
+      || input.target.channelId !== target.channelId
+      || (input.state !== "intent" && input.state !== "delivered")
+      || binding === null
+      || input.workspaceId !== binding.workspaceId
+      || input.bindingVersion !== binding.version
+      || !input.tasks.some((candidate) => candidate.taskId === taskId)
+    ) {
+      throw new Error("automatic Loop input does not identify this current workspace task");
+    }
+    const resolved = await this.resolveTask(groupId, taskId, signal);
+    if (resolved.binding.workspaceId !== input.workspaceId) {
+      throw new Error("automatic Loop task workspace changed before thread work");
+    }
+    const normalizedStatus = resolved.task.status.trim().toLowerCase();
+    if (CLOSED_LOOP_TASK_STATUSES[normalizedStatus] === true) {
+      throw new Error(`closed Loop task status ${normalizedStatus} cannot start automatic thread work`);
+    }
+    return resolved;
   }
 
   activeCreation(key: LoopTaskKey): Promise<unknown> | null {

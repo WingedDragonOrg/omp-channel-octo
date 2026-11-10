@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Database } from "bun:sqlite";
 import type { ChatTarget } from "../contracts.ts";
 import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopThreadCreation, LoopWorkspace } from "../loop/types.ts";
+import { isLoopTaskAutomaticallyStartable } from "../loop/task-status.ts";
 import { getOwnerId } from "./store-chats.ts";
 import { asNullableString, asNumber, asString, query, run, transaction, type SqlRow, type SqlValue } from "./store-schema.ts";
 
@@ -139,6 +140,7 @@ function isLoopTaskAssignedToOwnerOrBot(task: LoopTask, botUid: string, ownerId:
     && (assigneeOctoUid === ownerId || assigneeOctoUid === botUid);
 }
 
+
 function taskBusinessJson(task: LoopTask): string {
   return JSON.stringify({
     taskId: task.taskId,
@@ -271,8 +273,11 @@ export function bindLoopWorkspace(
       const key = { ...keyBase, taskId: task.taskId };
       saveLoopTaskSnapshot(db, key, task, now);
       if (loopTaskRouteRow(db, key)) {
-        routedTasks.push(task);
-      } else if (isLoopTaskAssignedToOwnerOrBot(task, botUid, ownerId)) {
+        if (isLoopTaskAutomaticallyStartable(task.status)) routedTasks.push(task);
+      } else if (
+        isLoopTaskAutomaticallyStartable(task.status)
+        && isLoopTaskAssignedToOwnerOrBot(task, botUid, ownerId)
+      ) {
         unthreadedObservedTasks.push(task);
       }
     }
@@ -329,10 +334,10 @@ export function commitLoopScan(db: Database, binding: LoopBinding, tasks: readon
     for (const task of uniqueTasks) {
       const key = { ...keyBase, taskId: task.taskId };
       const previousRow = loopTaskSnapshotRow(db, key);
-      const observed = Boolean(loopTaskRouteRow(db, key))
-        || isLoopTaskAssignedToOwnerOrBot(task, binding.botUid, ownerId);
+      const assigned = isLoopTaskAssignedToOwnerOrBot(task, binding.botUid, ownerId);
+      const routed = Boolean(loopTaskRouteRow(db, key));
       if (!previousRow) {
-        if (observed) {
+        if (routed || (assigned && isLoopTaskAutomaticallyStartable(task.status))) {
           insertLoopInput(db, {
             botUid: binding.botUid,
             groupId: binding.groupId,
@@ -346,7 +351,7 @@ export function commitLoopScan(db: Database, binding: LoopBinding, tasks: readon
         }
       } else {
         const previous = JSON.parse(asString(previousRow.task_json)) as LoopTask;
-        if (observed && taskBusinessChanged(asString(previousRow.business_json), task)) {
+        if ((routed || assigned) && taskBusinessChanged(asString(previousRow.business_json), task)) {
           insertLoopInput(db, {
             botUid: binding.botUid,
             groupId: binding.groupId,
@@ -400,13 +405,16 @@ export function isLoopInputObserved(db: Database, input: LoopInput): boolean {
       taskId: task.taskId,
     };
     const routed = loopTaskRouteRow(db, key) !== undefined;
-    if (input.taskId === null) {
-      if (routed) return false;
-    } else if (routed) {
+    if (input.taskId === null && routed) return false;
+    const latest = latestLoopTaskSnapshot(db, key);
+    if (!latest) return false;
+    if (routed) {
+      if (input.kind !== "updated" && !isLoopTaskAutomaticallyStartable(latest.status)) return false;
       continue;
     }
-    const latest = latestLoopTaskSnapshot(db, key);
-    if (!latest || !isLoopTaskAssignedToOwnerOrBot(latest, input.botUid, ownerId)) return false;
+    if ((input.kind !== "updated" && !isLoopTaskAutomaticallyStartable(latest.status)) || !isLoopTaskAssignedToOwnerOrBot(latest, input.botUid, ownerId)) {
+      return false;
+    }
   }
   return true;
 }
@@ -431,13 +439,14 @@ export function prepareLoopInput(db: Database, id: string): LoopInput | null {
           workspaceId: input.workspaceId,
           taskId: task.taskId,
         };
+        const latest = latestLoopTaskSnapshot(db, key);
+        if (!latest || !isLoopTaskAutomaticallyStartable(latest.status)) continue;
         if (loopTaskRouteRow(db, key)) {
-          routedGroups.push([task]);
+          routedGroups.push([latest]);
           continue;
         }
-        const latest = latestLoopTaskSnapshot(db, key);
-        if (latest && isLoopTaskAssignedToOwnerOrBot(latest, input.botUid, ownerId)) {
-          mainTasks.push(task);
+        if (isLoopTaskAssignedToOwnerOrBot(latest, input.botUid, ownerId)) {
+          mainTasks.push(latest);
         }
       }
       const mainGroups: LoopTask[][] = Array.from(

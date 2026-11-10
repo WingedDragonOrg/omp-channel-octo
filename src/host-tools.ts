@@ -44,7 +44,7 @@ import {
   cleanupOwnedThreadWorkspace as cleanupOwnedWorkspace,
   threadWorkspaceCleanupPaths,
 } from "./threads/thread-workspace-cleanup.ts";
-import { LoopThreadBindings } from "./loop/thread-bindings.ts";
+import { LOOP_INPUT_MESSAGE_PREFIX, LoopThreadBindings } from "./loop/thread-bindings.ts";
 import type { LoopTaskKey, LoopTaskRoute, LoopThreadCreation } from "./loop/types.ts";
 /** The small chat-scoped watch surface consumed by host tools. */
 interface HostWatchPort {
@@ -146,8 +146,12 @@ export interface HostToolHost {
   ): Promise<void>;
   replayThreadMergeSuccess(target: ChatTarget, operationId: string): Promise<string | null>;
   readonly watches: HostWatchPort;
-  /** Delivers through the destination chat's steer-or-task path; an optional guard is checked at acceptance. */
-  deliverToChat(message: InboundMessage, deliveryGuard?: () => boolean): Promise<"steered" | "queued">;
+  /** Delivers through the destination chat path; optional guards run at durable acceptance. */
+  deliverToChat(
+    message: InboundMessage,
+    deliveryGuard?: () => boolean,
+    beforeAccept?: () => Promise<void>,
+  ): Promise<"steered" | "queued">;
   /** Accepts an explicit child-task input as an independently queued creator task. */
   sendThreadCreatorInput(task: TaskRecord, text: string, toolCallId: string, signal: AbortSignal): Promise<string>;
 
@@ -579,8 +583,14 @@ async function runLoopTaskThreadCreate(
   creation: ValidatedThreadCreation,
   signal: AbortSignal,
   toolCallId: string | undefined,
+  automaticLoopInput: boolean,
 ): Promise<string> {
   const loop = requireLoopBindings(host);
+  const assertAutomaticTaskOpen = async (): Promise<void> => {
+    if (!automaticLoopInput) return;
+    await loop.resolveAutomaticTask(task.messageId, target, groupId, key.taskId, signal);
+  };
+  await assertAutomaticTaskOpen();
   const active = loop.activeCreation(key);
   if (active !== null) return (await active) as string;
   const currentRoute = host.store.getLoopTaskRoute(key);
@@ -627,7 +637,21 @@ async function runLoopTaskThreadCreate(
             knownNoAllocation = true;
             throw signal.reason ?? new Error("thread creation was cancelled before the remote call");
           }
+          if (automaticLoopInput) {
+            knownNoAllocation = true;
+            try {
+              await assertAutomaticTaskOpen();
+            } catch (error) {
+              host.store.failThreadWorkspaceIntent(
+                host.botUid,
+                creatorIntentId,
+                boundedManagementError(error, "Loop task thread creation rejected before allocation"),
+              );
+              throw error;
+            }
+          }
           try {
+            knownNoAllocation = false;
             thread = await host.transport.createThread(groupId, name, signal);
           } catch (error) {
             if (definitiveThreadCreateRejection(error)) {
@@ -692,7 +716,9 @@ async function runLoopTaskThreadCreate(
       }
 
       let batch: ThreadWorkspaceBatchResult;
+      let allocationStarted = false;
       try {
+        await assertAutomaticTaskOpen();
         batch = await createThreadWorkspaceBatch(
           host,
           groupId,
@@ -704,11 +730,18 @@ async function runLoopTaskThreadCreate(
             recordCreatedThreadListen(host, thread, target, creation.listen);
           },
           target,
+          async () => {
+            await assertAutomaticTaskOpen();
+            allocationStarted = true;
+          },
         );
       } catch (error) {
         const detail = boundedManagementError(error, "Loop task 隔离工作区准备失败");
         let latest = host.store.getLoopThreadCreation(key);
-        if (latest?.state === "reserved") {
+        if (!allocationStarted && latest?.state === "reserved") {
+          host.store.releaseLoopThreadCreation(key, reservation.operationId);
+          latest = host.store.getLoopThreadCreation(key);
+        } else if (latest?.state === "reserved") {
           host.store.markLoopThreadCreationUnknown(key, reservation.operationId, detail);
           latest = host.store.getLoopThreadCreation(key);
         }
@@ -731,7 +764,11 @@ async function runLoopTaskThreadCreate(
       }
       if (latest?.state === "reserved") {
         const detail = allocationError ?? batch.error ?? outcome?.error ?? "远端线程分配结果未确认";
-        host.store.markLoopThreadCreationUnknown(key, reservation.operationId, detail);
+        if (!allocationStarted && outcome === undefined) {
+          host.store.releaseLoopThreadCreation(key, reservation.operationId);
+        } else {
+          host.store.markLoopThreadCreationUnknown(key, reservation.operationId, detail);
+        }
         latest = host.store.getLoopThreadCreation(key);
       }
       let routeBound = false;
@@ -1188,6 +1225,7 @@ async function runManagementTool(
   onWorktreeMergeLifecycle?: (lifecycle: WorktreeMergeLifecycle) => void,
 ): Promise<string> {
   const action = args.action;
+  const automaticLoopInput = task.messageId.startsWith(LOOP_INPUT_MESSAGE_PREFIX);
   const known: readonly string[] = [...MANAGEMENT_BASE_ACTIONS, MANAGEMENT_DISPATCH_ACTION];
   if (typeof action !== "string" || !known.includes(action)) {
     throw new Error(`unknown action: ${typeof action === "string" ? action : String(action)}`);
@@ -1328,6 +1366,7 @@ async function runManagementTool(
       const name = namedText("name", MAX_MANAGEMENT_NAME_CHARS);
       const taskId = optionalText("task_id")?.trim();
       if (taskId === undefined) {
+        if (automaticLoopInput) throw new Error("task_id is required for automatic Loop thread creation");
         const creation = await validateThreadCreation(args, task.cwd, worktreeName(), signal);
         if (creation.workspace !== null) {
           await prepareThreadWorkspaceScope(host, groupId, creation.workspace, signal);
@@ -1435,7 +1474,10 @@ async function runManagementTool(
       if (args.layout === "separate" && Array.isArray(args.projects) && args.projects.length > 1) {
         throw new Error("task_id cannot create multiple separate threads; create one target and bind it explicitly");
       }
-      const { key } = await loop.resolveTask(groupId, taskId, signal);
+      const resolved = automaticLoopInput
+        ? await loop.resolveAutomaticTask(task.messageId, target, groupId, taskId, signal)
+        : await loop.resolveTask(groupId, taskId, signal);
+      const { key } = resolved;
       const active = loop.activeCreation(key);
       if (active !== null) return (await active) as string;
       const currentRoute = host.store.getLoopTaskRoute(key);
@@ -1462,6 +1504,7 @@ async function runManagementTool(
         creation,
         signal,
         toolCallId,
+        automaticLoopInput,
       );
     }
     case "thread-bind": {
@@ -1656,20 +1699,47 @@ async function runManagementTool(
         throw new Error(`text must be at most ${MAX_MANAGEMENT_TASK_CHARS} characters`);
       }
       const taskId = optionalText("task_id")?.trim();
+      if (automaticLoopInput && taskId === undefined) {
+        throw new Error("task_id is required for automatic Loop thread dispatch");
+      }
       const text = taskId === undefined ? normalizedText : rawText;
       let sourceKey: LoopTaskKey | undefined;
+      let beforeAccept: (() => Promise<void>) | undefined;
       if (taskId !== undefined) {
         if (taskId.length === 0) throw new Error("task_id must not be empty");
         const loop = requireLoopBindings(host);
-        const resolved = await loop.resolveTask(groupId, taskId, signal);
+        const resolveTask = () => loop.resolveAutomaticTask(
+          task.messageId,
+          target,
+          groupId,
+          taskId,
+          signal,
+        );
+        const resolved = automaticLoopInput
+          ? await resolveTask()
+          : await loop.resolveTask(groupId, taskId, signal);
         const route = host.store.getLoopTaskRoute(resolved.key);
         const requestedChannelId = threadChannelId(groupId, shortId);
         if (route === null || route.threadChannelId !== requestedChannelId) {
           throw new Error("task_id is not currently associated with the requested thread");
         }
         sourceKey = resolved.key;
+        if (automaticLoopInput) {
+          beforeAccept = async () => { await resolveTask(); };
+        }
       }
-      return dispatchThreadTask(host, task, target, groupId, shortId, text, signal, sourceKey, toolCallId);
+      return dispatchThreadTask(
+        host,
+        task,
+        target,
+        groupId,
+        shortId,
+        text,
+        signal,
+        sourceKey,
+        toolCallId,
+        beforeAccept,
+      );
     }
     default: {
       throw new Error(`unknown action: ${action}`);
@@ -1798,13 +1868,13 @@ async function dispatchTaskToThread(
   sourceKey?: LoopTaskKey,
   deliveryGuard?: () => boolean,
   stableMessageId?: string,
+  beforeAccept?: () => Promise<void>,
 ): Promise<{ messageId: string; delivery: "steered" | "queued" }> {
   const ownerId = host.store.getOwnerId(host.botUid)?.trim() ?? "";
-  if (ownerId.length === 0) {
-    throw new Error("owner is not enrolled; cannot dispatch a task");
-  }
+  if (ownerId.length === 0) throw new Error("owner is not enrolled; cannot dispatch a task");
   const threadTarget: ChatTarget = { channelId: thread.channelId, channelType: 5 };
-  host.enqueueText(threadTarget, `来自群会话的派发任务：\n\n${text}`, null);
+  if (beforeAccept === undefined) host.enqueueText(threadTarget, `来自群会话的派发任务：\n\n${text}`, null);
+  if (beforeAccept !== undefined) await beforeAccept();
   const messageId = stableMessageId ?? `${DISPATCH_MESSAGE_PREFIX}${randomUUID()}`;
   const message: InboundMessage = {
     channelId: threadTarget.channelId,
@@ -1819,9 +1889,8 @@ async function dispatchTaskToThread(
     messageSeq: 0,
     messageTimestamp: Date.now(),
   };
-  const delivery = deliveryGuard === undefined
-    ? await host.deliverToChat(message)
-    : await host.deliverToChat(message, deliveryGuard);
+  const delivery = await host.deliverToChat(message, deliveryGuard, beforeAccept);
+  if (beforeAccept !== undefined) host.enqueueText(threadTarget, `来自群会话的派发任务：\n\n${text}`, null);
   return { messageId, delivery };
 }
 /**
@@ -1838,6 +1907,7 @@ async function dispatchThreadTask(
   signal: AbortSignal,
   sourceKey?: LoopTaskKey,
   toolCallId?: string,
+  beforeAccept?: () => Promise<void>,
 ): Promise<string> {
   const threadTarget: ChatTarget = { channelId: threadChannelId(groupId, shortId), channelType: 5 };
   if (sourceKey !== undefined) {
@@ -1897,7 +1967,15 @@ async function dispatchThreadTask(
   const stableMessageId = sourceKey === undefined || toolCallId === undefined
     ? undefined
     : `${DISPATCH_MESSAGE_PREFIX}loop-${createHash("sha256").update(JSON.stringify([task.id, toolCallId])).digest("hex")}`;
-  const { messageId, delivery } = await dispatchTaskToThread(host, thread, text, sourceKey, deliveryGuard, stableMessageId);
+  const { messageId, delivery } = await dispatchTaskToThread(
+    host,
+    thread,
+    text,
+    sourceKey,
+    deliveryGuard,
+    stableMessageId,
+    beforeAccept,
+  );
   host.enqueueText(
     target,
     delivery === "steered"

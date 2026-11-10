@@ -304,6 +304,73 @@ test("unobserved creations stay silent and later owner or Bot assignment deliver
     await closeCoreHarness(harness);
   }
 });
+test("CoreService skips terminal Loop tasks until they reopen", async () => {
+  const terminalStatuses = ["done", "cancelled", "backlog"] as const;
+  const terminalTasks = terminalStatuses.map((status) => task(
+    `terminal-${status}`,
+    `${status} task`,
+    { status },
+  ));
+  const loop = loopFixture(terminalTasks);
+  const harness = await startHarness(loop);
+  let store: ChannelStore | undefined;
+  try {
+    store = await openChannelStore(harness.stateDir);
+    await harness.service.submitInbound(bindMessage("terminal-baseline"));
+    for (let attempt = 0; attempt < 500 && store.getLoopBinding(BOT_UID, GROUP_ID) === null; attempt++) {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      setImmediate(resolve);
+      await promise;
+    }
+    expect(store.getLoopBinding(BOT_UID, GROUP_ID)).not.toBeNull();
+    expect(harness.workers.prompts).toEqual([]);
+    expect(persistedInputs(harness.stateDir)).toEqual([]);
+
+    const database = new Database(join(harness.stateDir, "channel.sqlite"));
+    try {
+      expect(database.query(
+        `SELECT COUNT(*) AS count FROM loop_task_snapshots
+         WHERE bot_uid = ? AND group_id = ? AND workspace_id = ?`,
+      ).get(BOT_UID, GROUP_ID, WORKSPACE.workspaceId)).toEqual({ count: terminalTasks.length });
+    } finally {
+      database.close();
+    }
+
+    const reopenedTasks = terminalTasks.map((current) => ({
+      ...current,
+      title: `Reopened ${current.taskId}`,
+      status: "open",
+    }));
+    loop.tasks.set(WORKSPACE.workspaceId, reopenedTasks);
+    await harness.service.submitInbound(bindMessage("terminal-reopened"));
+    await harness.workers.waitForPromptCount(terminalTasks.length);
+    await waitForStatus(
+      harness.service,
+      MAIN_TARGET,
+      (status) => status.state === "completed" && status.queued === 0,
+    );
+    expect(harness.workers.prompts).toHaveLength(terminalTasks.length);
+    for (const reopened of reopenedTasks) {
+      expect(harness.workers.prompts.some((prompt) => prompt.text.includes(reopened.title))).toBe(true);
+      expect(harness.workers.prompts.some((prompt) => prompt.text.includes(`"status": "${reopened.status}"`))).toBe(true);
+    }
+
+    const closedAgain = reopenedTasks.map((current, index) => ({
+      ...current,
+      status: terminalStatuses[index]!,
+    }));
+    loop.tasks.set(WORKSPACE.workspaceId, closedAgain);
+    await harness.service.submitInbound(bindMessage("terminal-closed-again"));
+    expect(harness.workers.prompts).toHaveLength(terminalTasks.length);
+    expect(persistedInputs(harness.stateDir).map(({ kind }) => kind)).toEqual(
+      terminalTasks.map(() => "updated"),
+    );
+  } finally {
+    store?.close();
+    await closeCoreHarness(harness);
+  }
+});
+
 
 test("an unassociated task transferred away from the owner stops producing inputs after its snapshot advances", async () => {
   const owned = task("transfer-out", "Initially owned task");
@@ -397,6 +464,69 @@ test("a task route keeps changes direct to its child after reassignment or unass
     expect(store.getTaskByMessageId(BOT_UID, childTarget, `loop:${routedInput.id}`)).not.toBeNull();
     expect(store.getTaskByMessageId(BOT_UID, MAIN_TARGET, `loop:${routedInput.id}`)).toBeNull();
     expect(harness.workers.prompts).toHaveLength(2);
+  } finally {
+    store?.close();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("unrouted owner task status changes reach the main agent", async () => {
+  const owned = task("unrouted-status", "Owned task", { status: "in_progress" });
+  const loop = loopFixture([owned]);
+  const harness = await startHarness(loop);
+  try {
+    await harness.service.submitInbound(bindMessage("unrouted-status-bind"));
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, MAIN_TARGET, (status) => status.state === "completed" && status.queued === 0);
+    for (const [index, status] of ["done", "cancelled", "backlog"].entries()) {
+      loop.tasks.set(WORKSPACE.workspaceId, [{ ...owned, status }]);
+      await harness.service.submitInbound(bindMessage(`unrouted-status-${status}`));
+      await harness.workers.waitForPromptCount(index + 2);
+      await waitForStatus(harness.service, MAIN_TARGET, (current) => current.state === "completed" && current.queued === 0);
+      expect(harness.workers.prompts[index + 1]!.text).toContain(`"status": "${status}"`);
+    }
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("routed terminal status changes reach the child only as status notifications", async () => {
+  const owned = task("routed-terminal", "Routed task");
+  const loop = loopFixture([owned]);
+  const harness = await startHarness(loop);
+  let store: ChannelStore | undefined;
+  try {
+    store = await openChannelStore(harness.stateDir);
+    await harness.service.submitInbound(bindMessage("routed-terminal-baseline"));
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(
+      harness.service,
+      MAIN_TARGET,
+      (status) => status.state === "completed" && status.queued === 0,
+    );
+
+    const thread = await harness.transport.createThread(GROUP_ID, "Routed terminal task");
+    store.bindLoopTask({
+      botUid: BOT_UID,
+      groupId: GROUP_ID,
+      workspaceId: WORKSPACE.workspaceId,
+      taskId: owned.taskId,
+    }, thread.channelId);
+    const childTarget: ChatTarget = { channelType: 5, channelId: thread.channelId };
+    for (const [index, status] of ["done", "cancelled", "backlog"].entries()) {
+      const changedTask = task(owned.taskId, `Routed ${status} task`, { status });
+      loop.tasks.set(WORKSPACE.workspaceId, [changedTask]);
+      await harness.service.submitInbound(bindMessage(`routed-terminal-change-${status}`));
+      await harness.workers.waitForPromptCount(index + 2);
+      await waitForStatus(
+        harness.service,
+        childTarget,
+        (current) => current.state === "completed" && current.queued === 0,
+      );
+
+      const notice = harness.workers.prompts[index + 1]!.text;
+      expect(notice).toContain(`"status": "${status}"`);
+    }
   } finally {
     store?.close();
     await closeCoreHarness(harness);

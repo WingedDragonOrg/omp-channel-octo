@@ -60,6 +60,44 @@ async function openStore(root: string): Promise<Store> {
   store.setOwnerId(botUid, ownerUid);
   return store;
 }
+test("inactive unbound tasks remain snapshots until reopened and queued work is withdrawn", async () => {
+  await inTemporaryDirectory(async (root) => {
+    const store = await openStore(root);
+    try {
+      const inactive = ["backlog", "done", "cancelled"].map((status) => loopTask({ taskId: status, status }));
+      const active = loopTask({ taskId: "active", status: "todo" });
+      const binding = store.bindLoopWorkspace(botUid, groupId, workspaceA, [...inactive, active]).binding;
+      const baseline = store.listLoopInputs(botUid)[0]!;
+      expect(baseline.tasks.map((task) => task.taskId)).toEqual(["active"]);
+      store.commitLoopScan(binding, [...inactive, { ...active, status: "done" }]);
+      expect(store.prepareLoopInput(baseline.id)).toBeNull();
+      store.commitLoopScan(binding, [...inactive.map((task) => ({ ...task, status: "todo" })), { ...active, status: "done" }]);
+      expect(store.listLoopInputs(botUid).map((input) => input.taskId).sort()).toEqual(["active", "backlog", "cancelled", "done"]);
+    } finally {
+      store.close();
+    }
+  });
+});
+test("unrouted owner task status changes reach the main group even when work is no longer startable", async () => {
+  await inTemporaryDirectory(async (root) => {
+    const store = await openStore(root);
+    try {
+      const active = loopTask({ status: "in_progress" });
+      const binding = store.bindLoopWorkspace(botUid, groupId, workspaceA, [active]).binding;
+      for (const status of ["done", "cancelled", "backlog"]) {
+        const next = { ...active, status };
+        store.commitLoopScan(binding, [next]);
+        const input = store.listLoopInputs(botUid).at(-1)!;
+        expect(input).toMatchObject({ kind: "updated", taskId: active.taskId, tasks: [next] });
+        expect(store.prepareLoopInput(input.id)?.id).toBe(input.id);
+      }
+    } finally {
+      store.close();
+    }
+  });
+});
+
+
 test("loop bindings are bot/group isolated, same-workspace idempotent, and replacements supersede only old pending inputs", async () => {
   await inTemporaryDirectory(async (root) => {
     let store = await openStore(root);
@@ -316,6 +354,12 @@ test("a current task route observes tasks assigned to someone else and to nobody
         { kind: "updated", taskId: "routed-task", tasks: [otherMember] },
         { kind: "updated", taskId: "routed-task", tasks: [nobody] },
       ]);
+      for (const status of ["backlog", "done", "cancelled"]) {
+        store.commitLoopScan(binding, [{ ...nobody, status }]);
+        const notification = store.listLoopInputs(botUid).at(-1)!;
+        expect(notification.tasks[0]?.status).toBe(status);
+        expect(store.prepareLoopInput(notification.id)?.taskId).toBe("routed-task");
+      }
     } finally {
       store.close();
     }
@@ -439,6 +483,63 @@ test("pending baseline preparation persists routed-task splits, trims unobserved
       expect(store.commitLoopScan(allDropBinding, [noLongerObserved])).toBe(true);
       expect(store.prepareLoopInput(allDropInput.id)).toBeNull();
       expect(store.getLoopInput(allDropInput.id)?.state).toBe("superseded");
+    } finally {
+      store.close();
+    }
+  });
+});
+
+test("pending starts are clipped by latest status while routed terminal changes remain notifications", async () => {
+  await inTemporaryDirectory(async (root) => {
+    const store = await openStore(root);
+    try {
+      const pendingGroup = "pending-baseline-group";
+      const baselineTasks = [
+        loopTask({ taskId: "baseline-done", status: "open" }),
+        loopTask({ taskId: "baseline-open", status: "open" }),
+      ];
+      const baselineBinding = store.bindLoopWorkspace(
+        botUid,
+        pendingGroup,
+        workspaceA,
+        baselineTasks,
+      ).binding;
+      const baseline = store.listLoopInputs(botUid).find((input) => input.groupId === pendingGroup)!;
+      const nowDone = { ...baselineTasks[0]!, status: "done" };
+      expect(store.commitLoopScan(baselineBinding, [nowDone, baselineTasks[1]!])).toBe(true);
+      expect(store.prepareLoopInput(baseline.id)?.tasks).toEqual([baselineTasks[1]!]);
+      expect(store.getLoopInput(baseline.id)).toMatchObject({
+        state: "pending",
+        tasks: [baselineTasks[1]],
+      });
+
+      const createdGroup = "pending-created-group";
+      const createdBinding = store.bindLoopWorkspace(botUid, createdGroup, workspaceA, []).binding;
+      const createdTask = loopTask({ taskId: "created-before-terminal" });
+      expect(store.commitLoopScan(createdBinding, [createdTask])).toBe(true);
+      const created = store.listLoopInputs(botUid).find((input) => input.groupId === createdGroup)!;
+      expect(store.commitLoopScan(createdBinding, [{ ...createdTask, status: "cancelled" }])).toBe(true);
+      expect(store.prepareLoopInput(created.id)).toBeNull();
+      expect(store.getLoopInput(created.id)?.state).toBe("superseded");
+
+      const routedGroup = "routed-terminal-group";
+      const routedTask = loopTask({ taskId: "routed-terminal" });
+      const routedBinding = store.bindLoopWorkspace(botUid, routedGroup, workspaceA, [routedTask]).binding;
+      const routedBaseline = store.listLoopInputs(botUid).find((input) => input.groupId === routedGroup)!;
+      const routedTarget: ChatTarget = { channelType: 2, channelId: routedGroup };
+      expect(store.claimLoopInputIntent(routedBaseline.id, routedTarget)).toBe(true);
+      store.markLoopInputDelivered(routedBaseline.id);
+      store.bindLoopTask(taskKey({ groupId: routedGroup, taskId: routedTask.taskId }), `${routedGroup}____routed`);
+      const completed = { ...routedTask, status: "done" };
+      expect(store.commitLoopScan(routedBinding, [completed])).toBe(true);
+      const statusChange = store.listLoopInputs(botUid).find(
+        (input) => input.groupId === routedGroup && input.kind === "updated",
+      )!;
+      expect(store.prepareLoopInput(statusChange.id)).toMatchObject({
+        kind: "updated",
+        tasks: [completed],
+        state: "pending",
+      });
     } finally {
       store.close();
     }
