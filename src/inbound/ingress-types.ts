@@ -90,6 +90,8 @@ export type IngressOperationCheckpoint =
       /** Task identities whose cancellation was committed before this command was ACKed. */
       cancelledQueuedTaskIds?: readonly string[];
       stoppedTaskIds?: readonly string[];
+      /** Workspace-add identities whose cancellation was committed before this command was ACKed. */
+      cancelRequestedWorkspaceOperationIds?: readonly string[];
       /** Exact open question identities closed by this cancellation transaction. */
       cancelledQuestionIds?: readonly string[];
       /** Earlier commit waiters/tasks stopped before this command was ACKed. */

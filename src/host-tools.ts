@@ -22,7 +22,7 @@ import { isTransientServerFailure } from "./errors.ts";
 import { OctoError } from "./octo/error.ts";
 import type { ChannelStore } from "./store/index.ts";
 import type { TaskRecord } from "./store/store-records.ts";
-import type { ThreadWorkspaceRecord } from "./store/store-records.ts";
+import type { ThreadWorkspaceCleanupRecord, ThreadWorkspaceRecord } from "./store/store-records.ts";
 import type { WatchCreateArgs, WatchCreateResult, WatchListItem, WatchRecord } from "./watch/types.ts";
 import type { DestructiveResourceLease } from "./tasks/task-scheduler.ts";
 import { threadWorkspaceIdentityMatches, threadWorkspaceIsAvailable } from "./session/session-lifecycle.ts";
@@ -31,6 +31,7 @@ import {
   prepareThreadWorkspaceScope,
   validateThreadCreation,
   type ThreadWorkspaceBatchResult,
+  type ThreadWorkspaceOperationHost,
   type ValidatedThreadCreation,
 } from "./workspace/thread-workspaces.ts";
 import { taskTarget } from "./target.ts";
@@ -109,6 +110,17 @@ export interface HostToolHost {
     | "setThreadListen"
     | "suppressTaskRelay"
     | "listThreadWorkspaces"
+    | "acceptThreadWorkspaceOperation"
+    | "getThreadWorkspaceOperation"
+    | "getLatestThreadWorkspaceOperation"
+    | "listThreadWorkspaceOperations"
+    | "updateThreadWorkspaceOperation"
+    | "finishThreadWorkspaceOperation"
+    | "reserveThreadWorkspaceCleanup"
+    | "markThreadWorkspaceCleanupDeleted"
+    | "markThreadWorkspaceCleanupUnknown"
+    | "finishThreadWorkspaceCleanup"
+    | "releaseThreadWorkspaceCleanup"
     | "getLoopBinding"
     | "getLoopTaskRoute"
     | "bindLoopTask"
@@ -154,6 +166,14 @@ export interface HostToolHost {
   ): Promise<"steered" | "queued">;
   /** Accepts an explicit child-task input as an independently queued creator task. */
   sendThreadCreatorInput(task: TaskRecord, text: string, toolCallId: string, signal: AbortSignal): Promise<string>;
+  readonly moveThreadWorkspaceBinding: ThreadWorkspaceOperationHost["moveThreadWorkspaceBinding"];
+  expandThreadWorkspace(
+    task: TaskRecord,
+    target: ChatTarget,
+    args: Record<string, unknown>,
+    signal: AbortSignal,
+    toolCallId?: string,
+  ): Promise<string>;
 
   /**
    * `ask`：提问并等待答案。`toolCallId` 是 OMP 给这次工具调用的身份（retry 重执行同一个调用时
@@ -193,6 +213,7 @@ const MANAGEMENT_BASE_ACTIONS = [
   "thread-bind",
   "create-thread",
   "thread-info",
+  "thread-workspace-add",
   "thread-members",
   "thread-listen",
   "thread-join",
@@ -1116,11 +1137,11 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
         },
         worktree_name: {
           type: "string",
-          description: "create-thread：完整任务名，规范化为 ASCII 小写单连字符 slug（1–100 字符）；显式 projects（包括 single）必填，必须保留完整语义，不翻译、不截断，超长时提供更短但完整的名称。无 projects 时作为旧式单仓库 worktree 名称。",
+          description: "create-thread/thread-workspace-add：完整任务名，规范化为 ASCII 小写单连字符 slug（1–100 字符）；显式 projects 与追加操作均必填，作为新 worktree 的分支命名基础。无 projects 的 create-thread 可省略。",
         },
         projects: {
           type: "array",
-          description: "create-thread：每项指定项目显示名、绝对 Git 仓库路径和可选起始 commit/ref；name 同时生成稳定项目目录 slug，规范化后必须唯一且为 1–100 字符 ASCII slug。无可用 ASCII 字符、过长或归一化冲突均在创建前拒绝；请改用明确限定项目名（如 admin-web、customer-web），不要翻译或截断。显式 projects 必须同时提供完整 worktree_name。多项目必须显式提供 layout。",
+          description: "create-thread/thread-workspace-add：每项指定项目显示名、绝对 Git 仓库路径和可选起始 commit/ref；name 独立生成稳定项目目录 slug，必须为互不冲突的 1–100 字符 ASCII 名称。",
           items: {
             type: "object",
             properties: {
@@ -1525,14 +1546,42 @@ async function runManagementTool(
         changed: previous?.threadChannelId !== route.threadChannelId,
       });
     }
+    case "thread-workspace-add": {
+      const thread = await transport.getThread(groupId, threadId(), signal);
+      assertThreadBelongsToGroup(groupId, thread);
+      return host.expandThreadWorkspace(
+        task,
+        { channelId: thread.channelId, channelType: 5 },
+        args,
+        signal,
+        toolCallId,
+      );
+    }
     case "thread-info": {
       const thread = await transport.getThread(groupId, threadId(), signal);
       assertThreadBelongsToGroup(groupId, thread);
       const policy = ensureThreadListen(host, thread);
       const threadTarget: ChatTarget = { channelId: thread.channelId, channelType: 5 };
+      const workspace = host.store.getThreadWorkspace(host.botUid, threadTarget);
+      const workspaceOperation = host.store.getLatestThreadWorkspaceOperation(host.botUid, threadTarget);
       return JSON.stringify({
         ...managementThread(thread),
         listen: policy.listen,
+        workspace: workspace === null ? null : {
+          layout: workspace.layout,
+          status: workspace.status,
+          ready: await threadWorkspaceIsAvailable(workspace),
+          cwd: workspace.entryPath ?? workspace.projects[0]?.path ?? null,
+          projects: workspace.projects,
+          error: workspace.error,
+        },
+        workspace_operation: workspaceOperation === null ? null : {
+          id: workspaceOperation.id,
+          status: workspaceOperation.status,
+          phase: workspaceOperation.phase,
+          projects: workspaceOperation.candidateWorkspace.projects,
+          error: workspaceOperation.error,
+        },
         references: host.threadReferences(threadTarget),
         loop_tasks: loopThreadSources(host, groupId, thread.channelId),
       });
@@ -1573,14 +1622,47 @@ async function runManagementTool(
     case "thread-delete": {
       const shortId = threadId();
       const force = optionalBoolean("force") ?? false;
-      await deleteThread(host, groupId, shortId, signal);
       const deletedTarget: ChatTarget = {
         channelId: threadChannelId(groupId, shortId),
         channelType: 5,
       };
+      const cleanupId = `thread-delete:${createHash("sha256")
+        .update(JSON.stringify([host.botUid, task.id, toolCallId ?? randomUUID(), deletedTarget.channelId]))
+        .digest("hex")}`;
+      const reservation = host.store.reserveThreadWorkspaceCleanup({
+        id: cleanupId,
+        botUid: host.botUid,
+        target: deletedTarget,
+      });
+      if (reservation.phase === "settled") return `已删除线程 ${shortId}；工作区清理状态已记录`;
+      if (reservation.phase !== "reserved") throw new Error("线程删除结果尚未确认，资源已保留");
+      try {
+        await deleteThread(host, groupId, shortId, signal);
+      } catch (error) {
+        if (error instanceof Error && error.cause instanceof OctoError
+          && error.cause.permanent && error.cause.status !== undefined) {
+          host.store.releaseThreadWorkspaceCleanup(host.botUid, cleanupId);
+        } else {
+          host.store.markThreadWorkspaceCleanupUnknown(host.botUid, cleanupId);
+        }
+        throw error;
+      }
+      const cleanup = host.store.markThreadWorkspaceCleanupDeleted(host.botUid, cleanupId);
+      if (cleanup.phase !== "cleaning") throw new Error("线程已删除，但工作区归属已变化；资源已保留");
       host.watches.deleteChat(deletedTarget);
       host.deleteThreadReferences(deletedTarget);
-      const cleaned = await cleanupThreadWorkspace(host, task, groupId, shortId, force, signal);
+      let cleaned: string | null;
+      try {
+        cleaned = await cleanupThreadWorkspace(host, task, cleanup, force, signal);
+        if (signal.aborted) {
+          host.store.markThreadWorkspaceCleanupUnknown(host.botUid, cleanupId);
+        } else {
+          host.store.finishThreadWorkspaceCleanup(host.botUid, cleanupId);
+        }
+      } catch (error) {
+        host.store.markThreadWorkspaceCleanupUnknown(host.botUid, cleanupId);
+        throw error;
+      }
       return cleaned === null
         ? `已删除线程 ${shortId}`
         : `已删除线程 ${shortId}；${cleaned}`;
@@ -1765,7 +1847,7 @@ async function deleteThread(
     return;
   } catch (error) {
     if (signal?.aborted === true || !isTransientServerFailure(error)) {
-      throw new Error(boundedManagementError(error, "删除线程失败"));
+      throw new Error(boundedManagementError(error, "删除线程失败"), { cause: error });
     }
   }
   try {
@@ -1782,18 +1864,16 @@ async function deleteThread(
 async function cleanupThreadWorkspace(
   host: HostToolHost,
   task: TaskRecord,
-  groupId: string,
-  shortId: string,
+  cleanup: ThreadWorkspaceCleanupRecord,
   force: boolean,
   signal?: AbortSignal,
 ): Promise<string | null> {
-  const target: ChatTarget = { channelId: threadChannelId(groupId, shortId), channelType: 5 };
-  const ownership = host.store.getThreadWorkspace(host.botUid, target);
+  const ownership = cleanup.ownership;
   if (ownership !== null) {
     return cleanupOwnedThreadWorkspace(host, task, ownership, force, signal);
   }
 
-  const binding = host.store.getBinding(host.botUid, target);
+  const binding = cleanup.binding;
   if (!binding || binding.cwdPinned !== true || !host.worktrees) return null;
   const lease = await host.tryAcquireDestructiveResources([binding.cwd], task);
   if (!lease) return "工作区正被其他任务使用，资源已保留";

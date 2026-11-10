@@ -69,7 +69,7 @@ export interface SessionLifecycleDeps {
   readonly hasRuntime: (target: ChatTarget) => boolean;
   /** 该 cwd 是否因 worker 无法确认停止而被 block。 */
   readonly isDirectoryBlocked: (cwd: string) => boolean;
-  /** Do not infer a session move while an accepted/unknown ingress transition owns the binding. */
+  /** Do not infer a move while an ingress session transition or workspace operation owns this binding. */
   readonly hasUnresolvedSessionTransition: (target: ChatTarget) => boolean;
   /** 把该 cwd 标为不可用（worker 无法确认停止时）。 */
   readonly blockDirectory: (cwd: string) => void;
@@ -637,6 +637,80 @@ export class SessionLifecycle {
     } finally {
       commandLease.complete();
     }
+  }
+
+  /**
+   * Move an existing thread binding into a newly created shared entry without publishing it. The
+   * caller owns the durable workspace operation and session lease; this method only returns after
+   * the native worker has stopped and its ledger is settled, so the caller can atomically CAS the
+   * matching binding and workspace record.
+   */
+  async moveThreadWorkspaceBinding(
+    target: ChatTarget,
+    expected: BindingRecord,
+    destinationCwd: string,
+    workerLedgerId: string,
+    signal: AbortSignal,
+  ): Promise<BindingRecord> {
+    const bot = this.deps.bot();
+    if (bot === undefined || bot.uid !== expected.botUid || target.channelType !== 5) {
+      throw new Error("thread workspace session identity is unavailable");
+    }
+    const current = this.deps.store.getBinding(bot.uid, target);
+    if (
+      current === null
+      || current.sessionId !== expected.sessionId
+      || current.cwd !== expected.cwd
+      || current.sessionFile !== expected.sessionFile
+      || (current.cwdPinned === true) !== (expected.cwdPinned === true)
+      || (current.sessionSwitchedAt ?? null) !== (expected.sessionSwitchedAt ?? null)
+      || JSON.stringify(current.sessionInitialization ?? null)
+        !== JSON.stringify(expected.sessionInitialization ?? null)
+    ) {
+      throw new Error("子区会话绑定已变化，拒绝覆盖较新绑定");
+    }
+    if (!expected.sessionFile) {
+      return { ...expected, cwd: destinationCwd, cwdPinned: true };
+    }
+    const sessionFile = await existingSessionFile(expected.sessionFile);
+    if (sessionFile === null) {
+      throw new Error("绑定的 OMP 精确会话文件不存在，拒绝迁移");
+    }
+    const sessionDir = await ensureProjectSessionDir(sessionsRoot(this.deps.config), destinationCwd);
+    const model = this.deps.store.resolveChatModel(bot.uid, target).model;
+    const moved = await withStoppedWorker(
+      {
+        workerFactory: this.deps.workerFactory,
+        store: this.deps.store,
+        worker: {
+          cwd: expected.cwd,
+          sessionDir,
+          sessionFile,
+          ...(model === null ? {} : { model }),
+        },
+        ledger: {
+          id: workerLedgerId,
+          botUid: bot.uid,
+          sessionId: expected.sessionId,
+          sessionFile,
+        },
+        moveTargetCwd: destinationCwd,
+        blockDirectory: cwd => this.deps.blockDirectory(cwd),
+      },
+      async worker => {
+        await worker.prompt(`/move ${destinationCwd}`, () => {});
+        const movedState: ProjectSessionState = await worker.refreshState();
+        return verifyMovedSession(expected, movedState, destinationCwd);
+      },
+      signal,
+    );
+    return {
+      ...expected,
+      sessionId: moved.sessionId,
+      cwd: moved.cwd,
+      sessionFile: moved.sessionFile,
+      cwdPinned: true,
+    };
   }
 
   /** 找回旧会话的候选根：项目目录在前，改动前的扁平根与工厂自己的根在后。 */

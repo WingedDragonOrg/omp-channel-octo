@@ -238,6 +238,45 @@ export class TaskScheduler {
     };
     void next.then(cleanup, cleanup);
   }
+
+  /**
+   * Run one durable host operation at its persisted chat/session order. The reservation is
+   * installed synchronously so later tasks cannot pass it; the operation itself runs only after
+   * all earlier task/session owners release their leases.
+   */
+  scheduleSessionOperation(
+    target: ChatTarget,
+    order: number,
+    signal: AbortSignal,
+    run: () => Promise<void>,
+    onFailure: (error: unknown) => void,
+  ): void {
+    const reservation = this.reserveSessionCommand(target, [], order);
+    const next = Promise.resolve().then(async () => {
+      let lease: SessionLease | undefined;
+      try {
+        await this.deps.awaitStartReady();
+        await reservation.waitForPrior(signal);
+        lease = await reservation.tryAcquire();
+        if (lease === undefined) throw new Error("could not acquire ordered session operation lease");
+        await lease.ready;
+        if (this.deps.stopping() || signal.aborted) {
+          throw signal.aborted
+            ? (signal.reason instanceof Error ? signal.reason : new Error("session operation aborted"))
+            : new Error("channel stopping");
+        }
+        await run();
+      } catch (error) {
+        onFailure(error);
+      } finally {
+        lease?.complete();
+        reservation.release();
+      }
+    });
+    this.taskOperations.add(next);
+    const cleanup = () => this.taskOperations.delete(next);
+    void next.then(cleanup, cleanup);
+  }
   private taskOrder(taskId: string): number {
     const order = this.scheduledOrder.get(taskId) ?? this.deps.store.getTaskScheduleOrder(taskId);
     if (order === null) throw new Error(`queued task ${taskId} has no durable schedule order`);

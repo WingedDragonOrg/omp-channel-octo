@@ -964,6 +964,17 @@ export interface ThreadWorkspaceRequest {
   base?: string;
   /** Persist planned ownership before the worktree creation command can have side effects. */
   onPlanned?: (workspace: { cwd: string; branch: string; repo: string }) => void;
+  /** Durable process ownership for a create whose result may survive cancellation or restart. */
+  lifecycle?: WorktreeCreateLifecycle;
+}
+
+/** Per-command process tracking for one worktree-creation process group. */
+export interface WorktreeCreateLifecycle {
+  beforeSpawn(cwd: string): void;
+  onSpawn(process: WorkerProcess): void;
+  onConfirmedExit(): void;
+  onNotSpawned(): void;
+  onUnknown(): void;
 }
 
 export interface ThreadWorkspace {

@@ -1,5 +1,5 @@
-import { relative, sep } from "node:path";
-import { lstat, realpath, rm, rmdir } from "node:fs/promises";
+import { dirname, relative, resolve, sep } from "node:path";
+import { lstat, readlink, realpath, rm, rmdir, unlink } from "node:fs/promises";
 import { safeDisplayText } from "../cards/execution-text.ts";
 import type {
   WorktreePort,
@@ -49,6 +49,8 @@ export function threadWorkspaceCleanupPaths(
   const paths: string[] = [];
   for (const project of ownership.projects) {
     if (project.created && project.path !== null) paths.push(project.path);
+    if (project.accessPath != null) paths.push(project.accessPath);
+    if (project.accessTarget != null) paths.push(project.accessTarget);
     if (deleteBranch && (project.created || project.branch !== null)) paths.push(project.repo);
   }
   if (ownership.entryPath !== null) paths.push(ownership.entryPath);
@@ -112,6 +114,19 @@ export async function cleanupOwnedThreadWorkspace(
         messages.push("清理已中止；未归档");
         break;
       }
+      const hasAccessOwnership = project.accessPath !== undefined || project.accessTarget !== undefined;
+      if (
+        hasAccessOwnership
+        && (
+          ownership.layout !== "shared"
+          || project.accessPath == null
+          || project.accessTarget == null
+          || (project.path !== null && project.path !== project.accessTarget)
+        )
+      ) {
+        messages.push(`${project.name} 的原项目链接所有权不完整或目标不一致，资源已保留`);
+        continue;
+      }
       if (!project.created) {
         if (project.path !== null || project.branch !== null) {
           messages.push(`${project.name} 的创建或资源状态未确认，保留记录`);
@@ -157,6 +172,39 @@ export async function cleanupOwnedThreadWorkspace(
       } catch (error) {
         messages.push(`${safeDisplayText(`${project.name}（${project.path}；分支 ${project.branch}）`, 700) ?? "项目"} 清理失败：${boundedError(error)}`);
         if (options.isUnknown?.() === true || isAborted(signal)) {
+          stop = true;
+          break;
+        }
+      }
+    }
+    if (!stop && !isAborted(signal) && ownership.layout === "shared" && projectsWorktreesReleased(ownership)) {
+      for (const project of ownership.projects) {
+        if (project.accessPath === undefined && project.accessTarget === undefined) continue;
+        if (project.accessPath == null || project.accessTarget == null || ownership.entryPath === null) {
+          messages.push(`${project.name} 的原项目链接记录不完整，入口及所有权已保留`);
+          continue;
+        }
+        const linkResult = await removeOwnedProjectAccessLink(
+          ownership.entryPath,
+          project.accessPath,
+          project.accessTarget,
+          signal,
+        );
+        if (linkResult.kind === "unsafe") {
+          messages.push(`${project.name} 的原项目链接未清理，入口及所有权已保留：${linkResult.reason}`);
+          continue;
+        }
+        const priorAccessPath = project.accessPath;
+        const priorAccessTarget = project.accessTarget;
+        delete project.accessPath;
+        delete project.accessTarget;
+        try {
+          store.saveThreadWorkspace(ownership);
+          if (linkResult.kind === "removed") messages.push(`${project.name} 的原项目入口链接已清理`);
+        } catch (error) {
+          project.accessPath = priorAccessPath;
+          project.accessTarget = priorAccessTarget;
+          messages.push(`${project.name} 链接处置结果已知但所有权更新失败：${boundedError(error)}`);
           stop = true;
           break;
         }
@@ -213,7 +261,11 @@ export async function cleanupOwnedThreadWorkspace(
   }
 
   const complete = ownership.projects.every(project =>
-    !project.created && project.path === null && project.branch === null,
+    !project.created
+    && project.path === null
+    && project.branch === null
+    && project.accessPath == null
+    && project.accessTarget == null,
   ) && ownership.entryPath === null && (ownership.workspaceRoot ?? null) === null;
   return {
     complete,
@@ -252,9 +304,15 @@ function applyRemovalOutcome(
   }
 }
 
-function projectsReleased(ownership: ThreadWorkspaceRecord): boolean {
+function projectsWorktreesReleased(ownership: ThreadWorkspaceRecord): boolean {
   return ownership.projects.every(project =>
     !project.created && project.path === null && project.branch === null,
+  );
+}
+
+function projectsReleased(ownership: ThreadWorkspaceRecord): boolean {
+  return projectsWorktreesReleased(ownership) && ownership.projects.every(project =>
+    project.accessPath == null && project.accessTarget == null,
   );
 }
 type OwnedDirectoryInspection =
@@ -268,6 +326,58 @@ function isDirectChildPath(parent: string, child: string): boolean {
     && relativePath !== ".."
     && !relativePath.startsWith(`..${sep}`)
     && !relativePath.includes(sep);
+}
+
+type ProjectAccessLinkRemoval =
+  | { readonly kind: "removed" | "missing" }
+  | { readonly kind: "unsafe"; readonly reason: string };
+
+async function removeOwnedProjectAccessLink(
+  entryPath: string,
+  accessPath: string,
+  accessTarget: string,
+  signal?: AbortSignal,
+): Promise<ProjectAccessLinkRemoval> {
+  if (resolve(accessPath) !== accessPath || !isDirectChildPath(entryPath, accessPath)) {
+    return { kind: "unsafe", reason: "不是共享入口的直接子项" };
+  }
+  if (resolve(accessTarget) !== accessTarget) {
+    return { kind: "unsafe", reason: "目标路径不是规范绝对路径" };
+  }
+  try {
+    const entryState = await inspectOwnedDirectory(entryPath);
+    if (entryState.kind === "missing") return { kind: "missing" };
+    if (entryState.kind === "unsafe") return { kind: "unsafe", reason: `共享入口不可安全访问：${entryState.reason}` };
+    const entryInfo = await lstat(entryPath);
+    if (entryInfo.isSymbolicLink() || !entryInfo.isDirectory()) {
+      return { kind: "unsafe", reason: "共享入口已被替换" };
+    }
+    const info = await lstat(accessPath);
+    if (!info.isSymbolicLink()) return { kind: "unsafe", reason: "入口项已被替换或不是符号链接" };
+    const target = await readlink(accessPath);
+    if (resolve(dirname(accessPath), target) !== accessTarget) {
+      return { kind: "unsafe", reason: "符号链接目标与记录的原项目路径不一致" };
+    }
+    const current = await lstat(accessPath);
+    if (!current.isSymbolicLink() || current.dev !== info.dev || current.ino !== info.ino) {
+      return { kind: "unsafe", reason: "核验期间符号链接已发生变化" };
+    }
+    const currentEntry = await lstat(entryPath);
+    if (
+      currentEntry.isSymbolicLink()
+      || !currentEntry.isDirectory()
+      || currentEntry.dev !== entryInfo.dev
+      || currentEntry.ino !== entryInfo.ino
+    ) {
+      return { kind: "unsafe", reason: "核验期间共享入口已发生变化" };
+    }
+    if (isAborted(signal)) return { kind: "unsafe", reason: "清理已中止，入口保留" };
+    await unlink(accessPath);
+    return { kind: "removed" };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
+    return { kind: "unsafe", reason: boundedError(error) };
+  }
 }
 
 async function inspectOwnedDirectory(path: string): Promise<OwnedDirectoryInspection> {

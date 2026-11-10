@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openChannelStore } from "../src/store/index.ts";
@@ -185,6 +185,178 @@ test("shared cleanup removes only an empty owned task root and preserves unknown
       entryPath: null, workspaceRoot: occupiedRoot, projects: [{ path: null, branch: null, created: false }],
     });
     expect(await Bun.file(foreignFile).text()).toBe("owned by another task\n");
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+async function createCleanupWorktree(root: string, name: string): Promise<{ repo: string; path: string }> {
+  const repo = join(root, `${name}-repo`);
+  const path = join(root, `${name}-worktree`);
+  const git = async (...args: string[]): Promise<string> => {
+    const child = Bun.spawn(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+    const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    if (code !== 0) throw new Error(err);
+    return out.trim();
+  };
+  await mkdir(repo);
+  await git("init", "-qb", "main");
+  await writeFile(join(repo, "base"), "base\n");
+  await git("add", ".");
+  await git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-qm", "base");
+  await git("worktree", "add", "-qb", "feature", path);
+  return { repo, path };
+}
+
+test("shared cleanup unlinks a recorded original-worktree entry after releasing its target", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oco-cleanup-access-link-")));
+  const store = await openChannelStore(join(root, "state"));
+  try {
+    const { repo, path } = await createCleanupWorktree(root, "original");
+    const workspaceRoot = join(root, "task");
+    const entryPath = join(workspaceRoot, "scope");
+    const accessPath = join(entryPath, "project");
+    await mkdir(entryPath, { recursive: true });
+    await symlink(path, accessPath, "dir");
+    const ownership = {
+      botUid: "bot", channelType: 5 as const, channelId: "group____access-link", layout: "shared" as const,
+      status: "ready" as const, entryPath, workspaceRoot, error: null,
+      projects: [{ name: "project", repo, path, branch: "feature", created: true, accessPath, accessTarget: path }],
+    };
+    store.saveThreadWorkspace(ownership);
+
+    const result = await cleanupOwnedThreadWorkspace({
+      ownership, store,
+      worktrees: createWorktreePort({ command: "/no/omp", worktrunkCandidates: [] }),
+      deleteBranch: false, force: false,
+      lease: { ready: Promise.resolve(), complete() {} },
+    });
+
+    expect(result.complete).toBe(true);
+    expect(existsSync(path)).toBe(false);
+    expect(existsSync(entryPath)).toBe(false);
+    expect(existsSync(workspaceRoot)).toBe(false);
+    const saved = store.getThreadWorkspace("bot", ownership);
+    expect(saved?.projects[0]).toMatchObject({ path: null, branch: null, created: false });
+    expect(saved?.projects[0]).not.toHaveProperty("accessPath");
+    expect(saved?.projects[0]).not.toHaveProperty("accessTarget");
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("shared cleanup preserves a replaced access link and its external target", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oco-cleanup-replaced-link-")));
+  const store = await openChannelStore(join(root, "state"));
+  try {
+    const { repo, path } = await createCleanupWorktree(root, "original");
+    const workspaceRoot = join(root, "task");
+    const entryPath = join(workspaceRoot, "scope");
+    const accessPath = join(entryPath, "project");
+    const external = join(root, "external");
+    const sentinel = join(external, "keep");
+    await mkdir(entryPath, { recursive: true });
+    await mkdir(external);
+    await writeFile(sentinel, "unrelated data\n");
+    await symlink(external, accessPath, "dir");
+    const ownership = {
+      botUid: "bot", channelType: 5 as const, channelId: "group____replaced-link", layout: "shared" as const,
+      status: "ready" as const, entryPath, workspaceRoot, error: null,
+      projects: [{ name: "project", repo, path, branch: "feature", created: true, accessPath, accessTarget: path }],
+    };
+    store.saveThreadWorkspace(ownership);
+
+    const result = await cleanupOwnedThreadWorkspace({
+      ownership, store,
+      worktrees: createWorktreePort({ command: "/no/omp", worktrunkCandidates: [] }),
+      deleteBranch: false, force: false,
+      lease: { ready: Promise.resolve(), complete() {} },
+    });
+
+    expect(result.complete).toBe(false);
+    expect(existsSync(path)).toBe(false);
+    expect(existsSync(entryPath)).toBe(true);
+    expect((await lstat(accessPath)).isSymbolicLink()).toBe(true);
+    expect(await Bun.file(sentinel).text()).toBe("unrelated data\n");
+    expect(store.getThreadWorkspace("bot", ownership)?.projects[0]).toMatchObject({
+      path: null, branch: null, created: false, accessPath, accessTarget: path,
+    });
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("shared cleanup safely completes a previously unlinked recorded access path", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oco-cleanup-missing-link-")));
+  const store = await openChannelStore(join(root, "state"));
+  try {
+    const workspaceRoot = join(root, "task");
+    const entryPath = join(workspaceRoot, "scope");
+    const accessPath = join(entryPath, "project");
+    const external = join(root, "external");
+    const sentinel = join(external, "keep");
+    await mkdir(entryPath, { recursive: true });
+    await mkdir(external);
+    await writeFile(sentinel, "unrelated data\n");
+    const ownership = {
+      botUid: "bot", channelType: 5 as const, channelId: "group____missing-link", layout: "shared" as const,
+      status: "failed" as const, entryPath, workspaceRoot, error: null,
+      projects: [{ name: "project", repo: external, path: null, branch: null, created: false, accessPath, accessTarget: external }],
+    };
+    store.saveThreadWorkspace(ownership);
+
+    const result = await cleanupOwnedThreadWorkspace({
+      ownership, store, worktrees: undefined,
+      deleteBranch: false, force: false,
+      lease: { ready: Promise.resolve(), complete() {} },
+    });
+
+    expect(result.complete).toBe(true);
+    expect(existsSync(workspaceRoot)).toBe(false);
+    expect(await Bun.file(sentinel).text()).toBe("unrelated data\n");
+    expect(store.getThreadWorkspace("bot", ownership)?.projects[0]).toMatchObject({
+      path: null, branch: null, created: false,
+    });
+    expect(store.getThreadWorkspace("bot", ownership)?.projects[0]).not.toHaveProperty("accessPath");
+    expect(store.getThreadWorkspace("bot", ownership)?.projects[0]).not.toHaveProperty("accessTarget");
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("shared cleanup keeps an access link that is not a direct entry child", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oco-cleanup-nondirect-link-")));
+  const store = await openChannelStore(join(root, "state"));
+  try {
+    const { repo, path } = await createCleanupWorktree(root, "original");
+    const workspaceRoot = join(root, "task");
+    const entryPath = join(workspaceRoot, "scope");
+    const accessPath = join(root, "outside-link");
+    await mkdir(entryPath, { recursive: true });
+    await symlink(path, accessPath, "dir");
+    const ownership = {
+      botUid: "bot", channelType: 5 as const, channelId: "group____nondirect-link", layout: "shared" as const,
+      status: "ready" as const, entryPath, workspaceRoot, error: null,
+      projects: [{ name: "project", repo, path, branch: "feature", created: true, accessPath, accessTarget: path }],
+    };
+    store.saveThreadWorkspace(ownership);
+
+    const result = await cleanupOwnedThreadWorkspace({
+      ownership, store,
+      worktrees: createWorktreePort({ command: "/no/omp", worktrunkCandidates: [] }),
+      deleteBranch: false, force: false,
+      lease: { ready: Promise.resolve(), complete() {} },
+    });
+
+    expect(result.complete).toBe(false);
+    expect(existsSync(entryPath)).toBe(true);
+    expect((await lstat(accessPath)).isSymbolicLink()).toBe(true);
+    expect(store.getThreadWorkspace("bot", ownership)?.projects[0]).toMatchObject({
+      path: null, branch: null, created: false, accessPath, accessTarget: path,
+    });
   } finally {
     store.close();
     await rm(root, { recursive: true, force: true });

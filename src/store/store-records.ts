@@ -523,9 +523,14 @@ export interface ThreadWorkspaceProjectRecord {
   name: string;
   repo: string;
   base?: string;
+  /** Actual managed worktree path; for a converted project this remains the original path. */
   path: string | null;
   branch: string | null;
   created: boolean;
+  /** Managed shared-entry symlink for an existing project, never the worktree ownership path. */
+  accessPath?: string;
+  /** Persisted original worktree destination used to verify an accessPath after project.path is cleared. */
+  accessTarget?: string;
 }
 
 export interface ThreadWorkspaceRecord extends ChatTarget {
@@ -542,6 +547,82 @@ export interface ThreadWorkspaceRecord extends ChatTarget {
   projects: ThreadWorkspaceProjectRecord[];
   error: string | null;
 }
+
+export type ThreadWorkspaceOperationStatus =
+  | "queued"
+  | "running"
+  | "complete"
+  | "failed"
+  | "cancelled"
+  | "unknown";
+
+export type ThreadWorkspaceOperationPhase =
+  | "accepted"
+  | "entry-creating"
+  | "entry-root-created"
+  | "entry-create-intent"
+  | "entry-created"
+  | "alias-creating"
+  | "alias-created"
+  | "project-not-started"
+  | "project-creating"
+  | "project-process-exited"
+  | "project-created"
+  | "move-dispatch-intent"
+  | "move-confirmed"
+  | "committed";
+export interface ThreadWorkspaceOperationRecord {
+  id: string;
+  botUid: string;
+  channelType: 5;
+  channelId: string;
+  groupId: string;
+  toolCallId: string;
+  taskId: string;
+  scheduleOrder: number;
+  worktreeNameSeed: string;
+  /** Validated canonical additions, without a filesystem allocation yet. */
+  projects: Array<{ name: string; repo: string; base?: string }>;
+  expectedWorkspace: ThreadWorkspaceRecord;
+  expectedBinding: BindingRecord;
+  candidateWorkspace: ThreadWorkspaceRecord;
+  candidateBinding: BindingRecord;
+  phase: ThreadWorkspaceOperationPhase;
+  status: ThreadWorkspaceOperationStatus;
+  cancelRequested: boolean;
+  workerLedgerId: string | null;
+  processIdentity: WorkerProcess | null;
+  error: string | null;
+  version: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type ThreadWorkspaceCleanupPhase = "reserved" | "cleaning" | "unknown" | "settled";
+
+export interface ThreadWorkspaceCleanupInput {
+  id: string;
+  botUid: string;
+  target: ChatTarget;
+}
+
+/** Durable host-side deletion reservation; snapshots keep the pre-cleanup ownership and binding. */
+export interface ThreadWorkspaceCleanupRecord extends ChatTarget {
+  id: string;
+  botUid: string;
+  channelType: 5;
+  channelId: string;
+  phase: ThreadWorkspaceCleanupPhase;
+  ownership: ThreadWorkspaceRecord | null;
+  binding: BindingRecord | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type ThreadWorkspaceOperationInput = Omit<
+  ThreadWorkspaceOperationRecord,
+  "scheduleOrder" | "phase" | "status" | "cancelRequested" | "workerLedgerId" | "processIdentity" | "error" | "version" | "createdAt" | "updatedAt"
+>;
 
 export type ThreadWorkspaceIntentStatus = "preparing" | "failed" | "complete";
 export type ThreadWorkspaceIntentKind = "workspace" | "thread-create";

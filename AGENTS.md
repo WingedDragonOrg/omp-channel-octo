@@ -51,6 +51,8 @@ Creation intent is durable before each remote create, with one intent per remote
 
 New workspaces use readable full task slugs: explicit `projects` requires `worktree_name`; normalize ASCII lowercase/hyphens without truncation and reject empty or over-100-character task/project slugs before allocation. Shared entries use `<stateDir>/thread-workspaces/<task-slug>`, project directories use independent `projects[].name` slugs, and different repositories share the full task branch name. Single/separate retain `<repo>.<task-slug>` paths. Only actual resource collisions add `-2`, `-3`; duplicate display/normalized project names require qualified names instead of positional numbering. Reserve actual candidates durably before side effects, never adopt occupied entries, and preserve existing resource names across recovery/query/delete. See the readable naming SDD in the existing Worktrunk specification.
 
+`thread-workspace-add` extends a ready thread workspace using durable, ordered operations. A single-project conversion preserves the original worktree path, branch and changes, records a shared-entry symlink, and migrates the same session through native `/move`; shared additions create managed worktrees in the existing entry. Persist confirmed and uncertain resources, process ownership and cancellation intent; never replay an unknown side effect. Coordinate same-thread additions with cleanup and expose operation state through `thread-info`. See `docs/specs/2026-11-10-thread-workspace-expansion-design.md`; verify with isolated Git repositories and the workspace expansion, cleanup and restart regressions.
+
 
 ## Architecture & Data Flow
 

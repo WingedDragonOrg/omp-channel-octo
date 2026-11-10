@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
+  WorktreeCreateLifecycle,
   WorktreeMergeProcessIdentity,
   WorktreeMergeRequest,
   WorktreeMergeSummary,
@@ -97,7 +98,7 @@ export interface RunCommandOptions {
   onOutputExceeded?: () => void;
   /** Capture at most this many raw bytes per stream while still draining it to EOF. */
   maxOutputBytes?: { stdout: number; stderr: number };
-  lifecycle?: WorktreeRemovalLifecycle;
+  lifecycle?: WorktreeCreateLifecycle | WorktreeRemovalLifecycle;
   /** A successful wt cleanup must finish its real filesystem work before the process group settles. */
   waitForBackgroundCleanup?: {
     shouldWait(result: CommandResult): boolean;
@@ -636,6 +637,7 @@ export interface WorktrunkCreateOptions extends WorktrunkRunOptions {
   base?: string;
   /** Exact worktree directory, pinned through `--config-set worktree-path`. */
   path: string;
+  lifecycle?: WorktreeCreateLifecycle;
 }
 
 /** Creates the worktree through `wt switch --create` and returns the path it reports. */
@@ -658,6 +660,9 @@ export async function worktrunkCreate(options: WorktrunkCreateOptions): Promise<
       cwd: options.repoRoot,
       timeoutMs: options.timeoutMs,
       ...(options.signal === undefined ? {} : { signal: options.signal }),
+      ...(options.lifecycle === undefined
+        ? {}
+        : { parentDeathWatchdog: true, lifecycle: options.lifecycle }),
     },
   );
   if (!result) throw new Error(`无法执行 Worktrunk（${options.command}）：${options.path}`);

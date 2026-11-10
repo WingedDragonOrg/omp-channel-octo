@@ -1,19 +1,24 @@
-import { randomUUID } from "node:crypto";
-import { lstat, mkdir, realpath, stat } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { lstat, mkdir, realpath, stat, symlink } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type {
   ChannelTransport,
   ChatTarget,
   ThreadListenLevel,
   ThreadSummary,
   ThreadWorkspaceRequest,
+  WorktreeCreateLifecycle,
   WorktreePort,
 } from "../contracts.ts";
 import type { ChannelStore } from "../store/index.ts";
 import type {
+  BindingRecord,
+  TaskRecord,
+  ThreadWorkspaceOperationRecord,
   ThreadWorkspaceProjectRecord,
   ThreadWorkspaceRecord,
 } from "../store/store-records.ts";
+import { threadParentGroupId, threadShortId } from "../threads/thread-target.ts";
 import { isTransientServerFailure } from "../errors.ts";
 import { OctoError } from "../octo/error.ts";
 import { runCommand } from "./worktrunk.ts";
@@ -44,6 +49,7 @@ export interface ThreadWorkspaceHost {
   readonly store: Pick<
     ChannelStore,
     | "getBinding"
+    | "getThreadWorkspace"
     | "ensureBindingIfMatches"
     | "saveThreadWorkspace"
     | "saveThreadWorkspaces"
@@ -54,6 +60,29 @@ export interface ThreadWorkspaceHost {
     | "listThreadWorkspaces"
   >;
   readonly botUid: string;
+}
+
+/** Additional durable-session capabilities used only by accepted workspace operations. */
+export interface ThreadWorkspaceOperationHost extends ThreadWorkspaceHost {
+  readonly store: ThreadWorkspaceHost["store"] & Pick<
+    ChannelStore,
+    | "getTask"
+    | "getWorkerLedger"
+    | "acceptThreadWorkspaceOperation"
+    | "getThreadWorkspaceOperation"
+    | "listThreadWorkspaceOperations"
+    | "updateThreadWorkspaceOperation"
+    | "finishThreadWorkspaceOperation"
+  >;
+  readonly moveThreadWorkspaceBinding: (
+    target: ChatTarget,
+    expected: BindingRecord,
+    destinationCwd: string,
+    workerLedgerId: string,
+    signal: AbortSignal,
+  ) => Promise<BindingRecord>;
+  readonly scheduleThreadWorkspaceOperation: (operation: ThreadWorkspaceOperationRecord) => void;
+  readonly blockOperationResources: (operation: ThreadWorkspaceOperationRecord) => void;
 }
 
 export interface ThreadWorkspaceScope {
@@ -70,6 +99,11 @@ export interface ThreadWorkspaceCreatePlan {
   /** Full normalized task slug shared by every project in this batch. */
   worktreeNameSeed: string;
   /** Host-derived main-group project scope used only for shared workspace placement. */
+  sharedScope?: ThreadWorkspaceScope;
+}
+export interface ThreadWorkspaceAddPlan {
+  worktreeNameSeed: string;
+  projects: ThreadWorkspaceCreatePlan["projects"];
   sharedScope?: ThreadWorkspaceScope;
 }
 
@@ -429,6 +463,916 @@ export async function validateThreadCreation(
   };
 }
 
+/** Accepts a durable append request and schedules it behind the source turn without waiting for it. */
+export async function expandThreadWorkspace(
+  host: ThreadWorkspaceOperationHost,
+  task: TaskRecord,
+  target: ChatTarget,
+  args: Record<string, unknown>,
+  signal: AbortSignal,
+  toolCallId?: string,
+): Promise<string> {
+  if (
+    args.action !== "thread-workspace-add"
+    || Object.keys(args).some((key) =>
+      key !== "action" && key !== "worktree_name" && key !== "projects" && key !== "short_id"
+    )
+  ) throw new Error("thread-workspace-add 参数无效");
+  const groupId = threadParentGroupId(target.channelId);
+  const shortId = threadShortId(target.channelId);
+  if (target.channelType !== 5 || groupId === null || shortId === null) {
+    throw new Error("thread-workspace-add 目标不是有效子区");
+  }
+  if (args.short_id !== undefined && args.short_id !== shortId) {
+    throw new Error("short_id 与目标子区不匹配");
+  }
+  const callerGroupId = task.channelType === 2
+    ? task.channelId
+    : task.channelType === 5
+      ? threadParentGroupId(task.channelId)
+      : null;
+
+  const persistedTask = host.store.getTask(task.id);
+  if (
+    task.botUid !== host.botUid
+    || callerGroupId !== groupId
+    || persistedTask === null
+    || persistedTask.botUid !== task.botUid
+    || persistedTask.channelType !== task.channelType
+    || persistedTask.channelId !== task.channelId
+    || persistedTask.messageId !== task.messageId
+    || persistedTask.senderId !== task.senderId
+    || (persistedTask.state !== "running" && (persistedTask.state as string) !== "started")
+  ) throw new Error("thread-workspace-add 只能由当前运行的群或同群子区任务发起");
+  const rawName = optionalString(args, "worktree_name")?.trim();
+  if (rawName === undefined || rawName.length === 0) {
+    throw new Error("thread-workspace-add requires worktree_name");
+  }
+  const validated = await validateThreadCreation(
+    { action: "thread-workspace-add", worktree_name: rawName, projects: args.projects, layout: "shared" },
+    "",
+    undefined,
+    signal,
+  );
+  const plan = validated.workspace;
+  if (plan === null) throw new Error("thread-workspace-add requires projects");
+  plan.layout = "shared";
+
+  const nativeToolCallId = toolCallId?.trim();
+  const toolId = createHash("sha256")
+    .update(JSON.stringify(nativeToolCallId === undefined || nativeToolCallId.length === 0
+      ? [task.id, target.channelId, rawName, plan.projects]
+      : [task.id, target.channelId, nativeToolCallId]))
+    .digest("hex");
+  const operationId = `workspace-add-${createHash("sha256")
+    .update(`${host.botUid}\0${target.channelId}\0${toolId}`)
+    .digest("hex")}`;
+  const prior = host.store.getThreadWorkspaceOperation(host.botUid, operationId);
+  if (prior !== null) {
+    if (
+      prior.taskId !== task.id
+      || prior.channelId !== target.channelId
+      || prior.worktreeNameSeed !== plan.worktreeNameSeed
+      || JSON.stringify(prior.projects) !== JSON.stringify(plan.projects)
+    ) throw new Error("thread-workspace-add toolCallId was replayed with different arguments");
+    if (prior.status === "queued" || prior.status === "running") {
+      host.scheduleThreadWorkspaceOperation(prior);
+    }
+    return JSON.stringify({
+      accepted: true,
+      status: prior.status,
+      queued: prior.status === "queued" || prior.status === "running",
+      operation_id: prior.id,
+    });
+  }
+
+  const workspace = host.store.getThreadWorkspace(host.botUid, target);
+  const binding = host.store.getBinding(host.botUid, target);
+  if (workspace === null || workspace.status !== "ready" || binding === null) {
+    throw new Error("子区工作区或绑定尚未就绪，无法追加项目");
+  }
+  if (!host.worktrees) throw new Error("本部署未配置隔离工作区能力");
+  if (workspace.projects.length === 0 || workspace.projects.some(project =>
+    !project.created || project.path === null || project.branch === null
+  )) throw new Error("现有子区项目未全部就绪，拒绝追加");
+
+  const existingSlugs = new Set(workspace.projects.map(projectDirectoryName));
+  for (const project of plan.projects) {
+    if (existingSlugs.has(worktreeSlug(project.name))) {
+      throw new Error(`project name already exists in this thread workspace: ${project.name}`);
+    }
+  }
+  const bindingCwd = await realpath(binding.cwd);
+  if (bindingCwd !== binding.cwd || !(await stat(bindingCwd)).isDirectory()) {
+    throw new Error("子区绑定目录已被替换或不存在，拒绝迁移");
+  }
+
+  const converting = workspace.layout !== "shared";
+  let entryPath: string | null = null;
+  let workspaceRoot: string | null = null;
+  let stateDir: string | null = null;
+  let scopeName: string | null = null;
+  if (!converting) {
+    if (workspace.entryPath === null) throw new Error("shared 工作区缺少受管入口");
+    entryPath = await realpath(workspace.entryPath);
+    if (entryPath !== workspace.entryPath || bindingCwd !== entryPath) {
+      throw new Error("子区绑定已移出受管 shared 入口，拒绝覆盖外部变更");
+    }
+    workspaceRoot = workspace.workspaceRoot ?? null;
+  } else {
+    if (!workspace.projects.some(project => pathContains(project.path!, bindingCwd))) {
+      throw new Error("子区绑定已移出原项目工作区，拒绝覆盖外部变更");
+    }
+    for (const project of workspace.projects) await verifyOwnedProject(project, signal);
+    const scopePlan: ThreadWorkspaceCreatePlan = {
+      layout: "shared",
+      projects: plan.projects,
+      background: DEFAULT_BACKGROUND,
+      worktreeNameSeed: plan.worktreeNameSeed,
+    };
+    await prepareThreadWorkspaceScope(host, groupId, scopePlan, signal);
+    if (scopePlan.sharedScope === undefined) throw new Error("无法解析 shared 工作区作用域");
+    stateDir = await realpath(host.stateDir);
+    scopeName = scopePlan.sharedScope.name;
+  }
+
+  const operationInput = {
+    id: operationId,
+    botUid: host.botUid,
+    channelType: 5 as const,
+    channelId: target.channelId,
+    groupId,
+    toolCallId: toolId,
+    taskId: task.id,
+    worktreeNameSeed: plan.worktreeNameSeed,
+    projects: plan.projects,
+    expectedWorkspace: workspace,
+    expectedBinding: binding,
+    candidateBinding: { ...binding },
+  };
+  let accepted: { operation: ThreadWorkspaceOperationRecord; created: boolean };
+  if (converting) {
+    const allocationStateDir = stateDir!;
+    const sharedScopeName = scopeName!;
+    accepted = await withSharedEntryAllocationLock(allocationStateDir, async () => {
+      const reservedPaths = new Set<string>();
+      for (const owned of host.store.listThreadWorkspaces(host.botUid)) {
+        if (owned.workspaceRoot !== null && owned.workspaceRoot !== undefined) {
+          reservedPaths.add(owned.workspaceRoot);
+        }
+        if (owned.entryPath !== null) reservedPaths.add(owned.entryPath);
+      }
+      for (const pending of host.store.listThreadWorkspaceOperations(host.botUid)) {
+        if (pending.status !== "queued" && pending.status !== "running" && pending.status !== "unknown") continue;
+        if (pending.candidateWorkspace.workspaceRoot != null) {
+          reservedPaths.add(pending.candidateWorkspace.workspaceRoot);
+        }
+        if (pending.candidateWorkspace.entryPath !== null) {
+          reservedPaths.add(pending.candidateWorkspace.entryPath);
+        }
+      }
+
+      const parent = join(allocationStateDir, "thread-workspaces");
+      for (let suffix = 1; ; suffix += 1) {
+        const name = suffix === 1 ? plan.worktreeNameSeed : `${plan.worktreeNameSeed}-${suffix}`;
+        const candidateRoot = join(parent, name);
+        if (reservedPaths.has(candidateRoot)) continue;
+        try {
+          await lstat(candidateRoot);
+          continue;
+        } catch (error) {
+          if (errorCode(error) !== "ENOENT") throw error;
+        }
+        const candidateEntry = join(candidateRoot, sharedScopeName);
+        try {
+          return host.store.acceptThreadWorkspaceOperation({
+            ...operationInput,
+            candidateWorkspace: expansionCandidateWorkspace(
+              workspace,
+              plan.projects,
+              candidateEntry,
+              candidateRoot,
+              true,
+            ),
+          });
+        } catch (error) {
+          if (error instanceof Error && error.message === "shared workspace root is already reserved") {
+            reservedPaths.add(candidateRoot);
+            continue;
+          }
+          throw error;
+        }
+      }
+    });
+  } else {
+    accepted = host.store.acceptThreadWorkspaceOperation({
+      ...operationInput,
+      candidateWorkspace: expansionCandidateWorkspace(
+        workspace,
+        plan.projects,
+        entryPath!,
+        workspaceRoot,
+        false,
+      ),
+    });
+  }
+  host.scheduleThreadWorkspaceOperation(accepted.operation);
+  return JSON.stringify({
+    accepted: true,
+    status: accepted.operation.status,
+    queued: accepted.operation.status === "queued" || accepted.operation.status === "running",
+    operation_id: accepted.operation.id,
+  });
+}
+
+function expansionCandidateWorkspace(
+  existing: ThreadWorkspaceRecord,
+  requested: ThreadWorkspaceCreatePlan["projects"],
+  entryPath: string,
+  workspaceRoot: string | null,
+  converting: boolean,
+): ThreadWorkspaceRecord {
+  const additions: ThreadWorkspaceProjectRecord[] = requested.map(project => ({
+    ...project,
+    path: join(entryPath, projectDirectoryName(project)),
+    branch: null,
+    created: false,
+  }));
+  const existingProjects = existing.projects.map(project => converting
+    ? {
+      ...project,
+      accessPath: join(entryPath, projectDirectoryName(project)),
+      accessTarget: project.path!,
+    }
+    : { ...project });
+  return {
+    ...existing,
+    layout: "shared",
+    status: "preparing",
+    workspaceRoot,
+    entryPath,
+    error: null,
+    projects: [...existingProjects, ...additions],
+  };
+}
+
+/** Runs one already-accepted operation; all uncertain side effects remain durable and blocked. */
+export async function runThreadWorkspaceOperation(
+  host: ThreadWorkspaceOperationHost,
+  operationId: string,
+  signal: AbortSignal,
+  isUserCancellationRequested: () => boolean = () => false,
+): Promise<void> {
+  const initialOperation = host.store.getThreadWorkspaceOperation(host.botUid, operationId);
+  if (
+    initialOperation === null
+    || (
+      initialOperation.status !== "queued"
+      && !(initialOperation.status === "running" && initialOperation.cancelRequested)
+    )
+  ) return;
+  let operation: ThreadWorkspaceOperationRecord = initialOperation;
+  if (operation.status === "queued") {
+    operation = updateWorkspaceOperation(host, operation, { status: "running" });
+    operation = host.store.getThreadWorkspaceOperation(host.botUid, operation.id) ?? operation;
+  }
+  let confirmedEffects = operation.phase === "entry-root-created"
+    || operation.phase === "entry-create-intent"
+    || operation.phase === "entry-created"
+    || operation.phase === "alias-created"
+    || operation.phase === "project-created"
+    || operation.phase === "move-confirmed"
+    || operation.candidateWorkspace.projects.some(project =>
+      project.created && operation.projects.some(requested => requested.name === project.name)
+    );
+  const cancelWithoutFurtherEffects = async (detail: string): Promise<void> => {
+    operation = host.store.getThreadWorkspaceOperation(host.botUid, operation.id) ?? operation;
+    if (operation.status === "unknown") {
+      host.blockOperationResources(operation);
+      return;
+    }
+    if (operation.status !== "running") return;
+    if (
+      operation.processIdentity !== null
+      || operation.phase === "entry-creating"
+      || operation.phase === "alias-creating"
+      || operation.phase === "entry-create-intent"
+      || operation.phase === "project-creating"
+    ) {
+      markWorkspaceOperationUnknown(host, operation, "取消时资源创建结果未知");
+      return;
+    }
+    if (operation.phase === "move-dispatch-intent" && operation.workerLedgerId !== null) {
+      const ledger = host.store.getWorkerLedger(host.botUid, operation.workerLedgerId);
+      if (ledger !== null) {
+        markWorkspaceOperationUnknown(host, operation, "取消时原生 /move 结果未知");
+        return;
+      }
+    }
+    if (operation.phase === "project-process-exited") {
+      const reconciled = await reconcileExitedProject(host, operation);
+      if (reconciled === "unknown") {
+        markWorkspaceOperationUnknown(host, operation, "worktree 进程已退出但创建结果无法确认");
+        return;
+      }
+      operation = host.store.getThreadWorkspaceOperation(host.botUid, operation.id) ?? operation;
+      if (reconciled === "created") confirmedEffects = true;
+      else operation = updateWorkspaceOperation(host, operation, { phase: "project-not-started" });
+    }
+    if (operation.phase === "move-confirmed") {
+      const completed = host.store.finishThreadWorkspaceOperation(
+        {
+          ...operation,
+          candidateWorkspace: { ...operation.candidateWorkspace, status: "ready", error: null },
+        },
+        "complete",
+        true,
+        true,
+      );
+      if (completed === null) markWorkspaceOperationUnknown(host, operation, "已确认的 /move 无法原子提交");
+      return;
+    }
+    finishWorkspaceOperation(host, operation, "cancelled", confirmedEffects, false, detail);
+  };
+  try {
+    const task = host.store.getTask(operation.taskId);
+    if (
+      task?.state === "cancelled"
+      || operation.cancelRequested
+      || isUserCancellationRequested()
+    ) {
+      await cancelWithoutFurtherEffects(
+        task?.state === "cancelled" ? "来源任务已取消" : "目标聊天已取消子区工作区追加操作",
+      );
+      return;
+    }
+    assertWorkspaceOperationSnapshot(host, operation);
+    if (!host.worktrees) throw new Error("本部署未配置隔离工作区能力");
+    if (operation.phase === "project-process-exited") {
+      const reconciled = await reconcileExitedProject(host, operation);
+      if (reconciled === "unknown") {
+        markWorkspaceOperationUnknown(host, operation, "已退出的 worktree 结果无法确认");
+        return;
+      }
+      operation = host.store.getThreadWorkspaceOperation(host.botUid, operation.id) ?? operation;
+      if (reconciled === "created") confirmedEffects = true;
+      else operation = updateWorkspaceOperation(host, operation, { phase: "project-not-started" });
+    }
+    if (
+      host.store.getTask(operation.taskId)?.state === "cancelled"
+      || host.store.getThreadWorkspaceOperation(host.botUid, operation.id)?.cancelRequested
+      || isUserCancellationRequested()
+    ) {
+      await cancelWithoutFurtherEffects(
+        host.store.getTask(operation.taskId)?.state === "cancelled"
+          ? "来源任务已取消"
+          : "目标聊天已取消子区工作区追加操作",
+      );
+      return;
+    }
+
+    const converting = operation.expectedWorkspace.layout !== "shared";
+    if (converting) {
+      await ensureExpansionEntry(host, operation, signal, next => {
+        operation = next;
+        if (next.phase === "entry-root-created") confirmedEffects = true;
+      });
+      await ensureExpansionAliases(host, operation, signal, next => { operation = next; });
+      confirmedEffects = true;
+    }
+    await createExpansionProjects(host, operation, signal, next => {
+      operation = next;
+      if (next.phase === "project-created") confirmedEffects = true;
+    });
+    if (operation.status === "unknown") {
+      host.blockOperationResources(operation);
+      return;
+    }
+    operation = host.store.getThreadWorkspaceOperation(host.botUid, operation.id) ?? operation;
+    if (
+      host.store.getTask(operation.taskId)?.state === "cancelled"
+      || operation.cancelRequested
+      || isUserCancellationRequested()
+    ) {
+      await cancelWithoutFurtherEffects(
+        host.store.getTask(operation.taskId)?.state === "cancelled"
+          ? "来源任务已取消"
+          : "目标聊天已取消子区工作区追加操作",
+      );
+      return;
+    }
+
+    if (converting && operation.phase !== "move-confirmed") {
+      if (signal.aborted) throw signal.reason ?? new Error("workspace expansion aborted");
+      const workerLedgerId = randomUUID();
+      operation = updateWorkspaceOperation(host, operation, {
+        phase: "move-dispatch-intent",
+        workerLedgerId,
+      });
+      const moved = await host.moveThreadWorkspaceBinding(
+        { channelType: 5, channelId: operation.channelId },
+        operation.expectedBinding,
+        operation.candidateWorkspace.entryPath!,
+        workerLedgerId,
+        signal,
+      );
+      operation = updateWorkspaceOperation(host, operation, {
+        candidateBinding: moved,
+        phase: "move-confirmed",
+        workerLedgerId: null,
+      });
+      confirmedEffects = true;
+      operation = host.store.getThreadWorkspaceOperation(host.botUid, operation.id) ?? operation;
+      if (operation.cancelRequested || isUserCancellationRequested()) {
+        await cancelWithoutFurtherEffects("目标聊天已取消子区工作区追加操作");
+        return;
+      }
+    }
+
+    operation = {
+      ...operation,
+      candidateWorkspace: {
+        ...operation.candidateWorkspace,
+        status: "ready",
+        error: null,
+        projects: operation.candidateWorkspace.projects.map(project => ({ ...project })),
+      },
+    };
+    const completed = host.store.finishThreadWorkspaceOperation(
+      operation,
+      "complete",
+      true,
+      converting,
+    );
+    if (completed === null) {
+      markWorkspaceOperationUnknown(host, operation, "绑定或工作区所有权发生变化，无法原子发布");
+    }
+  } catch (error) {
+    const current = host.store.getThreadWorkspaceOperation(host.botUid, operation.id) ?? operation;
+    if (current.status === "unknown") return;
+    operation = current;
+    const aborted = signal.aborted;
+    const userCancelled = current.cancelRequested
+      || isUserCancellationRequested()
+      || host.store.getTask(current.taskId)?.state === "cancelled";
+    if (
+      current.phase === "entry-creating"
+      || current.phase === "entry-create-intent"
+      || current.phase === "alias-creating"
+      || current.phase === "project-creating"
+    ) {
+      markWorkspaceOperationUnknown(host, current, "资源创建阶段中断，副作用结果未知");
+      return;
+    }
+    if ((aborted || userCancelled) && current.processIdentity !== null) {
+      markWorkspaceOperationUnknown(host, current, "操作取消时 worktree 子进程结果未知");
+      return;
+    }
+    if (current.phase === "move-dispatch-intent" && current.workerLedgerId !== null) {
+      const ledger = host.store.getWorkerLedger(host.botUid, current.workerLedgerId);
+      if (ledger !== null) {
+        markWorkspaceOperationUnknown(host, current, "原生 /move 已派发，结果未知");
+        return;
+      }
+    }
+    if (userCancelled) {
+      await cancelWithoutFurtherEffects(
+        host.store.getTask(current.taskId)?.state === "cancelled"
+          ? "来源任务已取消"
+          : "目标聊天已取消子区工作区追加操作",
+      );
+      return;
+    }
+    if (aborted && current.phase === "project-process-exited") {
+      const reconciled = await reconcileExitedProject(host, current).catch(() => "unknown");
+      if (reconciled === "unknown") {
+        markWorkspaceOperationUnknown(host, current, "worktree 进程已退出但创建结果无法确认");
+        return;
+      }
+      if (reconciled === "created") {
+        confirmedEffects = true;
+        operation = host.store.getThreadWorkspaceOperation(host.botUid, current.id) ?? current;
+      } else {
+        operation = updateWorkspaceOperation(host, current, { phase: "project-not-started" });
+      }
+    }
+    if (aborted) {
+      updateWorkspaceOperation(host, operation, { status: "queued", error: null });
+      return;
+    }
+    const detail = boundedError(error, "thread workspace expansion failed");
+    if (confirmedEffects) {
+      operation = {
+        ...operation,
+        candidateWorkspace: {
+          ...operation.candidateWorkspace,
+          status: "failed",
+          error: detail,
+        },
+        error: detail,
+      };
+      const finalized = host.store.finishThreadWorkspaceOperation(
+        operation,
+        "failed",
+        true,
+        false,
+      );
+      if (finalized === null) markWorkspaceOperationUnknown(host, operation, detail);
+      return;
+    }
+    finishWorkspaceOperation(host, operation, "failed", false, false, detail);
+  }
+}
+
+async function ensureExpansionEntry(
+  host: ThreadWorkspaceOperationHost,
+  initial: ThreadWorkspaceOperationRecord,
+  signal: AbortSignal,
+  update: (operation: ThreadWorkspaceOperationRecord) => void,
+): Promise<void> {
+  let operation = initial;
+  const root = operation.candidateWorkspace.workspaceRoot;
+  const entry = operation.candidateWorkspace.entryPath;
+  if (root == null || entry == null || !pathContains(root, entry)) {
+    throw new Error("候选 shared 入口路径无效");
+  }
+  if (operation.phase === "accepted") {
+    operation = updateWorkspaceOperation(host, operation, { phase: "entry-creating" });
+    update(operation);
+    await validateSharedWorkspaceParent(await realpath(host.stateDir), signal);
+    await mkdir(dirname(root), { recursive: true });
+    const parent = await realpath(dirname(root));
+    if (parent !== dirname(root)) throw new Error("共享工作区任务根父目录被替换");
+    await mkdir(root);
+    if (await realpath(root) !== root || !(await stat(root)).isDirectory()) {
+      throw new Error("共享工作区任务根路径被替换");
+    }
+    operation = updateWorkspaceOperation(host, operation, { phase: "entry-root-created" });
+    update(operation);
+  } else if (operation.phase === "entry-root-created") {
+    if (await realpath(root) !== root || !(await stat(root)).isDirectory()) {
+      throw new Error("已登记的共享工作区任务根丢失或被替换");
+    }
+  } else if (operation.phase === "entry-create-intent") {
+    throw new Error("共享工作区作用域入口创建结果未知");
+  } else if (operation.phase === "entry-created" || operation.phase === "alias-created"
+    || operation.phase === "project-not-started" || operation.phase === "project-created"
+    || operation.phase === "move-confirmed") {
+    return;
+  } else if (operation.phase !== "entry-creating") {
+    throw new Error("共享工作区入口处于未知阶段");
+  } else {
+    throw new Error("共享工作区根目录创建结果未知");
+  }
+  if (signal.aborted) throw signal.reason ?? new Error("workspace expansion aborted");
+  const rootReal = await realpath(root);
+  if (rootReal !== root || !(await stat(rootReal)).isDirectory()) {
+    throw new Error("共享工作区任务根路径无效");
+  }
+  operation = updateWorkspaceOperation(host, operation, { phase: "entry-create-intent" });
+  update(operation);
+  try {
+    await mkdir(entry);
+  } catch (error) {
+    operation = updateWorkspaceOperation(host, operation, { phase: "entry-root-created" });
+    update(operation);
+    throw error;
+  }
+  if (await realpath(entry) !== entry || !(await stat(entry)).isDirectory()) {
+    throw new Error("共享工作区作用域入口被替换");
+  }
+  operation = updateWorkspaceOperation(host, operation, { phase: "entry-created" });
+  update(operation);
+}
+
+async function ensureExpansionAliases(
+  host: ThreadWorkspaceOperationHost,
+  initial: ThreadWorkspaceOperationRecord,
+  signal: AbortSignal,
+  update: (operation: ThreadWorkspaceOperationRecord) => void,
+): Promise<void> {
+  let operation = initial;
+  for (const project of operation.candidateWorkspace.projects) {
+    if (project.accessPath === undefined || project.accessTarget === undefined) continue;
+    if (signal.aborted) throw signal.reason ?? new Error("workspace expansion aborted");
+    const target = await realpath(project.accessTarget);
+    if (target !== project.accessTarget) throw new Error("原项目工作区路径已变化，拒绝创建别名");
+    try {
+      const details = await lstat(project.accessPath);
+      if (!details.isSymbolicLink() || await realpath(project.accessPath) !== target) {
+        throw new Error("受管项目别名已存在且目标不匹配，拒绝覆盖");
+      }
+      continue;
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") throw error;
+    }
+    operation = updateWorkspaceOperation(host, operation, { phase: "alias-creating" });
+    update(operation);
+    await symlink(target, project.accessPath, "dir");
+    const link = await lstat(project.accessPath);
+    if (!link.isSymbolicLink() || await realpath(project.accessPath) !== target) {
+      throw new Error("受管项目别名创建后验证失败");
+    }
+    operation = updateWorkspaceOperation(host, operation, { phase: "alias-created" });
+    update(operation);
+  }
+}
+
+async function createExpansionProjects(
+  host: ThreadWorkspaceOperationHost,
+  initial: ThreadWorkspaceOperationRecord,
+  signal: AbortSignal,
+  update: (operation: ThreadWorkspaceOperationRecord) => void,
+): Promise<void> {
+  let operation = initial;
+  const shortId = threadShortId(operation.channelId);
+  if (shortId === null) throw new Error("workspace operation has invalid thread identity");
+  for (const requested of operation.projects) {
+    let project = operation.candidateWorkspace.projects.find(item => item.name === requested.name);
+    if (project === undefined) throw new Error("候选项目所有权记录丢失");
+    if (project.created) continue;
+    if (signal.aborted) throw signal.reason ?? new Error("workspace expansion aborted");
+    if (project.path === null) throw new Error("候选 worktree 路径未持久化");
+    const requestedPath = project.path;
+    operation = updateWorkspaceOperation(host, operation, { phase: "project-not-started" });
+    update(operation);
+    const lifecycle: WorktreeCreateLifecycle = {
+      beforeSpawn: cwd => {
+        if (cwd !== requested.repo) throw new Error("worktree create cwd differs from the validated repository");
+        operation = updateWorkspaceOperation(host, operation, {
+          phase: "project-creating",
+          processIdentity: null,
+        });
+        update(operation);
+      },
+      onSpawn: process => {
+        if (process.cwd !== requested.repo) throw new Error("worktree process cwd differs from its repository");
+        operation = updateWorkspaceOperation(host, operation, {
+          phase: "project-creating",
+          processIdentity: process,
+        });
+        update(operation);
+      },
+      onConfirmedExit: () => {
+        operation = updateWorkspaceOperation(host, operation, {
+          phase: "project-process-exited",
+          processIdentity: null,
+        });
+        update(operation);
+      },
+      onNotSpawned: () => {
+        operation = updateWorkspaceOperation(host, operation, {
+          phase: "project-not-started",
+          processIdentity: null,
+        });
+        update(operation);
+      },
+      onUnknown: () => {
+        operation = updateWorkspaceOperation(host, operation, {
+          status: "unknown",
+          error: "worktree create child process outcome is unknown",
+        });
+        update(operation);
+      },
+    };
+    const request: ThreadWorkspaceRequest = {
+      baseDir: requested.repo,
+      label: operation.worktreeNameSeed,
+      threadId: shortId,
+      path: requestedPath,
+      ...(requested.base === undefined ? {} : { base: requested.base }),
+      onPlanned: planned => {
+        if (
+          !isAbsolute(planned.cwd)
+          || planned.cwd !== requestedPath
+          || planned.repo !== requested.repo
+          || planned.branch.length === 0
+        ) throw new Error("WorktreePort planned a path/repository outside the durable candidate");
+        const projects = operation.candidateWorkspace.projects.map(item => item.name === requested.name
+          ? { ...item, path: planned.cwd, branch: planned.branch, created: false }
+          : item);
+        operation = updateWorkspaceOperation(host, operation, {
+          candidateWorkspace: { ...operation.candidateWorkspace, projects },
+        });
+        update(operation);
+      },
+      lifecycle,
+    };
+    try {
+      const created = await host.worktrees!.create(request, signal);
+      const canonical = await realpath(created.cwd);
+      const plannedProject = operation.candidateWorkspace.projects.find(item => item.name === requested.name);
+      if (
+        plannedProject === undefined
+        || canonical !== requestedPath
+        || !(await stat(canonical)).isDirectory()
+        || created.branch.length === 0
+        || (plannedProject.branch !== null && plannedProject.branch !== created.branch)
+      ) throw new Error("WorktreePort 创建路径与已登记候选不一致");
+      await verifyOwnedProject({
+        ...plannedProject,
+        path: canonical,
+        branch: created.branch,
+        created: true,
+      }, signal);
+      const projects = operation.candidateWorkspace.projects.map(item => item.name === requested.name
+        ? { ...item, path: canonical, branch: created.branch, created: true }
+        : item);
+      operation = updateWorkspaceOperation(host, operation, {
+        candidateWorkspace: { ...operation.candidateWorkspace, projects },
+        phase: "project-created",
+        processIdentity: null,
+      });
+      update(operation);
+    } catch (error) {
+      const current = host.store.getThreadWorkspaceOperation(host.botUid, operation.id) ?? operation;
+      if (current.status === "unknown" || current.processIdentity !== null) {
+        if (current.status !== "unknown") markWorkspaceOperationUnknown(host, current, "worktree create result is unknown");
+        update(host.store.getThreadWorkspaceOperation(host.botUid, current.id) ?? {
+          ...current,
+          status: "unknown",
+        });
+        return;
+      }
+      if (current.phase === "project-process-exited") {
+        const reconciled = await reconcileExitedProject(host, current).catch(() => "unknown");
+        if (reconciled === "created") {
+          update(host.store.getThreadWorkspaceOperation(host.botUid, current.id) ?? current);
+          continue;
+        }
+        if (reconciled === "unknown") {
+          markWorkspaceOperationUnknown(host, current, "worktree process exited but result cannot be verified");
+          update(host.store.getThreadWorkspaceOperation(host.botUid, current.id) ?? current);
+          return;
+        }
+        operation = updateWorkspaceOperation(host, current, { phase: "project-not-started" });
+        update(operation);
+      }
+      throw error;
+    }
+  }
+}
+
+async function reconcileExitedProject(
+  host: ThreadWorkspaceOperationHost,
+  operation: ThreadWorkspaceOperationRecord,
+): Promise<"created" | "absent" | "unknown"> {
+  const project = operation.candidateWorkspace.projects.find(item =>
+    operation.projects.some(requested => requested.name === item.name)
+  && !item.created
+  );
+  if (project === undefined || project.path === null || project.branch === null) return "unknown";
+  try {
+    const path = await realpath(project.path);
+    if (path !== project.path || !(await stat(path)).isDirectory()) return "unknown";
+  } catch (error) {
+    return errorCode(error) === "ENOENT" ? "absent" : "unknown";
+  }
+  try {
+    await verifyOwnedProject({ ...project, created: true }, new AbortController().signal);
+  } catch {
+    return "unknown";
+  }
+  const projects = operation.candidateWorkspace.projects.map(item => item.name === project.name
+    ? { ...item, created: true }
+    : item);
+  const next = host.store.updateThreadWorkspaceOperation({
+    ...operation,
+    candidateWorkspace: { ...operation.candidateWorkspace, projects },
+    phase: "project-created",
+    status: "running",
+    processIdentity: null,
+  });
+  if (next === null) return "unknown";
+  return "created";
+}
+
+async function verifyOwnedProject(
+  project: ThreadWorkspaceProjectRecord,
+  signal: AbortSignal,
+): Promise<void> {
+  if (project.path === null || project.branch === null || !isAbsolute(project.path)) {
+    throw new Error("project lacks a durable worktree path or branch");
+  }
+  const path = await realpath(project.path);
+  if (path !== project.path || !(await stat(path)).isDirectory()) {
+    throw new Error("project worktree path was replaced or removed");
+  }
+  const top = await runCommand(
+    ["git", "-C", path, "rev-parse", "--show-toplevel"],
+    { timeoutMs: INPUT_CHECK_TIMEOUT_MS, signal },
+  );
+  if (!top || top.exitCode !== 0 || top.timedOut || top.aborted || top.stdout.trim() !== path) {
+    throw new Error("project path is not the recorded Git worktree");
+  }
+  const branch = await runCommand(
+    ["git", "-C", path, "branch", "--show-current"],
+    { timeoutMs: INPUT_CHECK_TIMEOUT_MS, signal },
+  );
+  if (!branch || branch.exitCode !== 0 || branch.timedOut || branch.aborted
+    || branch.stdout.trim() !== project.branch) {
+    throw new Error("project branch differs from its recorded ownership");
+  }
+  const commonDir = async (cwd: string): Promise<string> => {
+    const result = await runCommand(
+      ["git", "-C", cwd, "rev-parse", "--git-common-dir"],
+      { timeoutMs: INPUT_CHECK_TIMEOUT_MS, signal },
+    );
+    if (!result || result.exitCode !== 0 || result.timedOut || result.aborted) {
+      throw new Error("unable to verify project Git common directory");
+    }
+    return realpath(resolve(cwd, result.stdout.trim()));
+  };
+  if (await commonDir(path) !== await commonDir(project.repo)) {
+    throw new Error("project worktree belongs to a different repository");
+  }
+}
+
+function assertWorkspaceOperationSnapshot(
+  host: ThreadWorkspaceOperationHost,
+  operation: ThreadWorkspaceOperationRecord,
+): void {
+  const workspace = host.store.getThreadWorkspace(host.botUid, {
+    channelType: 5,
+    channelId: operation.channelId,
+  });
+  const binding = host.store.getBinding(host.botUid, {
+    channelType: 5,
+    channelId: operation.channelId,
+  });
+  if (
+    JSON.stringify(workspace) !== JSON.stringify(operation.expectedWorkspace)
+    || !sameWorkspaceBinding(binding, operation.expectedBinding)
+  ) throw new Error("绑定或工作区所有权已变化，拒绝追加");
+}
+
+function sameWorkspaceBinding(left: BindingRecord | null, right: BindingRecord): boolean {
+  return left !== null
+    && left.botUid === right.botUid
+    && left.channelType === right.channelType
+    && left.channelId === right.channelId
+    && left.sessionId === right.sessionId
+    && left.cwd === right.cwd
+    && left.sessionFile === right.sessionFile
+    && (left.cwdPinned === true) === (right.cwdPinned === true)
+    && (left.sessionSwitchedAt ?? null) === (right.sessionSwitchedAt ?? null)
+    && JSON.stringify(left.sessionInitialization ?? null) === JSON.stringify(right.sessionInitialization ?? null);
+}
+
+function updateWorkspaceOperation(
+  host: ThreadWorkspaceOperationHost,
+  operation: ThreadWorkspaceOperationRecord,
+  changes: Partial<Pick<
+    ThreadWorkspaceOperationRecord,
+    "candidateWorkspace" | "candidateBinding" | "phase" | "status" | "workerLedgerId" | "processIdentity" | "error"
+  >>,
+): ThreadWorkspaceOperationRecord {
+  const updated = host.store.updateThreadWorkspaceOperation({ ...operation, ...changes });
+  if (updated === null) throw new Error("thread workspace operation CAS failed");
+  return updated;
+}
+
+function markWorkspaceOperationUnknown(
+  host: ThreadWorkspaceOperationHost,
+  operation: ThreadWorkspaceOperationRecord,
+  error: string,
+): void {
+  if (operation.status === "unknown") {
+    host.blockOperationResources(operation);
+    return;
+  }
+  let durable = operation;
+  try {
+    durable = updateWorkspaceOperation(host, operation, {
+      status: "unknown",
+      error: boundedError(error, "thread workspace operation outcome is unknown"),
+    });
+  } catch {
+    // The prior durable running record still blocks the thread; never release an unconfirmed effect.
+  }
+  host.blockOperationResources(durable);
+}
+
+function finishWorkspaceOperation(
+  host: ThreadWorkspaceOperationHost,
+  operation: ThreadWorkspaceOperationRecord,
+  status: "failed" | "cancelled",
+  publishCandidate: boolean,
+  publishBinding: boolean,
+  error: string,
+): void {
+  const candidateWorkspace = publishCandidate
+    ? { ...operation.candidateWorkspace, status: "failed" as const, error }
+    : operation.candidateWorkspace;
+  const finished = host.store.finishThreadWorkspaceOperation(
+    { ...operation, candidateWorkspace, error },
+    status,
+    publishCandidate,
+    publishBinding,
+  );
+  if (finished === null) markWorkspaceOperationUnknown(host, operation, "operation finalization CAS failed");
+}
+
 function projectDirectoryName(project: Pick<ThreadWorkspaceProjectRecord, "name">): string {
   return worktreeSlug(project.name);
 }
@@ -492,6 +1436,11 @@ function withSharedEntryPlan(
 function errorCode(error: unknown): string | undefined {
   if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
   return typeof error.code === "string" ? error.code : undefined;
+}
+function pathContains(parent: string, child: string): boolean {
+  const resolved = relative(parent, child);
+  return resolved === ""
+    || (!isAbsolute(resolved) && resolved !== ".." && !resolved.startsWith(`..${sep}`));
 }
 
 async function canonicalReservedPath(path: string): Promise<string> {

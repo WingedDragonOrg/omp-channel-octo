@@ -960,6 +960,7 @@ export function createWorktreePort(options: WorktreePortOptions): WorktreePort {
             ...(request.base === undefined ? {} : { base: request.base }),
             timeoutMs: createTimeoutMs,
             ...(signal === undefined ? {} : { signal }),
+            ...(request.lifecycle === undefined ? {} : { lifecycle: request.lifecycle }),
           });
           const actualPath = await realpath(candidate.path);
           const created = await lstat(candidate.path);
@@ -987,7 +988,17 @@ export function createWorktreePort(options: WorktreePortOptions): WorktreePort {
             repoRoot,
             "-q",
           ],
-          { timeoutMs: createTimeoutMs, ...(signal === undefined ? {} : { signal }) },
+          {
+            timeoutMs: createTimeoutMs,
+            ...(signal === undefined ? {} : { signal }),
+            ...(request.lifecycle === undefined
+              ? {}
+              : {
+                parentDeathWatchdog: true,
+                operation: "OMP worktree add",
+                lifecycle: request.lifecycle,
+              }),
+          },
         );
         if (!created) {
           throw new Error(`无法执行 OMP（${options.command}）：${candidate.path}`);

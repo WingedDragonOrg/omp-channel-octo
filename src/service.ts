@@ -103,6 +103,7 @@ import type {
   TaskRecord,
   ThreadListenRecord,
   ThreadMergeEventRecord,
+  ThreadWorkspaceOperationRecord,
   ThreadWorkspaceRecord,
 } from "./store/store-records.ts";
 import type { ReviewJobRecord } from "./store/store-records.ts";
@@ -160,6 +161,11 @@ import {
   cleanupOwnedThreadWorkspace,
   threadWorkspaceCleanupPaths,
 } from "./threads/thread-workspace-cleanup.ts";
+import {
+  expandThreadWorkspace,
+  runThreadWorkspaceOperation,
+  type ThreadWorkspaceOperationHost,
+} from "./workspace/thread-workspaces.ts";
 import { ThreadCommands, type ThreadCommandIngressHooks } from "./commands/thread-commands.ts";
 import { ServiceRestart } from "./runtime/service-restart.ts";
 import { TaskEvents } from "./tasks/task-events.ts";
@@ -315,6 +321,13 @@ type BtwOperation = {
   done: Promise<void>;
 };
 
+type ThreadWorkspaceOperationControl = {
+  target: ChatTarget;
+  controller: AbortController;
+  cancelledByUser: boolean;
+  started: boolean;
+};
+
 class GoalDirectoryBusyError extends Error {
   constructor() {
     super("原生目标控制命令遇到忙目录");
@@ -440,6 +453,8 @@ class CoreService implements ChannelService {
   /** 任务排定与按 cwd 的租约：队列、等待回执与目录链都由它独占。 */
   private readonly scheduler: TaskScheduler;
   private readonly runtimes = new Map<string, RuntimeTask>();
+  /** Avoids installing duplicate ordered reservations when a tool call is replayed. */
+  private readonly scheduledThreadWorkspaceOperations = new Map<string, ThreadWorkspaceOperationControl>();
   /** Prevents replayed question-wake effects from racing their own steer/queue decision. */
   private readonly questionWakeOperations = new Set<string>();
   /** One in-flight native BTW per chat; its controller is shared with cancel/interrupt/shutdown. */
@@ -667,7 +682,11 @@ class CoreService implements ChannelService {
       bot: () => this.bot,
       hasRuntime: target => this.hasRuntime(target),
       isDirectoryBlocked: cwd => this.isWorkspaceDirectoryBlocked(cwd),
-      hasUnresolvedSessionTransition: target => this.hasUnresolvedIngressSessionTransition(target),
+      hasUnresolvedSessionTransition: target => {
+        const botUid = this.bot?.uid;
+        return this.hasUnresolvedIngressSessionTransition(target)
+          || (botUid !== undefined && this.store.isThreadWorkspaceOperationBlocked(botUid, target));
+      },
       blockDirectory: cwd => { this.blockedDirectories.add(cwd); },
       blockIngressDirectory: (jobId, cwd) => this.blockIngressSessionDirectory(jobId, cwd),
       tryAcquireCommandSession: (target, cwds) => this.scheduler.tryAcquireCommandSession(target, cwds),
@@ -997,6 +1016,18 @@ class CoreService implements ChannelService {
       if (configuredOwner) {
         this.store.setOwnerId(identity.uid, configuredOwner);
       }
+      for (const cleanup of this.store.recoverThreadWorkspaceCleanups(identity.uid)) {
+        const ownership = cleanup.ownership ?? this.store.getThreadWorkspace(identity.uid, {
+          channelType: 5,
+          channelId: cleanup.channelId,
+        });
+        const resources = ownership === null ? [] : threadWorkspaceCleanupPaths(ownership, false);
+        if (cleanup.binding !== null) resources.push(cleanup.binding.cwd);
+        for (const cwd of new Set(resources)) this.blockedDirectories.add(cwd);
+        console.error(
+          `[thread delete recovery] 清理意图 id=${cleanup.id} 的结果未知；保留所有权且不会自动重放`,
+        );
+      }
       // Never re-run a host merge. Reconcile its independent card after process recovery has
       // established known/unknown outcomes, then restore failed outcomes as repair tasks.
       const successfulHostMergeRecoveries: HostMergeLeaseRecord[] = [];
@@ -1216,6 +1247,7 @@ class CoreService implements ChannelService {
         interrupt: INTERRUPT_REASON_TEXT,
         question_timeout: QUESTION_TIMEOUT_REASON_TEXT,
       });
+      await this.recoverThreadWorkspaceOperations(identity.uid);
       const reviewRecovery = this.store.prepareReviewJobsForRestart(identity.uid);
       for (const review of [...reviewRecovery.stopped, ...reviewRecovery.uncertain]) {
         const ledger = this.store.getWorkerLedger(identity.uid, review.id);
@@ -5421,12 +5453,17 @@ class CoreService implements ChannelService {
     btwOperation?.controller.abort(new Error("BTW interrupted"));
     const mergeCancelled = this.abortThreadMerges(target, new Error("thread merge interrupted"));
     const removalCancelled = this.abortThreadRemovals(target, new Error("thread removal interrupted"));
+    const workspaceOperationCancelled = this.abortThreadWorkspaceOperations(
+      target,
+      new Error("thread workspace operation interrupted"),
+    );
     const sessionCancelled = this.abortIngressSessionOperations(target, new Error("session command interrupted"));
     const forkCancelled = this.threadForks.abortTarget(target, new Error("fork interrupted"));
     const archiveCancelled = this.abortForkArchiveWaits(target, new Error("fork archive interrupted"));
     const hostOperationCancelled = persistedEffects?.hostOperationCancelled === true
       || mergeCancelled
       || removalCancelled
+      || workspaceOperationCancelled
       || sessionCancelled
       || forkCancelled
       || archiveCancelled;
@@ -7110,6 +7147,7 @@ class CoreService implements ChannelService {
           cancelledQueuedTaskIds: cancelCheckpoint.cancelledQueuedTaskIds,
           stoppedTaskIds: cancelCheckpoint.stoppedTaskIds,
           cancelledQuestionIds: cancelCheckpoint.cancelledQuestionIds ?? [],
+          cancelRequestedWorkspaceOperationIds: cancelCheckpoint.cancelRequestedWorkspaceOperationIds,
         }
       : null;
     const stopIntentTaskIds = durableCancellation === null
@@ -7137,6 +7175,12 @@ class CoreService implements ChannelService {
     if (binding) this.invalidateGoalResumeChecks(target, binding.sessionId);
     const mergeCancelled = this.abortThreadMerges(target, new Error("thread merge cancelled"));
     const removalCancelled = this.abortThreadRemovals(target, new Error("thread removal cancelled"));
+    const workspaceCancellationIds = durableCancellation?.cancelRequestedWorkspaceOperationIds;
+    const workspaceOperationCancelled = this.abortThreadWorkspaceOperations(
+      target,
+      new Error("thread workspace operation cancelled"),
+      workspaceCancellationIds,
+    ) || (workspaceCancellationIds?.length ?? 0) > 0;
     const sessionCancelled = this.abortIngressSessionOperations(target, new Error("session command cancelled"));
     const forkCancelled = this.threadForks.abortTarget(target, new Error("fork cancelled"));
     const tanDispatchSettled = Promise.all(cancelledTanOperations
@@ -7175,6 +7219,7 @@ class CoreService implements ChannelService {
       for (const taskId of stoppingTaskIds) this.store.markTaskStopIntent(taskId, "cancel");
     }
     let active = btwOperation !== undefined || sessionCancelled || tanCancelled || tanInbound.length > 0
+      || workspaceOperationCancelled
       || runtimeTasks.length > 0
       || activeTask?.state === "running"
       || (durableCancellation?.cancelledIngressJobIds.length ?? 0) > 0
@@ -7323,6 +7368,10 @@ class CoreService implements ChannelService {
       lease.channelType === target.channelType
       && lease.channelId === target.channelId
       && lease.outcome === null
+    ) || this.store.listThreadWorkspaceOperations(this.bot!.uid).some(operation =>
+      operation.channelType === target.channelType
+      && operation.channelId === target.channelId
+      && operation.status === "unknown"
     );
     const sessionCompleted = sessionJobIds.some(id => this.store.getIngressJob(id)?.state === "handed-off");
     const response = commitStopUnconfirmed || unknownHostOperation || unknownIngressOperation
@@ -7335,9 +7384,11 @@ class CoreService implements ChannelService {
             ? `当前提交已完成，无法取消或回滚；HEAD=${this.shortHead(completedCommit.result.headAfter)}。`
             : sessionCompleted && queued.length === 0
               ? "会话操作已完成，无法取消或回滚。"
-              : queued.length > 0 || active || mergeCancelled || removalCancelled || forkCancelled || archiveCancelled || tanCancelled
-                ? DEFAULT_CANCELLED_TEXT
-                : "当前没有可取消的任务。";
+              : workspaceOperationCancelled
+                ? `已请求中止子区工作区追加；${DEFAULT_CANCELLED_TEXT} 若副作用无法确认，操作将保持未知且不会自动重放。`
+                : queued.length > 0 || active || mergeCancelled || removalCancelled || forkCancelled || archiveCancelled || tanCancelled
+                  ? DEFAULT_CANCELLED_TEXT
+                  : "当前没有可取消的任务。";
     await this.outbox.enqueueText(target, response, null);
   }
   private abortThreadMerges(target: ChatTarget, reason: Error): boolean {
@@ -7367,6 +7418,30 @@ class CoreService implements ChannelService {
     if (!controllers) return false;
     for (const controller of controllers) controller.abort(reason);
     return controllers.size > 0;
+  }
+  private abortThreadWorkspaceOperations(
+    target: ChatTarget,
+    reason: Error,
+    operationIds?: readonly string[],
+  ): boolean {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) return false;
+    const key = targetKey(target);
+    let requested = false;
+    const candidateIds = operationIds ?? [...this.scheduledThreadWorkspaceOperations.keys()];
+    for (const id of candidateIds) {
+      const control = this.scheduledThreadWorkspaceOperations.get(id);
+      if (control !== undefined && targetKey(control.target) !== key) continue;
+      const current = this.store.getThreadWorkspaceOperation(botUid, id);
+      if (current === null || (current.status !== "queued" && current.status !== "running")) continue;
+      if (!this.store.requestThreadWorkspaceOperationCancellation(current.botUid, id)) continue;
+      if (control !== undefined) {
+        control.cancelledByUser = true;
+        if (control.started) control.controller.abort(reason);
+      }
+      requested = true;
+    }
+    return requested;
   }
 
   private abortAllThreadRemovals(reason: Error): void {
@@ -7605,7 +7680,10 @@ class CoreService implements ChannelService {
         || workspace.projects.some(project => project.path !== null && related.has(project.path));
       if (!bindingUsesWorkspace) return [{ name: basename(binding.cwd), path: binding.cwd }];
       if (!await threadWorkspaceIsAvailable(workspace)) return [];
-      const available = workspace.projects.map(project => ({ name: project.name, path: project.path! }));
+      const available = workspace.projects.map(project => ({
+        name: project.name,
+        path: project.accessPath ?? project.path!,
+      }));
       if (workspace.layout === "shared") return available;
       const current = available.find(project => resourcePathsRelated(project.path, binding.cwd));
       return current === undefined ? [] : [current];
@@ -9085,14 +9163,7 @@ class CoreService implements ChannelService {
     if (botUid === undefined) return { kind: "refused", message: "Bot 身份未注册，未执行本地清理。" };
     if (!worktrees) return { kind: "refused", message: "本部署未配置隔离工作区能力。" };
 
-    const resourcePaths = threadWorkspaceCleanupPaths(ownership, true);
-    const anchor = resourcePaths[0]
-      ?? ownership.projects[0]?.repo
-      ?? ownership.entryPath
-      ?? this.store.getBinding(botUid, message)?.cwd;
-    if (anchor === undefined) {
-      return { kind: "refused", message: "当前子区没有可追踪的本地工作区资源，未执行清理。" };
-    }
+    let resourcePaths = threadWorkspaceCleanupPaths(ownership, true);
 
     const targetKeyValue = targetKey(message);
     const commandKey = this.threadMergeCommandKey(message);
@@ -9133,17 +9204,7 @@ class CoreService implements ChannelService {
     let operationUnknown = false;
     let removalProcessExited = false;
     const id = randomUUID();
-    const context = {
-      id,
-      botUid,
-      target: message,
-      sourceId: message.messageId,
-      commandText: safeDisplayText(message.text, 800) ?? "/thread remove",
-      senderId: message.senderId,
-      messageSeq: message.messageSeq,
-      receiptOutboxId,
-      resourcePaths,
-    } as const;
+    let cleanupOwnership: ThreadWorkspaceRecord;
     try {
       if (controller.signal.aborted || this.stopping) {
         return { kind: "refused", message: "channel 正在停止，未开始本地清理。" };
@@ -9153,10 +9214,65 @@ class CoreService implements ChannelService {
       if (!sessionLease) {
         return { kind: "refused", message: "当前子区会话仍有先前任务运行；清理未排队。" };
       }
+      if (controller.signal.aborted || this.stopping) {
+        return { kind: "refused", message: "channel 正在停止，未开始本地清理。" };
+      }
+      const currentOwnership = this.store.getThreadWorkspace(botUid, message);
+      if (currentOwnership === null) {
+        return { kind: "refused", message: "当前子区没有持久隔离工作区归属；未执行清理。" };
+      }
+      resourcePaths = threadWorkspaceCleanupPaths(currentOwnership, true);
+      const anchor = resourcePaths[0]
+        ?? currentOwnership.projects[0]?.repo
+        ?? currentOwnership.entryPath
+        ?? this.store.getBinding(botUid, message)?.cwd;
+      if (anchor === undefined) {
+        return { kind: "refused", message: "当前子区没有可追踪的本地工作区资源，未执行清理。" };
+      }
+      const context = {
+        id,
+        botUid,
+        target: message,
+        sourceId: message.messageId,
+        commandText: safeDisplayText(message.text, 800) ?? "/thread remove",
+        senderId: message.senderId,
+        messageSeq: message.messageSeq,
+        receiptOutboxId,
+        resourcePaths,
+      } as const;
+      this.store.reserveHostRemovalLease({ ...context, cwd: anchor });
+      reserved = true;
+
+      const latestOwnership = this.store.getThreadWorkspace(botUid, message);
+      if (latestOwnership === null) {
+        this.store.releaseHostRemovalLease(id);
+        reserved = false;
+        return { kind: "refused", message: "当前子区没有持久隔离工作区归属；未执行清理。" };
+      }
+      const latestResourcePaths = threadWorkspaceCleanupPaths(latestOwnership, true);
+      if (JSON.stringify(latestResourcePaths) !== JSON.stringify(resourcePaths)) {
+        throw new Error("子区工作区归属在本地清理预约后变化；未开始清理");
+      }
+      cleanupOwnership = latestOwnership;
+      resourcePaths = latestResourcePaths;
+      const reservationEntry = this.ingressCommandReservations.get(commandKey);
+      if (reservationEntry?.kind === "remove") {
+        this.ingressCommandReservations.set(commandKey, {
+          kind: "remove",
+          reservation,
+          resourceCwds: resourcePaths,
+        });
+      }
+      if (controller.signal.aborted || this.stopping) {
+        this.store.releaseHostRemovalLease(id);
+        reserved = false;
+        return { kind: "refused", message: "channel 正在停止，未开始本地清理。" };
+      }
       const cleanupLease: SessionLease = {
         ready: sessionLease.ready,
         complete: () => {},
       };
+      let removalDispatchHandoffComplete = false;
       const removalLifecycle = (
         project: ThreadWorkspaceRecord["projects"][number],
         step: WorktreeRemovalStep,
@@ -9182,10 +9298,10 @@ class CoreService implements ChannelService {
             if (expectedCwd === null || cwd !== expectedCwd || message.channelType !== 5) {
               throw new Error("host removal process identity changed before spawn");
             }
-            if (!reserved) {
+            if (!reserved) throw new Error("host removal process spawned without its durable target reservation");
+            if (!removalDispatchHandoffComplete) {
               const persistFirstStep = (): boolean => {
                 if (ingressHooks !== undefined && !ingressHooks.markDispatchIntent(id)) return false;
-                this.store.reserveHostRemovalLease({ ...context, cwd });
                 this.store.beginHostRemovalStep(id, step, cwd);
                 const claim = this.commandClaim(message, "thread");
                 this.store.completeCommand(claim);
@@ -9198,7 +9314,7 @@ class CoreService implements ChannelService {
               } else if (!persistFirstStep()) {
                 throw new Error("Host removal first step could not be persisted");
               }
-              reserved = true;
+              removalDispatchHandoffComplete = true;
             } else {
               this.store.beginHostRemovalStep(id, step, cwd);
             }
@@ -9237,17 +9353,13 @@ class CoreService implements ChannelService {
             if (processRunning) this.store.markHostRemovalProcessExited(id);
             beforeSpawned = false;
             processRunning = false;
-            if (!removalProcessExited) {
-              this.store.releaseHostRemovalLease(id);
-              reserved = false;
-            }
           },
           onUnknown: failClosedProcess,
         };
       };
 
       const result = await cleanupOwnedThreadWorkspace({
-        ownership,
+        ownership: cleanupOwnership,
         store: this.store,
         worktrees,
         force,
@@ -9278,10 +9390,6 @@ class CoreService implements ChannelService {
             kind: "partial",
             receiptText: `本地工作区清理未完整完成，本次不归档；已确认的资源结果已逐项保存。请核对后重新执行 /thread remove。${detail.length === 0 ? "" : `详情：${detail}`}`,
           };
-      if (!reserved) {
-        this.store.reserveHostRemovalLease({ ...context, cwd: anchor });
-        reserved = true;
-      }
       this.store.persistHostRemovalOutcome(id, outcome);
       return outcome;
     } catch (error) {
@@ -10194,6 +10302,194 @@ class CoreService implements ChannelService {
     });
   }
 
+  private threadWorkspaceHost(): ThreadWorkspaceOperationHost {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) throw new Error("Bot 身份未注册，无法构造 thread workspace host");
+    return {
+      stateDir: this.options.config.stateDir,
+      transport: this.options.transport,
+      worktrees: this.options.worktrees,
+      store: this.store,
+      botUid,
+      moveThreadWorkspaceBinding: (target, expected, destinationCwd, workerLedgerId, signal) =>
+        this.sessions.moveThreadWorkspaceBinding(target, expected, destinationCwd, workerLedgerId, signal),
+      scheduleThreadWorkspaceOperation: operation => this.scheduleThreadWorkspaceOperation(operation),
+      blockOperationResources: operation => this.blockThreadWorkspaceOperation(operation),
+    };
+  }
+
+  private scheduleThreadWorkspaceOperation(operation: ThreadWorkspaceOperationRecord): void {
+    if (this.scheduledThreadWorkspaceOperations.has(operation.id)) return;
+    const target: ChatTarget = { channelType: 5, channelId: operation.channelId };
+    const controller = new AbortController();
+    const control: ThreadWorkspaceOperationControl = {
+      target,
+      controller,
+      cancelledByUser: false,
+      started: false,
+    };
+    this.scheduledThreadWorkspaceOperations.set(operation.id, control);
+    const shutdownSignal = this.shutdownController.signal;
+    const abortOnShutdown = (): void => controller.abort(new Error("channel stopping"));
+    if (shutdownSignal.aborted) abortOnShutdown();
+    else shutdownSignal.addEventListener("abort", abortOnShutdown, { once: true });
+    const release = (): void => {
+      if (this.scheduledThreadWorkspaceOperations.get(operation.id) === control) {
+        this.scheduledThreadWorkspaceOperations.delete(operation.id);
+      }
+      shutdownSignal.removeEventListener("abort", abortOnShutdown);
+    };
+    try {
+      this.scheduler.scheduleSessionOperation(
+        target,
+        operation.scheduleOrder,
+        controller.signal,
+        async () => {
+          control.started = true;
+          try {
+            await runThreadWorkspaceOperation(
+              this.threadWorkspaceHost(),
+              operation.id,
+              controller.signal,
+              () => control.cancelledByUser,
+            );
+          } finally {
+            release();
+          }
+        },
+        error => {
+          try {
+            const current = this.store.getThreadWorkspaceOperation(operation.botUid, operation.id);
+            if (current === null || current.status === "complete" || current.status === "failed"
+              || current.status === "cancelled" || current.status === "unknown") return;
+            if (current.cancelRequested || (controller.signal.aborted && current.status === "queued")) return;
+            this.store.updateThreadWorkspaceOperation({
+              ...current,
+              status: current.status === "queued" ? "failed" : "unknown",
+              error: safeErrorMessage(error, "ordered thread workspace operation could not run"),
+            });
+          } finally {
+            release();
+          }
+        },
+      );
+    } catch (error) {
+      release();
+      const current = this.store.getThreadWorkspaceOperation(operation.botUid, operation.id);
+      if (current?.status === "queued" && !current.cancelRequested) {
+        this.store.updateThreadWorkspaceOperation({
+          ...current,
+          status: controller.signal.aborted ? "queued" : "failed",
+          error: safeErrorMessage(error, "ordered thread workspace reservation failed"),
+        });
+      }
+    }
+  }
+
+  private async recoverThreadWorkspaceOperations(botUid: string): Promise<void> {
+    // entry-create-intent is deliberately unsafe: mkdir may have happened before a crash.
+    const safePhases = new Set([
+      "accepted",
+      "entry-root-created",
+      "entry-created",
+      "alias-created",
+      "project-not-started",
+      "project-created",
+      "project-process-exited",
+      "move-confirmed",
+    ]);
+    for (let operation of this.store.listThreadWorkspaceOperations(botUid)) {
+      if (operation.phase === "entry-create-intent") {
+        operation = this.store.updateThreadWorkspaceOperation({
+          ...operation,
+          status: "unknown",
+          error: "共享入口 mkdir 结果未知；不自动重试",
+        }) ?? operation;
+        this.blockThreadWorkspaceOperation(operation);
+        continue;
+      }
+      if (operation.status === "complete" || operation.status === "failed" || operation.status === "cancelled") {
+        continue;
+      }
+      if (operation.processIdentity !== null) {
+        let stopped = false;
+        if (this.options.worktrees?.recoverMergeProcess) {
+          try {
+            stopped = await this.options.worktrees.recoverMergeProcess(operation.processIdentity);
+          } catch (error) {
+            console.error(
+              `[thread workspace recovery] 无法确认旧 worktree create 进程已停止 id=${operation.id}: ${safeErrorMessage(error, "process recovery failed")}`,
+            );
+          }
+        }
+        operation = this.store.updateThreadWorkspaceOperation({
+          ...operation,
+          status: "unknown",
+          processIdentity: stopped ? null : operation.processIdentity,
+          error: stopped
+            ? "旧 worktree create 进程已停止，但 worktree 创建结果未知；不自动重放"
+            : "旧 worktree create 进程未确认停止；不自动重放",
+        }) ?? operation;
+        this.blockThreadWorkspaceOperation(operation);
+        continue;
+      }
+      if (operation.status === "unknown") {
+        this.blockThreadWorkspaceOperation(operation);
+        continue;
+      }
+      if (operation.phase === "move-dispatch-intent" && operation.workerLedgerId !== null) {
+        const ledger = this.store.getWorkerLedger(botUid, operation.workerLedgerId);
+        if (ledger !== null) {
+          operation = this.store.updateThreadWorkspaceOperation({
+            ...operation,
+            status: "unknown",
+            error: ledger.state === "stopped"
+              ? "原生 /move worker 已停止，但 session 是否迁移未知；不自动重放"
+              : "原生 /move worker 未确认停止；不自动重放",
+          }) ?? operation;
+          if (ledger.state !== "stopped") this.blockedDirectories.add(ledger.cwd);
+          this.blockThreadWorkspaceOperation(operation);
+          continue;
+        }
+      }
+      if ((operation.status === "running" || operation.cancelRequested) && !safePhases.has(operation.phase)) {
+        operation = this.store.updateThreadWorkspaceOperation({
+          ...operation,
+          status: "unknown",
+          error: `重启时 operation phase=${operation.phase} 的副作用结果未知；不自动重放`,
+        }) ?? operation;
+        this.blockThreadWorkspaceOperation(operation);
+        continue;
+      }
+      if (operation.cancelRequested) {
+        this.scheduleThreadWorkspaceOperation(operation);
+        continue;
+      }
+      if (operation.status === "running") {
+        operation = this.store.updateThreadWorkspaceOperation({
+          ...operation,
+          status: "queued",
+          error: null,
+        }) ?? operation;
+      }
+      if (operation.status === "queued") this.scheduleThreadWorkspaceOperation(operation);
+    }
+  }
+
+  private blockThreadWorkspaceOperation(operation: ThreadWorkspaceOperationRecord): void {
+    const workspace = operation.candidateWorkspace;
+    for (const cwd of new Set([
+      operation.expectedBinding.cwd,
+      ...(workspace.workspaceRoot == null ? [] : [workspace.workspaceRoot]),
+      ...(workspace.entryPath === null ? [] : [workspace.entryPath]),
+      ...workspace.projects.flatMap(project => [
+        ...(project.path === null ? [] : [project.path]),
+        ...(project.accessPath === undefined ? [] : [project.accessPath]),
+        ...(project.accessTarget === undefined ? [] : [project.accessTarget]),
+      ]),
+    ])) this.blockedDirectories.add(cwd);
+  }
+
   private hostToolHost(): HostToolHost {
     const botUid = this.bot?.uid;
     if (botUid === undefined) throw new Error("Bot 身份未注册，无法构造 host tools");
@@ -10201,6 +10497,10 @@ class CoreService implements ChannelService {
       stateDir: this.options.config.stateDir,
       transport: this.options.transport,
       worktrees: this.options.worktrees,
+      moveThreadWorkspaceBinding: (target, expected, destinationCwd, workerLedgerId, signal) =>
+        this.sessions.moveThreadWorkspaceBinding(target, expected, destinationCwd, workerLedgerId, signal),
+      expandThreadWorkspace: (task, target, args, signal, toolCallId) =>
+        expandThreadWorkspace(this.threadWorkspaceHost(), task, target, args, signal, toolCallId),
       store: this.store,
       watches: this.hostWatchPort(),
       botUid,

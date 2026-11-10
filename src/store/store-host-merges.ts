@@ -10,7 +10,7 @@ import type {
   HostRemovalLeaseRecord,
   HostThreadRemovalOutcome,
 } from "./store-records.ts";
-import { asNullableString, asString, query, run } from "./store-schema.ts";
+import { asNullableString, asString, query, run, transaction } from "./store-schema.ts";
 
 export type HostMergeLeaseCompletion = { kind: "not-spawned"; diagnostic: string };
 
@@ -729,36 +729,56 @@ export function reserveHostRemovalLease(db: Database, input: HostRemovalLeaseInp
   ) {
     throw new Error("invalid host removal lease identity");
   }
-  const existing = query(db,
-    `SELECT id FROM host_merge_leases
-     WHERE operation_kind = 'thread-remove' AND bot_uid = ? AND channel_type = 5 AND channel_id = ? AND source_id = ?
-     ORDER BY created_at DESC, rowid DESC LIMIT 1`,
-    [input.botUid, input.target.channelId, input.sourceId],
-  )[0];
-  if (existing) throw new Error("thread removal source already has a durable lease");
-  const now = Date.now();
-  run(db,
-    `INSERT INTO host_merge_leases(
-       id, bot_uid, channel_type, channel_id, operation_kind, source_id, cwd, phase,
-       pid, pgid, process_identity, source_text, operator_note, sender_id, message_seq,
-       receipt_outbox_id, outcome_kind, outcome_json, removal_step, removal_resources_json,
-       removal_outcome_json, created_at, updated_at
-     ) VALUES(?, ?, 5, ?, 'thread-remove', ?, ?, 'starting', NULL, NULL, NULL, ?, NULL, ?, ?, ?, NULL, NULL, NULL, ?, NULL, ?, ?)`,
-    [
-      input.id,
-      input.botUid,
-      input.target.channelId,
-      input.sourceId,
-      input.cwd,
-      input.commandText,
-      input.senderId,
-      input.messageSeq,
-      input.receiptOutboxId,
-      JSON.stringify([...new Set(input.resourcePaths)]),
-      now,
-      now,
-    ],
-  );
+  transaction(db, () => {
+    const addition = query(
+      db,
+      `SELECT 1 FROM thread_workspace_operations
+       WHERE bot_uid = ? AND channel_type = 5 AND channel_id = ?
+         AND status IN ('queued', 'running', 'unknown')
+       LIMIT 1`,
+      [input.botUid, input.target.channelId],
+    )[0];
+    if (addition) throw new Error("子区工作区追加尚未结算，拒绝清理");
+    const workspaceCleanup = query(
+      db,
+      `SELECT 1 FROM thread_workspace_cleanups
+       WHERE bot_uid = ? AND channel_type = 5 AND channel_id = ?
+       LIMIT 1`,
+      [input.botUid, input.target.channelId],
+    )[0];
+    if (workspaceCleanup) throw new Error("子区删除或工作区清理尚未结算，拒绝重复清理");
+
+    const existing = query(db,
+      `SELECT id FROM host_merge_leases
+       WHERE operation_kind = 'thread-remove' AND bot_uid = ? AND channel_type = 5 AND channel_id = ? AND source_id = ?
+       ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      [input.botUid, input.target.channelId, input.sourceId],
+    )[0];
+    if (existing) throw new Error("thread removal source already has a durable lease");
+    const now = Date.now();
+    run(db,
+      `INSERT INTO host_merge_leases(
+         id, bot_uid, channel_type, channel_id, operation_kind, source_id, cwd, phase,
+         pid, pgid, process_identity, source_text, operator_note, sender_id, message_seq,
+         receipt_outbox_id, outcome_kind, outcome_json, removal_step, removal_resources_json,
+         removal_outcome_json, created_at, updated_at
+       ) VALUES(?, ?, 5, ?, 'thread-remove', ?, ?, 'starting', NULL, NULL, NULL, ?, NULL, ?, ?, ?, NULL, NULL, NULL, ?, NULL, ?, ?)`,
+      [
+        input.id,
+        input.botUid,
+        input.target.channelId,
+        input.sourceId,
+        input.cwd,
+        input.commandText,
+        input.senderId,
+        input.messageSeq,
+        input.receiptOutboxId,
+        JSON.stringify([...new Set(input.resourcePaths)]),
+        now,
+        now,
+      ],
+    );
+  });
 }
 
 /** Persist the next destructive command only after the prior process is confirmed or absent. */

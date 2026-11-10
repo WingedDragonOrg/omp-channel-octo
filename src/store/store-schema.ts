@@ -35,6 +35,49 @@ export const PROGRESS_CARD_COLUMNS = `
       updated_at INTEGER NOT NULL,
       PRIMARY KEY(bot_uid, task_id, message_id)`;
 
+const THREAD_WORKSPACE_OPERATION_PHASES_SQL = [
+  "accepted",
+  "entry-creating",
+  "entry-root-created",
+  "entry-create-intent",
+  "entry-created",
+  "alias-creating",
+  "alias-created",
+  "project-not-started",
+  "project-creating",
+  "project-process-exited",
+  "project-created",
+  "move-dispatch-intent",
+  "move-confirmed",
+  "committed",
+].map(phase => `'${phase}'`).join(", ");
+
+const THREAD_WORKSPACE_OPERATION_COLUMNS = `
+      id TEXT PRIMARY KEY NOT NULL,
+      bot_uid TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type = 5),
+      channel_id TEXT NOT NULL,
+      group_id TEXT NOT NULL,
+      tool_call_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      schedule_order INTEGER NOT NULL CHECK(schedule_order >= 1),
+      worktree_name_seed TEXT NOT NULL,
+      projects_json TEXT NOT NULL,
+      expected_workspace_json TEXT NOT NULL,
+      expected_binding_json TEXT NOT NULL,
+      candidate_workspace_json TEXT NOT NULL,
+      candidate_binding_json TEXT NOT NULL,
+      phase TEXT NOT NULL CHECK(phase IN (${THREAD_WORKSPACE_OPERATION_PHASES_SQL})),
+      status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'complete', 'failed', 'cancelled', 'unknown')),
+      worker_ledger_id TEXT,
+      process_identity_json TEXT,
+      error TEXT,
+      cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0, 1)),
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1),
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(bot_uid, channel_id, tool_call_id)`;
+
 /**
  * Group history accounting is keyed on full group (2) / CommunityTopic thread (5)
  * identities; anything else can never own a ledger row.
@@ -163,6 +206,27 @@ export function applySchema(db: Database): void {
       updated_at INTEGER NOT NULL,
       PRIMARY KEY(bot_uid, channel_id)
     );
+    CREATE TABLE IF NOT EXISTS thread_workspace_operations (
+      ${THREAD_WORKSPACE_OPERATION_COLUMNS}
+    );
+    CREATE INDEX IF NOT EXISTS thread_workspace_operations_target
+      ON thread_workspace_operations(bot_uid, channel_id, status, schedule_order);
+    CREATE TABLE IF NOT EXISTS thread_workspace_cleanups (
+      id TEXT PRIMARY KEY NOT NULL,
+      bot_uid TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type = 5),
+      channel_id TEXT NOT NULL,
+      phase TEXT NOT NULL CHECK(phase IN ('reserved', 'cleaning', 'unknown', 'settled')),
+      ownership_json TEXT,
+      binding_json TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS thread_workspace_cleanups_active_target
+      ON thread_workspace_cleanups(bot_uid, channel_id)
+      WHERE phase IN ('reserved', 'cleaning', 'unknown');
+    CREATE INDEX IF NOT EXISTS thread_workspace_cleanups_phase
+      ON thread_workspace_cleanups(bot_uid, phase, channel_id);
     CREATE TABLE IF NOT EXISTS thread_workspace_intents (
       id TEXT PRIMARY KEY NOT NULL,
       bot_uid TEXT NOT NULL,
@@ -679,6 +743,7 @@ export function applySchema(db: Database): void {
     "ALTER TABLE questions ADD COLUMN card_message_id TEXT",
     "ALTER TABLE questions ADD COLUMN answered_by TEXT",
     "ALTER TABLE questions ADD COLUMN closed_reason TEXT",
+    "ALTER TABLE thread_workspace_operations ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0, 1))",
     "ALTER TABLE thread_workspaces ADD COLUMN legacy_worktree_name TEXT",
     "ALTER TABLE thread_workspace_intents ADD COLUMN intent_kind TEXT NOT NULL DEFAULT 'workspace' CHECK(intent_kind IN ('workspace', 'thread-create'))",
     "ALTER TABLE thread_workspace_intents ADD COLUMN creator_channel_type INTEGER CHECK(creator_channel_type IS NULL OR creator_channel_type IN (2, 5))",
@@ -712,6 +777,7 @@ export function applySchema(db: Database): void {
       if (!String(error).includes("duplicate column")) throw error;
     }
   }
+  migrateThreadWorkspaceOperationPhases(db);
   migrateSchedulerOrder(db);
   db.exec("UPDATE host_merge_progress_cards SET delivery_state = 'bound' WHERE delivery_state = 'unknown' AND message_id IS NOT NULL");
   migrateWorkerLedgerNullableSessionFile(db);
@@ -946,6 +1012,42 @@ function migrateThreadForkPreparationStarted(db: Database): void {
     db.exec(
       "ALTER TABLE thread_forks ADD COLUMN preparation_started INTEGER NOT NULL DEFAULT 0 CHECK(preparation_started IN (0, 1))",
     );
+  });
+}
+// SQLite cannot widen CHECK constraints in place; preserve operation rows while rebuilding it.
+
+function migrateThreadWorkspaceOperationPhases(db: Database): void {
+  const sql = asString(
+    query(
+      db,
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'thread_workspace_operations'",
+    )[0]?.sql,
+  );
+  if (sql.includes("'entry-create-intent'")) return;
+  transaction(db, () => {
+    db.exec(`
+      CREATE TABLE thread_workspace_operations_phase_new (
+        ${THREAD_WORKSPACE_OPERATION_COLUMNS}
+      );
+      INSERT INTO thread_workspace_operations_phase_new(
+        id, bot_uid, channel_type, channel_id, group_id, tool_call_id, task_id,
+        schedule_order, worktree_name_seed, projects_json, expected_workspace_json,
+        expected_binding_json, candidate_workspace_json, candidate_binding_json,
+        phase, status, worker_ledger_id, process_identity_json, error,
+        cancel_requested, version, created_at, updated_at
+      )
+      SELECT
+        id, bot_uid, channel_type, channel_id, group_id, tool_call_id, task_id,
+        schedule_order, worktree_name_seed, projects_json, expected_workspace_json,
+        expected_binding_json, candidate_workspace_json, candidate_binding_json,
+        phase, status, worker_ledger_id, process_identity_json, error,
+        cancel_requested, version, created_at, updated_at
+      FROM thread_workspace_operations;
+      DROP TABLE thread_workspace_operations;
+      ALTER TABLE thread_workspace_operations_phase_new RENAME TO thread_workspace_operations;
+      CREATE INDEX IF NOT EXISTS thread_workspace_operations_target
+        ON thread_workspace_operations(bot_uid, channel_id, status, schedule_order);
+    `);
   });
 }
 

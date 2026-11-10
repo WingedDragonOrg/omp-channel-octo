@@ -193,6 +193,7 @@ function persistCancelIntent(
   cancelledQuestionIds: string[];
   cancelledQueuedTaskIds: string[];
   stoppedTaskIds: string[];
+  cancelRequestedWorkspaceOperationIds: string[];
 } {
   const target: ChatTarget = { channelType: input.channelType, channelId: input.channelId };
   const cancelledIngressJobIds = new Set<number>();
@@ -260,12 +261,31 @@ function persistCancelIntent(
     const taskId = asString(row.id);
     if (markTaskStopIntent(db, taskId, "cancel")) stoppedTaskIds.push(taskId);
   }
+  const cancelRequestedWorkspaceOperationIds: string[] = [];
+  if (target.channelType === 5) {
+    for (const row of query(
+      db,
+      `SELECT id FROM thread_workspace_operations
+       WHERE bot_uid = ? AND channel_type = 5 AND channel_id = ? AND status IN ('queued', 'running')
+       ORDER BY schedule_order ASC, created_at ASC, id ASC`,
+      [input.botUid, target.channelId],
+    )) {
+      const operationId = asString(row.id);
+      if (run(
+        db,
+        `UPDATE thread_workspace_operations SET cancel_requested = 1, updated_at = ?
+         WHERE bot_uid = ? AND id = ? AND status IN ('queued', 'running')`,
+        [Date.now(), input.botUid, operationId],
+      ).changes === 1) cancelRequestedWorkspaceOperationIds.push(operationId);
+    }
+  }
   return {
     cancelledIngressJobIds: [...cancelledIngressJobIds],
     cancelRequestedIngressJobIds: [...cancelRequestedIngressJobIds],
     cancelledQuestionIds,
     cancelledQueuedTaskIds,
     stoppedTaskIds,
+    cancelRequestedWorkspaceOperationIds,
   };
 }
 
