@@ -1,5 +1,9 @@
 # Repository Guidelines
 
+## Minimal Implementation
+
+Implement the requested behavior directly; do not use defensive programming. Do not add speculative checks, fallbacks, retries, or abstractions for hypothetical cases. Validate untrusted inputs and handle failures where the product contract or a demonstrated problem requires them.
+
 ## Project Overview
 
 `omp-channel-octo` is a private, resident TypeScript/Bun service that connects one Octo User Bot to a local OMP assistant. It accepts authenticated private messages and explicitly authorized group or CommunityTopic messages, keeps per-chat OMP sessions and durable task state, and returns assistant text, files, and optional execution progress cards. OMP runs as a child process over stdio RPC; it is not exposed through a network listener.
