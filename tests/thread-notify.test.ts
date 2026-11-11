@@ -19,7 +19,7 @@ function task(overrides: Partial<TaskRecord> = {}): TaskRecord {
     sessionId: "session-1",
     cwd: "/tmp/work",
     state: "completed",
-    resultText: "PRIVATE_RESULT_SECRET",
+    resultText: "已修复同步错误，回归测试通过。",
     errorText: null,
     messageSeq: 0,
     historyEligible: false,
@@ -28,7 +28,7 @@ function task(overrides: Partial<TaskRecord> = {}): TaskRecord {
   };
 }
 
-test("task notices carry stable identity and terminal state but no task or result content", () => {
+test("task notices identify the task and include its result without the input", () => {
   const notice = threadOutcomeNotice(task(), "回传线程");
   expect(notice).toContain("short_id short-9");
   expect(notice).toContain("channel_id group-a____short-9");
@@ -36,8 +36,18 @@ test("task notices carry stable identity and terminal state but no task or resul
   expect(notice).toContain("状态：已完成");
   expect(notice).toContain("说明：派发任务已完成。");
   expect(notice).not.toContain("PRIVATE_TASK_SECRET");
-  expect(notice).not.toContain("PRIVATE_RESULT_SECRET");
+  expect(notice).toContain("已修复同步错误，回归测试通过。");
   expect(threadNotifyMessageId("task-1")).toBe("notify:task-1");
+});
+
+test("completed notices redact credentials and identify missing results", () => {
+  const notice = threadOutcomeNotice(
+    task({ resultText: "部署已完成，token=abc123secret，测试通过。" }),
+    "回传线程",
+  );
+  expect(notice).toContain("部署已完成");
+  expect(notice).not.toContain("abc123secret");
+  expect(threadOutcomeNotice(task({ resultText: null }), "回传线程")).toContain("结果不可用");
 });
 
 test("Loop task outcomes identify their source without calling them dispatched tasks", () => {
@@ -93,13 +103,13 @@ test("untrusted task fields do not appear in bounded task summaries", () => {
   const notice = threadOutcomeNotice(
     task({
       text: "LONG_TASK_SECRET".repeat(200),
-      resultText: "LONG_RESULT_SECRET".repeat(200),
+      resultText: `${"结果".repeat(2_000)}END_OF_RESULT`,
       errorText: "LONG_ERROR_SECRET".repeat(200),
     }),
     "子区".repeat(200),
   );
   expect(notice).not.toContain("LONG_TASK_SECRET");
-  expect(notice).not.toContain("LONG_RESULT_SECRET");
+  expect(notice).not.toContain("END_OF_RESULT");
   expect(notice).not.toContain("LONG_ERROR_SECRET");
   expect(notice.length).toBeLessThan(2_000);
 });

@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import type { ChatTarget, ThreadListenLevel } from "../contracts.ts";
-import type { ThreadListenRecord, ThreadMergeEventRecord } from "./store-records.ts";
+import type { ThreadListenRecord, ThreadMergeEventRecord, ThreadTaskEventRecord } from "./store-records.ts";
 import { asNumber, asString, query, run, transaction } from "./store-schema.ts";
 
 export function ensureThreadListen(
@@ -209,6 +209,82 @@ export function markThreadMergeEventDelivered(db: Database, eventId: string): vo
   );
 }
 
+export function saveThreadTaskEvent(db: Database, event: ThreadTaskEventRecord): void {
+  run(db,
+    `INSERT OR IGNORE INTO thread_task_events(task_id, bot_uid, channel_id, created_at)
+     VALUES(?, ?, ?, ?)`,
+    [event.taskId, event.botUid, event.channelId, Date.now()],
+  );
+}
+
+/**
+ * Registers the durable notice for one terminal task. Called from the same transaction that
+ * settles the task, so a crash after settlement cannot lose the notice. Only independent
+ * dispatched and Loop tasks qualify; merge suppression and in-flight merge intent skip it.
+ */
+export function queueThreadTaskEvent(db: Database, taskId: string): void {
+  const row = query(db,
+    `SELECT t.bot_uid, t.channel_type, t.channel_id, t.message_id, t.relay_suppressed,
+            COALESCE(l.merge_pending, 0) AS merge_pending
+     FROM tasks AS t
+     LEFT JOIN thread_listens AS l
+       ON l.bot_uid = t.bot_uid AND l.channel_id = t.channel_id
+     WHERE t.id = ?`,
+    [taskId],
+  )[0];
+  if (row === undefined || asNumber(row.channel_type) !== 5) return;
+  const messageId = asString(row.message_id);
+  if (!messageId.startsWith("dispatch:") && !messageId.startsWith("loop:")) return;
+  if (asNumber(row.relay_suppressed) !== 0 || asNumber(row.merge_pending) !== 0) return;
+  saveThreadTaskEvent(db, {
+    taskId,
+    botUid: asString(row.bot_uid),
+    channelId: asString(row.channel_id),
+  });
+}
+
+export function getThreadTaskEvent(db: Database, taskId: string): ThreadTaskEventRecord | null {
+  const row = query(db, "SELECT * FROM thread_task_events WHERE task_id = ?", [taskId])[0];
+  return row ? threadTaskEventFromRow(row) : null;
+}
+
+export function listThreadTaskEvents(db: Database, botUid: string): ThreadTaskEventRecord[] {
+  return query(db,
+    "SELECT * FROM thread_task_events WHERE bot_uid = ? ORDER BY rowid",
+    [botUid],
+  ).map(threadTaskEventFromRow);
+}
+
+export function listPendingThreadTaskEvents(db: Database, botUid: string): ThreadTaskEventRecord[] {
+  return query(db,
+    `SELECT * FROM thread_task_events
+     WHERE bot_uid = ? AND delivery_state = 'pending' ORDER BY created_at, rowid`,
+    [botUid],
+  ).map(threadTaskEventFromRow);
+}
+
+export function isThreadTaskEventPending(db: Database, taskId: string): boolean {
+  return query(db,
+    "SELECT 1 FROM thread_task_events WHERE task_id = ? AND delivery_state = 'pending'",
+    [taskId],
+  ).length > 0;
+}
+
+export function claimThreadTaskDispatchIntent(db: Database, taskId: string): boolean {
+  return run(db,
+    "UPDATE thread_task_events SET delivery_state = 'intent' WHERE task_id = ? AND delivery_state = 'pending'",
+    [taskId],
+  ).changes === 1;
+}
+
+export function markThreadTaskEventDelivered(db: Database, taskId: string): void {
+  run(db,
+    `UPDATE thread_task_events SET delivery_state = 'delivered'
+     WHERE task_id = ? AND delivery_state IN ('pending', 'intent')`,
+    [taskId],
+  );
+}
+
 function threadListen(db: Database, botUid: string, channelId: string): ThreadListenRecord | null {
   const row = query(db,
     "SELECT * FROM thread_listens WHERE bot_uid = ? AND channel_id = ?",
@@ -226,6 +302,14 @@ function threadListenFromRow(row: Record<string, unknown>): ThreadListenRecord {
     threadName: asString(row.thread_name),
     listen: asString(row.listen) as ThreadListenLevel,
     mergePending: asNumber(row.merge_pending) !== 0,
+  };
+}
+
+function threadTaskEventFromRow(row: Record<string, unknown>): ThreadTaskEventRecord {
+  return {
+    taskId: asString(row.task_id),
+    botUid: asString(row.bot_uid),
+    channelId: asString(row.channel_id),
   };
 }
 

@@ -382,6 +382,65 @@ export function markOutboxDead(db: Database, id: string, errorText: string): voi
   );
 }
 
+/**
+ * Latest finalized assistant body persisted for this task. The stream id namespaces are
+ * `taskId:<messageId>` and `taskId:resume:<uuid>:<messageId>`; info notices use
+ * `taskId:notice:<id>` and are excluded. Only the newest finalized stream is eligible: an
+ * empty latest final frame is reported as empty rather than substituted with older output.
+ */
+export function getLatestFinalAssistantText(
+  db: Database,
+  botUid: string,
+  taskId: string,
+): string | null {
+  const streamPrefix = `${taskId}:`;
+  const rows = query(db,
+    `SELECT rowid AS row_id, stream_message_id, segment_index, stream_final, text
+     FROM outbox
+     WHERE bot_uid = ? AND task_id = ? AND kind = 'text' AND stream_message_id IS NOT NULL
+     ORDER BY rowid ASC`,
+    [botUid, taskId],
+  );
+  const streams = new Map<string, {
+    firstRowId: number;
+    final: boolean;
+    segments: Map<number, string>;
+  }>();
+  for (const row of rows) {
+    const streamId = asString(row.stream_message_id);
+    if (!streamId.startsWith(streamPrefix)) continue;
+    const messageId = streamId.slice(streamPrefix.length);
+    if (
+      messageId.length === 0
+      || messageId.startsWith("notice:")
+      || /^resume:[^:]+:notice:/u.test(messageId)
+    ) continue;
+    const segmentIndex = asNumber(row.segment_index);
+    const text = asNullableString(row.text) ?? "";
+    const final = asNumber(row.stream_final) !== 0;
+    const existing = streams.get(streamId);
+    if (existing) {
+      existing.segments.set(segmentIndex, text);
+      existing.final = existing.final || final;
+    } else {
+      streams.set(streamId, {
+        firstRowId: asNumber(row.row_id),
+        final,
+        segments: new Map([[segmentIndex, text]]),
+      });
+    }
+  }
+  let latest: { firstRowId: number; final: boolean; segments: Map<number, string> } | null = null;
+  for (const stream of streams.values()) {
+    if (latest === null || stream.firstRowId > latest.firstRowId) latest = stream;
+  }
+  if (latest === null || !latest.final) return null;
+  return [...latest.segments.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, text]) => text)
+    .join("");
+}
+
 export function getBotEventCursor(db: Database, botUid: string): number {
   const row = query(db, "SELECT event_id FROM bot_event_cursor WHERE bot_uid = ?", [botUid])[0];
   return row === undefined ? 0 : asNumber(row.event_id);

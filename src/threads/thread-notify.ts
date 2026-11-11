@@ -75,15 +75,27 @@ function relationGuidance(): string[] {
   ];
 }
 
-/** Terminal task notice, including the persisted failure reason when available. */
-export function threadOutcomeNotice(task: TaskRecord, threadName: string): string {
+/**
+ * Terminal task notice. `finalResult` is the task's latest finalized assistant body as persisted
+ * at settlement; omitting it keeps the record's aggregate for callers that only hold a task.
+ * Failures always report the persisted reason instead of the result.
+ */
+export function threadOutcomeNotice(
+  task: TaskRecord,
+  threadName: string,
+  finalResult?: string | null,
+): string {
   const taskKind = task.messageId.startsWith("loop:") ? "Loop 任务" : "派发任务";
+  const result = finalResult === undefined ? task.resultText : finalResult;
   return [
     `[子区任务回传] ${bounded(threadName, MAX_FIELD_CHARS) || "子区"}的一条${taskKind}已结束。`,
     ...sourceLine(task.channelId, threadName).split("\n"),
     `任务 ID：${bounded(task.id, MAX_FIELD_CHARS)}`,
     `状态：${stateLabel(task.state)}`,
     `说明：${taskStatusNote(task.state).replace("派发任务", taskKind)}`,
+    ...(task.state === "completed"
+      ? [`结果：${safeDisplayText(result) ?? "结果不可用。"}`]
+      : []),
     ...(task.state === "failed" ? [`失败原因：${safeDisplayText(task.errorText) ?? "原因不可用。"}`] : []),
     "",
     ...relationGuidance(),

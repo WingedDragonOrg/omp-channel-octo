@@ -4,6 +4,7 @@ import type { GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest
 import { ensureBindingIfMatches, getBinding, initializeBindingSessionFromTask } from "./store-chats.ts";
 import { asNumber, asNullableString, asString, query, run, targetValues, targetWhere, transaction } from "./store-schema.ts";
 import { cancelTaskQuestions } from "./store-questions.ts";
+import { queueThreadTaskEvent } from "./store-thread-listen.ts";
 
 function goalTaskFromRow(row: Record<string, unknown>): GoalTaskRecord {
   const op = asString(row.request_op);
@@ -433,6 +434,7 @@ export function stopGoalContinuation(
         "UPDATE tasks SET state = 'cancelled', finished_at = ?, error_text = 'goal continuation revoked before start', stop_intent = NULL WHERE id = ? AND state = 'queued'",
         [Date.now(), taskId],
       );
+      queueThreadTaskEvent(db, taskId);
       cancelTaskQuestions(db, taskId, "cancelled");
     }
     for (const row of queued) {

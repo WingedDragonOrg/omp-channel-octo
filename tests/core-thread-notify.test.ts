@@ -3,11 +3,13 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatTarget, PromptContext } from "../src/contracts";
+import type { LoopTask, LoopWorkspace } from "../src/loop/types";
 import { ChannelStore } from "../src/store";
 import {
   assistantText,
   closeCoreHarness,
   createCoreHarness,
+  FakeLoopReadPort,
   inbound,
   waitForStatus,
 } from "./fixtures/core-fakes";
@@ -62,10 +64,11 @@ function observeDispatchedOutcome(
   };
 }
 
-test("a task-listening thread relays a fixed completion summary to its creator", async () => {
+test("a task-listening thread relays the dispatched task's actual result to its creator", async () => {
   const notices: string[] = [];
   const noticeSeen = Promise.withResolvers<void>();
   const created = { shortId: "", channelId: "" };
+  const result = "实际修复结果：解析器测试通过。";
   const harness = await createCoreHarness({
     prompt: async ({ emit, promptContext, text }) => {
       if (text === "建区并派发") {
@@ -82,7 +85,8 @@ test("a task-listening thread relays a fixed completion summary to its creator",
         return;
       }
       if (text === "PRIVATE_TASK_SECRET") {
-        emit(assistantText("relay-result", "PRIVATE_RESULT_SECRET", true));
+        emit(assistantText("earlier-progress", "正在检查旧进度。", true));
+        emit(assistantText("relay-result", result, true));
         return;
       }
       if (text.startsWith("[子区任务回传]")) {
@@ -109,8 +113,10 @@ test("a task-listening thread relays a fixed completion summary to its creator",
     expect(notice).toContain(`short_id ${created.shortId}`);
     expect(notice).toContain(`channel_id ${created.channelId}`);
     expect(notice).toContain("状态：已完成");
+    expect(notice).toContain(result);
+    expect(notice).not.toContain("正在检查旧进度。");
+    expect(notice).toContain("结果");
     expect(notice).not.toContain("PRIVATE_TASK_SECRET");
-    expect(notice).not.toContain("PRIVATE_RESULT_SECRET");
 
     // The notice is one ordinary task in the dispatching chat, keyed to the thread task it reports.
     const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
@@ -121,11 +127,112 @@ test("a task-listening thread relays a fixed completion summary to its creator",
       });
       const groupTask = store.getLatestTask(harness.bot.uid, GROUP);
       expect(threadTask?.state).toBe("completed");
+      expect(threadTask?.resultText).toContain(result);
       expect(threadTask?.relaySuppressed).toBe(false);
       expect(groupTask?.messageId).toBe(`notify:${threadTask?.id}`);
     } finally {
       store.close();
     }
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a completed task without assistant text reports the result is unavailable", async () => {
+  const notices: string[] = [];
+  const noticeSeen = Promise.withResolvers<void>();
+  const harness = await createCoreHarness({
+    prompt: async ({ promptContext, text }) => {
+      if (text === "建区并派发无结果任务") {
+        const thread = await createThreadViaTool(promptContext, { name: "无结果线程", listen: "task" });
+        await dispatchViaTool(promptContext, { short_id: thread.short_id, text: "PRIVATE_EMPTY_TASK" });
+        return;
+      }
+      if (text === "PRIVATE_EMPTY_TASK") return;
+      if (text.startsWith("[子区任务回传]")) {
+        notices.push(text);
+        noticeSeen.resolve();
+        return;
+      }
+      throw new Error(`unexpected prompt: ${text}`);
+    },
+  });
+  try {
+    await harness.service.submitInbound(
+      inbound({
+        messageId: "empty-result-create",
+        ...GROUP,
+        text: "建区并派发无结果任务",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await noticeSeen.promise;
+
+    expect(notices).toHaveLength(1);
+    const notice = notices[0] ?? "";
+    expect(notice).toContain("状态：已完成");
+    expect(notice).toContain("任务 ID：");
+    // Missing output is stated explicitly, never rendered as a null/undefined payload.
+    expect(notice).toContain("结果不可用");
+    expect(notice).not.toContain("null");
+    expect(notice).not.toContain("undefined");
+    expect(notice).not.toContain("PRIVATE_EMPTY_TASK");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a result relay redacts recognizable credentials and bounds its length", async () => {
+  const notices: string[] = [];
+  const noticeSeen = Promise.withResolvers<void>();
+  const token = "PRIVATE_TOKEN_9f8e7d";
+  const bearer = "PRIVATE_BEARER_9f8e7d";
+  const githubToken = "ghp_PRIVATEabc123456789";
+  const keep = "RESULT_KEEP_ME";
+  const tail = "RESULT_TAIL_MARKER";
+  const longResult = `${keep} token=${token} Authorization: Bearer ${bearer} ${githubToken} ${"长结果填充。".repeat(300)} ${tail}`;
+  const harness = await createCoreHarness({
+    prompt: async ({ emit, promptContext, text }) => {
+      if (text === "建区并派发敏感结果") {
+        const thread = await createThreadViaTool(promptContext, { name: "敏感结果线程", listen: "task" });
+        await dispatchViaTool(promptContext, { short_id: thread.short_id, text: "PRIVATE_TASK_SECRET" });
+        return;
+      }
+      if (text === "PRIVATE_TASK_SECRET") {
+        emit(assistantText("sensitive-result", longResult, true));
+        return;
+      }
+      if (text.startsWith("[子区任务回传]")) {
+        notices.push(text);
+        noticeSeen.resolve();
+        return;
+      }
+      throw new Error(`unexpected prompt: ${text}`);
+    },
+  });
+  try {
+    await harness.service.submitInbound(
+      inbound({
+        messageId: "sensitive-result-create",
+        ...GROUP,
+        text: "建区并派发敏感结果",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await noticeSeen.promise;
+
+    expect(notices).toHaveLength(1);
+    const notice = notices[0] ?? "";
+    expect(notice).toContain(keep);
+    expect(notice).not.toContain(token);
+    expect(notice).not.toContain(bearer);
+    expect(notice).not.toContain(githubToken);
+    expect(notice).toContain("[redacted]");
+    // The full body is longer than any single user-visible notice; the tail proves truncation.
+    expect(notice).not.toContain(tail);
+    expect(notice).toContain("…");
+    expect(notice.length).toBeLessThan(1_600);
+    expect(notice).not.toContain("PRIVATE_TASK_SECRET");
   } finally {
     await closeCoreHarness(harness);
   }
@@ -535,6 +642,128 @@ test("a merge consumed while off does not replay after the policy changes to tas
     if (!firstClosed) await closeCoreHarness(first);
   }
 });
+test("a resumed dispatched task retains its last finalized result across restart", async () => {
+  const created = { channelId: "" };
+  const childOutput = Promise.withResolvers<void>();
+  const first = await createCoreHarness({
+    prompt: async ({ emit, promptContext, text, waitForAbort }) => {
+      if (text === "create resumable relay") {
+        const thread = await createThreadViaTool(promptContext, { name: "续跑结果线程", listen: "task" });
+        created.channelId = thread.channel_id;
+        await dispatchViaTool(promptContext, { short_id: thread.short_id, text: "resumable child" });
+      } else if (text === "resumable child") {
+        emit(assistantText("before-restart", "已完成的子区结果", true));
+        childOutput.resolve();
+        await waitForAbort();
+      }
+    },
+  });
+  const root = first.root;
+  try {
+    await first.service.submitInbound(inbound({
+      messageId: "resume-relay-create", ...GROUP, text: "create resumable relay",
+      mentionedUserIds: [first.bot.uid],
+    }));
+    await childOutput.promise;
+    await closeCoreHarness(first, { remove: false });
+    const notices: string[] = [];
+    const seen = Promise.withResolvers<void>();
+    const second = await createCoreHarness({
+      root, transport: first.transport,
+      prompt: async ({ text }) => {
+        if (text.startsWith("[子区任务回传]")) {
+          notices.push(text);
+          seen.resolve();
+        }
+      },
+    });
+    try {
+      await seen.promise;
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toContain("已完成的子区结果");
+      expect(notices[0]).toContain(created.channelId);
+    } finally {
+      await closeCoreHarness(second);
+    }
+  } finally {
+    await closeCoreHarness(first);
+  }
+});
+
+test("restart retries an undispatched task notice but not an ambiguous steer", async () => {
+  const created = { channelId: "" };
+  const first = await createCoreHarness({
+    prompt: async ({ promptContext, text }) => {
+      if (text === "create relay recovery thread") {
+        const thread = await createThreadViaTool(promptContext, { name: "任务恢复线程", listen: "task" });
+        created.channelId = thread.channel_id;
+      }
+    },
+  });
+  const root = first.root;
+  try {
+    await first.service.submitInbound(inbound({
+      messageId: "task-recovery-create", ...GROUP, text: "create relay recovery thread",
+      mentionedUserIds: [first.bot.uid],
+    }));
+    await first.workers.waitForPromptCount(1);
+    await waitForStatus(first.service, GROUP, (status) => status.state === "completed");
+    const target: ChatTarget = { channelId: created.channelId, channelType: 5 };
+    const store = await ChannelStore.open(join(first.stateDir, "channel.sqlite"));
+    try {
+      for (const id of ["pending-relay", "intent-relay"]) {
+        const messageId = `dispatch:${id}`;
+        expect(store.acceptTask(
+          { botUid: first.bot.uid, target, messageId, senderId: "owner-1", text: id, supported: true, kind: "task" },
+          {
+            id, botUid: first.bot.uid, ...target, messageId, senderId: "owner-1", text: id,
+            sessionId: `session-${id}`, cwd: root, state: "queued", resultText: null,
+            errorText: null, messageSeq: 0, historyEligible: false, relaySuppressed: false,
+          },
+        )).toBe(true);
+        store.setTaskFinalResultText(id, `实际结果 ${id}`);
+        store.markCompleted(id, `实际结果 ${id}`);
+        expect(store.claimCommand({
+          botUid: first.bot.uid, target: GROUP, messageId: `notify:${id}`, senderId: "owner-1",
+          text: "relay", supported: true, kind: "command",
+        })).toBe(true);
+      }
+      expect(store.claimThreadTaskDispatchIntent("intent-relay")).toBe(true);
+    } finally {
+      store.close();
+    }
+    await closeCoreHarness(first, { remove: false });
+    const notices: string[] = [];
+    const seen = Promise.withResolvers<void>();
+    const second = await createCoreHarness({
+      root, transport: first.transport,
+      prompt: async ({ text }) => {
+        if (text.startsWith("[子区任务回传]")) {
+          notices.push(text);
+          seen.resolve();
+        }
+      },
+    });
+    try {
+      await seen.promise;
+      await waitForStatus(second.service, GROUP, (status) => status.state === "completed");
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toContain("实际结果 pending-relay");
+      expect(notices[0]).not.toContain("intent-relay");
+      const recovered = await ChannelStore.open(join(second.stateDir, "channel.sqlite"));
+      try {
+        expect(recovered.getTaskByMessageId(second.bot.uid, GROUP, "notify:intent-relay")).toBeNull();
+      } finally {
+        recovered.close();
+      }
+    } finally {
+      await closeCoreHarness(second);
+    }
+  } finally {
+    await closeCoreHarness(first);
+  }
+});
+
 test("restart retries only merge events whose steer claim never crossed dispatch intent", async () => {
   const created = { shortId: "", channelId: "" };
   const first = await createCoreHarness({
@@ -1367,10 +1596,264 @@ test("a new thread defaults to merge-only listening, so dispatch completion stay
   }
 });
 
-test("create-thread listen=task relays terminal identity without task or result text", async () => {
+test("an independent Loop thread task relays its actual result at task listening level", async () => {
+  const workspace: LoopWorkspace = {
+    workspaceId: "loop-notify-workspace",
+    name: "Notify tasks",
+    slug: "notify-tasks",
+  };
+  const baseTask: LoopTask = {
+    taskId: "loop-notify-result",
+    title: "Before child work",
+    description: "fixture task description",
+    status: "open",
+    priority: "normal",
+    assigneeType: "member",
+    assigneeId: "owner-1",
+    assigneeOctoUid: "owner-1",
+    projectId: null,
+    parentTaskId: null,
+    startDate: null,
+    dueDate: null,
+    createdAt: "2026-11-03T00:00:00Z",
+    updatedAt: "2026-11-04T00:00:00Z",
+  };
+  const updatedTask: LoopTask = {
+    ...baseTask,
+    title: "After child work",
+    updatedAt: "2026-11-05T00:00:00Z",
+  };
+  const loop = new FakeLoopReadPort();
+  loop.workspaces.set(workspace.workspaceId, workspace);
+  loop.tasks.set(workspace.workspaceId, [baseTask]);
+  const threadResult = "LOOP_ACTUAL_RESULT：子区工作已完成。";
+  const notices: string[] = [];
+  const noticeSeen = Promise.withResolvers<void>();
+  let threadChannelId = "";
+  const harness = await createCoreHarness({
+    loop,
+    prompt: async ({ emit, text }) => {
+      if (text.startsWith("[子区任务回传]")) {
+        notices.push(text);
+        noticeSeen.resolve();
+        return;
+      }
+      if (text.includes("After child work")) {
+        emit(assistantText("loop-result", threadResult, true));
+        return;
+      }
+      // The initial bind snapshot and bind receipts are ordinary chat input in this fixture.
+    },
+  });
+  try {
+    await harness.service.submitInbound(
+      inbound({
+        messageId: "loop-bind-initial",
+        ...GROUP,
+        text: `/bind loop ${workspace.workspaceId}`,
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(
+      harness.service,
+      GROUP,
+      (status) => status.state === "completed" && status.queued === 0,
+    );
+
+    const thread = await harness.transport.createThread(GROUP.channelId, "Loop 结果线程");
+    threadChannelId = thread.channelId;
+    const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      store.bindLoopTask({
+        botUid: harness.bot.uid,
+        groupId: GROUP.channelId,
+        workspaceId: workspace.workspaceId,
+        taskId: baseTask.taskId,
+      }, thread.channelId);
+      store.ensureThreadListen({
+        botUid: harness.bot.uid,
+        channelId: thread.channelId,
+        creatorChannelType: 2,
+        creatorChannelId: GROUP.channelId,
+        threadName: thread.name,
+        listen: "task",
+      });
+    } finally {
+      store.close();
+    }
+
+    loop.tasks.set(workspace.workspaceId, [updatedTask]);
+    await harness.service.submitInbound(
+      inbound({
+        messageId: "loop-bind-update",
+        ...GROUP,
+        text: `/bind loop ${workspace.workspaceId}`,
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await waitForStatus(
+      harness.service,
+      { channelId: threadChannelId, channelType: 5 },
+      (status) => status.state === "completed",
+    );
+    await noticeSeen.promise;
+
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("Loop 任务");
+    expect(notices[0]).toContain(threadResult);
+    expect(notices[0]).toContain("任务 ID：");
+    expect(notices[0]).not.toContain("After child work");
+
+    const reopened = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      const threadTask = reopened.getLatestTask(harness.bot.uid, {
+        channelId: threadChannelId,
+        channelType: 5,
+      });
+      expect(threadTask?.messageId.startsWith("loop:")).toBe(true);
+      expect(threadTask?.resultText).toBe(threadResult);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("restart recovers a completed task whose notice was never accepted, then later restarts do not duplicate it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "omp-channel-octo-notify-crash-"));
+  const result = "重启前已经完成的实际结果。";
+  const created = { channelId: "", taskId: "" };
+  const relayAttempted = Promise.withResolvers<void>();
+  const releaseRelay = Promise.withResolvers<void>();
+  const first = await createCoreHarness({
+    root,
+    prompt: async ({ emit, promptContext, text }) => {
+      if (text === "建区并派发") {
+        const thread = await createThreadViaTool(promptContext, { name: "崩溃窗口线程", listen: "task" });
+        created.channelId = thread.channel_id;
+        await dispatchViaTool(promptContext, { short_id: thread.short_id, text: "崩溃窗口任务" });
+        return;
+      }
+      if (text === "崩溃窗口任务") {
+        emit(assistantText("crash-window-result", result, true));
+        return;
+      }
+      throw new Error(`unexpected first-session prompt: ${text}`);
+    },
+  });
+  const botUid = first.bot.uid;
+  const store = await ChannelStore.open(join(first.stateDir, "channel.sqlite"));
+  const seam = first.service as unknown as {
+    notifyThreadOutcome: (taskId: string) => Promise<void>;
+  };
+  const notify = seam.notifyThreadOutcome.bind(first.service);
+  // Crash point: the terminal row and its result are committed, but no notice was accepted.
+  seam.notifyThreadOutcome = async (taskId) => {
+    const task = store.getTask(taskId);
+    if (
+      task?.channelType === 5
+      && task.messageId.startsWith("dispatch:")
+      && task.state === "completed"
+    ) {
+      created.taskId = task.id;
+      relayAttempted.resolve();
+      await releaseRelay.promise;
+    }
+    await notify(taskId);
+  };
+  let firstClosed = false;
+  let storeClosed = false;
+  try {
+    await first.service.submitInbound(
+      inbound({
+        messageId: "crash-window-create",
+        ...GROUP,
+        text: "建区并派发",
+        mentionedUserIds: [first.bot.uid],
+      }),
+    );
+    await relayAttempted.promise;
+    const threadTask = store.getTask(created.taskId);
+    expect(threadTask?.state).toBe("completed");
+    expect(threadTask?.resultText).toBe(result);
+    expect(store.getTaskByMessageId(botUid, GROUP, `notify:${created.taskId}`)).toBeNull();
+    store.close();
+    storeClosed = true;
+
+    const stopping = first.service.stop();
+    releaseRelay.resolve();
+    await stopping;
+    await closeCoreHarness(first, { remove: false });
+    firstClosed = true;
+  } finally {
+    releaseRelay.resolve();
+    if (!storeClosed) store.close();
+    if (!firstClosed) await closeCoreHarness(first);
+  }
+
+  const recoveredNotices: string[] = [];
+  const recoveredSeen = Promise.withResolvers<void>();
+  const second = await createCoreHarness({
+    root,
+    transport: first.transport,
+    prompt: async ({ text }) => {
+      if (text.startsWith("[子区任务回传]")) {
+        recoveredNotices.push(text);
+        recoveredSeen.resolve();
+      }
+    },
+  });
+  try {
+    await recoveredSeen.promise;
+    await waitForStatus(second.service, GROUP, (status) => status.state === "completed" && status.queued === 0);
+    expect(recoveredNotices).toHaveLength(1);
+    expect(recoveredNotices[0]).toContain(result);
+    expect(recoveredNotices[0]).toContain(`任务 ID：${created.taskId}`);
+    const reopened = await ChannelStore.open(join(second.stateDir, "channel.sqlite"));
+    try {
+      const noticeTask = reopened.getTaskByMessageId(botUid, GROUP, `notify:${created.taskId}`);
+      expect(noticeTask?.state).toBe("completed");
+      expect(reopened.getLatestTask(botUid, GROUP)?.messageId).toBe(`notify:${created.taskId}`);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    await closeCoreHarness(second, { remove: false });
+  }
+
+  const duplicateNotices: string[] = [];
+  const third = await createCoreHarness({
+    root,
+    transport: second.transport,
+    prompt: async ({ text }) => {
+      if (text.startsWith("[子区任务回传]")) duplicateNotices.push(text);
+    },
+  });
+  try {
+    // The already delivered notice is durable; another restart must neither accept nor run it again.
+    await waitForStatus(third.service, GROUP, (status) => status.state === "completed" && status.queued === 0);
+    for (let attempt = 0; attempt < 50; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(duplicateNotices).toEqual([]);
+    const reopened = await ChannelStore.open(join(third.stateDir, "channel.sqlite"));
+    try {
+      const noticeTask = reopened.getTaskByMessageId(botUid, GROUP, `notify:${created.taskId}`);
+      expect(noticeTask?.state).toBe("completed");
+      expect(reopened.getLatestTask(botUid, GROUP)?.messageId).toBe(`notify:${created.taskId}`);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    await closeCoreHarness(third);
+  }
+});
+
+test("create-thread listen=task relays terminal identity and the actual result", async () => {
   const notices: string[] = [];
   const noticeSeen = Promise.withResolvers<void>();
   const created = { channelId: "", shortId: "" };
+  const result = "主动监听线程的实际结果。";
   const harness = await createCoreHarness({
     prompt: async ({ emit, promptContext, text }) => {
       if (text === "创建并派发") {
@@ -1387,7 +1870,7 @@ test("create-thread listen=task relays terminal identity without task or result 
         return;
       }
       if (text === "PRIVATE_TASK_SECRET") {
-        emit(assistantText("private-task-result", "PRIVATE_RESULT_SECRET", true));
+        emit(assistantText("private-task-result", result, true));
         return;
       }
       if (text.startsWith("[子区任务回传]")) {
@@ -1418,8 +1901,9 @@ test("create-thread listen=task relays terminal identity without task or result 
     expect(notices[0]).toContain(`channel_id ${created.channelId}`);
     expect(notices[0]).toContain("任务 ID：");
     expect(notices[0]).toContain("状态：已完成");
+    expect(notices[0]).toContain(result);
+    expect(notices[0]).toContain("结果");
     expect(notices[0]).not.toContain("PRIVATE_TASK_SECRET");
-    expect(notices[0]).not.toContain("PRIVATE_RESULT_SECRET");
   } finally {
     await closeCoreHarness(harness);
   }

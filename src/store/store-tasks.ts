@@ -6,8 +6,9 @@ import { Database } from "bun:sqlite";
 import type { ChatTarget } from "../contracts.ts";
 import type { CommandClaimState, GoalStoppedRecovery, GoalStopIntent, GoalTaskRequest, InboundClaim, StoppedTaskRecovery, TaskRecord, TaskRestartRecovery, TaskStopIntent } from "./store-records.ts";
 import { getGoalSession, getGoalTask, hasActiveGoalTask, insertGoalTask, revokedGoalTaskIds, stopGoalContinuation, stopGoalContinuationForTask, undispatchedGoalAcceptanceIds } from "./store-goals.ts";
-import { allocateScheduleOrder, asNumber, asStopIntent, asString, query, run, targetValues, targetWhere, taskFromRow, transaction } from "./store-schema.ts";
+import { allocateScheduleOrder, asNumber, asNullableString, asStopIntent, asString, query, run, targetValues, targetWhere, taskFromRow, transaction } from "./store-schema.ts";
 import { cancelTaskQuestions } from "./store-questions.ts";
+import { queueThreadTaskEvent } from "./store-thread-listen.ts";
 
 /** Returns the persisted command state; task rows and unknown messages return null. */
 export function getCommandClaimState(
@@ -353,6 +354,27 @@ export function markStarted(db: Database, taskId: string): boolean {
   ).changes === 1;
 }
 
+/**
+ * Latest finalized assistant body for this task, persisted on the task itself so a resumed
+ * turn without new assistant text still reports the last real output. `null` means never
+ * recorded; an empty string means the last finalized assistant frame was empty.
+ */
+export function getTaskFinalResultText(db: Database, taskId: string): string | null {
+  const row = query(db, "SELECT final_result_text FROM tasks WHERE id = ?", [taskId])[0];
+  return row ? asNullableString(row.final_result_text) : null;
+}
+
+/** Writes only for a live relay candidate; settled or suppressed tasks keep their previous value. */
+export function setTaskFinalResultText(db: Database, taskId: string, text: string | null): void {
+  run(db,
+    `UPDATE tasks SET final_result_text = ?
+     WHERE id = ? AND state IN ('queued', 'started')
+       AND channel_type = 5 AND relay_suppressed = 0
+       AND (message_id LIKE 'dispatch:%' OR message_id LIKE 'loop:%')`,
+    [text, taskId],
+  );
+}
+
 export function markCompleted(db: Database, taskId: string, resultText: string | null): void {
   transaction(db, () => {
     const completed = run(db,
@@ -361,7 +383,10 @@ export function markCompleted(db: Database, taskId: string, resultText: string |
     ).changes === 1;
     // 终态与关闭本任务待答提问同事务提交：commit 与 finally 清题之间被杀，旧卡不能再唤醒新回合。
     // 任务自行结束记 `ended`——它没有用户明确停止，迟到提交按新输入接受。
-    if (completed) cancelTaskQuestions(db, taskId, "ended");
+    if (completed) {
+      queueThreadTaskEvent(db, taskId);
+      cancelTaskQuestions(db, taskId, "ended");
+    }
   });
 }
 
@@ -371,7 +396,10 @@ export function markFailed(db: Database, taskId: string, errorText: string): voi
       "UPDATE tasks SET state = 'failed', finished_at = ?, error_text = ?, result_text = NULL, stop_intent = NULL WHERE id = ?",
       [Date.now(), errorText, taskId],
     ).changes === 1;
-    if (failed) cancelTaskQuestions(db, taskId, "ended");
+    if (failed) {
+      queueThreadTaskEvent(db, taskId);
+      cancelTaskQuestions(db, taskId, "ended");
+    }
   });
 }
 
@@ -383,6 +411,7 @@ export function markCancelled(db: Database, taskId: string, errorText = "cancell
     ).changes === 1;
     // 用户取消是终态：待答提问与任务终态同事务关闭，迟到的回答不再唤醒新回合。
     if (cancelled) {
+      queueThreadTaskEvent(db, taskId);
       cancelTaskQuestions(db, taskId, "cancelled");
       stopGoalContinuationForTask(db, taskId, "cancel");
     }
@@ -401,8 +430,15 @@ export function markInterrupted(db: Database, taskId: string, errorText: string)
       "UPDATE tasks SET state = ?, finished_at = ?, error_text = ?, stop_intent = NULL WHERE id = ? AND state IN ('queued', 'started')",
       [state, Date.now(), errorText, taskId],
     ).changes === 1;
-    if (interrupted && intent === "cancel") cancelTaskQuestions(db, taskId, "cancelled");
-    else if (interrupted && intent === "interrupt") cancelTaskQuestions(db, taskId, "interrupted");
+    if (interrupted && intent === "cancel") {
+      queueThreadTaskEvent(db, taskId);
+      cancelTaskQuestions(db, taskId, "cancelled");
+    } else if (interrupted && intent === "interrupt") {
+      queueThreadTaskEvent(db, taskId);
+      cancelTaskQuestions(db, taskId, "interrupted");
+    } else if (interrupted) {
+      queueThreadTaskEvent(db, taskId);
+    }
   });
 }
 
@@ -509,6 +545,7 @@ export function prepareTasksForRestart(
       );
       const settled = query(db, "SELECT * FROM tasks WHERE id = ?", [taskId])[0];
       if (settled) stopped.push({ ...taskFromRow(settled), stopIntent });
+      queueThreadTaskEvent(db, taskId);
       if (stopIntent === "cancel") cancelTaskQuestions(db, taskId, "cancelled");
       else if (stopIntent === "interrupt") cancelTaskQuestions(db, taskId, "interrupted");
 
@@ -537,6 +574,7 @@ export function prepareTasksForRestart(
          WHERE id = ? AND state = 'started'`,
         [Date.now(), taskId],
       );
+      queueThreadTaskEvent(db, taskId);
       cancelTaskQuestions(db, taskId, "ended");
     }
 
@@ -552,6 +590,7 @@ export function prepareTasksForRestart(
          WHERE id = ? AND state = 'started'`,
         [Date.now(), taskId],
       );
+      queueThreadTaskEvent(db, taskId);
       cancelTaskQuestions(db, taskId, "ended");
       const settled = query(db, "SELECT * FROM tasks WHERE id = ?", [taskId])[0];
       if (settled) {
@@ -646,7 +685,10 @@ export function cancelQueued(db: Database, botUid: string, target: ChatTarget): 
        WHERE bot_uid = ? AND ${targetWhere(target)} AND state = 'queued'`,
       [Date.now(), botUid, ...targetValues(target)],
     );
-    for (const taskId of taskIds) cancelTaskQuestions(db, taskId, "cancelled");
+    for (const taskId of taskIds) {
+      queueThreadTaskEvent(db, taskId);
+      cancelTaskQuestions(db, taskId, "cancelled");
+    }
     return taskIds;
   });
 }

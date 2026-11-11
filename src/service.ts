@@ -463,6 +463,8 @@ class CoreService implements ChannelService {
   private readonly boundSessionWorkers = new Set<TrackedWorker>();
   /** Prevents replayed question-wake effects from racing their own steer/queue decision. */
   private readonly questionWakeOperations = new Set<string>();
+  /** One in-flight durable task notice per source task; repeated terminal hooks share it. */
+  private readonly threadTaskNotices = new Map<string, Promise<void>>();
   /** One in-flight native BTW per chat; its controller is shared with cancel/interrupt/shutdown. */
   private readonly btwOperationsByTarget = new Map<string, BtwOperation>();
   /** In-flight native-state reads invalidated by a later explicit goal stop. */
@@ -1331,6 +1333,7 @@ class CoreService implements ChannelService {
           lease.sourceId,
         );
       }
+      await this.recoverThreadTaskEvents(identity.uid);
       await this.recoverThreadMergeEvents(identity.uid);
       for (const lease of successfulHostMergeRecoveries) {
         if (this.stopping) throw new Error("channel 正在停止");
@@ -5664,76 +5667,189 @@ class CoreService implements ChannelService {
     }
   }
 
-  /** Independent Loop and dispatched tasks notify only at task level; durable policy owns recipients. */
+  /**
+   * Independent Loop and dispatched tasks notify only at task level; the durable event row is
+   * registered in the task's terminal transaction so a crash between settlement and delivery is
+   * recovered on the next start. Policy, authorization and merge suppression are re-checked here.
+   */
   private async notifyThreadOutcome(taskId: string): Promise<void> {
-    try {
-      if (this.stopping) return;
-      const botUid = this.bot?.uid;
-      if (botUid === undefined) return;
-      const task = this.store.getTask(taskId);
-      if (
-        !task
-        || task.channelType !== 5
-        || (!task.messageId.startsWith("dispatch:") && !task.messageId.startsWith("loop:"))
-        || task.relaySuppressed
-      ) {
-        return;
-      }
-      if (
+    const existing = this.threadTaskNotices.get(taskId);
+    if (existing !== undefined) return existing;
+    const delivery = this.deliverThreadTaskEvent(taskId, false)
+      .catch((error) => {
+        console.error(
+          `[thread-notify] 回传投递失败 task=${taskId}：${safeErrorMessage(error, "notify failed")}`,
+        );
+      })
+      .finally(() => {
+        if (this.threadTaskNotices.get(taskId) === delivery) this.threadTaskNotices.delete(taskId);
+      });
+    this.threadTaskNotices.set(taskId, delivery);
+    return delivery;
+  }
+
+  /**
+   * Gate denials are persisted as consumed: a later policy change, restart or late permission
+   * grant must not expose an old terminal result. Only shutdown and an already recorded steer
+   * intent leave the event pending, and intent is never replayed.
+   */
+  private async deliverThreadTaskEvent(taskId: string, recovering: boolean): Promise<void> {
+    if (this.stopping) return;
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) return;
+    if (!this.store.isThreadTaskEventPending(taskId)) return;
+
+    const task = this.store.getTask(taskId);
+    if (
+      task === null
+      || task.channelType !== 5
+      || (!task.messageId.startsWith("dispatch:") && !task.messageId.startsWith("loop:"))
+      || task.relaySuppressed
+      || (
         task.state !== "completed"
         && task.state !== "failed"
         && task.state !== "cancelled"
         && task.state !== "interrupted"
-      ) {
-        return;
+      )
+    ) {
+      this.store.markThreadTaskEventDelivered(taskId);
+      return;
+    }
+
+    const source: ChatTarget = { channelId: task.channelId, channelType: 5 };
+    const policy = this.store.getThreadListen(botUid, source);
+    if (policy === null || policy.listen !== "task" || policy.mergePending) {
+      this.store.markThreadTaskEventDelivered(taskId);
+      return;
+    }
+    const recipient: ChatTarget = {
+      channelId: policy.creatorChannelId,
+      channelType: policy.creatorChannelType,
+    };
+    const messageId = threadNotifyMessageId(task.id);
+    // The stable inbound identity proves a previous attempt was durably accepted. Check it
+    // before any steer attempt so a recovery cannot deliver the same notice twice.
+    if (this.store.getTaskByMessageId(botUid, recipient, messageId) !== null) {
+      this.store.markThreadTaskEventDelivered(taskId);
+      return;
+    }
+    const ownerId = this.store.getOwnerId(botUid)?.trim() ?? "";
+    if (ownerId.length === 0) {
+      this.store.markThreadTaskEventDelivered(taskId);
+      return;
+    }
+
+    const finalResult = task.state === "completed"
+      ? this.taskFinalResult(botUid, task)
+      : null;
+    const text = threadOutcomeNotice(task, policy.threadName, finalResult);
+    const message: InboundMessage = {
+      ...recipient,
+      messageId,
+      senderId: ownerId,
+      text,
+      mentionedUserIds: [botUid],
+      attachments: [],
+      quoted: null,
+      supported: true,
+      messageSeq: 0,
+      messageTimestamp: Date.now(),
+    };
+    if (!(await this.threadNoticeAuthorized(source, recipient, message, ownerId))) {
+      this.consumeThreadTaskEvent(taskId);
+      return;
+    }
+    const deliveryGuard = (): boolean => {
+      const currentTask = this.store.getTask(task.id);
+      const currentPolicy = this.store.getThreadListen(botUid, source);
+      return !this.stopping
+        && this.bot?.uid === botUid
+        && this.store.getOwnerId(botUid)?.trim() === ownerId
+        && currentTask !== null
+        && (currentTask.messageId.startsWith("dispatch:") || currentTask.messageId.startsWith("loop:"))
+        && !currentTask.relaySuppressed
+        && currentTask.state === task.state
+        && this.store.isThreadTaskEventPending(task.id)
+        && currentPolicy?.listen === "task"
+        && !currentPolicy.mergePending
+        && currentPolicy.creatorChannelType === recipient.channelType
+        && currentPolicy.creatorChannelId === recipient.channelId
+        && this.authorization.isPermittedChat(source)
+        && this.authorization.isPermittedChat(recipient);
+    };
+    if (!deliveryGuard()) {
+      this.consumeThreadTaskEvent(taskId);
+      return;
+    }
+    // A pending steer claim with a still-pending event proves `worker.steer` was never reached
+    // (intent is recorded immediately before the RPC). Releasing it is safe; an intent event
+    // was already filtered out by `isThreadTaskEventPending`.
+    const steerState = this.store.getCommandClaimState(botUid, recipient, messageId);
+    if (steerState === "completed") {
+      this.store.markThreadTaskEventDelivered(taskId);
+      return;
+    }
+    if (steerState === "pending") {
+      this.store.releaseClaim(this.commandClaim(message, "steer"));
+    }
+
+    let dispatchIntent = false;
+    const beforeWorkerSteer = (): boolean => {
+      if (!deliveryGuard()) return false;
+      dispatchIntent = this.store.claimThreadTaskDispatchIntent(task.id);
+      return dispatchIntent;
+    };
+    if (await this.appendToRunningTask(message, text, deliveryGuard, beforeWorkerSteer)) {
+      if (dispatchIntent) this.store.markThreadTaskEventDelivered(task.id);
+      return;
+    }
+    // An intent already crossed the RPC boundary: never retry or fall back to a new task.
+    if (dispatchIntent || !this.store.isThreadTaskEventPending(task.id)) return;
+    if (!deliveryGuard()) {
+      this.consumeThreadTaskEvent(taskId);
+      return;
+    }
+    const accepted = await this.acceptTask(
+      message,
+      text,
+      true,
+      undefined,
+      undefined,
+      deliveryGuard,
+    );
+    if (accepted) {
+      this.store.markThreadTaskEventDelivered(taskId);
+      return;
+    }
+    // Durable acceptance may have landed before a crash; the stable message id is the receipt.
+    if (this.store.getTaskByMessageId(botUid, recipient, messageId) !== null) {
+      this.store.markThreadTaskEventDelivered(taskId);
+    }
+  }
+
+  /** Latest finalized assistant body; outbox projection is only a pre-field recovery fallback. */
+  private taskFinalResult(botUid: string, task: TaskRecord): string | null {
+    const stored = this.store.getTaskFinalResultText(task.id);
+    if (stored !== null) return stored;
+    return this.store.getLatestFinalAssistantText(botUid, task.id);
+  }
+
+  /** Marks a refused delivery consumed unless shutdown is in progress (recovery retries it). */
+  private consumeThreadTaskEvent(taskId: string): void {
+    if (this.stopping) return;
+    this.store.markThreadTaskEventDelivered(taskId);
+  }
+
+  private async recoverThreadTaskEvents(botUid: string): Promise<void> {
+    for (const event of this.store.listPendingThreadTaskEvents(botUid)) {
+      if (this.stopping) return;
+      try {
+        await this.deliverThreadTaskEvent(event.taskId, true);
+      } catch (error) {
+        console.error(
+          `[thread-notify] 恢复投递失败 task=${event.taskId}：${safeErrorMessage(error, "notify failed")}`,
+        );
       }
-      const source: ChatTarget = { channelId: task.channelId, channelType: 5 };
-      const policy = this.store.getThreadListen(botUid, source);
-      if (policy === null || policy.listen !== "task" || policy.mergePending) return;
-      const ownerId = this.store.getOwnerId(botUid)?.trim() ?? "";
-      if (ownerId.length === 0) return;
-      const recipient: ChatTarget = {
-        channelId: policy.creatorChannelId,
-        channelType: policy.creatorChannelType,
-      };
-      const text = threadOutcomeNotice(task, policy.threadName);
-      const message: InboundMessage = {
-        ...recipient,
-        messageId: threadNotifyMessageId(task.id),
-        senderId: ownerId,
-        text,
-        mentionedUserIds: [botUid],
-        attachments: [],
-        quoted: null,
-        supported: true,
-        messageSeq: 0,
-        messageTimestamp: Date.now(),
-      };
-      if (!(await this.threadNoticeAuthorized(source, recipient, message, ownerId))) return;
-      const deliveryGuard = (): boolean => {
-        const currentTask = this.store.getTask(task.id);
-        const currentPolicy = this.store.getThreadListen(botUid, source);
-        return !this.stopping
-          && this.bot?.uid === botUid
-          && this.store.getOwnerId(botUid)?.trim() === ownerId
-          && currentTask !== null
-          && (currentTask.messageId.startsWith("dispatch:") || currentTask.messageId.startsWith("loop:"))
-          && !currentTask.relaySuppressed
-          && currentTask.state === task.state
-          && currentPolicy?.listen === "task"
-          && !currentPolicy.mergePending
-          && currentPolicy.creatorChannelType === recipient.channelType
-          && currentPolicy.creatorChannelId === recipient.channelId
-          && this.authorization.isPermittedChat(source)
-          && this.authorization.isPermittedChat(recipient);
-      };
-      if (!deliveryGuard()) return;
-      if (await this.appendToRunningTask(message, text, deliveryGuard)) return;
-      await this.acceptTask(message, text, true, undefined, undefined, deliveryGuard);
-    } catch (error) {
-      console.error(
-        `[thread-notify] 回传投递失败 task=${taskId}：${safeErrorMessage(error, "notify failed")}`,
-      );
     }
   }
 
@@ -11082,6 +11198,7 @@ class CoreService implements ChannelService {
         acquiredReservation?.complete();
       }
       this.serviceRestart.maybeRunDeferred();
+      await this.notifyThreadOutcome(taskId);
     }
   }
 
@@ -11093,6 +11210,7 @@ class CoreService implements ChannelService {
       this.scheduler.takeWaitingReceipt(taskId);
       this.store.markFailed(taskId, "automatic thread-merge commit cannot be replayed after restart");
       this.typingLeases.release(target, `task:${taskId}`);
+      await this.notifyThreadOutcome(taskId);
       return;
     }
     const isWatchWakeTask = persistedTask.messageId.startsWith(WATCH_WAKE_PREFIX);
@@ -11232,6 +11350,17 @@ class CoreService implements ChannelService {
       control: runtime,
       stopping: () => this.stopping,
       parseAssistantMentions: true,
+      // Only independent thread tasks are later relayed; any other turn keeps zero extra writes.
+      ...(persistedTask.channelType === 5
+        && !persistedTask.relaySuppressed
+        && (persistedTask.messageId.startsWith("dispatch:") || persistedTask.messageId.startsWith("loop:"))
+        ? {
+            onFinalAssistantText: (text: string) => {
+              // A failed durable write must fail this turn rather than let stale text be relayed.
+              this.store.setTaskFinalResultText(taskId, text);
+            },
+          }
+        : {}),
       fileLinkSignal: AbortSignal.any([
         runtime.cancelController.signal,
         this.shutdownController.signal,

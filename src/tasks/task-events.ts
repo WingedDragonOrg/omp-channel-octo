@@ -30,6 +30,11 @@ export interface TaskEventsDeps {
   stopping: () => boolean;
   /** Enable structured mention parsing for assistant body snapshots. */
   parseAssistantMentions: boolean;
+  /**
+   * Persist each finalized assistant body so the task keeps its last real output even when a
+   * resumed turn produces no new text. Called synchronously before outbox projection.
+   */
+  onFinalAssistantText?: (text: string) => void;
   /** Cancel async resolver work when the task or service stops. */
   fileLinkSignal: AbortSignal;
   /** Capture a native /context command output for its standalone card. */
@@ -122,6 +127,9 @@ export class TaskEvents {
       // 空 messageId 一律丢弃；空 final 文本仍更新聚合与出站（收尾帧照常落编辑）。
       if (event.messageId.trim().length === 0 || (event.text.length === 0 && !event.final)) return;
       this.assistantTexts.set(event.messageId, event.text);
+      if (event.final && this.deps.onFinalAssistantText !== undefined) {
+        this.deps.onFinalAssistantText(event.text);
+      }
       this.deps.outbox.enqueueStreamText(
         this.deps.target,
         this.deps.taskId,

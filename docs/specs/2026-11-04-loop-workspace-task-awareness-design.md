@@ -158,7 +158,7 @@ Baseline 或 Loop task 变化
 
 已关联 task 的正常变化只发子区，主群没有对应镜像消息、agent 任务或 steering。主群获知工作结果沿用 `docs/specs/2026-09-17-thread-completion-notify-design.md`：`listen=off|merge|task`，默认 merge；listen 不是 Loop 变更订阅。
 
-Loop 变化直接在子区接受为独立 channel 任务时，保留系统来源，并使其执行终态按该子区现有 task 监听策略判定；steering 部分仍没有独立终态。合并失败及修复失败的抑制保持不变。子区主动通知主群走当前已授权消息能力，不新增越权身份或自动向 Loop 写回。
+Loop 变化直接在子区接受为独立 channel 任务时，保留系统来源，并使其执行终态按该子区现有 task 监听策略判定；成功回传携带该任务真实 assistant 结果的脱敏有界摘录，缺失时明确不可用，失败原因保持原有行为。steering 部分仍没有独立终态。合并失败及修复失败的抑制保持不变。子区主动通知主群走当前已授权消息能力，不新增越权身份或自动向 Loop 写回。
 
 ## 职责与持久化边界
 

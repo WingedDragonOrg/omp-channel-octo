@@ -165,6 +165,16 @@ export interface ThreadListenRecord {
   mergePending: boolean;
 }
 
+/**
+ * One relayable task terminal state. The task id is the stable parent-input identity; delivery
+ * state is the pending -> intent -> delivered receipt for that notice.
+ */
+export interface ThreadTaskEventRecord {
+  taskId: string;
+  botUid: string;
+  channelId: string;
+}
+
 export interface ThreadMergeEventRecord {
   id: string;
   botUid: string;

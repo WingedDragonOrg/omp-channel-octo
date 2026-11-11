@@ -317,6 +317,13 @@ export function applySchema(db: Database): void {
       archive TEXT NOT NULL CHECK(archive IN ('scheduled', 'not-scheduled')),
       delivery_state TEXT NOT NULL DEFAULT 'pending' CHECK(delivery_state IN ('pending', 'intent', 'delivered'))
     );
+    CREATE TABLE IF NOT EXISTS thread_task_events (
+      task_id TEXT PRIMARY KEY NOT NULL,
+      bot_uid TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      delivery_state TEXT NOT NULL DEFAULT 'pending' CHECK(delivery_state IN ('pending', 'intent', 'delivered')),
+      created_at INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS thread_references (
       bot_uid TEXT NOT NULL,
       channel_id TEXT NOT NULL,
@@ -330,6 +337,8 @@ export function applySchema(db: Database): void {
       PRIMARY KEY(bot_uid, channel_id)
     );
     CREATE INDEX IF NOT EXISTS thread_merge_events_bot ON thread_merge_events(bot_uid);
+    CREATE INDEX IF NOT EXISTS thread_task_events_pending
+      ON thread_task_events(bot_uid, delivery_state, created_at, task_id);
     CREATE TABLE IF NOT EXISTS inbound (
       bot_uid TEXT NOT NULL,
       channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
@@ -392,7 +401,8 @@ export function applySchema(db: Database): void {
       prompt_started INTEGER NOT NULL DEFAULT 0,
       prompt_accepted INTEGER NOT NULL DEFAULT 0,
       stop_intent TEXT,
-      relay_suppressed INTEGER NOT NULL DEFAULT 0 CHECK(relay_suppressed IN (0, 1))
+      relay_suppressed INTEGER NOT NULL DEFAULT 0 CHECK(relay_suppressed IN (0, 1)),
+      final_result_text TEXT
     );
     CREATE TABLE IF NOT EXISTS task_file_link_context (
       task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -743,6 +753,7 @@ export function applySchema(db: Database): void {
     "ALTER TABLE tasks ADD COLUMN message_seq INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN history_eligible INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE tasks ADD COLUMN stop_intent TEXT",
+    "ALTER TABLE tasks ADD COLUMN final_result_text TEXT",
     "ALTER TABLE chats ADD COLUMN cwd_pinned INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE chats ADD COLUMN session_switched_at INTEGER",
     "ALTER TABLE chats ADD COLUMN session_initialization_json TEXT",
