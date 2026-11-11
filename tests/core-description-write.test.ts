@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import type { GroupContext, HostTool } from "../src/contracts.ts";
+import { OctoError } from "../src/octo/error.ts";
 import { closeCoreHarness, createCoreHarness, FakeTransport, inbound, waitForStatus } from "./fixtures/core-fakes.ts";
 
 const target = { channelType: 2 as const, channelId: "group-tools" };
@@ -8,16 +9,18 @@ const initial: GroupContext = { present: true, content: "Original description", 
 
 async function withManagement(run: (tool: HostTool, transport: FakeTransport) => Promise<void>) {
   let failure: unknown;
+  const operationDone = Promise.withResolvers<void>();
   const harness = await createCoreHarness({
     prompt: async ({ promptContext }) => {
       const tool = promptContext?.tools?.find(candidate => candidate.name === "octo_management");
       if (!tool) throw new Error("Missing scoped management tool");
-      try { await run(tool, harness.transport); } catch (error) { failure = error; throw error; }
+      try { await run(tool, harness.transport); } catch (error) { failure = error; throw error; } finally { operationDone.resolve(); }
     },
   });
   harness.transport.setGroupContext(target, initial);
   try {
     await harness.service.submitInbound(inbound({ ...target, messageId: "description-guard", text: "maintain current description", mentionedUserIds: [harness.bot.uid] }));
+    await operationDone.promise;
     const status = await waitForStatus(harness.service, target, value => value.state === "completed" || value.state === "failed");
     if (failure) throw failure;
     expect(status.state).toBe("completed");
@@ -68,3 +71,24 @@ test("parallel description writes cannot reuse the same read to overwrite each o
     expect(await transport.getGroupContext(target)).toMatchObject({ content: "first parallel writer", version: 5 });
   });
 });
+
+test("live reads and write verification retry without accepting a changed description", async () => {
+  await withManagement(async (tool, transport) => {
+    const read = transport.getGroupContext.bind(transport);
+    let failNext = true;
+    transport.getGroupContext = async chat => {
+      if (failNext) {
+        failNext = false;
+        throw new OctoError("temporary", { status: 503 });
+      }
+      return read(chat);
+    };
+    const result = await tool.execute({ action: "description-read" }, signal);
+    expect(JSON.parse(String(result))).toMatchObject({ content: "Original description", version: 4 });
+    transport.setGroupContext(target, { ...initial, content: "Changed externally", version: 5 });
+    failNext = true;
+    await expect(tool.execute({ action: "description-write", content: "stale" }, signal)).rejects.toThrow(/description-read/);
+    expect(await read(target)).toMatchObject({ content: "Changed externally", version: 5 });
+    await expect(tool.execute({ action: "description-write", content: "stale again" }, signal)).rejects.toThrow(/description-read/);
+  });
+}, 15_000);

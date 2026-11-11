@@ -17,6 +17,7 @@ import { join } from "node:path";
 import type { ChannelTransport, ChatTarget, ContextInjection, GroupContext, WorkerOptions } from "../contracts.ts";
 import type { AgentContext } from "./agent-context.ts";
 import type { ChannelStore } from "../store/index.ts";
+import { readGroupContext } from "./read-group-context.ts";
 import {
   FRESH_CONTEXT_READ_SCHEMA_VERSION,
   freshContextReadPaths,
@@ -133,7 +134,7 @@ export class TurnContext {
   /**
    * 读取本回合的群说明快照；私聊只使用该门面发布会话作用域，不触碰群说明 API。
    */
-  async load(sessionId: string): Promise<GroupContext | null> {
+  async load(sessionId: string, signal: AbortSignal): Promise<GroupContext | null> {
     if (this.deps.target.channelType === 1) {
       this.snapshot = emptyGroupContext();
       this.hasSharedContext = false;
@@ -158,7 +159,7 @@ export class TurnContext {
       this.compactedContextReceipt = undefined;
       this.pendingCompaction = undefined;
       this.deps.store.clearContextLedger(this.deps.botUid, this.deps.target, sessionId);
-      this.snapshot = normalizeGroupContext(await this.deps.transport.getGroupContext(this.deps.target));
+      this.snapshot = normalizeGroupContext(await readGroupContext(this.deps.transport, this.deps.target, signal));
     } else {
       this.compactedContextReceipt = cached.compactedContext;
       this.pendingCompaction = cached.pendingCompaction;
@@ -460,7 +461,7 @@ export class TurnContext {
     try {
       if (await fileExists(paths.cancel)) return;
       const snapshot = normalizeGroupContext(await waitForAbortable(
-        Promise.resolve().then(() => this.deps.transport.getGroupContext(this.deps.target, readSignal)),
+        readGroupContext(this.deps.transport, this.deps.target, readSignal),
         readSignal,
       ));
       if (cancelled || signal.aborted) return;

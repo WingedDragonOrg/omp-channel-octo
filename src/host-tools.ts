@@ -3,6 +3,7 @@ import { copyFile, mkdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
 import { throwIfAborted } from "./abort.ts";
 import { normalizeGroupContext } from "./session/context-sidecar.ts";
+import { readGroupContext } from "./session/read-group-context.ts";
 import type {
   ChannelTransport,
   ChatTarget,
@@ -1358,7 +1359,7 @@ async function runManagementTool(
   switch (action) {
     case "description-read": {
       descriptionState.snapshot = undefined;
-      const snapshot = normalizeGroupContext(await transport.getGroupContext(target));
+      const snapshot = normalizeGroupContext(await readGroupContext(transport, target, signal));
       descriptionState.snapshot = snapshot;
       return JSON.stringify(snapshot);
     }
@@ -1368,7 +1369,7 @@ async function runManagementTool(
       const previous = descriptionState.snapshot;
       descriptionState.snapshot = undefined;
       if (!previous) throw new Error("请先调用 description-read 读取当前说明，再调用 description-write。");
-      const current = normalizeGroupContext(await transport.getGroupContext(target));
+      const current = normalizeGroupContext(await readGroupContext(transport, target, signal));
       if (current.version !== previous.version || current.content !== previous.content) {
         throw new Error("说明已变化，请重新调用 description-read 后再写入。");
       }

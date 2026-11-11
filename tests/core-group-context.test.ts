@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import type { LocalCommandEvent } from "../src/contracts";
+import { OctoError } from "../src/octo/error.ts";
 import {
   contextSidecarPath,
   readContextSidecar,
@@ -268,6 +269,97 @@ test("a recovered group session does not repeat a committed unchanged snapshot",
     }
   }
 });
+
+for (const group of [
+  { channelId: "group-retry", channelType: 2 as const },
+  { channelId: "group-retry____thread-retry", channelType: 5 as const },
+]) {
+  test(`retries a transient context read for ${group.channelType} before starting its task`, async () => {
+    const harness = await createCoreHarness({ allowedGroupIds: ["group-retry"] });
+    try {
+      harness.transport.setGroupContext(group, {
+        content: "fresh scoped description",
+        version: 7,
+        updatedAt: null,
+        updatedBy: "admin",
+      });
+      const read = harness.transport.getGroupContext.bind(harness.transport);
+      let attempts = 0;
+      harness.transport.getGroupContext = async target => {
+        if (attempts++ === 0) throw new OctoError("temporary", { status: 503 });
+        return read(target);
+      };
+      await harness.service.submitInbound(inbound({
+        messageId: `retry-context-${group.channelType}`,
+        ...group,
+        text: "run with fresh context",
+        mentionedUserIds: [harness.bot.uid],
+      }));
+      await harness.workers.waitForPromptCount(1);
+      await waitForStatus(harness.service, group, status => status.state === "completed");
+      const prompt = harness.workers.prompts[0]!;
+      const sidecar = await readContextSidecar(contextSidecarPath(prompt.sidecarRoot!, prompt.sessionId));
+      expect(sidecar.target).toEqual(group);
+      expect(sidecar.snapshot.content).toBe("fresh scoped description");
+      expect(attempts).toBe(2);
+    } finally {
+      await closeCoreHarness(harness);
+    }
+  }, 15_000);
+}
+
+test("persistent transient description failure exhausts retries without starting a task", async () => {
+  const harness = await createCoreHarness();
+  try {
+    const group = { channelId: "group-unavailable", channelType: 2 as const };
+    harness.transport.failGroupContextWith(new OctoError("context service unavailable", { status: 503 }));
+    const lastRead = Promise.withResolvers<void>();
+    const read = harness.transport.getGroupContext.bind(harness.transport);
+    harness.transport.getGroupContext = async target => {
+      if (harness.transport.groupContextCalls.length === 2) lastRead.resolve();
+      return read(target);
+    };
+    await harness.service.submitInbound(inbound({
+      ...group, messageId: "context-retry-exhausted", text: "must not run",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    await lastRead.promise;
+    await waitForStatus(harness.service, group, status => status.state === "failed");
+    expect(harness.transport.groupContextCalls).toEqual([group, group, group]);
+    expect(harness.workers.prompts).toHaveLength(0);
+    expect(harness.transport.sent.some(({ text }) => text.includes("群说明读取失败"))).toBe(true);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+}, 15_000);
+
+test("cancelling during context retry stops the task before a new read", async () => {
+  const harness = await createCoreHarness();
+  const firstRead = Promise.withResolvers<void>();
+  try {
+    const group = { channelId: "group-unavailable", channelType: 2 as const };
+    let attempts = 0;
+    harness.transport.getGroupContext = async () => {
+      attempts++;
+      firstRead.resolve();
+      throw new OctoError("context service unavailable", { status: 503 });
+    };
+    await harness.service.submitInbound(inbound({
+      ...group, messageId: "context-cancel", text: "must not run",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    await firstRead.promise;
+    await harness.service.submitInbound(inbound({
+      ...group, messageId: "context-cancel-command", text: "/cancel",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    await waitForStatus(harness.service, group, status => status.state === "cancelled");
+    expect(attempts).toBe(1);
+    expect(harness.workers.prompts).toHaveLength(0);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+}, 15_000);
 
 test("a group-context read failure fails the task before any worker prompt", async () => {
   const harness = await createCoreHarness();

@@ -1,6 +1,7 @@
 import { GroupHistoryCoordinator } from "./inbound/history-coordinator.ts";
 import { ModelSwitchController } from "./commands/model-controller.ts";
 import { modelPolicyDescription } from "./commands/model-switch.ts";
+import { readGroupContext } from "./session/read-group-context.ts";
 import { formatGoalSession, goalErrorText, GOAL_USAGE, parseGoalCommand } from "./commands/goal-command.ts";
 import {
   CONFIG_CARD_ACTION_PREFIX,
@@ -1542,7 +1543,7 @@ class CoreService implements ChannelService {
       ) {
         context = await this.waitForReferenceThreadContext(taskId, signal);
       } else {
-        context = await this.options.transport.getGroupContext(target, signal);
+        context = await readGroupContext(this.options.transport, target, signal);
       }
     }
     if (signal.aborted) throw signal.reason ?? new DOMException("Thread context load aborted", "AbortError");
@@ -11168,7 +11169,9 @@ class CoreService implements ChannelService {
         cwd: task.cwd,
         resolvers: this.options.config.fileLinks?.resolvers.map((resolver) => ({ ...resolver })) ?? [],
       });
-      const contextLoad = turnContext.load(task.sessionId);
+      const contextLoad = turnContext.load(task.sessionId, AbortSignal.any([
+        this.shutdownController.signal, runtime.cancelController.signal,
+      ]));
       runtime.turnContextLoad = contextLoad;
       const waiter = this.referenceContextWaiters.get(taskId);
       if (waiter) void contextLoad.then(waiter.resolve, waiter.reject);
