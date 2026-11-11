@@ -712,7 +712,7 @@ test("loop task routes are isolated and increment their durable version only whe
   });
 });
 
-test("loop creation reservation is unique, unknown is never reassigned, and stale allocations cannot publish", async () => {
+test("loop creation reservations are unique, unknown attempts remain historical, and stale allocations cannot publish", async () => {
   await inTemporaryDirectory(async (root) => {
     const store = await openStore(root);
     let contender: Store | null = null;
@@ -744,12 +744,15 @@ test("loop creation reservation is unique, unknown is never reassigned, and stal
       const unknown = store.reserveLoopThreadCreation(unknownKey, "tool-call-unknown");
       store.recordLoopThreadAllocated(unknownKey, unknown.operationId, `${groupId}____unknown-partial`);
       store.markLoopThreadCreationUnknown(unknownKey, unknown.operationId, "remote response timed out");
-      expect(store.reserveLoopThreadCreation(unknownKey, "must-not-reallocate")).toMatchObject({
-        operationId: "tool-call-unknown",
-        state: "unknown",
-        threadChannelId: `${groupId}____unknown-partial`,
-        error: "remote response timed out",
-      });
+      const retry = store.reserveLoopThreadCreation(unknownKey, "tool-call-unknown");
+      expect(retry).toMatchObject({ state: "reserved", threadChannelId: null });
+      expect(retry.operationId).not.toBe(unknown.operationId);
+      expect(store.listLoopThreadCreationAttempts(unknownKey).map(
+        ({ operationId, state, threadChannelId }) => ({ operationId, state, threadChannelId }),
+      )).toEqual([
+        { operationId: unknown.operationId, state: "unknown", threadChannelId: `${groupId}____unknown-partial` },
+        { operationId: retry.operationId, state: "reserved", threadChannelId: null },
+      ]);
       const rejectedKey = taskKey({ taskId: "loop-task-known-rejection" });
       const rejected = store.reserveLoopThreadCreation(rejectedKey, "tool-call-known-rejection");
       expect(store.releaseLoopThreadCreation(rejectedKey, rejected.operationId)).toBe(true);
@@ -759,13 +762,48 @@ test("loop creation reservation is unique, unknown is never reassigned, and stal
         state: "reserved",
         threadChannelId: null,
       });
-      expect(store.getLoopThreadCreation(unknownKey)?.operationId).toBe("tool-call-unknown");
+      expect(store.listLoopThreadCreationAttempts(unknownKey)).toHaveLength(2);
     } finally {
       store.close();
       contender?.close();
     }
   });
 });
+
+test("unknown creation attempts and known partial identities survive store reopen", async () => {
+  await inTemporaryDirectory(async (root) => {
+    let store = await openStore(root);
+    const key = taskKey();
+    let firstOperationId = "";
+    try {
+      store.bindLoopWorkspace(botUid, groupId, workspaceA, [loopTask()]);
+      const first = store.reserveLoopThreadCreation(key, "native-tool-call");
+      firstOperationId = first.operationId;
+      const partialChannelId = `${groupId}____partial-known-before-failure`;
+      store.recordLoopThreadAllocated(key, first.operationId, partialChannelId);
+      store.markLoopThreadCreationUnknown(key, first.operationId, "preparation response was lost");
+    } finally {
+      store.close();
+    }
+
+    store = await openStore(root);
+    try {
+      expect(store.listLoopThreadCreationAttempts(key)).toMatchObject([
+        { operationId: firstOperationId, state: "unknown", threadChannelId: `${groupId}____partial-known-before-failure` },
+      ]);
+      const retry = store.reserveLoopThreadCreation(key, "native-tool-call");
+      expect(retry.state).toBe("reserved");
+      expect(retry.operationId).not.toBe(firstOperationId);
+      expect(store.listLoopThreadCreationAttempts(key)).toMatchObject([
+        { operationId: firstOperationId, state: "unknown", threadChannelId: `${groupId}____partial-known-before-failure` },
+        { operationId: retry.operationId, state: "reserved", threadChannelId: null },
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+});
+
 
 test("loop thread creation atomically publishes its route and remains complete after reopen", async () => {
   await inTemporaryDirectory(async (root) => {

@@ -445,6 +445,83 @@ test("/fork reports actual partial session and thread identities when target bin
   }
 });
 
+test("an unknown Loop allocation with a preparing workspace intent does not block an independent fork", async () => {
+  const transport = new ForkTestTransport();
+  const workers = new ForkTestWorkerFactory();
+  const harness = await createCoreHarness({
+    transport,
+    workers,
+    allowedGroupIds: [FORK_GROUP.channelId],
+  });
+  const loopThread = threadSummary(FORK_GROUP.channelId, "loop-partial");
+  const workspaceId = "loop-workspace-unknown";
+  const taskId = "loop-task-unknown";
+
+  try {
+    await harness.service.submitInbound(ownerMessage(
+      harness,
+      FORK_GROUP,
+      "fork-loop-intent-source",
+      "prepare a fork source",
+    ));
+    await waitForStatus(harness.service, FORK_GROUP, (status) => status.state === "completed");
+    transport.setThreads(FORK_GROUP.channelId, [loopThread]);
+    await withStore(harness, (store) => {
+      store.bindLoopWorkspace(harness.bot.uid, FORK_GROUP.channelId, {
+        workspaceId,
+        name: "Unknown Loop workspace",
+        slug: "unknown-loop-workspace",
+      }, []);
+      const key = {
+        botUid: harness.bot.uid,
+        groupId: FORK_GROUP.channelId,
+        workspaceId,
+        taskId,
+      };
+      const creation = store.reserveLoopThreadCreation(key, "loop-unknown-create");
+      store.recordLoopThreadAllocated(key, creation.operationId, loopThread.channelId);
+      store.markLoopThreadCreationUnknown(key, creation.operationId, "remote creation outcome is unknown");
+      store.saveThreadWorkspaceIntent({
+        id: "loop-unknown-workspace-intent",
+        botUid: harness.bot.uid,
+        groupId: FORK_GROUP.channelId,
+        status: "preparing",
+        channelIds: [loopThread.channelId],
+      });
+    });
+
+    await harness.service.submitInbound(ownerMessage(
+      harness,
+      FORK_GROUP,
+      "fork-despite-loop-intent",
+      "/fork independent review",
+    ));
+    const fork = await waitForForkRecord(
+      harness,
+      (record) => record.name === "independent review" && record.phase === "ready",
+    );
+    expect(fork.thread?.channelId).not.toBe(loopThread.channelId);
+    expect(transport.createAttempts).toBe(1);
+    expect(workers.forkAttempts).toHaveLength(1);
+    await withStore(harness, (store) => {
+      expect(store.getLoopThreadCreation({
+        botUid: harness.bot.uid,
+        groupId: FORK_GROUP.channelId,
+        workspaceId,
+        taskId,
+      })).toMatchObject({
+        state: "unknown",
+        threadChannelId: loopThread.channelId,
+      });
+      expect(store.getThreadWorkspaceIntent(harness.bot.uid, "loop-unknown-workspace-intent"))
+        .toMatchObject({ status: "preparing", channelIds: [loopThread.channelId] });
+    });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+
 test("a detached fork tool releases a deferred restart after its source turn has already settled", async () => {
   const forkCallStarted = gate();
   const restartRequests: number[] = [];
@@ -588,7 +665,7 @@ test("/fork keeps a deferred restart pending until its result is sent and comman
       record => record.name === "deferred restart" && record.phase === "ready",
     );
     const forkAdmission = await waitForIngressJob(harness, forkCommandMessage, {
-      predicate: job => job.state === "accepted",
+      predicate: job => job.state === "accepted" || job.state === "dispatch-intent",
       rejectStates: [],
       description: "deferred fork admission",
     });

@@ -31,7 +31,6 @@ import { createWatchJudge } from "./watch/decision.ts";
 import { WatchCoordinator } from "./watch/index.ts";
 import {
   SessionLifecycle,
-  threadWorkspaceIdentityMatches,
   threadWorkspaceIsAvailable,
   type SessionCommandIngressHooks,
 } from "./session/session-lifecycle.ts";
@@ -4178,12 +4177,14 @@ class CoreService implements ChannelService {
     requireBinding = false,
   ): Promise<boolean> {
     if (target.channelType !== 5) return false;
-    if (this.loopController?.threads.isTargetBlocked(target)) return true;
     if (this.bot === undefined) return false;
     try {
-      const parentGroupId = threadParentGroupId(target.channelId);
       const fork = this.store.getThreadForkByTarget(this.bot.uid, target);
       if (fork !== null && fork.phase !== "ready") return true;
+      if (
+        this.store.isThreadWorkspaceOperationBlocked(this.bot.uid, target)
+        || this.store.isThreadWorkspaceCleanupBlocked(this.bot.uid, target)
+      ) return true;
       if (this.store.isThreadWorkspaceIntentBlocked(this.bot.uid, target)) return true;
       const workspace = this.store.getThreadWorkspace(this.bot.uid, target);
       if (workspace === null) return false;
@@ -4196,21 +4197,13 @@ class CoreService implements ChannelService {
       const binding = this.store.getBinding(this.bot.uid, target);
       // Fresh inbound can create a binding inside a ready workspace; a persisted task cannot
       // trust its old cwd without the binding that established it.
-      if (binding === null) {
-        return requireBinding || !(await threadWorkspaceIsAvailable(workspace)) ||
-          (parentGroupId !== null && this.store.listThreadWorkspaceIntents(this.bot.uid, parentGroupId).some(
-            (intent) => intent.status === "preparing" && intent.channelIds.length === 0,
-          ) && !(await threadWorkspaceIdentityMatches(workspace)));
-      }
+      if (binding === null) return requireBinding || !(await threadWorkspaceIsAvailable(workspace));
       const related = new Set(this.store.workspaceDirectories(binding.cwd));
       const stillOwned =
         (workspace.entryPath !== null && related.has(workspace.entryPath))
         || workspace.projects.some((project) => project.path !== null && related.has(project.path));
       if (!stillOwned) return false;
       if (!(await threadWorkspaceIsAvailable(workspace))) return true;
-      if (parentGroupId !== null && this.store.listThreadWorkspaceIntents(this.bot.uid, parentGroupId).some(
-        (intent) => intent.status === "preparing" && intent.channelIds.length === 0,
-      ) && !(await threadWorkspaceIdentityMatches(workspace))) return true;
       const bindingCwd = await canonicalExistingDirectory(binding.cwd).catch(() => null);
       return bindingCwd !== binding.cwd;
     } catch {
@@ -8776,7 +8769,7 @@ class CoreService implements ChannelService {
         if (ownership?.layout === "shared") {
           throw new Error("当前为多项目工作区，不支持 /thread merge。");
         }
-        if (this.store.isThreadWorkspaceIntentBlocked(botUid, message)) {
+        if (await this.threadWorkspaceIncomplete(message)) {
           throw new Error("当前子区工作区未就绪，无法合并");
         }
         if (ownership !== null && !(await threadWorkspaceIsAvailable(ownership))) {
@@ -10023,39 +10016,28 @@ class CoreService implements ChannelService {
       ) {
         throw new Error("thread-send-parent source thread creation is not durably ready");
       }
-      const allLoopCreations = this.store.listLoopThreadCreations(botUid);
-      // A resolved child keeps its creator when its Loop task route is later rebound.
-      if (allLoopCreations.some(
-        (creation) => creation.groupId === parentGroupId
-          && creation.state !== "ready"
-          && creation.state !== "superseded"
-          && creation.threadChannelId === null,
-      )) {
-        throw new Error("thread-send-parent cannot resolve a child while its group's Loop allocation is unknown");
-      }
-      const loopCreations = allLoopCreations.filter((creation) => creation.threadChannelId === source.channelId);
-      if (loopCreations.some((creation) => creation.state !== "ready" && creation.state !== "superseded")) {
-        throw new Error("thread-send-parent source thread has an unresolved Loop creation record");
-      }
+      const loopCreations = this.store.listLoopThreadCreations(botUid)
+        .filter((creation) => creation.threadChannelId === source.channelId);
       const workspaceIntents = this.store.listThreadWorkspaceIntents(botUid, parentGroupId);
-      // Empty preparing intents have unknown remote allocations; failed empty intents do not.
-      if (workspaceIntents.some(
-        (intent) => intent.status !== "complete"
-          && (
-            intent.channelIds.includes(source.channelId)
-            || (intent.status === "preparing" && intent.channelIds.length === 0)
-          ),
-      )) {
-        throw new Error("thread-send-parent source group has an unresolved thread allocation");
-      }
-      if (this.store.isThreadWorkspaceIntentBlocked(botUid, source)) {
-        throw new Error("thread-send-parent source thread workspace or creation is blocked");
-      }
       const sourceIntents = workspaceIntents.filter((intent) => intent.channelIds.includes(source.channelId));
 
       let policy = this.store.getThreadListen(botUid, source);
       if (policy === null) {
-        if (
+        const creatorIntent = sourceIntents.find(
+          (intent) => intent.creatorChannelType !== null && intent.creatorChannelId !== null,
+        );
+        if (creatorIntent !== undefined) {
+          // Older Loop workspace intents may retain the actual creator without a listen row.
+          policy = {
+            botUid,
+            channelId: source.channelId,
+            creatorChannelType: creatorIntent.creatorChannelType!,
+            creatorChannelId: creatorIntent.creatorChannelId!,
+            threadName: "",
+            listen: "merge",
+            mergePending: false,
+          };
+        } else if (
           !allowHistoricalFallback
           || fork !== null
           || loopCreations.length > 0
@@ -10063,18 +10045,20 @@ class CoreService implements ChannelService {
           || !this.authorization.isPermittedChat({ channelType: 2, channelId: parentGroupId })
         ) {
           throw new Error("thread-send-parent cannot prove a persisted creator for this child");
+        } else {
+          policy = {
+            botUid,
+            channelId: source.channelId,
+            creatorChannelType: 2,
+            creatorChannelId: parentGroupId,
+            threadName: "",
+            listen: "merge",
+            mergePending: false,
+          };
         }
-        policy = {
-          botUid,
-          channelId: source.channelId,
-          creatorChannelType: 2,
-          creatorChannelId: parentGroupId,
-          threadName: "",
-          listen: "merge",
-          mergePending: false,
-        };
-      } else if (fork === null) {
-        // Persisted listen rows remain authoritative for legacy children; new creator metadata must agree.
+      }
+      if (fork === null) {
+        // Persisted listen rows remain authoritative; durable creator metadata must agree.
         const creatorIntentConflict = sourceIntents.some(
           (intent) => (
             intent.kind === "thread-create"
@@ -10122,6 +10106,9 @@ class CoreService implements ChannelService {
       return policy;
     };
 
+    if (await this.threadWorkspaceIncomplete(source)) {
+      throw new Error("thread-send-parent source thread workspace or creation is blocked");
+    }
     const policy = resolveCreator(true);
     const creator: ChatTarget = {
       channelType: policy.creatorChannelType,

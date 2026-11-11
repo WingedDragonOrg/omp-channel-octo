@@ -8,7 +8,7 @@ import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ChatAppendMode, ChatTarget, HostMergeProgressPhase, ThreadListenLevel, ThreadSummary, WorkerGoal, WorktreeMergeOutcome } from "../contracts.ts";
 import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceCleanupInput, ThreadWorkspaceCleanupRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadWorkspaceOperationInput, ThreadWorkspaceOperationRecord, ThreadForkInput, ThreadForkRecord, ThreadListenRecord, ThreadMergeEventRecord, HostMergeLeaseRecord, HostMergeLeaseInput, HostMergeProgressCardInput, HostMergeProgressCardRecord, HostRemovalLeaseInput, HostRemovalLeaseRecord, HostThreadRemovalOutcome, ReviewJobRecord } from "./store-records.ts";
-import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopThreadCreation, LoopWorkspace } from "../loop/types.ts";
+import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopThreadCreation, LoopThreadCreationAttempt, LoopWorkspace } from "../loop/types.ts";
 import type { SessionContextSnapshotRecord, TanOperation, ReferenceHistoryEntry, ReferenceHistorySnapshot } from "./store-records.ts";
 export type { OutboxInsert, TanOperation, ReferenceHistoryEntry, ReferenceHistorySnapshot } from "./store-records.ts";
 export type { ThreadWorkspaceCleanupInput, ThreadWorkspaceCleanupPhase, ThreadWorkspaceCleanupRecord } from "./store-records.ts";
@@ -43,7 +43,7 @@ import { addThreadReferences, captureReferenceHistorySnapshot as captureHistoryS
 import * as storeWatch from "./store-watch.ts";
 import type { WatchCheckCompletion, WatchCreateResult, WatchListItem, WatchRecord } from "../watch/types.ts";
 import type { ThreadReference, ThreadReferences } from "../references/types.ts";
-import { bindLoopTask, bindLoopWorkspace, claimLoopInputIntent, commitLoopScan, completeLoopThreadCreation, getLoopBinding, getLoopInput, getLoopTaskRoute, getLoopThreadCreation, isLoopInputObserved, listLoopBindings, listLoopInputs, listLoopThreadCreations, listLoopThreadTasks, markLoopInputDelivered, markLoopInputFault, markLoopInputPending, markLoopInputUnknown, markLoopThreadCreationUnknown, prepareLoopInput, recordLoopThreadAllocated, releaseLoopThreadCreation, reserveLoopThreadCreation } from "./store-loop.ts";
+import { bindLoopTask, bindLoopWorkspace, claimLoopInputIntent, commitLoopScan, completeLoopThreadCreation, getLoopBinding, getLoopInput, getLoopTaskRoute, getLoopThreadCreation, isLoopInputObserved, listLoopBindings, listLoopInputs, listLoopThreadCreationAttempts, listLoopThreadCreations, listLoopThreadTasks, markLoopInputDelivered, markLoopInputFault, markLoopInputPending, markLoopInputUnknown, markLoopThreadCreationUnknown, prepareLoopInput, recordLoopThreadAllocated, releaseLoopThreadCreation, reserveLoopThreadCreation } from "./store-loop.ts";
 import { acceptTanOperation, acceptTanTask, cancelTanOperation, finishTanOperation, finishTanOperationWithOutbox, getTanOperation, listCancelledTanOperations, listPendingTanOperations, reclaimTanCommand } from "./store-tan.ts";
 import { acceptReviewJob, bindReviewSession, getActiveReviewJob, getReviewJob, listRecoverableReviewJobs, listTerminalReviewJobs, markReviewCompleted, markReviewDispatchStarted, markReviewFailed, markReviewPromptAccepted, markReviewStarted, markReviewStopped, persistReviewRecoveryNotices, prepareReviewJobsForRestart, releaseOrphanedReviewClaims, requestReviewStop, requestReviewStopForClaim } from "./store-reviews.ts";
 import {
@@ -1594,6 +1594,10 @@ export class ChannelStore {
   getLoopThreadCreation(key: LoopTaskKey): LoopThreadCreation | null {
     return getLoopThreadCreation(this.db, key);
   }
+  listLoopThreadCreationAttempts(key: LoopTaskKey): LoopThreadCreationAttempt[] {
+    return listLoopThreadCreationAttempts(this.db, key);
+  }
+
 
   reserveLoopThreadCreation(key: LoopTaskKey, operationId: string): LoopThreadCreation {
     return reserveLoopThreadCreation(this.db, key, operationId);

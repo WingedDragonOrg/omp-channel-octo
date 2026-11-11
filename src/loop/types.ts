@@ -64,6 +64,7 @@ export interface LoopInput {
   faultNotified: boolean;
 }
 
+/** One durable remote creation attempt; operationId is unique per attempt, not per native call. */
 export interface LoopThreadCreation extends LoopTaskKey {
   operationId: string;
   bindingVersion: number;
@@ -72,3 +73,6 @@ export interface LoopThreadCreation extends LoopTaskKey {
   threadChannelId: string | null;
   error: string | null;
 }
+
+/** Ordered creation history plus the current attempt, when a reservation exists. */
+export type LoopThreadCreationAttempt = LoopThreadCreation;

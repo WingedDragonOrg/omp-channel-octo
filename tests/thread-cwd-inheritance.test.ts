@@ -1,17 +1,23 @@
 import { expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
-import type { ChatTarget } from "../src/contracts";
+import type { ChatTarget, ThreadSummary } from "../src/contracts";
 import { threadParentGroupId, threadShortId } from "../src/threads/thread-target.ts";
+import type { LoopTask, LoopWorkspace } from "../src/loop/types.ts";
 import {
   closeCoreHarness,
   createCoreHarness,
+  FakeLoopReadPort,
+  FakeTransport,
   inbound,
   submitAndWaitForIngressHandoff,
   waitForStatus,
   type CoreHarness,
   type PromptRecord,
 } from "./fixtures/core-fakes";
+import { ChannelStore } from "../src/store";
+
 
 /**
  * `docs/specs/2026-09-12-octo-channel-design.md` (default work directory order) and the
@@ -20,6 +26,66 @@ import {
 const ALLOWED_GROUP_IDS = ["group-a", "group-a____thread-1", "group-b"];
 const GROUP: ChatTarget = { channelId: "group-a", channelType: 2 };
 const THREAD: ChatTarget = { channelId: "group-a____thread-1", channelType: 5 };
+const LOOP_WORKSPACE: LoopWorkspace = {
+  workspaceId: "loop-workspace-child-chat",
+  name: "Child chat workspace",
+  slug: "child-chat",
+};
+const LOOP_TASK_UNKNOWN = "child-chat-unknown-allocation";
+const LOOP_TASK_PARTIAL = "child-chat-known-partial-allocation";
+const UNKNOWN_CREATE_TEXT = "create a Loop child whose allocation is uncertain";
+const PARTIAL_CREATE_TEXT = "create a Loop child with a partial workspace";
+const LOCAL_THREAD: ChatTarget = { channelId: "group-a____known-local-child", channelType: 5 };
+const UNRELATED_THREAD: ChatTarget = { channelId: "group-a____unrelated-child", channelType: 5 };
+
+function loopTask(taskId: string): LoopTask {
+  return {
+    taskId,
+    title: taskId,
+    description: null,
+    status: "open",
+    priority: "normal",
+    assigneeType: null,
+    assigneeId: null,
+    assigneeOctoUid: null,
+    projectId: null,
+    parentTaskId: null,
+    startDate: null,
+    dueDate: null,
+    createdAt: "2026-11-10T00:00:00Z",
+    updatedAt: "2026-11-10T00:00:00Z",
+  };
+}
+
+class UnknownFirstCreateTransport extends FakeTransport {
+  private loseFirstCreateResponse = true;
+
+  override async createThread(
+    groupId: string,
+    name: string,
+    signal?: AbortSignal,
+  ): Promise<ThreadSummary> {
+    const thread = await super.createThread(groupId, name, signal);
+    if (this.loseFirstCreateResponse) {
+      this.loseFirstCreateResponse = false;
+      throw new Error("connection closed after remote allocation");
+    }
+    return thread;
+  }
+}
+
+async function withStore<T>(
+  harness: CoreHarness,
+  inspect: (store: ChannelStore) => T | Promise<T>,
+): Promise<T> {
+  const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+  try {
+    return await inspect(store);
+  } finally {
+    store.close();
+  }
+}
+
 
 function createHarness(): Promise<CoreHarness> {
   return createCoreHarness({ allowedGroupIds: ALLOWED_GROUP_IDS });
@@ -145,6 +211,164 @@ test("C2 a thread without a parent binding starts in the default work directory"
     expect(prompt.cwd).toBe(join(harness.root, "tmp"));
     const thread = await harness.service.status(THREAD);
     expect(thread.cwd).toBe(join(harness.root, "tmp"));
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+test("an unknown Loop allocation and its no-ID workspace intent do not block child conversations", async () => {
+  const transport = new UnknownFirstCreateTransport({
+    bot: { uid: "bot-child-loop-allocation", name: "Child chat fixture" },
+  });
+  const loop = new FakeLoopReadPort();
+  loop.workspaces.set(LOOP_WORKSPACE.workspaceId, LOOP_WORKSPACE);
+  loop.tasks.set(LOOP_WORKSPACE.workspaceId, [
+    loopTask(LOOP_TASK_UNKNOWN),
+    loopTask(LOOP_TASK_PARTIAL),
+  ]);
+  const createResults = new Map<string, {
+    creation_state?: string;
+    allocated_channel_id?: string | null;
+  }>();
+  let projectRepo = "";
+  let harness = await createCoreHarness({
+    allowedGroupIds: ALLOWED_GROUP_IDS,
+    transport,
+    loop,
+    prompt: async ({ promptContext, text }) => {
+      const taskId = text === UNKNOWN_CREATE_TEXT
+        ? LOOP_TASK_UNKNOWN
+        : text === PARTIAL_CREATE_TEXT
+          ? LOOP_TASK_PARTIAL
+          : null;
+      if (taskId === null) return;
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("expected octo_management in the group prompt");
+      const result = await management.execute(
+        {
+          action: "create-thread",
+          name: `Loop ${taskId}`,
+          task_id: taskId,
+          worktree_name: taskId,
+          projects: [{ name: "app", repo: projectRepo }],
+        },
+        new AbortController().signal,
+        `child-loop-create-${taskId}`,
+      );
+      createResults.set(taskId, JSON.parse(result) as {
+        creation_state?: string;
+        allocated_channel_id?: string | null;
+      });
+    },
+  });
+  try {
+    const localCwd = await createWorkDirectory(harness, "known-local-child-cwd");
+    await deliver(harness, LOCAL_THREAD, "loop-child-owned-new", `/new ${localCwd}`);
+    await waitForStatus(
+      harness.service,
+      LOCAL_THREAD,
+      (status) => status.state === "idle" && status.cwd === localCwd,
+    );
+
+    const parentCwd = await createWorkDirectory(harness, "loop-parent-cwd");
+    await deliver(harness, GROUP, "loop-child-parent-new", `/new ${parentCwd}`);
+    await waitForStatus(
+      harness.service,
+      GROUP,
+      (status) => status.state === "idle" && status.cwd === parentCwd,
+    );
+    projectRepo = join(parentCwd, "loop-child-project");
+    await mkdir(projectRepo, { recursive: true });
+    execFileSync("git", ["init", "--quiet", projectRepo]);
+    await deliver(harness, GROUP, "loop-child-bind-workspace", `/bind loop ${LOOP_WORKSPACE.workspaceId}`);
+
+    await runTask(harness, GROUP, "loop-child-create-unknown", UNKNOWN_CREATE_TEXT);
+    expect(createResults.get(LOOP_TASK_UNKNOWN)).toMatchObject({ creation_state: "unknown" });
+    await withStore(harness, (store) => {
+      expect(store.getLoopThreadCreation({
+        botUid: harness.bot.uid,
+        groupId: GROUP.channelId,
+        workspaceId: LOOP_WORKSPACE.workspaceId,
+        taskId: LOOP_TASK_UNKNOWN,
+      })).toMatchObject({ state: "unknown", threadChannelId: null });
+      const preparingWorkspaceIntents = store.listThreadWorkspaceIntents(harness.bot.uid, GROUP.channelId)
+        .filter(
+          (intent) => intent.kind === "workspace" && intent.status === "preparing" && intent.channelIds.length === 0,
+        );
+      expect(preparingWorkspaceIntents).toHaveLength(1);
+      expect(preparingWorkspaceIntents[0]?.id).not.toMatch(/^thread-create:/u);
+    });
+
+    if (!harness.worktrees) throw new Error("expected the isolated workspace fixture");
+    harness.worktrees.failure = new Error("fixture worktree creation failed");
+    await runTask(harness, GROUP, "loop-child-create-partial", PARTIAL_CREATE_TEXT);
+    const partial = createResults.get(LOOP_TASK_PARTIAL);
+    expect(partial).toMatchObject({ creation_state: "allocated" });
+    const partialChannelId = partial?.allocated_channel_id;
+    expect(typeof partialChannelId).toBe("string");
+    if (typeof partialChannelId !== "string") throw new Error("partial remote thread ID was not retained");
+    await withStore(harness, (store) => {
+      expect(store.getLoopThreadCreation({
+        botUid: harness.bot.uid,
+        groupId: GROUP.channelId,
+        workspaceId: LOOP_WORKSPACE.workspaceId,
+        taskId: LOOP_TASK_PARTIAL,
+      })).toMatchObject({
+        state: "allocated",
+        threadChannelId: partialChannelId,
+      });
+      expect(store.getThreadWorkspace(harness.bot.uid, {
+        channelType: 5,
+        channelId: partialChannelId,
+      })).toMatchObject({ status: "failed" });
+    });
+
+    const root = harness.root;
+    await closeCoreHarness(harness, { remove: false });
+    harness = await createCoreHarness({
+      root,
+      transport,
+      loop,
+      allowedGroupIds: ALLOWED_GROUP_IDS,
+    });
+    await withStore(harness, (store) => {
+      expect(store.getLoopThreadCreation({
+        botUid: harness.bot.uid,
+        groupId: GROUP.channelId,
+        workspaceId: LOOP_WORKSPACE.workspaceId,
+        taskId: LOOP_TASK_UNKNOWN,
+      })).toMatchObject({ state: "unknown", threadChannelId: null });
+      const preparingWorkspaceIntents = store.listThreadWorkspaceIntents(harness.bot.uid, GROUP.channelId)
+        .filter(
+          (intent) => intent.kind === "workspace" && intent.status === "preparing" && intent.channelIds.length === 0,
+        );
+      expect(preparingWorkspaceIntents).toHaveLength(1);
+      expect(preparingWorkspaceIntents[0]?.id).not.toMatch(/^thread-create:/u);
+      expect(store.getLoopThreadCreation({
+        botUid: harness.bot.uid,
+        groupId: GROUP.channelId,
+        workspaceId: LOOP_WORKSPACE.workspaceId,
+        taskId: LOOP_TASK_PARTIAL,
+      })).toMatchObject({ state: "allocated", threadChannelId: partialChannelId });
+    });
+    expect(transport.managementCalls.filter(({ action }) => action === "create-thread")).toHaveLength(2);
+
+    const unrelated = await runTask(
+      harness,
+      UNRELATED_THREAD,
+      "loop-child-unrelated-conversation",
+      "independent child work proceeds",
+    );
+    expect(unrelated.text).toBe("independent child work proceeds");
+    expect(unrelated.cwd).toBe(parentCwd);
+
+    const owned = await runTask(
+      harness,
+      LOCAL_THREAD,
+      "loop-child-known-conversation",
+      "known local child work proceeds",
+    );
+    expect(owned.text).toBe("known local child work proceeds");
+    expect(owned.cwd).toBe(localCwd);
   } finally {
     await closeCoreHarness(harness);
   }

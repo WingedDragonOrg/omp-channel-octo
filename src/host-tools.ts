@@ -25,7 +25,7 @@ import type { TaskRecord } from "./store/store-records.ts";
 import type { ThreadWorkspaceCleanupRecord, ThreadWorkspaceRecord } from "./store/store-records.ts";
 import type { WatchCreateArgs, WatchCreateResult, WatchListItem, WatchRecord } from "./watch/types.ts";
 import type { DestructiveResourceLease } from "./tasks/task-scheduler.ts";
-import { threadWorkspaceIdentityMatches, threadWorkspaceIsAvailable } from "./session/session-lifecycle.ts";
+import { threadWorkspaceIsAvailable } from "./session/session-lifecycle.ts";
 import {
   createThreadWorkspaceBatch,
   prepareThreadWorkspaceScope,
@@ -126,6 +126,7 @@ export interface HostToolHost {
     | "bindLoopTask"
     | "listLoopThreadTasks"
     | "getLoopThreadCreation"
+    | "listLoopThreadCreationAttempts"
     | "recordLoopThreadAllocated"
     | "completeLoopThreadCreation"
     | "markLoopThreadCreationUnknown"
@@ -516,6 +517,30 @@ function threadWorkspaceCreationResult(
   }
   return result;
 }
+function priorUnknownLoopAllocationFields(
+  host: HostToolHost,
+  key: LoopTaskKey,
+  currentOperationId?: string,
+): Record<string, unknown> {
+  const attempts = host.store.listLoopThreadCreationAttempts(key).filter((attempt) =>
+    attempt.state === "unknown" && attempt.operationId !== currentOperationId
+  );
+  return {
+    prior_unknown_allocations: attempts.length,
+    ...(attempts.length === 0
+      ? {}
+      : {
+          duplicate_thread_risk:
+            "此前有 Loop 子区创建结果未知；本次重试可能产生重复子区，不会自动删除任何子区。",
+          prior_unknown_thread_channel_ids: [
+            ...new Set(attempts.flatMap((attempt) =>
+              attempt.threadChannelId === null ? [] : [attempt.threadChannelId]
+            )),
+          ],
+        }),
+  };
+}
+
 function loopThreadPartialResult(
   host: HostToolHost,
   key: LoopTaskKey,
@@ -532,6 +557,7 @@ function loopThreadPartialResult(
     route_bound: false,
     current_workspace_id: host.store.getLoopBinding(host.botUid, key.groupId)?.workspaceId ?? null,
     current_route: loopRouteIdentity(currentLoopRoute(host, key)),
+    ...priorUnknownLoopAllocationFields(host, key, creation.operationId),
     ...(creation.error === null ? {} : { error: creation.error }),
     ...(attemptError === undefined ? {} : { attempt_error: attemptError }),
   };
@@ -581,6 +607,7 @@ async function reportExistingLoopRoute(
     ready: true,
     reused_existing: true,
     loop_task: loopTaskIdentity(key.workspaceId, key.taskId),
+    ...priorUnknownLoopAllocationFields(host, key),
     route_bound: true,
     ...(incompleteCreation && creation !== null
       ? {
@@ -619,13 +646,20 @@ async function runLoopTaskThreadCreate(
     return reportExistingLoopRoute(host, target, groupId, key, currentRoute, signal);
   }
   const previousCreation = host.store.getLoopThreadCreation(key);
-  if (previousCreation !== null) {
+  if (previousCreation !== null && previousCreation.state !== "unknown") {
     return reportExistingLoopCreation(host, groupId, key, previousCreation, signal);
   }
 
   const operationId = JSON.stringify([task.id, toolCallId ?? task.id]);
+  let attemptOperationId = operationId;
   try {
     return await loop.runCreation(key, operationId, async (reservation) => {
+      attemptOperationId = reservation.operationId;
+      const priorUnknownAllocationFields = priorUnknownLoopAllocationFields(
+        host,
+        key,
+        reservation.operationId,
+      );
       if (creation.workspace === null) {
         let thread: ThreadSummary | undefined;
         let knownNoAllocation = false;
@@ -705,6 +739,7 @@ async function runLoopTaskThreadCreate(
                     loop_task: loopTaskIdentity(key.workspaceId, key.taskId),
                     route_bound: false,
                     current_workspace_id: host.store.getLoopBinding(host.botUid, key.groupId)?.workspaceId ?? null,
+                    ...priorUnknownAllocationFields,
                     current_route: loopRouteIdentity(currentLoopRoute(host, key)),
                   }
                 : loopThreadPartialResult(host, key, latest, thread),
@@ -714,6 +749,7 @@ async function runLoopTaskThreadCreate(
             ...managementThread(thread),
             listen: policy.listen,
             ready: true,
+            ...priorUnknownAllocationFields,
             route_bound: true,
             loop_task: loopTaskIdentity(key.workspaceId, key.taskId),
           });
@@ -803,6 +839,7 @@ async function runLoopTaskThreadCreate(
         ready: routeBound,
         resource_ready: batch.ready,
         loop_task: loopTaskIdentity(key.workspaceId, key.taskId),
+        ...priorUnknownAllocationFields,
         creation_state: latest?.state ?? "unknown",
         allocated_channel_id: latest?.threadChannelId ?? outcome?.thread.channelId ?? null,
         route_bound: routeBound,
@@ -816,9 +853,9 @@ async function runLoopTaskThreadCreate(
       return reportExistingLoopRoute(host, target, groupId, key, route, signal);
     }
     let latest = host.store.getLoopThreadCreation(key);
-    if (latest?.operationId === operationId && latest.state === "reserved") {
+    if (latest?.operationId === attemptOperationId && latest.state === "reserved") {
       const detail = boundedManagementError(error, "Loop task thread creation did not finish");
-      host.store.markLoopThreadCreationUnknown(key, operationId, detail);
+      host.store.markLoopThreadCreationUnknown(key, attemptOperationId, detail);
       latest = host.store.getLoopThreadCreation(key);
     }
     if (latest !== null) {
@@ -1506,7 +1543,7 @@ async function runManagementTool(
         return reportExistingLoopRoute(host, target, groupId, key, currentRoute, signal);
       }
       const previousCreation = host.store.getLoopThreadCreation(key);
-      if (previousCreation !== null) {
+      if (previousCreation !== null && previousCreation.state !== "unknown") {
         return reportExistingLoopCreation(host, groupId, key, previousCreation, signal);
       }
       const creationArgs = { ...args };
@@ -2000,9 +2037,6 @@ async function dispatchThreadTask(
   if (ownership !== null) {
     const binding = host.store.getBinding(host.botUid, threadTarget);
     const workspaceAvailable = await threadWorkspaceIsAvailable(ownership);
-    const unidentifiedCreate = host.store.listThreadWorkspaceIntents(host.botUid, groupId).some(
-      (intent) => intent.status === "preparing" && intent.channelIds.length === 0,
-    );
     const legacyFallback =
       ownership.layout === "single" &&
       ownership.legacyWorktreeName !== undefined &&
@@ -2020,8 +2054,7 @@ async function dispatchThreadTask(
     })();
     if (
       (binding === null && !legacyFallback) ||
-      (bindingUsesWorkspace && (!workspaceAvailable ||
-        (unidentifiedCreate && !(await threadWorkspaceIdentityMatches(ownership)))) && !legacyFallback)
+      (bindingUsesWorkspace && !workspaceAvailable && !legacyFallback)
     ) {
       throw new Error("子区工作区未就绪，未派发任务。");
     }

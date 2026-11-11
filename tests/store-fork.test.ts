@@ -418,7 +418,7 @@ test("fork completion does not copy source workspace ownership, model, context, 
   });
 });
 
-test("ordinary workspace intents still block unknown allocations but allow an established binding", async () => {
+test("unmapped ordinary workspace intents leave child bindings available", async () => {
   await inTemporaryDirectory(async (root) => {
     const store = await openChannelStore(root);
     try {
@@ -430,7 +430,7 @@ test("ordinary workspace intents still block unknown allocations but allow an es
         status: "preparing",
         channelIds: [],
       });
-      expect(store.isThreadWorkspaceIntentBlocked(botUid, sibling)).toBe(true);
+      expect(store.isThreadWorkspaceIntentBlocked(botUid, sibling)).toBe(false);
 
       store.ensureBinding({
         botUid,

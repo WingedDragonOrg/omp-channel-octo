@@ -1,11 +1,15 @@
 import { expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { ChatTarget, HostTool, PromptContext, ThreadSummary } from "../src/contracts";
+import type { LoopTask, LoopWorkspace } from "../src/loop/types.ts";
 import { ChannelStore } from "../src/store";
 import {
   closeCoreHarness,
   createCoreHarness,
+  FakeLoopReadPort,
+  FakeTransport,
   inbound,
   waitForStatus,
   type CoreHarness,
@@ -35,6 +39,43 @@ const CREATOR_BODY = "核对蓝绿部署的回滚点";
 const CHILD_REQUEST = "send creator input";
 const REQUESTER_CALL_ID = "creator-input-native-call";
 const WAIT_TIMEOUT_MS = 3_000;
+const LOOP_WORKSPACE: LoopWorkspace = {
+  workspaceId: "loop-workspace-creator-input",
+  name: "Creator input workspace",
+  slug: "creator-input",
+};
+const LOOP_TASK_ID = "creator-input-unknown-allocation";
+const UNKNOWN_LOOP_CREATE_TEXT = "create a Loop child before the restart";
+
+function loopTask(taskId: string): LoopTask {
+  return {
+    taskId,
+    title: taskId,
+    description: null,
+    status: "open",
+    priority: "normal",
+    assigneeType: null,
+    assigneeId: null,
+    assigneeOctoUid: null,
+    projectId: null,
+    parentTaskId: null,
+    startDate: null,
+    dueDate: null,
+    createdAt: "2026-11-10T00:00:00Z",
+    updatedAt: "2026-11-10T00:00:00Z",
+  };
+}
+
+class UnknownCreateTransport extends FakeTransport {
+  override async createThread(
+    groupId: string,
+    name: string,
+    signal?: AbortSignal,
+  ): Promise<ThreadSummary> {
+    await super.createThread(groupId, name, signal);
+    throw new Error("connection closed after remote allocation");
+  }
+}
 
 type ToolInvocation =
   | { actions: string[]; result: string }
@@ -531,6 +572,170 @@ test("creator input initializes a session for an otherwise unbound creator chat"
     expect(parentBinding).not.toBeNull();
     if (parentBinding === null) throw new Error("creator binding was not created");
     expectCreatorInputPrompt(harness, parentBinding.cwd, creatorBody);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("an unknown Loop allocation and its preparing workspace intent survive restart without blocking child creator input", async () => {
+  const creatorBody = "重启后仍可把独立输入交给创建方";
+  const invocation = Promise.withResolvers<ToolInvocation>();
+  const unknownCreation = Promise.withResolvers<{
+    creation_state?: string;
+    allocated_channel_id?: string | null;
+  }>();
+  const transport = new UnknownCreateTransport({
+    bot: { uid: "bot-creator-loop-unknown", name: "Creator Loop fixture" },
+  });
+  const loop = new FakeLoopReadPort();
+  loop.workspaces.set(LOOP_WORKSPACE.workspaceId, LOOP_WORKSPACE);
+  loop.tasks.set(LOOP_WORKSPACE.workspaceId, [loopTask(LOOP_TASK_ID)]);
+  let projectRepo = "";
+  let harness = await createCoreHarness({
+    transport,
+    loop,
+    prompt: async ({ promptContext, text }) => {
+      if (text === UNKNOWN_LOOP_CREATE_TEXT) {
+        const result = await managementOf(promptContext).execute(
+          {
+            action: "create-thread",
+            name: "Unknown Loop workspace child",
+            task_id: LOOP_TASK_ID,
+            worktree_name: "unknown-loop-child",
+            projects: [{ name: "app", repo: projectRepo }],
+          },
+          new AbortController().signal,
+          "native-unknown-loop-child-create",
+        );
+        unknownCreation.resolve(JSON.parse(result) as {
+          creation_state?: string;
+          allocated_channel_id?: string | null;
+        });
+        return;
+      }
+      if (text === CHILD_REQUEST) {
+        invocation.resolve(
+          await invokeCreatorInput(promptContext, creatorBody, "creator-input-after-loop-recovery"),
+        );
+      }
+    },
+  });
+  try {
+    const { parentCwd } = await prepareChats(harness);
+    projectRepo = join(parentCwd, "unknown-loop-project");
+    await mkdir(projectRepo, { recursive: true });
+    execFileSync("git", ["init", "--quiet", projectRepo]);
+
+    await harness.service.submitInbound(
+      inbound({
+        messageId: "creator-input-loop-bind",
+        ...GROUP,
+        text: `/bind loop ${LOOP_WORKSPACE.workspaceId}`,
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.service.submitInbound(
+      inbound({
+        messageId: "creator-input-loop-create-unknown",
+        ...GROUP,
+        text: UNKNOWN_LOOP_CREATE_TEXT,
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    expect(await unknownCreation.promise).toMatchObject({
+      creation_state: "unknown",
+      allocated_channel_id: null,
+    });
+    await waitForStatus(harness.service, GROUP, (status) => status.state === "completed");
+    await withStore(harness, (store) => {
+      expect(store.getLoopThreadCreation({
+        botUid: harness.bot.uid,
+        groupId: GROUP.channelId,
+        workspaceId: LOOP_WORKSPACE.workspaceId,
+        taskId: LOOP_TASK_ID,
+      })).toMatchObject({ state: "unknown", threadChannelId: null });
+      const preparingWorkspaceIntents = store.listThreadWorkspaceIntents(harness.bot.uid, GROUP.channelId)
+        .filter(
+          (intent) => intent.kind === "workspace" && intent.status === "preparing" && intent.channelIds.length === 0,
+        );
+      expect(preparingWorkspaceIntents).toHaveLength(1);
+      expect(preparingWorkspaceIntents[0]?.id).not.toMatch(/^thread-create:/u);
+    });
+
+    const root = harness.root;
+    await closeCoreHarness(harness, { remove: false });
+    harness = await createCoreHarness({
+      root,
+      transport,
+      loop,
+      prompt: async ({ promptContext, text }) => {
+        if (text === CHILD_REQUEST) {
+          invocation.resolve(
+            await invokeCreatorInput(promptContext, creatorBody, "creator-input-after-loop-recovery"),
+          );
+        }
+      },
+    });
+    await withStore(harness, (store) => {
+      expect(store.getLoopThreadCreation({
+        botUid: harness.bot.uid,
+        groupId: GROUP.channelId,
+        workspaceId: LOOP_WORKSPACE.workspaceId,
+        taskId: LOOP_TASK_ID,
+      })).toMatchObject({ state: "unknown", threadChannelId: null });
+      const preparingWorkspaceIntents = store.listThreadWorkspaceIntents(harness.bot.uid, GROUP.channelId)
+        .filter(
+          (intent) => intent.kind === "workspace" && intent.status === "preparing" && intent.channelIds.length === 0,
+        );
+      expect(preparingWorkspaceIntents).toHaveLength(1);
+      expect(preparingWorkspaceIntents[0]?.id).not.toMatch(/^thread-create:/u);
+    });
+    expect(transport.managementCalls.filter(({ action }) => action === "create-thread")).toHaveLength(1);
+
+    await submitThreadRequest(harness, "creator-input-after-loop-recovery-request");
+    expectQueued(await invocation.promise);
+    await waitForPromptCount(harness, 2);
+    await waitForStatus(harness.service, THREAD, (status) => status.state === "completed");
+    await waitForStatus(harness.service, GROUP, (status) => status.state === "completed");
+    expectCreatorInputPrompt(harness, parentCwd, creatorBody);
+    expect(
+      harness.transport.sent.some(
+        ({ target, text }) => target.channelId === GROUP.channelId && text.includes(creatorBody),
+      ),
+    ).toBe(false);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a known child with an unknown Loop creation can converse and send its creator input", async () => {
+  const invocation = Promise.withResolvers<ToolInvocation>();
+  const harness = await createCoreHarness({
+    prompt: async ({ promptContext, text }) => {
+      if (text === CHILD_REQUEST) invocation.resolve(await invokeCreatorInput(promptContext, CREATOR_BODY));
+    },
+  });
+  try {
+    const { parentCwd } = await prepareChats(harness);
+    await withStore(harness, (store) => {
+      store.bindLoopWorkspace(harness.bot.uid, GROUP.channelId, LOOP_WORKSPACE, []);
+      const key = {
+        botUid: harness.bot.uid, groupId: GROUP.channelId,
+        workspaceId: LOOP_WORKSPACE.workspaceId, taskId: LOOP_TASK_ID,
+      };
+      store.reserveLoopThreadCreation(key, "known-unknown-operation");
+      store.recordLoopThreadAllocated(key, "known-unknown-operation", THREAD.channelId);
+      store.markLoopThreadCreationUnknown(key, "known-unknown-operation", "completion unknown");
+      store.saveThreadWorkspaceIntent({
+        id: "known-unknown-intent", botUid: harness.bot.uid, groupId: GROUP.channelId,
+        kind: "thread-create", creatorChannelType: 2, creatorChannelId: GROUP.channelId,
+        status: "preparing", channelIds: [THREAD.channelId], error: null,
+      });
+    });
+    await submitThreadRequest(harness, "known-unknown-child-request");
+    expectQueued(await invocation.promise);
+    await waitForPromptCount(harness, 2);
+    expectCreatorInputPrompt(harness, parentCwd, CREATOR_BODY);
   } finally {
     await closeCoreHarness(harness);
   }

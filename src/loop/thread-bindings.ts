@@ -1,5 +1,5 @@
+import { randomUUID } from "node:crypto";
 import type { ChatTarget } from "../contracts.ts";
-import { threadParentGroupId } from "../threads/thread-target.ts";
 import type { ChannelStore } from "../store/index.ts";
 import type {
   LoopBinding,
@@ -40,31 +40,9 @@ export class LoopThreadBindings {
       this.store.markLoopThreadCreationUnknown(
         this.keyOf(creation),
         creation.operationId,
-        "创建预留在远端身份确认前中断；需要人工核对，禁止自动重建。",
+        "创建预留在远端身份确认前中断；远端可能已创建子区。",
       );
     }
-  }
-
-  isTargetBlocked(target: ChatTarget): boolean {
-    if (target.channelType !== 5) return false;
-    const groupId = threadParentGroupId(target.channelId);
-    if (groupId === null) return false;
-
-    const hasLocalOwnership =
-      this.store.getBinding(this.botUid, target) !== null ||
-      this.store.getThreadWorkspace(this.botUid, target) !== null;
-    const currentWorkspaceId = this.store.getLoopBinding(this.botUid, groupId)?.workspaceId;
-    const explicitlyRouted = currentWorkspaceId !== undefined &&
-      this.store.listLoopThreadTasks(this.botUid, groupId, target.channelId)
-        .some((route) => route.workspaceId === currentWorkspaceId);
-    return this.store.listLoopThreadCreations(this.botUid).some((creation) => {
-      if (creation.groupId !== groupId || creation.state === "ready") return false;
-      if (creation.threadChannelId === target.channelId) return !explicitlyRouted;
-      return creation.threadChannelId === null
-        && (creation.state === "reserved" || creation.state === "unknown")
-        && !hasLocalOwnership
-        && !explicitlyRouted;
-    });
   }
 
   async resolveTask(groupId: string, taskId: string, signal?: AbortSignal): Promise<ResolvedLoopTask> {
@@ -132,11 +110,18 @@ export class LoopThreadBindings {
     const identity = this.keyIdentity(key);
     const active = this.activeCreations.get(identity);
     if (active !== undefined) return active as Promise<T>;
-    if (this.store.getLoopThreadCreation(key) !== null) {
+
+    const existing = this.store.getLoopThreadCreation(key);
+    if (existing !== null && existing.state !== "unknown") {
       throw new Error("该 Loop task 已有创建记录；必须核对已有资源，禁止再次创建。");
     }
-    const reservation = this.store.reserveLoopThreadCreation(key, operationId);
-    if (reservation.state !== "reserved" || reservation.operationId !== operationId) {
+    const attempts = this.store.listLoopThreadCreationAttempts(key);
+    const attemptOperationId = existing !== null
+      || attempts.some((attempt) => attempt.operationId === operationId)
+      ? `${operationId}:${randomUUID()}`
+      : operationId;
+    const reservation = this.store.reserveLoopThreadCreation(key, attemptOperationId);
+    if (reservation.state !== "reserved" || reservation.operationId !== attemptOperationId) {
       throw new Error("该 Loop task 已有创建预留；必须核对已有资源，禁止再次创建。");
     }
 

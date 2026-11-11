@@ -526,7 +526,7 @@ test("thread workspace preparation intents survive reopen and fail closed by exa
       expect(reopened.isThreadWorkspaceIntentBlocked(
         botUid,
         { channelType: 5, channelId: "group-a____not-yet-mapped" },
-      )).toBe(true);
+      )).toBe(false);
       expect(reopened.isThreadWorkspaceIntentBlocked(
         botUid,
         { channelType: 5, channelId: "group-b____unrelated" },
@@ -612,7 +612,7 @@ test("a definitively failed thread-create intent does not block unrelated childr
   });
 });
 
-test("unidentified thread creation does not block an established child after reopen, but its own mapped creation does", async () => {
+test("unidentified thread creation does not block a child after reopen, but its mapped target remains blocked", async () => {
   const root = await mkdtemp(join(tmpdir(), "omp-thread-intent-scope-"));
   const target = { channelType: 5 as const, channelId: "group-a____ready" };
   try {
@@ -641,7 +641,7 @@ test("unidentified thread creation does not block an established child after reo
       expect(reopened.isThreadWorkspaceIntentBlocked(botUid, target)).toBe(false);
       expect(reopened.isThreadWorkspaceIntentBlocked(botUid, {
         channelType: 5, channelId: "group-a____unidentified",
-      })).toBe(true);
+      })).toBe(false);
       expect(reopened.getThreadWorkspaceIntent(botUid, "unknown-create")?.status).toBe("preparing");
       reopened.addThreadWorkspaceIntentChannel(botUid, "unknown-create", target.channelId);
       expect(reopened.isThreadWorkspaceIntentBlocked(botUid, target)).toBe(true);

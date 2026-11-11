@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Database } from "bun:sqlite";
 import type { ChatTarget } from "../contracts.ts";
-import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopThreadCreation, LoopWorkspace } from "../loop/types.ts";
+import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopThreadCreation, LoopThreadCreationAttempt, LoopWorkspace } from "../loop/types.ts";
 import { isLoopTaskAutomaticallyStartable } from "../loop/task-status.ts";
 import { getOwnerId } from "./store-chats.ts";
 import { asNullableString, asNumber, asString, query, run, transaction, type SqlRow, type SqlValue } from "./store-schema.ts";
@@ -111,11 +111,51 @@ function loopTaskRouteRow(db: Database, key: LoopTaskKey): SqlRow | undefined {
 function loopThreadCreationRow(db: Database, key: LoopTaskKey): SqlRow | undefined {
   return query(db,
     `SELECT bot_uid, group_id, workspace_id, task_id, operation_id, binding_version, route_version,
-            state, thread_channel_id, error
+            state, thread_channel_id, error, updated_at
      FROM loop_thread_creations
      WHERE bot_uid = ? AND group_id = ? AND workspace_id = ? AND task_id = ?`,
     loopTaskKeyValues(key),
   )[0];
+}
+
+function archiveLoopThreadCreation(db: Database, row: SqlRow): void {
+  run(db,
+    `INSERT INTO loop_thread_creation_attempts(
+       bot_uid, group_id, workspace_id, task_id, operation_id, binding_version, route_version,
+       state, thread_channel_id, error, updated_at
+     ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      asString(row.bot_uid),
+      asString(row.group_id),
+      asString(row.workspace_id),
+      asString(row.task_id),
+      asString(row.operation_id),
+      asNumber(row.binding_version),
+      asNumber(row.route_version),
+      asString(row.state),
+      asNullableString(row.thread_channel_id),
+      asNullableString(row.error),
+      asNumber(row.updated_at),
+    ],
+  );
+}
+
+function loopThreadOperationIdExists(db: Database, botUid: string, operationId: string): boolean {
+  return query(db,
+    `SELECT 1 FROM loop_thread_creations WHERE bot_uid = ? AND operation_id = ?
+     UNION ALL
+     SELECT 1 FROM loop_thread_creation_attempts WHERE bot_uid = ? AND operation_id = ?
+     LIMIT 1`,
+    [botUid, operationId, botUid, operationId],
+  ).length > 0;
+}
+
+function uniqueLoopThreadOperationId(db: Database, botUid: string, operationId: string): string {
+  let candidate = operationId;
+  while (loopThreadOperationIdExists(db, botUid, candidate)) {
+    candidate = `${operationId}:${randomUUID()}`;
+  }
+  return candidate;
 }
 
 function assertLoopTaskKey(key: LoopTaskKey): void {
@@ -580,7 +620,8 @@ export function reserveLoopThreadCreation(db: Database, key: LoopTaskKey, operat
   if (!operationId) throw new Error("Loop thread creation operation ID is required");
   return transaction(db, () => {
     const existingRow = loopThreadCreationRow(db, key);
-    if (existingRow) return loopThreadCreationFromRow(existingRow);
+    const existing = existingRow ? loopThreadCreationFromRow(existingRow) : null;
+    if (existing !== null && existing.state !== "unknown") return existing;
 
     const binding = loopBindingRow(db, key.botUid, key.groupId);
     if (!binding || asString(binding.workspace_id) !== key.workspaceId) {
@@ -589,25 +630,68 @@ export function reserveLoopThreadCreation(db: Database, key: LoopTaskKey, operat
     const routeRow = loopTaskRouteRow(db, key);
     const route = routeRow ? loopTaskRouteFromRow(routeRow) : null;
     const state: LoopThreadCreation["state"] = route ? "ready" : "reserved";
-    run(db,
-      `INSERT INTO loop_thread_creations(
-         bot_uid, group_id, workspace_id, task_id, operation_id, binding_version, route_version,
-         state, thread_channel_id, error, updated_at
-       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
-      [
-        ...loopTaskKeyValues(key),
-        operationId,
-        asNumber(binding.version),
-        route?.version ?? 0,
-        state,
-        route?.threadChannelId ?? null,
-        Date.now(),
-      ],
-    );
+    const attemptOperationId = uniqueLoopThreadOperationId(db, key.botUid, operationId);
+    const now = Date.now();
+    if (existingRow !== undefined) {
+      archiveLoopThreadCreation(db, existingRow);
+      const updated = run(db,
+        `UPDATE loop_thread_creations SET operation_id = ?, binding_version = ?, route_version = ?,
+           state = ?, thread_channel_id = ?, error = NULL, updated_at = ?
+         WHERE bot_uid = ? AND group_id = ? AND workspace_id = ? AND task_id = ?
+           AND operation_id = ? AND state = 'unknown'`,
+        [
+          attemptOperationId,
+          asNumber(binding.version),
+          route?.version ?? 0,
+          state,
+          route?.threadChannelId ?? null,
+          now,
+          ...loopTaskKeyValues(key),
+          asString(existingRow.operation_id),
+        ],
+      );
+      if (updated.changes !== 1) {
+        throw new Error("Loop thread creation changed while reserving a retry");
+      }
+    } else {
+      run(db,
+        `INSERT INTO loop_thread_creations(
+           bot_uid, group_id, workspace_id, task_id, operation_id, binding_version, route_version,
+           state, thread_channel_id, error, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+        [
+          ...loopTaskKeyValues(key),
+          attemptOperationId,
+          asNumber(binding.version),
+          route?.version ?? 0,
+          state,
+          route?.threadChannelId ?? null,
+          now,
+        ],
+      );
+    }
     const creationRow = loopThreadCreationRow(db, key);
     if (!creationRow) throw new Error("Loop thread creation disappeared after reservation");
     return loopThreadCreationFromRow(creationRow);
   });
+}
+
+export function listLoopThreadCreationAttempts(
+  db: Database,
+  key: LoopTaskKey,
+): LoopThreadCreationAttempt[] {
+  assertLoopTaskKey(key);
+  const history = query(db,
+    `SELECT bot_uid, group_id, workspace_id, task_id, operation_id, binding_version, route_version,
+            state, thread_channel_id, error
+     FROM loop_thread_creation_attempts
+     WHERE bot_uid = ? AND group_id = ? AND workspace_id = ? AND task_id = ?
+     ORDER BY sequence ASC`,
+    loopTaskKeyValues(key),
+  ).map((row) => loopThreadCreationFromRow(row));
+  const currentRow = loopThreadCreationRow(db, key);
+  if (currentRow !== undefined) history.push(loopThreadCreationFromRow(currentRow));
+  return history;
 }
 
 export function recordLoopThreadAllocated(db: Database, key: LoopTaskKey, operationId: string, threadChannelId: string): void {

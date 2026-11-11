@@ -795,7 +795,7 @@ test("shutdown preserves an unknown in-flight create and restart does not retry 
     forkRequest = harness.service.submitInbound(forkMessage).catch(() => {});
     await waitForForkBoundary(transport.createThreadStarted.promise, "shutdown remote create");
     const forkAdmission = await waitForIngressJob(harness, forkMessage, {
-      predicate: job => job.state === "accepted",
+      predicate: job => job.state === "accepted" || job.state === "dispatch-intent",
       rejectStates: [],
       description: "in-flight fork admission",
     });

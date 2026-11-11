@@ -44,7 +44,6 @@ export interface ThreadForkControllerDeps {
     | "listThreadForks"
     | "saveThreadWorkspaceIntent"
     | "getThreadWorkspaceIntent"
-    | "listThreadWorkspaceIntents"
     | "addThreadWorkspaceIntentChannel"
     | "failThreadWorkspaceIntent"
     | "completeThreadFork"
@@ -319,12 +318,12 @@ export class ThreadForkController {
       return this.continueExisting(existing, signal);
     }
 
-    const blockedIntent = this.deps.store.listThreadWorkspaceIntents(botUid, sourceLocation.groupId)
-      .find(intent => intent.status === "preparing");
-    if (blockedIntent !== undefined) {
-      throw new Error("该群已有未完成的子区创建操作；先恢复或确认原操作，再发起新的分叉。");
+    const pendingFork = this.deps.store.listThreadForks(botUid)
+      .some((fork) => fork.groupId === sourceLocation.groupId
+        && this.deps.store.getThreadWorkspaceIntent(botUid, fork.id)?.status === "preparing");
+    if (pendingFork) {
+      throw new Error("该群已有未完成的分叉创建操作；先恢复或确认原操作，再发起新的分叉。");
     }
-
     const requested = requestedName === undefined ? undefined : this.validateName(requestedName);
     const source = capturedSource === undefined
       ? await this.resolveSource(sourceLocation.target, sourceLocation.groupId)

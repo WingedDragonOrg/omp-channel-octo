@@ -274,8 +274,18 @@ export function isThreadWorkspaceIntentBlocked(db: Database, botUid: string, tar
   const separator = target.channelId.indexOf("____");
   if (separator <= 0) return false;
   const groupId = target.channelId.slice(0, separator);
+  const unknownLoopTarget = query(db,
+    `SELECT 1 FROM loop_thread_creations
+       WHERE bot_uid = ? AND thread_channel_id = ? AND state = 'unknown'
+     UNION ALL
+     SELECT 1 FROM loop_thread_creation_attempts
+       WHERE bot_uid = ? AND thread_channel_id = ? AND state = 'unknown'
+     LIMIT 1`,
+    [botUid, target.channelId, botUid, target.channelId],
+  ).length > 0;
   const intents = listThreadWorkspaceIntents(db, botUid, groupId)
-    .map((intent) => finalizeWorkspaceIntentFromRecords(db, intent));
+    .map((intent) => finalizeWorkspaceIntentFromRecords(db, intent))
+    .filter((intent) => !(unknownLoopTarget && intent.channelIds.includes(target.channelId)));
   if (intents.some(
     (intent) => intent.kind === "thread-create"
       && intent.status === "preparing"
@@ -291,9 +301,13 @@ export function isThreadWorkspaceIntentBlocked(db: Database, botUid: string, tar
     [botUid, target.channelId],
   ).length > 0;
   if (hasBinding) return false;
+  if (intents.some((intent) =>
+    intent.status === "preparing" && intent.channelIds.length === 0
+    && query(db, "SELECT 1 FROM thread_forks WHERE bot_uid = ? AND id = ?", [botUid, intent.id]).length > 0
+  )) return true;
+  // Without a remote channel ID, a preparing intent cannot identify which child it belongs to.
   return intents.some((intent) =>
-    intent.status !== "complete"
-    && (intent.channelIds.includes(target.channelId) || intent.status === "preparing"),
+    intent.status !== "complete" && intent.channelIds.includes(target.channelId),
   );
 }
 

@@ -966,6 +966,23 @@ function migrateLoopStorage(db: Database): void {
         PRIMARY KEY(bot_uid, group_id, workspace_id, task_id),
         UNIQUE(bot_uid, operation_id)
       );
+      CREATE TABLE IF NOT EXISTS loop_thread_creation_attempts (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        bot_uid TEXT NOT NULL,
+        group_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        operation_id TEXT NOT NULL,
+        binding_version INTEGER NOT NULL CHECK(binding_version >= 1),
+        route_version INTEGER NOT NULL CHECK(route_version >= 0),
+        state TEXT NOT NULL CHECK(state IN ('reserved', 'allocated', 'ready', 'unknown', 'superseded')),
+        thread_channel_id TEXT,
+        error TEXT,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(bot_uid, operation_id)
+      );
+      CREATE INDEX IF NOT EXISTS loop_thread_creation_attempts_key
+        ON loop_thread_creation_attempts(bot_uid, group_id, workspace_id, task_id, sequence);
     `);
   });
 }
