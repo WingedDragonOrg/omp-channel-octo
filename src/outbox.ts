@@ -5,6 +5,15 @@ import { asAppError, failureText, type AppError } from "./errors.ts";
 import type { ChannelStore } from "./store/index.ts";
 import type { OutboxRecord, TextStreamOutboxCommit, TextStreamOutboxSegment } from "./store/store-records.ts";
 import { parseReplyMemberMarkers, type ReplyTextPart } from "./outbox-mentions.ts";
+import {
+  createFileLinkStream,
+  createZedFileLinkResolvers,
+  protectedMarkdownLinkRanges,
+  resolveMarkdownFileLinks,
+  splitUtf8WithProtectedMarkdownLinks,
+  type FileLinkResolution,
+  type FileLinkStream,
+} from "./file-links.ts";
 import { streamTargetKey, targetKey } from "./target.ts";
 
 const MAX_TEXT_BYTES = 3_000;
@@ -113,6 +122,11 @@ interface MentionSpan {
   codeUnitLength: number;
 }
 
+interface ProtectedSpan {
+  start: number;
+  end: number;
+}
+
 function isInsideMention(cut: number, mentions: readonly MentionSpan[]): boolean {
   let lower = 0;
   let upper = mentions.length - 1;
@@ -135,12 +149,18 @@ function findMentionSafeCut(
   start: number,
   end: number,
   mentions: readonly MentionSpan[],
+  protectedRanges: readonly ProtectedSpan[],
 ): number {
   let sentence = -1;
   let clause = -1;
   let word = -1;
   for (let cut = end; cut > start; cut -= 1) {
-    if (isInsideMention(cut, mentions)) continue;
+    if (
+      isInsideMention(cut, mentions)
+      || protectedRanges.some((range) => cut > range.start && cut < range.end)
+    ) {
+      continue;
+    }
     const tier = cutTier(characters, cut);
     if (tier === 0) continue;
     if (tier === 1) return cut;
@@ -154,8 +174,11 @@ function findMentionSafeCut(
   return end;
 }
 
-/** Splits one parsed message while keeping mention atoms intact and entity offsets in UTF-16 units. */
-function splitMentionedText(parts: readonly ReplyTextPart[]): TextStreamOutboxSegment[] {
+/** Splits one parsed message while keeping mentions and converted file-link units intact. */
+function splitMentionedText(
+  parts: readonly ReplyTextPart[],
+  protectedHrefs: readonly string[],
+): TextStreamOutboxSegment[] {
   const textParts: string[] = [];
   const mentions: MentionSpan[] = [];
   let codePointOffset = 0;
@@ -174,13 +197,18 @@ function splitMentionedText(parts: readonly ReplyTextPart[]): TextStreamOutboxSe
     codePointOffset += partCodePoints;
   }
 
-  const characters = Array.from(textParts.join(""));
+  const joinedText = textParts.join("");
+  const characters = Array.from(joinedText);
   if (characters.length === 0) return [];
   const codeUnitOffsets = new Array<number>(characters.length + 1);
   codeUnitOffsets[0] = 0;
   for (let index = 0; index < characters.length; index += 1) {
     codeUnitOffsets[index + 1] = (codeUnitOffsets[index] ?? 0) + (characters[index]?.length ?? 0);
   }
+  const protectedRanges = protectedMarkdownLinkRanges(joinedText, protectedHrefs).map((range) => ({
+    start: codePointOffsetAt(codeUnitOffsets, range.start),
+    end: codePointOffsetAt(codeUnitOffsets, range.end),
+  }));
 
   const chunks: TextStreamOutboxSegment[] = [];
   let start = 0;
@@ -193,9 +221,13 @@ function splitMentionedText(parts: readonly ReplyTextPart[]): TextStreamOutboxSe
       bytes += size;
       end += 1;
     }
+    const crossing = protectedRanges.find(
+      (range) => range.start >= start && range.start < end && range.end > end,
+    );
+    const safeEnd = crossing?.start ?? end;
     let cut = end === characters.length
       ? end
-      : findMentionSafeCut(characters, start, end, mentions);
+      : findMentionSafeCut(characters, start, safeEnd, mentions, protectedRanges);
     if (cut < characters.length && isInsideMention(cut, mentions)) {
       const atom = mentions.find((mention) => cut > mention.start && cut < mention.end);
       if (atom) cut = atom.start > start ? atom.start : atom.end;
@@ -224,6 +256,17 @@ function splitMentionedText(parts: readonly ReplyTextPart[]): TextStreamOutboxSe
     start = cut;
   }
   return chunks;
+}
+
+function codePointOffsetAt(offsets: readonly number[], codeUnitOffset: number): number {
+  let low = 0;
+  let high = offsets.length - 1;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if ((offsets[middle] ?? 0) < codeUnitOffset) low = middle + 1;
+    else high = middle;
+  }
+  return low;
 }
 
 
@@ -267,6 +310,10 @@ export interface StreamTextOptions {
   parseMentions?: boolean;
   /** Opts a task-event text stream into post-commit final-snapshot observation. */
   observeReferences?: boolean;
+  /** Resolves configured Markdown file links using the persisted task context. */
+  resolveFileLinks?: boolean;
+  /** Resolver work is cancelled when its task or the service stops. */
+  fileLinkSignal?: AbortSignal;
 }
 
 export interface Outbox {
@@ -291,6 +338,8 @@ export interface Outbox {
   stopTimers(): void;
   /** 停机第三步：等待在途排空结束。 */
   settle(): Promise<void>;
+  /** Waits for each message's latest file-link snapshot to commit and propagates persistence failures. */
+  settleStreamText(taskId: string): Promise<void>;
 }
 
 export function createOutboxDelivery(deps: OutboxDeps): Outbox {
@@ -301,6 +350,7 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
   const streamNotBefore = new Map<string, number>();
   const textAbortControllers = new Map<string, AbortController>();
   const deliveryAttempts = new Set<AbortController>();
+  const fileLinkStreams = new Map<string, { taskId: string; stream: FileLinkStream }>();
 
   function currentBotUid(): string {
     const uid = deps.botUid();
@@ -329,8 +379,40 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
     for (const key of streamNotBefore.keys()) {
       if (key.includes(streamMarker)) streamNotBefore.delete(key);
     }
+    for (const [key, pipeline] of fileLinkStreams) {
+      if (pipeline.taskId === taskId) fileLinkStreams.delete(key);
+    }
   }
 
+  async function settleStreamText(taskId: string): Promise<void> {
+    const results = await Promise.allSettled([...fileLinkStreams.values()]
+      .filter((pipeline) => pipeline.taskId === taskId)
+      .map((pipeline) => pipeline.stream.settle()));
+    const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(failures, "assistant file-link projections failed to settle");
+    }
+  }
+
+  async function resolveWithAbort(
+    resolution: FileLinkResolution | Promise<FileLinkResolution>,
+    text: string,
+    cwd: string,
+    final: boolean,
+    signal: AbortSignal,
+  ): Promise<FileLinkResolution> {
+    const fallback = await resolveMarkdownFileLinks(text, cwd, [], final);
+    if (signal.aborted) return fallback;
+    const { promise, resolve } = Promise.withResolvers<FileLinkResolution>();
+    const abortHandler = (): void => resolve(fallback);
+    signal.addEventListener("abort", abortHandler, { once: true });
+    try {
+      return await Promise.race([Promise.resolve(resolution), promise]);
+    } finally {
+      signal.removeEventListener("abort", abortHandler);
+    }
+  }
   function enqueueStreamText(
     target: ChatTarget,
     taskId: string,
@@ -341,14 +423,66 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
     const bodyStreamId = `${taskId}:${event.messageId}`;
     const previousBody = deps.store.listTextStream(currentBotUid(), taskId, bodyStreamId);
     if (!event.final && previousBody.some((item) => item.streamFinal)) return;
+
+    const context = options.resolveFileLinks === true
+      ? deps.store.getTaskFileLinkContext(taskId)
+      : null;
+    const resolvers = context === null ? [] : createZedFileLinkResolvers(context.resolvers);
+    if (context !== null && resolvers.length > 0) {
+      let pipeline = fileLinkStreams.get(bodyStreamId);
+      if (!pipeline) {
+        const stream = createFileLinkStream(
+          (text, final) => {
+            const resolution = resolveMarkdownFileLinks(text, context.cwd, resolvers, final);
+            return options.fileLinkSignal === undefined
+              ? resolution
+              : resolveWithAbort(resolution, text, context.cwd, final, options.fileLinkSignal);
+          },
+          (resolution, final) => {
+            commitTextSnapshot(
+              target,
+              taskId,
+              { ...event, text: resolution.text, final },
+              options,
+              resolution.protectedHrefs,
+              bodyStreamId,
+            );
+          },
+        );
+        pipeline = { taskId, stream };
+        fileLinkStreams.set(bodyStreamId, pipeline);
+      }
+      void pipeline.stream.enqueue(event.text, event.final).catch(() => {});
+      return;
+    }
+
+    commitTextSnapshot(target, taskId, event, options, [], bodyStreamId);
+  }
+
+  function commitTextSnapshot(
+    target: ChatTarget,
+    taskId: string,
+    event: TextEvent,
+    options: StreamTextOptions,
+    protectedHrefs: readonly string[],
+    bodyStreamId: string,
+  ): void {
+    const previousBody = deps.store.listTextStream(currentBotUid(), taskId, bodyStreamId);
+    if (!event.final && previousBody.some((item) => item.streamFinal)) return;
     const canParseMentions =
       options.parseMentions === true &&
       (target.channelType === 2 || target.channelType === 5);
     const bodySegments = canParseMentions
-      ? splitMentionedText(parseReplyMemberMarkers(event.text, !event.final, MAX_TEXT_BYTES))
+      ? splitMentionedText(
+        parseReplyMemberMarkers(event.text, !event.final, MAX_TEXT_BYTES),
+        protectedHrefs,
+      )
       : event.text.length === 0
         ? []
-        : splitUtf8(event.text).map((text) => ({ text, mention: null }));
+        : protectedHrefs.length === 0
+          ? splitUtf8(event.text).map((text) => ({ text, mention: null }))
+          : splitUtf8WithProtectedMarkdownLinks(event.text, protectedHrefs)
+            .map((text) => ({ text, mention: null }));
     const bodyCommit: TextStreamOutboxCommit = {
       botUid: currentBotUid(),
       target,
@@ -719,7 +853,10 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
   }
 
   async function settle(): Promise<void> {
-    await Promise.allSettled([...outboxFlushes.values()]);
+    await Promise.allSettled([
+      ...outboxFlushes.values(),
+      ...[...fileLinkStreams.values()].map((pipeline) => pipeline.stream.settle()),
+    ]);
   }
 
   return {
@@ -733,5 +870,6 @@ export function createOutboxDelivery(deps: OutboxDeps): Outbox {
     abortAll,
     stopTimers,
     settle,
+    settleStreamText,
   };
 }

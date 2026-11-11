@@ -393,6 +393,11 @@ export function applySchema(db: Database): void {
       stop_intent TEXT,
       relay_suppressed INTEGER NOT NULL DEFAULT 0 CHECK(relay_suppressed IN (0, 1))
     );
+    CREATE TABLE IF NOT EXISTS task_file_link_context (
+      task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      cwd TEXT NOT NULL,
+      resolvers_json TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS review_jobs (
       id TEXT PRIMARY KEY NOT NULL,
       bot_uid TEXT NOT NULL,

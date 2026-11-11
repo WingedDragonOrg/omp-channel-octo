@@ -7,6 +7,7 @@ import {
   type AskConfig,
   type AttachmentConfig,
   type CoreServiceConfig,
+  type FileLinkConfig,
   type GroupHistoryConfig,
 } from "../contracts.ts";
 import type { DecisionsConfig, EnabledDecisionsConfig } from "../references/types.ts";
@@ -338,6 +339,30 @@ function parseWatch(value: unknown, decisionsEnabled: boolean): { enabled: boole
   if (enabled && !decisionsEnabled) throw configError("watch.enabled 需要启用 decisions");
   return { enabled };
 }
+function parseFileLinks(env: NodeJS.ProcessEnv): FileLinkConfig | undefined {
+  const mode = optionalString(env.OMP_CHANNEL_OCTO_ZED_MODE, "OMP_CHANNEL_OCTO_ZED_MODE");
+  if (mode === undefined) return undefined;
+  if (mode === "local") return { resolvers: [{ type: "zed", mode }] };
+  if (mode !== "ssh") throw configError("OMP_CHANNEL_OCTO_ZED_MODE 必须是 local 或 ssh");
+
+  const hostname = requireString(env.OMP_CHANNEL_OCTO_ZED_HOSTNAME, "OMP_CHANNEL_OCTO_ZED_HOSTNAME");
+  const username = optionalString(env.OMP_CHANNEL_OCTO_ZED_USERNAME, "OMP_CHANNEL_OCTO_ZED_USERNAME");
+  const portText = optionalString(env.OMP_CHANNEL_OCTO_ZED_PORT, "OMP_CHANNEL_OCTO_ZED_PORT");
+  const port = portText === undefined ? undefined : Number(portText);
+  if (portText !== undefined && (!/^\d+$/u.test(portText) || !Number.isInteger(port) || port! < 1 || port! > 65_535)) {
+    throw configError("OMP_CHANNEL_OCTO_ZED_PORT 必须是 1 到 65535 的整数");
+  }
+  return {
+    resolvers: [{
+      type: "zed",
+      mode,
+      hostname,
+      ...(username === undefined ? {} : { username }),
+      ...(port === undefined ? {} : { port }),
+    }],
+  };
+}
+
 
 export function parseConfig(input: unknown, options: ConfigParseOptions = {}): AppConfig {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
@@ -395,6 +420,7 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
   const environment = options.env ?? process.env;
   const decisions = parseDecisions(document.decisions, environment);
   const watch = parseWatch(document.watch, decisions?.enabled === true);
+  const fileLinks = parseFileLinks(environment);
 
   return {
     apiUrl,
@@ -418,6 +444,7 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
     attachments,
     ask,
     ...(decisions === undefined ? {} : { decisions }),
+    ...(fileLinks === undefined ? {} : { fileLinks }),
     watch,
   };
 }
@@ -484,6 +511,13 @@ export function toCoreConfig(config: AppConfig): CoreServiceConfig {
     groupHistory: { ...config.groupHistory },
     attachments: { ...config.attachments },
     ask: { ...config.ask },
+    ...(config.fileLinks === undefined
+      ? {}
+      : {
+          fileLinks: {
+            resolvers: config.fileLinks.resolvers.map((resolver) => ({ ...resolver })),
+          },
+        }),
     ...(config.decisions === undefined ? {} : { decisions: { ...config.decisions } }),
     watch: { enabled: config.watch?.enabled ?? (config.decisions?.enabled === true) },
   };

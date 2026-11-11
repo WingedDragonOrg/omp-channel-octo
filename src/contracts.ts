@@ -814,6 +814,31 @@ export function taskStartupError(code: TaskStartupCode, error: unknown): TaskSta
   return new TaskStartupError(code, message);
 }
 
+/**
+ * One configured file-link resolver. SSH resolvers require a hostname; local resolvers
+ * keep the same optional connection fields available for a shared resolver contract.
+ */
+export type FileLinkResolverConfig =
+  | {
+      type: "zed";
+      mode: "local";
+      hostname?: string;
+      username?: string;
+      port?: number;
+    }
+  | {
+      type: "zed";
+      mode: "ssh";
+      hostname: string;
+      username?: string;
+      port?: number;
+    };
+
+/** Channel-wide file-link settings; an omitted configuration disables link resolution. */
+export interface FileLinkConfig {
+  resolvers: FileLinkResolverConfig[];
+}
+
 export interface GroupHistoryConfig {
   enabled: boolean;
   /** Upper bound of history entries injected per task turn (1..200). */
@@ -842,6 +867,8 @@ export interface CoreServiceConfig {
   decisions?: DecisionsConfig;
   /** Optional watch switch; omitted means follow enabled Decisions. */
   watch?: { enabled: boolean };
+  /** Zed links apply to this channel when configured; absent disables resolution. */
+  fileLinks?: FileLinkConfig;
 
 }
 

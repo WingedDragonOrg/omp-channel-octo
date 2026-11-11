@@ -302,6 +302,7 @@ channel 另补两块只读呈现，均由权威实验状态驱动，不从工具
 | `groupHistory` | 默认启用，每轮最多注入 50 条群/子区历史。 |
 | `attachments` | 默认启用，附件大小上限 25 MiB；启动时清理超过 14 天的附件。 |
 | `ask.timeoutMs` | 默认 6 小时，可配置为 30 分钟到 7 天的整数毫秒。 |
+| `OMP_CHANNEL_OCTO_ZED_MODE` | 默认关闭；按 channel 配置 Zed 本地或 SSH 链接，详见[配置与协议边界](docs/specs/2026-11-11-local-file-link-resolvers-design.md)。 |
 | `decisions` | 默认关闭；显式配置协议、HTTPS API 根地址、模型及独立密钥环境变量后，启用子区 PR/MR 引用判断。 |
 
 状态、会话、附件和日志可能包含私有内容，应按敏感数据保存和备份。配置字段及校验以 [src/runtime/config.ts](src/runtime/config.ts) 为准。

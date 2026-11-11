@@ -2,7 +2,7 @@
  * 持久层的记录类型：每张表在 TypeScript 侧的形状，被 store 门面与各领域模块共用。
  */
 
-import type { ChatAppendMode, ChatExecutionState, ChatTarget, HostMergeOutcome, HostMergeProgressPhase, TextMention, ThreadListenLevel, ThreadSummary, WorkerGoal, WorkerGoalRun, WorkerProcess, WorktreeRemovalStep } from "../contracts.ts";
+import type { ChatAppendMode, ChatExecutionState, ChatTarget, FileLinkResolverConfig, HostMergeOutcome, HostMergeProgressPhase, TextMention, ThreadListenLevel, ThreadSummary, WorkerGoal, WorkerGoalRun, WorkerProcess, WorktreeRemovalStep } from "../contracts.ts";
 
 export interface BindingSessionInitialization {
   taskId: string;
@@ -106,6 +106,14 @@ export interface TaskRecord extends ChatTarget {
   historyEligible: boolean;
   /** Completion notices are suppressed after a merge intent begins. */
   relaySuppressed: boolean;
+}
+
+/** Immutable task-start snapshot used only when constructing assistant Markdown links. */
+export interface TaskFileLinkContext {
+  taskId: string;
+  cwd: string;
+  /** An empty list is the durable "disabled" snapshot for an unconfigured chat. */
+  resolvers: FileLinkResolverConfig[];
 }
 
 /** Persisted, user-visible chat history used to restore PR/MR reference context. */

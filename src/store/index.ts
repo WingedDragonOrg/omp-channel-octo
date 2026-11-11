@@ -8,10 +8,15 @@ import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ChatAppendMode, ChatTarget, HostMergeProgressPhase, ThreadListenLevel, ThreadSummary, WorkerGoal, WorktreeMergeOutcome } from "../contracts.ts";
 import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceCleanupInput, ThreadWorkspaceCleanupRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadWorkspaceOperationInput, ThreadWorkspaceOperationRecord, ThreadForkInput, ThreadForkRecord, ThreadListenRecord, ThreadMergeEventRecord, HostMergeLeaseRecord, HostMergeLeaseInput, HostMergeProgressCardInput, HostMergeProgressCardRecord, HostRemovalLeaseInput, HostRemovalLeaseRecord, HostThreadRemovalOutcome, ReviewJobRecord } from "./store-records.ts";
+import type { TaskFileLinkContext } from "./store-records.ts";
 import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopThreadCreation, LoopThreadCreationAttempt, LoopWorkspace } from "../loop/types.ts";
 import type { SessionContextSnapshotRecord, TanOperation, ReferenceHistoryEntry, ReferenceHistorySnapshot } from "./store-records.ts";
 export type { OutboxInsert, TanOperation, ReferenceHistoryEntry, ReferenceHistorySnapshot } from "./store-records.ts";
 export type { ThreadWorkspaceCleanupInput, ThreadWorkspaceCleanupPhase, ThreadWorkspaceCleanupRecord } from "./store-records.ts";
+import {
+  ensureTaskFileLinkContext as persistTaskFileLinkContext,
+  getTaskFileLinkContext as readTaskFileLinkContext,
+} from "./store-task-file-links.ts";
 import {
   getSessionContextSnapshot as readSessionContextSnapshot,
   saveSessionContextSnapshot as writeSessionContextSnapshot,
@@ -762,6 +767,14 @@ export class ChannelStore {
 
   getTask(taskId: string): TaskRecord | null {
     return getTask(this.db, taskId);
+  }
+
+  getTaskFileLinkContext(taskId: string): TaskFileLinkContext | null {
+    return readTaskFileLinkContext(this.db, taskId);
+  }
+
+  ensureTaskFileLinkContext(context: TaskFileLinkContext): TaskFileLinkContext {
+    return persistTaskFileLinkContext(this.db, context);
   }
 
   getLatestTask(botUid: string, target: ChatTarget): TaskRecord | null {

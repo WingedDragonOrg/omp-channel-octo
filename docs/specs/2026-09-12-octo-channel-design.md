@@ -18,6 +18,8 @@
 
 包含服务侧获取的每轮群/线程成员上下文、system/developer 中的 mention 使用规则与 Octo CLI 能力入口，以及普通助手回复中的结构化 mention。正文和完整 mention 随流式输出持续更新同一消息；具体边界见「每轮成员与操作上下文」及「普通回复中的 mention」。
 
+包含可按 channel 实例配置的助手正文文件链接解析：使用任务实际工作目录解析相对路径，并由 Zed resolver 生成本地或 SSH 链接；流式投递和任务恢复的约束见 `docs/specs/2026-11-11-local-file-link-resolvers-design.md`。
+
 包含 owner-only 原生持续目标管理 `/goal`：创建时 token 预算、状态查询、暂停、恢复、删除、跨回合执行与在途目标跨服务重启续接，详细契约见 `docs/specs/2026-11-02-goal-command-design.md`。
 
 包含主群/子区已落盘上下文即时分叉：owner-only `/fork [子区名称]` 和独立 `fork` 宿主工具共用原生 CLI `--fork`，沿用 cwd、建立独立 session 并绑定同父群新子区。详细契约见 `docs/specs/2026-11-03-thread-fork-design.md`。

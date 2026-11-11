@@ -28,8 +28,10 @@ export interface TaskEventsDeps {
   control: TaskEventControl;
   /** 服务是否已进入关停：关停后到达的事件一律丢弃。 */
   stopping: () => boolean;
-  /** Enable structured mentions for assistant text, independently of notice delivery. */
+  /** Enable structured mention parsing for assistant body snapshots. */
   parseAssistantMentions: boolean;
+  /** Cancel async resolver work when the task or service stops. */
+  fileLinkSignal: AbortSignal;
   /** Capture a native /context command output for its standalone card. */
   contextCommand?: boolean;
   outbox: Pick<Outbox, "enqueueStreamText">;
@@ -120,7 +122,12 @@ export class TaskEvents {
         this.deps.target,
         this.deps.taskId,
         event,
-        { parseMentions: this.deps.parseAssistantMentions, observeReferences: true },
+        {
+          parseMentions: this.deps.parseAssistantMentions,
+          observeReferences: true,
+          resolveFileLinks: true,
+          fileLinkSignal: this.deps.fileLinkSignal,
+        },
       );
       return;
     }

@@ -1152,7 +1152,7 @@ class CoreService implements ChannelService {
             console.error(`[thread remove recovery] 无法确认旧清理进程组已停止 cwd=${lease.cwd}: ${safeErrorMessage(error, "process recovery failed")}`);
           }
           if (!stopped) {
-            console.error(`[thread remove recovery] 旧清理进程组仍未确认停止，结果保持未知且不会自动重放 cwd=${lease.cwd}`);
+            console.error(`[thread remove recovery] 旧 Worktrunk 进程组仍未确认停止，结果保持未知且不会自动重放 cwd=${lease.cwd}`);
           }
         }
         if (lease.phase !== "unknown") this.store.markHostRemovalLeaseUnknown(lease.id);
@@ -7910,6 +7910,7 @@ class CoreService implements ChannelService {
         control: { cancelRequested: false, stopCause: null, workAfterStop: false },
         stopping: () => this.stopping,
         parseAssistantMentions: false,
+        fileLinkSignal: runtime.controller.signal,
         outbox: this.outbox,
         progress,
         persistResearchReport: () => {},
@@ -11143,6 +11144,10 @@ class CoreService implements ChannelService {
       control: runtime,
       stopping: () => this.stopping,
       parseAssistantMentions: true,
+      fileLinkSignal: AbortSignal.any([
+        runtime.cancelController.signal,
+        this.shutdownController.signal,
+      ]),
       contextCommand: !resuming && task.text.trim() === "/context",
       outbox: this.outbox,
       progress,
@@ -11158,6 +11163,11 @@ class CoreService implements ChannelService {
     runtime.rollProgressCard = () => progress.roll();
 
     try {
+      this.store.ensureTaskFileLinkContext({
+        taskId,
+        cwd: task.cwd,
+        resolvers: this.options.config.fileLinks?.resolvers.map((resolver) => ({ ...resolver })) ?? [],
+      });
       const contextLoad = turnContext.load(task.sessionId);
       runtime.turnContextLoad = contextLoad;
       const waiter = this.referenceContextWaiters.get(taskId);
@@ -11448,6 +11458,7 @@ class CoreService implements ChannelService {
         if (historyTurn) this.history.commitTurn(target, verified.sessionId, historyTurn);
         await runtime.steerSerial;
       }
+      await this.outbox.settleStreamText(taskId);
       if (events.contextOutput !== undefined && !runtime.cancelRequested && runtime.stopCause === null && !runtime.suspended && !this.stopping) {
         const signal = AbortSignal.any([this.shutdownController.signal, runtime.cancelController.signal, AbortSignal.timeout(10_000)]);
         const aborted = Promise.withResolvers<never>();
@@ -11556,6 +11567,11 @@ class CoreService implements ChannelService {
         }
       }
     } catch (error) {
+      try {
+        await this.outbox.settleStreamText(taskId);
+      } catch (settlementError) {
+        error = new AggregateError([error, settlementError], "task and assistant projection settlement failed");
+      }
       if (runtime.cancelRequested) {
         this.store.markCancelled(taskId);
         progress.finish("cancelled");

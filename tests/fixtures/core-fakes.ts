@@ -1877,6 +1877,7 @@ export class FakeLoopReadPort implements LoopReadPort {
 
 
 
+
 export interface CoreHarnessOptions {
   root?: string;
   bot?: BotIdentity;
@@ -1913,7 +1914,9 @@ export interface CoreHarnessOptions {
   cliCredentials?: CliCredentialPort;
   /** Allowlist mirror into the config file; absent means a hand-built config with no path. */
   allowlistWriteback?: AllowlistWriteback;
+  fileLinks?: CoreServiceConfig["fileLinks"];
   loop?: LoopReadPort;
+
 }
 
 export async function createCoreHarness(options: CoreHarnessOptions = {}): Promise<CoreHarness> {
@@ -1950,6 +1953,7 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
     ...(options.groupHistory === undefined ? {} : { groupHistory: options.groupHistory }),
     ...(options.decisions === undefined ? {} : { decisions: options.decisions }),
     ...(options.watch === undefined ? {} : { watch: options.watch }),
+    ...(options.fileLinks === undefined ? {} : { fileLinks: options.fileLinks }),
     ...(options.ask === undefined ? {} : { ask: options.ask }),
   } as CoreServiceConfig;
   const service = await createChannelService({
