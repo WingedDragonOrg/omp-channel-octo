@@ -1,6 +1,7 @@
 import { constants as fsConstants } from "node:fs";
-import { access, chmod, mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, open, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { isIP } from "node:net";
 import { isAbsolute, join, normalize, resolve } from "node:path";
 import {
   DEFAULT_ASK_TIMEOUT_MS,
@@ -11,6 +12,7 @@ import {
   type GroupHistoryConfig,
 } from "../contracts.ts";
 import type { DecisionsConfig, EnabledDecisionsConfig } from "../references/types.ts";
+import { assertNoExtendedAcl } from "../status/private-file-acl.ts";
 
 export const OCO_HOME_DIRNAME = ".oco";
 export const DEFAULT_CONFIG_PATH = "~/.oco/config/config.json";
@@ -60,6 +62,7 @@ const CONFIG_KEYS: Record<string, true> = {
   ask: true,
   decisions: true,
   watch: true,
+  statusHttp: true,
 };
 const TOKEN_ENV_PATTERN = /^(?:OCTO_|OMP_CHANNEL_OCTO_)[A-Za-z_][A-Za-z0-9_]*$/u;
 /** Bot uids reach the filesystem as directory names; only the server's alphabet is allowed. */
@@ -76,6 +79,12 @@ const MAX_ATTACHMENT_MAX_BYTES = 1024 * 1024 * 1024;
 const MIN_ASK_TIMEOUT_MS = 30 * 60 * 1_000;
 const MAX_ASK_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1_000;
 const DECISIONS_ENV_PATTERN = /^OMP_CHANNEL_OCTO_[A-Za-z_][A-Za-z0-9_]*$/u;
+
+export interface StatusHttpConfig {
+  listenAddress: string;
+  port: number;
+  tokenFile: string;
+}
 
 export interface AppConfig extends CoreServiceConfig {
   apiUrl: string;
@@ -95,12 +104,15 @@ export interface AppConfig extends CoreServiceConfig {
   attachments: AttachmentConfig;
   /** `ask` wait behavior; defaults to a 6-hour timeout. */
   ask: AskConfig;
+  /** Optional read-only status listener configuration; the token remains in its separate file. */
+  statusHttp?: StatusHttpConfig;
   /**
    * Resolved path of the file `loadConfig` read; absent for configs built by hand. Runtime
    * write-back (the allowlist mirror) writes here, so it edits exactly the operator's file.
    */
   configPath?: string;
 }
+
 
 export interface ConfigParseOptions {
   env?: NodeJS.ProcessEnv;
@@ -364,6 +376,33 @@ function parseFileLinks(env: NodeJS.ProcessEnv): FileLinkConfig | undefined {
 }
 
 
+function parseStatusHttp(value: unknown, home: string): StatusHttpConfig | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw configError("statusHttp 必须是对象");
+  }
+
+  const document = value as Record<string, unknown>;
+  for (const key of Object.keys(document)) {
+    if (key !== "listenAddress" && key !== "port" && key !== "tokenFile") {
+      throw configError(`statusHttp 不支持字段 ${key}`);
+    }
+  }
+
+  const listenAddress = requireString(document.listenAddress, "statusHttp.listenAddress");
+  if (isIP(listenAddress) === 0) {
+    throw configError("statusHttp.listenAddress 必须是 IP 地址");
+  }
+
+  const port = document.port;
+  if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw configError("statusHttp.port 必须是 1 到 65535 之间的整数");
+  }
+
+  const tokenFile = resolveLocalPath(document.tokenFile, "statusHttp.tokenFile", home);
+  return { listenAddress, port, tokenFile };
+}
+
 export function parseConfig(input: unknown, options: ConfigParseOptions = {}): AppConfig {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw configError("根值必须是 JSON 对象");
@@ -421,6 +460,7 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
   const decisions = parseDecisions(document.decisions, environment);
   const watch = parseWatch(document.watch, decisions?.enabled === true);
   const fileLinks = parseFileLinks(environment);
+  const statusHttp = parseStatusHttp(document.statusHttp, home);
 
   return {
     apiUrl,
@@ -445,6 +485,7 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
     ask,
     ...(decisions === undefined ? {} : { decisions }),
     ...(fileLinks === undefined ? {} : { fileLinks }),
+    ...(statusHttp === undefined ? {} : { statusHttp }),
     watch,
   };
 }
@@ -480,7 +521,26 @@ export async function loadConfig(
   ) {
     throw new Error("配置无效：包含 botToken 的配置文件必须是私有权限");
   }
-  return { ...parseConfig(document, options), configPath: resolvedPath };
+  const config = parseConfig(document, options);
+  if (config.statusHttp !== undefined) await validateStatusTokenFile(config.statusHttp);
+  return { ...config, configPath: resolvedPath };
+
+}
+async function validateStatusTokenFile(config: StatusHttpConfig): Promise<void> {
+  try {
+    const file = await open(config.tokenFile, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW);
+    try {
+      const info = await file.stat();
+      if (!info.isFile() || info.uid !== process.geteuid?.() || (info.mode & 0o077) !== 0 || (info.mode & 0o400) === 0) {
+        throw new Error("unsafe token file");
+      }
+      assertNoExtendedAcl(file.fd);
+    } finally {
+      await file.close();
+    }
+  } catch {
+    throw new Error("配置无效：statusHttp.tokenFile 必须是可读取且仅所有者可访问的普通文件");
+  }
 }
 
 export async function ensureStateDirectory(config: Pick<AppConfig, "stateDir">): Promise<void> {

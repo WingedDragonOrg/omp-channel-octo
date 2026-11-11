@@ -67,10 +67,12 @@ import type {
   ChannelService,
   ChannelServiceOptions,
   ChannelStatus,
+  ChatStatusSnapshot,
   ChatAppendMode,
   ChatExecutionState,
   ChatTarget,
   GroupContext,
+  ServiceStatusSnapshot,
   CommitResult,
   ContextInjection,
   PromptContext,
@@ -321,6 +323,7 @@ type RuntimeTask = {
 type BtwOperation = {
   controller: AbortController;
   done: Promise<void>;
+  activeSessionId?: string;
 };
 
 type ThreadWorkspaceOperationControl = {
@@ -457,6 +460,7 @@ class CoreService implements ChannelService {
   private readonly runtimes = new Map<string, RuntimeTask>();
   /** Avoids installing duplicate ordered reservations when a tool call is replayed. */
   private readonly scheduledThreadWorkspaceOperations = new Map<string, ThreadWorkspaceOperationControl>();
+  private readonly boundSessionWorkers = new Set<TrackedWorker>();
   /** Prevents replayed question-wake effects from racing their own steer/queue decision. */
   private readonly questionWakeOperations = new Set<string>();
   /** One in-flight native BTW per chat; its controller is shared with cancel/interrupt/shutdown. */
@@ -3929,6 +3933,78 @@ class CoreService implements ChannelService {
     };
   }
 
+  statusSnapshot(): ServiceStatusSnapshot {
+    const botUid = this.bot?.uid;
+    let queuedTasks = 0;
+    if (botUid !== undefined) {
+      for (const task of this.store.listQueuedTasks()) {
+        if (task.botUid === botUid) queuedTasks += 1;
+      }
+    }
+    return {
+      version: 1,
+      sampledAt: new Date().toISOString(),
+      botUid: botUid ?? null,
+      ownerUid: botUid === undefined ? null : this.store.getOwnerId(botUid) ?? null,
+      pid: process.pid,
+      runningSessions: botUid === undefined ? 0 : this.runningSessionCount(),
+      queuedTasks,
+    };
+  }
+
+  chatStatusSnapshot(target: ChatTarget): ChatStatusSnapshot {
+    const sampledAt = new Date().toISOString();
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) {
+      return {
+        version: 1,
+        sampledAt,
+        channelType: target.channelType,
+        channelId: target.channelId,
+        state: "none",
+        model: null,
+        cwd: null,
+        queuedTasks: 0,
+        pendingQuestions: 0,
+      };
+    }
+
+    const binding = this.store.getBinding(botUid, target);
+    const active = this.store.getActiveTask(botUid, target);
+    const latest = this.store.getLatestTask(botUid, target);
+    return {
+      version: 1,
+      sampledAt,
+      channelType: target.channelType,
+      channelId: target.channelId,
+      state: statusState(active ?? latest, binding !== null),
+      model: this.store.resolveChatModel(botUid, target).model,
+      cwd: binding?.cwd ?? null,
+      queuedTasks: this.store.countQueuedTasks(botUid, target),
+      pendingQuestions: this.store.pendingQuestionIds(botUid, target).length,
+    };
+  }
+
+  private runningSessionCount(): number {
+    const sessionIds = new Set<string>();
+    for (const runtime of this.runtimes.values()) {
+      const sessionId = runtime.lease?.worker.sessionId;
+      if (sessionId) sessionIds.add(sessionId);
+    }
+    for (const runtime of this.reviewRuntimes.values()) {
+      const sessionId = runtime.lease?.worker.sessionId;
+      if (sessionId) sessionIds.add(sessionId);
+    }
+    for (const tracked of this.boundSessionWorkers) {
+      const sessionId = tracked.worker.sessionId;
+      if (sessionId) sessionIds.add(sessionId);
+    }
+    for (const operation of this.btwOperationsByTarget.values()) {
+      if (operation.activeSessionId) sessionIds.add(operation.activeSessionId);
+    }
+    return sessionIds.size;
+  }
+
   private commandClaim(message: InboundMessage, _name: string) {
     return {
       botUid: this.bot!.uid,
@@ -6035,6 +6111,7 @@ class CoreService implements ChannelService {
         },
         blockDirectory: cwd => this.blockedDirectories.add(cwd),
       });
+      this.boundSessionWorkers.add(tracked);
       if (signal?.aborted) throw signal.reason ?? new Error("旁路问题已取消");
       const state = await tracked.worker.refreshState();
       const verified = await verifyMovedSession(binding, state, binding.cwd);
@@ -6048,6 +6125,7 @@ class CoreService implements ChannelService {
           throw new Error("原生目标控制 worker 未能确认退出");
         }
       } finally {
+        if (tracked) this.boundSessionWorkers.delete(tracked);
         sessionLease.complete();
       }
     }
@@ -6104,7 +6182,7 @@ class CoreService implements ChannelService {
     const operation: BtwOperation = { controller, done };
     this.btwOperationsByTarget.set(key, operation);
     runtime?.btwOperations.add(done);
-    void this.performBtw(message, question, binding, runtime, pendingRuntime, signal).then(
+    void this.performBtw(message, question, binding, runtime, pendingRuntime, signal, operation).then(
       completion.resolve,
       completion.reject,
     );
@@ -6124,7 +6202,16 @@ class CoreService implements ChannelService {
     runtime: RuntimeTask | undefined,
     pendingRuntime: RuntimeTask | undefined,
     signal: AbortSignal,
+    operation: BtwOperation,
   ): Promise<void> {
+    const runBtw = async (worker: WorkerSession): Promise<string> => {
+      operation.activeSessionId = worker.sessionId;
+      try {
+        return await worker.btw(question, signal);
+      } finally {
+        delete operation.activeSessionId;
+      }
+    };
     let answer: string;
     try {
       if (signal.aborted || this.stopping) return;
@@ -6158,12 +6245,12 @@ class CoreService implements ChannelService {
         if (worker.sessionId !== binding.sessionId) {
           throw new WorkerGoalError("identity-mismatch", "当前绑定会话与运行中的会话不一致");
         }
-        answer = await worker.btw(question, signal);
+        answer = await runBtw(worker);
       } else {
         answer = await this.withBoundSessionWorker(
           message,
           binding,
-          worker => worker.btw(question, signal),
+          runBtw,
           signal,
         );
       }

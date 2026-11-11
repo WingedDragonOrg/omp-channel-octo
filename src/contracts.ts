@@ -905,6 +905,28 @@ export type ChatExecutionState =
   | "cancelled"
   | "interrupted";
 
+export interface ServiceStatusSnapshot {
+  version: 1;
+  sampledAt: string;
+  pid: number;
+  botUid: string | null;
+  ownerUid: string | null;
+  runningSessions: number;
+  queuedTasks: number;
+}
+
+export interface ChatStatusSnapshot {
+  version: 1;
+  sampledAt: string;
+  channelType: number;
+  channelId: string;
+  state: ChatExecutionState;
+  model: string | null;
+  cwd: string | null;
+  queuedTasks: number;
+  pendingQuestions: number;
+}
+
 export interface ChannelStatus {
   sessionId: string | null;
   cwd: string | null;
@@ -1113,6 +1135,8 @@ export interface ChannelService {
   receive(message: InboundMessage): InboundReceipt;
   /** Waits only until this delivery may be protocol-ACKed; it never waits for business completion. */
   submitInbound(message: InboundMessage): Promise<void>;
+  statusSnapshot(): ServiceStatusSnapshot;
+  chatStatusSnapshot(target: ChatTarget): ChatStatusSnapshot;
   status(target: ChatTarget): Promise<ChannelStatus>;
   start(): Promise<void>;
   stop(): Promise<void>;

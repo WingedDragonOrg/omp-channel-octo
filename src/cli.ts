@@ -33,6 +33,7 @@ import {
   type LogTee,
 } from "./runtime/logs.ts";
 import { createSupervisorClient, type SupervisorClient, type SupervisorTarget } from "./runtime/supervisor.ts";
+import { startStatusServer, type StatusServer } from "./status/server.ts";
 import { createChannelService } from "./service.ts";
 import { createWorktreePort } from "./workspace/worktree.ts";
 import type { ChannelService, OmpWorker } from "./contracts.ts";
@@ -271,6 +272,7 @@ async function runService(
     console.log("[restart] 未检测到守护进程：/restart 与 channel_control.restart 会明确拒绝。");
   }
   let service: ChannelService | undefined;
+  let statusServer: StatusServer | undefined;
   let startPromise: Promise<void> | undefined;
   const shutdown = Promise.withResolvers<void>();
   let shutdownRequested = false;
@@ -282,7 +284,7 @@ async function runService(
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
   try {
-    service = await createChannelService({
+    const activeService = await createChannelService({
       config: toCoreConfig(config),
       transport,
       workerFactory,
@@ -327,29 +329,47 @@ async function runService(
             },
           }),
     });
-    startPromise = service.start();
+    service = activeService;
+    startPromise = activeService.start();
     const first = await Promise.race([
       startPromise.then(() => "started" as const),
       shutdown.promise.then(() => "shutdown" as const),
     ]);
     if (first === "shutdown") {
-      await service.stop();
+      await activeService.stop();
       await startPromise.catch(() => {});
       return;
+    }
+    // Publish snapshots only after CoreService is ready; shutdown closes HTTP before stopping it.
+    if (!shutdownRequested && config.statusHttp !== undefined) {
+      statusServer = await startStatusServer({
+        ...config.statusHttp,
+        statusSnapshot: () => activeService.statusSnapshot(),
+        chatStatusSnapshot: target => activeService.chatStatusSnapshot(target),
+      });
+      if (!shutdownRequested) {
+        console.log(
+          `[status] HTTP 状态接口已启动：${config.statusHttp.listenAddress}:${statusServer.port}`,
+        );
+      }
     }
     if (config.ownerId === undefined) console.log(UNCONFIGURED_OWNER_NOTICE);
     await shutdown.promise;
   } finally {
     try {
-      if (service) {
-        await service.stop();
-      } else {
-        await transport.stop().catch(() => {});
-      }
+      if (statusServer) await statusServer.stop();
     } finally {
-      process.removeListener("SIGINT", onSignal);
-      process.removeListener("SIGTERM", onSignal);
-      if (logTee) await logTee.close().catch(() => {});
+      try {
+        if (service) {
+          await service.stop();
+        } else {
+          await transport.stop().catch(() => {});
+        }
+      } finally {
+        process.removeListener("SIGINT", onSignal);
+        process.removeListener("SIGTERM", onSignal);
+        if (logTee) await logTee.close().catch(() => {});
+      }
     }
   }
 }
