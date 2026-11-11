@@ -386,8 +386,10 @@ export interface LocalCommandEvent {
   type: "local_command";
 }
 
+/** The native session compaction phase represented by a safe worker notice. */
+export type WorkerCompactionStatus = "started" | "completed" | "failed" | "cancelled" | "skipped";
 /**
- * One upstream UI notification or native command output surfaced during a run.
+ * One upstream UI notification, native command output, or host-generated session compaction notice.
  * For `notify`, `messageId` preserves the validated upstream frame id (nonempty,
  * control-free, at most 200 UTF-16 code units); native command output gets a
  * request-scoped generated id. `text` is sanitized and bounded. `level` follows
@@ -398,6 +400,8 @@ export interface WorkerNoticeEvent {
   messageId: string;
   text: string;
   level: "info" | "warning" | "error";
+  /** Present only on fixed-text host notices for native compaction lifecycle events. */
+  compactionStatus?: WorkerCompactionStatus;
 }
 
 /**

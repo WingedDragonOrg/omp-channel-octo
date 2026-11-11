@@ -72,6 +72,17 @@ export type PromptRun = {
 	manualCompactEnded: boolean;
 	manualCompactCommandOutputSeen: boolean;
 	manualCompactAbortAcknowledged: boolean;
+	/** Current native manual compaction attempt, deduplicating repeats while allowing later attempts. */
+	manualCompactionAttempt: {
+		noticeId: string;
+		ended: boolean;
+	} | undefined;
+	/** Current automatic compaction attempt; end frames are accepted only for this started attempt. */
+	autoCompactionAttempt: {
+		noticeId: string;
+		action: string | undefined;
+		ended: boolean;
+	} | undefined;
 	localCompletionRequested: boolean;
 };
 

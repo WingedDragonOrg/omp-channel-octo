@@ -60,6 +60,7 @@ export type TaskProjectionEvent = Exclude<
   PromptAcceptedEvent | Extract<WorkerEvent, { type: "goal_accepted" | "goal_updated" }>
 >;
 
+
 /**
  * 一个 task 的事件所有者：`onEvent` 是实例箭头属性，可直接交给 worker 的 prompt；
  * `localOnly` 与 `resultText` 供回合结算（context commit 门限与结果落库）读取。
@@ -77,7 +78,10 @@ export class TaskEvents {
   constructor(private readonly deps: TaskEventsDeps) {}
 
   readonly onEvent = (event: TaskProjectionEvent): void => {
-    if (this.deps.control.cancelRequested || this.deps.stopping()) return;
+    const terminalCompactionNotice = event.type === "notice"
+      && event.compactionStatus !== undefined
+      && event.compactionStatus !== "started";
+    if (this.deps.stopping() || (this.deps.control.cancelRequested && !terminalCompactionNotice)) return;
     if (event.type === "notice") {
       // 扩展的通知帧（如 /autoresearch 的 enable/off/拒绝原因）是信息性 UI：原样投递到
       // 对应会话、带上级别标签，但它不是回合产出——不进 assistantTexts/resultText、不开

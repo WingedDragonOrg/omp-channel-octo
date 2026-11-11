@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
@@ -8,6 +9,7 @@ import type {
 	OmpWorker,
 	PromptContext,
 	WorkerEvent,
+	WorkerCompactionStatus,
 	WorkerFactory,
 	WorkerGoal,
 	WorkerGoalErrorCode,
@@ -197,6 +199,14 @@ const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 const DEFAULT_CANCEL_TIMEOUT_MS = 10_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const CONTEXT_USAGE_TIMEOUT_MS = 2_000;
+const COMPACTION_NOTICE_TEXT: Record<WorkerCompactionStatus, string> = {
+	started: "会话压缩已开始。",
+	completed: "会话压缩已完成。",
+	failed: "会话压缩失败。",
+	cancelled: "会话压缩已取消。",
+	skipped: "会话压缩已跳过。",
+};
+const COMPACTION_RETRY_NOTICE_TEXT = "本次压缩方式失败，正在尝试其他方式。";
 const PASSIVE_UI_METHODS: Record<string, true> = {
 	setStatus: true,
 	setWidget: true,
@@ -210,6 +220,13 @@ function modelLevel(frame: unknown): string | null {
 	if (!isRecord(frame)) return null;
 	const level = frame.thinkingLevel;
 	return typeof level === "string" && level.length > 0 ? level : null;
+}
+
+function compactionStatusFromFrame(frame: RpcFrame): WorkerCompactionStatus {
+	if (frame.aborted === true) return "cancelled";
+	if (frame.skipped === true) return "skipped";
+	if (frame.willRetry === true) return "failed";
+	return isRecord(frame.result) && frame.errorMessage === undefined ? "completed" : "failed";
 }
 
 function startupAbortError(signal: AbortSignal): Error {
@@ -257,6 +274,8 @@ class RpcWorker implements OmpWorker {
 	#stopPromise: Promise<boolean> | undefined;
 	#requestCounter = 0;
 	#commandOutputCounter = 0;
+	#compactionWorkerId: string | undefined;
+	#compactionCounter = 0;
 	/**
 	 * True while the internal `/retry` dispatch of `resume` runs: its native command-output
 	 * receipt is control traffic and never becomes a worker notice.
@@ -915,6 +934,8 @@ class RpcWorker implements OmpWorker {
 			manualCompactEnded: false,
 			manualCompactCommandOutputSeen: false,
 			manualCompactAbortAcknowledged: false,
+			manualCompactionAttempt: undefined,
+			autoCompactionAttempt: undefined,
 			localCompletionRequested: false,
 		};
 	}
@@ -1233,19 +1254,22 @@ class RpcWorker implements OmpWorker {
 			if (active?.manualCompact) {
 				// Native compact output can include provider-controlled error details.
 				// It has no request id, so suppress raw output for every compact builtin.
+				const isUsageError = typeof frame.text === "string"
+					&& frame.text.startsWith("/compact ")
+					&& frame.text.includes(" does not take focus instructions");
+				const isNativeFailure = typeof frame.text === "string" && frame.text.startsWith("Compaction failed:");
+				const isNativeCompletion = typeof frame.text === "string" && frame.text.startsWith("Compaction complete.");
 				if (
 					!active.settled
 					&& !active.manualCompactCommandOutputSeen
 					&& !active.manualCompactStarted
 					&& !active.manualCompactEnded
-					&& typeof frame.text === "string"
-					&& (
-						(frame.text.startsWith("/compact ") && frame.text.includes(" does not take focus instructions"))
-						|| frame.text.startsWith("Compaction failed:")
-						|| frame.text.startsWith("Compaction complete.")
-					)
+					&& (isUsageError || isNativeFailure || isNativeCompletion)
 				) {
 					active.manualCompactCommandOutputSeen = true;
+					if (isNativeFailure) {
+						this.#emitCompactionNotice(active, this.#newCompactionAttemptId(), "failed");
+					}
 					if (active.localCompletionRequested) this.#completeLocalCommand(active);
 				}
 				return;
@@ -1268,19 +1292,57 @@ class RpcWorker implements OmpWorker {
 			return;
 		}
 		if (frame.type === "manual_compaction_start" || frame.type === "manual_compaction_end") {
-			if (!active || active.settled || !active.manualCompact) return;
-			if (typeof frame.sessionId === "string" && frame.sessionId !== this.#sessionId) return;
+			if (!active || active.settled || (frame.sessionId !== undefined && frame.sessionId !== this.#sessionId)) return;
 			if (frame.type === "manual_compaction_start") {
-				if (active.manualCompactStarted) return;
-				active.manualCompactStarted = true;
-				active.manualCompactAbortAcknowledged = false;
-			} else if (active.manualCompactStarted && !active.manualCompactEnded) {
-				active.manualCompactEnded = true;
-				if (active.localCompletionRequested) this.#completeLocalCommand(active);
+				const previous = active.manualCompactionAttempt;
+				if (previous && !previous.ended) return;
+				if (active.manualCompact && active.manualCompactStarted) return;
+				if (active.manualCompact) {
+					active.manualCompactStarted = true;
+					active.manualCompactAbortAcknowledged = false;
+				}
+				const noticeId = this.#newCompactionAttemptId();
+				active.manualCompactionAttempt = { noticeId, ended: false };
+				this.#emitCompactionNotice(active, noticeId, "started");
+			} else {
+				const attempt = active.manualCompactionAttempt;
+				if (!attempt || attempt.ended) return;
+				attempt.ended = true;
+				if (active.manualCompact) active.manualCompactEnded = true;
+				const status = compactionStatusFromFrame(frame);
+				const text = status === "failed" && frame.willRetry === true
+					? COMPACTION_RETRY_NOTICE_TEXT
+					: undefined;
+				this.#emitCompactionNotice(active, attempt.noticeId, status, text);
+				if (active.manualCompact && active.localCompletionRequested) this.#completeLocalCommand(active);
 			}
 			return;
 		}
-		if (frame.type === "auto_compaction_start" || frame.type === "auto_compaction_end") return;
+		if (frame.type === "auto_compaction_start" || frame.type === "auto_compaction_end") {
+			if (!active || active.settled || (frame.sessionId !== undefined && frame.sessionId !== this.#sessionId)) return;
+			if (frame.type === "auto_compaction_start") {
+				if (active.autoCompactionAttempt && !active.autoCompactionAttempt.ended) return;
+				const noticeId = this.#newCompactionAttemptId();
+				active.autoCompactionAttempt = {
+					noticeId,
+					action: typeof frame.action === "string" ? frame.action : undefined,
+					ended: false,
+				};
+				this.#emitCompactionNotice(active, noticeId, "started");
+			} else {
+				const attempt = active.autoCompactionAttempt;
+				if (!attempt || attempt.ended) return;
+				const action = typeof frame.action === "string" ? frame.action : undefined;
+				if (attempt.action !== action) return;
+				attempt.ended = true;
+				const status = compactionStatusFromFrame(frame);
+				const text = status === "failed" && frame.willRetry === true
+					? COMPACTION_RETRY_NOTICE_TEXT
+					: undefined;
+				this.#emitCompactionNotice(active, attempt.noticeId, status, text);
+			}
+			return;
+		}
 		if (!active || active.settled) return;
 		if (frame.type === "session_settled") {
 			if (!active.waitForSessionSettled) return;
@@ -1603,6 +1665,31 @@ class RpcWorker implements OmpWorker {
 			if (event) active.onEvent(event);
 		} catch (error) {
 			this.#rejectPrompt(active, asError(error, "OMP event callback failed"));
+		}
+	}
+	#newCompactionAttemptId(): string {
+		const workerId = this.#compactionWorkerId ??= randomUUID();
+		return `compaction:${workerId}:${++this.#compactionCounter}`;
+	}
+
+
+	#emitCompactionNotice(
+		run: PromptRun,
+		attemptId: string,
+		status: WorkerCompactionStatus,
+		text = COMPACTION_NOTICE_TEXT[status],
+	): void {
+		if (run.settled) return;
+		try {
+			run.onEvent({
+				type: "notice",
+				messageId: `${attemptId}:${status}`,
+				text,
+				level: status === "failed" || status === "cancelled" ? "warning" : "info",
+				compactionStatus: status,
+			});
+		} catch (error) {
+			this.#rejectPrompt(run, asError(error, "OMP event callback failed"));
 		}
 	}
 

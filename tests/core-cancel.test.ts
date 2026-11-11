@@ -75,3 +75,66 @@ test("/cancel interrupts the active task and clears queued work immediately", as
     await closeCoreHarness(harness);
   }
 });
+
+test("/cancel delivers a safe compaction terminal notice but suppresses other late notices", async () => {
+  let promptReady!: () => void;
+  const promptReadySignal = new Promise<void>((resolve) => {
+    promptReady = resolve;
+  });
+  const harness = await createCoreHarness({
+    prompt: async ({ emit, waitForAbort }) => {
+      promptReady();
+      await waitForAbort();
+      emit({
+        type: "notice",
+        messageId: "compaction:fixture:late-start",
+        text: "会话压缩已开始。",
+        level: "info",
+        compactionStatus: "started",
+      });
+      emit({
+        type: "notice",
+        messageId: "compaction:fixture:cancelled",
+        text: "会话压缩已取消。",
+        level: "warning",
+        compactionStatus: "cancelled",
+      });
+      emit({
+        type: "notice",
+        messageId: "provider-error",
+        text: "fixture-private-provider-error",
+        level: "error",
+      });
+    },
+  });
+  try {
+    const target = { channelId: "dm-cancel-compaction", channelType: 1 as const };
+    await harness.service.submitInbound(
+      inbound({ messageId: "cancel-compaction-bind", ...target, text: "/new" }),
+    );
+    const compactionNotice = harness.transport.waitForRemoteText(({ target: sentTarget, text }) =>
+      sentTarget.channelId === target.channelId && text.includes("会话压缩已取消。"),
+    );
+    await harness.service.submitInbound(
+      inbound({ messageId: "cancel-compaction-task", ...target, text: "compact something" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await promptReadySignal;
+    await harness.service.submitInbound(
+      inbound({ messageId: "cancel-compaction-command", ...target, text: "/cancel" }),
+    );
+
+    const notice = await compactionNotice;
+    expect(notice.text).toBe("OMP 警告：会话压缩已取消。");
+    expect(harness.transport.visibleText(target)).not.toContain("fixture-private-provider-error");
+    expect(harness.transport.visibleText(target)).not.toContain("会话压缩已开始。");
+    const status = await waitForStatus(
+      harness.service,
+      target,
+      (next) => next.state === "cancelled",
+    );
+    expect(status.state).toBe("cancelled");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});

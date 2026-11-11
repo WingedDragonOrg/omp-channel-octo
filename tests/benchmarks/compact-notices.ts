@@ -87,10 +87,12 @@ function writeNativeConfig(remoteEndpoint: string, thresholdPercent: number): st
   ].join("\n");
 }
 function isStartNotice(text: string): boolean {
-  return /(?:压缩|compaction|compact).*(?:已开始|starting|started)|(?:已开始|starting|started).*(?:压缩|compaction|compact)/i.test(text);
+  return /压缩/.test(text) && /(?:开始|正在|进行中)/.test(text);
 }
 function isSuccessNotice(text: string): boolean {
-  return /(?:compact|compaction|压缩).{0,40}(?:complete|completed|success|已完成|完成|成功|committed)|(?:complete|completed|success).{0,40}(?:compact|compaction)/i.test(text);
+  return /压缩/.test(text)
+    && /(?:完成|成功)/.test(text)
+    && !/(?:失败|取消|未完成|未成功|未能完成|无法完成)/.test(text);
 }
 
 let channelId: string | undefined;
@@ -179,8 +181,20 @@ function messageText(message: FixtureSentMessage): string {
 function sentTexts(): string[] {
   return fixture!.sentMessages.map(messageText);
 }
-function findNotice(start: number, predicate: (text: string) => boolean): number {
-  return noticeIndexes(start, predicate)[0] ?? -1;
+function assertNoRawSummary(start: number, phase: Phase): void {
+  const label = phase === "manual" ? "Manual" : "Automatic";
+  const phaseName = phase.toUpperCase();
+  const summaries = [
+    `FIXTURE_${phaseName}_REMOTE_COMPACTION_RESULT`,
+    `FIXTURE_${phaseName}_COMPACTION_AUX_SUMMARY`,
+    `FIXTURE_${phaseName}_COMPACTION_SHORT_SUMMARY`,
+  ];
+  assert.ok(
+    !fixture!.sentMessages.slice(start).some(message =>
+      summaries.some(summary => messageText(message).includes(summary)),
+    ),
+    `${label} compaction leaked a raw summary into chat`,
+  );
 }
 function noticeIndexes(start: number, predicate: (text: string) => boolean): number[] {
   return fixture!.sentMessages.flatMap((message, index) =>
@@ -699,8 +713,15 @@ process.exit(await child.exited);
   assert.equal(manualAck.agentInvoked, false, "The native /compact command was not acknowledged as local-only");
   assert.equal(compactionEvent(manualFramesAtHold, "manual_compaction_end"), undefined,
     "Manual compaction emitted an end event while its remote summary was still blocked");
-  assert.equal(findNotice(manualNoticeStart, isStartNotice), -1);
-  assert.equal(findNotice(manualNoticeStart, isSuccessNotice), -1);
+  await wait("Manual compaction start notice was not delivered", () =>
+    noticeIndexes(manualNoticeStart, isStartNotice).length >= 1,
+  );
+  const manualStartNoticeIndexesAtHold = noticeIndexes(manualNoticeStart, isStartNotice);
+  assert.equal(manualStartNoticeIndexesAtHold.length, 1, "Manual compaction start was not announced exactly once");
+  assert.equal(noticeIndexes(manualNoticeStart, isSuccessNotice).length, 0,
+    "Manual compaction success was announced before its remote result committed");
+  assertNoRawSummary(manualNoticeStart, "manual");
+  assert.deepEqual(binding(), seedSession.binding, "Manual compaction changed the bound session");
   assert.equal((await compactionEntries(sessionFile)).length, 0,
     "A speculative summary was mistaken for a committed manual compaction entry");
   assert.ok(activeWorkerCount(seedSession.binding.session_id) > 0,
@@ -746,8 +767,10 @@ process.exit(await child.exited);
   assert.equal(afterManualCommit[0]?.method, "remote", "Persisted manual entry was not produced by remote compaction");
   assert.ok(afterManualCommit[0]?.summary?.includes("FIXTURE_MANUAL_REMOTE_COMPACTION_RESULT"),
     "Persisted manual session entry omitted the actual remote summary");
-  assert.equal(findNotice(manualNoticeStart, isSuccessNotice), -1,
+  assert.equal(noticeIndexes(manualNoticeStart, isSuccessNotice).length, 0,
     "Manual success notice escaped before the native end/result frame reached the host");
+  assertNoRawSummary(manualNoticeStart, "manual");
+  assert.deepEqual(binding(), seedSession.binding, "Pending manual compaction changed the bound session");
   await writeFile(manualEndReleasePath, "release");
   await wait("Wrapper did not forward the native manual end frame after release", async () =>
     !!forwardedCompactionEvent(
@@ -765,8 +788,17 @@ process.exit(await child.exited);
   await waitForWorkerCleanup();
   await rm(manualEndHoldPath, { force: true });
   await rm(manualEndReleasePath, { force: true });
-  assert.equal(findNotice(manualNoticeStart, isStartNotice), -1);
-  assert.equal(findNotice(manualNoticeStart, isSuccessNotice), -1);
+  await wait("Manual compaction success notice was not delivered", () =>
+    noticeIndexes(manualNoticeStart, isSuccessNotice).length >= 1,
+  );
+  const manualStartNoticeIndexes = noticeIndexes(manualNoticeStart, isStartNotice);
+  const manualSuccessNoticeIndexes = noticeIndexes(manualNoticeStart, isSuccessNotice);
+  assert.equal(manualStartNoticeIndexes.length, 1, "Manual compaction start was not announced exactly once");
+  assert.equal(manualSuccessNoticeIndexes.length, 1, "Manual compaction success was not announced exactly once");
+  assert.ok(manualSuccessNoticeIndexes[0]! > manualStartNoticeIndexes[0]!,
+    "Manual compaction success was announced before its start");
+  assertNoRawSummary(manualNoticeStart, "manual");
+  assert.deepEqual(binding(), seedSession.binding, "Manual compaction changed the bound session");
   console.log("CASE manual-remote-committed " + JSON.stringify({
     endSequence: manualEndHeld.sequence,
     nativeEndAtMs: manualEndHeld.atMs,
@@ -814,8 +846,15 @@ process.exit(await child.exited);
     "Automatic pass start was not distinct from its preceding skipped attempt");
   assert.equal(committedCompactionEnd(autoFramesAtHold, "auto_compaction_end"), undefined,
     "Automatic compaction committed before its remote summary was released");
-  assert.equal(findNotice(autoNoticeStart, isSuccessNotice), -1,
-    "Channel announced automatic compaction success before the remote result committed");
+  await wait("Automatic compaction start notice was not delivered", () =>
+    noticeIndexes(autoNoticeStart, isStartNotice).length >= 1,
+  );
+  const autoStartNoticeIndexesAtHold = noticeIndexes(autoNoticeStart, isStartNotice);
+  assert.ok(autoStartNoticeIndexesAtHold.length >= 1, "Automatic compaction start was not announced");
+  assert.equal(noticeIndexes(autoNoticeStart, isSuccessNotice).length, 0,
+    "Automatic compaction success was announced before its remote result committed");
+  assertNoRawSummary(autoNoticeStart, "automatic");
+  assert.deepEqual(binding(), seedSession.binding, "Pending automatic compaction changed the bound session");
   assert.equal((await compactionEntries(sessionFile)).length, 1,
     "An uncommitted automatic summary changed the persisted session history");
   assert.ok(activeWorkerCount(seedSession.binding.session_id) > 0,
@@ -859,8 +898,10 @@ process.exit(await child.exited);
   assert.equal(afterAutoCommit[1]?.method, "remote", "Persisted automatic entry was not produced by the remote method");
   assert.ok(afterAutoCommit[1]?.summary?.includes("FIXTURE_AUTOMATIC_REMOTE_COMPACTION_RESULT"),
     "Persisted automatic entry omitted the actual remote summary");
-  assert.equal(findNotice(autoNoticeStart, isSuccessNotice), -1,
+  assert.equal(noticeIndexes(autoNoticeStart, isSuccessNotice).length, 0,
     "Automatic success notice escaped before its native end/result frame reached the host");
+  assertNoRawSummary(autoNoticeStart, "automatic");
+  assert.deepEqual(binding(), seedSession.binding, "Pending automatic compaction changed the bound session");
   await writeFile(automaticEndReleasePath, "release");
   await wait("Wrapper did not forward the native automatic end frame after release", async () =>
     !!forwardedCompactionEvent(
@@ -877,8 +918,17 @@ process.exit(await child.exited);
   assert.ok(autoEndForwarded.atMs >= autoEndHeld.atMs, "Automatic end frame forwarding preceded its native event");
   await waitForTask(autoMessage, "AUTOMATIC_COMPACTION_TRIGGER_REPLY");
   await waitForWorkerCleanup();
-  assert.equal(findNotice(autoNoticeStart, isStartNotice), -1);
-  assert.equal(findNotice(autoNoticeStart, isSuccessNotice), -1);
+  await wait("Automatic compaction success notice was not delivered", () =>
+    noticeIndexes(autoNoticeStart, isSuccessNotice).length >= 1,
+  );
+  const autoStartNoticeIndexes = noticeIndexes(autoNoticeStart, isStartNotice);
+  const autoSuccessNoticeIndexes = noticeIndexes(autoNoticeStart, isSuccessNotice);
+  assert.ok(autoStartNoticeIndexes.length >= 1, "Automatic compaction start was not announced");
+  assert.equal(autoSuccessNoticeIndexes.length, 1, "Automatic compaction success was not announced exactly once");
+  assert.ok(autoSuccessNoticeIndexes[0]! > autoStartNoticeIndexes[0]!,
+    "Automatic compaction success was announced before its start");
+  assertNoRawSummary(autoNoticeStart, "automatic");
+  assert.deepEqual(binding(), seedSession.binding, "Automatic compaction changed the bound session");
   await rm(automaticEndHoldPath, { force: true });
   await rm(automaticEndReleasePath, { force: true });
   console.log("CASE automatic-remote-committed " + JSON.stringify({
@@ -910,8 +960,7 @@ process.exit(await child.exited);
     boundChat: channelId,
     loopbackProviderRequests: providerRequests.length,
     manualRemoteCompaction: true,
-    automaticRemoteCompaction: true,
-    compactionNotifications: false,
+    compactionNotifications: true,
     persistedCompactionEntries: 2,
     encryptedLocalOctoFixture: true,
     residentServiceTouched: false,

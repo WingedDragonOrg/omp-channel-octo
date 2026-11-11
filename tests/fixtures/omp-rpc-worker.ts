@@ -22,6 +22,7 @@ type Scenario =
 	| "compaction-no-start"
 	| "compaction-invalid-usage"
 	| "compaction-output-without-result"
+	| "compaction-manual-failure"
 	| "compaction-start"
 	| "compaction-stop-after-start"
 	| "normal"
@@ -1694,6 +1695,12 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		setTimeout(() => {
 			// The wrong session is not part of this worker's subscribed session.
 			emit({ type: "manual_compaction_start", sessionId: "fixture-other-session" });
+			emit({
+				type: "manual_compaction_end",
+				sessionId: "fixture-other-session",
+				aborted: false,
+				result: { summary: "fixture-private-other-session-summary" },
+			});
 			emit({ type: "manual_compaction_start", sessionId });
 			emit({ type: "manual_compaction_start", sessionId });
 			setTimeout(() => {
@@ -1711,6 +1718,19 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 				});
 				emit({ type: "command_output", text: "Compaction complete. fixture-private-command-output" });
 			}, 25);
+		}, 25);
+		return;
+	}
+	if (scenario === "compaction-manual-failure" && /^\/compact(?:[\s:]|$)/iu.test(compactFirstLine)) {
+		response(id, "prompt", { agentInvoked: false });
+		setTimeout(() => {
+			emit({ type: "manual_compaction_start", sessionId });
+			emit({
+				type: "manual_compaction_end",
+				sessionId,
+				aborted: false,
+				errorMessage: "fixture-private-manual-compaction-error",
+			});
 		}, 25);
 		return;
 	}
@@ -1846,31 +1866,58 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		emit({ type: "agent_start" });
 		emit({ type: "manual_compaction_start" });
 		emit({ type: "manual_compaction_start" });
+		const firstEnd = {
+			type: "manual_compaction_end",
+			sessionId,
+			aborted: false,
+			result: { summary: "fixture-private-compaction-summary" },
+		};
+		emit(firstEnd);
+		emit(firstEnd);
+		emit({ type: "manual_compaction_start", sessionId });
+		emit({ type: "manual_compaction_start", sessionId });
+		emit({
+			type: "manual_compaction_end",
+			sessionId,
+			aborted: false,
+			result: { summary: "fixture-private-compaction-summary" },
+		});
+		emit({ type: "manual_compaction_end", sessionId, aborted: false, result: { summary: "fixture-private-compaction-summary" } });
 		emit({ type: "agent_end", messages: [], willContinue: false });
 		return;
 	}
 	if (scenario === "compaction-fallback") {
 		emit({ type: "agent_start" });
-		emit({ type: "auto_compaction_start", reason: "threshold", action: "remote" });
+		emit({ type: "auto_compaction_start", sessionId, reason: "threshold", action: "remote" });
 		emit({
-			type: "auto_compaction_end", action: "remote", aborted: false, willRetry: false,
-			errorMessage: "Auto-compaction failed: fixture failure; trying the next preferred compaction method.",
+			type: "auto_compaction_end", sessionId, action: "remote", aborted: false, willRetry: true,
+			errorMessage: "Auto-compaction failed: fixture-private-compaction-error; trying the next preferred compaction method.",
 		});
-		emit({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
+		emit({ type: "auto_compaction_start", sessionId, reason: "threshold", action: "context-full" });
 		emit({
-			type: "auto_compaction_end", action: "context-full", aborted: false, willRetry: false,
+			type: "auto_compaction_end", sessionId, action: "context-full", aborted: false, willRetry: false,
 			result: { summary: "fixture-private-compaction-summary" },
 		});
 		emit({ type: "agent_end", messages: [], willContinue: false });
 		return;
 	}
 	if (scenario === "compaction-auto") {
+		emit({ type: "auto_compaction_start", sessionId: "fixture-other-session", reason: "threshold", action: "remote" });
+		emit({
+			type: "auto_compaction_end",
+			sessionId: "fixture-other-session",
+			action: "remote",
+			aborted: false,
+			willRetry: false,
+			result: { summary: "fixture-private-other-session-summary" },
+		});
 		emit({ type: "agent_start" });
-		const successStart = { type: "auto_compaction_start", reason: "threshold", action: "context-full" };
+		const successStart = { type: "auto_compaction_start", sessionId, reason: "threshold", action: "context-full" };
 		emit(successStart);
 		emit(successStart);
 		const successEnd = {
 			type: "auto_compaction_end",
+			sessionId,
 			action: "context-full",
 			aborted: false,
 			willRetry: false,
@@ -1879,11 +1926,12 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		emit(successEnd);
 		emit(successEnd);
 
-		const skippedStart = { type: "auto_compaction_start", reason: "idle", action: "remote" };
+		const skippedStart = { type: "auto_compaction_start", sessionId, reason: "idle", action: "remote" };
 		emit(skippedStart);
 		emit(skippedStart);
 		const skippedEnd = {
 			type: "auto_compaction_end",
+			sessionId,
 			action: "remote",
 			aborted: false,
 			willRetry: false,
@@ -1893,11 +1941,12 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		emit(skippedEnd);
 		emit(skippedEnd);
 
-		const abortedStart = { type: "auto_compaction_start", reason: "overflow", action: "handoff" };
+		const abortedStart = { type: "auto_compaction_start", sessionId, reason: "overflow", action: "handoff" };
 		emit(abortedStart);
 		emit(abortedStart);
 		const abortedEnd = {
 			type: "auto_compaction_end",
+			sessionId,
 			action: "handoff",
 			aborted: true,
 			willRetry: false,
@@ -1907,11 +1956,12 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		emit(abortedEnd);
 		emit(abortedEnd);
 
-		const failedStart = { type: "auto_compaction_start", reason: "incomplete", action: "shake" };
+		const failedStart = { type: "auto_compaction_start", sessionId, reason: "incomplete", action: "shake" };
 		emit(failedStart);
 		emit(failedStart);
 		const failedEnd = {
 			type: "auto_compaction_end",
+			sessionId,
 			action: "shake",
 			aborted: false,
 			willRetry: false,
@@ -1919,7 +1969,7 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		};
 		emit(failedEnd);
 		emit(failedEnd);
-		emit({ type: "auto_compaction_end", action: "context-full", aborted: false, result: { summary: "orphan result" } });
+		emit({ type: "auto_compaction_end", sessionId, action: "context-full", aborted: false, result: { summary: "fixture-private-orphan-result" } });
 		emit({ type: "agent_end", messages: [], willContinue: false });
 		return;
 	}
