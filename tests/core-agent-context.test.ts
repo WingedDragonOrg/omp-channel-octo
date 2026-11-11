@@ -1,5 +1,6 @@
-import { expect, test, vi } from "bun:test";
+import { expect, test } from "bun:test";
 import { WorkerSteerRejectedError } from "../src/contracts";
+import { OctoError } from "../src/octo/error.ts";
 import type { ChatTarget, GroupMember } from "../src/contracts";
 import {
   contextSidecarPath,
@@ -1000,6 +1001,224 @@ test("an unaccepted steering cannot publish its member snapshot into the running
   }
 });
 
+test("transient member failure retries the original steering once despite duplicate delivery", async () => {
+  const bot = { uid: "bot-member-retry", name: "Retry Bot" };
+  const transport = new FakeTransport({ bot });
+  transport.setGroupMembers(GROUP.channelId, [member("before", "Before")]);
+  const original = transport.getGroupMembers.bind(transport);
+  let calls = 0;
+  const failed = Promise.withResolvers<void>();
+  transport.getGroupMembers = async (groupId, signal) => {
+    calls++;
+    if (calls === 2) {
+      failed.resolve();
+      throw new OctoError("Octo group members request failed with HTTP 503", { status: 503 });
+    }
+    return original(groupId, signal);
+  };
+  const started = Promise.withResolvers<void>();
+  const consumed = Promise.withResolvers<CapturedTurn>();
+  const finish = Promise.withResolvers<void>();
+  let workers!: FakeWorkerFactory;
+  workers = new FakeWorkerFactory(async ({ text, sessionId, waitForAppend }) => {
+    await withExtensionScope(sidecarRoot(workers.prompts.at(-1)), bot.uid, GROUP, async (hooks) => {
+      const first = await captureTurn(hooks, sessionId, text);
+      started.resolve();
+      const appended = await waitForAppend();
+      const history = first.messages.filter(({ role }) => role === "user");
+      const steered = await transformUserText(hooks, sessionId, appended.text, history);
+      consumed.resolve(await captureTurn(hooks, sessionId, text, {
+        startAgent: false,
+        messages: [...history, { role: "user", content: steered }],
+      }));
+      await finish.promise;
+    });
+  });
+  const harness = await createCoreHarness({ bot, transport, workers });
+  try {
+    await harness.service.submitInbound(inboundFor(bot.uid, GROUP, "retry-base", "base"));
+    await started.promise;
+    transport.setGroupMembers(GROUP.channelId, [member("after", "After")]);
+    const message = inboundFor(bot.uid, GROUP, "retry-steer", "original input");
+    await harness.service.submitInbound(message);
+    await failed.promise;
+    await harness.service.submitInbound(message);
+    const turn = await consumed.promise;
+    expect(workers.workers[0]!.steerCalls).toEqual(["original input"]);
+    expect(parseMemberBlock(memberBlocks(turn.messages)[1]!).members).toEqual([
+      { uid: "after", name: "After" },
+    ]);
+    expect(transport.sent.map(({ text }) => text)).not.toContain(
+      "成员信息读取失败，本条消息未并入当前回合。",
+    );
+  } finally {
+    finish.resolve();
+    await closeCoreHarness(harness);
+  }
+}, 10_000);
+
+test("thread task retries a transient member read and uses that thread's recovered roster", async () => {
+  const bot = { uid: "bot-thread-member-retry", name: "Thread Retry Bot" };
+  const transport = new FakeTransport({ bot });
+  transport.setThreadMembers("group-allowed", "topic-7", [member("thread-member", "Thread member")]);
+  const original = transport.getThreadMembers.bind(transport);
+  let calls = 0;
+  transport.getThreadMembers = async (groupId, shortId, signal) => {
+    if (++calls === 1) throw new OctoError("temporary failure", { status: 503 });
+    return original(groupId, shortId, signal);
+  };
+  let captured: CapturedTurn | undefined;
+  let workers!: FakeWorkerFactory;
+  workers = new FakeWorkerFactory(async ({ text, sessionId }) => {
+    captured = await withExtensionScope(sidecarRoot(workers.prompts.at(-1)), bot.uid, THREAD,
+      (hooks) => captureTurn(hooks, sessionId, text));
+  });
+  const harness = await createCoreHarness({ bot, transport, workers });
+  try {
+    await harness.service.submitInbound(inboundFor(bot.uid, THREAD, "retry-thread", "thread input"));
+    await workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, THREAD, (status) => status.state === "completed");
+    expect(parseMemberBlock(memberBlocks(captured!.messages)[0]!).members).toEqual([
+      { uid: "thread-member", name: "Thread member" },
+    ]);
+    expect(workers.prompts.map(({ text }) => text)).toEqual(["thread input"]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+}, 10_000);
+
+test("a member permission failure does not retry or start the task", async () => {
+  const bot = { uid: "bot-member-forbidden", name: "Forbidden Bot" };
+  const transport = new FakeTransport({ bot });
+  let calls = 0;
+  transport.getGroupMembers = async () => {
+    calls++;
+    throw new OctoError("forbidden", { status: 403, permanent: true });
+  };
+  const harness = await createCoreHarness({ bot, transport });
+  try {
+    await harness.service.submitInbound(inboundFor(bot.uid, GROUP, "retry-forbidden", "must not start"));
+    await transport.waitForRemoteText(({ text }) => text === "成员信息读取失败，未启动任务。");
+    expect(calls).toBe(1);
+    expect(harness.workers.prompts).toEqual([]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("failed member read after the original turn ends hands the input to a new task", async () => {
+  const bot = { uid: "bot-retry-turn-ended", name: "Ended Turn Bot" };
+  const transport = new FakeTransport({ bot });
+  const original = transport.getGroupMembers.bind(transport);
+  const request = Promise.withResolvers<void>();
+  const response = Promise.withResolvers<GroupMember[]>();
+  let calls = 0;
+  transport.getGroupMembers = async (groupId, signal) => {
+    calls++;
+    if (calls === 2) {
+      request.resolve();
+      return response.promise;
+    }
+    return original(groupId, signal);
+  };
+  const started = Promise.withResolvers<void>();
+  const finish = Promise.withResolvers<void>();
+  const returned = Promise.withResolvers<void>();
+  const workers = new FakeWorkerFactory(async ({ text }) => {
+    if (text === "base") {
+      started.resolve();
+      await finish.promise;
+      returned.resolve();
+    }
+  });
+  const harness = await createCoreHarness({ bot, transport, workers });
+  try {
+    await harness.service.submitInbound(inboundFor(bot.uid, GROUP, "ended-base", "base"));
+    await started.promise;
+    await harness.service.submitInbound(inboundFor(bot.uid, GROUP, "ended-steer", "next input"));
+    await request.promise;
+    finish.resolve();
+    await returned.promise;
+    const nextTick = Promise.withResolvers<void>();
+    setImmediate(nextTick.resolve);
+    await nextTick.promise;
+    response.reject(new OctoError("forbidden", { status: 403, permanent: true }));
+    await workers.waitForPromptCount(2);
+    await waitForStatus(harness.service, GROUP, (status) => status.state === "completed");
+    expect(workers.prompts.map(({ text }) => text)).toEqual(["base", "next input"]);
+    expect(workers.workers[0]!.steerCalls).toEqual([]);
+    expect(transport.sent.map(({ text }) => text)).not.toContain(
+      "成员信息读取失败，本条消息未并入当前回合。",
+    );
+  } finally {
+    finish.resolve();
+    response.resolve([]);
+    await closeCoreHarness(harness);
+  }
+});
+
+test("cancelling steering during retry delay does not deliver or retry it", async () => {
+  const bot = { uid: "bot-cancel-member-retry", name: "Cancel Retry Bot" };
+  const transport = new FakeTransport({ bot });
+  const original = transport.getGroupMembers.bind(transport);
+  const failed = Promise.withResolvers<void>();
+  let calls = 0;
+  transport.getGroupMembers = async (groupId, signal) => {
+    if (++calls === 1) return original(groupId, signal);
+    failed.resolve();
+    throw new OctoError("service unavailable", { status: 503 });
+  };
+  const started = Promise.withResolvers<void>();
+  const finish = Promise.withResolvers<void>();
+  const workers = new FakeWorkerFactory(async () => {
+    started.resolve();
+    await finish.promise;
+  });
+  const harness = await createCoreHarness({ bot, transport, workers });
+  try {
+    await harness.service.submitInbound(inboundFor(bot.uid, GROUP, "retry-cancel-base", "base"));
+    await started.promise;
+    await harness.service.submitInbound(inboundFor(bot.uid, GROUP, "retry-cancel-steer", "cancelled input"));
+    await failed.promise;
+    await harness.service.submitInbound(inboundFor(bot.uid, GROUP, "retry-cancel-command", "/cancel"));
+    await waitForStatus(harness.service, GROUP, (status) => status.state === "cancelled");
+    // Exercise the real abortable backoff past its first retry deadline.
+    await Bun.sleep(1_200);
+    expect(calls).toBe(2);
+    expect(workers.workers[0]!.steerCalls).toEqual([]);
+    expect(transport.sent.map(({ text }) => text)).not.toContain(
+      "成员信息读取失败，本条消息未并入当前回合。",
+    );
+  } finally {
+    finish.resolve();
+    await closeCoreHarness(harness);
+  }
+}, 10_000);
+
+test("shutdown interrupts member retry backoff before another request", async () => {
+  const bot = { uid: "bot-retry-shutdown", name: "Shutdown Retry Bot" };
+  const transport = new FakeTransport({ bot });
+  const failed = Promise.withResolvers<void>();
+  let calls = 0;
+  transport.getGroupMembers = async () => {
+    calls++;
+    failed.resolve();
+    throw new OctoError("service unavailable", { status: 503 });
+  };
+  const harness = await createCoreHarness({ bot, transport });
+  try {
+    await harness.service.submitInbound(inboundFor(bot.uid, GROUP, "retry-shutdown", "pending input"));
+    await failed.promise;
+    await harness.service.stop();
+    // Exercise the real abortable backoff past its first retry deadline.
+    await Bun.sleep(1_200);
+    expect(calls).toBe(1);
+    expect(harness.workers.prompts).toEqual([]);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+}, 10_000);
+
 test("a timed-out member refresh consumes steering without queueing it", async () => {
   const bot = { uid: "bot-agent-context-steer-timeout", name: "Steer Timeout Bot" };
   const transport = new FakeTransport({ bot });
@@ -1030,7 +1249,6 @@ test("a timed-out member refresh consumes steering without queueing it", async (
     );
     await promptStarted.promise;
 
-    vi.useFakeTimers();
     steering = harness.service.submitInbound(
       inboundFor(bot.uid, GROUP, "agent-context-timeout-second", "timed-out steering input"),
     );
@@ -1038,11 +1256,14 @@ test("a timed-out member refresh consumes steering without queueing it", async (
     const failureNotice = transport.waitForRemoteText(({ text }) =>
       text === "成员信息读取失败，本条消息未并入当前回合。",
     );
-    vi.advanceTimersByTime(5_000);
     await failureNotice;
-    vi.useRealTimers();
 
     expect(workers.prompts.map(({ text }) => text)).toEqual(["long-running timeout task"]);
+    expect(memberCalls).toBe(4);
+    await harness.service.submitInbound(
+      inboundFor(bot.uid, GROUP, "agent-context-timeout-second", "timed-out steering input"),
+    );
+    expect(memberCalls).toBe(4);
     expect((await harness.service.status(GROUP)).state).toBe("running");
 
     finishPrompt.resolve();
@@ -1050,10 +1271,9 @@ test("a timed-out member refresh consumes steering without queueing it", async (
     await waitForStatus(harness.service, GROUP, (status) => status.state === "completed");
     expect(workers.prompts.map(({ text }) => text)).toEqual(["long-running timeout task"]);
   } finally {
-    vi.useRealTimers();
     memberResponse.resolve([]);
     finishPrompt.resolve();
     await Promise.all([steering?.catch(() => {}), running?.catch(() => {})]);
     await closeCoreHarness(harness);
   }
-});
+}, 55_000);

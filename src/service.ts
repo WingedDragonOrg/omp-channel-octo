@@ -48,6 +48,7 @@ import type { DestructiveResourceLease } from "./tasks/task-scheduler.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, rm } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import {
   ATTACHMENT_MAX_AGE_MS,
   sweepAttachments,
@@ -132,7 +133,8 @@ import type {
   IngressRoutePurpose,
 } from "./inbound/ingress-types.ts";
 import { recvIngressSourceId } from "./inbound/ingress-types.ts";
-import { InboundShutdownError, safeErrorMessage } from "./errors.ts";
+import { OctoError } from "./octo/error.ts";
+import { InboundShutdownError, isTransientServerFailure, safeErrorMessage } from "./errors.ts";
 import { safeDisplayText } from "./cards/execution-text.ts";
 import { classifyStartupFailure, classifyTaskFailure, GENERIC_TASK_FAILURE_NOTICE, type TaskStartupPhase } from "./tasks/task-failure.ts";
 import {
@@ -272,7 +274,7 @@ const UNCERTAIN_RECOVERY_NOTICE =
   "任务未自动恢复：无法确认 OMP 是否已接受该输入，请核对会话后继续。";
 const RESEARCH_HISTORY_EMPTY_TEXT =
   "本聊天还没有可导出的研究记录：先让任务运行 /autoresearch 并完成记录后再试。";
-const MEMBER_LOOKUP_TIMEOUT_MS = 5_000;
+const MEMBER_LOOKUP_TIMEOUT_MS = 15_000;
 const MEMBER_LOOKUP_FAILURE_STEER_NOTICE = "成员信息读取失败，本条消息未并入当前回合。";
 type RuntimeTask = {
   taskId: string;
@@ -4265,42 +4267,51 @@ class CoreService implements ChannelService {
     target: ChatTarget,
     cancelSignal?: AbortSignal,
   ): Promise<AgentMemberSnapshot> {
-    const controller = new AbortController();
-    const signals = cancelSignal === undefined
-      ? [controller.signal, this.shutdownController.signal]
-      : [controller.signal, this.shutdownController.signal, cancelSignal];
-    const signal = AbortSignal.any(signals);
-    if (signal.aborted) throw signal.reason ?? new Error("成员 API 请求已取消");
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let removeAbortListener = (): void => {};
-    const aborted = new Promise<never>((_, reject) => {
-      const rejectAborted = (): void => {
-        reject(signal.reason ?? new Error("成员 API 请求已取消"));
-      };
-      signal.addEventListener("abort", rejectAborted, { once: true });
-      removeAbortListener = () => signal.removeEventListener("abort", rejectAborted);
-    });
-    timer = setTimeout(
-      () => controller.abort(new Error("成员 API 查询超时")),
-      MEMBER_LOOKUP_TIMEOUT_MS,
-    );
-    try {
-      let request: Promise<unknown>;
-      if (target.channelType === 2) {
-        request = this.options.transport.getGroupMembers(target.channelId, signal);
-      } else if (target.channelType === 5) {
-        const groupId = threadParentGroupId(target.channelId);
-        const shortId = threadShortId(target.channelId);
-        if (groupId === null || shortId === null) throw new Error("线程成员查询身份无效");
-        request = this.options.transport.getThreadMembers(groupId, shortId, signal);
-      } else {
-        throw new Error("私聊不读取成员");
+    const signal = cancelSignal === undefined
+      ? this.shutdownController.signal
+      : AbortSignal.any([this.shutdownController.signal, cancelSignal]);
+    for (let attempt = 0; ; attempt++) {
+      signal.throwIfAborted();
+      const controller = new AbortController();
+      const requestSignal = AbortSignal.any([controller.signal, signal]);
+      const aborted = Promise.withResolvers<never>();
+      const onAbort = (): void => aborted.reject(requestSignal.reason);
+      requestSignal.addEventListener("abort", onAbort, { once: true });
+      const timer = setTimeout(
+        () => controller.abort(new Error("成员 API 查询超时")),
+        MEMBER_LOOKUP_TIMEOUT_MS,
+      );
+      let response: unknown;
+      let retry = false;
+      try {
+        let request: Promise<unknown>;
+        if (target.channelType === 2) {
+          request = this.options.transport.getGroupMembers(target.channelId, requestSignal);
+        } else if (target.channelType === 5) {
+          const groupId = threadParentGroupId(target.channelId);
+          const shortId = threadShortId(target.channelId);
+          if (groupId === null || shortId === null) throw new Error("线程成员查询身份无效");
+          request = this.options.transport.getThreadMembers(groupId, shortId, requestSignal);
+        } else {
+          throw new Error("私聊不读取成员");
+        }
+        response = await Promise.race([request, aborted.promise]);
+      } catch (error) {
+        signal.throwIfAborted();
+        const transient = controller.signal.aborted || isTransientServerFailure(error)
+          || (error instanceof OctoError && error.status === undefined
+            && /^Octo (group|thread) members request (failed|timed out)$/.test(error.message));
+        if (!transient || attempt === 2) throw error;
+        retry = true;
+      } finally {
+        clearTimeout(timer);
+        requestSignal.removeEventListener("abort", onAbort);
       }
-      const response = await Promise.race([request, aborted]);
+      if (retry) {
+        await sleep(1_000 * 2 ** attempt, undefined, { signal });
+        continue;
+      }
       return memberSnapshotFor(target, normalizeAgentMembers(response));
-    } finally {
-      clearTimeout(timer);
-      removeAbortListener();
     }
   }
 
@@ -4426,6 +4437,10 @@ class CoreService implements ChannelService {
         if (runtime.cancelRequested) {
           this.store.completeCommand(claim);
           return true;
+        }
+        if (!this.canDeliverSteer(runtime)) {
+          this.store.releaseClaim(claim);
+          return false;
         }
         const noMembers: AgentContext = { cliReady: this.cliIdentityReady };
         await runtime.turnContext.updateAgentContext(noMembers).catch(() => {});

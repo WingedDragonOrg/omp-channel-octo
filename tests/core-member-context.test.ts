@@ -320,7 +320,31 @@ test("a member API failure fails the new task before prompting and hides the raw
   }
 });
 
-// The real service timeout is a five-second AbortSignal boundary; this integration path must observe it.
+test("a member read taking more than five seconds can still start its task", async () => {
+  const transport = new FakeTransport();
+  const started = Promise.withResolvers<AbortSignal>();
+  const response = Promise.withResolvers<GroupMember[]>();
+  transport.getGroupMembers = async (_groupId, signal) => {
+    started.resolve(signal!);
+    return response.promise;
+  };
+  const harness = await createCoreHarness({ transport });
+  try {
+    await harness.service.submitInbound(groupInput(harness.bot.uid, "slow-member", "slow member input"));
+    const signal = await started.promise;
+    // Real timer integration: a successful response after the old 5-second deadline.
+    await Bun.sleep(6_000);
+    expect(signal.aborted).toBe(false);
+    response.resolve([]);
+    await harness.workers.waitForPromptCount(1);
+    expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["slow member input"]);
+  } finally {
+    response.resolve([]);
+    await closeCoreHarness(harness);
+  }
+}, 12_000);
+
+// Exercise the real per-attempt AbortSignal deadline.
 test("a hung member API request times out before the task reaches the model", async () => {
   const transport = new FakeTransport();
   let requestSignal: AbortSignal | undefined;
@@ -339,6 +363,7 @@ test("a hung member API request times out before the task reaches the model", as
       groupInput(harness.bot.uid, "member-timeout", "must not start after timeout"),
     );
     await requestAborted.promise;
+    await transport.waitForRemoteText(({ text }) => text === "成员信息读取失败，未启动任务。");
     const status = await waitForStatus(
       harness.service,
       GROUP,
@@ -370,7 +395,7 @@ test("a hung member API request times out before the task reaches the model", as
     logged.mockRestore();
     await closeCoreHarness(harness);
   }
-}, 10_000);
+}, 55_000);
 
 test("cancelling during member lookup aborts the request without starting a worker", async () => {
   const transport = new FakeTransport();
