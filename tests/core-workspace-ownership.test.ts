@@ -918,7 +918,7 @@ test("thread outcome relay cannot steer a shared owner after a project disappear
     else await rm(root, { recursive: true, force: true });
   }
 });
-test("an unmapped preparing workspace intent refuses unknown thread work before task creation", async () => {
+test("an unmapped preparing workspace intent does not block an independent thread", async () => {
   const harness = await createCoreHarness({ bot });
   const unknown: ThreadTarget = { channelId: "group-tools____thread-unknown-preparing", channelType: 5 };
   try {
@@ -931,20 +931,15 @@ test("an unmapped preparing workspace intent refuses unknown thread work before 
       error: null,
     };
     await withStore(harness.root, (store) => store.saveThreadWorkspaceIntent(intent));
-    const notice = waitForNotice(harness, unknown, unavailableNotice);
     await submitAndWaitForIngressHandoff(
       harness,
-      ownerMessage(harness, unknown, "unknown-preparing-inbound", "must stay blocked"),
+      ownerMessage(harness, unknown, "unknown-preparing-inbound", "independent thread work"),
     );
-    await notice;
+    await waitForStatus(harness.service, unknown, (status) => status.state === "completed");
 
-    expect(await withStore(harness.root, (store) => store.getLatestTask(bot.uid, unknown))).toBeNull();
-    expect(harness.workers.prompts).toHaveLength(0);
-    expect(harness.transport.sent.some(({ target, text }) =>
-      target.channelType === unknown.channelType
-      && target.channelId === unknown.channelId
-      && text === unavailableNotice,
-    )).toBe(true);
+    expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["independent thread work"]);
+    expect(await withStore(harness.root, (store) => store.getThreadWorkspaceIntent(bot.uid, intent.id)))
+      .toMatchObject({ status: "preparing", channelIds: [] });
   } finally {
     await closeCoreHarness(harness);
   }
