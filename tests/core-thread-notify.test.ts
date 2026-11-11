@@ -826,7 +826,10 @@ test("a direct thread task is not reported at task listening level by default", 
   }
 });
 
-test("a failed task-level dispatch sends a fixed failure summary", async () => {
+test.each([
+  ["model", "OMP model reported an error: Codex websocket transport error: websocket closed (1006) token=PRIVATE_TOKEN", "Codex websocket transport error: websocket closed (1006)"],
+  ["other", "数据库事务冲突，请重试 token=PRIVATE_TOKEN", "数据库事务冲突，请重试"],
+])("a failed %s dispatch relays a safe reason", async (_name, failure, reason) => {
   const notices: string[] = [];
   const noticeSeen = Promise.withResolvers<void>();
   const harness = await createCoreHarness({
@@ -836,7 +839,7 @@ test("a failed task-level dispatch sends a fixed failure summary", async () => {
         await dispatchViaTool(promptContext, { short_id: thread.short_id, text: "PRIVATE_FAILED_TASK" });
         return;
       }
-      if (text === "PRIVATE_FAILED_TASK") throw new Error("PRIVATE_FAILURE_REASON");
+      if (text === "PRIVATE_FAILED_TASK") throw new Error(failure);
       if (text.startsWith("[子区任务回传]")) {
         notices.push(text);
         noticeSeen.resolve();
@@ -857,9 +860,54 @@ test("a failed task-level dispatch sends a fixed failure summary", async () => {
     await noticeSeen.promise;
     expect(notices).toHaveLength(1);
     expect(notices[0]).toContain("状态：失败");
+    expect(notices[0]).toContain(reason);
+    expect(notices[0]).not.toContain("PRIVATE_TOKEN");
     expect(notices[0]).not.toContain("PRIVATE_FAILED_TASK");
-    expect(notices[0]).not.toContain("PRIVATE_FAILURE_REASON");
     expect(notices[0]).toContain("任务 ID：");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a context read failure reports the failing dispatched task to its creator", async () => {
+  const noticeSeen = Promise.withResolvers<string>();
+  let threadChannelId = "";
+  const harness = await createCoreHarness({
+    prompt: async ({ promptContext, text }) => {
+      if (text === "建区并派发") {
+        const thread = await createThreadViaTool(promptContext, { name: "启动失败", listen: "task" });
+        threadChannelId = thread.channel_id;
+        await dispatchViaTool(promptContext, { short_id: thread.short_id, text: "子区任务" });
+      } else if (text.startsWith("[子区任务回传]")) {
+        noticeSeen.resolve(text);
+      }
+    },
+  });
+  const getContext = harness.transport.getGroupContext.bind(harness.transport);
+  harness.transport.getGroupContext = async target => {
+    if (target.channelId === threadChannelId) throw new Error("Octo group context request failed with HTTP 503 token=PRIVATE_TOKEN");
+    return getContext(target);
+  };
+  try {
+    await harness.service.submitInbound(inbound({
+      messageId: "context-fail-create",
+      ...GROUP,
+      text: "建区并派发",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    const notice = await noticeSeen.promise;
+    const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      const task = store.getLatestTask(harness.bot.uid, { channelId: threadChannelId, channelType: 5 });
+      expect(task?.state).toBe("failed");
+      expect(task?.errorText).toContain("context-read");
+      expect(notice).toContain(`任务 ID：${task?.id}`);
+      expect(notice).toContain("群说明读取失败");
+      expect(notice).toContain("HTTP 503");
+      expect(notice).not.toContain("PRIVATE_TOKEN");
+    } finally {
+      store.close();
+    }
   } finally {
     await closeCoreHarness(harness);
   }

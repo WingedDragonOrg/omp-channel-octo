@@ -297,6 +297,7 @@ export function applySchema(db: Database): void {
       thread_name TEXT NOT NULL,
       listen TEXT NOT NULL CHECK(listen IN ('off', 'merge', 'task')),
       merge_pending INTEGER NOT NULL DEFAULT 0 CHECK(merge_pending IN (0, 1)),
+      policy_confirmed INTEGER NOT NULL DEFAULT 1 CHECK(policy_confirmed IN (0, 1)),
       PRIMARY KEY(bot_uid, channel_id)
     );
     CREATE TABLE IF NOT EXISTS thread_archive_generations (
@@ -750,6 +751,7 @@ export function applySchema(db: Database): void {
     "ALTER TABLE questions ADD COLUMN closed_reason TEXT",
     "ALTER TABLE thread_workspace_operations ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0, 1))",
     "ALTER TABLE thread_workspaces ADD COLUMN legacy_worktree_name TEXT",
+    "ALTER TABLE thread_listens ADD COLUMN policy_confirmed INTEGER NOT NULL DEFAULT 1 CHECK(policy_confirmed IN (0, 1))",
     "ALTER TABLE thread_workspace_intents ADD COLUMN intent_kind TEXT NOT NULL DEFAULT 'workspace' CHECK(intent_kind IN ('workspace', 'thread-create'))",
     "ALTER TABLE thread_workspace_intents ADD COLUMN creator_channel_type INTEGER CHECK(creator_channel_type IS NULL OR creator_channel_type IN (2, 5))",
     "ALTER TABLE thread_workspace_intents ADD COLUMN creator_channel_id TEXT",

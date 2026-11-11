@@ -1,7 +1,8 @@
 /**
- * 子区回传的稳定身份与固定摘要；任务正文、Agent 输出和错误载荷不离开子区。
+ * 子区回传的稳定身份与有界摘要；失败原因来自对应任务的持久记录。
  */
 
+import { safeDisplayText } from "../cards/execution-text.ts";
 import type { TaskRecord, ThreadMergeEventRecord } from "../store/store-records.ts";
 import { threadShortId } from "./thread-target.ts";
 
@@ -74,14 +75,16 @@ function relationGuidance(): string[] {
   ];
 }
 
-/** The fixed, terminal task notice; only dispatch identity and terminal state are variable. */
+/** Terminal task notice, including the persisted failure reason when available. */
 export function threadOutcomeNotice(task: TaskRecord, threadName: string): string {
+  const taskKind = task.messageId.startsWith("loop:") ? "Loop 任务" : "派发任务";
   return [
-    `[子区任务回传] ${bounded(threadName, MAX_FIELD_CHARS) || "子区"}的一条派发任务已结束。`,
+    `[子区任务回传] ${bounded(threadName, MAX_FIELD_CHARS) || "子区"}的一条${taskKind}已结束。`,
     ...sourceLine(task.channelId, threadName).split("\n"),
     `任务 ID：${bounded(task.id, MAX_FIELD_CHARS)}`,
     `状态：${stateLabel(task.state)}`,
-    `说明：${taskStatusNote(task.state)}`,
+    `说明：${taskStatusNote(task.state).replace("派发任务", taskKind)}`,
+    ...(task.state === "failed" ? [`失败原因：${safeDisplayText(task.errorText) ?? "原因不可用。"}`] : []),
     "",
     ...relationGuidance(),
   ].join("\n");

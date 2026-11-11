@@ -93,6 +93,25 @@ test("thread listen policy persists without changing its creator target", async 
   }
 });
 
+test("creation publishes its requested policy over an inbound fallback without overwriting later changes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "omp-channel-octo-thread-listen-race-"));
+  const store = await openChannelStore(root);
+  try {
+    const fallback = {
+      botUid, channelId: thread.channelId, creatorChannelType: 2 as const,
+      creatorChannelId: "listen-parent", threadName: "", listen: "merge" as const,
+    };
+    store.ensureThreadListen(fallback);
+    const created = { ...fallback, threadName: "Created", listen: "task" as const };
+    expect(store.recordCreatedThreadListen(created)).toMatchObject({ threadName: "Created", listen: "task" });
+    store.setThreadListen(botUid, thread, "off");
+    expect(store.recordCreatedThreadListen(created)).toMatchObject({ threadName: "Created", listen: "off" });
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("merge intent suppresses current and newly accepted tasks; successful events are stable and durable", async () => {
   const root = await mkdtemp(join(tmpdir(), "omp-channel-octo-thread-merge-event-"));
   let store = await openChannelStore(root);

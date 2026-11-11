@@ -40,14 +40,25 @@ test("task notices carry stable identity and terminal state but no task or resul
   expect(threadNotifyMessageId("task-1")).toBe("notify:task-1");
 });
 
-test("each failed, cancelled and interrupted terminal outcome is a fixed summary", () => {
+test("Loop task outcomes identify their source without calling them dispatched tasks", () => {
+  const notice = threadOutcomeNotice(
+    task({ messageId: "loop:change-1", state: "failed", errorText: "连接超时" }),
+    "回传线程",
+  );
+  expect(notice).toContain("Loop");
+  expect(notice).toContain("连接超时");
+  expect(notice).not.toContain("派发任务");
+});
+
+test("failed outcomes include the persisted reason; other terminal outcomes keep their state", () => {
   const failed = threadOutcomeNotice(
-    task({ state: "failed", resultText: null, errorText: "PRIVATE_ERROR_SECRET" }),
+    task({ state: "failed", resultText: null, errorText: "数据库事务冲突 token=PRIVATE_TOKEN" }),
     "回传线程",
   );
   expect(failed).toContain("状态：失败");
-  expect(failed).toContain("说明：派发任务失败。");
-  expect(failed).not.toContain("PRIVATE_ERROR_SECRET");
+  expect(failed).toContain("数据库事务冲突");
+  expect(failed).not.toContain("PRIVATE_TOKEN");
+  expect(threadOutcomeNotice(task({ state: "failed", errorText: null }), "回传线程")).toContain("原因不可用");
   expect(
     threadOutcomeNotice(task({ state: "cancelled", resultText: null }), "回传线程"),
   ).toContain("说明：派发任务已取消。");

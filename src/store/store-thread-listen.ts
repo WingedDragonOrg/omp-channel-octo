@@ -9,8 +9,8 @@ export function ensureThreadListen(
 ): ThreadListenRecord {
   run(db,
     `INSERT OR IGNORE INTO thread_listens(
-       bot_uid, channel_id, creator_channel_type, creator_channel_id, thread_name, listen, merge_pending
-     ) VALUES(?, ?, ?, ?, ?, ?, 0)`,
+       bot_uid, channel_id, creator_channel_type, creator_channel_id, thread_name, listen, merge_pending, policy_confirmed
+     ) VALUES(?, ?, ?, ?, ?, ?, 0, 0)`,
     [
       record.botUid,
       record.channelId,
@@ -44,7 +44,13 @@ export function recordCreatedThreadListen(
     ) {
       throw new Error("thread creator conflicts with an existing listen record; refusing to overwrite");
     }
-    return ensureThreadListen(db, record);
+    ensureThreadListen(db, record);
+    run(db,
+      `UPDATE thread_listens SET thread_name = ?, listen = ?, policy_confirmed = 1
+       WHERE bot_uid = ? AND channel_id = ? AND policy_confirmed = 0`,
+      [record.threadName, record.listen, record.botUid, record.channelId],
+    );
+    return threadListen(db, record.botUid, record.channelId)!;
   });
 }
 
@@ -70,7 +76,7 @@ export function setThreadListen(
 ): ThreadListenRecord {
   if (target.channelType !== 5) throw new Error("thread listen policies require a thread target");
   run(db,
-    "UPDATE thread_listens SET listen = ? WHERE bot_uid = ? AND channel_id = ?",
+    "UPDATE thread_listens SET listen = ?, policy_confirmed = 1 WHERE bot_uid = ? AND channel_id = ?",
     [listen, botUid, target.channelId],
   );
   const stored = threadListen(db, botUid, target.channelId);
