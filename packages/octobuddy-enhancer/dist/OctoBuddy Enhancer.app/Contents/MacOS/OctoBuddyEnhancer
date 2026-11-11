@@ -1,0 +1,2 @@
+#!/bin/sh
+exec '/Users/dong/.bun/bin/bun' '/Users/dong/.wtc/projects/omp-channel-octo/packages/octobuddy-enhancer/src/cli.ts' --dock

@@ -1,0 +1,18 @@
+{
+  "name": "@omp-channel-octo/octobuddy-enhancer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test ./tests/launcher.acceptance.ts ./tests/host.acceptance.ts ./tests/zed.acceptance.ts ./tests/status-client.acceptance.ts ./tests/status-panel.acceptance.ts ./tests/status-bridge.acceptance.ts ./tests/chat-panel.acceptance.ts ./tests/chat-observer.acceptance.ts",
+    "typecheck": "tsc --noEmit",
+    "test:integration": "bun test ./tests/real-octobuddy.acceptance.ts"
+  },
+  "dependencies": {
+    "chrome-remote-interface": "0.33.3"
+  },
+  "devDependencies": {
+    "playwright": "1.55.0",
+    "ws": "8.18.3"
+  }
+}

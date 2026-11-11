@@ -1,0 +1,4 @@
+Repository: https://github.com/boweiliu/electron-webext
+Commit: f184bd4281ca90d3a9e89a4c15b0cc548be295b3
+Forked for: @omp-channel-octo/octobuddy-enhancer
+The framework host, isolated-world shim, and management UI are adapted from this revision. Discord integration, demos, automatic page reload, broad target matching, and unimplemented API stubs are intentionally excluded.

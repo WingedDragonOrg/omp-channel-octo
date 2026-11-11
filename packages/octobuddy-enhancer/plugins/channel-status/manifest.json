@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "id": "channel-status",
+  "name": "Channel status",
+  "version": "1.0.0",
+  "description": "Read-only status panel for the Octo channel service.",
+  "content_scripts": [
+    {
+      "matches": ["file:///*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

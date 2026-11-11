@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "id": "_management",
+  "name": "OctoBuddy Enhancer",
+  "version": "0.1.0",
+  "description": "Manage trusted local OctoBuddy plugins.",
+  "content_scripts": [
+    {
+      "matches": ["file:///*"],
+      "js": ["toolbar.js", "panel.js"],
+      "run_at": "document_idle",
+      "world": "ISOLATED",
+      "all_frames": false
+    }
+  ]
+}
