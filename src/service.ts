@@ -957,12 +957,23 @@ class CoreService implements ChannelService {
     this.startupGate = Promise.withResolvers<void>();
     // 没有恢复任务等待时也不产生未处理拒绝（门只在 start 失败时拒绝）。
     void this.startupGate.promise.catch(() => {});
-    // Checked before `initialize`, because registering is what interrupts a running instance.
+    // A migration handoff already holds the lock for the source Bot, so it must match the
+    // migrated store before we skip the usual pre-registration lock check.
+    const migrationLock = this.options.migrationLock;
     const knownBotUid = this.store.getBotUid();
-    if (knownBotUid !== null) await assertBotLockFree(knownBotUid);
+    if (migrationLock !== undefined) {
+      if (knownBotUid !== migrationLock.botUid) {
+        throw new Error("迁移持有的 Bot 身份与状态数据库不一致，拒绝启动");
+      }
+    } else if (knownBotUid !== null) {
+      await assertBotLockFree(knownBotUid);
+    }
     const identity = await this.options.transport.initialize();
     if (!identity.uid || !identity.name) throw new Error("Octo Bot 身份无效");
-    const lock = await acquireBotLock(identity.uid);
+    if (migrationLock !== undefined && identity.uid !== migrationLock.botUid) {
+      throw new Error("迁移持有的 Bot 身份与当前 Bot 不一致，拒绝启动");
+    }
+    const lock = migrationLock?.lock ?? await acquireBotLock(identity.uid);
     this.lock = lock;
     this.bot = identity;
     let watchStarted = false;
@@ -1375,8 +1386,6 @@ class CoreService implements ChannelService {
       this.startupGate.reject(error instanceof Error ? error : new Error("channel 启动失败"));
       await this.botEvents.stop();
       await this.options.transport.stop().catch(() => {});
-      await lock.release().catch(() => {});
-      this.lock = undefined;
       this.bot = undefined;
       throw error;
     }
@@ -1454,12 +1463,15 @@ class CoreService implements ChannelService {
     await this.options.transport.stop().catch(() => {});
     // A start still in preparation or awaiting CONNACK must unwind before its store is closed.
     if (this.startPromise) await this.startPromise.catch(() => {});
-    if (this.lock) {
-      await this.lock.release().catch(() => {});
-      this.lock = undefined;
-    }
+    const lock = this.lock;
+    const migrationLock = this.options.migrationLock?.lock;
     this.ready = false;
     this.store.close();
+    this.lock = undefined;
+    if (lock) await lock.release().catch(() => {});
+    if (migrationLock !== undefined && migrationLock !== lock) {
+      await migrationLock.release().catch(() => {});
+    }
   }
 
   private async sendLifecycleNotice(notice: LifecycleNotice): Promise<void> {
@@ -11887,7 +11899,12 @@ class CoreService implements ChannelService {
 export async function createChannelService(options: ChannelServiceOptions): Promise<ChannelService> {
   const commandHandlers = normalizeCommandHandlers(options.commandHandlers);
   const store = await openChannelStore(options.config.stateDir);
-  return new CoreService(options, store, commandHandlers);
+  try {
+    return new CoreService(options, store, commandHandlers);
+  } catch (error) {
+    store.close();
+    throw error;
+  }
 }
 
 export { GROUP_TRUSTED_INSTRUCTION };

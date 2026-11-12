@@ -74,7 +74,6 @@ chmod 600 ~/.oco/config/config.json
   "ownerId": "你的 Octo 用户 ID",
   "allowedGroupIds": [],
   "ompCommand": "omp",
-  "stateDir": "~/.local/state/omp-channel-octo",
   "sessionsDir": "~/.oco/sessions",
   "groupHistory": { "enabled": true, "maxMessages": 50 },
   "attachments": { "enabled": true, "maxBytes": 26214400 },
@@ -91,7 +90,7 @@ oco check --config ~/.oco/config/config.json
 oco run --config ~/.oco/config/config.json
 ```
 
-`check` 会真实注册 Bot 并验证 OMP fresh worker 的启动和停止，不调用模型。**不要把它当作在线服务的存活探针**：重新注册可能影响正在运行的 Bot 连接。
+`check` 会真实注册 Bot 并验证 OMP fresh worker 的启动和停止，不调用模型。**不要把它当作在线服务的存活探针**：重新注册可能影响正在运行的 Bot 连接。`check` 只在系统临时目录中创建隔离工作目录，不会创建或迁移状态目录。
 
 `run` 用于前台调试，不参与守护进程探测。确认可用后，用守护进程托管 `oco start --config ~/.oco/config/config.json`，并在启动常驻实例前停止前台实例。守护进程必须有自己的凭据环境，不能依赖交互终端里的变量。
 
@@ -296,7 +295,7 @@ channel 另补两块只读呈现，均由权威实验状态驱动，不从工具
 | `botTokenEnv` | 默认 `OCTO_BOT_TOKEN`；自定义名称须以 `OCTO_` 或 `OMP_CHANNEL_OCTO_` 开头。 |
 | `allowedGroupIds` | 默认空数组；与运行中开通并持久保存的聊天取并集。 |
 | `ompCommand` | 默认 `omp`；也可用启动参数 `--omp-command` 指定可执行文件。 |
-| `stateDir` | `~/.local/state/omp-channel-octo`；保存 `channel.sqlite`、附件、研究完整记录报告及运行状态。 |
+| `stateDir` | 默认 `~/.oco/state`；保存 `channel.sqlite`、附件、研究完整记录报告及运行状态。省略时首次 `start`/`run` 自动迁移旧标准目录；显式配置仍生效且不迁移。 |
 | `sessionsDir` | `~/.oco/sessions`；按项目目录隔离保存 OMP 会话。 |
 | 服务日志 | `~/.oco/logs/channel-YYYY-MM-DD.log`，保留 14 天。 |
 | `groupHistory` | 默认启用，每轮最多注入 50 条群/子区历史。 |
@@ -306,6 +305,12 @@ channel 另补两块只读呈现，均由权威实验状态驱动，不从工具
 | `decisions` | 默认关闭；显式配置协议、HTTPS API 根地址、模型及独立密钥环境变量后，启用子区 PR/MR 引用判断。 |
 
 状态、会话、附件和日志可能包含私有内容，应按敏感数据保存和备份。配置字段及校验以 [src/runtime/config.ts](src/runtime/config.ts) 为准。
+
+### 状态目录与自动迁移
+
+省略 `stateDir` 时使用 `~/.oco/state`；显式配置仍生效，且不会触发自动迁移。省略 `stateDir` 的服务首次 `start`/`run` 时，会在打开目标数据库和注册 Bot 之前，自动把旧标准目录 `~/.local/state/omp-channel-octo` 的 SQLite 状态迁到新目录，保留已提交的 WAL 数据、owner、绑定、任务、队列、outbox 及其他已有记录。目标已存在且无法证明属于同一次迁移时拒绝启动，不会覆盖或合并，也不以空数据库冒充迁移成功；迁移中断后可安全重试，无法确认旧服务已退出时同样拒绝启动。
+
+迁移不改写现有持久路径：已有 OMP 会话及其 session ID、Git worktree、工作区目录与绑定、数据库中记录的附件绝对路径均保持原位置、原身份和原内容；旧状态目录中的既有附件、spool、上下文 sidecar 和其他文件不会被删除、移动或失效，新文件写入 `~/.oco/state`。`oco check` 与 `oco launchd install` 不创建、不迁移状态目录，迁移只发生在服务启动路径。
 
 ### 只读 HTTP 状态接口
 
@@ -373,7 +378,7 @@ oco launchd install --config ~/.oco/config/config.json
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.omp.channel-octo.plist"
 ```
 
-安装命令只写 plist，不启动服务。使用环境凭据时，生成的 plist 会包含 token，必须保持私有权限；安装前先确保当前环境已提供凭据。launchd 托管实例的启停使用 `launchctl`，当前 `oco restart` 的自动识别路径面向 Super。
+安装命令只写 plist，不启动服务，也不创建或迁移状态目录；状态目录在 plist 托管的实例首次 `start` 时准备。使用环境凭据时，生成的 plist 会包含 token，必须保持私有权限；安装前先确保当前环境已提供凭据。launchd 托管实例的启停使用 `launchctl`，当前 `oco restart` 的自动识别路径面向 Super。
 
 卸载时先停止，再删除 plist：
 

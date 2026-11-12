@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { constants as fsConstants } from "node:fs";
 import { access, mkdtemp, rm, stat } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { createOctoTransport } from "./octo/index.ts";
 import { createOctoCliCredentialProvisioner } from "./runtime/octo-cli.ts";
@@ -32,6 +32,7 @@ import {
   readLogTail,
   type LogTee,
 } from "./runtime/logs.ts";
+import { prepareStateMigration } from "./runtime/state-migration.ts";
 import { createSupervisorClient, type SupervisorClient, type SupervisorTarget } from "./runtime/supervisor.ts";
 import { startStatusServer, type StatusServer } from "./status/server.ts";
 import { createChannelService } from "./service.ts";
@@ -179,7 +180,6 @@ const UNCONFIGURED_OWNER_NOTICE =
 
 async function runCheck(configPath: string | undefined): Promise<void> {
   const config = await loadConfig(configPath);
-  await ensureStateDirectory(config);
   const ompCommand = await resolveExecutable(config.ompCommand);
   const transport = createOctoTransport({
     apiUrl: config.apiUrl,
@@ -200,7 +200,7 @@ async function runCheck(configPath: string | undefined): Promise<void> {
     if (identity.uid.trim().length === 0 || identity.name.trim().length === 0) {
       throw new Error("Octo User Bot 身份无效");
     }
-    checkDirectory = await mkdtemp(join(config.stateDir, ".check-"));
+    checkDirectory = await mkdtemp(join(tmpdir(), "oco-check-"));
     worker = await workerFactory.create({
       cwd: checkDirectory,
       sessionDir: checkDirectory,
@@ -233,8 +233,10 @@ async function runService(
   mode: ServiceMode,
 ): Promise<void> {
   const config = await loadConfig(configPath);
-  await ensureStateDirectory(config);
-  const ompCommand = await resolveExecutable(ompCommandOverride ?? config.ompCommand);
+  let pendingMigrationLock = await prepareStateMigration(config);
+  try {
+    await ensureStateDirectory(config);
+    const ompCommand = await resolveExecutable(ompCommandOverride ?? config.ompCommand);
   let logTee: LogTee | undefined;
   try {
     await ensureLogsDirectory();
@@ -288,6 +290,7 @@ async function runService(
       config: toCoreConfig(config),
       transport,
       workerFactory,
+      ...(pendingMigrationLock === undefined ? {} : { migrationLock: pendingMigrationLock }),
       loop: createLoopReadPort({ apiUrl: config.apiUrl, botToken: config.botToken }),
       worktrees: createWorktreePort({ command: ompCommand }),
       cliCredentials,
@@ -330,6 +333,7 @@ async function runService(
           }),
     });
     service = activeService;
+    pendingMigrationLock = undefined;
     startPromise = activeService.start();
     const first = await Promise.race([
       startPromise.then(() => "started" as const),
@@ -377,6 +381,11 @@ async function runService(
         process.removeListener("SIGTERM", onSignal);
         if (logTee) await logTee.close().catch(() => {});
       }
+    }
+  }
+  } finally {
+    if (pendingMigrationLock !== undefined) {
+      await pendingMigrationLock.lock.release().catch(() => {});
     }
   }
 }
@@ -498,7 +507,6 @@ async function runTest(card: boolean): Promise<void> {
 async function runLaunchdInstall(configPath: string | undefined, plistPath: string | undefined): Promise<void> {
   const selectedConfigPath = resolveConfigPath(configPath ?? DEFAULT_CONFIG_PATH);
   const config = await loadConfig(selectedConfigPath);
-  await ensureStateDirectory(config);
   const ompCommand = await resolveExecutable(config.ompCommand);
   const path = resolvePath(plistPath ?? DEFAULT_LAUNCHD_PLIST_PATH);
   const executable = resolve(process.execPath);

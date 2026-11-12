@@ -52,6 +52,12 @@ test("config parser resolves paths and accepts only filtered token env names", (
   )).toThrow(/前缀/);
 });
 
+test("config defaults the state directory under the oco home when omitted", () => {
+  const document = configDocument();
+  delete document.stateDir;
+  expect(parseConfig(document, { homeDir: "/home/test" }).stateDir).toBe("/home/test/.oco/state");
+});
+
 test("config parser uses the default API and omits owner when both fields are absent", () => {
   const document = configDocument();
   delete document.apiUrl;
@@ -208,7 +214,7 @@ test("ask rejects unknown fields and non-object values", () => {
 });
 
 test("config still requires credentials and all other required fields", () => {
-  for (const field of ["allowedGroupIds", "ompCommand", "stateDir"] as const) {
+  for (const field of ["allowedGroupIds", "ompCommand"] as const) {
     const document = configDocument({ ownerId: "owner" });
     delete document[field];
     expect(() => parseConfig(document)).toThrow(new RegExp(field));

@@ -3,7 +3,6 @@
   "botTokenEnv": "OCTO_BOT_TOKEN",
   "allowedGroupIds": [],
   "ompCommand": "omp",
-  "stateDir": "~/.local/state/omp-channel-octo",
   "sessionsDir": "~/.oco/sessions",
   "groupHistory": { "enabled": true, "maxMessages": 50 },
   "attachments": { "enabled": true, "maxBytes": 26214400 },

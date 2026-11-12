@@ -103,6 +103,7 @@ export interface AppConfig extends CoreServiceConfig {
   botTokenSource: "config" | "environment";
   ompCommand: string;
   ompExtraArgs: string[];
+  stateDirIsDefault: boolean;
   /** Always resolved by `parseConfig`, defaulting to `~/.oco/sessions`. */
   sessionsDir: string;
   startupTimeoutMs?: number;
@@ -556,7 +557,9 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
     allowedGroupIds,
     ompCommand,
     ompExtraArgs: [...ompExtraArgs],
-    stateDir: resolveLocalPath(document.stateDir, "stateDir", home),
+    stateDir: document.stateDir === undefined ? join(ocoHome(home), "state") : resolveLocalPath(document.stateDir, "stateDir", home),
+    stateDirIsDefault: document.stateDir === undefined,
+    homeDir: home,
     // Sessions default to `~/.oco/sessions`, one project directory per task cwd; the state
     // directory only keeps the database, attachments, sidecars, and spool.
     sessionsDir: document.sessionsDir === undefined

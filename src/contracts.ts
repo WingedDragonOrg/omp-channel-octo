@@ -4,6 +4,7 @@ import type { ProjectSessionState } from "./session/project-session.ts";
 import type { DecisionsConfig, DecisionFetch } from "./references/types.ts";
 import type { LoopReadPort } from "./loop/types.ts";
 import type { WatchCollector, WatchJudge } from "./watch/types.ts";
+import type { LockHandle } from "./runtime/bot-lock.ts";
 
 export interface ChatTarget {
   channelId: string;
@@ -956,6 +957,8 @@ export interface ChannelServiceOptions {
   config: CoreServiceConfig;
   transport: ChannelTransport;
   workerFactory: WorkerFactory;
+  /** Bot lock held by state migration and transferred to CoreService for this start. */
+  migrationLock?: { botUid: string; lock: LockHandle };
   commandHandlers?: readonly ChannelCommandHandler[];
   /** HTTP seam for the explicitly configured reference decision provider. */
   decisionsFetch?: DecisionFetch;
