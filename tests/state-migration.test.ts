@@ -124,6 +124,7 @@ test("refuses to overwrite an independent target database", async () => {
 test("refuses migration when the legacy database has no persisted bot uid", async () => {
   await withHome(async home => {
     const paths = legacyPaths(home);
+    await mkdir(paths.legacyDir, { recursive: true });
     const source = new Database(paths.sourceDb);
     source.exec("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);");
     source.exec("CREATE TABLE records(value TEXT);");
