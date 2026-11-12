@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { expect, test, vi } from "bun:test";
 import { TaskStartupError } from "../src/contracts.ts";
 import { createWorkerFactory } from "../src/omp/index.ts";
+import { classifyStartupFailure } from "../src/tasks/task-failure.ts";
 import {
   closeCoreHarness,
   createCoreHarness,
@@ -216,6 +217,44 @@ test("the worker factory reports not-ready when the child never becomes ready", 
       );
     expect(error).toBeInstanceOf(TaskStartupError);
     expect((error as TaskStartupError).code).toBe("not-ready");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("an early OMP exit reports bounded, redacted stderr and the exit status", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "oco-startup-stderr-"));
+  const script = join(workspace, "fail.sh");
+  try {
+    await writeFile(script, "#!/bin/sh\nsleep 0.2\nprintf 'Configuration broken: authorization: Bearer secret-value\\n' >&2\nexit 23\n", "utf8");
+    await chmod(script, 0o755);
+    const factory = createWorkerFactory({ ompCommand: script });
+    const error = await factory.create({ cwd: workspace, sessionDir: workspace, onSpawn: () => {} })
+      .then(() => undefined, (failure: unknown) => failure);
+    expect(error).toBeInstanceOf(TaskStartupError);
+    expect((error as TaskStartupError).code).toBe("exited");
+    const report = classifyStartupFailure(error, "startup");
+    expect(report.notice).toContain("Configuration broken");
+    expect(report.notice).toContain("23");
+    expect(report.notice).not.toContain("secret-value");
+    expect(report.detail).not.toContain("secret-value");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("a worker whose stdout closes while it is alive does not report the host's termination as its exit code", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "oco-startup-stdout-"));
+  const script = join(workspace, "close-stdout.sh");
+  try {
+    await writeFile(script, "#!/bin/sh\nsleep 0.2\nexec 1>&-\nprintf 'stdout closed\\n' >&2\nsleep 30\n", "utf8");
+    await chmod(script, 0o755);
+    const factory = createWorkerFactory({ ompCommand: script });
+    const error = await factory.create({ cwd: workspace, sessionDir: workspace, onSpawn: () => {} })
+      .then(() => undefined, (failure: unknown) => failure);
+    const report = classifyStartupFailure(error, "startup");
+    expect(report.notice).toContain("stdout closed");
+    expect(report.notice).not.toContain("退出码");
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }

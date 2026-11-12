@@ -802,11 +802,13 @@ export type TaskStartupCode =
  */
 export class TaskStartupError extends Error {
   readonly code: TaskStartupCode;
+  readonly diagnostic: string | undefined;
 
-  constructor(code: TaskStartupCode, message: string) {
+  constructor(code: TaskStartupCode, message: string, diagnostic?: string) {
     super(message);
     this.name = "TaskStartupError";
     this.code = code;
+    this.diagnostic = diagnostic;
   }
 }
 

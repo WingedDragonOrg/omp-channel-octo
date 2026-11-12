@@ -1,7 +1,6 @@
 /**
- * 任务失败分类:把 worker 创建成功之前的启动失败,以及启动之后的执行失败,收敛成固定类别的
- * 聊天文案、任务行前缀与日志细节。类别的判据是类型化原因码(`TaskStartupError`),阶段只做
- * 兜底;路径、错误对象与协议载荷都不出现在任何用户可见面。
+ * 任务失败分类:把 worker 创建成功之前的启动失败,以及启动之后的执行失败,收敛成分类的
+ * 聊天文案、任务行前缀与日志细节。worker 启动诊断经脱敏和限长后显示在当前聊天。
  */
 
 import { TaskStartupError, type TaskStartupCode } from "../contracts.ts";
@@ -98,7 +97,7 @@ function describeTaskFailure(kind: TaskFailureKind, code: string | undefined, er
     detail,
     notice: kind === "context" || kind === "members" || kind === "generic"
       ? words.notice
-      : `${words.notice}（${resolved}）。`,
+      : `${words.notice}（${resolved}）。${error instanceof TaskStartupError && error.diagnostic ? `\n${error.diagnostic}` : ""}`,
     row: `${words.row}（${resolved}）：${detail}`,
   };
 }

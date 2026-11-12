@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import { safeDisplayText } from "../cards/execution-text.ts";
 import type {
 	CommitWorker,
 	CommitWorkerOptions,
@@ -270,6 +271,9 @@ class RpcWorker implements OmpWorker {
 	/** True once OMP confirmed it will stream `subagent_lifecycle`/`subagent_progress` frames. */
 	#subagentFrames = false;
 	#closed = false;
+	#startupStderr = "";
+	#captureStartupStderr = true;
+	#stderrDone: Promise<void>;
 	#stopping = false;
 	#stopPromise: Promise<boolean> | undefined;
 	#requestCounter = 0;
@@ -321,7 +325,7 @@ class RpcWorker implements OmpWorker {
 		this.#readyResolve = ready.resolve;
 		this.#readyReject = ready.reject;
 		void this.#readStdout();
-		void this.#readStderr();
+		this.#stderrDone = this.#readStderr();
 		void this.#child.exited.then(
 			code => this.#onChildExit(code),
 			error => this.#onFatal(asError(error, "OMP worker exited")),
@@ -394,7 +398,10 @@ class RpcWorker implements OmpWorker {
 			throw taskStartupError("handshake-failed", error);
 		}
 		try {
-			return await this.refreshState();
+			const state = await this.refreshState();
+			this.#captureStartupStderr = false;
+			this.#startupStderr = "";
+			return state;
 		} catch (error) {
 			throw taskStartupError("session-invalid", error);
 		}
@@ -1194,15 +1201,33 @@ class RpcWorker implements OmpWorker {
 
 	async #readStderr(): Promise<void> {
 		const reader = this.#child.stderr.getReader();
+		const decoder = new TextDecoder();
 		try {
 			for (;;) {
 				const result = await reader.read();
 				if (result.done) break;
+				if (this.#captureStartupStderr && this.#startupStderr.length < 8192) {
+					this.#startupStderr += decoder.decode(result.value, { stream: true }).slice(0, 8192 - this.#startupStderr.length);
+				}
 			}
 		} catch {
-			// Stderr is deliberately discarded to keep credentials out of errors
-			// and logs while still draining the pipe to avoid child deadlocks.
+			// Continue to treat stderr as auxiliary to the worker's lifecycle.
 		}
+	}
+
+	async startupDiagnostic(error: TaskStartupError, exitCode: number | undefined): Promise<TaskStartupError> {
+		await this.#waitWithTimeout(this.#stderrDone, 1_000, "OMP stderr did not close").catch(() => {});
+		let stderr = this.#startupStderr;
+		this.#startupStderr = "";
+		for (const [key, value] of Object.entries(process.env)) {
+			if (/(?:TOKEN|SECRET|PASSWORD|API_KEY)/iu.test(key) && value && value.length >= 4) {
+				stderr = stderr.replaceAll(value, "[redacted]");
+			}
+		}
+		const text = safeDisplayText(stderr, 160);
+		const status = exitCode === undefined ? undefined : `退出码 ${exitCode}`;
+		const diagnostic = [status, text].filter(Boolean).join("；");
+		return diagnostic ? new TaskStartupError(error.code, `${error.message}；${diagnostic}`, diagnostic) : error;
 	}
 
 	#handlePhysicalFrame(value: RpcFrame): void {
@@ -1997,9 +2022,13 @@ class OmpWorkerFactory implements WorkerFactory {
 			}
 			return worker;
 		} catch (error) {
+			const startupError = taskStartupError("handshake-failed", asError(error, "OMP RPC worker failed during startup"));
+			const exitCode = startupError.code === "exited"
+				? await Promise.race([child.exited, Bun.sleep(250).then(() => undefined)])
+				: undefined;
 			await worker.stop();
 			if (options.signal?.aborted) throw startupAbortError(options.signal);
-			throw taskStartupError("handshake-failed", asError(error, "OMP RPC worker failed during startup"));
+			throw await worker.startupDiagnostic(startupError, exitCode);
 		}
 	}
 
