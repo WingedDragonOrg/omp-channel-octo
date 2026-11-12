@@ -23,16 +23,14 @@ bun run scripts/build-app.ts
 
 ## Channel 状态面板
 
-内置 `channel-status` 插件可在 OctoBuddy 通信页面显示可收起的悬浮状态面板。增强器从当前用户的私有配置 `~/.config/octobuddy-enhancer/status.json` 读取服务地址和 Bearer token；配置文件必须由当前用户拥有，权限为 `0600`，并且不能有额外 ACL。文件仅包含以下两个字段：
+内置 `channel-status` 插件在 OctoBuddy 通信页面右边缘中部显示状态入口，默认半透明，鼠标悬停时不透明；可拖拽位置，点击展开或收起面板。在增强器目录的私有 `.envrc` 配置服务地址和独立 Bearer token：
 
-```json
-{
-  "baseUrl": "http://my-mini:8765",
-  "token": "与服务端 tokenFile 内容完全一致的 64 位十六进制字符串"
-}
+```sh
+export OCTOBUDDY_HTTP_BASE_URL='http://my-mini:8765'
+export OCTOBUDDY_HTTP_TOKEN='<与服务端相同的 token>'
 ```
 
-`baseUrl` 是服务地址，不要附加 `/v1/status`。可使用普通 HTTP 或 HTTPS URL；增强器不判断 Tailscale、局域网或公网，按实际 DNS 和网络路由填写即可。公网应使用 HTTPS；明文 HTTP 会使 Bearer token 有被窃听的风险。该 token 允许读取整个 channel 的只读状态，应与服务端 `statusHttp.tokenFile` 中的值一致并妥善保管。
+进程环境变量优先于 `.envrc`；状态变量只传递给增强器宿主。已有私有配置 `~/.config/octobuddy-enhancer/status.json` 可作为未设置环境变量字段的回退，文件需由当前用户拥有、权限为 `0600` 且无额外 ACL。base URL 不要附加 `/v1/status`；公网应使用 HTTPS，明文 HTTP 会使 Bearer token 有被窃听的风险。该 token 允许读取整个 channel 的只读状态，应妥善保管。
 
 面板显示服务整体状态及最近成功采样时间，并读取 OctoBuddy 页面提供的当前目标，随聊天切换自动查询群、子区或 Bot 私聊状态。群与子区使用页面提供的聊天 ID；Bot 私聊的页面 ID 是 Bot UID，而服务侧私聊目标是 owner UID，面板依据服务快照将其映射到该目标。聊天状态包括执行状态、模型策略、工作目录、排队任务数和待回答问题数。服务端启用、停用及 token 文件要求见主仓库 [状态接口说明](../../README.md#只读-http-状态接口)。
 

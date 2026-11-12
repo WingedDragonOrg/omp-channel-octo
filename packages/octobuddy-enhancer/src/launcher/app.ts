@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import type { OctoBuddyApp } from "./paths.ts";
+import { withoutStatusEnvironment } from "./status-environment.ts";
 
 export interface StartedOctoBuddy {
   child: ChildProcess;
@@ -8,12 +9,13 @@ export interface StartedOctoBuddy {
 }
 
 export function startOctoBuddy(app: OctoBuddyApp, timeoutMs = 25_000): StartedOctoBuddy {
+  const env = withoutStatusEnvironment(process.env);
   const child = spawn(app.executablePath, [
     "--remote-debugging-address=127.0.0.1",
     "--remote-debugging-port=0",
   ], {
     stdio: ["ignore", "ignore", "pipe"],
-    env: process.env,
+    env,
   });
 
   if (!child.pid || !child.stderr) {

@@ -890,6 +890,26 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
     expect(initialStatusNodes.some((node) =>
       node.role?.value === "region" && node.name?.value === "频道状态详情",
     )).toBe(false);
+    const initialButton = await waitForStatusButton(browser, communicationSessionId);
+    expect(initialButton.x + initialButton.width).toBeCloseTo(1024, 0);
+    expect(initialButton.y + initialButton.height / 2).toBeCloseTo(384, 0);
+    const initialOpacity = await evaluate<number>(browser, communicationSessionId,
+      `Number(getComputedStyle(document.querySelector("[data-octobuddy-channel-status-button]")).opacity)`);
+    expect(initialOpacity).toBeLessThan(1);
+    const dragX = initialButton.x + initialButton.width / 2;
+    const dragY = initialButton.y + initialButton.height / 2;
+    await send(browser, "Input.dispatchMouseEvent", { type: "mouseMoved", x: dragX, y: dragY, button: "none", buttons: 0 }, communicationSessionId);
+    expect(await evaluate<number>(browser, communicationSessionId,
+      `Number(getComputedStyle(document.querySelector("[data-octobuddy-channel-status-button]")).opacity)`)).toBe(1);
+    await send(browser, "Input.dispatchMouseEvent", { type: "mousePressed", x: dragX, y: dragY, button: "left", buttons: 1, clickCount: 1 }, communicationSessionId);
+    await send(browser, "Input.dispatchMouseEvent", { type: "mouseMoved", x: dragX - 180, y: dragY + 100, button: "left", buttons: 1 }, communicationSessionId);
+    await send(browser, "Input.dispatchMouseEvent", { type: "mouseReleased", x: dragX - 180, y: dragY + 100, button: "left", buttons: 0, clickCount: 1 }, communicationSessionId);
+    const draggedButton = await waitForStatusButton(browser, communicationSessionId);
+    expect(draggedButton.x).toBeLessThan(initialButton.x - 150);
+    expect(draggedButton.y).toBeGreaterThan(initialButton.y + 70);
+    expect(await evaluate<string>(browser, communicationSessionId,
+      `document.querySelector("[data-octobuddy-channel-status-button]").getAttribute("aria-expanded")`)).toBe("false");
+
 
     await dispatchMouseClick(browser, communicationSessionId, await waitForStatusButton(browser, communicationSessionId));
     await waitUntil(async () => {

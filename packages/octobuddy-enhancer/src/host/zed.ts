@@ -3,6 +3,7 @@ import { access, realpath, stat } from "node:fs/promises";
 import { constants } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join, isAbsolute } from "node:path";
+import { withoutStatusEnvironment } from "../launcher/status-environment.ts";
 import { isRecord } from "./type-guards.ts";
 
 export interface OpenZedRequest {
@@ -89,7 +90,7 @@ export async function openInZed(
   if (!stillAuthorized()) throw new Error("plugin was disabled before Zed could be opened");
 
   const argument = isZedUrl ? path : `${path}:${request.line ?? 1}:1`;
-  const child = spawn(executable, [argument], { detached: true, shell: false, stdio: "ignore" });
+  const child = spawn(executable, [argument], { detached: true, shell: false, stdio: "ignore", env: withoutStatusEnvironment(process.env) });
   const { promise, resolve, reject } = Promise.withResolvers<void>();
   let spawned = false;
   child.once("spawn", () => {

@@ -8,7 +8,10 @@ import type { ChatStatusSnapshot, ChatTarget, ServiceStatusSnapshot } from "../c
 export interface StatusServerOptions {
   listenAddress: string;
   port: number;
-  tokenFile: string;
+  /** Direct bearer token; when set the token file is never read. */
+  token?: string;
+  /** Private token file, re-read for every request when no direct token is set. */
+  tokenFile?: string;
   statusSnapshot: () => ServiceStatusSnapshot;
   chatStatusSnapshot: (target: ChatTarget) => ChatStatusSnapshot;
 }
@@ -74,8 +77,15 @@ async function readPrivateToken(tokenFile: string): Promise<string> {
   }
 }
 
+
 export async function startStatusServer(options: StatusServerOptions): Promise<StatusServer> {
-  await readPrivateToken(options.tokenFile);
+  const directToken = options.token;
+  if (directToken === undefined && options.tokenFile !== undefined) {
+    await readPrivateToken(options.tokenFile);
+  } else if (directToken === undefined) {
+    throw new Error("Status server requires OMP_CHANNEL_OCTO_HTTP_TOKEN or OMP_CHANNEL_OCTO_HTTP_TOKEN_FILE");
+  }
+
   const server = (() => {
     try {
       return Bun.serve({
@@ -83,7 +93,7 @@ export async function startStatusServer(options: StatusServerOptions): Promise<S
         port: options.port,
         fetch: async request => {
           try {
-            const token = await readPrivateToken(options.tokenFile);
+            const token = directToken ?? await readPrivateToken(options.tokenFile as string);
             return createStatusHandler({
               token,
               statusSnapshot: options.statusSnapshot,

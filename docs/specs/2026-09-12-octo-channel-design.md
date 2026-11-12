@@ -135,7 +135,7 @@ OMP 扩展可在 `session_start` 恢复观察并发起自主回合；RPC `ready`
 
 ### 运行和配置
 
-使用 TypeScript/Bun 常驻服务，主动连接 Octo，启动并管理 OMP RPC worker。无需为 RPC 开放网络监听端口；可选的只读 HTTP 状态接口按独立配置启用，认证和面板契约见 `2026-11-11-channel-status-panel-design.md`。macOS 使用 launchd 托管；机器休眠或离线期间不承诺可用。
+使用 TypeScript/Bun 常驻服务，主动连接 Octo，启动并管理 OMP RPC worker。无需为 RPC 开放网络监听端口；只读 HTTP 状态接口在配置 token 后默认启用，认证和面板契约见 `2026-11-11-channel-status-panel-design.md`。macOS 使用 launchd 托管；机器休眠或离线期间不承诺可用。
 
 本机入口为 `oco`（`omp-channel-octo` 的别名，`bun link` 安装）：`start` 是守护进程托管的服务进程入口，`run` 是不探测守护进程的调试入口，`restart`/`status`/`logs` 通过自动识别出的守护进程程序操作常驻实例，`test --card` 发送真实预览卡。配置在 `~/.oco/config/config.json`，服务日志由服务自持在 `~/.oco/logs/`，状态目录仍在 `~/.local/state/omp-channel-octo`（数据库、附件、sidecar、spool），OMP 会话默认落在 `~/.oco/sessions/`（每个项目一个子目录，见下）；守护进程与程序名不写进配置。详见 `2026-09-16-oco-cli-entry-design.md`。
 

@@ -78,11 +78,11 @@ export function startManagedService(
   scriptPath: string,
   args: string[],
   name: string,
-  options: { detached: boolean; timeoutMs: number },
+  options: { detached: boolean; timeoutMs: number; env?: NodeJS.ProcessEnv },
 ): ManagedService {
   const child = spawn(process.execPath, [scriptPath, ...args], {
     detached: options.detached,
-    env: process.env,
+    env: options.env ?? process.env,
     stdio: ["ignore", "pipe", "ignore"],
   });
   const ready = waitForReady(child, name, options.timeoutMs).then(

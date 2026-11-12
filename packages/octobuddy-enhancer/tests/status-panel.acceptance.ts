@@ -186,6 +186,45 @@ test("channel status starts compact and expands and collapses with the live serv
   });
 }, 15_000);
 
+test("status control stays unobtrusive at the right edge and can be dragged without opening", async () => {
+  await withStatusPanelPage({ state: "online", snapshot: onlineSnapshot }, async ({ page }) => {
+    const control = page.getByRole("button", { name: /频道状态/ });
+    await control.waitFor({ state: "visible" });
+    const initial = (await control.boundingBox())!;
+    expect(initial.x + initial.width).toBeGreaterThan(1270);
+    expect(Math.abs(initial.y + initial.height / 2 - 400)).toBeLessThan(4);
+    expect(await control.evaluate((element) => Number(getComputedStyle(element).opacity))).toBeLessThan(1);
+
+    await control.hover();
+    expect(await control.evaluate((element) => Number(getComputedStyle(element).opacity))).toBe(1);
+    const x = initial.x + initial.width / 2;
+    const y = initial.y + initial.height / 2;
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x - 260, y + 180, { steps: 5 });
+    await page.mouse.up();
+    const moved = (await control.boundingBox())!;
+    expect(moved.x).toBeLessThan(initial.x - 200);
+    expect(moved.y).toBeGreaterThan(initial.y + 140);
+    expect(await control.getAttribute("aria-expanded")).toBe("false");
+    await control.click();
+    expect(await control.getAttribute("aria-expanded")).toBe("true");
+    const center = (await control.boundingBox())!;
+    await page.mouse.move(center.x + center.width / 2, center.y + center.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(1, 1, { steps: 5 });
+    await page.mouse.up();
+    const atEdge = (await control.boundingBox())!;
+    const panel = (await page.getByRole("region", { name: "频道状态详情" }).boundingBox())!;
+    expect(atEdge.x).toBeGreaterThanOrEqual(0);
+    expect(atEdge.y).toBeGreaterThanOrEqual(0);
+    expect(panel.x).toBeGreaterThanOrEqual(0);
+    expect(panel.y).toBeGreaterThanOrEqual(0);
+    expect(panel.x + panel.width).toBeLessThanOrEqual(1280);
+    expect(panel.y + panel.height).toBeLessThanOrEqual(800);
+  });
+}, 15_000);
+
 test("an offline response with a last successful snapshot is visibly marked stale", async () => {
   await withStatusPanelPage({
     state: "offline",

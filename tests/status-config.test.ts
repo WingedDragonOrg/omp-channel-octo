@@ -1,12 +1,34 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, parseConfig } from "../src/runtime/config.ts";
 
 const EXAMPLE_ADDRESS = "198.51.100.17";
-const STATUS_TOKEN = "status-config-fixture-token-0123456789abcdef";
+// A server credential is at least 32 random bytes encoded as hexadecimal (64 characters).
+const STATUS_TOKEN = "0123456789abcdef".repeat(4);
+const ENV_TOKEN = "fedcba9876543210".repeat(4);
 const HOME = "/home/status-config-fixture";
+const DEFAULT_STATUS_HTTP = { listenAddress: "0.0.0.0", port: 8765 } as const;
+
+const STATUS_ENVIRONMENT = {
+  enabled: "OMP_CHANNEL_OCTO_HTTP_ENABLED",
+  listenAddress: "OMP_CHANNEL_OCTO_HTTP_LISTEN_ADDRESS",
+  port: "OMP_CHANNEL_OCTO_HTTP_PORT",
+  token: "OMP_CHANNEL_OCTO_HTTP_TOKEN",
+  tokenFile: "OMP_CHANNEL_OCTO_HTTP_TOKEN_FILE",
+} as const;
+
+type StatusEnvironment = Partial<Record<keyof typeof STATUS_ENVIRONMENT, string>>;
+
+function statusEnvironment(values: StatusEnvironment = {}): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of Object.keys(STATUS_ENVIRONMENT) as Array<keyof typeof STATUS_ENVIRONMENT>) {
+    const value = values[key];
+    if (value !== undefined) env[STATUS_ENVIRONMENT[key]] = value;
+  }
+  return env;
+}
 
 function configDocument(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -29,9 +51,38 @@ function expectStatusHttpValidationFailure(statusHttp: unknown): void {
   expect(caught).toBeInstanceOf(Error);
 }
 
+function expectStatusEnvironmentFailure(env: Record<string, string>): Error {
+  let caught: unknown;
+  try {
+    parseConfig(configDocument(), { env, homeDir: HOME });
+  } catch (error) {
+    caught = error;
+  }
+
+  expect(caught).toBeInstanceOf(Error);
+  return caught as Error;
+}
+
 async function writeConfig(path: string, document: unknown, mode = 0o600): Promise<void> {
   await writeFile(path, `${JSON.stringify(document, null, 2)}\n`, { encoding: "utf8", mode });
   await chmod(path, mode);
+}
+
+async function relativeFilesUnder(root: string): Promise<string[]> {
+  const files: string[] = [];
+  const pending: Array<{ directory: string; prefix: string }> = [{ directory: root, prefix: "" }];
+  while (pending.length > 0) {
+    const { directory, prefix } = pending.pop()!;
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const relative = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+      if (entry.isDirectory()) {
+        pending.push({ directory: join(directory, entry.name), prefix: relative });
+      } else if (entry.isFile()) {
+        files.push(relative);
+      }
+    }
+  }
+  return files.sort();
 }
 
 const FIFO_SUBPROCESS_TIMEOUT_MS = 3_000;
@@ -128,9 +179,94 @@ test.skipIf(process.platform === "win32")("loadConfig promptly rejects a FIFO st
   }
 });
 
-test("omitting statusHttp leaves the optional listener disabled", () => {
+test("statusHttp defaults to the enabled all-interface listener without credentials", () => {
   const parsed = parseConfig(configDocument(), { env: {}, homeDir: HOME });
-  expect("statusHttp" in parsed ? parsed.statusHttp : undefined).toBeUndefined();
+  expect(parsed.statusHttp).toMatchObject(DEFAULT_STATUS_HTTP);
+  expect(parsed.statusHttp?.token).toBeUndefined();
+  expect(parsed.statusHttp?.tokenFile).toBeUndefined();
+});
+
+test("OMP_CHANNEL_OCTO_HTTP_ENABLED=false disables the listener even when a token is configured", () => {
+  const parsed = parseConfig(
+    configDocument({
+      statusHttp: { listenAddress: EXAMPLE_ADDRESS, port: 43127, tokenFile: "/var/private/status.token" },
+    }),
+    { env: statusEnvironment({ enabled: "false", token: ENV_TOKEN }), homeDir: HOME },
+  );
+  // Presence of `statusHttp` is the enabled signal; explicit disable removes the listener entirely.
+  expect(parsed.statusHttp).toBeUndefined();
+});
+
+test("status environment values override every configured statusHttp field", () => {
+  const parsed = parseConfig(
+    configDocument({
+      statusHttp: {
+        listenAddress: EXAMPLE_ADDRESS,
+        port: 43127,
+        tokenFile: "/var/private/status.token",
+      },
+    }),
+    {
+      env: statusEnvironment({
+        listenAddress: "127.0.0.1",
+        port: "43128",
+        tokenFile: "~/environment-status.token",
+      }),
+      homeDir: HOME,
+    },
+  );
+
+  expect(parsed.statusHttp).toMatchObject({
+    listenAddress: "127.0.0.1",
+    port: 43128,
+    tokenFile: join(HOME, "environment-status.token"),
+  });
+});
+
+test("status environment values fill only the fields they set", () => {
+  const parsed = parseConfig(
+    configDocument({
+      statusHttp: {
+        listenAddress: EXAMPLE_ADDRESS,
+        port: 43127,
+        tokenFile: "/var/private/status.token",
+      },
+    }),
+    { env: statusEnvironment({ port: "43128" }), homeDir: HOME },
+  );
+
+  expect(parsed.statusHttp).toMatchObject({
+    listenAddress: EXAMPLE_ADDRESS,
+    port: 43128,
+    tokenFile: "/var/private/status.token",
+  });
+});
+
+test("statusHttp block fields fall back individually to defaults", () => {
+  const cases: ReadonlyArray<readonly [unknown, Record<string, unknown>]> = [
+    [{}, DEFAULT_STATUS_HTTP],
+    [{ listenAddress: "127.0.0.1" }, { ...DEFAULT_STATUS_HTTP, listenAddress: "127.0.0.1" }],
+    [{ port: 43127 }, { ...DEFAULT_STATUS_HTTP, port: 43127 }],
+    [
+      { tokenFile: "~/.oco/status/status.token" },
+      { ...DEFAULT_STATUS_HTTP, tokenFile: join(HOME, ".oco/status/status.token") },
+    ],
+  ];
+
+  for (const [statusHttp, expected] of cases) {
+    const parsed = parseConfig(configDocument({ statusHttp }), { env: {}, homeDir: HOME });
+    expect(parsed.statusHttp).toMatchObject(expected);
+    expect(parsed.statusHttp?.token).toBeUndefined();
+  }
+});
+
+test("a direct environment token enables the listener when statusHttp is omitted", () => {
+  const parsed = parseConfig(configDocument(), {
+    env: statusEnvironment({ token: ENV_TOKEN }),
+    homeDir: HOME,
+  });
+
+  expect(parsed.statusHttp).toMatchObject({ ...DEFAULT_STATUS_HTTP, token: ENV_TOKEN });
 });
 
 test("statusHttp accepts general IP bind addresses and resolves absolute and home-relative token files", () => {
@@ -158,14 +294,10 @@ const invalidStatusHttp: ReadonlyArray<readonly [string, unknown]> = [
   ["a null block", null],
   ["an array block", []],
   ["a primitive block", true],
-  ["a missing listenAddress", { port: 43127, tokenFile: "/tmp/status.token" }],
-  ["a missing port", { listenAddress: EXAMPLE_ADDRESS, tokenFile: "/tmp/status.token" }],
-  ["a missing tokenFile", { listenAddress: EXAMPLE_ADDRESS, port: 43127 }],
   ["a whitespace-only listenAddress", { listenAddress: " ", port: 43127, tokenFile: "/tmp/status.token" }],
   ["a malformed IP literal", { listenAddress: "300.1.1.1", port: 43127, tokenFile: "/tmp/status.token" }],
   ["a URL instead of a bind address", { listenAddress: "http://198.51.100.17", port: 43127, tokenFile: "/tmp/status.token" }],
   ["a CIDR instead of a single bind address", { listenAddress: "198.51.100.17/24", port: 43127, tokenFile: "/tmp/status.token" }],
-  ["a missing port value", { listenAddress: EXAMPLE_ADDRESS, port: undefined, tokenFile: "/tmp/status.token" }],
   ["a string port", { listenAddress: EXAMPLE_ADDRESS, port: "43127", tokenFile: "/tmp/status.token" }],
   ["a fractional port", { listenAddress: EXAMPLE_ADDRESS, port: 43127.5, tokenFile: "/tmp/status.token" }],
   ["port zero", { listenAddress: EXAMPLE_ADDRESS, port: 0, tokenFile: "/tmp/status.token" }],
@@ -182,6 +314,143 @@ for (const [description, statusHttp] of invalidStatusHttp) {
   });
 }
 
+const invalidStatusEnvironment: ReadonlyArray<readonly [string, StatusEnvironment]> = [
+  ["a non-integer port", { port: "43127.5" }],
+  ["a non-numeric port", { port: "abc" }],
+  ["a port below the TCP range", { port: "0" }],
+  ["a port above the TCP range", { port: "65536" }],
+  ["a URL instead of a bind address", { listenAddress: "http://127.0.0.1" }],
+  ["a malformed IP literal", { listenAddress: "300.1.1.1" }],
+  ["a relative token file", { tokenFile: "status.token" }],
+  ["a token path for another user's home", { tokenFile: "~someone/status.token" }],
+];
+
+for (const [description, env] of invalidStatusEnvironment) {
+  test(`status environment rejects ${description}`, () => {
+    expectStatusEnvironmentFailure(statusEnvironment(env));
+  });
+}
+
+const invalidStatusEnvironmentTokens = [
+  ["a short token", "abc"],
+  ["an odd-length hexadecimal token", "a".repeat(63)],
+  ["a non-hexadecimal token", "g".repeat(64)],
+] as const;
+
+for (const [description, token] of invalidStatusEnvironmentTokens) {
+  test(`status environment token rejects ${description} without echoing it`, () => {
+    const error = expectStatusEnvironmentFailure(statusEnvironment({ token }));
+    expect(error.message).not.toContain(token);
+  });
+}
+
+test("loadConfig enables the listener by default without creating any status file", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "oco-status-config-default-"));
+  const configPath = join(directory, "config.json");
+
+  try {
+    await writeConfig(configPath, configDocument());
+
+    const loaded = await loadConfig(configPath, { env: {}, homeDir: directory });
+    expect(loaded.statusHttp).toMatchObject(DEFAULT_STATUS_HTTP);
+    expect(loaded.statusHttp?.token).toBeUndefined();
+    expect(loaded.statusHttp?.tokenFile).toBeUndefined();
+
+    // The only file is the operator's config: no generated token file or credential directory.
+    expect(await relativeFilesUnder(directory)).toEqual(["config.json"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig ignores a missing token file when a direct environment token is set", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "oco-status-config-env-token-"));
+  const configPath = join(directory, "config.json");
+  const missingTokenFile = join(directory, "missing.status.token");
+
+  try {
+    await writeConfig(configPath, configDocument());
+
+    const loaded = await loadConfig(configPath, {
+      env: statusEnvironment({ token: ENV_TOKEN, tokenFile: "~/missing.status.token" }),
+      homeDir: directory,
+    });
+
+    expect(loaded.statusHttp?.token).toBe(ENV_TOKEN);
+    await expect(stat(missingTokenFile)).rejects.toThrow();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig falls back to a private token file configured through the environment", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "oco-status-config-env-file-"));
+  const configPath = join(directory, "config.json");
+  const tokenFile = join(directory, "status.token");
+
+  try {
+    await writeFile(tokenFile, STATUS_TOKEN, { encoding: "utf8", mode: 0o600 });
+    await chmod(tokenFile, 0o600);
+    await writeConfig(configPath, configDocument());
+
+    const loaded = await loadConfig(configPath, {
+      env: statusEnvironment({ tokenFile: "~/status.token" }),
+      homeDir: directory,
+    });
+
+    expect(loaded.statusHttp).toMatchObject({ ...DEFAULT_STATUS_HTTP, tokenFile });
+    expect(loaded.statusHttp?.token).toBeUndefined();
+    expect(JSON.stringify(loaded)).not.toContain(STATUS_TOKEN);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig rejects an environment token file that is missing or unsafe", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "oco-status-config-env-bad-file-"));
+  const configPath = join(directory, "config.json");
+
+  try {
+    await writeConfig(configPath, configDocument());
+
+    const missingTokenFile = join(directory, "missing.status.token");
+    await expect(
+      loadConfig(configPath, {
+        env: statusEnvironment({ tokenFile: missingTokenFile }),
+        homeDir: directory,
+      }),
+    ).rejects.toThrow();
+
+    const unsafeTokenFile = join(directory, "unsafe.status.token");
+    await writeFile(unsafeTokenFile, STATUS_TOKEN, { encoding: "utf8", mode: 0o644 });
+    await chmod(unsafeTokenFile, 0o644);
+    await expect(
+      loadConfig(configPath, {
+        env: statusEnvironment({ tokenFile: unsafeTokenFile }),
+        homeDir: directory,
+      }),
+    ).rejects.toThrow();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig rejects an explicitly configured status token file that does not exist", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "oco-status-config-missing-file-"));
+  const configPath = join(directory, "config.json");
+  const tokenFile = join(directory, "missing.status.token");
+
+  try {
+    await writeConfig(configPath, configDocument({
+      statusHttp: { listenAddress: EXAMPLE_ADDRESS, port: 43127, tokenFile },
+    }));
+
+    await expect(loadConfig(configPath, { env: {}, homeDir: directory })).rejects.toThrow();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("loadConfig keeps the status token in a private separate file", async () => {
   const directory = await mkdtemp(join(tmpdir(), "oco-status-config-"));
   const configPath = join(directory, "config.json");
@@ -196,6 +465,7 @@ test("loadConfig keeps the status token in a private separate file", async () =>
     const loaded = await loadConfig(configPath, { env: {}, homeDir: directory });
 
     expect(loaded).toMatchObject({ statusHttp });
+    expect(loaded.statusHttp?.token).toBeUndefined();
     expect(JSON.stringify(loaded)).not.toContain(STATUS_TOKEN);
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -232,6 +502,7 @@ test.skipIf(process.platform !== "darwin")("loadConfig rejects a status token ac
     const configPath = join(directory, "config.json");
     const tokenFile = join(directory, "status.token");
     await writeFile(tokenFile, STATUS_TOKEN, { mode: 0o600 });
+    await chmod(tokenFile, 0o600);
     expect(Bun.spawnSync(["/bin/chmod", "+a", "everyone allow read", tokenFile]).exitCode).toBe(0);
     await writeConfig(configPath, configDocument({
       statusHttp: { listenAddress: EXAMPLE_ADDRESS, port: 43127, tokenFile },

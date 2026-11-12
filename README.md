@@ -309,21 +309,16 @@ channel 另补两块只读呈现，均由权威实验状态驱动，不从工具
 
 ### 只读 HTTP 状态接口
 
-状态接口默认关闭。只有在服务主配置中显式加入 `statusHttp` 块，channel 服务启动时才会启动 HTTP 只读状态监听；配置更改需重启服务生效。删除整个 `statusHttp` 字段并重启即可停止监听，不需要或支持用 `enabled: false` 关闭。
+状态接口默认启用；服务进程有独立 Bearer token 时监听 `0.0.0.0:8765`，缺少 token 时 channel 继续运行并提示接口未启动。在服务目录的私有 `.envrc` 设置：
 
-将以下块合并到 `~/.oco/config/config.json`，按部署选择服务端绑定地址、未占用端口和 token 文件路径：
-
-```json
-{
-  "statusHttp": {
-    "listenAddress": "0.0.0.0",
-    "port": 8765,
-    "tokenFile": "~/.oco/config/status-token"
-  }
-}
+```sh
+export OMP_CHANNEL_OCTO_HTTP_TOKEN='<32 字节随机值的十六进制编码>'
+# 可选：覆盖默认监听地址和端口
+export OMP_CHANNEL_OCTO_HTTP_LISTEN_ADDRESS='0.0.0.0'
+export OMP_CHANNEL_OCTO_HTTP_PORT='8765'
 ```
 
-`listenAddress` 必须是服务端的 IP 地址；示例 `0.0.0.0` 会监听所有 IPv4 接口，请按需限制主机防火墙。`tokenFile` 必须由运行服务的当前用户拥有、权限为 `0600` 且无额外 ACL，文件内容为 32 字节密码学随机值的 64 位十六进制字符串，不附加空白或换行。每次请求都会重新读取该文件；替换 token 后旧 token 即失效。不要把 token 放进仓库、配置示例或聊天；客户端必须配置与该文件内容完全一致的 token。
+监听地址必须是 IP 地址；`0.0.0.0` 会监听所有 IPv4 接口，请按需限制主机防火墙。设置 `OMP_CHANNEL_OCTO_HTTP_ENABLED=false` 可关闭接口。环境变量优先于原有 `statusHttp` 配置；`OMP_CHANNEL_OCTO_HTTP_TOKEN_FILE` 或原有 `statusHttp.tokenFile` 可作为未设置环境变量 token 时的回退，该文件必须由运行服务的当前用户拥有、权限为 `0600` 且无额外 ACL。文件 token 每次请求重新读取；环境变量 token 更改需要重启进程。不要将 token 写入仓库或聊天。
 
 客户端使用普通 HTTP(S) base URL；服务不区分 Tailscale、局域网或公网，网络可达性由系统网络、DNS 和监听/防火墙配置决定，只需相应填写 URL，例如 `http://my-mini:8765`。Bearer token 不加密传输；公网访问必须使用 HTTPS（例如经 HTTPS 反向代理），否则明文 HTTP 上的 token 可被窃听。客户端配置位置和状态面板行为见 [OctoBuddy Enhancer 说明](packages/octobuddy-enhancer/README.md)。
 

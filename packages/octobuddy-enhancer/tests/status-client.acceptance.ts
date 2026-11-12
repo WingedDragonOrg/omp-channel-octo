@@ -1,7 +1,8 @@
 import { chmod, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, test } from "bun:test";
+import { beforeAll, expect, test } from "bun:test";
 
 type StatusSnapshot = {
   version: 1;
@@ -48,6 +49,42 @@ type LocalHttpFixture = {
 };
 
 const bearerToken = "test-channel-status-token-0123456789abcdef";
+const envBearerToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const fileBearerToken = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+const statusEnvironmentNames = ["OCTOBUDDY_HTTP_BASE_URL", "OCTOBUDDY_HTTP_TOKEN"] as const;
+
+// The client must see only the test process environment; never inherit the user's private values.
+beforeAll(() => {
+  for (const name of statusEnvironmentNames) delete process.env[name];
+});
+
+interface StatusEnvironment {
+  baseUrl?: string;
+  token?: string;
+}
+
+async function withStatusEnvironment<T>(
+  values: StatusEnvironment,
+  exercise: () => Promise<T>,
+): Promise<T> {
+  const previous = new Map<string, string | undefined>();
+  for (const name of statusEnvironmentNames) {
+    previous.set(name, process.env[name]);
+    delete process.env[name];
+  }
+  if (values.baseUrl !== undefined) process.env.OCTOBUDDY_HTTP_BASE_URL = values.baseUrl;
+  if (values.token !== undefined) process.env.OCTOBUDDY_HTTP_TOKEN = values.token;
+  try {
+    return await exercise();
+  } finally {
+    for (const name of statusEnvironmentNames) {
+      const value = previous.get(name);
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
 const snapshot: StatusSnapshot = {
   version: 1,
   pid: 47291,
@@ -157,8 +194,12 @@ interface IsolatedScriptResult {
   stderr: string;
 }
 
-async function runIsolatedScript(script: string): Promise<IsolatedScriptResult> {
+async function runIsolatedScript(
+  script: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<IsolatedScriptResult> {
   const child = Bun.spawn([process.execPath, "-e", script], {
+    env: environment,
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -482,3 +523,218 @@ test.skipIf(process.platform !== "darwin")("rejects a client configuration that 
     });
   });
 });
+
+test("environment base URL and token override a private status file and authenticate over HTTP", async () => {
+  const clientModule = await loadStatusClient();
+  await withTempDirectory(async (directory) => {
+    const configPath = join(directory, "status-client.json");
+    // The file points at an unreachable endpoint and uses a different token; both environment values must win.
+    await writeFile(configPath, JSON.stringify({ baseUrl: "http://127.0.0.1:1", token: fileBearerToken }), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    await chmod(configPath, 0o600);
+
+    const authorizations: (string | null)[] = [];
+    await withLocalHttpFixture((request) => {
+      authorizations.push(request.headers.get("authorization"));
+      if (request.headers.get("authorization") !== `Bearer ${envBearerToken}`) {
+        return statusResponse({ error: { code: "unauthorized" } }, 401);
+      }
+      return statusResponse(snapshot);
+    }, async (fixture) => {
+      await withStatusEnvironment({ baseUrl: fixture.baseUrl, token: envBearerToken }, async () => {
+        const client = clientModule.createStatusClient({ configPath });
+        expect(await client.get()).toEqual({ state: "online", snapshot });
+      });
+      expect(authorizations).toEqual([`Bearer ${envBearerToken}`]);
+    });
+  });
+}, 10_000);
+
+test("falls back per field to a private status file when only one environment value is set", async () => {
+  const clientModule = await loadStatusClient();
+  await withTempDirectory(async (directory) => {
+    const configPath = join(directory, "status-client.json");
+    const authorizations: (string | null)[] = [];
+
+    await withLocalHttpFixture((request) => {
+      authorizations.push(request.headers.get("authorization"));
+      return statusResponse(snapshot);
+    }, async (fixture) => {
+      // Environment URL wins; the missing token comes from the private file.
+      await writeFile(configPath, JSON.stringify({ baseUrl: "http://127.0.0.1:1", token: fileBearerToken }), {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      await chmod(configPath, 0o600);
+      await withStatusEnvironment({ baseUrl: fixture.baseUrl }, async () => {
+        const client = clientModule.createStatusClient({ configPath });
+        expect(await client.get()).toEqual({ state: "online", snapshot });
+      });
+
+      // Environment token wins; the missing base URL comes from the private file.
+      await writeFile(configPath, JSON.stringify({ baseUrl: fixture.baseUrl, token: fileBearerToken }), {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      await chmod(configPath, 0o600);
+      await withStatusEnvironment({ token: envBearerToken }, async () => {
+        const client = clientModule.createStatusClient({ configPath });
+        expect(await client.get()).toEqual({ state: "online", snapshot });
+      });
+    });
+
+    expect(authorizations).toEqual([`Bearer ${fileBearerToken}`, `Bearer ${envBearerToken}`]);
+  });
+}, 10_000);
+
+test("reports unconfigured when environment and file together do not provide both values", async () => {
+  const clientModule = await loadStatusClient();
+  await withTempDirectory(async (directory) => {
+    let requestCount = 0;
+    await withLocalHttpFixture(() => {
+      requestCount += 1;
+      return statusResponse(snapshot);
+    }, async (fixture) => {
+      const configPath = join(directory, "missing.json");
+      const cases: StatusEnvironment[] = [
+        {},
+        { baseUrl: fixture.baseUrl },
+        { token: envBearerToken },
+      ];
+      for (const values of cases) {
+        await withStatusEnvironment(values, async () => {
+          expect(await clientModule.createStatusClient({ configPath }).get()).toEqual({ state: "unconfigured" });
+        });
+      }
+    });
+    expect(requestCount).toBe(0);
+  });
+}, 10_000);
+
+test("does not fall back to an unsafe private file for a missing environment field", async () => {
+  const clientModule = await loadStatusClient();
+  await withTempDirectory(async (directory) => {
+    const configPath = join(directory, "status-client.json");
+    let requestCount = 0;
+    await withLocalHttpFixture(() => {
+      requestCount += 1;
+      return statusResponse(snapshot);
+    }, async (fixture) => {
+      await writeFile(configPath, JSON.stringify({ baseUrl: fixture.baseUrl, token: fileBearerToken }), {
+        encoding: "utf8",
+        mode: 0o644,
+      });
+      await chmod(configPath, 0o644);
+      expect((await stat(configPath)).mode & 0o777).toBe(0o644);
+
+      await withStatusEnvironment({ baseUrl: fixture.baseUrl }, async () => {
+        expect(await clientModule.createStatusClient({ configPath }).get()).toEqual({ state: "invalid" });
+      });
+      await withStatusEnvironment({ token: envBearerToken }, async () => {
+        expect(await clientModule.createStatusClient({ configPath }).get()).toEqual({ state: "invalid" });
+      });
+    });
+    expect(requestCount).toBe(0);
+  });
+}, 10_000);
+
+test("uses environment configuration without reading or creating a status file", async () => {
+  const clientModule = await loadStatusClient();
+  await withTempDirectory(async (directory) => {
+    let authorizations: (string | null)[] = [];
+    await withLocalHttpFixture((request) => {
+      authorizations.push(request.headers.get("authorization"));
+      return statusResponse(snapshot);
+    }, async (fixture) => {
+      const missingPath = join(directory, "absent-status.json");
+      await withStatusEnvironment({ baseUrl: fixture.baseUrl, token: envBearerToken }, async () => {
+        const client = clientModule.createStatusClient({ configPath: missingPath });
+        expect(await client.get()).toEqual({ state: "online", snapshot });
+      });
+      expect(existsSync(missingPath)).toBe(false);
+
+      const fifoPath = join(directory, "fifo-status.json");
+      expect(Bun.spawnSync(["mkfifo", fifoPath]).exitCode).toBe(0);
+      expect((await stat(fifoPath)).isFIFO()).toBe(true);
+      await chmod(fifoPath, 0o600);
+
+      const clientModuleUrl = new URL("../src/host/status-client.ts", import.meta.url).href;
+      const child = await runIsolatedScript(`
+        void (async () => {
+          const { createStatusClient } = await import(${JSON.stringify(clientModuleUrl)});
+          const result = await createStatusClient({ configPath: ${JSON.stringify(fifoPath)} }).get();
+          process.stdout.write(JSON.stringify({ state: result.state }) + "\\n");
+        })().catch(error => {
+          console.error(error);
+          process.exitCode = 1;
+        });
+      `, {
+        ...process.env,
+        OCTOBUDDY_HTTP_BASE_URL: fixture.baseUrl,
+        OCTOBUDDY_HTTP_TOKEN: envBearerToken,
+      });
+
+      expect(child.timedOut).toBe(false);
+      expect(child.exitCode).toBe(0);
+      expect(child.stderr).not.toContain(envBearerToken);
+      expect(JSON.parse(child.stdout.trim())).toEqual({ state: "online" });
+      expect((await stat(fifoPath)).isFIFO()).toBe(true);
+    });
+    expect(authorizations).toEqual([`Bearer ${envBearerToken}`, `Bearer ${envBearerToken}`]);
+  });
+}, 10_000);
+
+test("sends the environment bearer token over real HTTP and reports a 401 as unauthorized", async () => {
+  const clientModule = await loadStatusClient();
+  await withTempDirectory(async (directory) => {
+    let authorization: string | null = null;
+    await withLocalHttpFixture((request) => {
+      authorization = request.headers.get("authorization");
+      return statusResponse({ error: { code: "unauthorized" } }, 401);
+    }, async (fixture) => {
+      const configPath = join(directory, "missing.json");
+      await withStatusEnvironment({ baseUrl: fixture.baseUrl, token: envBearerToken }, async () => {
+        const client = clientModule.createStatusClient({ configPath });
+        expect(await client.get()).toEqual({ state: "unauthorized" });
+      });
+      expect(authorization).toBe(`Bearer ${envBearerToken}`);
+    });
+  });
+}, 10_000);
+
+test("validates the merged configuration instead of an environment-overridden invalid file field", async () => {
+  const clientModule = await loadStatusClient();
+  await withTempDirectory(async (directory) => {
+    const configPath = join(directory, "status-client.json");
+    const authorizations: (string | null)[] = [];
+    await withLocalHttpFixture((request) => {
+      authorizations.push(request.headers.get("authorization"));
+      return statusResponse(snapshot);
+    }, async (fixture) => {
+      // The file base URL is invalid, but the environment URL replaces it; the file token remains valid.
+      await writeFile(configPath, JSON.stringify({ baseUrl: "ftp://127.0.0.1", token: fileBearerToken }), {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      await chmod(configPath, 0o600);
+      await withStatusEnvironment({ baseUrl: fixture.baseUrl }, async () => {
+        const client = clientModule.createStatusClient({ configPath });
+        expect(await client.get()).toEqual({ state: "online", snapshot });
+      });
+
+      // The file token is invalid, but the environment token replaces it; the file base URL remains valid.
+      await writeFile(configPath, JSON.stringify({ baseUrl: fixture.baseUrl, token: "too-short" }), {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      await chmod(configPath, 0o600);
+      await withStatusEnvironment({ token: envBearerToken }, async () => {
+        const client = clientModule.createStatusClient({ configPath });
+        expect(await client.get()).toEqual({ state: "online", snapshot });
+      });
+    });
+    expect(authorizations).toEqual([`Bearer ${fileBearerToken}`, `Bearer ${envBearerToken}`]);
+  });
+}, 10_000);

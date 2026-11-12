@@ -342,15 +342,22 @@ async function runService(
     }
     // Publish snapshots only after CoreService is ready; shutdown closes HTTP before stopping it.
     if (!shutdownRequested && config.statusHttp !== undefined) {
-      statusServer = await startStatusServer({
-        ...config.statusHttp,
-        statusSnapshot: () => activeService.statusSnapshot(),
-        chatStatusSnapshot: target => activeService.chatStatusSnapshot(target),
-      });
-      if (!shutdownRequested) {
-        console.log(
-          `[status] HTTP 状态接口已启动：${config.statusHttp.listenAddress}:${statusServer.port}`,
+      const statusHttp = config.statusHttp;
+      if (statusHttp.token === undefined && statusHttp.tokenFile === undefined) {
+        console.warn(
+          "[status] HTTP 状态接口未启动：缺少 OMP_CHANNEL_OCTO_HTTP_TOKEN 或 OMP_CHANNEL_OCTO_HTTP_TOKEN_FILE",
         );
+      } else {
+        statusServer = await startStatusServer({
+          ...statusHttp,
+          statusSnapshot: () => activeService.statusSnapshot(),
+          chatStatusSnapshot: target => activeService.chatStatusSnapshot(target),
+        });
+        if (!shutdownRequested) {
+          console.log(
+            `[status] HTTP 状态接口已启动：${statusHttp.listenAddress}:${statusServer.port}`,
+          );
+        }
       }
     }
     if (config.ownerId === undefined) console.log(UNCONFIGURED_OWNER_NOTICE);

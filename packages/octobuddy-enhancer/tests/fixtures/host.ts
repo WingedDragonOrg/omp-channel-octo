@@ -399,6 +399,9 @@ function createTestDocument(): TestDocument {
       querySelector(selector) { return query(element, selector, false)[0] ?? null; },
     };
     Object.assign(element, {
+      getBoundingClientRect: () => ({ left: 900, right: 1000, top: 300, width: 100, height: 38 }),
+      offsetWidth: 278,
+      offsetHeight: 200,
       classList: {
         add: (...names: string[]) => { element.setAttribute("class", [...names].join(" ")); },
         remove: (...names: string[]) => {
@@ -563,6 +566,8 @@ async function runCdpFixtureChild(): Promise<void> {
     const sandbox: Record<string, unknown> = {
       document: documentFacade,
       location: { href: location.href, origin: location.origin, pathname: location.pathname, hash: location.hash },
+      innerWidth: 1280,
+      innerHeight: 800,
       navigator: { userAgent: "OctoBuddy host fixture" },
       console,
       URL,

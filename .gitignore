@@ -12,3 +12,4 @@ state/
 *.sqlite-wal
 *.sqlite-shm
 *.log
+/packages/octobuddy-enhancer/dist/

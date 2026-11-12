@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { loadStatusEnvironment } from "../src/launcher/status-environment.ts";
 
 const packageDir = resolve(import.meta.dir, "..");
 const launcherCli = join(packageDir, "src/cli.ts");
@@ -72,6 +73,11 @@ interface RecordedProcessIdentity {
   startedAt: string;
 }
 
+const FIXTURE_STATUS_ENVIRONMENT = {
+  OCTOBUDDY_HTTP_BASE_URL: "http://127.0.0.1:1",
+  OCTOBUDDY_HTTP_TOKEN: "synthetic-launcher-fixture-status-token-0123456789abcdef",
+};
+
 function isolatedEnvironment(directory: string): NodeJS.ProcessEnv {
   return {
     PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
@@ -82,7 +88,16 @@ function isolatedEnvironment(directory: string): NodeJS.ProcessEnv {
     XDG_STATE_HOME: join(directory, "state-home"),
     LC_ALL: "C",
     TZ: "UTC",
+    // Both values make the launcher skip the real package .envrc during generic lifecycle tests.
+    ...FIXTURE_STATUS_ENVIRONMENT,
   };
+}
+
+function withoutFixtureStatusEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const result = { ...env };
+  delete result.OCTOBUDDY_HTTP_BASE_URL;
+  delete result.OCTOBUDDY_HTTP_TOKEN;
+  return result;
 }
 
 async function makeFixtureApp(directory: string): Promise<FixtureApp> {
@@ -144,6 +159,54 @@ function launcherCommand(app: FixtureApp, ...extraArgs: string[]): string[] {
     "--state-dir", app.stateDir,
     ...extraArgs,
   ];
+}
+
+const envrcStatusBaseUrl = "http://127.0.0.1:8765";
+const envrcStatusToken = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+const inheritedStatusToken = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+
+function statusEnvrc(baseUrl: string, token: string): string {
+  return `export OCTOBUDDY_HTTP_BASE_URL='${baseUrl}'\nexport OCTOBUDDY_HTTP_TOKEN='${token}'\n`;
+}
+
+async function makeStatusEnvironmentPackage(directory: string, envrc: string): Promise<string> {
+  const root = join(directory, "enhancer-package");
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  for (const name of ["src", "plugins", "vendor"]) {
+    await cp(join(packageDir, name), join(root, name), { recursive: true });
+  }
+  await symlink(join(packageDir, "node_modules"), join(root, "node_modules"));
+  await writeFile(join(root, ".envrc"), envrc.endsWith("\n") ? envrc : `${envrc}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  await chmod(join(root, ".envrc"), 0o600);
+  return root;
+}
+
+async function preAcceptCdpConsent(stateDir: string): Promise<void> {
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
+  await writeFile(
+    join(stateDir, "cdp-consent.json"),
+    JSON.stringify({ version: 1, accepted: true, acceptedAt: new Date().toISOString() }),
+    { encoding: "utf8", mode: 0o600 },
+  );
+}
+
+function readProcessEnvironment(pid: number, names: readonly string[]): Record<string, string | undefined> {
+  const result = Bun.spawnSync(["/bin/ps", "eww", "-p", String(pid)], {
+    env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(result.exitCode).toBe(0);
+  const text = decoder.decode(result.stdout);
+  const values: Record<string, string | undefined> = {};
+  for (const name of names) {
+    const match = new RegExp(`(?:^|\\s)${name}=([^\\s]+)`).exec(text);
+    values[name] = match?.[1];
+  }
+  return values;
 }
 
 
@@ -221,10 +284,16 @@ function capturedOutput(child: CapturedProcess): string {
   return `${child.output().stdout}\n${child.output().stderr}`.replace(/\s+/g, " ");
 }
 
-async function readLaunches(path: string): Promise<Array<{ pid: number; port: number }>> {
+interface RecordedLaunch {
+  pid: number;
+  port: number;
+  statusEnvironment?: { baseUrlPresent: boolean; tokenPresent: boolean };
+}
+
+async function readLaunches(path: string): Promise<RecordedLaunch[]> {
   try {
     const contents = await readFile(path, "utf8");
-    return contents.split("\n").filter(Boolean).map((line) => JSON.parse(line) as { pid: number; port: number });
+    return contents.split("\n").filter(Boolean).map((line) => JSON.parse(line) as RecordedLaunch);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw error;
@@ -838,3 +907,213 @@ test("concurrent launchers cannot both reclaim the same stale lock", async () =>
   }
 }, 45_000);
 
+
+test("Finder launch passes .envrc status values only to the enhancer host", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "octobuddy-launcher-status-env-"));
+  let app: FixtureApp | undefined;
+  let launcher: CapturedProcess | undefined;
+  const hosts: RecordedProcessIdentity[] = [];
+  const monitors: RecordedProcessIdentity[] = [];
+  try {
+    const packageRoot = await makeStatusEnvironmentPackage(
+      directory,
+      statusEnvrc(envrcStatusBaseUrl, envrcStatusToken),
+    );
+    app = await makeFixtureApp(directory);
+    await preAcceptCdpConsent(app.stateDir);
+    // The inherited environment supplies only the token; the private .envrc supplies the base URL.
+    const launcherEnvironment = withoutFixtureStatusEnvironment(app.env);
+    launcherEnvironment.OCTOBUDDY_HTTP_TOKEN = inheritedStatusToken;
+    launcher = startInteractive([
+      process.execPath,
+      join(packageRoot, "src", "cli.ts"),
+      "--dock",
+      "--app-path", app.appPath,
+      "--state-dir", app.stateDir,
+    ], launcherEnvironment);
+
+    await waitUntil(async () => {
+      const state = await readLauncherState(app!.stateDir);
+      return state === "ready" || state === "error";
+    }, 20_000);
+    expect(await readLauncherState(app.stateDir)).toBe("ready");
+
+    const host = await readStateProcess(join(app.stateDir, "host.json"));
+    if (host) hosts.push(host);
+    const monitor = await readStateProcess(join(app.stateDir, "launcher.lock"), "monitorPid", "monitorStartedAt");
+    if (monitor) monitors.push(monitor);
+    if (!host) throw new Error("launcher did not record its enhancer host identity");
+
+    const hostEnvironment = readProcessEnvironment(host.pid, [
+      "OCTOBUDDY_HTTP_BASE_URL",
+      "OCTOBUDDY_HTTP_TOKEN",
+    ]);
+    expect(hostEnvironment.OCTOBUDDY_HTTP_BASE_URL).toBe(envrcStatusBaseUrl);
+    expect(hostEnvironment.OCTOBUDDY_HTTP_TOKEN).toBe(inheritedStatusToken);
+
+    const launches = await readLaunches(app.launchLog);
+    expect(launches).toHaveLength(1);
+    expect(launches[0]!.statusEnvironment).toEqual({ baseUrlPresent: false, tokenPresent: false });
+  } finally {
+    if (app) await stopFixtureApp(app, (await readLaunches(app.launchLog)).map((launch) => launch.pid));
+    if (launcher && processIsAlive(launcher.child.pid)) launcher.child.kill("SIGTERM");
+    if (launcher) {
+      await launcher.child.exited;
+      await launcher.outputDone;
+    }
+    for (const identity of hosts) await signalRecordedProcess(identity);
+    for (const identity of monitors) await signalRecordedProcess(identity, "SIGKILL");
+    for (const identity of [...hosts, ...monitors]) {
+      await waitUntil(() => !isRecordedProcessAlive(identity), 8_000).catch(() => {});
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("Finder launch evaluates .envrc with standard shell expansion only for the enhancer host", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "octobuddy-launcher-status-env-shell-"));
+  let app: FixtureApp | undefined;
+  let launcher: CapturedProcess | undefined;
+  const hosts: RecordedProcessIdentity[] = [];
+  const monitors: RecordedProcessIdentity[] = [];
+  try {
+    const envrc = [
+      "export OCTOBUDDY_STATUS_TEST_HOST='127.0.0.1'",
+      "export OCTOBUDDY_HTTP_BASE_URL=\"http://${OCTOBUDDY_STATUS_TEST_HOST}:${OCTOBUDDY_STATUS_TEST_PORT:-8765}\"",
+      "export OCTOBUDDY_STATUS_TOKEN_HEAD='00112233445566778899aabbccddeeff'",
+      "export OCTOBUDDY_HTTP_TOKEN=\"$(printf '%s%s' \"$OCTOBUDDY_STATUS_TOKEN_HEAD\" '00112233445566778899aabbccddeeff')\"",
+    ].join("\n");
+    const packageRoot = await makeStatusEnvironmentPackage(directory, envrc);
+    app = await makeFixtureApp(directory);
+    await preAcceptCdpConsent(app.stateDir);
+    launcher = startInteractive([
+      process.execPath,
+      join(packageRoot, "src", "cli.ts"),
+      "--dock",
+      "--app-path", app.appPath,
+      "--state-dir", app.stateDir,
+    ], withoutFixtureStatusEnvironment(app.env));
+
+    await waitUntil(async () => {
+      const state = await readLauncherState(app!.stateDir);
+      return state === "ready" || state === "error";
+    }, 20_000);
+    expect(await readLauncherState(app.stateDir)).toBe("ready");
+
+    const host = await readStateProcess(join(app.stateDir, "host.json"));
+    if (host) hosts.push(host);
+    const monitor = await readStateProcess(join(app.stateDir, "launcher.lock"), "monitorPid", "monitorStartedAt");
+    if (monitor) monitors.push(monitor);
+    if (!host) throw new Error("launcher did not record its enhancer host identity");
+
+    const hostEnvironment = readProcessEnvironment(host.pid, [
+      "OCTOBUDDY_HTTP_BASE_URL",
+      "OCTOBUDDY_HTTP_TOKEN",
+    ]);
+    expect(hostEnvironment.OCTOBUDDY_HTTP_BASE_URL).toBe(envrcStatusBaseUrl);
+    expect(hostEnvironment.OCTOBUDDY_HTTP_TOKEN).toBe(envrcStatusToken);
+    expect(`${launcher.output().stdout}\n${launcher.output().stderr}`).not.toContain(envrcStatusToken);
+
+    const launches = await readLaunches(app.launchLog);
+    expect(launches).toHaveLength(1);
+    expect(launches[0]!.statusEnvironment).toEqual({ baseUrlPresent: false, tokenPresent: false });
+  } finally {
+    if (app) await stopFixtureApp(app, (await readLaunches(app.launchLog)).map((launch) => launch.pid));
+    if (launcher && processIsAlive(launcher.child.pid)) launcher.child.kill("SIGTERM");
+    if (launcher) {
+      await launcher.child.exited;
+      await launcher.outputDone;
+    }
+    for (const identity of hosts) await signalRecordedProcess(identity);
+    for (const identity of monitors) await signalRecordedProcess(identity, "SIGKILL");
+    for (const identity of [...hosts, ...monitors]) {
+      await waitUntil(() => !isRecordedProcessAlive(identity), 8_000).catch(() => {});
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("fails with a generic error when the private .envrc cannot be evaluated", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "octobuddy-launcher-status-env-failure-"));
+  try {
+    const envrcPath = join(directory, ".envrc");
+    await writeFile(envrcPath, [
+      "export OCTOBUDDY_HTTP_BASE_URL='http://127.0.0.1:8765'",
+      `export OCTOBUDDY_HTTP_TOKEN='${envrcStatusToken}'`,
+      'echo "$OCTOBUDDY_HTTP_TOKEN"',
+      'echo "$OCTOBUDDY_HTTP_TOKEN" >&2',
+      "false",
+    ].join("\n"), { encoding: "utf8", mode: 0o600 });
+    await chmod(envrcPath, 0o600);
+
+    let message = "";
+    try {
+      await loadStatusEnvironment({ envrcPath, env: {} });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toBe("status environment file could not be evaluated");
+    expect(message).not.toContain(envrcStatusToken);
+    expect(message).not.toContain("http://127.0.0.1:8765");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("CLI launch loads .envrc status values from the isolated package into the host", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "octobuddy-launcher-status-env-cli-"));
+  let app: FixtureApp | undefined;
+  let launcher: CapturedProcess | undefined;
+  const hosts: RecordedProcessIdentity[] = [];
+  const monitors: RecordedProcessIdentity[] = [];
+  try {
+    const packageRoot = await makeStatusEnvironmentPackage(
+      directory,
+      statusEnvrc(envrcStatusBaseUrl, envrcStatusToken),
+    );
+    app = await makeFixtureApp(directory);
+    await preAcceptCdpConsent(app.stateDir);
+    launcher = startInteractive([
+      process.execPath,
+      join(packageRoot, "src", "cli.ts"),
+      "--app-path", app.appPath,
+      "--state-dir", app.stateDir,
+    ], withoutFixtureStatusEnvironment(app.env));
+
+    await waitUntil(async () => {
+      const state = await readLauncherState(app!.stateDir);
+      return state === "ready" || state === "error";
+    }, 20_000);
+    expect(await readLauncherState(app.stateDir)).toBe("ready");
+
+    const host = await readStateProcess(join(app.stateDir, "host.json"));
+    if (host) hosts.push(host);
+    const monitor = await readStateProcess(join(app.stateDir, "launcher.lock"), "monitorPid", "monitorStartedAt");
+    if (monitor) monitors.push(monitor);
+    if (!host) throw new Error("launcher did not record its enhancer host identity");
+
+    const hostEnvironment = readProcessEnvironment(host.pid, [
+      "OCTOBUDDY_HTTP_BASE_URL",
+      "OCTOBUDDY_HTTP_TOKEN",
+    ]);
+    expect(hostEnvironment.OCTOBUDDY_HTTP_BASE_URL).toBe(envrcStatusBaseUrl);
+    expect(hostEnvironment.OCTOBUDDY_HTTP_TOKEN).toBe(envrcStatusToken);
+
+    const launches = await readLaunches(app.launchLog);
+    expect(launches).toHaveLength(1);
+    expect(launches[0]!.statusEnvironment).toEqual({ baseUrlPresent: false, tokenPresent: false });
+  } finally {
+    if (app) await stopFixtureApp(app, (await readLaunches(app.launchLog)).map((launch) => launch.pid));
+    if (launcher && processIsAlive(launcher.child.pid)) launcher.child.kill("SIGTERM");
+    if (launcher) {
+      await launcher.child.exited;
+      await launcher.outputDone;
+    }
+    for (const identity of hosts) await signalRecordedProcess(identity);
+    for (const identity of monitors) await signalRecordedProcess(identity, "SIGKILL");
+    for (const identity of [...hosts, ...monitors]) {
+      await waitUntil(() => !isRecordedProcessAlive(identity), 8_000).catch(() => {});
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
+}, 30_000);

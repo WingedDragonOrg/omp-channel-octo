@@ -117,6 +117,28 @@ test("passes a Zed SSH URL as one argument without local file resolution", async
   }
 }, 10_000);
 
+test("opening Zed does not pass the enhancer HTTP credentials to the editor", async () => {
+  const root = await mkdtemp(join(tmpdir(), "octobuddy-zed-env-"));
+  const executable = join(root, "zed");
+  const output = join(root, "environment");
+  const previousUrl = process.env.OCTOBUDDY_HTTP_BASE_URL;
+  const previousToken = process.env.OCTOBUDDY_HTTP_TOKEN;
+  try {
+    await writeFile(executable, `#!/bin/sh\nprintf '%s %s' "\${OCTOBUDDY_HTTP_BASE_URL+present}" "\${OCTOBUDDY_HTTP_TOKEN+present}" > ${JSON.stringify(output)}\n`, { mode: 0o755 });
+    process.env.OCTOBUDDY_HTTP_BASE_URL = "http://127.0.0.1:8765";
+    process.env.OCTOBUDDY_HTTP_TOKEN = "fixture-only-token";
+    await openInZed({ path: "zed://ssh/fixture/tmp/file" }, { zedExecutable: executable }, () => true);
+    await waitUntil(() => existsSync(output));
+    expect(await readFile(output, "utf8")).toBe(" ");
+  } finally {
+    if (previousUrl === undefined) delete process.env.OCTOBUDDY_HTTP_BASE_URL;
+    else process.env.OCTOBUDDY_HTTP_BASE_URL = previousUrl;
+    if (previousToken === undefined) delete process.env.OCTOBUDDY_HTTP_TOKEN;
+    else process.env.OCTOBUDDY_HTTP_TOKEN = previousToken;
+    await rm(root, { recursive: true, force: true });
+  }
+}, 10_000);
+
 test("matches every content_scripts entry and limits file pages to the two OctoBuddy entry points", async () => {
   await withHost(async (root, fixture, appPath) => {
     const pluginRoot = join(root, "plugins");

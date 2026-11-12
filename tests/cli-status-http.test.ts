@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -36,10 +36,27 @@ async function reserveLoopbackPort(): Promise<number> {
   return address.port;
 }
 
+const STATUS_ENV_KEYS = [
+  "OMP_CHANNEL_OCTO_HTTP_ENABLED",
+  "OMP_CHANNEL_OCTO_HTTP_LISTEN_ADDRESS",
+  "OMP_CHANNEL_OCTO_HTTP_PORT",
+  "OMP_CHANNEL_OCTO_HTTP_TOKEN",
+  "OMP_CHANNEL_OCTO_HTTP_TOKEN_FILE",
+] as const;
+
+function cliEnvironment(home: string, statusEnv: Record<string, string>): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value === undefined || (STATUS_ENV_KEYS as readonly string[]).includes(key)) continue;
+    env[key] = value;
+  }
+  return { ...env, HOME: home, TZ: "UTC", ...statusEnv };
+}
+
 async function startCliRun(
   home: string,
   fixture: OctoProtocolFixture,
-  statusHttp?: StatusHttpConfig,
+  options: { statusHttp?: StatusHttpConfig; statusEnv?: Record<string, string> } = {},
 ): Promise<{ child: Bun.Subprocess; output: Promise<[string, string]> }> {
   const configPath = join(home, "config.json");
   const config: Record<string, unknown> = {
@@ -49,7 +66,7 @@ async function startCliRun(
     stateDir: join(home, "state"),
     ompCommand: process.execPath,
   };
-  if (statusHttp !== undefined) config.statusHttp = statusHttp;
+  if (options.statusHttp !== undefined) config.statusHttp = options.statusHttp;
   await writeFile(configPath, JSON.stringify(config), { encoding: "utf8", mode: 0o600 });
   await chmod(configPath, 0o600);
 
@@ -59,7 +76,7 @@ async function startCliRun(
       cwd: CHECKOUT_ROOT,
       stdout: "pipe",
       stderr: "pipe",
-      env: { ...process.env, HOME: home, TZ: "UTC" },
+      env: cliEnvironment(home, options.statusEnv ?? {}),
     },
   );
   const output = Promise.all([
@@ -161,9 +178,11 @@ test("real CLI run serves an authenticated status snapshot and closes its listen
     fixture = await createOctoProtocolFixture();
     const port = await reserveLoopbackPort();
     const started = await startCliRun(home, fixture, {
-      listenAddress: LISTEN_ADDRESS,
-      port,
-      tokenFile,
+      statusHttp: {
+        listenAddress: LISTEN_ADDRESS,
+        port,
+        tokenFile,
+      },
     });
     child = started.child;
     output = started.output;
@@ -204,7 +223,7 @@ test("real CLI run serves an authenticated status snapshot and closes its listen
   }
 }, 20_000);
 
-test("real CLI run leaves the optional status port closed when statusHttp is omitted", async () => {
+test("real CLI run leaves the status port closed when no token is configured", async () => {
   let home: string | undefined;
   let fixture: OctoProtocolFixture | undefined;
   let child: Bun.Subprocess | undefined;
@@ -223,6 +242,143 @@ test("real CLI run leaves the optional status port closed when statusHttp is omi
 
     child.kill("SIGTERM");
     expect(await waitForChildExit(child)).toBe(0);
+  } finally {
+    await stopChild(child);
+    if (output !== undefined) await output;
+    if (fixture !== undefined) await fixture.close();
+    if (home !== undefined) await rm(home, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test("real CLI run starts the status listener from environment variables alone", async () => {
+  let home: string | undefined;
+  let fixture: OctoProtocolFixture | undefined;
+  let child: Bun.Subprocess | undefined;
+  let output: Promise<[string, string]> | undefined;
+  try {
+    home = await mkdtemp(join(tmpdir(), "oco-cli-status-env-"));
+    const token = randomBytes(32).toString("hex");
+    fixture = await createOctoProtocolFixture();
+    const port = await reserveLoopbackPort();
+    const started = await startCliRun(home, fixture, {
+      statusEnv: {
+        OMP_CHANNEL_OCTO_HTTP_LISTEN_ADDRESS: LISTEN_ADDRESS,
+        OMP_CHANNEL_OCTO_HTTP_PORT: String(port),
+        OMP_CHANNEL_OCTO_HTTP_TOKEN: token,
+      },
+    });
+    child = started.child;
+    output = started.output;
+    await waitForReadyConnection(fixture);
+    expect(fixture.registerRequests).toHaveLength(1);
+
+    const statusUrl = `http://${LISTEN_ADDRESS}:${port}/v1/status`;
+    await waitForStatusListener(statusUrl, child);
+    const authorized = await fetchStatus(statusUrl, `Bearer ${token}`);
+    expect(authorized.status).toBe(200);
+    const authorizedBody = await authorized.text();
+    expect(authorizedBody).not.toContain(token);
+    expect(JSON.parse(authorizedBody)).toMatchObject({ version: 1, pid: child.pid });
+
+    for (const authorization of [undefined, `Bearer ${token}-wrong`]) {
+      const response = await fetchStatus(statusUrl, authorization);
+      expect(response.status).toBe(401);
+      const body = await response.text();
+      expect(body).not.toContain(token);
+      expect(body).not.toContain(String(child.pid));
+    }
+
+    child.kill("SIGTERM");
+    expect(await waitForChildExit(child)).toBe(0);
+    await expectConnectionRefused(port);
+
+    const [stdout, stderr] = await output;
+    expect(stdout).not.toContain(token);
+    expect(stderr).not.toContain(token);
+
+    // Environment configuration is not persisted into the operator's config file.
+    const configText = await readFile(join(home, "config.json"), "utf8");
+    expect(configText).not.toContain("statusHttp");
+    expect(configText).not.toContain(token);
+  } finally {
+    await stopChild(child);
+    if (output !== undefined) await output;
+    if (fixture !== undefined) await fixture.close();
+    if (home !== undefined) await rm(home, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test("real CLI run keeps the channel alive and reports a missing status token", async () => {
+  let home: string | undefined;
+  let fixture: OctoProtocolFixture | undefined;
+  let child: Bun.Subprocess | undefined;
+  let output: Promise<[string, string]> | undefined;
+  try {
+    home = await mkdtemp(join(tmpdir(), "oco-cli-status-no-token-"));
+    fixture = await createOctoProtocolFixture();
+    const port = await reserveLoopbackPort();
+    const started = await startCliRun(home, fixture, {
+      statusEnv: {
+        OMP_CHANNEL_OCTO_HTTP_LISTEN_ADDRESS: LISTEN_ADDRESS,
+        OMP_CHANNEL_OCTO_HTTP_PORT: String(port),
+      },
+    });
+    child = started.child;
+    output = started.output;
+    await waitForReadyConnection(fixture);
+    expect(fixture.registerRequests).toHaveLength(1);
+    expect(child.exitCode).toBeNull();
+
+    await expectConnectionRefused(port);
+
+    child.kill("SIGTERM");
+    expect(await waitForChildExit(child)).toBe(0);
+
+    const [stdout, stderr] = await output;
+    const combined = `${stdout}\n${stderr}`;
+    expect(combined).not.toMatch(/HTTP 状态接口已启动/u);
+    // The operator must see which credential is missing; no value is required or printed.
+    expect(combined).toMatch(/[^\n]*\[status\][^\n]*token/iu);
+  } finally {
+    await stopChild(child);
+    if (output !== undefined) await output;
+    if (fixture !== undefined) await fixture.close();
+    if (home !== undefined) await rm(home, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test("real CLI run disables the status listener when the environment says false", async () => {
+  let home: string | undefined;
+  let fixture: OctoProtocolFixture | undefined;
+  let child: Bun.Subprocess | undefined;
+  let output: Promise<[string, string]> | undefined;
+  try {
+    home = await mkdtemp(join(tmpdir(), "oco-cli-status-off-"));
+    fixture = await createOctoProtocolFixture();
+    const port = await reserveLoopbackPort();
+    const token = randomBytes(32).toString("hex");
+    const started = await startCliRun(home, fixture, {
+      statusEnv: {
+        OMP_CHANNEL_OCTO_HTTP_ENABLED: "false",
+        OMP_CHANNEL_OCTO_HTTP_LISTEN_ADDRESS: LISTEN_ADDRESS,
+        OMP_CHANNEL_OCTO_HTTP_PORT: String(port),
+        OMP_CHANNEL_OCTO_HTTP_TOKEN: token,
+      },
+    });
+    child = started.child;
+    output = started.output;
+    await waitForReadyConnection(fixture);
+    expect(fixture.registerRequests).toHaveLength(1);
+
+    await expectConnectionRefused(port);
+
+    child.kill("SIGTERM");
+    expect(await waitForChildExit(child)).toBe(0);
+
+    const [stdout, stderr] = await output;
+    const combined = `${stdout}\n${stderr}`;
+    expect(combined).not.toMatch(/HTTP 状态接口已启动/u);
+    expect(combined).not.toContain(token);
   } finally {
     await stopChild(child);
     if (output !== undefined) await output;

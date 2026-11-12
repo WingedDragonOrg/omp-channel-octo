@@ -32,7 +32,9 @@ interface ChatStatusSnapshot extends ChatTarget {
 interface StatusServerOptions {
   listenAddress: string;
   port: number;
-  tokenFile: string;
+  /** Direct bearer token; wins over `tokenFile` when both are supplied. */
+  token?: string;
+  tokenFile?: string;
   statusSnapshot: () => ServiceSnapshot;
   chatStatusSnapshot: (target: ChatTarget) => ChatStatusSnapshot;
 }
@@ -215,12 +217,15 @@ function statusServerFifoReportScript(tokenFile: string): string {
   `;
 }
 
-function serverOptions(tokenFile: string, statusSnapshot: () => ServiceSnapshot = () => SERVICE_SNAPSHOT): StatusServerOptions {
+function serverOptions(
+  credentials: { token?: string; tokenFile?: string },
+  statusSnapshot: () => ServiceSnapshot = () => SERVICE_SNAPSHOT,
+): StatusServerOptions {
   return {
     // Tests bind only to loopback; production listen addresses are supplied by configuration.
     listenAddress: "127.0.0.1",
     port: 0,
-    tokenFile,
+    ...credentials,
     statusSnapshot,
     chatStatusSnapshot: target => ({
       version: 1,
@@ -258,7 +263,7 @@ test("status server binds localhost and authenticates real HTTP requests with it
   try {
     expect((await stat(fixture.tokenFile)).mode & 0o777).toBe(0o600);
     const startStatusServer = await loadStartStatusServer();
-    server = await startStatusServer(serverOptions(fixture.tokenFile));
+    server = await startStatusServer(serverOptions({ tokenFile: fixture.tokenFile }));
     expect(server.port).toBeGreaterThan(0);
 
     const url = `http://127.0.0.1:${server.port}/v1/status`;
@@ -283,12 +288,54 @@ test("status server binds localhost and authenticates real HTTP requests with it
   }
 });
 
+test("a direct token takes precedence over the configured token file", async () => {
+  const fixture = await createTokenFixture();
+  const fileToken = randomBytes(32).toString("hex");
+  await writeFile(fixture.tokenFile, fileToken, { mode: 0o600 });
+  let server: StatusServer | undefined;
+  try {
+    const startStatusServer = await loadStartStatusServer();
+    server = await startStatusServer(serverOptions({ token: TOKEN, tokenFile: fixture.tokenFile }));
+    const url = `http://127.0.0.1:${server.port}/v1/status`;
+
+    const direct = await fetch(url, { headers: { authorization: `Bearer ${TOKEN}` } });
+    expect(direct.status).toBe(200);
+    const directBody = await direct.text();
+    expectNoToken(directBody, "Direct-token response");
+    if (directBody.includes(fileToken)) throw new Error("Direct-token response disclosed the token file content");
+    expect(JSON.parse(directBody)).toEqual(SERVICE_SNAPSHOT);
+
+    const fromFile = await fetch(url, { headers: { authorization: `Bearer ${fileToken}` } });
+    expect(fromFile.status).toBe(401);
+  } finally {
+    await server?.stop();
+    await fixture.cleanup();
+  }
+});
+
+test("status server refuses to start without a direct token or token file", async () => {
+  const startStatusServer = await loadStartStatusServer();
+  let server: StatusServer | undefined;
+  let startupError: unknown;
+  try {
+    server = await startStatusServer(serverOptions({}));
+  } catch (error) {
+    startupError = error;
+  } finally {
+    await server?.stop();
+  }
+
+  expect(server).toBeUndefined();
+  expect(startupError).toBeDefined();
+  expect(errorDetails(startupError)).toMatch(/token|凭据|credential/iu);
+});
+
 test("replacing a private token revokes the old token without restarting the server", async () => {
   const fixture = await createTokenFixture();
   let server: StatusServer | undefined;
   try {
     const startStatusServer = await loadStartStatusServer();
-    server = await startStatusServer(serverOptions(fixture.tokenFile));
+    server = await startStatusServer(serverOptions({ tokenFile: fixture.tokenFile }));
     const url = `http://127.0.0.1:${server.port}/v1/status`;
     const replacement = randomBytes(32).toString("hex");
     await writeFile(fixture.tokenFile, replacement, { mode: 0o600 });
@@ -307,7 +354,7 @@ test("stopping the status server closes its listener so a subsequent connection 
   let server: StatusServer | undefined;
   try {
     const startStatusServer = await loadStartStatusServer();
-    server = await startStatusServer(serverOptions(fixture.tokenFile));
+    server = await startStatusServer(serverOptions({ tokenFile: fixture.tokenFile }));
     const url = `http://127.0.0.1:${server.port}/v1/status`;
     const response = await fetch(url, { headers: { authorization: `Bearer ${TOKEN}` } });
     expect(response.status).toBe(200);
@@ -339,7 +386,7 @@ test("status server refuses a token file with group or other access and keeps th
     expect((await stat(fixture.tokenFile)).mode & 0o777).toBe(0o644);
     const startStatusServer = await loadStartStatusServer();
     try {
-      server = await startStatusServer(serverOptions(fixture.tokenFile));
+      server = await startStatusServer(serverOptions({ tokenFile: fixture.tokenFile }));
     } catch (error) {
       startupError = error;
     }
@@ -385,7 +432,7 @@ test.skipIf(process.platform !== "darwin")("refuses a private-mode token file th
     const chmod = Bun.spawnSync(["/bin/chmod", "+a", "everyone allow read", fixture.tokenFile]);
     expect(chmod.exitCode).toBe(0);
     const startStatusServer = await loadStartStatusServer();
-    await expect(startStatusServer(serverOptions(fixture.tokenFile)).then(value => {
+    await expect(startStatusServer(serverOptions({ tokenFile: fixture.tokenFile })).then(value => {
       server = value;
     })).rejects.toThrow();
   } finally {
@@ -403,7 +450,7 @@ test("snapshot exceptions do not expose or print the bearer token", async () => 
   let server: StatusServer | undefined;
   try {
     const startStatusServer = await loadStartStatusServer();
-    server = await startStatusServer(serverOptions(fixture.tokenFile, () => {
+    server = await startStatusServer(serverOptions({ tokenFile: fixture.tokenFile }, () => {
       throw new Error(TOKEN);
     }));
 

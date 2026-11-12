@@ -58,6 +58,8 @@ const REQUEST_TIMEOUT_MS = 3_000;
 const MAX_BASE_URL_LENGTH = 2_048;
 const MAX_TOKEN_LENGTH = 512;
 const BEARER_TOKEN = /^[A-Za-z0-9._~+\/-]+=*$/;
+const STATUS_BASE_URL_ENVIRONMENT = "OCTOBUDDY_HTTP_BASE_URL";
+const STATUS_TOKEN_ENVIRONMENT = "OCTOBUDDY_HTTP_TOKEN";
 
 interface ClientConfig {
   baseUrl: URL;
@@ -67,6 +69,15 @@ interface ClientConfig {
 
 type ConfigRead =
   | { state: "ready"; config: ClientConfig }
+  | { state: "missing" | "invalid" };
+
+interface FileConfig {
+  baseUrl: unknown;
+  token: unknown;
+}
+
+type FileConfigRead =
+  | { state: "ready"; fields: FileConfig }
   | { state: "missing" | "invalid" };
 
 function errorCode(error: unknown): string | undefined {
@@ -99,31 +110,51 @@ function parseBaseUrl(value: unknown): URL | undefined {
   return url;
 }
 
-function parseConfig(value: unknown): ClientConfig | undefined {
-  if (!isRecord(value)) return undefined;
-  const keys = Object.keys(value);
-  if (keys.length !== 2 || !keys.includes("baseUrl") || !keys.includes("token")) return undefined;
-
-  const baseUrl = parseBaseUrl(value.baseUrl);
-  const token = value.token;
+function buildConfig(baseUrlValue: unknown, tokenValue: unknown): ClientConfig | undefined {
+  const baseUrl = parseBaseUrl(baseUrlValue);
   if (
     baseUrl === undefined ||
-    typeof token !== "string" ||
-    token.length < 32 ||
-    token.length > MAX_TOKEN_LENGTH ||
-    !BEARER_TOKEN.test(token)
+    typeof tokenValue !== "string" ||
+    tokenValue.length < 32 ||
+    tokenValue.length > MAX_TOKEN_LENGTH ||
+    !BEARER_TOKEN.test(tokenValue)
   ) {
     return undefined;
   }
 
   return {
     baseUrl,
-    token,
-    fingerprint: createHash("sha256").update(baseUrl.href).update("\0").update(token).digest("hex"),
+    token: tokenValue,
+    fingerprint: createHash("sha256").update(baseUrl.href).update("\0").update(tokenValue).digest("hex"),
   };
 }
 
-async function readConfig(configPath: string): Promise<ConfigRead> {
+function environmentValue(name: string): string | undefined {
+  const value = process.env[name];
+  return value === undefined || value.length === 0 ? undefined : value;
+}
+
+// Environment values override the private file per field. When both are present the file is not opened.
+async function loadConfig(configPath: string): Promise<ConfigRead> {
+  const baseUrl = environmentValue(STATUS_BASE_URL_ENVIRONMENT);
+  const token = environmentValue(STATUS_TOKEN_ENVIRONMENT);
+
+  if (baseUrl !== undefined && token !== undefined) {
+    const config = buildConfig(baseUrl, token);
+    return config === undefined ? { state: "invalid" } : { state: "ready", config };
+  }
+
+  const file = await readFileConfig(configPath);
+  if (file.state !== "ready") return file;
+  // Only the merged values are validated, so an invalid file field overwritten by the environment is ignored.
+  const config = buildConfig(
+    baseUrl !== undefined ? baseUrl : file.fields.baseUrl,
+    token !== undefined ? token : file.fields.token,
+  );
+  return config === undefined ? { state: "invalid" } : { state: "ready", config };
+}
+
+async function readFileConfig(configPath: string): Promise<FileConfigRead> {
   const uid = process.getuid?.();
   if (uid === undefined) return { state: "invalid" };
 
@@ -168,8 +199,10 @@ async function readConfig(configPath: string): Promise<ConfigRead> {
       return { state: "invalid" };
     }
 
-    const config = parseConfig(parsed);
-    return config === undefined ? { state: "invalid" } : { state: "ready", config };
+    if (!isRecord(parsed)) return { state: "invalid" };
+    const keys = Object.keys(parsed);
+    if (keys.length !== 2 || !keys.includes("baseUrl") || !keys.includes("token")) return { state: "invalid" };
+    return { state: "ready", fields: { baseUrl: parsed.baseUrl, token: parsed.token } };
   } catch {
     return { state: "invalid" };
   } finally {
@@ -425,7 +458,7 @@ export function createStatusClient(options: StatusClientOptions): StatusClient {
   return {
     async get(signal?: AbortSignal): Promise<StatusResult> {
       throwIfAborted(signal);
-      const loaded = await readConfig(options.configPath);
+      const loaded = await loadConfig(options.configPath);
       throwIfAborted(signal);
 
       if (loaded.state !== "ready") {
@@ -448,7 +481,7 @@ export function createStatusClient(options: StatusClientOptions): StatusClient {
 
     async getChat(target: ChatTarget, signal?: AbortSignal): Promise<ChatStatusResult> {
       throwIfAborted(signal);
-      const loaded = await readConfig(options.configPath);
+      const loaded = await loadConfig(options.configPath);
       throwIfAborted(signal);
 
       if (loaded.state !== "ready") {

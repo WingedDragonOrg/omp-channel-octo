@@ -79,11 +79,20 @@ const MAX_ATTACHMENT_MAX_BYTES = 1024 * 1024 * 1024;
 const MIN_ASK_TIMEOUT_MS = 30 * 60 * 1_000;
 const MAX_ASK_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1_000;
 const DECISIONS_ENV_PATTERN = /^OMP_CHANNEL_OCTO_[A-Za-z_][A-Za-z0-9_]*$/u;
+const DEFAULT_STATUS_HTTP_LISTEN_ADDRESS = "0.0.0.0";
+const DEFAULT_STATUS_HTTP_PORT = 8765;
+/** A status token is at least 32 random bytes encoded as hexadecimal. */
+const MIN_STATUS_TOKEN_HEX_LENGTH = 64;
+const MAX_STATUS_TOKEN_HEX_LENGTH = 16_384;
+const STATUS_TOKEN_HEX_PATTERN = /^[0-9A-Fa-f]+$/u;
 
 export interface StatusHttpConfig {
   listenAddress: string;
   port: number;
-  tokenFile: string;
+  /** Direct bearer token from `OMP_CHANNEL_OCTO_HTTP_TOKEN`; wins over `tokenFile`. */
+  token?: string;
+  /** Private token file, re-read per request when no direct token is configured. */
+  tokenFile?: string;
 }
 
 export interface AppConfig extends CoreServiceConfig {
@@ -376,31 +385,106 @@ function parseFileLinks(env: NodeJS.ProcessEnv): FileLinkConfig | undefined {
 }
 
 
-function parseStatusHttp(value: unknown, home: string): StatusHttpConfig | undefined {
-  if (value === undefined) return undefined;
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw configError("statusHttp 必须是对象");
+function parseStatusToken(value: string): string {
+  if (
+    value.length < MIN_STATUS_TOKEN_HEX_LENGTH
+    || value.length > MAX_STATUS_TOKEN_HEX_LENGTH
+    || value.length % 2 !== 0
+    || !STATUS_TOKEN_HEX_PATTERN.test(value)
+  ) {
+    // Do not echo the value: a malformed token is still a secret.
+    throw configError(`OMP_CHANNEL_OCTO_HTTP_TOKEN 必须是至少 ${MIN_STATUS_TOKEN_HEX_LENGTH / 2} 字节的十六进制编码`);
   }
+  return value;
+}
 
-  const document = value as Record<string, unknown>;
-  for (const key of Object.keys(document)) {
-    if (key !== "listenAddress" && key !== "port" && key !== "tokenFile") {
-      throw configError(`statusHttp 不支持字段 ${key}`);
+function parseStatusHttp(
+  value: unknown,
+  env: NodeJS.ProcessEnv,
+  home: string,
+): StatusHttpConfig | undefined {
+  if (value !== undefined) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      throw configError("statusHttp 必须是对象");
+    }
+    for (const key of Object.keys(value as Record<string, unknown>)) {
+      if (key !== "listenAddress" && key !== "port" && key !== "tokenFile") {
+        throw configError(`statusHttp 不支持字段 ${key}`);
+      }
     }
   }
 
-  const listenAddress = requireString(document.listenAddress, "statusHttp.listenAddress");
+  const enabledText = optionalString(env.OMP_CHANNEL_OCTO_HTTP_ENABLED, "OMP_CHANNEL_OCTO_HTTP_ENABLED");
+  let enabled = true;
+  if (enabledText !== undefined) {
+    if (enabledText !== "true" && enabledText !== "false") {
+      throw configError("OMP_CHANNEL_OCTO_HTTP_ENABLED 必须是 true 或 false");
+    }
+    enabled = enabledText === "true";
+  }
+  if (!enabled) return undefined;
+
+  const document = (value ?? {}) as Record<string, unknown>;
+
+  const environmentAddress = optionalString(
+    env.OMP_CHANNEL_OCTO_HTTP_LISTEN_ADDRESS,
+    "OMP_CHANNEL_OCTO_HTTP_LISTEN_ADDRESS",
+  );
+  const listenAddress = environmentAddress
+    ?? (document.listenAddress === undefined
+      ? DEFAULT_STATUS_HTTP_LISTEN_ADDRESS
+      : requireString(document.listenAddress, "statusHttp.listenAddress"));
   if (isIP(listenAddress) === 0) {
-    throw configError("statusHttp.listenAddress 必须是 IP 地址");
+    throw configError(
+      environmentAddress === undefined
+        ? "statusHttp.listenAddress 必须是 IP 地址"
+        : "OMP_CHANNEL_OCTO_HTTP_LISTEN_ADDRESS 必须是 IP 地址",
+    );
   }
 
-  const port = document.port;
-  if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65_535) {
+  const environmentPort = optionalString(env.OMP_CHANNEL_OCTO_HTTP_PORT, "OMP_CHANNEL_OCTO_HTTP_PORT");
+  let port: number;
+  if (environmentPort !== undefined) {
+    if (!/^\d+$/u.test(environmentPort)) {
+      throw configError("OMP_CHANNEL_OCTO_HTTP_PORT 必须是 1 到 65535 之间的整数");
+    }
+    port = Number(environmentPort);
+  } else if (document.port === undefined) {
+    port = DEFAULT_STATUS_HTTP_PORT;
+  } else if (typeof document.port !== "number") {
     throw configError("statusHttp.port 必须是 1 到 65535 之间的整数");
+  } else {
+    port = document.port;
+  }
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw configError(
+      environmentPort === undefined
+        ? "statusHttp.port 必须是 1 到 65535 之间的整数"
+        : "OMP_CHANNEL_OCTO_HTTP_PORT 必须是 1 到 65535 之间的整数",
+    );
   }
 
-  const tokenFile = resolveLocalPath(document.tokenFile, "statusHttp.tokenFile", home);
-  return { listenAddress, port, tokenFile };
+  const environmentTokenFile = optionalString(
+    env.OMP_CHANNEL_OCTO_HTTP_TOKEN_FILE,
+    "OMP_CHANNEL_OCTO_HTTP_TOKEN_FILE",
+  );
+  const tokenFileText = environmentTokenFile
+    ?? (document.tokenFile === undefined
+      ? undefined
+      : requireString(document.tokenFile, "statusHttp.tokenFile"));
+  const tokenFile = tokenFileText === undefined
+    ? undefined
+    : resolveLocalPath(tokenFileText, "statusHttp.tokenFile", home);
+
+  const tokenText = optionalString(env.OMP_CHANNEL_OCTO_HTTP_TOKEN, "OMP_CHANNEL_OCTO_HTTP_TOKEN");
+  const token = tokenText === undefined ? undefined : parseStatusToken(tokenText);
+
+  return {
+    listenAddress,
+    port,
+    ...(token === undefined ? {} : { token }),
+    ...(tokenFile === undefined ? {} : { tokenFile }),
+  };
 }
 
 export function parseConfig(input: unknown, options: ConfigParseOptions = {}): AppConfig {
@@ -460,7 +544,7 @@ export function parseConfig(input: unknown, options: ConfigParseOptions = {}): A
   const decisions = parseDecisions(document.decisions, environment);
   const watch = parseWatch(document.watch, decisions?.enabled === true);
   const fileLinks = parseFileLinks(environment);
-  const statusHttp = parseStatusHttp(document.statusHttp, home);
+  const statusHttp = parseStatusHttp(document.statusHttp, environment, home);
 
   return {
     apiUrl,
@@ -522,13 +606,19 @@ export async function loadConfig(
     throw new Error("配置无效：包含 botToken 的配置文件必须是私有权限");
   }
   const config = parseConfig(document, options);
-  if (config.statusHttp !== undefined) await validateStatusTokenFile(config.statusHttp);
+  if (
+    config.statusHttp !== undefined
+    && config.statusHttp.token === undefined
+    && config.statusHttp.tokenFile !== undefined
+  ) {
+    await validateStatusTokenFile(config.statusHttp.tokenFile);
+  }
   return { ...config, configPath: resolvedPath };
 
 }
-async function validateStatusTokenFile(config: StatusHttpConfig): Promise<void> {
+async function validateStatusTokenFile(tokenFile: string): Promise<void> {
   try {
-    const file = await open(config.tokenFile, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW);
+    const file = await open(tokenFile, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW);
     try {
       const info = await file.stat();
       if (!info.isFile() || info.uid !== process.geteuid?.() || (info.mode & 0o077) !== 0 || (info.mode & 0o400) === 0) {

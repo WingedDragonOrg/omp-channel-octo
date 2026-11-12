@@ -11,6 +11,11 @@ import { findRunningOctoBuddy, resolveOctoBuddyApp } from "./launcher/paths.ts";
 import { showLauncherNotification } from "./launcher/notifications.ts";
 import { startManagedService, waitForProcessExit, type ManagedService, type ServiceExit } from "./launcher/service.ts";
 import {
+  loadStatusEnvironment,
+  withStatusEnvironment,
+  withoutStatusEnvironment,
+} from "./launcher/status-environment.ts";
+import {
   ensureStateDirectory,
   launcherPaths,
   writeJsonAtomically,
@@ -162,6 +167,13 @@ async function runWithLock(options: CliOptions, lock: LauncherLock): Promise<num
     }
 
     await clearPreviousRunState(paths);
+    // Environment values win per field; the private package .envrc fills the rest for every launch mode.
+    const statusEnvironment = await loadStatusEnvironment({
+      envrcPath: join(packageDir, ".envrc"),
+      env: process.env,
+    });
+    const hostEnvironment = withStatusEnvironment(process.env, statusEnvironment);
+    const monitorEnvironment = withoutStatusEnvironment(process.env);
     await writeLauncherStatus(options.stateDir, {
       state: "starting",
       message: "Starting independent process monitor",
@@ -171,6 +183,7 @@ async function runWithLock(options: CliOptions, lock: LauncherLock): Promise<num
     monitor = startManagedService(monitorScript, ["--state-dir", options.stateDir], "Process monitor", {
       detached: true,
       timeoutMs: 10_000,
+      env: monitorEnvironment,
     });
     const monitorStartedAt = await monitor.startedAt;
     await lock.setMonitorIdentity(monitor.child.pid!, monitorStartedAt);
@@ -201,7 +214,7 @@ async function runWithLock(options: CliOptions, lock: LauncherLock): Promise<num
       "--port", String(targetIdentity.port),
       "--pid", String(targetIdentity.pid),
       "--started-at", targetIdentity.startedAt,
-    ], "OctoBuddy Enhancer host", { detached: false, timeoutMs: 30_000 });
+    ], "OctoBuddy Enhancer host", { detached: false, timeoutMs: 30_000, env: hostEnvironment });
     const hostStartedAt = await host.startedAt;
     await writeJsonAtomically(paths.hostFile, { pid: host.child.pid, startedAt: hostStartedAt });
     const hostReadiness = await host.ready;

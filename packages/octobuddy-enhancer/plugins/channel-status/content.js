@@ -49,6 +49,8 @@
   let chatStatusError = false;
   let chatRequestSequence = 0;
   let activeChatRequest;
+  let drag;
+  let suppressClick = false;
   let instance;
 
   const style = document.createElement("style");
@@ -57,8 +59,8 @@
       all: initial !important;
       position: fixed !important;
       z-index: 2147483646 !important;
-      right: 16px !important;
-      bottom: 16px !important;
+      right: 0 !important;
+      top: calc(50% - 19px) !important;
       color: #eaf1f3 !important;
       color-scheme: dark !important;
       isolation: isolate !important;
@@ -78,6 +80,9 @@
       border-radius: 999px !important;
       box-shadow: 0 5px 18px rgba(0, 0, 0, 0.28) !important;
       color: #eaf1f3 !important;
+      opacity: 0.58 !important;
+      touch-action: none !important;
+      user-select: none !important;
       cursor: pointer !important;
       display: flex !important;
       font: 600 12px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
@@ -87,9 +92,11 @@
       white-space: nowrap !important;
     }
     [data-octobuddy-channel-status-button]:hover {
+      opacity: 1 !important;
       background: #20343c !important;
     }
     [data-octobuddy-channel-status-button]:focus-visible {
+      opacity: 1 !important;
       outline: 2px solid #71d8d0 !important;
       outline-offset: 3px !important;
     }
@@ -114,6 +121,9 @@
       background: #99a5aa !important;
     }
     [data-octobuddy-channel-status-panel] {
+      position: absolute !important;
+      max-height: calc(100vh - 16px) !important;
+      overflow-y: auto !important;
       background: #142229 !important;
       border: 1px solid #39515b !important;
       border-radius: 11px !important;
@@ -169,8 +179,7 @@
     }
     @media (max-width: 480px), (max-height: 560px) {
       [data-octobuddy-channel-status-root] {
-        bottom: 8px !important;
-        right: 8px !important;
+        top: calc(50% - 17px) !important;
       }
       [data-octobuddy-channel-status-button] {
         min-height: 34px !important;
@@ -424,16 +433,60 @@
     appendChatDetails();
   }
 
+  function positionPanel() {
+    const bounds = root.getBoundingClientRect();
+    const width = panel.offsetWidth;
+    const height = panel.offsetHeight;
+    const x = bounds.left >= width + 8 ? bounds.left - width - 8 : bounds.right + 8;
+    const y = bounds.top + bounds.height / 2 - height / 2;
+    panel.style.left = `${Math.max(8, Math.min(x, window.innerWidth - width - 8)) - bounds.left}px`;
+    panel.style.top = `${Math.max(8, Math.min(y, window.innerHeight - height - 8)) - bounds.top}px`;
+  }
+
+  function beginDrag(event) {
+    if (event.button !== 0) return;
+    const bounds = root.getBoundingClientRect();
+    suppressClick = false;
+    drag = { id: event.pointerId, x: event.clientX, y: event.clientY, left: bounds.left, top: bounds.top, moved: false };
+    button.setPointerCapture(event.pointerId);
+  }
+
+  function moveDrag(event) {
+    if (!drag || event.pointerId !== drag.id) return;
+    const dx = event.clientX - drag.x;
+    const dy = event.clientY - drag.y;
+    if (!drag.moved && Math.hypot(dx, dy) < 4) return;
+    drag.moved = true;
+    const bounds = root.getBoundingClientRect();
+    root.style.setProperty("left", `${Math.max(0, Math.min(drag.left + dx, window.innerWidth - bounds.width))}px`, "important");
+    root.style.setProperty("top", `${Math.max(0, Math.min(drag.top + dy, window.innerHeight - bounds.height))}px`, "important");
+    root.style.setProperty("right", "auto", "important");
+    if (expanded) positionPanel();
+  }
+
+  function endDrag(event) {
+    if (!drag || event.pointerId !== drag.id) return;
+    suppressClick = drag.moved;
+    drag = undefined;
+  }
+
   function renderEntry() {
     const state = currentStatus?.state ?? "loading";
     const label = currentStatus ? STATUS_LABELS[state] : "读取中";
     root.dataset.state = state;
     buttonLabel.textContent = `频道状态：${label}`;
     button.setAttribute("aria-label", `频道状态：${label}`);
-    if (expanded) renderDetails();
+    if (expanded) {
+      renderDetails();
+      positionPanel();
+    }
   }
 
   function togglePanel() {
+    if (suppressClick) {
+      suppressClick = false;
+      return;
+    }
     if (disposed) return;
     expanded = !expanded;
     button.setAttribute("aria-expanded", String(expanded));
@@ -441,6 +494,7 @@
     if (expanded) {
       detailReady = false;
       renderDetails();
+      positionPanel();
       requestRefresh();
     } else {
       detailReady = false;
@@ -511,6 +565,10 @@
     refreshTimeout = 0;
     refreshPending = false;
     button.removeEventListener("click", togglePanel);
+    button.removeEventListener("pointerdown", beginDrag);
+    button.removeEventListener("pointermove", moveDrag);
+    button.removeEventListener("pointerup", endDrag);
+    button.removeEventListener("pointercancel", endDrag);
     window.removeEventListener("message", handleChatMessage);
     panel.replaceChildren();
     root.remove();
@@ -524,6 +582,10 @@
   }
 
   button.addEventListener("click", togglePanel);
+  button.addEventListener("pointerdown", beginDrag);
+  button.addEventListener("pointermove", moveDrag);
+  button.addEventListener("pointerup", endDrag);
+  button.addEventListener("pointercancel", endDrag);
   window.addEventListener("message", handleChatMessage);
   root.append(panel, button);
   instance = { active: true, dispose };

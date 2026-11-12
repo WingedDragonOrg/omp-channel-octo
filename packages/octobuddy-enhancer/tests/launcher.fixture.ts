@@ -303,8 +303,16 @@ async function serveUntilStopped(
     port: address.port,
     startedAt: processStartIdentity(process.pid),
   };
-  if (launchLog) appendFileSync(launchLog, `${JSON.stringify({ ...identity, argv: process.argv.slice(2) })}\n`);
-  else writeFileSync(marker, JSON.stringify(identity), "utf8");
+  if (launchLog) {
+    appendFileSync(launchLog, `${JSON.stringify({
+      ...identity,
+      argv: process.argv.slice(2),
+      statusEnvironment: {
+        baseUrlPresent: process.env.OCTOBUDDY_HTTP_BASE_URL !== undefined,
+        tokenPresent: process.env.OCTOBUDDY_HTTP_TOKEN !== undefined,
+      },
+    })}\n`);
+  } else writeFileSync(marker, JSON.stringify(identity), "utf8");
   process.stderr.write(`DevTools listening on ws://127.0.0.1:${address.port}/devtools/browser/fixture\n`);
 
   let stopping = false;
