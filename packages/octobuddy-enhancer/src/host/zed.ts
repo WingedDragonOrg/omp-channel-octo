@@ -1,8 +1,9 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { access, realpath, stat } from "node:fs/promises";
 import { constants } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join, isAbsolute } from "node:path";
+import { promisify } from "node:util";
 import { withoutStatusEnvironment } from "../launcher/status-environment.ts";
 import { isRecord } from "./type-guards.ts";
 
@@ -13,6 +14,7 @@ export interface OpenZedRequest {
 
 export interface ZedBackendOptions {
   zedExecutable?: string;
+  cwd?: string;
 }
 
 function parseRequest(value: unknown): OpenZedRequest {
@@ -48,6 +50,10 @@ async function resolveZedExecutable(options: ZedBackendOptions): Promise<string>
   }
 
   const candidates = [
+    ...(options.cwd === undefined ? [] : [
+      "/Applications/Zed Preview.app/Contents/MacOS/cli",
+      join(homedir(), "Applications", "Zed Preview.app", "Contents", "MacOS", "cli"),
+    ]),
     "/Applications/Zed.app/Contents/MacOS/cli",
     join(homedir(), "Applications", "Zed.app", "Contents", "MacOS", "cli"),
     ...(process.env.PATH ?? "").split(delimiter)
@@ -79,7 +85,7 @@ async function readableFilePath(path: string): Promise<string> {
 export async function openInZed(
   value: unknown,
   options: ZedBackendOptions,
-  stillAuthorized: () => boolean,
+  stillAuthorized: () => boolean | Promise<boolean>,
 ): Promise<void> {
   const request = parseRequest(value);
   const isZedUrl = /^zed:\/\//i.test(request.path);
@@ -87,19 +93,47 @@ export async function openInZed(
     isZedUrl ? request.path : readableFilePath(request.path),
     resolveZedExecutable(options),
   ]);
-  if (!stillAuthorized()) throw new Error("plugin was disabled before Zed could be opened");
-
-  const argument = isZedUrl ? path : `${path}:${request.line ?? 1}:1`;
-  const child = spawn(executable, [argument], { detached: true, shell: false, stdio: "ignore", env: withoutStatusEnvironment(process.env) });
+  let args = [isZedUrl ? path : `${path}:${request.line ?? 1}:1`];
+  if (options.cwd !== undefined) {
+    const remote = new URL(`ssh://${path.slice("zed://ssh/".length)}`);
+    const match = /:(\d+)(?::(\d+))?$/.exec(remote.pathname);
+    const file = decodeURIComponent(match ? remote.pathname.slice(0, -match[0].length) : remote.pathname);
+    const fragment = /^#L([1-9]\d*)$/.exec(remote.hash);
+    const line = fragment ? `:${fragment[1]}` : match?.[0] ?? "";
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    const command = `cwd=$(realpath -- ${quote(options.cwd)}) && file=$(realpath -- ${quote(file)}) && printf '%s\\0%s\\0' "$cwd" "$file"`;
+    const host = `${remote.username ? `${decodeURIComponent(remote.username)}@` : ""}${remote.hostname}`;
+    const sshArgs = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+      ...(remote.port ? ["-p", remote.port] : []), "--", host, command];
+    const { stdout } = await promisify(execFile)("ssh", sshArgs, {
+      timeout: 15_000,
+      env: withoutStatusEnvironment(process.env),
+    }).catch(() => { throw new Error("Could not resolve the remote workspace or file over SSH"); });
+    const [cwd, target] = stdout.split("\0");
+    if (!cwd || !target || !target.startsWith(cwd === "/" ? "/" : `${cwd}/`)) {
+      throw new Error("Zed file is outside the chat workspace");
+    }
+    const authority = `${remote.username ? `${remote.username}@` : ""}${remote.host}`;
+    const encoded = (value: string) => value.split("/").map(encodeURIComponent).join("/");
+    args = [`ssh://${authority}${encoded(cwd)}`, `ssh://${authority}${encoded(target)}${line}`];
+  }
+  if (!await stillAuthorized()) throw new Error("Zed request is no longer current before Zed could be opened");
+  const child = spawn(executable, args, { detached: true, shell: false, stdio: "ignore", env: withoutStatusEnvironment(process.env) });
   const { promise, resolve, reject } = Promise.withResolvers<void>();
   let spawned = false;
   child.once("spawn", () => {
     spawned = true;
     child.unref();
-    resolve();
+    if (options.cwd === undefined) resolve();
   });
+  if (options.cwd !== undefined) {
+    child.once("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error("Zed could not open the remote workspace and file"));
+    });
+  }
   child.on("error", (error) => {
-    if (spawned) process.stderr.write(`[octobuddy-enhancer] Zed process error: ${error.message}\n`);
+    if (spawned && options.cwd === undefined) process.stderr.write(`[octobuddy-enhancer] Zed process error: ${error.message}\n`);
     else reject(new Error(`could not start Zed: ${error.message}`, { cause: error }));
   });
   await promise;

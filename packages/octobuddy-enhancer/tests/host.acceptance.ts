@@ -117,6 +117,77 @@ test("passes a Zed SSH URL as one argument without local file resolution", async
   }
 }, 10_000);
 
+test("opens a canonical remote project and its file at the requested line", async () => {
+  const root = await mkdtemp(join(tmpdir(), "octobuddy-zed-workspace-"));
+  const previousPath = process.env.PATH;
+  try {
+    const zed = await createFakeZed(root);
+    await writeFile(join(root, "ssh"), "#!/bin/sh\nprintf '/private/work/project\\0/private/work/project/src/a b.ts\\0'\n", { mode: 0o755 });
+    process.env.PATH = `${root}:${previousPath}`;
+    await openInZed(
+      { path: "zed://ssh/dong@my-mini:2222/work/project/src/a%20b.ts#L42" },
+      { zedExecutable: zed.executable, cwd: "/work/project" },
+      () => true,
+    );
+    await waitUntil(async () => (await zedArguments(zed.argvFile)).length === 1);
+    expect(await zedArguments(zed.argvFile)).toEqual([[
+      "ssh://dong@my-mini:2222/private/work/project",
+      "ssh://dong@my-mini:2222/private/work/project/src/a%20b.ts:42",
+    ]]);
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("does not open a remote file outside the canonical chat workspace", async () => {
+  const root = await mkdtemp(join(tmpdir(), "octobuddy-zed-outside-"));
+  const previousPath = process.env.PATH;
+  try {
+    const zed = await createFakeZed(root);
+    await writeFile(join(root, "ssh"), "#!/bin/sh\nprintf '/work/project\\0/work/another/file.ts\\0'\n", { mode: 0o755 });
+    process.env.PATH = `${root}:${previousPath}`;
+    await expect(openInZed(
+      { path: "zed://ssh/host/work/another/file.ts" },
+      { zedExecutable: zed.executable, cwd: "/work/project" },
+      () => true,
+    )).rejects.toThrow("outside the chat workspace");
+    expect(await zedArguments(zed.argvFile)).toEqual([]);
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("opens a quoted remote filename without executing its shell characters", async () => {
+  const root = await mkdtemp(join(tmpdir(), "octobuddy-zed-quoted-"));
+  const previousPath = process.env.PATH;
+  try {
+    const zed = await createFakeZed(root);
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const file = join(workspace, "a';touch injected;'.ts");
+    await writeFile(file, "content");
+    await writeFile(join(root, "ssh"), `#!/bin/sh\nfor last do :; done\ncd ${JSON.stringify(root)}\nexec /bin/sh -c "$last"\n`, { mode: 0o755 });
+    process.env.PATH = `${root}:${previousPath}`;
+    await openInZed(
+      { path: `zed://ssh/fixture${pathToFileURL(file).pathname}#L1` },
+      { zedExecutable: zed.executable, cwd: workspace },
+      () => true,
+    );
+    const canonicalWorkspace = await realpath(workspace);
+    const canonicalFile = await realpath(file);
+    expect(await zedArguments(zed.argvFile)).toEqual([[
+      `ssh://fixture${pathToFileURL(canonicalWorkspace).pathname}`,
+      `ssh://fixture${pathToFileURL(canonicalFile).pathname.replaceAll(";", "%3B")}:1`,
+    ]]);
+    expect(existsSync(join(root, "injected"))).toBe(false);
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(root, { recursive: true, force: true });
+  }
+}, 10_000);
+
 test("opening Zed does not pass the enhancer HTTP credentials to the editor", async () => {
   const root = await mkdtemp(join(tmpdir(), "octobuddy-zed-env-"));
   const executable = join(root, "zed");
@@ -508,7 +579,7 @@ test("revokes Zed after navigation invalidates a context captured before realpat
       const calls = await fixture.calls(targetId);
       const revoked = calls.some((call) => call.method === "Runtime.evaluate"
         && String(call.params.expression).includes("management.onErrors")
-        && String(call.params.expression).includes("plugin was disabled before Zed could be opened"));
+        && String(call.params.expression).includes("before Zed could be opened"));
       return revoked || (await zedArguments(zed.argvFile)).length > 0;
     });
     expect(await zedArguments(zed.argvFile)).toEqual([]);

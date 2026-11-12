@@ -108,7 +108,7 @@ const localStatusSnapshot = {
   sampledAt: "2026-11-11T10:14:30.000Z",
 };
 
-async function createLocalStatusServer(): Promise<LocalStatusServer> {
+async function createLocalStatusServer(cwd: string): Promise<LocalStatusServer> {
   const received: StatusRequest[] = [];
   const server = createServer((request, response) => {
     received.push({
@@ -159,7 +159,7 @@ async function createLocalStatusServer(): Promise<LocalStatusServer> {
       channelId,
       state: "idle",
       model: null,
-      cwd: null,
+      cwd: channelType === 2 ? join(cwd, "group") : cwd,
       queuedTasks: 0,
       pendingQuestions: 0,
     }));
@@ -588,7 +588,8 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
       mkdir(paths.tempDir, { recursive: true }),
     ]);
     const fakeZed = await createFakeZed(join(root, "fake-zed"));
-    const statusFixture = await createLocalStatusServer();
+    await writeFile(join(root, "fake-zed", "ssh"), "#!/bin/sh\nfor last do :; done\nexec /bin/sh -c \"$last\"\n", { mode: 0o755 });
+    const statusFixture = await createLocalStatusServer(await realpath(paths.workspace));
     statusServer = statusFixture;
     const statusConfigPath = join(root, "channel-status.json");
     await writeFile(statusConfigPath, JSON.stringify({
@@ -599,9 +600,12 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
     expect((await stat(statusConfigPath)).mode & 0o777).toBe(0o600);
     const fileUrlPath = join(paths.workspace, "file URL with spaces.md");
     const literalPercentPath = join(paths.workspace, "literal%20 path with spaces.md");
+    const groupFilePath = join(paths.workspace, "group", "group-file.ts");
+    await mkdir(join(paths.workspace, "group"), { recursive: true });
     await Promise.all([
       writeFile(fileUrlPath, "line one\n".repeat(40)),
       writeFile(literalPercentPath, "line one\n".repeat(20)),
+      writeFile(groupFilePath, "group content\n"),
     ]);
     const fileUrl = `${pathToFileURL(fileUrlPath).href}#L37`;
     const rawAbsolutePath = `${literalPercentPath}:9`;
@@ -630,6 +634,7 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
       TMPDIR: paths.tempDir,
       OCTOBUDDY_HOME: paths.octobuddyHome,
       E2E_TEST: "1",
+      PATH: `${join(root, "fake-zed")}:${process.env.PATH}`,
     });
     const { startHost } = await loadHostEntry();
     host = await startHost({
@@ -726,45 +731,6 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
       [`${await realpath(literalPercentPath)}:9:1`],
     ]);
 
-    const zedUrl = "zed://ssh/my-mini/Users/dong/workspace/omp-channel-octo.local-file-link-resolver-plugins/docs/specs/2026-09-12-octo-channel-design.md";
-    const remoteLink = await evaluate<ActionBox>(browser, pageSessionId, `(() => {
-      const link = document.createElement("a");
-      link.href = ${JSON.stringify(zedUrl)};
-      link.textContent = "Remote Zed file";
-      Object.assign(link.style, { position: "fixed", left: "24px", top: "230px", zIndex: "2147483647" });
-      document.body.append(link);
-      const rect = link.getBoundingClientRect();
-      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
-    })()`);
-    await dispatchMouseClick(browser, pageSessionId, remoteLink);
-    await waitForZedCalls(fakeZed.argvFile, 3);
-    expect(await readZedArguments(fakeZed.argvFile)).toEqual([
-      [`${await realpath(fileUrlPath)}:37:1`],
-      [`${await realpath(literalPercentPath)}:9:1`],
-      [zedUrl],
-    ]);
-
-    const sanitizedLink = await evaluate<ActionBox>(browser, pageSessionId, `(() => {
-      const link = document.createElement("a");
-      link.href = "";
-      link.setAttribute("node", "[object Object]");
-      link.textContent = "Sanitized remote link";
-      const source = "[Sanitized remote link](" + ${JSON.stringify(zedUrl)} + ")";
-      link.__reactProps$fixture = { node: { position: { start: { offset: 0 }, end: { offset: source.length } } } };
-      link.__reactFiber$fixture = { return: { memoizedProps: { children: source }, return: null } };
-      Object.assign(link.style, { position: "fixed", left: "24px", top: "270px", zIndex: "2147483647" });
-      document.body.append(link);
-      const rect = link.getBoundingClientRect();
-      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
-    })()`);
-    await dispatchMouseClick(browser, pageSessionId, sanitizedLink);
-    await waitForZedCalls(fakeZed.argvFile, 4);
-    expect(await readZedArguments(fakeZed.argvFile)).toEqual([
-      [`${await realpath(fileUrlPath)}:37:1`],
-      [`${await realpath(literalPercentPath)}:9:1`],
-      [zedUrl],
-      [zedUrl],
-    ]);
 
     const loadEvent = Promise.withResolvers<void>();
     const reloadTimer = setTimeout(() => loadEvent.reject(new Error("Timed out reloading OctoBuddy main renderer")), 30_000);
@@ -998,6 +964,24 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
       const text = await rendererStatusText();
       return text.includes(`群聊 ${controlledGroup.channelID}`) && text.includes("空闲");
     }, "the real panel to show the selected test group status", 10_000);
+    const groupZedUrl = `zed://ssh/fixture${pathToFileURL(groupFilePath).pathname}#L1`;
+    const groupLink = await evaluate<ActionBox>(browser, communicationSessionId, `(() => {
+      const link = document.createElement("a");
+      link.href = ${JSON.stringify(groupZedUrl)};
+      link.textContent = "Group Zed file";
+      Object.assign(link.style, { position: "fixed", left: "24px", top: "190px", zIndex: "2147483647" });
+      document.body.append(link);
+      const rect = link.getBoundingClientRect();
+      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    })()`);
+    await dispatchMouseClick(browser, communicationSessionId, groupLink);
+    await waitForZedCalls(fakeZed.argvFile, 3);
+    const expectedGroup = [
+      `ssh://fixture${pathToFileURL(await realpath(join(paths.workspace, "group"))).pathname}`,
+      `ssh://fixture${pathToFileURL(await realpath(groupFilePath)).pathname}:1`,
+    ];
+    expect((await readZedArguments(fakeZed.argvFile))[2]).toEqual(expectedGroup);
+
 
     const threadAssignment = await assignRendererChannel(controlledThread);
     expect(threadAssignment.identity).toEqual({ channelType: 5, channelId: controlledThread.channelID });
@@ -1008,6 +992,40 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
       const text = await rendererStatusText();
       return text.includes(`话题 ${controlledThread.channelID}`) && text.includes("空闲");
     }, "the real panel to replace the old group with the selected thread status", 10_000);
+    const zedUrl = `zed://ssh/fixture${pathToFileURL(fileUrlPath).pathname}#L37`;
+    const remoteLink = await evaluate<ActionBox>(browser, communicationSessionId, `(() => {
+      const link = document.createElement("a");
+      link.href = ${JSON.stringify(zedUrl)};
+      link.textContent = "Remote Zed file";
+      Object.assign(link.style, { position: "fixed", left: "24px", top: "230px", zIndex: "2147483647" });
+      document.body.append(link);
+      const rect = link.getBoundingClientRect();
+      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    })()`);
+    await dispatchMouseClick(browser, communicationSessionId, remoteLink);
+    await waitForZedCalls(fakeZed.argvFile, 4);
+    const expectedRemote = [
+      `ssh://fixture${pathToFileURL(await realpath(paths.workspace)).pathname}`,
+      `ssh://fixture${pathToFileURL(await realpath(fileUrlPath)).pathname}:37`,
+    ];
+    expect((await readZedArguments(fakeZed.argvFile))[3]).toEqual(expectedRemote);
+
+    const sanitizedLink = await evaluate<ActionBox>(browser, communicationSessionId, `(() => {
+      const link = document.createElement("a");
+      link.href = "";
+      link.setAttribute("node", "[object Object]");
+      link.textContent = "Sanitized remote link";
+      const source = "[Sanitized remote link](" + ${JSON.stringify(zedUrl)} + ")";
+      link.__reactProps$fixture = { node: { position: { start: { offset: 0 }, end: { offset: source.length } } } };
+      link.__reactFiber$fixture = { return: { memoizedProps: { children: source }, return: null } };
+      Object.assign(link.style, { position: "fixed", left: "24px", top: "270px", zIndex: "2147483647" });
+      document.body.append(link);
+      const rect = link.getBoundingClientRect();
+      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    })()`);
+    await dispatchMouseClick(browser, communicationSessionId, sanitizedLink);
+    await waitForZedCalls(fakeZed.argvFile, 5);
+    expect((await readZedArguments(fakeZed.argvFile))[4]).toEqual(expectedRemote);
     await evaluate(browser, communicationSessionId, `Array.from(document.querySelectorAll('[data-octobuddy-channel-status-panel] [role="tab"]'))
       .find((element) => element.textContent.trim() === "上下文").click()`);
     await waitUntil(async () => {
@@ -1110,8 +1128,9 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
     expect(await readZedArguments(fakeZed.argvFile)).toEqual([
       [`${await realpath(fileUrlPath)}:37:1`],
       [`${await realpath(literalPercentPath)}:9:1`],
-      [zedUrl],
-      [zedUrl],
+      expectedGroup,
+      expectedRemote,
+      expectedRemote,
     ]);
     expect(child.exitCode).toBeNull();
     expect(await processStartIdentity(childPid)).toBe(startedAt);

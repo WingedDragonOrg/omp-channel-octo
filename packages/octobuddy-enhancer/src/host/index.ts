@@ -41,7 +41,7 @@ interface CdpClient {
   Runtime: {
     enable(): Promise<unknown>;
     addBinding(params: { name: string }): Promise<unknown>;
-    evaluate(params: { expression: string; contextId?: number; returnByValue?: boolean }): Promise<EvaluationResult>;
+    evaluate(params: { expression: string; contextId?: number; returnByValue?: boolean; awaitPromise?: boolean }): Promise<EvaluationResult>;
     executionContextCreated(handler: (event: { context: ExecutionContextInfo }) => void): unknown;
     executionContextDestroyed(handler: (event: { executionContextId: number }) => void): unknown;
     executionContextsCleared(handler: () => void): unknown;
@@ -956,9 +956,48 @@ class OctoBuddyHost {
       if (result.exceptionDetails || typeof result.result?.value !== "string") throw new Error("Zed message link could not be resolved");
       argument = { path: result.result.value };
     }
+    let cwd: string | undefined;
+    let chatStillCurrent: (() => Promise<boolean>) | undefined;
+    if (isRecord(argument) && typeof argument.path === "string" && /^zed:\/\/ssh\//i.test(argument.path)) {
+      if (!isCommunicationRendererUrl(attachment.rootUrl, this.#identity.appPath)) {
+        throw new Error("chat workspace is unavailable");
+      }
+      const currentChat = async (): Promise<ChatTarget> => {
+        // The page's hashed module is chosen by the installed OctoBuddy build.
+        const result = await withCdpTimeout(attachment.client.Runtime.evaluate({
+          expression: `(async () => {
+            const link = [...document.querySelectorAll('link[rel="modulepreload"]')]
+              .find(element => /\\/App-[^/]+\\.js$/.test(element.href));
+            const module = await import(link.href);
+            const chat = module.i.shared.openChannel;
+            return { channelType: chat?.channelType, channelId: chat?.channelID };
+          })()`,
+          awaitPromise: true,
+          returnByValue: true,
+        }), "reading current chat");
+        const target = result.result?.value;
+        if (!isRecord(target) || (target.channelType !== 2 && target.channelType !== 5)
+          || typeof target.channelId !== "string" || !target.channelId) {
+          throw new Error("current group or thread is unavailable");
+        }
+        return { channelType: target.channelType, channelId: target.channelId };
+      };
+      const target = await currentChat();
+      const status = await this.#statusClient.getChat(target);
+      if (status.state !== "online" || status.snapshot.cwd === null) {
+        throw new Error("chat workspace is unavailable");
+      }
+      chatStillCurrent = async () => {
+        const chat = await currentChat();
+        return chat.channelType === target.channelType && chat.channelId === target.channelId;
+      };
+      if (!isCurrent() || !await chatStillCurrent()) throw new Error("chat changed before Zed could be opened");
+      cwd = status.snapshot.cwd;
+    }
     await openInZed(argument, {
       ...(this.#zedExecutable !== undefined ? { zedExecutable: this.#zedExecutable } : {}),
-    }, isCurrent);
+      ...(cwd !== undefined ? { cwd } : {}),
+    }, async () => isCurrent() && (chatStillCurrent === undefined || await chatStillCurrent()) && isCurrent());
     return undefined;
   }
 

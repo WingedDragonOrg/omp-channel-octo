@@ -36,7 +36,9 @@ export OCTOBUDDY_HTTP_TOKEN='<与服务端相同的 token>'
 
 ## Zed
 
-内置插件为明确的本地文件链接提供 Zed 操作，支持行号；点击 `zed://` 链接会将完整链接交给 Zed，例如 `zed://ssh/my-mini/Users/dong/project/file.ts`。SSH 连接由本机 Zed 和 SSH 配置处理。其他链接保留原来的打开方式。Zed 需要安装在本机；路径和链接作为独立参数传递，不作为 shell 命令运行。
+内置插件为明确的本地文件链接提供 Zed 操作，支持行号。点击群聊或子区消息中的 `zed://ssh/` 文件链接时，增强器读取该聊天当前绑定工作目录，通过链接中的 SSH 连接解析工作目录和文件的真实路径，并在 Zed 的对应项目中打开文件。文件须位于绑定目录内；当前聊天不可识别、状态接口不可用、SSH 连接失败或文件不属于该目录时显示失败。SSH 使用本机配置并要求非交互式认证。
+
+远程工作区需要 Zed 1.29.1 Preview 或包含同主机多 SSH 路径修复的后续版本。安装在 `/Applications/Zed Preview.app` 或 `~/Applications/Zed Preview.app` 的 Preview 优先用于远程工作区；其他 Zed 链接和本地文件沿用原有选择方式。路径和链接作为独立参数传递，不作为本地 shell 命令运行。
 
 ## 验证
 
