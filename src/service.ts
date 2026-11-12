@@ -4087,7 +4087,9 @@ class CoreService implements ChannelService {
           taskId: route.taskId,
           title: task?.title ?? null,
           status: task?.status ?? null,
-          url: null,
+          url: task?.identifier && task.workspaceSlug && this.options.loopWebOrigin
+            ? `${this.options.loopWebOrigin}/fleet/${encodeURIComponent(task.workspaceSlug)}/issues/${encodeURIComponent(task.identifier)}`
+            : null,
         });
       }
     }

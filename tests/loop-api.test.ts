@@ -122,6 +122,7 @@ describe("Loop REST read port", () => {
   it("reads a UUID workspace and a task directly without enumerating workspaces", async () => {
     const workspace = workspaceDetailRecord(WORKSPACE_ID, "Platform Ops", "platform-ops");
     const task = taskRecord(TASK_ID, {
+      identifier: "TES9-1",
       assignee_type: "member",
       assignee_id: FLEET_MEMBER_UUID,
       assignee_octo_uid: MEMBER_OCTO_UID,
@@ -146,6 +147,7 @@ describe("Loop REST read port", () => {
       assert.notEqual(FLEET_MEMBER_UUID, MEMBER_OCTO_UID);
       assert.deepEqual(await port.getTask(WORKSPACE_ID, TASK_ID), {
         taskId: TASK_ID,
+        identifier: "TES9-1",
         title: `Task ${TASK_ID}`,
         description: "Task description",
         status: "in_progress",

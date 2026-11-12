@@ -1916,6 +1916,7 @@ export interface CoreHarnessOptions {
   allowlistWriteback?: AllowlistWriteback;
   fileLinks?: CoreServiceConfig["fileLinks"];
   loop?: LoopReadPort;
+  loopWebOrigin?: string;
 
 }
 
@@ -1960,6 +1961,7 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
     config,
     transport,
     ...(options.loop === undefined ? {} : { loop: options.loop }),
+    ...(options.loopWebOrigin === undefined ? {} : { loopWebOrigin: options.loopWebOrigin }),
     workerFactory: workers,
     ...(worktreePort === undefined ? {} : { worktrees: worktreePort }),
     ...(options.commandHandlers === undefined ? {} : { commandHandlers: options.commandHandlers }),

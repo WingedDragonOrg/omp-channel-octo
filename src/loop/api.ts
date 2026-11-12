@@ -189,6 +189,7 @@ function taskFromRecord(record: JsonRecord, workspaceId: string, expectedTaskId?
   }
   return {
     taskId,
+    ...(typeof record.identifier === "string" && record.identifier.length > 0 ? { identifier: record.identifier } : {}),
     title: requiredText(record.title, "task"),
     description: nullableText(record, "description", "task"),
     status: requiredText(record.status, "task"),

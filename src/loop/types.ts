@@ -9,6 +9,7 @@ export interface LoopWorkspace {
 /** Normalized public task fields; native Loop IDs never identify channel execution tasks. */
 export interface LoopTask {
   taskId: string;
+  identifier?: string;
   title: string;
   description: string | null;
   status: string;

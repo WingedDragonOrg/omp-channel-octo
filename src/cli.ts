@@ -292,6 +292,7 @@ async function runService(
       workerFactory,
       ...(pendingMigrationLock === undefined ? {} : { migrationLock: pendingMigrationLock }),
       loop: createLoopReadPort({ apiUrl: config.apiUrl, botToken: config.botToken }),
+      loopWebOrigin: new URL(config.apiUrl).origin,
       worktrees: createWorktreePort({ command: ompCommand }),
       cliCredentials,
       // Only a config that came from a file can be written back; a hand-built config has no path.

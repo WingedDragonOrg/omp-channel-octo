@@ -416,6 +416,7 @@ test("details snapshots retain thread-routed Loop tasks across workspace switche
   let promptFinished = false;
   const harness = await createCoreHarness({
     allowedGroupIds: [THREAD_GROUP],
+    loopWebOrigin: "https://im.deepminer.com.cn",
     prompt: async () => {
       promptStarted.resolve();
       await releasePrompt.promise;
@@ -427,7 +428,7 @@ test("details snapshots retain thread-routed Loop tasks across workspace switche
 
   try {
     const workspace = { workspaceId: "details-workspace", name: "Details", slug: "details" };
-    const mainTask = loopTask("details-main-task", "Main thread task", "in_progress");
+    const mainTask = { ...loopTask("details-main-task", "Main thread task", "in_progress"), identifier: "TES9-1" };
     store.bindLoopWorkspace(harness.bot.uid, THREAD_GROUP, workspace, [mainTask]);
     store.bindLoopTask({
       botUid: harness.bot.uid,
@@ -497,7 +498,7 @@ test("details snapshots retain thread-routed Loop tasks across workspace switche
         taskId: mainTask.taskId,
         title: mainTask.title,
         status: mainTask.status,
-        url: null,
+        url: "https://im.deepminer.com.cn/fleet/details/issues/TES9-1",
       },
       {
         workspaceId: workspace.workspaceId,
@@ -521,7 +522,7 @@ test("details snapshots retain thread-routed Loop tasks across workspace switche
     expect(promptFinished).toBe(false);
 
     const nextWorkspace = { workspaceId: "details-workspace-next", name: "Details Next", slug: "details-next" };
-    const nextTask = loopTask(mainTask.taskId, "Next workspace task", "done");
+    const nextTask = { ...loopTask(mainTask.taskId, "Next workspace task", "done"), identifier: "NEXT-1" };
     store.bindLoopWorkspace(harness.bot.uid, THREAD_GROUP, nextWorkspace, [nextTask]);
     store.bindLoopTask({
       botUid: harness.bot.uid,
@@ -539,14 +540,14 @@ test("details snapshots retain thread-routed Loop tasks across workspace switche
         taskId: mainTask.taskId,
         title: mainTask.title,
         status: mainTask.status,
-        url: null,
+        url: "https://im.deepminer.com.cn/fleet/details/issues/TES9-1",
       },
       {
         workspaceId: nextWorkspace.workspaceId,
         taskId: nextTask.taskId,
         title: nextTask.title,
         status: nextTask.status,
-        url: null,
+        url: "https://im.deepminer.com.cn/fleet/details-next/issues/NEXT-1",
       },
       {
         workspaceId: workspace.workspaceId,

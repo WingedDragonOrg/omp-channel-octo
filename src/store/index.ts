@@ -1636,7 +1636,7 @@ export class ChannelStore {
     return getLoopTaskRoute(this.db, key);
   }
 
-  getLoopTaskSummary(key: LoopTaskKey): Pick<LoopTask, "title" | "status"> | null {
+  getLoopTaskSummary(key: LoopTaskKey): (Pick<LoopTask, "title" | "status" | "identifier"> & { workspaceSlug: string | null }) | null {
     return readLoopTaskSummary(this.db, key);
   }
 

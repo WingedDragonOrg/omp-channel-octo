@@ -925,6 +925,15 @@ function migrateLoopStorage(db: Database): void {
         updated_at INTEGER NOT NULL,
         PRIMARY KEY(bot_uid, group_id)
       );
+      CREATE TABLE IF NOT EXISTS loop_workspace_slugs (
+        bot_uid TEXT NOT NULL,
+        group_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        workspace_slug TEXT NOT NULL,
+        PRIMARY KEY(bot_uid, group_id, workspace_id)
+      );
+      INSERT OR IGNORE INTO loop_workspace_slugs(bot_uid, group_id, workspace_id, workspace_slug)
+        SELECT bot_uid, group_id, workspace_id, workspace_slug FROM loop_bindings;
       CREATE TABLE IF NOT EXISTS loop_task_snapshots (
         bot_uid TEXT NOT NULL,
         group_id TEXT NOT NULL,

@@ -121,7 +121,7 @@ const fullChatDetails: ChatDetails = {
       taskId: "loop-23",
       title: "Reduce chat panel state leakage",
       status: "In Progress",
-      url: "https://example.com/workspaces/workspace-1/tasks/loop-23",
+      url: "https://im.deepminer.com.cn/fleet/test3-fxpv/issues/TES9-1",
     },
     {
       workspaceId: "workspace-2",

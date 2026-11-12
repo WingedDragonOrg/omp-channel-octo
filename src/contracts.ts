@@ -984,6 +984,7 @@ export interface ChannelServiceOptions {
   config: CoreServiceConfig;
   transport: ChannelTransport;
   workerFactory: WorkerFactory;
+  loopWebOrigin?: string;
   /** Bot lock held by state migration and transferred to CoreService for this start. */
   migrationLock?: { botUid: string; lock: LockHandle };
   commandHandlers?: readonly ChannelCommandHandler[];

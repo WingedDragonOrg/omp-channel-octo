@@ -270,6 +270,11 @@ export function bindLoopWorkspace(
   if (!botUid || !groupId || !workspace.workspaceId) throw new Error("Loop workspace binding identity is invalid");
   const uniqueTasks = deduplicateTasks(tasks);
   return transaction(db, () => {
+    run(db,
+      `INSERT INTO loop_workspace_slugs(bot_uid, group_id, workspace_id, workspace_slug) VALUES(?, ?, ?, ?)
+       ON CONFLICT(bot_uid, group_id, workspace_id) DO UPDATE SET workspace_slug = excluded.workspace_slug`,
+      [botUid, groupId, workspace.workspaceId, workspace.slug],
+    );
     const existingRow = loopBindingRow(db, botUid, groupId);
     const existing = existingRow ? loopBindingFromRow(existingRow) : null;
     if (existing?.workspaceId === workspace.workspaceId) {
@@ -437,10 +442,15 @@ function latestLoopTaskSnapshot(db: Database, key: LoopTaskKey): LoopTask | null
 export function getLoopTaskSummary(
   db: Database,
   key: LoopTaskKey,
-): Pick<LoopTask, "title" | "status"> | null {
+): (Pick<LoopTask, "title" | "status" | "identifier"> & { workspaceSlug: string | null }) | null {
   assertLoopTaskKey(key);
   const task = latestLoopTaskSnapshot(db, key);
-  return task === null ? null : { title: task.title, status: task.status };
+  if (task === null) return null;
+  const row = query(db,
+    "SELECT workspace_slug FROM loop_workspace_slugs WHERE bot_uid = ? AND group_id = ? AND workspace_id = ?",
+    [key.botUid, key.groupId, key.workspaceId],
+  )[0];
+  return { title: task.title, status: task.status, ...(task.identifier === undefined ? {} : { identifier: task.identifier }), workspaceSlug: row ? asString(row.workspace_slug) : null };
 }
 
 export function isLoopInputObserved(db: Database, input: LoopInput): boolean {
