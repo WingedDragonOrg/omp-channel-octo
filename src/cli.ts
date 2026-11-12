@@ -356,6 +356,7 @@ async function runService(
           ...statusHttp,
           statusSnapshot: () => activeService.statusSnapshot(),
           chatStatusSnapshot: target => activeService.chatStatusSnapshot(target),
+          chatDetailsSnapshot: (target, signal) => activeService.chatDetailsSnapshot(target, signal),
         });
         if (!shutdownRequested) {
           console.log(

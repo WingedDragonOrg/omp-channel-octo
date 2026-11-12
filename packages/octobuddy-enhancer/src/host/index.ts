@@ -109,10 +109,13 @@ interface ContextOwner {
   frameId: string;
 }
 
+type StatusRequestKind = "service" | "chat-status" | "chat-details";
+
 interface StatusRequest {
   pluginId: string;
   targetId: string;
   contextId: number;
+  requestKind: StatusRequestKind;
   requestId?: number;
   controller: AbortController;
 }
@@ -867,7 +870,13 @@ class OctoBuddyHost {
     request: BridgeRequest,
   ): Promise<unknown> {
     if (request.api === "status" && request.method === "getChannelStatus" && request.args.length === 0) {
-      return this.withStatusRequest(plugin, attachment, contextId, (signal) => this.#statusClient.get(signal));
+      return this.withStatusRequest(
+        plugin,
+        attachment,
+        contextId,
+        (signal) => this.#statusClient.get(signal),
+        "service",
+      );
     }
     if (request.api === "status" && request.method === "getChatStatus") {
       if (request.args.length !== 2 || !isStatusRequestId(request.args[1])) {
@@ -878,6 +887,20 @@ class OctoBuddyHost {
         attachment,
         contextId,
         (signal) => this.#statusClient.getChat(request.args[0] as ChatTarget, signal),
+        "chat-status",
+        request.args[1],
+      );
+    }
+    if (request.api === "status" && request.method === "getChatDetails") {
+      if (request.args.length !== 2 || !isStatusRequestId(request.args[1])) {
+        throw new Error("invalid chat details request");
+      }
+      return this.withStatusRequest(
+        plugin,
+        attachment,
+        contextId,
+        (signal) => this.#statusClient.getChatDetails(request.args[0] as ChatTarget, signal),
+        "chat-details",
         request.args[1],
       );
     }
@@ -886,6 +909,13 @@ class OctoBuddyHost {
         throw new Error("invalid chat status cancellation request");
       }
       this.cancelChatStatus(plugin, attachment, contextId, request.args[0]);
+      return undefined;
+    }
+    if (request.api === "status" && request.method === "cancelChatDetails") {
+      if (request.args.length !== 1 || !isStatusRequestId(request.args[0])) {
+        throw new Error("invalid chat details cancellation request");
+      }
+      this.cancelChatDetails(plugin, attachment, contextId, request.args[0]);
       return undefined;
     }
     if (request.api !== "zed" || request.method !== "openZed" || request.args.length !== 1) {
@@ -962,6 +992,7 @@ class OctoBuddyHost {
     attachment: TargetAttachment,
     contextId: number,
     get: (signal: AbortSignal) => Promise<T>,
+    requestKind: StatusRequestKind,
     requestId?: number,
   ): Promise<T> {
     if (!this.isAuthorizedStatusContext(plugin, attachment, contextId)) {
@@ -972,6 +1003,7 @@ class OctoBuddyHost {
       pluginId: plugin.id,
       targetId: attachment.target.id,
       contextId,
+      requestKind,
       ...(requestId === undefined ? {} : { requestId }),
       controller: new AbortController(),
     };
@@ -997,7 +1029,24 @@ class OctoBuddyHost {
     }
     for (const request of this.#statusRequests) {
       if (request.pluginId !== plugin.id || request.targetId !== attachment.target.id
-        || request.contextId !== contextId || request.requestId !== requestId
+        || request.contextId !== contextId || request.requestKind !== "chat-status" || request.requestId !== requestId
+        || request.controller.signal.aborted) continue;
+      request.controller.abort();
+    }
+  }
+
+  private cancelChatDetails(
+    plugin: HostPlugin,
+    attachment: TargetAttachment,
+    contextId: number,
+    requestId: number,
+  ): void {
+    if (!this.isAuthorizedStatusContext(plugin, attachment, contextId)) {
+      throw new Error("plugin is not authorized to cancel chat details");
+    }
+    for (const request of this.#statusRequests) {
+      if (request.pluginId !== plugin.id || request.targetId !== attachment.target.id
+        || request.contextId !== contextId || request.requestKind !== "chat-details" || request.requestId !== requestId
         || request.controller.signal.aborted) continue;
       request.controller.abort();
     }

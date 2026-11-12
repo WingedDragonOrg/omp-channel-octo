@@ -358,6 +358,8 @@
       getChannelStatus: () => call("status", "getChannelStatus", []),
       getChatStatus: (target, requestId) => call("status", "getChatStatus", [target, requestId]),
       cancelChatStatus: (requestId) => call("status", "cancelChatStatus", [requestId]),
+      getChatDetails: (target, requestId) => call("status", "getChatDetails", [target, requestId]),
+      cancelChatDetails: (requestId) => call("status", "cancelChatDetails", [requestId]),
       onDispose: registerDispose,
     });
     Object.defineProperty(window, "octoEnhancer", { configurable: false, enumerable: false, value: api });

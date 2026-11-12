@@ -434,6 +434,15 @@ function latestLoopTaskSnapshot(db: Database, key: LoopTaskKey): LoopTask | null
   return row ? JSON.parse(asString(row.task_json)) as LoopTask : null;
 }
 
+export function getLoopTaskSummary(
+  db: Database,
+  key: LoopTaskKey,
+): Pick<LoopTask, "title" | "status"> | null {
+  assertLoopTaskKey(key);
+  const task = latestLoopTaskSnapshot(db, key);
+  return task === null ? null : { title: task.title, status: task.status };
+}
+
 export function isLoopInputObserved(db: Database, input: LoopInput): boolean {
   if (input.tasks.length === 0) return false;
   const ownerId = getOwnerId(db, input.botUid);

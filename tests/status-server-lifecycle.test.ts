@@ -29,6 +29,23 @@ interface ChatStatusSnapshot extends ChatTarget {
   pendingQuestions: number;
 }
 
+interface ChatDetailsSnapshot extends ChatTarget {
+  version: 1;
+  sampledAt: string;
+  context: {
+    source: "live" | "persisted" | "unavailable";
+    stale: boolean;
+    usedTokens: number | null;
+    contextWindow: number | null;
+    percent: number | null;
+    model: string | null;
+    observedAt: string | null;
+    note: string;
+  };
+  references: { pr: string[]; mr: string[] };
+  tasks: { workspaceId: string; taskId: string; title: string | null; status: string | null; url: string | null }[];
+}
+
 interface StatusServerOptions {
   listenAddress: string;
   port: number;
@@ -37,6 +54,7 @@ interface StatusServerOptions {
   tokenFile?: string;
   statusSnapshot: () => ServiceSnapshot;
   chatStatusSnapshot: (target: ChatTarget) => ChatStatusSnapshot;
+  chatDetailsSnapshot: (target: ChatTarget, signal: AbortSignal) => Promise<ChatDetailsSnapshot>;
 }
 
 interface StatusServer {
@@ -220,6 +238,25 @@ function statusServerFifoReportScript(tokenFile: string): string {
 function serverOptions(
   credentials: { token?: string; tokenFile?: string },
   statusSnapshot: () => ServiceSnapshot = () => SERVICE_SNAPSHOT,
+  chatDetailsSnapshot: (target: ChatTarget, signal: AbortSignal) => Promise<ChatDetailsSnapshot> =
+    async target => ({
+      version: 1,
+      sampledAt: "2026-11-11T08:32:00.000Z",
+      channelType: target.channelType,
+      channelId: target.channelId,
+      context: {
+        source: "unavailable",
+        stale: false,
+        usedTokens: null,
+        contextWindow: null,
+        percent: null,
+        model: null,
+        observedAt: null,
+        note: "fixture has no bound session",
+      },
+      references: { pr: [], mr: [] },
+      tasks: [],
+    }),
 ): StatusServerOptions {
   return {
     // Tests bind only to loopback; production listen addresses are supplied by configuration.
@@ -238,6 +275,7 @@ function serverOptions(
       queuedTasks: 0,
       pendingQuestions: 0,
     }),
+    chatDetailsSnapshot,
   };
 }
 
@@ -465,6 +503,61 @@ test("snapshot exceptions do not expose or print the bearer token", async () => 
   } finally {
     await server?.stop();
     errorSpy.mockRestore();
+    await fixture.cleanup();
+  }
+});
+
+test("stopping the status server aborts its in-flight details context read", async () => {
+  const fixture = await createTokenFixture();
+  let server: StatusServer | undefined;
+  const clientController = new AbortController();
+  const handlerStarted = Promise.withResolvers<void>();
+  let requestSignal: AbortSignal | undefined;
+  let callbackSawAbort = false;
+
+  try {
+    const startStatusServer = await loadStartStatusServer();
+    server = await startStatusServer(serverOptions(
+      { tokenFile: fixture.tokenFile },
+      undefined,
+      async (_target, signal) => {
+        requestSignal = signal;
+        const aborted = Promise.withResolvers<void>();
+        signal.addEventListener("abort", () => {
+          callbackSawAbort = true;
+          aborted.resolve();
+        }, { once: true });
+        handlerStarted.resolve();
+        await aborted.promise;
+        signal.throwIfAborted();
+        throw new Error("cancelled details callback should not produce a snapshot");
+      },
+    ));
+    const responseResult = fetch(
+      `http://127.0.0.1:${server.port}/v1/chats/details?channelType=5&channelId=group-42____thread-9`,
+      {
+        headers: { authorization: `Bearer ${TOKEN}` },
+        signal: clientController.signal,
+      },
+    ).then(
+      response => ({ response }) as const,
+      error => ({ error }) as const,
+    );
+    const requestOutcome = await Promise.race([
+      handlerStarted.promise.then(() => null),
+      responseResult,
+    ]);
+    expect(requestOutcome).toBeNull();
+
+    await server.stop();
+    const abortedByServerStop: boolean = Boolean(requestSignal?.aborted && callbackSawAbort);
+    if (!abortedByServerStop) clientController.abort();
+    const result = await responseResult;
+    if ("response" in result) await result.response.body?.cancel();
+    expect(abortedByServerStop).toBe(true);
+  } finally {
+    clientController.abort();
+    await server?.stop();
     await fixture.cleanup();
   }
 });

@@ -43,17 +43,42 @@ type ChatStatusSnapshot = {
   pendingQuestions: number;
 };
 
+type ChatDetailsSnapshot = {
+  version: 1;
+  sampledAt: string;
+  channelType: 1 | 2 | 5;
+  channelId: string;
+  context: {
+    source: "live" | "persisted" | "unavailable";
+    stale: boolean;
+    usedTokens: number | null;
+    contextWindow: number | null;
+    percent: number | null;
+    model: string | null;
+    observedAt: string | null;
+    note: string;
+  };
+  references: { pr: string[]; mr: string[] };
+  tasks: { workspaceId: string; taskId: string; title: string | null; status: string | null; url: string | null }[];
+};
+
+
 type StatusRequest = { method: string; path: string; authorization: string | undefined };
 
 type LocalStatusServer = {
   baseUrl: string;
   requests(): StatusRequest[];
   chatRequests(): StatusRequest[];
+  detailsRequests(): StatusRequest[];
   releaseChatResponse(target: ChatStatusTarget): void;
   pendingChatResponse(target: ChatStatusTarget): boolean;
   abortedResponse(): boolean;
   abortedChatResponse(): boolean;
   abortedChatTarget(target: ChatStatusTarget): boolean;
+  releaseDetailsResponse(target: ChatStatusTarget): void;
+  pendingDetailsResponse(target: ChatStatusTarget): boolean;
+  abortedDetailsResponse(): boolean;
+  abortedDetailsTarget(target: ChatStatusTarget): boolean;
   close(): Promise<void>;
 };
 
@@ -125,17 +150,55 @@ function chatSnapshotFor(target: ChatStatusTarget): ChatStatusSnapshot {
   };
 }
 
+function chatDetailsSnapshotFor(target: ChatStatusTarget): ChatDetailsSnapshot {
+  const thread = target.channelType === 5;
+  return {
+    version: 1,
+    sampledAt: snapshot.sampledAt,
+    channelType: target.channelType,
+    channelId: target.channelId,
+    context: {
+      source: "live",
+      stale: false,
+      usedTokens: 12_345,
+      contextWindow: 200_000,
+      percent: 6.17,
+      model: `model-${target.channelId}`,
+      observedAt: snapshot.sampledAt,
+      note: "Current live worker",
+    },
+    references: {
+      pr: thread ? ["https://github.com/example/project/pull/42"] : [],
+      mr: thread ? ["https://gitlab.com/example/project/-/merge_requests/7"] : [],
+    },
+    tasks: thread ? [{
+      workspaceId: "workspace-17",
+      taskId: "TASK-42",
+      title: "Persist callback",
+      status: "in_progress",
+      url: "https://loop.example/tasks/TASK-42",
+    }] : [],
+  };
+}
+
+
 function createLocalStatusServer(options: {
   holdResponse?: boolean;
   holdChatTargets?: ChatStatusTarget[];
+  holdDetailsTargets?: ChatStatusTarget[];
 } = {}): Promise<LocalStatusServer> {
   const requests: StatusRequest[] = [];
   const chatRequests: StatusRequest[] = [];
+  const detailsRequests: StatusRequest[] = [];
   const heldChatTargets = new Set((options.holdChatTargets ?? []).map(chatStatusKey));
+  const heldDetailsTargets = new Set((options.holdDetailsTargets ?? []).map(chatStatusKey));
   const pendingChatResponses = new Map<string, ServerResponse[]>();
+  const pendingDetailsResponses = new Map<string, ServerResponse[]>();
   let didAbortResponse = false;
   let didAbortChatResponse = false;
+  let didAbortDetailsResponse = false;
   const abortedChatTargets = new Set<string>();
+  const abortedDetailsTargets = new Set<string>();
   const server = createServer((request, response) => {
     const path = request.url ?? "/";
     requests.push({
@@ -144,7 +207,8 @@ function createLocalStatusServer(options: {
       authorization: request.headers.authorization,
     });
     const url = new URL(path, "http://127.0.0.1");
-    if (request.method !== "GET" || (url.pathname !== "/v1/status" && url.pathname !== "/v1/chats/status")) {
+    if (request.method !== "GET" || (url.pathname !== "/v1/status" && url.pathname !== "/v1/chats/status"
+      && url.pathname !== "/v1/chats/details")) {
       response.writeHead(404).end();
       return;
     }
@@ -170,9 +234,13 @@ function createLocalStatusServer(options: {
       return;
     }
     const target = { channelType: channelType as ChatStatusTarget["channelType"], channelId };
-    chatRequests.push({ method: request.method ?? "", path, authorization: request.headers.authorization });
+    if (url.pathname === "/v1/chats/status") {
+      chatRequests.push({ method: request.method ?? "", path, authorization: request.headers.authorization });
+    } else {
+      detailsRequests.push({ method: request.method ?? "", path, authorization: request.headers.authorization });
+    }
     const key = chatStatusKey(target);
-    if (heldChatTargets.has(key)) {
+    if (url.pathname === "/v1/chats/status" && heldChatTargets.has(key)) {
       const responses = pendingChatResponses.get(key) ?? [];
       responses.push(response);
       pendingChatResponses.set(key, responses);
@@ -186,8 +254,24 @@ function createLocalStatusServer(options: {
       });
       return;
     }
+    if (url.pathname === "/v1/chats/details" && heldDetailsTargets.has(key)) {
+      const responses = pendingDetailsResponses.get(key) ?? [];
+      responses.push(response);
+      pendingDetailsResponses.set(key, responses);
+      response.on("close", () => {
+        if (response.writableEnded) return;
+        didAbortDetailsResponse = true;
+        abortedDetailsTargets.add(key);
+        const remaining = pendingDetailsResponses.get(key)?.filter((pending) => pending !== response) ?? [];
+        if (remaining.length === 0) pendingDetailsResponses.delete(key);
+        else pendingDetailsResponses.set(key, remaining);
+      });
+      return;
+    }
     response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-    response.end(JSON.stringify(chatSnapshotFor(target)));
+    response.end(JSON.stringify(url.pathname === "/v1/chats/details"
+      ? chatDetailsSnapshotFor(target)
+      : chatSnapshotFor(target)));
   });
   const { promise, resolve, reject } = Promise.withResolvers<LocalStatusServer>();
   server.once("error", reject);
@@ -202,6 +286,7 @@ function createLocalStatusServer(options: {
       baseUrl: `http://127.0.0.1:${address.port}`,
       requests: () => [...requests],
       chatRequests: () => [...chatRequests],
+      detailsRequests: () => [...detailsRequests],
       releaseChatResponse: (target) => {
         const key = chatStatusKey(target);
         const response = pendingChatResponses.get(key)?.shift();
@@ -215,6 +300,18 @@ function createLocalStatusServer(options: {
       abortedChatTarget: (target) => abortedChatTargets.has(chatStatusKey(target)),
       abortedResponse: () => didAbortResponse,
       abortedChatResponse: () => didAbortChatResponse,
+      releaseDetailsResponse: (target) => {
+        const key = chatStatusKey(target);
+        const response = pendingDetailsResponses.get(key)?.shift();
+        if (!response) throw new Error(`No held chat details response for ${key}`);
+        if (pendingDetailsResponses.get(key)?.length === 0) pendingDetailsResponses.delete(key);
+        response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+        response.end(JSON.stringify(chatDetailsSnapshotFor(target)));
+      },
+      pendingDetailsResponse: (target) => (pendingDetailsResponses.get(chatStatusKey(target)) ?? [])
+        .some((response) => !response.writableEnded),
+      abortedDetailsResponse: () => didAbortDetailsResponse,
+      abortedDetailsTarget: (target) => abortedDetailsTargets.has(chatStatusKey(target)),
       close: async () => {
         server.closeAllConnections();
         const closed = Promise.withResolvers<void>();
@@ -230,6 +327,7 @@ async function withStatusHost(
   options: {
     holdResponse?: boolean;
     holdChatTargets?: ChatStatusTarget[];
+    holdDetailsTargets?: ChatStatusTarget[];
     preparePlugins?: (pluginRoot: string) => Promise<void>;
     prepareTargets?: (fixture: OwnedCdpFixture, root: string, appPath: string) => Promise<void>;
   },
@@ -245,6 +343,7 @@ async function withStatusHost(
     server = await createLocalStatusServer({
       holdResponse: options.holdResponse ?? false,
       ...(options.holdChatTargets !== undefined ? { holdChatTargets: options.holdChatTargets } : {}),
+      ...(options.holdDetailsTargets !== undefined ? { holdDetailsTargets: options.holdDetailsTargets } : {}),
     });
     const pluginRoot = join(root, "extra-plugins");
     await mkdir(pluginRoot, { recursive: true });
@@ -440,18 +539,26 @@ test("a page script cannot invoke the status capability or forge its bridge requ
     const before = server.requests().length;
     const attempt = await fixture.evaluate(targetId, pageContext!.id, `(() => {
       const method = window.octoEnhancer?.getChannelStatus;
-      if (typeof method === "function") {
-        const pending = method.call(window.octoEnhancer);
-        pending?.catch?.(() => {});
+      const detailsMethod = window.octoEnhancer?.getChatDetails;
+      if (typeof method === "function") method.call(window.octoEnhancer).catch(() => {});
+      if (typeof detailsMethod === "function") detailsMethod.call(
+        window.octoEnhancer, { channelType: 5, channelId: "page-forged" }, 901,
+      ).catch(() => {});
+      if (typeof window.__ewSend === "function") {
+        window.__ewSend(JSON.stringify({ callId: 98101, api: "status", method: "getChannelStatus", args: [] }));
+        window.__ewSend(JSON.stringify({
+          callId: 98102, api: "status", method: "getChatDetails",
+          args: [{ channelType: 5, channelId: "page-forged" }, 901],
+        }));
       }
-      const forged = JSON.stringify({ callId: 98101, api: "status", method: "getChannelStatus", args: [] });
-      if (typeof window.__ewSend === "function") window.__ewSend(forged);
-      return typeof method;
+      return [typeof method, typeof detailsMethod];
     })()`);
-    expect(attempt).toBe("undefined");
+    expect(attempt).toEqual(["undefined", "undefined"]);
     await fixture.drain();
     expect(server.requests()).toHaveLength(before);
-    expect((await fixture.resolutions(targetId, pageContext!.id)).some((resolution) => resolution.callId === 98101)).toBe(false);
+    expect(server.detailsRequests()).toHaveLength(0);
+    const resolutions = await fixture.resolutions(targetId, pageContext!.id);
+    expect(resolutions.some((resolution) => resolution.callId === 98101 || resolution.callId === 98102)).toBe(false);
   });
 }, 15_000);
 
@@ -472,6 +579,17 @@ test("a different plugin cannot impersonate the status plugin", async () => {
               (value) => { document.documentElement.dataset.statusSpoof = value?.state === "online" ? "online" : "resolved"; },
               (error) => { document.documentElement.dataset.statusSpoof = "rejected:" + String(error?.message ?? error); },
             );
+          };
+          window.__attemptDetailsSpoof = () => {
+            const method = window.octoEnhancer?.getChatDetails;
+            if (typeof method !== "function") {
+              document.documentElement.dataset.statusDetailsSpoof = "unavailable";
+              return;
+            }
+            void method.call(window.octoEnhancer, { channelType: 5, channelId: "spoof-thread" }, 903).then(
+              (value) => { document.documentElement.dataset.statusDetailsSpoof = value?.state === "online" ? "online" : "resolved"; },
+              (error) => { document.documentElement.dataset.statusDetailsSpoof = "rejected:" + String(error?.message ?? error); },
+            );
           };`,
         },
       });
@@ -490,14 +608,17 @@ test("a different plugin cannot impersonate the status plugin", async () => {
     expect(spoofContext).toBeDefined();
 
     const before = server.requests().length;
-    expect(await fixture.evaluate(targetId, spoofContext!.id, "window.__attemptStatusSpoof(); true")).toBe(true);
+    expect(await fixture.evaluate(targetId, spoofContext!.id, "window.__attemptStatusSpoof(); window.__attemptDetailsSpoof(); true")).toBe(true);
     await waitUntil(async () => {
       const effects = await fixture.effects(targetId, `${targetId}-main`);
-      return typeof effects.dataset.statusSpoof === "string";
-    }, "the spoof attempt result");
+      return typeof effects.dataset.statusSpoof === "string" && typeof effects.dataset.statusDetailsSpoof === "string";
+    }, "the status and details spoof attempts");
     const result = (await fixture.effects(targetId, `${targetId}-main`)).dataset.statusSpoof;
+    const detailsResult = (await fixture.effects(targetId, `${targetId}-main`)).dataset.statusDetailsSpoof;
     expect(result).not.toBe("online");
+    expect(detailsResult).not.toBe("online");
     expect(server.requests()).toHaveLength(before);
+    expect(server.detailsRequests()).toHaveLength(0);
   });
 }, 15_000);
 
@@ -723,5 +844,311 @@ test("cancelChatStatus aborts only the request with the matching panel generatio
     });
     expect(typeof (await fixture.evaluate(targetId, context!.id, "window.__chatRequestResults.previous.error"))).toBe("string");
     expect(server.chatRequests()).toHaveLength(2);
+  });
+}, 15_000);
+
+test("chat details are available only to the authorized status plugin on the communication page", async () => {
+  const target = { channelType: 5, channelId: "group + 7____thread-details" } as const;
+  await withStatusHost({
+    prepareTargets: async (fixture, _root, appPath) => {
+      await fixture.addTarget({ id: "details-authorized-communication", url: communicationUrl(appPath) });
+      await fixture.addTarget({ id: "details-denied-conversation", url: conversationUrl(appPath) });
+    },
+  }, async ({ fixture, server }) => {
+    const authorizedTargetId = "details-authorized-communication";
+    const deniedTargetId = "details-denied-conversation";
+    await waitUntil(async () =>
+      (await statusContext(fixture, authorizedTargetId)) !== undefined &&
+      (await statusContext(fixture, deniedTargetId)) !== undefined,
+    "both status plugin contexts");
+    await activatePackagedStatusPlugin(fixture, authorizedTargetId);
+    await activatePackagedStatusPlugin(fixture, deniedTargetId);
+    const authorizedContext = await statusContext(fixture, authorizedTargetId);
+    const deniedContext = await statusContext(fixture, deniedTargetId);
+    expect(authorizedContext).toBeDefined();
+    expect(deniedContext).toBeDefined();
+    expect(await fixture.evaluate(authorizedTargetId, authorizedContext!.id, "typeof window.octoEnhancer?.getChatDetails")).toBe("function");
+    expect(await fixture.evaluate(deniedTargetId, deniedContext!.id, "typeof window.octoEnhancer?.getChatDetails")).toBe("function");
+
+    await fixture.evaluate(authorizedTargetId, authorizedContext!.id, `window.__detailsAuthorized = undefined;
+      window.octoEnhancer.getChatDetails(${JSON.stringify(target)}, 401).then(
+        (result) => { window.__detailsAuthorized = { result }; },
+        (error) => { window.__detailsAuthorized = { error: String(error?.message ?? error) }; },
+      );`);
+    await fixture.evaluate(deniedTargetId, deniedContext!.id, `window.__detailsDenied = undefined;
+      window.octoEnhancer.getChatDetails(${JSON.stringify(target)}, 402).then(
+        (result) => { window.__detailsDenied = { result }; },
+        (error) => { window.__detailsDenied = { error: String(error?.message ?? error) }; },
+      );`);
+
+    await waitUntil(async () => await fixture.evaluate(
+      authorizedTargetId,
+      authorizedContext!.id,
+      "window.__detailsAuthorized !== undefined",
+    ) === true, "the authorized chat details result");
+    await waitUntil(async () => await fixture.evaluate(
+      deniedTargetId,
+      deniedContext!.id,
+      "window.__detailsDenied !== undefined",
+    ) === true, "the non-communication details denial");
+    expect(await fixture.evaluate(authorizedTargetId, authorizedContext!.id, "window.__detailsAuthorized")).toEqual({
+      result: { state: "online", snapshot: chatDetailsSnapshotFor(target) },
+    });
+    expect(await fixture.evaluate(deniedTargetId, deniedContext!.id, "window.__detailsDenied.error")).toContain("not authorized");
+    expect(server.detailsRequests()).toHaveLength(1);
+    const detailsUrl = new URL(server.detailsRequests()[0]!.path, server.baseUrl);
+    expect(detailsUrl.pathname).toBe("/v1/chats/details");
+    expect(detailsUrl.searchParams.get("channelType")).toBe("5");
+    expect(detailsUrl.searchParams.get("channelId")).toBe(target.channelId);
+    expect(server.detailsRequests()[0]).toMatchObject({
+      method: "GET",
+      authorization: `Bearer ${bearerToken}`,
+    });
+
+    const pageContext = await fixture.context(authorizedTargetId, `${authorizedTargetId}-main`);
+    expect(pageContext?.isDefault).toBe(true);
+    expect(await fixture.evaluate(authorizedTargetId, pageContext!.id, "typeof window.octoEnhancer?.getChatDetails")).toBe("undefined");
+  });
+}, 15_000);
+
+test("disabling the status plugin aborts pending chat details and revokes later bridge calls", async () => {
+  const target = { channelType: 5, channelId: "group____details-disable" } as const;
+  await withStatusHost({
+    holdDetailsTargets: [target],
+    prepareTargets: (fixture, _root, appPath) => fixture.addTarget({
+      id: "details-disable-boundary",
+      url: communicationUrl(appPath),
+    }),
+  }, async ({ fixture, host, server }) => {
+    const targetId = "details-disable-boundary";
+    await waitUntil(async () => (await statusContext(fixture, targetId)) !== undefined, "the status plugin context");
+    await activatePackagedStatusPlugin(fixture, targetId);
+    const context = await statusContext(fixture, targetId);
+    expect(context).toBeDefined();
+    await fixture.evaluate(targetId, context!.id, `window.__detailsDisableResult = undefined;
+      window.octoEnhancer.getChatDetails(${JSON.stringify(target)}, 501).then(
+        (result) => { window.__detailsDisableResult = { result }; },
+        (error) => { window.__detailsDisableResult = { error: String(error?.message ?? error) }; },
+      );`);
+    await waitUntil(() => server.pendingDetailsResponse(target), "the held chat details request");
+
+    await host.setPluginEnabled("channel-status", false);
+    await waitUntil(() => server.abortedDetailsTarget(target), "the details request to abort on disable");
+    await waitUntil(async () => await fixture.evaluate(
+      targetId,
+      context!.id,
+      "window.__detailsDisableResult?.error === 'plugin is disabled'",
+    ) === true, "the pending bridge call to reject on disable");
+    await fixture.evaluate(targetId, context!.id, `window.__detailsDisabledCall = undefined;
+      window.octoEnhancer.getChatDetails(${JSON.stringify(target)}, 502).then(
+        () => { window.__detailsDisabledCall = "fulfilled"; },
+        (error) => { window.__detailsDisabledCall = String(error?.message ?? error); },
+      );`);
+    await waitUntil(async () => await fixture.evaluate(
+      targetId,
+      context!.id,
+      "window.__detailsDisabledCall !== undefined",
+    ) === true, "subsequent disabled details calls to settle");
+    expect(await fixture.evaluate(targetId, context!.id, "window.__detailsDisabledCall")).toBe("plugin is disabled");
+    expect(server.detailsRequests()).toHaveLength(1);
+  });
+}, 15_000);
+
+test("destroying a status plugin execution context aborts its pending chat details request", async () => {
+  const target = { channelType: 5, channelId: "group____details-destroy" } as const;
+  await withStatusHost({
+    holdDetailsTargets: [target],
+    prepareTargets: (fixture, _root, appPath) => fixture.addTarget({
+      id: "details-destroy-boundary",
+      url: communicationUrl(appPath),
+    }),
+  }, async ({ appPath, fixture, server }) => {
+    const targetId = "details-destroy-boundary";
+    await waitUntil(async () => (await statusContext(fixture, targetId)) !== undefined, "the status plugin context");
+    await activatePackagedStatusPlugin(fixture, targetId);
+    const context = await statusContext(fixture, targetId);
+    expect(context).toBeDefined();
+    await fixture.evaluate(targetId, context!.id, `window.octoEnhancer.getChatDetails(${JSON.stringify(target)}, 601).catch(() => {});`);
+    await waitUntil(() => server.pendingDetailsResponse(target), "the held details request before navigation");
+
+    await fixture.navigate(targetId, `${targetId}-main`, settingsUrl(appPath));
+    await waitUntil(() => server.abortedDetailsTarget(target), "the pending request to abort when its execution context is destroyed");
+    expect(server.pendingDetailsResponse(target)).toBe(false);
+  });
+}, 15_000);
+
+test("chat details cancellation is isolated from chat status requests with the same request ID", async () => {
+  const detailsCancelTarget = { channelType: 2, channelId: "details-cancel-id-isolation" } as const;
+  const statusCancelTarget = { channelType: 5, channelId: "group____status-cancel-id-isolation" } as const;
+  await withStatusHost({
+    holdChatTargets: [detailsCancelTarget, statusCancelTarget],
+    holdDetailsTargets: [detailsCancelTarget, statusCancelTarget],
+    prepareTargets: (fixture, _root, appPath) => fixture.addTarget({
+      id: "details-request-id-isolation",
+      url: communicationUrl(appPath),
+    }),
+  }, async ({ fixture, server }) => {
+    const targetId = "details-request-id-isolation";
+    await waitUntil(async () => (await statusContext(fixture, targetId)) !== undefined, "the authorized status context");
+    await activatePackagedStatusPlugin(fixture, targetId);
+    const context = await statusContext(fixture, targetId);
+    expect(context).toBeDefined();
+    expect(await fixture.evaluate(targetId, context!.id, "typeof window.octoEnhancer?.getChatDetails")).toBe("function");
+    expect(await fixture.evaluate(targetId, context!.id, "typeof window.octoEnhancer?.cancelChatDetails")).toBe("function");
+
+    await fixture.evaluate(targetId, context!.id, `window.__requestKindResults = {};
+      window.octoEnhancer.getChatStatus(${JSON.stringify(detailsCancelTarget)}, 701).then(
+        (result) => { window.__requestKindResults.statusDetailsCancel = { result }; },
+        (error) => { window.__requestKindResults.statusDetailsCancel = { error: String(error?.message ?? error) }; },
+      );
+      window.octoEnhancer.getChatDetails(${JSON.stringify(detailsCancelTarget)}, 701).then(
+        (result) => { window.__requestKindResults.detailsCancel = { result }; },
+        (error) => { window.__requestKindResults.detailsCancel = { error: String(error?.message ?? error) }; },
+      );`);
+    await waitUntil(() => server.pendingChatResponse(detailsCancelTarget) && server.pendingDetailsResponse(detailsCancelTarget),
+      "same-ID status and details requests");
+    await fixture.evaluate(targetId, context!.id, `window.__detailsCancelResult = undefined;
+      window.octoEnhancer.cancelChatDetails(701).then(
+        () => { window.__detailsCancelResult = "done"; },
+        (error) => { window.__detailsCancelResult = String(error?.message ?? error); },
+      );
+      true;`);
+    await waitUntil(async () => await fixture.evaluate(
+      targetId,
+      context!.id,
+      'window.__detailsCancelResult === "done"',
+    ) === true, "details cancellation bridge call to resolve");
+    await waitUntil(() => server.abortedDetailsTarget(detailsCancelTarget), "details-only cancellation");
+    expect(server.pendingChatResponse(detailsCancelTarget)).toBe(true);
+    expect(server.abortedChatTarget(detailsCancelTarget)).toBe(false);
+    server.releaseChatResponse(detailsCancelTarget);
+    await waitUntil(async () => await fixture.evaluate(
+      targetId,
+      context!.id,
+      "window.__requestKindResults.statusDetailsCancel?.result !== undefined",
+    ) === true, "the status request with the matching numeric ID to remain active");
+    expect(await fixture.evaluate(targetId, context!.id, "window.__requestKindResults.statusDetailsCancel")).toEqual({
+      result: { state: "online", snapshot: chatSnapshotFor(detailsCancelTarget) },
+    });
+
+    await fixture.evaluate(targetId, context!.id, `window.__requestKindResults.statusCancel = undefined;
+      window.octoEnhancer.getChatStatus(${JSON.stringify(statusCancelTarget)}, 702).then(
+        (result) => { window.__requestKindResults.statusCancel = { result }; },
+        (error) => { window.__requestKindResults.statusCancel = { error: String(error?.message ?? error) }; },
+      );
+      window.__requestKindResults.detailsStatusCancel = undefined;
+      window.octoEnhancer.getChatDetails(${JSON.stringify(statusCancelTarget)}, 702).then(
+        (result) => { window.__requestKindResults.detailsStatusCancel = { result }; },
+        (error) => { window.__requestKindResults.detailsStatusCancel = { error: String(error?.message ?? error) }; },
+      );`);
+    await waitUntil(() => server.pendingChatResponse(statusCancelTarget) && server.pendingDetailsResponse(statusCancelTarget),
+      "second same-ID status and details requests");
+    await fixture.evaluate(targetId, context!.id, `window.__statusCancelResult = undefined;
+      window.octoEnhancer.cancelChatStatus(702).then(
+        () => { window.__statusCancelResult = "done"; },
+        (error) => { window.__statusCancelResult = String(error?.message ?? error); },
+      );
+      true;`);
+    await waitUntil(async () => await fixture.evaluate(
+      targetId,
+      context!.id,
+      'window.__statusCancelResult === "done"',
+    ) === true, "status cancellation bridge call to resolve");
+    await waitUntil(() => server.abortedChatTarget(statusCancelTarget), "status-only cancellation");
+    expect(server.pendingDetailsResponse(statusCancelTarget)).toBe(true);
+    expect(server.abortedDetailsTarget(statusCancelTarget)).toBe(false);
+    server.releaseDetailsResponse(statusCancelTarget);
+    await waitUntil(async () => await fixture.evaluate(
+      targetId,
+      context!.id,
+      "window.__requestKindResults.detailsStatusCancel?.result !== undefined",
+    ) === true, "the details request with the matching numeric ID to remain active");
+    expect(await fixture.evaluate(targetId, context!.id, "window.__requestKindResults.detailsStatusCancel")).toEqual({
+      result: { state: "online", snapshot: chatDetailsSnapshotFor(statusCancelTarget) },
+    });
+    const expectedTargets = [
+      `${detailsCancelTarget.channelType}:${detailsCancelTarget.channelId}`,
+      `${statusCancelTarget.channelType}:${statusCancelTarget.channelId}`,
+    ].sort();
+    const requestTargets = (requests: StatusRequest[], pathname: string) => requests.map(({ path }) => {
+      const url = new URL(path, server.baseUrl);
+      expect(url.pathname).toBe(pathname);
+      return `${url.searchParams.get("channelType")}:${url.searchParams.get("channelId")}`;
+    }).sort();
+    expect(server.chatRequests()).toHaveLength(2);
+    expect(requestTargets(server.chatRequests(), "/v1/chats/status")).toEqual(expectedTargets);
+    expect(server.detailsRequests()).toHaveLength(2);
+    expect(requestTargets(server.detailsRequests(), "/v1/chats/details")).toEqual(expectedTargets);
+  });
+}, 15_000);
+
+test("switching detail targets cancels the old request without canceling the current target", async () => {
+  const previousTarget = { channelType: 2, channelId: "group-before-details-switch" } as const;
+  const currentTarget = { channelType: 5, channelId: "group____thread-after-details-switch" } as const;
+  await withStatusHost({
+    holdDetailsTargets: [previousTarget, currentTarget],
+    prepareTargets: (fixture, _root, appPath) => fixture.addTarget({
+      id: "details-target-switch",
+      url: communicationUrl(appPath),
+    }),
+  }, async ({ fixture, server }) => {
+    const targetId = "details-target-switch";
+    await waitUntil(async () => (await statusContext(fixture, targetId)) !== undefined, "the authorized status context");
+    await activatePackagedStatusPlugin(fixture, targetId);
+    const context = await statusContext(fixture, targetId);
+    expect(context).toBeDefined();
+    expect(await fixture.evaluate(targetId, context!.id, `(() => {
+      window.__detailSwitchResults = {};
+      window.octoEnhancer.getChatDetails(${JSON.stringify(previousTarget)}, 801).then(
+        (result) => { window.__detailSwitchResults.previous = { result }; },
+        (error) => { window.__detailSwitchResults.previous = { error: String(error?.message ?? error) }; },
+      );
+      window.octoEnhancer.getChatDetails(${JSON.stringify(currentTarget)}, 802).then(
+        (result) => { window.__detailSwitchResults.current = { result }; },
+        (error) => { window.__detailSwitchResults.current = { error: String(error?.message ?? error) }; },
+      );
+      return true;
+    })()`)).toBe(true);
+    await waitUntil(() => server.pendingDetailsResponse(previousTarget) && server.pendingDetailsResponse(currentTarget),
+      "both previous and current chat details requests");
+
+    await fixture.evaluate(targetId, context!.id, `window.__detailSwitchCancel = undefined;
+      window.octoEnhancer.cancelChatDetails(801).then(
+        () => { window.__detailSwitchCancel = "done"; },
+        (error) => { window.__detailSwitchCancel = String(error?.message ?? error); },
+      );
+      true;`);
+    await waitUntil(() => server.abortedDetailsTarget(previousTarget), "the previous target request to be canceled");
+    await waitUntil(async () => await fixture.evaluate(
+      targetId,
+      context!.id,
+      'window.__detailSwitchCancel === "done" && window.__detailSwitchResults.previous?.error !== undefined',
+    ) === true, "the previous request and cancellation bridge call to settle");
+    expect(server.pendingDetailsResponse(currentTarget)).toBe(true);
+    expect(server.abortedDetailsTarget(currentTarget)).toBe(false);
+    expect(await fixture.evaluate(targetId, context!.id, "window.__detailSwitchResults.current === undefined")).toBe(true);
+
+    server.releaseDetailsResponse(currentTarget);
+    await waitUntil(async () => await fixture.evaluate(
+      targetId,
+      context!.id,
+      "window.__detailSwitchResults.current !== undefined",
+    ) === true, "the current target details response");
+    expect(await fixture.evaluate(targetId, context!.id, "window.__detailSwitchResults.current")).toEqual({
+      result: { state: "online", snapshot: chatDetailsSnapshotFor(currentTarget) },
+    });
+    const requestedTargets = server.detailsRequests().map(({ path }) => {
+      const url = new URL(path, server.baseUrl);
+      expect(url.pathname).toBe("/v1/chats/details");
+      return `${url.searchParams.get("channelType")}:${url.searchParams.get("channelId")}`;
+    }).sort();
+    const expectedTargets = [
+      `${previousTarget.channelType}:${previousTarget.channelId}`,
+      `${currentTarget.channelType}:${currentTarget.channelId}`,
+    ].sort();
+    expect(server.detailsRequests()).toHaveLength(2);
+    expect(requestedTargets).toEqual(expectedTargets);
+    expect(server.detailsRequests().every((request) =>
+      request.method === "GET" && request.authorization === `Bearer ${bearerToken}`)).toBe(true);
   });
 }, 15_000);

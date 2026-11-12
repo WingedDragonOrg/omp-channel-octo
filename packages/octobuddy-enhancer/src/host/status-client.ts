@@ -43,9 +43,44 @@ export type ChatStatusResult =
   | { state: "online"; snapshot: ChatStatusSnapshot }
   | { state: "unconfigured" | "offline" | "unauthorized" | "invalid"; lastSuccess?: ChatStatusSnapshot };
 
+export interface ChatDetailsContext {
+  source: "live" | "persisted" | "unavailable";
+  stale: boolean;
+  usedTokens: number | null;
+  contextWindow: number | null;
+  percent: number | null;
+  model: string | null;
+  observedAt: string | null;
+  note: string;
+}
+
+export interface ChatDetailsTask {
+  workspaceId: string;
+  taskId: string;
+  title: string | null;
+  status: string | null;
+  url: string | null;
+}
+
+export interface ChatDetailsSnapshot {
+  version: 1;
+  sampledAt: string;
+  channelType: ChatChannelType;
+  channelId: string;
+  context: ChatDetailsContext;
+  references: { pr: string[]; mr: string[] };
+  tasks: ChatDetailsTask[];
+}
+
+export type ChatDetailsResult =
+  | { state: "online"; snapshot: ChatDetailsSnapshot }
+  | { state: "unconfigured" | "offline" | "unauthorized" | "invalid"; lastSuccess?: ChatDetailsSnapshot };
+
+
 export interface StatusClient {
   get(signal?: AbortSignal): Promise<StatusResult>;
   getChat(target: ChatTarget, signal?: AbortSignal): Promise<ChatStatusResult>;
+  getChatDetails(target: ChatTarget, signal?: AbortSignal): Promise<ChatDetailsResult>;
 }
 
 export interface StatusClientOptions {
@@ -286,6 +321,82 @@ function parseChatSnapshot(value: unknown, target: ChatTarget): ChatStatusSnapsh
   };
 }
 
+function parseChatDetailsSnapshot(value: unknown, target: ChatTarget): ChatDetailsSnapshot | undefined {
+  if (!isRecord(value) || !isRecord(value.context) || !isRecord(value.references) || !Array.isArray(value.tasks)) {
+    return undefined;
+  }
+
+  const { version, sampledAt, channelType, channelId, context, references, tasks } = value;
+  const {
+    source,
+    stale,
+    usedTokens,
+    contextWindow,
+    percent,
+    model,
+    observedAt,
+    note,
+  } = context;
+  const { pr, mr } = references;
+  const nullableString = (entry: unknown): boolean => entry === null || typeof entry === "string";
+
+  if (
+    version !== 1 ||
+    channelType !== target.channelType ||
+    channelId !== target.channelId ||
+    !isUtcIsoDateTime(sampledAt) ||
+    (source !== "live" && source !== "persisted" && source !== "unavailable") ||
+    typeof stale !== "boolean" ||
+    (usedTokens !== null &&
+      (typeof usedTokens !== "number" || !Number.isFinite(usedTokens) || usedTokens < 0)) ||
+    (contextWindow !== null &&
+      (typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow < 0)) ||
+    (percent !== null && (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0)) ||
+    !nullableString(model) ||
+    (observedAt !== null && !isUtcIsoDateTime(observedAt)) ||
+    typeof note !== "string" ||
+    !Array.isArray(pr) || !pr.every((entry) => typeof entry === "string") ||
+    !Array.isArray(mr) || !mr.every((entry) => typeof entry === "string") ||
+    !tasks.every((task) =>
+      isRecord(task) &&
+      typeof task.workspaceId === "string" &&
+      typeof task.taskId === "string" &&
+      nullableString(task.title) &&
+      nullableString(task.status) &&
+      nullableString(task.url))
+  ) {
+    return undefined;
+  }
+
+  return {
+    version: 1,
+    sampledAt,
+    channelType: target.channelType,
+    channelId: target.channelId,
+    context: {
+      source,
+      stale,
+      usedTokens: usedTokens as number | null,
+      contextWindow: contextWindow as number | null,
+      percent: percent as number | null,
+      model: model as string | null,
+      observedAt,
+      note,
+    },
+    references: { pr: [...pr] as string[], mr: [...mr] as string[] },
+    tasks: tasks.map((task) => {
+      const value = task as Record<string, unknown>;
+      return {
+        workspaceId: value.workspaceId as string,
+        taskId: value.taskId as string,
+        title: value.title as string | null,
+        status: value.status as string | null,
+        url: value.url as string | null,
+      };
+    }),
+  };
+}
+
 function endpointUrl(baseUrl: URL): URL {
   const url = new URL(baseUrl.href);
   const prefix = url.pathname.replace(/\/+$/, "");
@@ -302,12 +413,30 @@ function chatEndpointUrl(baseUrl: URL, target: ChatTarget): URL {
   return url;
 }
 
+function chatDetailsEndpointUrl(baseUrl: URL, target: ChatTarget): URL {
+  const url = new URL(baseUrl.href);
+  const prefix = url.pathname.replace(/\/+$/, "");
+  url.pathname = `${prefix}/v1/chats/details`;
+  url.searchParams.set("channelType", String(target.channelType));
+  url.searchParams.set("channelId", target.channelId);
+  return url;
+}
+
 function snapshotCopy(snapshot: StatusSnapshot): StatusSnapshot {
   return { ...snapshot };
 }
 
 function chatSnapshotCopy(snapshot: ChatStatusSnapshot): ChatStatusSnapshot {
   return { ...snapshot };
+}
+
+function chatDetailsSnapshotCopy(snapshot: ChatDetailsSnapshot): ChatDetailsSnapshot {
+  return {
+    ...snapshot,
+    context: { ...snapshot.context },
+    references: { pr: [...snapshot.references.pr], mr: [...snapshot.references.mr] },
+    tasks: snapshot.tasks.map((task) => ({ ...task })),
+  };
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
@@ -427,6 +556,7 @@ export function createStatusClient(options: StatusClientOptions): StatusClient {
   let configGeneration = 0;
   let lastSuccess: StatusSnapshot | undefined;
   const chatLastSuccess = new Map<string, { snapshot: ChatStatusSnapshot; requestId: number }>();
+  const chatDetailsLastSuccess = new Map<string, { snapshot: ChatDetailsSnapshot; requestId: number }>();
   let nextRequestId = 0;
   let lastSuccessRequestId = 0;
 
@@ -436,6 +566,7 @@ export function createStatusClient(options: StatusClientOptions): StatusClient {
       configGeneration += 1;
       lastSuccess = undefined;
       chatLastSuccess.clear();
+      chatDetailsLastSuccess.clear();
       lastSuccessRequestId = 0;
     }
     return configGeneration;
@@ -453,6 +584,15 @@ export function createStatusClient(options: StatusClientOptions): StatusClient {
   ): ChatStatusResult => {
     const cached = generation === configGeneration ? chatLastSuccess.get(key)?.snapshot : undefined;
     return cached === undefined ? { state } : { state, lastSuccess: chatSnapshotCopy(cached) };
+  };
+
+  const chatDetailsFailure = (
+    state: "unconfigured" | "offline" | "unauthorized" | "invalid",
+    generation: number | undefined,
+    key: string,
+  ): ChatDetailsResult => {
+    const cached = generation === configGeneration ? chatDetailsLastSuccess.get(key)?.snapshot : undefined;
+    return cached === undefined ? { state } : { state, lastSuccess: chatDetailsSnapshotCopy(cached) };
   };
 
   return {
@@ -506,6 +646,35 @@ export function createStatusClient(options: StatusClientOptions): StatusClient {
         chatLastSuccess.set(key, { snapshot: result.snapshot, requestId });
       }
       return { state: "online", snapshot: chatSnapshotCopy(result.snapshot) };
+    },
+
+    async getChatDetails(target: ChatTarget, signal?: AbortSignal): Promise<ChatDetailsResult> {
+      throwIfAborted(signal);
+      const loaded = await loadConfig(options.configPath);
+      throwIfAborted(signal);
+
+      if (loaded.state !== "ready") {
+        updateConfig(undefined);
+        return loaded.state === "missing" ? { state: "unconfigured" } : { state: "invalid" };
+      }
+
+      const { baseUrl, token, fingerprint } = loaded.config;
+      const generation = updateConfig(fingerprint);
+      const key = JSON.stringify([target.channelType, target.channelId]);
+      const requestId = ++nextRequestId;
+      const result = await requestSnapshot(
+        chatDetailsEndpointUrl(baseUrl, target),
+        token,
+        signal,
+        (value) => parseChatDetailsSnapshot(value, target),
+      );
+      if (result.state !== "online") return chatDetailsFailure(result.state, generation, key);
+
+      const cached = chatDetailsLastSuccess.get(key);
+      if (generation === configGeneration && (cached === undefined || requestId > cached.requestId)) {
+        chatDetailsLastSuccess.set(key, { snapshot: result.snapshot, requestId });
+      }
+      return { state: "online", snapshot: chatDetailsSnapshotCopy(result.snapshot) };
     },
   };
 }

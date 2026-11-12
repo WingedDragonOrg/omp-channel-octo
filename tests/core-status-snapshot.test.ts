@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { Database } from "bun:sqlite";
+import { mkdir, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import type { ChannelService, ChatTarget } from "../src/contracts.ts";
+import type { LoopTask } from "../src/loop/types.ts";
 import { projectSessionDir } from "../src/session/session-dir.ts";
 import { openChannelStore } from "../src/store/index.ts";
 import type { BindingRecord } from "../src/store/store-records.ts";
@@ -44,6 +46,80 @@ function statusSnapshotApi(service: ChannelService): StatusSnapshotApi {
   return snapshotApi;
 }
 
+interface ChatDetailsSnapshot extends ChatTarget {
+  version: 1;
+  sampledAt: string;
+  context: {
+    source: "live" | "persisted" | "unavailable";
+    stale: boolean;
+    usedTokens: number | null;
+    contextWindow: number | null;
+    percent: number | null;
+    model: string | null;
+    observedAt: string | null;
+    note: string;
+  };
+  references: { pr: string[]; mr: string[] };
+  tasks: { workspaceId: string; taskId: string; title: string | null; status: string | null; url: string | null }[];
+}
+
+interface ChatDetailsSnapshotApi {
+  chatDetailsSnapshot(target: ChatTarget, signal: AbortSignal): Promise<ChatDetailsSnapshot>;
+}
+
+function chatDetailsSnapshotApi(service: ChannelService): ChatDetailsSnapshotApi {
+  const snapshotApi = service as unknown as ChatDetailsSnapshotApi;
+  expect(typeof snapshotApi.chatDetailsSnapshot).toBe("function");
+  return snapshotApi;
+}
+
+function databaseVersion(database: Database): number {
+  const row: unknown = database.query("PRAGMA data_version").get();
+  if (
+    typeof row !== "object"
+    || row === null
+    || !("data_version" in row)
+    || typeof row.data_version !== "number"
+  ) {
+    throw new Error("SQLite did not return its data version");
+  }
+  return row.data_version;
+}
+
+function loopTask(taskId: string, title: string, status: string): LoopTask {
+  return {
+    taskId,
+    title,
+    description: `private-task-description:${taskId}`,
+    status,
+    priority: "normal",
+    assigneeType: null,
+    assigneeId: null,
+    assigneeOctoUid: null,
+    projectId: null,
+    parentTaskId: null,
+    startDate: null,
+    dueDate: null,
+    createdAt: "2026-11-11T08:00:00.000Z",
+    updatedAt: "2026-11-11T08:00:00.000Z",
+  };
+}
+
+async function writeBoundSession(sessionFile: string, sessionId: string, cwd: string): Promise<void> {
+  await mkdir(dirname(sessionFile), { recursive: true });
+  await writeFile(
+    sessionFile,
+    `${JSON.stringify({
+      type: "session",
+      version: 3,
+      id: sessionId,
+      timestamp: "2026-11-11T08:00:00.000Z",
+      cwd,
+    })}\n`,
+    "utf8",
+  );
+}
+
 function expectUtcTimestamp(value: string): void {
   expect(Number.isNaN(Date.parse(value))).toBe(false);
   expect(new Date(value).toISOString()).toBe(value);
@@ -53,6 +129,11 @@ const CHAT_A: ChatTarget = { channelType: 1, channelId: "dm-snapshot-a" };
 const CHAT_B: ChatTarget = { channelType: 1, channelId: "dm-snapshot-b" };
 const UNKNOWN_CHAT: ChatTarget = { channelType: 1, channelId: "dm-snapshot-unknown" };
 const CHAT_GOAL_CONTROL: ChatTarget = { channelType: 1, channelId: "dm-snapshot-goal-control" };
+
+const THREAD_GROUP = "group-tools";
+const DETAILS_THREAD: ChatTarget = { channelType: 5, channelId: `${THREAD_GROUP}____status-details` };
+const SIBLING_THREAD: ChatTarget = { channelType: 5, channelId: `${THREAD_GROUP}____status-sibling` };
+const UNBOUND_THREAD: ChatTarget = { channelType: 5, channelId: `${THREAD_GROUP}____status-unbound` };
 
 test("status snapshots reflect live work, queued tasks, chat isolation, and unknown chats", async () => {
   const promptAStarted = Promise.withResolvers<void>();
@@ -324,6 +405,391 @@ test("status snapshot counts an idle goal-show temporary worker until its contro
     expect(snapshots.statusSnapshot().runningSessions).toBe(0);
   } finally {
     releaseGoalCall.resolve();
+    store.close();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("details snapshots retain thread-routed Loop tasks across workspace switches", async () => {
+  const promptStarted = Promise.withResolvers<void>();
+  const releasePrompt = Promise.withResolvers<void>();
+  let promptFinished = false;
+  const harness = await createCoreHarness({
+    allowedGroupIds: [THREAD_GROUP],
+    prompt: async () => {
+      promptStarted.resolve();
+      await releasePrompt.promise;
+      promptFinished = true;
+    },
+  });
+  const store = await openChannelStore(harness.stateDir);
+  const observer = new Database(join(harness.stateDir, "channel.sqlite"));
+
+  try {
+    const workspace = { workspaceId: "details-workspace", name: "Details", slug: "details" };
+    const mainTask = loopTask("details-main-task", "Main thread task", "in_progress");
+    store.bindLoopWorkspace(harness.bot.uid, THREAD_GROUP, workspace, [mainTask]);
+    store.bindLoopTask({
+      botUid: harness.bot.uid,
+      groupId: THREAD_GROUP,
+      workspaceId: workspace.workspaceId,
+      taskId: mainTask.taskId,
+    }, DETAILS_THREAD.channelId);
+    const missingSnapshotTaskId = "details-missing-snapshot";
+    store.bindLoopTask({
+      botUid: harness.bot.uid,
+      groupId: THREAD_GROUP,
+      workspaceId: workspace.workspaceId,
+      taskId: missingSnapshotTaskId,
+    }, DETAILS_THREAD.channelId);
+
+    const mainPr = "https://github.com/example/service/pull/17";
+    const mainMr = "https://gitlab.example/team/service/-/merge_requests/42";
+    const siblingPr = "https://github.com/example/service/pull/99";
+    store.addThreadReferences(harness.bot.uid, DETAILS_THREAD, [
+      { kind: "pr", url: mainPr },
+      { kind: "mr", url: mainMr },
+    ]);
+    store.addThreadReferences(harness.bot.uid, SIBLING_THREAD, [{ kind: "pr", url: siblingPr }]);
+    store.addThreadReferences("another-bot", DETAILS_THREAD, [
+      { kind: "pr", url: "https://github.com/private/other-bot/pull/1" },
+    ]);
+
+    await harness.service.submitInbound(inbound({
+      ...DETAILS_THREAD,
+      messageId: "details-live-worker",
+      text: "private-thread-message-must-not-leak",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    await promptStarted.promise;
+    await waitForStatus(harness.service, DETAILS_THREAD, status => status.state === "running");
+
+    const snapshotApi = chatDetailsSnapshotApi(harness.service);
+    const bindingBefore = store.getBinding(harness.bot.uid, DETAILS_THREAD);
+    expect(bindingBefore).not.toBeNull();
+    const referencesBefore = store.getThreadReferences(harness.bot.uid, DETAILS_THREAD);
+    const routesBefore = store.listLoopThreadTasks(harness.bot.uid, THREAD_GROUP, DETAILS_THREAD.channelId);
+    const inputsBefore = store.listLoopInputs(harness.bot.uid);
+    const versionBefore = databaseVersion(observer);
+    const workersBefore = harness.workers.workers.length;
+
+    const details = await snapshotApi.chatDetailsSnapshot(DETAILS_THREAD, new AbortController().signal);
+
+    expect(details).toMatchObject({
+      version: 1,
+      channelType: DETAILS_THREAD.channelType,
+      channelId: DETAILS_THREAD.channelId,
+      context: {
+        source: "live",
+        stale: false,
+        usedTokens: 4_096,
+        contextWindow: 8_192,
+        percent: 50,
+      },
+      references: { pr: [mainPr], mr: [mainMr] },
+    });
+    expectUtcTimestamp(details.sampledAt);
+    expect(details.context.observedAt).not.toBeNull();
+    expectUtcTimestamp(details.context.observedAt!);
+    expect(details.tasks).toEqual([
+      {
+        workspaceId: workspace.workspaceId,
+        taskId: mainTask.taskId,
+        title: mainTask.title,
+        status: mainTask.status,
+        url: null,
+      },
+      {
+        workspaceId: workspace.workspaceId,
+        taskId: missingSnapshotTaskId,
+        title: null,
+        status: null,
+        url: null,
+      },
+    ]);
+    expect(JSON.stringify(details)).not.toContain("private-thread-message-must-not-leak");
+    expect(JSON.stringify(details)).not.toContain("private-task-description");
+    expect(JSON.stringify(details)).not.toContain("sibling");
+    expect(store.getBinding(harness.bot.uid, DETAILS_THREAD)).toEqual(bindingBefore);
+    expect(store.getThreadReferences(harness.bot.uid, DETAILS_THREAD)).toEqual(referencesBefore);
+    expect(store.listLoopThreadTasks(harness.bot.uid, THREAD_GROUP, DETAILS_THREAD.channelId)).toEqual(routesBefore);
+    expect(store.getSessionContextSnapshot(harness.bot.uid, DETAILS_THREAD)).toBeNull();
+    expect(store.listLoopInputs(harness.bot.uid)).toEqual(inputsBefore);
+    expect(databaseVersion(observer)).toBe(versionBefore);
+    expect(harness.workers.workers).toHaveLength(workersBefore);
+    expect(harness.workers.workers[0]?.contextUsageReads).toBe(1);
+    expect(promptFinished).toBe(false);
+
+    const nextWorkspace = { workspaceId: "details-workspace-next", name: "Details Next", slug: "details-next" };
+    const nextTask = loopTask(mainTask.taskId, "Next workspace task", "done");
+    store.bindLoopWorkspace(harness.bot.uid, THREAD_GROUP, nextWorkspace, [nextTask]);
+    store.bindLoopTask({
+      botUid: harness.bot.uid,
+      groupId: THREAD_GROUP,
+      workspaceId: nextWorkspace.workspaceId,
+      taskId: nextTask.taskId,
+    }, DETAILS_THREAD.channelId);
+    expect(store.getLoopBinding(harness.bot.uid, THREAD_GROUP)?.workspaceId).toBe(nextWorkspace.workspaceId);
+    const switchedVersion = databaseVersion(observer);
+
+    const afterSwitch = await snapshotApi.chatDetailsSnapshot(DETAILS_THREAD, new AbortController().signal);
+    expect(afterSwitch.tasks).toEqual([
+      {
+        workspaceId: workspace.workspaceId,
+        taskId: mainTask.taskId,
+        title: mainTask.title,
+        status: mainTask.status,
+        url: null,
+      },
+      {
+        workspaceId: nextWorkspace.workspaceId,
+        taskId: nextTask.taskId,
+        title: nextTask.title,
+        status: nextTask.status,
+        url: null,
+      },
+      {
+        workspaceId: workspace.workspaceId,
+        taskId: missingSnapshotTaskId,
+        title: null,
+        status: null,
+        url: null,
+      },
+    ]);
+    expect(harness.workers.workers).toHaveLength(workersBefore);
+
+    const sibling = await snapshotApi.chatDetailsSnapshot(SIBLING_THREAD, new AbortController().signal);
+    expect(sibling).toMatchObject({
+      channelType: SIBLING_THREAD.channelType,
+      channelId: SIBLING_THREAD.channelId,
+      references: { pr: [siblingPr], mr: [] },
+      tasks: [],
+    });
+    expect(JSON.stringify(sibling)).not.toContain(mainPr);
+    expect(JSON.stringify(sibling)).not.toContain(mainTask.title);
+
+    const unbound = await snapshotApi.chatDetailsSnapshot(UNBOUND_THREAD, new AbortController().signal);
+    expect(unbound).toMatchObject({
+      channelType: UNBOUND_THREAD.channelType,
+      channelId: UNBOUND_THREAD.channelId,
+      context: { source: "unavailable", usedTokens: null, contextWindow: null, percent: null, model: null },
+      references: { pr: [], mr: [] },
+      tasks: [],
+    });
+    const parentGroup = await snapshotApi.chatDetailsSnapshot(
+      { channelType: 2, channelId: THREAD_GROUP },
+      new AbortController().signal,
+    );
+    expect(parentGroup.references).toEqual({ pr: [], mr: [] });
+    expect(parentGroup.tasks).toEqual([]);
+    expect(harness.workers.workers).toHaveLength(workersBefore);
+    expect(databaseVersion(observer)).toBe(switchedVersion);
+  } finally {
+    releasePrompt.resolve();
+    observer.close();
+    store.close();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("details snapshots use an identity-matched persisted usage sample and return empty unavailable data", async () => {
+  const harness = await createCoreHarness();
+  const store = await openChannelStore(harness.stateDir);
+  const observer = new Database(join(harness.stateDir, "channel.sqlite"));
+  const target: ChatTarget = { channelType: 1, channelId: "dm-persisted-details" };
+
+  try {
+    const cwd = join(harness.root, "persisted-details-workspace");
+    const sessionFile = join(harness.root, "sessions", "persisted-details.jsonl");
+    const sessionId = "persisted-details-session";
+    await mkdir(cwd, { recursive: true });
+    await writeBoundSession(sessionFile, sessionId, cwd);
+    const binding: BindingRecord = {
+      botUid: harness.bot.uid,
+      ...target,
+      sessionId,
+      cwd,
+      sessionFile,
+      cwdPinned: true,
+      sessionSwitchedAt: null,
+    };
+    store.ensureBinding(binding);
+    const file = await stat(sessionFile);
+    store.saveSessionContextSnapshot({
+      botUid: harness.bot.uid,
+      ...target,
+      sessionId,
+      sessionFile,
+      cwd,
+      usedTokens: 2_048,
+      contextWindow: 8_192,
+      percent: 25,
+      model: "fixture/persisted-details",
+      observedAt: "2026-11-11T08:00:00.000Z",
+      fileSize: file.size,
+      fileMtimeMs: file.mtimeMs,
+    });
+    const versionBefore = databaseVersion(observer);
+    const snapshotApi = chatDetailsSnapshotApi(harness.service);
+
+    const persisted = await snapshotApi.chatDetailsSnapshot(target, new AbortController().signal);
+
+    expect(persisted).toMatchObject({
+      channelType: target.channelType,
+      channelId: target.channelId,
+      context: {
+        source: "persisted",
+        stale: false,
+        usedTokens: 2_048,
+        contextWindow: 8_192,
+        percent: 25,
+        model: "fixture/persisted-details",
+        observedAt: "2026-11-11T08:00:00.000Z",
+      },
+      references: { pr: [], mr: [] },
+      tasks: [],
+    });
+    expect(persisted.context.note).toMatch(/非实时|历史/u);
+    expect(harness.workers.workers).toHaveLength(0);
+
+    const unavailable = await snapshotApi.chatDetailsSnapshot(UNBOUND_THREAD, new AbortController().signal);
+    expect(unavailable).toMatchObject({
+      context: {
+        source: "unavailable",
+        usedTokens: null,
+        contextWindow: null,
+        percent: null,
+        model: null,
+        observedAt: null,
+      },
+      references: { pr: [], mr: [] },
+      tasks: [],
+    });
+    expect(harness.workers.workers).toHaveLength(0);
+    expect(databaseVersion(observer)).toBe(versionBefore);
+  } finally {
+    observer.close();
+    store.close();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("details snapshots discard a live usage result when the session binding changes during the async read", async () => {
+  const promptStarted = Promise.withResolvers<void>();
+  const releasePrompt = Promise.withResolvers<void>();
+  const usageStarted = Promise.withResolvers<void>();
+  const releaseUsage = Promise.withResolvers<void>();
+  const harness = await createCoreHarness({
+    prompt: async () => {
+      promptStarted.resolve();
+      await releasePrompt.promise;
+    },
+  });
+  const store = await openChannelStore(harness.stateDir);
+  const observer = new Database(join(harness.stateDir, "channel.sqlite"));
+
+  try {
+    await harness.service.submitInbound(inbound({
+      ...CHAT_A,
+      messageId: "details-binding-race",
+      text: "binding race fixture",
+    }));
+    await promptStarted.promise;
+    await waitForStatus(harness.service, CHAT_A, status => status.state === "running");
+
+    const binding = store.getBinding(harness.bot.uid, CHAT_A);
+    expect(binding).not.toBeNull();
+    const worker = harness.workers.workers[0]!;
+    const readContextUsage = worker.contextUsage.bind(worker);
+    worker.contextUsage = async signal => {
+      usageStarted.resolve();
+      await releaseUsage.promise;
+      return readContextUsage(signal);
+    };
+    const snapshotApi = chatDetailsSnapshotApi(harness.service);
+    const detailsPromise = snapshotApi.chatDetailsSnapshot(CHAT_A, new AbortController().signal);
+    await usageStarted.promise;
+
+    const replacementSessionId = "replacement-session-during-details";
+    const replacementSessionFile = join(harness.root, "replacement-session.jsonl");
+    await writeBoundSession(replacementSessionFile, replacementSessionId, binding!.cwd);
+    store.ensureBinding({
+      ...binding!,
+      sessionId: replacementSessionId,
+      sessionFile: replacementSessionFile,
+    });
+    const versionAfterRebind = databaseVersion(observer);
+    releaseUsage.resolve();
+
+    const details = await detailsPromise;
+
+    expect(details.context).toMatchObject({
+      source: "unavailable",
+      usedTokens: null,
+      contextWindow: null,
+      percent: null,
+      model: null,
+      observedAt: null,
+    });
+    expect(store.getSessionContextSnapshot(harness.bot.uid, CHAT_A)).toBeNull();
+    expect(databaseVersion(observer)).toBe(versionAfterRebind);
+    expect(harness.workers.workers).toHaveLength(1);
+  } finally {
+    releaseUsage.resolve();
+    releasePrompt.resolve();
+    observer.close();
+    store.close();
+    await closeCoreHarness(harness);
+  }
+});
+
+test("cancelling a live details context read does not persist a snapshot or start a worker", async () => {
+  const promptStarted = Promise.withResolvers<void>();
+  const releasePrompt = Promise.withResolvers<void>();
+  const usageStarted = Promise.withResolvers<void>();
+  const releaseUsage = Promise.withResolvers<void>();
+  const harness = await createCoreHarness({
+    prompt: async () => {
+      promptStarted.resolve();
+      await releasePrompt.promise;
+    },
+  });
+  const store = await openChannelStore(harness.stateDir);
+  const observer = new Database(join(harness.stateDir, "channel.sqlite"));
+
+  try {
+    await harness.service.submitInbound(inbound({
+      ...CHAT_B,
+      messageId: "details-cancellation",
+      text: "cancellation fixture",
+    }));
+    await promptStarted.promise;
+    await waitForStatus(harness.service, CHAT_B, status => status.state === "running");
+
+    const worker = harness.workers.workers[0]!;
+    const readContextUsage = worker.contextUsage.bind(worker);
+    worker.contextUsage = async signal => {
+      usageStarted.resolve();
+      await releaseUsage.promise;
+      return readContextUsage(signal);
+    };
+    const snapshotApi = chatDetailsSnapshotApi(harness.service);
+    const requestController = new AbortController();
+    const versionBefore = databaseVersion(observer);
+    const detailsPromise = snapshotApi.chatDetailsSnapshot(CHAT_B, requestController.signal);
+    await usageStarted.promise;
+    requestController.abort(new DOMException("request cancelled", "AbortError"));
+    releaseUsage.resolve();
+
+    await expect(detailsPromise).rejects.toMatchObject({ name: "AbortError" });
+
+    expect(store.getSessionContextSnapshot(harness.bot.uid, CHAT_B)).toBeNull();
+    expect(databaseVersion(observer)).toBe(versionBefore);
+    expect(harness.workers.workers).toHaveLength(1);
+  } finally {
+    releaseUsage.resolve();
+    releasePrompt.resolve();
+    observer.close();
     store.close();
     await closeCoreHarness(harness);
   }

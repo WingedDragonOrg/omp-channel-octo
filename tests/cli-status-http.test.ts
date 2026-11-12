@@ -199,6 +199,19 @@ test("real CLI run serves an authenticated status snapshot and closes its listen
     expect(snapshot).toMatchObject({ version: 1, pid: child.pid });
     expect(snapshot).toHaveProperty("pid", child.pid);
 
+    const detailsUrl = `http://${LISTEN_ADDRESS}:${port}/v1/chats/details?channelType=2&channelId=fixture-group`;
+    const detailsResponse = await fetchStatus(detailsUrl, `Bearer ${token}`);
+    expect(detailsResponse.status).toBe(200);
+    expect(await detailsResponse.json()).toMatchObject({
+      version: 1,
+      channelType: 2,
+      channelId: "fixture-group",
+      context: { source: "unavailable", usedTokens: null, contextWindow: null },
+      references: { pr: [], mr: [] },
+      tasks: [],
+    });
+    expect((await fetchStatus(detailsUrl)).status).toBe(401);
+
     for (const authorization of [undefined, `Bearer ${token}-wrong`]) {
       const response = await fetchStatus(statusUrl, authorization);
       expect(response.status).toBe(401);

@@ -117,7 +117,7 @@ async function createLocalStatusServer(): Promise<LocalStatusServer> {
       authorization: request.headers.authorization,
     });
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
-    if (request.method !== "GET" || (url.pathname !== "/v1/status" && url.pathname !== "/v1/chats/status")) {
+    if (request.method !== "GET" || !["/v1/status", "/v1/chats/status", "/v1/chats/details"].includes(url.pathname)) {
       response.writeHead(404).end();
       return;
     }
@@ -136,6 +136,19 @@ async function createLocalStatusServer(): Promise<LocalStatusServer> {
     if (![1, 2, 5].includes(channelType) || !channelId) {
       response.writeHead(400, { "content-type": "application/json", "cache-control": "no-store" })
         .end(JSON.stringify({ error: { code: "invalid_request" } }));
+      return;
+    }
+    if (url.pathname === "/v1/chats/details") {
+      response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+      response.end(JSON.stringify({
+        version: 1, sampledAt: localStatusSnapshot.sampledAt, channelType, channelId,
+        context: {
+          source: "live", stale: false, usedTokens: 4200, contextWindow: 10000,
+          percent: 42, model: "test/model", observedAt: localStatusSnapshot.sampledAt, note: "实时估算",
+        },
+        references: { pr: ["https://github.com/example/project/pull/42"], mr: [] },
+        tasks: [{ workspaceId: "workspace-1", taskId: "task-1", title: "面板验收任务", status: "doing", url: null }],
+      }));
       return;
     }
     response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
@@ -936,6 +949,12 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
     expect(expandedStatusText).toContain(String(localStatusSnapshot.runningSessions));
     expect(expandedStatusText).toContain(String(localStatusSnapshot.queuedTasks));
     expect(expandedStatusText).toContain("无法识别当前聊天");
+    for (const name of ["状态", "上下文", "关联"]) {
+      expect(expandedStatusNodes.some((node) => node.role?.value === "tab" && node.name?.value === name)).toBe(true);
+    }
+    const panelWidth = await evaluate<number>(browser, communicationSessionId,
+      `document.querySelector("[data-octobuddy-channel-status-panel]").getBoundingClientRect().width`);
+    expect(panelWidth).toBeGreaterThanOrEqual(400);
     const controlledGroup: RendererChannel = { channelID: "status-observer-test-group", channelType: 2 };
     const controlledThread: RendererChannel = { channelID: "status-observer-test-thread", channelType: 5 };
     const assignRendererChannel = async (channel: RendererChannel | null) =>
@@ -989,6 +1008,22 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
       const text = await rendererStatusText();
       return text.includes(`话题 ${controlledThread.channelID}`) && text.includes("空闲");
     }, "the real panel to replace the old group with the selected thread status", 10_000);
+    await evaluate(browser, communicationSessionId, `Array.from(document.querySelectorAll('[data-octobuddy-channel-status-panel] [role="tab"]'))
+      .find((element) => element.textContent.trim() === "上下文").click()`);
+    await waitUntil(async () => {
+      const text = await rendererStatusText();
+      return text.includes("test/model") && /4,?200/.test(text);
+    }, "the real panel to render the selected thread's live context", 10_000);
+    await evaluate(browser, communicationSessionId, `Array.from(document.querySelectorAll('[data-octobuddy-channel-status-panel] [role="tab"]'))
+      .find((element) => element.textContent.trim() === "关联").click()`);
+    await waitUntil(async () => {
+      const text = await rendererStatusText();
+      const hasLink = await evaluate<boolean>(browser!, communicationSessionId,
+        `!!document.querySelector('a[href="https://github.com/example/project/pull/42"]')`);
+      return hasLink && text.includes("面板验收任务");
+    }, "the real panel to render the selected thread's associations", 10_000);
+    await evaluate(browser, communicationSessionId, `Array.from(document.querySelectorAll('[data-octobuddy-channel-status-panel] [role="tab"]'))
+      .find((element) => element.textContent.trim() === "状态").click()`);
 
     const clearedAssignment = await assignRendererChannel(null);
     expect(clearedAssignment.identity).toBeNull();
@@ -1018,7 +1053,7 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
       const url = new URL(request.path, statusFixture.baseUrl);
       return request.method === "GET"
         && request.authorization === `Bearer ${statusToken}`
-        && (url.pathname === "/v1/status" || url.pathname === "/v1/chats/status");
+        && ["/v1/status", "/v1/chats/status", "/v1/chats/details"].includes(url.pathname);
     })).toBe(true);
     for (const target of [controlledGroup, controlledThread]) {
       expect(statusRequests.some((request) => {
@@ -1028,6 +1063,12 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
           && url.searchParams.get("channelId") === target.channelID;
       })).toBe(true);
     }
+    expect(statusRequests.some((request) => {
+      const url = new URL(request.path, statusFixture.baseUrl);
+      return url.pathname === "/v1/chats/details"
+        && url.searchParams.get("channelType") === String(controlledThread.channelType)
+        && url.searchParams.get("channelId") === controlledThread.channelID;
+    })).toBe(true);
 
     await host.setPluginEnabled("channel-status", false);
     await waitUntil(async () => await evaluate<boolean>(browser!, communicationSessionId, `window.__octobuddyStatusNavigation === undefined

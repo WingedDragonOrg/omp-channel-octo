@@ -48,7 +48,7 @@ import { addThreadReferences, captureReferenceHistorySnapshot as captureHistoryS
 import * as storeWatch from "./store-watch.ts";
 import type { WatchCheckCompletion, WatchCreateResult, WatchListItem, WatchRecord } from "../watch/types.ts";
 import type { ThreadReference, ThreadReferences } from "../references/types.ts";
-import { bindLoopTask, bindLoopWorkspace, claimLoopInputIntent, commitLoopScan, completeLoopThreadCreation, getLoopBinding, getLoopInput, getLoopTaskRoute, getLoopThreadCreation, isLoopInputObserved, listLoopBindings, listLoopInputs, listLoopThreadCreationAttempts, listLoopThreadCreations, listLoopThreadTasks, markLoopInputDelivered, markLoopInputFault, markLoopInputPending, markLoopInputUnknown, markLoopThreadCreationUnknown, prepareLoopInput, recordLoopThreadAllocated, releaseLoopThreadCreation, reserveLoopThreadCreation } from "./store-loop.ts";
+import { bindLoopTask, bindLoopWorkspace, claimLoopInputIntent, commitLoopScan, completeLoopThreadCreation, getLoopBinding, getLoopInput, getLoopTaskRoute, getLoopTaskSummary as readLoopTaskSummary, getLoopThreadCreation, isLoopInputObserved, listLoopBindings, listLoopInputs, listLoopThreadCreationAttempts, listLoopThreadCreations, listLoopThreadTasks, markLoopInputDelivered, markLoopInputFault, markLoopInputPending, markLoopInputUnknown, markLoopThreadCreationUnknown, prepareLoopInput, recordLoopThreadAllocated, releaseLoopThreadCreation, reserveLoopThreadCreation } from "./store-loop.ts";
 import { acceptTanOperation, acceptTanTask, cancelTanOperation, finishTanOperation, finishTanOperationWithOutbox, getTanOperation, listCancelledTanOperations, listPendingTanOperations, reclaimTanCommand } from "./store-tan.ts";
 import { acceptReviewJob, bindReviewSession, getActiveReviewJob, getReviewJob, listRecoverableReviewJobs, listTerminalReviewJobs, markReviewCompleted, markReviewDispatchStarted, markReviewFailed, markReviewPromptAccepted, markReviewStarted, markReviewStopped, persistReviewRecoveryNotices, prepareReviewJobsForRestart, releaseOrphanedReviewClaims, requestReviewStop, requestReviewStopForClaim } from "./store-reviews.ts";
 import {
@@ -1634,6 +1634,10 @@ export class ChannelStore {
 
   getLoopTaskRoute(key: LoopTaskKey): LoopTaskRoute | null {
     return getLoopTaskRoute(this.db, key);
+  }
+
+  getLoopTaskSummary(key: LoopTaskKey): Pick<LoopTask, "title" | "status"> | null {
+    return readLoopTaskSummary(this.db, key);
   }
 
   bindLoopTask(key: LoopTaskKey, threadChannelId: string): LoopTaskRoute {

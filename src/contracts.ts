@@ -930,6 +930,31 @@ export interface ChatStatusSnapshot {
   pendingQuestions: number;
 }
 
+export interface ChatDetailsSnapshot {
+  version: 1;
+  sampledAt: string;
+  channelType: number;
+  channelId: string;
+  context: {
+    source: "live" | "persisted" | "unavailable";
+    stale: boolean;
+    usedTokens: number | null;
+    contextWindow: number | null;
+    percent: number | null;
+    model: string | null;
+    observedAt: string | null;
+    note: string;
+  };
+  references: { pr: string[]; mr: string[] };
+  tasks: {
+    workspaceId: string;
+    taskId: string;
+    title: string | null;
+    status: string | null;
+    url: string | null;
+  }[];
+}
+
 export interface ChannelStatus {
   sessionId: string | null;
   cwd: string | null;
@@ -1142,6 +1167,7 @@ export interface ChannelService {
   submitInbound(message: InboundMessage): Promise<void>;
   statusSnapshot(): ServiceStatusSnapshot;
   chatStatusSnapshot(target: ChatTarget): ChatStatusSnapshot;
+  chatDetailsSnapshot(target: ChatTarget, signal: AbortSignal): Promise<ChatDetailsSnapshot>;
   status(target: ChatTarget): Promise<ChannelStatus>;
   start(): Promise<void>;
   stop(): Promise<void>;

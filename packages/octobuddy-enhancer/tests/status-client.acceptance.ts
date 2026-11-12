@@ -36,11 +36,47 @@ type ChatStatusResult =
   | { state: "online"; snapshot: ChatStatusSnapshot }
   | { state: "unconfigured" | "offline" | "unauthorized" | "invalid"; lastSuccess?: ChatStatusSnapshot };
 
+type ChatDetailsContext = {
+  source: "live" | "persisted" | "unavailable";
+  stale: boolean;
+  usedTokens: number | null;
+  contextWindow: number | null;
+  percent: number | null;
+  model: string | null;
+  observedAt: string | null;
+  note: string;
+};
+
+type ChatDetailsSnapshot = {
+  version: 1;
+  sampledAt: string;
+  channelType: 1 | 2 | 5;
+  channelId: string;
+  context: ChatDetailsContext;
+  references: { pr: string[]; mr: string[] };
+  tasks: {
+    workspaceId: string;
+    taskId: string;
+    title: string | null;
+    status: string | null;
+    url: string | null;
+  }[];
+};
+
+type ChatDetailsResult =
+  | { state: "online"; snapshot: ChatDetailsSnapshot }
+  | { state: "unconfigured" | "offline" | "unauthorized" | "invalid"; lastSuccess?: ChatDetailsSnapshot };
+
+type ChatDetailsTarget = ChatTarget;
+
+type StatusClient = {
+  get(signal?: AbortSignal): Promise<StatusResult>;
+  getChat(target: ChatTarget, signal?: AbortSignal): Promise<ChatStatusResult>;
+  getChatDetails(target: ChatDetailsTarget, signal?: AbortSignal): Promise<ChatDetailsResult>;
+};
+
 type StatusClientModule = {
-  createStatusClient(options: { configPath: string }): {
-    get(signal?: AbortSignal): Promise<StatusResult>;
-    getChat(target: ChatTarget, signal?: AbortSignal): Promise<ChatStatusResult>;
-  };
+  createStatusClient(options: { configPath: string }): StatusClient;
 };
 
 type LocalHttpFixture = {
@@ -131,7 +167,41 @@ const threadChatSnapshot: ChatStatusSnapshot = {
   pendingQuestions: 0,
 };
 
-function expectChatStatusQuery(client: ReturnType<StatusClientModule["createStatusClient"]>): void {
+function chatDetailsSnapshotFor(target: ChatDetailsTarget): ChatDetailsSnapshot {
+  return {
+    version: 1,
+    sampledAt: "2026-11-11T10:16:00.000Z",
+    channelType: target.channelType,
+    channelId: target.channelId,
+    context: {
+      source: "live",
+      stale: false,
+      usedTokens: 12_345,
+      contextWindow: 200_000,
+      percent: 6.17,
+      model: "anthropic/claude-sonnet",
+      observedAt: "2026-11-11T10:15:59.000Z",
+      note: "Current live worker",
+    },
+    references: {
+      pr: ["https://github.com/example/project/pull/42"],
+      mr: ["https://gitlab.com/example/project/-/merge_requests/7"],
+    },
+    tasks: [{
+      workspaceId: "workspace-17",
+      taskId: "TASK-42",
+      title: "Persist callback",
+      status: "in_progress",
+      url: "https://loop.example/tasks/TASK-42",
+    }],
+  };
+}
+
+function expectChatDetailsQuery(client: StatusClient): void {
+  expect(typeof client.getChatDetails, "createStatusClient must expose getChatDetails(target, signal?)").toBe("function");
+}
+
+function expectChatStatusQuery(client: StatusClient): void {
   expect(typeof client.getChat, "createStatusClient must expose getChat(target, signal?)").toBe("function");
 }
 
@@ -351,6 +421,175 @@ test("queries exact chat identities and keeps snapshots separate while switching
         channelId: target.channelId,
         authorization: `Bearer ${bearerToken}`,
       })));
+    });
+  });
+}, 10_000);
+
+test("queries authenticated chat details from environment configuration and preserves exact target data", async () => {
+  const clientModule = await loadStatusClient();
+  const target: ChatDetailsTarget = { channelType: 5, channelId: "group + 7____thread/42" };
+  const details = chatDetailsSnapshotFor(target);
+  const requests: { method: string; pathname: string; channelType: string | null; channelId: string | null; authorization: string | null }[] = [];
+
+  await withTempDirectory(async (directory) => {
+    await withLocalHttpFixture((request) => {
+      const url = new URL(request.url);
+      requests.push({
+        method: request.method,
+        pathname: url.pathname,
+        channelType: url.searchParams.get("channelType"),
+        channelId: url.searchParams.get("channelId"),
+        authorization: request.headers.get("authorization"),
+      });
+      if (request.headers.get("authorization") !== `Bearer ${envBearerToken}`) {
+        return statusResponse({ error: { code: "unauthorized" } }, 401);
+      }
+      return statusResponse(details);
+    }, async (fixture) => {
+      const configPath = join(directory, "missing-status.json");
+      await withStatusEnvironment({ baseUrl: fixture.baseUrl, token: envBearerToken }, async () => {
+        const client = clientModule.createStatusClient({ configPath });
+        expectChatDetailsQuery(client);
+        expect(await client.getChatDetails(target)).toEqual({ state: "online", snapshot: details });
+      });
+      expect(requests).toEqual([{
+        method: "GET",
+        pathname: "/v1/chats/details",
+        channelType: "5",
+        channelId: target.channelId,
+        authorization: `Bearer ${envBearerToken}`,
+      }]);
+    });
+  });
+}, 10_000);
+
+test("preserves fractional OMP context estimates in a consumed details snapshot", async () => {
+  const clientModule = await loadStatusClient();
+  const target: ChatDetailsTarget = { channelType: 5, channelId: "group____fractional-context" };
+  const baseSnapshot = chatDetailsSnapshotFor(target);
+  const snapshot: ChatDetailsSnapshot = {
+    ...baseSnapshot,
+    context: {
+      ...baseSnapshot.context,
+      usedTokens: 12_345.5,
+      contextWindow: 200_000.5,
+      percent: 6.1725,
+    },
+  };
+
+  await withTempDirectory(async (directory) => {
+    await withLocalHttpFixture(() => statusResponse(snapshot), async (fixture) => {
+      const configPath = join(directory, "status-client.json");
+      await writeConfig(configPath, fixture.baseUrl);
+      const client = clientModule.createStatusClient({ configPath });
+      expectChatDetailsQuery(client);
+      expect(await client.getChatDetails(target)).toEqual({ state: "online", snapshot });
+    });
+  });
+}, 10_000);
+
+test("classifies chat details authentication, protocol errors, and offline cache accurately", async () => {
+  const clientModule = await loadStatusClient();
+  const target: ChatDetailsTarget = { channelType: 2, channelId: "group-details-errors" };
+  const details = chatDetailsSnapshotFor(target);
+  let requestCount = 0;
+  const authorizations: (string | null)[] = [];
+
+  await withTempDirectory(async (directory) => {
+    await withLocalHttpFixture((request) => {
+      authorizations.push(request.headers.get("authorization"));
+      requestCount += 1;
+      if (requestCount === 1) return statusResponse({ error: { code: "unauthorized" } }, 401);
+      if (requestCount === 2) {
+        return statusResponse(chatDetailsSnapshotFor({ ...target, channelId: "another-group" }));
+      }
+      if (requestCount === 3) return statusResponse({ error: { code: "unavailable" } }, 503);
+      return statusResponse(details);
+    }, async (fixture) => {
+      const configPath = join(directory, "status-client.json");
+      await writeConfig(configPath, fixture.baseUrl);
+      const client = clientModule.createStatusClient({ configPath });
+      expectChatDetailsQuery(client);
+
+      expect(await client.getChatDetails(target)).toEqual({ state: "unauthorized" });
+      expect(await client.getChatDetails(target)).toEqual({ state: "invalid" });
+      expect(await client.getChatDetails(target)).toEqual({ state: "offline" });
+      expect(await client.getChatDetails(target)).toEqual({ state: "online", snapshot: details });
+      fixture.stop();
+      expect(await client.getChatDetails(target)).toEqual({ state: "offline", lastSuccess: details });
+      expect(authorizations).toEqual(Array(4).fill(`Bearer ${bearerToken}`));
+    });
+  });
+}, 10_000);
+
+test("an older details response for the previous target cannot replace the current target cache", async () => {
+  const clientModule = await loadStatusClient();
+  const previousTarget: ChatDetailsTarget = { channelType: 2, channelId: "group-before-switch" };
+  const currentTarget: ChatDetailsTarget = { channelType: 5, channelId: "group____thread-after-switch" };
+  const previousDetails = chatDetailsSnapshotFor(previousTarget);
+  const currentDetails = chatDetailsSnapshotFor(currentTarget);
+  let previousRequestCount = 0;
+  const olderResponse = Promise.withResolvers<Response>();
+  const olderRequestStarted = Promise.withResolvers<void>();
+  let currentRequestCount = 0;
+
+  await withTempDirectory(async (directory) => {
+    await withLocalHttpFixture((request) => {
+      const url = new URL(request.url);
+      const channelId = url.searchParams.get("channelId");
+      if (channelId === previousTarget.channelId) {
+        if (previousRequestCount++ === 0) {
+          olderRequestStarted.resolve();
+          return olderResponse.promise;
+        }
+        return statusResponse({ error: { code: "unavailable" } }, 503);
+      }
+      if (channelId === currentTarget.channelId && currentRequestCount++ === 0) return statusResponse(currentDetails);
+      return statusResponse({ error: { code: "unavailable" } }, 503);
+    }, async (fixture) => {
+      const configPath = join(directory, "status-client.json");
+      await writeConfig(configPath, fixture.baseUrl);
+      const client = clientModule.createStatusClient({ configPath });
+      expectChatDetailsQuery(client);
+
+      const previousRequest = client.getChatDetails(previousTarget);
+      await olderRequestStarted.promise;
+      expect(await client.getChatDetails(currentTarget)).toEqual({ state: "online", snapshot: currentDetails });
+      olderResponse.resolve(statusResponse(previousDetails));
+      expect(await previousRequest).toEqual({ state: "online", snapshot: previousDetails });
+      expect(await client.getChatDetails(currentTarget)).toEqual({ state: "offline", lastSuccess: currentDetails });
+      expect(await client.getChatDetails(previousTarget)).toEqual({ state: "offline", lastSuccess: previousDetails });
+    });
+  });
+}, 10_000);
+
+test("aborting a pending chat details request cancels its HTTP fetch", async () => {
+  const clientModule = await loadStatusClient();
+  const target: ChatDetailsTarget = { channelType: 5, channelId: "group____thread-abort" };
+  const requestStarted = Promise.withResolvers<void>();
+  const requestAborted = Promise.withResolvers<void>();
+
+  await withTempDirectory(async (directory) => {
+    await withLocalHttpFixture((request) => {
+      requestStarted.resolve();
+      const response = Promise.withResolvers<Response>();
+      request.signal.addEventListener("abort", () => {
+        requestAborted.resolve();
+        response.resolve(new Response(null, { status: 499 }));
+      }, { once: true });
+      return response.promise;
+    }, async (fixture) => {
+      const configPath = join(directory, "status-client.json");
+      await writeConfig(configPath, fixture.baseUrl);
+      const client = clientModule.createStatusClient({ configPath });
+      expectChatDetailsQuery(client);
+      const controller = new AbortController();
+      const pending = client.getChatDetails(target, controller.signal);
+      await requestStarted.promise;
+      const rejected = pending.then(() => undefined, (error: unknown) => error);
+      controller.abort();
+      expect(await rejected).toMatchObject({ name: "AbortError" });
+      await requestAborted.promise;
     });
   });
 }, 10_000);

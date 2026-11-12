@@ -1,11 +1,17 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 
-import type { ChatStatusSnapshot, ChatTarget, ServiceStatusSnapshot } from "../contracts.ts";
+import type {
+  ChatDetailsSnapshot,
+  ChatStatusSnapshot,
+  ChatTarget,
+  ServiceStatusSnapshot,
+} from "../contracts.ts";
 
 interface StatusHandlerOptions {
   token: string;
   statusSnapshot: () => ServiceStatusSnapshot;
   chatStatusSnapshot: (target: ChatTarget) => ChatStatusSnapshot;
+  chatDetailsSnapshot: (target: ChatTarget, signal: AbortSignal) => Promise<ChatDetailsSnapshot>;
 }
 
 const JSON_HEADERS = {
@@ -60,8 +66,9 @@ export function createStatusHandler({
   token,
   statusSnapshot,
   chatStatusSnapshot,
-}: StatusHandlerOptions): (request: Request) => Response {
-  return request => {
+  chatDetailsSnapshot,
+}: StatusHandlerOptions): (request: Request) => Promise<Response> {
+  return async request => {
     try {
       if (!isAuthorized(request, token)) return errorResponse(401, "unauthorized");
       if (request.method !== "GET") return errorResponse(405, "method_not_allowed");
@@ -79,6 +86,17 @@ export function createStatusHandler({
         if (target === null) return errorResponse(400, "invalid_request");
 
         const snapshot = chatStatusSnapshot(target);
+        if (snapshot.channelType !== target.channelType || snapshot.channelId !== target.channelId) {
+          return errorResponse(500, "internal_error");
+        }
+        return jsonResponse(snapshot);
+      }
+
+      if (url.pathname === "/v1/chats/details") {
+        const target = parseChatTarget(url.searchParams);
+        if (target === null) return errorResponse(400, "invalid_request");
+
+        const snapshot = await chatDetailsSnapshot(target, request.signal);
         if (snapshot.channelType !== target.channelType || snapshot.channelId !== target.channelId) {
           return errorResponse(500, "internal_error");
         }

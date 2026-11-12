@@ -27,6 +27,10 @@ export interface SessionContextStatus {
 
 export type SessionContextStore = Pick<ChannelStore, "getSessionContextSnapshot" | "saveSessionContextSnapshot">;
 export type LiveSessionContextWorker = Pick<OmpWorker, "sessionId" | "sessionFile" | "contextUsage">;
+export interface SessionContextReadOptions {
+  /** Live status queries do not publish a new durable sample. */
+  persistLiveSnapshot?: boolean;
+}
 
 interface ValidatedBinding {
   sessionId: string;
@@ -144,6 +148,7 @@ export async function readSessionContext(
   live: LiveSessionContextWorker | undefined,
   signal: AbortSignal,
   store: SessionContextStore,
+  options: SessionContextReadOptions = {},
 ): Promise<SessionContextStatus> {
   signal.throwIfAborted();
   if (binding === null) return unavailable("当前聊天尚未绑定 OMP session。");
@@ -195,7 +200,10 @@ export async function readSessionContext(
     : null;
   const percent = usage.percent ?? calculatedPercent;
   const model = usage.model;
-  if (usedTokens !== null || contextWindow !== null || usage.percent !== null || model !== null) {
+  if (
+    options.persistLiveSnapshot !== false
+    && (usedTokens !== null || contextWindow !== null || usage.percent !== null || model !== null)
+  ) {
     store.saveSessionContextSnapshot({
       botUid: binding.botUid,
       channelType: binding.channelType,

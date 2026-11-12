@@ -68,6 +68,7 @@ import type {
   ChannelServiceOptions,
   ChannelStatus,
   ChatStatusSnapshot,
+  ChatDetailsSnapshot,
   ChatAppendMode,
   ChatExecutionState,
   ChatTarget,
@@ -394,6 +395,26 @@ function isNativeRetryPrompt(text: string): boolean {
 function statusState(task: TaskRecord | null, hasBinding: boolean): ChatExecutionState {
   if (!task) return hasBinding ? "idle" : "none";
   return task.state;
+}
+
+function sameSessionIdentity(left: BindingRecord | null, right: BindingRecord | null): boolean {
+  if (left === null || right === null) return left === right;
+  return left.sessionId === right.sessionId
+    && left.sessionFile === right.sessionFile
+    && left.cwd === right.cwd;
+}
+
+function unavailableSessionContext(note: string): ChatDetailsSnapshot["context"] {
+  return {
+    source: "unavailable",
+    stale: false,
+    usedTokens: null,
+    contextWindow: null,
+    percent: null,
+    model: null,
+    observedAt: null,
+    note,
+  };
 }
 
 function createSessionId(): string {
@@ -3997,6 +4018,89 @@ class CoreService implements ChannelService {
       cwd: binding?.cwd ?? null,
       queuedTasks: this.store.countQueuedTasks(botUid, target),
       pendingQuestions: this.store.pendingQuestionIds(botUid, target).length,
+    };
+  }
+
+  async chatDetailsSnapshot(target: ChatTarget, requestSignal: AbortSignal): Promise<ChatDetailsSnapshot> {
+    const signal = AbortSignal.any([requestSignal, this.shutdownController.signal]);
+    signal.throwIfAborted();
+
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) {
+      return {
+        version: 1,
+        sampledAt: new Date().toISOString(),
+        channelType: target.channelType,
+        channelId: target.channelId,
+        context: unavailableSessionContext("当前 channel 尚未完成 Bot 身份初始化。"),
+        references: { pr: [], mr: [] },
+        tasks: [],
+      };
+    }
+
+    const binding = this.store.getBinding(botUid, target);
+    let live: TrackedWorker["worker"] | undefined;
+    if (binding !== null && binding.sessionFile !== null) {
+      for (const runtime of this.runtimes.values()) {
+        if (
+          runtime.closing
+          || runtime.suspended
+          || runtime.target.channelType !== target.channelType
+          || runtime.target.channelId !== target.channelId
+        ) continue;
+        const worker = runtime.lease?.worker;
+        if (worker !== undefined && worker.sessionId === binding.sessionId) {
+          live = worker;
+          break;
+        }
+      }
+    }
+
+    let context = await readSessionContext(
+      binding,
+      live,
+      signal,
+      this.store,
+      { persistLiveSnapshot: false },
+    );
+    signal.throwIfAborted();
+    const currentBinding = this.store.getBinding(botUid, target);
+    if (!sameSessionIdentity(binding, currentBinding)) {
+      context = unavailableSessionContext("读取上下文期间聊天绑定的 session 身份已变化；未返回旧会话用量。");
+    }
+
+    const groupId = target.channelType === 5 ? threadParentGroupId(target.channelId) : null;
+    const references = groupId === null
+      ? { pr: [], mr: [] }
+      : this.store.getThreadReferences(botUid, target);
+    const tasks: ChatDetailsSnapshot["tasks"] = [];
+    if (groupId !== null) {
+      for (const route of this.store.listLoopThreadTasks(botUid, groupId, target.channelId)) {
+        const task = this.store.getLoopTaskSummary({
+          botUid,
+          groupId,
+          workspaceId: route.workspaceId,
+          taskId: route.taskId,
+        });
+        tasks.push({
+          workspaceId: route.workspaceId,
+          taskId: route.taskId,
+          title: task?.title ?? null,
+          status: task?.status ?? null,
+          url: null,
+        });
+      }
+    }
+
+    signal.throwIfAborted();
+    return {
+      version: 1,
+      sampledAt: new Date().toISOString(),
+      channelType: target.channelType,
+      channelId: target.channelId,
+      context,
+      references,
+      tasks,
     };
   }
 
