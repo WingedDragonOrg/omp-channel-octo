@@ -15,6 +15,7 @@ export interface OpenZedRequest {
 export interface ZedBackendOptions {
   zedExecutable?: string;
   cwd?: string;
+  workspace?: boolean;
 }
 
 function parseRequest(value: unknown): OpenZedRequest {
@@ -50,7 +51,7 @@ async function resolveZedExecutable(options: ZedBackendOptions): Promise<string>
   }
 
   const candidates = [
-    ...(options.cwd === undefined ? [] : [
+    ...(options.cwd === undefined && !options.workspace ? [] : [
       "/Applications/Zed Preview.app/Contents/MacOS/cli",
       join(homedir(), "Applications", "Zed Preview.app", "Contents", "MacOS", "cli"),
     ]),
@@ -94,6 +95,25 @@ export async function openInZed(
     resolveZedExecutable(options),
   ]);
   let args = [isZedUrl ? path : `${path}:${request.line ?? 1}:1`];
+  if (options.workspace) {
+    if (path.startsWith("zed://file/")) {
+      const directory = await realpath(decodeURIComponent(new URL(path).pathname));
+      if (!(await stat(directory)).isDirectory()) throw new Error("chat workspace is not a directory");
+      args = [directory];
+    } else if (path.startsWith("zed://ssh/")) {
+      const remote = new URL(`ssh://${path.slice("zed://ssh/".length)}`);
+      const directory = decodeURIComponent(remote.pathname);
+      const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+      const host = `${remote.username ? `${decodeURIComponent(remote.username)}@` : ""}${remote.hostname}`;
+      const { stdout } = await promisify(execFile)("ssh", [
+        "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+        ...(remote.port ? ["-p", remote.port] : []), "--", host,
+        `directory=$(realpath -- ${quote(directory)}) && test -d "$directory" && printf '%s' "$directory"`,
+      ], { timeout: 15_000, env: withoutStatusEnvironment(process.env) });
+      const authority = `${remote.username ? `${remote.username}@` : ""}${remote.host}`;
+      args = [`ssh://${authority}${stdout.split("/").map(encodeURIComponent).join("/")}`];
+    } else throw new Error("invalid Zed workspace URL");
+  }
   if (options.cwd !== undefined) {
     const remote = new URL(`ssh://${path.slice("zed://ssh/".length)}`);
     const match = /:(\d+)(?::(\d+))?$/.exec(remote.pathname);
@@ -124,16 +144,16 @@ export async function openInZed(
   child.once("spawn", () => {
     spawned = true;
     child.unref();
-    if (options.cwd === undefined) resolve();
+    if (options.cwd === undefined && !options.workspace) resolve();
   });
-  if (options.cwd !== undefined) {
+  if (options.cwd !== undefined || options.workspace) {
     child.once("exit", (code) => {
       if (code === 0) resolve();
-      else reject(new Error("Zed could not open the remote workspace and file"));
+      else reject(new Error("Zed could not open the workspace"));
     });
   }
   child.on("error", (error) => {
-    if (spawned && options.cwd === undefined) process.stderr.write(`[octobuddy-enhancer] Zed process error: ${error.message}\n`);
+    if (spawned && options.cwd === undefined && !options.workspace) process.stderr.write(`[octobuddy-enhancer] Zed process error: ${error.message}\n`);
     else reject(new Error(`could not start Zed: ${error.message}`, { cause: error }));
   });
   await promise;

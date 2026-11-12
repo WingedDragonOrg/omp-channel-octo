@@ -47,6 +47,7 @@ interface StatusHandlerOptions {
   statusSnapshot: () => ServiceSnapshot;
   chatStatusSnapshot: (target: ChatTarget) => ChatStatusSnapshot;
   chatDetailsSnapshot: (target: ChatTarget, signal: AbortSignal) => Promise<ChatDetailsSnapshot>;
+  fileLinks?: { resolvers: Array<{ type: "zed"; mode: "ssh"; hostname: string; username: string; port: number } | { type: "zed"; mode: "local" }> };
 }
 
 type StatusHandler = (request: Request) => Promise<Response>;
@@ -135,6 +136,7 @@ async function makeHandler(
       channelType: target.channelType,
       channelId: target.channelId,
     }),
+  fileLinks?: StatusHandlerOptions["fileLinks"],
 ): Promise<StatusHandler> {
   const createStatusHandler = await loadCreateStatusHandler();
   return createStatusHandler({
@@ -142,6 +144,7 @@ async function makeHandler(
     statusSnapshot: () => SERVICE_SNAPSHOT,
     chatStatusSnapshot,
     chatDetailsSnapshot,
+    ...(fileLinks ? { fileLinks } : {}),
   });
 }
 
@@ -199,7 +202,33 @@ test("GET /v1/chats/status resolves the exact query target and returns its snaps
 
   expect(response.status).toBe(200);
   expectResponseHeaders(response);
-  expect(await response.json()).toEqual(CHAT_SNAPSHOT);
+  expect(await response.json()).toEqual({ ...CHAT_SNAPSHOT, zedWorkspaceUrl: null });
+});
+
+test("chat status supplies the configured SSH workspace URL independent of the HTTP host", async () => {
+  const handler = await makeHandler(undefined, undefined, {
+    resolvers: [{ type: "zed", mode: "ssh", hostname: "ssh-host", username: "dev", port: 2222 }],
+  });
+  const response = await handler(makeRequest(
+    "/v1/chats/status?channelType=5&channelId=group-42____thread-9",
+    { authorization: `Bearer ${TOKEN}` },
+  ));
+  expect((await response.json() as { zedWorkspaceUrl: string }).zedWorkspaceUrl)
+    .toBe("zed://ssh/dev@ssh-host:2222/tmp/status-workspace");
+});
+
+test("chat status encodes a local workspace path containing literal URL characters", async () => {
+  const handler = await makeHandler(
+    target => ({ ...CHAT_SNAPSHOT, ...target, cwd: "/tmp/shared #1%20" }),
+    undefined,
+    { resolvers: [{ type: "zed", mode: "local" }] },
+  );
+  const response = await handler(makeRequest(
+    "/v1/chats/status?channelType=5&channelId=group-42____thread-9",
+    { authorization: `Bearer ${TOKEN}` },
+  ));
+  expect((await response.json() as { zedWorkspaceUrl: string }).zedWorkspaceUrl)
+    .toBe("zed://file/tmp/shared%20%231%2520");
 });
 
 for (const [description, authorization] of [

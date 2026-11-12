@@ -160,6 +160,7 @@ async function createLocalStatusServer(cwd: string): Promise<LocalStatusServer> 
       state: "idle",
       model: null,
       cwd: channelType === 2 ? join(cwd, "group") : cwd,
+      zedWorkspaceUrl: `zed://file${pathToFileURL(channelType === 2 ? join(cwd, "group") : cwd).pathname}`,
       queuedTasks: 0,
       pendingQuestions: 0,
     }));
@@ -1043,6 +1044,14 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
     await evaluate(browser, communicationSessionId, `Array.from(document.querySelectorAll('[data-octobuddy-channel-status-panel] [role="tab"]'))
       .find((element) => element.textContent.trim() === "状态").click()`);
 
+    const workspaceButton = await evaluate<ActionBox>(browser, communicationSessionId, `(() => {
+      const rect = document.querySelector("[data-octobuddy-workspace-open]").getBoundingClientRect();
+      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    })()`);
+    await dispatchMouseClick(browser, communicationSessionId, workspaceButton);
+    await waitForZedCalls(fakeZed.argvFile, 6);
+    expect((await readZedArguments(fakeZed.argvFile))[5]).toEqual([await realpath(paths.workspace)]);
+
     const clearedAssignment = await assignRendererChannel(null);
     expect(clearedAssignment.identity).toBeNull();
     expect(clearedAssignment.after).toBe(clearedAssignment.before);
@@ -1131,6 +1140,7 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
       expectedGroup,
       expectedRemote,
       expectedRemote,
+      [await realpath(paths.workspace)],
     ]);
     expect(child.exitCode).toBeNull();
     expect(await processStartIdentity(childPid)).toBe(startedAt);

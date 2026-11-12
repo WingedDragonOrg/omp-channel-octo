@@ -16,6 +16,7 @@ type ChatSnapshot = ChatIdentity & {
   state: "none" | "idle" | "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted";
   model: string | null;
   cwd: string | null;
+  zedWorkspaceUrl?: string | null;
   queuedTasks: number;
   pendingQuestions: number;
 };
@@ -168,6 +169,7 @@ interface ChatPanelFixture {
   resolveChatDetails(index: number, details: ChatDetailsResult): Promise<boolean>;
   setChannelStatus(status: ChannelStatus): Promise<boolean>;
   openedUrls(): string[];
+  zedRequests(): Promise<ChatIdentity[]>;
 }
 
 const contentScriptPath = new URL("../plugins/channel-status/content.js", import.meta.url);
@@ -260,6 +262,7 @@ async function withChatPanelPage(
       resolveChatStatus: (index, status) => readBridge(`window.__chatPanelTestBridge.resolve(${index}, ${JSON.stringify(status)})`),
       resolveChatDetails: (index, details) => readBridge(`window.__chatPanelTestBridge.resolveDetails(${index}, ${JSON.stringify(details)})`),
       setChannelStatus: (status) => readBridge(`window.__chatPanelTestBridge.setServiceStatus(${JSON.stringify(status)})`),
+      zedRequests: () => readBridge("window.__chatPanelTestBridge.zedRequests"),
       openedUrls: () => externalRequests.slice(),
     });
   } finally {
@@ -287,6 +290,7 @@ function bridgeBootstrap(initialServiceStatus: ChannelStatus): string {
   const cancelled = [];
   const details = [];
   const cancelledDetails = [];
+  const zedRequests = [];
   const disposeCallbacks = [];
   let serviceStatus = ${JSON.stringify(initialServiceStatus)};
   Object.defineProperty(window, "__chatPanelTestBridge", {
@@ -296,6 +300,7 @@ function bridgeBootstrap(initialServiceStatus: ChannelStatus): string {
       cancelled,
       details,
       cancelledDetails,
+      zedRequests,
       setServiceStatus(status) {
         serviceStatus = structuredClone(status);
         return true;
@@ -334,6 +339,7 @@ function bridgeBootstrap(initialServiceStatus: ChannelStatus): string {
         return promise;
       },
       cancelChatDetails: async (requestId) => { cancelledDetails.push(requestId); },
+      openChatWorkspace: async (target) => { zedRequests.push(structuredClone(target)); },
       onDispose: (callback) => {
         if (typeof callback !== "function") throw new TypeError("onDispose requires a callback");
         disposeCallbacks.push(callback);
@@ -422,6 +428,17 @@ test("the real content script displays the active chat snapshot from the page id
 
     expectChatDetails(await panelText(page), initialChat);
     expect(await panelText(page)).toMatch(/运行中|running/i);
+  });
+}, 15_000);
+
+test("opens the current shared working directory in Zed from a trusted click", async () => {
+  await withChatPanelPage(async ({ page, resolveChatStatus, zedRequests }) => {
+    await openPanel(page);
+    await announceChat(page, threadTarget);
+    await resolveChatStatus(0, onlineChatStatus({ ...initialChat, cwd: "/workspaces/shared project", zedWorkspaceUrl: "zed://ssh/my-mini/workspaces/shared%20project" }));
+    const button = page.getByRole("button", { name: /在 Zed 中打开工作目录/ });
+    await button.click();
+    expect(await zedRequests()).toEqual([threadTarget]);
   });
 }, 15_000);
 

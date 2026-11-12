@@ -355,6 +355,7 @@
   } else {
     const api = Object.freeze({
       openZed: (options) => call("zed", "openZed", [options]),
+      openChatWorkspace: (target) => call("status", "openChatWorkspace", [target]),
       getChannelStatus: () => call("status", "getChannelStatus", []),
       getChatStatus: (target, requestId) => call("status", "getChatStatus", [target, requestId]),
       cancelChatStatus: (requestId) => call("status", "cancelChatStatus", [requestId]),

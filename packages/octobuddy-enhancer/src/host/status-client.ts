@@ -35,6 +35,7 @@ export interface ChatStatusSnapshot {
   state: ChatExecutionState;
   model: string | null;
   cwd: string | null;
+  zedWorkspaceUrl?: string | null;
   queuedTasks: number;
   pendingQuestions: number;
 }
@@ -293,7 +294,7 @@ function parseSnapshot(value: unknown): StatusSnapshot | undefined {
 
 function parseChatSnapshot(value: unknown, target: ChatTarget): ChatStatusSnapshot | undefined {
   if (!isRecord(value)) return undefined;
-  const { version, sampledAt, channelType, channelId, state, model, cwd, queuedTasks, pendingQuestions } = value;
+  const { version, sampledAt, channelType, channelId, state, model, cwd, zedWorkspaceUrl, queuedTasks, pendingQuestions } = value;
   if (
     version !== 1 ||
     channelType !== target.channelType ||
@@ -303,6 +304,7 @@ function parseChatSnapshot(value: unknown, target: ChatTarget): ChatStatusSnapsh
       state !== "completed" && state !== "failed" && state !== "cancelled" && state !== "interrupted") ||
     (model !== null && typeof model !== "string") ||
     (cwd !== null && typeof cwd !== "string") ||
+    (zedWorkspaceUrl !== undefined && zedWorkspaceUrl !== null && typeof zedWorkspaceUrl !== "string") ||
     !Number.isSafeInteger(queuedTasks) || (queuedTasks as number) < 0 ||
     !Number.isSafeInteger(pendingQuestions) || (pendingQuestions as number) < 0
   ) {
@@ -316,6 +318,7 @@ function parseChatSnapshot(value: unknown, target: ChatTarget): ChatStatusSnapsh
     state: state as ChatExecutionState,
     model,
     cwd,
+    ...(zedWorkspaceUrl === undefined ? {} : { zedWorkspaceUrl: zedWorkspaceUrl as string | null }),
     queuedTasks: queuedTasks as number,
     pendingQuestions: pendingQuestions as number,
   };

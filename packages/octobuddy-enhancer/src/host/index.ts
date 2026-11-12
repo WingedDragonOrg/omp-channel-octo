@@ -869,6 +869,51 @@ class OctoBuddyHost {
     contextId: number,
     request: BridgeRequest,
   ): Promise<unknown> {
+    if (request.api === "status" && request.method === "openChatWorkspace" && request.args.length === 1) {
+      if (!request.trustedClick || !this.isAuthorizedStatusContext(plugin, attachment, contextId)) {
+        throw new Error("opening the workspace requires a trusted status-panel click");
+      }
+      const target = request.args[0];
+      if (!isRecord(target) || (target.channelType !== 1 && target.channelType !== 2 && target.channelType !== 5)
+        || typeof target.channelId !== "string" || !target.channelId) throw new Error("invalid chat target");
+      const generation = plugin.generation;
+      const currentChat = async () => {
+        const result = await withCdpTimeout(attachment.client.Runtime.evaluate({
+          expression: `(async () => {
+            const link = [...document.querySelectorAll('link[rel="modulepreload"]')]
+              .find(element => /\\/App-[^/]+\\.js$/.test(element.href));
+            const module = await import(link.href);
+            const chat = module.i.shared.openChannel;
+            return { channelType: chat?.channelType, channelId: chat?.channelID };
+          })()`,
+          awaitPromise: true,
+          returnByValue: true,
+        }), "reading current chat");
+        return result.result?.value;
+      };
+      const matches = async () => {
+        const chat = await currentChat();
+        if (!isRecord(chat) || chat.channelType !== target.channelType) return false;
+        if (target.channelType !== 1) return chat.channelId === target.channelId;
+        const service = await this.#statusClient.get();
+        return service.state === "online" && chat.channelId === service.snapshot.botUid
+          && target.channelId === service.snapshot.ownerUid;
+      };
+      if (!await matches()) throw new Error("chat changed before Zed could be opened");
+      const status = await this.#statusClient.getChat(target as unknown as ChatTarget);
+      if (status.state !== "online" || status.snapshot.cwd === null || !status.snapshot.zedWorkspaceUrl) throw new Error("chat workspace is unavailable");
+      await openInZed({ path: status.snapshot.zedWorkspaceUrl }, {
+        ...(this.#zedExecutable !== undefined ? { zedExecutable: this.#zedExecutable } : {}),
+        workspace: true,
+      }, async () => {
+        if (!this.isAuthorizedStatusContext(plugin, attachment, contextId) || plugin.generation !== generation || !await matches()) return false;
+        const latest = await this.#statusClient.getChat(target as unknown as ChatTarget);
+        return latest.state === "online" && latest.snapshot.cwd === status.snapshot.cwd
+          && latest.snapshot.zedWorkspaceUrl === status.snapshot.zedWorkspaceUrl
+          && this.isAuthorizedStatusContext(plugin, attachment, contextId) && plugin.generation === generation;
+      });
+      return undefined;
+    }
     if (request.api === "status" && request.method === "getChannelStatus" && request.args.length === 0) {
       return this.withStatusRequest(
         plugin,

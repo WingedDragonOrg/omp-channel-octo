@@ -1,9 +1,11 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import { createZedFileLinkResolvers } from "../file-links.ts";
 
 import type {
   ChatDetailsSnapshot,
   ChatStatusSnapshot,
   ChatTarget,
+  FileLinkConfig,
   ServiceStatusSnapshot,
 } from "../contracts.ts";
 
@@ -12,6 +14,7 @@ interface StatusHandlerOptions {
   statusSnapshot: () => ServiceStatusSnapshot;
   chatStatusSnapshot: (target: ChatTarget) => ChatStatusSnapshot;
   chatDetailsSnapshot: (target: ChatTarget, signal: AbortSignal) => Promise<ChatDetailsSnapshot>;
+  fileLinks?: FileLinkConfig;
 }
 
 const JSON_HEADERS = {
@@ -67,6 +70,7 @@ export function createStatusHandler({
   statusSnapshot,
   chatStatusSnapshot,
   chatDetailsSnapshot,
+  fileLinks,
 }: StatusHandlerOptions): (request: Request) => Promise<Response> {
   return async request => {
     try {
@@ -89,7 +93,9 @@ export function createStatusHandler({
         if (snapshot.channelType !== target.channelType || snapshot.channelId !== target.channelId) {
           return errorResponse(500, "internal_error");
         }
-        return jsonResponse(snapshot);
+        const resolver = fileLinks && createZedFileLinkResolvers(fileLinks.resolvers)[0];
+        const zedWorkspaceUrl = snapshot.cwd && resolver ? await resolver.resolve(".", snapshot.cwd) : null;
+        return jsonResponse({ ...snapshot, zedWorkspaceUrl });
       }
 
       if (url.pathname === "/v1/chats/details") {

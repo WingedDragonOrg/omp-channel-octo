@@ -117,6 +117,33 @@ test("passes a Zed SSH URL as one argument without local file resolution", async
   }
 }, 10_000);
 
+test("opens the canonical remote shared directory as one Zed project", async () => {
+  const root = await mkdtemp(join(tmpdir(), "octobuddy-zed-shared-"));
+  const previousPath = process.env.PATH;
+  try {
+    const zed = await createFakeZed(root);
+    await writeFile(join(root, "ssh"), "#!/bin/sh\nprintf '/private/work/shared project'\n", { mode: 0o755 });
+    process.env.PATH = `${root}:${previousPath}`;
+    await openInZed({ path: "zed://ssh/dev@ssh-host:2222/work/shared%20project" }, { zedExecutable: zed.executable, workspace: true }, () => true);
+    await waitUntil(async () => (await zedArguments(zed.argvFile)).length === 1);
+    expect(await zedArguments(zed.argvFile)).toEqual([["ssh://dev@ssh-host:2222/private/work/shared%20project"]]);
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("opens a local working directory without a file line suffix", async () => {
+  const root = await mkdtemp(join(tmpdir(), "octobuddy-zed-directory-"));
+  try {
+    const zed = await createFakeZed(root);
+    await openInZed({ path: `zed://file${pathToFileURL(root).pathname}` }, { zedExecutable: zed.executable, workspace: true }, () => true);
+    expect(await zedArguments(zed.argvFile)).toEqual([[await realpath(root)]]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}, 10_000);
+
 test("opens a canonical remote project and its file at the requested line", async () => {
   const root = await mkdtemp(join(tmpdir(), "octobuddy-zed-workspace-"));
   const previousPath = process.env.PATH;

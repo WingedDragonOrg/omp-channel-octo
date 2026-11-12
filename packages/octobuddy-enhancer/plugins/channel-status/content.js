@@ -167,6 +167,21 @@
       text-align: right !important;
       overflow-wrap: anywhere !important;
     }
+    [data-octobuddy-workspace-open] {
+      background: transparent !important;
+      border: 0 !important;
+      color: #71d8d0 !important;
+      cursor: pointer !important;
+      font: inherit !important;
+      overflow-wrap: anywhere !important;
+      padding: 0 !important;
+      text-align: right !important;
+      text-decoration: underline !important;
+    }
+    [data-octobuddy-workspace-open]:focus-visible {
+      outline: 2px solid #71d8d0 !important;
+      outline-offset: 2px !important;
+    }
     [data-octobuddy-channel-status-stale] {
       background: rgba(255, 189, 102, 0.11) !important;
       border-left: 2px solid #ffbd66 !important;
@@ -571,7 +586,27 @@
     appendRow("状态目标", `${channelLabel} ${snapshot.channelId}`);
     appendRow("执行状态", CHAT_STATUS_LABELS[snapshot.state]);
     appendRow("模型", snapshot.model ?? "由 OMP 自动选择");
-    appendRow("工作目录", snapshot.cwd ?? "未绑定");
+    if (snapshot.cwd && snapshot.zedWorkspaceUrl) {
+      const row = document.createElement("div");
+      row.setAttribute("data-octobuddy-channel-status-row", "");
+      const label = document.createElement("span");
+      label.textContent = "工作目录";
+      const button = document.createElement("button");
+      button.type = "button";
+      button.setAttribute("data-octobuddy-workspace-open", "");
+      button.setAttribute("aria-label", `在 Zed 中打开工作目录 ${snapshot.cwd}`);
+      button.textContent = snapshot.cwd;
+      button.addEventListener("click", async (event) => {
+        if (!event.isTrusted) return;
+        try {
+          await capability.openChatWorkspace(target);
+        } catch {
+          if (button.isConnected) appendNote("无法在 Zed 中打开工作目录。");
+        }
+      });
+      row.append(label, button);
+      panelBody.append(row);
+    } else appendRow("工作目录", snapshot.cwd ?? "未绑定");
     appendRow("排队任务", String(snapshot.queuedTasks));
     appendRow("待回答问题", String(snapshot.pendingQuestions));
   }

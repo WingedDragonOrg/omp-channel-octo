@@ -3,7 +3,7 @@ import { open, type FileHandle } from "node:fs/promises";
 import { createStatusHandler } from "./http.ts";
 import { assertNoExtendedAcl } from "./private-file-acl.ts";
 
-import type { ChatDetailsSnapshot, ChatStatusSnapshot, ChatTarget, ServiceStatusSnapshot } from "../contracts.ts";
+import type { ChatDetailsSnapshot, ChatStatusSnapshot, ChatTarget, FileLinkConfig, ServiceStatusSnapshot } from "../contracts.ts";
 
 export interface StatusServerOptions {
   listenAddress: string;
@@ -15,6 +15,7 @@ export interface StatusServerOptions {
   statusSnapshot: () => ServiceStatusSnapshot;
   chatStatusSnapshot: (target: ChatTarget) => ChatStatusSnapshot;
   chatDetailsSnapshot: (target: ChatTarget, signal: AbortSignal) => Promise<ChatDetailsSnapshot>;
+  fileLinks?: FileLinkConfig;
 }
 
 export interface StatusServer {
@@ -100,6 +101,7 @@ export async function startStatusServer(options: StatusServerOptions): Promise<S
               statusSnapshot: options.statusSnapshot,
               chatStatusSnapshot: options.chatStatusSnapshot,
               chatDetailsSnapshot: options.chatDetailsSnapshot,
+              ...(options.fileLinks === undefined ? {} : { fileLinks: options.fileLinks }),
             })(request);
           } catch {
             return Response.json({ error: { code: "internal_error" } }, {

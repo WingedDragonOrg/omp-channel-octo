@@ -425,6 +425,20 @@ test("queries exact chat identities and keeps snapshots separate while switching
   });
 }, 10_000);
 
+test("preserves the workspace URL supplied by the channel independently of the HTTP address", async () => {
+  const clientModule = await loadStatusClient();
+  const target = { channelType: 5, channelId: threadChatSnapshot.channelId } as const;
+  const response = { ...threadChatSnapshot, zedWorkspaceUrl: "zed://ssh/dev@ssh-host:2222/work/shared%20space" };
+  await withTempDirectory(async directory => {
+    await withLocalHttpFixture(() => statusResponse(response), async fixture => {
+      const configPath = join(directory, "status-client.json");
+      await writeConfig(configPath, fixture.baseUrl);
+      const result = await clientModule.createStatusClient({ configPath }).getChat(target);
+      expect(result).toEqual({ state: "online", snapshot: response });
+    });
+  });
+}, 10_000);
+
 test("queries authenticated chat details from environment configuration and preserves exact target data", async () => {
   const clientModule = await loadStatusClient();
   const target: ChatDetailsTarget = { channelType: 5, channelId: "group + 7____thread/42" };

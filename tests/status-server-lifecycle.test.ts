@@ -55,6 +55,7 @@ interface StatusServerOptions {
   statusSnapshot: () => ServiceSnapshot;
   chatStatusSnapshot: (target: ChatTarget) => ChatStatusSnapshot;
   chatDetailsSnapshot: (target: ChatTarget, signal: AbortSignal) => Promise<ChatDetailsSnapshot>;
+  fileLinks?: { resolvers: [{ type: "zed"; mode: "ssh"; hostname: string; username: string; port: number }] };
 }
 
 interface StatusServer {
@@ -323,6 +324,25 @@ test("status server binds localhost and authenticates real HTTP requests with it
   } finally {
     await server?.stop();
     await fixture.cleanup();
+  }
+});
+
+test("real status HTTP server returns its configured SSH destination for a bound chat", async () => {
+  const startStatusServer = await loadStartStatusServer();
+  const options = serverOptions({ token: TOKEN });
+  const server = await startStatusServer({
+    ...options,
+    fileLinks: { resolvers: [{ type: "zed", mode: "ssh", hostname: "ssh-target", username: "dev", port: 2222 }] },
+    chatStatusSnapshot: target => ({ ...options.chatStatusSnapshot(target), cwd: "/workspace/shared project" }),
+  });
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.port}/v1/chats/status?channelType=5&channelId=group____thread`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    expect((await response.json() as { zedWorkspaceUrl: string }).zedWorkspaceUrl)
+      .toBe("zed://ssh/dev@ssh-target:2222/workspace/shared%20project");
+  } finally {
+    await server.stop();
   }
 });
 
