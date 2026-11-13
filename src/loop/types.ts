@@ -49,6 +49,22 @@ export interface LoopTaskRoute extends LoopTaskKey {
   version: number;
 }
 
+/**
+ * Durable fact that a Loop task's child route no longer receives new inputs. `pending` records an
+ * in-flight end operation; `ended` records a confirmed archive or successful merge/removal. Both
+ * keep the association visible for rendering while routing new inputs to the bound parent group.
+ */
+export type LoopTaskRouteEndingState = "pending" | "ended";
+export type LoopTaskRouteEndingReason = "archived" | "merged" | "removed";
+
+export interface LoopTaskRouteEnding extends LoopTaskKey {
+  threadChannelId: string;
+  routeVersion: number;
+  state: LoopTaskRouteEndingState;
+  reason: LoopTaskRouteEndingReason;
+  updatedAt: number;
+}
+
 export type LoopInputState = "pending" | "intent" | "delivered" | "unknown" | "superseded";
 export interface LoopInput {
   id: string;

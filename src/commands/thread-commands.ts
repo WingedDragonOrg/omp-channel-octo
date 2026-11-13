@@ -232,6 +232,10 @@ export interface ThreadCommandsDeps {
     receiptOutboxId: string,
     archiveGeneration?: number,
   ) => void;
+  /** Reconciles the durable child-route ending from a recovered removal outcome before settlement. */
+  readonly reconcileRemovalEnding?: (target: InboundMessage, complete: boolean) => Promise<void>;
+  /** Reconciles the durable child-route ending from a recovered merge outcome before settlement. */
+  readonly reconcileMergeEnding?: (target: InboundMessage, removed: boolean) => Promise<void>;
   /** 启动恢复成功结果时，重建严格 receipt barrier 后的归档排定。 */
   readonly recoverMergeArchive: (
     target: InboundMessage,
@@ -349,6 +353,7 @@ export class ThreadCommands {
     };
     if (outcome.kind === "succeeded") {
       if (lease.commandText === null) throw new Error("host merge success recovery is missing its original command");
+      await this.deps.reconcileMergeEnding?.(target, outcome.summary.removed);
       const receiptId = lease.receiptOutboxId ?? mergeReceiptId(lease.botUid, target, lease.sourceId);
       const archiveScheduled = outcome.summary.removed
         ? this.deps.recoverMergeArchive(target, receiptId, lease.sourceId, lease.archiveGeneration)
@@ -370,6 +375,7 @@ export class ThreadCommands {
       return;
     }
     if (outcome.kind === "not-started") {
+      await this.deps.reconcileMergeEnding?.(target, false);
       const receiptId = lease.receiptOutboxId ?? mergeReceiptId(lease.botUid, target, lease.sourceId);
       this.deps.enqueueMergeReceipt(target, receiptId, threadMergeNotStartedReceipt(outcome.diagnostic));
       this.completeRecoveredThreadCommand(lease.botUid, target);
@@ -377,6 +383,7 @@ export class ThreadCommands {
       return;
     }
     if (lease.commandText === null) throw new Error("host merge repair recovery is missing its original command");
+    await this.deps.reconcileMergeEnding?.(target, false);
     await this.acceptMergeRepairTask({
       message: target,
       sourceId: lease.sourceId,
@@ -411,6 +418,7 @@ export class ThreadCommands {
       messageTimestamp: 0,
     };
     this.deps.enqueueRemovalReceipt(target, lease.receiptOutboxId, outcome.receiptText);
+    await this.deps.reconcileRemovalEnding?.(target, outcome.kind === "complete");
     if (outcome.kind === "complete") {
       this.deps.recoverRemovalArchive(target, lease.receiptOutboxId);
     }

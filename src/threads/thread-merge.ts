@@ -46,6 +46,12 @@ export interface ThreadMergeHost {
   /** Generation captured by the command turn; an intervening inbound prevents stale archival. */
   readonly archiveGeneration: () => number;
   /**
+   * Called after every qualification and plan check, immediately before the merge process may
+   * start. It persists the provisional child-route ending so racing Loop inputs reselect the
+   * parent while the destructive operation is in flight.
+   */
+  readonly beginEnding?: () => void;
+  /**
    * Optional caller preflight after qualification and ownership checks, before the merge port runs:
    * host tools persist listen provenance here. Merge suppression belongs to
    * WorktreeMergeLifecycle.beforeSpawn, after worktree identity validation.
@@ -185,6 +191,7 @@ export async function mergeThreadWorkspace(
       },
     };
   }
+  host.beginEnding?.();
   host.beforeMerge?.();
   try {
     const summary = await worktrees.merge(request, signal);

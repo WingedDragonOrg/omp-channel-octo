@@ -45,6 +45,14 @@ export interface ThreadArchiveDeps {
   readonly outbox: Pick<Outbox, "flush" | "enqueueText">;
   readonly botUid: () => string | undefined;
   readonly stopping: () => boolean;
+  /**
+   * Confirms or withdraws the durable child-route ending after the actual archive call. The
+   * callback must not turn a successful archive into a transport failure; it is best-effort.
+   */
+  readonly onArchiveResult?: (
+    target: ChatTarget,
+    outcome: "archived" | "failed",
+  ) => void | Promise<void>;
 }
 
 type ThreadArchiveRunOutcome = "finished" | "cancelled" | "stopped" | "skipped";
@@ -211,6 +219,13 @@ export class ThreadArchiveScheduler {
       const outcome = await this.archivePendingThread(key, pending, signal);
       if (outcome === "archived") {
         console.error(`[thread-archive] 已归档子区 ${pending.shortId} target=${key}`);
+        try {
+          await this.deps.onArchiveResult?.(pending.target, "archived");
+        } catch (error) {
+          console.error(
+            `[thread-archive] 归档结果持久化失败 target=${key}：${failureText(error, "result persistence failed")}`,
+          );
+        }
         return "finished";
       }
       return this.deps.stopping() ? "stopped" : "cancelled";
@@ -221,6 +236,13 @@ export class ThreadArchiveScheduler {
       const reason = failureText(error, "归档失败");
       console.error(`[thread-archive] 归档失败 target=${key} short=${pending.shortId}：${reason}`);
       this.deps.outbox.enqueueText(pending.target, `归档失败：${reason}`, null);
+      try {
+        await this.deps.onArchiveResult?.(pending.target, "failed");
+      } catch (callbackError) {
+        console.error(
+          `[thread-archive] 归档失败结果持久化失败 target=${key}：${failureText(callbackError, "result persistence failed")}`,
+        );
+      }
       return "finished";
     } finally {
       if (this.pendingThreadArchives.get(key) === pending) this.pendingThreadArchives.delete(key);

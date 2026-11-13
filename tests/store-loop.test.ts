@@ -210,6 +210,237 @@ test("loop snapshots ignore timestamp-only updates, retain missing tasks, and re
   });
 });
 
+test("in_review-only transitions advance snapshots while same-scan and later changes still deliver", async () => {
+  await inTemporaryDirectory(async (root) => {
+    const store = await openStore(root);
+    try {
+      const reviewOwner = loopTask({ taskId: "review-owner", title: "Owner review task" });
+      const reviewRouted = loopTask({
+        taskId: "review-routed",
+        title: "Routed review task",
+        assigneeType: null,
+        assigneeId: null,
+        assigneeOctoUid: null,
+      });
+      const sameScanOther = loopTask({ taskId: "same-scan-other", title: "Same scan task" });
+      const binding = store.bindLoopWorkspace(botUid, groupId, workspaceA, [
+        reviewOwner,
+        reviewRouted,
+        sameScanOther,
+      ]).binding;
+      store.bindLoopTask(taskKey({ taskId: reviewRouted.taskId }), `${groupId}____review-routed`);
+
+      const ownerReview = { ...reviewOwner, status: "in_review" };
+      const routedReview = { ...reviewRouted, status: "in_review" };
+      const otherChanged = { ...sameScanOther, title: "Same scan task renamed" };
+      expect(store.commitLoopScan(binding, [ownerReview, routedReview, otherChanged])).toBe(true);
+      const afterReviewTransition = store.listLoopInputs(botUid);
+      expect(afterReviewTransition).toHaveLength(2);
+      expect(afterReviewTransition[1]).toMatchObject({
+        kind: "updated",
+        taskId: sameScanOther.taskId,
+        previous: sameScanOther,
+        tasks: [otherChanged],
+      });
+      expect(store.getLoopTaskSummary(taskKey({ taskId: reviewOwner.taskId }))).toMatchObject({
+        status: "in_review",
+      });
+      expect(store.getLoopTaskSummary(taskKey({ taskId: reviewRouted.taskId }))).toMatchObject({
+        status: "in_review",
+      });
+
+      const ownerWhileReview = { ...ownerReview, title: "Owner review task revised" };
+      const routedWhileReview = { ...routedReview, title: "Routed review task revised" };
+      expect(store.commitLoopScan(binding, [ownerWhileReview, routedWhileReview])).toBe(true);
+      const whileReviewInputs = store.listLoopInputs(botUid).slice(2);
+      expect(whileReviewInputs).toMatchObject([
+        {
+          kind: "updated",
+          taskId: reviewOwner.taskId,
+          previous: ownerReview,
+          tasks: [ownerWhileReview],
+        },
+        {
+          kind: "updated",
+          taskId: reviewRouted.taskId,
+          previous: routedReview,
+          tasks: [routedWhileReview],
+        },
+      ]);
+
+      const ownerLeavesReview = { ...ownerWhileReview, status: "in_progress" };
+      const routedLeavesReview = { ...routedWhileReview, status: "done" };
+      expect(store.commitLoopScan(binding, [ownerLeavesReview, routedLeavesReview])).toBe(true);
+      const leavingInputs = store.listLoopInputs(botUid).slice(4);
+      expect(leavingInputs).toMatchObject([
+        {
+          kind: "updated",
+          taskId: reviewOwner.taskId,
+          previous: ownerWhileReview,
+          tasks: [ownerLeavesReview],
+        },
+        {
+          kind: "updated",
+          taskId: reviewRouted.taskId,
+          previous: routedWhileReview,
+          tasks: [routedLeavesReview],
+        },
+      ]);
+      for (const input of leavingInputs) {
+        expect(input.previous?.status).toBe("in_review");
+        expect(store.prepareLoopInput(input.id)?.id).toBe(input.id);
+      }
+    } finally {
+      store.close();
+    }
+  });
+});
+
+test("a mixed transition into in_review delivers title and description changes without a status change", async () => {
+  await inTemporaryDirectory(async (root) => {
+    const store = await openStore(root);
+    try {
+      const original = loopTask({
+        taskId: "mixed-review",
+        title: "Review draft",
+        description: "First draft",
+      });
+      const binding = store.bindLoopWorkspace(botUid, groupId, workspaceA, [original]).binding;
+      const mixed = {
+        ...original,
+        title: "Review draft revised",
+        description: "Revised draft",
+        status: "in_review",
+        updatedAt: "2026-11-01T11:00:00.000Z",
+      };
+      expect(store.commitLoopScan(binding, [mixed])).toBe(true);
+
+      const inputs = store.listLoopInputs(botUid);
+      expect(inputs).toHaveLength(2);
+      const event = inputs[1]!;
+      expect(event.kind).toBe("updated");
+      expect(event.taskId).toBe(original.taskId);
+      expect(event.tasks).toHaveLength(1);
+      const current = event.tasks[0]!;
+      const previous = event.previous!;
+      expect(current.title).toBe(mixed.title);
+      expect(current.description).toBe(mixed.description);
+      expect(previous.title).toBe(original.title);
+      expect(previous.description).toBe(original.description);
+      expect(current.status).toBe(previous.status);
+      expect(store.getLoopTaskSummary(taskKey({ taskId: original.taskId }))).toMatchObject({
+        title: mixed.title,
+        status: "in_review",
+      });
+      expect(store.prepareLoopInput(event.id)?.id).toBe(event.id);
+
+      const leavesReview = { ...mixed, status: "done", updatedAt: "2026-11-01T12:00:00.000Z" };
+      expect(store.commitLoopScan(binding, [leavesReview])).toBe(true);
+      const leaveEvent = store.listLoopInputs(botUid)[2]!;
+      expect(leaveEvent).toMatchObject({
+        kind: "updated",
+        previous: mixed,
+        tasks: [leavesReview],
+      });
+      expect(leaveEvent.previous?.status).toBe("in_review");
+      expect(store.prepareLoopInput(leaveEvent.id)?.id).toBe(leaveEvent.id);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+test("prepareLoopInput filters only persisted pending review transitions", async () => {
+  await inTemporaryDirectory(async (root) => {
+    let store = await openStore(root);
+    try {
+      const pureOriginal = loopTask({ taskId: "persisted-pure-review", title: "Pure review task" });
+      const mixedOriginal = loopTask({ taskId: "persisted-mixed-review", title: "Mixed review draft" });
+      const binding = store.bindLoopWorkspace(botUid, groupId, workspaceA, [pureOriginal, mixedOriginal]).binding;
+      const baseline = store.listLoopInputs(botUid)[0]!;
+      expect(store.prepareLoopInput(baseline.id)?.id).toBe(baseline.id);
+      expect(store.claimLoopInputIntent(baseline.id, mainTarget)).toBe(true);
+      store.markLoopInputDelivered(baseline.id);
+
+      const pureReview = { ...pureOriginal, status: "in_review" };
+      const mixedReview = { ...mixedOriginal, title: "Mixed review draft revised", status: "in_review" };
+      expect(store.commitLoopScan(binding, [pureReview, mixedReview])).toBe(true);
+      const mixedInput = store.listLoopInputs(botUid).find((input) => input.taskId === mixedOriginal.taskId)!;
+
+      const database = new Database(join(root, "channel.sqlite"));
+      try {
+        // Recreate the event payload written by an older version before prepareLoopInput accepts it.
+        database.query("UPDATE loop_inputs SET previous_json = ? WHERE id = ?")
+          .run(JSON.stringify(mixedOriginal), mixedInput.id);
+        const insert = database.query(
+          `INSERT INTO loop_inputs(
+             id, bot_uid, group_id, workspace_id, binding_version, kind, task_id, tasks_json,
+             previous_json, state, target_channel_type, target_channel_id, fault_notified, created_at
+           ) VALUES(?, ?, ?, ?, ?, 'updated', ?, ?, ?, ?, ?, ?, 0, ?)`,
+        );
+        for (const state of ["pending", "intent", "unknown", "delivered"] as const) {
+          const target = state === "pending" ? null : mainTarget;
+          insert.run(
+            `persisted-pure-review-${state}`,
+            botUid,
+            groupId,
+            workspaceA.workspaceId,
+            binding.version,
+            pureOriginal.taskId,
+            JSON.stringify([pureReview]),
+            JSON.stringify(pureOriginal),
+            state,
+            target?.channelType ?? null,
+            target?.channelId ?? null,
+            Date.now(),
+          );
+        }
+      } finally {
+        database.close();
+      }
+
+      store.close();
+      store = await openStore(root);
+
+      const purePendingId = "persisted-pure-review-pending";
+      expect(store.prepareLoopInput(purePendingId)).toBeNull();
+      expect(store.getLoopInput(purePendingId)).toMatchObject({
+        state: "superseded",
+        previous: pureOriginal,
+        tasks: [pureReview],
+      });
+
+      const preparedMixed = store.prepareLoopInput(mixedInput.id);
+      expect(preparedMixed).toMatchObject({
+        state: "pending",
+        previous: { ...mixedOriginal, status: "in_review" },
+        tasks: [mixedReview],
+      });
+      expect(store.getLoopInput(mixedInput.id)?.previous).toEqual({ ...mixedOriginal, status: "in_review" });
+
+      for (const state of ["intent", "unknown", "delivered"] as const) {
+        const input = store.getLoopInput(`persisted-pure-review-${state}`)!;
+        expect(store.prepareLoopInput(input.id)).toBeNull();
+        expect(store.getLoopInput(input.id)).toMatchObject({ state, previous: pureOriginal });
+      }
+
+      const snapshotDatabase = new Database(join(root, "channel.sqlite"));
+      try {
+        const snapshot = snapshotDatabase.query(
+          `SELECT task_id, task_json FROM loop_task_snapshots
+           WHERE bot_uid = ? AND group_id = ? AND workspace_id = ? ORDER BY task_id ASC`,
+        ).all(botUid, groupId, workspaceA.workspaceId) as { task_id: string; task_json: string }[];
+        expect(snapshot.map(({ task_json }) => JSON.parse(task_json))).toEqual([mixedReview, pureReview]);
+      } finally {
+        snapshotDatabase.close();
+      }
+    } finally {
+      store.close();
+    }
+  });
+});
+
+
 test("loop snapshots retain every task while baseline and change inputs include only owner-or-bot members", async () => {
   await inTemporaryDirectory(async (root) => {
     const store = await openStore(root);

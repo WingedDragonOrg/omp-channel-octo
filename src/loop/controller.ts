@@ -2,7 +2,7 @@ import type { ChatTarget } from "../contracts.ts";
 import type { ChannelStore } from "../store/index.ts";
 import { LoopThreadBindings } from "./thread-bindings.ts";
 import { renderLoopInput } from "./render.ts";
-import type { LoopBinding, LoopInput, LoopReadPort, LoopTaskKey, LoopTaskRoute } from "./types.ts";
+import type { LoopBinding, LoopInput, LoopReadPort, LoopTaskKey, LoopTaskRoute, LoopTaskRouteEnding } from "./types.ts";
 
 const SCAN_INTERVAL_MS = 60_000;
 
@@ -30,7 +30,16 @@ export interface LoopControllerOptions {
 interface LoopDestination {
   target: ChatTarget;
   route: LoopTaskRoute | null;
+  ending: LoopTaskRouteEnding | null;
   key: LoopTaskKey | null;
+}
+
+/** An ending fact stops child routing only while it still describes the current route version. */
+function endingApplies(ending: LoopTaskRouteEnding | null, route: LoopTaskRoute | null): boolean {
+  return route !== null
+    && ending !== null
+    && ending.threadChannelId === route.threadChannelId
+    && ending.routeVersion === route.version;
 }
 
 function sameBinding(left: LoopBinding | null, right: LoopBinding | null): boolean {
@@ -330,16 +339,20 @@ export class LoopController {
       }
       if (!this.guard(input, binding, destination)) continue;
       const routes = new Map<string, string>();
+      const endedRoutes = new Map<string, string>();
       for (const task of input.tasks) {
-        const route = this.options.store.getLoopTaskRoute({
+        const key = {
           botUid: input.botUid,
           groupId: input.groupId,
           workspaceId: input.workspaceId,
           taskId: task.taskId,
-        });
+        };
+        const route = this.options.store.getLoopTaskRoute(key);
         if (route !== null) routes.set(task.taskId, route.threadChannelId);
+        const ending = this.options.store.getLoopTaskRouteEnding(key);
+        if (endingApplies(ending, route)) endedRoutes.set(task.taskId, route!.threadChannelId);
       }
-      const text = renderLoopInput(input, destination.target, routes);
+      const text = renderLoopInput(input, destination.target, routes, endedRoutes);
       const beforeWorkerSteer = (): boolean => this.claimIntent(input, destination.target, binding, destination);
       const beforeTaskAccept = (): boolean => this.claimIntent(input, destination.target, binding, destination);
       let steerAccepted = false;
@@ -411,7 +424,12 @@ export class LoopController {
 
   private destination(input: LoopInput): LoopDestination {
     if (input.taskId === null) {
-      return { target: { channelType: 2, channelId: input.groupId }, route: null, key: null };
+      return {
+        target: { channelType: 2, channelId: input.groupId },
+        route: null,
+        ending: null,
+        key: null,
+      };
     }
     const key: LoopTaskKey = {
       botUid: input.botUid,
@@ -420,11 +438,13 @@ export class LoopController {
       taskId: input.taskId,
     };
     const route = this.options.store.getLoopTaskRoute(key);
+    const ending = this.options.store.getLoopTaskRouteEnding(key);
     return {
-      target: route === null
+      target: route === null || endingApplies(ending, route)
         ? { channelType: 2, channelId: input.groupId }
         : { channelType: 5, channelId: route.threadChannelId },
       route,
+      ending,
       key,
     };
   }
@@ -436,8 +456,12 @@ export class LoopController {
     if (!this.options.store.isLoopInputObserved(input)) return false;
     if (destination.key === null) return true;
     const currentRoute = this.options.store.getLoopTaskRoute(destination.key);
-    return currentRoute?.version === destination.route?.version
-      && currentRoute?.threadChannelId === destination.route?.threadChannelId;
+    if (
+      currentRoute?.version !== destination.route?.version
+      || currentRoute?.threadChannelId !== destination.route?.threadChannelId
+    ) return false;
+    const currentEnding = this.options.store.getLoopTaskRouteEnding(destination.key);
+    return endingApplies(currentEnding, currentRoute) === endingApplies(destination.ending, destination.route);
   }
 
   private claimIntent(

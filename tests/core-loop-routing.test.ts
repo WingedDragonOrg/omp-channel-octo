@@ -300,7 +300,6 @@ test("new unassociated tasks reach the main group while linked updates go only t
       taskId: "loop-task-1",
     };
     store.bindLoopTask(key, thread.channelId);
-    await harness.transport.archiveThread(GROUP_ID, thread.shortId);
 
     loop.tasks.set(WORKSPACE.workspaceId, [task("loop-task-1", "Updated task")]);
     await harness.service.submitInbound(bindMessage(harness.bot.uid, "route-update"));

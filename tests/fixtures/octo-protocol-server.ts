@@ -923,7 +923,7 @@ export class OctoProtocolFixture {
         }
         this.managedThreads.set(
           groupId,
-          threads.map((thread) => thread.short_id === route.shortId ? { ...thread, archived: true } : thread),
+          threads.map((thread) => thread.short_id === route.shortId ? { ...thread, status: 2, archived: true } : thread),
         );
         writeJson(response, 200, { status: 200 });
         return;

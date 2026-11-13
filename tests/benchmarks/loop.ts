@@ -91,7 +91,7 @@ const model = Bun.serve({
     const messages = body.messages ?? [];
     const messagesJson = JSON.stringify(messages);
     const lastUser = [...messages].reverse().find(message =>
-      message.role === "user" && /LOOP_SMOKE_(?:EXISTING|UPDATED|RESTARTED|CHILD_INITIAL)/.test(JSON.stringify(message.content)));
+      message.role === "user" && /LOOP_SMOKE_(?:EXISTING|UPDATED|RESTARTED|CHILD_INITIAL|ENDED_PARENT)/.test(JSON.stringify(message.content)));
     const text = JSON.stringify(lastUser?.content ?? "");
     const kind = text.includes("LOOP_SMOKE_CHILD_INITIAL") ? "child-initial"
       : phase === "changed" ? "child-change" : "main-baseline";
@@ -106,6 +106,13 @@ const model = Bun.serve({
     if (leakedIrrelevantInputs.length > 0) {
       modelError = `Unrelated task input leaked into agent prompt: ${leakedIrrelevantInputs.join(",")}`;
       return new Response(modelError, { status: 400 });
+    }
+    if (text.includes("LOOP_SMOKE_ENDED_PARENT")) {
+      const route = store!.getLoopTaskRoute({ botUid: fixture.botUid, groupId, workspaceId, taskId: loopTaskId });
+      if (!route || !text.includes(route.threadChannelId) || text.includes("在当前关联子区处理任务变化")) {
+        modelError = "Ended-thread input did not identify the original route for parent handling";
+        return new Response(modelError, { status: 400 });
+      }
     }
     const call = (perKind.get(kind) ?? 0) + 1;
     perKind.set(kind, call);
@@ -130,6 +137,7 @@ const model = Bun.serve({
     if (kind === "child-initial" && call === 1) return completion("LOOP_SMOKE_CHILD_DONE");
     if (kind === "child-change" && call === 1 && text.includes("LOOP_SMOKE_UPDATED")) return completion("LOOP_SMOKE_UPDATE_DONE");
     if (kind === "child-change" && call === 2 && text.includes("LOOP_SMOKE_RESTARTED")) return completion("LOOP_SMOKE_RESTART_DONE");
+    if (kind === "child-change" && call === 3 && text.includes("LOOP_SMOKE_ENDED_PARENT")) return completion("LOOP_SMOKE_PARENT_DONE");
     modelError = `Unexpected finite model request: ${kind}/${call}: ${text.slice(-400)}`;
     return new Response(modelError, { status: 400 });
   },
@@ -331,9 +339,47 @@ try {
   assert.ok(mainPrompts.every(prompt => irrelevantTaskIds.every(id => !prompt.includes(id))));
   assert.ok(mainPrompts.every(prompt => irrelevantTaskInputs.every(input => !prompt.includes(input))));
   await stop(child);
+  task.status = "in_review";
+  task.updated_at = "2026-11-06T00:00:00Z";
+  child = await launch();
+  await wait("Review status was not saved", () => JSON.parse(taskSnapshot(loopTaskId)?.task_json ?? "{}").status === "in_review");
+  await wait("Review scan left pending input", () => store!.listLoopInputs(fixture.botUid).length === 0);
+  await settled();
+  assert.equal(modelCalls.length, callsAfterInitial + 2, "Review-only transition woke an agent");
+  assert.equal(taskCount(2), mainTasks);
+  assert.equal(taskCount(5), updates);
+  const shortId = route.threadChannelId.split("____")[1]!;
+  const archived = await fetch(`${fixture.apiUrl}/v1/bot/groups/${groupId}/threads/${shortId}/archive`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${fixture.botToken}` },
+  });
+  assert.ok(archived.ok, "Local thread archive failed");
+  const archivedInfo = await fetch(`${fixture.apiUrl}/v1/bot/groups/${groupId}/threads/${shortId}`, {
+    headers: { Authorization: `Bearer ${fixture.botToken}` },
+  });
+  assert.equal((await archivedInfo.json() as { status: number }).status, 2, "Local thread was not archived");
+  await stop(child);
+  task.title = "LOOP_SMOKE_ENDED_PARENT";
+  task.updated_at = "2026-11-07T00:00:00Z";
+  child = await launch();
+  await wait("Archived child change did not reach the main group", () => sentText().includes("LOOP_SMOKE_PARENT_DONE"));
+  await settled();
+  assert.equal(taskCount(2), mainTasks + 1);
+  assert.equal(taskCount(5), updates, "Archived child received a Loop task");
+  const parentDelivery = fixture.sentMessages.find(message => messageText(message) === "LOOP_SMOKE_PARENT_DONE");
+  assert.equal(parentDelivery?.body.channel_id, groupId);
+  const endedSnapshot = taskSnapshot(loopTaskId)!;
+  await stop(child);
+  child = await launch();
+  await wait("Restart never scanned ended-thread task", () => taskSnapshot(loopTaskId)!.updated_at > endedSnapshot.updated_at);
+  await wait("Restart left an ended-thread input", () => store!.listLoopInputs(fixture.botUid).length === 0);
+  await settled();
+  assert.equal(taskCount(2), mainTasks + 1, "Ended-thread event replayed after restart");
+  assert.equal(taskCount(5), updates);
+  await stop(child);
   const logs = (await Promise.all(outputs)).join("\n");
   assert.ok(!logs.includes(fixture.botToken), "Credential leaked to CLI output");
-  console.log(JSON.stringify({ modelRequests: modelCalls.length, loopReads: reads.length, threadCreates: threadCreateCount(), mainTasks, childTasks: updates, ignoredTasks: 2, ignoredTaskSideEffects: 0, periodicTaskUpdates: 1, restarts: 2, duplicateInputs: 0, parentUpdateInputs: 0 }));
+  console.log(JSON.stringify({ modelRequests: modelCalls.length, loopReads: reads.length, threadCreates: threadCreateCount(), mainTasks: mainTasks + 1, childTasks: updates, ignoredTasks: 2, ignoredTaskSideEffects: 0, periodicTaskUpdates: 1, restarts: 5, reviewWakeups: 0, endedParentInputs: 1, duplicateInputs: 0 }));
   succeeded = true;
 } catch (error) {
   console.error(JSON.stringify({ root, modelError, modelCalls, reads }, null, 2));

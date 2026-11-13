@@ -671,6 +671,53 @@ export function clearRestartNotices(db: Database, botUid: string): void {
   run(db, "DELETE FROM restart_notices WHERE bot_uid = ?", [botUid]);
 }
 
+/** Loop inputs persist their own event row; a transferred child task must never notify that ended chat. */
+export const LOOP_TRANSFER_ERROR_TEXT = "Loop 关联子区已结束；输入已转交主群处理";
+
+/** Undispatched Loop tasks still owned by one child chat; a prompt_started row is resumable work. */
+export function listUndispatchedLoopTasks(
+  db: Database,
+  botUid: string,
+  target: ChatTarget,
+): TaskRecord[] {
+  return query(db,
+    `SELECT * FROM tasks
+     WHERE bot_uid = ? AND ${targetWhere(target)} AND state IN ('queued', 'started')
+       AND prompt_started = 0 AND message_id LIKE 'loop:%'
+     ORDER BY accepted_at ASC, rowid ASC`,
+    [botUid, ...targetValues(target)],
+  ).map((row) => taskFromRow(row));
+}
+
+/** Tasks this process already claimed for parent transfer, used to finish an interrupted handoff. */
+export function listTransferredLoopTasks(
+  db: Database,
+  botUid: string,
+  target: ChatTarget,
+): TaskRecord[] {
+  return query(db,
+    `SELECT * FROM tasks
+     WHERE bot_uid = ? AND ${targetWhere(target)} AND state = 'cancelled'
+       AND error_text = ? AND message_id LIKE 'loop:%'
+     ORDER BY accepted_at ASC, rowid ASC`,
+    [botUid, ...targetValues(target), LOOP_TRANSFER_ERROR_TEXT],
+  ).map((row) => taskFromRow(row));
+}
+
+/**
+ * Claims an accepted-but-undispatched Loop task for transfer. A `started` row that has not yet
+ * recorded its prompt is still undispatched: worker startup may be in flight, and the dispatch
+ * gate re-reads this state before `markTaskPromptStarted`. A prompt_started row keeps its existing
+ * session contract.
+ */
+export function cancelUndispatchedTask(db: Database, taskId: string, reason: string): boolean {
+  return run(db,
+    `UPDATE tasks SET state = 'cancelled', finished_at = ?, error_text = ?, stop_intent = NULL
+     WHERE id = ? AND state IN ('queued', 'started') AND prompt_started = 0`,
+    [Date.now(), reason, taskId],
+  ).changes === 1;
+}
+
 export function cancelQueued(db: Database, botUid: string, target: ChatTarget): string[] {
   return transaction(db, () => {
     const goalTaskIds = stopGoalContinuation(db, botUid, target, null, "cancel", false);

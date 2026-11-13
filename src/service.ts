@@ -58,7 +58,8 @@ import { createChatGrantDesk, type ChatGrantDesk } from "./inbound/chat-grants.t
 import { acquireBotLock, assertBotLockFree, type LockHandle } from "./runtime/bot-lock.ts";
 import { openTrackedCommit, openTrackedWorker, type TrackedCommit, type TrackedWorker, type WorkerSession } from "./runtime/worker-lease.ts";
 import { LoopController, type LoopDeliveryOutcome } from "./loop/controller.ts";
-import type { LoopBinding, LoopInput } from "./loop/types.ts";
+import type { LoopBinding, LoopInput, LoopTaskKey, LoopTaskRoute, LoopTaskRouteEndingReason } from "./loop/types.ts";
+import { renderLoopInput } from "./loop/render.ts";
 import { TaskStartupError, WorkerGoalError, WorkerSteerRejectedError } from "./contracts.ts";
 import type {
   BotCardAction,
@@ -848,6 +849,13 @@ class CoreService implements ChannelService {
       outbox: this.outbox,
       botUid: () => this.bot?.uid,
       stopping: () => this.stopping,
+      onArchiveResult: async (target, outcome) => {
+        if (outcome === "archived") {
+          await this.confirmAndTransferThreadRoutesEnding(target, "archived");
+          return;
+        }
+        this.clearPendingThreadRoutesEnding(target);
+      },
     });
     this.threadCommands = new ThreadCommands({
       store: this.store,
@@ -881,6 +889,14 @@ class CoreService implements ChannelService {
       settleHostRemoval: (target, sourceId) => this.settleHostRemovalForSource(target, sourceId),
       recoverRemovalArchive: (target, receiptOutboxId, archiveGeneration) =>
         this.recoverHostRemovalArchive(target, receiptOutboxId, archiveGeneration),
+      reconcileRemovalEnding: async (target, complete) => {
+        if (complete) await this.confirmAndTransferThreadRoutesEnding(target, "removed");
+        else this.clearPendingThreadRoutesEnding(target);
+      },
+      reconcileMergeEnding: async (target, removed) => {
+        if (removed) await this.confirmAndTransferThreadRoutesEnding(target, "merged");
+        else this.clearPendingThreadRoutesEnding(target);
+      },
       recoverMergeArchive: (target, receiptOutboxId, sourceId, archiveGeneration) =>
         this.recoverHostMergeArchive(target, receiptOutboxId, sourceId, archiveGeneration),
       runThreadArchive: target => this.runThreadArchive(target),
@@ -1287,6 +1303,9 @@ class CoreService implements ChannelService {
         interrupt: INTERRUPT_REASON_TEXT,
         question_timeout: QUESTION_TIMEOUT_REASON_TEXT,
       });
+      // Reconcile route endings and hand off undispatched child Loop tasks before any recovered
+      // task enters scheduler tails, so an ended child can never dispatch an old Loop prompt.
+      await this.reconcileLoopRouteEndingsAtStartup(identity.uid);
       await this.recoverThreadWorkspaceOperations(identity.uid);
       const reviewRecovery = this.store.prepareReviewJobsForRestart(identity.uid);
       for (const review of [...reviewRecovery.stopped, ...reviewRecovery.uncertain]) {
@@ -5342,6 +5361,193 @@ class CoreService implements ChannelService {
   }
 
 
+  /**
+   * Host merge/removal leases are the durable outcome for an in-flight end operation; startup
+   * confirms or withdraws provisional route endings from them before recovered tasks are
+   * scheduled. A pending fact with no durable outcome stays fail-closed.
+   */
+  private async reconcileLoopRouteEndingsAtStartup(botUid: string): Promise<void> {
+    for (const lease of this.store.listHostMergeLeases(botUid)) {
+      const outcome = lease.outcome;
+      if (outcome === null) continue;
+      const target: ChatTarget = { channelType: 5, channelId: lease.channelId };
+      if (outcome.kind === "succeeded" && outcome.summary.removed) {
+        this.confirmThreadRoutesEnding(target, "merged");
+      } else {
+        this.clearPendingThreadRoutesEnding(target);
+      }
+    }
+    for (const lease of this.store.listHostRemovalLeases(botUid)) {
+      const outcome = lease.outcome;
+      if (outcome === null) continue;
+      const target: ChatTarget = { channelType: 5, channelId: lease.channelId };
+      if (outcome.kind === "complete") {
+        this.confirmThreadRoutesEnding(target, "removed");
+      } else {
+        this.clearPendingThreadRoutesEnding(target);
+      }
+    }
+    const endedThreads = new Set(
+      this.store.listLoopTaskRouteEndings(botUid).map((ending) => ending.threadChannelId),
+    );
+    for (const threadChannelId of endedThreads) {
+      if (this.stopping) return;
+      await this.transferUndispatchedLoopTasks({ channelType: 5, channelId: threadChannelId });
+    }
+  }
+
+  private loopRouteEndingApplies(key: LoopTaskKey, route: LoopTaskRoute | null): boolean {
+    if (route === null) return false;
+    const ending = this.store.getLoopTaskRouteEnding(key);
+    return ending !== null
+      && ending.threadChannelId === route.threadChannelId
+      && ending.routeVersion === route.version;
+  }
+
+  private beginThreadRoutesEnding(target: ChatTarget, reason: LoopTaskRouteEndingReason): void {
+    const botUid = this.bot?.uid;
+    const groupId = target.channelType === 5 ? threadParentGroupId(target.channelId) : null;
+    if (botUid === undefined || groupId === null) return;
+    this.store.markLoopThreadRoutesEnding(botUid, groupId, target.channelId, reason, "pending");
+  }
+
+  private confirmThreadRoutesEnding(target: ChatTarget, reason: LoopTaskRouteEndingReason): void {
+    const botUid = this.bot?.uid;
+    const groupId = target.channelType === 5 ? threadParentGroupId(target.channelId) : null;
+    if (botUid === undefined || groupId === null) return;
+    this.store.markLoopThreadRoutesEnding(botUid, groupId, target.channelId, reason, "ended");
+  }
+
+  private clearPendingThreadRoutesEnding(target: ChatTarget): void {
+    const botUid = this.bot?.uid;
+    const groupId = target.channelType === 5 ? threadParentGroupId(target.channelId) : null;
+    if (botUid === undefined || groupId === null) return;
+    this.store.clearPendingLoopThreadRoutesEnding(botUid, groupId, target.channelId);
+  }
+
+  private async confirmAndTransferThreadRoutesEnding(
+    target: ChatTarget,
+    reason: LoopTaskRouteEndingReason,
+  ): Promise<void> {
+    this.confirmThreadRoutesEnding(target, reason);
+    await this.transferUndispatchedLoopTasks(target);
+  }
+
+  /**
+   * An already-accepted Loop task that never dispatched its prompt must not run in a child whose
+   * association just ended. It is cancelled under the same condition that guards `markStarted`,
+   * then re-accepted under the stable `loop:<input>` identity in the parent group. A crash between
+   * the two steps leaves the transfer marker so startup can finish the handoff without replaying
+   * the original child prompt.
+   */
+  private loopTaskRouteEndedForTask(task: TaskRecord, target: ChatTarget): boolean {
+    if (!task.messageId.startsWith("loop:")) return false;
+    if (target.channelType !== 5) return false;
+    const input = this.store.getLoopInput(task.messageId.slice("loop:".length));
+    if (input === null || input.taskId === null) return false;
+    const key: LoopTaskKey = {
+      botUid: input.botUid,
+      groupId: input.groupId,
+      workspaceId: input.workspaceId,
+      taskId: input.taskId,
+    };
+    const route = this.store.getLoopTaskRoute(key);
+    // The parent handoff deliberately reuses `loop:<inputId>`; only a task still targeting the
+    // ended child may be cancelled here, never the already-transferred parent task.
+    return target.channelId === route?.threadChannelId
+      && this.loopRouteEndingApplies(key, route);
+  }
+
+  /**
+   * A task may already be `started` while its worker is still starting. Before the prompt marker
+   * is written, re-check the durable route ending synchronously and hand the input to the parent
+   * instead of dispatching it into the ended child.
+   */
+  private async cancelEndedLoopTaskBeforeDispatch(
+    taskId: string,
+    target: ChatTarget,
+  ): Promise<boolean> {
+    const task = this.store.getTask(taskId);
+    if (task === null || task.state !== "running" || !this.loopTaskRouteEndedForTask(task, target)) {
+      return false;
+    }
+    this.scheduler.takeWaitingReceipt(taskId);
+    this.store.cancelUndispatchedTask(taskId, this.store.loopTransferErrorText);
+    await this.transferUndispatchedLoopTasks(target);
+    return true;
+  }
+
+  private async transferUndispatchedLoopTasks(target: ChatTarget): Promise<void> {
+    const botUid = this.bot?.uid;
+    if (this.stopping || botUid === undefined || target.channelType !== 5) return;
+    const groupId = threadParentGroupId(target.channelId);
+    const shortId = threadShortId(target.channelId);
+    if (groupId === null || shortId === null) return;
+    const parent: ChatTarget = { channelType: 2, channelId: groupId };
+    const ownerId = this.store.getOwnerId(botUid)?.trim() ?? "";
+    if (ownerId.length === 0 || !this.authorization.isPermittedChat(parent)) return;
+    const tasks = [
+      ...this.store.listUndispatchedLoopTasks(botUid, target),
+      ...this.store.listTransferredLoopTasks(botUid, target),
+    ];
+    for (const task of tasks) {
+      const inputId = task.messageId.startsWith("loop:") ? task.messageId.slice("loop:".length) : null;
+      if (inputId === null) continue;
+      const input = this.store.getLoopInput(inputId);
+      if (input === null || input.botUid !== botUid || input.groupId !== groupId) continue;
+      const messageId = task.messageId;
+      if (this.store.getTaskByMessageId(botUid, parent, messageId) !== null) {
+        this.store.cancelUndispatchedTask(task.id, this.store.loopTransferErrorText);
+        continue;
+      }
+      if (
+        task.state !== "cancelled"
+        && !this.store.cancelUndispatchedTask(task.id, this.store.loopTransferErrorText)
+      ) continue;
+      const routes = new Map<string, string>();
+      const endedRoutes = new Map<string, string>();
+      for (const changed of input.tasks) {
+        const key: LoopTaskKey = {
+          botUid,
+          groupId,
+          workspaceId: input.workspaceId,
+          taskId: changed.taskId,
+        };
+        const route = this.store.getLoopTaskRoute(key);
+        if (route !== null) routes.set(changed.taskId, route.threadChannelId);
+        if (this.loopRouteEndingApplies(key, route)) {
+          endedRoutes.set(changed.taskId, route!.threadChannelId);
+        }
+      }
+      const text = renderLoopInput(input, parent, routes, endedRoutes);
+      const message: InboundMessage = {
+        ...parent,
+        messageId,
+        senderId: ownerId,
+        text,
+        mentionedUserIds: [botUid],
+        attachments: [],
+        quoted: null,
+        supported: true,
+        messageSeq: 0,
+        messageTimestamp: Date.now(),
+      };
+      try {
+        const accepted = await this.acceptTask(message, text, false);
+        if (!accepted && this.store.getTaskByMessageId(botUid, parent, messageId) === null) {
+          console.error(
+            `[loop] 已结束子区输入转交主群失败 input=${inputId} target=${target.channelId}`,
+          );
+        }
+      } catch (error) {
+        console.error(
+          `[loop] 已结束子区输入转交主群失败 input=${inputId} target=${target.channelId}：`
+          + safeErrorMessage(error, "transfer failed"),
+        );
+      }
+    }
+  }
+
   private async validateLoopTarget(
     binding: LoopBinding,
     target: ChatTarget,
@@ -5376,8 +5582,16 @@ class CoreService implements ChannelService {
       thread.groupId !== binding.groupId
       || thread.channelId !== target.channelId
       || (thread.status !== 1 && thread.status !== 2)
-      || await this.threadWorkspaceIncomplete(target)
     ) {
+      throw new Error("Loop 子区或工作区当前不可用。");
+    }
+    if (thread.status === 2) {
+      // An observed archived status is a durable end fact; the current guard then reselects the
+      // bound parent group for this not-yet-accepted input.
+      await this.confirmAndTransferThreadRoutesEnding(target, "archived");
+      return;
+    }
+    if (await this.threadWorkspaceIncomplete(target)) {
       throw new Error("Loop 子区或工作区当前不可用。");
     }
   }
@@ -5446,6 +5660,28 @@ class CoreService implements ChannelService {
       claimAcceptIntent,
       true,
     );
+    if (accepted && target.channelType === 5) {
+      const route = input.taskId === null
+        ? null
+        : this.store.getLoopTaskRoute({
+          botUid,
+          groupId: input.groupId,
+          workspaceId: input.workspaceId,
+          taskId: input.taskId,
+        });
+      const key = input.taskId === null
+        ? null
+        : {
+          botUid,
+          groupId: input.groupId,
+          workspaceId: input.workspaceId,
+          taskId: input.taskId,
+        };
+      if (key !== null && this.loopRouteEndingApplies(key, route)) {
+        // A provisional ending can land between the final accept guard and task persistence.
+        await this.transferUndispatchedLoopTasks(target);
+      }
+    }
     return accepted ? "accepted" : "not-accepted";
   }
 
@@ -6020,6 +6256,11 @@ class CoreService implements ChannelService {
     operationId: string,
   ): Promise<void> {
     const event = await this.persistThreadMergeSuccess(target, summary, archive, operationId);
+    if (summary.removed) {
+      await this.confirmAndTransferThreadRoutesEnding(target, "merged");
+    } else {
+      this.clearPendingThreadRoutesEnding(target);
+    }
     if (!this.store.isThreadMergeEventPending(event.id)) return;
     try {
       await this.deliverThreadMergeEvent(event);
@@ -7811,6 +8052,7 @@ class CoreService implements ChannelService {
       } else {
         this.threadArchives.cancel(target);
       }
+      if (target.channelType === 5) this.clearPendingThreadRoutesEnding(target);
     } catch (error) {
       try {
         this.threadArchives.cancel(target);
@@ -8811,6 +9053,7 @@ class CoreService implements ChannelService {
     let acceptedNotified = false;
     const finishNotSpawned = (): void => {
       if (!reserved || outcomePersisted) return;
+      this.clearPendingThreadRoutesEnding(target);
       const diagnostic = autoCommitDiagnostic?.()
         ?? "Worktrunk merge was confirmed not to have started; it will not be replayed automatically.";
       this.store.completeHostMergeLease(id, { kind: "not-spawned", diagnostic });
@@ -8849,6 +9092,7 @@ class CoreService implements ChannelService {
         if (commandBeforeSpawn) commandBeforeSpawn(id, persistHostLease);
         else persistHostLease();
         if (!reserved) throw new Error("host merge lease was not persisted before process spawn");
+        this.beginThreadRoutesEnding(target, "merged");
         if (commandContext?.autoCommitTaskId !== undefined) {
           const current = this.store.getHostMergeLeaseBySourceId(botUid, target, sourceId);
           if (
@@ -8885,6 +9129,9 @@ class CoreService implements ChannelService {
         if (!reserved) throw new Error("host merge outcome has no durable reservation");
         if (!confirmedExit) throw new Error("host merge outcome cannot be persisted before confirmed process exit");
         this.store.persistHostMergeOutcome(id, outcome);
+        if (!(outcome.kind === "succeeded" && outcome.summary.removed)) {
+          this.clearPendingThreadRoutesEnding(target);
+        }
         outcomePersisted = true;
         progress?.finishFromOutcome(outcome);
       },
@@ -9343,6 +9590,7 @@ class CoreService implements ChannelService {
         worktrees: this.options.worktrees,
         sourceId: message.messageId,
         worktreeMergeLifecycle: () => lifecycle,
+        beginEnding: () => this.beginThreadRoutesEnding(message, "merged"),
         archiveGeneration: () => archiveGeneration,
         planThreadArchive: (target, groupId, shortId, generation) => {
           const currentGeneration = this.currentThreadArchiveGeneration(target);
@@ -9689,6 +9937,10 @@ class CoreService implements ChannelService {
         };
       };
 
+      // Cleanup is an in-flight end operation: no new Loop input may enter the child before its
+      // complete/partial outcome is known. A failed or interrupted cleanup withdraws the fact.
+      this.beginThreadRoutesEnding(message, "removed");
+
       const result = await cleanupOwnedThreadWorkspace({
         ownership: cleanupOwnership,
         store: this.store,
@@ -9708,6 +9960,7 @@ class CoreService implements ChannelService {
       }
       if (this.stopping || controller.signal.aborted) {
         if (reserved) this.releaseOrRetainUnknownHostRemoval(id, removalProcessExited, resourcePaths);
+        if (!operationUnknown) this.clearPendingThreadRoutesEnding(message);
         return { kind: "refused", message: "channel 已停止或清理已中止；本次不归档。" };
       }
 
@@ -9722,11 +9975,17 @@ class CoreService implements ChannelService {
             receiptText: `本地工作区清理未完整完成，本次不归档；已确认的资源结果已逐项保存。请核对后重新执行 /thread remove。${detail.length === 0 ? "" : `详情：${detail}`}`,
           };
       this.store.persistHostRemovalOutcome(id, outcome);
+      if (outcome.kind === "complete") {
+        await this.confirmAndTransferThreadRoutesEnding(message, "removed");
+      } else {
+        this.clearPendingThreadRoutesEnding(message);
+      }
       return outcome;
     } catch (error) {
       if (reserved && !operationUnknown) {
         this.releaseOrRetainUnknownHostRemoval(id, removalProcessExited, resourcePaths);
       }
+      if (!operationUnknown) this.clearPendingThreadRoutesEnding(message);
       const detail = safeDisplayText(safeErrorMessage(error, "清理失败"), 180) ?? "未知错误";
       return {
         kind: "refused",
@@ -9988,6 +10247,9 @@ class CoreService implements ChannelService {
       await this.outbox.enqueueText(message, "当前子区有任务正在运行或排队，未归档。", null);
       return;
     }
+    // Archive readiness itself is an in-flight end operation: new Loop inputs must wait for a
+    // failed archive to withdraw this provisional fact instead of entering the child.
+    this.beginThreadRoutesEnding(message, "archived");
 
     const key = targetKey(message);
     const controller = new AbortController();
@@ -10058,6 +10320,7 @@ class CoreService implements ChannelService {
       } else {
         generationRejected = true;
         this.recoveredHostMergeArchiveTargets.delete(key);
+        this.clearPendingThreadRoutesEnding(target);
       }
     }
     const progressTail = Promise.allSettled(
@@ -10842,10 +11105,15 @@ class CoreService implements ChannelService {
           || this.threadArchives.generation(target) !== capturedGeneration
         ) return false;
         this.threadArchives.schedule(target, groupId, shortId, capturedGeneration);
-        return this.threadArchives.generation(target) === capturedGeneration;
+        if (this.threadArchives.generation(target) !== capturedGeneration) return false;
+        this.beginThreadRoutesEnding(target, "archived");
+        return true;
       },
       publishThreadMergeSuccess: (target, summary, archive, operationId) =>
         this.publishThreadMergeSuccess(target, summary, archive, operationId),
+      markThreadRoutesEnded: (target) =>
+        this.confirmAndTransferThreadRoutesEnding(target, "removed"),
+      beginThreadRoutesEnding: (target) => this.beginThreadRoutesEnding(target, "merged"),
       replayThreadMergeSuccess: (target, operationId) =>
         this.replayThreadMergeSuccess(target, operationId),
       threadArchiveGeneration: (target) => this.currentThreadArchiveGeneration(target),
@@ -11423,6 +11691,7 @@ class CoreService implements ChannelService {
       return;
     }
     if (!this.store.markStarted(taskId)) return;
+    if (await this.cancelEndedLoopTaskBeforeDispatch(taskId, target)) return;
     // Goal recovery requires its own native goal receipt; ordinary prompts retain prompt receipts.
     const goalResuming = this.store.isGoalTaskResuming(taskId);
     const resuming = this.store.isTaskResuming(taskId) || goalResuming;
@@ -11781,6 +12050,9 @@ class CoreService implements ChannelService {
               );
             }
           }
+          const dispatchTask = this.store.getTask(taskId);
+          if (dispatchTask === null || dispatchTask.state !== "running") return;
+          if (await this.cancelEndedLoopTaskBeforeDispatch(taskId, target)) return;
           this.store.markTaskPromptStarted(taskId, verified.sessionId);
           runtime.promptInFlight = true;
           const prompt = isTanDispatch

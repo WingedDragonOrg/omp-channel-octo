@@ -18,7 +18,11 @@ function preview(value: string | null, limit: number): FieldPreview {
   return { text: `${value.slice(0, end)}…`, truncated: true };
 }
 
-function summarizeTask(task: LoopTask, threadChannelId: string | null) {
+function summarizeTask(
+  task: LoopTask,
+  threadChannelId: string | null,
+  associationEnded: boolean,
+) {
   const title = preview(task.title, TITLE_PREVIEW_CHARS);
   const description = preview(task.description, DESCRIPTION_PREVIEW_CHARS);
   return {
@@ -42,6 +46,11 @@ function summarizeTask(task: LoopTask, threadChannelId: string | null) {
     created_at: task.createdAt,
     updated_at: task.updatedAt,
     thread_channel_id: threadChannelId,
+    association: associationEnded
+      ? "ended_child"
+      : threadChannelId === null
+        ? "none"
+        : "current_child",
   };
 }
 
@@ -50,16 +59,22 @@ export function renderLoopInput(
   input: LoopInput,
   target: ChatTarget,
   threadRoutes: ReadonlyMap<string, string>,
+  endedRoutes: ReadonlyMap<string, string> = new Map(),
 ): string {
   const tasks = input.tasks.map((current) => {
     const isUpdate = input.kind === "updated";
     const actionable = isLoopTaskAutomaticallyStartable(current.status);
+    const ended = endedRoutes.has(current.taskId);
     return {
       task_id: current.taskId,
-      current: summarizeTask(current, threadRoutes.get(current.taskId) ?? null),
+      current: summarizeTask(current, threadRoutes.get(current.taskId) ?? null, ended),
       previous: input.kind === "baseline" || input.previous === null
         ? null
-        : summarizeTask(input.previous, threadRoutes.get(input.previous.taskId) ?? null),
+        : summarizeTask(
+          input.previous,
+          threadRoutes.get(input.previous.taskId) ?? null,
+          endedRoutes.has(input.previous.taskId),
+        ),
       handling: actionable
         ? "actionable"
         : isUpdate
@@ -68,17 +83,20 @@ export function renderLoopInput(
     };
   });
   const hasCurrentThreadRoute = input.taskId !== null && threadRoutes.has(input.taskId);
+  const hasEndedThreadRoute = input.taskId !== null && endedRoutes.has(input.taskId);
   const allTasksNonActionable = input.tasks.length > 0
     && input.tasks.every((task) => !isLoopTaskAutomaticallyStartable(task.status));
   const routingGuidance = allTasksNonActionable
     ? "任务状态变化已送达；请结合上下文处理。待规划、已完成和已取消的任务不自动开工。"
-    : hasCurrentThreadRoute
-      ? "该任务已有当前子区关联；在当前关联子区处理任务变化，工作进展按 listen 策略或由子区主动通知主群。"
-      : input.kind === "baseline"
-        ? "本批未关联子区的负责人任务，逐项按现有流程复用或新建子区并绑定，再派发开工。"
-        : input.kind === "created"
-          ? "该新任务已通过负责人身份客观过滤；按现有流程新建并绑定子区，再派发开工。"
-          : "该已有任务已通过负责人身份客观过滤且尚未关联子区；按现有流程关联或创建子区并派发。";
+    : hasEndedThreadRoute
+      ? "该任务的原子区关联已归档或完成收尾；此变化只在主群处理，不要向已结束子区派发或重启工作。如需继续，先显式绑定或创建新的子区。"
+      : hasCurrentThreadRoute
+        ? "该任务已有当前子区关联；在当前关联子区处理任务变化，工作进展按 listen 策略或由子区主动通知主群。"
+        : input.kind === "baseline"
+          ? "本批未关联子区的负责人任务，逐项按现有流程复用或新建子区并绑定，再派发开工。"
+          : input.kind === "created"
+            ? "该新任务已通过负责人身份客观过滤；按现有流程新建并绑定子区，再派发开工。"
+            : "该已有任务已通过负责人身份客观过滤且尚未关联子区；按现有流程关联或创建子区并派发。";
   const data = {
     source: "Loop read-only observation",
     input_id: input.id,
@@ -91,6 +109,12 @@ export function renderLoopInput(
     existing_thread_routes: [...threadRoutes].map(([taskId, threadChannelId]) => ({
       task_id: taskId,
       thread_channel_id: threadChannelId,
+    })),
+    ended_thread_routes: [...endedRoutes].map(([taskId, threadChannelId]) => ({
+      task_id: taskId,
+      thread_channel_id: threadChannelId,
+      routing: "parent_only",
+      reason: "the associated child is archived or its thread work was merged or removed",
     })),
     baseline_batch: input.kind === "baseline"
       ? {
@@ -108,7 +132,9 @@ export function renderLoopInput(
           "reuse an existing child in this parent group",
           "octo_management.thread-bind to associate or rebind a Loop task with a child",
           "octo_management.create-thread with task_id to create and associate a new child",
-          "octo_management.thread-dispatch with task_id to dispatch work to its associated child",
+          ...(hasEndedThreadRoute
+            ? []
+            : ["octo_management.thread-dispatch with task_id to dispatch work to its associated child"]),
         ]
       : [],
   };

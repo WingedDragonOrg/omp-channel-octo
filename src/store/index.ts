@@ -9,7 +9,7 @@ import { dirname } from "node:path";
 import type { ChatAppendMode, ChatTarget, HostMergeProgressPhase, ThreadListenLevel, ThreadSummary, WorkerGoal, WorktreeMergeOutcome } from "../contracts.ts";
 import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceCleanupInput, ThreadWorkspaceCleanupRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadWorkspaceOperationInput, ThreadWorkspaceOperationRecord, ThreadForkInput, ThreadForkRecord, ThreadListenRecord, ThreadMergeEventRecord, ThreadTaskEventRecord, HostMergeLeaseRecord, HostMergeLeaseInput, HostMergeProgressCardInput, HostMergeProgressCardRecord, HostRemovalLeaseInput, HostRemovalLeaseRecord, HostThreadRemovalOutcome, ReviewJobRecord } from "./store-records.ts";
 import type { TaskFileLinkContext } from "./store-records.ts";
-import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopThreadCreation, LoopThreadCreationAttempt, LoopWorkspace } from "../loop/types.ts";
+import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopTaskRouteEnding, LoopTaskRouteEndingReason, LoopTaskRouteEndingState, LoopThreadCreation, LoopThreadCreationAttempt, LoopWorkspace } from "../loop/types.ts";
 import type { SessionContextSnapshotRecord, TanOperation, ReferenceHistoryEntry, ReferenceHistorySnapshot } from "./store-records.ts";
 export type { OutboxInsert, TanOperation, ReferenceHistoryEntry, ReferenceHistorySnapshot } from "./store-records.ts";
 export type { ThreadWorkspaceCleanupInput, ThreadWorkspaceCleanupPhase, ThreadWorkspaceCleanupRecord } from "./store-records.ts";
@@ -32,7 +32,7 @@ import type {
 } from "../inbound/ingress-types.ts";
 import { allocateScheduleOrder, applySchema, transaction } from "./store-schema.ts";
 import { claimOwnerEnrollment, clearChatModel, clearThreadModel, ensureBinding, ensureBindingIfMatches, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, getThreadModel, grantAllowedChat, hasOwnerEnrollment, initializeBindingSessionFromTask, listAllowedChats, resolveChatModel, setBotUid, setChatMode, setChatModel, setOwnerId, setThreadModel, updateBindingSession } from "./store-chats.ts";
-import { acceptCommitTask, acceptTask, acceptTaskIf, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, getTaskByMessageId, getTaskFinalResultText, getTaskScheduleOrder, hasTaskStopIntent, isCommitTask, isTaskResuming, listQueuedTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim, setTaskFinalResultText, suppressTaskRelay } from "./store-tasks.ts";
+import { acceptCommitTask, acceptTask, acceptTaskIf, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, getTaskByMessageId, getTaskFinalResultText, getTaskScheduleOrder, hasTaskStopIntent, isCommitTask, isTaskResuming, listQueuedTasks, listTransferredLoopTasks, listUndispatchedLoopTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim, setTaskFinalResultText, suppressTaskRelay, cancelUndispatchedTask, LOOP_TRANSFER_ERROR_TEXT } from "./store-tasks.ts";
 import { bindGoalTaskSession, clearGoalSession, finishGoalTaskProgress, getGoalSession, getGoalTask, isGoalTaskResuming, markGoalTaskAccepted, markGoalTaskAgentAccepted, markGoalTaskDispatched, saveGoalSessionProgress, stopGoalContinuation, updateGoalTaskProgress } from "./store-goals.ts";
 import { clearProgressCard, listProgressCards, recordProgressCardAttempt, saveProgressCard } from "./store-cards.ts";
 import { getWorkerLedger, listWorkerLedger, markWorkerStopped, recordWorker } from "./store-workers.ts";
@@ -49,6 +49,7 @@ import * as storeWatch from "./store-watch.ts";
 import type { WatchCheckCompletion, WatchCreateResult, WatchListItem, WatchRecord } from "../watch/types.ts";
 import type { ThreadReference, ThreadReferences } from "../references/types.ts";
 import { bindLoopTask, bindLoopWorkspace, claimLoopInputIntent, commitLoopScan, completeLoopThreadCreation, getLoopBinding, getLoopInput, getLoopTaskRoute, getLoopTaskSummary as readLoopTaskSummary, getLoopThreadCreation, isLoopInputObserved, listLoopBindings, listLoopInputs, listLoopThreadCreationAttempts, listLoopThreadCreations, listLoopThreadTasks, markLoopInputDelivered, markLoopInputFault, markLoopInputPending, markLoopInputUnknown, markLoopThreadCreationUnknown, prepareLoopInput, recordLoopThreadAllocated, releaseLoopThreadCreation, reserveLoopThreadCreation } from "./store-loop.ts";
+import { clearLoopTaskRouteEnding, clearPendingLoopThreadRoutesEnding, getLoopTaskRouteEnding, listLoopTaskRouteEndings, markLoopThreadRoutesEnding } from "./store-loop-endings.ts";
 import { acceptTanOperation, acceptTanTask, cancelTanOperation, finishTanOperation, finishTanOperationWithOutbox, getTanOperation, listCancelledTanOperations, listPendingTanOperations, reclaimTanCommand } from "./store-tan.ts";
 import { acceptReviewJob, bindReviewSession, getActiveReviewJob, getReviewJob, listRecoverableReviewJobs, listTerminalReviewJobs, markReviewCompleted, markReviewDispatchStarted, markReviewFailed, markReviewPromptAccepted, markReviewStarted, markReviewStopped, persistReviewRecoveryNotices, prepareReviewJobsForRestart, releaseOrphanedReviewClaims, requestReviewStop, requestReviewStopForClaim } from "./store-reviews.ts";
 import {
@@ -1017,6 +1018,22 @@ export class ChannelStore {
     return cancelQueued(this.db, botUid, target);
   }
 
+  listUndispatchedLoopTasks(botUid: string, target: ChatTarget): TaskRecord[] {
+    return listUndispatchedLoopTasks(this.db, botUid, target);
+  }
+
+  listTransferredLoopTasks(botUid: string, target: ChatTarget): TaskRecord[] {
+    return listTransferredLoopTasks(this.db, botUid, target);
+  }
+
+  cancelUndispatchedTask(taskId: string, reason: string): boolean {
+    return cancelUndispatchedTask(this.db, taskId, reason);
+  }
+
+  get loopTransferErrorText(): string {
+    return LOOP_TRANSFER_ERROR_TEXT;
+  }
+
   recordWorker(worker: WorkerLedgerRecord): void {
     recordWorker(this.db, worker);
   }
@@ -1641,7 +1658,46 @@ export class ChannelStore {
   }
 
   bindLoopTask(key: LoopTaskKey, threadChannelId: string): LoopTaskRoute {
-    return bindLoopTask(this.db, key, threadChannelId);
+    const route = bindLoopTask(this.db, key, threadChannelId);
+    clearLoopTaskRouteEnding(this.db, key);
+    return route;
+  }
+
+  getLoopTaskRouteEnding(key: LoopTaskKey): LoopTaskRouteEnding | null {
+    return getLoopTaskRouteEnding(this.db, key);
+  }
+
+  listLoopTaskRouteEndings(botUid: string): LoopTaskRouteEnding[] {
+    return listLoopTaskRouteEndings(this.db, botUid);
+  }
+
+  markLoopThreadRoutesEnding(
+    botUid: string,
+    groupId: string,
+    threadChannelId: string,
+    reason: LoopTaskRouteEndingReason,
+    state: LoopTaskRouteEndingState,
+  ): number {
+    return markLoopThreadRoutesEnding(
+      this.db,
+      botUid,
+      groupId,
+      threadChannelId,
+      reason,
+      state,
+    );
+  }
+
+  clearPendingLoopThreadRoutesEnding(
+    botUid: string,
+    groupId: string,
+    threadChannelId: string,
+  ): number {
+    return clearPendingLoopThreadRoutesEnding(this.db, botUid, groupId, threadChannelId);
+  }
+
+  clearLoopTaskRouteEnding(key: LoopTaskKey): void {
+    clearLoopTaskRouteEnding(this.db, key);
   }
 
   listLoopThreadTasks(botUid: string, groupId: string, threadChannelId: string): LoopTaskRoute[] {
@@ -1665,7 +1721,9 @@ export class ChannelStore {
   }
 
   completeLoopThreadCreation(key: LoopTaskKey, operationId: string): boolean {
-    return completeLoopThreadCreation(this.db, key, operationId);
+    const complete = completeLoopThreadCreation(this.db, key, operationId);
+    if (complete) clearLoopTaskRouteEnding(this.db, key);
+    return complete;
   }
 
   markLoopThreadCreationUnknown(key: LoopTaskKey, operationId: string, error: string): void {

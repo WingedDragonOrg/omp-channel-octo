@@ -147,6 +147,10 @@ export interface HostToolHost {
   flushTarget(target: ChatTarget): Promise<void>;
   /** Current generation; a new inbound invalidates an archive planned by an older merge. */
   threadArchiveGeneration(target: ChatTarget): number;
+  /** A successfully deleted thread is permanently ended; later Loop inputs route to its parent. */
+  markThreadRoutesEnded(target: ChatTarget): Promise<void>;
+  /** Marks a child's Loop routes as in-flight ending immediately before a destructive merge. */
+  beginThreadRoutesEnding(target: ChatTarget): void;
   /**
    * `thread-archive`（以及默认 pipeline 的 `thread-merge` 收尾）：把一次子区归档排定到该聊天
    * 本回合输出排空之后执行——任何发进子区的消息都会把归档子区解档，所以工具内不即时归档。
@@ -1689,6 +1693,7 @@ async function runManagementTool(
       if (cleanup.phase !== "cleaning") throw new Error("线程已删除，但工作区归属已变化；资源已保留");
       host.watches.deleteChat(deletedTarget);
       host.deleteThreadReferences(deletedTarget);
+      await host.markThreadRoutesEnded(deletedTarget);
       let cleaned: string | null;
       try {
         cleaned = await cleanupThreadWorkspace(host, task, cleanup, force, signal);
@@ -1741,6 +1746,7 @@ async function runManagementTool(
             worktrees: host.worktrees,
             sourceId: operationId,
             requireStableSourceId: true,
+            beginEnding: () => host.beginThreadRoutesEnding(workspaceTarget),
             ...(host.worktreeMergeLifecycle === undefined
               ? {}
               : {

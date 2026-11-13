@@ -181,8 +181,8 @@ function isLoopTaskAssignedToOwnerOrBot(task: LoopTask, botUid: string, ownerId:
 }
 
 
-function taskBusinessJson(task: LoopTask): string {
-  return JSON.stringify({
+function taskBusinessFields(task: LoopTask): Record<string, unknown> {
+  return {
     taskId: task.taskId,
     title: task.title,
     description: task.description,
@@ -195,13 +195,34 @@ function taskBusinessJson(task: LoopTask): string {
     parentTaskId: task.parentTaskId,
     startDate: task.startDate,
     dueDate: task.dueDate,
-  });
+  };
 }
 
-function taskBusinessChanged(previousJson: string, task: LoopTask): boolean {
-  const current = taskBusinessJson(task);
-  return previousJson !== current
-    && taskBusinessJson(JSON.parse(previousJson) as LoopTask) !== current;
+interface TaskBusinessChange {
+  changed: boolean;
+  enteringReview: boolean;
+}
+
+/**
+ * A transition into `in_review` is not delivered on its own; same-scan changes to any other
+ * business field still deliver, with the returned `enteringReview` flag masking that status field.
+ */
+function taskBusinessChange(previousJson: string, task: LoopTask): TaskBusinessChange {
+  const currentFields = taskBusinessFields(task);
+  const current = JSON.stringify(currentFields);
+  if (previousJson === current) return { changed: false, enteringReview: false };
+  const previous = JSON.parse(previousJson) as LoopTask;
+  const previousFields = taskBusinessFields(previous);
+  if (JSON.stringify(previousFields) === current) return { changed: false, enteringReview: false };
+  if (previous.status === "in_review" || task.status !== "in_review") {
+    return { changed: true, enteringReview: false };
+  }
+  delete previousFields.status;
+  delete currentFields.status;
+  return {
+    changed: JSON.stringify(previousFields) !== JSON.stringify(currentFields),
+    enteringReview: true,
+  };
 }
 
 function saveLoopTaskSnapshot(db: Database, key: LoopTaskKey, task: LoopTask, now: number): void {
@@ -213,7 +234,7 @@ function saveLoopTaskSnapshot(db: Database, key: LoopTaskKey, task: LoopTask, no
        task_json = excluded.task_json,
        business_json = excluded.business_json,
        updated_at = excluded.updated_at`,
-    [key.botUid, key.groupId, key.workspaceId, task.taskId, JSON.stringify(task), taskBusinessJson(task), now],
+    [key.botUid, key.groupId, key.workspaceId, task.taskId, JSON.stringify(task), JSON.stringify(taskBusinessFields(task)), now],
   );
 }
 
@@ -396,7 +417,10 @@ export function commitLoopScan(db: Database, binding: LoopBinding, tasks: readon
         }
       } else {
         const previous = JSON.parse(asString(previousRow.task_json)) as LoopTask;
-        if ((routed || assigned) && taskBusinessChanged(asString(previousRow.business_json), task)) {
+        const change = (routed || assigned)
+          ? taskBusinessChange(asString(previousRow.business_json), task)
+          : null;
+        if (change !== null && change.changed) {
           insertLoopInput(db, {
             botUid: binding.botUid,
             groupId: binding.groupId,
@@ -405,7 +429,7 @@ export function commitLoopScan(db: Database, binding: LoopBinding, tasks: readon
             kind: "updated",
             taskId: task.taskId,
             tasks: [task],
-            previous,
+            previous: change.enteringReview ? { ...previous, status: task.status } : previous,
           }, now);
         }
       }
@@ -480,12 +504,29 @@ export function isLoopInputObserved(db: Database, input: LoopInput): boolean {
 
 export function prepareLoopInput(db: Database, id: string): LoopInput | null {
   return transaction(db, () => {
-    const input = getLoopInput(db, id);
+    let input = getLoopInput(db, id);
     if (!input || input.state !== "pending") return null;
     const binding = loopBindingRow(db, input.botUid, input.groupId);
     if (!binding
       || asString(binding.workspace_id) !== input.workspaceId
       || asNumber(binding.version) !== input.bindingVersion) return null;
+
+    if (input.kind === "updated" && input.previous !== null && input.tasks.length === 1) {
+      const current = input.tasks[0]!;
+      const change = taskBusinessChange(JSON.stringify(input.previous), current);
+      if (change.enteringReview) {
+        if (!change.changed) {
+          run(db, "UPDATE loop_inputs SET state = 'superseded' WHERE id = ? AND state = 'pending'", [input.id]);
+          return null;
+        }
+        const previous = { ...input.previous, status: current.status };
+        run(db,
+          "UPDATE loop_inputs SET previous_json = ? WHERE id = ? AND state = 'pending'",
+          [JSON.stringify(previous), input.id],
+        );
+        input = { ...input, previous };
+      }
+    }
 
     if (input.kind === "baseline" && input.taskId === null) {
       const ownerId = getOwnerId(db, input.botUid);

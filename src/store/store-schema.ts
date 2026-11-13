@@ -978,6 +978,20 @@ function migrateLoopStorage(db: Database): void {
       );
       CREATE INDEX IF NOT EXISTS loop_task_routes_thread
         ON loop_task_routes(bot_uid, group_id, thread_channel_id, task_id);
+      CREATE TABLE IF NOT EXISTS loop_route_endings (
+        bot_uid TEXT NOT NULL,
+        group_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        thread_channel_id TEXT NOT NULL,
+        route_version INTEGER NOT NULL CHECK(route_version >= 1),
+        state TEXT NOT NULL CHECK(state IN ('pending', 'ended')),
+        reason TEXT NOT NULL CHECK(reason IN ('archived', 'merged', 'removed')),
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(bot_uid, group_id, workspace_id, task_id)
+      );
+      CREATE INDEX IF NOT EXISTS loop_route_endings_thread
+        ON loop_route_endings(bot_uid, group_id, thread_channel_id);
       CREATE TABLE IF NOT EXISTS loop_thread_creations (
         bot_uid TEXT NOT NULL,
         group_id TEXT NOT NULL,
