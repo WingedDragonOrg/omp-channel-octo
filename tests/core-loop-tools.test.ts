@@ -377,10 +377,12 @@ test("explicit thread-bind preserves a known partial Loop allocation identity", 
 
 test("concurrent task-aware create and native tool-call replay allocate once", async () => {
   const transport = new BlockingCreateTransport({ bot: { uid: BOT_UID, name: "Loop Fixture Bot" } });
-  const fixture = await createFixture({ transport });
+  const fixture = await createFixture({ transport, worktrees: true });
   try {
     const tool = fixture.management();
-    const args = { action: "create-thread", name: "Task 17", task_id: LOOP_TASK_ID };
+    const args = {
+      action: "create-thread", name: "Task 17", task_id: LOOP_TASK_ID, worktree_name: "task-seventeen",
+    };
     const first = execute(tool, args, "native-create-17");
     const allocated = await transport.started.promise;
     const replay = execute(tool, args, "native-create-17");
@@ -432,7 +434,7 @@ test("thread-bind rebinds explicitly and thread info/list report source IDs", as
 });
 
 test("automatic Loop tasks can create and dispatch while the latest status is open", async () => {
-  const fixture = await createFixture();
+  const fixture = await createFixture({ worktrees: true });
   try {
     const messageId = fixture.automaticMessageId();
     const tool = fixture.management(GROUP_ID, messageId);
@@ -440,6 +442,7 @@ test("automatic Loop tasks can create and dispatch while the latest status is op
       action: "create-thread",
       name: "Open automatic task",
       task_id: LOOP_TASK_ID,
+      worktree_name: "open-automatic-task",
     })) as { channel_id: string; short_id: string; route_bound: boolean };
     expect(created.route_bound).toBe(true);
 
@@ -457,20 +460,40 @@ test("automatic Loop tasks can create and dispatch while the latest status is op
   }
 });
 
-test("automatic Loop creation rechecks status immediately before remote allocation", async () => {
+test("Loop create-thread rejects a missing worktree_name before remote allocation", async () => {
   const fixture = await createFixture();
+  try {
+    const rejection = await execute(fixture.management(), {
+      action: "create-thread",
+      name: "Loop thread without a workspace",
+      task_id: LOOP_TASK_ID,
+    }).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+
+    expect(rejection).toContain("worktree_name");
+    expect(createCalls(fixture.transport)).toBe(0);
+    expect(await fixture.transport.listThreads(GROUP_ID)).toHaveLength(0);
+    expect(fixture.store.getLoopTaskRoute(fixture.key())).toBeNull();
+    expect(fixture.store.getLoopThreadCreation(fixture.key())).toBeNull();
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("automatic Loop creation rechecks status immediately before remote allocation", async () => {
+  const fixture = await createFixture({ worktrees: true });
   try {
     const messageId = fixture.automaticMessageId();
     let reads = 0;
     fixture.controls.beforeTaskRead = async (taskId) => {
       if (taskId !== LOOP_TASK_ID) return;
       reads += 1;
-      if (reads === 3) fixture.setTaskStatus(taskId, "done");
+      if (reads === 4) fixture.setTaskStatus(taskId, "done");
     };
     await expect(execute(fixture.management(GROUP_ID, messageId), {
       action: "create-thread",
       name: "Task closed during creation",
       task_id: LOOP_TASK_ID,
+      worktree_name: "closed-during-creation",
     })).rejects.toThrow(/closed Loop task/);
     expect(createCalls(fixture.transport)).toBe(0);
     expect(fixture.store.getLoopThreadCreation(fixture.key())).toBeNull();
@@ -515,6 +538,7 @@ test.each(["done", "cancelled", "backlog"])(
         action: "create-thread",
         name: "Closed automatic task",
         task_id: LOOP_TASK_ID,
+        worktree_name: "closed-automatic-task",
       })).rejects.toThrow(/closed Loop task/);
       expect(createCalls(fixture.transport)).toBe(0);
       expect(fixture.store.getLoopThreadCreation(fixture.key())).toBeNull();
@@ -602,7 +626,7 @@ test("automatic Loop dispatch rechecks status at the destination acceptance boun
 });
 
 test("manual explicit create and dispatch remain available for a closed Loop task", async () => {
-  const fixture = await createFixture();
+  const fixture = await createFixture({ worktrees: true });
   try {
     fixture.setTaskStatus(LOOP_TASK_ID, "done");
     const tool = fixture.management(GROUP_ID, "human-explicit-task");
@@ -610,6 +634,7 @@ test("manual explicit create and dispatch remain available for a closed Loop tas
       action: "create-thread",
       name: "Manual explicit task",
       task_id: LOOP_TASK_ID,
+      worktree_name: "manual-explicit-task",
     })) as { channel_id: string; short_id: string };
 
     const dispatch = JSON.parse(await execute(tool, {
@@ -738,7 +763,9 @@ test("same task and native tool call can retry an unknown remote creation that f
   const fixture = await createFixture({ transport });
   try {
     const tool = fixture.management();
-    const args = { action: "create-thread", name: "Task 17", task_id: LOOP_TASK_ID };
+    const args = {
+      action: "create-thread", name: "Task 17", task_id: LOOP_TASK_ID, worktree_name: "task-seventeen",
+    };
     const first = JSON.parse(await execute(tool, args, "native-create-unknown")) as {
       creation_state: string;
       allocated_channel_id: string | null;
@@ -772,12 +799,14 @@ test("same task and native tool call can retry an unknown remote creation that f
 
 test("unknown creation history survives restart and a same-call retry routes the actual new child", async () => {
   const transport = new LostCreateResponseTransport(1);
-  const firstFixture = await createFixture({ transport, removeRootOnClose: false });
+  const firstFixture = await createFixture({ transport, removeRootOnClose: false, worktrees: true });
   const root = firstFixture.root;
   let firstFixtureClosed = false;
   let reopenedFixture: LoopToolsFixture | undefined;
   try {
-    const args = { action: "create-thread", name: "Task 17", task_id: LOOP_TASK_ID };
+    const args = {
+      action: "create-thread", name: "Task 17", task_id: LOOP_TASK_ID, worktree_name: "task-seventeen",
+    };
     const first = JSON.parse(
       await execute(firstFixture.management(), args, "native-create-after-restart"),
     ) as { creation_state: string; allocated_channel_id: string | null };
@@ -785,7 +814,7 @@ test("unknown creation history survives restart and a same-call retry routes the
 
     await firstFixture.close();
     firstFixtureClosed = true;
-    reopenedFixture = await createFixture({ transport, root });
+    reopenedFixture = await createFixture({ transport, root, worktrees: true });
     const result = JSON.parse(
       await execute(reopenedFixture.management(), args, "native-create-after-restart"),
     ) as {
@@ -824,7 +853,7 @@ test("unknown creation history survives restart and a same-call retry routes the
 });
 
 test("unknown creation with a known child permits a new attempt while preserving its identity", async () => {
-  const fixture = await createFixture();
+  const fixture = await createFixture({ worktrees: true });
   try {
     const key = fixture.key();
     const priorChild = threadRecord(GROUP_ID, "prior-partial");
@@ -834,7 +863,7 @@ test("unknown creation with a known child permits a new attempt while preserving
     fixture.store.markLoopThreadCreationUnknown(key, "prior-operation", "completion unknown");
 
     const result = JSON.parse(await execute(fixture.management(), {
-      action: "create-thread", name: "Task 17", task_id: LOOP_TASK_ID,
+      action: "create-thread", name: "Task 17", task_id: LOOP_TASK_ID, worktree_name: "task-seventeen",
     }, "retry-known-child")) as {
       channel_id: string;
       ready: boolean;
@@ -946,11 +975,12 @@ test("worktree preparation failure retains the allocated thread and never re-cre
 
 test("known partial allocation identity is preserved and is not re-created", async () => {
   const transport = new DescriptionFailureTransport({ bot: { uid: BOT_UID, name: "Loop Fixture Bot" } });
-  const fixture = await createFixture({ transport });
+  const fixture = await createFixture({ transport, worktrees: true });
   try {
     const tool = fixture.management();
     const args = {
-      action: "create-thread", name: "Task 17", task_id: LOOP_TASK_ID, background: "Prepare a task thread",
+      action: "create-thread", name: "Task 17", task_id: LOOP_TASK_ID,
+      worktree_name: "task-seventeen", background: "Prepare a task thread",
     };
     const first = JSON.parse(await execute(tool, args, "native-create-description-failure")) as {
       creation_state: string;
@@ -983,10 +1013,10 @@ test("known partial allocation identity is preserved and is not re-created", asy
 
 test("workspace replacement during creation preserves the allocation without publishing it", async () => {
   const transport = new BlockingCreateTransport({ bot: { uid: BOT_UID, name: "Loop Fixture Bot" } });
-  const fixture = await createFixture({ transport });
+  const fixture = await createFixture({ transport, worktrees: true });
   try {
     const pending = execute(fixture.management(), {
-      action: "create-thread", name: "Task 17", task_id: LOOP_TASK_ID,
+      action: "create-thread", name: "Task 17", task_id: LOOP_TASK_ID, worktree_name: "task-seventeen",
     }, "native-create-workspace-race");
     const allocated = await transport.started.promise;
     fixture.store.bindLoopWorkspace(BOT_UID, GROUP_ID, OTHER_WORKSPACE, []);
@@ -1004,11 +1034,13 @@ test("workspace replacement during creation preserves the allocation without pub
 
 test("explicit thread-bind during creation wins the route compare-and-set", async () => {
   const transport = new BlockingCreateTransport({ bot: { uid: BOT_UID, name: "Loop Fixture Bot" } });
-  const fixture = await createFixture({ transport });
+  const fixture = await createFixture({ transport, worktrees: true });
   try {
     transport.setThreads(GROUP_ID, [threadRecord(GROUP_ID, "existing-target")]);
     const tool = fixture.management();
-    const pending = execute(tool, { action: "create-thread", name: "Task 17", task_id: LOOP_TASK_ID }, "native-create-bind-race");
+    const pending = execute(tool, {
+      action: "create-thread", name: "Task 17", task_id: LOOP_TASK_ID, worktree_name: "task-seventeen",
+    }, "native-create-bind-race");
     const allocated = await transport.started.promise;
     await execute(tool, { action: "thread-bind", task_id: LOOP_TASK_ID, short_id: "existing-target" });
     transport.release.resolve();
@@ -1023,6 +1055,7 @@ test("explicit thread-bind during creation wins the route compare-and-set", asyn
       action: "create-thread",
       name: "Task 17",
       task_id: LOOP_TASK_ID,
+      worktree_name: "task-seventeen",
     })) as { superseded_creation: { allocated_channel_id: string } };
     expect(existing.superseded_creation.allocated_channel_id).toBe(allocated.channelId);
     expect(createCalls(transport)).toBe(1);
@@ -1040,6 +1073,7 @@ test("existing target is reused and separate multi-thread creation is rejected",
     const tool = fixture.management();
     const existing = JSON.parse(await execute(tool, {
       action: "create-thread", name: "do not duplicate", task_id: LOOP_TASK_ID,
+      worktree_name: "do-not-duplicate",
     }, "native-create-existing")) as { channel_id: string };
     expect(existing.channel_id).toBe(threadRecord(GROUP_ID, "existing-target").channelId);
     expect(createCalls(fixture.transport)).toBe(0);
@@ -1077,6 +1111,7 @@ test("task IDs outside the current workspace are rejected before thread allocati
   try {
     await expect(execute(fixture.management(), {
       action: "create-thread", name: "wrong workspace task", task_id: "loop-task-other",
+      worktree_name: "wrong-workspace-task",
     })).rejects.toThrow();
     expect(createCalls(fixture.transport)).toBe(0);
   } finally {
@@ -1085,10 +1120,10 @@ test("task IDs outside the current workspace are rejected before thread allocati
 });
 
 test("create-thread without task_id retains ordinary behavior", async () => {
-  const fixture = await createFixture();
+  const fixture = await createFixture({ worktrees: true });
   try {
     const created = JSON.parse(await execute(fixture.management(), {
-      action: "create-thread", name: "ordinary thread",
+      action: "create-thread", name: "ordinary thread", worktree_name: "ordinary-thread",
     })) as { channel_id: string };
     expect(created.channel_id).toBe(threadRecord(GROUP_ID, "thread-1").channelId);
     expect(createCalls(fixture.transport)).toBe(1);

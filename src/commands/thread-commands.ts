@@ -38,8 +38,8 @@ function mergeReceiptId(botUid: string, target: InboundMessage, sourceId: string
   );
 }
 const THREAD_USAGE = [
-  "用法：/thread <任务>；无项目需求时沿用普通子区；无 projects 时可直接提供 legacy worktree_name 建立单仓 worktree；显式 projects（包括 single）必须提供完整任务 worktree_name 和互不冲突的稳定 ASCII 项目名（如 admin-web、customer-web），省略 layout 表示 single；多项目必须明确选择 layout=shared|separate；",
-  "agent 根据任务意图和已知仓库用途自行确定完整语义任务名并规范化为 1–100 字符 ASCII slug；项目名也要是互不冲突的 1–100 字符 ASCII slug。名称过长时改用更短但完整的语义名，不翻译、不截断；只有无法判断项目真实身份时才向 owner 问最少必要问题。",
+  "用法：/thread <任务>；create-thread 必须提供完整任务 worktree_name（1–100 字符 ASCII slug），无 projects 的单仓创建与带 Loop task_id 的创建同样必需，缺失会在远端子区分配前被拒绝；无 projects 时按调用方 cwd 所属仓库建立单仓 worktree；显式 projects（包括 single）还须提供互不冲突的稳定 ASCII 项目名（如 admin-web、customer-web），省略 layout 表示 single；多项目必须明确选择 layout=shared|separate；",
+  "agent 根据任务意图和已知仓库用途自行确定完整语义任务名并规范化为 1–100 字符 ASCII slug；项目名也要是互不冲突的 1–100 字符 ASCII slug。名称过长时改用更短但完整的语义名，不翻译、不截断；只有无法判断显式项目真实身份时才向 owner 问最少必要问题；显式项目的 repo/base 无法确定时向 owner 澄清，不臆造路径。",
   "background 只写简短用途，不放任务正文、SDD 或验收标准；实际路径以 create-thread 返回为准，不预先臆造。整批 ready=true 后才可派发，未就绪时报告资源结果并停止；",
   "之后用 thread-dispatch 派发任务；普通子区内 /thread merge [补充说明] 由宿主执行默认合并与清理；仅实际合并失败后派发一次修复任务，并保留补充说明；普通子区内 /thread remove [--force] 清理本地隔离工作区并在成功后归档；已就绪的 fork 子区的这两个命令只归档 Octo 子区，不触碰本地资源。",
 ].join("");
@@ -69,10 +69,10 @@ const THREAD_REMOVE_UNCONFIGURED_TEXT = "本部署未配置隔离工作区能力
 function threadIntentPrompt(intent: string): string {
   return [
     "用户希望把下面这件事放进隔离子区处理，而不是在当前会话直接执行。",
-    "先理解意图，确定简洁的子区名称与工作区计划：无项目/Worktree 需求时可建普通子区；无 projects 时可用 legacy worktree_name 建立单仓 worktree；若指定项目仓库或 base，则必须传 projects=[{name,repo,base?}]，包括单项目也必须同时提供完整任务 worktree_name，单项目省略 layout 表示 single；多项目必须列出所有项目并明确选择 layout=shared 或 separate（每项 repo 为绝对规范路径，base 为可选 Git 起始 ref；shared 是一个子区，separate 是每个项目一个子区）。",
-    "项目、repo 或多项目 layout 无法从意图中可靠确定时，只向 owner 问最少必要的问题；不要臆造 repo 路径，也不要用当前 cwd 代替项目 repo。",
-    "根据任务意图与已知仓库用途自行确定完整语义的 worktree_name，并作为所有项目共用的 1–100 字符 ASCII slug，不追加项目序号或项目名；project name 是独立稳定目录 slug，需是唯一且明确限定项目的 1–100 字符 ASCII 名称（如 admin-web、customer-web）。不得翻译或截断；名称过长时改用更短但完整的名称，只有无法判断项目真实身份时才向 owner 问最少必要问题。",
-    "调用 octo_management create-thread 时传入完整 projects/layout；background 只写简短用途，不放任务正文、SDD 或验收标准；实际成功资源路径以创建结果为准，不预先臆造路径。",
+    "先理解意图，确定简洁的子区名称与工作区计划：create-thread 一律要求提供完整任务 worktree_name，不存在不带工作区的普通子区；无 projects 时按调用方 cwd 所属仓库建立单仓 worktree（legacy 参数路径），带 Loop task_id 时同样必须提供；若指定项目仓库或 base，则必须传 projects=[{name,repo,base?}]，包括单项目也须同时提供完整任务 worktree_name，单项目省略 layout 表示 single；多项目必须列出所有项目并明确选择 layout=shared 或 separate（每项 repo 为绝对规范路径，base 为可选 Git 起始 ref；shared 是一个子区，separate 是每个项目一个子区）。",
+    "显式 projects 的项目、repo 或多项目 layout 无法从意图中可靠确定时，只向 owner 问最少必要的问题；不要臆造 repo 路径，也不要用调用方 cwd 冒充显式项目 repo；无 projects 的单仓路径由宿主按调用方 cwd 解析。",
+    "根据任务意图与已知仓库用途自行确定完整语义的 worktree_name（无 projects 与带 Loop task_id 的创建同样必填），并作为所有项目共用的 1–100 字符 ASCII slug，不追加项目序号或项目名；project name 是独立稳定目录 slug，需是唯一且明确限定项目的 1–100 字符 ASCII 名称（如 admin-web、customer-web）。不得翻译或截断；名称过长时改用更短但完整的名称，只有无法判断显式项目真实身份时才向 owner 问最少必要问题。",
+    "调用 octo_management create-thread 时始终传入 worktree_name，并按需传入完整 projects/layout；缺少 worktree_name 会在远端分配前被拒绝，补齐后重试；background 只写简短用途，不放任务正文、SDD 或验收标准；实际成功资源路径以创建结果为准，不预先臆造路径。",
     "必须等待 create-thread 返回整批 ready=true 后才能调用 thread-dispatch；若 ready=false，说明各项目/子区的成功与失败资源并停止，不派发任何实现任务。",
     "整批就绪后，再按 short_id（separate 时逐项目对应）调用 thread-dispatch。派发正文按 SDD 格式写（目标、范围、约束与验收标准）：",
     "- 需求简单或非常明确时，保留全部意图并按 SDD 格式写清，让子区直接生成 SDD 并立刻开工；",

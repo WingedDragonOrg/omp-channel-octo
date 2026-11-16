@@ -34,7 +34,7 @@
 
 ## 工具契约
 
-`create-thread` 增加 `listen`（默认 merge），包括 single/shared/separate 与普通子区；separate 每个创建结果各自保存策略及同一创建方目标。`thread-listen` 使用既有 thread-* 定位方式，带 listen 修改，不带时查询。`thread-info` 同时报告策略。修改策略不修改创建方目标。
+`create-thread` 增加 `listen`（默认 merge），包括所有新建的 single/shared/separate 子区（创建均带隔离 worktree）；既有普通子区仍可通过 `thread-listen` 设置或查询策略；separate 每个创建结果各自保存策略及同一创建方目标。`thread-listen` 使用既有 thread-* 定位方式，带 listen 修改，不带时查询。`thread-info` 同时报告策略。修改策略不修改创建方目标。
 
 `thread-dispatch` 不再接受 notify。派发仍复用权限、深度限制、durable 接受、追加模式和收据；独立派发任务及直接送达子区的 Loop 独立任务有自己的终态通知，steering 部分没有独立终态。Loop 变化本身只送关联子区；此处订阅的是执行结果，不是变更镜像。已有任务级登记不参与决策。
 

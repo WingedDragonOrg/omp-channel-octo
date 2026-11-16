@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -22,8 +23,9 @@ const realOmp = resolve(requestedOmp);
 const checkout = resolve(import.meta.dir, "../..");
 const root = await realpath(await mkdtemp(join(tmpdir(), "oco-thread-creator-input-")));
 const stateDir = join(root, "state");
+const childWorkspaceName = "thread-creator-child";
 const parentCwd = join(root, "parent-cwd");
-const childCwd = join(root, "child-cwd");
+const childCwd = `${parentCwd}.${childWorkspaceName}`;
 const auditPath = join(root, "omp-audit.jsonl");
 const groupId = "thread-creator-input-smoke";
 const runId = `${process.pid}-${Date.now()}`;
@@ -250,7 +252,7 @@ async function finiteModel(request: Request): Promise<Response> {
           kind: "tool",
           name: "octo_management",
           toolCallId: `thread_create_${runId}`,
-          arguments: { action: "create-thread", name: sourceThreadName },
+          arguments: { action: "create-thread", name: sourceThreadName, worktree_name: childWorkspaceName },
         }, modelRequests.length);
       }
       return completion({ kind: "text", text: `THREAD_CREATOR_CHILD_CREATED_${runId}` }, modelRequests.length);
@@ -414,9 +416,10 @@ try {
     mkdir(join(root, "tmp"), { recursive: true }),
     mkdir(join(root, "agent"), { recursive: true }),
     mkdir(parentCwd, { recursive: true }),
-    mkdir(childCwd, { recursive: true }),
     writeFile(auditPath, ""),
   ]);
+  execFileSync("git", ["init", "--quiet", parentCwd]);
+  execFileSync("git", ["-C", parentCwd, "-c", "user.name=Thread Fixture", "-c", "user.email=thread@fixture.invalid", "commit", "--quiet", "--allow-empty", "-m", "fixture"]);
   for (const command of ["octo-cli", "super"]) {
     await writeFile(join(root, "bin", command), "#!/bin/sh\nexit 127\n", { mode: 0o755 });
   }
@@ -629,7 +632,7 @@ process.exitCode = code ?? 1;
       "Native management tool execution returned an error");
   }
 
-  const workerCount = db!.query("SELECT COUNT(*) AS count FROM worker_ledger WHERE state != 'stopped'").get() as { count: number };
+  const workerCount = db!.query("SELECT COUNT(*) AS count FROM worker_ledger").get() as { count: number };
   assert.ok(workerCount.count > 0, "Acceptance did not exercise real OMP RPC worker processes");
   assert.equal(modelRequests.length, 6, "Finite model must handle create-thread, held parent, child tool, and queued parent turns");
   assert.equal(modelError, undefined);

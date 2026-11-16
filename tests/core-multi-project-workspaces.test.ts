@@ -1365,7 +1365,6 @@ test("explicit projects without worktree_name are rejected before remote allocat
     for (const error of missingSeedErrors) {
       expect(error).not.toBe("resolved");
       expect(error).toContain("worktree_name");
-      expect(error).toMatch(/任务|task/iu);
     }
     expect(await transport.listThreads(GROUP_ID)).toHaveLength(0);
     expect(await pathExists(join(harness.stateDir, "thread-workspaces"))).toBe(false);

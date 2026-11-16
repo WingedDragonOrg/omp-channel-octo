@@ -73,6 +73,10 @@ test("/thread turns the message into an instructed task without creating anythin
     const prompt = harness.workers.prompts[0];
     expect(prompt?.cwd).toBe(parentCwd);
     expect(prompt?.text.endsWith(intent)).toBe(true);
+    // Workspace is required even without explicit projects or with a Loop task_id.
+    expect(prompt?.text).toContain("create-thread 一律要求提供完整任务 worktree_name");
+    expect(prompt?.text).toContain("无 projects 时按调用方 cwd 所属仓库建立单仓 worktree");
+    expect(prompt?.text).toContain("带 Loop task_id 时同样必须提供");
   } finally {
     await closeCoreHarness(harness);
   }
@@ -205,7 +209,7 @@ test("shared sub-thread merge command is notice-only and leaves task listening a
       if (!management) throw new Error("management tool missing");
       const result = JSON.parse(
         await management.execute(
-          { action: "create-thread", name: "共享命令线程", listen: "task" },
+          { action: "create-thread", name: "共享命令线程", worktree_name: "shared-command-thread", listen: "task" },
           new AbortController().signal,
         ),
       ) as { channel_id: string };
@@ -279,6 +283,9 @@ test("/thread without a task replies with usage, and DMs and threads are refused
     );
     await waitForReply(harness, group, "用法：/thread <任务>");
     expect(harness.transport.sent.some(({ text }) => text.includes("用法：/thread <任务>"))).toBe(true);
+    expect(harness.transport.sent.some(({ text }) =>
+      text.includes("create-thread 必须提供完整任务 worktree_name"),
+    )).toBe(true);
 
     await submitAndWaitForHandoff(harness, inbound({ messageId: "thread-dm", text: "/thread do it" }));
     await waitForReply(harness, { channelType: 1, channelId: "dm-owner" }, "/thread 需要在群聊中使用。");

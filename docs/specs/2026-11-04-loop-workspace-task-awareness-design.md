@@ -103,7 +103,7 @@ Agent 结合任务状态和变化上下文处理输入；待规划、已完成�
 
 `octo_management` 扩展如下：
 
-- `create-thread`：可选 `task_id`。从调用所在主群或子区的真实父群解析当前 workspace；验证 task 属于该 workspace 后，为该 task 预留创建意图，准备子区，ready 时发布关联。创建与绑定完成后，agent 再用 `thread-dispatch` 派发正文。
+- `create-thread`：可选 `task_id`，但 `worktree_name` 始终必填，带 `task_id` 时同样不能省略，缺少时在远端分配前拒绝。从调用所在主群或子区的真实父群解析当前 workspace；验证 task 属于该 workspace 后，为该 task 预留创建意图，准备子区，ready 时发布关联。创建与绑定完成后，agent 再用 `thread-dispatch` 派发正文。
 - 新增 `thread-bind`：必填 `task_id`，按既有 `short_id` 规则定位本群子区；设置或显式替换该 task 的当前关联。重复绑定到同一目标幂等。回执包含 workspace ID、task ID、原目标及新目标；替换不删除原子区或取消其已接受工作。
 - `thread-dispatch`：可选 `task_id`，用于标注任务来源。携带时必须与该目标的当前关联一致；派发本身不隐式改绑。workspace/task 来源随实际子区输入持久保存，当前路由在实际接受前复核。同一 channel 任务的同一 native `toolCallId` 使用稳定输入身份，已确认接受不重复执行，steer 结果不明时保留 pending claim 并拒绝降级为第二个任务。普通派发省略时维持原行为。
 - `thread-info`、`list-threads`：返回本地已知的关联 workspace/task IDs；保留既有分页/截断说明，不通过名称或 THREAD.md 猜关联。
@@ -114,7 +114,7 @@ Agent 结合任务状态和变化上下文处理输入；待规划、已完成�
 
 ### 创建与改绑顺序
 
-创建预留在远端创建前持久化；普通子区和有 worktree 子区都覆盖。已有 ready 目标及已知部分结果按实际身份处理；未知远端分配保留历史，同时允许同一任务的新尝试。并发在途调用共享当前尝试，已结束未知尝试的重试可能创建重复子区，回执报告这一风险。
+创建预留在远端创建前持久化；所有 `create-thread` 子区（创建均带 `worktree_name` 隔离工作区）都覆盖，带 `task_id` 的创建同样必须提供 `worktree_name`。已有 ready 目标及已知部分结果按实际身份处理；未知远端分配保留历史，同时允许同一任务的新尝试。并发在途调用共享当前尝试，已结束未知尝试的重试可能创建重复子区，回执报告这一风险。
 
 创建预留记录其依据的 workspace 绑定版本和 task 关联版本。`thread-bind` 显式修改关联会递增版本；创建 ready 发布及重启恢复必须以原版本条件提交。期间已发生改绑或 workspace 替换时，原创建不得覆盖当前关联：保留实际分配结果及资源归属供核对，回执分别报告已创建资源和当前有效路由目标，不报告原目标绑定成功，也不自动派发或删除已创建资源。
 

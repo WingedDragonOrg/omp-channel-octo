@@ -35,7 +35,9 @@ test("task-aware native dispatch replay executes once while a new call still run
       const management = context.promptContext?.tools?.find(tool => tool.name === "octo_management");
       if (!management) throw new Error("scoped management tool missing");
       const signal = new AbortController().signal;
-      const created = JSON.parse(await management.execute({ action: "create-thread", name: "Replay child", task_id: taskId }, signal, "replay-create")) as { short_id: string; channel_id: string };
+      const created = JSON.parse(await management.execute({
+        action: "create-thread", name: "Replay child", task_id: taskId, worktree_name: "replay-child",
+      }, signal, "replay-create")) as { short_id: string; channel_id: string };
       threadChannelId = created.channel_id;
       store!.setChatMode(harness.bot.uid, { channelType: 5, channelId: threadChannelId }, "queue");
       const args = { action: "thread-dispatch", short_id: created.short_id, task_id: taskId, text: "LOOP_NATIVE_DISPATCH_WORK" };

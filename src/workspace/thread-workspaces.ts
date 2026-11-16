@@ -108,7 +108,7 @@ export interface ThreadWorkspaceAddPlan {
 }
 
 export interface ValidatedThreadCreation {
-  workspace: ThreadWorkspaceCreatePlan | null;
+  workspace: ThreadWorkspaceCreatePlan;
   listen: ThreadListenLevel;
   background?: string;
 }
@@ -361,13 +361,7 @@ export async function validateThreadCreation(
   const rawProjects = args.projects;
   if (rawProjects === undefined) {
     if (layout !== undefined) throw new Error("layout requires projects");
-    if (legacyWorktreeName === undefined) {
-      return {
-        workspace: null,
-        listen,
-        ...(background === undefined ? {} : { background }),
-      };
-    }
+    if (legacyWorktreeName === undefined) throw new Error("create-thread requires worktree_name");
     const repo = await realpath(callerCwd);
     if (!(await stat(repo)).isDirectory()) throw new Error("调用方工作目录不是目录");
     return {
@@ -515,7 +509,6 @@ export async function expandThreadWorkspace(
     signal,
   );
   const plan = validated.workspace;
-  if (plan === null) throw new Error("thread-workspace-add requires projects");
   plan.layout = "shared";
 
   const nativeToolCallId = toolCallId?.trim();

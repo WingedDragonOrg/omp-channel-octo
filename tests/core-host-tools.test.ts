@@ -127,7 +127,10 @@ test("group dispatch freezes scoped management/file tools to the current target 
         name: string;
       };
       const created = JSON.parse(
-        await management.execute({ action: "create-thread", name: "thread from worker" }, signal),
+        await management.execute(
+          { action: "create-thread", name: "thread from worker", worktree_name: "worker-thread" },
+          signal,
+        ),
       ) as { short_id: string; channel_id: string };
       const fileResult = await fileTool.execute({ path: "picture.png", kind: "image" }, signal);
       await append(
@@ -550,7 +553,10 @@ test("thread dispatch queues the task in the target thread and reports it in bot
       );
       if (text === "handoff work") {
         const created = JSON.parse(
-          await management.execute({ action: "create-thread", name: "handoff" }, signal),
+          await management.execute(
+            { action: "create-thread", name: "handoff", worktree_name: "handoff-thread" },
+            signal,
+          ),
         ) as { short_id: string };
         const dispatched = JSON.parse(
           await management.execute(
@@ -572,6 +578,7 @@ test("thread dispatch queues the task in the target thread and reports it in bot
   });
   try {
     const cwd = join(harness.root, "dispatch cwd");
+    const workspace = join(harness.root, "worktrees", "thread-1");
     await mkdir(cwd, { recursive: true });
     await harness.service.submitInbound(
       inbound({ messageId: "dispatch-bind", ...GROUP_TOOLS, text: `/new ${cwd}`, mentionedUserIds: [harness.bot.uid] }),
@@ -595,10 +602,11 @@ test("thread dispatch queues the task in the target thread and reports it in bot
       (status) => status.state === "completed",
     );
 
-    const lines = (await readText(join(cwd, "dispatch.log"))).trim().split("\n");
-    expect(lines[0]).toBe(`group|true|true|queued|thread-1|${dispatchedChannelId}|${cwd}`);
-    expect(lines[1]).toBe(`thread|false|检查部署状态|${cwd}`);
-    expect(harness.workers.prompts[1]?.cwd).toBe(cwd);
+    const groupLog = (await readText(join(cwd, "dispatch.log"))).trim();
+    const threadLog = (await readText(join(workspace, "dispatch.log"))).trim();
+    expect(groupLog).toBe(`group|true|true|queued|thread-1|${dispatchedChannelId}|${cwd}`);
+    expect(threadLog).toBe("thread|false|检查部署状态|" + workspace);
+    expect(harness.workers.prompts[1]?.cwd).toBe(workspace);
     expect(
       harness.transport.sent.some(
         ({ target, text }) =>
@@ -937,6 +945,55 @@ test("create-thread worktree_name leaves failed workspace non-dispatchable", asy
   }
 });
 
+test("create-thread rejects a missing worktree_name before remote thread allocation", async () => {
+  const harness = await createCoreHarness({
+    prompt: async ({ append, cwd, promptContext }) => {
+      const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
+      if (!management) throw new Error("management tool missing");
+      let rejection = "accepted";
+      try {
+        await management.execute(
+          { action: "create-thread", name: "thread without a workspace" },
+          new AbortController().signal,
+        );
+      } catch (error) {
+        rejection = error instanceof Error ? error.message : String(error);
+      }
+      await append("missing-worktree.log", `${rejection}\n${cwd}\n`);
+    },
+  });
+  try {
+    const cwd = join(harness.root, "missing worktree cwd");
+    await mkdir(cwd, { recursive: true });
+    await harness.service.submitInbound(
+      inbound({
+        messageId: "missing-worktree-bind",
+        ...GROUP_TOOLS,
+        text: `/new ${cwd}`,
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await harness.service.submitInbound(
+      inbound({
+        messageId: "missing-worktree-create",
+        ...GROUP_TOOLS,
+        text: "create a thread without a workspace",
+        mentionedUserIds: [harness.bot.uid],
+      }),
+    );
+    await waitForPrompts(harness, 1);
+    await waitForStatus(harness.service, GROUP_TOOLS, (status) => status.state === "completed");
+
+    expect(await readText(join(cwd, "missing-worktree.log"))).toContain("worktree_name");
+    expect(
+      harness.transport.managementCalls.filter(({ action }) => action === "create-thread"),
+    ).toHaveLength(0);
+    await expect(harness.transport.listThreads(GROUP_TOOLS.channelId)).resolves.toHaveLength(0);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
 test("thread-listen query and update persist the policy used by dispatched tasks", async () => {
   const relaySeen = Promise.withResolvers<void>();
   const createdChannel = { channelId: "" };
@@ -947,7 +1004,10 @@ test("thread-listen query and update persist the policy used by dispatched tasks
       const signal = new AbortController().signal;
       if (text === "handoff with listen") {
         const created = JSON.parse(
-          await management.execute({ action: "create-thread", name: "监听线程" }, signal),
+          await management.execute(
+            { action: "create-thread", name: "监听线程", worktree_name: "listen-thread" },
+            signal,
+          ),
         ) as { short_id: string; channel_id: string };
         createdChannel.channelId = created.channel_id;
         const before = JSON.parse(
@@ -999,9 +1059,11 @@ test("thread-listen query and update persist the policy used by dispatched tasks
     );
     await waitForSignal(relaySeen.promise, "thread merge relay notice");
 
-    expect(await readText(join(harness.root, "tmp", "listen.log"))).toBe(
-      "merge|task|task|queued\nthread:检查部署状态\ntask-notice\n",
-    );
+    const groupLog = await readText(join(harness.root, "tmp", "listen.log"));
+    const threadLog = await readText(join(harness.root, "worktrees", "thread-1", "listen.log"));
+    expect(groupLog).toContain("merge|task|task|queued\n");
+    expect(groupLog).toContain("task-notice\n");
+    expect(threadLog).toBe("thread:检查部署状态\n");
     const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
     try {
       const task = store.getLatestTask(harness.bot.uid, {
@@ -1485,7 +1547,7 @@ test("shared direct merge refusal suppresses only its task and preserves later t
       if (text === "prepare shared task") {
         const thread = JSON.parse(
           await management.execute(
-            { action: "create-thread", name: "共享工作区线程", listen: "task" },
+            { action: "create-thread", name: "共享工作区线程", worktree_name: "shared-thread", listen: "task" },
             signal,
           ),
         ) as { channel_id: string; short_id: string };

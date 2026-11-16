@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { Database } from "bun:sqlite";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -123,7 +124,10 @@ const model = Bun.serve({
         modelError = "Installed OMP did not receive scoped management host tools";
         return new Response(modelError, { status: 400 });
       }
-      return management("loop-create-stable", { action: "create-thread", name: "Loop acceptance task", task_id: loopTaskId, listen: "merge" });
+      return management("loop-create-stable", {
+        action: "create-thread", name: "Loop acceptance task", task_id: loopTaskId,
+        worktree_name: "loop-acceptance-task", listen: "merge",
+      });
     }
     if (kind === "main-baseline" && call === 2) {
       const route = store!.getLoopTaskRoute({ botUid: fixture.botUid, groupId, workspaceId, taskId: loopTaskId });
@@ -230,6 +234,9 @@ try {
   await mkdir(join(root, "bin"));
   await mkdir(join(root, "agent"));
   await mkdir(join(root, "cwd"));
+  const taskCwd = join(root, "cwd");
+  execFileSync("git", ["init", "--quiet", taskCwd]);
+  execFileSync("git", ["-C", taskCwd, "-c", "user.name=Loop Fixture", "-c", "user.email=loop@fixture.invalid", "commit", "--quiet", "--allow-empty", "-m", "fixture"]);
   for (const command of ["octo-cli", "super"]) await writeFile(join(root, "bin", command), "#!/bin/sh\nexit 127\n", { mode: 0o755 });
   await writeFile(join(root, "agent", "models.yml"), JSON.stringify({ providers: { "local-loop": {
     baseUrl: `http://127.0.0.1:${model.port}/v1`, apiKey: "local-placeholder", api: "openai-completions",

@@ -30,7 +30,11 @@ async function createThreadViaTool(
 ): Promise<Record<string, unknown> & { short_id: string; channel_id: string }> {
   return JSON.parse(
     await managementOf(promptContext).execute(
-      { action: "create-thread", ...args },
+      {
+        action: "create-thread",
+        worktree_name: "notify-thread-workspace",
+        ...args,
+      },
       new AbortController().signal,
     ),
   ) as Record<string, unknown> & { short_id: string; channel_id: string };
@@ -1490,7 +1494,7 @@ test("queued dispatches resume after restart and emit each task notice once", as
           senderId: "owner-1",
           text: "重启前的排队任务",
           sessionId: "session-queued",
-          cwd: first.root,
+          cwd: store.getBinding(first.bot.uid, { channelId: created.channelId, channelType: 5 })!.cwd,
           state: "queued",
           resultText: null,
           errorText: null,
@@ -1508,6 +1512,7 @@ test("queued dispatches resume after restart and emit each task notice once", as
   const secondSeen = Promise.withResolvers<void>();
   const second = await createCoreHarness({
     root,
+    transport: first.transport,
     prompt: async ({ emit, promptContext, text }) => {
       if (text === "再派发一次") {
         const thread = await createThreadViaTool(promptContext, { name: "回传线程", listen: "task" });

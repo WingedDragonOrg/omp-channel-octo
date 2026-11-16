@@ -57,12 +57,12 @@
 
 #### 目标与对外契约
 
-统一由 `octo_management create-thread` 创建子区、准备隔离工作区、持久化绑定并写入 Octo `THREAD.md`。具体工作只来自后续 `thread-dispatch` 的正文；创建本身不启动实施。保留当前群作用域、owner 权限、去重和单项目行为。
+统一由 `octo_management create-thread` 创建子区、准备隔离工作区、持久化绑定并写入 Octo `THREAD.md`。具体工作只来自后续 `thread-dispatch` 的正文；创建本身不启动实施。保留当前群作用域、owner 权限、去重和单仓库 worktree 命名与创建能力。
 
 创建参数：
 
-- `name`：子区名称；`worktree_name`：agent 提供的简短、完整语义任务名。显式 `projects` 创建必须提供；未提供 projects 时仍可省略以创建普通子区。
-- `projects`：显式项目列表，每项 `{name, repo, base?}`；`repo` 是项目仓库的绝对路径，`base` 是可选起始 Git ref。未提供项目时，原单仓库工作区仍取调用方 cwd 所属仓库。
+- `name`：子区名称；`worktree_name`：agent 提供的简短、完整语义任务名。所有 `create-thread` 调用均必填，包括无 `projects` 的单仓创建与带 `task_id` 的 Loop 创建；显式 `projects`（含 single）同样必填。缺少时在远端子区分配前拒绝，不创建无工作区子区。
+- `projects`：显式项目列表，每项 `{name, repo, base?}`；`repo` 是项目仓库的绝对路径，`base` 是可选起始 Git ref。未提供项目时，仍须提供 `worktree_name`，由调用方 cwd 所属仓库建立单仓 worktree。
 - `layout`：多项目必须由 agent 根据任务耦合选择 `shared` 或 `separate`，不要求 owner 每次决定；单项目可省略。
 - `background`：为什么创建、涉及哪些项目的简短背景。宿主补充实际成功的 worktree 路径；不是任务、SDD、实施要求或验收要求。
 
@@ -76,7 +76,7 @@
 
 **输入与长度。** agent 为 `worktree_name` 选择简短完整语义名，建议直接提供 ASCII 小写、单连字符分词的 slug。宿主沿用 ASCII 规范化（小写、连续非字母数字转为单连字符、去掉首尾连字符），不翻译中文，不调用模型、不按字符截断。任务 slug 与项目 slug 均须为 1–100 字符；工具输入 `worktree_name` 同样最多 100 字符。超长或无可用 ASCII 的输入在远端创建前拒绝，提示提供更短但完整的语义名称。冲突后缀不占基础 slug 的 100 字符额度，完整保留基础名称。
 
-显式 `projects` 必须提供 `worktree_name`，包括 single；缺少时提示 agent 补齐任务 slug，不从线程显示名或项目名称猜任务。每个 `projects[].name` 既是显示名，也是独立项目 slug 的来源，通常直接使用项目/仓库名。规范化后无 ASCII、超长、重复显示名或重复 slug 均在任何远端创建前拒绝；要求使用 `admin-web`、`customer-web` 这类明确限定名，不自动添加项目序号。同一来源仓库沿用现有多 worktree 能力；使用 `backend-baseline`、`backend-feature` 等用途名称区分目录，不增加创建模式。
+所有 `create-thread` 调用都必须提供 `worktree_name`，包括无 `projects` 的单仓创建、显式 `projects`（含 single）与带 `task_id` 的创建；缺少时在任何远端分配前拒绝，提示 agent 补齐任务 slug，不从线程显示名、项目名称或 cwd 猜任务。每个 `projects[].name` 既是显示名，也是独立项目 slug 的来源，通常直接使用项目/仓库名。规范化后无 ASCII、超长、重复显示名或重复 slug 均在任何远端创建前拒绝；要求使用 `admin-web`、`customer-web` 这类明确限定名，不自动添加项目序号。同一来源仓库沿用现有多 worktree 能力；使用 `backend-baseline`、`backend-feature` 等用途名称区分目录，不增加创建模式。
 
 **布局与分支。**
 
@@ -108,7 +108,7 @@
 
 #### 状态、归属与就绪
 
-工作区资源归属独立于当前会话绑定，SQLite 记录 thread、layout、入口、每个项目来源仓库/起始 ref/计划与实际路径/分支/创建确认状态，以及 `preparing`、`ready`、`failed` 状态。仅原 `worktree_name` 单仓库调用带可选 `legacy_worktree_name` 持久标记，用于保持其未建立会话时工作区缺失后回退父群的既有行为；显式 projects 的 single/shared/separate 不继承该回退。运行时不解析 `THREAD.md` 决定路径、资源归属或执行资格。
+工作区资源归属独立于当前会话绑定，SQLite 记录 thread、layout、入口、每个项目来源仓库/起始 ref/计划与实际路径/分支/创建确认状态，以及 `preparing`、`ready`、`failed` 状态。仅无 `projects` 的单仓库创建带可选 `legacy_worktree_name` 持久标记，用于保持其未建立会话时工作区缺失后回退父群的既有行为；显式 projects 的 single/shared/separate 不继承该回退。运行时不解析 `THREAD.md` 决定路径、资源归属或执行资格。
 
 每次远端 thread 创建之前，先在 `thread_workspace_intents` 保存独立创建意图；separate 的每个远端创建各有自己的 intent，不能用已完成项目推断未映射远端资源不存在。创建返回后把真实 channel ID 映射到该 intent，再保存 preparing 归属记录。Git 副作用之前记录已分配候选路径，只有 create 返回成功才标记实际资源已创建。每个项目成功后保存结果与 cwd 绑定；整次调用所有工作区、绑定和 `THREAD.md` 均成功后，才在一个 SQLite transaction 内将整批工作区标记 ready，随后分别完成对应 intent。背景只写确认成功的实际资源，不把计划值当成成功。
 
@@ -153,7 +153,7 @@ shared 的 `/thread merge` 只回复「当前为多项目工作区，不支持 /
 
 ### 创建（create-thread --worktree_name）
 
-无显式项目的单仓库路径由调用方 cwd 解析仓库根；显式 projects 则各用传入 repo。按上述可读命名 SDD 分配：canonical Git common-dir 下串行排除已占用分支和目录，实际冲突以递增后缀退让；shared 使用独立项目路径，分支冲突不改变正常项目目录。随后：
+每次创建都使用 agent 提供的必填 `worktree_name`；无显式项目的单仓库路径由调用方 cwd 解析仓库根，显式 projects 则各用传入 repo。按上述可读命名 SDD 分配：canonical Git common-dir 下串行排除已占用分支和目录，实际冲突以递增后缀退让；shared 使用独立项目路径，分支冲突不改变正常项目目录。随后：
 
 - wt 可用：`wt switch --create <branch> --no-cd --format json --config-set worktree-path="<候选路径>"`（在仓库根运行，120 秒上限）。hooks 按项目配置执行（pre-start 阻塞）。返回 JSON 的 `path` 经 realpath 作为绑定 cwd。
 - wt 不可用：现状 `omp worktree add <path> -b <branch> -C <baseDir> -q`。

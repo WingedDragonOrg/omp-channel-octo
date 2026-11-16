@@ -228,9 +228,9 @@ fork 目标保留原生分叉历史及显式业务正文；发送给模型时排
 }
 ```
 
-同一参数改为 `"layout": "separate"`，返回 `threads` 列表，每项携带 `short_id`、`cwd`、项目路径与分支。单项目可省略 layout；既有 `name` + `worktree_name` 单仓库调用继续可用。
+同一参数改为 `"layout": "separate"`，返回 `threads` 列表，每项携带 `short_id`、`cwd`、项目路径与分支。单项目可省略 layout；无 projects 的 `name` + `worktree_name` 单仓库调用仍可用，但 `worktree_name` 现在对所有创建必填。
 
-显式 `projects` 创建须提供 `worktree_name`，由助手根据任务选择简短完整的 ASCII 语义名（如 `fix-login-flow`），小写、单连字符分词，最多 100 字符；超长明确报错并要求缩短完整语义，不截断单词。shared 入口采用任务名，入口内项目目录各用独立项目 slug（如 `backend/`、`frontend/`），不同仓库的分支均为完整任务名；交换 projects 顺序不改变名称。single/separate 保持 `<repo>.<任务名>` 目录布局。实际资源占用才使用 `-2`、`-3` 递增后缀；项目显示名或规范化 slug 冲突时，须提供 `admin-web`、`customer-web` 等明确限定名。已有资源及归属保持原名。
+所有 `create-thread` 创建（含无 projects 单仓、显式 projects 与带 Loop `task_id`）都必须提供 `worktree_name`，由助手根据任务选择简短完整的 ASCII 语义名（如 `fix-login-flow`），小写、单连字符分词，最多 100 字符；超长明确报错并要求缩短完整语义，不截断单词。shared 入口采用任务名，入口内项目目录各用独立项目 slug（如 `backend/`、`frontend/`），不同仓库的分支均为完整任务名；交换 projects 顺序不改变名称。single/separate 保持 `<repo>.<任务名>` 目录布局。实际资源占用才使用 `-2`、`-3` 递增后缀；项目显示名或规范化 slug 冲突时，须提供 `admin-web`、`customer-web` 等明确限定名。已有资源及归属保持原名。
 
 
 只有结果 `ready: true` 才能继续 `thread-dispatch`；全部 worktree、持久绑定与共享说明均须成功。部分失败会返回已完成/未确认资源与错误，保留现场，不自动开始实施。THREAD.md 仅含创建目的、项目及实际路径；具体目标、实施要求与验收写在派发正文中。
