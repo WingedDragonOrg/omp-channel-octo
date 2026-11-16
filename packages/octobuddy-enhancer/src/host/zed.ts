@@ -15,6 +15,7 @@ export interface OpenZedRequest {
 export interface ZedBackendOptions {
   zedExecutable?: string;
   cwd?: string;
+  workspaceCwds?: string[];
   workspace?: boolean;
 }
 
@@ -121,7 +122,8 @@ export async function openInZed(
     const fragment = /^#L([1-9]\d*)$/.exec(remote.hash);
     const line = fragment ? `:${fragment[1]}` : match?.[0] ?? "";
     const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-    const command = `cwd=$(realpath -- ${quote(options.cwd)}) && file=$(realpath -- ${quote(file)}) && printf '%s\\0%s\\0' "$cwd" "$file"`;
+    const candidates = (options.workspaceCwds ?? []).map(quote).join(" ");
+    const command = `cwd=$(realpath -- ${quote(options.cwd)}) && file=$(realpath -- ${quote(file)}) && printf '%s\\0%s\\0' "$cwd" "$file" && { for dir in ${candidates}; do resolved=$(realpath -- "$dir" 2>/dev/null) && test -d "$resolved" && printf '%s\\0' "$resolved"; done; :; }`;
     const host = `${remote.username ? `${decodeURIComponent(remote.username)}@` : ""}${remote.hostname}`;
     const sshArgs = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
       ...(remote.port ? ["-p", remote.port] : []), "--", host, command];
@@ -129,13 +131,16 @@ export async function openInZed(
       timeout: 15_000,
       env: withoutStatusEnvironment(process.env),
     }).catch(() => { throw new Error("Could not resolve the remote workspace or file over SSH"); });
-    const [cwd, target] = stdout.split("\0");
-    if (!cwd || !target || !target.startsWith(cwd === "/" ? "/" : `${cwd}/`)) {
-      throw new Error("Zed file is outside the chat workspace");
-    }
+    const [cwd, target, ...workspaces] = stdout.split("\0");
+    if (!cwd || !target) throw new Error("Could not resolve the remote workspace or file over SSH");
+    const project = target.startsWith(cwd === "/" ? "/" : `${cwd}/`)
+      ? cwd
+      : workspaces.filter((directory) => directory && target.startsWith(directory === "/" ? "/" : `${directory}/`))
+        .sort((a, b) => b.length - a.length)[0]
+        ?? (target.slice(0, target.lastIndexOf("/")) || "/");
     const authority = `${remote.username ? `${remote.username}@` : ""}${remote.host}`;
     const encoded = (value: string) => value.split("/").map(encodeURIComponent).join("/");
-    args = [`ssh://${authority}${encoded(cwd)}`, `ssh://${authority}${encoded(target)}${line}`];
+    args = [`ssh://${authority}${encoded(project)}`, `ssh://${authority}${encoded(target)}${line}`];
   }
   if (!await stillAuthorized()) throw new Error("Zed request is no longer current before Zed could be opened");
   const child = spawn(executable, args, { detached: true, shell: false, stdio: "ignore", env: withoutStatusEnvironment(process.env) });

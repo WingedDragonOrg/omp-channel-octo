@@ -24,6 +24,7 @@ type ChatStatusSnapshot = {
   state: "none" | "idle" | "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted";
   model: string | null;
   cwd: string | null;
+  workspaceCwds?: string[];
   queuedTasks: number;
   pendingQuestions: number;
 };
@@ -174,6 +175,7 @@ const groupChatSnapshot: ChatStatusSnapshot = {
   state: "running",
   model: "anthropic/claude-sonnet",
   cwd: "/Users/test/work/group",
+  workspaceCwds: ["/Users/test/work/group", "/Users/test/work/thread"],
   queuedTasks: 2,
   pendingQuestions: 1,
 };

@@ -1022,6 +1022,7 @@ class OctoBuddyHost {
       argument = { path: result.result.value };
     }
     let cwd: string | undefined;
+    let workspaceCwds: string[] | undefined;
     let chatStillCurrent: (() => Promise<boolean>) | undefined;
     if (isRecord(argument) && typeof argument.path === "string" && /^zed:\/\/ssh\//i.test(argument.path)) {
       if (!isCommunicationRendererUrl(attachment.rootUrl, this.#identity.appPath)) {
@@ -1058,10 +1059,18 @@ class OctoBuddyHost {
       };
       if (!isCurrent() || !await chatStillCurrent()) throw new Error("chat changed before Zed could be opened");
       cwd = status.snapshot.cwd;
+      if (status.snapshot.zedWorkspaceUrl?.startsWith("zed://ssh/")) {
+        const configured = new URL(`ssh://${status.snapshot.zedWorkspaceUrl.slice("zed://ssh/".length)}`);
+        const link = new URL(`ssh://${argument.path.slice("zed://ssh/".length)}`);
+        if (configured.host === link.host && configured.username === link.username) {
+          workspaceCwds = status.snapshot.workspaceCwds;
+        }
+      }
     }
     await openInZed(argument, {
       ...(this.#zedExecutable !== undefined ? { zedExecutable: this.#zedExecutable } : {}),
       ...(cwd !== undefined ? { cwd } : {}),
+      ...(workspaceCwds !== undefined ? { workspaceCwds } : {}),
     }, async () => isCurrent() && (chatStillCurrent === undefined || await chatStillCurrent()) && isCurrent());
     return undefined;
   }

@@ -552,6 +552,38 @@ export function isWorkspaceDirectoryOwned(db: Database, cwd: string): boolean {
   return listThreadWorkspaceRecords(db).some((record) => matchesOwnedResource(cwd, record));
 }
 
+/**
+ * Absolute workspace roots this bot owns right now: every persisted chat binding, plus the roots
+ * of ready thread workspaces. A shared workspace is opened as its entire managed entry; single and
+ * separate workspaces expose their actual project roots. Ownership records outlive binding moves,
+ * so a ready workspace still contributes even when its chat binding was moved elsewhere; the
+ * current binding cwd is included independently and duplicates collapse.
+ */
+export function listWorkspaceCwds(db: Database, botUid: string): string[] {
+  const cwds = new Set<string>();
+  for (const row of query(
+    db,
+    "SELECT cwd FROM chats WHERE bot_uid = ? ORDER BY channel_type ASC, channel_id ASC",
+    [botUid],
+  )) {
+    const cwd = asString(row.cwd);
+    if (isAbsolute(cwd)) cwds.add(cwd);
+  }
+  for (const workspace of listThreadWorkspaces(db, botUid)) {
+    if (workspace.status !== "ready") continue;
+    if (workspace.layout === "shared") {
+      if (workspace.entryPath !== null && isAbsolute(workspace.entryPath)) {
+        cwds.add(workspace.entryPath);
+      }
+      continue;
+    }
+    for (const project of workspace.projects) {
+      if (project.created && project.path !== null && isAbsolute(project.path)) cwds.add(project.path);
+    }
+  }
+  return [...cwds];
+}
+
 function listThreadWorkspaceRecords(db: Database): ThreadWorkspaceRecord[] {
   return query(
     db,

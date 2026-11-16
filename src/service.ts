@@ -4023,6 +4023,7 @@ class CoreService implements ChannelService {
         state: "none",
         model: null,
         cwd: null,
+        workspaceCwds: [],
         queuedTasks: 0,
         pendingQuestions: 0,
       };
@@ -4039,6 +4040,7 @@ class CoreService implements ChannelService {
       state: statusState(active ?? latest, binding !== null),
       model: this.store.resolveChatModel(botUid, target).model,
       cwd: binding?.cwd ?? null,
+      workspaceCwds: this.store.listWorkspaceCwds(botUid),
       queuedTasks: this.store.countQueuedTasks(botUid, target),
       pendingQuestions: this.store.pendingQuestionIds(botUid, target).length,
     };

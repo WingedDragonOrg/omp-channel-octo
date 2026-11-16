@@ -30,6 +30,7 @@ interface ChatStatusSnapshot {
   state: "none" | "idle" | "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted";
   model: string | null;
   cwd: string | null;
+  workspaceCwds: string[];
   queuedTasks: number;
   pendingQuestions: number;
 }
@@ -183,6 +184,33 @@ test("status snapshots reflect live work, queued tasks, chat isolation, and unkn
     }));
     await promptBStarted.promise;
 
+    // Another bot's binding and ready workspace must never leak into this instance's snapshot.
+    store.ensureBinding({
+      botUid: "bot-other",
+      channelType: 5,
+      channelId: "other-group____thread",
+      sessionId: "other-session",
+      cwd: join(harness.root, "other-bot"),
+      sessionFile: null,
+    });
+    store.saveThreadWorkspace({
+      botUid: "bot-other",
+      channelType: 5,
+      channelId: "other-group____thread",
+      layout: "shared",
+      status: "ready",
+      entryPath: join(harness.root, "other-entry"),
+      workspaceRoot: null,
+      projects: [{
+        name: "other-project",
+        repo: join(harness.root, "other-repo"),
+        path: join(harness.root, "other-entry", "other-project"),
+        branch: "thread-other",
+        created: true,
+      }],
+      error: null,
+    });
+
     const snapshots = statusSnapshotApi(harness.service);
     const serviceSnapshot = snapshots.statusSnapshot();
     expect(serviceSnapshot).toMatchObject({
@@ -203,10 +231,12 @@ test("status snapshots reflect live work, queued tasks, chat isolation, and unkn
       state: "running",
       model: "fixture/snapshot-a",
       cwd: join(harness.root, "tmp"),
+      workspaceCwds: [join(harness.root, "tmp")],
       queuedTasks: 1,
       pendingQuestions: 0,
     });
     expectUtcTimestamp(chatA.sampledAt);
+    expect(chatA.workspaceCwds).toEqual([join(harness.root, "tmp")]);
 
     const chatB = snapshots.chatStatusSnapshot(CHAT_B);
     expect(chatB).toMatchObject({
@@ -229,10 +259,12 @@ test("status snapshots reflect live work, queued tasks, chat isolation, and unkn
       state: "none",
       model: null,
       cwd: null,
+      workspaceCwds: [join(harness.root, "tmp")],
       queuedTasks: 0,
       pendingQuestions: 0,
     });
     expectUtcTimestamp(unknown.sampledAt);
+    expect(unknown.workspaceCwds).toEqual([join(harness.root, "tmp")]);
     expect(store.getBinding(harness.bot.uid, UNKNOWN_CHAT)).toBeNull();
     expect(store.getLatestTask(harness.bot.uid, UNKNOWN_CHAT)).toBeNull();
 

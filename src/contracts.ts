@@ -948,6 +948,12 @@ export interface ChatStatusSnapshot {
   state: ChatExecutionState;
   model: string | null;
   cwd: string | null;
+  /**
+   * Absolute workspace roots the current bot owns: every persisted chat binding cwd plus ready
+   * thread workspace entries (shared) or project roots (single/separate), deduplicated. The client
+   * resolves these remotely and matches the opened file against the longest containing root.
+   */
+  workspaceCwds: string[];
   queuedTasks: number;
   pendingQuestions: number;
 }

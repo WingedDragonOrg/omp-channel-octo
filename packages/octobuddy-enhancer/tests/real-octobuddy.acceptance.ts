@@ -175,7 +175,10 @@ async function createLocalStatusServer(cwd: string): Promise<LocalStatusServer> 
       state: "idle",
       model: null,
       cwd: channelType === 2 ? join(cwd, "group") : cwd,
-      zedWorkspaceUrl: `zed://file${pathToFileURL(channelType === 2 ? join(cwd, "group") : cwd).pathname}`,
+      zedWorkspaceUrl: channelType === 2
+        ? `zed://ssh/fixture${pathToFileURL(join(cwd, "group")).pathname}`
+        : `zed://file${pathToFileURL(cwd).pathname}`,
+      workspaceCwds: [cwd],
       queuedTasks: 0,
       pendingQuestions: 0,
     }));
@@ -980,7 +983,7 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
       const text = await rendererStatusText();
       return text.includes(`群聊 ${controlledGroup.channelID}`) && text.includes("空闲");
     }, "the real panel to show the selected test group status", 10_000);
-    const groupZedUrl = `zed://ssh/fixture${pathToFileURL(groupFilePath).pathname}#L1`;
+    const groupZedUrl = `zed://ssh/fixture${pathToFileURL(fileUrlPath).pathname}#L37`;
     const groupLink = await evaluate<ActionBox>(browser, communicationSessionId, `(() => {
       const link = document.createElement("a");
       link.href = ${JSON.stringify(groupZedUrl)};
@@ -993,8 +996,8 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
     await dispatchMouseClick(browser, communicationSessionId, groupLink);
     await waitForZedCalls(fakeZed.argvFile, 3);
     const expectedGroup = [
-      `ssh://fixture${pathToFileURL(await realpath(join(paths.workspace, "group"))).pathname}`,
-      `ssh://fixture${pathToFileURL(await realpath(groupFilePath)).pathname}:1`,
+      `ssh://fixture${pathToFileURL(await realpath(paths.workspace)).pathname}`,
+      `ssh://fixture${pathToFileURL(await realpath(fileUrlPath)).pathname}:37`,
     ];
     expect((await readZedArguments(fakeZed.argvFile))[2]).toEqual(expectedGroup);
 

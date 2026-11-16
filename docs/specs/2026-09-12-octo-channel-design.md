@@ -19,6 +19,7 @@
 包含服务侧获取的每轮群/线程成员上下文、system/developer 中的 mention 使用规则与 Octo CLI 能力入口，以及普通助手回复中的结构化 mention。正文和完整 mention 随流式输出持续更新同一消息；具体边界见「每轮成员与操作上下文」及「普通回复中的 mention」。
 
 包含可按 channel 实例配置的助手正文文件链接解析：使用任务实际工作目录解析相对路径，并由 Zed resolver 生成本地或 SSH 链接；流式投递和任务恢复的约束见 `docs/specs/2026-11-11-local-file-link-resolvers-design.md`。
+OctoBuddy 增强器打开跨工作区的 Zed SSH 文件时，状态接口提供当前 Bot 的已知工作区目录；目标在当前 cwd 外时优先匹配其来源工作区，否则以文件父目录作为项目根，具体契约见 `docs/specs/2026-11-12-zed-chat-workspace-design.md`。
 
 包含 owner-only 原生持续目标管理 `/goal`：创建时 token 预算、状态查询、暂停、恢复、删除、跨回合执行与在途目标跨服务重启续接，详细契约见 `docs/specs/2026-11-02-goal-command-design.md`。
 

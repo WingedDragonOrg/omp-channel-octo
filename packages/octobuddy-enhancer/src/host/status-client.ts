@@ -36,6 +36,7 @@ export interface ChatStatusSnapshot {
   model: string | null;
   cwd: string | null;
   zedWorkspaceUrl?: string | null;
+  workspaceCwds?: string[];
   queuedTasks: number;
   pendingQuestions: number;
 }
@@ -324,7 +325,7 @@ function parseSnapshot(value: unknown): StatusSnapshot | undefined {
 
 function parseChatSnapshot(value: unknown, target: ChatTarget): ChatStatusSnapshot | undefined {
   if (!isRecord(value)) return undefined;
-  const { version, sampledAt, channelType, channelId, state, model, cwd, zedWorkspaceUrl, queuedTasks, pendingQuestions } = value;
+  const { version, sampledAt, channelType, channelId, state, model, cwd, zedWorkspaceUrl, workspaceCwds, queuedTasks, pendingQuestions } = value;
   if (
     version !== 1 ||
     channelType !== target.channelType ||
@@ -335,6 +336,7 @@ function parseChatSnapshot(value: unknown, target: ChatTarget): ChatStatusSnapsh
     (model !== null && typeof model !== "string") ||
     (cwd !== null && typeof cwd !== "string") ||
     (zedWorkspaceUrl !== undefined && zedWorkspaceUrl !== null && typeof zedWorkspaceUrl !== "string") ||
+    (workspaceCwds !== undefined && (!Array.isArray(workspaceCwds) || workspaceCwds.some((path) => typeof path !== "string" || !path.startsWith("/")))) ||
     !Number.isSafeInteger(queuedTasks) || (queuedTasks as number) < 0 ||
     !Number.isSafeInteger(pendingQuestions) || (pendingQuestions as number) < 0
   ) {
@@ -349,6 +351,7 @@ function parseChatSnapshot(value: unknown, target: ChatTarget): ChatStatusSnapsh
     model,
     cwd,
     ...(zedWorkspaceUrl === undefined ? {} : { zedWorkspaceUrl: zedWorkspaceUrl as string | null }),
+    ...(workspaceCwds === undefined ? {} : { workspaceCwds: workspaceCwds as string[] }),
     queuedTasks: queuedTasks as number,
     pendingQuestions: pendingQuestions as number,
   };

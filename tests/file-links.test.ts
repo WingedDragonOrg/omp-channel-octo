@@ -64,6 +64,19 @@ test("SSH links encode the remote path and include the configured authority", ()
   );
 });
 
+test("SSH links retain outside absolute and parent-relative destinations", () => {
+  const result = resolveMarkdownFileLinks(
+    "[relative](../other/report.md#L3) [absolute](/srv/shared/report.md#L5)",
+    cwd,
+    [new ZedSshFileLinkResolver({ type: "zed", mode: "ssh", hostname: "my-mini" })],
+    true,
+  );
+  expectResolved(result);
+  expect(result.text).toBe(
+    "[relative](zed://ssh/my-mini/Users/dev/other/report.md#L3) [absolute](zed://ssh/my-mini/srv/shared/report.md#L5)",
+  );
+});
+
 test("a non-final incomplete link tail is withheld, then a final incomplete tail stays literal", () => {
   const resolver = new ZedLocalFileLinkResolver();
   const partial = resolveMarkdownFileLinks("Read: [guide](docs/gui", cwd, [resolver], false);

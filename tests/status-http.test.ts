@@ -21,6 +21,7 @@ interface ChatStatusSnapshot extends ChatTarget {
   state: "none" | "idle" | "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted";
   model: string | null;
   cwd: string | null;
+  workspaceCwds: string[];
   queuedTasks: number;
   pendingQuestions: number;
 }
@@ -72,6 +73,7 @@ const CHAT_SNAPSHOT: ChatStatusSnapshot = {
   state: "running",
   model: "fixture/next-worker",
   cwd: "/tmp/status-workspace",
+  workspaceCwds: ["/tmp/status-workspace", "/tmp/status-shared-entry"],
   queuedTasks: 2,
   pendingQuestions: 1,
 };

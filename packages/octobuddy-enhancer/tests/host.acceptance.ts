@@ -167,19 +167,57 @@ test("opens a canonical remote project and its file at the requested line", asyn
   }
 }, 10_000);
 
-test("does not open a remote file outside the canonical chat workspace", async () => {
+test("opens an outside file in its matching workspace", async () => {
   const root = await mkdtemp(join(tmpdir(), "octobuddy-zed-outside-"));
   const previousPath = process.env.PATH;
   try {
     const zed = await createFakeZed(root);
-    await writeFile(join(root, "ssh"), "#!/bin/sh\nprintf '/work/project\\0/work/another/file.ts\\0'\n", { mode: 0o755 });
+    const current = join(root, "current");
+    const other = join(root, "other");
+    const nested = join(other, "nested");
+    await mkdir(current);
+    await mkdir(nested, { recursive: true });
+    const file = join(nested, "file.ts");
+    await writeFile(file, "content");
+    await writeFile(join(root, "ssh"), "#!/bin/sh\nfor last do :; done\nexec /bin/sh -c \"$last\"\n", { mode: 0o755 });
     process.env.PATH = `${root}:${previousPath}`;
-    await expect(openInZed(
-      { path: "zed://ssh/host/work/another/file.ts" },
-      { zedExecutable: zed.executable, cwd: "/work/project" },
+    await openInZed(
+      { path: `zed://ssh/fixture${pathToFileURL(file).pathname}#L7` },
+      { zedExecutable: zed.executable, cwd: current, workspaceCwds: [other, nested] },
       () => true,
-    )).rejects.toThrow("outside the chat workspace");
-    expect(await zedArguments(zed.argvFile)).toEqual([]);
+    );
+    expect(await zedArguments(zed.argvFile)).toEqual([[
+      `ssh://fixture${pathToFileURL(await realpath(nested)).pathname}`,
+      `ssh://fixture${pathToFileURL(await realpath(file)).pathname}:7`,
+    ]]);
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("opens an unmatched outside file with its parent directory as project", async () => {
+  const root = await mkdtemp(join(tmpdir(), "octobuddy-zed-unmatched-"));
+  const previousPath = process.env.PATH;
+  try {
+    const zed = await createFakeZed(root);
+    const current = join(root, "current");
+    const outside = join(root, "outside");
+    await mkdir(current);
+    await mkdir(outside);
+    const file = join(outside, "file.ts");
+    await writeFile(file, "content");
+    await writeFile(join(root, "ssh"), "#!/bin/sh\nfor last do :; done\nexec /bin/sh -c \"$last\"\n", { mode: 0o755 });
+    process.env.PATH = `${root}:${previousPath}`;
+    await openInZed(
+      { path: `zed://ssh/fixture${pathToFileURL(file).pathname}` },
+      { zedExecutable: zed.executable, cwd: current, workspaceCwds: [] },
+      () => true,
+    );
+    expect(await zedArguments(zed.argvFile)).toEqual([[
+      `ssh://fixture${pathToFileURL(await realpath(outside)).pathname}`,
+      `ssh://fixture${pathToFileURL(await realpath(file)).pathname}`,
+    ]]);
   } finally {
     process.env.PATH = previousPath;
     await rm(root, { recursive: true, force: true });

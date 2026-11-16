@@ -51,6 +51,27 @@ function sharedWorkspace(
   };
 }
 
+function layoutWorkspace(
+  layout: "single" | "shared" | "separate",
+  channelId: string,
+  status: WorkspaceStatus,
+  entryPath: string | null,
+  projects: WorkspaceProject[],
+  ownerBotUid = botUid,
+): ThreadWorkspaceRecord {
+  return {
+    botUid: ownerBotUid,
+    channelId,
+    channelType: 5,
+    layout,
+    status,
+    entryPath,
+    workspaceRoot: null,
+    projects,
+    error: null,
+  };
+}
+
 function schedulerFor(store: ChannelStore, overrides: Partial<TaskSchedulerDeps> = {}): TaskScheduler {
   return new TaskScheduler({
     store,
@@ -332,6 +353,123 @@ test("workspace directory expansion covers entries, owned projects, subdirectori
     expect(fromExplicitParentBinding.has(projectB)).toBe(true);
 
     expect(store.workspaceDirectories(prefixSibling)).toEqual([prefixSibling]);
+  });
+});
+
+test("workspace cwd projection lists only this bot's bindings and ready owned roots", async () => {
+  await withStore(async (store, _stateDir, root) => {
+    const otherBotUid = "bot-workspace-other";
+    const parentCwd = join(root, "tmp");
+    const movedBindingCwd = join(root, "moved-thread");
+    const sharedEntry = join(root, "thread-workspaces", "shared-entry");
+    const sharedRoot = join(root, "thread-workspaces", "shared-root");
+    const sharedProjectA = join(sharedEntry, "project-a");
+    const sharedProjectB = join(sharedEntry, "project-b");
+    const orphanSharedProject = join(root, "thread-workspaces", "orphan-shared-project");
+    const separateProject = join(root, "thread-workspaces", "separate-project");
+    const singleProject = join(root, "thread-workspaces", "single-project");
+    const plannedProject = join(root, "thread-workspaces", "planned-project");
+    const preparingEntry = join(root, "thread-workspaces", "preparing-entry");
+    const failedProject = join(root, "thread-workspaces", "failed-project");
+    const otherEntry = join(root, "thread-workspaces", "other-entry");
+    const otherProject = join(otherEntry, "project");
+    const project = (name: string, path: string): WorkspaceProject => ({
+      name,
+      repo: join(root, "repos", name),
+      path,
+      branch: `thread-${name}`,
+      created: true,
+    });
+
+    store.ensureBinding({
+      botUid,
+      channelType: 2,
+      channelId: "group-a",
+      sessionId: "parent-session",
+      cwd: parentCwd,
+      sessionFile: null,
+    });
+    store.ensureBinding({
+      botUid,
+      channelType: 5,
+      channelId: "group-a____thread-moved",
+      sessionId: "moved-session",
+      cwd: movedBindingCwd,
+      sessionFile: null,
+    });
+    store.ensureBinding({
+      botUid,
+      channelType: 5,
+      channelId: "group-a____thread-entry",
+      sessionId: "entry-session",
+      cwd: sharedEntry,
+      sessionFile: null,
+    });
+    store.ensureBinding({
+      botUid: otherBotUid,
+      channelType: 5,
+      channelId: "other-group____thread",
+      sessionId: "other-session",
+      cwd: join(root, "other-bot"),
+      sessionFile: null,
+    });
+
+    store.saveThreadWorkspaces([
+      {
+        ...layoutWorkspace("shared", "group-a____thread-moved", "ready", sharedEntry, [
+          project("project-a", sharedProjectA),
+          project("project-b", sharedProjectB),
+        ]),
+        workspaceRoot: sharedRoot,
+      },
+      layoutWorkspace("shared", "group-a____thread-no-entry", "ready", null, [
+        project("orphan", orphanSharedProject),
+      ]),
+      layoutWorkspace("separate", "group-a____thread-separate", "ready", null, [
+        project("separate", separateProject),
+      ]),
+      layoutWorkspace("single", "group-a____thread-single", "ready", null, [
+        project("single", singleProject),
+      ]),
+      layoutWorkspace("separate", "group-a____thread-uncreated", "ready", null, [
+        { ...project("uncreated", plannedProject), created: false },
+      ]),
+      layoutWorkspace("shared", "group-a____thread-preparing", "preparing", preparingEntry, [
+        project("preparing", join(preparingEntry, "project")),
+      ]),
+      layoutWorkspace("separate", "group-a____thread-failed", "failed", null, [
+        project("failed", failedProject),
+      ]),
+      layoutWorkspace("shared", "other-group____thread", "ready", otherEntry, [
+        project("other", otherProject),
+      ], otherBotUid),
+    ]);
+
+    const cwds = store.listWorkspaceCwds(botUid);
+
+    expect(cwds).toEqual([
+      parentCwd,
+      sharedEntry,
+      movedBindingCwd,
+      separateProject,
+      singleProject,
+    ]);
+    expect(new Set(cwds).size).toBe(cwds.length);
+    // A shared workspace opens as its whole managed entry, never as its project worktrees.
+    expect(cwds).not.toContain(sharedProjectA);
+    expect(cwds).not.toContain(sharedProjectB);
+    // The enclosing task root and an entry-less shared record are not openable shared workspaces.
+    expect(cwds).not.toContain(sharedRoot);
+    expect(cwds).not.toContain(orphanSharedProject);
+    // The moved chat binding contributes its current cwd independently of its ready ownership.
+    expect(cwds).toContain(movedBindingCwd);
+    // Preparing, failed, planned-only, and other-bot records are not actual ready roots for this bot.
+    expect(cwds).not.toContain(preparingEntry);
+    expect(cwds).not.toContain(failedProject);
+    expect(cwds).not.toContain(plannedProject);
+    expect(cwds).not.toContain(otherEntry);
+    expect(cwds).not.toContain(otherProject);
+    expect(store.listWorkspaceCwds(otherBotUid)).toEqual([join(root, "other-bot"), otherEntry]);
   });
 });
 

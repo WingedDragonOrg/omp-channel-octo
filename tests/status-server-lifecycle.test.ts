@@ -25,6 +25,7 @@ interface ChatStatusSnapshot extends ChatTarget {
   state: "none" | "idle" | "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted";
   model: string | null;
   cwd: string | null;
+  workspaceCwds: string[];
   queuedTasks: number;
   pendingQuestions: number;
 }
@@ -204,6 +205,7 @@ function statusServerFifoReportScript(tokenFile: string): string {
             state: "none",
             model: null,
             cwd: null,
+            workspaceCwds: [],
             queuedTasks: 0,
             pendingQuestions: 0,
           }),
@@ -273,6 +275,7 @@ function serverOptions(
       state: "none",
       model: null,
       cwd: null,
+      workspaceCwds: [],
       queuedTasks: 0,
       pendingQuestions: 0,
     }),
@@ -339,8 +342,10 @@ test("real status HTTP server returns its configured SSH destination for a bound
     const response = await fetch(`http://127.0.0.1:${server.port}/v1/chats/status?channelType=5&channelId=group____thread`, {
       headers: { authorization: `Bearer ${TOKEN}` },
     });
-    expect((await response.json() as { zedWorkspaceUrl: string }).zedWorkspaceUrl)
+    const body = await response.json() as { zedWorkspaceUrl: string; workspaceCwds: string[] };
+    expect(body.zedWorkspaceUrl)
       .toBe("zed://ssh/dev@ssh-target:2222/workspace/shared%20project");
+    expect(body.workspaceCwds).toEqual([]);
   } finally {
     await server.stop();
   }
