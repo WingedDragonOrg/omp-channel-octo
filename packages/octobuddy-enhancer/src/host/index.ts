@@ -109,7 +109,7 @@ interface ContextOwner {
   frameId: string;
 }
 
-type StatusRequestKind = "service" | "chat-status" | "chat-details";
+type StatusRequestKind = "service" | "chat-status" | "chat-details" | "chat-commands";
 
 interface StatusRequest {
   pluginId: string;
@@ -949,6 +949,19 @@ class OctoBuddyHost {
         request.args[1],
       );
     }
+    if (request.api === "status" && request.method === "getChatCommands") {
+      if (request.args.length !== 2 || !isStatusRequestId(request.args[1])) {
+        throw new Error("invalid chat commands request");
+      }
+      return this.withStatusRequest(
+        plugin,
+        attachment,
+        contextId,
+        (signal) => this.#statusClient.getChatCommands(request.args[0] as ChatTarget, signal),
+        "chat-commands",
+        request.args[1],
+      );
+    }
     if (request.api === "status" && request.method === "cancelChatStatus") {
       if (request.args.length !== 1 || !isStatusRequestId(request.args[0])) {
         throw new Error("invalid chat status cancellation request");
@@ -961,6 +974,13 @@ class OctoBuddyHost {
         throw new Error("invalid chat details cancellation request");
       }
       this.cancelChatDetails(plugin, attachment, contextId, request.args[0]);
+      return undefined;
+    }
+    if (request.api === "status" && request.method === "cancelChatCommands") {
+      if (request.args.length !== 1 || !isStatusRequestId(request.args[0])) {
+        throw new Error("invalid chat commands cancellation request");
+      }
+      this.cancelChatCommands(plugin, attachment, contextId, request.args[0]);
       return undefined;
     }
     if (request.api !== "zed" || request.method !== "openZed" || request.args.length !== 1) {
@@ -1131,6 +1151,23 @@ class OctoBuddyHost {
     for (const request of this.#statusRequests) {
       if (request.pluginId !== plugin.id || request.targetId !== attachment.target.id
         || request.contextId !== contextId || request.requestKind !== "chat-details" || request.requestId !== requestId
+        || request.controller.signal.aborted) continue;
+      request.controller.abort();
+    }
+  }
+
+  private cancelChatCommands(
+    plugin: HostPlugin,
+    attachment: TargetAttachment,
+    contextId: number,
+    requestId: number,
+  ): void {
+    if (!this.isAuthorizedStatusContext(plugin, attachment, contextId)) {
+      throw new Error("plugin is not authorized to cancel chat commands");
+    }
+    for (const request of this.#statusRequests) {
+      if (request.pluginId !== plugin.id || request.targetId !== attachment.target.id
+        || request.contextId !== contextId || request.requestKind !== "chat-commands" || request.requestId !== requestId
         || request.controller.signal.aborted) continue;
       request.controller.abort();
     }

@@ -62,6 +62,20 @@ type ChatDetailsSnapshot = {
   tasks: { workspaceId: string; taskId: string; title: string | null; status: string | null; url: string | null }[];
 };
 
+type ChatCommandsSnapshot = {
+  version: 1;
+  channelType: 1 | 2 | 5;
+  channelId: string;
+  commands: {
+    name: string;
+    source: "channel" | "omp";
+    description?: string;
+    hint?: string;
+    aliases?: string[];
+    subcommands?: { name: string; description?: string; hint?: string }[];
+  }[];
+  omp: "available" | "unavailable";
+};
 
 type StatusRequest = { method: string; path: string; authorization: string | undefined };
 
@@ -70,6 +84,7 @@ type LocalStatusServer = {
   requests(): StatusRequest[];
   chatRequests(): StatusRequest[];
   detailsRequests(): StatusRequest[];
+  commandsRequests(): StatusRequest[];
   releaseChatResponse(target: ChatStatusTarget): void;
   pendingChatResponse(target: ChatStatusTarget): boolean;
   abortedResponse(): boolean;
@@ -79,6 +94,10 @@ type LocalStatusServer = {
   pendingDetailsResponse(target: ChatStatusTarget): boolean;
   abortedDetailsResponse(): boolean;
   abortedDetailsTarget(target: ChatStatusTarget): boolean;
+  releaseCommandsResponse(target: ChatStatusTarget): void;
+  pendingCommandsResponse(target: ChatStatusTarget): boolean;
+  abortedCommandsResponse(): boolean;
+  abortedCommandsTarget(target: ChatStatusTarget): boolean;
   close(): Promise<void>;
 };
 
@@ -181,24 +200,58 @@ function chatDetailsSnapshotFor(target: ChatStatusTarget): ChatDetailsSnapshot {
   };
 }
 
+function chatCommandsSnapshotFor(target: ChatStatusTarget): ChatCommandsSnapshot {
+  return {
+    version: 1,
+    channelType: target.channelType,
+    channelId: target.channelId,
+    commands: [
+      {
+        name: "status",
+        source: "channel",
+        description: `Status for ${target.channelId}`,
+        aliases: ["st"],
+      },
+      {
+        name: "switch",
+        source: "channel",
+        description: "Switch the active model",
+        hint: "<model>",
+        subcommands: [
+          { name: "model", description: "Switch model", hint: "<name>" },
+          { name: "memory mm list", description: "List memory", hint: "<scope>" },
+        ],
+      },
+      { name: "skill:review", source: "omp", description: "Run an OMP skill" },
+    ],
+    omp: "available",
+  };
+}
+
 
 function createLocalStatusServer(options: {
   holdResponse?: boolean;
   holdChatTargets?: ChatStatusTarget[];
   holdDetailsTargets?: ChatStatusTarget[];
+  holdCommandsTargets?: ChatStatusTarget[];
 } = {}): Promise<LocalStatusServer> {
   const requests: StatusRequest[] = [];
   const chatRequests: StatusRequest[] = [];
   const detailsRequests: StatusRequest[] = [];
+  const commandsRequests: StatusRequest[] = [];
   const heldChatTargets = new Set((options.holdChatTargets ?? []).map(chatStatusKey));
   const heldDetailsTargets = new Set((options.holdDetailsTargets ?? []).map(chatStatusKey));
+  const heldCommandsTargets = new Set((options.holdCommandsTargets ?? []).map(chatStatusKey));
   const pendingChatResponses = new Map<string, ServerResponse[]>();
   const pendingDetailsResponses = new Map<string, ServerResponse[]>();
+  const pendingCommandsResponses = new Map<string, ServerResponse[]>();
   let didAbortResponse = false;
   let didAbortChatResponse = false;
   let didAbortDetailsResponse = false;
+  let didAbortCommandsResponse = false;
   const abortedChatTargets = new Set<string>();
   const abortedDetailsTargets = new Set<string>();
+  const abortedCommandsTargets = new Set<string>();
   const server = createServer((request, response) => {
     const path = request.url ?? "/";
     requests.push({
@@ -208,7 +261,7 @@ function createLocalStatusServer(options: {
     });
     const url = new URL(path, "http://127.0.0.1");
     if (request.method !== "GET" || (url.pathname !== "/v1/status" && url.pathname !== "/v1/chats/status"
-      && url.pathname !== "/v1/chats/details")) {
+      && url.pathname !== "/v1/chats/details" && url.pathname !== "/v1/chats/commands")) {
       response.writeHead(404).end();
       return;
     }
@@ -236,6 +289,8 @@ function createLocalStatusServer(options: {
     const target = { channelType: channelType as ChatStatusTarget["channelType"], channelId };
     if (url.pathname === "/v1/chats/status") {
       chatRequests.push({ method: request.method ?? "", path, authorization: request.headers.authorization });
+    } else if (url.pathname === "/v1/chats/commands") {
+      commandsRequests.push({ method: request.method ?? "", path, authorization: request.headers.authorization });
     } else {
       detailsRequests.push({ method: request.method ?? "", path, authorization: request.headers.authorization });
     }
@@ -268,10 +323,26 @@ function createLocalStatusServer(options: {
       });
       return;
     }
+    if (url.pathname === "/v1/chats/commands" && heldCommandsTargets.has(key)) {
+      const responses = pendingCommandsResponses.get(key) ?? [];
+      responses.push(response);
+      pendingCommandsResponses.set(key, responses);
+      response.on("close", () => {
+        if (response.writableEnded) return;
+        didAbortCommandsResponse = true;
+        abortedCommandsTargets.add(key);
+        const remaining = pendingCommandsResponses.get(key)?.filter((pending) => pending !== response) ?? [];
+        if (remaining.length === 0) pendingCommandsResponses.delete(key);
+        else pendingCommandsResponses.set(key, remaining);
+      });
+      return;
+    }
     response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
     response.end(JSON.stringify(url.pathname === "/v1/chats/details"
       ? chatDetailsSnapshotFor(target)
-      : chatSnapshotFor(target)));
+      : url.pathname === "/v1/chats/commands"
+        ? chatCommandsSnapshotFor(target)
+        : chatSnapshotFor(target)));
   });
   const { promise, resolve, reject } = Promise.withResolvers<LocalStatusServer>();
   server.once("error", reject);
@@ -287,6 +358,7 @@ function createLocalStatusServer(options: {
       requests: () => [...requests],
       chatRequests: () => [...chatRequests],
       detailsRequests: () => [...detailsRequests],
+      commandsRequests: () => [...commandsRequests],
       releaseChatResponse: (target) => {
         const key = chatStatusKey(target);
         const response = pendingChatResponses.get(key)?.shift();
@@ -312,6 +384,18 @@ function createLocalStatusServer(options: {
         .some((response) => !response.writableEnded),
       abortedDetailsResponse: () => didAbortDetailsResponse,
       abortedDetailsTarget: (target) => abortedDetailsTargets.has(chatStatusKey(target)),
+      releaseCommandsResponse: (target) => {
+        const key = chatStatusKey(target);
+        const response = pendingCommandsResponses.get(key)?.shift();
+        if (!response) throw new Error(`No held chat commands response for ${key}`);
+        if (pendingCommandsResponses.get(key)?.length === 0) pendingCommandsResponses.delete(key);
+        response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+        response.end(JSON.stringify(chatCommandsSnapshotFor(target)));
+      },
+      pendingCommandsResponse: (target) => (pendingCommandsResponses.get(chatStatusKey(target)) ?? [])
+        .some((response) => !response.writableEnded),
+      abortedCommandsResponse: () => didAbortCommandsResponse,
+      abortedCommandsTarget: (target) => abortedCommandsTargets.has(chatStatusKey(target)),
       close: async () => {
         server.closeAllConnections();
         const closed = Promise.withResolvers<void>();
@@ -328,6 +412,7 @@ async function withStatusHost(
     holdResponse?: boolean;
     holdChatTargets?: ChatStatusTarget[];
     holdDetailsTargets?: ChatStatusTarget[];
+    holdCommandsTargets?: ChatStatusTarget[];
     preparePlugins?: (pluginRoot: string) => Promise<void>;
     prepareTargets?: (fixture: OwnedCdpFixture, root: string, appPath: string) => Promise<void>;
   },
@@ -344,6 +429,7 @@ async function withStatusHost(
       holdResponse: options.holdResponse ?? false,
       ...(options.holdChatTargets !== undefined ? { holdChatTargets: options.holdChatTargets } : {}),
       ...(options.holdDetailsTargets !== undefined ? { holdDetailsTargets: options.holdDetailsTargets } : {}),
+      ...(options.holdCommandsTargets !== undefined ? { holdCommandsTargets: options.holdCommandsTargets } : {}),
     });
     const pluginRoot = join(root, "extra-plugins");
     await mkdir(pluginRoot, { recursive: true });
@@ -1150,5 +1236,112 @@ test("switching detail targets cancels the old request without canceling the cur
     expect(requestedTargets).toEqual(expectedTargets);
     expect(server.detailsRequests().every((request) =>
       request.method === "GET" && request.authorization === `Bearer ${bearerToken}`)).toBe(true);
+  });
+}, 15_000);
+
+test("chat commands are available only to the authorized status plugin on the communication page", async () => {
+  const target = { channelType: 5, channelId: "group + 7____thread-commands" } as const;
+  await withStatusHost({
+    prepareTargets: async (fixture, _root, appPath) => {
+      await fixture.addTarget({ id: "commands-authorized-communication", url: communicationUrl(appPath) });
+      await fixture.addTarget({ id: "commands-denied-conversation", url: conversationUrl(appPath) });
+    },
+  }, async ({ fixture, server }) => {
+    const authorizedTargetId = "commands-authorized-communication";
+    const deniedTargetId = "commands-denied-conversation";
+    await waitUntil(async () =>
+      (await statusContext(fixture, authorizedTargetId)) !== undefined &&
+      (await statusContext(fixture, deniedTargetId)) !== undefined,
+    "both status plugin contexts");
+    await activatePackagedStatusPlugin(fixture, authorizedTargetId);
+    await activatePackagedStatusPlugin(fixture, deniedTargetId);
+    const authorizedContext = await statusContext(fixture, authorizedTargetId);
+    const deniedContext = await statusContext(fixture, deniedTargetId);
+    expect(authorizedContext).toBeDefined();
+    expect(deniedContext).toBeDefined();
+    expect(await fixture.evaluate(authorizedTargetId, authorizedContext!.id, "typeof window.octoEnhancer?.getChatCommands")).toBe("function");
+    expect(await fixture.evaluate(deniedTargetId, deniedContext!.id, "typeof window.octoEnhancer?.getChatCommands")).toBe("function");
+
+    await fixture.evaluate(authorizedTargetId, authorizedContext!.id, `window.__commandsAuthorized = undefined;
+      window.octoEnhancer.getChatCommands(${JSON.stringify(target)}, 601).then(
+        (result) => { window.__commandsAuthorized = { result }; },
+        (error) => { window.__commandsAuthorized = { error: String(error?.message ?? error) }; },
+      );`);
+    await fixture.evaluate(deniedTargetId, deniedContext!.id, `window.__commandsDenied = undefined;
+      window.octoEnhancer.getChatCommands(${JSON.stringify(target)}, 602).then(
+        (result) => { window.__commandsDenied = { result }; },
+        (error) => { window.__commandsDenied = { error: String(error?.message ?? error) }; },
+      );`);
+
+    await waitUntil(async () => await fixture.evaluate(
+      authorizedTargetId,
+      authorizedContext!.id,
+      "window.__commandsAuthorized !== undefined",
+    ) === true, "the authorized chat commands result");
+    await waitUntil(async () => await fixture.evaluate(
+      deniedTargetId,
+      deniedContext!.id,
+      "window.__commandsDenied !== undefined",
+    ) === true, "the non-communication command denial");
+    expect(await fixture.evaluate(authorizedTargetId, authorizedContext!.id, "window.__commandsAuthorized")).toEqual({
+      result: { state: "online", snapshot: chatCommandsSnapshotFor(target) },
+    });
+    expect(await fixture.evaluate(deniedTargetId, deniedContext!.id, "window.__commandsDenied.error")).toContain("not authorized");
+    expect(server.commandsRequests()).toHaveLength(1);
+    const commandsUrl = new URL(server.commandsRequests()[0]!.path, server.baseUrl);
+    expect(commandsUrl.pathname).toBe("/v1/chats/commands");
+    expect(commandsUrl.searchParams.get("channelType")).toBe("5");
+    expect(commandsUrl.searchParams.get("channelId")).toBe(target.channelId);
+    expect(server.commandsRequests()[0]).toMatchObject({
+      method: "GET",
+      authorization: `Bearer ${bearerToken}`,
+    });
+
+    const pageContext = await fixture.context(authorizedTargetId, `${authorizedTargetId}-main`);
+    expect(pageContext?.isDefault).toBe(true);
+    expect(await fixture.evaluate(authorizedTargetId, pageContext!.id, "typeof window.octoEnhancer?.getChatCommands")).toBe("undefined");
+  });
+}, 15_000);
+
+test("disabling the status plugin cancels a pending chat commands bridge request", async () => {
+  const target = { channelType: 5, channelId: "group____commands-disable" } as const;
+  await withStatusHost({
+    holdCommandsTargets: [target],
+    prepareTargets: (fixture, _root, appPath) => fixture.addTarget({
+      id: "commands-disable-boundary",
+      url: communicationUrl(appPath),
+    }),
+  }, async ({ fixture, host, server }) => {
+    const targetId = "commands-disable-boundary";
+    await waitUntil(async () => (await statusContext(fixture, targetId)) !== undefined, "the status plugin context");
+    await activatePackagedStatusPlugin(fixture, targetId);
+    const context = await statusContext(fixture, targetId);
+    expect(context).toBeDefined();
+    await fixture.evaluate(targetId, context!.id, `window.__commandsDisableResult = undefined;
+      window.octoEnhancer.getChatCommands(${JSON.stringify(target)}, 701).then(
+        (result) => { window.__commandsDisableResult = { result }; },
+        (error) => { window.__commandsDisableResult = { error: String(error?.message ?? error) }; },
+      );`);
+    await waitUntil(() => server.pendingCommandsResponse(target), "the held chat commands request");
+
+    await host.setPluginEnabled("channel-status", false);
+    await waitUntil(() => server.abortedCommandsTarget(target), "the commands request to abort on disable");
+    await waitUntil(async () => await fixture.evaluate(
+      targetId,
+      context!.id,
+      "window.__commandsDisableResult?.error === 'plugin is disabled'",
+    ) === true, "the pending command bridge call to reject on disable");
+    await fixture.evaluate(targetId, context!.id, `window.__commandsDisabledCall = undefined;
+      window.octoEnhancer.getChatCommands(${JSON.stringify(target)}, 702).then(
+        () => { window.__commandsDisabledCall = "fulfilled"; },
+        (error) => { window.__commandsDisabledCall = String(error?.message ?? error); },
+      );`);
+    await waitUntil(async () => await fixture.evaluate(
+      targetId,
+      context!.id,
+      "window.__commandsDisabledCall !== undefined",
+    ) === true, "subsequent disabled command calls to settle");
+    expect(await fixture.evaluate(targetId, context!.id, "window.__commandsDisabledCall")).toBe("plugin is disabled");
+    expect(server.commandsRequests()).toHaveLength(1);
   });
 }, 15_000);

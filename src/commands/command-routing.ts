@@ -84,6 +84,13 @@ const BUILTIN_ALIASES = {
 /** 内建命令的 canonical action，从别名表的值推导，识别与分派共用同一份定义。 */
 export type BuiltinAction = (typeof BUILTIN_ALIASES)[keyof typeof BUILTIN_ALIASES];
 
+/** Route names and aliases for discovery, derived from the same table used by resolution. */
+export const BUILTIN_COMMAND_ENTRIES: readonly { name: string; action: BuiltinAction }[] = Object.freeze(
+  Object.entries(BUILTIN_ALIASES).map(([name, action]) =>
+    Object.freeze({ name, action: action as BuiltinAction }),
+  ),
+);
+
 /**
  * 每个 canonical action 一个 handler：`message` 是原始入站消息（含正文与目标），`arg` 是
  * 解析出的参数。返回 `true` 表示请求本回合排定重启；其余返回值不参与判定。

@@ -327,7 +327,7 @@ export OMP_CHANNEL_OCTO_HTTP_PORT='8765'
 
 客户端使用普通 HTTP(S) base URL；服务不区分 Tailscale、局域网或公网，网络可达性由系统网络、DNS 和监听/防火墙配置决定，只需相应填写 URL，例如 `http://my-mini:8765`。Bearer token 不加密传输；公网访问必须使用 HTTPS（例如经 HTTPS 反向代理），否则明文 HTTP 上的 token 可被窃听。客户端配置位置和状态面板行为见 [OctoBuddy Enhancer 说明](packages/octobuddy-enhancer/README.md)。
 
-该接口仅提供只读的服务和聊天状态查询，不接受任务、消息或重启操作；它独立于聊天中的 `/status` 命令。
+接口提供只读的服务和聊天状态，以及当前聊天的命令提示目录；不接受任务、消息或重启操作。它独立于聊天中的 `/status` 命令。命令目录按聊天绑定的工作目录读取 OMP 可用命令，空闲聊天会启动并关闭一个隔离探测 worker；该查询不会向模型发送消息。
 
 ### 外部决策与 PR/MR 引用
 

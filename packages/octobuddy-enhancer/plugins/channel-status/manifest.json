@@ -7,7 +7,7 @@
   "content_scripts": [
     {
       "matches": ["file:///*"],
-      "js": ["content.js"],
+      "js": ["content.js", "command-suggestions.js"],
       "run_at": "document_idle",
       "all_frames": false
     }

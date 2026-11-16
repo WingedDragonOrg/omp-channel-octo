@@ -69,10 +69,33 @@ type ChatDetailsResult =
 
 type ChatDetailsTarget = ChatTarget;
 
+type ChatCommandSubcommand = { name: string; description?: string; hint?: string };
+type ChatCommand = {
+  name: string;
+  source: "channel" | "omp";
+  description?: string;
+  hint?: string;
+  aliases?: string[];
+  subcommands?: ChatCommandSubcommand[];
+};
+
+type ChatCommandsSnapshot = {
+  version: 1;
+  channelType: 1 | 2 | 5;
+  channelId: string;
+  commands: ChatCommand[];
+  omp: "available" | "unavailable";
+};
+
+type ChatCommandsResult =
+  | { state: "online"; snapshot: ChatCommandsSnapshot }
+  | { state: "unconfigured" | "offline" | "unauthorized" | "invalid"; lastSuccess?: ChatCommandsSnapshot };
+
 type StatusClient = {
   get(signal?: AbortSignal): Promise<StatusResult>;
   getChat(target: ChatTarget, signal?: AbortSignal): Promise<ChatStatusResult>;
   getChatDetails(target: ChatDetailsTarget, signal?: AbortSignal): Promise<ChatDetailsResult>;
+  getChatCommands(target: ChatTarget, signal?: AbortSignal): Promise<ChatCommandsResult>;
 };
 
 type StatusClientModule = {
@@ -197,8 +220,34 @@ function chatDetailsSnapshotFor(target: ChatDetailsTarget): ChatDetailsSnapshot 
   };
 }
 
+function chatCommandsSnapshotFor(target: ChatTarget, commandCount = 3): ChatCommandsSnapshot {
+  const commands: ChatCommand[] = Array.from({ length: commandCount }, (_, index) => ({
+    name: `skill-${String(index + 1).padStart(3, "0")}`,
+    source: index < 2 ? "channel" : "omp",
+    description: `Catalog entry ${index + 1}`,
+    ...(index === 0 ? { hint: "<path>", aliases: ["sk"] } : {}),
+    ...(index === 1 ? {
+      subcommands: [
+        { name: "model", description: "Switch model", hint: "<name>" },
+        { name: "memory mm list", description: "List memory", hint: "<scope>" },
+      ],
+    } : {}),
+  }));
+  return {
+    version: 1,
+    channelType: target.channelType,
+    channelId: target.channelId,
+    commands,
+    omp: "available",
+  };
+}
+
 function expectChatDetailsQuery(client: StatusClient): void {
   expect(typeof client.getChatDetails, "createStatusClient must expose getChatDetails(target, signal?)").toBe("function");
+}
+
+function expectChatCommandsQuery(client: StatusClient): void {
+  expect(typeof client.getChatCommands, "createStatusClient must expose getChatCommands(target, signal?)").toBe("function");
 }
 
 function expectChatStatusQuery(client: StatusClient): void {
@@ -989,5 +1038,208 @@ test("validates the merged configuration instead of an environment-overridden in
       });
     });
     expect(authorizations).toEqual([`Bearer ${fileBearerToken}`, `Bearer ${envBearerToken}`]);
+  });
+}, 10_000);
+
+test("queries authenticated chat commands with the exact identity and optional metadata", async () => {
+  const clientModule = await loadStatusClient();
+  const target: ChatTarget = { channelType: 5, channelId: "group + 7____thread/42" };
+  const commands = chatCommandsSnapshotFor(target, 4);
+  const requests: {
+    method: string;
+    pathname: string;
+    channelType: string | null;
+    channelId: string | null;
+    authorization: string | null;
+  }[] = [];
+
+  await withTempDirectory(async (directory) => {
+    await withLocalHttpFixture((request) => {
+      const url = new URL(request.url);
+      requests.push({
+        method: request.method,
+        pathname: url.pathname,
+        channelType: url.searchParams.get("channelType"),
+        channelId: url.searchParams.get("channelId"),
+        authorization: request.headers.get("authorization"),
+      });
+      if (request.headers.get("authorization") !== `Bearer ${bearerToken}`) {
+        return statusResponse({ error: { code: "unauthorized" } }, 401);
+      }
+      if (request.method !== "GET" || url.pathname !== "/v1/chats/commands") {
+        return statusResponse({ error: { code: "not_found" } }, 404);
+      }
+      return statusResponse(commands);
+    }, async (fixture) => {
+      const configPath = join(directory, "status-client.json");
+      await writeConfig(configPath, fixture.baseUrl);
+      const client = clientModule.createStatusClient({ configPath });
+      expectChatCommandsQuery(client);
+      expect(await client.getChatCommands(target)).toEqual({ state: "online", snapshot: commands });
+    });
+  });
+
+  expect(requests).toEqual([{
+    method: "GET",
+    pathname: "/v1/chats/commands",
+    channelType: "5",
+    channelId: target.channelId,
+    authorization: `Bearer ${bearerToken}`,
+  }]);
+}, 10_000);
+
+test("accepts a command catalog larger than the 64KiB status response limit", async () => {
+  const clientModule = await loadStatusClient();
+  const target: ChatTarget = { channelType: 2, channelId: "group-large-catalog" };
+  const commands = chatCommandsSnapshotFor(target, 130);
+  const longDescription = "x".repeat(600);
+  for (const command of commands.commands) command.description = longDescription;
+  const body = JSON.stringify(commands);
+  expect(Buffer.byteLength(body, "utf8")).toBeGreaterThan(64 * 1024);
+
+  await withTempDirectory(async (directory) => {
+    await withLocalHttpFixture(() => new Response(body, {
+      status: 200,
+      headers: { "content-type": "application/json", "content-length": String(Buffer.byteLength(body, "utf8")) },
+    }), async (fixture) => {
+      const configPath = join(directory, "status-client.json");
+      await writeConfig(configPath, fixture.baseUrl);
+      const client = clientModule.createStatusClient({ configPath });
+      expectChatCommandsQuery(client);
+      const result = await client.getChatCommands(target);
+      expect(result.state).toBe("online");
+      if (result.state !== "online") return;
+      expect(result.snapshot.commands).toHaveLength(130);
+      expect(result.snapshot.commands[0]!.description).toHaveLength(600);
+      expect(result.snapshot.commands[129]!.name).toBe("skill-130");
+    });
+  });
+}, 10_000);
+
+test("classifies command authentication, protocol errors, and offline cache per chat", async () => {
+  const clientModule = await loadStatusClient();
+  const target: ChatTarget = { channelType: 5, channelId: "group____commands-errors" };
+  const commands = chatCommandsSnapshotFor(target, 3);
+  let requestCount = 0;
+  const authorizations: (string | null)[] = [];
+
+  await withTempDirectory(async (directory) => {
+    await withLocalHttpFixture((request) => {
+      authorizations.push(request.headers.get("authorization"));
+      requestCount += 1;
+      if (requestCount === 1) return statusResponse({ error: { code: "unauthorized" } }, 401);
+      if (requestCount === 2) {
+        return statusResponse({
+          ...commands,
+          channelType: 2,
+          channelId: "another-group",
+        });
+      }
+      if (requestCount === 3) return statusResponse({ error: { code: "unavailable" } }, 503);
+      return statusResponse(commands);
+    }, async (fixture) => {
+      const configPath = join(directory, "status-client.json");
+      await writeConfig(configPath, fixture.baseUrl);
+      const client = clientModule.createStatusClient({ configPath });
+      expectChatCommandsQuery(client);
+
+      expect(await client.getChatCommands(target)).toEqual({ state: "unauthorized" });
+      expect(await client.getChatCommands(target)).toEqual({ state: "invalid" });
+      expect(await client.getChatCommands(target)).toEqual({ state: "offline" });
+      expect(await client.getChatCommands(target)).toEqual({ state: "online", snapshot: commands });
+      fixture.stop();
+      expect(await client.getChatCommands(target)).toEqual({ state: "offline", lastSuccess: commands });
+      expect(authorizations).toEqual(Array(4).fill(`Bearer ${bearerToken}`));
+    });
+  });
+}, 10_000);
+
+test("a previous chat's command snapshot is not reused for the current target", async () => {
+  const clientModule = await loadStatusClient();
+  const previousTarget: ChatTarget = { channelType: 2, channelId: "group-before-commands" };
+  const currentTarget: ChatTarget = { channelType: 5, channelId: "group____thread-after-commands" };
+  const previousCommands = chatCommandsSnapshotFor(previousTarget, 2);
+  const currentCommands = chatCommandsSnapshotFor(currentTarget, 2);
+  const requestTargets: string[] = [];
+
+  await withTempDirectory(async (directory) => {
+    await withLocalHttpFixture((request) => {
+      const url = new URL(request.url);
+      const channelId = url.searchParams.get("channelId") ?? "";
+      requestTargets.push(channelId);
+      if (channelId === previousTarget.channelId) {
+        return requestTargets.filter((value) => value === channelId).length === 1
+          ? statusResponse(previousCommands)
+          : statusResponse({ error: { code: "unavailable" } }, 503);
+      }
+      if (channelId === currentTarget.channelId) {
+        return requestTargets.filter((value) => value === channelId).length === 1
+          ? statusResponse({ error: { code: "unavailable" } }, 503)
+          : statusResponse(currentCommands);
+      }
+      return statusResponse({ error: { code: "invalid_request" } }, 400);
+    }, async (fixture) => {
+      const configPath = join(directory, "status-client.json");
+      await writeConfig(configPath, fixture.baseUrl);
+      const client = clientModule.createStatusClient({ configPath });
+      expectChatCommandsQuery(client);
+
+      expect(await client.getChatCommands(previousTarget)).toEqual({ state: "online", snapshot: previousCommands });
+      expect(await client.getChatCommands(currentTarget)).toEqual({ state: "offline" });
+      expect(await client.getChatCommands(currentTarget)).toEqual({ state: "online", snapshot: currentCommands });
+      expect(await client.getChatCommands(previousTarget)).toEqual({ state: "offline", lastSuccess: previousCommands });
+    });
+  });
+}, 10_000);
+
+test("command requests use their own timeout instead of the 3s status timeout", async () => {
+  const clientModule = await loadStatusClient();
+  const target: ChatTarget = { channelType: 2, channelId: "group-slow-commands" };
+  const commands = chatCommandsSnapshotFor(target, 3);
+
+  await withTempDirectory(async (directory) => {
+    await withLocalHttpFixture(async () => {
+      await Bun.sleep(4_000);
+      return statusResponse(commands);
+    }, async (fixture) => {
+      const configPath = join(directory, "status-client.json");
+      await writeConfig(configPath, fixture.baseUrl);
+      const client = clientModule.createStatusClient({ configPath });
+      expectChatCommandsQuery(client);
+      const startedAt = Date.now();
+      expect(await client.getChatCommands(target)).toEqual({ state: "online", snapshot: commands });
+      expect(Date.now() - startedAt).toBeGreaterThan(3_000);
+    });
+  });
+}, 15_000);
+
+test("aborting a pending command request cancels its HTTP fetch", async () => {
+  const clientModule = await loadStatusClient();
+  const target: ChatTarget = { channelType: 5, channelId: "group____commands-abort" };
+  const requestStarted = Promise.withResolvers<void>();
+  const requestAborted = Promise.withResolvers<void>();
+
+  await withTempDirectory(async (directory) => {
+    await withLocalHttpFixture((request) => {
+      requestStarted.resolve();
+      const response = Promise.withResolvers<Response>();
+      request.signal.addEventListener("abort", () => {
+        requestAborted.resolve();
+        response.resolve(new Response(null, { status: 499 }));
+      }, { once: true });
+      return response.promise;
+    }, async (fixture) => {
+      const configPath = join(directory, "status-client.json");
+      await writeConfig(configPath, fixture.baseUrl);
+      const client = clientModule.createStatusClient({ configPath });
+      expectChatCommandsQuery(client);
+      const controller = new AbortController();
+      const pending = client.getChatCommands(target, controller.signal);
+      await requestStarted.promise;
+      const rejected = pending.then(() => undefined, (error: unknown) => error);
+      controller.abort();
+      expect(await rejected).toMatchObject({ name: "AbortError" });
+      await requestAborted.promise;
+    });
   });
 }, 10_000);

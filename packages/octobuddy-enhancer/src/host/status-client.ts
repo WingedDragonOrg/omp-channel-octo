@@ -77,11 +77,38 @@ export type ChatDetailsResult =
   | { state: "online"; snapshot: ChatDetailsSnapshot }
   | { state: "unconfigured" | "offline" | "unauthorized" | "invalid"; lastSuccess?: ChatDetailsSnapshot };
 
+export interface ChatCommandSubcommand {
+  name: string;
+  description?: string;
+  hint?: string;
+}
+
+export interface ChatCommand {
+  name: string;
+  source: "channel" | "omp";
+  description?: string;
+  hint?: string;
+  aliases?: string[];
+  subcommands?: ChatCommandSubcommand[];
+}
+
+export interface ChatCommandsSnapshot {
+  version: 1;
+  channelType: ChatChannelType;
+  channelId: string;
+  commands: ChatCommand[];
+  omp: "available" | "unavailable";
+}
+
+export type ChatCommandsResult =
+  | { state: "online"; snapshot: ChatCommandsSnapshot }
+  | { state: "unconfigured" | "offline" | "unauthorized" | "invalid"; lastSuccess?: ChatCommandsSnapshot };
 
 export interface StatusClient {
   get(signal?: AbortSignal): Promise<StatusResult>;
   getChat(target: ChatTarget, signal?: AbortSignal): Promise<ChatStatusResult>;
   getChatDetails(target: ChatTarget, signal?: AbortSignal): Promise<ChatDetailsResult>;
+  getChatCommands(target: ChatTarget, signal?: AbortSignal): Promise<ChatCommandsResult>;
 }
 
 export interface StatusClientOptions {
@@ -90,7 +117,10 @@ export interface StatusClientOptions {
 
 const MAX_CONFIG_BYTES = 16 * 1024;
 const MAX_RESPONSE_BYTES = 64 * 1024;
+const MAX_COMMANDS_RESPONSE_BYTES = 512 * 1024;
 const REQUEST_TIMEOUT_MS = 3_000;
+// An idle chat probe may cold-start OMP before the catalog is available; allow the documented 30s path to finish.
+const COMMANDS_REQUEST_TIMEOUT_MS = 60_000;
 const MAX_BASE_URL_LENGTH = 2_048;
 const MAX_TOKEN_LENGTH = 512;
 const BEARER_TOKEN = /^[A-Za-z0-9._~+\/-]+=*$/;
@@ -400,6 +430,89 @@ function parseChatDetailsSnapshot(value: unknown, target: ChatTarget): ChatDetai
   };
 }
 
+function parseChatCommand(value: unknown): ChatCommand | undefined {
+  if (!isRecord(value)) return undefined;
+  const { name, source, description, hint, aliases, subcommands } = value;
+  if (
+    typeof name !== "string" || name.length === 0 || name.length > 128 || /\s/.test(name) ||
+    (source !== "channel" && source !== "omp") ||
+    (description !== undefined && typeof description !== "string") ||
+    (hint !== undefined && typeof hint !== "string")
+  ) {
+    return undefined;
+  }
+  if (
+    aliases !== undefined &&
+    (!Array.isArray(aliases) || aliases.length > 100 ||
+      !aliases.every((alias) => typeof alias === "string" && alias.length > 0 && alias.length <= 128 && !/\s/.test(alias)))
+  ) {
+    return undefined;
+  }
+
+  let parsedSubcommands: ChatCommandSubcommand[] | undefined;
+  if (subcommands !== undefined) {
+    if (!Array.isArray(subcommands) || subcommands.length > 500) return undefined;
+    parsedSubcommands = [];
+    for (const subcommand of subcommands) {
+      if (!isRecord(subcommand)) return undefined;
+      const subName = subcommand.name;
+      if (
+        typeof subName !== "string" || subName.length === 0 || subName.length > 128 ||
+        !/^\S+(?: \S+)*$/.test(subName)
+      ) {
+        return undefined;
+      }
+      const subDescription = subcommand.description;
+      if (subDescription !== undefined && typeof subDescription !== "string") return undefined;
+      const subHint = subcommand.hint;
+      if (subHint !== undefined && typeof subHint !== "string") return undefined;
+      parsedSubcommands.push({
+        name: subName,
+        ...(subDescription === undefined ? {} : { description: subDescription }),
+        ...(subHint === undefined ? {} : { hint: subHint }),
+      });
+    }
+  }
+
+  return {
+    name,
+    source,
+    ...(description === undefined ? {} : { description }),
+    ...(hint === undefined ? {} : { hint }),
+    ...(aliases === undefined ? {} : { aliases: aliases as string[] }),
+    ...(parsedSubcommands === undefined ? {} : { subcommands: parsedSubcommands }),
+  };
+}
+
+function parseChatCommandsSnapshot(value: unknown, target: ChatTarget): ChatCommandsSnapshot | undefined {
+  if (!isRecord(value)) return undefined;
+  const { version, channelType, channelId, commands, omp } = value;
+  if (
+    version !== 1 ||
+    channelType !== target.channelType ||
+    channelId !== target.channelId ||
+    !Array.isArray(commands) ||
+    commands.length > 2_000 ||
+    (omp !== "available" && omp !== "unavailable")
+  ) {
+    return undefined;
+  }
+
+  const parsedCommands: ChatCommand[] = [];
+  for (const command of commands) {
+    const parsed = parseChatCommand(command);
+    if (parsed === undefined) return undefined;
+    parsedCommands.push(parsed);
+  }
+  return {
+    version: 1,
+    channelType: target.channelType,
+    channelId: target.channelId,
+    commands: parsedCommands,
+    omp,
+  };
+}
+
 function endpointUrl(baseUrl: URL): URL {
   const url = new URL(baseUrl.href);
   const prefix = url.pathname.replace(/\/+$/, "");
@@ -425,6 +538,15 @@ function chatDetailsEndpointUrl(baseUrl: URL, target: ChatTarget): URL {
   return url;
 }
 
+function chatCommandsEndpointUrl(baseUrl: URL, target: ChatTarget): URL {
+  const url = new URL(baseUrl.href);
+  const prefix = url.pathname.replace(/\/+$/, "");
+  url.pathname = `${prefix}/v1/chats/commands`;
+  url.searchParams.set("channelType", String(target.channelType));
+  url.searchParams.set("channelId", target.channelId);
+  return url;
+}
+
 function snapshotCopy(snapshot: StatusSnapshot): StatusSnapshot {
   return { ...snapshot };
 }
@@ -442,14 +564,25 @@ function chatDetailsSnapshotCopy(snapshot: ChatDetailsSnapshot): ChatDetailsSnap
   };
 }
 
+function chatCommandsSnapshotCopy(snapshot: ChatCommandsSnapshot): ChatCommandsSnapshot {
+  return {
+    ...snapshot,
+    commands: snapshot.commands.map((command) => ({
+      ...command,
+      ...(command.aliases === undefined ? {} : { aliases: [...command.aliases] }),
+      ...(command.subcommands === undefined ? {} : { subcommands: command.subcommands.map((subcommand) => ({ ...subcommand })) }),
+    })),
+  };
+}
+
 function throwIfAborted(signal?: AbortSignal): void {
   if (!signal?.aborted) return;
   throw signal.reason ?? new DOMException("The operation was aborted", "AbortError");
 }
 
-async function readBoundedResponse(response: Response): Promise<Uint8Array | undefined> {
+async function readBoundedResponse(response: Response, maxBytes = MAX_RESPONSE_BYTES): Promise<Uint8Array | undefined> {
   const lengthHeader = response.headers.get("content-length");
-  if (lengthHeader !== null && /^\d+$/.test(lengthHeader) && Number(lengthHeader) > MAX_RESPONSE_BYTES) {
+  if (lengthHeader !== null && /^\d+$/.test(lengthHeader) && Number(lengthHeader) > maxBytes) {
     void response.body?.cancel().catch(() => undefined);
     return undefined;
   }
@@ -464,7 +597,7 @@ async function readBoundedResponse(response: Response): Promise<Uint8Array | und
       const { done, value } = await reader.read();
       if (done) break;
       length += value.byteLength;
-      if (length > MAX_RESPONSE_BYTES) {
+      if (length > maxBytes) {
         await reader.cancel().catch(() => undefined);
         return undefined;
       }
@@ -499,12 +632,14 @@ async function requestSnapshot<T>(
   token: string,
   signal: AbortSignal | undefined,
   parse: (value: unknown) => T | undefined,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+  maxBytes = MAX_RESPONSE_BYTES,
 ): Promise<SnapshotRequestResult<T>> {
   const controller = new AbortController();
   const onAbort = (): void => controller.abort(signal?.reason);
   signal?.addEventListener("abort", onAbort, { once: true });
   if (signal?.aborted) onAbort();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     throwIfAborted(signal);
@@ -530,7 +665,7 @@ async function requestSnapshot<T>(
       return { state: "invalid" };
     }
 
-    const body = await readBoundedResponse(response);
+    const body = await readBoundedResponse(response, maxBytes);
     throwIfAborted(signal);
     if (body === undefined) return { state: "invalid" };
 
@@ -560,6 +695,7 @@ export function createStatusClient(options: StatusClientOptions): StatusClient {
   let lastSuccess: StatusSnapshot | undefined;
   const chatLastSuccess = new Map<string, { snapshot: ChatStatusSnapshot; requestId: number }>();
   const chatDetailsLastSuccess = new Map<string, { snapshot: ChatDetailsSnapshot; requestId: number }>();
+  const chatCommandsLastSuccess = new Map<string, { snapshot: ChatCommandsSnapshot; requestId: number }>();
   let nextRequestId = 0;
   let lastSuccessRequestId = 0;
 
@@ -570,6 +706,7 @@ export function createStatusClient(options: StatusClientOptions): StatusClient {
       lastSuccess = undefined;
       chatLastSuccess.clear();
       chatDetailsLastSuccess.clear();
+      chatCommandsLastSuccess.clear();
       lastSuccessRequestId = 0;
     }
     return configGeneration;
@@ -596,6 +733,15 @@ export function createStatusClient(options: StatusClientOptions): StatusClient {
   ): ChatDetailsResult => {
     const cached = generation === configGeneration ? chatDetailsLastSuccess.get(key)?.snapshot : undefined;
     return cached === undefined ? { state } : { state, lastSuccess: chatDetailsSnapshotCopy(cached) };
+  };
+
+  const chatCommandsFailure = (
+    state: "unconfigured" | "offline" | "unauthorized" | "invalid",
+    generation: number | undefined,
+    key: string,
+  ): ChatCommandsResult => {
+    const cached = generation === configGeneration ? chatCommandsLastSuccess.get(key)?.snapshot : undefined;
+    return cached === undefined ? { state } : { state, lastSuccess: chatCommandsSnapshotCopy(cached) };
   };
 
   return {
@@ -678,6 +824,37 @@ export function createStatusClient(options: StatusClientOptions): StatusClient {
         chatDetailsLastSuccess.set(key, { snapshot: result.snapshot, requestId });
       }
       return { state: "online", snapshot: chatDetailsSnapshotCopy(result.snapshot) };
+    },
+
+    async getChatCommands(target: ChatTarget, signal?: AbortSignal): Promise<ChatCommandsResult> {
+      throwIfAborted(signal);
+      const loaded = await loadConfig(options.configPath);
+      throwIfAborted(signal);
+
+      if (loaded.state !== "ready") {
+        updateConfig(undefined);
+        return loaded.state === "missing" ? { state: "unconfigured" } : { state: "invalid" };
+      }
+
+      const { baseUrl, token, fingerprint } = loaded.config;
+      const generation = updateConfig(fingerprint);
+      const key = JSON.stringify([target.channelType, target.channelId]);
+      const requestId = ++nextRequestId;
+      const result = await requestSnapshot(
+        chatCommandsEndpointUrl(baseUrl, target),
+        token,
+        signal,
+        (value) => parseChatCommandsSnapshot(value, target),
+        COMMANDS_REQUEST_TIMEOUT_MS,
+        MAX_COMMANDS_RESPONSE_BYTES,
+      );
+      if (result.state !== "online") return chatCommandsFailure(result.state, generation, key);
+
+      const cached = chatCommandsLastSuccess.get(key);
+      if (generation === configGeneration && (cached === undefined || requestId > cached.requestId)) {
+        chatCommandsLastSuccess.set(key, { snapshot: result.snapshot, requestId });
+      }
+      return { state: "online", snapshot: chatCommandsSnapshotCopy(result.snapshot) };
     },
   };
 }

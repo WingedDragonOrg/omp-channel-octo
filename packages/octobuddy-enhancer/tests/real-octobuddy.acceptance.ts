@@ -117,7 +117,7 @@ async function createLocalStatusServer(cwd: string): Promise<LocalStatusServer> 
       authorization: request.headers.authorization,
     });
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
-    if (request.method !== "GET" || !["/v1/status", "/v1/chats/status", "/v1/chats/details"].includes(url.pathname)) {
+    if (request.method !== "GET" || !["/v1/status", "/v1/chats/status", "/v1/chats/details", "/v1/chats/commands"].includes(url.pathname)) {
       response.writeHead(404).end();
       return;
     }
@@ -136,6 +136,21 @@ async function createLocalStatusServer(cwd: string): Promise<LocalStatusServer> 
     if (![1, 2, 5].includes(channelType) || !channelId) {
       response.writeHead(400, { "content-type": "application/json", "cache-control": "no-store" })
         .end(JSON.stringify({ error: { code: "invalid_request" } }));
+      return;
+    }
+    if (url.pathname === "/v1/chats/commands") {
+      response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+      response.end(JSON.stringify({
+        version: 1, channelType, channelId, omp: "available",
+        commands: [
+          { name: "status", source: "channel", description: "查看当前状态", aliases: ["st"] },
+          {
+            name: "switch", source: "channel", description: "切换当前会话", hint: "<model>",
+            subcommands: [{ name: "model", description: "切换模型" }],
+          },
+          { name: "skill:review", source: "omp", description: "运行 OMP skill" },
+        ],
+      }));
       return;
     }
     if (url.pathname === "/v1/chats/details") {
@@ -1063,6 +1078,100 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
       probe.shared.openChannel = probe.originalOpenChannel;
     })()`);
 
+    // Verify the command suggestion plugin against the installed communication renderer.
+    // The unauthenticated child normally has no ChatComposer; record that limitation instead of
+    // fabricating a composer or sending a message. A logged-in or pre-rendered composer, when
+    // present, is exercised only with Tab/Escape and ordinary editing commands.
+    const commandChatAssignment = await assignRendererChannel(controlledThread);
+    await assertRendererEvent({ channelType: 5, channelId: controlledThread.channelID },
+      "the installed renderer to publish the thread for command suggestions", commandChatAssignment.after);
+    const commandProbe = await evaluate<{
+      composerAvailable: boolean;
+      initialText: string;
+      rootPresent: boolean;
+      rootHidden: boolean | null;
+    }>(browser, communicationSessionId, `(() => {
+      const editor = document.querySelector('.wk-messageinput-editor [contenteditable="true"]');
+      const root = document.querySelector("[data-octobuddy-command-suggestions-root]");
+      return {
+        composerAvailable: Boolean(editor),
+        initialText: editor instanceof HTMLElement ? editor.innerText.trim() : "",
+        rootPresent: Boolean(root),
+        rootHidden: root instanceof HTMLElement ? root.hidden : null,
+      };
+    })()`);
+    console.info(`Isolated OctoBuddy composer: ${commandProbe.composerAvailable ? (commandProbe.initialText ? "draft-present" : "available") : "unavailable-without-login"}`);
+    expect(commandProbe.rootPresent).toBe(true);
+    if (!commandProbe.composerAvailable) {
+      expect(commandProbe.rootHidden).toBe(true);
+      expect(commandProbe.initialText).toBe("");
+      expect(statusFixture.requests().some((request) => {
+        const url = new URL(request.path, statusFixture.baseUrl);
+        return url.pathname === "/v1/chats/commands";
+      })).toBe(false);
+      await evaluate(browser, communicationSessionId,
+        `document.documentElement.dataset.octobuddyCommandComposer = "unavailable-without-login"`);
+      expect(await evaluate<string>(browser, communicationSessionId,
+        `document.documentElement.dataset.octobuddyCommandComposer`)).toBe("unavailable-without-login");
+    } else if (commandProbe.initialText.length > 0) {
+      // Do not modify a real draft. The isolated child should not have one, but preserve it if it does.
+      await evaluate(browser, communicationSessionId,
+        `document.documentElement.dataset.octobuddyCommandComposer = "skipped-nonempty-draft"`);
+      expect(await evaluate<string>(browser, communicationSessionId,
+        `document.documentElement.dataset.octobuddyCommandComposer`)).toBe("skipped-nonempty-draft");
+    } else {
+      // Never send a message in the isolated app: completion uses Tab, not Enter.
+      await evaluate(browser, communicationSessionId, `(() => {
+        const editor = document.querySelector('.wk-messageinput-editor [contenteditable="true"]');
+        if (!(editor instanceof HTMLElement)) throw new Error("command composer is missing");
+        editor.focus();
+        const selection = window.getSelection();
+        if (!selection) throw new Error("selection is unavailable");
+        const range = document.createRange();
+        range.selectNodeContents(editor);
+        range.collapse(false);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        return true;
+      })()`);
+      await send(browser, "Input.insertText", { text: "/stat" }, communicationSessionId);
+      await waitUntil(async () => await evaluate<boolean>(browser!, communicationSessionId, `(() => {
+        const root = document.querySelector("[data-octobuddy-command-suggestions-root]");
+        const item = root?.querySelector('[data-command-name="/status"]');
+        return root instanceof HTMLElement && !root.hidden && Boolean(item);
+      })()`), "the installed command suggestion menu for /stat", 10_000);
+      expect(await evaluate<boolean>(browser, communicationSessionId,
+        `document.querySelector("[data-octobuddy-command-suggestions-root]").textContent.includes("/status")`)).toBe(true);
+      await send(browser, "Input.dispatchKeyEvent", {
+        type: "keyDown", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9,
+      }, communicationSessionId);
+      await send(browser, "Input.dispatchKeyEvent", {
+        type: "keyUp", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9,
+      }, communicationSessionId);
+      await waitUntil(async () => await evaluate<boolean>(browser!, communicationSessionId,
+        `(() => {
+          const editor = document.querySelector('.wk-messageinput-editor [contenteditable="true"]');
+          return editor instanceof HTMLElement && editor.innerText.trim() === "/status";
+        })()`), "the installed composer to complete /status without sending", 10_000);
+      expect(statusFixture.requests().some((request) => {
+        const url = new URL(request.path, statusFixture.baseUrl);
+        return url.pathname === "/v1/chats/commands"
+          && url.searchParams.get("channelType") === String(controlledThread.channelType)
+          && url.searchParams.get("channelId") === controlledThread.channelID;
+      })).toBe(true);
+      await evaluate(browser, communicationSessionId, `(() => {
+        const editor = document.querySelector('.wk-messageinput-editor [contenteditable="true"]');
+        if (!(editor instanceof HTMLElement)) throw new Error("command composer is missing");
+        editor.focus();
+        document.execCommand("selectAll");
+        document.execCommand("delete");
+        return editor.innerText;
+      })()`);
+      expect(await evaluate<string>(browser, communicationSessionId,
+        `document.querySelector('.wk-messageinput-editor [contenteditable="true"]').innerText.trim()`)).toBe("");
+      await evaluate(browser, communicationSessionId,
+        `document.documentElement.dataset.octobuddyCommandComposer = "verified"`);
+    }
 
     await dispatchMouseClick(browser, communicationSessionId, await waitForStatusButton(browser, communicationSessionId));
     await waitUntil(async () => {
@@ -1080,7 +1189,7 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
       const url = new URL(request.path, statusFixture.baseUrl);
       return request.method === "GET"
         && request.authorization === `Bearer ${statusToken}`
-        && ["/v1/status", "/v1/chats/status", "/v1/chats/details"].includes(url.pathname);
+        && ["/v1/status", "/v1/chats/status", "/v1/chats/details", "/v1/chats/commands"].includes(url.pathname);
     })).toBe(true);
     for (const target of [controlledGroup, controlledThread]) {
       expect(statusRequests.some((request) => {

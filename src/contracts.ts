@@ -701,6 +701,22 @@ export class WorkerSteerRejectedError extends Error {
 export const RESUME_CONTINUATION_PROMPT =
   "Continue the unfinished work in this session from the recorded history. Do not restart the original request: first verify the outcome of any previous tool call whose result is uncertain before repeating that call, then finish the remaining steps and report the result.";
 
+export interface OmpAvailableSubcommand {
+  name: string;
+  description?: string;
+  usage?: string;
+}
+
+/** The metadata returned by OMP's read-only `get_available_commands` RPC. */
+export interface OmpAvailableCommand {
+  name: string;
+  source: string;
+  description?: string;
+  hint?: string;
+  aliases?: string[];
+  subcommands?: OmpAvailableSubcommand[];
+}
+
 export interface OmpWorker {
   readonly sessionFile: string;
   readonly sessionId: string;
@@ -745,8 +761,14 @@ export interface OmpWorker {
   abortTurn(): Promise<void>;
   /** Reads one non-prompting native context estimate within two seconds and honors cancellation. */
   contextUsage(signal?: AbortSignal): Promise<WorkerContextUsage>;
-  /** Reads the live session's model and the models OMP currently offers, without prompting. */
+  /** Reads the current model and OMP's available model catalog. */
   models(): Promise<WorkerModelCatalog>;
+  /** Reads OMP's current slash-command metadata without dispatching a prompt. */
+  availableCommands?(signal?: AbortSignal): Promise<readonly OmpAvailableCommand[]>;
+  /** Receives OMP's live available-command catalog updates. */
+  subscribeAvailableCommands?(
+    listener: (commands: readonly OmpAvailableCommand[]) => void,
+  ): () => void;
   /**
    * Hands a model selector to OMP's own `/switch`, which resolves it against the live catalog
    * (`provider/id`, model id or substring, `@role`, an optional `:level` suffix) and switches
@@ -953,6 +975,21 @@ export interface ChatDetailsSnapshot {
     status: string | null;
     url: string | null;
   }[];
+}
+
+export interface ChatCommandSuggestion {
+  name: string;
+  source: "channel" | "omp";
+  description?: string;
+  hint?: string;
+  aliases?: string[];
+  subcommands?: { name: string; description?: string; hint?: string }[];
+}
+
+export interface ChatCommandsSnapshot extends ChatTarget {
+  version: 1;
+  commands: ChatCommandSuggestion[];
+  omp: "available" | "unavailable";
 }
 
 export interface ChannelStatus {
@@ -1169,6 +1206,7 @@ export interface ChannelService {
   statusSnapshot(): ServiceStatusSnapshot;
   chatStatusSnapshot(target: ChatTarget): ChatStatusSnapshot;
   chatDetailsSnapshot(target: ChatTarget, signal: AbortSignal): Promise<ChatDetailsSnapshot>;
+  chatCommandsSnapshot(target: ChatTarget, signal: AbortSignal): Promise<ChatCommandsSnapshot | null>;
   status(target: ChatTarget): Promise<ChannelStatus>;
   start(): Promise<void>;
   stop(): Promise<void>;

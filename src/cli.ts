@@ -358,6 +358,7 @@ async function runService(
           statusSnapshot: () => activeService.statusSnapshot(),
           chatStatusSnapshot: target => activeService.chatStatusSnapshot(target),
           chatDetailsSnapshot: (target, signal) => activeService.chatDetailsSnapshot(target, signal),
+          chatCommandsSnapshot: (target, signal) => activeService.chatCommandsSnapshot(target, signal),
           ...(config.fileLinks === undefined ? {} : { fileLinks: config.fileLinks }),
         });
         if (!shutdownRequested) {

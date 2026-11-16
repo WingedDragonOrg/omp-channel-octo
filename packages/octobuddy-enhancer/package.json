@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "bun test ./tests/launcher.acceptance.ts ./tests/host.acceptance.ts ./tests/zed.acceptance.ts ./tests/status-client.acceptance.ts ./tests/status-panel.acceptance.ts ./tests/status-bridge.acceptance.ts ./tests/chat-panel.acceptance.ts ./tests/chat-observer.acceptance.ts",
+    "test": "bun test ./tests/launcher.acceptance.ts ./tests/host.acceptance.ts ./tests/zed.acceptance.ts ./tests/status-client.acceptance.ts ./tests/status-panel.acceptance.ts ./tests/status-bridge.acceptance.ts ./tests/chat-panel.acceptance.ts ./tests/chat-observer.acceptance.ts ./tests/command-suggestions.acceptance.ts",
     "typecheck": "tsc --noEmit",
     "test:integration": "bun test ./tests/real-octobuddy.acceptance.ts"
   },

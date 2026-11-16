@@ -8,6 +8,8 @@ import type {
 	CommitWorkerOptions,
 	HostTool,
 	OmpWorker,
+	OmpAvailableCommand,
+	OmpAvailableSubcommand,
 	PromptContext,
 	WorkerEvent,
 	WorkerCompactionStatus,
@@ -254,6 +256,38 @@ type ActiveBtw = {
 	abortListener: (() => void) | undefined;
 };
 
+function parseAvailableCommands(value: unknown): OmpAvailableCommand[] | null {
+	if (!Array.isArray(value)) return null;
+	const commands: OmpAvailableCommand[] = [];
+	for (const raw of value) {
+		if (!isRecord(raw) || typeof raw.name !== "string" || raw.name.trim().length === 0 || typeof raw.source !== "string") {
+			continue;
+		}
+		const command: OmpAvailableCommand = { name: raw.name, source: raw.source };
+		if (typeof raw.description === "string") command.description = raw.description;
+		const input = isRecord(raw.input) ? raw.input : undefined;
+		if (typeof input?.hint === "string") command.hint = input.hint;
+		else if (typeof raw.hint === "string") command.hint = raw.hint;
+		if (Array.isArray(raw.aliases)) {
+			command.aliases = raw.aliases.filter((alias): alias is string => typeof alias === "string");
+		}
+		if (Array.isArray(raw.subcommands)) {
+			command.subcommands = raw.subcommands.flatMap(subcommand => {
+				if (!isRecord(subcommand) || typeof subcommand.name !== "string" || subcommand.name.trim().length === 0) {
+					return [];
+				}
+				const parsed: OmpAvailableSubcommand = { name: subcommand.name };
+				if (typeof subcommand.description === "string") parsed.description = subcommand.description;
+				if (typeof subcommand.usage === "string") parsed.usage = subcommand.usage;
+				return [parsed];
+			});
+		}
+		commands.push(command);
+	}
+	return commands;
+}
+
+
 class RpcWorker implements OmpWorker {
 	#child: RpcChild;
 	#watchdog: RpcChild | undefined;
@@ -286,6 +320,9 @@ class RpcWorker implements OmpWorker {
 	 */
 	#suppressCommandOutput = false;
 	#pending = new Map<string, PendingResponse>();
+	#availableCommands: readonly OmpAvailableCommand[] | undefined;
+	#availableCommandsRevision = 0;
+	#availableCommandListeners = new Set<(commands: readonly OmpAvailableCommand[]) => void>();
 	#activePrompt: PromptRun | undefined;
 	#activeBtw: ActiveBtw | undefined;
 	/** True after prompt acceptance or during an agent turn; false between turns and at settlement. */
@@ -535,6 +572,51 @@ class RpcWorker implements OmpWorker {
 		}
 		return { current, level, available };
 	}
+
+	async availableCommands(signal?: AbortSignal): Promise<readonly OmpAvailableCommand[]> {
+		if (this.#closed) throw new Error("OMP worker is not running");
+		const revision = this.#availableCommandsRevision;
+		const response = await this.#request(
+			{ type: "get_available_commands" },
+			DEFAULT_REQUEST_TIMEOUT_MS,
+			undefined,
+			signal,
+		);
+		this.#assertSuccess(response, "get_available_commands");
+		const data = isRecord(response.data) ? response.data : undefined;
+		const commands = parseAvailableCommands(data?.commands);
+		if (commands === null) throw new Error("OMP RPC get_available_commands returned an invalid catalog");
+		if (this.#availableCommandsRevision !== revision && this.#availableCommands !== undefined) {
+			return this.#availableCommands;
+		}
+		if (this.#availableCommandsRevision === revision) this.#publishAvailableCommands(commands);
+		return commands;
+	}
+
+	subscribeAvailableCommands(listener: (commands: readonly OmpAvailableCommand[]) => void): () => void {
+		this.#availableCommandListeners.add(listener);
+		if (this.#availableCommands !== undefined) {
+			try {
+				listener(this.#availableCommands);
+			} catch {
+				// Catalog listeners are advisory and cannot break worker startup or RPC access.
+			}
+		}
+		return () => this.#availableCommandListeners.delete(listener);
+	}
+
+	#publishAvailableCommands(commands: readonly OmpAvailableCommand[]): void {
+		this.#availableCommands = commands;
+		this.#availableCommandsRevision += 1;
+		for (const listener of this.#availableCommandListeners) {
+			try {
+				listener(commands);
+			} catch {
+				// Catalog listeners are advisory; they cannot break the managed worker's RPC loop.
+			}
+		}
+	}
+
 
 	/**
 	 * Hand a selector to OMP's own `/switch` builtin and report what it resolved to. The dispatch
@@ -1258,6 +1340,11 @@ class RpcWorker implements OmpWorker {
 			return;
 		}
 		if (frame.type === "btw_delta") return;
+		if (frame.type === "available_commands_update") {
+			const commands = parseAvailableCommands(frame.commands);
+			if (commands !== null) this.#publishAvailableCommands(commands);
+			return;
+		}
 		if (frame.type === "extension_ui_request") {
 			this.#handleUiRequest(frame);
 			return;

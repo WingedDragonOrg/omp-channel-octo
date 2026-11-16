@@ -1,5 +1,6 @@
 import { GroupHistoryCoordinator } from "./inbound/history-coordinator.ts";
 import { ModelSwitchController } from "./commands/model-controller.ts";
+import { buildChatCommandsSnapshot } from "./commands/chat-command-catalog.ts";
 import { modelPolicyDescription } from "./commands/model-switch.ts";
 import { readGroupContext } from "./session/read-group-context.ts";
 import { formatGoalSession, goalErrorText, GOAL_USAGE, parseGoalCommand } from "./commands/goal-command.ts";
@@ -46,7 +47,8 @@ import {
 } from "./tasks/task-scheduler.ts";
 import type { DestructiveResourceLease } from "./tasks/task-scheduler.ts";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
@@ -72,6 +74,7 @@ import type {
   ChatDetailsSnapshot,
   ChatAppendMode,
   ChatExecutionState,
+  ChatCommandsSnapshot,
   ChatTarget,
   GroupContext,
   ServiceStatusSnapshot,
@@ -94,6 +97,7 @@ import type {
   WorktreeMergeRequest,
   WorkerOptions,
   WorktreeMergeSummary,
+  OmpAvailableCommand,
 } from "./contracts.ts";
 import type {
   BindingRecord,
@@ -4038,6 +4042,138 @@ class CoreService implements ChannelService {
       queuedTasks: this.store.countQueuedTasks(botUid, target),
       pendingQuestions: this.store.pendingQuestionIds(botUid, target).length,
     };
+  }
+
+  chatCommandsSnapshot(target: ChatTarget, requestSignal: AbortSignal): Promise<ChatCommandsSnapshot | null> {
+    if (this.stopping) return Promise.reject(new Error("channel stopping"));
+    const operation = this.readChatCommandsSnapshot(target, requestSignal);
+    this.operationSet(operation.then(() => undefined, () => undefined));
+    return operation;
+  }
+
+  private async readChatCommandsSnapshot(
+    target: ChatTarget,
+    requestSignal: AbortSignal,
+  ): Promise<ChatCommandsSnapshot | null> {
+    const signal = AbortSignal.any([requestSignal, this.shutdownController.signal]);
+    signal.throwIfAborted();
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) return null;
+    const ownerId = this.store.getOwnerId(botUid)?.trim();
+    if (!ownerId) return null;
+    const permitted = target.channelType === 1
+      ? target.channelId === ownerId
+      : this.authorization.isPermittedChat(target);
+    if (!permitted) return null;
+
+    const unavailable = (): ChatCommandsSnapshot =>
+      buildChatCommandsSnapshot(target, this.commandHandlers);
+    const binding = this.store.getBinding(botUid, target);
+    let live: WorkerSession | undefined;
+    if (binding !== null && binding.sessionFile !== null) {
+      for (const runtime of this.runtimes.values()) {
+        if (
+          runtime.closing
+          || runtime.suspended
+          || runtime.target.channelType !== target.channelType
+          || runtime.target.channelId !== target.channelId
+        ) continue;
+        const worker = runtime.lease?.worker;
+        if (worker !== undefined && worker.sessionId === binding.sessionId) {
+          live = worker;
+          break;
+        }
+      }
+    }
+
+    if (live !== undefined) {
+      let commands: readonly OmpAvailableCommand[] | undefined;
+      try {
+        commands = await live.availableCommands?.(signal);
+      } catch {
+        signal.throwIfAborted();
+        return unavailable();
+      }
+      signal.throwIfAborted();
+      if (commands === undefined || !sameSessionIdentity(binding, this.store.getBinding(botUid, target))) {
+        return unavailable();
+      }
+      return buildChatCommandsSnapshot(target, this.commandHandlers, commands);
+    }
+
+    let cwd: string | null;
+    try {
+      cwd = await this.sessions.probeDirectory(target);
+    } catch {
+      signal.throwIfAborted();
+      return unavailable();
+    }
+    signal.throwIfAborted();
+    if (cwd === null || !sameSessionIdentity(binding, this.store.getBinding(botUid, target))) {
+      return unavailable();
+    }
+
+    let sessionDir: string;
+    try {
+      sessionDir = await mkdtemp(join(tmpdir(), "omp-channel-octo-commands-"));
+    } catch {
+      signal.throwIfAborted();
+      return unavailable();
+    }
+    const sessionId = randomUUID();
+    const model = this.store.resolveChatModel(botUid, target).model;
+    let lease: TrackedWorker | undefined;
+    let commands: readonly OmpAvailableCommand[] | undefined;
+    let stopConfirmed = false;
+    let uncertain = false;
+    try {
+      signal.throwIfAborted();
+      try {
+        lease = await openTrackedWorker({
+          workerFactory: this.options.workerFactory,
+          store: this.store,
+          worker: { cwd, sessionDir, signal, ...(model === null ? {} : { model }) },
+          ledger: {
+            id: `commands-${sessionId}`,
+            botUid,
+            sessionId,
+            sessionFile: join(sessionDir, `${sessionId}.jsonl`),
+          },
+          blockDirectory: blockedCwd => {
+            this.blockedDirectories.add(blockedCwd);
+            uncertain = true;
+          },
+        });
+      } catch {
+        signal.throwIfAborted();
+        return unavailable();
+      }
+
+      try {
+        commands = await lease.worker.availableCommands?.(signal);
+      } catch {
+        signal.throwIfAborted();
+      }
+    } finally {
+      if (lease !== undefined) {
+        try {
+          stopConfirmed = await lease.close();
+        } catch {
+          uncertain = true;
+          this.blockedDirectories.add(cwd);
+        }
+        if (!stopConfirmed) uncertain = true;
+      } else if (!uncertain) {
+        // A failed create with no unconfirmed spawned process is safe to clean up.
+        stopConfirmed = true;
+      }
+      if (stopConfirmed && !uncertain) await rm(sessionDir, { recursive: true, force: true }).catch(() => {});
+    }
+
+    signal.throwIfAborted();
+    if (!stopConfirmed || uncertain || commands === undefined) return unavailable();
+    if (!sameSessionIdentity(binding, this.store.getBinding(botUid, target))) return unavailable();
+    return buildChatCommandsSnapshot(target, this.commandHandlers, commands);
   }
 
   async chatDetailsSnapshot(target: ChatTarget, requestSignal: AbortSignal): Promise<ChatDetailsSnapshot> {
