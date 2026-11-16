@@ -172,6 +172,17 @@ function validCommandName(value: unknown): value is string {
     && value.trim() === value
     && !/[\s\u0000-\u001f\u007f/]/u.test(value);
 }
+
+function validNamespacedSkillCommandName(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 128 || !value.startsWith("skill:")) return false;
+  const skillName = value.slice("skill:".length);
+  const separator = skillName.indexOf("/");
+  if (separator <= 0 || separator === skillName.length - 1 || skillName.indexOf("/", separator + 1) !== -1) {
+    return false;
+  }
+  return validCommandName(skillName.slice(0, separator)) && validCommandName(skillName.slice(separator + 1));
+}
+
 function validSubcommandName(value: unknown): value is string {
   return typeof value === "string"
     && value.length > 0
@@ -180,7 +191,12 @@ function validSubcommandName(value: unknown): value is string {
 }
 
 function ompSuggestion(command: OmpAvailableCommand, channelNames: ReadonlySet<string>): ChatCommandSuggestion | null {
-  if (command.source === "extension" || !validCommandName(command.name)) return null;
+  // OMP emits ordinary skills as `skill:<name>` and collision-qualified ones as
+  // `skill:<namespace>/<name>`. Preserve that one source-specific path shape.
+  const validName = validCommandName(command.name)
+    || (command.source === "skill" && validNamespacedSkillCommandName(command.name));
+  if (command.source === "extension" || !validName) return null;
+
   const aliases = [...new Set((command.aliases ?? []).filter(alias =>
     validCommandName(alias)
       && alias.toLowerCase() !== command.name.toLowerCase()

@@ -29,7 +29,8 @@ type CommandsSnapshot = {
 
 type CommandsResult =
   | { state: "online"; snapshot: CommandsSnapshot }
-  | { state: "unconfigured" | "offline" | "unauthorized" | "invalid"; lastSuccess?: CommandsSnapshot };
+  | { state: "unconfigured" | "offline" | "unauthorized" | "invalid"; lastSuccess?: CommandsSnapshot }
+  | { state: "not_found" };
 
 type ChannelStatusResult =
   | { state: "online"; snapshot: { botUid: string | null; ownerUid: string | null } }
@@ -319,6 +320,21 @@ test("selecting a slash command completes the draft without sending it", async (
   }
 });
 
+test("completes namespaced skill commands without sending", async () => {
+  const harness = await createHarness({
+    commands: [{ name: "skill:frontend/example", source: "omp", description: "Frontend skill" }],
+  });
+  try {
+    await typeCommand(harness.page, "/skill:frontend/ex");
+    await waitForCandidate(harness.page, "/skill:frontend/example");
+    await harness.page.keyboard.press("Tab");
+    expect(await harness.page.locator(editorSelector).innerText()).toMatch(/^\/skill:frontend\/example\s*$/);
+    expect((await harness.state()).sends).toBe(0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("filters by name and alias and completes with arrow, tab, mouse, and subcommands", async () => {
   const commands: Command[] = [
     { name: "status", source: "channel", description: "查看当前状态", aliases: ["st"] },
@@ -567,6 +583,41 @@ test("an unknown private chat reports identity failure without issuing a command
   }
 });
 
+test("unavailable chats keep the native editor without command suggestions", async () => {
+  const harness = await createHarness({ getCommands: () => ({ state: "not_found" }) });
+  try {
+    await typeCommand(harness.page, "/");
+    await waitFor(async () => (await harness.state()).commandsCalls.length > 0, "the chat command request");
+    await waitFor(async () => !await menuVisible(harness.page), "the unavailable chat menu to close");
+    await harness.page.keyboard.type("stat");
+    await Bun.sleep(50);
+    expect(await menuVisible(harness.page)).toBe(false);
+    expect(await harness.page.locator(editorSelector).innerText()).toBe("/stat");
+    await harness.page.keyboard.press("Enter");
+    expect((await harness.state()).sends).toBe(1);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("the loading message is visible above the editor while commands are requested", async () => {
+  const harness = await createHarness({ getCommands: () => new Promise<CommandsResult>(() => {}) });
+  try {
+    await typeCommand(harness.page, "/");
+    await waitForNote(harness.page, "正在读取命令");
+    const menu = await harness.page.locator(rootSelector).boundingBox();
+    const editor = await harness.page.locator(editorSelector).boundingBox();
+    expect(menu).not.toBeNull();
+    expect(editor).not.toBeNull();
+    expect(menu!.height).toBeGreaterThan(0);
+    expect(Math.abs(menu!.x - editor!.x)).toBeLessThan(1);
+    expect(editor!.y - (menu!.y + menu!.height)).toBeGreaterThanOrEqual(0);
+    expect(editor!.y - (menu!.y + menu!.height)).toBeLessThan(10);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("authentication failure still permits typing and sending", async () => {
   const harness = await createHarness({
     getCommands: () => ({ state: "unauthorized" }),
@@ -676,6 +727,8 @@ test("the menu is a white system-font popover above the editor with a purple sel
         fontFamily: rootStyle.fontFamily,
         selectedBackground: selectedStyle.backgroundColor,
         rootBottom: rootRect.bottom,
+        rootLeft: rootRect.left,
+        editorLeft: editorRect.left,
         editorTop: editorRect.top,
         visible: !root.hidden && rootRect.width > 0 && rootRect.height > 0,
       };
@@ -686,6 +739,8 @@ test("the menu is a white system-font popover above the editor with a purple sel
     expect(visual.borderWidth).toBe("1px");
     expect(visual.fontFamily.toLowerCase()).toContain("-apple-system");
     expect(visual.selectedBackground).toBe("rgb(108, 86, 201)");
+    expect(Math.abs(visual.rootLeft - visual.editorLeft)).toBeLessThan(1);
+    expect(visual.editorTop - visual.rootBottom).toBeLessThan(10);
     expect(visual.rootBottom).toBeLessThanOrEqual(visual.editorTop);
   } finally {
     await harness.cleanup();

@@ -90,7 +90,8 @@ type ChatCommandsSnapshot = {
 
 type ChatCommandsResult =
   | { state: "online"; snapshot: ChatCommandsSnapshot }
-  | { state: "unconfigured" | "offline" | "unauthorized" | "invalid"; lastSuccess?: ChatCommandsSnapshot };
+  | { state: "unconfigured" | "offline" | "unauthorized" | "invalid"; lastSuccess?: ChatCommandsSnapshot }
+  | { state: "not_found" };
 
 type StatusClient = {
   get(signal?: AbortSignal): Promise<StatusResult>;
@@ -1088,6 +1089,24 @@ test("queries authenticated chat commands with the exact identity and optional m
     channelId: target.channelId,
     authorization: `Bearer ${bearerToken}`,
   }]);
+}, 10_000);
+
+test("a missing chat command catalog clears previously cached suggestions", async () => {
+  const clientModule = await loadStatusClient();
+  const target: ChatTarget = { channelType: 2, channelId: "unlisted-group" };
+  let available = true;
+  await withTempDirectory(async (directory) => {
+    await withLocalHttpFixture(() => available
+      ? statusResponse(chatCommandsSnapshotFor(target, 2))
+      : statusResponse({ error: { code: "not_found" } }, 404), async (fixture) => {
+      const configPath = join(directory, "status-client.json");
+      await writeConfig(configPath, fixture.baseUrl);
+      const client = clientModule.createStatusClient({ configPath });
+      expect((await client.getChatCommands(target)).state).toBe("online");
+      available = false;
+      expect(await client.getChatCommands(target)).toEqual({ state: "not_found" });
+    });
+  });
 }, 10_000);
 
 test("accepts a command catalog larger than the 64KiB status response limit", async () => {

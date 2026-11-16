@@ -189,6 +189,41 @@ test("OMP suggestions reserve hidden channel routes in an owner DM", async () =>
     await harness.close();
   }
 });
+test("OMP skill commands retain plain and namespaced RPC names for slash completion", async () => {
+  const harness = await createCommandCatalogHarness({
+    allowedGroupIds: ["group-a"],
+    availableCommands: async () => [
+      { name: "skill:plain", source: "skill", description: "Plain skill", hint: "arguments" },
+      { name: "skill:agents/alpha", source: "skill", description: "Namespaced skill", hint: "arguments" },
+      { name: "file:agents/alpha", source: "file", description: "Invalid slash command" },
+      { name: "skill:agents/nested/alpha", source: "skill", description: "Invalid nested namespace" },
+    ],
+  });
+  const target = { channelType: 2, channelId: "group-a" } as const;
+  seedBinding(harness.store, harness.bot.uid, target, harness.root);
+
+  try {
+    const snapshot = await harness.service.chatCommandsSnapshot(target, new AbortController().signal);
+    // OMP RPC already supplies `skill:`; the enhancer adds the leading `/` for display/completion.
+    expect(snapshot?.commands).toContainEqual({
+      name: "skill:plain",
+      source: "omp",
+      description: "Plain skill",
+      hint: "arguments",
+    });
+    expect(snapshot?.commands).toContainEqual({
+      name: "skill:agents/alpha",
+      source: "omp",
+      description: "Namespaced skill",
+      hint: "arguments",
+    });
+    expect(snapshot?.commands.some(command => command.name === "/skill:plain")).toBe(false);
+    expect(snapshot?.commands.some(command => command.name === "file:agents/alpha")).toBe(false);
+    expect(snapshot?.commands.some(command => command.name === "skill:agents/nested/alpha")).toBe(false);
+  } finally {
+    await harness.close();
+  }
+});
 
 test("channel commands win over OMP aliases while project and skill suggestions remain visible", async () => {
   const commands: TestOmpAvailableCommand[] = [

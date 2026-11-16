@@ -587,13 +587,13 @@
     if (rect.width <= 0 && rect.height <= 0) return;
 
     const width = Math.max(220, Math.min(rect.width, Math.max(220, viewportWidth - 16)));
-    root.style.width = `${Math.min(width, 520)}px`;
+    root.style.setProperty("width", `${Math.min(width, 520)}px`, "important");
     const height = root.getBoundingClientRect().height;
     const left = Math.max(8, Math.min(rect.left, viewportWidth - width - 8));
     let top = rect.top - height - 8;
     if (top < 8) top = Math.min(rect.bottom + 8, Math.max(8, viewportHeight - height - 8));
-    root.style.left = `${left}px`;
-    root.style.top = `${top}px`;
+    root.style.setProperty("left", `${left}px`, "important");
+    root.style.setProperty("top", `${top}px`, "important");
   }
 
   function suppressNativeMenus() {
@@ -813,6 +813,10 @@
     }
 
     loadCommands(false);
+    if (catalogState === "not_found") {
+      hideMenu({ cancel: false });
+      return;
+    }
     renderMenu();
   }
 
@@ -910,6 +914,15 @@
       return;
     }
     activeRequest = undefined;
+
+    if (result?.state === "not_found") {
+      catalog = undefined;
+      catalogFetchedAt = Date.now();
+      catalogState = "not_found";
+      catalogError = undefined;
+      scheduleUpdate();
+      return;
+    }
 
     if (result?.state === "online") {
       catalog = result.snapshot;

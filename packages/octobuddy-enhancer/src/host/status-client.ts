@@ -103,7 +103,8 @@ export interface ChatCommandsSnapshot {
 
 export type ChatCommandsResult =
   | { state: "online"; snapshot: ChatCommandsSnapshot }
-  | { state: "unconfigured" | "offline" | "unauthorized" | "invalid"; lastSuccess?: ChatCommandsSnapshot };
+  | { state: "unconfigured" | "offline" | "unauthorized" | "invalid"; lastSuccess?: ChatCommandsSnapshot }
+  | { state: "not_found" };
 
 export interface StatusClient {
   get(signal?: AbortSignal): Promise<StatusResult>;
@@ -628,7 +629,7 @@ function isJsonContentType(response: Response): boolean {
 
 type SnapshotRequestResult<T> =
   | { state: "online"; snapshot: T }
-  | { state: "offline" | "unauthorized" | "invalid" };
+  | { state: "offline" | "unauthorized" | "invalid"; notFound?: true };
 
 async function requestSnapshot<T>(
   url: URL,
@@ -658,6 +659,10 @@ async function requestSnapshot<T>(
     if (response.status === 401 || response.status === 403) {
       void response.body?.cancel().catch(() => undefined);
       return { state: "unauthorized" };
+    }
+    if (response.status === 404) {
+      void response.body?.cancel().catch(() => undefined);
+      return { state: "offline", notFound: true };
     }
     if (response.status < 200 || response.status >= 300) {
       void response.body?.cancel().catch(() => undefined);
@@ -851,7 +856,16 @@ export function createStatusClient(options: StatusClientOptions): StatusClient {
         COMMANDS_REQUEST_TIMEOUT_MS,
         MAX_COMMANDS_RESPONSE_BYTES,
       );
-      if (result.state !== "online") return chatCommandsFailure(result.state, generation, key);
+      if (result.state !== "online") {
+        if (result.notFound) {
+          const cached = chatCommandsLastSuccess.get(key);
+          if (generation === configGeneration && (cached === undefined || requestId > cached.requestId)) {
+            chatCommandsLastSuccess.delete(key);
+          }
+          return { state: "not_found" };
+        }
+        return chatCommandsFailure(result.state, generation, key);
+      }
 
       const cached = chatCommandsLastSuccess.get(key);
       if (generation === configGeneration && (cached === undefined || requestId > cached.requestId)) {
