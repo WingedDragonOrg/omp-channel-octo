@@ -6,6 +6,7 @@ import {
   closeCoreHarness,
   createCoreHarness,
   FakeLoopReadPort,
+  GitBackedTestWorktrees,
   inbound,
   waitForStatus,
 } from "./fixtures/core-fakes.ts";
@@ -26,6 +27,7 @@ test("task-aware native dispatch replay executes once while a new call still run
   let store: ChannelStore | undefined;
   let threadChannelId = "";
   const harness = await createCoreHarness({
+    worktreePort: (root) => new GitBackedTestWorktrees(root),
     loop,
     prompt: async (context) => {
       if (context.text.includes("LOOP_NATIVE_DISPATCH_WORK")) {

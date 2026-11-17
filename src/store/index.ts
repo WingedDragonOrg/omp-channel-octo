@@ -45,6 +45,8 @@ import { acceptThreadWorkspaceOperation, addThreadWorkspaceIntentChannel, comple
 import { completeThreadFork, getThreadFork, getThreadForkByTarget, listThreadForks, saveThreadFork } from "./store-forks.ts";
 import { advanceThreadArchiveGeneration, beginThreadMerge, claimThreadTaskDispatchIntent, claimThreadMergeDispatchIntent, ensureThreadListen, getThreadArchiveGeneration, getThreadListen, getThreadMergeEvent, getThreadTaskEvent, isThreadMergeEventPending, isThreadTaskEventPending, listPendingThreadMergeEvents, listPendingThreadTaskEvents, listThreadMergeEvents, listThreadTaskEvents, markThreadMergeEventDelivered, markThreadTaskEventDelivered, recordCreatedThreadListen, saveThreadMergeEvent, saveThreadTaskEvent, setThreadListen } from "./store-thread-listen.ts";
 import { addThreadReferences, captureReferenceHistorySnapshot as captureHistorySnapshot, deleteThreadReferences, getThreadReferences, isThreadReferencesDeleted, listReferenceHistory as readReferenceHistory } from "./store-references.ts";
+import { findDiscoveryAssociations } from "./store-discovery.ts";
+import type { DiscoveryAssociation, DiscoveryQuery } from "./store-discovery.ts";
 import * as storeWatch from "./store-watch.ts";
 import type { WatchCheckCompletion, WatchCreateResult, WatchListItem, WatchRecord } from "../watch/types.ts";
 import type { ThreadReference, ThreadReferences } from "../references/types.ts";
@@ -1740,6 +1742,15 @@ export class ChannelStore {
 
   listLoopThreadCreations(botUid: string): LoopThreadCreation[] {
     return listLoopThreadCreations(this.db, botUid);
+  }
+
+  /**
+   * Read-only local association lookup for the discovery host tool. Every clue is optional, but at
+   * least one structured clue is required; an empty query returns no rows instead of enumerating
+   * the bot's records. Results stay strictly scoped to `botUid`.
+   */
+  findDiscoveryAssociations(botUid: string, query: DiscoveryQuery): DiscoveryAssociation[] {
+    return findDiscoveryAssociations(this.db, botUid, query);
   }
 }
 

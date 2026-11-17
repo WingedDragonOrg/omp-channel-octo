@@ -135,7 +135,8 @@ async function waitForStoppedGoalWorker(worker: { readonly stopped: boolean }): 
 async function waitForSentText(harness: CoreHarness, previousCount: number): Promise<string> {
   const deadline = performance.now() + 3_000;
   while (performance.now() < deadline) {
-    const sent = harness.transport.sent.slice(previousCount);
+    const sent = harness.transport.sent.slice(previousCount)
+      .filter((message) => !message.text.startsWith("开始执行排队消息"));
     if (sent.length > 0) return sent.at(-1)!.text;
     const next = Promise.withResolvers<void>();
     setImmediate(next.resolve);

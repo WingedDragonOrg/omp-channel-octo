@@ -3,6 +3,7 @@ import type { CommitContent } from "./cards/commit-content.ts";
 import type { ProjectSessionState } from "./session/project-session.ts";
 import type { DecisionsConfig, DecisionFetch } from "./references/types.ts";
 import type { LoopReadPort } from "./loop/types.ts";
+import type { DiscoveryRemote } from "./discovery/remote.ts";
 import type { WatchCollector, WatchJudge } from "./watch/types.ts";
 import type { LockHandle } from "./runtime/bot-lock.ts";
 
@@ -1061,6 +1062,8 @@ export interface ChannelServiceOptions {
   allowlistWriteback?: AllowlistWriteback;
   /** Authenticated Loop reads for group workspace binding and polling. */
   loop?: LoopReadPort;
+  /** Read-only, authenticated remote sources used by the cross-chat discovery tool. */
+  discovery?: DiscoveryRemote;
 }
 
 export interface AllowlistWriteback {

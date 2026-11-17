@@ -59,6 +59,8 @@
 
 统一由 `octo_management create-thread` 创建子区、准备隔离工作区、持久化绑定并写入 Octo `THREAD.md`。具体工作只来自后续 `thread-dispatch` 的正文；创建本身不启动实施。保留当前群作用域、owner 权限、去重和单仓库 worktree 命名与创建能力。
 
+当子区的当前绑定仍指向受管工作区时，`thread-dispatch` 在交付前核验每个 worktree 的实际来源仓库与持久记录的分支；身份不一致时拒绝派发。显式换绑后的目录沿用其绑定行为，不因旧工作区而拒绝；检查不引入跨聊天路径锁。
+
 创建参数：
 
 - `name`：子区名称；`worktree_name`：agent 提供的简短、完整语义任务名。所有 `create-thread` 调用均必填，包括无 `projects` 的单仓创建与带 `task_id` 的 Loop 创建；显式 `projects`（含 single）同样必填。缺少时在远端子区分配前拒绝，不创建无工作区子区。

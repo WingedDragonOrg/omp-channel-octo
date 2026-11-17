@@ -4,6 +4,7 @@ import { access, mkdtemp, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { createOctoTransport } from "./octo/index.ts";
+import { createDiscoveryRemote } from "./discovery/remote.ts";
 import { createOctoCliCredentialProvisioner } from "./runtime/octo-cli.ts";
 import { createWorkerFactory } from "./omp/index.ts";
 import { createLoopReadPort } from "./loop/api.ts";
@@ -292,6 +293,7 @@ async function runService(
       workerFactory,
       ...(pendingMigrationLock === undefined ? {} : { migrationLock: pendingMigrationLock }),
       loop: createLoopReadPort({ apiUrl: config.apiUrl, botToken: config.botToken }),
+      discovery: createDiscoveryRemote({ apiUrl: config.apiUrl, botToken: config.botToken }),
       loopWebOrigin: new URL(config.apiUrl).origin,
       worktrees: createWorktreePort({ command: ompCommand }),
       cliCredentials,

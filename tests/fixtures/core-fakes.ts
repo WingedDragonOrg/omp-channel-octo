@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -60,6 +61,7 @@ import type {
   WorktrunkProbe,
 } from "../../src/contracts";
 import type { LoopReadPort, LoopTask, LoopWorkspace } from "../../src/loop/types.ts";
+import type { DiscoveryRemote } from "../../src/discovery/remote.ts";
 import type { WatchCollector, WatchJudge } from "../../src/watch/types.ts";
 import { RESUME_CONTINUATION_PROMPT } from "../../src/contracts";
 import { AttachmentError } from "../../src/inbound/attachments";
@@ -1832,6 +1834,102 @@ export class FakeWorktrees implements WorktreePort {
     return this.probe;
   }
 }
+
+function fixtureGit(cwd: string, ...args: string[]): string {
+  return execFileSync("git", ["-C", cwd, ...args], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+const preparedFixtureRepositories = new Map<string, Promise<void>>();
+
+export async function prepareGitFixtureRepository(path: string): Promise<void> {
+  await mkdir(path, { recursive: true });
+  const repo = await realpath(path);
+  const existing = preparedFixtureRepositories.get(repo);
+  if (existing !== undefined) {
+    await existing;
+    return;
+  }
+
+  const preparation = (async () => {
+    try {
+      fixtureGit(repo, "rev-parse", "--git-common-dir");
+    } catch {
+      execFileSync("git", ["init", "--quiet", repo], { stdio: "ignore" });
+    }
+    fixtureGit(repo, "config", "user.name", "OMP test fixture");
+    fixtureGit(repo, "config", "user.email", "omp-test-fixture@example.invalid");
+    try {
+      fixtureGit(repo, "rev-parse", "--verify", "HEAD");
+    } catch {
+      fixtureGit(repo, "commit", "--allow-empty", "--quiet", "-m", "fixture baseline");
+    }
+  })();
+  preparedFixtureRepositories.set(repo, preparation);
+  try {
+    await preparation;
+  } catch (error) {
+    preparedFixtureRepositories.delete(repo);
+    throw error;
+  }
+}
+
+/** Creates actual linked Git worktrees for tests that exercise dispatch ownership checks. */
+export class GitBackedTestWorktrees extends FakeWorktrees {
+  constructor(private readonly fixtureRoot: string) {
+    super(fixtureRoot);
+  }
+
+  override async create(request: ThreadWorkspaceRequest): Promise<ThreadWorkspace> {
+    const { onPlanned, ...recordedRequest } = request;
+    this.requests.push({ ...recordedRequest });
+    if (this.failure) throw this.failure;
+
+    const repo = await realpath(request.baseDir);
+    await prepareGitFixtureRepository(repo);
+    let branch = request.threadId;
+    let suffix = 2;
+    for (;;) {
+      try {
+        fixtureGit(repo, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`);
+      } catch {
+        break;
+      }
+      branch = `${request.threadId}-${suffix++}`;
+    }
+
+    let cwd: string;
+    if (request.path !== undefined) {
+      cwd = request.path;
+      await mkdir(dirname(cwd), { recursive: true });
+    } else {
+      const preferredPath = join(this.fixtureRoot, "worktrees", request.threadId);
+      await mkdir(dirname(preferredPath), { recursive: true });
+      for (let suffix = 1; ; suffix += 1) {
+        const candidate = suffix === 1 ? preferredPath : `${preferredPath}-${suffix}`;
+        try {
+          await mkdir(candidate);
+          cwd = candidate;
+          break;
+        } catch (error) {
+          const code =
+            typeof error === "object" && error !== null && "code" in error
+              ? error.code
+              : undefined;
+          if (code !== "EEXIST") throw error;
+        }
+      }
+    }
+    onPlanned?.({ cwd, branch, repo });
+    const args = ["-C", repo, "worktree", "add", "--quiet", "-b", branch, cwd];
+    if (request.base !== undefined) args.push(request.base);
+    execFileSync("git", args, { stdio: "ignore" });
+    return { cwd: await realpath(cwd), branch };
+  }
+}
+
 export class FakeLoopReadPort implements LoopReadPort {
   readonly workspaces = new Map<string, LoopWorkspace>();
   readonly tasks = new Map<string, LoopTask[]>();
@@ -1909,7 +2007,7 @@ export interface CoreHarnessOptions {
   /** Isolated thread workspaces; `null` omits the port so isolate reports an unconfigured deployment. */
   worktrees?: FakeWorktrees | null;
   /** Injects a real or instrumented host WorktreePort in integration tests. */
-  worktreePort?: WorktreePort;
+  worktreePort?: WorktreePort | ((root: string) => WorktreePort);
   /** Per-bot octo-cli credential port; absent means the deployment has no such capability. */
   cliCredentials?: CliCredentialPort;
   /** Allowlist mirror into the config file; absent means a hand-built config with no path. */
@@ -1917,6 +2015,7 @@ export interface CoreHarnessOptions {
   fileLinks?: CoreServiceConfig["fileLinks"];
   loop?: LoopReadPort;
   loopWebOrigin?: string;
+  discovery?: DiscoveryRemote;
 
 }
 
@@ -1934,10 +2033,13 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
       startOnline: options.startOnline ?? true,
     });
   const workers = options.workers ?? new FakeWorkerFactory(options.prompt);
+  const injectedWorktreePort = typeof options.worktreePort === "function"
+    ? options.worktreePort(root)
+    : options.worktreePort;
   const worktreePort =
     options.worktrees === null
       ? undefined
-      : (options.worktreePort ?? options.worktrees ?? new FakeWorktrees(root));
+      : (injectedWorktreePort ?? options.worktrees ?? new FakeWorktrees(root));
   const config = {
     ...(options.ownerId === null ? {} : { ownerId: options.ownerId ?? "owner-1" }),
     allowedGroupIds: options.allowedGroupIds ?? [
@@ -1970,6 +2072,7 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
     ...(options.restart === undefined ? {} : { restart: options.restart }),
     ...(options.cliCredentials === undefined ? {} : { cliCredentials: options.cliCredentials }),
     ...(options.allowlistWriteback === undefined ? {} : { allowlistWriteback: options.allowlistWriteback }),
+    ...(options.discovery === undefined ? {} : { discovery: options.discovery }),
   });
   await service.start();
   return {

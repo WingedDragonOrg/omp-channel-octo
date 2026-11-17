@@ -8,6 +8,8 @@ import {
   assistantText,
   closeCoreHarness,
   createCoreHarness,
+  GitBackedTestWorktrees,
+  prepareGitFixtureRepository,
   FakeTransport,
   inbound,
   readText,
@@ -200,7 +202,7 @@ test("private prompts receive ask, file, and channel tools but no group tools", 
   const harness = await createCoreHarness({
     prompt: async ({ append, promptContext, text }) => {
       const names = (promptContext?.tools ?? []).map(({ name }) => name).sort();
-      if (names.join(",") !== "ask,channel_control,octo_send_file,watch") {
+      if (names.join(",") !== "ask,channel_control,octo_discover,octo_send_file,watch") {
         throw new Error(`unexpected private host tools: ${names.join(",")}`);
       }
       await append("private-tools.log", text);
@@ -544,6 +546,7 @@ test("thread-delete does not retry a permanent server rejection", async () => {
 
 test("thread dispatch queues the task in the target thread and reports it in both chats", async () => {
   const harness = await createCoreHarness({
+    worktreePort: (root) => new GitBackedTestWorktrees(root),
     prompt: async ({ append, cwd, promptContext, text }) => {
       const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
       if (!management) throw new Error("management tool missing");
@@ -998,6 +1001,7 @@ test("thread-listen query and update persist the policy used by dispatched tasks
   const relaySeen = Promise.withResolvers<void>();
   const createdChannel = { channelId: "" };
   const harness = await createCoreHarness({
+    worktreePort: (root) => new GitBackedTestWorktrees(root),
     prompt: async ({ append, promptContext, text }) => {
       const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
       if (!management) throw new Error("management tool missing");
@@ -1366,6 +1370,7 @@ test("thread-merge reports the port's failure and refuses a thread without a wor
   const notices: string[] = [];
   const createdShortId = { value: "" };
   const harness = await createCoreHarness({
+    worktreePort: (root) => new GitBackedTestWorktrees(root),
     prompt: async ({ promptContext, text }) => {
       if (text.startsWith("[子区")) {
         notices.push(text);
@@ -1535,6 +1540,7 @@ test("shared direct merge refusal suppresses only its task and preserves later t
   const noticeSeen = Promise.withResolvers<void>();
   const notices: string[] = [];
   const harness = await createCoreHarness({
+    worktreePort: (root) => new GitBackedTestWorktrees(root),
     prompt: async ({ promptContext, text }) => {
       if (text.startsWith("[子区任务回传]")) {
         notices.push(text);
@@ -1545,47 +1551,23 @@ test("shared direct merge refusal suppresses only its task and preserves later t
       if (!management) throw new Error("management tool missing");
       const signal = new AbortController().signal;
       if (text === "prepare shared task") {
+        const sourceRepo = join(harness.root, "shared-source");
+        await prepareGitFixtureRepository(sourceRepo);
         const thread = JSON.parse(
           await management.execute(
-            { action: "create-thread", name: "共享工作区线程", worktree_name: "shared-thread", listen: "task" },
+            {
+              action: "create-thread",
+              name: "共享工作区线程",
+              worktree_name: "shared-thread",
+              listen: "task",
+              layout: "shared",
+              projects: [{ name: "project-one", repo: sourceRepo }],
+            },
             signal,
           ),
         ) as { channel_id: string; short_id: string };
         created.channelId = thread.channel_id;
         created.shortId = thread.short_id;
-        const entryPath = join(harness.root, "shared-entry");
-        const projectPath = join(entryPath, "project-one");
-        await mkdir(projectPath, { recursive: true });
-        const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
-        try {
-          store.saveThreadWorkspace({
-            botUid: harness.bot.uid,
-            channelType: 5,
-            channelId: thread.channel_id,
-            layout: "shared",
-            status: "ready",
-            entryPath,
-            projects: [{
-              name: "项目一",
-              repo: harness.root,
-              path: projectPath,
-              branch: "main",
-              created: true,
-            }],
-            error: null,
-          });
-          store.ensureBinding({
-            botUid: harness.bot.uid,
-            channelType: 5,
-            channelId: thread.channel_id,
-            sessionId: `shared-${thread.short_id}`,
-            cwd: entryPath,
-            sessionFile: null,
-            cwdPinned: true,
-          });
-        } finally {
-          store.close();
-        }
         await management.execute(
           {
             action: "thread-dispatch",

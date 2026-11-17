@@ -9,7 +9,7 @@ import { LoopThreadBindings } from "../src/loop/thread-bindings.ts";
 import type { LoopReadPort, LoopTask, LoopTaskKey, LoopWorkspace } from "../src/loop/types.ts";
 import { ChannelStore } from "../src/store/index.ts";
 import type { TaskRecord } from "../src/store/store-records.ts";
-import { FakeTransport, FakeWorktrees } from "./fixtures/core-fakes.ts";
+import { FakeTransport, FakeWorktrees, GitBackedTestWorktrees } from "./fixtures/core-fakes.ts";
 
 const BOT_UID = "bot-loop-tools";
 const OWNER_UID = "owner-loop-tools";
@@ -115,11 +115,10 @@ interface LoopToolsFixture {
   key(groupId?: string, workspace?: LoopWorkspace, taskId?: string): LoopTaskKey;
   close(): Promise<void>;
 }
-
 async function createFixture(options: {
   transport?: FakeTransport;
   groupId?: string;
-  worktrees?: boolean;
+  worktrees?: boolean | ((root: string) => FakeWorktrees);
   root?: string;
   removeRootOnClose?: boolean;
 } = {}): Promise<LoopToolsFixture> {
@@ -127,7 +126,9 @@ async function createFixture(options: {
     ? await realpath(await mkdtemp(join(tmpdir(), "omp-loop-thread-tools-")))
     : await realpath(options.root);
   const groupId = options.groupId ?? GROUP_ID;
-  const worktrees = options.worktrees ? new FakeWorktrees(root) : undefined;
+  const worktrees = typeof options.worktrees === "function"
+    ? options.worktrees(root)
+    : options.worktrees ? new FakeWorktrees(root) : undefined;
   const workspaces = [MAIN_WORKSPACE, OTHER_WORKSPACE];
   const tasks = [
     { workspaceId: MAIN_WORKSPACE.workspaceId, task: loopTask(LOOP_TASK_ID) },
@@ -434,7 +435,7 @@ test("thread-bind rebinds explicitly and thread info/list report source IDs", as
 });
 
 test("automatic Loop tasks can create and dispatch while the latest status is open", async () => {
-  const fixture = await createFixture({ worktrees: true });
+  const fixture = await createFixture({ worktrees: (root) => new GitBackedTestWorktrees(root) });
   try {
     const messageId = fixture.automaticMessageId();
     const tool = fixture.management(GROUP_ID, messageId);
@@ -626,7 +627,7 @@ test("automatic Loop dispatch rechecks status at the destination acceptance boun
 });
 
 test("manual explicit create and dispatch remain available for a closed Loop task", async () => {
-  const fixture = await createFixture({ worktrees: true });
+  const fixture = await createFixture({ worktrees: (root) => new GitBackedTestWorktrees(root) });
   try {
     fixture.setTaskStatus(LOOP_TASK_ID, "done");
     const tool = fixture.management(GROUP_ID, "human-explicit-task");

@@ -34,6 +34,7 @@ OctoBuddy 增强器打开跨工作区的 Zed SSH 文件时，状态接口提供�
 群与子区当前事实清单使用当前 GROUP.md / THREAD.md 中的固定 `### Memory Start ###` / `### Memory End ###` 区段。agent 先通过已有 `octo_management.description-read` 读取完整说明，只修改该区段并保留区段外原文，再经 `description-write` 写回；宿主要求本任务先显式读取，并在写前重新核对正文与版本，说明变化时拒绝并要求重读。群与子区分别使用自己的说明，沿用现有版本快照与 compaction 注入。完整合同与验收见 `docs/specs/2026-11-04-group-thread-current-facts-design.md`。
 
 包含显式请求驱动的有界语义 `watch`：宿主持久保存采集器、完成条件、间隔和截止时间，独立于原 OMP worker 周期检查；单次命中生成归属聊天的独立排队输入。启用 `decisions` 时 watch 默认启用，并与引用识别共用 protocol、endpoint、model 和 key；可用 `watch.enabled=false` 单独关闭。客观状态、退出或事件条件使用程序机制。完整授权、预算、停止与恢复契约见 `docs/specs/2026-11-04-bounded-stoppable-watch-design.md`。
+包含只读宿主工具 `octo_discover`：channel 任务按当前 bot 的实际 Octo 和 Loop 权限跨群发现事项相关群及子区，综合本实例关联和远端搜索，并通过 Decisions 对候选排序与过滤。身份、证据、分页、权限和结果边界见 `docs/specs/2026-11-17-cross-chat-association-discovery-design.md`。
 原生 `/context` 以独立 `octo/v1` 卡展示 OMP 的上下文占用明细；不支持卡片或发送失败时只发送失败提示，不重试卡片。命令与投递边界见 `docs/specs/2026-11-10-context-command-card-design.md`。
 
 
@@ -85,6 +86,7 @@ OctoBuddy 增强器打开跨工作区的 Zed SSH 文件时，状态接口提供�
 `cards/progress-cards.ts` 统一拥有进度卡的持久恢复与每任务轮次状态。服务将已归一化的 `ExecutionEvent` 交给每任务的 `TaskProgress`；研究帧自身可以开卡，其最近快照在同一任务滚卡时结转，新任务独立开始。队列 tail 仍登记到服务关停排空集合，子区归档前读取并等待当前 tail。`session/session-lifecycle.ts` 负责会话身份/cwd 校验、目录回退、`/new` 和原生 `/move`；它通过 `TaskScheduler` 取得聊天/会话租约，blocked 集合继续由服务单点拥有，源、目标目录仅检查未确认退出的 worker 阻塞。
 
 `runtime/worker-lease.ts` 独占运行期 worker 的终止、恢复回收和台账收尾；业务侧只取得不含 `stop` 的 `WorkerSession`，服务的停机、取消、问答超时及任务收尾共用同一 lease。首次 `close` 的策略和完整 Promise（包含台账写入失败）由 lease 保存，并发与后续关闭复用同一结果。停止或恢复未确认时，按 spawn 的真实 cwd 与预先声明的迁移目标阻塞目录；迁移目标随 spawn 台账一次写入，初始化失败和重启恢复也使用这份记录。
+服务启动在取得 Bot 独占锁后失败时，先完成启动路径清理并释放该锁，再报告失败；若停机已接管清理，则由停机路径释放。
 
 `/new`、`/move` 的候选 worker 通过 `withStoppedWorker` 运行：scope 验证会话、确认进程停止并完成台账更新后才交付结果，调用方随后持久化绑定并发送回执。停止未确认或台账更新失败不会交付成功结果；操作失败仍执行关闭，关闭中的台账错误优先返回，否则保留原操作错误。聊天/会话租约覆盖整个 scope 和绑定提交。
 

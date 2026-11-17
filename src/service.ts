@@ -186,6 +186,8 @@ import {
   type ResearchReportStore,
 } from "./research/research-report.ts";
 import { createReferenceJudge } from "./references/decision-client.ts";
+import { createDiscoveryCoordinator, type DiscoveryCoordinator } from "./discovery/coordinator.ts";
+import { createDiscoveryJudge } from "./discovery/decision.ts";
 import { ThreadReferenceCoordinator } from "./references/thread-references.ts";
 import type { WatchCreateArgs, WatchRecord } from "./watch/types.ts";
 import { captureReviewSnapshot } from "./review/snapshot.ts";
@@ -604,6 +606,7 @@ class CoreService implements ChannelService {
   private loopController: LoopController | undefined;
   private readonly threadForks: ThreadForkController;
   private readonly watchCoordinator: WatchCoordinator;
+  private readonly discovery: DiscoveryCoordinator;
   private stopPromise: Promise<void> | undefined;
   constructor(
     private readonly options: ChannelServiceOptions,
@@ -611,6 +614,13 @@ class CoreService implements ChannelService {
     commandHandlers: ReadonlyMap<string, ChannelCommandHandler>,
   ) {
     this.commandHandlers = commandHandlers;
+    this.discovery = createDiscoveryCoordinator({
+      store: this.store,
+      ...(options.discovery === undefined ? {} : { remote: options.discovery }),
+      ...(options.config.decisions?.enabled === true
+        ? { judge: createDiscoveryJudge(options.config.decisions, options.decisionsFetch) }
+        : {}),
+    });
     this.threadReferences = new ThreadReferenceCoordinator({
       store: this.store,
       botUid: () => this.bot?.uid,
@@ -1431,6 +1441,10 @@ class CoreService implements ChannelService {
       await this.botEvents.stop();
       await this.options.transport.stop().catch(() => {});
       this.bot = undefined;
+      if (!this.stopping) {
+        await lock.release();
+        if (this.lock === lock) this.lock = undefined;
+      }
       throw error;
     }
   }
@@ -1447,6 +1461,7 @@ class CoreService implements ChannelService {
     // Seal synchronous receive admission before any shutdown work can yield.
     this.ingress.seal();
     this.watchCoordinator.seal();
+    this.discovery.stop();
     const watchShutdown = this.watchCoordinator.stop();
     this.abortAllThreadForks(new Error("channel stopping"));
     this.abortAllForkArchiveWaits(new Error("channel stopping"));
@@ -11229,6 +11244,7 @@ class CoreService implements ChannelService {
         expandThreadWorkspace(this.threadWorkspaceHost(), task, target, args, signal, toolCallId),
       store: this.store,
       watches: this.hostWatchPort(),
+      discovery: this.discovery,
       botUid,
       ...(this.loopController === undefined ? {} : { loop: this.loopController.threads }),
       enqueueText: (target, text, taskId) => this.outbox.enqueueText(target, text, taskId),
@@ -12392,6 +12408,7 @@ class CoreService implements ChannelService {
       if (runtime.lease) await runtime.lease.close();
       this.outbox.releaseIfIdle(taskId);
       // Deregister before a creator-chat notice so a shared directory does not queue behind this run.
+      this.discovery.releaseTask(taskId);
       this.runtimes.delete(taskId);
       await this.notifyThreadOutcome(taskId);
       await this.threadArchives.run(target, progress.tail);

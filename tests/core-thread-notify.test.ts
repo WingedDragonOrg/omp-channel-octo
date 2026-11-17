@@ -8,13 +8,22 @@ import { ChannelStore } from "../src/store";
 import {
   assistantText,
   closeCoreHarness,
-  createCoreHarness,
+  createCoreHarness as createCoreHarnessBase,
   FakeLoopReadPort,
+  GitBackedTestWorktrees,
   inbound,
   waitForStatus,
 } from "./fixtures/core-fakes";
 
 const GROUP: ChatTarget = { channelId: "group-tools", channelType: 2 };
+
+const createCoreHarness = (options: Parameters<typeof createCoreHarnessBase>[0] = {}) =>
+  createCoreHarnessBase({
+    ...options,
+    ...(options.worktreePort === undefined && options.worktrees === undefined
+      ? { worktreePort: (root: string) => new GitBackedTestWorktrees(root) }
+      : {}),
+  });
 
 /** The management tool the prompt actually received. */
 function managementOf(promptContext: PromptContext | undefined) {
@@ -67,6 +76,7 @@ function observeDispatchedOutcome(
     if (store.getTask(taskId)?.messageId.startsWith("dispatch:")) completed.resolve();
   };
 }
+
 
 test("a task-listening thread relays the dispatched task's actual result to its creator", async () => {
   const notices: string[] = [];
@@ -1449,6 +1459,13 @@ test("queued dispatches resume after restart and emit each task notice once", as
     },
   });
   try {
+    // This restart case observes notices as separate prompts; active-session steering has its own coverage.
+    const modeStore = await ChannelStore.open(join(first.stateDir, "channel.sqlite"));
+    try {
+      modeStore.setChatMode(first.bot.uid, GROUP, "queue");
+    } finally {
+      modeStore.close();
+    }
     await first.service.submitInbound(
       inbound({
         messageId: "restart-create",
@@ -1468,6 +1485,7 @@ test("queued dispatches resume after restart and emit each task notice once", as
   // A dispatch accepted before restart retains its durable task and the thread's policy.
   const store = await ChannelStore.open(join(first.stateDir, "channel.sqlite"));
   try {
+    expect(store.getChatMode(first.bot.uid, GROUP)).toBe("queue");
     const persisted = store.getLatestTask(first.bot.uid, {
       channelId: created.channelId,
       channelType: 5,

@@ -25,8 +25,12 @@ import type { ChannelStore } from "./store/index.ts";
 import type { TaskRecord } from "./store/store-records.ts";
 import type { ThreadWorkspaceCleanupRecord, ThreadWorkspaceRecord } from "./store/store-records.ts";
 import type { WatchCreateArgs, WatchCreateResult, WatchListItem, WatchRecord } from "./watch/types.ts";
+import type { DiscoveryCoordinator } from "./discovery/coordinator.ts";
 import type { DestructiveResourceLease } from "./tasks/task-scheduler.ts";
-import { threadWorkspaceIsAvailable } from "./session/session-lifecycle.ts";
+import {
+  threadWorkspaceIdentityMatches,
+  threadWorkspaceIsAvailable,
+} from "./session/session-lifecycle.ts";
 import {
   createThreadWorkspaceBatch,
   prepareThreadWorkspaceScope,
@@ -140,6 +144,7 @@ export interface HostToolHost {
   /** 任务必然属于已注册的 Bot，构造工具时身份一定存在。 */
   readonly loop?: LoopThreadBindings;
   readonly botUid: string;
+  readonly discovery: DiscoveryCoordinator;
   enqueueText(target: ChatTarget, text: string, taskId: string | null): void;
   threadReferences(target: ChatTarget): ThreadReferences;
   /** Marks a remotely deleted thread as permanently closed to reference observations. */
@@ -889,6 +894,86 @@ function createWatchTool(host: HostToolHost, task: TaskRecord, target: ChatTarge
   };
 }
 
+function discoveryArgument(args: Record<string, unknown>, name: string, required = false): string | undefined {
+  const value = args[name];
+  if (value === undefined && !required) return undefined;
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`${name} must be a non-empty string`);
+  }
+  return value.trim();
+}
+
+function createDiscoveryTool(host: HostToolHost, task: TaskRecord): HostTool {
+  return {
+    name: "octo_discover",
+    description:
+      "只读发现当前 bot 可访问的相关群与子区；绑定本次任务和 bot，不接受其他身份。search 要求 query（最多 1,000 个 Unicode 字符），可附 workspace_id + task_id、reference_url、repo、path；page 用 query_id、collection（candidates/filtered）和 position。每页最多 20 个候选，每次最多收集 200 个；每个数据来源最多 10 次远端请求：全局群搜索 1 次（计数近似且无续页游标），消息搜索每次最多 100 条且最多 10 次，群列表无分页，active 子区每页 100 条且群/子区枚举合计最多 10 次（不含归档），Loop workspace 列表与 task 搜索各最多 10 页、每页 100 项。模型最多评估 100 个候选、每项最多 1,000 个 Unicode 字符、30 秒；未配置时不筛选，失败时保留候选。快照最大 2 MiB、5 分钟有效；每任务最多 4 个、每 bot 最多 32 个。目标和 Loop workspace 权限会在输出及模型调用前核验，并在每次 page 重验。",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["search", "page"] },
+        query: { type: "string", description: "search 事项描述或关键词；page 不需要 query。" },
+        workspace_id: { type: "string", description: "Loop workspace UUID；仅与 task_id 成对使用。" },
+        task_id: { type: "string", description: "Loop task UUID；必须同时提供 workspace_id。" },
+        reference_url: { type: "string", description: "已记录的精确 PR/MR URL。" },
+        repo: { type: "string", description: "精确仓库 URL。" },
+        path: { type: "string", description: "精确工作区路径。" },
+        query_id: { type: "string", description: "search 返回的不透明查询 ID。" },
+        collection: { type: "string", enum: ["candidates", "filtered"] },
+        position: { type: "integer", minimum: 1, description: "1 起始的页号。" },
+      },
+      required: ["action"],
+      oneOf: [
+        { properties: { action: { const: "search" } }, required: ["query"] },
+        { properties: { action: { const: "page" } }, required: ["query_id"] },
+      ],
+      additionalProperties: false,
+    },
+    execute: async (args, signal) => {
+      throwIfAborted(signal);
+      const action = args.action;
+      if (action === "search") {
+        const query = discoveryArgument(args, "query", true)!;
+        const workspaceId = discoveryArgument(args, "workspace_id");
+        const loopTaskId = discoveryArgument(args, "task_id");
+        const referenceUrl = discoveryArgument(args, "reference_url");
+        const repo = discoveryArgument(args, "repo");
+        const path = discoveryArgument(args, "path");
+        return host.discovery.search({
+          botUid: host.botUid,
+          taskId: task.id,
+          query,
+          ...(workspaceId === undefined ? {} : { workspaceId }),
+          ...(loopTaskId === undefined ? {} : { loopTaskId }),
+          ...(referenceUrl === undefined ? {} : { referenceUrl }),
+          ...(repo === undefined ? {} : { repo }),
+          ...(path === undefined ? {} : { path }),
+        }, signal);
+      }
+      if (action === "page") {
+        const queryId = discoveryArgument(args, "query_id", true)!;
+        const collection = args.collection;
+        if (collection !== undefined && collection !== "candidates" && collection !== "filtered") {
+          throw new Error("collection must be candidates or filtered");
+        }
+        const position = args.position;
+        if (position !== undefined && (typeof position !== "number" || !Number.isSafeInteger(position) || position < 1)) {
+          throw new Error("position must be a positive integer");
+        }
+        return host.discovery.page({
+          botUid: host.botUid,
+          taskId: task.id,
+          queryId,
+          ...(collection === undefined ? {} : { collection }),
+          ...(position === undefined ? {} : { position }),
+        }, signal);
+      }
+      throw new Error("action must be search or page");
+    },
+  };
+}
+
+
 export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[] {
   const target = taskTarget(task);
   const fileTool: HostTool = {
@@ -993,13 +1078,14 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
   };
   const channelTool = createChannelTool(host);
   const watchTool = createWatchTool(host, task, target);
+  const discoveryTool = createDiscoveryTool(host, task);
   const parentGroupId =
     target.channelType === 2
       ? target.channelId
       : target.channelType === 5
         ? threadParentGroupId(target.channelId)
         : null;
-  if (parentGroupId === null) return [channelTool, fileTool, askTool, watchTool];
+  if (parentGroupId === null) return [channelTool, fileTool, askTool, watchTool, discoveryTool];
   const currentShortId =
     target.channelType === 5 ? threadShortId(target.channelId) : null;
   // Dispatched tasks and watch wakes cannot dispatch further work.
@@ -1123,7 +1209,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
       pendingMergeLifecycles.delete(toolCallId);
     },
   };
-  return [channelTool, managementTool, fileTool, askTool, forkTool, watchTool];
+  return [channelTool, managementTool, fileTool, askTool, forkTool, watchTool, discoveryTool];
 }
 
 /**
@@ -1854,7 +1940,9 @@ async function dispatchThreadTask(
     })();
     if (
       (binding === null && !legacyFallback) ||
-      (bindingUsesWorkspace && !workspaceAvailable && !legacyFallback)
+      (bindingUsesWorkspace &&
+        !legacyFallback &&
+        (!workspaceAvailable || !(await threadWorkspaceIdentityMatches(ownership))))
     ) {
       throw new Error("子区工作区未就绪，未派发任务。");
     }

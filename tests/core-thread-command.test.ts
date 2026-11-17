@@ -8,6 +8,7 @@ import {
   createCoreHarness,
   inbound,
   submitAndWaitForIngressHandoff,
+  GitBackedTestWorktrees,
   waitForStatus,
   type CoreHarness,
 } from "./fixtures/core-fakes";
@@ -84,6 +85,7 @@ test("/thread turns the message into an instructed task without creating anythin
 
 test("the instructed task sets the sub-thread up with the agent's own names", async () => {
   const harness = await createCoreHarness({
+    worktreePort: (root) => new GitBackedTestWorktrees(root),
     prompt: async ({ promptContext, text }) => {
       if (!text.includes("原始意图")) return; // only the hand-over task drives octo_management
       const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
