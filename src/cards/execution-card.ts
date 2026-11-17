@@ -163,6 +163,9 @@ function buildCandidate(
     visibleSubagents.length > 0 ? "暂无其他工具活动" : snapshot.state === "running" ? "正在准备" : "暂无工具活动",
     traceHistoryTools.length > 0,
   );
+  if (snapshot.currentIntent !== undefined) {
+    timelineItems.unshift(makeTextBlock(`意图：${snapshot.currentIntent}`, { weight: "Bolder", spacing: "Small" }));
+  }
   const hasRenderedSubagentActivity = visibleSubagents.length > 0
     || olderSubagents.length > 0
     || hiddenSubagents > 0;
@@ -327,6 +330,7 @@ function buildCandidate(
       "OMP 自动执行",
       ...(notice ? [notice.text] : []),
       ...(snapshot.research ? makeResearchFlatLines(snapshot.research, researchRowLimit, snapshot.state) : []),
+      ...(snapshot.currentIntent === undefined ? [] : [`意图：${snapshot.currentIntent}`]),
       ...visibleTools.map(tool => markdownSafeToolLine(tool)),
       ...(hiddenTools > 0 ? [`已隐藏前 ${hiddenTools} 个步骤，共 ${snapshot.tools.length} 个步骤`] : []),
       ...subagents.map(subagent => subagentLine(subagent, true)),

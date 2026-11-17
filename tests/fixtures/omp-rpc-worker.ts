@@ -600,6 +600,7 @@ function emitToolProgressScenario(id: string | undefined): void {
 		type: "tool_execution_start",
 		toolCallId: "fixture-progress-call-1",
 		toolName: "fixture_echo",
+		intent: "检查执行进度",
 		args: { secret: "SECRET_TOOL_ARGUMENTS" },
 	});
 	emit({

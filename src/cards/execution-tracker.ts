@@ -52,6 +52,7 @@ export type ExecutionEvent =
       readonly toolName: string;
       readonly atMs: number;
       readonly summary?: string;
+      readonly intent?: string;
     }
   | {
       readonly type: "tool_end";
@@ -187,6 +188,7 @@ export interface ExecutionSnapshot {
   readonly tools: readonly ExecutionToolSnapshot[];
   readonly subagents: readonly ExecutionSubagentSnapshot[];
   readonly todos: readonly ExecutionTodoPhase[];
+  readonly currentIntent?: string;
   /**
    * 最近一次 research_update 注入的研究状态;任务未携带研究时不出现此键。事件上的 report
    * 只供投递层落盘,从不进入快照——重启复原不能复活上 MiB 的全记录载荷。
@@ -217,6 +219,7 @@ export interface ExecutionTrackerOptions {
   readonly initialPhaseCount?: number;
   /** Commit projection replayed from a durable card row; absent for ordinary rounds. */
   readonly initialCommit?: ExecutionCommitSnapshot;
+  readonly initialIntent?: string;
 }
 
 interface MutablePhase {
@@ -393,6 +396,7 @@ class ExecutionTrackerState implements ExecutionTracker {
   readonly #subagents = new Map<string, MutableSubagent>();
   readonly #subagentOrder: string[] = [];
   #todos: ExecutionTodoPhase[] = [];
+  #currentIntent: string | undefined;
   #research: ResearchSnapshot | undefined;
   #commit: { summary: string; recentSteps: string[]; result?: string; content?: CommitContent } | undefined;
   readonly #phaseCountBase: number;
@@ -407,6 +411,7 @@ class ExecutionTrackerState implements ExecutionTracker {
     this.#lastAtMs = this.#startedAtMs ?? 0;
     this.#phaseCountBase = safePhaseCount(options.initialPhaseCount);
     this.#commit = copiedCommitSnapshot(options.initialCommit);
+    this.#currentIntent = safeDisplayText(options.initialIntent, 160);
   }
 
   apply(event: ExecutionEvent): ExecutionSnapshot {
@@ -502,6 +507,7 @@ class ExecutionTrackerState implements ExecutionTracker {
         }];
       }),
       todos: copySnapshotTodos(this.#todos),
+      ...(this.#currentIntent === undefined ? {} : { currentIntent: this.#currentIntent }),
       ...(this.#research === undefined ? {} : { research: this.#research }),
       ...(this.#commit === undefined ? {} : {
         commit: {
@@ -531,6 +537,8 @@ class ExecutionTrackerState implements ExecutionTracker {
 
   #startTool(event: Extract<ExecutionEvent, { type: "tool_start" }>, atMs: number): void {
     if (this.#state !== "running") return;
+    const intent = safeDisplayText(event.intent, 160);
+    if (intent !== undefined) this.#currentIntent = intent;
     this.#ensureStarted(atMs);
     const existing = this.#tools.get(event.toolCallId);
     if (existing !== undefined) {
@@ -735,8 +743,9 @@ export function createExecutionTracker(options: ExecutionTrackerOptions = {}): E
  * baselines, bests, statuses, round numbers, and the aggregate counts stay.
  */
 export function stripCardSummaries(snapshot: ExecutionSnapshot): ExecutionSnapshot {
+  const { currentIntent: _currentIntent, ...rest } = snapshot;
   return {
-    ...snapshot,
+    ...rest,
     tools: snapshot.tools.map((tool) => ({
       toolCallId: tool.toolCallId,
       toolName: tool.toolName,
@@ -832,6 +841,7 @@ export function restoreExecutionTracker(
     todos?: unknown;
     research?: unknown;
     commit?: unknown;
+    currentIntent?: unknown;
   };
   if (!Array.isArray(record.tools) || !Array.isArray(record.todos)) return null;
   const startedAtMs = typeof record.startedAtMs === "number" ? finiteTime(record.startedAtMs) : null;
@@ -861,6 +871,7 @@ export function restoreExecutionTracker(
     // 终态恢复沿用旧行为(阶段计数归零);续接的一轮属于同一次运行,接着上一进程数到的阶段数走。
     ...(resume ? { initialPhaseCount: safePhaseCount(record.phaseCount) } : {}),
     ...(initialCommit === undefined ? {} : { initialCommit }),
+    ...(typeof record.currentIntent === "string" ? { initialIntent: record.currentIntent } : {}),
   });
   const entries = record.tools;
   for (let index = 0; index < entries.length; index += 1) {

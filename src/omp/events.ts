@@ -5,6 +5,7 @@
 
 import type { WorkerEvent, WorkerNoticeEvent } from "../contracts.ts";
 import type { ExecutionEvent, ExecutionTodoPhase, TodoOperation, TodoStatus } from "../cards/execution-tracker.ts";
+import { safeDisplayText } from "../cards/execution-text.ts";
 import type { ResearchTracker } from "../research/index.ts";
 import { isRecord, type RpcFrame } from "./rpc.ts";
 
@@ -588,12 +589,13 @@ export function emitWorkerEvent(active: PromptRun, frame: RpcFrame, subagentFram
 		const toolName = safeToolName(frame.toolName);
 		if (!toolCallId || !toolName) return;
 		const summary = safeToolSummary(toolName, frame.args);
+		const intent = safeDisplayText(frame.intent, 160);
 		if (summary) active.toolSummaries.set(toolCallId, summary);
-		if (summary === undefined) {
-			emitExecutionEvent(active, { type: "tool_start", toolCallId, toolName, atMs: Date.now() });
-		} else {
-			emitExecutionEvent(active, { type: "tool_start", toolCallId, toolName, atMs: Date.now(), summary });
-		}
+		emitExecutionEvent(active, {
+			type: "tool_start", toolCallId, toolName, atMs: Date.now(),
+			...(summary === undefined ? {} : { summary }),
+			...(intent === undefined ? {} : { intent }),
+		});
 		const researchStart = active.research.startTool(toolName, toolCallId);
 		if (researchStart) emitExecutionEvent(active, researchStart);
 		return;

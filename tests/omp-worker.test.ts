@@ -2264,6 +2264,7 @@ describe("OMP RPC worker", () => {
 				type: "tool_start",
 				toolCallId: "fixture-progress-call-1",
 				toolName: "fixture_echo",
+				intent: "检查执行进度",
 			});
 			expect(executionEvents[2]).toMatchObject({
 				type: "tool_end",

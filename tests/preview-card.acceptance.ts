@@ -113,6 +113,7 @@ function addPreviewTool(
     readonly toolName: string;
     readonly atMs: number;
     readonly summary: string;
+    readonly intent?: string;
     readonly status?: PreviewToolTerminalState;
     readonly endAtMs?: number;
     readonly errorCategory?: PreviewErrorCategory;
@@ -124,6 +125,7 @@ function addPreviewTool(
     toolName: options.toolName,
     atMs: PREVIEW_STARTED_AT + options.atMs,
     summary: options.summary,
+    ...(options.intent === undefined ? {} : { intent: options.intent }),
   });
   if (options.status === undefined || options.endAtMs === undefined) return;
   tracker.apply({
@@ -260,6 +262,7 @@ function previewSnapshot() {
     toolCallId: "preview-running-task",
     toolName: "task",
     atMs: 1_200,
+    intent: "分析执行结果",
     summary: "子代理 · analyst",
   });
   // The subagent section is driven by the real lifecycle frames; the `task` rows above are what

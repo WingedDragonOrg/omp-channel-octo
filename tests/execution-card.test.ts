@@ -205,6 +205,28 @@ test("waiting and cancelled tool markers remain visible through Markdown renderi
   expect(rendered.some(html => html.includes("<ul>"))).toBe(false);
 });
 
+test("keeps the latest tool intent above the trace across missing intents and recovery", () => {
+  const tracker = createExecutionTracker();
+  tracker.apply({ type: "tool_start", toolCallId: "one", toolName: "read", atMs: 100, intent: "核实接口" } as ExecutionEvent);
+  tracker.apply({ type: "tool_start", toolCallId: "two", toolName: "edit", atMs: 200 });
+  const running = tracker.snapshot(300);
+  const card = buildExecutionCard(running, fullCapabilities)!;
+  const text = cardText(nodeById(card.card, "timeline_detail"));
+  expect(text.indexOf("核实接口")).toBeGreaterThanOrEqual(0);
+  expect((nodeById(card.card, "timeline_detail").items as JsonRecord[])[0]?.text).toBe("意图：核实接口");
+  const restored = restoreExecutionSnapshot(encodeExecutionSnapshot(running), { state: "failed", atMs: 400 })!;
+  expect(cardText(buildExecutionCard(restored, fullCapabilities)!.card)).toContain("核实接口");
+  const safe = tracker.apply({ type: "tool_start", toolCallId: "secret", toolName: "read", atMs: 250, intent: "检查 token=private123" } as ExecutionEvent);
+  const safeText = cardText(buildExecutionCard(safe, fullCapabilities)!.card);
+  expect(safeText).toContain("token=[redacted]");
+  expect(safeText).not.toContain("private123");
+  expect(cardText(buildExecutionCard(stripCardSummaries(restored), fullCapabilities)!.card)).not.toContain("核实接口");
+  tracker.apply({ type: "tool_start", toolCallId: "three", toolName: "bash", atMs: 300, intent: "验证结果" } as ExecutionEvent);
+  const updated = cardText(buildExecutionCard(tracker.snapshot(), fullCapabilities)!.card);
+  expect(updated).toContain("验证结果");
+  expect(updated).not.toContain("核实接口");
+});
+
 describe("execution tracker", () => {
   test("projects turn phases, tool counts, elapsed time, and terminal state", () => {
     const tracker = createExecutionTracker({ runId: "run-1" });
