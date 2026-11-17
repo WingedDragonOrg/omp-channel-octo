@@ -57,7 +57,11 @@ export interface SupervisorClient {
    * ambiguous machine instead of picking one.
    */
   detectCheckout(checkoutRoot: string): Promise<SupervisorTarget[]>;
-  /** Foreground restart used by the CLI: waits for the program to become healthy. */
+  /**
+   * Programs that invoke this exact compiled executable. AOT distributions may run from a
+   * different working directory than the binary's directory.
+   */
+  detectExecutable(executablePath: string): Promise<SupervisorTarget[]>;
   restartArgv(target: SupervisorTarget, timeoutSeconds: number): string[];
   /** Detached restart used by the channel itself: the supervisor stops this process. */
   detachedRestartArgv(target: SupervisorTarget): string[];
@@ -83,6 +87,19 @@ async function normalizePath(path: string): Promise<string> {
     return path;
   }
 }
+function commandLineContainsPath(line: string, path: string): boolean {
+  let index = line.indexOf(path);
+  while (index >= 0) {
+    const before = line[index - 1];
+    const after = line[index + path.length];
+    if ((before === undefined || /[\s'"`=]/.test(before)) && (after === undefined || /[\s'"`]/.test(after))) {
+      return true;
+    }
+    index = line.indexOf(path, index + 1);
+  }
+  return false;
+}
+
 
 export function parseSuperExport(value: unknown): SupervisorProgram[] {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -223,6 +240,20 @@ export function createSupervisorClient(options: SupervisorClientOptions): Superv
       }
       return matches;
     },
+    async detectExecutable(executablePath: string): Promise<SupervisorTarget[]> {
+      const executable = await normalizePath(executablePath);
+      const paths = [...new Set([executablePath, executable])];
+      const programs = await this.listPrograms();
+      const matches: SupervisorTarget[] = [];
+      for (const program of programs) {
+        const command = await normalizePath(program.command);
+        const line = [program.command, ...program.args].join(" ");
+        if (command !== executable && !paths.some((path) => commandLineContainsPath(line, path))) continue;
+        matches.push({ kind: "super", program: program.name });
+      }
+      return matches;
+    },
+
 
     restartArgv(target: SupervisorTarget, timeoutSeconds: number): string[] {
       return [

@@ -410,13 +410,13 @@ bun tests/benchmarks/context.ts
 bun tests/benchmarks/restart.ts
 ```
 
-可选的 AOT 发布构建需要支持实验性 `--aot` 的 Bun：
+可选的 AOT 发布构建会先检查 `bun build --help` 是否明确列出实验性 `--aot`；旧版 Bun 会在写入产物前拒绝构建：
 
 ```sh
 bun run build:aot
 ```
 
-请将 `dist/oco`、`dist/oco-watchdog` 和 `dist/runtime/omp/` 一起部署；后者包含可由独立 OMP 进程读取的打包扩展及 goal RPC 配置。常规 `bun run` / `bun link` 仍运行源码。AOT 离线回归会在临时目录构建，并通过本地 Octo 与 worker fixture 验证 watchdog、扩展加载和正常消息路径，不连接真实 Bot 或模型：
+请将 `dist/oco`、`dist/oco-watchdog`、`dist/tests/preview-card.acceptance.test.ts` 和 `dist/runtime/omp/` 一起部署；preview test、OMP 扩展与 goal RPC 配置都是可读的外部资源。常规 `bun run` / `bun link` 仍运行源码。AOT 的 `status` / `restart` 按编译程序路径识别 Super，不依赖二进制目录作为工作目录；`test --card` 使用打包测试资源并调用 Bun test。离线回归会用假 Bun 校验参数，不发送真实消息；另验证 watchdog、扩展加载和正常消息路径，不连接真实 Bot 或模型：
 
 ```sh
 bun tests/benchmarks/aot.ts
@@ -427,10 +427,10 @@ bun tests/benchmarks/aot.ts
 涉及执行卡片布局的改动还需运行真实预览，并在 Octo 客户端检查：
 
 ```sh
-oco test --card
+oco test --card        # 发送真实预览卡
 ```
 
-该命令会读取仓库的 `.envrc`，使用其中配置的 Bot 凭据、API 地址和预览目标发送真实消息。它是线上验收操作，不是离线单元测试。
+该命令会先读取 `.envrc` 再运行打包或源码验收测试，并使用其中配置的 Bot 凭据、API 地址和预览目标发送真实消息。源码 CLI 读取 checkout 根目录的 `.envrc`；AOT 默认读取二进制目录的上一级 `.envrc`（仓库默认 `dist/oco` 因而读取仓库根目录），也可用 `OMP_CHANNEL_OCTO_ENV_FILE` 指定独立部署时的 env 文件。该命令是线上验收操作，不是离线单元测试；CLI 不会主动打印已加载的凭据。
 
 ### 代码结构
 

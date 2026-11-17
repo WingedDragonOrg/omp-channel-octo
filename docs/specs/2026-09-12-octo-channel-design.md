@@ -141,15 +141,15 @@ OMP 扩展可在 `session_start` 恢复观察并发起自主回合；RPC `ready`
 
 使用 TypeScript/Bun 常驻服务，主动连接 Octo，启动并管理 OMP RPC worker。无需为 RPC 开放网络监听端口；只读 HTTP 状态接口在配置 token 后默认启用，认证和面板契约见 `2026-11-11-channel-status-panel-design.md`。macOS 使用 launchd 托管；机器休眠或离线期间不承诺可用。
 
-本机入口为 `oco`（`omp-channel-octo` 的别名，`bun link` 安装）：`start` 是守护进程托管的服务进程入口，`run` 是不探测守护进程的调试入口，`restart`/`status`/`logs` 通过自动识别出的守护进程程序操作常驻实例，`test --card` 发送真实预览卡。配置在 `~/.oco/config/config.json`，服务日志由服务自持在 `~/.oco/logs/`，状态目录默认 `~/.oco/state/`，OMP 会话默认落在 `~/.oco/sessions/`（每个项目一个子目录，见下）；守护进程与程序名不写进配置。省略 `stateDir` 的已有实例启动时自动迁移旧标准状态目录的 SQLite；工作区、会话和已有文件保持原位置。迁移契约见 `2026-11-12-oco-state-directory-design.md`。
+本机入口为 `oco`（`omp-channel-octo` 的别名，`bun link` 安装）：`start` 是守护进程托管的服务进程入口，`run` 是不探测守护进程的调试入口；`restart`/`status`/`logs` 通过自动识别出的守护进程程序操作常驻实例，源码 CLI 按 checkout 识别，AOT CLI 按运行中的编译程序路径识别。`test --card` 在源码和 AOT 中均通过 Bun test 发送真实预览卡；AOT 使用单独打包的外部测试资源。源码读取 checkout 根目录 `.envrc`；AOT 默认读取二进制目录上级的 `.envrc`，独立部署可用 `OMP_CHANNEL_OCTO_ENV_FILE` 指定位置，不输出凭据。配置在 `~/.oco/config/config.json`，服务日志由服务自持在 `~/.oco/logs/`，状态目录默认 `~/.oco/state/`，OMP 会话默认落在 `~/.oco/sessions/`（每个项目一个子目录，见下）；守护进程与程序名不写进配置。省略 `stateDir` 的已有实例启动时自动迁移旧标准状态目录的 SQLite；工作区、会话和已有文件保持原位置。迁移契约见 `2026-11-12-oco-state-directory-design.md`。
 
 OMP worker 启动失败时，保留启动阶段有限的 stderr；退出后将退出码和脱敏、单行、限长的 stderr 摘要随分类提示发到当前聊天，并写入有界任务错误与服务日志。仅启动失败使用该诊断；已就绪后仍排空并丢弃 stderr。群成员可见摘要，脱敏无法保证识别所有自定义凭据。
 
 #### AOT 编译发布
 
-常规 `bun run` 与 `bun link` 仍通过 Bun 运行源码；可选 `bun run build:aot` 使用支持实验性 `--aot` 的 Bun 在当前构建平台生成 `dist/oco` 与独立的 `dist/oco-watchdog`。发布时必须将二者与 `dist/runtime/omp/context-extension.ts`、`dist/runtime/omp/goal-rpc.yml` 一起部署。扩展被打包为独立、包含其本地传递依赖的 TypeScript 文件，供 OMP 子进程读取；goal 配置也保持为外部文件，不依赖 channel 的 bunfs。AOT watchdog 使用单独编译的轻量入口，保留隔离进程组、ready 握手、父进程退出后终止 worker 进程组及原有回收行为。
+常规 `bun run` 与 `bun link` 仍通过 Bun 运行源码；可选 `bun run build:aot` 会先检查 `bun build --help` 明确声明实验性 `--aot`，仅在支持该选项的 Bun 上为当前构建平台生成 `dist/oco` 与独立的 `dist/oco-watchdog`。发布时必须将二者、`dist/tests/preview-card.acceptance.test.ts` 与 `dist/runtime/omp/context-extension.ts`、`dist/runtime/omp/goal-rpc.yml` 一起部署。扩展被打包为独立、包含其本地传递依赖的 TypeScript 文件，供 OMP 子进程读取；goal 配置和 preview acceptance test 也保持为外部文件，不依赖 channel 的 bunfs，test bundle 保留 `bun:test`。AOT watchdog 使用单独编译的轻量入口，保留隔离进程组、ready 握手、父进程退出后终止 worker 进程组及原有回收行为。
 
-`bun tests/benchmarks/aot.ts` 在临时目录构建，并用离线 Octo/OMP 子进程 fixture 覆盖 compiled CLI 的正常消息和 watchdog 路径；另由独立 Bun 进程加载外部 extension 与 goal 配置。它不注册 Bot、不调用模型服务。AOT 构建实验性且面向构建机器的平台；未构建产物前不应按源码运行方式部署。
+`bun tests/benchmarks/aot.ts` 在临时目录构建，并用离线 Octo/OMP 子进程 fixture 覆盖 compiled CLI 的正常消息、watchdog、外部扩展与 goal 配置加载、`status` / `restart` 的程序识别，并通过假 Bun 验证 `test --card` 调用打包资源、加载 checkout `.envrc` 或显式 `OMP_CHANNEL_OCTO_ENV_FILE` 且不触发真实消息发送；它不注册 Bot、不调用模型服务。AOT 构建实验性且面向构建机器的平台；未构建产物前不应按源码运行方式部署。
 
 每次 Super CLI 查询有独立期限（默认 10 秒），覆盖进程退出及 stdout/stderr 读取。在 POSIX 上该调用使用独立进程组，期限到达时终止该组及直接子进程，即使子进程忽略 SIGTERM 或后代仍持有管道，也以超时错误结束调用。
 父进程死亡 watchdog 使用独立进程组，启动环境移除继承的 `BUN_FEATURE_FLAG_NO_ORPHANS`，确保宿主以 Bun `--no-orphans` 运行时，看门狗仍能在宿主退出后回收受管进程组；普通 worker 的环境策略不变。

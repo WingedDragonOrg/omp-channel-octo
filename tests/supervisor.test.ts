@@ -97,6 +97,29 @@ test("checkout detection reports every candidate instead of picking one", async 
   const matches = await client.detectCheckout(CHECKOUT);
   expect(matches.map((entry) => entry.program)).toEqual(["omp-channel-octo", "omp-channel-octo-staging"]);
 });
+test("AOT executable detection matches the compiled binary regardless of supervisor cwd", async () => {
+  const executable = "/opt/oco/dist/oco";
+  const compiledProgram = {
+    name: "compiled-channel",
+    command: executable,
+    args: ["start", "--config", "/var/lib/oco/config.json"],
+    cwd: "/var/lib/oco",
+  };
+  const similarlyNamedProgram = {
+    ...compiledProgram,
+    name: "compiled-channel-staging",
+    command: `${executable}-staging`,
+  };
+  const client = clientWith(() => ({
+    code: 0,
+    stdout: exportDocument([compiledProgram, similarlyNamedProgram]),
+    stderr: "",
+  }));
+
+  expect(await client.detectExecutable(executable)).toEqual([{ kind: "super", program: "compiled-channel" }]);
+  expect(await client.detectExecutable("/opt/oco/dist/not-oco")).toEqual([]);
+});
+
 
 test("self detection trusts the live PID, not the shape of the program", async () => {
   const client = clientWith((argv) => {

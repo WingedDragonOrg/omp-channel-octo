@@ -64,7 +64,6 @@ function helpText(name: string): string {
   ${name} status                                          守护进程状态与路径
   ${name} logs [--tail N] [--follow|-f]                   服务日志
   ${name} test --card                                     发送真实预览卡
-  ${name} launchd install|uninstall [--plist PATH]        launchd plist
 
 配置 ${resolveConfigPath(DEFAULT_CONFIG_PATH)} · 日志 ${ocoLogsDir()} · 凭证 botToken/OCTO_BOT_TOKEN
 `;
@@ -403,7 +402,9 @@ async function runRestart(programFlag: string | undefined, timeoutSeconds: numbe
   if (programFlag !== undefined) {
     target = { kind: "super", program: programFlag };
   } else {
-    const matches = await supervisor.detectCheckout(CHECKOUT_ROOT);
+    const matches = IS_AOT_BINARY
+      ? await supervisor.detectExecutable(process.execPath)
+      : await supervisor.detectCheckout(CHECKOUT_ROOT);
     if (matches.length === 0) {
       throw new Error(`未检测到守护进程程序：确认 channel 由 Super 托管，或用 --program 指定程序名`);
     }
@@ -455,7 +456,9 @@ async function runStatus(): Promise<void> {
   const logFile = await newestLogFile();
   try {
     const supervisor = await supervisorClient();
-    const matches = await supervisor.detectCheckout(CHECKOUT_ROOT);
+    const matches = IS_AOT_BINARY
+      ? await supervisor.detectExecutable(process.execPath)
+      : await supervisor.detectCheckout(CHECKOUT_ROOT);
     const target = matches.length === 1 ? matches[0]! : undefined;
     if (target) {
       const info = await supervisor.info(target.program).catch(() => undefined);
@@ -495,16 +498,27 @@ async function runLogs(tail: number | undefined, follow: boolean): Promise<void>
 }
 
 /**
- * The preview card can only be judged on the real client, so the acceptance test sends it. The
- * checkout's `.envrc` supplies the token and target, which makes the command work from a shell
- * that never loaded direnv.
+ * The checkout's `.envrc` supplies the token and target. AOT uses the same file beside the
+ * checkout's `dist` directory by default; relocated distributions can set
+ * `OMP_CHANNEL_OCTO_ENV_FILE` to an explicit env file path.
  */
 async function runTest(card: boolean): Promise<void> {
   if (!card) throw new Error(TEST_USAGE);
   const bun = await resolveExecutable("bun");
-  const script = 'set -a; if [ -f ./.envrc ]; then . ./.envrc; fi; set +a; exec "$@"';
+  const configuredEnvFile = process.env.OMP_CHANNEL_OCTO_ENV_FILE;
+  const envFile = IS_AOT_BINARY
+    ? configuredEnvFile
+      ? resolvePath(configuredEnvFile)
+      : join(dirname(CHECKOUT_ROOT), ".envrc")
+    : join(CHECKOUT_ROOT, ".envrc");
+  const testFile = join(
+    CHECKOUT_ROOT,
+    "tests",
+    IS_AOT_BINARY ? "preview-card.acceptance.test.ts" : "preview-card.acceptance.ts",
+  );
+  const script = 'set -a; if [ -f "$1" ]; then . "$1"; fi; set +a; shift; exec "$@"';
   const child = Bun.spawn(
-    ["/bin/sh", "-c", script, "oco-test", bun, "test", join(CHECKOUT_ROOT, "tests", "preview-card.acceptance.ts")],
+    ["/bin/sh", "-c", script, "oco-test", envFile, bun, "test", testFile],
     { cwd: CHECKOUT_ROOT, stdout: "inherit", stderr: "inherit", stdin: "inherit" },
   );
   const code = await child.exited;
