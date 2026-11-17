@@ -3,6 +3,9 @@
  * 以及父进程死亡时终止子进程组的看门狗脚本。这里不解析协议,也不组装 worker。
  */
 
+import { realpathSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { IS_AOT_BINARY } from "../runtime/aot-runtime.ts";
 import { workerEnv } from "./profile.ts";
 import { failureText } from "../errors.ts";
 
@@ -25,103 +28,6 @@ export type ProcessSnapshot = {
 
 export const PROCESS_POLL_INTERVAL_MS = 20;
 export const SAFE_MIN_PID = 2;
-/**
- * The watchdog is deliberately a separate process group.  If the channel
- * process is killed, the watchdog remains alive long enough to terminate the
- * RPC worker's group and any tool descendants.  It also reaps descendants
- * after an unexpected worker-parent exit.
- */
-const WATCHDOG_SCRIPT = String.raw`
-const watchdogArgs = process.argv.slice(-6);
-const parentPid = Number(watchdogArgs[0]);
-const workerPid = Number(watchdogArgs[1]);
-const workerPgid = Number(watchdogArgs[2]);
-const parentIdentity = watchdogArgs[3] ?? "";
-const configuredKillGraceMs = Number(watchdogArgs[4]);
-const terminateOnWorkerExit = watchdogArgs[5] !== "false";
-const killGraceMs = Number.isFinite(configuredKillGraceMs) ? Math.max(0, configuredKillGraceMs) : 10_000;
-const decoder = new TextDecoder();
-let terminating = false;
-let killSent = false;
-let killDeadline = 0;
-
-function processAlive(pid) {
-  if (!Number.isSafeInteger(pid) || pid < 2) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error && typeof error === "object" && error.code === "EPERM";
-  }
-}
-
-function processStart(pid) {
-  try {
-    const result = Bun.spawnSync(["/bin/ps", "-p", String(pid), "-o", "lstart="]);
-    if (result.exitCode !== 0) return "";
-    return decoder.decode(result.stdout).trim();
-  } catch {
-    return "";
-  }
-}
-
-function parentAlive() {
-  if (!processAlive(parentPid)) return false;
-  if (!parentIdentity) return true;
-  const current = processStart(parentPid);
-  return current.length > 0 && ("pid=" + parentPid + ";start=" + current) === parentIdentity;
-}
-
-function groupAlive() {
-  if (!Number.isSafeInteger(workerPgid) || workerPgid < 2) return false;
-  try {
-    process.kill(-workerPgid, 0);
-    return true;
-  } catch (error) {
-    return error && typeof error === "object" && error.code === "EPERM";
-  }
-}
-
-function signalGroup(signal) {
-  if (!groupAlive()) return false;
-  try {
-    process.kill(-workerPgid, signal);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function beginTermination() {
-  if (!terminating) {
-    terminating = true;
-    killDeadline = Date.now() + killGraceMs;
-    signalGroup("SIGTERM");
-  }
-  if (!groupAlive()) {
-    process.exit(0);
-    return;
-  }
-  if (Date.now() >= killDeadline) {
-    if (killSent) {
-      process.exit(1);
-      return;
-    }
-    killSent = true;
-    killDeadline = Date.now() + 1000;
-    signalGroup("SIGKILL");
-  }
-}
-
-process.stdout.write("__omp_watchdog_ready__\n");
-setInterval(() => {
-  if (terminating) {
-    beginTermination();
-    return;
-  }
-  if (!parentAlive() || (terminateOnWorkerExit && !processAlive(workerPid)) || !groupAlive()) beginTermination();
-}, 100);
-`;
 
 export function isSafeGroupId(pgid: number): boolean {
 	return Number.isSafeInteger(pgid) && pgid >= SAFE_MIN_PID && pgid !== process.pid;
@@ -272,26 +178,24 @@ function spawnWatchdogProcess(
   const env = workerEnv();
   // The watchdog must outlive its parent to terminate the guarded process group.
   delete env.BUN_FEATURE_FLAG_NO_ORPHANS;
-  return Bun.spawn(
-    [
-      process.execPath,
-      "-e",
-      WATCHDOG_SCRIPT,
-      String(process.pid),
-      String(childPid),
-      String(workerPgid),
-      parentIdentity,
-      String(killGraceMs),
-      String(terminateOnWorkerExit),
-    ],
-    {
-      stdin: "ignore",
-      env,
-      stdout: "pipe",
-      stderr: "pipe",
-      detached: true,
-    },
-  ) as unknown as RpcChild;
+  const watchdogArgs = [
+    String(process.pid),
+    String(childPid),
+    String(workerPgid),
+    parentIdentity,
+    String(killGraceMs),
+    String(terminateOnWorkerExit),
+  ];
+  const command = IS_AOT_BINARY
+    ? [resolve(dirname(realpathSync(process.execPath)), "oco-watchdog"), ...watchdogArgs]
+    : [process.execPath, resolve(import.meta.dir, "watchdog-entry.ts"), ...watchdogArgs];
+  return Bun.spawn(command, {
+    stdin: "ignore",
+    env,
+    stdout: "pipe",
+    stderr: "pipe",
+    detached: true,
+  }) as unknown as RpcChild;
 }
 
 /**

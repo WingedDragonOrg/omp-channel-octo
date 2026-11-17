@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, mkdtemp, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
@@ -7,6 +7,7 @@ import { createOctoTransport } from "./octo/index.ts";
 import { createDiscoveryRemote } from "./discovery/remote.ts";
 import { createOctoCliCredentialProvisioner } from "./runtime/octo-cli.ts";
 import { createWorkerFactory } from "./omp/index.ts";
+import { IS_AOT_BINARY } from "./runtime/aot-runtime.ts";
 import { createLoopReadPort } from "./loop/api.ts";
 import {
   DEFAULT_CONFIG_PATH,
@@ -41,7 +42,7 @@ import { createWorktreePort } from "./workspace/worktree.ts";
 import type { ChannelService, OmpWorker } from "./contracts.ts";
 
 /** The checkout this CLI runs from; supervisor detection is scoped to it. */
-const CHECKOUT_ROOT = dirname(import.meta.dir);
+const CHECKOUT_ROOT = IS_AOT_BINARY ? dirname(realpathSync(process.execPath)) : dirname(import.meta.dir);
 const PROGRAM_NAMES: Record<string, true> = { oco: true, "omp-channel-octo": true };
 
 /**
@@ -521,18 +522,12 @@ async function runLaunchdInstall(configPath: string | undefined, plistPath: stri
   const environmentVariables = config.botTokenSource === "environment"
     ? { [config.botTokenEnv]: config.botToken }
     : undefined;
+  const programArguments = IS_AOT_BINARY
+    ? [executable, "start", "--config", selectedConfigPath, "--omp-command", ompCommand]
+    : [executable, "run", script, "start", "--config", selectedConfigPath, "--omp-command", ompCommand];
   await installLaunchdPlist(path, {
     label: DEFAULT_LAUNCHD_LABEL,
-    programArguments: [
-      executable,
-      "run",
-      script,
-      "start",
-      "--config",
-      selectedConfigPath,
-      "--omp-command",
-      ompCommand,
-    ],
+    programArguments,
     workingDirectory: dirname(selectedConfigPath),
     stdoutPath: join(logsDir, "launchd.out.log"),
     stderrPath: join(logsDir, "launchd.err.log"),

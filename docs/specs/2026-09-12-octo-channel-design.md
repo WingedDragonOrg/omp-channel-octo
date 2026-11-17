@@ -145,6 +145,12 @@ OMP 扩展可在 `session_start` 恢复观察并发起自主回合；RPC `ready`
 
 OMP worker 启动失败时，保留启动阶段有限的 stderr；退出后将退出码和脱敏、单行、限长的 stderr 摘要随分类提示发到当前聊天，并写入有界任务错误与服务日志。仅启动失败使用该诊断；已就绪后仍排空并丢弃 stderr。群成员可见摘要，脱敏无法保证识别所有自定义凭据。
 
+#### AOT 编译发布
+
+常规 `bun run` 与 `bun link` 仍通过 Bun 运行源码；可选 `bun run build:aot` 使用支持实验性 `--aot` 的 Bun 在当前构建平台生成 `dist/oco` 与独立的 `dist/oco-watchdog`。发布时必须将二者与 `dist/runtime/omp/context-extension.ts`、`dist/runtime/omp/goal-rpc.yml` 一起部署。扩展被打包为独立、包含其本地传递依赖的 TypeScript 文件，供 OMP 子进程读取；goal 配置也保持为外部文件，不依赖 channel 的 bunfs。AOT watchdog 使用单独编译的轻量入口，保留隔离进程组、ready 握手、父进程退出后终止 worker 进程组及原有回收行为。
+
+`bun tests/benchmarks/aot.ts` 在临时目录构建，并用离线 Octo/OMP 子进程 fixture 覆盖 compiled CLI 的正常消息和 watchdog 路径；另由独立 Bun 进程加载外部 extension 与 goal 配置。它不注册 Bot、不调用模型服务。AOT 构建实验性且面向构建机器的平台；未构建产物前不应按源码运行方式部署。
+
 每次 Super CLI 查询有独立期限（默认 10 秒），覆盖进程退出及 stdout/stderr 读取。在 POSIX 上该调用使用独立进程组，期限到达时终止该组及直接子进程，即使子进程忽略 SIGTERM 或后代仍持有管道，也以超时错误结束调用。
 父进程死亡 watchdog 使用独立进程组，启动环境移除继承的 `BUN_FEATURE_FLAG_NO_ORPHANS`，确保宿主以 Bun `--no-orphans` 运行时，看门狗仍能在宿主退出后回收受管进程组；普通 worker 的环境策略不变。
 

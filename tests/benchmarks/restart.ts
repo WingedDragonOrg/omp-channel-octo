@@ -38,7 +38,7 @@ async function exited(child: Bun.Subprocess, timeoutMs = 10_000): Promise<number
     })]);
   } finally { clearTimeout(timer); }
 }
-async function scenario(mode: "graceful" | "crash"): Promise<Result> {
+async function scenario(mode: "graceful" | "crash", cliExecutable?: string): Promise<Result> {
   const root = await realpath(await mkdtemp(join(tmpdir(), "oco-restart-benchmark-")));
   const fixture = await createOctoProtocolFixture({ cardProfileBody: { enabled: false }, botEventsStatus: 404 });
   const children: Bun.Subprocess[] = [];
@@ -73,7 +73,10 @@ exit 2
     }), { mode: 0o600 });
     const env = { HOME: root, PATH: `${bin}:/usr/bin:/bin`, TMPDIR: root, LANG: "C", TZ: "UTC" };
     async function launch(): Promise<{ child: Bun.Subprocess; connection: FixtureConnection }> {
-      const child = Bun.spawn([process.execPath, join(checkout, "src/cli.ts"), "start", "--config", configPath], {
+      const cliCommand = cliExecutable === undefined
+        ? [process.execPath, join(checkout, "src/cli.ts"), "start", "--config", configPath]
+        : [cliExecutable, "start", "--config", configPath];
+      const child = Bun.spawn(cliCommand, {
         cwd: root, env, stdin: "ignore", stdout: "pipe", stderr: "pipe",
       });
       children.push(child);
@@ -184,12 +187,16 @@ exit 2
   }
 }
 
-const results: Result[] = [];
-for (const mode of ["graceful", "crash"] as const) results.push(await scenario(mode));
-const total = (key: keyof Result) => results.reduce((sum, result) => sum + result[key], 0);
-console.log(`METRIC seamless_restart_cases=${total("seamless")}`);
-console.log(`METRIC resumed_tasks=${total("resumed")}`);
-console.log(`METRIC recovered_queued_tasks=${total("queued")}`);
-console.log(`METRIC disruption_notices=${total("notices")}`);
-console.log(`METRIC session_overlaps=${total("overlaps")}`);
-console.log(`METRIC duplicate_effects=${total("duplicates")}`);
+export async function runRestartBenchmark(cliExecutable?: string): Promise<void> {
+  const results: Result[] = [];
+  for (const mode of ["graceful", "crash"] as const) results.push(await scenario(mode, cliExecutable));
+  const total = (key: keyof Result) => results.reduce((sum, result) => sum + result[key], 0);
+  console.log(`METRIC seamless_restart_cases=${total("seamless")}`);
+  console.log(`METRIC resumed_tasks=${total("resumed")}`);
+  console.log(`METRIC recovered_queued_tasks=${total("queued")}`);
+  console.log(`METRIC disruption_notices=${total("notices")}`);
+  console.log(`METRIC session_overlaps=${total("overlaps")}`);
+  console.log(`METRIC duplicate_effects=${total("duplicates")}`);
+}
+
+if (import.meta.main) await runRestartBenchmark();

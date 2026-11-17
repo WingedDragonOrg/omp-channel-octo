@@ -410,6 +410,18 @@ bun tests/benchmarks/context.ts
 bun tests/benchmarks/restart.ts
 ```
 
+可选的 AOT 发布构建需要支持实验性 `--aot` 的 Bun：
+
+```sh
+bun run build:aot
+```
+
+请将 `dist/oco`、`dist/oco-watchdog` 和 `dist/runtime/omp/` 一起部署；后者包含可由独立 OMP 进程读取的打包扩展及 goal RPC 配置。常规 `bun run` / `bun link` 仍运行源码。AOT 离线回归会在临时目录构建，并通过本地 Octo 与 worker fixture 验证 watchdog、扩展加载和正常消息路径，不连接真实 Bot 或模型：
+
+```sh
+bun tests/benchmarks/aot.ts
+```
+
 `context.ts` 捕获实际 provider 请求，比较固定 system 与消息前缀，验证成员输入归属、retry/恢复、compact fresh read、主动 reread 及 task/eval 隔离。它证明接线和上下文内容，不测量真实 provider cache 命中率；失败时保留并输出临时诊断目录，成功后清理。
 
 涉及执行卡片布局的改动还需运行真实预览，并在 Octo 客户端检查：

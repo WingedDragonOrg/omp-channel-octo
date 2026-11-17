@@ -13,3 +13,4 @@ state/
 *.sqlite-shm
 *.log
 /packages/octobuddy-enhancer/dist/
+/dist/

@@ -11,6 +11,7 @@
     "test": "bun test",
     "test:preview-card": "bun test ./tests/preview-card.acceptance.ts",
     "typecheck": "tsc --noEmit",
+    "build:aot": "bun run scripts/build-aot.ts",
     "check": "bun run src/cli.ts check",
     "start": "bun run src/cli.ts start",
     "launchd": "bun run src/cli.ts launchd"

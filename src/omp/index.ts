@@ -59,6 +59,7 @@ import {
 	stripEnforcedArgs,
 	workerEnv,
 } from "./profile.ts";
+import { OMP_CONTEXT_EXTENSION_PATH, OMP_GOAL_RPC_CONFIG_PATH } from "../runtime/aot-runtime.ts";
 import { ResearchTracker } from "../research/index.ts";
 import {
 	HostCall,
@@ -72,8 +73,6 @@ import {
 } from "./events.ts";
 import { createNativeCommitWorker } from "./commit.ts";
 
-const FIXED_CONTEXT_EXTENSION_PATH = resolve(import.meta.dir, "context-extension.ts");
-const FIXED_GOAL_RPC_CONFIG_PATH = resolve(import.meta.dir, "goal-rpc.yml");
 
 const GOAL_ERROR_MESSAGES: Record<WorkerGoalErrorCode, string> = {
 	unsupported: "当前 OMP 不支持原生目标 RPC",
@@ -2014,7 +2013,7 @@ class OmpWorkerFactory implements WorkerFactory {
 			this.#options.ompCommand,
 			...stripEnforcedArgs(this.#options.extraArgs ?? []),
 			"--extension",
-			FIXED_CONTEXT_EXTENSION_PATH,
+			OMP_CONTEXT_EXTENSION_PATH,
 			"--mode",
 			"rpc",
 			"--approval-mode",
@@ -2037,7 +2036,7 @@ class OmpWorkerFactory implements WorkerFactory {
 		if (options.model) command.push("--model", options.model);
 		if (options.sessionFile) command.push("--resume", resolve(options.sessionFile));
 		else if (forkSourceState) command.push("--fork", forkSourceState.sessionFile);
-		if (options.goalContinuation === true) command.push("--config", FIXED_GOAL_RPC_CONFIG_PATH);
+		if (options.goalContinuation === true) command.push("--config", OMP_GOAL_RPC_CONFIG_PATH);
 		let child: RpcChild;
 		try {
 			child = Bun.spawn(command, {

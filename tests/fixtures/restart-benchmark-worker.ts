@@ -22,6 +22,13 @@ const ownerFile = `${sessionFile}.owner`;
 function audit(kind: string, details: Frame = {}): void {
   appendFileSync(auditPath!, `${JSON.stringify({ kind, pid: process.pid, sessionFile, ...details })}\n`);
 }
+const contextExtensionPath = flag("--extension");
+if (!contextExtensionPath || !existsSync(contextExtensionPath)) {
+  throw new Error("Channel did not pass a readable external OMP context extension");
+}
+const contextExtensionBytes = readFileSync(contextExtensionPath).byteLength;
+if (contextExtensionBytes === 0) throw new Error("OMP context extension is empty");
+audit("extension_loaded", { extensionPath: contextExtensionPath, bytes: contextExtensionBytes });
 function alive(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
   catch (error) {
