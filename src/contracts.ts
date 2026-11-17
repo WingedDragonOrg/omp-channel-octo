@@ -5,6 +5,7 @@ import type { DecisionsConfig, DecisionFetch } from "./references/types.ts";
 import type { LoopReadPort } from "./loop/types.ts";
 import type { DiscoveryRemote } from "./discovery/remote.ts";
 import type { WatchCollector, WatchJudge } from "./watch/types.ts";
+import type { WatchSourceFactory } from "./watch/source-types.ts";
 import type { LockHandle } from "./runtime/bot-lock.ts";
 
 export interface ChatTarget {
@@ -1037,6 +1038,8 @@ export interface ChannelServiceOptions {
   /** Injectable collector and judge seams for offline watch integration tests. */
   watchCollector?: WatchCollector;
   watchJudge?: WatchJudge;
+  /** Injectable adapter factory for isolated multi-source watch integration tests. */
+  watchSourceFactory?: WatchSourceFactory;
   /**
    * Supervisor restart port, present only when the host detected the process supervisor that
    * runs this channel. `request` asks that supervisor to restart the program, which stops this

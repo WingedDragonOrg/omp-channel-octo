@@ -34,6 +34,7 @@ OctoBuddy 增强器打开跨工作区的 Zed SSH 文件时，状态接口提供�
 群与子区当前事实清单使用当前 GROUP.md / THREAD.md 中的固定 `### Memory Start ###` / `### Memory End ###` 区段。agent 先通过已有 `octo_management.description-read` 读取完整说明，只修改该区段并保留区段外原文，再经 `description-write` 写回；宿主要求本任务先显式读取，并在写前重新核对正文与版本，说明变化时拒绝并要求重读。群与子区分别使用自己的说明，沿用现有版本快照与 compaction 注入。完整合同与验收见 `docs/specs/2026-11-04-group-thread-current-facts-design.md`。
 
 包含显式请求驱动的有界语义 `watch`：宿主持久保存采集器、完成条件、间隔和截止时间，独立于原 OMP worker 周期检查；单次命中生成归属聊天的独立排队输入。启用 `decisions` 时 watch 默认启用，并与引用识别共用 protocol、endpoint、model 和 key；可用 `watch.enabled=false` 单独关闭。客观状态、退出或事件条件使用程序机制。完整授权、预算、停止与恢复契约见 `docs/specs/2026-11-04-bounded-stoppable-watch-design.md`。
+包含有界多事件 source watch：当前支持 GitHub PR 和显式 host 的 GitLab MR，通过 `watch discover` 查询来源与限制；可独立判断事件是否消费及订阅何时结束，结束判断支持确定性字段规则或自然语言。事件续办属于原授权任务，语义判断外传须经该订阅明确授权。多页按用户确认的尽力而为合同扫描，报告已检测到的缺口，不承诺完整连续；旧脚本 watch 合同不变。完整范围、预算、恢复与来源限制见 `docs/specs/2026-11-17-multi-source-watch-subscriptions-design.md`。
 包含只读宿主工具 `octo_discover`：channel 任务按当前 bot 的实际 Octo 和 Loop 权限跨群发现事项相关群及子区，综合本实例关联和远端搜索，并通过 Decisions 对候选排序与过滤。身份、证据、分页、权限和结果边界见 `docs/specs/2026-11-17-cross-chat-association-discovery-design.md`。
 该工具使用兼容 Codex 的顶层 object 参数 schema；`search.query` 与 `page.query_id` 的必填规则由执行入口按 action 校验。
 原生 `/context` 以独立 `octo/v1` 卡展示 OMP 的上下文占用明细；不支持卡片或发送失败时只发送失败提示，不重试卡片。命令与投递边界见 `docs/specs/2026-11-10-context-command-card-design.md`。

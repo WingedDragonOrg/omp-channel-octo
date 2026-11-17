@@ -31,6 +31,7 @@ import {
 import { collectWatch } from "./watch/collector.ts";
 import { createWatchJudge } from "./watch/decision.ts";
 import { WatchCoordinator } from "./watch/index.ts";
+import { SourceWatchCoordinator } from "./watch/source-coordinator.ts";
 import {
   SessionLifecycle,
   threadWorkspaceIsAvailable,
@@ -189,7 +190,13 @@ import { createReferenceJudge } from "./references/decision-client.ts";
 import { createDiscoveryCoordinator, type DiscoveryCoordinator } from "./discovery/coordinator.ts";
 import { createDiscoveryJudge } from "./discovery/decision.ts";
 import { ThreadReferenceCoordinator } from "./references/thread-references.ts";
-import type { WatchCreateArgs, WatchRecord } from "./watch/types.ts";
+import type { WatchCreateArgs, WatchListItem, WatchRecord } from "./watch/types.ts";
+import type {
+  SourceWatchCreateArgs,
+  SourceWatchEventRecord,
+  SourceWatchListItem,
+  SourceWatchRecord,
+} from "./watch/source-types.ts";
 import { captureReviewSnapshot } from "./review/snapshot.ts";
 import { renderReviewPrompt } from "./tasks/review-prompt.ts";
 
@@ -460,7 +467,7 @@ type PreparedGoalStop = {
 
 type IngressCommandStopEffects = {
   goal?: PreparedGoalStop;
-  watch?: readonly WatchRecord[];
+  watch?: readonly (WatchRecord | SourceWatchRecord)[];
   interrupt?: {
     interruptedTaskIds: readonly string[];
     hostOperationCancelled: boolean;
@@ -606,6 +613,7 @@ class CoreService implements ChannelService {
   private loopController: LoopController | undefined;
   private readonly threadForks: ThreadForkController;
   private readonly watchCoordinator: WatchCoordinator;
+  private readonly sourceWatchCoordinator: SourceWatchCoordinator;
   private readonly discovery: DiscoveryCoordinator;
   private stopPromise: Promise<void> | undefined;
   constructor(
@@ -959,6 +967,21 @@ class CoreService implements ChannelService {
       deliver: (record, text) => this.deliverWatchWake(record, text),
       acquireUse: record => this.acquireWatchUse(record),
     });
+    this.sourceWatchCoordinator = new SourceWatchCoordinator({
+      store: this.store,
+      botUid: () => this.bot?.uid,
+      enabled: () => this.options.config.decisions?.enabled !== true || this.options.config.watch?.enabled !== false,
+      permitted: target => this.isWatchTargetPermitted(target),
+      judge: options.watchJudge
+        ?? (watchConfig?.enabled === true && options.config.watch?.enabled !== false
+          ? createWatchJudge(watchConfig)
+          : undefined),
+      ...(options.watchSourceFactory === undefined ? {} : { sourceFactory: options.watchSourceFactory }),
+      decisionProfile: watchConfig?.enabled === true
+        ? { protocol: watchConfig.protocol, endpoint: watchConfig.baseUrl, model: watchConfig.model }
+        : null,
+      deliver: (record, event, messageId, text) => this.deliverSourceWatchWake(record, event, messageId, text),
+    });
     // 内建命令的 canonical handler 表：每个 action 一个函数，直接返回原 handler 的 Promise
     // （不再包一层 async），`handleCommand` 里的 await 因此仍是原来的微任务边界；只有
     // `restart` 的返回值参与重启判定。
@@ -1028,6 +1051,7 @@ class CoreService implements ChannelService {
     this.lock = lock;
     this.bot = identity;
     let watchStarted = false;
+    let sourceWatchStarted = false;
     try {
       this.store.setBotUid(identity.uid);
       this.store.releaseOrphanedReviewClaims(identity.uid);
@@ -1427,6 +1451,8 @@ class CoreService implements ChannelService {
       this.botEvents.start();
       await this.watchCoordinator.start();
       watchStarted = true;
+      await this.sourceWatchCoordinator.start();
+      sourceWatchStarted = true;
       this.startupGate.resolve();
       this.ready = true;
       this.loopController?.start();
@@ -1435,6 +1461,7 @@ class CoreService implements ChannelService {
       await this.sendLifecycleNotice("startup");
     } catch (error) {
       if (watchStarted) await this.watchCoordinator.stop();
+      if (sourceWatchStarted) await this.sourceWatchCoordinator.stop();
       this.ready = false;
       this.started = false;
       this.startupGate.reject(error instanceof Error ? error : new Error("channel 启动失败"));
@@ -1461,8 +1488,10 @@ class CoreService implements ChannelService {
     // Seal synchronous receive admission before any shutdown work can yield.
     this.ingress.seal();
     this.watchCoordinator.seal();
+    this.sourceWatchCoordinator.seal();
     this.discovery.stop();
     const watchShutdown = this.watchCoordinator.stop();
+    const sourceWatchShutdown = this.sourceWatchCoordinator.stop();
     this.abortAllThreadForks(new Error("channel stopping"));
     this.abortAllForkArchiveWaits(new Error("channel stopping"));
     this.abortAllThreadMerges(new Error("channel stopping"));
@@ -1512,6 +1541,7 @@ class CoreService implements ChannelService {
     // Waiting ingress commands may have depended on the worker/session leases released above.
     await this.ingress.settle();
     await watchShutdown;
+    await sourceWatchShutdown;
     await this.researchReports.drain();
     this.typingLeases.releaseAll();
     await this.botEvents.stop();
@@ -8724,17 +8754,17 @@ class CoreService implements ChannelService {
   private async handleWatchCommand(
     target: ChatTarget,
     argument: string,
-    preStoppedRecords?: readonly WatchRecord[],
+    preStoppedRecords?: readonly (WatchRecord | SourceWatchRecord)[],
   ): Promise<void> {
     const parts = argument.trim().split(/\s+/u).filter(Boolean);
     const usage = "用法：/watch [list|<id>|stop <id|all>]";
     if (parts.length === 0 || (parts.length === 1 && parts[0]?.toLowerCase() === "list")) {
-      const records = this.watchCoordinator.list(target, 20, 0);
+      const records = this.listChatWatches(target, 20, 0);
       const summary = records.length === 0
         ? "当前聊天没有已登记的 watch。"
-        : records.map(record =>
-          `${record.id} · ${record.state} · ${record.checks}/${record.maxChecks} checks · `
-          + `截止 ${new Date(record.deadlineAt).toISOString()} · wake=${record.wakeStatus}`,
+        : records.map(record => "target" in record
+          ? `${record.id} · ${record.state} · ${record.checks}/${record.maxChecks} checks · 截止 ${new Date(record.deadlineAt).toISOString()} · wake=${record.wakeStatus}`
+          : `${record.id} · ${record.state} · ${record.resource} · ${record.wakeUsed}/${record.wakeBudget} follow-ups · 截止 ${new Date(record.deadlineAt).toISOString()} · 未处理事件=${record.unresolvedEvents}`,
         ).join("\n");
       await this.outbox.enqueueText(target, `当前聊天 watch（最多显示 20 条）：\n${summary}`, null);
       return;
@@ -8747,9 +8777,9 @@ class CoreService implements ChannelService {
       const records = preStoppedRecords ?? this.stopChatWatches(target, parts[1]!);
       const summary = records.length === 0
         ? "当前聊天没有可停止的 watch。"
-        : records.map(record =>
-          `${record.id} · ${record.state} · wake=${record.wakeStatus}`
-          + (record.wakeTaskId === null ? "" : ` · task=${record.wakeTaskId}（已派发任务请用 /cancel 停止）`),
+        : records.map(record => "target" in record
+          ? `${record.id} · ${record.state} · wake=${record.wakeStatus}${record.wakeTaskId === null ? "" : ` · task=${record.wakeTaskId}（已派发任务请用 /cancel 停止）`}`
+          : `${record.id} · ${record.state} · wake=${record.wakeUsed}/${record.spec.wakeBudget} · stop=${record.stopReason ?? "none"}`,
         ).join("\n");
       await this.outbox.enqueueText(target, summary, null);
       return;
@@ -8759,6 +8789,23 @@ class CoreService implements ChannelService {
       return;
     }
     const id = parts[0]!;
+    const source = this.sourceWatchCoordinator.get(target, id);
+    if (source !== null) {
+      const events = this.store.listSourceWatchEvents(source.id, Number.POSITIVE_INFINITY).slice(-50);
+      const detail = [
+        `watch ${source.id} · ${source.state}`,
+        `resource=${source.spec.resource}`,
+        `events=${source.spec.eventTypes.join(",")} consume=${source.spec.consumeCondition ?? "deterministic"} end=${source.spec.endCondition ?? "none"}`,
+        `created=${new Date(source.createdAt).toISOString()} deadline=${new Date(source.deadlineAt).toISOString()}`,
+        `source=${source.sourceUsed}/${source.spec.sourceBudget} decisions=${source.decisionUsed}/${source.spec.decisionBudget} wakes=${source.wakeUsed}/${source.spec.wakeBudget}`,
+        `failures=${source.failures} gap=${source.gap ?? "none"} latest=${source.latestError ?? "none"} stop=${source.stopReason ?? "none"}`,
+        ...events.map(event =>
+          `event ${event.identity}@${event.version} ${event.type} · consume=${event.consumeState} end=${event.endState} wake=${event.wakeStatus}${event.error === null ? "" : ` error=${event.error}`}`,
+        ),
+      ].join("\n");
+      await this.outbox.enqueueText(target, detail, null);
+      return;
+    }
     const record = this.watchCoordinator.get(target, id);
     if (record === null) {
       await this.outbox.enqueueText(target, "当前聊天中没有这个 watch。", null);
@@ -10510,6 +10557,51 @@ class CoreService implements ChannelService {
   }
 
 
+  private listChatWatches(target: ChatTarget, limit: number, offset: number): Array<WatchListItem | SourceWatchListItem> {
+    const legacy: WatchListItem[] = [];
+    const sources: SourceWatchListItem[] = [];
+    for (let pageOffset = 0; ; pageOffset += 100) {
+      const page = this.watchCoordinator.list(target, 100, pageOffset);
+      legacy.push(...page);
+      if (page.length < 100) break;
+    }
+    for (let pageOffset = 0; ; pageOffset += 100) {
+      const page = this.sourceWatchCoordinator.list(target, 100, pageOffset);
+      sources.push(...page);
+      if (page.length < 100) break;
+    }
+    const records: Array<WatchListItem | SourceWatchListItem> = [...legacy, ...sources];
+    records.sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+    const start = Math.max(0, Math.trunc(offset));
+    return records.slice(start, start + Math.max(1, Math.trunc(limit)));
+  }
+
+  private sourceWakeTaskIds(target: ChatTarget, id: string | "all"): string[] {
+    const botUid = this.bot?.uid;
+    if (!botUid) return [];
+    let candidates = this.store.listActiveSourceWatches(botUid).filter(record =>
+      record.channelType === target.channelType && record.channelId === target.channelId,
+    );
+    if (id !== "all") {
+      const selected = this.store.getSourceWatch(botUid, id);
+      candidates = selected && selected.channelType === target.channelType && selected.channelId === target.channelId
+        ? [selected]
+        : [];
+    }
+    return [...new Set(candidates.flatMap(record =>
+      this.store.listSourceWatchEvents(record.id, Number.POSITIVE_INFINITY)
+        .filter(event => (event.wakeStatus === "queued" || event.wakeStatus === "accepted") && event.wakeTaskId !== null)
+        .map(event => event.wakeTaskId!),
+    ))];
+  }
+
+  private cancelSourceWakeTaskReceipts(taskIds: readonly string[], reason: string): void {
+    for (const taskId of taskIds) {
+      this.scheduler.takeWaitingReceipt(taskId);
+      if (this.store.getTask(taskId)?.state === "queued") this.store.markCancelled(taskId, reason);
+    }
+  }
+
   private async acquireWatchUse(record: WatchRecord): Promise<(() => void) | undefined> {
     const lease = await this.scheduler.tryAcquireSharedResources(
       `watch:${record.id}`,
@@ -10539,16 +10631,23 @@ class CoreService implements ChannelService {
     }
   }
 
-  private stopChatWatches(target: ChatTarget, id: string | "all"): WatchRecord[] {
-    const records = this.watchCoordinator.stopWatch(target, id);
-    this.cancelQueuedWatchWakes(records, "watch stopped before first prompt");
-    return records;
+  private stopChatWatches(target: ChatTarget, id: string | "all"): Array<WatchRecord | SourceWatchRecord> {
+    const sourceTaskIds = this.sourceWakeTaskIds(target, id);
+    const legacyRecords = this.watchCoordinator.stopWatch(target, id);
+    const sourceRecords = this.sourceWatchCoordinator.stopWatch(target, id);
+    this.cancelQueuedWatchWakes(legacyRecords, "watch stopped before first prompt");
+    this.cancelSourceWakeTaskReceipts(sourceTaskIds, "watch stopped before first prompt");
+    return [...legacyRecords, ...sourceRecords];
   }
 
   private deleteChatWatches(target: ChatTarget): void {
-    const records = this.watchCoordinator.deleteChat(target);
-    this.cancelQueuedWatchWakes(records, "chat deleted before watch wake prompt");
+    const sourceTaskIds = this.sourceWakeTaskIds(target, "all");
+    const legacyRecords = this.watchCoordinator.deleteChat(target);
+    this.sourceWatchCoordinator.deleteChat(target);
+    this.cancelQueuedWatchWakes(legacyRecords, "chat deleted before watch wake prompt");
+    this.cancelSourceWakeTaskReceipts(sourceTaskIds, "chat deleted before watch wake prompt");
   }
+
 
   private hostWatchPort() {
     return {
@@ -10564,9 +10663,21 @@ class CoreService implements ChannelService {
           toolCallId,
         );
       },
+      createSource: async (task: TaskRecord, args: SourceWatchCreateArgs, toolCallId?: string) => {
+        this.throwIfStopping();
+        return this.sourceWatchCoordinator.create(task, args, toolCallId);
+      },
+      discover: () => this.sourceWatchCoordinator.discover(),
       list: (target: ChatTarget, limit?: number, offset?: number) =>
-        this.watchCoordinator.list(target, limit, offset),
-      get: (target: ChatTarget, id: string) => this.watchCoordinator.get(target, id),
+        this.listChatWatches(target, limit ?? 25, offset ?? 0),
+      get: (target: ChatTarget, id: string) => {
+        const legacy = this.watchCoordinator.get(target, id);
+        if (legacy) return legacy;
+        const source = this.sourceWatchCoordinator.get(target, id);
+        return source
+          ? { ...source, events: this.store.listSourceWatchEvents(source.id, Number.POSITIVE_INFINITY).slice(-50) }
+          : null;
+      },
       stopWatch: (target: ChatTarget, id: string | "all") => this.stopChatWatches(target, id),
       deleteChat: (target: ChatTarget) => this.deleteChatWatches(target),
     };
@@ -10624,6 +10735,65 @@ class CoreService implements ChannelService {
       if (current?.state === "queued") {
         this.scheduler.takeWaitingReceipt(task.id);
         this.store.markCancelled(task.id, "watch wake was revoked before association");
+      }
+      return null;
+    }
+    if (task.state === "queued") this.scheduler.scheduleTask(task.id);
+    return task.id;
+  }
+
+  private async deliverSourceWatchWake(
+    record: SourceWatchRecord,
+    _event: SourceWatchEventRecord,
+    messageId: string,
+    text: string,
+  ): Promise<string | null> {
+    const botUid = this.bot?.uid;
+    const target: ChatTarget = { channelType: record.channelType, channelId: record.channelId };
+    if (
+      botUid === undefined
+      || this.stopping
+      || !this.isWatchTargetPermitted(target)
+      || this.store.isWatchChatDeleted(botUid, target)
+      || !this.sourceWatchCoordinator.wakeAllowed(target, messageId)
+    ) return null;
+    const source = this.store.getTask(record.sourceTaskId);
+    if (!source || source.botUid !== botUid || source.channelType !== target.channelType || source.channelId !== target.channelId) {
+      return null;
+    }
+    const message: InboundMessage = {
+      ...target,
+      messageId,
+      senderId: source.senderId,
+      text,
+      mentionedUserIds: [],
+      attachments: [],
+      quoted: null,
+      supported: true,
+      messageSeq: 0,
+      messageTimestamp: Date.now(),
+    };
+    await this.acceptTask(
+      message,
+      text,
+      true,
+      undefined,
+      undefined,
+      () =>
+        !this.stopping
+        && this.isWatchTargetPermitted(target)
+        && !this.store.isWatchChatDeleted(botUid, target)
+        && this.sourceWatchCoordinator.wakeAllowed(target, messageId),
+      false,
+      false,
+    );
+    if (this.stopping) return null;
+    const task = this.store.getTaskByMessageId(botUid, target, messageId);
+    if (task === null || (task.state !== "queued" && task.state !== "running")) return null;
+    if (!this.store.markSourceWakeTask(_event.id, task.id, Date.now())) {
+      if (task.state === "queued") {
+        this.scheduler.takeWaitingReceipt(task.id);
+        this.store.markCancelled(task.id, "source watch wake was revoked before association");
       }
       return null;
     }
@@ -11754,6 +11924,7 @@ class CoreService implements ChannelService {
       return;
     }
     const isWatchWakeTask = persistedTask.messageId.startsWith(WATCH_WAKE_PREFIX);
+    const isSourceWatchWakeTask = persistedTask.messageId.startsWith("watch:event:");
     const tanOperationId = persistedTask.messageId.startsWith("dispatch:tan:")
       ? persistedTask.messageId.slice("dispatch:tan:".length)
       : null;
@@ -12171,7 +12342,13 @@ class CoreService implements ChannelService {
           runtime.promptInFlight = true;
           await worker.resume(consumeEvent, promptContext);
         } else {
-          if (isWatchWakeTask) {
+          if (isSourceWatchWakeTask) {
+            if (!this.sourceWatchCoordinator.wakeAllowed(target, persistedTask.messageId)) {
+              this.store.markCancelled(taskId, "source watch wake was revoked before prompt dispatch");
+              progress.finish("cancelled");
+              return;
+            }
+          } else if (isWatchWakeTask) {
             const watchId = persistedTask.messageId.slice(WATCH_WAKE_PREFIX.length);
             // Recovery may find a queued wake accepted before shutdown but never linked; adopt
             // this stable task against the still-queued record. Revoked, expired, deleted, or
@@ -12207,7 +12384,20 @@ class CoreService implements ChannelService {
           const dispatchTask = this.store.getTask(taskId);
           if (dispatchTask === null || dispatchTask.state !== "running") return;
           if (await this.cancelEndedLoopTaskBeforeDispatch(taskId, target)) return;
-          this.store.markTaskPromptStarted(taskId, verified.sessionId);
+          if (isSourceWatchWakeTask) {
+            if (!this.sourceWatchCoordinator.markWakeDispatched(
+              target,
+              persistedTask.messageId,
+              taskId,
+              verified.sessionId,
+            )) {
+              this.store.markCancelled(taskId, "source watch wake was revoked before prompt dispatch");
+              progress.finish("cancelled");
+              return;
+            }
+          } else {
+            this.store.markTaskPromptStarted(taskId, verified.sessionId);
+          }
           runtime.promptInFlight = true;
           const prompt = isTanDispatch
             ? (/^\s*\/\S+/u.test(task.text) ? `用户请求：\n${task.text}` : task.text)

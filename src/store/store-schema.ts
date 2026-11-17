@@ -716,6 +716,71 @@ export function applySchema(db: Database): void {
       channel_id TEXT NOT NULL,
       created_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS source_watches (
+      id TEXT PRIMARY KEY NOT NULL,
+      bot_uid TEXT NOT NULL,
+      channel_type INTEGER NOT NULL CHECK(channel_type IN (1, 2, 5)),
+      channel_id TEXT NOT NULL,
+      source_task_id TEXT NOT NULL,
+      creation_key TEXT NOT NULL,
+      spec_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      deadline_at INTEGER NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('initializing', 'watching', 'budget-exhausted', 'ended', 'failed', 'expired', 'stopped', 'deleted')),
+      generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+      cursor_json TEXT,
+      snapshot_json TEXT,
+      snapshot_sequence INTEGER NOT NULL DEFAULT 0 CHECK(snapshot_sequence >= 0),
+      source_budget INTEGER NOT NULL CHECK(source_budget > 0),
+      source_used INTEGER NOT NULL DEFAULT 0 CHECK(source_used >= 0),
+      decision_budget INTEGER NOT NULL CHECK(decision_budget >= 0),
+      decision_used INTEGER NOT NULL DEFAULT 0 CHECK(decision_used >= 0),
+      wake_budget INTEGER NOT NULL CHECK(wake_budget >= 0),
+      wake_used INTEGER NOT NULL DEFAULT 0 CHECK(wake_used >= 0),
+      failures INTEGER NOT NULL DEFAULT 0 CHECK(failures >= 0),
+      gap TEXT,
+      latest_error TEXT,
+      stop_reason TEXT,
+      observed_at INTEGER,
+      UNIQUE(bot_uid, source_task_id, creation_key)
+    );
+    CREATE TABLE IF NOT EXISTS source_watch_events (
+      id TEXT PRIMARY KEY NOT NULL,
+      watch_id TEXT NOT NULL,
+      identity TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      version TEXT NOT NULL,
+      body_json TEXT NOT NULL,
+      observed_at INTEGER NOT NULL,
+      snapshot_sequence INTEGER NOT NULL CHECK(snapshot_sequence >= 0),
+      state TEXT NOT NULL CHECK(state IN ('pending', 'judging', 'ready', 'failed', 'cancelled')),
+      consume_state TEXT NOT NULL CHECK(consume_state IN ('pending', 'satisfied', 'not_satisfied', 'insufficient_evidence', 'failure', 'deterministic')),
+      consume_decision_json TEXT,
+      end_state TEXT NOT NULL CHECK(end_state IN ('pending', 'satisfied', 'not_satisfied', 'insufficient_evidence', 'failure', 'deterministic')),
+      end_decision_json TEXT,
+      wake_task_id TEXT,
+      wake_status TEXT NOT NULL CHECK(wake_status IN ('none', 'queued', 'accepted', 'dispatched', 'cancelled', 'failed')),
+      next_attempt_at INTEGER NOT NULL DEFAULT 0,
+      error TEXT,
+      UNIQUE(watch_id, identity, version)
+    );
+    CREATE TABLE IF NOT EXISTS source_watch_decision_intents (
+      id TEXT PRIMARY KEY NOT NULL,
+      watch_id TEXT NOT NULL,
+      event_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('consume', 'end')),
+      generation INTEGER NOT NULL CHECK(generation >= 0),
+      state TEXT NOT NULL CHECK(state IN ('dispatched', 'completed', 'abandoned')),
+      decision_json TEXT,
+      error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS source_watches_due ON source_watches(state, deadline_at, created_at);
+    CREATE INDEX IF NOT EXISTS source_watches_bot_chat ON source_watches(bot_uid, channel_type, channel_id, created_at, id);
+    CREATE INDEX IF NOT EXISTS source_watch_events_pending ON source_watch_events(watch_id, state, next_attempt_at, observed_at, id);
+    CREATE INDEX IF NOT EXISTS source_watch_events_wake ON source_watch_events(wake_status, observed_at, id);
+    CREATE INDEX IF NOT EXISTS source_watch_decision_intents_open ON source_watch_decision_intents(watch_id, state, created_at);
     CREATE INDEX IF NOT EXISTS watches_due ON watches(state, next_at, deadline_at);
     CREATE INDEX IF NOT EXISTS watches_bot_chat ON watches(bot_uid, channel_type, channel_id, created_at, id);
     CREATE INDEX IF NOT EXISTS chat_grant_operations_recovery

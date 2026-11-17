@@ -49,6 +49,19 @@ import { findDiscoveryAssociations } from "./store-discovery.ts";
 import type { DiscoveryAssociation, DiscoveryQuery } from "./store-discovery.ts";
 import * as storeWatch from "./store-watch.ts";
 import type { WatchCheckCompletion, WatchCreateResult, WatchListItem, WatchRecord } from "../watch/types.ts";
+import * as storeWatchSources from "./store-watch-sources.ts";
+import type {
+  SourceWatchCreateResult,
+  SourceWatchDecision,
+  SourceWatchDecisionIntent,
+  SourceWatchEventRecord,
+  SourceWatchJudgmentState,
+  SourceWatchListItem,
+  SourceWatchRecord,
+  WatchSourceCursor,
+  WatchSourceEvent,
+  WatchSourceSnapshot,
+} from "../watch/source-types.ts";
 import type { ThreadReference, ThreadReferences } from "../references/types.ts";
 import { bindLoopTask, bindLoopWorkspace, claimLoopInputIntent, commitLoopScan, completeLoopThreadCreation, getLoopBinding, getLoopInput, getLoopTaskRoute, getLoopTaskSummary as readLoopTaskSummary, getLoopThreadCreation, isLoopInputObserved, listLoopBindings, listLoopInputs, listLoopThreadCreationAttempts, listLoopThreadCreations, listLoopThreadTasks, markLoopInputDelivered, markLoopInputFault, markLoopInputPending, markLoopInputUnknown, markLoopThreadCreationUnknown, prepareLoopInput, recordLoopThreadAllocated, releaseLoopThreadCreation, reserveLoopThreadCreation } from "./store-loop.ts";
 import { clearLoopTaskRouteEnding, clearPendingLoopThreadRoutesEnding, getLoopTaskRouteEnding, listLoopTaskRouteEndings, markLoopThreadRoutesEnding } from "./store-loop-endings.ts";
@@ -1582,6 +1595,101 @@ export class ChannelStore {
 
   expireWatchRecords(now: number): void {
     storeWatch.expireWatchRecords(this.db, now);
+  }
+  createSourceWatch(record: SourceWatchRecord): SourceWatchCreateResult {
+    return storeWatchSources.createSourceWatch(this.db, record);
+  }
+
+  getSourceWatch(botUid: string, id: string): SourceWatchRecord | null {
+    return storeWatchSources.getSourceWatch(this.db, botUid, id);
+  }
+
+  listSourceWatches(botUid?: string): SourceWatchRecord[] {
+    return storeWatchSources.listSourceWatches(this.db, botUid);
+  }
+
+  listActiveSourceWatches(botUid?: string): SourceWatchRecord[] {
+    return storeWatchSources.listActiveSourceWatches(this.db, botUid);
+  }
+
+  listSourceWatchesForChat(botUid: string, target: ChatTarget, limit: number, offset: number): SourceWatchListItem[] {
+    return storeWatchSources.listSourceWatchesForChat(this.db, botUid, target, limit, offset);
+  }
+
+  listSourceWatchEvents(id: string, dueAt: number): SourceWatchEventRecord[] {
+    return storeWatchSources.listSourceWatchEvents(this.db, id, dueAt);
+  }
+
+  stopSourceWatches(botUid: string, target: ChatTarget, id: string | "all", now: number, reason: string): SourceWatchRecord[] {
+    return storeWatchSources.stopSourceWatches(this.db, botUid, target, id, now, reason);
+  }
+
+  deleteSourceWatchChat(botUid: string, target: ChatTarget, now: number): SourceWatchRecord[] {
+    return storeWatchSources.deleteSourceWatchChat(this.db, botUid, target, now);
+  }
+
+  expireSourceWatches(now: number): void {
+    storeWatchSources.expireSourceWatches(this.db, now);
+  }
+
+  initializeSourceWatch(id: string, generation: number, cursor: WatchSourceCursor, snapshot: WatchSourceSnapshot, events: readonly WatchSourceEvent[], observedAt: number): boolean {
+    return storeWatchSources.initializeSourceWatch(this.db, id, generation, cursor, snapshot, events, observedAt);
+  }
+
+  commitSourceObservation(id: string, generation: number, cursor: WatchSourceCursor, snapshot: WatchSourceSnapshot, events: readonly WatchSourceEvent[], observedAt: number): boolean {
+    return storeWatchSources.commitSourceObservation(this.db, id, generation, cursor, snapshot, events, observedAt);
+  }
+
+  failSourceWatch(id: string, generation: number, reason: string, now: number, gap?: string): boolean {
+    return storeWatchSources.failSourceWatch(this.db, id, generation, reason, now, gap);
+  }
+
+  reserveSourceRequest(id: string, generation: number, now: number): boolean {
+    return storeWatchSources.reserveSourceRequest(this.db, id, generation, now);
+  }
+
+  beginSourceDecision(id: string, eventId: string, kind: "consume" | "end", generation: number, now: number): SourceWatchDecisionIntent | null {
+    return storeWatchSources.beginSourceDecision(this.db, id, eventId, kind, generation, now);
+  }
+
+  finishSourceDecision(intent: SourceWatchDecisionIntent, decision: SourceWatchDecision | null, error: string | null, now: number): SourceWatchEventRecord | null {
+    return storeWatchSources.finishSourceDecision(this.db, intent, decision, error, now);
+  }
+
+  completeSourceEvent(id: string, generation: number, eventId: string, consumeState: SourceWatchJudgmentState, endState: SourceWatchJudgmentState, endSatisfied: boolean, now: number): boolean {
+    return storeWatchSources.completeSourceEvent(this.db, id, generation, eventId, consumeState, endState, endSatisfied, now);
+  }
+
+  markSourceEventFailure(id: string, eventId: string, error: string, nextAttemptAt: number): boolean {
+    return storeWatchSources.markSourceEventFailure(this.db, id, eventId, error, nextAttemptAt);
+  }
+
+  markSourceBudgetExhausted(id: string, generation: number, now: number): boolean {
+    return storeWatchSources.markSourceBudgetExhausted(this.db, id, generation, now);
+  }
+
+  markSourceWakeTask(eventId: string, taskId: string, now: number): boolean {
+    return storeWatchSources.markSourceWakeTask(this.db, eventId, taskId, now);
+  }
+
+  sourceWakeAllowed(eventId: string, now: number): boolean {
+    return storeWatchSources.sourceWakeAllowed(this.db, eventId, now);
+  }
+
+  markSourceWakeDispatched(eventId: string, taskId: string, sessionId: string, now: number): boolean {
+    return storeWatchSources.markSourceWakeDispatched(this.db, eventId, taskId, sessionId, now);
+  }
+
+  markSourceWakeFailed(eventId: string, reason: string, now: number): boolean {
+    return storeWatchSources.markSourceWakeFailed(this.db, eventId, reason, now);
+  }
+
+  getSourceWakeByMessageId(botUid: string, target: ChatTarget, messageId: string): SourceWatchEventRecord | null {
+    return storeWatchSources.getSourceWakeByMessageId(this.db, botUid, target, messageId);
+  }
+
+  recoverSourceWatch(id: string, now: number): SourceWatchRecord | null {
+    return storeWatchSources.recoverSourceWatch(this.db, id, now);
   }
 
   getWatchMatchEvent(id: string): storeWatch.WatchMatchEvent | null {

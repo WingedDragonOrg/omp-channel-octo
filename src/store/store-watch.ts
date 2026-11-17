@@ -10,6 +10,7 @@ import type {
 import { asNumber, asString, query, run, targetValues, targetWhere, transaction, type SqlValue } from "./store-schema.ts";
 
 const ACTIVE_WATCH_SQL = "(state IN ('waiting', 'checking', 'unknown') OR process_json IS NOT NULL OR process_unknown = 1 OR (state = 'matched' AND wake_status IN ('queued', 'accepted')))";
+const ACTIVE_SOURCE_WATCH_SQL = "(state IN ('initializing', 'watching') OR (state = 'budget-exhausted' AND EXISTS (SELECT 1 FROM source_watch_events e WHERE e.watch_id = source_watches.id AND (e.state IN ('pending', 'judging') OR e.wake_status IN ('queued', 'accepted')))) OR (state = 'ended' AND EXISTS (SELECT 1 FROM source_watch_events e WHERE e.watch_id = source_watches.id AND e.wake_status IN ('queued', 'accepted'))))";
 
 function cancelUnstartedWakeTask(
   db: Database,
@@ -56,15 +57,21 @@ export function createWatch(db: Database, record: WatchRecord): WatchCreateResul
     )[0];
     if (duplicate) return { kind: "duplicate", record: watchFromRow(duplicate) };
 
-    if (query(db,
-      `SELECT 1 FROM watches WHERE bot_uid = ? AND ${targetWhere(record.target)} AND ${ACTIVE_WATCH_SQL} LIMIT 1 OFFSET 4`,
-      [record.botUid, ...targetValues(record.target)],
-    ).length > 0) return { kind: "quota-chat", record: null };
+    const chatCount = asNumber(query(db,
+      `SELECT
+         (SELECT COUNT(*) FROM watches WHERE bot_uid = ? AND ${targetWhere(record.target)} AND ${ACTIVE_WATCH_SQL}) +
+         (SELECT COUNT(*) FROM source_watches WHERE bot_uid = ? AND ${targetWhere(record.target)} AND ${ACTIVE_SOURCE_WATCH_SQL}) AS count`,
+      [record.botUid, ...targetValues(record.target), record.botUid, ...targetValues(record.target)],
+    )[0]?.count);
+    if (chatCount >= 5) return { kind: "quota-chat", record: null };
 
-    if (query(db,
-      `SELECT 1 FROM watches WHERE bot_uid = ? AND ${ACTIVE_WATCH_SQL} LIMIT 1 OFFSET 19`,
-      [record.botUid],
-    ).length > 0) return { kind: "quota-bot", record: null };
+    const botCount = asNumber(query(db,
+      `SELECT
+         (SELECT COUNT(*) FROM watches WHERE bot_uid = ? AND ${ACTIVE_WATCH_SQL}) +
+         (SELECT COUNT(*) FROM source_watches WHERE bot_uid = ? AND ${ACTIVE_SOURCE_WATCH_SQL}) AS count`,
+      [record.botUid, record.botUid],
+    )[0]?.count);
+    if (botCount >= 20) return { kind: "quota-bot", record: null };
 
     const idCollision = query(db, "SELECT 1 FROM watches WHERE id = ?", [record.id])[0];
     if (idCollision) throw new Error("watch id already exists");

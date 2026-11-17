@@ -353,6 +353,14 @@ Typesafe 使用 `protocol: "typesafe-systemone"`、`baseUrl: "https://api.typesa
 
 Typesafe SDK 0.7.0 在 Bun 的原响应流锁定路径使用随 `bun install` 应用的固定版本补丁；保留 `patches/`、`patchedDependencies` 和锁文件。详见 [引用绑定规格与验收](docs/specs/2026-11-04-thread-pr-mr-reference-binding-design.md)。
 
+### 多来源 watch
+
+用户明确要求持续关注时，agent 可调用 `watch` 的 `discover` 查看可用来源和限制，再创建 GitHub PR 或 GitLab MR 订阅。GitLab 资源使用 `gitlab://<host>/<namespace>/<project>/-/merge_requests/<iid>`，访问沿用该 host 的 `glab` 身份；GitHub 使用 `gh` 身份。相关事件可在原任务授权范围内触发独立排队续办。
+
+订阅默认 6 小时、最长 24 小时，不自动续期；来源请求、Decisions 请求和续办分别有预算。结束条件可使用 `endWhen: {"field":"merged","equals":true}` 等确定性等值规则，支持 `state`、`merged`、`title` 和 `headSha`，与自然语言 `endCondition` 互斥。自然语言判断会发送必要的有界来源内容到配置的 Decisions 服务，须为每个订阅明确授权；仅确定性规则无需外传。`/watch list`、`/watch <id>` 和 `/watch stop <id|all>` 可由 owner 管理当前聊天的订阅。
+
+首批只观察 PR/MR 状态快照与指定评论、review 或 notes，不承诺行内讨论、CI 或完整事件历史。多页扫描尽力而为：会报告检测到的覆盖缺口，但扫描间删除、覆盖或迟到的事件可能遗漏。详细授权、去重和恢复合同见 [多来源 watch 规格](docs/specs/2026-11-17-multi-source-watch-subscriptions-design.md)。
+
 
 ## 日常运维
 

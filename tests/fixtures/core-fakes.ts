@@ -63,6 +63,7 @@ import type {
 import type { LoopReadPort, LoopTask, LoopWorkspace } from "../../src/loop/types.ts";
 import type { DiscoveryRemote } from "../../src/discovery/remote.ts";
 import type { WatchCollector, WatchJudge } from "../../src/watch/types.ts";
+import type { WatchSourceFactory } from "../../src/watch/source-types.ts";
 import { RESUME_CONTINUATION_PROMPT } from "../../src/contracts";
 import { AttachmentError } from "../../src/inbound/attachments";
 import {
@@ -2001,6 +2002,7 @@ export interface CoreHarnessOptions {
   /** Injectable watch runner/judge for real CoreService integration tests. */
   watchCollector?: WatchCollector;
   watchJudge?: WatchJudge;
+  watchSourceFactory?: WatchSourceFactory;
   /** Extra command handlers, e.g. an observing handler that still runs a prompt. */
   commandHandlers?: readonly ChannelCommandHandler[];
   restart?: RestartPort;
@@ -2069,6 +2071,7 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
     ...(options.commandHandlers === undefined ? {} : { commandHandlers: options.commandHandlers }),
     ...(options.watchCollector === undefined ? {} : { watchCollector: options.watchCollector }),
     ...(options.watchJudge === undefined ? {} : { watchJudge: options.watchJudge }),
+    ...(options.watchSourceFactory === undefined ? {} : { watchSourceFactory: options.watchSourceFactory }),
     ...(options.restart === undefined ? {} : { restart: options.restart }),
     ...(options.cliCredentials === undefined ? {} : { cliCredentials: options.cliCredentials }),
     ...(options.allowlistWriteback === undefined ? {} : { allowlistWriteback: options.allowlistWriteback }),

@@ -14,7 +14,8 @@
     "build:aot": "bun run scripts/build-aot.ts",
     "check": "bun run src/cli.ts check",
     "start": "bun run src/cli.ts start",
-    "launchd": "bun run src/cli.ts launchd"
+    "launchd": "bun run src/cli.ts launchd",
+    "benchmark:source-watch": "bun run tests/benchmarks/source-watch.ts"
   },
   "dependencies": {
     "@typesafe-ai/sdk": "0.7.0",

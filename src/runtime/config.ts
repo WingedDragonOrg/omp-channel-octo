@@ -358,7 +358,7 @@ function parseWatch(value: unknown, decisionsEnabled: boolean): { enabled: boole
   }
   const enabled = "enabled" in value ? value.enabled : decisionsEnabled;
   if (typeof enabled !== "boolean") throw configError("watch.enabled 必须是布尔值");
-  if (enabled && !decisionsEnabled) throw configError("watch.enabled 需要启用 decisions");
+  if (enabled && !decisionsEnabled) throw configError("watch.enabled requires enabled decisions");
   return { enabled };
 }
 function parseFileLinks(env: NodeJS.ProcessEnv): FileLinkConfig | undefined {
