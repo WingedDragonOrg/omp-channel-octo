@@ -10,6 +10,7 @@ import {
   type FixtureSentMessage,
   type OctoProtocolFixture,
 } from "./fixtures/octo-protocol-server.ts";
+import { cliEnvironment, observeCli, type ObservedCli } from "./fixtures/cli-process.ts";
 
 function sentText(message: FixtureSentMessage): string {
   const payload = message.body.payload;
@@ -105,6 +106,7 @@ function expectLifecycleNotice(
 
 /** Wait for one lifecycle event and assert its route, PID, and event-time stamp together. */
 async function waitForLifecycleNotice(
+  observed: ObservedCli,
   fixture: OctoProtocolFixture,
   kind: LifecycleKind,
   pid: number,
@@ -112,7 +114,7 @@ async function waitForLifecycleNotice(
   ownerUid = fixture.ownerUid,
   timeoutMs = 5_000,
 ): Promise<FixtureSentMessage> {
-  const notice = await waitForFixture(
+  const notice = await observed.waitFor(
     () => lifecycleNoticeFor(fixture, kind, pid),
     timeoutMs,
     description,
@@ -144,19 +146,6 @@ async function pauseWhileChildIsBlocked(ms: number): Promise<void> {
 }
 
 const CHECKOUT_ROOT = resolve(import.meta.dir, "..");
-
-/**
- * Environment for the spawned CLI: it writes its own logs under `$HOME/.oco`, so the tests keep
- * that inside their temp root instead of the developer's home.
- */
-function cliEnvironment(root: string, binDir?: string): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    HOME: root,
-    TZ: "Asia/Kathmandu",
-    ...(binDir === undefined ? {} : { PATH: `${binDir}:${process.env.PATH ?? ""}` }),
-  };
-}
 
 /** Working directories of the OMP RPC workers whose startup lines appear in a fixture-log slice. */
 function workerStartupCwds(logText: string): string[] {
@@ -206,21 +195,26 @@ test("real CLI sends lifecycle notices to configured owner around /status and SI
 
     const spawned = Bun.spawn(
       [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "start", "--config", configPath],
-      { stdout: "pipe", stderr: "pipe", env: cliEnvironment(currentRoot) },
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: cliEnvironment(currentRoot, { TZ: "Asia/Kathmandu" }),
+      },
     );
     child = spawned;
-    const stdout = new Response(spawned.stdout).text();
-    const stderr = new Response(spawned.stderr).text();
-    const capturedOutput = Promise.all([stdout, stderr]);
-    outputPromise = capturedOutput;
+    const observed = observeCli(spawned);
+    outputPromise = observed.output;
 
-    const connection = await currentFixture.waitForConnection(1, 5_000);
-    await waitForFixture(
-      () => connection.ready ? connection : undefined,
+    const connection = await observed.waitFor(
+      () => {
+        const connection = currentFixture.connections[0];
+        return connection?.ready ? connection : undefined;
+      },
       5_000,
       "CLI did not authenticate its WebSocket connection",
     );
     await waitForLifecycleNotice(
+      observed,
       currentFixture,
       "startup",
       spawned.pid,
@@ -236,7 +230,7 @@ test("real CLI sends lifecycle notices to configured owner around /status and SI
       messageId: "9007199254741999",
     });
 
-    const statusReply = await waitForFixture(
+    const statusReply = await observed.waitFor(
       () =>
         currentFixture.sentMessages.find(
           (message) =>
@@ -255,6 +249,7 @@ test("real CLI sends lifecycle notices to configured owner around /status and SI
     // Repeated stop signals share the same shutdown and must not duplicate the owner notice.
     spawned.kill("SIGTERM");
     await waitForLifecycleNotice(
+      observed,
       currentFixture,
       "stop",
       spawned.pid,
@@ -267,7 +262,7 @@ test("real CLI sends lifecycle notices to configured owner around /status and SI
     expect(connection.closed).toBe(false);
 
     const exitCode = await waitForChildExit(spawned);
-    const [stdoutText, stderrText] = await capturedOutput;
+    const [stdoutText, stderrText] = await observed.output;
     expect(exitCode).toBe(0);
     await waitForFixture(
       () => connection.closed ? connection : undefined,
@@ -317,19 +312,25 @@ test("a second start refuses before it registers the Bot and leaves the running 
 
     const spawned = Bun.spawn(
       [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "start", "--config", configPath],
-      { stdout: "pipe", stderr: "pipe", env: cliEnvironment(currentRoot) },
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: cliEnvironment(currentRoot, { TZ: "Asia/Kathmandu" }),
+      },
     );
     children.push(spawned);
-    const stdout = new Response(spawned.stdout).text();
-    const stderr = new Response(spawned.stderr).text();
-    outputPromise = Promise.all([stdout, stderr]);
-    const connection = await currentFixture.waitForConnection(1, 5_000);
-    await waitForFixture(
-      () => connection.ready ? connection : undefined,
+    const observed = observeCli(spawned);
+    outputPromise = observed.output;
+    const connection = await observed.waitFor(
+      () => {
+        const connection = currentFixture.connections[0];
+        return connection?.ready ? connection : undefined;
+      },
       5_000,
       "CLI did not authenticate its WebSocket connection",
     );
     await waitForLifecycleNotice(
+      observed,
       currentFixture,
       "startup",
       spawned.pid,
@@ -338,7 +339,11 @@ test("a second start refuses before it registers the Bot and leaves the running 
 
     const duplicate = Bun.spawn(
       [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "start", "--config", configPath],
-      { stdout: "pipe", stderr: "pipe", env: cliEnvironment(currentRoot) },
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: cliEnvironment(currentRoot, { TZ: "Asia/Kathmandu" }),
+      },
     );
     const duplicatePid = duplicate.pid;
     children.push(duplicate);
@@ -369,9 +374,9 @@ test("a second start refuses before it registers the Bot and leaves the running 
       text: "/status",
       messageId: "9007199254742201",
     });
-    await waitForFixture(
+    await observed.waitFor(
       () =>
-        currentFixture.sentMessages.some(
+        currentFixture.sentMessages.find(
           (message) =>
             message.body.channel_id === currentFixture.ownerUid &&
             sentText(message).includes("state=none"),
@@ -382,10 +387,12 @@ test("a second start refuses before it registers the Bot and leaves the running 
 
     // Reconnecting the transport is not a new start: the owner gets no second startup notice.
     currentFixture.kickConnection(0);
-    const reconnected = await currentFixture.waitForConnection(2, 8_000);
-    await waitForFixture(
-      () => reconnected.ready ? reconnected : undefined,
-      5_000,
+    const reconnected = await observed.waitFor(
+      () => {
+        const connection = currentFixture.connections[1];
+        return connection?.ready ? connection : undefined;
+      },
+      8_000,
       "the running instance did not reconnect its Octo WebSocket",
     );
     const beforeReconnectStatus = currentFixture.sentMessages.length;
@@ -396,7 +403,7 @@ test("a second start refuses before it registers the Bot and leaves the running 
       text: "/status",
       messageId: "9007199254742202",
     });
-    await waitForFixture(
+    await observed.waitFor(
       () =>
         currentFixture.sentMessages
           .slice(beforeReconnectStatus)
@@ -411,6 +418,7 @@ test("a second start refuses before it registers the Bot and leaves the running 
 
     spawned.kill("SIGTERM");
     await waitForLifecycleNotice(
+      observed,
       currentFixture,
       "stop",
       spawned.pid,
@@ -457,16 +465,21 @@ test("real CLI runs the owner's group command with the bot mention placed before
 
     const spawned = Bun.spawn(
       [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "start", "--config", configPath],
-      { stdout: "pipe", stderr: "pipe", env: cliEnvironment(currentRoot) },
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: cliEnvironment(currentRoot, { TZ: "Asia/Kathmandu" }),
+      },
     );
     child = spawned;
-    const stdout = new Response(spawned.stdout).text();
-    const stderr = new Response(spawned.stderr).text();
-    outputPromise = Promise.all([stdout, stderr]);
+    const observed = observeCli(spawned);
+    outputPromise = observed.output;
 
-    const connection = await currentFixture.waitForConnection(1, 5_000);
-    await waitForFixture(
-      () => connection.ready ? connection : undefined,
+    const connection = await observed.waitFor(
+      () => {
+        const connection = currentFixture.connections[0];
+        return connection?.ready ? connection : undefined;
+      },
       5_000,
       "CLI did not authenticate its WebSocket connection",
     );
@@ -523,7 +536,7 @@ test("real CLI runs the owner's group command with the bot mention placed before
       },
     ]);
 
-    await waitForFixture(
+    await observed.waitFor(
       () => {
         const replies = businessMessages(currentFixture);
         return replies.length === 4 ? replies : undefined;
@@ -532,7 +545,7 @@ test("real CLI runs the owner's group command with the bot mention placed before
       "CLI did not answer the two owner commands, the member notice, and the sentinel status request",
     );
     // Every inbound frame was acknowledged after handling, so a rejected message cannot still be answered later.
-    await waitForFixture(
+    await observed.waitFor(
       () => connection.recvAcks.length === 6 ? connection.recvAcks : undefined,
       5_000,
       "CLI did not acknowledge every inbound frame",
@@ -624,18 +637,24 @@ exit 2
       "--config",
       configPath,
     ];
-    const cliEnv = cliEnvironment(currentRoot, fakeBin);
+    const cliEnv = cliEnvironment(currentRoot, {
+      TZ: "Asia/Kathmandu",
+      PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+    });
 
     const first = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe", env: cliEnv });
     children.push(first);
-    const firstOutput = Promise.all([new Response(first.stdout).text(), new Response(first.stderr).text()]);
-    const firstConnection = await currentFixture.waitForConnection(1, 5_000);
-    await waitForFixture(
-      () => firstConnection.ready ? firstConnection : undefined,
+    const firstObserved = observeCli(first);
+    const firstConnection = await firstObserved.waitFor(
+      () => {
+        const connection = currentFixture.connections[0];
+        return connection?.ready ? connection : undefined;
+      },
       5_000,
       "first CLI did not authenticate its WebSocket connection",
     );
     await waitForLifecycleNotice(
+      firstObserved,
       currentFixture,
       "startup",
       first.pid,
@@ -649,7 +668,7 @@ exit 2
       messageId: "9007199254742001",
     });
 
-    const acknowledgement = await waitForFixture(
+    const acknowledgement = await firstObserved.waitFor(
       () => currentFixture.sentMessages.find((message) => sentText(message).includes("正在重启 channel")),
       5_000,
       "CLI did not acknowledge the restart request",
@@ -657,6 +676,7 @@ exit 2
     expect(sentText(acknowledgement)).toContain("正在重启 channel");
 
     const firstStop = await waitForLifecycleNotice(
+      firstObserved,
       currentFixture,
       "stop",
       first.pid,
@@ -665,7 +685,7 @@ exit 2
     await pauseWhileChildIsBlocked(150);
     expect(firstConnection.closed).toBe(false);
     expect(await waitForChildExit(first, 10_000)).toBe(0);
-    await firstOutput;
+    await firstObserved.output;
     await waitForFixture(
       () => existsSync(markerPath) ? true : undefined,
       5_000,
@@ -680,14 +700,17 @@ exit 2
 
     const second = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe", env: cliEnv });
     children.push(second);
-    const secondOutput = Promise.all([new Response(second.stdout).text(), new Response(second.stderr).text()]);
-    const secondConnection = await currentFixture.waitForConnection(2, 5_000);
-    await waitForFixture(
-      () => secondConnection.ready ? secondConnection : undefined,
+    const secondObserved = observeCli(second);
+    const secondConnection = await secondObserved.waitFor(
+      () => {
+        const connection = currentFixture.connections[1];
+        return connection?.ready ? connection : undefined;
+      },
       5_000,
       "restarted CLI did not authenticate its WebSocket connection",
     );
     const secondStartup = await waitForLifecycleNotice(
+      secondObserved,
       currentFixture,
       "startup",
       second.pid,
@@ -711,7 +734,7 @@ exit 2
       text: "/status",
       messageId: "9007199254742002",
     });
-    const statusReply = await waitForFixture(
+    const statusReply = await secondObserved.waitFor(
       () =>
         currentFixture.sentMessages
           .slice(beforeRestart)
@@ -727,13 +750,14 @@ exit 2
 
     second.kill("SIGTERM");
     await waitForLifecycleNotice(
+      secondObserved,
       currentFixture,
       "stop",
       second.pid,
       "the replacement CLI did not send its stopping lifecycle notice",
     );
     expect(await waitForChildExit(second)).toBe(0);
-    await secondOutput;
+    await secondObserved.output;
 
     // The whole restart produced exactly one notice per event, in process order.
     const startupNotices = lifecycleMessages(currentFixture, "startup");
@@ -795,13 +819,23 @@ exit 0
 
     const spawned = Bun.spawn(
       [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "run", "--config", configPath],
-      { stdout: "pipe", stderr: "pipe", env: cliEnvironment(currentRoot, fakeBin) },
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: cliEnvironment(currentRoot, {
+          TZ: "Asia/Kathmandu",
+          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+        }),
+      },
     );
     children.push(spawned);
+    const observed = observeCli(spawned);
 
-    const connection = await currentFixture.waitForConnection(1, 5_000);
-    await waitForFixture(
-      () => connection.ready ? connection : undefined,
+    const connection = await observed.waitFor(
+      () => {
+        const connection = currentFixture.connections[0];
+        return connection?.ready ? connection : undefined;
+      },
       5_000,
       "the debugging CLI did not authenticate its WebSocket connection",
     );
@@ -812,7 +846,7 @@ exit 0
       text: "/restart",
       messageId: "9007199254742101",
     });
-    const reply = await waitForFixture(
+    const reply = await observed.waitFor(
       () => currentFixture.sentMessages.find((message) => sentText(message).includes("无法重启 channel")),
       5_000,
       "the debugging CLI did not refuse the restart request",
@@ -822,6 +856,7 @@ exit 0
 
     spawned.kill("SIGINT");
     await waitForLifecycleNotice(
+      observed,
       currentFixture,
       "stop",
       spawned.pid,
@@ -830,6 +865,7 @@ exit 0
     await pauseWhileChildIsBlocked(150);
     expect(connection.closed).toBe(false);
     expect(await waitForChildExit(spawned)).toBe(0);
+    await observed.output;
     await waitForFixture(
       () => connection.closed ? connection : undefined,
       5_000,
@@ -917,16 +953,18 @@ test("real CLI gives a CommunityTopic thread the parent group's work directory",
       { encoding: "utf8", mode: 0o600 },
     );
     const cliArgs = [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "start", "--config", configPath];
-    const cliEnv = cliEnvironment(currentRoot);
+    const cliEnv = cliEnvironment(currentRoot, { TZ: "Asia/Kathmandu" });
     const botPrefix = `@${currentFixture.botName}`;
     const botMention = { entities: [{ uid: currentFixture.botUid, offset: 0, length: botPrefix.length }] };
 
     const first = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe", env: cliEnv });
     children.push(first);
-    const firstOutput = Promise.all([new Response(first.stdout).text(), new Response(first.stderr).text()]);
-    const firstConnection = await currentFixture.waitForConnection(1, 5_000);
-    await waitForFixture(
-      () => firstConnection.ready ? firstConnection : undefined,
+    const firstObserved = observeCli(first);
+    const firstConnection = await firstObserved.waitFor(
+      () => {
+        const connection = currentFixture.connections[0];
+        return connection?.ready ? connection : undefined;
+      },
       5_000,
       "CLI did not authenticate its WebSocket connection",
     );
@@ -940,7 +978,7 @@ test("real CLI gives a CommunityTopic thread the parent group's work directory",
       mention: botMention,
       messageId: "9007199254744001",
     });
-    const created = await waitForFixture(
+    const created = await firstObserved.waitFor(
       () => currentFixture.sentMessages.find((message) => message.body.channel_id === groupId),
       10_000,
       "the parent group /new command did not get a reply",
@@ -957,7 +995,7 @@ test("real CLI gives a CommunityTopic thread the parent group's work directory",
       mention: botMention,
       messageId: "9007199254744002",
     });
-    const taskReply = await waitForFixture(
+    const taskReply = await firstObserved.waitFor(
       () =>
         currentFixture.sentMessages.find(
           (message) =>
@@ -986,7 +1024,7 @@ test("real CLI gives a CommunityTopic thread the parent group's work directory",
       mention: botMention,
       messageId: "9007199254744003",
     });
-    const status = await waitForFixture(
+    const status = await firstObserved.waitFor(
       () =>
         currentFixture.sentMessages
           .slice(beforeStatus)
@@ -999,14 +1037,16 @@ test("real CLI gives a CommunityTopic thread the parent group's work directory",
     // The inherited binding and the completed task survive a restart.
     first.kill("SIGTERM");
     expect(await waitForChildExit(first, 10_000)).toBe(0);
-    await firstOutput.catch(() => {});
+    await firstObserved.output;
 
     const second = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe", env: cliEnv });
     children.push(second);
-    const secondOutput = Promise.all([new Response(second.stdout).text(), new Response(second.stderr).text()]);
-    const secondConnection = await currentFixture.waitForConnection(2, 5_000);
-    await waitForFixture(
-      () => secondConnection.ready ? secondConnection : undefined,
+    const secondObserved = observeCli(second);
+    const secondConnection = await secondObserved.waitFor(
+      () => {
+        const connection = currentFixture.connections[1];
+        return connection?.ready ? connection : undefined;
+      },
       5_000,
       "restarted CLI did not authenticate its WebSocket connection",
     );
@@ -1019,7 +1059,7 @@ test("real CLI gives a CommunityTopic thread the parent group's work directory",
       mention: botMention,
       messageId: "9007199254744004",
     });
-    const restartedStatus = await waitForFixture(
+    const restartedStatus = await secondObserved.waitFor(
       () =>
         currentFixture.sentMessages
           .slice(beforeRestartStatus)
@@ -1034,7 +1074,7 @@ test("real CLI gives a CommunityTopic thread the parent group's work directory",
 
     second.kill("SIGTERM");
     expect(await waitForChildExit(second, 10_000)).toBe(0);
-    await secondOutput.catch(() => {});
+    await secondObserved.output;
   } finally {
     for (const child of children) {
       if (child.exitCode === null) {
@@ -1157,16 +1197,20 @@ exec '${process.execPath}' "$@"
 
     const spawned = Bun.spawn(
       [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "start", "--config", configPath],
-      { stdout: "pipe", stderr: "pipe", env: cliEnvironment(currentRoot) },
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: cliEnvironment(currentRoot, { TZ: "Asia/Kathmandu" }),
+      },
     );
     child = spawned;
-    const stdout = new Response(spawned.stdout).text();
-    const stderr = new Response(spawned.stderr).text();
-    const capturedOutput = Promise.all([stdout, stderr]);
-    outputPromise = capturedOutput;
-    const connection = await currentFixture.waitForConnection(1, 5_000);
-    await waitForFixture(
-      () => connection.ready ? connection : undefined,
+    const observed = observeCli(spawned);
+    outputPromise = observed.output;
+    const connection = await observed.waitFor(
+      () => {
+        const connection = currentFixture.connections[0];
+        return connection?.ready ? connection : undefined;
+      },
       5_000,
       "CLI did not authenticate its WebSocket connection",
     );
@@ -1182,7 +1226,7 @@ exec '${process.execPath}' "$@"
       mention: botMention,
       messageId: "9007199254745001",
     });
-    const bound = await waitForFixture(
+    const bound = await observed.waitFor(
       () => currentFixture.sentMessages.find((message) => message.body.channel_id === groupId),
       10_000,
       "the parent group /new command did not get a reply",
@@ -1199,7 +1243,7 @@ exec '${process.execPath}' "$@"
       mention: botMention,
       messageId: "9007199254745002",
     });
-    const reply = await waitForFixture(
+    const reply = await observed.waitFor(
       () =>
         currentFixture.sentMessages.find(
           (message) =>
@@ -1263,6 +1307,7 @@ function readTaskRow(
 ): { state: string; errorText: string | null; promptAccepted: number } | undefined {
   const db = new Database(dbPath, { readonly: true });
   try {
+    db.query("PRAGMA busy_timeout = 1000").run();
     const row = db
       .query("SELECT state, error_text, prompt_accepted FROM tasks WHERE message_id = ?")
       .get(messageId) as { state?: unknown; error_text?: unknown; prompt_accepted?: unknown } | null;
@@ -1324,20 +1369,23 @@ test("real CLI killed after an accepted interrupt never resumes that turn", asyn
       "--config",
       configPath,
     ];
-    const cliEnv = cliEnvironment(currentRoot);
+    const cliEnv = cliEnvironment(currentRoot, { TZ: "Asia/Kathmandu" });
     const chatId = `${currentFixture.ownerUid}@${currentFixture.botUid}`;
     const taskMessageId = "9007199254748001";
 
     const first = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe", env: cliEnv });
     children.push(first);
-    const firstOutput = Promise.all([new Response(first.stdout).text(), new Response(first.stderr).text()]);
-    const firstConnection = await currentFixture.waitForConnection(1, 5_000);
-    await waitForFixture(
-      () => firstConnection.ready ? firstConnection : undefined,
+    const firstObserved = observeCli(first);
+    const firstConnection = await firstObserved.waitFor(
+      () => {
+        const connection = currentFixture.connections[0];
+        return connection?.ready ? connection : undefined;
+      },
       5_000,
       "first CLI did not authenticate its WebSocket connection",
     );
     await waitForLifecycleNotice(
+      firstObserved,
       currentFixture,
       "startup",
       first.pid,
@@ -1352,7 +1400,7 @@ test("real CLI killed after an accepted interrupt never resumes that turn", asyn
     });
     // 派发已经进了会话（OMP 的接受回执已落账）而回合被 fixture 挂住：这就是「控制已回执、回合尚
     // 未收束」的窗口。
-    await waitForFixture(
+    await firstObserved.waitFor(
       () => readTaskRow(join(stateDir, "channel.sqlite"), taskMessageId)?.promptAccepted === 1 ? true : undefined,
       15_000,
       "the hanging prompt was not accepted by OMP before the interrupt",
@@ -1364,7 +1412,7 @@ test("real CLI killed after an accepted interrupt never resumes that turn", asyn
       text: "/interrupt",
       messageId: "9007199254748002",
     });
-    await waitForFixture(
+    await firstObserved.waitFor(
       () => currentFixture.sentMessages.find((message) => sentText(message).includes("已中断当前回合")),
       8_000,
       "the CLI did not acknowledge the interrupt",
@@ -1372,7 +1420,7 @@ test("real CLI killed after an accepted interrupt never resumes that turn", asyn
     // 中断已回执、prompt 仍未收束：此刻 SIGKILL，进程连一次关停清理都跑不到。
     first.kill("SIGKILL");
     await first.exited;
-    await firstOutput;
+    await firstObserved.output;
     await pauseWhileChildIsBlocked(200);
     // A killed process cannot run the stopping path, so the owner never hears a stop notice.
     expect(lifecycleMessages(currentFixture, "stop")).toHaveLength(0);
@@ -1380,14 +1428,17 @@ test("real CLI killed after an accepted interrupt never resumes that turn", asyn
 
     const second = Bun.spawn(cliArgs, { stdout: "pipe", stderr: "pipe", env: cliEnv });
     children.push(second);
-    const secondOutput = Promise.all([new Response(second.stdout).text(), new Response(second.stderr).text()]);
-    const secondConnection = await currentFixture.waitForConnection(2, 5_000);
-    await waitForFixture(
-      () => secondConnection.ready ? secondConnection : undefined,
+    const secondObserved = observeCli(second);
+    const secondConnection = await secondObserved.waitFor(
+      () => {
+        const connection = currentFixture.connections[1];
+        return connection?.ready ? connection : undefined;
+      },
       5_000,
       "restarted CLI did not authenticate its WebSocket connection",
     );
     await waitForLifecycleNotice(
+      secondObserved,
       currentFixture,
       "startup",
       second.pid,
@@ -1403,7 +1454,7 @@ test("real CLI killed after an accepted interrupt never resumes that turn", asyn
       text: "/status",
       messageId: "9007199254748003",
     });
-    const statusReply = await waitForFixture(
+    const statusReply = await secondObserved.waitFor(
       () =>
         currentFixture.sentMessages
           .slice(sentBefore)
@@ -1426,7 +1477,7 @@ test("real CLI killed after an accepted interrupt never resumes that turn", asyn
 
     second.kill("SIGTERM");
     expect(await waitForChildExit(second)).toBe(0);
-    await secondOutput;
+    await secondObserved.output;
   } finally {
     for (const child of children) {
       if (child.exitCode === null) {

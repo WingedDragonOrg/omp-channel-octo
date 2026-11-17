@@ -35,6 +35,7 @@ OctoBuddy 增强器打开跨工作区的 Zed SSH 文件时，状态接口提供�
 
 包含显式请求驱动的有界语义 `watch`：宿主持久保存采集器、完成条件、间隔和截止时间，独立于原 OMP worker 周期检查；单次命中生成归属聊天的独立排队输入。启用 `decisions` 时 watch 默认启用，并与引用识别共用 protocol、endpoint、model 和 key；可用 `watch.enabled=false` 单独关闭。客观状态、退出或事件条件使用程序机制。完整授权、预算、停止与恢复契约见 `docs/specs/2026-11-04-bounded-stoppable-watch-design.md`。
 包含只读宿主工具 `octo_discover`：channel 任务按当前 bot 的实际 Octo 和 Loop 权限跨群发现事项相关群及子区，综合本实例关联和远端搜索，并通过 Decisions 对候选排序与过滤。身份、证据、分页、权限和结果边界见 `docs/specs/2026-11-17-cross-chat-association-discovery-design.md`。
+该工具使用兼容 Codex 的顶层 object 参数 schema；`search.query` 与 `page.query_id` 的必填规则由执行入口按 action 校验。
 原生 `/context` 以独立 `octo/v1` 卡展示 OMP 的上下文占用明细；不支持卡片或发送失败时只发送失败提示，不重试卡片。命令与投递边界见 `docs/specs/2026-11-10-context-command-card-design.md`。
 
 
@@ -145,6 +146,7 @@ OMP 扩展可在 `session_start` 恢复观察并发起自主回合；RPC `ready`
 OMP worker 启动失败时，保留启动阶段有限的 stderr；退出后将退出码和脱敏、单行、限长的 stderr 摘要随分类提示发到当前聊天，并写入有界任务错误与服务日志。仅启动失败使用该诊断；已就绪后仍排空并丢弃 stderr。群成员可见摘要，脱敏无法保证识别所有自定义凭据。
 
 每次 Super CLI 查询有独立期限（默认 10 秒），覆盖进程退出及 stdout/stderr 读取。在 POSIX 上该调用使用独立进程组，期限到达时终止该组及直接子进程，即使子进程忽略 SIGTERM 或后代仍持有管道，也以超时错误结束调用。
+父进程死亡 watchdog 使用独立进程组，启动环境移除继承的 `BUN_FEATURE_FLAG_NO_ORPHANS`，确保宿主以 Bun `--no-orphans` 运行时，看门狗仍能在宿主退出后回收受管进程组；普通 worker 的环境策略不变。
 
 配置包含 Octo API 地址（缺省为 `https://im.deepminer.com.cn/`）、Bot token、可选 owner 用户 ID、允许群 ID、OMP 可执行文件、本地状态目录与会话目录（`sessionsDir`，缺省 `~/.oco/sessions`，每个项目一个子目录）；WebSocket 地址可按现有发现机制取得或显式配置；`ask` 块可配置问答等待超时 `timeoutMs`（默认 6 小时，允许 30 分钟到 7 天的整数毫秒，越界或非法值启动即拒绝）。未配置 owner 时，服务仅在该 Bot 尚无持久 owner 的条件下接受首次有效私聊绑定。凭证只来自本地配置或环境，不通过聊天设置，不写入日志。使用环境凭证时环境变量名默认 `OCTO_BOT_TOKEN`，显式名称仅允许 `OCTO_` 或 `OMP_CHANNEL_OCTO_` 前缀；所有这两类前缀的变量都会从 worker/watchdog 环境中剔除，以免子进程继承凭证。启动时校验配置、账户能力和状态目录可写性。同一 Bot 只允许一个 channel 实例，使用本机独占锁；不支持跨机器复制运行同一账户。
 发卡前必须通过同一能力门禁：profile `enabled=true`（兼容服务端返回 `1`），`profiles` 包含 `octo/v1`，`card_version=1.5`，且 `config.card_enabled=true`、`config.display_enabled=true`、`config.reasoning_enabled=true`；`TextBlock` 是唯一硬依赖，`Container` 等可选元素缺失时使用 fallback；若响应提供 `elements` 或 `limits`，则遵守所需元素和各项限额（包括 payload、node、depth 限额）。能力响应明确不满足必需条件时按未启用处理；HTTP 失败属于请求失败，不等同未启用，不通过发送试探能力。

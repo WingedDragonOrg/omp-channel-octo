@@ -396,6 +396,10 @@ bun test
 
 测试覆盖权限、持久化、流式投递、重启恢复、工作区和 RPC 生命周期；HTTP/WebSocket 与真实子进程夹具不调用模型。默认 transport 夹具的 Bot ID 按测试进程隔离；显式 Bot ID 仍用于同身份互斥与恢复验证。
 
+CLI 协议测试通过 `tests/fixtures/cli-process.ts` 隔离 HOME 与宿主的 `OMP_CHANNEL_OCTO_HTTP_*` 配置，默认关闭 HTTP 状态接口；专门的 HTTP 测试显式启用自己的 loopback 端口与凭据。等待 CLI 连接或业务回复时检查进程是否提前退出，并附退出码及捕获的 stdout/stderr；并发读取 CLI 数据库的轮询使用有界 SQLite 锁等待。
+
+排查失败时可运行 `bun test --bail=1 --no-orphans`，在首个失败后退出并清理测试子进程。Bun 的单测超时不限制整套测试总时长；外部执行器应分别设置整体运行期限。
+
 上下文、目标与 BTW 另有显式真实 OMP 验收，使用隔离的配置/会话、有限 localhost 模型替身和本地 Octo fixture，不需要模型凭据，也不连接常驻 Bot：
 
 ```sh

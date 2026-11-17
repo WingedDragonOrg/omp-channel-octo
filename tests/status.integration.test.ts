@@ -2,9 +2,9 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { cliEnvironment, observeCli, type ObservedCli } from "./fixtures/cli-process.ts";
 import {
   createOctoProtocolFixture,
-  waitForFixture,
   type FixtureCardProfile,
   type FixtureSentMessage,
   type OctoProtocolFixture,
@@ -63,14 +63,14 @@ interface StatusCliRun {
   statusMessage: FixtureSentMessage;
   root: string;
   child: Bun.Subprocess;
-  output: Promise<[string, string]>;
+  observed: ObservedCli;
 }
 
 async function runStatusWithProfile(elements: string[], cardVersion = "1.5"): Promise<StatusCliRun> {
   const root = await mkdtemp(join(tmpdir(), "octo-status-integration-"));
   let fixture: OctoProtocolFixture | undefined;
   let child: Bun.Subprocess | undefined;
-  let output: Promise<[string, string]> | undefined;
+  let observed: ObservedCli | undefined;
   try {
     fixture = await createOctoProtocolFixture({ cardProfileBody: cardProfile(elements, cardVersion) });
     const configPath = join(root, "config.json");
@@ -88,17 +88,20 @@ async function runStatusWithProfile(elements: string[], cardVersion = "1.5"): Pr
       {
         stdout: "pipe",
         stderr: "pipe",
-        env: { ...process.env, HOME: root, TZ: "UTC" },
+        env: cliEnvironment(root),
       },
     );
     child = spawned;
-    output = Promise.all([
-      new Response(spawned.stdout).text(),
-      new Response(spawned.stderr).text(),
-    ]);
+    observed = observeCli(spawned);
 
-    const connection = await fixture.waitForConnection(1, 5_000);
-    await waitForFixture(() => connection.ready ? connection : undefined, 5_000, "CLI Octo connection readiness");
+    const connection = await observed.waitFor(
+      () => {
+        const candidate = fixture!.connections[0];
+        return candidate?.ready ? candidate : undefined;
+      },
+      5_000,
+      "CLI Octo connection readiness",
+    );
     fixture.sendInbound(connection, {
       fromUid: fixture.ownerUid,
       channelId: `${fixture.ownerUid}@${fixture.botUid}`,
@@ -106,8 +109,7 @@ async function runStatusWithProfile(elements: string[], cardVersion = "1.5"): Pr
       text: "/status",
       messageId: "9007199254744501",
     });
-
-    const statusMessage = await waitForFixture(
+    const statusMessage = await observed.waitFor(
       () => fixture!.sentMessages.find(message =>
         message.body.channel_id === fixture!.ownerUid
         && (payloadOf(message).type === 17 || textOf(message).includes("session=")),
@@ -115,7 +117,7 @@ async function runStatusWithProfile(elements: string[], cardVersion = "1.5"): Pr
       5_000,
       "CLI /status card or text response",
     );
-    return { fixture, statusMessage, root, child: spawned, output: output! };
+    return { fixture, statusMessage, root, child: spawned, observed };
   } catch (error) {
     if (child !== undefined) {
       child.kill("SIGTERM");
@@ -125,7 +127,7 @@ async function runStatusWithProfile(elements: string[], cardVersion = "1.5"): Pr
         child.kill("SIGKILL");
         await child.exited;
       }
-      await output?.catch(() => undefined);
+      await observed?.output.catch(() => undefined);
     }
     await fixture?.close();
     await rm(root, { recursive: true, force: true });
@@ -147,7 +149,7 @@ async function closeRun(result: StatusCliRun): Promise<void> {
       result.child.kill("SIGKILL");
       await result.child.exited;
     }
-    const [stdout, stderr] = await result.output;
+    const [stdout, stderr] = await result.observed.output;
     const logs = `${stdout}\n${stderr}`;
     expect(logs).not.toContain(result.fixture.botToken);
     if (exitFailed) throw exitFailure;

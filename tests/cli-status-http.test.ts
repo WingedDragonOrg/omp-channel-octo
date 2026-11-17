@@ -5,6 +5,7 @@ import { once } from "node:events";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { cliEnvironment } from "./fixtures/cli-process.ts";
 import {
   createOctoProtocolFixture,
   waitForFixture,
@@ -36,22 +37,6 @@ async function reserveLoopbackPort(): Promise<number> {
   return address.port;
 }
 
-const STATUS_ENV_KEYS = [
-  "OMP_CHANNEL_OCTO_HTTP_ENABLED",
-  "OMP_CHANNEL_OCTO_HTTP_LISTEN_ADDRESS",
-  "OMP_CHANNEL_OCTO_HTTP_PORT",
-  "OMP_CHANNEL_OCTO_HTTP_TOKEN",
-  "OMP_CHANNEL_OCTO_HTTP_TOKEN_FILE",
-] as const;
-
-function cliEnvironment(home: string, statusEnv: Record<string, string>): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value === undefined || (STATUS_ENV_KEYS as readonly string[]).includes(key)) continue;
-    env[key] = value;
-  }
-  return { ...env, HOME: home, TZ: "UTC", ...statusEnv };
-}
 
 async function startCliRun(
   home: string,
@@ -76,7 +61,10 @@ async function startCliRun(
       cwd: CHECKOUT_ROOT,
       stdout: "pipe",
       stderr: "pipe",
-      env: cliEnvironment(home, options.statusEnv ?? {}),
+      env: cliEnvironment(home, {
+        OMP_CHANNEL_OCTO_HTTP_ENABLED: "true",
+        ...(options.statusEnv ?? {}),
+      }),
     },
   );
   const output = Promise.all([

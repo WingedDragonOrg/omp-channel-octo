@@ -269,6 +269,9 @@ function spawnWatchdogProcess(
   killGraceMs: number,
   terminateOnWorkerExit: boolean,
 ): RpcChild {
+  const env = workerEnv();
+  // The watchdog must outlive its parent to terminate the guarded process group.
+  delete env.BUN_FEATURE_FLAG_NO_ORPHANS;
   return Bun.spawn(
     [
       process.execPath,
@@ -283,7 +286,7 @@ function spawnWatchdogProcess(
     ],
     {
       stdin: "ignore",
-      env: workerEnv(),
+      env,
       stdout: "pipe",
       stderr: "pipe",
       detached: true,

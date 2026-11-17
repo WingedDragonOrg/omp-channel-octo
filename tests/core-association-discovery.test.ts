@@ -245,13 +245,13 @@ async function search(discovery: HostTool, args: Record<string, unknown>): Promi
 }
 
 test("every chat, including private chats, advertises octo_discover", async () => {
-  const advertised: Array<{ chat: string; names: string[] }> = [];
+  const advertised: Array<{ chat: string; tools: readonly HostTool[] }> = [];
   const harness = await createCoreHarness({
     allowedGroupIds: [GROUP_A, `group-fresh`],
     prompt: async ({ promptContext }) => {
       advertised.push({
         chat: String(advertised.length),
-        names: (promptContext?.tools ?? []).map(({ name }) => name),
+        tools: promptContext?.tools ?? [],
       });
     },
   });
@@ -278,8 +278,15 @@ test("every chat, including private chats, advertises octo_discover", async () =
     });
     await waitForPrompts(harness, 3);
     expect(advertised).toHaveLength(3);
-    for (const { chat, names } of advertised) {
-      expect({ chat, hasDiscover: names.includes("octo_discover") }).toEqual({ chat, hasDiscover: true });
+    for (const { chat, tools } of advertised) {
+      expect({ chat, hasDiscover: tools.some(({ name }) => name === "octo_discover") })
+        .toEqual({ chat, hasDiscover: true });
+      const parameters = objectFrom(discoveryTool({ tools }).parameters, "octo_discover parameters");
+      expect(parameters.type).toBe("object");
+      // Codex rejects these keywords at the function-parameters root.
+      for (const keyword of ["oneOf", "anyOf", "allOf", "enum", "const", "not"]) {
+        expect(parameters).not.toHaveProperty(keyword);
+      }
     }
   } finally {
     await closeCoreHarness(harness);
@@ -308,16 +315,11 @@ test("private discovery finds cross-group local associations and withholds unrea
       const parameters = objectFrom(discovery.parameters, "octo_discover parameters");
       expect(parameters.required).toContain("action");
       expect(parameters.required).not.toContain("query");
-      const branches = parameters.oneOf;
-      if (!Array.isArray(branches) || branches.length !== 2) throw new Error("discovery action schema is not conditional");
-      const requiredByAction = branches.map((branch) => {
-        const schema = objectFrom(branch, "action branch");
-        const properties = objectFrom(schema.properties, "action branch properties");
-        const action = objectFrom(properties.action, "action branch action");
-        return { action: action.const, required: schema.required };
-      });
-      expect(requiredByAction).toContainEqual({ action: "search", required: ["query"] });
-      expect(requiredByAction).toContainEqual({ action: "page", required: ["query_id"] });
+      const signal = new AbortController().signal;
+      await expect(discovery.execute({ action: "search" }, signal))
+        .rejects.toThrow("query must be a non-empty string");
+      await expect(discovery.execute({ action: "page" }, signal))
+        .rejects.toThrow("query_id must be a non-empty string");
       const properties = objectFrom(parameters.properties, "octo_discover properties");
       expect(objectFrom(properties.action, "action schema").enum).toContain("search");
       expect(objectFrom(properties.query, "query schema").type).toBe("string");

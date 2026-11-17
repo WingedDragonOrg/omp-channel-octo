@@ -1263,7 +1263,7 @@ while :; do sleep 10; done`,
         `.merge({ cwd, lifecycle });\n`,
       "utf8",
     );
-    host = Bun.spawn([process.execPath, hostScript, wt, linked, lifecycleState], {
+    host = Bun.spawn([process.execPath, "--no-orphans", hostScript, wt, linked, lifecycleState], {
       stdin: "ignore",
       stdout: "ignore",
       stderr: "ignore",

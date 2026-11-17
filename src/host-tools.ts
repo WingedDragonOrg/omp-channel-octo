@@ -912,21 +912,17 @@ function createDiscoveryTool(host: HostToolHost, task: TaskRecord): HostTool {
       type: "object",
       properties: {
         action: { type: "string", enum: ["search", "page"] },
-        query: { type: "string", description: "search 事项描述或关键词；page 不需要 query。" },
+        query: { type: "string", description: "search 必填：事项描述或关键词；page 不需要 query。" },
         workspace_id: { type: "string", description: "Loop workspace UUID；仅与 task_id 成对使用。" },
         task_id: { type: "string", description: "Loop task UUID；必须同时提供 workspace_id。" },
         reference_url: { type: "string", description: "已记录的精确 PR/MR URL。" },
         repo: { type: "string", description: "精确仓库 URL。" },
         path: { type: "string", description: "精确工作区路径。" },
-        query_id: { type: "string", description: "search 返回的不透明查询 ID。" },
+        query_id: { type: "string", description: "page 必填：search 返回的不透明查询 ID。" },
         collection: { type: "string", enum: ["candidates", "filtered"] },
         position: { type: "integer", minimum: 1, description: "1 起始的页号。" },
       },
       required: ["action"],
-      oneOf: [
-        { properties: { action: { const: "search" } }, required: ["query"] },
-        { properties: { action: { const: "page" } }, required: ["query_id"] },
-      ],
       additionalProperties: false,
     },
     execute: async (args, signal) => {

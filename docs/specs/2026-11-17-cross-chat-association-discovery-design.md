@@ -44,6 +44,8 @@
 
 新增只读 discovery host tool，向 channel 启动的各聊天任务提供，包括私聊、群和子区。调用绑定任务所属的真实 bot；不接受 bot UID、token、任意身份或其他实例作为选择器。支持首次查询和后续分页：
 
+工具参数使用顶层 `type: "object"` 的平面 schema，必填 `action`，兼容 Codex function calling；`search` 的 `query` 和 `page` 的 `query_id` 在执行入口按 action 校验，并在字段描述中标明要求。
+
 - 首次查询可提供事项描述/关键词，和可选的结构化线索：Loop workspace ID 与 task ID、PR/MR URL、项目仓库 URL 或本地工作区路径。至少提供一条线索。结构化值按其来源的规范形式精确匹配，不以名称相似伪造身份；task ID 与 workspace ID 成对定位，避免跨 workspace 混淆。对没有对应结构化线索的来源使用明确的事项文本查询，而不把 URL 或路径变成无约束全库枚举。
 - 首次查询返回查询 ID、正常候选的第一页、被模型过滤候选的数量及其独立分页入口、各来源覆盖状态和正常候选续页入口。每个候选有真实 `channelType`、`channelId`、父群及子区身份（适用时）、可显示的名称、证据列表、来源采样时间，以及可用的进一步读取入口；不得猜造 URL、名称、任务状态或时间。
 - 证据类别至少区分 `loop_route`（明确 task—子区路由）、`recorded_reference`（本实例记录的 PR/MR 引用，标识其模型识别性质）、`workspace`（本实例记录的项目/路径/仓库线索）及 `message_match`（远端搜索命中）。候选可有多条证据。每条带真实来源及可用的 task、URL、项目记录或消息身份；不存在的原始消息、证据摘录及模型置信度均不补造。workspace 和文本命中只作为相关线索。
