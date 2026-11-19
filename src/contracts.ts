@@ -558,6 +558,8 @@ export interface WorkerOptions {
    * active OMP profile has `goal.enabled: false`.
    */
   goalContinuation?: boolean;
+  /** Restore the ratchet prelude for a session that accepted its native command. */
+  ratchetEnabled?: boolean;
   /**
    * Cancels worker startup. If the process has spawned, startup rejects only after its managed
    * process group has been stopped or handed to the existing recovery path.

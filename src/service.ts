@@ -222,6 +222,7 @@ const COMMAND_HELP = [
   "/queue <文本> · 将消息排到当前任务之后",
   "/mode [steer|queue] · 查看或设置新消息的追加方式",
   "/goal [show|set [--budget N] <目标>|pause|resume|drop|budget [N|off]] · 管理本会话的原生目标",
+  "/ratchet [流程与目标] · 启动 OMP 原生评估和优化，按原生步骤确认",
   "/retry · 重试当前会话上次失败或中止的回合，忙时排队",
   "/btw <问题> · 在当前绑定会话旁路提问",
   "/interrupt · 中断当前回合，保留排队消息",
@@ -12150,6 +12151,9 @@ class CoreService implements ChannelService {
         sessionDir,
         ...(chatModel === null ? {} : { model: chatModel }),
         ...(goalTask === null ? {} : { goalContinuation: true }),
+        ...(this.store.hasRatchetSession(this.bot!.uid, target, task.sessionId)
+          || (!resuming && !isTanDispatch && /^\/ratchet(?:\s|$)/u.test(task.text.trimStart()))
+          ? { ratchetEnabled: true } : {}),
       };
       if (binding?.sessionFile) {
         const sessionFile = await existingSessionFile(binding.sessionFile);
@@ -12402,7 +12406,7 @@ class CoreService implements ChannelService {
           const prompt = isTanDispatch
             ? (/^\s*\/\S+/u.test(task.text) ? `用户请求：\n${task.text}` : task.text)
             : (historyTurn?.text ?? task.text);
-          await worker.prompt(prompt, consumeEvent, promptContext);
+          await worker.prompt(/^\/ratchet(?:\s|$)/u.test(prompt.trimStart()) ? prompt.trimStart() : prompt, consumeEvent, promptContext);
         }
       } finally {
         runtime.promptInFlight = false;

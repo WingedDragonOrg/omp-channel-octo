@@ -76,6 +76,7 @@ runBun([
 ]);
 
 await copyFile(join(projectRoot, "src", "omp", "goal-rpc.yml"), join(runtimeOmpDir, "goal-rpc.yml"));
+await copyFile(join(projectRoot, "src", "omp", "ratchet-rpc.yml"), join(runtimeOmpDir, "ratchet-rpc.yml"));
 await chmod(executablePath, 0o755);
 await chmod(watchdogPath, 0o755);
 console.log(`Built AOT channel: ${executablePath}`);

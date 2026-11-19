@@ -169,6 +169,26 @@ test("injects the newest maxMessages of the conversation on the first turn", asy
   }
 });
 
+test("owner /ratchet reaches OMP at the start of the prompt without a group-history prefix", async () => {
+  const harness = await createCoreHarness({
+    groupHistory: { enabled: true, maxMessages: 3 },
+    allowedGroupIds: GROUP_IDS,
+  });
+  try {
+    await deliverGroupMessages(harness, 1, 2);
+    const ratchetText = '  /ratchet   eval --goal "optimize"  ';
+    await harness.service.submitInbound(triggerMessage(harness, 3, ratchetText));
+    await waitForTask(harness, 1);
+
+    expect(harness.workers.prompts[0]?.text).toBe('/ratchet   eval --goal "optimize"  ');
+    expect(harness.workers.prompts[0]?.text).not.toContain("[群聊历史");
+    expect(harness.workers.prompts[0]?.text).not.toContain("群消息 1");
+    expect(harness.workers.prompts[0]?.text).not.toContain("群消息 2");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
 test("a later turn on the same session only injects what is new", async () => {
   const harness = await createCoreHarness({
     groupHistory: { enabled: true, maxMessages: 5 },

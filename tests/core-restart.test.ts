@@ -15,6 +15,7 @@ import {
   type FakePrompt,
   createCoreHarness,
   inbound,
+  submitAndWaitForIngressHandoff,
   readText,
   waitForStatus,
 } from "./fixtures/core-fakes";
@@ -242,6 +243,47 @@ test("a restart resumes the interrupted turn in its own session without replayin
     expect(delivered).not.toContain("因重启中断");
     expect(delivered).not.toContain("任务已取消");
     expect(delivered).not.toContain("任务已中断");
+  } finally {
+    await closeCoreHarness(restarted);
+  }
+});
+
+test("an accepted ratchet task resumes with the ratchet prelude after restart", async () => {
+  const target: ChatTarget = { channelId: "dm-ratchet-recovery", channelType: 1 };
+  const ratchetText = "/ratchet eval recovery-flow";
+  const first = await createCoreHarness({ prompt: suspendedPrompt });
+  try {
+    await submitAndWaitForIngressHandoff(
+      first,
+      inbound({ messageId: "ratchet-recovery-task", ...target, text: ratchetText }),
+    );
+    await first.workers.waitForPromptCount(1);
+    await waitForStatus(first.service, target, status => status.state === "running");
+    expect(first.workers.prompts[0]?.text).toBe(ratchetText);
+  } finally {
+    await closeCoreHarness(first, { remove: false });
+  }
+
+  const resumed = await withStore(first.root, store => {
+    const task = store.getLatestTask(first.bot.uid, target);
+    return { task, resuming: task === null ? false : store.isTaskResuming(task.id) };
+  });
+  expect(resumed.task?.state).toBe("running");
+  expect(resumed.resuming).toBe(true);
+
+  const restarted = await createCoreHarness({
+    root: first.root,
+    bot: first.bot,
+    prompt: recordingPrompt,
+  });
+  try {
+    await waitForStatus(
+      restarted.service,
+      target,
+      status => status.state === "completed" && status.outbox === 0,
+    );
+    expect(restarted.workers.prompts.map(({ text }) => text)).toEqual(["/retry"]);
+    expect(restarted.workers.creations.at(-1)?.ratchetEnabled).toBe(true);
   } finally {
     await closeCoreHarness(restarted);
   }

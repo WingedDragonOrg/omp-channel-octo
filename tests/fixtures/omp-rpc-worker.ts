@@ -94,7 +94,8 @@ type Scenario =
 	| "research-higher"
 	| "no-models"
 	| "context-partial"
-	| "model-window-only";
+	| "model-window-only"
+	| "ratchet-ask";
 
 const argv = process.argv.slice(2);
 
@@ -324,6 +325,15 @@ type HostToolRegistration = {
 	parameters?: unknown;
 };
 const hostTools = new Map<string, HostToolRegistration>();
+let askDialogEnabled = false;
+let ratchetUiRequestCount = 0;
+type RatchetAskMode = "flow" | "text-approve" | "reject" | "cancel" | "secret";
+let pendingRatchetUi: {
+	requestId: string;
+	mode: RatchetAskMode;
+	stage: "ask" | "input";
+	promptId: string | undefined;
+} | undefined;
 let pendingHostToolRequestId: string | undefined;
 let pendingHostToolCallId: string | undefined;
 let pendingHostToolName: string | undefined;
@@ -916,6 +926,94 @@ function emitHostToolCall(): void {
 			});
 		}, 20);
 	}
+}
+function emitRatchetUiRequest(
+	mode: RatchetAskMode,
+	stage: "ask" | "input",
+	promptId: string | undefined,
+): void {
+	const requestId = `fixture-ratchet-ui-${++ratchetUiRequestCount}`;
+	pendingRatchetUi = { requestId, mode, stage, promptId };
+	if (stage === "input") {
+		emit({
+			type: "extension_ui_request",
+			id: requestId,
+			method: "input",
+			title: "What should change about the input?",
+			...(mode === "secret" ? { secret: true } : {}),
+		});
+		return;
+	}
+	const questionId = mode === "flow"
+		? "ratchet-input"
+		: mode === "text-approve"
+			? "ratchet-text-approval"
+			: mode === "reject"
+				? "ratchet-rejection"
+				: "ratchet-cancellation";
+	emit({
+		type: "extension_ui_request",
+		id: requestId,
+		method: "ask",
+		questions: [{
+			id: questionId,
+			question: mode === "flow" ? "Use this input for the evaluation?" : "Approve this ratchet step?",
+			header: "Ratchet approval",
+			options: [
+				{
+					label: "Approve",
+					description: "Continue with the current input.",
+					preview: "Current input preview",
+				},
+				{
+					label: "Reject",
+					description: "Do not continue with the current input.",
+					preview: "Rejected input preview",
+				},
+			],
+			multi: false,
+			recommended: 1,
+		}],
+	});
+}
+
+function completeRatchetPrompt(id: string | undefined): void {
+	streaming = false;
+	emitAssistantMessage("fixture ratchet interaction complete", 0);
+	emit({ type: "agent_end", messages: [], willContinue: false });
+	appendLog({ kind: "turn_complete", id, ratchet: true });
+}
+
+function handleRatchetUiResponse(frame: Frame): void {
+	const pending = pendingRatchetUi;
+	if (!pending || frame.id !== pending.requestId) return;
+	pendingRatchetUi = undefined;
+	if (pending.stage === "ask" && pending.mode === "flow") {
+		emitRatchetUiRequest(pending.mode, "input", pending.promptId);
+		return;
+	}
+	completeRatchetPrompt(pending.promptId);
+}
+
+function beginRatchetPrompt(id: string | undefined, message: string): void {
+	if (!askDialogEnabled) {
+		response(id, "prompt", { agentInvoked: false });
+		emit({ type: "prompt_result", id, agentInvoked: false });
+		return;
+	}
+	const mode: RatchetAskMode = message.includes("secret")
+		? "secret"
+		: message.includes("text-approve")
+			? "text-approve"
+		: message.includes("reject")
+			? "reject"
+			: message.includes("cancel")
+				? "cancel"
+				: "flow";
+	streaming = true;
+	response(id, "prompt", { agentInvoked: true });
+	emit({ type: "agent_start" });
+	emitRatchetUiRequest(mode, mode === "secret" ? "input" : "ask", id);
 }
 
 function resultText(result: unknown): string {
@@ -1538,6 +1636,10 @@ function emitResearchHigherScenario(id: string | undefined): void {
 
 async function handlePrompt(id: string | undefined, message: string): Promise<void> {
 	appendLog({ kind: "prompt", id, message });
+	if (scenario === "ratchet-ask" && message.startsWith("/ratchet")) {
+		beginRatchetPrompt(id, message);
+		return;
+	}
 	if (scenario === "context-card" && message === "/context") {
 		emit({ type: "command_output", text: "Context window: 400000 tokens (8% used)\n  System prompt [\u001b[38;5;243m░░\u001b[39m] 1% 3094 tokens\n  Messages [\u001b[1m█░\u001b[22m] 4% 16217 tokens" });
 		response(id, "prompt", { agentInvoked: false });
@@ -2583,6 +2685,11 @@ function handleCommand(command: Frame): void {
 		response(id, type, { level: subagentSubscription });
 		return;
 	}
+	if (type === "set_ask_dialog") {
+		askDialogEnabled = command.enabled === true;
+		response(id, type, { enabled: askDialogEnabled });
+		return;
+	}
 	if (type === "set_host_tools") {
 		hostTools.clear();
 		const tools = Array.isArray(command.tools) ? command.tools : [];
@@ -2612,6 +2719,10 @@ function handleCommand(command: Frame): void {
 			return;
 		}
 		completeHostToolTurn(command);
+		return;
+	}
+	if (type === "extension_ui_response") {
+		if (scenario === "ratchet-ask") handleRatchetUiResponse(command);
 		return;
 	}
 	if (type === "btw") {

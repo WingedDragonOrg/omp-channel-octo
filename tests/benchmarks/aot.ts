@@ -23,6 +23,8 @@ try {
 
   const extensionPath = join(runtimeAssets, "context-extension.ts");
   const goalConfigPath = join(runtimeAssets, "goal-rpc.yml");
+  const ratchetConfigPath = join(runtimeAssets, "ratchet-rpc.yml");
+  assert.ok(existsSync(ratchetConfigPath), "AOT ratchet worker config is packaged");
   assert.ok(!extensionPath.includes("$bunfs"), "OMP extension is an external filesystem asset");
   assert.ok(!goalConfigPath.includes("$bunfs"), "OMP goal config is an external filesystem asset");
 

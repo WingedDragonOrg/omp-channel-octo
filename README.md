@@ -12,6 +12,7 @@
 - **执行反馈**：展示工具、待办和子代理进度；支持交互问答卡片，也可直接用文字作答。卡片能力取决于 Octo 部署，卡片失败不阻断正文。
 - **原生命令与通知**：未注册的 OMP slash 命令（如 `/autoresearch`）按独立任务原样转交 OMP 会话；扩展通知按级别标签独立投递，离线排队且跨服务重启可达。
 - **持续目标**：`/goal` 通过原生结构化 RPC 管理目标；支持创建时 token 预算、跨回合续跑、暂停恢复及在途目标的重启续接。
+- **评估优化**：`/ratchet [流程与目标]` 启动 OMP 原生评估与优化；输入、评分器和计划的原生审批经聊天问答展示。
 - **旁路问答**：`/btw <问题>` 通过原生 RPC 读取当前聊天会话上下文，主任务运行时立即发起，问题与完整答案独立投递。
 - **群组上下文**：注入群与子区说明、增量聊天历史，按会话记录已读取的位置。
 - **成员与点名**：每条新任务和 steering 获取当前群或子区成员信息；普通回复可生成结构化 @成员提醒。
@@ -125,6 +126,7 @@ oco run --config ~/.oco/config/config.json
 | `/goal set [--budget N] <目标>` | 创建目标并持续执行；`N` 为正整数 token 预算。 |
 | `/goal pause`、`/goal resume`、`/goal drop` | 暂停后续续跑、恢复或删除目标。 |
 | `/goal budget` | 查看预算；当前原生 RPC 仅支持创建时设置预算。 |
+| `/ratchet [流程与目标]` | 在当前工作目录建立或复用原生评估流程，审批后持续优化；审批使用现有问答权限。 |
 | `/btw <问题>` | 在当前聊天原会话上发起一次旁路问答；主任务继续，独立展示问题与答案。 |
 | `/retry` | 由 OMP 重试当前会话上次失败或中止的回合；忙时作为独立任务排队。没有可重试回合时返回 OMP 提示。 |
 | `/commit` | 用 OMP 原生 commit 提交当前绑定的单仓库、单 worktree 工作区；同一张进度卡持续更新原生阶段及最终 HEAD 结果。资源忙碌时拒绝。 |
@@ -424,7 +426,7 @@ bun tests/benchmarks/restart.ts
 bun run build:aot
 ```
 
-请将 `dist/oco`、`dist/oco-watchdog`、`dist/tests/preview-card.acceptance.test.ts` 和 `dist/runtime/omp/` 一起部署；preview test、OMP 扩展与 goal RPC 配置都是可读的外部资源。常规 `bun run` / `bun link` 仍运行源码。AOT 的 `status` / `restart` 按编译程序路径识别 Super，不依赖二进制目录作为工作目录；`test --card` 使用打包测试资源并调用 Bun test。离线回归会用假 Bun 校验参数，不发送真实消息；另验证 watchdog、扩展加载和正常消息路径，不连接真实 Bot 或模型：
+请将 `dist/oco`、`dist/oco-watchdog`、`dist/tests/preview-card.acceptance.test.ts` 和 `dist/runtime/omp/` 一起部署；preview test、OMP 扩展、goal 与 ratchet RPC 配置都是可读的外部资源。常规 `bun run` / `bun link` 仍运行源码。AOT 的 `status` / `restart` 按编译程序路径识别 Super，不依赖二进制目录作为工作目录；`test --card` 使用打包测试资源并调用 Bun test。离线回归会用假 Bun 校验参数，不发送真实消息；另验证 watchdog、扩展加载和正常消息路径，不连接真实 Bot 或模型：
 
 ```sh
 bun tests/benchmarks/aot.ts

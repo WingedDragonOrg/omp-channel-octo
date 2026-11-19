@@ -33,6 +33,7 @@ import type {
 import { allocateScheduleOrder, applySchema, transaction } from "./store-schema.ts";
 import { claimOwnerEnrollment, clearChatModel, clearThreadModel, ensureBinding, ensureBindingIfMatches, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, getThreadModel, grantAllowedChat, hasOwnerEnrollment, initializeBindingSessionFromTask, listAllowedChats, resolveChatModel, setBotUid, setChatMode, setChatModel, setOwnerId, setThreadModel, updateBindingSession } from "./store-chats.ts";
 import { acceptCommitTask, acceptTask, acceptTaskIf, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, getTaskByMessageId, getTaskFinalResultText, getTaskScheduleOrder, hasTaskStopIntent, isCommitTask, isTaskResuming, listQueuedTasks, listTransferredLoopTasks, listUndispatchedLoopTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim, setTaskFinalResultText, suppressTaskRelay, cancelUndispatchedTask, LOOP_TRANSFER_ERROR_TEXT } from "./store-tasks.ts";
+import { hasRatchetSession } from "./store-tasks.ts";
 import { bindGoalTaskSession, clearGoalSession, finishGoalTaskProgress, getGoalSession, getGoalTask, isGoalTaskResuming, markGoalTaskAccepted, markGoalTaskAgentAccepted, markGoalTaskDispatched, saveGoalSessionProgress, stopGoalContinuation, updateGoalTaskProgress } from "./store-goals.ts";
 import { clearProgressCard, listProgressCards, recordProgressCardAttempt, saveProgressCard } from "./store-cards.ts";
 import { getWorkerLedger, listWorkerLedger, markWorkerStopped, recordWorker } from "./store-workers.ts";
@@ -906,6 +907,10 @@ export class ChannelStore {
   }
   hasTaskStopIntent(taskId: string): boolean {
     return hasTaskStopIntent(this.db, taskId);
+  }
+
+  hasRatchetSession(botUid: string, target: ChatTarget, sessionId: string): boolean {
+    return hasRatchetSession(this.db, botUid, target, sessionId);
   }
 
   /**

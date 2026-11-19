@@ -93,6 +93,7 @@ async function withHarness<T>(
 		cliEnv?: () => Record<string, string> | undefined;
 		model?: string;
 		goalContinuation?: boolean;
+		ratchetEnabled?: boolean;
 		btwScenario?: string;
 		userConfig?: string;
 		/** Leaves the native tool-call identity off the frame, like a legacy host_tool_call. */
@@ -147,6 +148,7 @@ async function withHarness<T>(
 		...(options.contextScope === undefined ? {} : { contextScope: options.contextScope }),
 		...(options.model === undefined ? {} : { model: options.model }),
 		...(options.goalContinuation === true ? { goalContinuation: true } : {}),
+		...(options.ratchetEnabled === true ? { ratchetEnabled: true } : {}),
 		onSpawn: processInfo => {
 			spawned = processInfo;
 		},
@@ -2604,6 +2606,168 @@ describe("OMP RPC worker", () => {
 			expect(acceptedToolCallId).toBe(receivedToolCallId);
 		});
 	});
+
+	test("bridges native ratchet ask and input dialogs through the registered ask tool", async () => {
+		await withHarness("ratchet-ask", async harness => {
+			const askCalls: Record<string, unknown>[] = [];
+			let invocation = 0;
+			const ask: HostTool = {
+				name: "ask",
+				description: "Ask the user one or more questions",
+				parameters: { type: "object", properties: { questions: { type: "array" } } },
+				execute: async args => {
+					askCalls.push(args);
+					const questions = args.questions;
+					if (!Array.isArray(questions) || !questions[0] || typeof questions[0] !== "object") {
+						throw new Error("ask received no questions");
+					}
+					const question = questions[0] as LogEntry;
+					const questionId = typeof question.id === "string" ? question.id : "ratchet-input-revision";
+					const answer = invocation++ === 0 ? "1" : "Revise the input to include the dataset context.";
+					return JSON.stringify({
+						answers: [{
+							id: questionId,
+							questionId: `stored-${questionId}`,
+							answer,
+							answeredBy: "member-17",
+						}],
+					});
+				},
+			};
+			await harness.worker.prompt("/ratchet optimize the evaluation flow", () => {}, { tools: [ask] });
+
+			expect(askCalls).toHaveLength(2);
+			const firstQuestions = askCalls[0]?.questions;
+			expect(Array.isArray(firstQuestions)).toBe(true);
+			expect((firstQuestions as LogEntry[])[0]).toMatchObject({
+				id: "ratchet-input",
+				question: "Ratchet approval\n\nUse this input for the evaluation?\n\nApprove:\nCurrent input preview\n\nReject:\nRejected input preview",
+				options: [
+					{ label: "Approve", description: "Continue with the current input." },
+					{ label: "Reject", description: "Do not continue with the current input." },
+				],
+			});
+			expect(askCalls[1]).toMatchObject({
+				questions: [{ question: "What should change about the input?" }],
+			});
+
+			const entries = await readLog(harness.logPath);
+			const startup = entries.find(entry => entry.kind === "startup");
+			expect(argumentValue(startup?.argv, "--mode")).toBe("rpc-ui");
+			expect(argumentValue(startup?.argv, "--config")).toEndWith("/src/omp/ratchet-rpc.yml");
+			const registeredTools = rpcCommands(entries, "set_host_tools");
+			expect(registeredTools.some(command =>
+				Array.isArray(command.tools) && (command.tools as LogEntry[]).some(tool => tool.name === "ask"),
+			)).toBe(false);
+			const askDialog = rpcCommands(entries, "set_ask_dialog").find(command => command.enabled === true);
+			expect(askDialog).toMatchObject({ type: "set_ask_dialog", enabled: true });
+			const dialogResponse = rpcOutputFrames(entries).find(frame =>
+				frame.type === "response" && frame.command === "set_ask_dialog",
+			);
+			expect(dialogResponse).toMatchObject({
+				success: true,
+				data: { enabled: true },
+			});
+			expect(commandTypes(entries).indexOf("set_host_tools")).toBeLessThan(commandTypes(entries).indexOf("set_ask_dialog"));
+			expect(commandTypes(entries).indexOf("set_ask_dialog")).toBeLessThan(commandTypes(entries).indexOf("prompt"));
+			expect(entries.find(entry => entry.kind === "prompt")?.message).toBe("/ratchet optimize the evaluation flow");
+			expect(rpcCommands(entries, "extension_ui_response")).toEqual([
+				{
+					type: "extension_ui_response",
+					id: "fixture-ratchet-ui-1",
+					answers: [{ id: "ratchet-input", selectedOptions: ["Approve"] }],
+				},
+				{
+					type: "extension_ui_response",
+					id: "fixture-ratchet-ui-2",
+					value: "Revise the input to include the dataset context.",
+				},
+			]);
+		}, { ratchetEnabled: true });
+	});
+
+	test("does not treat Approve text, Reject, or a cancelled ask as approval", async () => {
+		const cases: Array<{
+			prompt: string;
+			questionId: string;
+			answer?: string;
+			cancel?: boolean;
+			expected: LogEntry;
+		}> = [
+			{
+				prompt: "/ratchet text-approve",
+				questionId: "ratchet-text-approval",
+				answer: "Approve",
+				expected: {
+					type: "extension_ui_response",
+					id: "fixture-ratchet-ui-1",
+					answers: [{ id: "ratchet-text-approval", selectedOptions: [], customInput: "Approve" }],
+				},
+			},
+			{
+				prompt: "/ratchet reject",
+				questionId: "ratchet-rejection",
+				answer: "2",
+				expected: {
+					type: "extension_ui_response",
+					id: "fixture-ratchet-ui-1",
+					answers: [{ id: "ratchet-rejection", selectedOptions: ["Reject"] }],
+				},
+			},
+			{
+				prompt: "/ratchet cancel",
+				questionId: "ratchet-cancellation",
+				cancel: true,
+				expected: { type: "extension_ui_response", id: "fixture-ratchet-ui-1", cancelled: true },
+			},
+		];
+		for (const example of cases) {
+			await withHarness("ratchet-ask", async harness => {
+				let askedQuestions: LogEntry[] = [];
+				const ask: HostTool = {
+					name: "ask",
+					description: "Ask the user one or more questions",
+					parameters: { type: "object", properties: { questions: { type: "array" } } },
+					execute: async args => {
+						const questions = args.questions;
+						if (!Array.isArray(questions) || !questions[0] || typeof questions[0] !== "object") {
+							throw new Error("ask received no questions");
+						}
+						askedQuestions = questions as LogEntry[];
+						if (example.cancel) throw new Error("question cancelled");
+						return JSON.stringify({
+							answers: [{
+								id: example.questionId,
+								questionId: `stored-${example.questionId}`,
+								answer: example.answer,
+								answeredBy: "member-17",
+							}],
+						});
+					},
+				};
+				const prompt = harness.worker.prompt(example.prompt, () => {}, { tools: [ask] });
+				if (example.cancel) await prompt.catch(() => undefined);
+				else await prompt;
+				expect(askedQuestions[0]?.id).toBe(example.questionId);
+				expect(rpcCommands(await readLog(harness.logPath), "extension_ui_response")).toEqual([example.expected]);
+			}, { ratchetEnabled: true });
+		}
+	});
+
+	test("does not send native secret inputs to the chat ask tool", async () => {
+		await withHarness("ratchet-ask", async harness => {
+			let called = false;
+			const ask: HostTool = {
+				name: "ask",
+				description: "Ask the user",
+				parameters: { type: "object" },
+				execute: async () => { called = true; return ""; },
+			};
+			await expect(harness.worker.prompt("/ratchet secret", () => {}, { tools: [ask] })).rejects.toThrow();
+			expect(called).toBe(false);
+		}, { ratchetEnabled: true });
+	});
+
 
 	test("runs a host tool without a call identity when the native frame carries none", async () => {
 		await withHarness(

@@ -59,7 +59,7 @@ import {
 	stripEnforcedArgs,
 	workerEnv,
 } from "./profile.ts";
-import { OMP_CONTEXT_EXTENSION_PATH, OMP_GOAL_RPC_CONFIG_PATH } from "../runtime/aot-runtime.ts";
+import { OMP_CONTEXT_EXTENSION_PATH, OMP_GOAL_RPC_CONFIG_PATH, OMP_RATCHET_RPC_CONFIG_PATH } from "../runtime/aot-runtime.ts";
 import { ResearchTracker } from "../research/index.ts";
 import {
 	HostCall,
@@ -295,6 +295,8 @@ class RpcWorker implements OmpWorker {
 	#cancelTimeoutMs: number;
 	#newSessionOnStart: boolean;
 	#goalContinuation: boolean;
+	#ratchetEnabled: boolean;
+	#ratchetDialogs = false;
 	/** Invalidates goal starts that have not crossed their structured RPC dispatch boundary. */
 	#goalControlGeneration = 0;
 	#decoder = new RpcFrameDecoder();
@@ -348,6 +350,7 @@ class RpcWorker implements OmpWorker {
 		cancelTimeoutMs: number,
 		newSessionOnStart: boolean,
 		goalContinuation: boolean,
+		ratchetEnabled: boolean,
 	) {
 		this.#child = child;
 		this.#watchdog = watchdog;
@@ -356,6 +359,7 @@ class RpcWorker implements OmpWorker {
 		this.#cancelTimeoutMs = cancelTimeoutMs;
 		this.#newSessionOnStart = newSessionOnStart;
 		this.#goalContinuation = goalContinuation;
+		this.#ratchetEnabled = ratchetEnabled;
 		const ready = Promise.withResolvers<void>();
 		this.#readyPromise = ready.promise;
 		this.#readyResolve = ready.resolve;
@@ -869,6 +873,11 @@ class RpcWorker implements OmpWorker {
 		let acceptedGoalId: string | undefined;
 		try {
 			await this.#installHostTools(context?.tools ?? []);
+			if (this.#ratchetEnabled && this.#activeTools.has("ask")) {
+				const dialog = await this.#request({ type: "set_ask_dialog", enabled: true }, DEFAULT_REQUEST_TIMEOUT_MS);
+				this.#assertSuccess(dialog, "set_ask_dialog");
+				this.#ratchetDialogs = true;
+			}
 			if (controlGeneration !== this.#goalControlGeneration) {
 				this.#settlePrompt(run);
 				return await this.#goalAfterControl(expectedGoalId);
@@ -1047,6 +1056,11 @@ class RpcWorker implements OmpWorker {
 		this.#suppressCommandOutput = internalCommandOutput;
 		try {
 			await this.#installHostTools(context?.tools ?? []);
+			if (!this.#ratchetDialogs && this.#ratchetEnabled && this.#activeTools.has("ask")) {
+				const dialog = await this.#request({ type: "set_ask_dialog", enabled: true }, DEFAULT_REQUEST_TIMEOUT_MS);
+				this.#assertSuccess(dialog, "set_ask_dialog");
+				this.#ratchetDialogs = true;
+			}
 			const response = await this.#request(
 				{ type: "prompt", message: text },
 				DEFAULT_REQUEST_TIMEOUT_MS,
@@ -1156,7 +1170,9 @@ class RpcWorker implements OmpWorker {
 			if (typeof tool.description !== "string" || !tool.parameters || typeof tool.parameters !== "object")
 				throw new Error(`Invalid host tool definition: ${tool.name}`);
 			nextTools.set(tool.name, tool);
-			definitions.push({ name: tool.name, description: tool.description, parameters: tool.parameters, loadMode: "essential" });
+			if (!(this.#ratchetEnabled && tool.name === "ask")) {
+				definitions.push({ name: tool.name, description: tool.description, parameters: tool.parameters, loadMode: "essential" });
+			}
 		}
 		const response = await this.#request({ type: "set_host_tools", tools: definitions }, DEFAULT_REQUEST_TIMEOUT_MS);
 		this.#assertSuccess(response, "set_host_tools");
@@ -1750,6 +1766,14 @@ class RpcWorker implements OmpWorker {
 			this.#handleNotice(frame);
 			return;
 		}
+		if (this.#ratchetDialogs && method === "cancel" && typeof frame.targetId === "string") {
+			this.#hostCalls.get(`ui:${frame.targetId}`)?.controller.abort(new Error("OMP cancelled dialog"));
+			return;
+		}
+		if (this.#ratchetDialogs && (method === "ask" || (method === "input" && frame.secret !== true))) {
+			this.#handleRatchetDialog(frame, method);
+			return;
+		}
 		if (PASSIVE_UI_METHODS[method] === true) return;
 		try {
 			if (typeof frame.id === "string" && !this.#closed) this.#writeFrame({ type: "extension_ui_response", id: frame.id, cancelled: true });
@@ -1759,6 +1783,72 @@ class RpcWorker implements OmpWorker {
 		const active = this.#activePrompt;
 		if (active) this.#rejectPrompt(active, describeUiFailure(method));
 		void this.stop();
+	}
+
+	#handleRatchetDialog(frame: RpcFrame, method: "ask" | "input"): void {
+		if (typeof frame.id !== "string") return;
+		const id = frame.id;
+		const key = `ui:${id}`;
+		const controller = new AbortController();
+		const call: HostCall = { requestId: key, controller };
+		this.#hostCalls.set(key, call);
+		void (async () => {
+			try {
+				const native = method === "ask" ? frame.questions : [{ id: "ratchet-input", question: frame.title, options: [] }];
+				if (!Array.isArray(native) || native.length === 0) throw new Error("OMP dialog has no questions");
+				const questions = native.map(value => {
+					if (!isRecord(value) || typeof value.id !== "string" || typeof value.question !== "string"
+						|| !Array.isArray(value.options)) throw new Error("OMP dialog question is invalid");
+					const options = value.options.map(option => {
+						if (!isRecord(option) || typeof option.label !== "string") throw new Error("OMP dialog option is invalid");
+						const description = typeof option.description === "string" ? option.description : "";
+						return { label: option.label, ...(description ? { description } : {}) };
+					});
+					const previews = value.options.flatMap(option =>
+						isRecord(option) && typeof option.label === "string" && typeof option.preview === "string" && option.preview
+							? [`${option.label}:\n${option.preview}`] : []);
+					const title = typeof value.header === "string" && value.header
+						? `${value.header}\n\n${value.question}` : value.question;
+					const question = [title, ...previews].join("\n\n");
+					return {
+						id: value.id, question, ...(options.length ? { options } : {}),
+						...(value.multi === true ? { multi: true } : {}),
+					};
+				});
+				const tool = this.#activeTools.get("ask");
+				if (!tool) throw new Error("OMP dialog has no ask host tool");
+				const result: unknown = JSON.parse(await tool.execute({ questions }, controller.signal, key));
+				if (!isRecord(result) || !Array.isArray(result.answers) || result.answers.length !== questions.length)
+					throw new Error("OMP dialog answer is invalid");
+				const returnedAnswers = result.answers;
+				const answers = questions.map((question, index) => {
+					const answer = returnedAnswers[index];
+					if (!isRecord(answer) || answer.id !== question.id || typeof answer.answer !== "string")
+						throw new Error("OMP dialog answer is invalid");
+					const text = answer.answer.trim();
+					const indexes = /^\d+(?:\s*,\s*\d+)*$/u.test(text) ? text.split(",").map(Number) : [];
+					const options = question.options ?? [];
+					const selected = indexes.length > 0 && indexes.every(n => n >= 1 && n <= options.length)
+						&& new Set(indexes).size === indexes.length && (question.multi === true || indexes.length === 1)
+						? indexes.map(n => options[n - 1]!.label) : [];
+					return { id: question.id, selectedOptions: selected, ...(selected.length ? {} : { customInput: text }) };
+				});
+				if (!this.#closed && !controller.signal.aborted) {
+					this.#writeFrame(method === "input"
+						? { type: "extension_ui_response", id, value: answers[0]!.customInput ?? answers[0]!.selectedOptions[0] }
+						: { type: "extension_ui_response", id, answers });
+				}
+			} catch (error) {
+				if (!this.#closed) this.#writeFrame({ type: "extension_ui_response", id, cancelled: true });
+				if (!controller.signal.aborted && !(error instanceof Error && error.message === "question cancelled")) {
+					const active = this.#activePrompt;
+					if (active) this.#rejectPrompt(active, asError(error, "OMP dialog failed"));
+					void this.stop();
+				}
+			} finally {
+				if (this.#hostCalls.get(key) === call) this.#hostCalls.delete(key);
+			}
+		})();
 	}
 
 	/**
@@ -2015,7 +2105,7 @@ class OmpWorkerFactory implements WorkerFactory {
 			"--extension",
 			OMP_CONTEXT_EXTENSION_PATH,
 			"--mode",
-			"rpc",
+			options.ratchetEnabled === true ? "rpc-ui" : "rpc",
 			"--approval-mode",
 			"yolo",
 			"--cwd",
@@ -2037,6 +2127,7 @@ class OmpWorkerFactory implements WorkerFactory {
 		if (options.sessionFile) command.push("--resume", resolve(options.sessionFile));
 		else if (forkSourceState) command.push("--fork", forkSourceState.sessionFile);
 		if (options.goalContinuation === true) command.push("--config", OMP_GOAL_RPC_CONFIG_PATH);
+		if (options.ratchetEnabled === true) command.push("--config", OMP_RATCHET_RPC_CONFIG_PATH);
 		let child: RpcChild;
 		try {
 			child = Bun.spawn(command, {
@@ -2094,6 +2185,7 @@ class OmpWorkerFactory implements WorkerFactory {
 			this.#cancelTimeoutMs,
 			!options.sessionFile && forkSourceState === undefined,
 			options.goalContinuation === true,
+			options.ratchetEnabled === true,
 		);
 		try {
 			const state = await worker.initialize(options.signal);

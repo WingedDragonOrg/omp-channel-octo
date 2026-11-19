@@ -46,6 +46,51 @@ test("/new without a path initially uses ~/tmp, then reuses that cwd with a fres
   }
 });
 
+test("an accepted /ratchet enables the next worker in its session but not after /new", async () => {
+  const harness = await createCoreHarness();
+  const target = { channelId: "dm-ratchet-session", channelType: 1 as const };
+  try {
+    await submitAndWaitForIngressHandoff(
+      harness,
+      inbound({ messageId: "ratchet-session-enable", ...target, text: "/ratchet eval fixture-flow" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, status => status.state === "completed");
+    expect(harness.workers.creations.at(-1)?.ratchetEnabled).toBe(true);
+    const ratchetSessionId = harness.workers.prompts[0]!.sessionId;
+
+    await submitAndWaitForIngressHandoff(
+      harness,
+      inbound({ messageId: "ratchet-session-next-task", ...target, text: "continue the flow" }),
+    );
+    await harness.workers.waitForPromptCount(2);
+    await waitForStatus(harness.service, target, status => status.state === "completed");
+    expect(harness.workers.prompts[1]?.sessionId).toBe(ratchetSessionId);
+    expect(harness.workers.creations.at(-1)?.ratchetEnabled).toBe(true);
+
+    await submitAndWaitForIngressHandoff(
+      harness,
+      inbound({ messageId: "ratchet-session-new", ...target, text: "/new" }),
+    );
+    await waitForStatus(
+      harness.service,
+      target,
+      status => status.sessionId !== null && status.sessionId !== ratchetSessionId,
+    );
+
+    await submitAndWaitForIngressHandoff(
+      harness,
+      inbound({ messageId: "ratchet-session-fresh-task", ...target, text: "start a fresh flow" }),
+    );
+    await harness.workers.waitForPromptCount(3);
+    await waitForStatus(harness.service, target, status => status.state === "completed");
+    expect(harness.workers.prompts[2]?.sessionId).not.toBe(ratchetSessionId);
+    expect(harness.workers.creations.at(-1)?.ratchetEnabled).not.toBe(true);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
 test("/new records the session switch on the binding, and later session writes keep it", async () => {
   const harness = await createCoreHarness();
   try {

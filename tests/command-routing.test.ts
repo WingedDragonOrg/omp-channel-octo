@@ -393,6 +393,31 @@ test("a member's command earns one throttled notice and never reaches a handler,
   }
 });
 
+test("a non-owner ratchet command follows the owner-only slash-command authorization", async () => {
+  const harness = await openRoutingHarness();
+  try {
+    const target = { channelId: "group-allowed", channelType: 2 as const };
+    const message = inbound({
+      messageId: "routing-ratchet-member-command",
+      ...target,
+      senderId: "other-user",
+      mentionedUserIds: [harness.transport.bot.uid],
+      text: "/ratchet eval fixture-flow",
+    });
+    const noticePromise = harness.transport.waitForRemoteText(({ target: sentTarget, text }) =>
+      sentTarget.channelId === target.channelId
+      && sentTarget.channelType === target.channelType
+      && text.includes("命令仅 owner 可用"));
+
+    await submitWithoutIngress(harness, message);
+    expect((await noticePromise).target).toMatchObject(target);
+    expect(harness.workers.prompts).toHaveLength(0);
+    expect((await harness.service.status(target)).state).toBe("none");
+  } finally {
+    await closeRoutingHarness(harness);
+  }
+});
+
 test("handler registration rejects blank names and normalized duplicates", async () => {
   const fixture = await createRoutingFixture();
   try {

@@ -310,6 +310,14 @@ export function getTask(db: Database, taskId: string): TaskRecord | null {
   const row = query(db, "SELECT * FROM tasks WHERE id = ?", [taskId])[0];
   return row ? taskFromRow(row) : null;
 }
+
+/** A confirmed native ratchet prompt enabled its prelude in this exact chat session. */
+export function hasRatchetSession(db: Database, botUid: string, target: ChatTarget, sessionId: string): boolean {
+  return query(db,
+    `SELECT text FROM tasks WHERE bot_uid = ? AND ${targetWhere(target)} AND session_id = ? AND prompt_accepted = 1 AND message_id NOT LIKE 'dispatch:tan:%' AND text LIKE '%/ratchet%'`,
+    [botUid, ...targetValues(target), sessionId],
+  ).some(row => /^\/ratchet(?:\s|$)/u.test(asString(row.text).trimStart()));
+}
 export function getTaskScheduleOrder(db: Database, taskId: string): number | null {
   const row = query(db, "SELECT schedule_order FROM tasks WHERE id = ?", [taskId])[0];
   const order = asNumber(row?.schedule_order);

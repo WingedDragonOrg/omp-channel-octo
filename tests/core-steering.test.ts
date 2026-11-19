@@ -212,6 +212,73 @@ test("queue mode turns a message during a run into a task that follows it", asyn
   }
 });
 
+test("a queued /ratchet prompt keeps its text and delivers native command errors", async () => {
+  const started = gate();
+  const release = gate();
+  const ratchetText = "/ratchet eval missing-tools";
+  const target = { channelId: "dm-ratchet-queue", channelType: 1 as const };
+  const harness = await createCoreHarness({
+    prompt: async ({ text, emit, onStop }) => {
+      if (text === "hold") {
+        started.release();
+        onStop(() => release.release());
+        await release.promise;
+      } else if (text === ratchetText) {
+        emit({
+          type: "notice",
+          messageId: "ratchet-native-error",
+          text: "OMP ratchet error: eval tool is unavailable",
+          level: "error",
+        });
+      }
+    },
+  });
+  try {
+    await submitAndWaitForHandoff(harness, inbound({
+      messageId: "ratchet-queue-mode",
+      ...target,
+      text: "/mode queue",
+    }));
+    expect((await harness.service.status(target)).mode).toBe("queue");
+
+    await submitAndWaitForHandoff(harness, inbound({
+      messageId: "ratchet-queue-hold",
+      ...target,
+      text: "hold",
+    }));
+    await started.promise;
+    await submitAndWaitForHandoff(harness, inbound({
+      messageId: "ratchet-queue-command",
+      ...target,
+      text: ratchetText,
+    }));
+    expect((await harness.service.status(target)).queued).toBe(1);
+
+    release.release();
+    await waitForStatus(
+      harness.service,
+      target,
+      status => status.state === "completed" && status.queued === 0,
+    );
+    await harness.workers.waitForPromptCount(2);
+    expect(harness.workers.prompts.map(({ text }) => text)).toEqual(["hold", ratchetText]);
+
+    await waitForText(harness, target, "开始执行排队消息");
+    const queuedNotice = harness.transport.sent.find(({ target: sentTarget, text }) =>
+      sentTarget.channelId === target.channelId
+      && text.startsWith("开始执行排队消息"));
+    expect(queuedNotice?.text).toContain("/ratchet");
+
+    const nativeError = await harness.transport.waitForRemoteText(({ target: sentTarget, text }) =>
+      sentTarget.channelId === target.channelId
+      && text.includes("eval tool is unavailable"));
+    expect(nativeError.text).toContain("eval tool is unavailable");
+  } finally {
+    release.release();
+    await closeCoreHarness(harness);
+  }
+});
+
 test("/queue forces a task behind the run even in steer mode", async () => {
   const started = gate();
   const release = gate();

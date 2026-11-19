@@ -12,3 +12,4 @@ export function runtimeAssetPath(relativePath: string): string {
 
 export const OMP_CONTEXT_EXTENSION_PATH = runtimeAssetPath("omp/context-extension.ts");
 export const OMP_GOAL_RPC_CONFIG_PATH = runtimeAssetPath("omp/goal-rpc.yml");
+export const OMP_RATCHET_RPC_CONFIG_PATH = runtimeAssetPath("omp/ratchet-rpc.yml");

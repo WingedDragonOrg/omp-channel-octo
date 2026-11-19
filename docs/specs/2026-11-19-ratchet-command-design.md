@@ -1,0 +1,33 @@
+# OMP `/ratchet` 接入设计
+
+日期：2026-11-19
+
+## 用户原始需求
+
+1. 「适配 OMP 的 `/ratchet` 命令，包括命令处理和相关信息展示。先调查已安装 OMP 的 `/ratchet` 实际命令、协议与输出，以及本项目现有命令和展示路径；据此确定需要支持的操作与状态展示，完成端到端适配。遵循仓库既有授权、会话、生命周期及展示约定，复用 OMP 原生命令与现有机制；先形成 SDD。若实际语义或产品选择无法从现有行为确定，在本子区使用最少问答与 owner 确认，必要时使用 spec-design。不要操作或重启常驻服务。支持已确认的 `/ratchet` 命令操作，准确展示相关信息及错误；覆盖相应命令、会话和展示边界，运行针对性测试并验证实际 OMP 接口；同步维护相关规格。需求明确后直接实现。」
+2. 对原生审批的作答权限，owner 选择「沿用现有 ask 权限」：已开通群或子区的成员可以回答。
+
+## 原生契约
+
+已安装 OMP 19.0.0 的命令目录将 `/ratchet [flow and goal]` 描述为建立或复用评估并持续优化 LLM 流程。隔离 RPC 实测：缺少 `eval`、`task` 时原生 `command_output` 明确报错；前置空白会让原生命令被当作模型输入。`rpc` 模式的 ratchet 审批为 headless，不发交互请求；`rpc-ui` 配合 `set_ask_dialog` 发出包含题目、预览及 Approve/Revise/Abort 的原生审批，批准后由 OMP 写入审批记录。Ratchet 通过原生 prompt 启动模型任务，flow 保存在工作目录的 `.omp/ratchet/<flow>/`，同目录同名 flow 可被不同会话访问；不承诺跨进程互斥。
+
+## 设计
+
+- `/ratchet` 按既有 owner-only slash 路由和普通任务调度，移除命令前的空白，其余正文交给 OMP，禁止在命令前注入历史；不自造子命令或复刻 ratchet 引擎。命令目录使用 OMP 的动态发现。原生错误和输出沿用现有有界通知及助手投递。
+- 将 ratchet 使用的原生交互经现有持久 `ask` 机制交付，保留题目、完整预览、选项、回复者、取消与超时语义。现有群成员作答权限不变。仅明确的 Approve 选择可对应批准；自由文本和 Revise 不可误判为批准，Abort 和取消不批准。
+- `/ratchet` 使用 OMP `rpc-ui` 模式与 `set_ask_dialog` 打开原生工具交互；普通会话继续使用 `rpc`。Ratchet prelude 属于 OMP 进程内会话覆盖；channel 每轮关闭 worker，因此后续任务和重启续接必须在同一真实 session 恢复这一启用状态。只以该聊天该 session 已被 OMP 接受的 `/ratchet` 任务作为启用凭据，禁止在新 session 或其他聊天中继承；启动时通过受管 worker 的临时配置恢复，不修改用户全局配置。已派发但接受不明的任务沿用既有 fail-closed 恢复。
+- `rpc-ui` 的原生 `ask` 与宿主同名工具不能同时注册：保留原生工具，将 ask 和非 secret input 交互桥接到现有问题台；问题与预览在可作答时完整展示。原生 secret input 不转发到聊天，其他交互类型维持既有拒绝行为。
+- 使用 OMP 对应会话和工作目录执行，复用现有精确会话租约、任务排队、worker 生命周期、停止和重启恢复。原生 flow 文件及审批记录归 OMP；不根据 channel 任务状态推断 flow 完成或审批通过。新会话及移动目录遵从 OMP 的会话和 cwd 语义。
+- 信息展示以 OMP 的实际输出和原生交互为准，保留状态与错误，不从终端字符、已结束任务或本地缓存臆造 ratchet 状态。保持现有正文和进度卡边界。
+
+## 验收
+
+1. 隔离真实 OMP RPC 验证命令发现、参数原样派发、工具缺失错误和审批交互协议，不连接真实 provider 或常驻 bot。
+2. 定向回归覆盖原生审批的批准、修改、取消、文本及卡片作答、成员权限、失败、会话与恢复边界；任何非明确批准不得记录为批准。
+3. 原生命令不被历史前缀破坏；输出和错误可见；其他命令和普通 ask 保持既有行为。同步主规格与用户帮助。
+
+## 验证记录
+
+- OMP 19.0.0 隔离 RPC：命令目录、缺工具错误、`rpc-ui` 审批请求与原生审批记录均已实测。本地有限模型替身驱动真实 `eval`，经 channel 的真实 `RpcWorker`、ask 桥接后写入输入审批；不连接真实模型 provider。
+- `tests/core-ratchet.test.ts` 通过真实 RPC fixture、服务问题台和成员卡片点击验证审批及后续修改意见；定向测试覆盖路由、会话、重启、问答和 RPC 边界。
+- 离线 restart benchmark 的 graceful/crash 场景均为 seamless=1、resumed=1、queued=1、overlaps=0、duplicates=0；AOT 离线 benchmark 通过。
