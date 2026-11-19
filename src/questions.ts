@@ -46,6 +46,8 @@ const ENDED_NOTE = "任务已结束：该问题不再有等待中的回合；之
 const TIMEOUT_WAKE_HEADLINE = "[ask 答复] 先前询问的等待已超时停住，现已收到回复；请据此继续：";
 const RESTART_WAKE_HEADLINE = "[ask 答复] 先前询问的等待随重启中断，现已收到回复；请据此继续：";
 const LATE_WAKE_HEADLINE = "[ask 答复] 该问题的原等待已结束，收到关闭后的提交；请作为该聊天的新输入处理：";
+const ASK_EMPTY_TEXT_REPLY = '""';
+const ASK_KEEP_DEFAULT_TEXT_REPLY = "保持原值";
 /** Long-poll hold and the pause between rounds that returned immediately or failed. */
 
 /** One recorded answer plus who gave it; `answeredBy` is `null` only for rows written before attribution. */
@@ -154,7 +156,14 @@ function askQuestionFromPayload(payload: Record<string, unknown>): AskCardQuesti
     const description = typeof option.description === "string" ? option.description.trim() : "";
     options.push(description.length > 0 ? { label, description } : { label });
   }
-  return { question: text, options, multi: payload.multi === true };
+  return {
+    question: text,
+    options,
+    multi: payload.multi === true,
+    ...(typeof payload.defaultValue === "string" ? { defaultValue: payload.defaultValue } : {}),
+    ...(payload.allowEmpty === true ? { allowEmpty: true } : {}),
+    ...(payload.allowFreeText === false ? { allowFreeText: false } : {}),
+  };
 }
 
 /**
@@ -189,6 +198,9 @@ function questionIdentity(payload: Record<string, unknown>, sourceId: string | n
     ask?.options ?? [],
     ask?.multi ?? false,
     position === null ? null : [position.index, position.size],
+    typeof payload.defaultValue === "string" ? payload.defaultValue : null,
+    payload.allowEmpty === undefined ? null : payload.allowEmpty,
+    payload.allowFreeText === undefined ? null : payload.allowFreeText,
   ]);
 }
 
@@ -376,6 +388,7 @@ export function createQuestionDesk(deps: QuestionDeskDeps): QuestionDesk {
     let answerById = new Map<string, string>();
     let lateLanded: Array<{ question: QuestionRecord; answer: string; answeredBy: string }> = [];
     let rejectedNotice: string | null = null;
+    let rejectedStrictSelect = false;
 
     return {
       consumerId,
@@ -394,6 +407,7 @@ export function createQuestionDesk(deps: QuestionDeskDeps): QuestionDesk {
         wakeTaskIds.length = 0;
         noticeIds.length = 0;
         rejectedNotice = null;
+        rejectedStrictSelect = false;
         if (snapshot.questionIds.length === 0 || text.length === 0) {
           persisted = true;
           return true;
@@ -417,8 +431,13 @@ export function createQuestionDesk(deps: QuestionDeskDeps): QuestionDesk {
         const pendingAnswers: Array<{ id: string; answer: string; answeredBy: string }> = [];
         for (const question of pending) {
           try {
-            pendingAnswers.push({ id: question.id, answer: normalizeAnswer(question, text), answeredBy });
+            pendingAnswers.push({ id: question.id, answer: normalizeAnswer(question, text, true), answeredBy });
           } catch {
+            if (parseQuestionPayload(question)?.allowFreeText === false) {
+              rejectedStrictSelect = true;
+              rejectedNotice = invalidTextAnswerNotice(question);
+              break;
+            }
             if (isFrozenSet) {
               pendingAnswers.push({ id: question.id, answer: text, answeredBy });
               continue;
@@ -435,7 +454,7 @@ export function createQuestionDesk(deps: QuestionDeskDeps): QuestionDesk {
         }
 
         const lateCandidates: Array<{ question: QuestionRecord; answer: string; answeredBy: string }> = [];
-        for (const question of rows) {
+        for (const question of rejectedStrictSelect ? [] : rows) {
           if (landedIds.includes(question.id)) continue;
           if (question.state === "answered") {
             rejectedNotice = "问题已失效，本次回复未作为答案记录。";
@@ -450,18 +469,21 @@ export function createQuestionDesk(deps: QuestionDeskDeps): QuestionDesk {
           try {
             lateCandidates.push({
               question,
-              answer: normalizeAnswer(question, text),
+              answer: normalizeAnswer(question, text, true),
               answeredBy,
             });
           } catch {
-            if (isFrozenSet) {
+            if (parseQuestionPayload(question)?.allowFreeText === false) {
+              rejectedStrictSelect = true;
+              rejectedNotice = invalidTextAnswerNotice(question);
+            } else if (isFrozenSet) {
               lateCandidates.push({ question, answer: text, answeredBy });
             } else {
               rejectedNotice = "问题已失效，本次回复未作为答案记录。";
             }
           }
         }
-        lateLanded = landLateAnswers(lateCandidates);
+        if (!rejectedStrictSelect) lateLanded = landLateAnswers(lateCandidates);
 
         const wakeEntries: Array<{ question: QuestionRecord; answer: string; answeredBy: string }> = [];
         for (const id of landedIds) {
@@ -571,9 +593,67 @@ function closeQuestionCards(botUid: string, questions: readonly QuestionRecord[]
 }
 
 
-function normalizeAnswer(question: { payload: string }, answer: string): string {
+function isEscapedReservedReply(answer: string, token: string): boolean {
+  if (answer.length === token.length || !answer.endsWith(token)) return false;
+  const prefixLength = answer.length - token.length;
+  for (let index = 0; index < prefixLength; index++) {
+    if (answer.charCodeAt(index) !== 92) return false;
+  }
+  return true;
+}
+
+function invalidTextAnswerNotice(question: QuestionRecord): string {
+  const payload = parseQuestionPayload(question);
+  const options = Array.isArray(payload?.options) ? payload.options : [];
+  const range = options.length === 1 ? "1" : `1–${options.length}`;
+  const multiple = payload?.multi === true ? "，多选请用逗号分隔" : "";
+  return options.length === 0
+    ? "答案无效：此题只接受有效选项编号，请回复编号。"
+    : `答案无效：此题只接受有效选项编号（${range}${multiple}），请回复编号。`;
+}
+function normalizeAnswer(
+  question: { payload: string },
+  answer: string,
+  textReply = false,
+): string {
   const payload = JSON.parse(question.payload) as Record<string, unknown>;
   const options = payload.options;
+  if (payload.allowFreeText === false) {
+    if (payload.allowEmpty === true && answer === "" && !textReply) return "";
+    if (textReply && payload.allowEmpty === true && answer === ASK_EMPTY_TEXT_REPLY) return "";
+    let selection = answer;
+    if (textReply && answer === ASK_KEEP_DEFAULT_TEXT_REPLY && typeof payload.defaultValue === "string") {
+      selection = payload.defaultValue;
+      if (selection.length === 0 && payload.allowEmpty === true) return "";
+    }
+    if (!Array.isArray(options) || options.length === 0 || !/^\d+(?:\s*,\s*\d+)*$/u.test(selection)) {
+      throw new Error("select question requires option indexes");
+    }
+    const values = selection.split(",").map((value) => Number(value.trim()));
+    if (payload.multi !== true && values.length !== 1) throw new Error("multiple options are not allowed");
+    if (new Set(values).size !== values.length || values.some((value) => value < 1 || value > options.length)) {
+      throw new Error("option is out of range");
+    }
+    return values.join(",");
+  }
+  if (textReply) {
+    if (
+      typeof payload.defaultValue === "string" &&
+      isEscapedReservedReply(answer, ASK_KEEP_DEFAULT_TEXT_REPLY)
+    ) {
+      return answer.slice(1);
+    }
+    if (payload.allowEmpty === true && isEscapedReservedReply(answer, ASK_EMPTY_TEXT_REPLY)) {
+      return answer.slice(1);
+    }
+    if (answer === ASK_KEEP_DEFAULT_TEXT_REPLY && typeof payload.defaultValue === "string") {
+      if (payload.defaultValue.length === 0 && payload.allowEmpty !== true) {
+        throw new Error("empty answer is not allowed");
+      }
+      return payload.defaultValue;
+    }
+    if (payload.allowEmpty === true && answer === ASK_EMPTY_TEXT_REPLY) return "";
+  }
   if (!Array.isArray(options) || options.length === 0) return answer;
   const numeric = /^\d+(?:\s*,\s*\d+)*$/u.test(answer);
   if (!numeric) return answer;
@@ -773,6 +853,18 @@ function askSpec(
   if (question.multi !== undefined && typeof question.multi !== "boolean") {
     throw new Error("question multi must be boolean");
   }
+  if (question.defaultValue !== undefined && typeof question.defaultValue !== "string") {
+    throw new Error("question defaultValue must be a string");
+  }
+  if (question.allowEmpty !== undefined && typeof question.allowEmpty !== "boolean") {
+    throw new Error("question allowEmpty must be boolean");
+  }
+  if (question.allowFreeText !== undefined && question.allowFreeText !== false) {
+    throw new Error("question allowFreeText must be false when provided");
+  }
+  if (question.allowFreeText === false && question.options === undefined) {
+    throw new Error("question with allowFreeText false must have options");
+  }
   if (question.options !== undefined) {
     if (!Array.isArray(question.options) || question.options.length === 0) {
       throw new Error("question options must be non-empty");
@@ -795,6 +887,9 @@ function askSpec(
     question: question.question,
     options: question.options,
     multi: question.multi === true,
+    ...(question.defaultValue === undefined ? {} : { defaultValue: question.defaultValue }),
+    ...(question.allowEmpty === undefined ? {} : { allowEmpty: question.allowEmpty }),
+    ...(question.allowFreeText === undefined ? {} : { allowFreeText: question.allowFreeText }),
     recommended: question.recommended,
     askGroup: call.key,
   };
@@ -956,9 +1051,22 @@ async function askQuestionSet(
         return { id: sourceId ?? id, questionId: id, answer: answer.answer, answeredBy: answer.answeredBy };
       });
     }
-    // The set frame was refused: ask each question exactly like a single-question ask would. A
-    // text reply can settle the remaining rows before their turn, so only still-open ones are
-    // delivered and every resolved completion is read back in question order.
+    // Editor values and empty-answer options must be visible together; a plain reply settles the whole set.
+    // Ordinary questions keep the existing one-at-a-time text fallback below.
+    const editorQuestionSet = specs.some(({ payload }) =>
+      typeof payload.defaultValue === "string" || payload.allowEmpty === true
+    );
+    if (editorQuestionSet) {
+      const pending = specs.filter(({ id }) => deps.store.getQuestion(id)?.state === "pending");
+      if (pending.length > 0) {
+        deps.enqueueText(target, formatQuestionSet(pending.map(({ payload }) => payload)), task.id);
+      }
+      const settled = await Promise.all(completions.map(({ promise }) => promise));
+      return specs.map(({ id, sourceId }, index) => {
+        const answer = settled[index] ?? { answer: "", answeredBy: null };
+        return { id: sourceId ?? id, questionId: id, answer: answer.answer, answeredBy: answer.answeredBy };
+      });
+    }
     const answers: Array<{ id: string; questionId: string; answer: string; answeredBy: string | null }> = [];
     for (const [index, spec] of specs.entries()) {
       if (deps.store.getQuestion(spec.id)?.state === "pending") {
@@ -1039,11 +1147,13 @@ function formatQuestion(question: Record<string, unknown>): string {
   // refused and it ends up asked on its own: one text reply settles every open question.
   const rule = questionPosition(question) !== null
     ? "直接回复本消息即作为整组答案（一次回答全部问题）。"
-    : entries.length === 0
-      ? "直接回复即可，内容会作为答案返回。"
-      : question.multi === true
-        ? "直接回复编号（如 1,3）作为答案，或自填答案。"
-        : "直接回复选项编号作为答案，或自填答案。";
+    : question.allowFreeText === false
+      ? "直接回复有效选项编号作为答案。"
+      : entries.length === 0
+        ? "直接回复即可，内容会作为答案返回。"
+        : question.multi === true
+          ? "直接回复编号（如 1,3）作为答案，或自填答案。"
+          : "直接回复选项编号作为答案，或自填答案。";
   return `${questionPrompt(question)}${rule}`;
 }
 
@@ -1070,7 +1180,30 @@ function questionPrompt(question: Record<string, unknown>): string {
     .join("\n");
   const position = questionPosition(question);
   const heading = position === null ? "问题：" : `问题 ${position.index}/${position.size}：`;
-  return `${heading}${question.question as string}\n${list}${list ? "\n" : ""}`;
+  const editorGuidance: string[] = [];
+  const escapedReservedReplies: string[] = [];
+  if (typeof question.defaultValue === "string") {
+    editorGuidance.push(
+      `当前值：${JSON.stringify(question.defaultValue)}（回复原值可确认；也可回复「${ASK_KEEP_DEFAULT_TEXT_REPLY}」）`,
+    );
+    escapedReservedReplies.push(
+      `${ASK_KEEP_DEFAULT_TEXT_REPLY} → \\${ASK_KEEP_DEFAULT_TEXT_REPLY}`,
+    );
+  }
+  if (question.allowEmpty === true) {
+    editorGuidance.push(`回复 ${ASK_EMPTY_TEXT_REPLY} 可提交空字符串。`);
+    escapedReservedReplies.push(`${ASK_EMPTY_TEXT_REPLY} → \\${ASK_EMPTY_TEXT_REPLY}`);
+  }
+  if (escapedReservedReplies.length > 0) {
+    editorGuidance.push(
+      `字面答案用反斜线前缀：${escapedReservedReplies.join("；")}；字面值在保留词前已有反斜线时，保留它们并额外加一条转义反斜线。`,
+    );
+  }
+  if (question.allowFreeText === false) {
+    editorGuidance.push("此题只接受有效选项编号，不支持自填文本。");
+  }
+  const guidance = editorGuidance.length === 0 ? "" : `${editorGuidance.join("\n")}\n`;
+  return `${heading}${question.question as string}\n${guidance}${list}${list ? "\n" : ""}`;
 }
 
 /**

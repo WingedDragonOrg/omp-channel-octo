@@ -96,6 +96,8 @@ type Scenario =
 	| "context-partial"
 	| "model-window-only"
 	| "ratchet-ask"
+	| "ratchet-revise-notify"
+	| "ratchet-standalone-input"
 	| "native-ask"
 	| "native-ask-other"
 	| "native-ask-radio-other"
@@ -105,6 +107,9 @@ type Scenario =
 	| "native-ask-secret"
 	| "native-ask-no-other"
 	| "native-ask-start-after-ui"
+	| "native-ask-resume-start-after-ui"
+	| "native-ask-input-resume-start-after-ui"
+	| "native-ask-input-multi-start-after-ui"
 	| "native-ask-editor-start-after-ui"
 	| "native-ask-input-start-after-ui";
 
@@ -338,6 +343,7 @@ type HostToolRegistration = {
 const hostTools = new Map<string, HostToolRegistration>();
 let askDialogEnabled = false;
 let ratchetUiRequestCount = 0;
+let ratchetEvalToolStarted = false;
 type RatchetAskMode = "flow" | "text-approve" | "reject" | "cancel" | "secret";
 let pendingRatchetUi: {
 	requestId: string;
@@ -991,6 +997,7 @@ function emitRatchetUiRequest(
 					description: "Do not continue with the current input.",
 					preview: "Rejected input preview",
 				},
+				{ label: "Revise" },
 			],
 			multi: false,
 			recommended: 1,
@@ -999,6 +1006,16 @@ function emitRatchetUiRequest(
 }
 
 function completeRatchetPrompt(id: string | undefined): void {
+	if (ratchetEvalToolStarted) {
+		emit({
+			type: "tool_execution_end",
+			toolCallId: "fixture-ratchet-retry-eval",
+			toolName: "eval",
+			isError: false,
+			result: { content: [{ type: "text", text: "completed" }] },
+		});
+		ratchetEvalToolStarted = false;
+	}
 	streaming = false;
 	emitAssistantMessage("fixture ratchet interaction complete", 0);
 	emit({ type: "agent_end", messages: [], willContinue: false });
@@ -1027,6 +1044,40 @@ function nativeAskSteps(): NativeAskStep[] {
 				title: "Choose a deployment target",
 				options: ["Production"],
 				selectionMarker: "radio",
+			},
+		}];
+	}
+	if (scenario === "native-ask-resume-start-after-ui") {
+		return [{
+			toolCallId: "fixture-native-ask-resume-call",
+			request: {
+				id: "fixture-native-ui-resume-before-start",
+				method: "select",
+				title: "Choose a deployment target",
+				options: ["Production"],
+				selectionMarker: "radio",
+			},
+		}];
+	}
+	if (scenario === "native-ask-input-resume-start-after-ui") {
+		return [{
+			toolCallId: "fixture-native-ask-input-resume-call",
+			request: {
+				id: "fixture-native-ui-input-resume-before-start",
+				method: "input",
+				title: "What should change?",
+				defaultValue: "existing value",
+			},
+		}];
+	}
+	if (scenario === "native-ask-input-multi-start-after-ui") {
+		return [{
+			toolCallId: "fixture-native-ask-multi-call",
+			request: {
+				id: "fixture-native-ui-input-multi-before-start",
+				method: "input",
+				title: "What should change?",
+				defaultValue: "existing value",
 			},
 		}];
 	}
@@ -1271,20 +1322,52 @@ function emitNativeAskStep(): void {
 	}
 	const requestId = typeof step.request.id === "string" ? step.request.id : "";
 	pendingNativeAskUi = { requestId };
-	if (scenario.endsWith("-start-after-ui") && !flow.toolStarted) {
+	if (
+		scenario.endsWith("-start-after-ui") &&
+		!flow.toolStarted &&
+		scenario !== "native-ask-resume-start-after-ui" &&
+		scenario !== "native-ask-input-resume-start-after-ui"
+	) {
+		const askToolCall = {
+			type: "toolCall",
+			id: flow.toolCallId,
+			name: "ask",
+			arguments: { questions: [{ id: "fixture-question", question: "fixture question", options: [] }] },
+		};
+		const content = scenario === "native-ask-input-multi-start-after-ui"
+			? [
+				{
+					type: "toolCall",
+					id: "fixture-native-read-before-ask-call",
+					name: "read",
+					arguments: { path: "fixture.txt" },
+				},
+				askToolCall,
+			]
+			: [askToolCall];
 		const message = {
 			role: "assistant",
-			content: [{
-				type: "toolCall",
-				id: flow.toolCallId,
-				name: "ask",
-				arguments: { questions: [{ id: "fixture-question", question: "fixture question", options: [] }] },
-			}],
+			content,
 			timestamp: Date.now(),
 			stopReason: "toolUse",
 		};
 		emit({ type: "message_start", message });
 		emit({ type: "message_end", message });
+		if (scenario === "native-ask-input-multi-start-after-ui") {
+			emit({
+				type: "tool_execution_start",
+				toolCallId: "fixture-native-read-before-ask-call",
+				toolName: "read",
+				args: { path: "fixture.txt" },
+			});
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "fixture-native-read-before-ask-call",
+				toolName: "read",
+				isError: false,
+				result: { content: [{ type: "text", text: "fixture contents" }] },
+			});
+		}
 	}
 	emit({ type: "extension_ui_request", ...step.request });
 	if (scenario.endsWith("-start-after-ui") && !flow.toolStarted) {
@@ -1330,6 +1413,13 @@ function handleRatchetUiResponse(frame: Frame): void {
 	if (!pending || frame.id !== pending.requestId) return;
 	pendingRatchetUi = undefined;
 	if (pending.stage === "ask" && pending.mode === "flow") {
+		if (scenario === "ratchet-revise-notify") {
+			emit({
+				type: "extension_ui_request",
+				method: "notify",
+				message: "Ratchet is preparing the revise input.",
+			});
+		}
 		emitRatchetUiRequest(pending.mode, "input", pending.promptId);
 		return;
 	}
@@ -1354,11 +1444,22 @@ function beginRatchetPrompt(id: string | undefined, message: string): void {
 	streaming = true;
 	response(id, "prompt", { agentInvoked: true });
 	emit({ type: "agent_start" });
-	emitRatchetUiRequest(mode, mode === "secret" ? "input" : "ask", id);
+	if (
+		(message === "/retry" || message === "standalone-input-retry") &&
+		scenario !== "ratchet-revise-notify"
+	) {
+		ratchetEvalToolStarted = true;
+		emit({
+			type: "tool_execution_start",
+			toolCallId: "fixture-ratchet-retry-eval",
+			toolName: "eval",
+			args: {},
+		});
+	}
+	emitRatchetUiRequest(mode, mode === "secret" || message.startsWith("standalone-input") ? "input" : "ask", id);
 }
 
 function resultText(result: unknown): string {
-	if (!result || typeof result !== "object" || Array.isArray(result)) return String(result ?? "");
 	const content = (result as Frame).content;
 	if (!Array.isArray(content)) return String(result);
 	const text = content.find(
@@ -1977,12 +2078,20 @@ function emitResearchHigherScenario(id: string | undefined): void {
 
 async function handlePrompt(id: string | undefined, message: string): Promise<void> {
 	appendLog({ kind: "prompt", id, message });
-	if (scenario.startsWith("native-ask") && message === "/native ask") {
+	if (scenario.startsWith("native-ask") && (message === "/native ask" || message === "/retry")) {
 		beginNativeAskPrompt(id);
 		return;
 	}
-	if (scenario === "ratchet-ask" && message.startsWith("/ratchet")) {
+	if ((scenario === "ratchet-ask" || scenario === "ratchet-revise-notify") && (message.startsWith("/ratchet") || message === "/retry")) {
 		beginRatchetPrompt(id, message);
+		return;
+	}
+	if (scenario === "ratchet-standalone-input" && message === "/standalone input") {
+		beginRatchetPrompt(id, "standalone-input");
+		return;
+	}
+	if (scenario === "ratchet-standalone-input" && message === "/retry") {
+		beginRatchetPrompt(id, "standalone-input-retry");
 		return;
 	}
 	if (scenario === "context-card" && message === "/context") {
@@ -3067,7 +3176,7 @@ function handleCommand(command: Frame): void {
 		return;
 	}
 	if (type === "extension_ui_response") {
-		if (scenario === "ratchet-ask") handleRatchetUiResponse(command);
+		if (scenario.startsWith("ratchet-")) handleRatchetUiResponse(command);
 		else if (scenario.startsWith("native-ask")) handleNativeAskUiResponse(command);
 		return;
 	}

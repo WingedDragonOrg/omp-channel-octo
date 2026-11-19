@@ -295,6 +295,23 @@ const SET = [
   { id: "target", question: "Which deployment target?", options: [{ label: "staging" }, { label: "production" }] },
   { id: "window", question: "When do we ship?" },
 ];
+const EDITOR = [
+  {
+    id: "editor-value",
+    question: "Edit the configuration value",
+    defaultValue: "before restart",
+    allowEmpty: true,
+  },
+];
+
+const SELECT = [
+  {
+    id: "deployment-target",
+    question: "Which deployment target?",
+    options: [{ label: "staging" }, { label: "production" }],
+  },
+];
+const SELECT_ONLY = [{ ...SELECT[0]!, allowFreeText: false }];
 
 test("停机不吊销待答问题：恢复端认领原行，原卡片点击照旧作答", async () => {
   const interrupted = await interruptAsk(SINGLE);
@@ -323,6 +340,127 @@ test("停机不吊销待答问题：恢复端认领原行，原卡片点击照�
     expect(transport.sentCards).toHaveLength(0);
   });
 });
+test("editor defaults and explicit empty answers survive restart recovery", async () => {
+  const interrupted = await interruptAsk(EDITOR);
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    const [row] = store.listTaskQuestions(task.id);
+    if (row === undefined) throw new Error("editor question row missing");
+    expect(JSON.parse(row.payload)).toMatchObject({
+      defaultValue: "before restart",
+      allowEmpty: true,
+    });
+
+    const { desk, transport } = resumeDesk(store);
+    desk.beginRecovery(task.id);
+    const call = desk.askQuestions(task, TARGET, args(EDITOR), new AbortController().signal);
+    expect(store.listTaskQuestions(task.id).map(({ id }) => id)).toEqual([row.id]);
+    expect(transport.sentCards).toHaveLength(0);
+    expect(await desk.answerFromCard(click(interrupted.cardMessageId, "ask_submit", { ask_empty: "empty" })))
+      .toBe("handled");
+    expect(answers(await call)).toEqual([
+      { id: "editor-value", questionId: row.id, answer: "", answeredBy: OWNER },
+    ]);
+    await transport.waitForCardEdit(({ messageId }) => messageId === interrupted.cardMessageId);
+  });
+});
+
+test("a no-Other select remains strict and answerable after restart", async () => {
+  const interrupted = await interruptAsk(SELECT_ONLY);
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    const [row] = store.listTaskQuestions(task.id);
+    if (row === undefined) throw new Error("select question row missing");
+    expect(JSON.parse(row.payload)).toMatchObject({ allowFreeText: false });
+    expect(JSON.stringify(interrupted.transport.sentCards[0]!.frame.card)).not.toContain("Input.Text");
+
+    const { desk, transport, record } = resumeDesk(store);
+    desk.beginRecovery(task.id);
+    const call = desk.askQuestions(task, TARGET, args(SELECT_ONLY), new AbortController().signal);
+    expect(store.listTaskQuestions(task.id).map(({ id }) => id)).toEqual([row.id]);
+    expect(transport.sentCards).toHaveLength(0);
+
+    expect(await consumeCurrentText(
+      desk,
+      inbound({ messageId: "restart-select-write-in", ...TARGET, text: "write-in" }),
+      "write-in",
+    )).toBe(true);
+    expect(store.getQuestion(row.id)?.state).toBe("pending");
+    expect(record.wakes).toEqual([]);
+    expect(record.notices.map(({ text }) => text).join("\n"))
+      .toContain("答案无效：此题只接受有效选项编号");
+
+    expect(await desk.answerFromCard(click(interrupted.cardMessageId, "ask_submit", {
+      ask_choices: "2",
+    }))).toBe("handled");
+    expect(answers(await call)).toEqual([
+      { id: "deployment-target", questionId: row.id, answer: "2", answeredBy: OWNER },
+    ]);
+  });
+});
+
+test("recovery identity does not reuse a select row when allowFreeText changes", async () => {
+  const interrupted = await interruptAsk(SELECT);
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    const originalId = interrupted.questionIds[0]!;
+    const { desk, transport } = resumeDesk(store);
+    desk.beginRecovery(task.id);
+    const abort = new AbortController();
+    const call = desk.askQuestions(task, TARGET, args(SELECT_ONLY), abort.signal);
+    const fresh = await transport.waitForCardSend(() => true);
+
+    const rows = store.listTaskQuestions(task.id);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.id).toBe(originalId);
+    expect(rows[1]?.id).not.toBe(originalId);
+    expect(JSON.parse(rows[1]?.payload ?? "{}")).toMatchObject({ allowFreeText: false });
+    expect(JSON.stringify(fresh.frame.card)).not.toContain("Input.Text");
+
+    abort.abort();
+    await expect(call).rejects.toThrow();
+  });
+});
+
+test.each([
+  {
+    field: "defaultValue",
+    changed: [{ ...EDITOR[0]!, defaultValue: "after restart" }],
+    expectedValue: "after restart",
+  },
+  {
+    field: "allowEmpty",
+    changed: [{ ...EDITOR[0]!, allowEmpty: false }],
+    expectedValue: "before restart",
+  },
+])("recovery identity does not reuse an editor row when $field changes", async ({ changed, expectedValue }) => {
+  const interrupted = await interruptAsk(EDITOR);
+  await withStore(interrupted, async (store) => {
+    const task = latestTask(store);
+    const originalId = interrupted.questionIds[0]!;
+    const { desk, transport } = resumeDesk(store);
+    desk.beginRecovery(task.id);
+    const abort = new AbortController();
+    const call = desk.askQuestions(task, TARGET, args([changed[0]!]), abort.signal);
+    const fresh = await transport.waitForCardSend(() => true);
+
+    const rows = store.listTaskQuestions(task.id);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.id).toBe(originalId);
+    expect(rows[1]?.id).not.toBe(originalId);
+    expect(transport.sentCards).toHaveLength(1);
+    expect(JSON.stringify(fresh.frame.card)).toContain(expectedValue);
+    if (changed[0]?.allowEmpty === false) {
+      expect(JSON.stringify(fresh.frame.card)).not.toContain("ask_empty");
+    } else {
+      expect(JSON.stringify(fresh.frame.card)).toContain("ask_empty");
+    }
+
+    abort.abort();
+    await expect(call).rejects.toThrow();
+  });
+});
+
 
 test("恢复端重挂后普通回复即答案，且不另起回合", async () => {
   const interrupted = await interruptAsk(SINGLE);

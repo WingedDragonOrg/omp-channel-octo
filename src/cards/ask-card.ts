@@ -30,6 +30,9 @@ const OTHER_INPUT_LABEL = "其他（选填，填写后以它为准）";
 const OTHER_INPUT_PLACEHOLDER = "自定义答案";
 const ANSWER_INPUT_LABEL = "自填答案";
 const ANSWER_INPUT_PLACEHOLDER = "输入答案";
+const ASK_EMPTY_INPUT_ID = "ask_empty";
+const EMPTY_ANSWER_VALUE = "empty";
+const EMPTY_ANSWER_TITLE = "明确提交空字符串";
 
 export interface AskCardOption {
   label: string;
@@ -40,6 +43,9 @@ export interface AskCardQuestion {
   question: string;
   options: readonly AskCardOption[];
   multi: boolean;
+  defaultValue?: string;
+  allowEmpty?: boolean;
+  allowFreeText?: false;
 }
 
 /**
@@ -100,6 +106,7 @@ function submitActionId(generation: number): string {
   return generation > 1 ? `${SUBMIT_ACTION_PREFIX}#${generation}` : SUBMIT_ACTION_PREFIX;
 }
 
+
 /** Parses the action id of a click; `null` for ids this module never issued. */
 export function parseAskActionId(actionId: string): AskActionRef | null {
   const option = OPTION_ACTION_ID.exec(actionId);
@@ -121,6 +128,7 @@ export function parseAskActionId(actionId: string): AskActionRef | null {
 
 /** Renders a recorded answer back into the frame: option indexes become their labels. */
 export function askAnswerText(question: AskCardQuestion, answer: string): string {
+  if (answer.length === 0) return '""';
   if (question.options.length === 0) return answer;
   const indexes = answer.split(",").map((value) => value.trim());
   if (!indexes.every((value) => /^\d+$/u.test(value))) return answer;
@@ -214,11 +222,17 @@ export function resolveAskAnswer(
     if (ref.index < 1 || ref.index > question.options.length) return { kind: "invalid" };
     return { kind: "answer", answer: String(ref.index) };
   }
-  const text = (inputs[ASK_TEXT_INPUT_ID] ?? "").trim();
-  if (question.options.length === 0) {
-    return text.length === 0 ? { kind: "invalid" } : { kind: "answer", answer: text };
+  const textInput = inputs[ASK_TEXT_INPUT_ID] ?? "";
+  if (question.allowEmpty === true && inputs[ASK_EMPTY_INPUT_ID] === EMPTY_ANSWER_VALUE) {
+    return { kind: "answer", answer: "" };
   }
-  if (text.length > 0) return { kind: "answer", answer: text };
+  const text = question.defaultValue === undefined ? textInput.trim() : textInput;
+  if (question.options.length === 0) {
+    return question.allowFreeText === false || text.length === 0
+      ? { kind: "invalid" }
+      : { kind: "answer", answer: text };
+  }
+  if (text.length > 0 && question.allowFreeText !== false) return { kind: "answer", answer: text };
   const selected = selectionAnswer(question, inputs[ASK_CHOICES_INPUT_ID] ?? "");
   return selected === null ? { kind: "invalid" } : { kind: "answer", answer: selected };
 }
@@ -233,9 +247,18 @@ export function resolveAskSetAnswer(
   ordinal: number,
   inputs: Readonly<Record<string, string>>,
 ): string | null {
-  const text = (inputs[`${ASK_TEXT_INPUT_ID}_${ordinal}`] ?? "").trim();
-  if (text.length > 0) return text;
-  if (question.options.length === 0) return null;
+  if (
+    question.allowEmpty === true &&
+    inputs[`${ASK_EMPTY_INPUT_ID}_${ordinal}`] === EMPTY_ANSWER_VALUE
+  ) {
+    return "";
+  }
+  const rawText = inputs[`${ASK_TEXT_INPUT_ID}_${ordinal}`] ?? "";
+  const text = question.defaultValue === undefined ? rawText.trim() : rawText;
+  if (question.options.length === 0) {
+    return question.allowFreeText === false || text.length === 0 ? null : text;
+  }
+  if (text.length > 0 && question.allowFreeText !== false) return text;
   return selectionAnswer(question, inputs[`${ASK_CHOICES_INPUT_ID}_${ordinal}`] ?? "");
 }
 
@@ -288,21 +311,38 @@ function choiceSetInput(question: AskCardQuestion, id: string): Record<string, u
   };
 }
 
-function answerInput(id: string, hasOptions: boolean): Record<string, unknown> {
+function answerInput(id: string, hasOptions: boolean, defaultValue?: string): Record<string, unknown> {
   return {
     type: "Input.Text",
     id,
     label: hasOptions ? OTHER_INPUT_LABEL : ANSWER_INPUT_LABEL,
     placeholder: hasOptions ? OTHER_INPUT_PLACEHOLDER : ANSWER_INPUT_PLACEHOLDER,
     isMultiline: !hasOptions,
+    ...(defaultValue === undefined ? {} : { value: defaultValue }),
+  };
+}
+
+function emptyAnswerInput(id: string): Record<string, unknown> {
+  return {
+    type: "Input.Toggle",
+    id,
+    title: EMPTY_ANSWER_TITLE,
+    valueOn: EMPTY_ANSWER_VALUE,
+    valueOff: "",
+    value: "",
   };
 }
 
 function pendingInputs(question: AskCardQuestion): Record<string, unknown>[] {
-  if (question.options.length === 0) {
-    return [answerInput(ASK_TEXT_INPUT_ID, false)];
+  const inputs: Record<string, unknown>[] = [];
+  if (question.options.length > 0) {
+    inputs.push(choiceSetInput(question, ASK_CHOICES_INPUT_ID));
   }
-  return [choiceSetInput(question, ASK_CHOICES_INPUT_ID), answerInput(ASK_TEXT_INPUT_ID, true)];
+  if (question.allowFreeText !== false) {
+    inputs.push(answerInput(ASK_TEXT_INPUT_ID, question.options.length > 0, question.defaultValue));
+  }
+  if (question.allowEmpty === true) inputs.push(emptyAnswerInput(ASK_EMPTY_INPUT_ID));
+  return inputs;
 }
 
 /** A single submit commits the selected option(s) or free-form answer. */
@@ -374,7 +414,10 @@ function setQuestionBody(
   if (question.options.length > 0) {
     body.push(choiceSetInput(question, `${ASK_CHOICES_INPUT_ID}_${ordinal}`));
   }
-  body.push(answerInput(`${ASK_TEXT_INPUT_ID}_${ordinal}`, question.options.length > 0));
+  if (question.allowFreeText !== false) {
+    body.push(answerInput(`${ASK_TEXT_INPUT_ID}_${ordinal}`, question.options.length > 0, question.defaultValue));
+  }
+  if (question.allowEmpty === true) body.push(emptyAnswerInput(`${ASK_EMPTY_INPUT_ID}_${ordinal}`));
   return body;
 }
 

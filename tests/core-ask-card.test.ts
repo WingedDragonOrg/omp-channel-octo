@@ -547,6 +547,85 @@ test("a single-choice selection is recorded only through the card submit", async
     await closeCoreHarness(harness);
   }
 });
+test("a select without a free-text option rejects write-ins and stays pending", async () => {
+  const harness = await startAskHarness({
+    id: "deployment-target",
+    question: "Which deployment target?",
+    options: [{ label: "staging" }, { label: "production" }],
+    allowFreeText: false,
+  }, { cards: false });
+  try {
+    const target: ChatTarget = { channelId: "dm-select-no-other-text", channelType: 1 };
+    await harness.service.submitInbound(
+      inbound({ messageId: "select-no-other-start", ...target, text: "needs an answer" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 1);
+
+    await submitAndWaitForIngressHandoff(
+      harness,
+      inbound({ messageId: "select-no-other-write-in", ...target, text: "write-in" }),
+    );
+    const rejected = await harness.transport.waitForAttempt(({ text }) => text.includes("答案无效"));
+    expect(rejected.text).toContain("答案无效：此题只接受有效选项编号");
+
+    await harness.service.submitInbound(
+      inbound({ messageId: "select-no-other-answer", ...target, text: "2" }),
+    );
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(await readAnswers(harness)).toMatchObject({
+      answers: [{ id: "deployment-target", answer: "2" }],
+    });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a select without a free-text option hides the card editor and accepts its choice", async () => {
+  const harness = await startAskHarness({
+    id: "deployment-target",
+    question: "Which deployment target?",
+    options: [{ label: "staging" }, { label: "production" }],
+    allowFreeText: false,
+  });
+  try {
+    const target: ChatTarget = { channelId: "dm-select-no-other-card", channelType: 1 };
+    await harness.service.submitInbound(
+      inbound({ messageId: "select-no-other-card-start", ...target, text: "needs an answer" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 1);
+    const card = harness.transport.sentCards[0];
+    if (!card) throw new Error("ask card was not sent");
+
+    expect(cardBody(card.frame.card).map(({ type }) => type)).toContain("Input.ChoiceSet");
+    expect(cardBody(card.frame.card).map(({ type }) => type)).not.toContain("Input.Text");
+    expect(cardActions(card)).toEqual(["ask_submit"]);
+
+    harness.transport.pushBotEvent(cardActionEvent(62, {
+      messageId: card.messageId,
+      channelType: 1,
+      channelId: target.channelId,
+      actionId: "ask_submit",
+      operatorUid: "owner-1",
+      inputs: { ask_choices: "2" },
+    }));
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(await readAnswers(harness)).toMatchObject({
+      answers: [{ id: "deployment-target", answer: "2" }],
+    });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
 
 test("a plain reply answers the card question and rewrites the same card", async () => {
   const harness = await startAskHarness({
@@ -1960,6 +2039,362 @@ test.each(["text", "cancel"] as const)("a partial set keeps earlier answers when
   }
 });
 
+test("an editor card pre-fills its current value and accepts an edited value", async () => {
+  const harness = await startAskHarness({
+    id: "editor-value",
+    question: "Edit the configuration value",
+    defaultValue: "old configuration",
+    allowEmpty: true,
+  });
+  try {
+    const target: ChatTarget = { channelType: 1, channelId: "dm-editor-prefill" };
+    await harness.service.submitInbound(
+      inbound({ messageId: "editor-prefill-start", ...target, text: "edit this value" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 1);
+
+    const card = harness.transport.sentCards[0];
+    if (!card) throw new Error("editor card was not sent");
+    const input = cardBody(card.frame.card).find((element) => element.id === "ask_text");
+    expect(input).toMatchObject({ type: "Input.Text", value: "old configuration" });
+    expect(inputIds(card)).toContain("ask_empty");
+
+    harness.transport.pushBotEvent(cardActionEvent(201, {
+      messageId: card.messageId,
+      ...target,
+      actionId: "ask_submit",
+      operatorUid: "owner-1",
+      inputs: { ask_text: "new configuration" },
+    }));
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(await readAnswers(harness)).toEqual({
+      answers: [{
+        id: "editor-value",
+        questionId: expect.any(String),
+        answeredBy: "owner-1",
+        answer: "new configuration",
+      }],
+    });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("an editor card keeps a missing submission invalid but accepts its explicit empty choice", async () => {
+  const harness = await startAskHarness({
+    id: "editor-empty",
+    question: "Edit the optional value",
+    defaultValue: "",
+    allowEmpty: true,
+  });
+  try {
+    const target: ChatTarget = { channelType: 1, channelId: "dm-editor-empty" };
+    await harness.service.submitInbound(
+      inbound({ messageId: "editor-empty-start", ...target, text: "edit this value" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 1);
+    const card = harness.transport.sentCards[0];
+    if (!card) throw new Error("editor card was not sent");
+    const input = cardBody(card.frame.card).find((element) => element.id === "ask_text");
+    expect(input).toMatchObject({ type: "Input.Text", value: "" });
+
+    harness.transport.pushBotEvent(cardActionEvent(202, {
+      messageId: card.messageId,
+      ...target,
+      actionId: "ask_submit",
+      operatorUid: "owner-1",
+      inputs: {},
+    }));
+    const retry = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
+    expect(cardActions(retry)).toEqual(["ask_submit#2"]);
+    await expect(harness.service.status(target)).resolves.toMatchObject({
+      pendingQuestionIds: [expect.any(String)],
+    });
+
+    harness.transport.pushBotEvent(cardActionEvent(203, {
+      messageId: card.messageId,
+      ...target,
+      actionId: "ask_submit#2",
+      operatorUid: "owner-1",
+      inputs: { ask_empty: "empty" },
+    }));
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    const answered = await harness.transport.waitForCardEdit(
+      ({ messageId, cardSeq }) => messageId === card.messageId && cardSeq === 3,
+    );
+    expect(answeredTexts(answered.frame.card)).toContain('已由 owner-1 回复：""');
+    expect(await readAnswers(harness)).toEqual({
+      answers: [{
+        id: "editor-empty",
+        questionId: expect.any(String),
+        answeredBy: "owner-1",
+        answer: "",
+      }],
+    });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a text fallback shows the editor value and lets the user confirm it", async () => {
+  const harness = await startAskHarness(
+    {
+      id: "editor-text",
+      question: "Edit the deployment target",
+      defaultValue: "staging-west",
+      allowEmpty: true,
+    },
+    { cards: false },
+  );
+  try {
+    const target: ChatTarget = { channelType: 1, channelId: "dm-editor-text" };
+    await harness.service.submitInbound(
+      inbound({ messageId: "editor-text-start", ...target, text: "edit this value" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 1);
+    const prompt = sentToChat(harness.transport, target).map(({ text }) => text).join("\n");
+    expect(prompt).toContain('当前值："staging-west"');
+    expect(prompt).toContain("回复原值可确认");
+
+    await harness.service.submitInbound(
+      inbound({ messageId: "editor-text-confirm", ...target, text: "staging-west" }),
+    );
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(await readAnswers(harness)).toMatchObject({
+      answers: [{ id: "editor-text", answer: "staging-west" }],
+    });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+test("text fallback in an editor set shows and confirms each question's own default", async () => {
+  const harness = await startAskHarness([
+    { id: "editor-first-text", question: "First value", defaultValue: "first old" },
+    { id: "editor-second-text", question: "Second value", defaultValue: "second old" },
+  ], { cards: false });
+  try {
+    const target: ChatTarget = { channelType: 1, channelId: "dm-editor-set-text" };
+    await harness.service.submitInbound(
+      inbound({ messageId: "editor-set-text-start", ...target, text: "edit both values" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 2);
+    const prompts = sentToChat(harness.transport, target);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]?.text).toContain('当前值："first old"');
+    expect(prompts[0]?.text).toContain('当前值："second old"');
+
+    await harness.service.submitInbound(
+      inbound({ messageId: "editor-set-text-confirm", ...target, text: "保持原值" }),
+    );
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(await readAnswers(harness)).toEqual({
+      answers: [
+        { id: "editor-first-text", questionId: expect.any(String), answeredBy: "owner-1", answer: "first old" },
+        { id: "editor-second-text", questionId: expect.any(String), answeredBy: "owner-1", answer: "second old" },
+      ],
+    });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+
+test("a text fallback accepts the explicit empty-string answer", async () => {
+  const harness = await startAskHarness(
+    {
+      id: "editor-text-empty",
+      question: "Edit the optional value",
+      defaultValue: "existing value",
+      allowEmpty: true,
+    },
+    { cards: false },
+  );
+  try {
+    const target: ChatTarget = { channelType: 1, channelId: "dm-editor-text-empty" };
+    await harness.service.submitInbound(
+      inbound({ messageId: "editor-text-empty-start", ...target, text: "edit this value" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 1);
+    const prompt = sentToChat(harness.transport, target).map(({ text }) => text).join("\n");
+    expect(prompt).toContain('回复 "" 可提交空字符串');
+
+    await harness.service.submitInbound(
+      inbound({ messageId: "editor-text-empty-reply", ...target, text: '""' }),
+    );
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(await readAnswers(harness)).toMatchObject({
+      answers: [{ id: "editor-text-empty", answer: "" }],
+    });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test.each([
+  { name: "the current-value token", reply: "\\保持原值", answer: "保持原值" },
+  { name: "the empty token", reply: "\\\"\"", answer: '""' },
+  { name: "a literal backslash before the current-value token", reply: "\\\\保持原值", answer: "\\保持原值" },
+])("text fallback treats escaped $name as literal content", async ({ reply, answer }) => {
+  const harness = await startAskHarness(
+    {
+      id: "editor-escaped-literal",
+      question: "Edit the value",
+      defaultValue: "existing",
+      allowEmpty: true,
+    },
+    { cards: false },
+  );
+  try {
+    const target: ChatTarget = { channelType: 1, channelId: "dm-editor-escaped-literal" };
+    await harness.service.submitInbound(
+      inbound({ messageId: "editor-escaped-literal-start", ...target, text: "edit this value" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 1);
+    const prompt = sentToChat(harness.transport, target).map(({ text }) => text).join("\n");
+    expect(prompt).toContain("字面答案用反斜线前缀");
+    expect(prompt).toContain("保持原值 → \\保持原值");
+    expect(prompt).toContain('"" → \\""');
+    expect(prompt).toContain("额外加一条转义反斜线");
+
+    await harness.service.submitInbound(
+      inbound({ messageId: "editor-escaped-literal-reply", ...target, text: reply }),
+    );
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(await readAnswers(harness)).toMatchObject({
+      answers: [{ id: "editor-escaped-literal", answer }],
+    });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test.each(['""', "保持原值"] as const)("ordinary text asks keep %s as literal answers", async (answer) => {
+  const harness = await startAskHarness(
+    { id: "plain-text-answer", question: "What should the value be?" },
+    { cards: false },
+  );
+  try {
+    const target: ChatTarget = { channelType: 1, channelId: "dm-plain-reserved-text" };
+    await harness.service.submitInbound(
+      inbound({ messageId: "plain-reserved-start", ...target, text: "ask" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 1);
+
+    await harness.service.submitInbound(
+      inbound({ messageId: "plain-reserved-reply", ...target, text: answer }),
+    );
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(await readAnswers(harness)).toMatchObject({
+      answers: [{ id: "plain-text-answer", answer }],
+    });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("a partial editor set keeps defaults and records an explicitly empty answer", async () => {
+  const harness = await startAskHarness([
+    {
+      id: "editor-first",
+      question: "First optional value",
+      defaultValue: "first old",
+      allowEmpty: true,
+    },
+    {
+      id: "editor-second",
+      question: "Second value",
+      defaultValue: "second old",
+    },
+  ]);
+  try {
+    const target: ChatTarget = { channelType: 1, channelId: "dm-editor-set" };
+    await harness.service.submitInbound(
+      inbound({ messageId: "editor-set-start", ...target, text: "edit both values" }),
+    );
+    await harness.workers.waitForPromptCount(1);
+    await waitForStatus(harness.service, target, (status) => status.pendingQuestionIds.length === 2);
+    const card = harness.transport.sentCards[0];
+    if (!card) throw new Error("editor set card was not sent");
+    const initial = cardBody(card.frame.card);
+    expect(initial.find((element) => element.id === "ask_text_1")).toMatchObject({ value: "first old" });
+    expect(initial.find((element) => element.id === "ask_text_2")).toMatchObject({ value: "second old" });
+    expect(inputIds(card)).toContain("ask_empty_1");
+    expect(inputIds(card)).not.toContain("ask_empty_2");
+
+    harness.transport.pushBotEvent(cardActionEvent(204, {
+      messageId: card.messageId,
+      ...target,
+      actionId: "ask_submit",
+      operatorUid: "owner-1",
+      inputs: { ask_empty_1: "empty" },
+    }));
+    const partial = await harness.transport.waitForCardEdit(({ messageId }) => messageId === card.messageId);
+    expect(cardActions(partial)).toEqual(["ask_submit#2"]);
+    expect(cardBody(partial.frame.card).find((element) => element.id === "ask_text_2"))
+      .toMatchObject({ value: "second old" });
+    await expect(harness.service.status(target)).resolves.toMatchObject({
+      pendingQuestionIds: [expect.any(String)],
+    });
+
+    harness.transport.pushBotEvent(cardActionEvent(205, {
+      messageId: card.messageId,
+      ...target,
+      actionId: "ask_submit#2",
+      operatorUid: "owner-1",
+      inputs: { ask_text_2: "second new" },
+    }));
+    await waitForStatus(
+      harness.service,
+      target,
+      (status) => status.state === "completed" && status.pendingQuestionIds.length === 0,
+    );
+    expect(await readAnswers(harness)).toEqual({
+      answers: [
+        { id: "editor-first", questionId: expect.any(String), answeredBy: "owner-1", answer: "" },
+        { id: "editor-second", questionId: expect.any(String), answeredBy: "owner-1", answer: "second new" },
+      ],
+    });
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+ 
 test("a declined card does not fall back to re-asking an answer recorded during send", async () => {
   const sending = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();

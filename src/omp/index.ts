@@ -267,6 +267,7 @@ type PendingNativeAskUi = {
 	frame: RpcFrame;
 	method: "select" | "input" | "editor";
 	toolCallId?: string;
+	toolName?: string;
 	timer: NodeJS.Timeout;
 };
 
@@ -348,7 +349,12 @@ class RpcWorker implements OmpWorker {
 	#hostCalls = new Map<string, HostCall>();
 	#nativeAskCall: NativeAskCall | undefined;
 	#nativeAskToolCallCandidate: string | undefined;
+	#assistantToolCallBatch = new Map<string, string>();
+	#ambiguousNativeAskToolCall = false;
 	#pendingNativeAskUi: PendingNativeAskUi | undefined;
+	#activeNonAskToolCalls = new Map<string, string>();
+	#unidentifiedNonAskToolCalls = 0;
+	#ratchetReviseInputExpected = false;
 	#pendingSteerReceipts: Array<{ text: string }> = [];
 	#sessionFile = "";
 	#sessionId = "";
@@ -890,6 +896,7 @@ class RpcWorker implements OmpWorker {
 		this.#nativeAskCall = undefined;
 		this.#nativeAskToolCallCandidate = undefined;
 		this.#clearPendingNativeAskUi();
+		this.#clearTransientAskRoutingState();
 		this.#activePrompt = run;
 		let acceptedGoalId: string | undefined;
 		try {
@@ -1079,6 +1086,7 @@ class RpcWorker implements OmpWorker {
 		this.#nativeAskCall = undefined;
 		this.#nativeAskToolCallCandidate = undefined;
 		this.#clearPendingNativeAskUi();
+		this.#clearTransientAskRoutingState();
 		this.#activePrompt = run;
 		this.#suppressCommandOutput = internalCommandOutput;
 		try {
@@ -1796,6 +1804,9 @@ class RpcWorker implements OmpWorker {
 
 	#handleUiRequest(frame: RpcFrame): void {
 		const method = typeof frame.method === "string" ? frame.method : "unknown";
+		if (method !== "input" && method !== "notify" && PASSIVE_UI_METHODS[method] !== true) {
+			this.#ratchetReviseInputExpected = false;
+		}
 		if (method === "notify") {
 			this.#handleNotice(frame);
 			return;
@@ -1813,15 +1824,38 @@ class RpcWorker implements OmpWorker {
 			this.#handleNativeAskUiRequest(frame, method);
 			return;
 		}
-		if (
-			this.#ratchetDialogs &&
-			method === "input" &&
-			(this.#nativeAskCall !== undefined || this.#nativeAskToolCallCandidate !== undefined)
-		) {
+		if (this.#ratchetDialogs && method === "input") {
+			if (this.#nativeAskCall !== undefined || this.#nativeAskToolCallCandidate !== undefined) {
+				this.#handleNativeAskUiRequest(frame, "input");
+				return;
+			}
+			if (frame.secret === true) {
+				this.#ratchetReviseInputExpected = false;
+				this.#failUiRequest(frame, "Secret OMP input is unsupported by the channel");
+				return;
+			}
+			if (this.#ratchetReviseInputExpected) {
+				this.#ratchetReviseInputExpected = false;
+				this.#handleRatchetDialog(frame, "input");
+				return;
+			}
+			if (this.#ambiguousNativeAskToolCall) {
+				this.#failUiRequest(frame, "OMP input request has ambiguous assistant tool-call identity");
+				return;
+			}
+			const activeLegacyToolCount = this.#activeNonAskToolCalls.size + this.#unidentifiedNonAskToolCalls;
+			if (!this.#suppressCommandOutput || activeLegacyToolCount === 1) {
+				this.#handleRatchetDialog(frame, "input");
+				return;
+			}
+			if (activeLegacyToolCount > 1) {
+				this.#failUiRequest(frame, "OMP input request has ambiguous active tool identity");
+				return;
+			}
 			this.#handleNativeAskUiRequest(frame, "input");
 			return;
 		}
-		if (this.#ratchetDialogs && (method === "ask" || (method === "input" && frame.secret !== true))) {
+		if (this.#ratchetDialogs && method === "ask") {
 			this.#handleRatchetDialog(frame, method);
 			return;
 		}
@@ -1833,32 +1867,66 @@ class RpcWorker implements OmpWorker {
 		if (!this.#ratchetDialogs || !this.#activePrompt || this.#activePrompt.settled) return;
 		const message = frame.message;
 		if (!isRecord(message) || message.role !== "assistant" || !Array.isArray(message.content)) return;
-		const firstToolCall = message.content.find(value => isRecord(value) && value.type === "toolCall");
-		const toolCallId =
-			isRecord(firstToolCall) &&
-			firstToolCall.name === "ask" &&
-			typeof firstToolCall.id === "string" &&
-			firstToolCall.id.length > 0
-				? firstToolCall.id
-				: undefined;
-		const pending = this.#pendingNativeAskUi;
-		if (!toolCallId) {
-			this.#nativeAskToolCallCandidate = undefined;
-			if (pending?.toolCallId !== undefined) {
-				this.#failPendingNativeAskUi("OMP native ask UI request no longer matches a pending ask tool call");
+		const toolCalls = message.content.filter(value => isRecord(value) && value.type === "toolCall");
+		const batch = new Map<string, string>();
+		const askToolCallIds: string[] = [];
+		let invalidToolIdentity = false;
+		for (const value of toolCalls) {
+			if (!isRecord(value) || typeof value.name !== "string" || typeof value.id !== "string" || value.id.length === 0) {
+				invalidToolIdentity = true;
+				continue;
+			}
+			if (batch.has(value.id)) invalidToolIdentity = true;
+			batch.set(value.id, value.name);
+			if (value.name === "ask") askToolCallIds.push(value.id);
+		}
+		this.#assistantToolCallBatch = batch;
+		this.#ambiguousNativeAskToolCall =
+			toolCalls.length > 0 &&
+			(invalidToolIdentity ||
+				askToolCallIds.length > 1 ||
+				(askToolCallIds.length === 0 && batch.size !== 1));
+		const uniqueAskToolCallId = askToolCallIds.length === 1 && !invalidToolIdentity
+			? askToolCallIds[0]
+			: undefined;
+		if (this.#nativeAskCall) {
+			if (
+				askToolCallIds.length > 0 &&
+				(askToolCallIds.length !== 1 || askToolCallIds[0] !== this.#nativeAskCall.toolCallId)
+			) {
+				this.#nativeAskCall.invalid = true;
 			}
 			return;
 		}
-		if (this.#nativeAskCall) {
-			if (this.#nativeAskCall.toolCallId !== toolCallId) this.#nativeAskCall.invalid = true;
-			return;
+		const pending = this.#pendingNativeAskUi;
+		if (pending) {
+			if (this.#ambiguousNativeAskToolCall) {
+				this.#failPendingNativeAskUi("OMP UI request cannot be correlated with an ambiguous assistant tool-call batch");
+				return;
+			}
+			if (pending.toolCallId !== undefined) {
+				const pendingToolName = batch.get(pending.toolCallId);
+				if (
+					pendingToolName === undefined ||
+					(pending.toolName !== undefined && pending.toolName !== pendingToolName)
+				) {
+					this.#failPendingNativeAskUi("OMP UI request does not match the assistant tool-call batch");
+					return;
+				}
+				pending.toolName = pendingToolName;
+			} else if (uniqueAskToolCallId !== undefined) {
+				pending.toolCallId = uniqueAskToolCallId;
+				pending.toolName = "ask";
+			} else if (pending.method === "input" && batch.size === 1) {
+				const [toolCallId, toolName] = batch.entries().next().value as [string, string];
+				pending.toolCallId = toolCallId;
+				pending.toolName = toolName;
+			} else {
+				this.#failPendingNativeAskUi("OMP UI request cannot be correlated with the assistant tool-call batch");
+				return;
+			}
 		}
-		if (pending?.toolCallId !== undefined && pending.toolCallId !== toolCallId) {
-			this.#failPendingNativeAskUi("OMP native ask UI request does not match the assistant tool call");
-			return;
-		}
-		this.#nativeAskToolCallCandidate = toolCallId;
-		if (pending) pending.toolCallId = toolCallId;
+		this.#nativeAskToolCallCandidate = uniqueAskToolCallId;
 	}
 
 	#observeNativeAskTool(frame: RpcFrame): void {
@@ -1868,11 +1936,49 @@ class RpcWorker implements OmpWorker {
 			? frame.toolCallId
 			: undefined;
 		if (frame.type === "tool_execution_start") {
+			this.#ratchetReviseInputExpected = false;
 			if (toolName !== "ask") {
-				this.#nativeAskToolCallCandidate = undefined;
-				if (this.#nativeAskCall) this.#nativeAskCall.invalid = true;
-				if (this.#pendingNativeAskUi) {
-					this.#failPendingNativeAskUi("OMP native ask UI request was followed by a different tool call");
+				if (toolCallId === undefined) this.#unidentifiedNonAskToolCalls++;
+				else this.#activeNonAskToolCalls.set(toolCallId, toolName);
+				const candidate = this.#nativeAskToolCallCandidate;
+				const isSiblingOfPendingAsk =
+					candidate !== undefined &&
+					toolCallId !== undefined &&
+					this.#assistantToolCallBatch.get(candidate) === "ask" &&
+					this.#assistantToolCallBatch.get(toolCallId) === toolName;
+				if (this.#nativeAskCall) {
+					const isSafeSibling =
+						toolName === "read" &&
+						toolCallId !== undefined &&
+						this.#assistantToolCallBatch.get(this.#nativeAskCall.toolCallId ?? "") === "ask" &&
+						this.#assistantToolCallBatch.get(toolCallId) === "read";
+					if (!isSafeSibling) this.#nativeAskCall.invalid = true;
+				}
+				const pending = this.#pendingNativeAskUi;
+				if (pending) {
+					const waitingForAskSibling =
+						pending.toolName === "ask" &&
+						pending.toolCallId === candidate &&
+						isSiblingOfPendingAsk &&
+						toolName === "read";
+					if (waitingForAskSibling) return;
+					const matchesLegacyInput =
+						pending.method === "input" &&
+						pending.toolName !== "ask" &&
+						!this.#ambiguousNativeAskToolCall &&
+						(pending.toolCallId === undefined || pending.toolCallId === toolCallId) &&
+						(pending.toolName === undefined || pending.toolName === toolName);
+					if (!matchesLegacyInput) {
+						this.#failPendingNativeAskUi("OMP native ask UI request was followed by an unrelated tool call");
+						return;
+					}
+					this.#clearPendingNativeAskUi();
+					this.#handleRatchetDialog(pending.frame, "input");
+					return;
+				}
+				if (!isSiblingOfPendingAsk) {
+					if (candidate !== undefined) this.#ambiguousNativeAskToolCall = true;
+					this.#nativeAskToolCallCandidate = undefined;
 				}
 				return;
 			}
@@ -1884,17 +1990,24 @@ class RpcWorker implements OmpWorker {
 				return;
 			}
 			const candidate = this.#nativeAskToolCallCandidate;
-			if (candidate !== undefined && candidate !== toolCallId && this.#pendingNativeAskUi) {
+			const pending = this.#pendingNativeAskUi;
+			if (pending && this.#ambiguousNativeAskToolCall) {
+				this.#failPendingNativeAskUi("OMP native ask UI request cannot be correlated with an ambiguous tool-call batch");
+				return;
+			}
+			if (candidate !== undefined && candidate !== toolCallId && pending) {
 				this.#failPendingNativeAskUi("OMP native ask tool start did not match its assistant tool call");
 				return;
 			}
 			this.#nativeAskToolCallCandidate = undefined;
+			this.#assistantToolCallBatch.clear();
+			this.#ambiguousNativeAskToolCall = false;
 			this.#nativeAskCall = { toolCallId, nextUiOrdinal: 0 };
-			const pending = this.#pendingNativeAskUi;
 			if (pending) {
 				if (
 					toolCallId === undefined ||
-					(pending.toolCallId !== undefined && pending.toolCallId !== toolCallId)
+					(pending.toolCallId !== undefined && pending.toolCallId !== toolCallId) ||
+					(pending.toolName !== undefined && pending.toolName !== "ask")
 				) {
 					this.#failPendingNativeAskUi("OMP native ask UI request has no matching stable tool-call identity");
 					return;
@@ -1904,8 +2017,24 @@ class RpcWorker implements OmpWorker {
 			}
 			return;
 		}
+		this.#ratchetReviseInputExpected = false;
 		if (toolName !== "ask") {
-			if (this.#nativeAskCall) this.#nativeAskCall.invalid = true;
+			if (toolCallId === undefined) {
+				this.#unidentifiedNonAskToolCalls = Math.max(0, this.#unidentifiedNonAskToolCalls - 1);
+			} else {
+				this.#activeNonAskToolCalls.delete(toolCallId);
+			}
+			const pending = this.#pendingNativeAskUi;
+			if (pending) {
+				const endedAskSibling =
+					pending.toolName === "ask" &&
+					pending.toolCallId === this.#nativeAskToolCallCandidate &&
+					toolCallId !== undefined &&
+					this.#assistantToolCallBatch.get(toolCallId) === "read";
+				if (!endedAskSibling) {
+					this.#failPendingNativeAskUi("OMP native ask UI request outlived its matching tool call");
+				}
+			}
 			return;
 		}
 		const active = this.#nativeAskCall;
@@ -1924,6 +2053,14 @@ class RpcWorker implements OmpWorker {
 		if (!pending) return;
 		clearTimeout(pending.timer);
 		this.#pendingNativeAskUi = undefined;
+	}
+
+	#clearTransientAskRoutingState(): void {
+		this.#activeNonAskToolCalls.clear();
+		this.#unidentifiedNonAskToolCalls = 0;
+		this.#assistantToolCallBatch.clear();
+		this.#ambiguousNativeAskToolCall = false;
+		this.#ratchetReviseInputExpected = false;
 	}
 
 	#failPendingNativeAskUi(message: string): void {
@@ -1953,7 +2090,7 @@ class RpcWorker implements OmpWorker {
 			method,
 			...(this.#nativeAskToolCallCandidate === undefined
 				? {}
-				: { toolCallId: this.#nativeAskToolCallCandidate }),
+				: { toolCallId: this.#nativeAskToolCallCandidate, toolName: "ask" }),
 			timer: setTimeout(() => {
 				if (this.#pendingNativeAskUi !== pending) return;
 				this.#pendingNativeAskUi = undefined;
@@ -1987,11 +2124,21 @@ class RpcWorker implements OmpWorker {
 			this.#failUiRequest(frame, "Secret OMP input is unsupported by the channel");
 			return;
 		}
+		if (!nativeCall && this.#ambiguousNativeAskToolCall) {
+			this.#failUiRequest(frame, "OMP native ask UI request has ambiguous assistant tool-call identity");
+			return;
+		}
+		if (
+			!nativeCall &&
+			this.#nativeAskToolCallCandidate !== undefined &&
+			this.#activeNonAskToolCalls.size + this.#unidentifiedNonAskToolCalls > 0
+		) {
+			this.#failUiRequest(frame, "OMP native ask UI request conflicts with an active non-ask tool");
+			return;
+		}
 		if (!nativeCall) {
-			if (this.#nativeAskToolCallCandidate === undefined) {
-				this.#failUiRequest(frame, "OMP native ask UI request has no stable tool-call identity");
-				return;
-			}
+			// A resumed OMP /retry can re-emit its first UI request before any assistant
+			// message_end; bind it only when the matching ask tool start arrives.
 			this.#queueNativeAskUiRequest(frame, method);
 			return;
 		}
@@ -2271,6 +2418,17 @@ class RpcWorker implements OmpWorker {
 					return { id: question.id, selectedOptions: selected, ...(selected.length ? {} : { customInput: text }) };
 				});
 				if (!this.#closed && !controller.signal.aborted) {
+					if (
+						method === "ask" &&
+						this.#activePrompt !== undefined &&
+						!this.#activePrompt.settled &&
+						answers.length === 1 &&
+						answers[0]!.selectedOptions.length === 1 &&
+						answers[0]!.selectedOptions[0] === "Revise" &&
+						answers[0]!.customInput === undefined
+					) {
+						this.#ratchetReviseInputExpected = true;
+					}
 					this.#writeFrame(method === "input"
 						? { type: "extension_ui_response", id, value: answers[0]!.customInput ?? answers[0]!.selectedOptions[0] }
 						: { type: "extension_ui_response", id, answers });
@@ -2425,6 +2583,7 @@ class RpcWorker implements OmpWorker {
 		this.#streaming = false;
 		this.#nativeAskToolCallCandidate = undefined;
 		this.#clearPendingNativeAskUi();
+		this.#clearTransientAskRoutingState();
 		run.resolve();
 	}
 
@@ -2463,12 +2622,14 @@ class RpcWorker implements OmpWorker {
 		this.#streaming = false;
 		this.#nativeAskToolCallCandidate = undefined;
 		this.#clearPendingNativeAskUi();
+		this.#clearTransientAskRoutingState();
 		run.reject(error);
 	}
 
 	#abortHostCalls(reason: Error): void {
 		this.#nativeAskToolCallCandidate = undefined;
 		this.#clearPendingNativeAskUi();
+		this.#clearTransientAskRoutingState();
 		for (const call of this.#hostCalls.values()) call.controller.abort(reason);
 		this.#hostCalls.clear();
 	}

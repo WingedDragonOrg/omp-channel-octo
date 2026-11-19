@@ -2716,6 +2716,133 @@ describe("OMP RPC worker", () => {
 				.toBeLessThan(frames.findIndex(frame => frame.type === "tool_execution_start"));
 		}, { ratchetEnabled: true });
 	});
+	test("binds a resumed native ask UI request without message_end to the subsequent ask start", async () => {
+		await withHarness("native-ask-resume-start-after-ui", async harness => {
+			const askCallIds: string[] = [];
+			const ask: HostTool = {
+				name: "ask",
+				description: "Ask the user",
+				parameters: { type: "object", properties: { questions: { type: "array" } } },
+				execute: async (args, _signal, toolCallId) => {
+					askCallIds.push(toolCallId ?? "");
+					const question = (args.questions as LogEntry[])[0]!;
+					return JSON.stringify({
+						answers: [{ id: question.id, questionId: "stored-resume", answer: "1" }],
+					});
+				},
+			};
+			await harness.worker.resume(() => {}, { tools: [ask] });
+
+			expect(askCallIds).toEqual(['omp-native-ask:["fixture-native-ask-resume-call",0]']);
+			const entries = await readLog(harness.logPath);
+			expect(rpcCommands(entries, "extension_ui_response")).toEqual([
+				{ type: "extension_ui_response", id: "fixture-native-ui-resume-before-start", value: "Production" },
+			]);
+			const frames = rpcOutputFrames(entries);
+			const startIndex = frames.findIndex(frame => frame.type === "tool_execution_start");
+			expect(frames.findIndex(frame => frame.type === "extension_ui_request")).toBeLessThan(startIndex);
+			expect(frames.slice(0, startIndex).some(frame => frame.type === "message_end")).toBe(false);
+		}, { ratchetEnabled: true });
+	});
+	test("binds a resumed native ask input without message_end to its subsequent ask start", async () => {
+		await withHarness("native-ask-input-resume-start-after-ui", async harness => {
+			const exactValue = "  keep this input exactly\n";
+			let receivedQuestion: LogEntry | undefined;
+			let receivedToolCallId: string | undefined;
+			const ask: HostTool = {
+				name: "ask",
+				description: "Ask the user",
+				parameters: { type: "object", properties: { questions: { type: "array" } } },
+				execute: async (args, _signal, toolCallId) => {
+					receivedQuestion = (args.questions as LogEntry[])[0]!;
+					receivedToolCallId = toolCallId;
+					return JSON.stringify({
+						answers: [{
+							id: receivedQuestion.id,
+							questionId: "stored-resume-input",
+							answer: exactValue,
+						}],
+					});
+				},
+			};
+			await harness.worker.resume(() => {}, { tools: [ask] });
+
+			expect(receivedQuestion).toMatchObject({
+				question: "What should change?",
+				defaultValue: "existing value",
+				allowEmpty: true,
+			});
+			expect(receivedToolCallId).toBe('omp-native-ask:["fixture-native-ask-input-resume-call",0]');
+			const entries = await readLog(harness.logPath);
+			expect(rpcCommands(entries, "extension_ui_response")).toEqual([
+				{
+					type: "extension_ui_response",
+					id: "fixture-native-ui-input-resume-before-start",
+					value: exactValue,
+				},
+			]);
+			const frames = rpcOutputFrames(entries);
+			const startIndex = frames.findIndex(frame => frame.type === "tool_execution_start");
+			expect(frames.findIndex(frame => frame.type === "extension_ui_request")).toBeLessThan(startIndex);
+			expect(frames.slice(0, startIndex).some(frame => frame.type === "message_end")).toBe(false);
+		}, { ratchetEnabled: true });
+	});
+	test("binds a resumed input-first ask to the ask call after a sibling read", async () => {
+		await withHarness("native-ask-input-multi-start-after-ui", async harness => {
+			const exactValue = "  keep this input exactly\n";
+			let receivedQuestion: LogEntry | undefined;
+			let receivedToolCallId: string | undefined;
+			const ask: HostTool = {
+				name: "ask",
+				description: "Ask the user",
+				parameters: { type: "object", properties: { questions: { type: "array" } } },
+				execute: async (args, _signal, toolCallId) => {
+					receivedQuestion = (args.questions as LogEntry[])[0]!;
+					receivedToolCallId = toolCallId;
+					return JSON.stringify({
+						answers: [{
+							id: receivedQuestion.id,
+							questionId: "stored-multi-input-resume",
+							answer: exactValue,
+						}],
+					});
+				},
+			};
+			await harness.worker.resume(() => {}, { tools: [ask] });
+
+			expect(receivedQuestion).toMatchObject({
+				question: "What should change?",
+				defaultValue: "existing value",
+				allowEmpty: true,
+			});
+			expect(receivedToolCallId).toBe('omp-native-ask:["fixture-native-ask-multi-call",0]');
+			const entries = await readLog(harness.logPath);
+			expect(rpcCommands(entries, "extension_ui_response")).toEqual([
+				{
+					type: "extension_ui_response",
+					id: "fixture-native-ui-input-multi-before-start",
+					value: exactValue,
+				},
+			]);
+			const frames = rpcOutputFrames(entries);
+			const readStart = frames.findIndex(frame =>
+				frame.type === "tool_execution_start" && frame.toolCallId === "fixture-native-read-before-ask-call",
+			);
+			const readEnd = frames.findIndex(frame =>
+				frame.type === "tool_execution_end" && frame.toolCallId === "fixture-native-read-before-ask-call",
+			);
+			const uiRequest = frames.findIndex(frame =>
+				frame.type === "extension_ui_request" && frame.id === "fixture-native-ui-input-multi-before-start",
+			);
+			const askStart = frames.findIndex(frame =>
+				frame.type === "tool_execution_start" && frame.toolName === "ask",
+			);
+			expect(readStart).toBeGreaterThanOrEqual(0);
+			expect(readStart).toBeLessThan(readEnd);
+			expect(readEnd).toBeLessThan(uiRequest);
+			expect(uiRequest).toBeLessThan(askStart);
+		}, { ratchetEnabled: true });
+	});
 	test("routes early editor and input requests through the matching native ask identity", async () => {
 		const cases = [
 			{
@@ -2977,7 +3104,7 @@ describe("OMP RPC worker", () => {
 					}
 					const question = questions[0] as LogEntry;
 					const questionId = typeof question.id === "string" ? question.id : "ratchet-input-revision";
-					const answer = invocation++ === 0 ? "1" : "Revise the input to include the dataset context.";
+					const answer = invocation++ === 0 ? "3" : "Revise the input to include the dataset context.";
 					return JSON.stringify({
 						answers: [{
 							id: questionId,
@@ -2999,6 +3126,7 @@ describe("OMP RPC worker", () => {
 				options: [
 					{ label: "Approve", description: "Continue with the current input." },
 					{ label: "Reject", description: "Do not continue with the current input." },
+					{ label: "Revise" },
 				],
 			});
 			expect(askCalls[1]).toMatchObject({
@@ -3029,7 +3157,7 @@ describe("OMP RPC worker", () => {
 				{
 					type: "extension_ui_response",
 					id: "fixture-ratchet-ui-1",
-					answers: [{ id: "ratchet-input", selectedOptions: ["Approve"] }],
+					answers: [{ id: "ratchet-input", selectedOptions: ["Revise"] }],
 				},
 				{
 					type: "extension_ui_response",
@@ -3039,6 +3167,50 @@ describe("OMP RPC worker", () => {
 			]);
 		}, { ratchetEnabled: true });
 		expect(await readFile(ratchetRpcConfigPath, "utf8")).toContain("ask:\n  timeout: 0");
+	});
+	test("keeps the ratchet Revise input associated after a passive notify", async () => {
+		await withHarness("ratchet-revise-notify", async harness => {
+			const askCalls: Record<string, unknown>[] = [];
+			let invocation = 0;
+			const ask: HostTool = {
+				name: "ask",
+				description: "Ask the user",
+				parameters: { type: "object", properties: { questions: { type: "array" } } },
+				execute: async args => {
+					askCalls.push(args);
+					const questions = args.questions;
+					if (!Array.isArray(questions) || !questions[0] || typeof questions[0] !== "object") {
+						throw new Error("ask received no questions");
+					}
+					const question = questions[0] as LogEntry;
+					return JSON.stringify({
+						answers: [{
+							id: question.id,
+							questionId: `stored-revise-${invocation}`,
+							answer: invocation++ === 0 ? "3" : "Revised input",
+						}],
+					});
+				},
+			};
+			await harness.worker.resume(() => {}, { tools: [ask] });
+
+			expect(askCalls).toHaveLength(2);
+			expect(askCalls[1]).toMatchObject({
+				questions: [{ question: "What should change about the input?" }],
+			});
+			expect(rpcCommands(await readLog(harness.logPath), "extension_ui_response")).toEqual([
+				{
+					type: "extension_ui_response",
+					id: "fixture-ratchet-ui-1",
+					answers: [{ id: "ratchet-input", selectedOptions: ["Revise"] }],
+				},
+				{
+					type: "extension_ui_response",
+					id: "fixture-ratchet-ui-2",
+					value: "Revised input",
+				},
+			]);
+		}, { ratchetEnabled: true });
 	});
 
 	test("does not treat Approve text, Reject, or a cancelled ask as approval", async () => {

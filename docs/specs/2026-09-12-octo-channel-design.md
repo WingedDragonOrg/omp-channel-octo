@@ -23,7 +23,7 @@ OctoBuddy 增强器打开跨工作区的 Zed SSH 文件时，状态接口提供�
 
 包含 owner-only 原生持续目标管理 `/goal`：创建时 token 预算、状态查询、暂停、恢复、删除、跨回合执行与在途目标跨服务重启续接，详细契约见 `docs/specs/2026-11-02-goal-command-design.md`。
 
-包含 owner-only `/ratchet [流程与目标]`：经 OMP 原生命令启动评估优化，使用现有问答投递原生审批，并在同一会话的后续 worker 与重启续接中恢复 prelude。工作目录内同名 flow 可被其他会话访问；详细契约见 `docs/specs/2026-11-19-ratchet-command-design.md`。
+包含 owner-only `/ratchet [流程与目标]`：经 OMP 原生命令启动评估优化，使用现有问答投递原生审批和同一会话后续任务的原生 ask 表单，并在后续 worker 与重启续接中恢复 prelude。工作目录内同名 flow 可被其他会话访问；详细契约见 `docs/specs/2026-11-19-ratchet-command-design.md`。
 
 包含主群/子区已落盘上下文即时分叉：owner-only `/fork [子区名称]` 和独立 `fork` 宿主工具共用原生 CLI `--fork`，沿用 cwd、建立独立 session 并绑定同父群新子区。详细契约见 `docs/specs/2026-11-03-thread-fork-design.md`。
 
