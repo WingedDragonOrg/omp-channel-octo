@@ -23,6 +23,7 @@ import { FakeWorkerFactory } from "./fixtures/core-fakes";
 const fixturePath = resolve(import.meta.dir, "fixtures/omp-rpc-worker.ts");
 const watchdogParentFixturePath = resolve(import.meta.dir, "fixtures/omp-watchdog-parent.ts");
 const goalRpcConfigPath = resolve(import.meta.dir, "../src/omp/goal-rpc.yml");
+const ratchetRpcConfigPath = resolve(import.meta.dir, "../src/omp/ratchet-rpc.yml");
 
 type LogEntry = Record<string, unknown>;
 
@@ -2607,6 +2608,359 @@ describe("OMP RPC worker", () => {
 		});
 	});
 
+	test("bridges native rpc-ui ask fields through stable active QuestionDesk identities", async () => {
+		await withHarness("native-ask", async harness => {
+			const askCalls: Record<string, unknown>[] = [];
+			const askCallIds: string[] = [];
+			const answers = ["3", "2", "1", "3", "  keep\n the exact text  ", "", "2", "3"];
+			const ask: HostTool = {
+				name: "ask",
+				description: "Ask the user one or more questions",
+				parameters: { type: "object", properties: { questions: { type: "array" } } },
+				execute: async (args, _signal, toolCallId) => {
+					askCalls.push(args);
+					askCallIds.push(toolCallId ?? "");
+					const questions = args.questions;
+					if (!Array.isArray(questions) || !questions[0] || typeof questions[0] !== "object") {
+						throw new Error("ask received no questions");
+					}
+					const question = questions[0] as LogEntry;
+					const answer = answers.shift();
+					if (answer === undefined) throw new Error("fixture asked too many questions");
+					return JSON.stringify({
+						answers: [{
+							id: question.id,
+							questionId: `stored-${String(question.id)}`,
+							answer,
+							answeredBy: "member-17",
+						}],
+					});
+				},
+			};
+			await harness.worker.prompt("/native ask", () => {}, { tools: [ask] });
+
+			expect(askCalls).toHaveLength(8);
+			const radio = askCalls[0]?.questions as LogEntry[];
+			expect(radio[0]).toMatchObject({
+				question: "Choose a numeric value\n\n初始焦点：3. 007",
+				multi: false,
+				allowFreeText: false,
+				options: [
+					{ label: "1. 1", description: "first duplicate" },
+					{ label: "2. 1", description: "second duplicate" },
+					{ label: "3. 007（初始焦点）" },
+					{ label: "4. Other（操作）" },
+				],
+			});
+			const checkbox = askCalls[1]?.questions as LogEntry[];
+			expect(checkbox[0]).toMatchObject({ multi: false, allowFreeText: false });
+			expect(checkbox[0]?.question).toContain("当前勾选：1. A");
+			expect((checkbox[0]?.options as LogEntry[]).map(option => option.label)).toEqual([
+				"1. A（已选）",
+				"2. B",
+				"3. Done selecting（操作）",
+				"4. Other（操作）",
+			]);
+			expect(askCalls[4]?.questions).toMatchObject([{
+				question: "Enter text",
+				defaultValue: "prefilled",
+				allowEmpty: true,
+			}]);
+			expect(askCalls[5]?.questions).toMatchObject([{
+				question: "Legacy input\n\nType exact",
+				allowEmpty: true,
+			}]);
+			expect(askCallIds.slice(0, 6)).not.toContain("");
+			expect(new Set(askCallIds.slice(0, 6)).size).toBe(6);
+			expect(askCallIds[0]).toContain("fixture-native-ask-call-1");
+			expect(askCallIds[0]).not.toContain("fixture-native-ui-1");
+			expect(askCallIds[0]).not.toBe(askCallIds[6]);
+			expect(askCallIds[0]).toBe(askCallIds[7]);
+			const entries = await readLog(harness.logPath);
+			expect(rpcCommands(entries, "extension_ui_response")).toEqual([
+				{ type: "extension_ui_response", id: "fixture-native-ui-1", value: "007" },
+				{ type: "extension_ui_response", id: "fixture-native-ui-2", value: "B" },
+				{ type: "extension_ui_response", id: "fixture-native-ui-3", value: "A" },
+				{ type: "extension_ui_response", id: "fixture-native-ui-4", value: "Done selecting" },
+				{ type: "extension_ui_response", id: "fixture-native-ui-5", value: "  keep\n the exact text  " },
+				{ type: "extension_ui_response", id: "fixture-native-ui-6", value: "" },
+				{ type: "extension_ui_response", id: "fixture-native-ui-7", value: "same" },
+				{ type: "extension_ui_response", id: "fixture-native-ui-8", value: "007" },
+			]);
+		}, { ratchetEnabled: true });
+	});
+	test("waits for the matching native ask tool start when its first UI request arrives early", async () => {
+		await withHarness("native-ask-start-after-ui", async harness => {
+			const askCallIds: string[] = [];
+			const ask: HostTool = {
+				name: "ask",
+				description: "Ask the user",
+				parameters: { type: "object", properties: { questions: { type: "array" } } },
+				execute: async (args, _signal, toolCallId) => {
+					askCallIds.push(toolCallId ?? "");
+					const question = (args.questions as LogEntry[])[0]!;
+					return JSON.stringify({
+						answers: [{ id: question.id, questionId: "stored-race", answer: "1" }],
+					});
+				},
+			};
+			await harness.worker.prompt("/native ask", () => {}, { tools: [ask] });
+
+			expect(askCallIds).toEqual(['omp-native-ask:["fixture-native-ask-race-call",0]']);
+			const entries = await readLog(harness.logPath);
+			expect(rpcCommands(entries, "extension_ui_response")).toEqual([
+				{ type: "extension_ui_response", id: "fixture-native-ui-before-start", value: "Production" },
+			]);
+			const frames = rpcOutputFrames(entries);
+			expect(frames.findIndex(frame => frame.type === "extension_ui_request"))
+				.toBeLessThan(frames.findIndex(frame => frame.type === "tool_execution_start"));
+		}, { ratchetEnabled: true });
+	});
+	test("routes early editor and input requests through the matching native ask identity", async () => {
+		const cases = [
+			{
+				scenario: "native-ask-editor-start-after-ui",
+				requestId: "fixture-native-editor-before-start",
+				toolCallId: "fixture-native-ask-editor-race-call",
+				answer: "  edited notes\nexactly  ",
+				defaultValue: "existing notes",
+			},
+			{
+				scenario: "native-ask-input-start-after-ui",
+				requestId: "fixture-native-input-before-start",
+				toolCallId: "fixture-native-ask-input-race-call",
+				answer: "",
+				defaultValue: "existing notes",
+			},
+		] as const;
+		for (const example of cases) {
+			await withHarness(example.scenario, async harness => {
+				let receivedQuestion: LogEntry | undefined;
+				let receivedToolCallId: string | undefined;
+				const ask: HostTool = {
+					name: "ask",
+					description: "Ask the user",
+					parameters: { type: "object", properties: { questions: { type: "array" } } },
+					execute: async (args, _signal, toolCallId) => {
+						receivedQuestion = (args.questions as LogEntry[])[0]!;
+						receivedToolCallId = toolCallId;
+						return JSON.stringify({
+							answers: [{
+								id: receivedQuestion.id,
+								questionId: "stored-early-input",
+								answer: example.answer,
+							}],
+						});
+					},
+				};
+				await harness.worker.prompt("/native ask", () => {}, { tools: [ask] });
+
+				expect(receivedToolCallId).toBe(`omp-native-ask:${JSON.stringify([example.toolCallId, 0])}`);
+				expect(receivedQuestion).toMatchObject({ defaultValue: example.defaultValue, allowEmpty: true });
+				expect(rpcCommands(await readLog(harness.logPath), "extension_ui_response")).toEqual([
+					{ type: "extension_ui_response", id: example.requestId, value: example.answer },
+				]);
+			}, { ratchetEnabled: true });
+		}
+	});
+
+	test("routes checkbox Other free text into the following input", async () => {
+		await withHarness("native-ask-other", async harness => {
+			const askCalls: Record<string, unknown>[] = [];
+			const answers = ["custom target", "custom target with edits"];
+			const ask: HostTool = {
+				name: "ask",
+				description: "Ask the user",
+				parameters: { type: "object" },
+				execute: async args => {
+					askCalls.push(args);
+					const questions = args.questions;
+					if (!Array.isArray(questions) || !questions[0] || typeof questions[0] !== "object") {
+						throw new Error("ask received no questions");
+					}
+					const answer = answers.shift();
+					if (answer === undefined) throw new Error("fixture asked too many questions");
+					return JSON.stringify({ answers: [{ id: (questions[0] as LogEntry).id, questionId: "stored", answer }] });
+				},
+			};
+			await harness.worker.prompt("/native ask", () => {}, { tools: [ask] });
+
+			expect(askCalls).toHaveLength(2);
+			expect(askCalls[0]?.questions).toMatchObject([{
+				multi: false,
+				question: "Choose a deployment target\n\n当前勾选：无",
+				options: [
+					{ label: "1. Production" },
+					{ label: "2. Other (type your own)" },
+				],
+			}]);
+			expect((askCalls[0]?.questions as LogEntry[])[0]?.allowFreeText).toBeUndefined();
+			expect(askCalls[1]?.questions).toMatchObject([{
+				question: "Enter the target",
+				defaultValue: "custom target",
+				allowEmpty: true,
+			}]);
+			expect(rpcCommands(await readLog(harness.logPath), "extension_ui_response")).toEqual([
+				{ type: "extension_ui_response", id: "fixture-native-ui-other", value: "Other (type your own)" },
+				{ type: "extension_ui_response", id: "fixture-native-ui-other-input", value: "custom target with edits" },
+			]);
+		}, { ratchetEnabled: true });
+	});
+
+	test("maps only OMP's disambiguated radio Other row and preserves its custom input", async () => {
+		await withHarness("native-ask-radio-other", async harness => {
+			const askCalls: Record<string, unknown>[] = [];
+			const answers = ["custom target", "custom target with edits"];
+			const ask: HostTool = {
+				name: "ask",
+				description: "Ask the user",
+				parameters: { type: "object" },
+				execute: async args => {
+					askCalls.push(args);
+					const question = (args.questions as LogEntry[])[0]!;
+					const answer = answers.shift();
+					if (answer === undefined) throw new Error("fixture asked too many questions");
+					return JSON.stringify({ answers: [{ id: question.id, questionId: "stored", answer }] });
+				},
+			};
+			await harness.worker.prompt("/native ask", () => {}, { tools: [ask] });
+
+			const question = (askCalls[0]?.questions as LogEntry[])[0]!;
+			expect(question.options).toMatchObject([
+				{ label: "1. Production（初始焦点）" },
+				{ label: "2. Other (type your own) (2)" },
+				{ label: "3. Other (type your own)" },
+			]);
+			expect(question.allowFreeText).toBeUndefined();
+			expect(askCalls[1]?.questions).toMatchObject([{
+				question: "Enter the target",
+				defaultValue: "custom target",
+				allowEmpty: true,
+			}]);
+			expect(rpcCommands(await readLog(harness.logPath), "extension_ui_response")).toEqual([
+				{ type: "extension_ui_response", id: "fixture-native-ui-radio-other", value: "Other (type your own)" },
+				{ type: "extension_ui_response", id: "fixture-native-ui-radio-other-input", value: "custom target with edits" },
+			]);
+		}, { ratchetEnabled: true });
+	});
+
+	test("requires unchecking an already checked checkbox Other row before entering new custom text", async () => {
+		await withHarness("native-ask-other-checked", async harness => {
+			const askCalls: Record<string, unknown>[] = [];
+			const answers = ["2", "custom target", "final target"];
+			const ask: HostTool = {
+				name: "ask",
+				description: "Ask the user",
+				parameters: { type: "object" },
+				execute: async args => {
+					askCalls.push(args);
+					const question = (args.questions as LogEntry[])[0]!;
+					const answer = answers.shift();
+					if (answer === undefined) throw new Error("fixture asked too many questions");
+					return JSON.stringify({ answers: [{ id: question.id, questionId: "stored", answer }] });
+				},
+			};
+			await harness.worker.prompt("/native ask", () => {}, { tools: [ask] });
+
+			const checked = (askCalls[0]?.questions as LogEntry[])[0]!;
+			expect(checked.allowFreeText).toBe(false);
+			expect(checked.options).toMatchObject([
+				{ label: "1. Production" },
+				{ label: "2. Other (type your own)（已选）" },
+				{ label: "3. Done selecting（操作）" },
+			]);
+			expect((askCalls[1]?.questions as LogEntry[])[0]?.allowFreeText).toBeUndefined();
+			expect(askCalls[2]?.questions).toMatchObject([{
+				question: "Enter the custom value",
+				defaultValue: "custom target",
+				allowEmpty: true,
+			}]);
+			expect(rpcCommands(await readLog(harness.logPath), "extension_ui_response")).toEqual([
+				{ type: "extension_ui_response", id: "fixture-native-ui-other-checked", value: "Other (type your own)" },
+				{ type: "extension_ui_response", id: "fixture-native-ui-other-unchecked", value: "Other (type your own)" },
+				{ type: "extension_ui_response", id: "fixture-native-ui-other-reentered", value: "final target" },
+			]);
+		}, { ratchetEnabled: true });
+	});
+
+	test("fails closed for native ask UI requests without a stable tool-call identity", async () => {
+		await withHarness("native-ask-unidentified", async harness => {
+			let called = false;
+			const ask: HostTool = {
+				name: "ask",
+				description: "Ask the user",
+				parameters: { type: "object" },
+				execute: async () => {
+					called = true;
+					return JSON.stringify({ answers: [] });
+				},
+			};
+			await expect(harness.worker.prompt("/native ask", () => {}, { tools: [ask] })).rejects.toThrow();
+			expect(called).toBe(false);
+			expect(rpcCommands(await readLog(harness.logPath), "extension_ui_response")).toEqual([
+				{ type: "extension_ui_response", id: "fixture-native-ui-no-id", cancelled: true },
+			]);
+		}, { ratchetEnabled: true });
+	});
+	test("rejects native secret input without exposing it to QuestionDesk", async () => {
+		await withHarness("native-ask-secret", async harness => {
+			let called = false;
+			const ask: HostTool = {
+				name: "ask",
+				description: "Ask the user",
+				parameters: { type: "object" },
+				execute: async () => {
+					called = true;
+					return JSON.stringify({ answers: [] });
+				},
+			};
+			await expect(harness.worker.prompt("/native ask", () => {}, { tools: [ask] })).rejects.toThrow();
+			expect(called).toBe(false);
+			expect(rpcCommands(await readLog(harness.logPath), "extension_ui_response")).toEqual([
+				{ type: "extension_ui_response", id: "fixture-native-ui-secret", cancelled: true },
+			]);
+		}, { ratchetEnabled: true });
+	});
+
+	test("fails closed rather than returning free text when a native select has no Other option", async () => {
+		await withHarness("native-ask-no-other", async harness => {
+			let receivedQuestion: LogEntry | undefined;
+			const ask: HostTool = {
+				name: "ask",
+				description: "Ask the user",
+				parameters: { type: "object" },
+				execute: async args => {
+					const questions = args.questions as LogEntry[];
+					receivedQuestion = questions[0];
+					return JSON.stringify({
+						answers: [{ id: receivedQuestion?.id, questionId: "stored", answer: "custom value" }],
+					});
+				},
+			};
+			await expect(harness.worker.prompt("/native ask", () => {}, { tools: [ask] })).rejects.toThrow();
+			expect(receivedQuestion?.allowFreeText).toBe(false);
+			expect(rpcCommands(await readLog(harness.logPath), "extension_ui_response")).toEqual([
+				{ type: "extension_ui_response", id: "fixture-native-ui-no-other", cancelled: true },
+			]);
+		}, { ratchetEnabled: true });
+	});
+
+
+	test("native ask cancellation never becomes a value or an approval", async () => {
+		await withHarness("native-ask-cancel", async harness => {
+			const ask: HostTool = {
+				name: "ask",
+				description: "Ask the user",
+				parameters: { type: "object" },
+				execute: async () => { throw new Error("question cancelled"); },
+			};
+			await harness.worker.prompt("/native ask", () => {}, { tools: [ask] });
+			expect(rpcCommands(await readLog(harness.logPath), "extension_ui_response")).toEqual([
+				{ type: "extension_ui_response", id: "fixture-native-ui-cancel", cancelled: true },
+			]);
+		}, { ratchetEnabled: true });
+	});
+
 	test("bridges native ratchet ask and input dialogs through the registered ask tool", async () => {
 		await withHarness("ratchet-ask", async harness => {
 			const askCalls: Record<string, unknown>[] = [];
@@ -2684,6 +3038,7 @@ describe("OMP RPC worker", () => {
 				},
 			]);
 		}, { ratchetEnabled: true });
+		expect(await readFile(ratchetRpcConfigPath, "utf8")).toContain("ask:\n  timeout: 0");
 	});
 
 	test("does not treat Approve text, Reject, or a cancelled ask as approval", async () => {

@@ -255,6 +255,22 @@ type ActiveBtw = {
 	abortListener: (() => void) | undefined;
 };
 
+type NativeAskCall = {
+	/** OMP's stable tool identity, reused when a failed native call is retried. */
+	toolCallId: string | undefined;
+	/** UI field order within that tool call; unlike extension UI request IDs, this is replayable. */
+	nextUiOrdinal: number;
+	pendingCustomInput?: string;
+	invalid?: boolean;
+};
+type PendingNativeAskUi = {
+	frame: RpcFrame;
+	method: "select" | "input" | "editor";
+	toolCallId?: string;
+	timer: NodeJS.Timeout;
+};
+
+
 function parseAvailableCommands(value: unknown): OmpAvailableCommand[] | null {
 	if (!Array.isArray(value)) return null;
 	const commands: OmpAvailableCommand[] = [];
@@ -330,6 +346,9 @@ class RpcWorker implements OmpWorker {
 	#streaming = false;
 	#activeTools = new Map<string, HostTool>();
 	#hostCalls = new Map<string, HostCall>();
+	#nativeAskCall: NativeAskCall | undefined;
+	#nativeAskToolCallCandidate: string | undefined;
+	#pendingNativeAskUi: PendingNativeAskUi | undefined;
 	#pendingSteerReceipts: Array<{ text: string }> = [];
 	#sessionFile = "";
 	#sessionId = "";
@@ -868,8 +887,10 @@ class RpcWorker implements OmpWorker {
 		if (this.#closed) throw new Error("OMP worker is not running");
 		if (this.#activePrompt) throw new Error("OMP worker already has a run in progress");
 		const run = this.#createPromptRun(onEvent, true);
+		this.#nativeAskCall = undefined;
+		this.#nativeAskToolCallCandidate = undefined;
+		this.#clearPendingNativeAskUi();
 		this.#activePrompt = run;
-		this.#suppressCommandOutput = false;
 		let acceptedGoalId: string | undefined;
 		try {
 			await this.#installHostTools(context?.tools ?? []);
@@ -948,6 +969,9 @@ class RpcWorker implements OmpWorker {
 			}
 			throw failure;
 		} finally {
+			this.#nativeAskCall = undefined;
+			this.#nativeAskToolCallCandidate = undefined;
+			this.#clearPendingNativeAskUi();
 			this.#abortHostCalls(new Error("goal run finished"));
 			await this.#clearHostTools();
 			if (this.#activePrompt === run) this.#activePrompt = undefined;
@@ -1052,6 +1076,9 @@ class RpcWorker implements OmpWorker {
 			false,
 			/^\/compact(?:[\s:]|$)/iu.test(promptFirstLine),
 		);
+		this.#nativeAskCall = undefined;
+		this.#nativeAskToolCallCandidate = undefined;
+		this.#clearPendingNativeAskUi();
 		this.#activePrompt = run;
 		this.#suppressCommandOutput = internalCommandOutput;
 		try {
@@ -1079,6 +1106,9 @@ class RpcWorker implements OmpWorker {
 			this.#rejectPrompt(run, asError(error, "OMP prompt failed"));
 			throw error;
 		} finally {
+			this.#nativeAskCall = undefined;
+			this.#nativeAskToolCallCandidate = undefined;
+			this.#clearPendingNativeAskUi();
 			this.#abortHostCalls(new Error("prompt finished"));
 			await this.#clearHostTools();
 			if (this.#activePrompt === run) this.#activePrompt = undefined;
@@ -1359,6 +1389,10 @@ class RpcWorker implements OmpWorker {
 			const commands = parseAvailableCommands(frame.commands);
 			if (commands !== null) this.#publishAvailableCommands(commands);
 			return;
+		}
+		if (frame.type === "message_end") this.#observeNativeAskToolCall(frame);
+		if (frame.type === "tool_execution_start" || frame.type === "tool_execution_end") {
+			this.#observeNativeAskTool(frame);
 		}
 		if (frame.type === "extension_ui_request") {
 			this.#handleUiRequest(frame);
@@ -1767,7 +1801,24 @@ class RpcWorker implements OmpWorker {
 			return;
 		}
 		if (this.#ratchetDialogs && method === "cancel" && typeof frame.targetId === "string") {
-			this.#hostCalls.get(`ui:${frame.targetId}`)?.controller.abort(new Error("OMP cancelled dialog"));
+			const pendingUi = this.#pendingNativeAskUi;
+			if (pendingUi && pendingUi.frame.id === frame.targetId) {
+				this.#failPendingNativeAskUi("OMP cancelled the native ask UI request before its tool identity was confirmed");
+			} else {
+				this.#hostCalls.get(`ui:${frame.targetId}`)?.controller.abort(new Error("OMP cancelled dialog"));
+			}
+			return;
+		}
+		if (this.#ratchetDialogs && (method === "select" || method === "editor")) {
+			this.#handleNativeAskUiRequest(frame, method);
+			return;
+		}
+		if (
+			this.#ratchetDialogs &&
+			method === "input" &&
+			(this.#nativeAskCall !== undefined || this.#nativeAskToolCallCandidate !== undefined)
+		) {
+			this.#handleNativeAskUiRequest(frame, "input");
 			return;
 		}
 		if (this.#ratchetDialogs && (method === "ask" || (method === "input" && frame.secret !== true))) {
@@ -1775,14 +1826,400 @@ class RpcWorker implements OmpWorker {
 			return;
 		}
 		if (PASSIVE_UI_METHODS[method] === true) return;
+		this.#failUiRequest(frame, describeUiFailure(method).message);
+	}
+
+	#observeNativeAskToolCall(frame: RpcFrame): void {
+		if (!this.#ratchetDialogs || !this.#activePrompt || this.#activePrompt.settled) return;
+		const message = frame.message;
+		if (!isRecord(message) || message.role !== "assistant" || !Array.isArray(message.content)) return;
+		const firstToolCall = message.content.find(value => isRecord(value) && value.type === "toolCall");
+		const toolCallId =
+			isRecord(firstToolCall) &&
+			firstToolCall.name === "ask" &&
+			typeof firstToolCall.id === "string" &&
+			firstToolCall.id.length > 0
+				? firstToolCall.id
+				: undefined;
+		const pending = this.#pendingNativeAskUi;
+		if (!toolCallId) {
+			this.#nativeAskToolCallCandidate = undefined;
+			if (pending?.toolCallId !== undefined) {
+				this.#failPendingNativeAskUi("OMP native ask UI request no longer matches a pending ask tool call");
+			}
+			return;
+		}
+		if (this.#nativeAskCall) {
+			if (this.#nativeAskCall.toolCallId !== toolCallId) this.#nativeAskCall.invalid = true;
+			return;
+		}
+		if (pending?.toolCallId !== undefined && pending.toolCallId !== toolCallId) {
+			this.#failPendingNativeAskUi("OMP native ask UI request does not match the assistant tool call");
+			return;
+		}
+		this.#nativeAskToolCallCandidate = toolCallId;
+		if (pending) pending.toolCallId = toolCallId;
+	}
+
+	#observeNativeAskTool(frame: RpcFrame): void {
+		if (!this.#ratchetDialogs || !this.#activePrompt || this.#activePrompt.settled) return;
+		const toolName = typeof frame.toolName === "string" ? frame.toolName : "";
+		const toolCallId = typeof frame.toolCallId === "string" && frame.toolCallId.length > 0
+			? frame.toolCallId
+			: undefined;
+		if (frame.type === "tool_execution_start") {
+			if (toolName !== "ask") {
+				this.#nativeAskToolCallCandidate = undefined;
+				if (this.#nativeAskCall) this.#nativeAskCall.invalid = true;
+				if (this.#pendingNativeAskUi) {
+					this.#failPendingNativeAskUi("OMP native ask UI request was followed by a different tool call");
+				}
+				return;
+			}
+			if (this.#nativeAskCall) {
+				this.#nativeAskCall.invalid = true;
+				if (this.#pendingNativeAskUi) {
+					this.#failPendingNativeAskUi("OMP started another ask tool call before the prior UI request settled");
+				}
+				return;
+			}
+			const candidate = this.#nativeAskToolCallCandidate;
+			if (candidate !== undefined && candidate !== toolCallId && this.#pendingNativeAskUi) {
+				this.#failPendingNativeAskUi("OMP native ask tool start did not match its assistant tool call");
+				return;
+			}
+			this.#nativeAskToolCallCandidate = undefined;
+			this.#nativeAskCall = { toolCallId, nextUiOrdinal: 0 };
+			const pending = this.#pendingNativeAskUi;
+			if (pending) {
+				if (
+					toolCallId === undefined ||
+					(pending.toolCallId !== undefined && pending.toolCallId !== toolCallId)
+				) {
+					this.#failPendingNativeAskUi("OMP native ask UI request has no matching stable tool-call identity");
+					return;
+				}
+				this.#clearPendingNativeAskUi();
+				this.#handleNativeAskUiRequest(pending.frame, pending.method);
+			}
+			return;
+		}
+		if (toolName !== "ask") {
+			if (this.#nativeAskCall) this.#nativeAskCall.invalid = true;
+			return;
+		}
+		const active = this.#nativeAskCall;
+		if (!active) {
+			if (this.#pendingNativeAskUi) {
+				this.#failPendingNativeAskUi("OMP native ask UI request ended before its tool identity was confirmed");
+			}
+			return;
+		}
+		if (active.toolCallId === toolCallId) this.#nativeAskCall = undefined;
+		else active.invalid = true;
+	}
+
+	#clearPendingNativeAskUi(): void {
+		const pending = this.#pendingNativeAskUi;
+		if (!pending) return;
+		clearTimeout(pending.timer);
+		this.#pendingNativeAskUi = undefined;
+	}
+
+	#failPendingNativeAskUi(message: string): void {
+		const pending = this.#pendingNativeAskUi;
+		if (!pending) return;
+		this.#clearPendingNativeAskUi();
+		this.#failUiRequest(pending.frame, message);
+	}
+
+	#queueNativeAskUiRequest(frame: RpcFrame, method: "select" | "input" | "editor"): void {
+		const requestId = typeof frame.id === "string" ? frame.id : "";
+		if (!requestId) {
+			this.#failUiRequest(frame, "OMP native ask UI request has no request ID");
+			return;
+		}
+		if (frame.secret === true) {
+			this.#failUiRequest(frame, "Secret OMP input is unsupported by the channel");
+			return;
+		}
+		if (this.#pendingNativeAskUi) {
+			this.#failPendingNativeAskUi("OMP sent a second native ask UI request before identity confirmation");
+			this.#failUiRequest(frame, "OMP sent a second native ask UI request before identity confirmation");
+			return;
+		}
+		const pending: PendingNativeAskUi = {
+			frame,
+			method,
+			...(this.#nativeAskToolCallCandidate === undefined
+				? {}
+				: { toolCallId: this.#nativeAskToolCallCandidate }),
+			timer: setTimeout(() => {
+				if (this.#pendingNativeAskUi !== pending) return;
+				this.#pendingNativeAskUi = undefined;
+				this.#failUiRequest(frame, "OMP native ask UI request has no stable tool-call identity");
+			}, DEFAULT_REQUEST_TIMEOUT_MS),
+		};
+		this.#pendingNativeAskUi = pending;
+	}
+
+	#failUiRequest(frame: RpcFrame, message: string): void {
 		try {
-			if (typeof frame.id === "string" && !this.#closed) this.#writeFrame({ type: "extension_ui_response", id: frame.id, cancelled: true });
+			if (typeof frame.id === "string" && !this.#closed) {
+				this.#writeFrame({ type: "extension_ui_response", id: frame.id, cancelled: true });
+			}
 		} catch {
 			// The fatal path below still rejects the prompt and stops the group.
 		}
 		const active = this.#activePrompt;
-		if (active) this.#rejectPrompt(active, describeUiFailure(method));
+		if (active) this.#rejectPrompt(active, new Error(message));
 		void this.stop();
+	}
+
+	#handleNativeAskUiRequest(frame: RpcFrame, method: "select" | "input" | "editor"): void {
+		const requestId = typeof frame.id === "string" ? frame.id : "";
+		const nativeCall = this.#nativeAskCall;
+		if (!requestId) {
+			this.#failUiRequest(frame, "OMP native ask UI request has no request ID");
+			return;
+		}
+		if (frame.secret === true) {
+			this.#failUiRequest(frame, "Secret OMP input is unsupported by the channel");
+			return;
+		}
+		if (!nativeCall) {
+			if (this.#nativeAskToolCallCandidate === undefined) {
+				this.#failUiRequest(frame, "OMP native ask UI request has no stable tool-call identity");
+				return;
+			}
+			this.#queueNativeAskUiRequest(frame, method);
+			return;
+		}
+		if (nativeCall.invalid || typeof nativeCall.toolCallId !== "string" || nativeCall.toolCallId.length === 0) {
+			this.#failUiRequest(frame, "OMP native ask UI request has no stable tool-call identity");
+			return;
+		}
+
+		const ordinal = nativeCall.nextUiOrdinal++;
+		const questionId = `native-ui-${ordinal}`;
+		const key = `ui:${requestId}`;
+		if (this.#hostCalls.has(key)) {
+			this.#failUiRequest(frame, "OMP native ask UI request identity is already active");
+			return;
+		}
+
+		let question: Record<string, unknown>;
+		let optionValues: string[] | undefined;
+		let displayLabels: string[] | undefined;
+		let otherIndex = -1;
+		try {
+			if (method === "select") {
+				if (typeof frame.title !== "string" || frame.title.trim().length === 0) {
+					throw new Error("invalid title");
+				}
+				if (!Array.isArray(frame.options) || frame.options.length === 0 || !frame.options.every(value => typeof value === "string")) {
+					throw new Error("invalid options");
+				}
+				optionValues = frame.options as string[];
+				let selectionMarker: "radio" | "checkbox" = "radio";
+				if (frame.selectionMarker !== undefined) {
+					if (frame.selectionMarker !== "radio" && frame.selectionMarker !== "checkbox") {
+						throw new Error("invalid selection marker");
+					}
+					selectionMarker = frame.selectionMarker;
+				}
+				let markableCount = optionValues.length;
+				if (frame.markableCount !== undefined) {
+					if (
+						typeof frame.markableCount !== "number" ||
+						!Number.isSafeInteger(frame.markableCount) ||
+						frame.markableCount < 0 ||
+						frame.markableCount > optionValues.length
+					) {
+						throw new Error("invalid markable count");
+					}
+					markableCount = frame.markableCount;
+				}
+				let initialIndex: number | undefined;
+				if (frame.initialIndex !== undefined) {
+					if (
+						typeof frame.initialIndex !== "number" ||
+						!Number.isSafeInteger(frame.initialIndex) ||
+						frame.initialIndex < 0 ||
+						frame.initialIndex >= optionValues.length
+					) {
+						throw new Error("invalid initial index");
+					}
+					initialIndex = frame.initialIndex;
+				}
+				let checkedIndices: number[] = [];
+				if (frame.checkedIndices !== undefined) {
+					if (
+						selectionMarker !== "checkbox" ||
+						!Array.isArray(frame.checkedIndices) ||
+						!frame.checkedIndices.every(index =>
+							typeof index === "number" &&
+							Number.isSafeInteger(index) &&
+							index >= 0 &&
+							index < optionValues!.length
+						)
+					) {
+						throw new Error("invalid checked indices");
+					}
+					checkedIndices = frame.checkedIndices as number[];
+					if (new Set(checkedIndices).size !== checkedIndices.length) {
+						throw new Error("duplicate checked indices");
+					}
+				}
+				if (frame.optionDetails !== undefined && !Array.isArray(frame.optionDetails)) {
+					throw new Error("invalid option details");
+				}
+				const details = Array.isArray(frame.optionDetails) ? frame.optionDetails : [];
+				const checked = new Set(checkedIndices);
+				displayLabels = optionValues.map((value, index) => {
+					const marks: string[] = [];
+					if (checked.has(index)) marks.push("已选");
+					if (initialIndex === index) marks.push("初始焦点");
+					if (index >= markableCount) marks.push("操作");
+					return `${index + 1}. ${value}${marks.length === 0 ? "" : `（${marks.join("，")}）`}`;
+				});
+				const options = optionValues.map((_, index) => {
+					const detail = details[index];
+					const description = isRecord(detail) && typeof detail.description === "string"
+						? detail.description
+						: "";
+					return {
+						label: displayLabels![index]!,
+						...(description.length > 0 ? { description } : {}),
+					};
+				});
+				const context: string[] = [];
+				if (selectionMarker === "checkbox") {
+					const checkedText = checkedIndices.length === 0
+						? "无"
+						: checkedIndices.map(index => `${index + 1}. ${optionValues![index]}`).join("、");
+					context.push(`当前勾选：${checkedText}`);
+				}
+				if (initialIndex !== undefined) {
+					context.push(`初始焦点：${initialIndex + 1}. ${optionValues[initialIndex]}`);
+				}
+				const title = [frame.title, ...context].join("\n\n");
+				const otherIndices = optionValues.flatMap((value, index) =>
+					value === "Other (type your own)" && index < markableCount ? [index] : [],
+				);
+				const checkedOther = selectionMarker === "checkbox" && otherIndices.some(index => checked.has(index));
+				otherIndex = otherIndices.length === 1 && !checkedOther ? otherIndices[0]! : -1;
+				question = {
+					id: questionId,
+					question: title,
+					options,
+					multi: false,
+					...(otherIndex < 0 ? { allowFreeText: false } : {}),
+				};
+			} else {
+				if (typeof frame.title !== "string" || frame.title.trim().length === 0) {
+					throw new Error("invalid title");
+				}
+				let defaultValue = nativeCall.pendingCustomInput;
+				if (method === "editor") {
+					if (frame.prefill !== undefined && typeof frame.prefill !== "string") {
+						throw new Error("invalid editor prefill");
+					}
+					if (defaultValue === undefined && typeof frame.prefill === "string") defaultValue = frame.prefill;
+				} else {
+					if (frame.placeholder !== undefined && typeof frame.placeholder !== "string") {
+						throw new Error("invalid input placeholder");
+					}
+					if (frame.defaultValue !== undefined && typeof frame.defaultValue !== "string") {
+						throw new Error("invalid input default");
+					}
+					if (defaultValue === undefined && typeof frame.defaultValue === "string") defaultValue = frame.defaultValue;
+				}
+				const title = method === "input" && typeof frame.placeholder === "string" && frame.placeholder.length > 0
+					? `${frame.title}\n\n${frame.placeholder}`
+					: frame.title;
+				question = {
+					id: questionId,
+					question: title,
+					...(defaultValue === undefined ? {} : { defaultValue }),
+					allowEmpty: true,
+				};
+			}
+		} catch {
+			this.#failUiRequest(frame, "OMP native ask UI request is invalid");
+			return;
+		}
+
+		const controller = new AbortController();
+		const call: HostCall = { requestId: key, controller };
+		this.#hostCalls.set(key, call);
+		const stableQuestionCallId = `omp-native-ask:${JSON.stringify([nativeCall.toolCallId, ordinal])}`;
+		void (async () => {
+			try {
+				const tool = this.#activeTools.get("ask");
+				if (!tool) throw new Error("missing ask host tool");
+				const raw = await tool.execute(
+					{ questions: [question] },
+					controller.signal,
+					stableQuestionCallId,
+				);
+				if (this.#nativeAskCall !== nativeCall || nativeCall.invalid) {
+					throw new Error("native ask tool-call identity changed");
+				}
+				const result: unknown = JSON.parse(raw);
+				if (!isRecord(result) || !Array.isArray(result.answers) || result.answers.length !== 1) {
+					throw new Error("invalid answer");
+				}
+				const answer = result.answers[0];
+				if (!isRecord(answer) || answer.id !== questionId || typeof answer.answer !== "string") {
+					throw new Error("invalid answer");
+				}
+				if (this.#closed || controller.signal.aborted) return;
+				if (method === "select") {
+					const options = optionValues!;
+					let selectedIndex = -1;
+					const numeric = answer.answer.trim();
+					if (/^\d+$/u.test(numeric)) {
+						const oneBased = Number(numeric);
+						if (Number.isSafeInteger(oneBased) && oneBased >= 1 && oneBased <= options.length) {
+							selectedIndex = oneBased - 1;
+						}
+					}
+					if (selectedIndex < 0) selectedIndex = displayLabels!.indexOf(answer.answer);
+					if (selectedIndex < 0) {
+						const exactMatches = options.flatMap((value, index) => value === answer.answer ? [index] : []);
+						if (exactMatches.length > 1) throw new Error("ambiguous option");
+						if (exactMatches.length === 1) selectedIndex = exactMatches[0]!;
+					}
+					let customInput: string | undefined;
+					if (selectedIndex < 0) {
+						if (answer.answer.trim().length === 0 || otherIndex < 0) {
+							throw new Error("answer has no matching option");
+						}
+						selectedIndex = otherIndex;
+						customInput = answer.answer;
+					}
+					this.#writeFrame({ type: "extension_ui_response", id: requestId, value: options[selectedIndex]! });
+					if (customInput !== undefined) nativeCall.pendingCustomInput = customInput;
+				} else {
+					this.#writeFrame({ type: "extension_ui_response", id: requestId, value: answer.answer });
+					delete nativeCall.pendingCustomInput;
+				}
+			} catch (error) {
+				try {
+					if (!this.#closed) this.#writeFrame({ type: "extension_ui_response", id: requestId, cancelled: true });
+				} catch {
+					// The child is already stopping; do not mask the prompt failure below.
+				}
+				if (!controller.signal.aborted && !(error instanceof Error && error.message === "question cancelled")) {
+					const active = this.#activePrompt;
+					if (active) this.#rejectPrompt(active, new Error("OMP native ask UI interaction failed"));
+					void this.stop();
+				}
+			} finally {
+				if (this.#hostCalls.get(key) === call) this.#hostCalls.delete(key);
+			}
+		})();
 	}
 
 	#handleRatchetDialog(frame: RpcFrame, method: "ask" | "input"): void {
@@ -1817,7 +2254,7 @@ class RpcWorker implements OmpWorker {
 				});
 				const tool = this.#activeTools.get("ask");
 				if (!tool) throw new Error("OMP dialog has no ask host tool");
-				const result: unknown = JSON.parse(await tool.execute({ questions }, controller.signal, key));
+				const result: unknown = JSON.parse(await tool.execute({ questions }, controller.signal));
 				if (!isRecord(result) || !Array.isArray(result.answers) || result.answers.length !== questions.length)
 					throw new Error("OMP dialog answer is invalid");
 				const returnedAnswers = result.answers;
@@ -1986,6 +2423,8 @@ class RpcWorker implements OmpWorker {
 		if (run.settled) return;
 		run.settled = true;
 		this.#streaming = false;
+		this.#nativeAskToolCallCandidate = undefined;
+		this.#clearPendingNativeAskUi();
 		run.resolve();
 	}
 
@@ -2022,10 +2461,14 @@ class RpcWorker implements OmpWorker {
 		if (run.settled) return;
 		run.settled = true;
 		this.#streaming = false;
+		this.#nativeAskToolCallCandidate = undefined;
+		this.#clearPendingNativeAskUi();
 		run.reject(error);
 	}
 
 	#abortHostCalls(reason: Error): void {
+		this.#nativeAskToolCallCandidate = undefined;
+		this.#clearPendingNativeAskUi();
 		for (const call of this.#hostCalls.values()) call.controller.abort(reason);
 		this.#hostCalls.clear();
 	}

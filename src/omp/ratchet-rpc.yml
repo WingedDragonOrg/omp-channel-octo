@@ -1,2 +1,4 @@
 ratchet:
   enabled: true
+ask:
+  timeout: 0

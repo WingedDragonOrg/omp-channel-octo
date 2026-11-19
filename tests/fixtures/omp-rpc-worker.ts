@@ -95,7 +95,18 @@ type Scenario =
 	| "no-models"
 	| "context-partial"
 	| "model-window-only"
-	| "ratchet-ask";
+	| "ratchet-ask"
+	| "native-ask"
+	| "native-ask-other"
+	| "native-ask-radio-other"
+	| "native-ask-other-checked"
+	| "native-ask-unidentified"
+	| "native-ask-cancel"
+	| "native-ask-secret"
+	| "native-ask-no-other"
+	| "native-ask-start-after-ui"
+	| "native-ask-editor-start-after-ui"
+	| "native-ask-input-start-after-ui";
 
 const argv = process.argv.slice(2);
 
@@ -334,6 +345,16 @@ let pendingRatchetUi: {
 	stage: "ask" | "input";
 	promptId: string | undefined;
 } | undefined;
+type NativeAskStep = { toolCallId?: string; request: Frame };
+type NativeAskFlow = {
+	promptId: string | undefined;
+	steps: NativeAskStep[];
+	index: number;
+	toolCallId: string | undefined;
+	toolStarted: boolean;
+};
+let pendingNativeAskUi: { requestId: string } | undefined;
+let nativeAskFlow: NativeAskFlow | undefined;
 let pendingHostToolRequestId: string | undefined;
 let pendingHostToolCallId: string | undefined;
 let pendingHostToolName: string | undefined;
@@ -982,6 +1003,326 @@ function completeRatchetPrompt(id: string | undefined): void {
 	emitAssistantMessage("fixture ratchet interaction complete", 0);
 	emit({ type: "agent_end", messages: [], willContinue: false });
 	appendLog({ kind: "turn_complete", id, ratchet: true });
+}
+function nativeAskSteps(): NativeAskStep[] {
+	const firstCall = "fixture-native-ask-call-1";
+	if (scenario === "native-ask-unidentified") {
+		return [{
+			request: {
+				id: "fixture-native-ui-no-id",
+				method: "select",
+				title: "Choose an option",
+				options: ["Yes", "Other"],
+				selectionMarker: "radio",
+				markableCount: 1,
+			},
+		}];
+	}
+	if (scenario === "native-ask-start-after-ui") {
+		return [{
+			toolCallId: "fixture-native-ask-race-call",
+			request: {
+				id: "fixture-native-ui-before-start",
+				method: "select",
+				title: "Choose a deployment target",
+				options: ["Production"],
+				selectionMarker: "radio",
+			},
+		}];
+	}
+	if (scenario === "native-ask-editor-start-after-ui") {
+		return [{
+			toolCallId: "fixture-native-ask-editor-race-call",
+			request: {
+				id: "fixture-native-editor-before-start",
+				method: "editor",
+				title: "Enter deployment notes",
+				prefill: "existing notes",
+				promptStyle: true,
+			},
+		}];
+	}
+	if (scenario === "native-ask-input-start-after-ui") {
+		return [{
+			toolCallId: "fixture-native-ask-input-race-call",
+			request: {
+				id: "fixture-native-input-before-start",
+				method: "input",
+				title: "Enter deployment notes",
+				defaultValue: "existing notes",
+			},
+		}];
+	}
+	if (scenario === "native-ask-no-other") {
+		return [{
+			toolCallId: firstCall,
+			request: {
+				id: "fixture-native-ui-no-other",
+				method: "select",
+				title: "Choose one",
+				options: ["Other", "No"],
+				selectionMarker: "radio",
+				markableCount: 2,
+			},
+		}];
+	}
+	if (scenario === "native-ask-secret") {
+		return [{
+			toolCallId: firstCall,
+			request: {
+				id: "fixture-native-ui-secret",
+				method: "input",
+				title: "Enter secret value",
+				secret: true,
+			},
+		}];
+	}
+	if (scenario === "native-ask-cancel") {
+		return [{
+			toolCallId: firstCall,
+			request: {
+				id: "fixture-native-ui-cancel",
+				method: "select",
+				title: "Choose an option",
+				options: ["Approve", "Other"],
+				selectionMarker: "radio",
+				markableCount: 1,
+			},
+		}];
+	}
+	if (scenario === "native-ask-radio-other") {
+		return [
+			{
+				toolCallId: firstCall,
+				request: {
+					id: "fixture-native-ui-radio-other",
+					method: "select",
+					title: "Choose a deployment target",
+					options: ["Production", "Other (type your own) (2)", "Other (type your own)"],
+					selectionMarker: "radio",
+					initialIndex: 0,
+				},
+			},
+			{
+				toolCallId: firstCall,
+				request: { id: "fixture-native-ui-radio-other-input", method: "input", title: "Enter the target" },
+			},
+		];
+	}
+	if (scenario === "native-ask-other-checked") {
+		return [
+			{
+				toolCallId: firstCall,
+				request: {
+					id: "fixture-native-ui-other-checked",
+					method: "select",
+					title: "Choose features",
+					options: ["Production", "Other (type your own)", "Done selecting"],
+					selectionMarker: "checkbox",
+					checkedIndices: [1],
+					markableCount: 2,
+				},
+			},
+			{
+				toolCallId: firstCall,
+				request: {
+					id: "fixture-native-ui-other-unchecked",
+					method: "select",
+					title: "Choose features",
+					options: ["Production", "Other (type your own)"],
+					selectionMarker: "checkbox",
+					checkedIndices: [],
+					markableCount: 2,
+				},
+			},
+			{
+				toolCallId: firstCall,
+				request: { id: "fixture-native-ui-other-reentered", method: "input", title: "Enter the custom value" },
+			},
+		];
+	}
+	if (scenario === "native-ask-other") {
+		return [
+			{
+				toolCallId: firstCall,
+				request: {
+					id: "fixture-native-ui-other",
+					method: "select",
+					title: "Choose a deployment target",
+					options: ["Production", "Other (type your own)"],
+					selectionMarker: "checkbox",
+					checkedIndices: [],
+					markableCount: 2,
+				},
+			},
+			{
+				toolCallId: firstCall,
+				request: { id: "fixture-native-ui-other-input", method: "input", title: "Enter the target" },
+			},
+		];
+	}
+	const secondCall = "fixture-native-ask-call-2";
+	const radio = {
+		title: "Choose a numeric value",
+		options: ["1", "1", "007", "Other"],
+		optionDetails: [{ description: "first duplicate" }, { description: "second duplicate" }],
+		selectionMarker: "radio",
+		initialIndex: 2,
+		markableCount: 3,
+	};
+	const checkbox = {
+		title: "Choose features",
+		options: ["A", "B", "Done selecting", "Other"],
+		optionDetails: [{ description: "first feature" }, { description: "second feature" }],
+		selectionMarker: "checkbox",
+		markableCount: 2,
+	};
+	return [
+		{ toolCallId: firstCall, request: { id: "fixture-native-ui-1", method: "select", ...radio } },
+		{
+			toolCallId: firstCall,
+			request: { id: "fixture-native-ui-2", method: "select", ...checkbox, checkedIndices: [0] },
+		},
+		{
+			toolCallId: firstCall,
+			request: { id: "fixture-native-ui-3", method: "select", ...checkbox, checkedIndices: [0, 1] },
+		},
+		{
+			toolCallId: firstCall,
+			request: { id: "fixture-native-ui-4", method: "select", ...checkbox, checkedIndices: [1] },
+		},
+		{
+			toolCallId: firstCall,
+			request: {
+				id: "fixture-native-ui-5",
+				method: "editor",
+				title: "Enter text",
+				prefill: "prefilled",
+				promptStyle: true,
+			},
+		},
+		{
+			toolCallId: firstCall,
+			request: {
+				id: "fixture-native-ui-6",
+				method: "input",
+				title: "Legacy input",
+				placeholder: "Type exact",
+			},
+		},
+		{
+			toolCallId: secondCall,
+			request: { id: "fixture-native-ui-7", method: "select", title: "Repeated values", options: ["same", "same"], selectionMarker: "radio", markableCount: 2 },
+		},
+		{ toolCallId: firstCall, request: { id: "fixture-native-ui-8", method: "select", ...radio } },
+	];
+}
+
+function finishNativeAskFlow(isError = false): void {
+	const flow = nativeAskFlow;
+	if (!flow) return;
+	pendingNativeAskUi = undefined;
+	if (flow.toolStarted) {
+		emit({
+			type: "tool_execution_end",
+			...(flow.toolCallId === undefined ? {} : { toolCallId: flow.toolCallId }),
+			toolName: "ask",
+			isError,
+			result: { content: [{ type: "text", text: isError ? "cancelled" : "completed" }] },
+		});
+	}
+	nativeAskFlow = undefined;
+	streaming = false;
+	sessionIsSettled = true;
+	emitAssistantMessage("fixture native ask completed", 0);
+	emit({ type: "agent_end", messages: [], willContinue: false });
+	appendLog({ kind: "turn_complete", id: flow.promptId, nativeAsk: true, isError });
+}
+
+function emitNativeAskStep(): void {
+	const flow = nativeAskFlow;
+	if (!flow) return;
+	const step = flow.steps[flow.index];
+	if (!step) {
+		finishNativeAskFlow();
+		return;
+	}
+	if (!flow.toolStarted || flow.toolCallId !== step.toolCallId) {
+		if (flow.toolStarted) {
+			emit({
+				type: "tool_execution_end",
+				...(flow.toolCallId === undefined ? {} : { toolCallId: flow.toolCallId }),
+				toolName: "ask",
+				isError: false,
+				result: { content: [{ type: "text", text: "completed" }] },
+			});
+		}
+		flow.toolCallId = step.toolCallId;
+		const startAfterUi = scenario.endsWith("-start-after-ui");
+		if (!startAfterUi) {
+			flow.toolStarted = true;
+			emit({
+				type: "tool_execution_start",
+				...(flow.toolCallId === undefined ? {} : { toolCallId: flow.toolCallId }),
+				toolName: "ask",
+				args: { questions: [{ id: "fixture-question", question: "fixture question", options: [] }] },
+			});
+		}
+	}
+	const requestId = typeof step.request.id === "string" ? step.request.id : "";
+	pendingNativeAskUi = { requestId };
+	if (scenario.endsWith("-start-after-ui") && !flow.toolStarted) {
+		const message = {
+			role: "assistant",
+			content: [{
+				type: "toolCall",
+				id: flow.toolCallId,
+				name: "ask",
+				arguments: { questions: [{ id: "fixture-question", question: "fixture question", options: [] }] },
+			}],
+			timestamp: Date.now(),
+			stopReason: "toolUse",
+		};
+		emit({ type: "message_start", message });
+		emit({ type: "message_end", message });
+	}
+	emit({ type: "extension_ui_request", ...step.request });
+	if (scenario.endsWith("-start-after-ui") && !flow.toolStarted) {
+		flow.toolStarted = true;
+		emit({
+			type: "tool_execution_start",
+			...(flow.toolCallId === undefined ? {} : { toolCallId: flow.toolCallId }),
+			toolName: "ask",
+			args: { questions: [{ id: "fixture-question", question: "fixture question", options: [] }] },
+		});
+	}
+}
+
+function beginNativeAskPrompt(id: string | undefined): void {
+	if (!askDialogEnabled) {
+		response(id, "prompt", { agentInvoked: false });
+		emit({ type: "prompt_result", id, agentInvoked: false });
+		return;
+	}
+	streaming = true;
+	sessionIsSettled = false;
+	response(id, "prompt", { agentInvoked: true });
+	emit({ type: "agent_start" });
+	nativeAskFlow = { promptId: id, steps: nativeAskSteps(), index: 0, toolCallId: undefined, toolStarted: false };
+	emitNativeAskStep();
+}
+
+function handleNativeAskUiResponse(frame: Frame): void {
+	const pending = pendingNativeAskUi;
+	if (!pending || frame.id !== pending.requestId) return;
+	if (frame.cancelled === true) {
+		finishNativeAskFlow(true);
+		return;
+	}
+	const flow = nativeAskFlow;
+	if (!flow) return;
+	flow.index += 1;
+	emitNativeAskStep();
 }
 
 function handleRatchetUiResponse(frame: Frame): void {
@@ -1636,6 +1977,10 @@ function emitResearchHigherScenario(id: string | undefined): void {
 
 async function handlePrompt(id: string | undefined, message: string): Promise<void> {
 	appendLog({ kind: "prompt", id, message });
+	if (scenario.startsWith("native-ask") && message === "/native ask") {
+		beginNativeAskPrompt(id);
+		return;
+	}
 	if (scenario === "ratchet-ask" && message.startsWith("/ratchet")) {
 		beginRatchetPrompt(id, message);
 		return;
@@ -2723,6 +3068,7 @@ function handleCommand(command: Frame): void {
 	}
 	if (type === "extension_ui_response") {
 		if (scenario === "ratchet-ask") handleRatchetUiResponse(command);
+		else if (scenario.startsWith("native-ask")) handleNativeAskUiResponse(command);
 		return;
 	}
 	if (type === "btw") {
