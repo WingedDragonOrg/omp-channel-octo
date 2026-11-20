@@ -364,6 +364,10 @@
       cancelChatDetails: (requestId) => call("status", "cancelChatDetails", [requestId]),
       getChatCommands: (target, requestId) => call("status", "getChatCommands", [target, requestId]),
       cancelChatCommands: (requestId) => call("status", "cancelChatCommands", [requestId]),
+      loadInputHistory: (chatKey) => call("inputHistory", "loadInputHistory", [chatKey]),
+      appendInputHistory: (chatKey, entry) => call("inputHistory", "appendInputHistory", [chatKey, entry]),
+      setInputHistoryLimit: (limit) => call("inputHistory", "setInputHistoryLimit", [limit]),
+      importInputHistory: (chatKey, entries, limit) => call("inputHistory", "importInputHistory", [chatKey, entries, limit]),
       onDispose: registerDispose,
     });
     Object.defineProperty(window, "octoEnhancer", { configurable: false, enumerable: false, value: api });

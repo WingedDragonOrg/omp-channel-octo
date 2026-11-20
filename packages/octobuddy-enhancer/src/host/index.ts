@@ -15,6 +15,7 @@ import {
 } from "./plugins.ts";
 import { openInZed } from "./zed.ts";
 import { createStatusClient, type ChatTarget, type StatusClient } from "./status-client.ts";
+import { InputHistoryStore } from "./input-history.ts";
 
 // Restricted electron-webext host fork: retain its CDP attachment, named-world injection, and Runtime.addBinding model while exposing only OctoBuddy capabilities.
 
@@ -97,6 +98,7 @@ export interface HostStartOptions extends HostIdentity {
   pluginDirectories: string[];
   zedExecutable?: string;
   statusConfigPath?: string;
+  inputHistoryPath?: string;
 }
 
 export interface HostSession {
@@ -138,6 +140,7 @@ interface BridgeRequest {
   method: string;
   args: unknown[];
   trustedClick: boolean;
+  error?: string;
 }
 
 interface ManagementAsset {
@@ -307,22 +310,57 @@ function statusNavigationSource(source: string, appPath: string): string {
   })();`;
 }
 
+const defaultBridgePayloadLimit = 64 * 1024;
+// LocalStorage migration can exceed the ordinary 64 KiB bridge cap; keep history calls bounded but quota-sized.
+const inputHistoryBridgePayloadLimit = 16 * 1024 * 1024;
+const inputHistoryMethods: Record<string, true> = {
+  loadInputHistory: true,
+  appendInputHistory: true,
+  setInputHistoryLimit: true,
+  importInputHistory: true,
+};
+
+function bridgeCallId(payload: string): number | undefined {
+  const match = /^\s*\{\s*"callId"\s*:\s*(\d+)(?:\s*,|\s*\})/.exec(payload);
+  if (!match) return undefined;
+  const callId = Number(match[1]);
+  return isStatusRequestId(callId) ? callId : undefined;
+}
+
 function parseBridgeRequest(payload: string): BridgeRequest | undefined {
-  if (payload.length > 64 * 1024) return undefined;
+  if (payload.length > inputHistoryBridgePayloadLimit) {
+    const callId = bridgeCallId(payload);
+    return callId === undefined ? undefined : {
+      callId, api: "", method: "", args: [], trustedClick: false, error: "bridge request exceeds size limit",
+    };
+  }
   let value: unknown;
   try { value = JSON.parse(payload); }
-  catch { return undefined; }
+  catch {
+    const callId = bridgeCallId(payload);
+    return callId === undefined ? undefined : {
+      callId, api: "", method: "", args: [], trustedClick: false, error: "invalid bridge request",
+    };
+  }
   if (!isRecord(value)) return undefined;
-  const request = value;
-  if (typeof request.callId !== "number" || !Number.isSafeInteger(request.callId) || request.callId < 1) return undefined;
-  if (typeof request.api !== "string" || typeof request.method !== "string") return undefined;
-  if (!Array.isArray(request.args)) return undefined;
+  const callId = value.callId;
+  if (typeof callId !== "number" || !Number.isSafeInteger(callId) || callId < 1) return undefined;
+  const api = value.api;
+  const method = value.method;
+  const args = value.args;
+  if (typeof api !== "string" || typeof method !== "string" || !Array.isArray(args)) {
+    return { callId, api: "", method: "", args: [], trustedClick: false, error: "invalid bridge request" };
+  }
+  const payloadLimit = api === "inputHistory" && inputHistoryMethods[method] === true
+    ? inputHistoryBridgePayloadLimit
+    : defaultBridgePayloadLimit;
   return {
-    callId: request.callId as number,
-    api: request.api,
-    method: request.method,
-    args: request.args,
-    trustedClick: request.trustedClick === true,
+    callId,
+    api,
+    method,
+    args,
+    trustedClick: value.trustedClick === true,
+    ...(payload.length > payloadLimit ? { error: "bridge request exceeds size limit" } : {}),
   };
 }
 function isStatusRequestId(value: unknown): value is number {
@@ -373,10 +411,12 @@ class OctoBuddyHost {
   readonly #builtinStatusDirectory: string | undefined;
   readonly #statusNavigationScript: string | undefined;
   readonly #statusClient: StatusClient;
+  readonly #inputHistory: InputHistoryStore;
   readonly #statusRequests = new Set<StatusRequest>();
   readonly #worldOwners = new Map<string, string>();
   readonly #attachments = new Map<string, TargetAttachment>();
   readonly #pluginTransitions = new Map<string, Promise<void>>();
+  #inputHistoryTail: Promise<void> = Promise.resolve();
   #pollTimer: ReturnType<typeof setInterval> | undefined;
   #discovering: Promise<void> | undefined;
   #stopPromise: Promise<void> | undefined;
@@ -391,6 +431,7 @@ class OctoBuddyHost {
     builtinStatusDirectory: string | undefined,
     statusNavigationScript: string | undefined,
     statusClient: StatusClient,
+    inputHistoryPath: string | undefined,
   ) {
     this.#identity = identity;
     this.#plugins = plugins;
@@ -402,7 +443,13 @@ class OctoBuddyHost {
     this.#builtinStatusDirectory = builtinStatusDirectory;
     this.#statusNavigationScript = statusNavigationScript;
     this.#statusClient = statusClient;
+    this.#inputHistory = new InputHistoryStore(inputHistoryPath);
     for (const plugin of this.#plugins.values()) this.#worldOwners.set(worldName(plugin.id), plugin.id);
+  }
+  private enqueueInputHistory<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.#inputHistoryTail.then(operation);
+    this.#inputHistoryTail = result.then(() => undefined, () => undefined);
+    return result;
   }
 
   async start(): Promise<void> {
@@ -811,23 +858,34 @@ class OctoBuddyHost {
     if (!plugin || (!plugin.builtin && !plugin.enabled)) return;
 
     try {
-      await assertOwnedCdp(this.#identity);
-      const result = context.pluginId === managementPluginId
-        ? await this.handleManagement(plugin, request)
-        : await this.handlePlugin(plugin, attachment, event.executionContextId, request);
-      if (request.api === "status" && !this.isCurrentPluginContext(plugin, attachment, event.executionContextId)) return;
-      await this.resolveBridge(
-        attachment,
-        event.executionContextId,
-        request.callId,
-        result,
-        false,
-        request.api === "status" ? plugin : undefined,
-      );
+      if (request.api === "inputHistory" && !this.isAuthorizedStatusContext(plugin, attachment, event.executionContextId)) {
+        throw new Error("input history is not authorized for this renderer");
+      }
+      if (request.error) throw new Error(request.error);
+      const dispatch = async () => {
+        await assertOwnedCdp(this.#identity);
+        const result = context.pluginId === managementPluginId
+          ? await this.handleManagement(plugin, request)
+          : await this.handlePlugin(plugin, attachment, event.executionContextId, request);
+        const contextScoped = request.api === "status" || request.api === "inputHistory";
+        if (request.api === "inputHistory" && !this.isAuthorizedStatusContext(plugin, attachment, event.executionContextId)) return;
+        if (contextScoped && !this.isCurrentPluginContext(plugin, attachment, event.executionContextId)) return;
+        await this.resolveBridge(
+          attachment,
+          event.executionContextId,
+          request.callId,
+          result,
+          false,
+          contextScoped ? plugin : undefined,
+        );
+      };
+      if (request.api === "inputHistory") await this.enqueueInputHistory(dispatch);
+      else await dispatch();
     } catch (error) {
       const message = errorMessage(error);
+      const contextScoped = request.api === "status" || request.api === "inputHistory";
       const canceled = request.api === "status" && error instanceof Error && error.name === "AbortError";
-      if (request.api === "status" && !this.isCurrentPluginContext(plugin, attachment, event.executionContextId)) return;
+      if (contextScoped && !this.isCurrentPluginContext(plugin, attachment, event.executionContextId)) return;
       if (context.pluginId !== managementPluginId && message !== "plugin is disabled" && !canceled) {
         this.recordPluginError(plugin, new Error(message));
       }
@@ -837,7 +895,7 @@ class OctoBuddyHost {
         request.callId,
         message,
         true,
-        request.api === "status" ? plugin : undefined,
+        contextScoped ? plugin : undefined,
       ).catch((resolveError: unknown) => {
         notice(`could not return bridge error to ${plugin.id}: ${errorMessage(resolveError)}`);
       });
@@ -862,6 +920,31 @@ class OctoBuddyHost {
     }
     throw new Error(`unsupported management API: ${request.method}`);
   }
+  private async handleInputHistory(
+    plugin: HostPlugin,
+    attachment: TargetAttachment,
+    contextId: number,
+    request: BridgeRequest,
+  ): Promise<unknown> {
+    if (!this.isAuthorizedStatusContext(plugin, attachment, contextId)) {
+      throw new Error("input history is not authorized for this renderer");
+    }
+    if (request.api !== "inputHistory") throw new Error("unsupported input history capability");
+    if (request.method === "loadInputHistory" && request.args.length === 1 && typeof request.args[0] === "string") {
+      return this.#inputHistory.loadInputHistory(request.args[0]);
+    }
+    if (request.method === "appendInputHistory" && request.args.length === 2 && typeof request.args[0] === "string") {
+      return this.#inputHistory.appendInputHistory(request.args[0], request.args[1]);
+    }
+    if (request.method === "setInputHistoryLimit" && request.args.length === 1 && typeof request.args[0] === "number") {
+      return this.#inputHistory.setInputHistoryLimit(request.args[0]);
+    }
+    if (request.method === "importInputHistory" && request.args.length === 3 && typeof request.args[0] === "string"
+      && Array.isArray(request.args[1]) && typeof request.args[2] === "number") {
+      return this.#inputHistory.importInputHistory(request.args[0], request.args[1], request.args[2]);
+    }
+    throw new Error("invalid input history request");
+  }
 
   private async handlePlugin(
     plugin: HostPlugin,
@@ -869,6 +952,7 @@ class OctoBuddyHost {
     contextId: number,
     request: BridgeRequest,
   ): Promise<unknown> {
+    if (request.api === "inputHistory") return this.handleInputHistory(plugin, attachment, contextId, request);
     if (request.api === "status" && request.method === "openChatWorkspace" && request.args.length === 1) {
       if (!request.trustedClick || !this.isAuthorizedStatusContext(plugin, attachment, contextId)) {
         throw new Error("opening the workspace requires a trusted status-panel click");
@@ -882,6 +966,7 @@ class OctoBuddyHost {
           expression: `(async () => {
             const link = [...document.querySelectorAll('link[rel="modulepreload"]')]
               .find(element => /\\/App-[^/]+\\.js$/.test(element.href));
+    if (request.api === "inputHistory") return this.handleInputHistory(plugin, attachment, contextId, request);
             const module = await import(link.href);
             const chat = module.i.shared.openChannel;
             return { channelType: chat?.channelType, channelId: chat?.channelID };
@@ -1199,9 +1284,9 @@ class OctoBuddyHost {
     callId: number,
     result: unknown,
     isError: boolean,
-    statusPlugin?: HostPlugin,
+    contextPlugin?: HostPlugin,
   ): Promise<void> {
-    if (statusPlugin && !this.isCurrentPluginContext(statusPlugin, attachment, contextId)) return;
+    if (contextPlugin && !this.isCurrentPluginContext(contextPlugin, attachment, contextId)) return;
     if (attachment.closed || !attachment.contexts.has(contextId)) return;
     const expression = `window.__ewResolve?.(${callId}, ${sourceExpression(result)}, ${isError});`;
     const response = await withCdpTimeout(attachment.client.Runtime.evaluate({ expression, contextId, returnByValue: true }), `Runtime.evaluate (${attachment.target.id})`);
@@ -1288,6 +1373,9 @@ class OctoBuddyHost {
       try { await this.detachTarget(attachment.target.id); }
       catch (error) { errors.push(error instanceof Error ? error : new Error(String(error))); }
     }
+    await this.#inputHistoryTail;
+    try { await this.#inputHistory.close(); }
+    catch { errors.push(new Error("input history storage cleanup failed")); }
     if (errors.length > 0) throw new AggregateError(errors, "host stopped with CDP cleanup errors");
   }
 }
@@ -1324,6 +1412,7 @@ export async function startHost(options: HostStartOptions): Promise<HostSession>
     builtinStatusDirectory,
     statusNavigationScript,
     statusClient,
+    options.inputHistoryPath,
   );
   try {
     await host.start();

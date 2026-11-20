@@ -1,13 +1,13 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { FakeZedFixture, OwnedCdpFixture } from "./fixtures/host.ts";
 import { createFakeZed, createGatedHostProcessFixture, createOwnedCdpFixture, writePlugin } from "./fixtures/host.ts";
 import { openInZed } from "../src/host/zed.ts";
-type HostTestSetup = Pick<HostStartOptions, "pluginDirectories" | "zedExecutable"> & {
+type HostTestSetup = Pick<HostStartOptions, "pluginDirectories" | "zedExecutable" | "inputHistoryPath"> & {
   zed?: FakeZedFixture;
   filePath?: string;
 };
@@ -18,6 +18,7 @@ type HostStartOptions = {
   startedAt: string;
   pluginDirectories: string[];
   zedExecutable?: string;
+  inputHistoryPath?: string;
 };
 type HostSession = {
   stop(): Promise<void>;
@@ -73,6 +74,7 @@ async function withHost(
       startedAt: fixture.startedAt,
       pluginDirectories: options.pluginDirectories,
       ...(options.zedExecutable ? { zedExecutable: options.zedExecutable } : {}),
+      ...(options.inputHistoryPath ? { inputHistoryPath: options.inputHistoryPath } : {}),
     });
     await exercise(host, fixture, root, options, appPath);
   } finally {
@@ -741,3 +743,122 @@ test("refuses a CDP listener whose process start identity does not match", async
     finally { await rm(root, { recursive: true, force: true }); }
   }
 }, 10_000);
+test("input history persists through the authorized status bridge across host recreation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "octobuddy-input-history-bridge-"));
+  const appPath = await createFakeAppBundle(root);
+  const fixture = await createOwnedCdpFixture();
+  let host: HostSession | undefined;
+  try {
+    const targetId = "input-history-bridge";
+    const pluginRoot = join(root, "untrusted-plugins");
+    await writePlugin(pluginRoot, {
+      id: "untrusted-history-plugin",
+      contentScripts: [{ matches: ["file:///*"], js: ["plugin.js"] }],
+      files: { "plugin.js": "" },
+    });
+    await fixture.addTarget({ id: targetId, url: communicationUrl(appPath) });
+    const historyPath = join(root, "private", "input-history.sqlite");
+    const options: HostStartOptions = {
+      appPath,
+      port: fixture.port,
+      pid: fixture.pid,
+      startedAt: fixture.startedAt,
+      pluginDirectories: [join(import.meta.dir, "../plugins"), pluginRoot],
+      inputHistoryPath: historyPath,
+    };
+    const { startHost } = await loadHostEntry();
+    host = await startHost(options);
+
+    const findContexts = async () => fixture.contexts(targetId);
+    await waitUntil(async () => {
+      const contexts = await findContexts();
+      return contexts.some((context) => context.worldName === "octo-channel-status")
+        && contexts.some((context) => context.worldName === "octo-untrusted-history-plugin");
+    });
+    let contexts = await findContexts();
+    let statusContext = contexts.find((context) => context.worldName === "octo-channel-status");
+    const untrustedContext = contexts.find((context) => context.worldName === "octo-untrusted-history-plugin");
+    const pageContext = await fixture.context(targetId, `${targetId}-main`, "");
+    expect(statusContext).toBeDefined();
+    expect(untrustedContext).toBeDefined();
+    expect(pageContext).toBeDefined();
+    expect(await fixture.evaluate(targetId, statusContext!.id, "typeof window.octoEnhancer.loadInputHistory")).toBe("function");
+    expect(await fixture.evaluate(targetId, pageContext!.id, "typeof window.octoEnhancer?.loadInputHistory")).toBe("undefined");
+
+    type BridgeOutcome = { result?: unknown; error?: string };
+    const callRenderer = async (contextId: number, method: string, args: unknown[]): Promise<BridgeOutcome> => {
+      await fixture.evaluate(targetId, contextId, `(() => {
+        window.__historyBridgeResult = undefined;
+        window.__historyBridgeError = undefined;
+        window.octoEnhancer[${JSON.stringify(method)}](...${JSON.stringify(args)}).then(
+          value => { window.__historyBridgeResult = value; },
+          error => { window.__historyBridgeError = error instanceof Error ? error.message : String(error); }
+        );
+      })()`);
+      await waitUntil(async () => await fixture.evaluate(
+        targetId,
+        contextId,
+        "window.__historyBridgeResult !== undefined || window.__historyBridgeError !== undefined",
+      ) === true);
+      const value = await fixture.evaluate(
+        targetId,
+        contextId,
+        "({ result: window.__historyBridgeResult, error: window.__historyBridgeError })",
+      );
+      if (value === null || typeof value !== "object" || !("result" in value || "error" in value)) {
+        throw new Error("history bridge fixture returned an invalid result");
+      }
+      return {
+        ...("result" in value ? { result: value.result } : {}),
+        ...("error" in value && typeof value.error === "string" ? { error: value.error } : {}),
+      };
+    };
+
+    const chatKey = JSON.stringify([2, "persisted-group"]);
+    const longText = "x".repeat(96 * 1024);
+    const largeAppend = await callRenderer(statusContext!.id, "appendInputHistory", [chatKey, { text: longText }]);
+    expect(largeAppend.error).toBeUndefined();
+    expect(largeAppend.result).toEqual({ limit: 100, entries: [{ text: longText }] });
+
+    const structured = {
+      text: "Hello @[uid:42]",
+      mentions: [{ start: 6, end: 14, id: "42", label: "Ada", char: "@" }],
+    };
+    const saved = await callRenderer(statusContext!.id, "appendInputHistory", [chatKey, structured]);
+    expect(saved.error).toBeUndefined();
+    expect(saved.result).toEqual({ limit: 100, entries: [structured, { text: longText }] });
+
+    const denied = await callRenderer(untrustedContext!.id, "appendInputHistory", [chatKey, { text: "must not persist" }]);
+    expect(denied.error).toBe("input history is not authorized for this renderer");
+
+    const forgedPageCall = JSON.stringify({
+      callId: 901,
+      api: "inputHistory",
+      method: "loadInputHistory",
+      args: [chatKey],
+      trustedClick: false,
+    });
+    await fixture.callBinding(targetId, pageContext!.id, "__ewSend", forgedPageCall);
+    await fixture.drain();
+    expect((await fixture.resolutions(targetId, pageContext!.id)).some((resolution) => resolution.callId === 901)).toBe(false);
+
+    await host.stop();
+    host = undefined;
+    await waitUntil(async () => (await findContexts()).length === 0);
+    host = await startHost(options);
+    await waitUntil(async () => (await findContexts()).some((context) => context.worldName === "octo-channel-status"));
+    contexts = await findContexts();
+    statusContext = contexts.find((context) => context.worldName === "octo-channel-status");
+    expect(statusContext).toBeDefined();
+    const loaded = await callRenderer(statusContext!.id, "loadInputHistory", [chatKey]);
+    expect(loaded.error).toBeUndefined();
+    expect(loaded.result).toEqual({ limit: 100, entries: [structured, { text: longText }] });
+    expect((await stat(historyPath)).mode & 0o777).toBe(0o600);
+  } finally {
+    try { await host?.stop(); }
+    finally {
+      try { await fixture.close(); }
+      finally { await rm(root, { recursive: true, force: true }); }
+    }
+  }
+}, 20_000);

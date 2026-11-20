@@ -48,6 +48,7 @@ type HostOptions = {
   pluginDirectories: string[];
   zedExecutable: string;
   statusConfigPath?: string;
+  inputHistoryPath?: string;
 };
 
 type HostSession = { stop(): Promise<void>; setPluginEnabled(pluginId: string, enabled: boolean): Promise<void> };
@@ -664,6 +665,7 @@ test("real installed OctoBuddy loads and disposes the Zed and channel status plu
       pluginDirectories: [join(resolve(import.meta.dir, ".."), "plugins")],
       zedExecutable: fakeZed.executable,
       statusConfigPath,
+      inputHistoryPath: join(root, "input-history.sqlite"),
     });
 
     const version = await cdp.Version({ host: cdpHost, port });
