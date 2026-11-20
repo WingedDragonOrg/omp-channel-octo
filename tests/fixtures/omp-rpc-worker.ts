@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 /**
@@ -87,6 +87,7 @@ type Scenario =
 	| "host-cancel"
 	| "host-stop"
 	| "subagent-events"
+	| "agent-hub"
 	| "no-subagent-subscription"
 	| "autoresearch"
 	| "research"
@@ -507,6 +508,150 @@ function emitAgentTurn(id: string | undefined): void {
 async function holdFixtureGate(path: string): Promise<void> {
 	writeFileSync(path, "waiting", "utf8");
 	while (existsSync(path)) await Bun.sleep(5);
+}
+
+function agentHubArtifactRoot(): string {
+	return sessionFile.slice(0, -".jsonl".length);
+}
+
+function agentHubChildSessionFile(): string {
+	return join(agentHubArtifactRoot(), "live-agent.jsonl");
+}
+
+function agentHubNestedSessionFile(): string {
+	return join(agentHubArtifactRoot(), "live-agent", "nested-helper.jsonl");
+}
+
+function agentHubRootAdvisorSessionFile(): string {
+	return join(agentHubArtifactRoot(), "__advisor.jsonl");
+}
+
+function agentHubNestedAdvisorSessionFile(): string {
+	return join(agentHubArtifactRoot(), "live-agent", "__advisor.audit.jsonl");
+}
+
+function agentHubMessageEntry(
+	id: string,
+	parentId: string | null,
+	role: "user" | "assistant",
+	text: string,
+	timestamp: string,
+): Frame {
+	return {
+		type: "message",
+		id,
+		parentId,
+		timestamp,
+		message: { id, role, content: [{ type: "text", text }] },
+	};
+}
+
+function writeAgentHubTranscript(
+	path: string,
+	sessionId: string,
+	agent: string,
+	task: string,
+	messages: Array<{ id: string; role: "user" | "assistant"; text: string }>,
+): Frame[] {
+	const timestamp = new Date().toISOString();
+	const initId = `${sessionId}-init`;
+	const entries: Frame[] = [
+		{ type: "session", version: 3, id: sessionId, timestamp, cwd: cwdArg },
+		{
+			type: "session_init",
+			id: initId,
+			parentId: null,
+			timestamp,
+			systemPrompt: [],
+			task,
+			tools: [],
+			agent,
+		},
+	];
+	let parentId = initId;
+	for (const message of messages) {
+		entries.push(agentHubMessageEntry(message.id, parentId, message.role, message.text, timestamp));
+		parentId = message.id;
+	}
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+	return entries;
+}
+
+function materializeAgentHubArtifacts(): void {
+	const timestamp = new Date().toISOString();
+	appendFileSync(
+		sessionFile,
+		[
+			agentHubMessageEntry("hub-root-user", null, "user", "root conversation input", timestamp),
+			agentHubMessageEntry("hub-root-assistant", "hub-root-user", "assistant", "root conversation reply", timestamp),
+		].map(entry => `${JSON.stringify(entry)}\n`).join(""),
+		"utf8",
+	);
+	writeAgentHubTranscript(agentHubChildSessionFile(), "fixture-agent-session", "scout", "Inspect the live fixture", [
+		{ id: "hub-live-user", role: "user", text: "live child input" },
+		{ id: "hub-live-assistant", role: "assistant", text: "live child reply" },
+	]);
+	writeAgentHubTranscript(agentHubNestedSessionFile(), "fixture-nested-session", "reviewer", "Review nested fixture", [
+		{ id: "hub-nested-user", role: "user", text: "nested child input" },
+		{ id: "hub-nested-assistant", role: "assistant", text: "nested child reply" },
+	]);
+	writeAgentHubTranscript(agentHubRootAdvisorSessionFile(), "fixture-root-advisor-session", "advisor", "Observe root conversation", [
+		{ id: "hub-advisor-user", role: "user", text: "root advisor input" },
+		{ id: "hub-advisor-assistant", role: "assistant", text: "root advisor reply" },
+	]);
+	writeAgentHubTranscript(agentHubNestedAdvisorSessionFile(), "fixture-nested-advisor-session", "advisor", "Observe nested agent", [
+		{ id: "hub-nested-advisor-user", role: "user", text: "nested advisor input" },
+		{ id: "hub-nested-advisor-assistant", role: "assistant", text: "nested advisor reply" },
+	]);
+}
+
+function agentHubSubagentSnapshot(): Frame {
+	return {
+		id: "live-agent",
+		index: 0,
+		agent: "scout",
+		agentSource: "bundled",
+		description: "Live scout",
+		status: "running",
+		task: "Inspect the live fixture",
+		assignment: "Inspect the current bound session",
+		sessionFile: agentHubChildSessionFile(),
+		parentToolCallId: "fixture-agent-hub-task",
+		lastUpdate: Date.now(),
+		progress: {
+			id: "live-agent",
+			status: "running",
+			lastIntent: "reading the fixture transcript",
+			currentAction: "waiting for the read-only hub",
+		},
+	};
+}
+
+function readAgentHubTranscript(sessionFile: string, fromByte: number): Frame {
+	const bytes = readFileSync(sessionFile);
+	let startByte = Math.max(0, Math.trunc(fromByte));
+	let reset = false;
+	if (startByte > bytes.byteLength) {
+		startByte = 0;
+		reset = true;
+	}
+	const remaining = bytes.subarray(startByte).toString("utf8");
+	const lastNewline = remaining.lastIndexOf("\n");
+	const completeText = lastNewline >= 0 ? remaining.slice(0, lastNewline + 1) : "";
+	const entries = completeText.length === 0
+		? []
+		: completeText.trimEnd().split("\n").map(line => JSON.parse(line) as Frame);
+	return {
+		sessionFile,
+		fromByte: startByte,
+		nextByte: startByte + Buffer.byteLength(completeText, "utf8"),
+		reset,
+		entries,
+		messages: entries
+			.filter(entry => entry.type === "message" && entry.message && typeof entry.message === "object")
+			.map(entry => entry.message),
+	};
 }
 
 async function emitSessionSettledScenario(id: string | undefined): Promise<void> {
@@ -2643,6 +2788,10 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		setTimeout(() => process.exit(71), 35);
 		return;
 	}
+	if (scenario === "agent-hub") {
+		await emitAgentHubScenario(id);
+		return;
+	}
 	if (scenario === "subagent-events" || scenario === "no-subagent-subscription") {
 		await emitSubagentScenario(id);
 		return;
@@ -2658,6 +2807,64 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		return;
 	}
 	promptTimer = setTimeout(() => emitAgentTurn(id), scenario === "normal" ? 90 : 60);
+}
+
+async function emitAgentHubScenario(id: string | undefined): Promise<void> {
+	emit({ type: "agent_start" });
+	emit({ type: "turn_start", turnIndex: 0, timestamp: 1_000 });
+	const taskCallId = "fixture-agent-hub-task";
+	emit({
+		type: "tool_execution_start",
+		toolCallId: taskCallId,
+		toolName: "task",
+		args: { tasks: [{ agent: "scout", task: "Inspect the live fixture" }] },
+	});
+	materializeAgentHubArtifacts();
+	emit({
+		type: "subagent_lifecycle",
+		payload: {
+			id: "live-agent",
+			agent: "scout",
+			agentSource: "bundled",
+			status: "started",
+			description: "Live scout",
+			index: 0,
+			parentToolCallId: taskCallId,
+			sessionFile: agentHubChildSessionFile(),
+			detached: true,
+		},
+	});
+	emit({
+		type: "subagent_progress",
+		payload: {
+			index: 0,
+			agent: "scout",
+			agentSource: "bundled",
+			task: "Inspect the live fixture",
+			parentToolCallId: taskCallId,
+			detached: true,
+			progress: {
+				id: "live-agent",
+				index: 0,
+				agent: "scout",
+				agentSource: "bundled",
+				status: "running",
+				task: "Inspect the live fixture",
+				lastIntent: "reading the fixture transcript",
+				currentTool: "read",
+				toolCount: 1,
+				recentTools: [{ tool: "read", args: "tests/fixtures/omp-rpc-worker.ts", endMs: 1_500 }],
+			},
+		},
+	});
+	const logPath = flag("--fixture-log");
+	if (!logPath) throw new Error("agent-hub fixture needs a log path");
+	appendLog({ kind: "agent_hub_ready", id, sessionFile, subagentSessionFile: agentHubChildSessionFile() });
+	await holdFixtureGate(`${logPath}.agent-hub`);
+	emitAssistantMessage("agent hub fixture complete", 1, true);
+	emit({ type: "agent_end", messages: [], willContinue: false });
+	response(id, "prompt", { agentInvoked: true });
+	appendLog({ kind: "turn_complete", id, agentHub: true });
 }
 
 async function emitSubagentScenario(id: string | undefined): Promise<void> {
@@ -3128,6 +3335,26 @@ function handleCommand(command: Frame): void {
 			return;
 		}
 		response(id, type, { models: availableModels.map(model => ({ ...model })) });
+		return;
+	}
+	if (type === "get_subagents") {
+		const subagents =
+			scenario === "agent-hub" && existsSync(agentHubChildSessionFile())
+				? [agentHubSubagentSnapshot()]
+				: [];
+		response(id, type, { subagents });
+		return;
+	}
+	if (type === "get_subagent_messages") {
+		const subagentId = typeof command.subagentId === "string" ? command.subagentId : "";
+		if (scenario !== "agent-hub" || subagentId !== "live-agent") {
+			failure(id, type, `Unknown fixture subagent: ${subagentId}`, "fixture_subagent_unknown");
+			return;
+		}
+		response(id, type, readAgentHubTranscript(
+			agentHubChildSessionFile(),
+			typeof command.fromByte === "number" ? command.fromByte : 0,
+		));
 		return;
 	}
 	if (type === "set_subagent_subscription") {

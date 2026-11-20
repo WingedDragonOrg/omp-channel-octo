@@ -26,7 +26,7 @@
 
 OctoBuddy Enhancer 在客户端机器上显示浮动状态面板；部署在 `my-mini` 的 `omp-channel-octo` 提供 HTTP 状态快照。客户端通过配置的 HTTP(S) base URL 访问，独立 Bearer token 限制接口访问。面板不干扰聊天，可收起，显示连接状态和最近成功更新时间。
 
-本设计只涉及查询：不提供任务控制、重启、发送消息或读取文件；不发送聊天正文、凭据、原始工具参数或模型输出。实施与隔离验收不修改或重启现有常驻服务；实际部署需另行授权。
+状态、上下文和关联接口只提供查询；Agent Hub 同样只读，并开放当前会话的 agent 活动和对话，具体合同见 `2026-11-19-octobuddy-agent-hub-design.md`。不提供任务控制、重启或发送消息。实施与隔离验收不修改或重启现有常驻服务；实际部署需另行授权。
 
 ## 系统边界
 
@@ -60,7 +60,8 @@ OctoBuddy Enhancer 在客户端机器上显示浮动状态面板；部署在 `my
 - `GET /v1/chats/details?channelType=<type>&channelId=<id>`：同样认证并精确按 bot 和聊天隔离，返回 `version`、`sampledAt`、`channelType`、`channelId`、`context`、`references`、`tasks`。`context` 包含 `source`（`live|persisted|unavailable`）、`stale`、`usedTokens`、`contextWindow`、`percent`、`model`、`observedAt`、`note`；数据不可用时数值为 null。实时读取仅查询当前绑定的活动 worker，不启动 worker 或写入快照；无活动 worker 时读身份匹配的持久快照并标识历史数据。`references` 是 `{pr: string[], mr: string[]}`，仅返回当前线程已确认的关联。`tasks` 是当前线程已绑定的 Loop Task，元素包含 `workspaceId`、`taskId`、`title`、`status`、`url`；缺少快照或可靠链接时对应字段为 null，不猜测链接。非线程返回空关联；不返回上下文正文、任务描述或其他聊天的数据。
 - Loop Task 链接使用 channel 配置的 Octo 地址、任务所属 workspace slug 与 Fleet 返回的任务 `identifier`，格式为 `/fleet/<workspace-slug>/issues/<identifier>`。workspace slug 按 bot、群和 workspace 持久保存，切换绑定后仍可展示已记录的旧任务链接；缺少编号或 slug 的旧快照等待对应数据更新，不推测链接。
 - 成功响应字段：`version` 为整数 `1`；`sampledAt` 为 UTC ISO 8601 字符串；`pid`、`runningSessions`、`queuedTasks`、`pendingQuestions` 均为非负整数。服务快照包含 `version`、`sampledAt`、`pid`、`botUid`、`ownerUid`、`runningSessions`、`queuedTasks`；两种 UID 为字符串或 null。聊天快照包含 `version`、`sampledAt`、`channelType`（整数）、`channelId`（字符串）、`state`、`model`、`cwd`、`workspaceCwds`、`queuedTasks` 和 `pendingQuestions`。`state` 为 `none | idle | queued | running | completed | failed | cancelled | interrupted`，`model` 与 `cwd` 是字符串或 null。`workspaceCwds` 是绝对路径字符串数组，只包含当前 bot 的绑定 cwd 与 ready 工作区根，不包含聊天身份。`model` 是下一 worker 的显式或父线程策略，null 表示交由 OMP 决定。错误响应形如 `{"error":{"code":"invalid_request"}}`，状态码为 400、401、404、405 或 500；不返回内部异常内容。新增字段不得改变既有字段语义。不返回所有聊天身份列表、会话正文、问答内容、原始日志或凭据。
-- 客户端按页面提供的当前聊天身份请求状态，并核对响应身份与发起请求时的身份；聊天已切换、页面重建或请求过期时丢弃响应。持有 token 即可查询任意知道身份的聊天，因此 token 是该 channel 状态的完整读取权限。
+- 上述不返回会话正文的约束适用于状态和详情快照；Agent Hub 接口按其专门合同返回对话与活动。
+- 客户端按页面提供的当前聊天身份请求状态，并核对响应身份与发起请求时的身份；聊天已切换、页面重建或请求过期时丢弃响应。持有 token 即可查询任意知道身份的聊天状态，以及其当前会话的 Agent Hub 活动和对话。
 
 ## 客户端与面板
 

@@ -740,6 +740,31 @@ export interface OmpAvailableCommand {
   aliases?: string[];
   subcommands?: OmpAvailableSubcommand[];
 }
+export interface OmpSubagentSnapshot {
+  id: string;
+  index: number;
+  agent: string;
+  agentSource: string;
+  description?: string;
+  status: string;
+  task?: string;
+  assignment?: string;
+  sessionFile?: string;
+  lastUpdate: number;
+  progress?: unknown;
+  parentToolCallId?: string;
+}
+
+/** The full transcript response from OMP's read-only `get_subagent_messages` RPC. */
+export interface OmpSubagentMessages {
+  sessionFile: string;
+  fromByte: number;
+  nextByte: number;
+  reset: boolean;
+  entries: readonly unknown[];
+  messages: readonly unknown[];
+}
+
 
 export interface OmpWorker {
   readonly sessionFile: string;
@@ -785,6 +810,11 @@ export interface OmpWorker {
   abortTurn(): Promise<void>;
   /** Reads one non-prompting native context estimate within two seconds and honors cancellation. */
   contextUsage(signal?: AbortSignal): Promise<WorkerContextUsage>;
+  /** Reads the OMP worker's current in-memory subagent roster without starting a turn. */
+  getSubagents?(signal?: AbortSignal): Promise<readonly OmpSubagentSnapshot[]>;
+  /** Reads one complete subagent transcript by its OMP roster ID, never by a caller-supplied path. */
+  getSubagentMessages?(subagentId: string, signal?: AbortSignal): Promise<OmpSubagentMessages>;
+
   /** Reads the current model and OMP's available model catalog. */
   models(): Promise<WorkerModelCatalog>;
   /** Reads OMP's current slash-command metadata without dispatching a prompt. */
@@ -1006,6 +1036,21 @@ export interface ChatDetailsSnapshot {
     url: string | null;
   }[];
 }
+export interface ChatAgentHubAgent {
+  id: string;
+  parentId: string | null;
+  agent: string;
+  status: string;
+  description: string | null;
+  activity: unknown[];
+  messages: unknown[];
+}
+
+export interface ChatAgentsSnapshot extends ChatTarget {
+  version: 1;
+  agents: ChatAgentHubAgent[];
+}
+
 
 export interface ChatCommandSuggestion {
   name: string;
@@ -1261,6 +1306,7 @@ export interface ChannelService {
   chatStatusSnapshot(target: ChatTarget): ChatStatusSnapshot;
   chatDetailsSnapshot(target: ChatTarget, signal: AbortSignal): Promise<ChatDetailsSnapshot>;
   chatCommandsSnapshot(target: ChatTarget, signal: AbortSignal): Promise<ChatCommandsSnapshot | null>;
+  chatAgentsSnapshot(target: ChatTarget, signal: AbortSignal): Promise<ChatAgentsSnapshot>;
   status(target: ChatTarget): Promise<ChannelStatus>;
   start(): Promise<void>;
   stop(): Promise<void>;

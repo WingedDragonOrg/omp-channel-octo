@@ -42,12 +42,25 @@ interface ChatDetailsSnapshot extends ChatTarget {
   references: { pr: string[]; mr: string[] };
   tasks: { workspaceId: string; taskId: string; title: string | null; status: string | null; url: string | null }[];
 }
+interface ChatAgentHubSnapshot extends ChatTarget {
+  version: 1;
+  agents: Array<{
+    id: string;
+    parentId: string | null;
+    agent: string;
+    status: string;
+    description: string | null;
+    activity: unknown[];
+    messages: unknown[];
+  }>;
+}
 
 interface StatusHandlerOptions {
   token: string;
   statusSnapshot: () => ServiceSnapshot;
   chatStatusSnapshot: (target: ChatTarget) => ChatStatusSnapshot;
   chatDetailsSnapshot: (target: ChatTarget, signal: AbortSignal) => Promise<ChatDetailsSnapshot>;
+  chatAgentsSnapshot: (target: ChatTarget, signal: AbortSignal) => Promise<ChatAgentHubSnapshot>;
   fileLinks?: { resolvers: Array<{ type: "zed"; mode: "ssh"; hostname: string; username: string; port: number } | { type: "zed"; mode: "local" }> };
 }
 
@@ -105,6 +118,41 @@ const DETAILS_SNAPSHOT: ChatDetailsSnapshot = {
     url: null,
   }],
 };
+const AGENT_HUB_SNAPSHOT: ChatAgentHubSnapshot = {
+  version: 1,
+  channelType: 5,
+  channelId: "group-42____thread-9",
+  agents: [
+    {
+      id: "main",
+      parentId: null,
+      agent: "main",
+      status: "running",
+      description: "Bound conversation",
+      activity: [{ type: "turn", status: "running" }],
+      messages: [{ role: "user", content: [{ type: "text", text: "root prompt" }] }],
+    },
+    {
+      id: "task-alpha",
+      parentId: null,
+      agent: "worker",
+      status: "running",
+      description: "Current task",
+      activity: [{ type: "tool", name: "edit", status: "running" }],
+      messages: [{ role: "assistant", content: [{ type: "text", text: "working" }] }],
+    },
+    {
+      id: "nested-agent",
+      parentId: "task-alpha",
+      agent: "worker",
+      status: "parked",
+      description: null,
+      activity: [],
+      messages: [{ role: "assistant", content: [{ type: "text", text: "persisted result" }] }],
+    },
+  ],
+};
+
 
 async function loadCreateStatusHandler(): Promise<CreateStatusHandler> {
   let statusModule: { createStatusHandler?: unknown } | undefined;
@@ -139,6 +187,12 @@ async function makeHandler(
       channelId: target.channelId,
     }),
   fileLinks?: StatusHandlerOptions["fileLinks"],
+  chatAgentsSnapshot: (target: ChatTarget, signal: AbortSignal) => Promise<ChatAgentHubSnapshot> =
+    async target => ({
+      ...AGENT_HUB_SNAPSHOT,
+      channelType: target.channelType,
+      channelId: target.channelId,
+    }),
 ): Promise<StatusHandler> {
   const createStatusHandler = await loadCreateStatusHandler();
   return createStatusHandler({
@@ -146,9 +200,100 @@ async function makeHandler(
     statusSnapshot: () => SERVICE_SNAPSHOT,
     chatStatusSnapshot,
     chatDetailsSnapshot,
+    chatAgentsSnapshot,
     ...(fileLinks ? { fileLinks } : {}),
   });
 }
+
+
+test("GET /v1/chats/agents returns the snapshot for the requested bound chat", async () => {
+  const target = { channelType: 5, channelId: "group-42____thread-9" };
+  const calls: { target: ChatTarget; signal: AbortSignal }[] = [];
+  const request = makeRequest(
+    `/v1/chats/agents?channelType=${target.channelType}&channelId=${target.channelId}`,
+    { authorization: `Bearer ${TOKEN}` },
+  );
+  const handler = await makeHandler(
+    undefined,
+    undefined,
+    undefined,
+    async (actualTarget, signal) => {
+      calls.push({ target: actualTarget, signal });
+      return { ...AGENT_HUB_SNAPSHOT, ...actualTarget };
+    },
+  );
+
+  const response = await handler(request);
+
+  expect(response.status).toBe(200);
+  expectResponseHeaders(response);
+  expect(await response.json()).toEqual(AGENT_HUB_SNAPSHOT);
+  expect(calls).toEqual([{ target, signal: request.signal }]);
+});
+
+test("GET /v1/chats/agents rejects an invalid target before reading agent data", async () => {
+  let called = false;
+  const handler = await makeHandler(
+    undefined,
+    undefined,
+    undefined,
+    async target => {
+      called = true;
+      return { ...AGENT_HUB_SNAPSHOT, ...target };
+    },
+  );
+
+  const response = await handler(makeRequest(
+    "/v1/chats/agents?channelType=5&channelType=5&channelId=group-42____thread-9",
+    { authorization: `Bearer ${TOKEN}` },
+  ));
+
+  const body = await expectErrorResponse(response, 400);
+  expect(body).toEqual({ error: { code: "invalid_request" } });
+  expect(called).toBe(false);
+});
+
+test("GET /v1/chats/agents reports snapshot failures instead of an empty agent tree", async () => {
+  const handler = await makeHandler(
+    undefined,
+    undefined,
+    undefined,
+    async () => {
+      throw new Error("agent transcript read failed");
+    },
+  );
+
+  const response = await handler(makeRequest(
+    "/v1/chats/agents?channelType=5&channelId=group-42____thread-9",
+    { authorization: `Bearer ${TOKEN}` },
+  ));
+
+  const body = await expectErrorResponse(response, 500);
+  expect(body).toEqual({ error: { code: "internal_error" } });
+  expect(JSON.stringify(body)).not.toContain("agent transcript read failed");
+});
+
+test("POST /v1/chats/agents is rejected without reading or changing agent data", async () => {
+  let called = false;
+  const handler = await makeHandler(
+    undefined,
+    undefined,
+    undefined,
+    async target => {
+      called = true;
+      return { ...AGENT_HUB_SNAPSHOT, ...target };
+    },
+  );
+
+  const response = await handler(makeRequest(
+    "/v1/chats/agents?channelType=5&channelId=group-42____thread-9",
+    { method: "POST", authorization: `Bearer ${TOKEN}` },
+  ));
+
+  await expectErrorResponse(response, 405);
+  expect(called).toBe(false);
+});
+
 
 function makeRequest(
   path: string,

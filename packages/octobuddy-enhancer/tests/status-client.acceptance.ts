@@ -69,6 +69,25 @@ type ChatDetailsResult =
   | { state: "unconfigured" | "offline" | "unauthorized" | "invalid"; lastSuccess?: ChatDetailsSnapshot };
 
 type ChatDetailsTarget = ChatTarget;
+type AgentHubSnapshot = {
+  version: 1;
+  channelType: 1 | 2 | 5;
+  channelId: string;
+  agents: {
+    id: string;
+    parentId: string | null;
+    agent: string;
+    status: string;
+    description: string | null;
+    activity: unknown[];
+    messages: unknown[];
+  }[];
+};
+
+type AgentHubResult =
+  | { state: "online"; snapshot: AgentHubSnapshot }
+  | { state: "unconfigured" | "offline" | "unauthorized" | "invalid"; lastSuccess?: AgentHubSnapshot };
+
 
 type ChatCommandSubcommand = { name: string; description?: string; hint?: string };
 type ChatCommand = {
@@ -98,6 +117,7 @@ type StatusClient = {
   getChat(target: ChatTarget, signal?: AbortSignal): Promise<ChatStatusResult>;
   getChatDetails(target: ChatDetailsTarget, signal?: AbortSignal): Promise<ChatDetailsResult>;
   getChatCommands(target: ChatTarget, signal?: AbortSignal): Promise<ChatCommandsResult>;
+  getAgentHub(target: ChatTarget, signal?: AbortSignal): Promise<AgentHubResult>;
 };
 
 type StatusClientModule = {
@@ -256,6 +276,11 @@ function expectChatCommandsQuery(client: StatusClient): void {
 function expectChatStatusQuery(client: StatusClient): void {
   expect(typeof client.getChat, "createStatusClient must expose getChat(target, signal?)").toBe("function");
 }
+
+function expectAgentHubQuery(client: StatusClient): void {
+  expect(typeof client.getAgentHub, "createStatusClient must expose getAgentHub(target, signal?)").toBe("function");
+}
+
 
 // Intentionally dynamic so the acceptance test can assert the missing production module at runtime.
 async function loadStatusClient(): Promise<StatusClientModule> {
@@ -1261,6 +1286,84 @@ test("aborting a pending command request cancels its HTTP fetch", async () => {
       controller.abort();
       expect(await rejected).toMatchObject({ name: "AbortError" });
       await requestAborted.promise;
+    });
+  });
+}, 10_000);
+
+test("queries the authenticated Agent Hub for the exact chat and preserves the complete conversation response", async () => {
+  const clientModule = await loadStatusClient();
+  const target: ChatTarget = { channelType: 5, channelId: "group + 7____thread/42" };
+  const completeMessage = "full agent conversation content ".repeat(25_000);
+  const hub: AgentHubSnapshot = {
+    version: 1,
+    ...target,
+    agents: [{
+      id: "run-42",
+      parentId: null,
+      agent: "coordinator",
+      status: "running",
+      description: "Owns the request",
+      activity: [{ type: "tool", summary: "Read the current task" }],
+      messages: [{ role: "assistant", content: completeMessage }],
+    }],
+  };
+  const body = JSON.stringify(hub);
+  expect(Buffer.byteLength(body, "utf8")).toBeGreaterThan(512 * 1024);
+  const requests: {
+    method: string;
+    pathname: string;
+    channelType: string | null;
+    channelId: string | null;
+    authorization: string | null;
+  }[] = [];
+
+  await withTempDirectory(async (directory) => {
+    await withLocalHttpFixture((request) => {
+      const url = new URL(request.url);
+      requests.push({
+        method: request.method,
+        pathname: url.pathname,
+        channelType: url.searchParams.get("channelType"),
+        channelId: url.searchParams.get("channelId"),
+        authorization: request.headers.get("authorization"),
+      });
+      if (url.pathname !== "/v1/chats/agents") return statusResponse({ error: { code: "not_found" } }, 404);
+      return new Response(body, {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(Buffer.byteLength(body, "utf8")),
+        },
+      });
+    }, async (fixture) => {
+      const configPath = join(directory, "status-client.json");
+      await writeConfig(configPath, fixture.baseUrl);
+      const client = clientModule.createStatusClient({ configPath });
+      expectAgentHubQuery(client);
+      expect(await client.getAgentHub(target)).toEqual({ state: "online", snapshot: hub });
+    });
+  });
+
+  expect(requests).toEqual([{
+    method: "GET",
+    pathname: "/v1/chats/agents",
+    channelType: "5",
+    channelId: target.channelId,
+    authorization: `Bearer ${bearerToken}`,
+  }]);
+}, 10_000);
+
+test("a failed Agent Hub read is not returned as an empty agent list", async () => {
+  const clientModule = await loadStatusClient();
+  const target: ChatTarget = { channelType: 2, channelId: "agent-hub-failure" };
+
+  await withTempDirectory(async (directory) => {
+    await withLocalHttpFixture(() => statusResponse({ error: { code: "unavailable" } }, 503), async (fixture) => {
+      const configPath = join(directory, "status-client.json");
+      await writeConfig(configPath, fixture.baseUrl);
+      const client = clientModule.createStatusClient({ configPath });
+      expectAgentHubQuery(client);
+      expect(await client.getAgentHub(target)).toEqual({ state: "offline" });
     });
   });
 }, 10_000);

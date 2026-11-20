@@ -10,6 +10,8 @@ import type {
 	OmpWorker,
 	OmpAvailableCommand,
 	OmpAvailableSubcommand,
+	OmpSubagentMessages,
+	OmpSubagentSnapshot,
 	PromptContext,
 	WorkerEvent,
 	WorkerCompactionStatus,
@@ -302,6 +304,45 @@ function parseAvailableCommands(value: unknown): OmpAvailableCommand[] | null {
 	}
 	return commands;
 }
+function parseSubagentRoster(value: unknown): readonly OmpSubagentSnapshot[] {
+	if (!isRecord(value) || !Array.isArray(value.subagents)) {
+		throw new Error("OMP RPC get_subagents returned an invalid roster");
+	}
+	for (const candidate of value.subagents) {
+		if (
+			!isRecord(candidate)
+			|| typeof candidate.id !== "string"
+			|| typeof candidate.index !== "number"
+			|| typeof candidate.agent !== "string"
+			|| typeof candidate.agentSource !== "string"
+			|| typeof candidate.status !== "string"
+			|| typeof candidate.lastUpdate !== "number"
+			|| (candidate.description !== undefined && typeof candidate.description !== "string")
+			|| (candidate.task !== undefined && typeof candidate.task !== "string")
+			|| (candidate.assignment !== undefined && typeof candidate.assignment !== "string")
+			|| (candidate.sessionFile !== undefined && typeof candidate.sessionFile !== "string")
+			|| (candidate.parentToolCallId !== undefined && typeof candidate.parentToolCallId !== "string")
+		) {
+			throw new Error("OMP RPC get_subagents returned an invalid subagent snapshot");
+		}
+	}
+	return value.subagents as OmpSubagentSnapshot[];
+}
+
+function parseSubagentMessages(value: unknown): OmpSubagentMessages {
+	if (
+		!isRecord(value)
+		|| typeof value.sessionFile !== "string"
+		|| typeof value.fromByte !== "number"
+		|| typeof value.nextByte !== "number"
+		|| typeof value.reset !== "boolean"
+		|| !Array.isArray(value.entries)
+		|| !Array.isArray(value.messages)
+	) {
+		throw new Error("OMP RPC get_subagent_messages returned an invalid transcript");
+	}
+	return value as unknown as OmpSubagentMessages;
+}
 
 
 class RpcWorker implements OmpWorker {
@@ -563,6 +604,24 @@ class RpcWorker implements OmpWorker {
 			percent,
 			model,
 		};
+	}
+	/** Reads the live session's in-memory subagent roster without prompting or starting another worker. */
+	async getSubagents(signal?: AbortSignal): Promise<readonly OmpSubagentSnapshot[]> {
+		const response = await this.#request({ type: "get_subagents" }, DEFAULT_REQUEST_TIMEOUT_MS, undefined, signal);
+		this.#assertSuccess(response, "get_subagents");
+		return parseSubagentRoster(response.data);
+	}
+
+	/** Reads the complete transcript from byte zero, addressed only by the OMP roster ID. */
+	async getSubagentMessages(subagentId: string, signal?: AbortSignal): Promise<OmpSubagentMessages> {
+		const response = await this.#request(
+			{ type: "get_subagent_messages", subagentId, fromByte: 0 },
+			DEFAULT_REQUEST_TIMEOUT_MS,
+			undefined,
+			signal,
+		);
+		this.#assertSuccess(response, "get_subagent_messages");
+		return parseSubagentMessages(response.data);
 	}
 
 

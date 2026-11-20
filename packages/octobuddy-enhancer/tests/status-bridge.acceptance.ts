@@ -77,6 +77,21 @@ type ChatCommandsSnapshot = {
   omp: "available" | "unavailable";
 };
 
+type AgentHubSnapshot = {
+  version: 1;
+  channelType: 1 | 2 | 5;
+  channelId: string;
+  agents: {
+    id: string;
+    parentId: string | null;
+    agent: string;
+    status: string;
+    description: string | null;
+    activity: unknown[];
+    messages: unknown[];
+  }[];
+};
+
 type StatusRequest = { method: string; path: string; authorization: string | undefined };
 
 type LocalStatusServer = {
@@ -85,6 +100,7 @@ type LocalStatusServer = {
   chatRequests(): StatusRequest[];
   detailsRequests(): StatusRequest[];
   commandsRequests(): StatusRequest[];
+  agentRequests(): StatusRequest[];
   releaseChatResponse(target: ChatStatusTarget): void;
   pendingChatResponse(target: ChatStatusTarget): boolean;
   abortedResponse(): boolean;
@@ -228,6 +244,35 @@ function chatCommandsSnapshotFor(target: ChatStatusTarget): ChatCommandsSnapshot
   };
 }
 
+function agentHubSnapshotFor(target: ChatStatusTarget): AgentHubSnapshot {
+  return {
+    version: 1,
+    channelType: target.channelType,
+    channelId: target.channelId,
+    agents: [
+      {
+        id: "main-42",
+        parentId: null,
+        agent: "coordinator",
+        status: "running",
+        description: "Coordinates the chat task",
+        activity: [{ type: "tool", summary: "Started coordination" }],
+        messages: [{ role: "assistant", content: "Main agent response" }],
+      },
+      {
+        id: "subagent-42",
+        parentId: "main-42",
+        agent: "researcher",
+        status: "completed",
+        description: "Read the referenced design",
+        activity: [{ type: "tool", summary: "Opened the specification" }],
+        messages: [{ role: "assistant", content: "Subagent response" }],
+      },
+    ],
+  };
+}
+
+
 
 function createLocalStatusServer(options: {
   holdResponse?: boolean;
@@ -239,6 +284,7 @@ function createLocalStatusServer(options: {
   const chatRequests: StatusRequest[] = [];
   const detailsRequests: StatusRequest[] = [];
   const commandsRequests: StatusRequest[] = [];
+  const agentRequests: StatusRequest[] = [];
   const heldChatTargets = new Set((options.holdChatTargets ?? []).map(chatStatusKey));
   const heldDetailsTargets = new Set((options.holdDetailsTargets ?? []).map(chatStatusKey));
   const heldCommandsTargets = new Set((options.holdCommandsTargets ?? []).map(chatStatusKey));
@@ -261,7 +307,8 @@ function createLocalStatusServer(options: {
     });
     const url = new URL(path, "http://127.0.0.1");
     if (request.method !== "GET" || (url.pathname !== "/v1/status" && url.pathname !== "/v1/chats/status"
-      && url.pathname !== "/v1/chats/details" && url.pathname !== "/v1/chats/commands")) {
+      && url.pathname !== "/v1/chats/details" && url.pathname !== "/v1/chats/commands"
+      && url.pathname !== "/v1/chats/agents")) {
       response.writeHead(404).end();
       return;
     }
@@ -291,6 +338,8 @@ function createLocalStatusServer(options: {
       chatRequests.push({ method: request.method ?? "", path, authorization: request.headers.authorization });
     } else if (url.pathname === "/v1/chats/commands") {
       commandsRequests.push({ method: request.method ?? "", path, authorization: request.headers.authorization });
+    } else if (url.pathname === "/v1/chats/agents") {
+      agentRequests.push({ method: request.method ?? "", path, authorization: request.headers.authorization });
     } else {
       detailsRequests.push({ method: request.method ?? "", path, authorization: request.headers.authorization });
     }
@@ -342,7 +391,9 @@ function createLocalStatusServer(options: {
       ? chatDetailsSnapshotFor(target)
       : url.pathname === "/v1/chats/commands"
         ? chatCommandsSnapshotFor(target)
-        : chatSnapshotFor(target)));
+        : url.pathname === "/v1/chats/agents"
+          ? agentHubSnapshotFor(target)
+          : chatSnapshotFor(target)));
   });
   const { promise, resolve, reject } = Promise.withResolvers<LocalStatusServer>();
   server.once("error", reject);
@@ -359,6 +410,7 @@ function createLocalStatusServer(options: {
       chatRequests: () => [...chatRequests],
       detailsRequests: () => [...detailsRequests],
       commandsRequests: () => [...commandsRequests],
+      agentRequests: () => [...agentRequests],
       releaseChatResponse: (target) => {
         const key = chatStatusKey(target);
         const response = pendingChatResponses.get(key)?.shift();
@@ -1343,5 +1395,60 @@ test("disabling the status plugin cancels a pending chat commands bridge request
     ) === true, "subsequent disabled command calls to settle");
     expect(await fixture.evaluate(targetId, context!.id, "window.__commandsDisabledCall")).toBe("plugin is disabled");
     expect(server.commandsRequests()).toHaveLength(1);
+  });
+}, 15_000);
+
+test("Agent Hub is available only on the authorized communication page and preserves its full snapshot", async () => {
+  const target = { channelType: 5, channelId: "group + 7____thread/agent-hub" } as const;
+  await withStatusHost({
+    prepareTargets: async (fixture, _root, appPath) => {
+      await fixture.addTarget({ id: "agent-hub-authorized", url: communicationUrl(appPath) });
+      await fixture.addTarget({ id: "agent-hub-denied", url: conversationUrl(appPath) });
+    },
+  }, async ({ fixture, server }) => {
+    const authorizedTargetId = "agent-hub-authorized";
+    const deniedTargetId = "agent-hub-denied";
+    await waitUntil(async () =>
+      (await statusContext(fixture, authorizedTargetId)) !== undefined
+      && (await statusContext(fixture, deniedTargetId)) !== undefined,
+    "both Agent Hub plugin contexts");
+    await activatePackagedStatusPlugin(fixture, authorizedTargetId);
+    await activatePackagedStatusPlugin(fixture, deniedTargetId);
+    const authorizedContext = await statusContext(fixture, authorizedTargetId);
+    const deniedContext = await statusContext(fixture, deniedTargetId);
+    expect(authorizedContext).toBeDefined();
+    expect(deniedContext).toBeDefined();
+    expect(await fixture.evaluate(authorizedTargetId, authorizedContext!.id, "typeof window.octoEnhancer?.getAgentHub")).toBe("function");
+    expect(await fixture.evaluate(deniedTargetId, deniedContext!.id, "typeof window.octoEnhancer?.getAgentHub")).toBe("function");
+
+    await fixture.evaluate(authorizedTargetId, authorizedContext!.id, `window.__agentHubAuthorized = undefined;
+      window.octoEnhancer.getAgentHub(${JSON.stringify(target)}).then(
+        (result) => { window.__agentHubAuthorized = { result }; },
+        (error) => { window.__agentHubAuthorized = { error: String(error?.message ?? error) }; },
+      );`);
+    await fixture.evaluate(deniedTargetId, deniedContext!.id, `window.__agentHubDenied = undefined;
+      window.octoEnhancer.getAgentHub(${JSON.stringify(target)}).then(
+        (result) => { window.__agentHubDenied = { result }; },
+        (error) => { window.__agentHubDenied = { error: String(error?.message ?? error) }; },
+      );`);
+
+    await waitUntil(async () =>
+      await fixture.evaluate(authorizedTargetId, authorizedContext!.id, "window.__agentHubAuthorized !== undefined") === true
+      && await fixture.evaluate(deniedTargetId, deniedContext!.id, "window.__agentHubDenied !== undefined") === true,
+    "authorized and denied Agent Hub bridge results");
+    expect(await fixture.evaluate(authorizedTargetId, authorizedContext!.id, "window.__agentHubAuthorized")).toEqual({
+      result: { state: "online", snapshot: agentHubSnapshotFor(target) },
+    });
+    expect(await fixture.evaluate(deniedTargetId, deniedContext!.id, "window.__agentHubDenied.error")).toContain("not authorized");
+    expect(server.agentRequests()).toHaveLength(1);
+    const request = server.agentRequests()[0]!;
+    const url = new URL(request.path, server.baseUrl);
+    expect(url.pathname).toBe("/v1/chats/agents");
+    expect(url.searchParams.get("channelType")).toBe(String(target.channelType));
+    expect(url.searchParams.get("channelId")).toBe(target.channelId);
+    expect(request).toMatchObject({
+      method: "GET",
+      authorization: `Bearer ${bearerToken}`,
+    });
   });
 }, 15_000);

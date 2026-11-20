@@ -109,7 +109,7 @@ interface ContextOwner {
   frameId: string;
 }
 
-type StatusRequestKind = "service" | "chat-status" | "chat-details" | "chat-commands";
+type StatusRequestKind = "service" | "chat-status" | "chat-details" | "chat-commands" | "agent-hub";
 
 interface StatusRequest {
   pluginId: string;
@@ -947,6 +947,17 @@ class OctoBuddyHost {
         (signal) => this.#statusClient.getChatDetails(request.args[0] as ChatTarget, signal),
         "chat-details",
         request.args[1],
+      );
+    }
+
+    if (request.api === "status" && request.method === "getAgentHub") {
+      if (request.args.length !== 1) throw new Error("invalid Agent Hub request");
+      return this.withStatusRequest(
+        plugin,
+        attachment,
+        contextId,
+        (signal) => this.#statusClient.getAgentHub(request.args[0] as ChatTarget, signal),
+        "agent-hub",
       );
     }
     if (request.api === "status" && request.method === "getChatCommands") {

@@ -3,7 +3,7 @@ import { open, type FileHandle } from "node:fs/promises";
 import { createStatusHandler } from "./http.ts";
 import { assertNoExtendedAcl } from "./private-file-acl.ts";
 
-import type { ChatCommandsSnapshot, ChatDetailsSnapshot, ChatStatusSnapshot, ChatTarget, FileLinkConfig, ServiceStatusSnapshot } from "../contracts.ts";
+import type { ChatAgentsSnapshot, ChatCommandsSnapshot, ChatDetailsSnapshot, ChatStatusSnapshot, ChatTarget, FileLinkConfig, ServiceStatusSnapshot } from "../contracts.ts";
 
 export interface StatusServerOptions {
   listenAddress: string;
@@ -16,6 +16,7 @@ export interface StatusServerOptions {
   chatStatusSnapshot: (target: ChatTarget) => ChatStatusSnapshot;
   chatDetailsSnapshot: (target: ChatTarget, signal: AbortSignal) => Promise<ChatDetailsSnapshot>;
   chatCommandsSnapshot?: (target: ChatTarget, signal: AbortSignal) => Promise<ChatCommandsSnapshot | null>;
+  chatAgentsSnapshot?: (target: ChatTarget, signal: AbortSignal) => Promise<ChatAgentsSnapshot>;
   fileLinks?: FileLinkConfig;
 }
 
@@ -105,6 +106,9 @@ export async function startStatusServer(options: StatusServerOptions): Promise<S
               ...(options.chatCommandsSnapshot === undefined
                 ? {}
                 : { chatCommandsSnapshot: options.chatCommandsSnapshot }),
+              ...(options.chatAgentsSnapshot === undefined
+                ? {}
+                : { chatAgentsSnapshot: options.chatAgentsSnapshot }),
               ...(options.fileLinks === undefined ? {} : { fileLinks: options.fileLinks }),
             })(request);
           } catch {

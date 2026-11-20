@@ -99,6 +99,7 @@ import type {
   WorkerOptions,
   WorktreeMergeSummary,
   OmpAvailableCommand,
+  ChatAgentsSnapshot,
 } from "./contracts.ts";
 import type {
   BindingRecord,
@@ -120,6 +121,7 @@ import type { ReviewJobRecord } from "./store/store-records.ts";
 import { DEFAULT_ASK_TIMEOUT_MS } from "./contracts.ts";
 import { TurnContext } from "./session/turn-context.ts";
 import { readSessionContext } from "./session/status-context.ts";
+import { readChatAgentsSnapshot as readBoundChatAgentsSnapshot } from "./session/agent-hub.ts";
 import { readRepositoryHead, readWorkspaceChanges, readWorkspaceGitState } from "./workspace/git-status.ts";
 import { memberSnapshotFor, normalizeAgentMembers, type AgentContext, type AgentMemberSnapshot } from "./session/agent-context.ts";
 import { threadShortId, threadParentGroupId } from "./threads/thread-target.ts";
@@ -4093,6 +4095,66 @@ class CoreService implements ChannelService {
       pendingQuestions: this.store.pendingQuestionIds(botUid, target).length,
     };
   }
+  chatAgentsSnapshot(target: ChatTarget, requestSignal: AbortSignal): Promise<ChatAgentsSnapshot> {
+    if (this.stopping) return Promise.reject(new Error("channel stopping"));
+    const operation = this.readChatAgentsSnapshot(target, requestSignal);
+    this.operationSet(operation.then(() => undefined, () => undefined));
+    return operation;
+  }
+
+  private async readChatAgentsSnapshot(
+    target: ChatTarget,
+    requestSignal: AbortSignal,
+  ): Promise<ChatAgentsSnapshot> {
+    const signal = AbortSignal.any([requestSignal, this.shutdownController.signal]);
+    signal.throwIfAborted();
+
+    const botUid = this.bot?.uid;
+    if (botUid === undefined) return { version: 1, channelType: target.channelType, channelId: target.channelId, agents: [] };
+
+    const binding = this.store.getBinding(botUid, target);
+    if (binding === null) {
+      return { version: 1, channelType: target.channelType, channelId: target.channelId, agents: [] };
+    }
+
+    let liveWorker: WorkerSession | undefined;
+    for (const runtime of this.runtimes.values()) {
+      if (
+        runtime.closing
+        || runtime.suspended
+        || runtime.target.channelType !== target.channelType
+        || runtime.target.channelId !== target.channelId
+      ) continue;
+      const worker = runtime.lease?.worker;
+      if (worker !== undefined && worker.sessionId === binding.sessionId) {
+        liveWorker = worker;
+        break;
+      }
+    }
+    const sessionFile = binding.sessionFile ?? liveWorker?.sessionFile;
+    if (sessionFile === undefined) {
+      return { version: 1, channelType: target.channelType, channelId: target.channelId, agents: [] };
+    }
+
+    const snapshot = await readBoundChatAgentsSnapshot({
+      target,
+      sessionId: binding.sessionId,
+      sessionFile,
+      rootStatus: liveWorker === undefined
+        ? "parked"
+        : this.store.getActiveTask(botUid, target) === null
+          ? "idle"
+          : "running",
+      ...(liveWorker === undefined ? {} : { liveWorker }),
+      signal,
+    });
+    signal.throwIfAborted();
+    if (!sameSessionIdentity(binding, this.store.getBinding(botUid, target))) {
+      throw new Error("Chat binding changed while reading the Agent Hub snapshot");
+    }
+    return snapshot;
+  }
+
 
   chatCommandsSnapshot(target: ChatTarget, requestSignal: AbortSignal): Promise<ChatCommandsSnapshot | null> {
     if (this.stopping) return Promise.reject(new Error("channel stopping"));

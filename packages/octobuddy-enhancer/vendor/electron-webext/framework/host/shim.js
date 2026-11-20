@@ -360,6 +360,7 @@
       getChatStatus: (target, requestId) => call("status", "getChatStatus", [target, requestId]),
       cancelChatStatus: (requestId) => call("status", "cancelChatStatus", [requestId]),
       getChatDetails: (target, requestId) => call("status", "getChatDetails", [target, requestId]),
+      getAgentHub: (target) => call("status", "getAgentHub", [target]),
       cancelChatDetails: (requestId) => call("status", "cancelChatDetails", [requestId]),
       getChatCommands: (target, requestId) => call("status", "getChatCommands", [target, requestId]),
       cancelChatCommands: (requestId) => call("status", "cancelChatCommands", [requestId]),

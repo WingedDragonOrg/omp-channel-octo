@@ -55,6 +55,13 @@
   let chatDetailsLoading = false;
   let detailsRequestSequence = 0;
   let activeDetailsRequest;
+  let agentHubLookupTarget;
+  let agentHubResult;
+  let agentHubLoading = false;
+  let agentHubRequestSequence = 0;
+  let activeAgentHubRequest;
+  let selectedAgentId;
+  let agentHubMobileView = "list";
   let drag;
   let suppressClick = false;
   let instance;
@@ -199,7 +206,7 @@
       border-radius: 8px !important;
       display: grid !important;
       gap: 3px !important;
-      grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+      grid-template-columns: repeat(4, minmax(0, 1fr)) !important;
       margin: 0 0 12px !important;
       padding: 3px !important;
     }
@@ -256,6 +263,174 @@
     [data-octobuddy-channel-status-link]:focus-visible {
       outline: 2px solid #71d8d0 !important;
       outline-offset: 2px !important;
+    }
+    [data-octobuddy-channel-status-panel][data-agent-hub-active="true"] {
+      width: min(860px, calc(100vw - 16px)) !important;
+    }
+    [data-octobuddy-agent-hub] {
+      background: #17272e !important;
+      color: #eaf1f3 !important;
+      display: grid !important;
+      font: 12px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+      grid-template-columns: minmax(180px, 0.32fr) minmax(0, 1fr) !important;
+      height: min(560px, calc(100vh - 64px)) !important;
+      min-height: 320px !important;
+      min-width: 0 !important;
+      overflow: hidden !important;
+    }
+    [data-octobuddy-agent-hub] *,
+    [data-octobuddy-agent-hub] *::before,
+    [data-octobuddy-agent-hub] *::after {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+      font-size: 12px !important;
+      line-height: 1.45 !important;
+    }
+    [data-octobuddy-agent-hub-tree-pane] {
+      background: #20343c !important;
+      border-right: 1px solid #39515b !important;
+      min-width: 0 !important;
+      overflow: auto !important;
+      padding: 12px !important;
+    }
+    [data-octobuddy-agent-hub-heading] {
+      color: #eaf1f3 !important;
+      font: 600 13px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+      margin: 0 0 10px !important;
+    }
+    [data-octobuddy-agent-hub-tree],
+    [data-octobuddy-agent-hub-tree] [role="group"] {
+      list-style: none !important;
+      margin: 0 !important;
+      min-width: 0 !important;
+      padding: 0 !important;
+    }
+    [data-octobuddy-agent-hub-tree] [role="group"] {
+      padding-left: 14px !important;
+    }
+    [data-octobuddy-agent-hub-tree] [role="treeitem"] {
+      list-style: none !important;
+      margin: 2px 0 !important;
+      min-width: 0 !important;
+    }
+    [data-octobuddy-agent-hub-agent] {
+      align-items: flex-start !important;
+      background: transparent !important;
+      border: 1px solid transparent !important;
+      border-radius: 5px !important;
+      color: #eaf1f3 !important;
+      cursor: pointer !important;
+      display: grid !important;
+      font: inherit !important;
+      gap: 2px !important;
+      min-width: 0 !important;
+      padding: 7px !important;
+      text-align: left !important;
+      width: 100% !important;
+    }
+    [data-octobuddy-agent-hub-agent][aria-selected="true"] {
+      background: #17272e !important;
+      border-color: #39515b !important;
+    }
+    [data-octobuddy-agent-hub-agent]:focus-visible,
+    [data-octobuddy-agent-hub-list-toggle]:focus-visible {
+      outline: 2px solid #62d5a2 !important;
+      outline-offset: 1px !important;
+    }
+    [data-octobuddy-agent-hub-status] {
+      color: #62d5a2 !important;
+      font-size: 11px !important;
+    }
+    [data-octobuddy-agent-hub-detail] {
+      background: #17272e !important;
+      min-width: 0 !important;
+      overflow: auto !important;
+      padding: 14px !important;
+    }
+    [data-octobuddy-agent-hub-description] {
+      color: #b6c6cc !important;
+      margin: 5px 0 14px !important;
+      overflow-wrap: anywhere !important;
+    }
+    [data-octobuddy-agent-hub-section] {
+      border-top: 1px solid #39515b !important;
+      margin-top: 13px !important;
+      padding-top: 10px !important;
+    }
+    [data-octobuddy-agent-hub-activity],
+    [data-octobuddy-agent-hub-messages] {
+      display: grid !important;
+      gap: 8px !important;
+      list-style: none !important;
+      margin: 0 !important;
+      min-width: 0 !important;
+      padding: 0 !important;
+    }
+    [data-octobuddy-agent-hub-activity-item] {
+      border-left: 2px solid #39515b !important;
+      margin: 0 !important;
+      min-width: 0 !important;
+      overflow-wrap: anywhere !important;
+      padding: 2px 0 2px 9px !important;
+      white-space: pre-wrap !important;
+    }
+    [data-octobuddy-agent-hub-message] {
+      border-bottom: 1px solid #39515b !important;
+      margin: 0 !important;
+      min-width: 0 !important;
+      padding: 4px 0 8px !important;
+    }
+    [data-octobuddy-agent-hub-message-role] {
+      color: #62d5a2 !important;
+      font-weight: 600 !important;
+      margin: 0 0 4px !important;
+    }
+    [data-octobuddy-agent-hub-message-content] {
+      color: #eaf1f3 !important;
+      margin: 0 !important;
+      min-width: 0 !important;
+      overflow-wrap: anywhere !important;
+      white-space: pre-wrap !important;
+    }
+    [data-octobuddy-agent-hub-message-content] > p,
+    [data-octobuddy-agent-hub-message-content] > pre {
+      margin: 0 0 6px !important;
+      min-width: 0 !important;
+      overflow-wrap: anywhere !important;
+      white-space: pre-wrap !important;
+    }
+    [data-octobuddy-agent-hub-message-content] > pre {
+      color: #b6c6cc !important;
+    }
+    [data-octobuddy-agent-hub-message-meta] {
+      color: #b6c6cc !important;
+      margin: 6px 0 0 !important;
+      min-width: 0 !important;
+      overflow-wrap: anywhere !important;
+      white-space: pre-wrap !important;
+    }
+    [data-octobuddy-agent-hub-list-toggle] {
+      display: none !important;
+    }
+    @media (max-width: 600px) {
+      [data-octobuddy-agent-hub] {
+        display: block !important;
+        height: auto !important;
+        min-height: 0 !important;
+      }
+      [data-octobuddy-agent-hub][data-view="list"] [data-octobuddy-agent-hub-detail],
+      [data-octobuddy-agent-hub][data-view="detail"] [data-octobuddy-agent-hub-tree-pane] {
+        display: none !important;
+      }
+      [data-octobuddy-agent-hub-list-toggle] {
+        background: transparent !important;
+        border: 0 !important;
+        color: #62d5a2 !important;
+        cursor: pointer !important;
+        display: inline-flex !important;
+        font: inherit !important;
+        margin: 0 0 10px !important;
+        padding: 0 !important;
+      }
     }
     @media (prefers-reduced-motion: reduce) {
       [data-octobuddy-channel-status-root] *,
@@ -322,6 +497,7 @@
     status: "状态",
     context: "上下文",
     associations: "关联",
+    "agent-hub": "Agent Hub",
   })) {
     const tab = document.createElement("button");
     tab.type = "button";
@@ -414,8 +590,18 @@
     chatDetailsLoading = false;
   }
 
+  function clearAgentHub() {
+    agentHubRequestSequence += 1;
+    activeAgentHubRequest = undefined;
+    agentHubLookupTarget = undefined;
+    agentHubResult = undefined;
+    agentHubLoading = false;
+    selectedAgentId = undefined;
+    agentHubMobileView = "list";
+  }
+
   async function refreshChatDetails() {
-    if (disposed || !expanded || activeTab === "status") return;
+    if (disposed || !expanded || activeTab === "status" || activeTab === "agent-hub") return;
     if (currentStatus?.state !== "online") {
       clearChatDetails();
       return;
@@ -454,6 +640,54 @@
       if (disposed || requestId !== detailsRequestSequence) return;
       activeDetailsRequest = undefined;
       chatDetailsLoading = false;
+      renderEntry();
+    }
+  }
+
+  async function refreshAgentHub() {
+    if (disposed || !expanded || activeTab !== "agent-hub") return;
+    if (currentStatus?.state !== "online") {
+      clearAgentHub();
+      return;
+    }
+
+    const target = resolveChatTarget();
+    if (!target) {
+      clearAgentHub();
+      return;
+    }
+    if (!sameTarget(agentHubLookupTarget, target)) {
+      clearAgentHub();
+      agentHubLookupTarget = target;
+    }
+    if (activeAgentHubRequest && sameTarget(activeAgentHubRequest.target, target)) return;
+    // Continue polling; renderAgentHub keeps the last successful snapshot visible while refreshing.
+    if (typeof capability.getAgentHub !== "function") {
+      agentHubResult = { state: "invalid" };
+      agentHubLoading = false;
+      renderEntry();
+      return;
+    }
+
+    const requestId = ++agentHubRequestSequence;
+    activeAgentHubRequest = { requestId, target };
+    agentHubLoading = true;
+    renderEntry();
+    try {
+      const response = await capability.getAgentHub(target);
+      if (disposed || requestId !== agentHubRequestSequence) return;
+      if (!sameTarget(target, resolveChatTarget()) || currentStatus?.state !== "online") return;
+      agentHubResult = response;
+      if (response.state === "online" && !response.snapshot.agents.some((agent) => agent.id === selectedAgentId)) {
+        selectedAgentId = response.snapshot.agents[0]?.id;
+      }
+    } catch {
+      if (disposed || requestId !== agentHubRequestSequence) return;
+      agentHubResult = { state: "offline" };
+    } finally {
+      if (disposed || requestId !== agentHubRequestSequence) return;
+      activeAgentHubRequest = undefined;
+      agentHubLoading = false;
       renderEntry();
     }
   }
@@ -515,10 +749,12 @@
     currentChat = nextChat;
     clearChatStatus();
     clearChatDetails();
+    clearAgentHub();
     renderEntry();
     if (currentStatus?.state === "online") {
       void refreshChatStatus();
-      if (expanded && activeTab !== "status") void refreshChatDetails();
+      if (expanded && activeTab === "agent-hub") void refreshAgentHub();
+      else if (expanded && activeTab !== "status") void refreshChatDetails();
     }
   }
 
@@ -771,6 +1007,245 @@
     appendTaskList(snapshot.tasks);
   }
 
+  function agentHubValueText(value) {
+    return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  }
+
+  function appendAgentHubMessageContent(parent, value) {
+    if (!Array.isArray(value)) {
+      parent.textContent = agentHubValueText(value);
+      return;
+    }
+    for (const block of value) {
+      if (block !== null
+        && typeof block === "object"
+        && !Array.isArray(block)
+        && block.type === "text"
+        && typeof block.text === "string") {
+        const text = document.createElement("p");
+        text.textContent = block.text;
+        parent.append(text);
+      } else {
+        const detail = document.createElement("pre");
+        detail.setAttribute("data-octobuddy-agent-hub-content-block", "");
+        detail.textContent = agentHubValueText(block);
+        parent.append(detail);
+      }
+    }
+  }
+
+  function appendAgentHubNotice(parent, text) {
+    const note = document.createElement("p");
+    note.setAttribute("data-octobuddy-channel-status-note", "");
+    note.textContent = text;
+    parent.append(note);
+  }
+
+  function appendAgentHubHeading(parent, text) {
+    const heading = document.createElement("h2");
+    heading.setAttribute("data-octobuddy-agent-hub-heading", "");
+    heading.textContent = text;
+    parent.append(heading);
+  }
+
+  function appendAgentHubTree(agents, tree) {
+    const childrenByParent = new Map();
+    for (const agent of agents) {
+      let children = childrenByParent.get(agent.parentId);
+      if (!children) {
+        children = [];
+        childrenByParent.set(agent.parentId, children);
+      }
+      children.push(agent);
+    }
+
+    function appendChildren(parentId, list, level) {
+      for (const agent of childrenByParent.get(parentId) ?? []) {
+        const item = document.createElement("li");
+        item.setAttribute("role", "treeitem");
+        item.setAttribute("aria-level", String(level));
+        item.setAttribute("aria-selected", String(agent.id === selectedAgentId));
+        const button = document.createElement("button");
+        button.type = "button";
+        button.setAttribute("data-octobuddy-agent-hub-agent", "");
+        button.setAttribute("aria-selected", String(agent.id === selectedAgentId));
+        button.setAttribute("aria-label", `${agent.agent}, ${agent.status}`);
+        const name = document.createElement("span");
+        name.textContent = agent.agent;
+        const status = document.createElement("span");
+        status.setAttribute("data-octobuddy-agent-hub-status", "");
+        status.textContent = agent.status;
+        button.append(name, status);
+        button.addEventListener("click", () => {
+          selectedAgentId = agent.id;
+          agentHubMobileView = "detail";
+          renderEntry();
+        });
+        item.append(button);
+
+        const descendants = document.createElement("ul");
+        descendants.setAttribute("role", "group");
+        appendChildren(agent.id, descendants, level + 1);
+        if (descendants.childElementCount > 0) item.append(descendants);
+        list.append(item);
+      }
+    }
+
+    appendChildren(null, tree, 1);
+  }
+
+  function appendAgentHubSection(parent, title, attribute) {
+    const section = document.createElement("section");
+    section.setAttribute("data-octobuddy-agent-hub-section", "");
+    appendAgentHubHeading(section, title);
+    const list = document.createElement("ul");
+    list.setAttribute(`data-octobuddy-agent-hub-${attribute}`, "");
+    section.append(list);
+    parent.append(section);
+    return list;
+  }
+
+  function appendAgentHubDetails(agent, detail) {
+    const back = document.createElement("button");
+    back.type = "button";
+    back.setAttribute("data-octobuddy-agent-hub-list-toggle", "");
+    back.textContent = "返回智能体列表";
+    back.addEventListener("click", () => {
+      agentHubMobileView = "list";
+      renderEntry();
+    });
+    detail.append(back);
+    appendAgentHubHeading(detail, agent.agent);
+    const status = document.createElement("p");
+    status.setAttribute("data-octobuddy-agent-hub-status", "");
+    status.textContent = agent.status;
+    detail.append(status);
+    if (agent.description !== null) {
+      const description = document.createElement("p");
+      description.setAttribute("data-octobuddy-agent-hub-description", "");
+      description.textContent = agent.description;
+      detail.append(description);
+    }
+
+    const activity = appendAgentHubSection(detail, "活动", "activity");
+    if (agent.activity.length === 0) {
+      appendAgentHubNotice(activity.parentElement, "暂无活动");
+    } else {
+      for (const entry of agent.activity) {
+        const item = document.createElement("li");
+        item.setAttribute("data-octobuddy-agent-hub-activity-item", "");
+        item.textContent = agentHubValueText(entry);
+        activity.append(item);
+      }
+    }
+
+    const messages = appendAgentHubSection(detail, "对话", "messages");
+    if (agent.messages.length === 0) {
+      appendAgentHubNotice(messages.parentElement, "暂无对话");
+    } else {
+      for (const entry of agent.messages) {
+        const message = document.createElement("article");
+        message.setAttribute("data-octobuddy-agent-hub-message", "");
+        const isRecord = entry !== null && typeof entry === "object" && !Array.isArray(entry);
+        const role = isRecord && typeof entry.role === "string" ? entry.role : "消息";
+        const body = isRecord
+          ? entry.content ?? entry.text ?? entry.message ?? entry
+          : entry;
+        const roleNode = document.createElement("p");
+        roleNode.setAttribute("data-octobuddy-agent-hub-message-role", "");
+        roleNode.textContent = role;
+        const content = document.createElement("div");
+        content.setAttribute("data-octobuddy-agent-hub-message-content", "");
+        appendAgentHubMessageContent(content, body);
+        message.append(roleNode, content);
+
+        if (isRecord) {
+          const metadata = { ...entry };
+          delete metadata.role;
+          delete metadata.content;
+          delete metadata.text;
+          delete metadata.message;
+          if (Object.keys(metadata).length > 0) {
+            const metadataNode = document.createElement("pre");
+            metadataNode.setAttribute("data-octobuddy-agent-hub-message-meta", "");
+            metadataNode.textContent = JSON.stringify(metadata, null, 2);
+            message.append(metadataNode);
+          }
+        }
+        messages.append(message);
+      }
+    }
+  }
+
+  function renderAgentHub() {
+    const hub = document.createElement("section");
+    hub.setAttribute("data-octobuddy-agent-hub", "");
+    hub.setAttribute("aria-label", "Agent Hub");
+    hub.dataset.view = agentHubMobileView;
+    const treePane = document.createElement("div");
+    treePane.setAttribute("data-octobuddy-agent-hub-tree-pane", "");
+    const detailPane = document.createElement("div");
+    detailPane.setAttribute("data-octobuddy-agent-hub-detail", "");
+    const tree = document.createElement("ul");
+    tree.setAttribute("role", "tree");
+    tree.setAttribute("aria-label", "Agent list");
+    tree.setAttribute("data-octobuddy-agent-hub-tree", "");
+    appendAgentHubHeading(treePane, "Agents");
+    treePane.append(tree);
+    hub.append(treePane, detailPane);
+    panelBody.append(hub);
+
+    if (!currentChat) {
+      appendAgentHubNotice(treePane, "无法识别当前聊天");
+      return;
+    }
+    if (!detailReady || !currentStatus) {
+      appendAgentHubNotice(treePane, "正在获取服务状态以识别当前聊天…");
+      return;
+    }
+    if (currentStatus.state !== "online") {
+      appendAgentHubNotice(treePane, `服务${STATUS_LABELS[currentStatus.state]}，Agent Hub 暂不可用。`);
+      return;
+    }
+    const target = resolveChatTarget();
+    if (!target) {
+      appendAgentHubNotice(treePane, "无法识别当前聊天");
+      return;
+    }
+    if (!sameTarget(agentHubLookupTarget, target)) {
+      appendAgentHubNotice(treePane, "正在读取当前聊天的 Agent Hub…");
+      return;
+    }
+    if (agentHubLoading && agentHubResult?.state !== "online") {
+      appendAgentHubNotice(treePane, "正在读取当前聊天的 Agent Hub…");
+      return;
+    }
+    if (!agentHubResult) {
+      appendAgentHubNotice(treePane, "等待 Agent Hub 查询");
+      return;
+    }
+    if (agentHubResult.state !== "online") {
+      const messages = {
+        offline: "Agent Hub 读取失败：服务暂时无法连接。",
+        unconfigured: "Agent Hub 读取失败：接口尚未配置。",
+        unauthorized: "Agent Hub 读取失败：认证失败。",
+        invalid: "Agent Hub 读取失败：接口响应无效。",
+      };
+      appendAgentHubNotice(treePane, messages[agentHubResult.state]);
+      return;
+    }
+
+    const agents = agentHubResult.snapshot.agents;
+    if (agents.length === 0) {
+      appendAgentHubNotice(treePane, "当前聊天没有 Agent。");
+      return;
+    }
+    if (!agents.some((agent) => agent.id === selectedAgentId)) selectedAgentId = agents[0].id;
+    appendAgentHubTree(agents, tree);
+    const selected = agents.find((agent) => agent.id === selectedAgentId);
+    if (selected) appendAgentHubDetails(selected, detailPane);
+  }
+
   function renderStatusTab() {
     if (!detailReady || !currentStatus) {
       appendHeading("服务状态");
@@ -792,9 +1267,11 @@
 
   function renderDetails() {
     panelBody.replaceChildren();
+    panel.setAttribute("data-agent-hub-active", String(activeTab === "agent-hub"));
     panelBody.setAttribute("aria-labelledby", tabButtons[activeTab].id);
     if (activeTab === "status") renderStatusTab();
     else if (activeTab === "context") appendContextTab();
+    else if (activeTab === "agent-hub") renderAgentHub();
     else appendAssociationsTab();
   }
 
@@ -813,7 +1290,8 @@
       renderDetails();
       positionPanel();
     }
-    if (key !== "status"
+    if (key === "agent-hub") void refreshAgentHub();
+    else if (key !== "status"
       && (previousTab === "status" || !chatDetailsResult || chatDetailsResult.state !== "online")) {
       void refreshChatDetails();
     }
@@ -930,6 +1408,8 @@
     } else {
       detailReady = false;
       clearChatDetails();
+      clearAgentHub();
+      panel.setAttribute("data-agent-hub-active", "false");
       panelBody.replaceChildren();
     }
   }
@@ -945,7 +1425,8 @@
       if (currentStatus.state === "online") {
         lastSuccess = currentStatus.snapshot;
         void refreshChatStatus();
-        if (expanded && activeTab !== "status") void refreshChatDetails();
+        if (expanded && activeTab === "agent-hub") void refreshAgentHub();
+        else if (expanded && activeTab !== "status") void refreshChatDetails();
       } else {
         if (currentStatus.state === "invalid" || currentStatus.state === "unconfigured") {
           lastSuccess = undefined;
@@ -957,6 +1438,7 @@
         }
         clearChatStatus();
         clearChatDetails();
+        clearAgentHub();
       }
     } catch {
       if (disposed) return;
@@ -964,6 +1446,7 @@
       if (lastSuccess) currentStatus.lastSuccess = lastSuccess;
       clearChatStatus();
       clearChatDetails();
+      clearAgentHub();
     } finally {
       requestInFlight = false;
       if (disposed) return;
@@ -995,6 +1478,7 @@
     if (disposed) return;
     disposed = true;
     clearChatDetails();
+    clearAgentHub();
     chatRequestSequence += 1;
     activeChatRequest = undefined;
     if (refreshTimeout) window.clearTimeout(refreshTimeout);

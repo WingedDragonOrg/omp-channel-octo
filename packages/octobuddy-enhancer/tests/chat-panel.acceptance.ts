@@ -146,6 +146,25 @@ const fullChatDetailsWithUnexpectedBody: { state: "online"; snapshot: ChatDetail
   },
 };
 
+type AgentHubSnapshot = {
+  version: 1;
+  channelType: 1 | 2 | 5;
+  channelId: string;
+  agents: {
+    id: string;
+    parentId: string | null;
+    agent: string;
+    status: string;
+    description: string | null;
+    activity: unknown[];
+    messages: unknown[];
+  }[];
+};
+
+type AgentHubResult =
+  | { state: "online"; snapshot: AgentHubSnapshot }
+  | { state: "unconfigured" | "offline" | "unauthorized" | "invalid"; lastSuccess?: AgentHubSnapshot };
+
 type RecordedDetailsRequest = { target: ChatIdentity; requestId: number };
 
 const emptyOfflineLastSuccess: ChannelSnapshot = {
@@ -170,6 +189,9 @@ interface ChatPanelFixture {
   setChannelStatus(status: ChannelStatus): Promise<boolean>;
   openedUrls(): string[];
   zedRequests(): Promise<ChatIdentity[]>;
+  agentHubRequests(): Promise<ChatIdentity[]>;
+  waitForAgentHubCount(count: number, timeoutMs?: number): Promise<number>;
+  resolveAgentHub(index: number, result: AgentHubResult): Promise<boolean>;
 }
 
 const contentScriptPath = new URL("../plugins/channel-status/content.js", import.meta.url);
@@ -249,6 +271,16 @@ async function withChatPanelPage(
       chatTargets: () => readBridge("window.__chatPanelTestBridge.requests.map((request) => request.target)"),
       cancelledTargets: () => readBridge("window.__chatPanelTestBridge.cancelled.map((id) => window.__chatPanelTestBridge.requests.find((request) => request.id === id).target)"),
       detailsRequests: () => readBridge("window.__chatPanelTestBridge.details.map(({ target, requestId }) => ({ target, requestId }))"),
+      agentHubRequests: () => readBridge("window.__chatPanelTestBridge.agentHub.map((request) => request.target)"),
+      waitForAgentHubCount: (count, timeoutMs = 3_000) => readBridge(`(async () => {
+        const deadline = Date.now() + ${timeoutMs};
+        while (window.__chatPanelTestBridge.agentHub.length < ${count} && Date.now() < deadline) {
+          const { promise, resolve } = Promise.withResolvers();
+          window.setTimeout(resolve, 10);
+          await promise;
+        }
+        return window.__chatPanelTestBridge.agentHub.length;
+      })()`),
       cancelledDetailRequestIds: () => readBridge("window.__chatPanelTestBridge.cancelledDetails"),
       waitForDetailsCount: (count) => readBridge(`(async () => {
         const deadline = Date.now() + 3_000;
@@ -261,6 +293,7 @@ async function withChatPanelPage(
       })()`),
       resolveChatStatus: (index, status) => readBridge(`window.__chatPanelTestBridge.resolve(${index}, ${JSON.stringify(status)})`),
       resolveChatDetails: (index, details) => readBridge(`window.__chatPanelTestBridge.resolveDetails(${index}, ${JSON.stringify(details)})`),
+      resolveAgentHub: (index, result) => readBridge(`window.__chatPanelTestBridge.resolveAgentHub(${index}, ${JSON.stringify(result)})`),
       setChannelStatus: (status) => readBridge(`window.__chatPanelTestBridge.setServiceStatus(${JSON.stringify(status)})`),
       zedRequests: () => readBridge("window.__chatPanelTestBridge.zedRequests"),
       openedUrls: () => externalRequests.slice(),
@@ -289,6 +322,7 @@ function bridgeBootstrap(initialServiceStatus: ChannelStatus): string {
   const requests = [];
   const cancelled = [];
   const details = [];
+  const agentHub = [];
   const cancelledDetails = [];
   const zedRequests = [];
   const disposeCallbacks = [];
@@ -299,6 +333,7 @@ function bridgeBootstrap(initialServiceStatus: ChannelStatus): string {
       requests,
       cancelled,
       details,
+      agentHub,
       cancelledDetails,
       zedRequests,
       setServiceStatus(status) {
@@ -320,7 +355,15 @@ function bridgeBootstrap(initialServiceStatus: ChannelStatus): string {
         request.resolve = undefined;
         resolve(structuredClone(response));
         return true;
-      }
+      },
+      resolveAgentHub(index, response) {
+        const request = agentHub[index];
+        if (!request || !request.resolve) return false;
+        const resolve = request.resolve;
+        request.resolve = undefined;
+        resolve(structuredClone(response));
+        return true;
+      },
     }
   });
   Object.defineProperty(window, "octoEnhancer", {
@@ -336,6 +379,11 @@ function bridgeBootstrap(initialServiceStatus: ChannelStatus): string {
       getChatDetails: (target, requestId) => {
         const { promise, resolve } = Promise.withResolvers();
         details.push({ target: structuredClone(target), requestId, resolve });
+        return promise;
+      },
+      getAgentHub: (target) => {
+        const { promise, resolve } = Promise.withResolvers();
+        agentHub.push({ target: structuredClone(target), resolve });
         return promise;
       },
       cancelChatDetails: async (requestId) => { cancelledDetails.push(requestId); },
@@ -590,7 +638,7 @@ test("the panel defaults to status, stays about 420px wide, and remains usable o
     await panel.waitFor({ state: "visible" });
     const statusTab = panel.getByRole("tab", { name: /状态|status/i });
     await statusTab.waitFor({ state: "visible" });
-    expect(await panel.getByRole("tab").count()).toBe(3);
+    expect(await panel.getByRole("tab").count()).toBe(4);
     expect(await statusTab.getAttribute("aria-selected")).toBe("true");
     expect(await panelText(page)).toContain("47291");
 
@@ -845,5 +893,299 @@ test("switching chats cancels pending details, clears prior associations and ign
     expect(currentPanelText).toContain("Current chat task");
     expect(currentPanelText).not.toContain("Old chat confidential task");
     expect(currentPanelText).not.toContain("openai/old-model");
+  }, onlineChannelStatus);
+}, 15_000);
+
+test("the Agent Hub page renders its tree, activity, and complete conversation across wide and narrow layouts", async () => {
+  const completeMessage = `${"Full Agent Hub conversation text. ".repeat(120)}FULL_AGENT_HUB_CONVERSATION_END`;
+  const snapshot: AgentHubSnapshot = {
+    version: 1,
+    ...threadTarget,
+    agents: [
+      {
+        id: "run-main",
+        parentId: null,
+        agent: "coordinator",
+        status: "running",
+        description: "Coordinates the current request",
+        activity: [{ type: "tool", summary: "Started the chat task" }],
+        messages: [{ role: "assistant", content: "I will delegate the research." }],
+      },
+      {
+        id: "run-researcher",
+        parentId: "run-main",
+        agent: "researcher",
+        status: "completed",
+        description: "Read the linked implementation",
+        activity: [{ type: "tool", summary: "AGENT_HUB_ACTIVITY_SENTINEL" }],
+        messages: [
+          { role: "user", content: "Inspect the current endpoint." },
+          { role: "assistant", content: completeMessage },
+        ],
+      },
+    ],
+  };
+
+  await withChatPanelPage(async ({ page, resolveChatStatus, agentHubRequests, waitForAgentHubCount, resolveAgentHub }) => {
+    await openPanel(page);
+    await announceChat(page, threadTarget);
+    expect(await resolveChatStatus(0, onlineChatStatus(initialChat))).toBe(true);
+
+    const panel = page.locator(chatPanelRegion);
+    await panel.getByRole("tab", { name: /Agent Hub|智能体/i }).click();
+    expect(await waitForAgentHubCount(1)).toBeGreaterThanOrEqual(1);
+    expect(await agentHubRequests()).toEqual([threadTarget]);
+    expect(await resolveAgentHub(0, { state: "online", snapshot })).toBe(true);
+
+    const hub = page.locator("[data-octobuddy-agent-hub]");
+    await hub.waitFor({ state: "visible" });
+    const tree = hub.locator("[data-octobuddy-agent-hub-tree]");
+    const items = tree.getByRole("treeitem");
+    await items.nth(1).waitFor({ state: "visible" });
+    expect(await items.count()).toBe(2);
+    expect(await items.nth(0).getAttribute("aria-level")).toBe("1");
+    expect(await items.nth(1).getAttribute("aria-level")).toBe("2");
+    await items.nth(1).click();
+
+    const details = hub.locator("[data-octobuddy-agent-hub-detail]");
+    await details.waitFor({ state: "visible" });
+    const detailsText = await details.innerText();
+    expect(detailsText).toContain("researcher");
+    expect(detailsText).toContain("completed");
+    expect(detailsText).toContain("Read the linked implementation");
+    expect(detailsText).toContain("AGENT_HUB_ACTIVITY_SENTINEL");
+    expect(detailsText).toContain("Inspect the current endpoint.");
+    expect(detailsText).toContain(completeMessage);
+
+    const treeBox = await tree.boundingBox();
+    const detailBox = await details.boundingBox();
+    expect(treeBox).not.toBeNull();
+    expect(detailBox).not.toBeNull();
+    if (treeBox && detailBox) expect(treeBox.x + treeBox.width).toBeLessThanOrEqual(detailBox.x + 2);
+
+    await page.setViewportSize({ width: 360, height: 640 });
+    await hub.getByRole("button", { name: /Agent list|Back to list|智能体列表|返回列表/i }).click();
+    expect(await tree.isVisible()).toBe(true);
+    expect(await details.isVisible()).toBe(false);
+    await items.nth(1).click();
+    expect(await tree.isVisible()).toBe(false);
+    expect(await details.isVisible()).toBe(true);
+    expect(await details.innerText()).toContain(completeMessage);
+  }, onlineChannelStatus);
+}, 15_000);
+
+test("Agent Hub renders OMP transcript text blocks naturally and retains complete tool calls and metadata", async () => {
+  const firstText = "I will inspect the worker lease before answering.";
+  const finalText = `The lease closes only its owned worker. ${"OMP transcript continuation. ".repeat(80)}OMP_TRANSCRIPT_TEXT_END`;
+  const toolArgument = `${"inspect current implementation; ".repeat(80)}OMP_TOOL_ARGUMENT_END`;
+  const messageMetadata = `${"persisted transcript metadata. ".repeat(80)}OMP_MESSAGE_METADATA_END`;
+  const snapshot: AgentHubSnapshot = {
+    version: 1,
+    ...threadTarget,
+    agents: [{
+      id: "run-omp-transcript",
+      parentId: null,
+      agent: "worker",
+      status: "completed",
+      description: "Reads the worker lease implementation",
+      activity: [],
+      messages: [{
+        role: "assistant",
+        content: [
+          { type: "text", text: firstText },
+          {
+            type: "toolCall",
+            id: "call-omp-agent-hub-1",
+            name: "read",
+            arguments: { path: "src/runtime/worker-lease.ts", query: toolArgument },
+          },
+          { type: "text", text: finalText },
+        ],
+        api: "openai-responses",
+        provider: "openai",
+        model: "gpt-6-luna",
+        timestamp: 1790000000000,
+        stopReason: "toolUse",
+        usage: { input: 412, output: 63, cacheRead: 81, cacheWrite: 0 },
+        audit: messageMetadata,
+      }],
+    }],
+  };
+
+  await withChatPanelPage(async ({ page, resolveChatStatus, waitForAgentHubCount, resolveAgentHub }) => {
+    await openPanel(page);
+    await announceChat(page, threadTarget);
+    expect(await resolveChatStatus(0, onlineChatStatus(initialChat))).toBe(true);
+    const panel = page.locator(chatPanelRegion);
+    await panel.getByRole("tab", { name: /Agent Hub|智能体/i }).click();
+    expect(await waitForAgentHubCount(1)).toBeGreaterThanOrEqual(1);
+    expect(await resolveAgentHub(0, { state: "online", snapshot })).toBe(true);
+
+    const message = page.locator("[data-octobuddy-agent-hub-message]").first();
+    const content = message.locator("[data-octobuddy-agent-hub-message-content]");
+    await content.getByText("OMP_TRANSCRIPT_TEXT_END").waitFor({ state: "visible" });
+    const bodyText = await content.innerText();
+    expect(bodyText).toContain(firstText);
+    expect(bodyText).toContain(finalText);
+    expect(bodyText).not.toMatch(/"type"\s*:\s*"text"/);
+
+    const renderedMessage = await message.innerText();
+    expect(renderedMessage).toContain("call-omp-agent-hub-1");
+    expect(renderedMessage).toContain("src/runtime/worker-lease.ts");
+    expect(renderedMessage).toContain(toolArgument);
+    expect(renderedMessage).toContain("openai-responses");
+    expect(renderedMessage).toContain("gpt-6-luna");
+    expect(renderedMessage).toContain("stopReason");
+    expect(renderedMessage).toContain("toolUse");
+    expect(renderedMessage).toContain("cacheWrite");
+    expect(renderedMessage).toContain(messageMetadata);
+  }, onlineChannelStatus);
+}, 15_000);
+
+test("Agent Hub distinguishes a chat with no agents from a failed data read", async () => {
+  const emptyTarget: ChatIdentity = { channelType: 2, channelId: "group-without-agents" };
+  const failedTarget: ChatIdentity = { channelType: 5, channelId: "group____agent-hub-offline" };
+  const emptySnapshot: AgentHubSnapshot = { version: 1, ...emptyTarget, agents: [] };
+  const noAgents = /no agents|暂无[ \t\n]*(?:agent|智能体)|没有(?:可用的)?[ \t\n]*(?:agent|智能体)/i;
+  const readFailure = /读取失败|无法读取|读取错误|failed|failure|error|offline|unavailable|暂不可用/i;
+
+  await withChatPanelPage(async ({ page, resolveChatStatus, agentHubRequests, waitForAgentHubCount, resolveAgentHub }) => {
+    await openPanel(page);
+    await announceChat(page, emptyTarget);
+    expect(await resolveChatStatus(0, onlineChatStatus({ ...initialChat, ...emptyTarget }))).toBe(true);
+    const panel = page.locator(chatPanelRegion);
+    await panel.getByRole("tab", { name: /Agent Hub|智能体/i }).click();
+    expect(await waitForAgentHubCount(1)).toBeGreaterThanOrEqual(1);
+    expect(await resolveAgentHub(0, { state: "online", snapshot: emptySnapshot })).toBe(true);
+    await page.getByText(noAgents).waitFor({ state: "visible" });
+    expect(await panel.getByRole("tabpanel").innerText()).toMatch(noAgents);
+
+    await announceChat(page, failedTarget);
+    expect(await waitForAgentHubCount(2)).toBeGreaterThanOrEqual(2);
+    expect(await agentHubRequests()).toEqual([emptyTarget, failedTarget]);
+    const hub = page.locator("[data-octobuddy-agent-hub]");
+    expect(await hub.innerText()).not.toMatch(noAgents);
+    expect(await resolveAgentHub(1, { state: "offline" })).toBe(true);
+    await page.getByText(readFailure).waitFor({ state: "visible" });
+    const failedText = await hub.innerText();
+    expect(failedText).toMatch(readFailure);
+    expect(failedText).not.toMatch(noAgents);
+  }, onlineChannelStatus);
+}, 15_000);
+
+test("Agent Hub refreshes the current chat until a running agent completes", async () => {
+  const target: ChatIdentity = { channelType: 2, channelId: "group-agent-hub-refresh" };
+  const runningSnapshot: AgentHubSnapshot = {
+    version: 1,
+    ...target,
+    agents: [{
+      id: "run-refresh",
+      parentId: null,
+      agent: "worker",
+      status: "running",
+      description: "Working on the current request",
+      activity: [{ type: "tool", summary: "Started refresh fixture" }],
+      messages: [{ role: "assistant", content: "RUNNING_AGENT_HUB_REFRESH_SENTINEL" }],
+    }],
+  };
+  const completedSnapshot: AgentHubSnapshot = {
+    version: 1,
+    ...target,
+    agents: [{
+      id: "run-refresh",
+      parentId: null,
+      agent: "worker",
+      status: "completed",
+      description: "Finished the current request",
+      activity: [{ type: "tool", summary: "Completed refresh fixture" }],
+      messages: [{ role: "assistant", content: "COMPLETED_AGENT_HUB_REFRESH_SENTINEL" }],
+    }],
+  };
+
+  await withChatPanelPage(async ({
+    page,
+    resolveChatStatus,
+    agentHubRequests,
+    waitForAgentHubCount,
+    resolveAgentHub,
+  }) => {
+    await openPanel(page);
+    await announceChat(page, target);
+    expect(await resolveChatStatus(0, onlineChatStatus({ ...initialChat, ...target }))).toBe(true);
+
+    const panel = page.locator(chatPanelRegion);
+    await panel.getByRole("tab", { name: /Agent Hub|智能体/i }).click();
+    expect(await waitForAgentHubCount(1)).toBeGreaterThanOrEqual(1);
+    expect(await resolveAgentHub(0, { state: "online", snapshot: runningSnapshot })).toBe(true);
+
+    const hub = page.locator("[data-octobuddy-agent-hub]");
+    await page.getByText("RUNNING_AGENT_HUB_REFRESH_SENTINEL", { exact: true }).waitFor({ state: "visible" });
+    expect(await waitForAgentHubCount(2, 8_000)).toBeGreaterThanOrEqual(2);
+    expect(await agentHubRequests()).toEqual([target, target]);
+    expect(await hub.innerText()).toContain("RUNNING_AGENT_HUB_REFRESH_SENTINEL");
+    expect(await hub.innerText()).not.toContain("正在读取当前聊天的 Agent Hub");
+
+    expect(await resolveAgentHub(1, { state: "online", snapshot: completedSnapshot })).toBe(true);
+    await page.getByText("COMPLETED_AGENT_HUB_REFRESH_SENTINEL", { exact: true }).waitFor({ state: "visible" });
+    const refreshedText = await hub.innerText();
+    expect(refreshedText).toContain("completed");
+    expect(refreshedText).toContain("COMPLETED_AGENT_HUB_REFRESH_SENTINEL");
+    expect(refreshedText).not.toContain("RUNNING_AGENT_HUB_REFRESH_SENTINEL");
+  }, onlineChannelStatus);
+}, 15_000);
+
+test("switching chats requests the new Agent Hub and ignores a late response from the previous chat", async () => {
+  const previousTarget: ChatIdentity = { channelType: 2, channelId: "group-agent-hub-before-switch" };
+  const currentTarget: ChatIdentity = { channelType: 5, channelId: "group____agent-hub-after-switch" };
+  const previousSnapshot: AgentHubSnapshot = {
+    version: 1,
+    ...previousTarget,
+    agents: [{
+      id: "old-run",
+      parentId: null,
+      agent: "old-agent",
+      status: "running",
+      description: "Previous chat data",
+      activity: [],
+      messages: [{ role: "assistant", content: "OLD_AGENT_HUB_RESPONSE_SENTINEL" }],
+    }],
+  };
+  const currentSnapshot: AgentHubSnapshot = {
+    version: 1,
+    ...currentTarget,
+    agents: [{
+      id: "new-run",
+      parentId: null,
+      agent: "current-agent",
+      status: "running",
+      description: "Current chat data",
+      activity: [],
+      messages: [{ role: "assistant", content: "CURRENT_AGENT_HUB_RESPONSE_SENTINEL" }],
+    }],
+  };
+
+  await withChatPanelPage(async ({ page, resolveChatStatus, agentHubRequests, waitForAgentHubCount, resolveAgentHub }) => {
+    await openPanel(page);
+    await announceChat(page, previousTarget);
+    expect(await resolveChatStatus(0, onlineChatStatus({ ...initialChat, ...previousTarget }))).toBe(true);
+    const panel = page.locator(chatPanelRegion);
+    await panel.getByRole("tab", { name: /Agent Hub|智能体/i }).click();
+    expect(await waitForAgentHubCount(1)).toBeGreaterThanOrEqual(1);
+
+    await announceChat(page, currentTarget);
+    expect(await waitForAgentHubCount(2)).toBeGreaterThanOrEqual(2);
+    expect(await agentHubRequests()).toEqual([previousTarget, currentTarget]);
+    const hub = page.locator("[data-octobuddy-agent-hub]");
+    expect(await hub.innerText()).not.toContain("OLD_AGENT_HUB_RESPONSE_SENTINEL");
+
+    expect(await resolveAgentHub(1, { state: "online", snapshot: currentSnapshot })).toBe(true);
+    await page.getByText("CURRENT_AGENT_HUB_RESPONSE_SENTINEL", { exact: true }).waitFor({ state: "visible" });
+    expect(await resolveAgentHub(0, { state: "online", snapshot: previousSnapshot })).toBe(true);
+    await settleStatusRendering(page);
+    const currentText = await hub.innerText();
+    expect(currentText).toContain("current-agent");
+    expect(currentText).toContain("CURRENT_AGENT_HUB_RESPONSE_SENTINEL");
+    expect(currentText).not.toContain("old-agent");
+    expect(currentText).not.toContain("OLD_AGENT_HUB_RESPONSE_SENTINEL");
   }, onlineChannelStatus);
 }, 15_000);

@@ -2364,6 +2364,57 @@ describe("OMP RPC worker", () => {
 		});
 	});
 
+	test("reads a live OMP subagent and its transcript through the owning worker RPC", async () => {
+		await withHarness("agent-hub", async harness => {
+			type AgentHubWorker = typeof harness.worker & {
+				getSubagents(signal?: AbortSignal): Promise<LogEntry[]>;
+				getSubagentMessages(subagentId: string, signal?: AbortSignal): Promise<LogEntry>;
+			};
+			const worker = harness.worker as AgentHubWorker;
+			const prompt = harness.worker.prompt("run an agent hub fixture", () => {});
+			const gatePath = `${harness.logPath}.agent-hub`;
+			try {
+				await waitUntil(() => existsSync(gatePath));
+				const subagents = await worker.getSubagents();
+				expect(subagents).toEqual([
+					expect.objectContaining({
+						id: "live-agent",
+						index: 0,
+						agent: "scout",
+						agentSource: "bundled",
+						description: "Live scout",
+						status: "running",
+						sessionFile: expect.stringContaining("live-agent.jsonl"),
+					}),
+				]);
+
+				const transcript = await worker.getSubagentMessages("live-agent");
+				expect(transcript).toMatchObject({
+					sessionFile: expect.stringContaining("live-agent.jsonl"),
+					fromByte: 0,
+					reset: false,
+					messages: [
+						{ id: "hub-live-user", role: "user", content: [{ type: "text", text: "live child input" }] },
+						{ id: "hub-live-assistant", role: "assistant", content: [{ type: "text", text: "live child reply" }] },
+					],
+				});
+				expect(transcript.entries).toContainEqual(
+					expect.objectContaining({ type: "session_init", agent: "scout", task: "Inspect the live fixture" }),
+				);
+
+				const commands = await readLog(harness.logPath);
+				expect(rpcCommands(commands, "get_subagents")).toHaveLength(1);
+				const messageRequests = rpcCommands(commands, "get_subagent_messages");
+				expect(messageRequests).toHaveLength(1);
+				expect(messageRequests[0]).toMatchObject({ subagentId: "live-agent" });
+				expect(messageRequests[0]).not.toHaveProperty("sessionFile");
+			} finally {
+				await rm(gatePath, { force: true });
+				await prompt;
+			}
+		});
+	});
+
 	test("keeps the worker usable when the deployment offers no subagent subscription", async () => {
 		await withHarness("no-subagent-subscription", async harness => {
 			const events: WorkerEvent[] = [];

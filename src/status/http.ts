@@ -3,6 +3,7 @@ import { createZedFileLinkResolvers } from "../file-links.ts";
 
 import type {
   ChatDetailsSnapshot,
+  ChatAgentsSnapshot,
   ChatCommandsSnapshot,
   ChatStatusSnapshot,
   ChatTarget,
@@ -16,6 +17,7 @@ interface StatusHandlerOptions {
   chatStatusSnapshot: (target: ChatTarget) => ChatStatusSnapshot;
   chatDetailsSnapshot: (target: ChatTarget, signal: AbortSignal) => Promise<ChatDetailsSnapshot>;
   chatCommandsSnapshot?: (target: ChatTarget, signal: AbortSignal) => Promise<ChatCommandsSnapshot | null>;
+  chatAgentsSnapshot?: (target: ChatTarget, signal: AbortSignal) => Promise<ChatAgentsSnapshot>;
   fileLinks?: FileLinkConfig;
 }
 
@@ -73,6 +75,7 @@ export function createStatusHandler({
   chatStatusSnapshot,
   chatDetailsSnapshot,
   chatCommandsSnapshot,
+  chatAgentsSnapshot,
   fileLinks,
 }: StatusHandlerOptions): (request: Request) => Promise<Response> {
   return async request => {
@@ -111,6 +114,18 @@ export function createStatusHandler({
         }
         return jsonResponse(snapshot);
       }
+      if (url.pathname === "/v1/chats/agents") {
+        const target = parseChatTarget(url.searchParams);
+        if (target === null) return errorResponse(400, "invalid_request");
+        if (chatAgentsSnapshot === undefined) return errorResponse(503, "unavailable");
+
+        const snapshot = await chatAgentsSnapshot(target, request.signal);
+        if (snapshot.channelType !== target.channelType || snapshot.channelId !== target.channelId) {
+          return errorResponse(500, "internal_error");
+        }
+        return jsonResponse(snapshot);
+      }
+
 
       if (url.pathname === "/v1/chats/commands") {
         const target = parseChatTarget(url.searchParams);

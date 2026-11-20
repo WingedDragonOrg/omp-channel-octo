@@ -78,6 +78,28 @@ export type ChatDetailsResult =
   | { state: "online"; snapshot: ChatDetailsSnapshot }
   | { state: "unconfigured" | "offline" | "unauthorized" | "invalid"; lastSuccess?: ChatDetailsSnapshot };
 
+export interface AgentHubAgent {
+  id: string;
+  parentId: string | null;
+  agent: string;
+  status: string;
+  description: string | null;
+  activity: unknown[];
+  messages: unknown[];
+}
+
+export interface AgentHubSnapshot {
+  version: 1;
+  channelType: ChatChannelType;
+  channelId: string;
+  agents: AgentHubAgent[];
+}
+
+export type AgentHubResult =
+  | { state: "online"; snapshot: AgentHubSnapshot }
+  | { state: "unconfigured" | "offline" | "unauthorized" | "invalid" };
+
+
 export interface ChatCommandSubcommand {
   name: string;
   description?: string;
@@ -111,6 +133,7 @@ export interface StatusClient {
   getChat(target: ChatTarget, signal?: AbortSignal): Promise<ChatStatusResult>;
   getChatDetails(target: ChatTarget, signal?: AbortSignal): Promise<ChatDetailsResult>;
   getChatCommands(target: ChatTarget, signal?: AbortSignal): Promise<ChatCommandsResult>;
+  getAgentHub(target: ChatTarget, signal?: AbortSignal): Promise<AgentHubResult>;
 }
 
 export interface StatusClientOptions {
@@ -434,6 +457,34 @@ function parseChatDetailsSnapshot(value: unknown, target: ChatTarget): ChatDetai
   };
 }
 
+function parseAgentHubSnapshot(value: unknown, target: ChatTarget): AgentHubSnapshot | undefined {
+  if (!isRecord(value) || !Array.isArray(value.agents)) return undefined;
+  const { version, channelType, channelId, agents } = value;
+  if (
+    version !== 1 ||
+    channelType !== target.channelType ||
+    channelId !== target.channelId ||
+    !agents.every((agent) =>
+      isRecord(agent) &&
+      typeof agent.id === "string" &&
+      (agent.parentId === null || typeof agent.parentId === "string") &&
+      typeof agent.agent === "string" &&
+      typeof agent.status === "string" &&
+      (agent.description === null || typeof agent.description === "string") &&
+      Array.isArray(agent.activity) &&
+      Array.isArray(agent.messages))
+  ) {
+    return undefined;
+  }
+  return {
+    version: 1,
+    channelType: target.channelType,
+    channelId: target.channelId,
+    agents: agents as AgentHubAgent[],
+  };
+}
+
+
 function parseChatCommand(value: unknown): ChatCommand | undefined {
   if (!isRecord(value)) return undefined;
   const { name, source, description, hint, aliases, subcommands } = value;
@@ -551,6 +602,16 @@ function chatCommandsEndpointUrl(baseUrl: URL, target: ChatTarget): URL {
   return url;
 }
 
+function agentHubEndpointUrl(baseUrl: URL, target: ChatTarget): URL {
+  const url = new URL(baseUrl.href);
+  const prefix = url.pathname.replace(/\/+$/, "");
+  url.pathname = `${prefix}/v1/chats/agents`;
+  url.searchParams.set("channelType", String(target.channelType));
+  url.searchParams.set("channelId", target.channelId);
+  return url;
+}
+
+
 function snapshotCopy(snapshot: StatusSnapshot): StatusSnapshot {
   return { ...snapshot };
 }
@@ -620,6 +681,12 @@ async function readBoundedResponse(response: Response, maxBytes = MAX_RESPONSE_B
   return bytes;
 }
 
+async function readUnboundedResponse(response: Response): Promise<Uint8Array | undefined> {
+  if (response.body === null) return undefined;
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+
 function isJsonContentType(response: Response): boolean {
   const contentType = response.headers.get("content-type");
   if (contentType === null) return false;
@@ -637,7 +704,7 @@ async function requestSnapshot<T>(
   signal: AbortSignal | undefined,
   parse: (value: unknown) => T | undefined,
   timeoutMs = REQUEST_TIMEOUT_MS,
-  maxBytes = MAX_RESPONSE_BYTES,
+  maxBytes: number | null = MAX_RESPONSE_BYTES,
 ): Promise<SnapshotRequestResult<T>> {
   const controller = new AbortController();
   const onAbort = (): void => controller.abort(signal?.reason);
@@ -673,7 +740,9 @@ async function requestSnapshot<T>(
       return { state: "invalid" };
     }
 
-    const body = await readBoundedResponse(response, maxBytes);
+    const body = maxBytes === null
+      ? await readUnboundedResponse(response)
+      : await readBoundedResponse(response, maxBytes);
     throwIfAborted(signal);
     if (body === undefined) return { state: "invalid" };
 
@@ -832,6 +901,28 @@ export function createStatusClient(options: StatusClientOptions): StatusClient {
         chatDetailsLastSuccess.set(key, { snapshot: result.snapshot, requestId });
       }
       return { state: "online", snapshot: chatDetailsSnapshotCopy(result.snapshot) };
+    },
+
+    async getAgentHub(target: ChatTarget, signal?: AbortSignal): Promise<AgentHubResult> {
+      throwIfAborted(signal);
+      const loaded = await loadConfig(options.configPath);
+      throwIfAborted(signal);
+
+      if (loaded.state !== "ready") {
+        updateConfig(undefined);
+        return loaded.state === "missing" ? { state: "unconfigured" } : { state: "invalid" };
+      }
+
+      const { baseUrl, token } = loaded.config;
+      const result = await requestSnapshot(
+        agentHubEndpointUrl(baseUrl, target),
+        token,
+        signal,
+        (value) => parseAgentHubSnapshot(value, target),
+        REQUEST_TIMEOUT_MS,
+        null,
+      );
+      return result.state === "online" ? result : { state: result.state };
     },
 
     async getChatCommands(target: ChatTarget, signal?: AbortSignal): Promise<ChatCommandsResult> {

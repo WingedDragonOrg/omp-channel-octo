@@ -31,9 +31,11 @@ export OCTOBUDDY_HTTP_BASE_URL='http://my-mini:8765'
 export OCTOBUDDY_HTTP_TOKEN='<与服务端相同的 token>'
 ```
 
-进程环境变量优先于 `.envrc`；状态变量只传递给增强器宿主。已有私有配置 `~/.config/octobuddy-enhancer/status.json` 可作为未设置环境变量字段的回退，文件需由当前用户拥有、权限为 `0600` 且无额外 ACL。base URL 不要附加 `/v1/status`；公网应使用 HTTPS，明文 HTTP 会使 Bearer token 有被窃听的风险。该 token 允许读取整个 channel 的只读状态，应妥善保管。
+进程环境变量优先于 `.envrc`；状态变量只传递给增强器宿主。已有私有配置 `~/.config/octobuddy-enhancer/status.json` 可作为未设置环境变量字段的回退，文件需由当前用户拥有、权限为 `0600` 且无额外 ACL。base URL 不要附加 `/v1/status`；公网应使用 HTTPS，明文 HTTP 会使 Bearer token 有被窃听的风险。该 token 可读取整个 channel 的状态，以及 Agent Hub 的活动和对话内容，应妥善保管。
 
 面板显示服务整体状态及最近成功采样时间，并读取 OctoBuddy 页面提供的当前目标，随聊天切换自动查询群、子区或 Bot 私聊状态。群与子区使用页面提供的聊天 ID；Bot 私聊的页面 ID 是 Bot UID，而服务侧私聊目标是 owner UID，面板依据服务快照将其映射到该目标。聊天状态包括执行状态、模型策略、工作目录、排队任务数和待回答问题数。服务端启用、停用及 token 文件要求见主仓库 [状态接口说明](../../README.md#只读-http-状态接口)。
+
+Agent Hub 是同一面板中的只读视图，显示当前聊天绑定会话的 agent 树、状态、活动和完整对话；切换聊天时自动读取新目标。宽屏并排显示树与详情，窄屏可切换列表和详情。无 agent 与读取失败会分别显示，不提供控制 agent 的操作；沿用上述状态接口地址和 Bearer token。
 
 在 Bot 私聊、已启用群聊或子区的输入框输入 `/` 可查看当前聊天的 channel 与 OMP 命令。输入命令前缀可筛选，方向键选择，Tab、Enter 或鼠标补全，Esc 关闭；补全不会发送消息。未启用的群聊和子区不展示命令提示。目录包括项目文件命令和 skill 命令；由于 OMP 不提供交互能力标记，扩展命令不列入提示。OMP 命令目录依赖已配置并可访问的 channel HTTP 接口，目录不可用时输入框仍可正常使用。
 
