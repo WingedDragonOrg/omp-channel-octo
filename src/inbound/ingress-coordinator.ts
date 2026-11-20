@@ -667,6 +667,7 @@ export class IngressCoordinator {
           purpose: admission.purpose,
           sessionGeneration: barrierJobId ?? 0,
           binding,
+          ...(candidate.key.sourceKind === "recv" ? { sourceSenderUid: message.senderId } : {}),
           barrierJobId,
         };
         const checkpoint = admission.checkpoint === null ? null : {

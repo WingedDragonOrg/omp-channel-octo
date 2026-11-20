@@ -776,6 +776,59 @@ export function applySchema(db: Database): void {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS schedules (
+      id TEXT PRIMARY KEY NOT NULL,
+      bot_uid TEXT NOT NULL,
+      name TEXT NOT NULL,
+      cron TEXT NOT NULL,
+      timezone TEXT NOT NULL,
+      cwd TEXT NOT NULL,
+      spec_json TEXT NOT NULL,
+      source_channel_type INTEGER NOT NULL CHECK(source_channel_type IN (1, 2, 5)),
+      source_channel_id TEXT NOT NULL,
+      source_message_id TEXT NOT NULL,
+      source_requester_uid TEXT,
+      source_kind TEXT NOT NULL CHECK(source_kind IN ('direct', 'synthetic')),
+      source_task_id TEXT NOT NULL,
+      tool_call_id TEXT NOT NULL,
+      target_channel_type INTEGER NOT NULL CHECK(target_channel_type IN (1, 2, 5)),
+      target_channel_id TEXT NOT NULL,
+      timeout_ms INTEGER NOT NULL CHECK(timeout_ms > 0),
+      created_at INTEGER NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('active', 'paused', 'stopped')),
+      stopped_at INTEGER,
+      UNIQUE(bot_uid, source_task_id, tool_call_id)
+    );
+    CREATE TABLE IF NOT EXISTS schedule_runs (
+      id TEXT PRIMARY KEY NOT NULL,
+      schedule_id TEXT NOT NULL REFERENCES schedules(id),
+      bot_uid TEXT NOT NULL,
+      scheduled_at INTEGER NOT NULL,
+      target_channel_type INTEGER NOT NULL CHECK(target_channel_type IN (1, 2, 5)),
+      target_channel_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      started_at INTEGER,
+      ended_at INTEGER,
+      status TEXT NOT NULL CHECK(status IN ('claimed', 'dispatching', 'running', 'skipped', 'cancelled', 'failed', 'success', 'unknown')),
+      stage TEXT NOT NULL CHECK(stage IN ('claimed', 'dispatch-intent', 'accepted', 'process-exited', 'settled')),
+      stop_requested INTEGER NOT NULL DEFAULT 0 CHECK(stop_requested IN (0, 1)),
+      prompt_accepted INTEGER NOT NULL DEFAULT 0 CHECK(prompt_accepted IN (0, 1)),
+      process_json TEXT,
+      process_exited INTEGER NOT NULL DEFAULT 0 CHECK(process_exited IN (0, 1)),
+      session_id TEXT,
+      session_file TEXT,
+      result_text TEXT,
+      error_text TEXT,
+      stdout TEXT,
+      stderr TEXT,
+      skipped_reason TEXT,
+      artifacts_json TEXT NOT NULL DEFAULT '[]',
+      UNIQUE(schedule_id, scheduled_at)
+    );
+    CREATE INDEX IF NOT EXISTS schedules_source ON schedules(bot_uid, source_channel_type, source_channel_id, created_at, id);
+    CREATE INDEX IF NOT EXISTS schedules_active ON schedules(bot_uid, status, created_at, id);
+    CREATE INDEX IF NOT EXISTS schedule_runs_schedule ON schedule_runs(bot_uid, schedule_id, scheduled_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS schedule_runs_inflight ON schedule_runs(bot_uid, status, process_exited, created_at);
     CREATE INDEX IF NOT EXISTS source_watches_due ON source_watches(state, deadline_at, created_at);
     CREATE INDEX IF NOT EXISTS source_watches_bot_chat ON source_watches(bot_uid, channel_type, channel_id, created_at, id);
     CREATE INDEX IF NOT EXISTS source_watch_events_pending ON source_watch_events(watch_id, state, next_attempt_at, observed_at, id);
@@ -792,6 +845,7 @@ export function applySchema(db: Database): void {
   const taskColumns = query(db, "PRAGMA table_info(tasks)");
   const promptStartedWasMissing = !taskColumns.some((row) => asString(row.name) === "prompt_started");
   const promptAcceptedWasMissing = !taskColumns.some((row) => asString(row.name) === "prompt_accepted");
+  const scheduleCreateIdentityWasMissing = !taskColumns.some((row) => asString(row.name) === "schedule_create_identity_mixed");
   if (promptStartedWasMissing || promptAcceptedWasMissing) {
     transaction(db, () => {
       if (promptStartedWasMissing) {
@@ -801,6 +855,14 @@ export function applySchema(db: Database): void {
         db.exec("ALTER TABLE tasks ADD COLUMN prompt_accepted INTEGER NOT NULL DEFAULT 0");
       }
       if (promptStartedWasMissing) markLegacyStartedUnconfirmed(db);
+    });
+  }
+  // Prior task turns may already contain steering that had no persisted identity fence. Install
+  // and seed the sticky bit atomically so a crash cannot make old work look like a clean new turn.
+  if (scheduleCreateIdentityWasMissing) {
+    transaction(db, () => {
+      db.exec("ALTER TABLE tasks ADD COLUMN schedule_create_identity_mixed INTEGER NOT NULL DEFAULT 0 CHECK(schedule_create_identity_mixed IN (0, 1))");
+      db.exec("UPDATE tasks SET schedule_create_identity_mixed = 1");
     });
   }
   for (const statement of [

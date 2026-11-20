@@ -7,6 +7,7 @@ import type { DiscoveryRemote } from "./discovery/remote.ts";
 import type { WatchCollector, WatchJudge } from "./watch/types.ts";
 import type { WatchSourceFactory } from "./watch/source-types.ts";
 import type { LockHandle } from "./runtime/bot-lock.ts";
+import type { ScheduleClock } from "./scheduler/types.ts";
 
 export interface ChatTarget {
   channelId: string;
@@ -1124,6 +1125,8 @@ export interface ChannelServiceOptions {
    * can call `octo-cli` as this bot; failures leave the agent without a CLI identity.
    */
   cliCredentials?: CliCredentialPort;
+  /** Calendar clock/timer seam for isolated scheduler integration. Production defaults to system time. */
+  scheduleClock?: ScheduleClock;
   /**
    * Operator-visible allowlist baseline. A chat the owner enables at runtime is durable in the
    * state store on its own; this port is what keeps the config file's `allowedGroupIds` in step,

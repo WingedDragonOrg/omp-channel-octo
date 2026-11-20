@@ -311,6 +311,22 @@ export function getTask(db: Database, taskId: string): TaskRecord | null {
   return row ? taskFromRow(row) : null;
 }
 
+/** Persist the fail-closed schedule-creation fence once a task turn may contain mixed identities. */
+export function markTaskScheduleIdentityMixed(db: Database, taskId: string): boolean {
+  return transaction(db, () => {
+    if (run(
+      db,
+      "UPDATE tasks SET schedule_create_identity_mixed = 1 WHERE id = ? AND schedule_create_identity_mixed = 0",
+      [taskId],
+    ).changes === 1) return true;
+    return asNumber(query(
+      db,
+      "SELECT schedule_create_identity_mixed FROM tasks WHERE id = ?",
+      [taskId],
+    )[0]?.schedule_create_identity_mixed) === 1;
+  });
+}
+
 /** A confirmed native ratchet prompt enabled its prelude in this exact chat session. */
 export function hasRatchetSession(db: Database, botUid: string, target: ChatTarget, sessionId: string): boolean {
   return query(db,

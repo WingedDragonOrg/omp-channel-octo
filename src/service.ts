@@ -31,6 +31,7 @@ import {
 import { collectWatch } from "./watch/collector.ts";
 import { createWatchJudge } from "./watch/decision.ts";
 import { WatchCoordinator } from "./watch/index.ts";
+import { ScheduleCoordinator } from "./scheduler/index.ts";
 import { SourceWatchCoordinator } from "./watch/source-coordinator.ts";
 import {
   SessionLifecycle,
@@ -200,6 +201,7 @@ import type {
   SourceWatchListItem,
   SourceWatchRecord,
 } from "./watch/source-types.ts";
+import type { ScheduleAccessRole, ScheduleCreateRequest, ScheduleRecord } from "./scheduler/types.ts";
 import { captureReviewSnapshot } from "./review/snapshot.ts";
 import { renderReviewPrompt } from "./tasks/review-prompt.ts";
 
@@ -618,6 +620,7 @@ class CoreService implements ChannelService {
   private readonly threadForks: ThreadForkController;
   private readonly watchCoordinator: WatchCoordinator;
   private readonly sourceWatchCoordinator: SourceWatchCoordinator;
+  private readonly scheduleCoordinator: ScheduleCoordinator;
   private readonly discovery: DiscoveryCoordinator;
   private stopPromise: Promise<void> | undefined;
   constructor(
@@ -949,8 +952,8 @@ class CoreService implements ChannelService {
         || this.threadForks.running
         || this.forkCommandTargets.size > 0
         || this.tanInboundOperations.size > 0
-        || this.tanDispatchOperations.size > 0
         || this.forkArchiveControllers.size > 0
+        || this.scheduleCoordinator.hasInFlight
         || this.ingress.pendingCount() > 0
         || (this.bot !== undefined && this.store.countPendingIngressJobs(this.bot.uid) > 0),
       restart: options.restart,
@@ -985,6 +988,23 @@ class CoreService implements ChannelService {
         ? { protocol: watchConfig.protocol, endpoint: watchConfig.baseUrl, model: watchConfig.model }
         : null,
       deliver: (record, event, messageId, text) => this.deliverSourceWatchWake(record, event, messageId, text),
+    });
+    this.scheduleCoordinator = new ScheduleCoordinator({
+      store: this.store,
+      workerFactory: options.workerFactory,
+      botUid: () => this.bot?.uid,
+      stateDir: options.config.stateDir,
+      sessionRoot: sessionsRoot(options.config),
+      ...(options.scheduleClock === undefined ? {} : { clock: options.scheduleClock }),
+      createRecord: (task, request, toolCallId, signal) =>
+        this.createScheduleRecord(task, request, toolCallId, signal),
+      classifyAccess: (task, record, signal) =>
+        this.classifyScheduleAccess(task, record, signal),
+      validateExecution: (record, signal) =>
+        this.validateScheduleExecution(record, signal),
+      cliEnv: () => this.options.cliCredentials?.env(),
+      cliReady: () => this.cliIdentityReady,
+      blockDirectory: cwd => { this.blockedDirectories.add(cwd); },
     });
     // 内建命令的 canonical handler 表：每个 action 一个函数，直接返回原 handler 的 Promise
     // （不再包一层 async），`handleCommand` 里的 await 因此仍是原来的微任务边界；只有
@@ -1056,6 +1076,7 @@ class CoreService implements ChannelService {
     this.bot = identity;
     let watchStarted = false;
     let sourceWatchStarted = false;
+    let scheduleStartupAttempted = false;
     try {
       this.store.setBotUid(identity.uid);
       this.store.releaseOrphanedReviewClaims(identity.uid);
@@ -1458,15 +1479,19 @@ class CoreService implements ChannelService {
       watchStarted = true;
       await this.sourceWatchCoordinator.start();
       sourceWatchStarted = true;
-      this.startupGate.resolve();
+      scheduleStartupAttempted = true;
+      await this.scheduleCoordinator.start();
       this.ready = true;
       this.loopController?.start();
       for (const job of reviewRecovery.runnable) this.operationSet(this.runReview(job));
       this.releaseRecoveredHostMergeArchives();
       await this.sendLifecycleNotice("startup");
+      // Inbound candidates may be admitted while transport startup is in progress; open dispatch only
+      // after recovery and all coordinators are ready.
+      this.startupGate.resolve();
     } catch (error) {
-      if (watchStarted) await this.watchCoordinator.stop();
       if (sourceWatchStarted) await this.sourceWatchCoordinator.stop();
+      if (scheduleStartupAttempted) await this.scheduleCoordinator.stop().catch(() => {});
       this.ready = false;
       this.started = false;
       this.startupGate.reject(error instanceof Error ? error : new Error("channel 启动失败"));
@@ -1494,9 +1519,11 @@ class CoreService implements ChannelService {
     this.ingress.seal();
     this.watchCoordinator.seal();
     this.sourceWatchCoordinator.seal();
+    this.scheduleCoordinator.seal();
     this.discovery.stop();
     const watchShutdown = this.watchCoordinator.stop();
     const sourceWatchShutdown = this.sourceWatchCoordinator.stop();
+    const scheduleShutdown = this.scheduleCoordinator.stop();
     this.abortAllThreadForks(new Error("channel stopping"));
     this.abortAllForkArchiveWaits(new Error("channel stopping"));
     this.abortAllThreadMerges(new Error("channel stopping"));
@@ -1547,6 +1574,7 @@ class CoreService implements ChannelService {
     await this.ingress.settle();
     await watchShutdown;
     await sourceWatchShutdown;
+    await scheduleShutdown;
     await this.researchReports.drain();
     this.typingLeases.releaseAll();
     await this.botEvents.stop();
@@ -2782,6 +2810,7 @@ class CoreService implements ChannelService {
       let steerAccepted = false;
       let steerRejected = false;
       let steerTaskId: string | undefined;
+      let steerAdmissionRejected = false;
       let steerClaim: InboundClaim | undefined;
       let steeringDelivery: Promise<boolean> | undefined;
       const steered = await this.appendToRunningTask(
@@ -2803,6 +2832,7 @@ class CoreService implements ChannelService {
         true,
         delivery => { steeringDelivery = delivery; },
         () => { steerRejected = true; },
+        () => { steerAdmissionRejected = true; },
       );
       if (this.stopping) throw new InboundShutdownError();
       if (steered && steeringDelivery !== undefined) {
@@ -2814,6 +2844,13 @@ class CoreService implements ChannelService {
           cancellationRefusal = accepted
             && !steerAccepted
             && this.store.isIngressCancellationRequested(job.id);
+          if (steerAdmissionRejected && !steerIntent) {
+            completion = {
+              consumer: { kind: "operation", id: job.sourceId },
+              persistConsumer: () => true,
+            };
+            return;
+          }
           if (steerIntent && !steerAccepted && !steerRejected && !cancellationRefusal) {
             this.markIngressUnknown(job);
             throw new Error("steering dispatch outcome is unknown; ingress will not retry it");
@@ -2935,6 +2972,7 @@ class CoreService implements ChannelService {
     let steerAccepted = false;
     let steerRejected = false;
     let steerTaskId: string | undefined;
+    let steerAdmissionRejected = false;
     let steerClaim: InboundClaim | undefined;
     let steeringDelivery: Promise<boolean> | undefined;
     const steered = await this.appendToRunningTask(
@@ -2961,6 +2999,7 @@ class CoreService implements ChannelService {
       true,
       delivery => { steeringDelivery = delivery; },
       () => { steerRejected = true; },
+      () => { steerAdmissionRejected = true; },
     );
     if (steered && steeringDelivery !== undefined) {
       const delivery = steeringDelivery;
@@ -2974,6 +3013,13 @@ class CoreService implements ChannelService {
         cancellationRefusal = accepted
           && !steerAccepted
           && this.store.isIngressCancellationRequested(job.id);
+        if (steerAdmissionRejected && !steerIntent) {
+          result = {
+            consumer: { kind: "operation", id: job.sourceId },
+            persistConsumer: () => true,
+          };
+          return;
+        }
         if (steerIntent && !steerAccepted && !steerRejected && !cancellationRefusal) {
           this.markIngressUnknown(job);
           throw new Error("thread-task steering outcome is unknown; ingress will not retry it");
@@ -4837,6 +4883,7 @@ class CoreService implements ChannelService {
     onWorkerSteerAccepted?: (taskId: string) => void,
     deferCommandCompletion?: (claim: InboundClaim) => void,
     onWorkerSteerRejected?: () => void,
+    onWorkerSteerAdmissionRejected?: () => void,
   ): Promise<boolean> {
     if (!this.canDeliverSteer(runtime) || (deliveryGuard && !deliveryGuard())) {
       if (runtime.cancelRequested) {
@@ -4910,13 +4957,21 @@ class CoreService implements ChannelService {
     }
     let workerSteerRejected = false;
     let workerSteerAttempted = false;
-    const beginWorkerSteer = beforeWorkerSteer === undefined
-      ? undefined
-      : (): boolean => {
-          if (!beforeWorkerSteer()) return false;
-          workerSteerAttempted = true;
-          return true;
-        };
+    let steerAdmissionRejected = false;
+    const beginWorkerSteer = (): boolean => {
+      if (beforeWorkerSteer !== undefined && !beforeWorkerSteer()) {
+        steerAdmissionRejected = true;
+        onWorkerSteerAdmissionRejected?.();
+        return false;
+      }
+      workerSteerAttempted = true;
+      if (!systemInput && !this.markScheduleSteerIdentity(runtime.taskId, message)) {
+        steerAdmissionRejected = true;
+        onWorkerSteerAdmissionRejected?.();
+        return false;
+      }
+      return true;
+    };
 
     if (await this.deliverSteer(
       runtime,
@@ -4947,7 +5002,7 @@ class CoreService implements ChannelService {
       runtime.agentContext = restored;
     }
     if (deliveryGuard !== undefined && workerSteerAttempted && !systemInput) {
-      if (workerSteerRejected) this.store.releaseClaim(claim);
+      if (workerSteerRejected || steerAdmissionRejected) this.store.releaseClaim(claim);
       return false;
     }
     if (this.stopping) {
@@ -4979,6 +5034,7 @@ class CoreService implements ChannelService {
     skipWorkspaceRefusal = false,
     onDeliveryScheduled?: (delivery: Promise<boolean>) => void,
     onWorkerSteerRejected?: () => void,
+    onWorkerSteerAdmissionRejected?: () => void,
   ): Promise<boolean> {
     this.throwIfStopping();
     if (!skipWorkspaceRefusal && await this.refuseIncompleteThreadWorkspace(message, !systemInput)) return true;
@@ -5003,6 +5059,7 @@ class CoreService implements ChannelService {
         onWorkerSteerAccepted,
         deferCommandCompletion,
         onWorkerSteerRejected,
+        onWorkerSteerAdmissionRejected,
       ));
     runtime.steerSerial = delivery.then(() => {}, () => {});
     if (onDeliveryScheduled !== undefined) {
@@ -11468,11 +11525,291 @@ class CoreService implements ChannelService {
     ])) this.blockedDirectories.add(cwd);
   }
 
+  private sameScheduleScope(left: ChatTarget, right: ChatTarget): boolean {
+    if (left.channelType === right.channelType && left.channelId === right.channelId) return true;
+    const parent = (target: ChatTarget): string | null => target.channelType === 2
+      ? target.channelId
+      : target.channelType === 5 ? threadParentGroupId(target.channelId) : null;
+    const leftParent = parent(left);
+    return leftParent !== null && leftParent === parent(right);
+  }
+
+  private directScheduleSourceRequesterUid(task: TaskRecord): string | null {
+    const sourceId = recvIngressSourceId(task.channelType, task.channelId, task.messageId);
+    const job = this.store.getIngressJobBySource({
+      botUid: task.botUid,
+      sourceKind: "recv",
+      sourceId,
+    });
+    const senderUid = job?.routeSnapshot?.sourceSenderUid;
+    if (
+      job === null
+      || job.state !== "handed-off"
+      || job.lane !== "ordered"
+      || job.consumerKind !== "task"
+      || job.consumerId !== task.id
+      || job.botUid !== task.botUid
+      || job.sourceKind !== "recv"
+      || job.sourceId !== sourceId
+      || job.channelType !== task.channelType
+      || job.channelId !== task.channelId
+      || job.messageId !== task.messageId
+      || typeof senderUid !== "string"
+      || senderUid !== task.senderId
+      || senderUid.trim().length === 0
+    ) return null;
+    return senderUid;
+  }
+
+  /**
+   * A schedule tool is bound to its original task, so a later message may only retain schedule
+   * creation eligibility when durable receive provenance proves it came from the same requester.
+   * Any other or unverifiable steer permanently fences creation for this task turn.
+   */
+  private markScheduleSteerIdentity(taskId: string, message: InboundMessage): boolean {
+    try {
+      const botUid = this.bot?.uid;
+      const task = this.store.getTask(taskId);
+      if (
+        botUid === undefined
+        || task === null
+        || task.botUid !== botUid
+        || task.channelType !== message.channelType
+        || task.channelId !== message.channelId
+        || !this.scheduleTaskIsCurrent(task)
+      ) return false;
+      const sourceId = recvIngressSourceId(message.channelType, message.channelId, message.messageId);
+      const source = this.store.getIngressJobBySource({
+        botUid,
+        sourceKind: "recv",
+        sourceId,
+      });
+      const sourceSenderUid = source?.routeSnapshot?.sourceSenderUid;
+      const incomingIsDirect = source !== null
+        && source.botUid === botUid
+        && source.sourceKind === "recv"
+        && source.sourceId === sourceId
+        && source.channelType === message.channelType
+        && source.channelId === message.channelId
+        && source.messageId === message.messageId
+        && source.lane === "ordered"
+        && source.state === "dispatch-intent"
+        && typeof sourceSenderUid === "string"
+        && sourceSenderUid.length > 0
+        && sourceSenderUid === message.senderId;
+      const originalRequesterUid = this.directScheduleSourceRequesterUid(task);
+      if (incomingIsDirect && originalRequesterUid !== null && sourceSenderUid === originalRequesterUid) {
+        return true;
+      }
+      return this.store.markTaskScheduleIdentityMixed(task.id);
+    } catch {
+      return false;
+    }
+  }
+
+  private scheduleTaskIsCurrent(task: TaskRecord): boolean {
+    const current = this.store.getTask(task.id);
+    return current !== null
+      && current.botUid === task.botUid
+      && current.channelType === task.channelType
+      && current.channelId === task.channelId
+      && current.messageId === task.messageId
+      && current.senderId === task.senderId;
+  }
+
+  private async createScheduleRecord(
+    task: TaskRecord,
+    request: ScheduleCreateRequest,
+    toolCallId: string,
+    signal: AbortSignal,
+  ): Promise<ScheduleRecord> {
+    const botUid = this.bot?.uid;
+    const ownerId = botUid === undefined ? "" : this.store.getOwnerId(botUid)?.trim() ?? "";
+    const source = taskTarget(task);
+    if (
+      signal.aborted
+      || this.stopping
+      || botUid === undefined
+      || task.botUid !== botUid
+      || !this.scheduleTaskIsCurrent(task)
+    ) throw new Error("schedule source task is unavailable");
+    const sourceRequesterUid = this.directScheduleSourceRequesterUid(task)?.trim() || null;
+    if (source.channelType === 1 && (!ownerId || sourceRequesterUid !== ownerId)) {
+      throw new Error("permission denied: private-chat schedules require a directly authenticated current owner");
+    }
+    if (source.channelType !== 1 && !this.authorization.isPermittedChat(source)) {
+      throw new Error("permission denied: schedule source chat is no longer authorized");
+    }
+    if (!this.sameScheduleScope(source, request.target) && (!ownerId || sourceRequesterUid !== ownerId)) {
+      throw new Error("permission denied: cross-chat schedules require a directly authenticated current owner");
+    }
+    try {
+      await this.assertScheduleTarget(source, signal, sourceRequesterUid);
+      await this.assertScheduleTarget(request.target, signal, sourceRequesterUid);
+    } catch (error) {
+      if (signal.aborted || this.stopping) throw new Error("schedule creation cancelled");
+      throw new Error(`permission denied: ${safeErrorMessage(error, "schedule target could not be authorized")}`);
+    }
+    const cwd = await canonicalExistingDirectory(request.cwd);
+    if (this.isWorkspaceDirectoryBlocked(cwd)) throw new Error("schedule working directory is currently blocked");
+    if (signal.aborted || this.stopping) throw new Error("schedule creation cancelled");
+    return {
+      id: randomUUID(),
+      botUid,
+      name: request.name,
+      cron: request.cron,
+      timezone: request.timezone,
+      cwd,
+      spec: request.spec,
+      source,
+      sourceMessageId: task.messageId,
+      sourceRequesterUid,
+      sourceKind: sourceRequesterUid === null ? "synthetic" : "direct",
+      sourceTaskId: task.id,
+      toolCallId,
+      target: request.target,
+      timeoutMs: request.timeoutMs,
+      createdAt: this.options.scheduleClock?.now() ?? Date.now(),
+      status: "active",
+    };
+  }
+
+  private async classifyScheduleAccess(
+    task: TaskRecord,
+    record: ScheduleRecord,
+    signal: AbortSignal,
+  ): Promise<ScheduleAccessRole> {
+    const botUid = this.bot?.uid;
+    if (
+      signal.aborted
+      || botUid === undefined
+      || task.botUid !== botUid
+      || record.botUid !== botUid
+      || !this.scheduleTaskIsCurrent(task)
+    ) return "denied";
+    const caller = taskTarget(task);
+    const ownerId = this.store.getOwnerId(botUid)?.trim() ?? "";
+    const directRequesterUid = this.directScheduleSourceRequesterUid(task);
+    if (
+      caller.channelType === 1
+      && ownerId.length > 0
+      && caller.channelId === ownerId
+      && directRequesterUid?.trim() === ownerId
+    ) return "owner";
+    if (
+      caller.channelType === record.source.channelType
+      && caller.channelId === record.source.channelId
+      && (caller.channelType === 1
+        ? ownerId.length > 0 && directRequesterUid?.trim() === ownerId
+        : this.authorization.isPermittedChat(caller))
+    ) return "source";
+    return "denied";
+  }
+
+  private async assertScheduleTarget(
+    target: ChatTarget,
+    signal: AbortSignal,
+    requesterUid: string | null,
+  ): Promise<void> {
+    const botUid = this.bot?.uid;
+    if (botUid === undefined || signal.aborted) throw new Error("schedule target cannot be verified");
+    if (!requesterUid) throw new Error("schedule creator identity cannot be verified");
+    const requester = await this.options.transport.getUserInfo(requesterUid, signal);
+    if (signal.aborted || requester.uid !== requesterUid) throw new Error("schedule creator identity mismatch");
+    if (target.channelType === 1) {
+      if (target.channelId === botUid) throw new Error("Bot cannot be a schedule destination");
+      const user = await this.options.transport.getUserInfo(target.channelId, signal);
+      if (signal.aborted || user.uid !== target.channelId) throw new Error("schedule user target identity mismatch");
+      return;
+    }
+    const verifyMembers = async (members: ReadonlyArray<{ uid: string; robot: boolean }>): Promise<void> => {
+      const botMember = members.find(member => member.uid === botUid);
+      const creatorMember = members.find(member => member.uid === requesterUid);
+      if (!botMember?.robot || creatorMember?.robot !== false) {
+        throw new Error("schedule creator and Bot must be members of the exact target");
+      }
+    };
+    if (target.channelType === 2) {
+      const group = await this.options.transport.getGroupInfo(target.channelId, signal);
+      if (signal.aborted || group.groupId !== target.channelId || group.status !== 1) {
+        throw new Error("schedule group target is unavailable or does not match");
+      }
+      await verifyMembers(await this.options.transport.getGroupMembers(target.channelId, signal));
+      if (signal.aborted) throw new Error("schedule target verification was cancelled");
+      return;
+    }
+    const parentGroupId = threadParentGroupId(target.channelId);
+    const shortId = threadShortId(target.channelId);
+    if (parentGroupId === null || shortId === null) throw new Error("schedule thread target is malformed");
+    const group = await this.options.transport.getGroupInfo(parentGroupId, signal);
+    if (signal.aborted || group.groupId !== parentGroupId || group.status !== 1) {
+      throw new Error("schedule thread parent is unavailable or does not match");
+    }
+    const thread = await this.options.transport.getThread(parentGroupId, shortId, signal);
+    if (
+      signal.aborted
+      || thread.groupId !== parentGroupId
+      || thread.shortId !== shortId
+      || thread.channelId !== target.channelId
+      || thread.status !== 1
+    ) throw new Error("schedule thread target is unavailable or does not match its parent");
+    await verifyMembers(await this.options.transport.getThreadMembers(parentGroupId, shortId, signal));
+    if (signal.aborted) throw new Error("schedule target verification was cancelled");
+  }
+
+  private async validateScheduleExecution(record: ScheduleRecord, signal: AbortSignal): Promise<boolean> {
+    try {
+      const botUid = this.bot?.uid;
+      const ownerId = botUid === undefined ? "" : this.store.getOwnerId(botUid)?.trim() ?? "";
+      const cliEnv = this.options.cliCredentials?.env();
+      if (
+        signal.aborted
+        || this.stopping
+        || botUid === undefined
+        || record.botUid !== botUid
+        || !this.cliIdentityReady
+        || !cliEnv?.OCTO_CONFIG_DIR?.trim()
+        || !cliEnv.OCTO_API_BASE_URL?.trim()
+        || cliEnv.OCTO_BOT_ID !== botUid
+      ) return false;
+      const task = this.store.getTask(record.sourceTaskId);
+      if (
+        task === null
+        || task.botUid !== record.botUid
+        || task.channelType !== record.source.channelType
+        || task.channelId !== record.source.channelId
+        || task.messageId !== record.sourceMessageId
+      ) return false;
+      const directRequesterUid = this.directScheduleSourceRequesterUid(task);
+      if (record.sourceKind === "direct") {
+        if (directRequesterUid?.trim() !== record.sourceRequesterUid) return false;
+      } else if (directRequesterUid !== null || record.sourceRequesterUid !== null) {
+        return false;
+      }
+      if (record.source.channelType === 1) {
+        if (!ownerId || record.sourceRequesterUid !== ownerId) return false;
+      } else if (!this.authorization.isPermittedChat(record.source)) {
+        return false;
+      }
+      if (!this.sameScheduleScope(record.source, record.target)) {
+        if (!ownerId || record.sourceKind !== "direct" || record.sourceRequesterUid !== ownerId) return false;
+      }
+      const requesterUid = record.sourceKind === "direct" ? record.sourceRequesterUid : null;
+      await this.assertScheduleTarget(record.source, signal, requesterUid);
+      await this.assertScheduleTarget(record.target, signal, requesterUid);
+      const cwd = await canonicalExistingDirectory(record.cwd);
+      return !signal.aborted && cwd === record.cwd && !this.isWorkspaceDirectoryBlocked(cwd);
+    } catch {
+      return false;
+    }
+  }
+
   private hostToolHost(): HostToolHost {
     const botUid = this.bot?.uid;
     if (botUid === undefined) throw new Error("Bot 身份未注册，无法构造 host tools");
     return {
       stateDir: this.options.config.stateDir,
+      scheduleTool: task => this.scheduleCoordinator.createTool(task),
       transport: this.options.transport,
       worktrees: this.options.worktrees,
       moveThreadWorkspaceBinding: (target, expected, destinationCwd, workerLedgerId, signal) =>

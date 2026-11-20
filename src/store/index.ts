@@ -6,7 +6,7 @@
 import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { ChatAppendMode, ChatTarget, HostMergeProgressPhase, ThreadListenLevel, ThreadSummary, WorkerGoal, WorktreeMergeOutcome } from "../contracts.ts";
+import type { ChatAppendMode, ChatTarget, HostMergeProgressPhase, ThreadListenLevel, ThreadSummary, WorkerGoal, WorkerProcess, WorktreeMergeOutcome } from "../contracts.ts";
 import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceCleanupInput, ThreadWorkspaceCleanupRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadWorkspaceOperationInput, ThreadWorkspaceOperationRecord, ThreadForkInput, ThreadForkRecord, ThreadListenRecord, ThreadMergeEventRecord, ThreadTaskEventRecord, HostMergeLeaseRecord, HostMergeLeaseInput, HostMergeProgressCardInput, HostMergeProgressCardRecord, HostRemovalLeaseInput, HostRemovalLeaseRecord, HostThreadRemovalOutcome, ReviewJobRecord } from "./store-records.ts";
 import type { TaskFileLinkContext } from "./store-records.ts";
 import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopTaskRouteEnding, LoopTaskRouteEndingReason, LoopTaskRouteEndingState, LoopThreadCreation, LoopThreadCreationAttempt, LoopWorkspace } from "../loop/types.ts";
@@ -32,7 +32,7 @@ import type {
 } from "../inbound/ingress-types.ts";
 import { allocateScheduleOrder, applySchema, transaction } from "./store-schema.ts";
 import { claimOwnerEnrollment, clearChatModel, clearThreadModel, ensureBinding, ensureBindingIfMatches, getBinding, getBotUid, getChatMode, getChatModel, getOwnerId, getThreadModel, grantAllowedChat, hasOwnerEnrollment, initializeBindingSessionFromTask, listAllowedChats, resolveChatModel, setBotUid, setChatMode, setChatModel, setOwnerId, setThreadModel, updateBindingSession } from "./store-chats.ts";
-import { acceptCommitTask, acceptTask, acceptTaskIf, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, getTaskByMessageId, getTaskFinalResultText, getTaskScheduleOrder, hasTaskStopIntent, isCommitTask, isTaskResuming, listQueuedTasks, listTransferredLoopTasks, listUndispatchedLoopTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskStopIntent, prepareTasksForRestart, releaseClaim, setTaskFinalResultText, suppressTaskRelay, cancelUndispatchedTask, LOOP_TRANSFER_ERROR_TEXT } from "./store-tasks.ts";
+import { acceptCommitTask, acceptTask, acceptTaskIf, cancelQueued, claimCommand, clearRestartNotices, clearTaskStopIntent, completeCommand, countQueuedTasks, failCommand, getActiveTask, getCommandClaimState, getLatestTask, getTask, getTaskByMessageId, getTaskFinalResultText, getTaskScheduleOrder, hasTaskStopIntent, isCommitTask, isTaskResuming, listQueuedTasks, listTransferredLoopTasks, listUndispatchedLoopTasks, markCancelled, markCompleted, markFailed, markInterrupted, markStarted, markTaskPromptAccepted, markTaskPromptStarted, markTaskScheduleIdentityMixed, markTaskStopIntent, prepareTasksForRestart, releaseClaim, setTaskFinalResultText, suppressTaskRelay, cancelUndispatchedTask, LOOP_TRANSFER_ERROR_TEXT } from "./store-tasks.ts";
 import { hasRatchetSession } from "./store-tasks.ts";
 import { bindGoalTaskSession, clearGoalSession, finishGoalTaskProgress, getGoalSession, getGoalTask, isGoalTaskResuming, markGoalTaskAccepted, markGoalTaskAgentAccepted, markGoalTaskDispatched, saveGoalSessionProgress, stopGoalContinuation, updateGoalTaskProgress } from "./store-goals.ts";
 import { clearProgressCard, listProgressCards, recordProgressCardAttempt, saveProgressCard } from "./store-cards.ts";
@@ -63,6 +63,16 @@ import type {
   WatchSourceEvent,
   WatchSourceSnapshot,
 } from "../watch/source-types.ts";
+import * as storeSchedule from "../scheduler/store.ts";
+import type {
+  ScheduleArtifact,
+  ScheduleCreateResult,
+  ScheduleOccurrenceResult,
+  ScheduleRecord,
+  ScheduleRunRecord,
+  ScheduleRunSettlement,
+  ScheduleStatus,
+} from "../scheduler/types.ts";
 import type { ThreadReference, ThreadReferences } from "../references/types.ts";
 import { bindLoopTask, bindLoopWorkspace, claimLoopInputIntent, commitLoopScan, completeLoopThreadCreation, getLoopBinding, getLoopInput, getLoopTaskRoute, getLoopTaskSummary as readLoopTaskSummary, getLoopThreadCreation, isLoopInputObserved, listLoopBindings, listLoopInputs, listLoopThreadCreationAttempts, listLoopThreadCreations, listLoopThreadTasks, markLoopInputDelivered, markLoopInputFault, markLoopInputPending, markLoopInputUnknown, markLoopThreadCreationUnknown, prepareLoopInput, recordLoopThreadAllocated, releaseLoopThreadCreation, reserveLoopThreadCreation } from "./store-loop.ts";
 import { clearLoopTaskRouteEnding, clearPendingLoopThreadRoutesEnding, getLoopTaskRouteEnding, listLoopTaskRouteEndings, markLoopThreadRoutesEnding } from "./store-loop-endings.ts";
@@ -1615,6 +1625,88 @@ export class ChannelStore {
 
   expireWatchRecords(now: number): void {
     storeWatch.expireWatchRecords(this.db, now);
+  }
+
+  markTaskScheduleIdentityMixed(taskId: string): boolean {
+    return markTaskScheduleIdentityMixed(this.db, taskId);
+  }
+
+  createSchedule(record: ScheduleRecord): ScheduleCreateResult {
+    return storeSchedule.createSchedule(this.db, record);
+  }
+
+  getSchedule(botUid: string, id: string): ScheduleRecord | null {
+    return storeSchedule.getSchedule(this.db, botUid, id);
+  }
+
+  listSchedules(botUid: string, source: ChatTarget, limit: number, offset: number): ScheduleRecord[] {
+    return storeSchedule.listSchedules(this.db, botUid, source, limit, offset);
+  }
+
+  listActiveSchedules(botUid: string): ScheduleRecord[] {
+    return storeSchedule.listActiveSchedules(this.db, botUid);
+  }
+
+  setScheduleStatus(
+    botUid: string,
+    id: string,
+    source: ChatTarget,
+    status: ScheduleStatus,
+    now: number,
+  ): ScheduleRecord | null {
+    return storeSchedule.setScheduleStatus(this.db, botUid, id, source, status, now);
+  }
+
+  claimScheduleOccurrence(
+    scheduleId: string,
+    scheduledAt: number,
+    now: number,
+    maxConcurrent: number,
+  ): ScheduleOccurrenceResult {
+    return storeSchedule.claimScheduleOccurrence(this.db, scheduleId, scheduledAt, now, maxConcurrent);
+  }
+
+  beginScheduleDispatch(runId: string, now: number): boolean {
+    return storeSchedule.beginScheduleDispatch(this.db, runId, now);
+  }
+
+  setScheduleProcess(runId: string, process: WorkerProcess): boolean {
+    return storeSchedule.setScheduleProcess(this.db, runId, process);
+  }
+
+  setScheduleAgentSession(runId: string, sessionId: string, sessionFile: string): boolean {
+    return storeSchedule.setScheduleAgentSession(this.db, runId, sessionId, sessionFile);
+  }
+
+  markSchedulePromptAccepted(runId: string, now: number): boolean {
+    return storeSchedule.markSchedulePromptAccepted(this.db, runId, now);
+  }
+
+  markScheduleProcessExited(runId: string, now: number): boolean {
+    return storeSchedule.markScheduleProcessExited(this.db, runId, now);
+  }
+
+  addScheduleArtifact(runId: string, artifact: ScheduleArtifact, toolCallId: string, now: number): boolean {
+    return storeSchedule.addScheduleArtifact(this.db, runId, artifact, toolCallId, now);
+  }
+
+  settleScheduleRun(runId: string, settlement: ScheduleRunSettlement, now: number): ScheduleRunRecord | null {
+    return storeSchedule.settleScheduleRun(this.db, runId, settlement, now);
+  }
+
+  getScheduleRun(botUid: string, runId: string): ScheduleRunRecord | null {
+    return storeSchedule.getScheduleRun(this.db, botUid, runId);
+  }
+
+  listScheduleRuns(botUid: string, scheduleId: string, limit: number, offset: number): ScheduleRunRecord[] {
+    return storeSchedule.listScheduleRuns(this.db, botUid, scheduleId, limit, offset);
+  }
+
+  listRecoverableScheduleRuns(botUid: string): ScheduleRunRecord[] {
+    return storeSchedule.listRecoverableScheduleRuns(this.db, botUid);
+  }
+  listScheduleRunsNeedingStop(botUid: string, scheduleId: string): ScheduleRunRecord[] {
+    return storeSchedule.listScheduleRunsNeedingStop(this.db, botUid, scheduleId);
   }
   createSourceWatch(record: SourceWatchRecord): SourceWatchCreateResult {
     return storeWatchSources.createSourceWatch(this.db, record);

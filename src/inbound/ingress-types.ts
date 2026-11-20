@@ -42,6 +42,8 @@ export interface IngressRouteSnapshot {
   purpose: IngressRoutePurpose;
   sessionGeneration: number;
   binding: IngressBindingSnapshot | null;
+  /** Exact requester UID from the original receive event; survives task handoff without retaining message text. */
+  sourceSenderUid?: string;
   /** Exact id of the earlier session-switch ingress job that gates this route, if any. */
   barrierJobId: number | null;
 }

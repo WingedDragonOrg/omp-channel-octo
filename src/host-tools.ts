@@ -80,6 +80,7 @@ interface HostWatchPort {
  */
 export interface HostToolHost {
   readonly stateDir: string;
+  readonly scheduleTool?: (task: TaskRecord) => HostTool;
   readonly transport: Pick<
     ChannelTransport,
     | "getGroupContext"
@@ -1187,6 +1188,8 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
   };
   const channelTool = createChannelTool(host);
   const watchTool = createWatchTool(host, task, target);
+  const scheduleTool = host.scheduleTool?.(task);
+  const scheduleTools = scheduleTool === undefined ? [] : [scheduleTool];
   const discoveryTool = createDiscoveryTool(host, task);
   const parentGroupId =
     target.channelType === 2
@@ -1194,7 +1197,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
       : target.channelType === 5
         ? threadParentGroupId(target.channelId)
         : null;
-  if (parentGroupId === null) return [channelTool, fileTool, askTool, watchTool, discoveryTool];
+  if (parentGroupId === null) return [channelTool, fileTool, askTool, watchTool, discoveryTool, ...scheduleTools];
   const currentShortId =
     target.channelType === 5 ? threadShortId(target.channelId) : null;
   // Dispatched tasks and watch wakes cannot dispatch further work.
@@ -1318,7 +1321,7 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
       pendingMergeLifecycles.delete(toolCallId);
     },
   };
-  return [channelTool, managementTool, fileTool, askTool, forkTool, watchTool, discoveryTool];
+  return [channelTool, managementTool, fileTool, askTool, forkTool, watchTool, discoveryTool, ...scheduleTools];
 }
 
 /**
