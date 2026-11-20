@@ -113,11 +113,11 @@ export interface HostToolHost {
     | "getThreadWorkspace"
     | "getThreadForkByTarget"
     | "saveThreadWorkspace"
-    | "saveThreadWorkspaces"
+    | "saveThreadWorkspaceWithOutbox"
+    | "commitThreadWorkspaceBatch"
     | "saveThreadWorkspaceIntent"
     | "addThreadWorkspaceIntentChannel"
     | "completeThreadCreatorIntent"
-    | "completeThreadWorkspaceIntent"
     | "failThreadWorkspaceIntent"
     | "getThreadWorkspaceIntent"
     | "listThreadWorkspaceIntents"
@@ -467,6 +467,7 @@ function ensureThreadListenForTarget(host: HostToolHost, target: ChatTarget) {
     listen: "merge",
   });
 }
+
 function workspaceProjectResults(outcome: ThreadWorkspaceBatchResult["threads"][number]) {
   return outcome.record.projects.map((project, index) => ({
     name: project.name,
@@ -475,6 +476,8 @@ function workspaceProjectResults(outcome: ThreadWorkspaceBatchResult["threads"][
     path: project.path,
     branch: project.branch,
     created: project.created,
+    ...(project.sync === undefined ? {} : { sync: project.sync }),
+    ...(project.syncState === "unknown" ? { sync_status: "unknown" } : {}),
     ...(outcome.projectErrors[index] === undefined ? {} : { error: outcome.projectErrors[index] }),
   }));
 }

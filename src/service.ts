@@ -174,6 +174,7 @@ import {
 } from "./threads/thread-workspace-cleanup.ts";
 import {
   expandThreadWorkspace,
+  recoverPendingWorkspaceSync,
   runThreadWorkspaceOperation,
   type ThreadWorkspaceOperationHost,
 } from "./workspace/thread-workspaces.ts";
@@ -1318,6 +1319,7 @@ class CoreService implements ChannelService {
         identity.uid,
         new Set(pendingTanOperations.map(operation => operation.id)),
       );
+      recoverPendingWorkspaceSync(this.store, identity.uid);
       this.recoverCancelledTanReceipts(identity.uid);
       this.recoverAcceptedTanReceipts(identity.uid);
       for (const review of this.store.listTerminalReviewJobs(identity.uid)) {

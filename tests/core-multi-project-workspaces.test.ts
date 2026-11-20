@@ -35,6 +35,13 @@ interface ProjectOutcome {
   path: string | null;
   branch: string | null;
   created: boolean;
+  sync?: {
+    status: "synced" | "fallback" | "explicit-base";
+    originalHead: string;
+    head: string;
+    reason?: string;
+  };
+  sync_status?: "unknown";
   error?: string;
 }
 
@@ -100,8 +107,13 @@ class WorkspaceTransport extends FakeTransport {
 
 const TRANSLATING_OMP_STUB = String.raw`set -e
 [ "$1" = "worktree" ] && [ "$2" = "add" ] || exit 64
-[ "$4" = "-b" ] && [ "$6" = "-C" ] || exit 64
-exec git -C "$7" worktree add "$3" -b "$5" -q`;
+if [ "$4" = "-b" ] && [ "$6" = "-C" ]; then
+  exec git -C "$7" worktree add "$3" -b "$5" -q
+fi
+if [ "$5" = "-b" ] && [ "$7" = "-C" ]; then
+  exec git -C "$8" worktree add "$3" -b "$6" "$4" -q
+fi
+exit 64`;
 
 async function createGitWorktreePort(root: string): Promise<WorktreePort> {
   const command = join(root, "omp-worktree-translator");
@@ -1120,6 +1132,253 @@ test("separate multi-project threads each dispatch from their own actual reposit
   }
 });
 
+test("a failed planned worktree creation notifies the creator to inspect the candidate", async () => {
+  let created: SharedOutcome | undefined;
+  let repo = "";
+  const done = promptCompletionLatch();
+  const { harness, transport } = await createWorkspaceHarness(async ({ promptContext, text }) => {
+    if (text !== "create uncertain workspace") return;
+    try {
+      created = JSON.parse(await createThread(managementTool(promptContext), {
+        name: "Uncertain", layout: "shared", worktree_name: "uncertain",
+        projects: [{ name: "uncertain-project", repo }],
+      })) as SharedOutcome;
+    } finally {
+      done.complete();
+    }
+  }, { instrument: port => ({
+    ...port,
+    async create(request) {
+      request.onPlanned?.({ cwd: request.path!, repo: request.baseDir, branch: request.label });
+      throw new Error("creation result unknown");
+    },
+  }) });
+  try {
+    repo = await createRepo(harness.root, "uncertain-source", "source\n");
+    await sendGroupTask(harness, "uncertain-create", "create uncertain workspace");
+    await finishGroupTask(harness, done.completion);
+    if (!created) throw new Error("missing result");
+    expect(created.ready).toBe(false);
+    expect(transport.sent.some(message =>
+      message.text.includes("同步结果未确认") && message.text.includes("uncertain-project")
+    )).toBe(true);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("shared creation syncs real upstream progress and reports a real merge conflict", async () => {
+  let created: SharedOutcome | undefined;
+  let firstRepo = "";
+  let secondRepo = "";
+  const done = promptCompletionLatch();
+  const { harness, transport } = await createWorkspaceHarness(async ({ promptContext, text }) => {
+    if (text !== "create real sync workspace") return;
+    try {
+      created = JSON.parse(await createThread(managementTool(promptContext), {
+        name: "Real sync", layout: "shared", worktree_name: "real-sync",
+        projects: [{ name: "updated", repo: firstRepo }, { name: "conflict", repo: secondRepo }],
+      })) as SharedOutcome;
+    } finally {
+      done.complete();
+    }
+  });
+  try {
+    firstRepo = await createRepo(harness.root, "real-sync-one", "initial\n");
+    secondRepo = await createRepo(harness.root, "real-sync-two", "initial\n");
+    for (const [index, repo] of [firstRepo, secondRepo].entries()) {
+      const remote = join(harness.root, `remote-${index}.git`);
+      const publisher = join(harness.root, `publisher-${index}`);
+      await runGit(harness.root, ["init", "--bare", "-q", remote]);
+      await runGit(repo, ["config", "user.name", "Fixture"]);
+      await runGit(repo, ["config", "user.email", "fixture@example.com"]);
+      await runGit(repo, ["remote", "add", "origin", remote]);
+      await runGit(repo, ["push", "-q", "-u", "origin", "main"]);
+      await runGit(harness.root, ["clone", "-q", "-b", "main", remote, publisher]);
+      await writeFile(join(publisher, "origin.txt"), "upstream\n");
+      await runGit(publisher, ["add", "."]);
+      await runGit(publisher, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "commit", "-qm", "upstream"]);
+      await runGit(publisher, ["push", "-q", "origin", "main"]);
+    }
+    await writeFile(join(secondRepo, "origin.txt"), "local committed\n");
+    await runGit(secondRepo, ["commit", "-qam", "local"]);
+    const original = await runGit(secondRepo, ["rev-parse", "HEAD"]);
+    await writeFile(join(firstRepo, "uncommitted.txt"), "keep\n");
+    await sendGroupTask(harness, "real-sync-create", "create real sync workspace");
+    await finishGroupTask(harness, done.completion);
+    if (!created) throw new Error("missing workspace result");
+    expect(created.ready).toBe(true);
+    const [updated, conflict] = created.projects;
+    if (!updated?.path || !conflict?.path) throw new Error("missing project paths");
+    expect(updated.sync?.status).toBe("synced");
+    expect(await readFile(join(updated.path, "origin.txt"), "utf8")).toBe("upstream\n");
+    expect(conflict.sync?.status).toBe("fallback");
+    expect(await runGit(conflict.path, ["rev-parse", "HEAD"])).toBe(original);
+    expect(await readFile(join(firstRepo, "uncommitted.txt"), "utf8")).toBe("keep\n");
+    expect(transport.sent.some(message => message.text.includes("手动同步") && message.text.includes("conflict"))).toBe(true);
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("create-thread returns each sync result and durably notifies its creator about fallback", async () => {
+  let created: SharedOutcome | undefined;
+  let callbackError: string | undefined;
+  let firstRepo = "";
+  let secondRepo = "";
+  const syncRequests: boolean[] = [];
+  const parentPrompt = promptCompletionLatch();
+  const { harness, transport } = await createWorkspaceHarness(async ({ promptContext, text }) => {
+    if (text !== "create a workspace with sync results") return;
+    try {
+      created = JSON.parse(await createThread(managementTool(promptContext), {
+        name: "Sync Result Workspace",
+        layout: "shared",
+        worktree_name: "sync-result-workspace",
+        projects: [
+          { name: "sync-one", repo: firstRepo },
+          { name: "explicit-two", repo: secondRepo, base: "HEAD" },
+        ],
+      })) as SharedOutcome;
+    } catch (error) {
+      callbackError = error instanceof Error ? error.message : String(error);
+    } finally {
+      parentPrompt.complete();
+    }
+  }, {
+    instrument: (port) => ({
+      ...port,
+      async create(request, signal) {
+        syncRequests.push("sync" in request && request.sync === true);
+        const workspace = await port.create(request, signal);
+        return {
+          ...workspace,
+          sync: request.base === undefined
+            ? {
+              status: "fallback" as const,
+              originalHead: "source-head",
+              head: "source-head",
+              reason: "当前分支未配置 upstream，未执行同步 credential=must-not-be-shown",
+            }
+            : {
+              status: "explicit-base" as const,
+              originalHead: "explicit-head",
+              head: "explicit-head",
+            },
+        };
+      },
+    }),
+  });
+  try {
+    firstRepo = await createRepo(harness.root, "sync-source-one", "one\n");
+    secondRepo = await createRepo(harness.root, "sync-source-two", "two\n");
+    await sendGroupTask(harness, "sync-result-create", "create a workspace with sync results");
+    await finishGroupTask(harness, parentPrompt.completion);
+
+    expect(callbackError).toBeUndefined();
+    if (!created) throw new Error("workspace sync result was not captured");
+    expect(created.ready).toBe(true);
+    expect(syncRequests).toEqual([true, true]);
+    expect(created.projects.map(({ sync }) => sync?.status)).toEqual(["fallback", "explicit-base"]);
+    expect(created.projects[0]?.sync).toMatchObject({
+      originalHead: "source-head",
+      head: "source-head",
+      reason: "无 upstream，未执行自动同步",
+    });
+    const notices = transport.sent.filter((message) =>
+      message.target.channelType === 2
+      && message.target.channelId === GROUP_ID
+      && message.text.includes("手动同步")
+    );
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.text).toContain("sync-one");
+    expect(notices[0]?.text).toContain(created.projects[0]?.path ?? "");
+    expect(notices[0]?.text).toContain("source-head");
+    expect(notices[0]?.text).toContain("无 upstream，未执行自动同步");
+    expect(notices[0]?.text).not.toContain("credential=must-not-be-shown");
+    const database = new Database(join(harness.stateDir, "channel.sqlite"));
+    try {
+      const noticeRows = database.query(
+        "SELECT state, text FROM outbox WHERE channel_type = 2 AND channel_id = ? AND text LIKE ?",
+      ).all(GROUP_ID, "%未能自动同步%") as Array<{ state: string; text: string }>;
+      expect(noticeRows).toHaveLength(1);
+      expect(noticeRows[0]?.state).toBe("sent");
+      expect(noticeRows[0]?.text).toContain("source-head");
+    } finally {
+      database.close();
+    }
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
+
+test("create-thread remains unready and sends a check notice when sync status is unknown", async () => {
+  let created: SharedOutcome | undefined;
+  let callbackError: string | undefined;
+  let repo = "";
+  const parentPrompt = promptCompletionLatch();
+  const { harness, transport } = await createWorkspaceHarness(async ({ promptContext, text }) => {
+    if (text !== "create a workspace with unknown sync") return;
+    try {
+      created = JSON.parse(await createThread(managementTool(promptContext), {
+        name: "Unknown Sync Workspace",
+        layout: "shared",
+        worktree_name: "unknown-sync-workspace",
+        projects: [{ name: "uncertain-project", repo }],
+      })) as SharedOutcome;
+    } catch (error) {
+      callbackError = error instanceof Error ? error.message : String(error);
+    } finally {
+      parentPrompt.complete();
+    }
+  }, {
+    instrument: (port) => ({
+      ...port,
+      async create(request, signal) {
+        const workspace = await port.create(request, signal);
+        return { cwd: workspace.cwd, branch: workspace.branch };
+      },
+    }),
+  });
+  try {
+    repo = await createRepo(harness.root, "unknown-sync-source", "source\n");
+    await sendGroupTask(harness, "unknown-sync-create", "create a workspace with unknown sync");
+    await finishGroupTask(harness, parentPrompt.completion);
+
+    expect(callbackError).toBeUndefined();
+    if (!created) throw new Error("unknown sync result was not captured");
+    expect(created.ready).toBe(false);
+    expect(created.projects[0]).toMatchObject({
+      created: true,
+      sync_status: "unknown",
+    });
+    const persisted = await storedThreadWorkspace(harness, created.channel_id);
+    expect(persisted?.status).toBe("failed");
+    expect(persisted?.projects[0]?.syncState).toBe("unknown");
+    const store = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+    try {
+      if (persisted === null) throw new Error("unknown sync workspace was not persisted");
+      expect(() => store.saveThreadWorkspace({
+        ...persisted,
+        status: "ready",
+        projects: persisted.projects.map(project => ({ ...project, syncState: "pending" })),
+      })).toThrow("thread workspace cannot be ready before every sync result is settled");
+      expect(store.getThreadWorkspace(harness.bot.uid, {
+        channelType: 5,
+        channelId: created.channel_id,
+      })?.status).toBe("failed");
+    } finally {
+      store.close();
+    }
+    const notices = transport.sent.filter((message) =>
+      message.target.channelId === GROUP_ID && message.text.includes("同步结果未确认")
+    );
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.text).toContain(created.projects[0]?.path ?? "");
+  } finally {
+    await closeCoreHarness(harness);
+  }
+});
 test("single explicit project uses the complete task slug in its repository worktree path", async () => {
   const taskSlug = "single-project-refresh-session-auth";
   let created: SingleOutcome | undefined;

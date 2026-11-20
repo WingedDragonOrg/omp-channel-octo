@@ -1117,6 +1117,8 @@ export interface ThreadWorkspaceRequest {
   path?: string;
   /** Git ref from which the new branch starts. */
   base?: string;
+  /** Synchronize only a thread-created workspace from its source branch's fetched upstream. */
+  sync?: boolean;
   /** Persist planned ownership before the worktree creation command can have side effects. */
   onPlanned?: (workspace: { cwd: string; branch: string; repo: string }) => void;
   /** Durable process ownership for a create whose result may survive cancellation or restart. */
@@ -1137,6 +1139,16 @@ export interface ThreadWorkspace {
   cwd: string;
   /** Branch the workspace checks out. */
   branch: string;
+  /** Present only when the caller explicitly requested synchronization for thread creation. */
+  sync?: ThreadWorkspaceSync;
+}
+
+/** Safe, per-project result of the optional thread workspace upstream synchronization. */
+export interface ThreadWorkspaceSync {
+  status: "synced" | "fallback" | "explicit-base";
+  originalHead: string;
+  head: string;
+  reason?: string;
 }
 
 /** `version` is display metadata only and does not affect whether an executable wt is available. */

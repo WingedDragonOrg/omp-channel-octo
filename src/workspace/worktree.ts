@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type {
   BigIntStats,
   Stats,
@@ -7,6 +8,7 @@ import { basename, dirname, isAbsolute, resolve } from "node:path";
 import type {
   ThreadWorkspace,
   ThreadWorkspaceRequest,
+  ThreadWorkspaceSync,
   WorktreeMergePlan,
   WorktreeMergeProcessIdentity,
   WorktreeMergeRequest,
@@ -72,6 +74,461 @@ export function worktreeSlug(label: string): string {
 
 function isAborted(signal?: AbortSignal): boolean {
   return signal?.aborted === true;
+}
+
+const THREAD_SYNC_REF_PREFIX = "refs/omp/thread-sync/";
+const THREAD_SYNC_STATUS_MAX_BYTES = 16_384;
+
+type ThreadWorkspaceSyncPlan =
+  | { kind: "explicit-base"; originalHead: string }
+  | { kind: "fallback"; originalHead: string; reason: string }
+  | { kind: "upstream"; originalHead: string; upstreamHead: string; fetchRef: string };
+
+async function runThreadSyncGit(
+  cwd: string,
+  args: string[],
+  timeoutMs: number,
+  signal?: AbortSignal,
+  maxOutputBytes?: number,
+  lifecycle?: ThreadWorkspaceRequest["lifecycle"],
+  processCwd?: string,
+): Promise<CommandResult | null> {
+  try {
+    return await runCommand(["git", "-C", cwd, ...args], {
+      cwd: processCwd ?? cwd,
+      timeoutMs,
+      parentDeathWatchdog: true,
+      operation: "Git thread workspace synchronization",
+      ...(signal === undefined ? {} : { signal }),
+      ...(lifecycle === undefined ? {} : { lifecycle }),
+      ...(maxOutputBytes === undefined
+        ? { maxOutputChars: 4_096 }
+        : { maxOutputBytes: { stdout: maxOutputBytes, stderr: 1_024 } }),
+    });
+  } catch {
+    if (isAborted(signal)) throw new Error("创建隔离工作区同步已取消");
+    throw new Error("Git 同步进程状态无法确认，拒绝继续创建隔离工作区");
+  }
+}
+
+function assertThreadSyncNotCancelled(result: CommandResult | null, signal?: AbortSignal): void {
+  if (isAborted(signal) || result?.aborted === true) {
+    throw new Error("创建隔离工作区同步已取消");
+  }
+}
+
+async function readThreadSyncCommit(
+  cwd: string,
+  revision: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const result = await runThreadSyncGit(
+    cwd,
+    ["rev-parse", "--verify", "--quiet", "--end-of-options", `${revision}^{commit}`],
+    timeoutMs,
+    signal,
+  );
+  assertThreadSyncNotCancelled(result, signal);
+  if (!result || result.timedOut || (result.exitCode !== 0 && result.exitCode !== 1)) {
+    throw new Error("无法确认 Git 同步提交状态");
+  }
+  if (result.exitCode === 1) return null;
+  const commit = result.stdout.trim();
+  if (!/^[0-9a-f]{40,64}$/u.test(commit)) {
+    throw new Error("Git 未返回有效的同步提交");
+  }
+  return commit;
+}
+
+async function readRequiredThreadSyncCommit(
+  cwd: string,
+  revision: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  const commit = await readThreadSyncCommit(cwd, revision, timeoutMs, signal);
+  if (commit === null) throw new Error("无法读取 Git 同步提交");
+  return commit;
+}
+
+async function removeThreadSyncRef(
+  repoRoot: string,
+  ref: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+  lifecycle?: ThreadWorkspaceRequest["lifecycle"],
+): Promise<void> {
+  const head = await readThreadSyncCommit(repoRoot, ref, timeoutMs, signal);
+  if (head === null) return;
+  const removed = await runThreadSyncGit(
+    repoRoot,
+    ["update-ref", "--no-deref", "-d", ref, head],
+    timeoutMs,
+    signal,
+    undefined,
+    lifecycle,
+    repoRoot,
+  );
+  assertThreadSyncNotCancelled(removed, signal);
+  if (!removed || removed.timedOut || removed.exitCode !== 0) {
+    throw new Error("无法安全清理 Git 同步临时引用");
+  }
+}
+
+async function prepareThreadWorkspaceSync(
+  repoRoot: string,
+  explicitBase: boolean,
+  timeoutMs: number,
+  signal?: AbortSignal,
+  lifecycle?: ThreadWorkspaceRequest["lifecycle"],
+): Promise<ThreadWorkspaceSyncPlan> {
+  if (explicitBase) {
+    const originalHead = await readRequiredThreadSyncCommit(repoRoot, "HEAD", timeoutMs, signal);
+    return { kind: "explicit-base", originalHead };
+  }
+
+  const branchSnapshot = await runThreadSyncGit(
+    repoRoot,
+    [
+      "for-each-ref",
+      "--format=%(HEAD)%00%(objectname)%00%(refname)%00%(upstream:remotename)%00%(upstream:remoteref)",
+      "refs/heads/",
+    ],
+    timeoutMs,
+    signal,
+    THREAD_SYNC_STATUS_MAX_BYTES,
+  );
+  assertThreadSyncNotCancelled(branchSnapshot, signal);
+  if (
+    !branchSnapshot ||
+    branchSnapshot.timedOut ||
+    branchSnapshot.outputExceeded === true ||
+    branchSnapshot.exitCode !== 0
+  ) {
+    const originalHead = await readRequiredThreadSyncCommit(repoRoot, "HEAD", timeoutMs, signal);
+    return { kind: "fallback", originalHead, reason: "无法解析当前分支 upstream，未执行同步" };
+  }
+  const currentBranch = branchSnapshot.stdout
+    .trimEnd()
+    .split("\n")
+    .map((line) => line.split("\0"))
+    .find((fields) => fields[0] === "*");
+  if (!currentBranch) {
+    const originalHead = await readRequiredThreadSyncCommit(repoRoot, "HEAD", timeoutMs, signal);
+    return {
+      kind: "fallback",
+      originalHead,
+      reason: "当前 HEAD 未关联可同步的分支 upstream",
+    };
+  }
+  const originalHead = currentBranch[1] ?? "";
+  const branchRef = currentBranch[2] ?? "";
+  const remote = (currentBranch[3] ?? "").trim();
+  const upstreamRef = (currentBranch[4] ?? "").trim();
+  if (!/^[0-9a-f]{40,64}$/u.test(originalHead) || !branchRef.startsWith("refs/heads/")) {
+    throw new Error("无法固定当前分支提交，拒绝创建同步工作区");
+  }
+  if (remote.length === 0 || !upstreamRef.startsWith("refs/")) {
+    return {
+      kind: "fallback",
+      originalHead,
+      reason: "当前分支未配置 upstream，未执行同步",
+    };
+  }
+
+  const fetchRef = `${THREAD_SYNC_REF_PREFIX}${randomUUID()}`;
+  const fetched = await runThreadSyncGit(
+    repoRoot,
+    [
+      "fetch",
+      "--no-tags",
+      "--no-write-fetch-head",
+      "--no-recurse-submodules",
+      "--",
+      remote.trim(),
+      `+${upstreamRef}:${fetchRef}`,
+    ],
+    timeoutMs,
+    signal,
+    undefined,
+    lifecycle,
+    repoRoot,
+  );
+  if (isAborted(signal) || fetched?.aborted === true) {
+    if (fetched !== null && fetched !== undefined) {
+      await removeThreadSyncRef(repoRoot, fetchRef, timeoutMs, undefined, lifecycle);
+    }
+    throw new Error("创建隔离工作区同步已取消");
+  }
+  if (!fetched || fetched.timedOut || fetched.exitCode !== 0) {
+    await removeThreadSyncRef(repoRoot, fetchRef, timeoutMs, signal, lifecycle);
+    return {
+      kind: "fallback",
+      originalHead,
+      reason: "无法获取 upstream，未执行同步",
+    };
+  }
+  const upstreamHead = await readThreadSyncCommit(repoRoot, fetchRef, timeoutMs, signal);
+  if (upstreamHead === null) {
+    await removeThreadSyncRef(repoRoot, fetchRef, timeoutMs, signal, lifecycle);
+    return {
+      kind: "fallback",
+      originalHead,
+      reason: "无法确认已获取的 upstream，未执行同步",
+    };
+  }
+  return { kind: "upstream", originalHead, upstreamHead, fetchRef };
+}
+
+async function threadWorkspaceStatus(
+  cwd: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<CommandResult | null> {
+  return runThreadSyncGit(
+    cwd,
+    ["status", "--porcelain=v1", "--untracked-files=normal", "--ignored"],
+    timeoutMs,
+    signal,
+    THREAD_SYNC_STATUS_MAX_BYTES,
+  );
+}
+
+async function restoreAfterThreadSyncMergeFailure(
+  cwd: string,
+  originalHead: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+  lifecycle?: ThreadWorkspaceRequest["lifecycle"],
+  processCwd?: string,
+): Promise<void> {
+  const currentHead = await readRequiredThreadSyncCommit(cwd, "HEAD", timeoutMs, signal);
+  if (currentHead !== originalHead) {
+    throw new Error("Git 同步失败后工作区提交已改变，拒绝回退");
+  }
+
+  const mergeHead = await readThreadSyncCommit(cwd, "MERGE_HEAD", timeoutMs, signal);
+  if (mergeHead !== null) {
+    const aborted = await runThreadSyncGit(
+      cwd,
+      ["merge", "--abort"],
+      timeoutMs,
+      signal,
+      undefined,
+      lifecycle,
+      processCwd,
+    );
+    assertThreadSyncNotCancelled(aborted, signal);
+    if (!aborted || aborted.timedOut || aborted.exitCode !== 0) {
+      throw new Error("无法确认 Git 同步冲突已安全回退");
+    }
+  }
+
+  const restoredHead = await readRequiredThreadSyncCommit(cwd, "HEAD", timeoutMs, signal);
+  const status = await threadWorkspaceStatus(cwd, timeoutMs, signal);
+  assertThreadSyncNotCancelled(status, signal);
+  if (
+    restoredHead !== originalHead ||
+    !status ||
+    status.timedOut ||
+    status.exitCode !== 0 ||
+    status.outputExceeded === true ||
+    status.stdout.length !== 0
+  ) {
+    throw new Error("无法确认 Git 同步冲突已安全回退");
+  }
+}
+
+async function completeThreadWorkspaceSync(
+  repoRoot: string,
+  commonDir: string,
+  workspacePath: string,
+  branch: string,
+  plan: ThreadWorkspaceSyncPlan,
+  timeoutMs: number,
+  signal?: AbortSignal,
+  lifecycle?: ThreadWorkspaceRequest["lifecycle"],
+): Promise<ThreadWorkspaceSync> {
+  const commonDirResult = await runThreadSyncGit(
+    workspacePath,
+    ["rev-parse", "--git-common-dir"],
+    timeoutMs,
+    signal,
+  );
+  assertThreadSyncNotCancelled(commonDirResult, signal);
+  if (!commonDirResult || commonDirResult.timedOut || commonDirResult.exitCode !== 0) {
+    throw new Error("无法确认新隔离工作区所属仓库，拒绝同步");
+  }
+  const commonDirOutput = commonDirResult.stdout.trim();
+  if (commonDirOutput.length === 0) throw new Error("无法确认新隔离工作区所属仓库，拒绝同步");
+  const actualCommonDir = await realpath(
+    isAbsolute(commonDirOutput) ? commonDirOutput : resolve(workspacePath, commonDirOutput),
+  );
+  if (actualCommonDir !== commonDir) {
+    throw new Error("新隔离工作区所属仓库已改变，拒绝同步");
+  }
+  const branchResult = await runThreadSyncGit(
+    workspacePath,
+    ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    timeoutMs,
+    signal,
+  );
+  assertThreadSyncNotCancelled(branchResult, signal);
+  if (!branchResult || branchResult.timedOut || branchResult.exitCode !== 0 || branchResult.stdout.trim() !== branch) {
+    throw new Error("新隔离工作区分支与计划不符，拒绝同步");
+  }
+  let head = await readRequiredThreadSyncCommit(workspacePath, "HEAD", timeoutMs, signal);
+  if (plan.kind === "explicit-base") {
+    return { status: "explicit-base", originalHead: plan.originalHead, head };
+  }
+  if (head !== plan.originalHead) {
+    throw new Error("新隔离工作区未从固定的原始提交创建，拒绝同步");
+  }
+  if (plan.kind === "fallback") {
+    return { status: "fallback", originalHead: plan.originalHead, head, reason: plan.reason };
+  }
+  const alreadyContainsUpstream = await runThreadSyncGit(
+    workspacePath,
+    ["merge-base", "--is-ancestor", plan.upstreamHead, plan.originalHead],
+    timeoutMs,
+    signal,
+  );
+  assertThreadSyncNotCancelled(alreadyContainsUpstream, signal);
+  if (alreadyContainsUpstream && !alreadyContainsUpstream.timedOut && alreadyContainsUpstream.exitCode === 0) {
+    head = await readRequiredThreadSyncCommit(workspacePath, "HEAD", timeoutMs, signal);
+    if (head !== plan.originalHead) {
+      throw new Error("新隔离工作区提交在同步前已改变，拒绝同步");
+    }
+    await removeThreadSyncRef(repoRoot, plan.fetchRef, timeoutMs, signal, lifecycle);
+    return { status: "synced", originalHead: plan.originalHead, head };
+  }
+  if (
+    !alreadyContainsUpstream ||
+    alreadyContainsUpstream.timedOut ||
+    alreadyContainsUpstream.exitCode !== 1
+  ) {
+    head = await readRequiredThreadSyncCommit(workspacePath, "HEAD", timeoutMs, signal);
+    if (head !== plan.originalHead) {
+      throw new Error("新隔离工作区提交在同步前已改变，拒绝同步");
+    }
+    await removeThreadSyncRef(repoRoot, plan.fetchRef, timeoutMs, signal, lifecycle);
+    return {
+      status: "fallback",
+      originalHead: plan.originalHead,
+      head,
+      reason: "无法确认 upstream 是否需要整合，未执行同步",
+    };
+  }
+
+  const beforeMerge = await threadWorkspaceStatus(workspacePath, timeoutMs, signal);
+  assertThreadSyncNotCancelled(beforeMerge, signal);
+  head = await readRequiredThreadSyncCommit(workspacePath, "HEAD", timeoutMs, signal);
+  if (head !== plan.originalHead) {
+    throw new Error("新隔离工作区提交在同步前已改变，拒绝同步");
+  }
+
+  if (
+    !beforeMerge ||
+    beforeMerge.timedOut ||
+    beforeMerge.exitCode !== 0 ||
+    beforeMerge.outputExceeded === true
+  ) {
+    await removeThreadSyncRef(repoRoot, plan.fetchRef, timeoutMs, signal, lifecycle);
+    return {
+      status: "fallback",
+      originalHead: plan.originalHead,
+      head,
+      reason: "无法确认新工作区状态，未执行 upstream 同步",
+    };
+  }
+  if (beforeMerge.stdout.length !== 0) {
+    await removeThreadSyncRef(repoRoot, plan.fetchRef, timeoutMs, signal, lifecycle);
+    return {
+      status: "fallback",
+      originalHead: plan.originalHead,
+      head,
+      reason: "新工作区包含本地文件，未执行 upstream 同步",
+    };
+  }
+
+  const merged = await runThreadSyncGit(
+    workspacePath,
+    ["merge", "--ff", "--no-edit", plan.upstreamHead],
+    timeoutMs,
+    signal,
+    undefined,
+    lifecycle,
+    repoRoot,
+  );
+  assertThreadSyncNotCancelled(merged, signal);
+  if (merged && !merged.timedOut && merged.exitCode === 0) {
+    head = await readRequiredThreadSyncCommit(workspacePath, "HEAD", timeoutMs, signal);
+    for (const ancestor of [plan.originalHead, plan.upstreamHead]) {
+      const included = await runThreadSyncGit(
+        workspacePath,
+        ["merge-base", "--is-ancestor", ancestor, head],
+        timeoutMs,
+        signal,
+      );
+      assertThreadSyncNotCancelled(included, signal);
+      if (!included || included.timedOut || included.exitCode !== 0) {
+        throw new Error("Git 合并完成后无法确认双方提交均已保留");
+      }
+    }
+    await removeThreadSyncRef(repoRoot, plan.fetchRef, timeoutMs, signal, lifecycle);
+    return { status: "synced", originalHead: plan.originalHead, head };
+  }
+
+  await restoreAfterThreadSyncMergeFailure(
+    workspacePath,
+    plan.originalHead,
+    timeoutMs,
+    signal,
+    lifecycle,
+    repoRoot,
+  );
+  head = await readRequiredThreadSyncCommit(workspacePath, "HEAD", timeoutMs, signal);
+  await removeThreadSyncRef(repoRoot, plan.fetchRef, timeoutMs, signal, lifecycle);
+  return {
+    status: "fallback",
+    originalHead: plan.originalHead,
+    head,
+    reason: "upstream 与当前代码存在冲突或无法自动整合",
+  };
+}
+
+function trackedCreateLifecycle(
+  lifecycle?: ThreadWorkspaceRequest["lifecycle"],
+): {
+  lifecycle: NonNullable<ThreadWorkspaceRequest["lifecycle"]>;
+  outcome: () => "not-started" | "started" | "confirmed" | "not-spawned" | "unknown";
+} {
+  let state: "not-started" | "started" | "confirmed" | "not-spawned" | "unknown" = "not-started";
+  return {
+    lifecycle: {
+      beforeSpawn(cwd) {
+        state = "started";
+        lifecycle?.beforeSpawn(cwd);
+      },
+      onSpawn(process) {
+        lifecycle?.onSpawn(process);
+      },
+      onConfirmedExit() {
+        state = "confirmed";
+        lifecycle?.onConfirmedExit();
+      },
+      onNotSpawned() {
+        state = "not-spawned";
+        lifecycle?.onNotSpawned();
+      },
+      onUnknown() {
+        state = "unknown";
+        lifecycle?.onUnknown();
+      },
+    },
+    outcome: () => state,
+  };
 }
 
 const worktreeCreationTails = new Map<string, Promise<void>>();
@@ -1225,75 +1682,131 @@ export function createWorktreePort(options: WorktreePortOptions): WorktreePort {
         if (isAborted(signal)) {
           throw new Error(`创建隔离工作区已取消：${candidate.path}`);
         }
-        if (available.available) {
-          const reportedPath = await worktrunkCreate({
-            command: available.command,
+        const syncLifecycle = request.sync === true ? trackedCreateLifecycle(request.lifecycle) : undefined;
+        const createLifecycle = syncLifecycle?.lifecycle ?? request.lifecycle;
+        const syncPlan = request.sync === true
+          ? await prepareThreadWorkspaceSync(
             repoRoot,
-            branch: candidate.branch,
-            path: candidate.path,
-            ...(request.base === undefined ? {} : { base: request.base }),
-            timeoutMs: createTimeoutMs,
-            ...(signal === undefined ? {} : { signal }),
-            ...(request.lifecycle === undefined ? {} : { lifecycle: request.lifecycle }),
-          });
-          const actualPath = await realpath(candidate.path);
-          const created = await lstat(candidate.path);
-          if (
-            created.isSymbolicLink() ||
-            !created.isDirectory() ||
-            actualPath !== candidate.path ||
-            (await realpath(isAbsolute(reportedPath) ? reportedPath : resolve(repoRoot, reportedPath))) !==
-              candidate.path
-          ) {
-            throw new Error(`Worktrunk 创建到非预期工作区目录：${candidate.path}`);
+            request.base !== undefined,
+            createTimeoutMs,
+            signal,
+            createLifecycle,
+          )
+          : undefined;
+        const startBase = request.base === undefined ? syncPlan?.originalHead : request.base;
+
+        const createActualWorktree = async (): Promise<string> => {
+          if (available.available) {
+            const reportedPath = await worktrunkCreate({
+              command: available.command,
+              repoRoot,
+              branch: candidate.branch,
+              path: candidate.path,
+              ...(startBase === undefined ? {} : { base: startBase }),
+              timeoutMs: createTimeoutMs,
+              ...(signal === undefined ? {} : { signal }),
+              ...(createLifecycle === undefined ? {} : { lifecycle: createLifecycle }),
+            });
+            const actualPath = await realpath(candidate.path);
+            const created = await lstat(candidate.path);
+            if (
+              created.isSymbolicLink() ||
+              !created.isDirectory() ||
+              actualPath !== candidate.path ||
+              (await realpath(isAbsolute(reportedPath) ? reportedPath : resolve(repoRoot, reportedPath))) !==
+                candidate.path
+            ) {
+              throw new Error(`Worktrunk 创建到非预期工作区目录：${candidate.path}`);
+            }
+            return actualPath;
           }
-          return { cwd: actualPath, branch: candidate.branch };
-        }
-        const created = await runCommand(
-          [
-            options.command,
-            "worktree",
-            "add",
-            candidate.path,
-            ...(request.base === undefined ? [] : [request.base]),
-            "-b",
-            candidate.branch,
-            "-C",
-            repoRoot,
-            "-q",
-          ],
-          {
-            timeoutMs: createTimeoutMs,
-            ...(signal === undefined ? {} : { signal }),
-            ...(request.lifecycle === undefined
-              ? {}
-              : {
-                parentDeathWatchdog: true,
-                operation: "OMP worktree add",
-                lifecycle: request.lifecycle,
-              }),
-          },
-        );
-        if (!created) {
-          throw new Error(`无法执行 OMP（${options.command}）：${candidate.path}`);
-        }
-        if (created.timedOut) {
-          throw new Error(`创建隔离工作区超时（${createTimeoutMs} ms）：${candidate.path}`);
-        }
-        if (created.aborted) {
-          throw new Error(`创建隔离工作区已取消：${candidate.path}`);
-        }
-        if (created.exitCode !== 0) {
-          throw new Error(
-            `创建隔离工作区失败（退出码 ${created.exitCode}）：${commandFailure(created)}`,
+          const created = await runCommand(
+            [
+              options.command,
+              "worktree",
+              "add",
+              candidate.path,
+              ...(startBase === undefined ? [] : [startBase]),
+              "-b",
+              candidate.branch,
+              "-C",
+              repoRoot,
+              "-q",
+            ],
+            {
+              timeoutMs: createTimeoutMs,
+              ...(signal === undefined ? {} : { signal }),
+              ...(createLifecycle === undefined
+                ? {}
+                : {
+                  parentDeathWatchdog: true,
+                  operation: "OMP worktree add",
+                  lifecycle: createLifecycle,
+                }),
+            },
           );
+          if (!created) {
+            throw new Error(`无法执行 OMP（${options.command}）：${candidate.path}`);
+          }
+          if (created.timedOut) {
+            throw new Error(`创建隔离工作区超时（${createTimeoutMs} ms）：${candidate.path}`);
+          }
+          if (created.aborted) {
+            throw new Error(`创建隔离工作区已取消：${candidate.path}`);
+          }
+          if (created.exitCode !== 0) {
+            throw new Error(
+              `创建隔离工作区失败（退出码 ${created.exitCode}）：${commandFailure(created)}`,
+            );
+          }
+          const actualPath = await realpath(candidate.path);
+          const createdPath = await lstat(candidate.path);
+          if (createdPath.isSymbolicLink() || !createdPath.isDirectory() || actualPath !== candidate.path) {
+            throw new Error(`OMP 创建到非预期工作区目录：${candidate.path}`);
+          }
+          return actualPath;
+        };
+
+        let actualPath: string;
+        try {
+          actualPath = await createActualWorktree();
+        } catch (error) {
+          const createOutcome = syncLifecycle?.outcome();
+          if (
+            syncPlan?.kind === "upstream" &&
+            createOutcome !== "started" &&
+            createOutcome !== "unknown"
+          ) {
+            await removeThreadSyncRef(
+              repoRoot,
+              syncPlan.fetchRef,
+              createTimeoutMs,
+              isAborted(signal) ? undefined : signal,
+              createLifecycle,
+            );
+          }
+          throw error;
         }
-        const actualPath = await realpath(candidate.path);
-        const createdPath = await lstat(candidate.path);
-        if (createdPath.isSymbolicLink() || !createdPath.isDirectory() || actualPath !== candidate.path) {
-          throw new Error(`OMP 创建到非预期工作区目录：${candidate.path}`);
+        if (syncPlan === undefined) return { cwd: actualPath, branch: candidate.branch };
+        let sync: ThreadWorkspaceSync;
+        try {
+          sync = await completeThreadWorkspaceSync(
+            repoRoot,
+            commonDir,
+            actualPath,
+            candidate.branch,
+            syncPlan,
+            createTimeoutMs,
+            signal,
+            createLifecycle,
+          );
+        } catch (error) {
+          if (!isAborted(signal) && syncLifecycle?.outcome() !== "unknown") {
+            syncLifecycle?.lifecycle.onUnknown();
+          }
+          throw error;
         }
-        return { cwd: actualPath, branch: candidate.branch };
+        return { cwd: actualPath, branch: candidate.branch, sync };
       });
     },
 

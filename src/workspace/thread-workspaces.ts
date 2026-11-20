@@ -6,6 +6,7 @@ import type {
   ChatTarget,
   ThreadListenLevel,
   ThreadSummary,
+  ThreadWorkspace,
   ThreadWorkspaceRequest,
   WorktreeCreateLifecycle,
   WorktreePort,
@@ -13,6 +14,7 @@ import type {
 import type { ChannelStore } from "../store/index.ts";
 import type {
   BindingRecord,
+  OutboxInsert,
   TaskRecord,
   ThreadWorkspaceOperationRecord,
   ThreadWorkspaceProjectRecord,
@@ -21,6 +23,7 @@ import type {
 import { threadParentGroupId, threadShortId } from "../threads/thread-target.ts";
 import { isTransientServerFailure } from "../errors.ts";
 import { OctoError } from "../octo/error.ts";
+import { splitUtf8 } from "../outbox.ts";
 import { runCommand } from "./worktrunk.ts";
 import { worktreeSlug } from "./worktree.ts";
 
@@ -52,14 +55,15 @@ export interface ThreadWorkspaceHost {
     | "getThreadWorkspace"
     | "ensureBindingIfMatches"
     | "saveThreadWorkspace"
-    | "saveThreadWorkspaces"
     | "saveThreadWorkspaceIntent"
     | "addThreadWorkspaceIntentChannel"
-    | "completeThreadWorkspaceIntent"
     | "failThreadWorkspaceIntent"
+    | "saveThreadWorkspaceWithOutbox"
+    | "commitThreadWorkspaceBatch"
     | "listThreadWorkspaces"
   >;
   readonly botUid: string;
+  readonly flushTarget?: (target: ChatTarget) => Promise<void>;
 }
 
 /** Additional durable-session capabilities used only by accepted workspace operations. */
@@ -134,6 +138,116 @@ function boundedError(error: unknown, fallback: string): string {
   const detail = message.replace(/\s+/gu, " ").trim();
   return (detail.length > 0 ? detail : fallback).slice(0, MAX_ERROR_CHARS);
 }
+type ThreadWorkspaceSyncResult = NonNullable<ThreadWorkspace["sync"]>;
+
+const THREAD_SYNC_VISIBLE_REASONS = [
+  ["无法解析当前分支 upstream", "无 upstream，未执行自动同步"],
+  ["当前 HEAD 未关联可同步的分支 upstream", "无 upstream，未执行自动同步"],
+  ["当前分支未配置 upstream", "无 upstream，未执行自动同步"],
+  ["无法获取 upstream", "无法获取 upstream（可能离线或远端获取失败）"],
+  ["无法确认已获取的 upstream", "无法获取 upstream（可能离线或远端获取失败）"],
+  ["无法确认 upstream 是否需要整合", "无法确认 upstream 整合状态，未执行自动同步"],
+  ["无法确认新工作区状态", "无法确认新工作区状态，未执行自动同步"],
+  ["新工作区包含本地文件", "新工作区包含本地文件，未执行自动同步"],
+  ["upstream 与当前代码存在冲突或无法自动整合", "upstream 冲突或自动合并失败，已保留原始提交"],
+] as const;
+
+function safeThreadWorkspaceSyncReason(reason: string | undefined): string {
+  if (reason !== undefined) {
+    const known = THREAD_SYNC_VISIBLE_REASONS.find(([prefix]) => reason.startsWith(prefix));
+    if (known !== undefined) return known[1];
+  }
+  return "自动同步未完成，建议人工同步";
+}
+
+function safeThreadWorkspaceSync(sync: ThreadWorkspaceSyncResult): ThreadWorkspaceSyncResult {
+  return {
+    status: sync.status,
+    originalHead: sync.originalHead,
+    head: sync.head,
+    ...(sync.status === "fallback" ? { reason: safeThreadWorkspaceSyncReason(sync.reason) } : {}),
+  };
+}
+
+function oneLine(value: string, maxChars: number): string {
+  return Array.from(value.replace(/[\u0000-\u001f\u007f]/gu, " ").replace(/\s+/gu, " ").trim())
+    .slice(0, maxChars)
+    .join("");
+}
+
+function syncNoticeOutbox(
+  botUid: string,
+  creator: ChatTarget,
+  thread: Pick<ThreadSummary, "shortId" | "channelId">,
+  project: ThreadWorkspaceProjectRecord,
+): OutboxInsert[] {
+  const sync = project.sync;
+  const unknown = project.syncState === "unknown";
+  if (project.path === null || (!unknown && (sync?.status !== "fallback" || !project.created))) return [];
+
+  const message = unknown
+    ? [
+      `子区 ${oneLine(thread.shortId, 100)} 的项目 ${oneLine(project.name, 200)} 同步结果未确认。`,
+      `候选路径：${oneLine(project.path, 1_000)}`,
+      "请先检查该路径是否为已创建工作区及其当前 Git 提交，再决定如何手动同步。",
+    ].join("\n")
+    : [
+      `子区 ${oneLine(thread.shortId, 100)} 的项目 ${oneLine(project.name, 200)} 未能自动同步，已保留工作区。`,
+      `路径：${oneLine(project.path, 1_000)}`,
+      `起点：${oneLine(sync!.originalHead, 200)}`,
+      `当前提交：${oneLine(sync!.head, 200)}`,
+      `原因：${oneLine(sync!.reason ?? "自动同步未完成，建议人工同步", 120)}`,
+      "请在该工作区手动同步后继续；未在此通知中包含底层 Git 诊断。",
+    ].join("\n");
+  const identity = createHash("sha256")
+    .update(JSON.stringify([
+      botUid,
+      creator.channelType,
+      creator.channelId,
+      thread.channelId,
+      project.name,
+    ]))
+    .digest("hex");
+  return splitUtf8(message).map((text, segmentIndex) => {
+    const messageNo = createHash("sha256").update(`${identity}\0${segmentIndex}`).digest("hex").slice(0, 32);
+    return {
+      id: `thread-sync-${identity}-${segmentIndex}`,
+      botUid,
+      channelType: creator.channelType,
+      channelId: creator.channelId,
+      taskId: null,
+      kind: "text",
+      text,
+      path: null,
+      fileKind: null,
+      clientMsgNo: `${messageNo.slice(0, 8)}-${messageNo.slice(8, 12)}-${messageNo.slice(12, 16)}-${messageNo.slice(16, 20)}-${messageNo.slice(20)}`,
+    };
+  });
+}
+
+/** Recover an interrupted create without guessing whether its Git side effects completed. */
+export function recoverPendingWorkspaceSync(store: ChannelStore, botUid: string): void {
+  for (const workspace of store.listThreadWorkspaces(botUid)) {
+    const pending = workspace.projects.filter((project) => project.syncState === "pending");
+    if (pending.length === 0) continue;
+    const policy = store.getThreadListen(botUid, workspace);
+    if (policy === null) continue;
+    const shortId = threadShortId(workspace.channelId);
+    if (shortId === null) continue;
+    const creator: ChatTarget = {
+      channelType: policy.creatorChannelType,
+      channelId: policy.creatorChannelId,
+    };
+    for (const project of pending) project.syncState = "unknown";
+    workspace.status = "failed";
+    workspace.error = "工作区同步结果未确认，创建批次保持未就绪状态";
+    const notices = pending.flatMap((project) =>
+      syncNoticeOutbox(botUid, creator, { channelId: workspace.channelId, shortId }, project)
+    );
+    store.saveThreadWorkspaceWithOutbox(workspace, notices);
+  }
+}
+
 
 function optionalString(args: Record<string, unknown>, field: string): string | undefined {
   const value = args[field];
@@ -1797,6 +1911,7 @@ export async function createThreadWorkspaceBatch(
           baseDir: project.repo,
           label,
           threadId: thread.shortId,
+          sync: true,
           ...(requestedPath === undefined ? {} : { path: requestedPath }),
           ...(project.base === undefined ? {} : { base: project.base }),
           onPlanned: (planned) => {
@@ -1811,6 +1926,7 @@ export async function createThreadWorkspaceBatch(
             }
             project.path = planned.cwd;
             project.branch = planned.branch;
+            project.syncState = "pending";
             if (plan.legacyWorktreeName !== undefined) project.repo = planned.repo;
             host.store.saveThreadWorkspace(record);
           },
@@ -1831,12 +1947,57 @@ export async function createThreadWorkspaceBatch(
           project.path = canonicalPath;
           project.branch = workspace.branch;
           project.created = true;
-          host.store.saveThreadWorkspace(record);
+          const sync = workspace.sync;
+          if (
+            sync !== undefined
+            && (project.base === undefined
+              ? sync.status === "synced" || sync.status === "fallback"
+              : sync.status === "explicit-base")
+          ) {
+            project.sync = safeThreadWorkspaceSync(sync);
+            project.syncState = "settled";
+          } else {
+            delete project.sync;
+            project.syncState = "unknown";
+            const detail = "工作区同步结果未确认，创建批次保持未就绪状态";
+            errors.push(detail);
+            outcome.projectErrors[index] = detail;
+            outcome.error ??= detail;
+          }
+          const notices = onThreadCreated === undefined
+            ? []
+            : syncNoticeOutbox(host.botUid, creator, thread, project);
+          host.store.saveThreadWorkspaceWithOutbox(record, notices);
+          if (notices.length > 0 && host.flushTarget !== undefined) {
+            try {
+              await host.flushTarget(creator);
+            } catch {
+              // The persisted outbox row remains the source of truth for delivery recovery.
+            }
+          }
           if (plan.layout !== "shared") ensureThreadBinding(host, thread, canonicalPath);
         } catch (error) {
-          const detail = addFailure(errors, error, "隔离工作区创建失败");
-          outcome.projectErrors[index] = detail;
-          outcome.error = detail;
+          const pendingSync = project.syncState === "pending";
+          if (pendingSync) project.syncState = "unknown";
+          const detail = pendingSync || project.syncState === "unknown"
+            ? "工作区同步结果未确认，创建批次保持未就绪状态"
+            : addFailure(errors, error, "隔离工作区创建失败");
+          if (pendingSync) errors.push(detail);
+          outcome.projectErrors[index] ??= detail;
+          outcome.error ??= detail;
+          if (pendingSync) {
+            const notices = onThreadCreated === undefined
+              ? []
+              : syncNoticeOutbox(host.botUid, creator, thread, project);
+            host.store.saveThreadWorkspaceWithOutbox(record, notices);
+            if (notices.length > 0 && host.flushTarget !== undefined) {
+              try {
+                await host.flushTarget(creator);
+              } catch {
+                // The durable outbox retains delivery state.
+              }
+            }
+          }
         }
       }
     }
@@ -1876,43 +2037,28 @@ export async function createThreadWorkspaceBatch(
     outcome.record.error = firstFailure;
     if (firstFailure !== null) outcome.error ??= firstFailure;
   }
-  let recordsPersisted = true;
+  let finalizedIntentCount = 0;
   if (records.length > 0) {
+    const finalizations = outcomes.flatMap((outcome) => {
+      const intentId = mappedIntents.get(outcome.thread.channelId);
+      return intentId === undefined
+        ? []
+        : [{
+          id: intentId,
+          status: outcome.record.status === "ready" ? "complete" as const : "failed" as const,
+          error: outcome.record.error,
+        }];
+    });
     try {
-      host.store.saveThreadWorkspaces(records);
+      host.store.commitThreadWorkspaceBatch(host.botUid, records, finalizations);
+      finalizedIntentCount = finalizations.length;
     } catch (error) {
       const detail = addFailure(errors, error, "无法原子提交线程工作区状态");
-      recordsPersisted = false;
       const failed = normalizedFailure(errors) ?? detail;
       for (const outcome of outcomes) {
         outcome.record.status = "failed";
         outcome.record.error = failed;
         outcome.error = failed;
-      }
-    }
-  }
-
-  let finalizedIntentCount = 0;
-  if (recordsPersisted) {
-    for (const outcome of outcomes) {
-      const intentId = mappedIntents.get(outcome.thread.channelId);
-      if (intentId === undefined) continue;
-      try {
-        if (outcome.record.status === "ready") {
-          host.store.completeThreadWorkspaceIntent(host.botUid, intentId);
-        } else {
-          host.store.failThreadWorkspaceIntent(
-            host.botUid,
-            intentId,
-            outcome.record.error ?? normalizedFailure(errors),
-          );
-        }
-        finalizedIntentCount += 1;
-      } catch (error) {
-        const detail = addFailure(errors, error, "无法持久化线程工作区创建结果");
-        outcome.record.status = "failed";
-        outcome.record.error = detail;
-        outcome.error = detail;
       }
     }
   }

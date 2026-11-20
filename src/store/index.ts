@@ -42,7 +42,7 @@ import { advanceHistoryLedger, clearContextLedger, commitContextInjection, commi
 import { acknowledgeTextOutbox, beginTextCreate, bindTextOutbox, commitTextStream, countPendingOutbox, countUnknownOutbox, enqueueOutbox, failTextOutbox, getBotEventCursor, getLatestFinalAssistantText, getOutbox, listPendingOutbox, listPendingOutboxTargets, listTextStream, markOutboxDead, markOutboxFailure, markOutboxSent, setBotEventCursor, updateTextOutbox } from "./store-outbox.ts";
 import { answerClosedQuestion, answerQuestion, answerQuestions, cancelQuestion, cancelQuestions, cancelTaskQuestions, createQuestion, getQuestion, listPendingQuestions, listQuestionsByCard, listTaskQuestions, markQuestionsSettled, pendingQuestionIds, reserveQuestionCardSeq, setQuestionCard, setQuestionsCard, updateQuestionPayloads } from "./store-questions.ts";
 import { acceptChatGrantOperation, getChatGrantOperation, getChatGrantOperationByEvent, listPendingChatGrantOperations, markChatGrantConfigMirror, markChatGrantResultDelivered, nextChatGrantCardEditSeq } from "./store-grants.ts";
-import { acceptThreadWorkspaceOperation, addThreadWorkspaceIntentChannel, completeThreadCreatorIntent, completeThreadWorkspaceIntent, failThreadWorkspaceIntent, finishThreadWorkspaceCleanup, finishThreadWorkspaceOperation, getLatestThreadWorkspaceOperation, getThreadWorkspace, getThreadWorkspaceCleanup, getThreadWorkspaceIntent, getThreadWorkspaceOperation, isThreadWorkspaceCleanupBlocked, isThreadWorkspaceIntentBlocked, isThreadWorkspaceOperationBlocked, isWorkspaceDirectoryOwned, listThreadWorkspaceIntents, listThreadWorkspaceOperations, listThreadWorkspaces, listWorkspaceCwds, markThreadWorkspaceCleanupDeleted, markThreadWorkspaceCleanupUnknown, recoverThreadWorkspaceCleanups, releaseThreadWorkspaceCleanup, requestThreadWorkspaceOperationCancellation, reserveThreadWorkspaceCleanup, saveThreadWorkspace, saveThreadWorkspaceIntent, saveThreadWorkspaces, updateThreadWorkspaceOperation, workspaceDirectories } from "./store-workspaces.ts";
+import { acceptThreadWorkspaceOperation, addThreadWorkspaceIntentChannel, commitThreadWorkspaceBatch, completeThreadCreatorIntent, completeThreadWorkspaceIntent, failThreadWorkspaceIntent, finishThreadWorkspaceCleanup, finishThreadWorkspaceOperation, getLatestThreadWorkspaceOperation, getThreadWorkspace, getThreadWorkspaceCleanup, getThreadWorkspaceIntent, getThreadWorkspaceOperation, isThreadWorkspaceCleanupBlocked, isThreadWorkspaceIntentBlocked, isThreadWorkspaceOperationBlocked, isWorkspaceDirectoryOwned, listThreadWorkspaceIntents, listThreadWorkspaceOperations, listThreadWorkspaces, listWorkspaceCwds, markThreadWorkspaceCleanupDeleted, markThreadWorkspaceCleanupUnknown, recoverThreadWorkspaceCleanups, releaseThreadWorkspaceCleanup, requestThreadWorkspaceOperationCancellation, reserveThreadWorkspaceCleanup, saveThreadWorkspace, saveThreadWorkspaceIntent, saveThreadWorkspaceWithOutbox, saveThreadWorkspaces, updateThreadWorkspaceOperation, workspaceDirectories } from "./store-workspaces.ts";
 import { completeThreadFork, getThreadFork, getThreadForkByTarget, listThreadForks, saveThreadFork } from "./store-forks.ts";
 import { advanceThreadArchiveGeneration, beginThreadMerge, claimThreadTaskDispatchIntent, claimThreadMergeDispatchIntent, ensureThreadListen, getThreadArchiveGeneration, getThreadListen, getThreadMergeEvent, getThreadTaskEvent, isThreadMergeEventPending, isThreadTaskEventPending, listPendingThreadMergeEvents, listPendingThreadTaskEvents, listThreadMergeEvents, listThreadTaskEvents, markThreadMergeEventDelivered, markThreadTaskEventDelivered, recordCreatedThreadListen, saveThreadMergeEvent, saveThreadTaskEvent, setThreadListen } from "./store-thread-listen.ts";
 import { addThreadReferences, captureReferenceHistorySnapshot as captureHistorySnapshot, deleteThreadReferences, getThreadReferences, isThreadReferencesDeleted, listReferenceHistory as readReferenceHistory } from "./store-references.ts";
@@ -235,6 +235,21 @@ export class ChannelStore {
 
   saveThreadWorkspaces(records: readonly ThreadWorkspaceRecord[]): void {
     saveThreadWorkspaces(this.db, records);
+  }
+  saveThreadWorkspaceWithOutbox(record: ThreadWorkspaceRecord, outbox: readonly OutboxInsert[]): void {
+    saveThreadWorkspaceWithOutbox(this.db, record, outbox);
+  }
+
+  commitThreadWorkspaceBatch(
+    botUid: string,
+    records: readonly ThreadWorkspaceRecord[],
+    intents: readonly {
+      id: string;
+      status: "complete" | "failed";
+      error?: string | null;
+    }[],
+  ): void {
+    commitThreadWorkspaceBatch(this.db, botUid, records, intents);
   }
 
   getThreadWorkspace(botUid: string, target: ChatTarget): ThreadWorkspaceRecord | null {

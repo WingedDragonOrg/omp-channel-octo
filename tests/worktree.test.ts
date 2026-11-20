@@ -171,6 +171,257 @@ async function recordedArgv(stub: string): Promise<string[]> {
 /** A worktree stub set where wt is unavailable, so creation exercises the omp fallback. */
 const NOWT = ["/nonexistent/wt"];
 
+test("updates the new worktree from its upstream without modifying a dirty source", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-sync-")));
+  try {
+    const repo = await createRepo(root);
+    const remote = join(root, "remote.git");
+    await runGit(root, ["init", "--bare", "-q", remote]);
+    await runGit(repo, ["remote", "add", "origin", remote]);
+    await runGit(repo, ["push", "-q", "-u", "origin", "main"]);
+    const publisher = join(root, "publisher");
+    await runGit(root, ["clone", "-q", "-b", "main", remote, publisher]);
+    await writeFile(join(publisher, "upstream.txt"), "remote progress\n");
+    await runGit(publisher, ["add", "."]);
+    await runGit(publisher, ["-c", "user.email=test@example.com", "-c", "user.name=Fixture", "commit", "-q", "-m", "remote progress"]);
+    await runGit(publisher, ["push", "-q", "origin", "main"]);
+    await writeFile(join(repo, "file.txt"), "uncommitted source\n");
+    await writeFile(join(repo, "staged.txt"), "staged source\n");
+    await runGit(repo, ["add", "staged.txt"]);
+    await writeFile(join(repo, "untracked.txt"), "untracked source\n");
+    const sourceHead = await runGit(repo, ["rev-parse", "HEAD"]);
+    const sourceStatus = await runGit(repo, ["status", "--porcelain"]);
+    const wt = await writeStub(root, WT_SWITCH_STUB, "wt");
+    const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [wt] });
+    const workspace = await port.create({ baseDir: repo, label: "sync", threadId: "123", sync: true });
+    const workspaceHead = await runGit(workspace.cwd, ["rev-parse", "HEAD"]);
+    expect(workspace.sync).toEqual({ status: "synced", originalHead: sourceHead, head: workspaceHead });
+    expect(await readFile(join(workspace.cwd, "upstream.txt"), "utf8")).toBe("remote progress\n");
+    expect(await runGit(repo, ["rev-parse", "HEAD"])).toBe(sourceHead);
+    expect(await runGit(repo, ["status", "--porcelain"])).toBe(sourceStatus);
+    expect(await readFile(join(repo, "file.txt"), "utf8")).toBe("uncommitted source\n");
+    expect(await readFile(join(repo, "staged.txt"), "utf8")).toBe("staged source\n");
+    expect(await readFile(join(repo, "untracked.txt"), "utf8")).toBe("untracked source\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("falls back to the original commit after an upstream merge conflict", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-sync-")));
+  try {
+    const repo = await createRepo(root);
+    const remote = join(root, "remote.git");
+    await runGit(root, ["init", "--bare", "-q", remote]);
+    await runGit(repo, ["remote", "add", "origin", remote]);
+    await runGit(repo, ["push", "-q", "-u", "origin", "main"]);
+    const publisher = join(root, "publisher");
+    await runGit(root, ["clone", "-q", "-b", "main", remote, publisher]);
+
+    await writeFile(join(repo, "file.txt"), "local progress\n");
+    await runGit(repo, ["add", "file.txt"]);
+    await runGit(repo, ["-c", "user.email=test@example.com", "-c", "user.name=Fixture", "commit", "-q", "-m", "local progress"]);
+    const sourceHead = await runGit(repo, ["rev-parse", "HEAD"]);
+    await writeFile(join(publisher, "file.txt"), "remote progress\n");
+    await runGit(publisher, ["add", "file.txt"]);
+    await runGit(publisher, ["-c", "user.email=test@example.com", "-c", "user.name=Fixture", "commit", "-q", "-m", "remote progress"]);
+    await runGit(publisher, ["push", "-q", "origin", "main"]);
+
+    const wt = await writeStub(root, WT_SWITCH_STUB, "wt");
+    const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [wt] });
+    const workspace = await port.create({ baseDir: repo, label: "conflict", threadId: "123", sync: true });
+    expect(workspace.sync).toMatchObject({
+      status: "fallback",
+      originalHead: sourceHead,
+      head: sourceHead,
+    });
+    expect(workspace.sync?.reason).toBeTruthy();
+    expect(await readFile(join(workspace.cwd, "file.txt"), "utf8")).toBe("local progress\n");
+    expect(await runGit(workspace.cwd, ["status", "--porcelain"])).toBe("");
+    expect(await runGit(repo, ["rev-parse", "HEAD"])).toBe(sourceHead);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("falls back without discarding files created by worktree hooks", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-sync-")));
+  try {
+    const repo = await createRepo(root);
+    const remote = join(root, "remote.git");
+    await runGit(root, ["init", "--bare", "-q", remote]);
+    await runGit(repo, ["remote", "add", "origin", remote]);
+    await runGit(repo, ["push", "-q", "-u", "origin", "main"]);
+    const publisher = join(root, "publisher");
+    await runGit(root, ["clone", "-q", "-b", "main", remote, publisher]);
+    await writeFile(join(publisher, "upstream.txt"), "remote progress\n");
+    await runGit(publisher, ["add", "."]);
+    await runGit(publisher, ["-c", "user.email=test@example.com", "-c", "user.name=Fixture", "commit", "-q", "-m", "remote progress"]);
+    await runGit(publisher, ["push", "-q", "origin", "main"]);
+
+    const hookWt = await writeStub(
+      root,
+      String.raw`set -e
+if [ "$1" = "--version" ]; then echo "wt v0.80.0"; exit 0; fi
+[ "$1" = "switch" ] && [ "$2" = "--create" ] || exit 64
+branch="$3"
+shift 3
+base="HEAD"
+config=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --base) base="$2"; shift 2 ;;
+    worktree-path=*) config="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+path=$(printf '%s' "$config" | sed -e 's/^worktree-path=//' -e 's/^"//' -e 's/"$//')
+git worktree add -q -b "$branch" "$path" "$base"
+printf 'preserve this hook output\n' > "$path/hook-data.txt"
+printf '{"action":"created","branch":"%s","path":"%s"}\n' "$branch" "$path"`,
+      "wt-hook-data",
+    );
+    const sourceHead = await runGit(repo, ["rev-parse", "HEAD"]);
+    const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [hookWt] });
+    const workspace = await port.create({ baseDir: repo, label: "hook-data", threadId: "123", sync: true });
+    expect(workspace.sync).toMatchObject({
+      status: "fallback",
+      originalHead: sourceHead,
+      head: sourceHead,
+    });
+    expect(await readFile(join(workspace.cwd, "hook-data.txt"), "utf8")).toBe("preserve this hook output\n");
+    expect(await readFile(join(workspace.cwd, "upstream.txt")).catch(() => null)).toBeNull();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("falls back when the configured upstream cannot be fetched", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-sync-")));
+  try {
+    const repo = await createRepo(root);
+    const remote = join(root, "remote.git");
+    await runGit(root, ["init", "--bare", "-q", remote]);
+    await runGit(repo, ["remote", "add", "origin", remote]);
+    await runGit(repo, ["push", "-q", "-u", "origin", "main"]);
+    await runGit(repo, ["remote", "set-url", "origin", join(root, "offline-remote.git")]);
+    const sourceHead = await runGit(repo, ["rev-parse", "HEAD"]);
+    const wt = await writeStub(root, WT_SWITCH_STUB, "wt");
+    const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [wt] });
+    const workspace = await port.create({ baseDir: repo, label: "offline", threadId: "123", sync: true });
+    expect(workspace.sync).toMatchObject({
+      status: "fallback",
+      originalHead: sourceHead,
+      head: sourceHead,
+    });
+    expect(workspace.sync?.reason).toBeTruthy();
+    expect(await runGit(workspace.cwd, ["status", "--porcelain"])).toBe("");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("reports missing upstream and creates from the fixed original commit", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-sync-")));
+  try {
+    const repo = await createRepo(root);
+    const sourceHead = await runGit(repo, ["rev-parse", "HEAD"]);
+    const wt = await writeStub(root, WT_SWITCH_STUB, "wt");
+    const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [wt] });
+    const workspace = await port.create({ baseDir: repo, label: "no-upstream", threadId: "123", sync: true });
+    expect(workspace.sync).toMatchObject({
+      status: "fallback",
+      originalHead: sourceHead,
+      head: sourceHead,
+    });
+    expect(workspace.sync?.reason).toBeTruthy();
+    expect(await runGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(sourceHead);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("does not synchronize an explicit base and reports its actual starting commit", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-sync-")));
+  try {
+    const repo = await createRepoWithRelease(root);
+    const remote = join(root, "remote.git");
+    await runGit(root, ["init", "--bare", "-q", remote]);
+    await runGit(repo, ["remote", "add", "origin", remote]);
+    await runGit(repo, ["push", "-q", "-u", "origin", "main"]);
+    const publisher = join(root, "publisher");
+    await runGit(root, ["clone", "-q", "-b", "main", remote, publisher]);
+    await writeFile(join(publisher, "upstream.txt"), "remote progress\n");
+    await runGit(publisher, ["add", "."]);
+    await runGit(publisher, ["-c", "user.email=test@example.com", "-c", "user.name=Fixture", "commit", "-q", "-m", "remote progress"]);
+    await runGit(publisher, ["push", "-q", "origin", "main"]);
+
+    const originalHead = await runGit(repo, ["rev-parse", "HEAD"]);
+    const explicitHead = await runGit(repo, ["rev-parse", "release"]);
+    const wt = await writeStub(root, WT_SWITCH_STUB, "wt");
+    const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [wt] });
+    const workspace = await port.create({
+      baseDir: repo,
+      label: "explicit-base",
+      threadId: "123",
+      base: "release",
+      sync: true,
+    });
+    expect(workspace.sync).toEqual({
+      status: "explicit-base",
+      originalHead,
+      head: explicitHead,
+    });
+    expect(await readFile(join(workspace.cwd, "upstream.txt")).catch(() => null)).toBeNull();
+    expect(await runGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(explicitHead);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("merges non-conflicting local and upstream progress in the new worktree", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-sync-")));
+  try {
+    const repo = await createRepo(root);
+    await runGit(repo, ["config", "user.email", "test@example.com"]);
+    await runGit(repo, ["config", "user.name", "Fixture"]);
+    const remote = join(root, "remote.git");
+    await runGit(root, ["init", "--bare", "-q", remote]);
+    await runGit(repo, ["remote", "add", "origin", remote]);
+    await runGit(repo, ["push", "-q", "-u", "origin", "main"]);
+    const publisher = join(root, "publisher");
+    await runGit(root, ["clone", "-q", "-b", "main", remote, publisher]);
+
+    await writeFile(join(repo, "local.txt"), "local progress\n");
+    await runGit(repo, ["add", "local.txt"]);
+    await runGit(repo, ["-c", "user.email=test@example.com", "-c", "user.name=Fixture", "commit", "-q", "-m", "local progress"]);
+    const sourceHead = await runGit(repo, ["rev-parse", "HEAD"]);
+    await writeFile(join(publisher, "remote.txt"), "remote progress\n");
+    await runGit(publisher, ["add", "remote.txt"]);
+    await runGit(publisher, ["-c", "user.email=test@example.com", "-c", "user.name=Fixture", "commit", "-q", "-m", "remote progress"]);
+    await runGit(publisher, ["push", "-q", "origin", "main"]);
+    const upstreamHead = await runGit(publisher, ["rev-parse", "HEAD"]);
+
+    const wt = await writeStub(root, WT_SWITCH_STUB, "wt");
+    const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [wt] });
+    const workspace = await port.create({ baseDir: repo, label: "merge-progress", threadId: "123", sync: true });
+    const merge = (await runGit(workspace.cwd, ["rev-list", "--parents", "-n", "1", "HEAD"])).split(" ");
+    const mergeHead = merge[0];
+    if (mergeHead === undefined) throw new Error("Git merge did not produce a commit");
+    expect(merge.slice(1)).toContain(sourceHead);
+    expect(merge.slice(1)).toContain(upstreamHead);
+    expect(await readFile(join(workspace.cwd, "local.txt"), "utf8")).toBe("local progress\n");
+    expect(await readFile(join(workspace.cwd, "remote.txt"), "utf8")).toBe("remote progress\n");
+    expect(workspace.sync).toEqual({
+      status: "synced",
+      originalHead: sourceHead,
+      head: mergeHead,
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("creates a worktree with every word in a long readable task name", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-worktree-")));
   try {

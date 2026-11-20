@@ -13,6 +13,7 @@
 包含个人单 Bot、单服务实例、文本指令与回复、执行状态、新建会话、指定目录、取消、会话恢复、消息去重和连接重建。支持私聊、指定群及 CommunityTopic 线程（channelType=5）内明确 @Bot 的指令；支持群/线程共享说明、线程默认继承父群工作目录、群/线程对话历史的增量上下文注入（详细设计见 `docs/specs/2026-09-16-group-history-context-design.md`）、线程隔离工作区的 Worktrunk 生命周期（详细设计见 `docs/specs/2026-09-17-thread-worktrunk-design.md`）、任务启动失败的分类报错与可观测性（详细设计见 `docs/specs/2026-09-17-task-startup-failure-design.md`）、常见入站消息类型的内容提取与附件接收（详细设计见 `docs/specs/2026-09-16-inbound-message-content-design.md`）、子区级回传监听（`listen=off|merge|task`，详细设计见 `docs/specs/2026-09-17-thread-completion-notify-design.md`）、出站文件和持久化问答、已开通群/子区内成员的消息驱动与 ask 卡片作答（命令仍仅 owner；详细设计见 `docs/specs/2026-09-17-group-member-participation-design.md`）、子区归档与合并后自动归档（详细设计见 `docs/specs/2026-09-17-thread-archive-design.md`）。
 
 包含已创建子区的受管项目追加：shared 工作区追加 worktree；单项目工作区转换为 shared 时保留原项目路径、分支和会话。持久归属、原生会话迁移、操作恢复及清理契约见 `docs/specs/2026-11-10-thread-workspace-expansion-design.md`。
+子区创建前按项目同步当前分支 upstream、在新 worktree 整合并对明确失败回退和通知；显式 base 保持指定起点。同步范围、源工作区保护及故障契约见 `docs/specs/2026-11-20-thread-worktree-sync-design.md`。
 
 包含发给当前 owner 私聊的服务启动就绪与正常停机通知：覆盖 Super、`oco` 和聊天命令最终触发的同一服务生命周期，按事件做有界发送，不承担异常离线监控。
 

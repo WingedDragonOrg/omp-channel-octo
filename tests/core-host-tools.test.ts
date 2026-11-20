@@ -845,7 +845,7 @@ test("create-thread worktree_name binds the new thread to a workspace of its own
 
     const workspace = join(harness.root, "worktrees", "thread-1");
     expect(worktrees.requests).toEqual([
-      { baseDir: cwd, label: "owl-workspace", threadId: "thread-1" },
+      { baseDir: cwd, label: "owl-workspace", threadId: "thread-1", sync: true },
     ]);
     expect(await readText(join(cwd, "worktree.log"))).toBe(
       `thread-1|${workspace}|thread-1|none\n`,

@@ -1787,7 +1787,15 @@ export class FakeWorktrees implements WorktreePort {
     const repo = await realpath(request.baseDir);
     onPlanned?.({ cwd, branch, repo });
     await mkdir(cwd, { recursive: true });
-    return { cwd: await realpath(cwd), branch };
+    return {
+      cwd: await realpath(cwd),
+      branch,
+      ...(request.sync === true ? { sync: {
+        status: request.base === undefined ? "synced" as const : "explicit-base" as const,
+        originalHead: "fixture-head",
+        head: "fixture-head",
+      } } : {}),
+    };
   }
 
   async planMerge(request: WorktreeMergeRequest): Promise<WorktreeMergePlan> {
@@ -1927,7 +1935,15 @@ export class GitBackedTestWorktrees extends FakeWorktrees {
     const args = ["-C", repo, "worktree", "add", "--quiet", "-b", branch, cwd];
     if (request.base !== undefined) args.push(request.base);
     execFileSync("git", args, { stdio: "ignore" });
-    return { cwd: await realpath(cwd), branch };
+    return {
+      cwd: await realpath(cwd),
+      branch,
+      ...(request.sync === true ? { sync: {
+        status: request.base === undefined ? "synced" as const : "explicit-base" as const,
+        originalHead: "fixture-head",
+        head: "fixture-head",
+      } } : {}),
+    };
   }
 }
 

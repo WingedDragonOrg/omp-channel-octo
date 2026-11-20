@@ -1,8 +1,10 @@
 import { relative, isAbsolute, sep } from "node:path";
+import { enqueueOutbox } from "./store-outbox.ts";
 import { Database } from "bun:sqlite";
 import type { ChatTarget, ThreadListenLevel, ThreadSummary, WorktreeRemovalPlan } from "../contracts.ts";
 import type {
   BindingRecord,
+  OutboxInsert,
   ThreadWorkspaceCleanupInput,
   ThreadWorkspaceCleanupPhase,
   ThreadWorkspaceCleanupRecord,
@@ -34,40 +36,108 @@ export function saveThreadWorkspace(db: Database, record: ThreadWorkspaceRecord)
 
 export function saveThreadWorkspaces(db: Database, records: readonly ThreadWorkspaceRecord[]): void {
   if (records.length === 0) return;
+  transaction(db, () => saveThreadWorkspacesInTransaction(db, records));
+}
+
+export function saveThreadWorkspaceWithOutbox(
+  db: Database,
+  record: ThreadWorkspaceRecord,
+  outbox: readonly OutboxInsert[],
+): void {
   transaction(db, () => {
-    const updatedAt = Date.now();
-    for (const record of records) {
-      run(
-        db,
-        `INSERT INTO thread_workspaces(
-           bot_uid, channel_type, channel_id, layout, status, entry_path, workspace_root, projects, legacy_worktree_name, error, updated_at
-         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(bot_uid, channel_id) DO UPDATE SET
-           channel_type = excluded.channel_type,
-           layout = excluded.layout,
-           status = excluded.status,
-           entry_path = excluded.entry_path,
-           workspace_root = excluded.workspace_root,
-           projects = excluded.projects,
-           legacy_worktree_name = excluded.legacy_worktree_name,
-           error = excluded.error,
-           updated_at = excluded.updated_at`,
-        [
-          record.botUid,
-          record.channelType,
-          record.channelId,
-          record.layout,
-          record.status,
-          record.entryPath,
-          record.workspaceRoot ?? null,
-          JSON.stringify(record.projects),
-          record.legacyWorktreeName ?? null,
-          record.error,
-          updatedAt,
-        ],
-      );
+    saveThreadWorkspacesInTransaction(db, [record]);
+    for (const message of outbox) enqueueOutboxIdempotently(db, message);
+  });
+}
+
+export interface ThreadWorkspaceIntentFinalization {
+  id: string;
+  status: "complete" | "failed";
+  error?: string | null;
+}
+
+export function commitThreadWorkspaceBatch(
+  db: Database,
+  botUid: string,
+  records: readonly ThreadWorkspaceRecord[],
+  intents: readonly ThreadWorkspaceIntentFinalization[],
+): void {
+  transaction(db, () => {
+    saveThreadWorkspacesInTransaction(db, records);
+    for (const intent of intents) {
+      if (intent.status === "complete") {
+        completeThreadWorkspaceIntentInTransaction(db, botUid, intent.id);
+      } else {
+        failThreadWorkspaceIntentInTransaction(db, botUid, intent.id, intent.error ?? null);
+      }
     }
   });
+}
+
+function saveThreadWorkspacesInTransaction(db: Database, records: readonly ThreadWorkspaceRecord[]): void {
+  const updatedAt = Date.now();
+  for (const record of records) {
+    if (
+      record.status === "ready"
+      && record.projects.some(project => !workspaceProjectSyncReady(project))
+    ) {
+      throw new Error("thread workspace cannot be ready before every sync result is settled");
+    }
+    run(
+      db,
+      `INSERT INTO thread_workspaces(
+         bot_uid, channel_type, channel_id, layout, status, entry_path, workspace_root, projects, legacy_worktree_name, error, updated_at
+       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(bot_uid, channel_id) DO UPDATE SET
+         layout = excluded.layout,
+         status = excluded.status,
+         entry_path = excluded.entry_path,
+         workspace_root = excluded.workspace_root,
+         projects = excluded.projects,
+         legacy_worktree_name = excluded.legacy_worktree_name,
+         error = excluded.error,
+         updated_at = excluded.updated_at`,
+      [
+        record.botUid,
+        record.channelType,
+        record.channelId,
+        record.layout,
+        record.status,
+        record.entryPath,
+        record.workspaceRoot ?? null,
+        JSON.stringify(record.projects),
+        record.legacyWorktreeName ?? null,
+        record.error,
+        updatedAt,
+      ],
+    );
+  }
+}
+
+function enqueueOutboxIdempotently(db: Database, message: OutboxInsert): void {
+  const row = query(
+    db,
+    `SELECT bot_uid, channel_type, channel_id, task_id, kind, text, path, file_kind, client_msg_no
+     FROM outbox WHERE id = ?`,
+    [message.id],
+  )[0];
+  if (row !== undefined) {
+    if (
+      asString(row.bot_uid) !== message.botUid
+      || asNumber(row.channel_type) !== message.channelType
+      || asString(row.channel_id) !== message.channelId
+      || asNullableString(row.task_id) !== message.taskId
+      || asString(row.kind) !== message.kind
+      || asNullableString(row.text) !== message.text
+      || asNullableString(row.path) !== message.path
+      || asNullableString(row.file_kind) !== message.fileKind
+      || asString(row.client_msg_no) !== message.clientMsgNo
+    ) {
+      throw new Error("thread workspace sync notice identity was reused with different content");
+    }
+    return;
+  }
+  enqueueOutbox(db, message);
 }
 
 export function getThreadWorkspace(
@@ -368,6 +438,15 @@ export function completeThreadWorkspaceIntentInTransaction(db: Database, botUid:
   updateThreadWorkspaceIntentInTransaction(db, botUid, id, "complete", null);
 }
 
+export function failThreadWorkspaceIntentInTransaction(
+  db: Database,
+  botUid: string,
+  id: string,
+  error: string | null,
+): void {
+  updateThreadWorkspaceIntentInTransaction(db, botUid, id, "failed", error);
+}
+
 function updateThreadWorkspaceIntentInTransaction(
   db: Database,
   botUid: string,
@@ -419,7 +498,8 @@ function updateThreadWorkspaceIntentInTransaction(
     (status === "complete" && !readyFork && (
       channelIds.length === 0
       || workspaces.some((workspace) =>
-        workspace?.status !== "ready" || workspace.projects.some((project) => !project.created)
+        workspace?.status !== "ready"
+        || workspace.projects.some((project) => !project.created || !workspaceProjectSyncReady(project))
       )
     ))
     || (status === "failed" && workspaces.some(
@@ -639,6 +719,14 @@ function isWorkspaceProject(value: unknown): value is ThreadWorkspaceProjectReco
     && (project.path === null || typeof project.path === "string")
     && (project.branch === null || typeof project.branch === "string")
     && typeof project.created === "boolean"
+    && (project.sync === undefined || isWorkspaceSync(project.sync))
+    && (
+      project.syncState === undefined
+      || project.syncState === "pending"
+      || project.syncState === "settled"
+      || project.syncState === "unknown"
+    )
+    && (project.syncState !== "settled" || project.sync !== undefined)
     && (project.accessPath === undefined || typeof project.accessPath === "string")
     && (project.accessTarget === undefined || typeof project.accessTarget === "string")
     && (project.removal === undefined || isWorktreeRemovalPlan(project.removal))
@@ -668,6 +756,22 @@ function isWorktreeRemovalPlan(value: unknown): value is WorktreeRemovalPlan {
         && (ref.state === "pending" || ref.state === "deleted" || ref.state === "missing" || ref.state === "retained")
       );
     })
+  );
+}
+
+function workspaceProjectSyncReady(project: ThreadWorkspaceProjectRecord): boolean {
+  return project.syncState === undefined
+    || (project.syncState === "settled" && project.sync !== undefined);
+}
+
+function isWorkspaceSync(value: unknown): value is NonNullable<ThreadWorkspaceProjectRecord["sync"]> {
+  if (value === null || typeof value !== "object") return false;
+  const sync = value as Record<string, unknown>;
+  return (
+    (sync.status === "synced" || sync.status === "fallback" || sync.status === "explicit-base")
+    && typeof sync.originalHead === "string"
+    && typeof sync.head === "string"
+    && (sync.reason === undefined || typeof sync.reason === "string")
   );
 }
 
