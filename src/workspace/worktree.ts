@@ -1,4 +1,7 @@
-import type { BigIntStats, Stats } from "node:fs";
+import type {
+  BigIntStats,
+  Stats,
+} from "node:fs";
 import { lstat, readdir, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
 import type {
@@ -10,6 +13,8 @@ import type {
   WorktreeMergeSummary,
   WorktreePort,
   WorktreeRemovalOutcome,
+  WorktreeRemovalPlan,
+  WorktreeRemovalProgress,
   WorktreeRemovalRequest,
   WorktrunkProbe,
 } from "../contracts.ts";
@@ -344,6 +349,7 @@ interface WorktreeRemovalIdentity {
   inode: number | bigint;
   commonDir: string;
   branch: string | null;
+  headOid: string | null;
 }
 
 async function assertWorktreePathUnchanged(identity: WorktreeRemovalIdentity): Promise<void> {
@@ -395,6 +401,12 @@ async function inspectWorktreeForRemoval(
     throw new Error(`核对隔离工作区分支失败：${commandFailure(branchResult)}`);
   }
   const branch = branchResult.stdout.trim() || null;
+  const headOid = request.deleteBranch === true
+    ? await readGitRef(path, "HEAD", timeoutMs, signal)
+    : null;
+  if (request.deleteBranch === true && headOid === null) {
+    throw new Error(`无法读取隔离工作区 HEAD，拒绝删除分支：${request.path}`);
+  }
   const identity: WorktreeRemovalIdentity = {
     requestedPath,
     path,
@@ -402,6 +414,7 @@ async function inspectWorktreeForRemoval(
     inode: pathStat.ino,
     commonDir,
     branch,
+    headOid,
   };
   await assertWorktreePathUnchanged(identity);
 
@@ -416,8 +429,20 @@ async function inspectWorktreeForRemoval(
       throw new Error(`隔离工作区所属仓库与所有权记录不匹配：${request.path}`);
     }
   }
-  if (request.branch !== undefined && branch !== request.branch) {
-    throw new Error(`隔离工作区分支与所有权记录不匹配：${request.path}`);
+  if (
+    request.branch !== undefined
+    && branch !== request.branch
+    && !(
+      request.deleteBranch === true
+      && request.force === true
+      && request.allowBranchMismatch === true
+      && branch !== null
+    )
+  ) {
+    if (branch === null) {
+      throw new Error(`隔离工作区当前为 detached HEAD，无法确认待清理分支：${request.path}`);
+    }
+    throw new Error(`隔离工作区分支与所有权记录不匹配：登记 ${request.branch}，实际 ${branch}；切换分支仅允许 /thread remove --force`);
   }
   await assertWorktreePathUnchanged(identity);
   return identity;
@@ -652,6 +677,64 @@ async function branchCheckedOutElsewhere(
   }
   return null;
 }
+function localBranchNameFromRef(ref: string, remoteNames: readonly string[]): string | null {
+  if (ref.startsWith("refs/heads/")) return ref.slice("refs/heads/".length);
+  if (ref.startsWith("refs/remotes/")) {
+    const remoteBranch = ref.slice("refs/remotes/".length);
+    const branches = new Set(
+      remoteNames
+        .filter((remote) => remoteBranch.startsWith(`${remote}/`))
+        .map((remote) => remoteBranch.slice(remote.length + 1))
+        .filter((branch) => branch.length > 0 && branch !== "HEAD" && !branch.endsWith("/HEAD")),
+    );
+    return branches.size === 1 ? [...branches][0]! : null;
+  }
+  return null;
+}
+
+async function sourceCheckoutBranch(
+  repoRoot: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  const result = await runRemovalGitCommand(
+    repoRoot,
+    ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    timeoutMs,
+    signal,
+  );
+  if (result.exitCode !== 0 || result.stdout.trim().length === 0) {
+    throw new Error("无法可靠确认来源仓库主检出分支，拒绝强制删除切换分支工作区");
+  }
+  return result.stdout.trim();
+}
+async function assertBranchesUnprotected(
+  branches: readonly string[],
+  repoRoot: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  const defaultBranch = await resolveDefaultBranch(repoRoot, timeoutMs, signal);
+  const remotesResult = await runRemovalGitCommand(repoRoot, ["remote"], timeoutMs, signal);
+  if (remotesResult.exitCode !== 0) throw new Error(`无法确认默认分支归属，拒绝强制删除：${commandFailure(remotesResult)}`);
+  const remoteNames = remotesResult.stdout.split("\n").map((remote) => remote.trim()).filter(Boolean);
+  const defaultName = defaultBranch === null
+    ? null
+    : localBranchNameFromRef(defaultBranch.ref, remoteNames);
+  if (defaultName === null) {
+    throw new Error("无法可靠确认来源仓库默认分支，拒绝强制删除工作区");
+  }
+  const mainBranch = await sourceCheckoutBranch(repoRoot, timeoutMs, signal);
+  const protectedBranch = branches.find((branch) => branch === mainBranch || branch === defaultName);
+  if (protectedBranch !== undefined) {
+    throw new Error(`强制清理涉及来源仓库主检出或默认分支，拒绝删除：${protectedBranch}`);
+  }
+}
+
+
+function copyRemovalPlan(plan: WorktreeRemovalPlan): WorktreeRemovalPlan {
+  return { ...plan, refs: plan.refs.map((ref) => ({ ...ref })) };
+}
 
 async function removeOwnedWorktreeAndBranch(
   request: WorktreeRemovalRequest,
@@ -662,6 +745,7 @@ async function removeOwnedWorktreeAndBranch(
   if (!request.repo || !request.branch) {
     throw new Error("删除关联分支必须提供来源仓库和所有权分支");
   }
+  const requestedPath = resolve(request.path);
   const requestedRepo = resolve(request.repo);
   const repoRoot = await realpath(requestedRepo);
   if (repoRoot !== requestedRepo) throw new Error(`来源仓库路径已更换，拒绝删除分支：${request.repo}`);
@@ -673,26 +757,125 @@ async function removeOwnedWorktreeAndBranch(
   if (initial && initial.commonDir !== sourceCommonDir) {
     throw new Error(`隔离工作区所属仓库与所有权记录不匹配：${request.path}`);
   }
-  const ownerPath = initial?.path ?? resolve(request.path);
-  const branchRef = `refs/heads/${request.branch}`;
-  const validBranchRef = await runRemovalGitCommand(
-    repoRoot,
-    ["check-ref-format", branchRef],
-    timeoutMs,
-    signal,
-  );
-  if (validBranchRef.exitCode !== 0) throw new Error(`所有权记录中的分支名无效：${request.branch}`);
-  const originalHead = await readGitRef(repoRoot, branchRef, timeoutMs, signal);
-  const checkedOutElsewhere = await branchCheckedOutElsewhere(
-    repoRoot,
-    branchRef,
-    ownerPath,
-    timeoutMs,
-    signal,
-  );
-  if (checkedOutElsewhere) {
-    throw new Error(`分支仍在其他 worktree 检出，拒绝删除：${checkedOutElsewhere}`);
+
+  let plan: WorktreeRemovalPlan;
+  if (request.expectedPlan !== undefined) {
+    plan = copyRemovalPlan(request.expectedPlan);
+    if (
+      plan.path !== requestedPath
+      || plan.repoRoot !== repoRoot
+      || plan.commonDir !== sourceCommonDir
+      || plan.registeredBranch !== request.branch
+    ) {
+      throw new Error(`强制清理记录与当前工作区或来源仓库归属不匹配，拒绝删除：${request.path}`);
+    }
+    if (
+      plan.worktree === "pending"
+      && (plan.actualBranch === null || plan.headOid === null || plan.pathDevice === null || plan.pathInode === null)
+    ) {
+      throw new Error(`强制清理记录缺少工作区身份，拒绝删除：${request.path}`);
+    }
+    const expectedBranches = new Set([
+      plan.registeredBranch,
+      ...(plan.actualBranch === null ? [] : [plan.actualBranch]),
+    ]);
+    if (
+      plan.refs.length !== expectedBranches.size
+      || plan.refs.some((ref) =>
+        !expectedBranches.has(ref.branch)
+        || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/iu.test(ref.oid ?? "")
+          && ref.oid !== null
+        || !["pending", "deleted", "missing", "retained"].includes(ref.state)
+      )
+    ) {
+      throw new Error(`强制清理记录中的分支身份无效，拒绝删除：${request.path}`);
+    }
+    for (const branch of expectedBranches) {
+      if (!plan.refs.some((ref) => ref.branch === branch)) {
+        throw new Error(`强制清理记录缺少分支身份，拒绝删除：${branch}`);
+      }
+      const valid = await runRemovalGitCommand(
+        repoRoot,
+        ["check-ref-format", `refs/heads/${branch}`],
+        timeoutMs,
+        signal,
+      );
+      if (valid.exitCode !== 0) throw new Error(`强制清理记录中的分支名无效：${branch}`);
+    }
+    if (
+      initial !== null
+      && (
+        plan.worktree !== "pending"
+        || plan.actualBranch === null
+        || initial.branch !== plan.actualBranch
+        || initial.headOid !== plan.headOid
+        || String(initial.device) !== plan.pathDevice
+        || String(initial.inode) !== plan.pathInode
+      )
+    ) {
+      throw new Error(`隔离工作区路径、仓库、分支或 HEAD 已变化，拒绝重试清理：${request.path}`);
+    }
+    if (initial === null && plan.worktree !== "pending" && await lstatIfPresent(requestedPath)) {
+      throw new Error(`已清理的隔离工作区路径重新出现，拒绝删除：${request.path}`);
+    }
+  } else {
+    const actualBranch = initial?.branch ?? null;
+    if (initial !== null && actualBranch === null) {
+      throw new Error(`隔离工作区当前为 detached HEAD，无法确认待清理分支：${request.path}`);
+    }
+    const branches = [...new Set([
+      ...(actualBranch === null ? [] : [actualBranch]),
+      request.branch,
+    ])];
+    const refs: WorktreeRemovalPlan["refs"] = [];
+    for (const branch of branches) {
+      const ref = `refs/heads/${branch}`;
+      const valid = await runRemovalGitCommand(repoRoot, ["check-ref-format", ref], timeoutMs, signal);
+      if (valid.exitCode !== 0) throw new Error(`所有权记录中的分支名无效：${branch}`);
+      const oid = await readGitRef(repoRoot, ref, timeoutMs, signal);
+      if (branch === actualBranch && oid === null) {
+        throw new Error(`隔离工作区当前分支引用已不存在，拒绝清理：${branch}`);
+      }
+      refs.push({ branch, oid, state: oid === null ? "missing" : "pending" });
+    }
+    plan = {
+      path: requestedPath,
+      repoRoot,
+      commonDir: sourceCommonDir,
+      pathDevice: initial === null ? null : String(initial.device),
+      pathInode: initial === null ? null : String(initial.inode),
+      registeredBranch: request.branch,
+      actualBranch,
+      headOid: initial?.headOid ?? null,
+      worktree: initial === null ? "missing" : "pending",
+      refs,
+    };
   }
+
+  const switched = plan.actualBranch !== null && plan.actualBranch !== plan.registeredBranch;
+  if (switched && !(request.force === true && request.allowBranchMismatch === true)) {
+    throw new Error(
+      `隔离工作区分支与所有权记录不匹配：登记 ${plan.registeredBranch}，实际 ${plan.actualBranch}；仅 /thread remove --force 可清理切换分支`,
+    );
+  }
+  if (switched && request.force === true && request.allowBranchMismatch === true) {
+    await assertBranchesUnprotected(plan.refs.map((ref) => ref.branch), repoRoot, timeoutMs, signal);
+  }
+  // Check before the worktree removal; the later ref check still closes the race.
+  for (const ref of plan.refs) {
+    if (ref.state !== "pending" || ref.oid === null) continue;
+    const otherCheckout = await branchCheckedOutElsewhere(
+      repoRoot,
+      `refs/heads/${ref.branch}`,
+      requestedPath,
+      timeoutMs,
+      signal,
+    );
+    if (otherCheckout !== null) {
+      throw new Error(`分支 ${ref.branch} 仍在其他 worktree 检出，分支保留，拒绝删除：${otherCheckout}`);
+    }
+  }
+
 
   if (request.force !== true && initial !== null) {
     const status = await runRemovalGitCommand(
@@ -706,92 +889,183 @@ async function removeOwnedWorktreeAndBranch(
       throw new Error(`隔离工作区有未提交改动，拒绝默认删除；请显式使用 --force：${request.path}`);
     }
   }
-  if (request.force !== true && originalHead !== null) {
-    if (!(await branchIsMergedIntoDefault(repoRoot, originalHead, timeoutMs, signal))) {
-      throw new Error(`分支未并入来源仓库默认分支，拒绝默认删除；请显式使用 --force：${request.branch}`);
+  if (request.force !== true) {
+    const registered = plan.refs.find((ref) => ref.branch === plan.registeredBranch);
+    if (registered?.oid !== null && registered?.oid !== undefined) {
+      if (!(await branchIsMergedIntoDefault(repoRoot, registered.oid, timeoutMs, signal))) {
+        throw new Error(
+          `分支未并入来源仓库默认分支，拒绝默认删除；请显式使用 --force：${plan.registeredBranch}`,
+        );
+      }
     }
   }
 
-  const current = await inspectWorktreeForRemoval(request, timeoutMs, signal);
-  if (
-    (initial === null && current !== null) ||
-    (initial !== null &&
-      (current === null ||
-        current.path !== initial.path ||
-        current.device !== initial.device ||
-        current.inode !== initial.inode ||
-        current.commonDir !== initial.commonDir ||
-        current.branch !== initial.branch))
-  ) {
-    throw new Error(`隔离工作区在删除前已更换，拒绝删除：${request.path}`);
-  }
-
-  let worktreeRemoval: WorktreeRemovalOutcome | null = null;
-  if (current !== null) {
-    await assertWorktreePathUnchanged(current);
-    if (isAborted(signal)) throw new Error(`删除隔离工作区已取消：${request.path}`);
-    const available = await probe(signal);
-    if (isAborted(signal)) throw new Error(`删除隔离工作区已取消：${request.path}`);
-    const lifecycle = request.lifecycle?.("worktree");
-    worktreeRemoval = available.available
-      ? await worktrunkRemove({
-          command: available.command,
-          path: current.path,
-          force: request.force === true,
-          keepBranch: true,
-          managed: true,
-          timeoutMs,
-          ...(lifecycle === undefined ? {} : { lifecycle }),
-          ...(signal === undefined ? {} : { signal }),
-        })
-      : await gitWorktreeRemove({
-          path: current.path,
-          force: request.force === true,
-          timeoutMs,
-          managed: true,
-          ...(lifecycle === undefined ? {} : { lifecycle }),
-          ...(signal === undefined ? {} : { signal }),
-        });
-    if (worktreeRemoval.kind !== "removed") {
-      throw new Error(`无法确认隔离工作区已删除：${request.path}`);
+  request.onPlanned?.(copyRemovalPlan(plan));
+  let via: "wt" | "git" | null = null;
+  const recordProgress = (progress: WorktreeRemovalProgress): void => {
+    if (progress.step === "worktree") {
+      plan.worktree = progress.state;
+    } else {
+      const branchRef = plan.refs.find((ref) => ref.branch === progress.branch);
+      if (branchRef === undefined) throw new Error("清理结果不属于预读分支身份");
+      branchRef.state = progress.state;
     }
-    if (await lstatIfPresent(current.requestedPath)) {
-      throw new Error(`删除后隔离工作区路径仍存在，拒绝处理分支：${request.path}`);
-    }
-  }
-
-  const finish = (branchOutcome: "deleted" | "kept" | "missing"): WorktreeRemovalOutcome => {
-    if (current === null) return { kind: "missing", branchOutcome };
-    if (!worktreeRemoval || worktreeRemoval.kind !== "removed") {
-      throw new Error(`无法确认隔离工作区已删除：${request.path}`);
-    }
-    return { kind: "removed", via: worktreeRemoval.via, branchOutcome };
+    request.onProgress?.(progress);
   };
 
-  const currentHead = await readGitRef(repoRoot, branchRef, timeoutMs, signal);
-  if (currentHead === null) return finish(originalHead === null ? "missing" : "deleted");
-  if (originalHead === null || currentHead !== originalHead) return finish("kept");
-  if (
-    await branchCheckedOutElsewhere(repoRoot, branchRef, ownerPath, timeoutMs, signal)
-  ) {
-    return finish("kept");
-  }
-  if (request.force !== true && !(await branchIsMergedIntoDefault(repoRoot, originalHead, timeoutMs, signal))) {
-    return finish("kept");
+  if (plan.worktree === "pending") {
+    if (initial === null) {
+      recordProgress({ step: "worktree", state: "missing" });
+    } else {
+      const current = await inspectWorktreeForRemoval(request, timeoutMs, signal);
+      if (
+        current === null
+        || current.path !== initial.path
+        || current.device !== initial.device
+        || current.inode !== initial.inode
+        || current.commonDir !== initial.commonDir
+        || current.branch !== initial.branch
+        || current.headOid !== initial.headOid
+      ) {
+        if (current === null) {
+          recordProgress({ step: "worktree", state: "missing" });
+        } else {
+          throw new Error(`隔离工作区在删除前已更换，拒绝删除：${request.path}`);
+        }
+      } else {
+        await assertWorktreePathUnchanged(current);
+        if (isAborted(signal)) throw new Error(`删除隔离工作区已取消：${request.path}`);
+        const available = await probe(signal);
+        if (isAborted(signal)) throw new Error(`删除隔离工作区已取消：${request.path}`);
+        const verified = await inspectWorktreeForRemoval(request, timeoutMs, signal);
+        if (
+          verified === null
+          || verified.path !== current.path
+          || verified.device !== current.device
+          || verified.inode !== current.inode
+          || verified.commonDir !== current.commonDir
+          || verified.branch !== current.branch
+          || verified.headOid !== current.headOid
+        ) {
+          throw new Error(`隔离工作区在删除前已更换，拒绝删除：${request.path}`);
+        }
+        const lifecycle = request.lifecycle?.("worktree");
+        const removed = available.available
+          ? await worktrunkRemove({
+              command: available.command,
+              path: verified.path,
+              force: request.force === true,
+              keepBranch: true,
+              managed: true,
+              timeoutMs,
+              ...(lifecycle === undefined ? {} : { lifecycle }),
+              ...(signal === undefined ? {} : { signal }),
+            })
+          : await gitWorktreeRemove({
+              path: verified.path,
+              force: request.force === true,
+              timeoutMs,
+              managed: true,
+              ...(lifecycle === undefined ? {} : { lifecycle }),
+              ...(signal === undefined ? {} : { signal }),
+            });
+        if (removed.kind !== "removed" || await lstatIfPresent(requestedPath)) {
+          throw new Error(`删除后隔离工作区仍存在或无法确认，拒绝处理分支：${request.path}`);
+        }
+        via = removed.via;
+        recordProgress({ step: "worktree", state: "removed" });
+      }
+    }
   }
 
-  const branchLifecycle = request.lifecycle?.("branch");
-  await gitBranchRemove({
-    repoRoot,
-    branchRef,
-    expectedHead: originalHead,
-    timeoutMs,
-    ...(branchLifecycle === undefined ? {} : { lifecycle: branchLifecycle }),
-    ...(signal === undefined ? {} : { signal }),
-  });
-  const remainingHead = await readGitRef(repoRoot, branchRef, timeoutMs, signal);
-  return finish(remainingHead === null ? "deleted" : "kept");
+  if (await lstatIfPresent(requestedPath)) {
+    throw new Error(`隔离工作区路径重新出现，拒绝删除分支：${request.path}`);
+  }
+  for (const ref of plan.refs) {
+    if (isAborted(signal)) throw new Error(`删除关联分支已取消：${ref.branch}`);
+    const branchRef = `refs/heads/${ref.branch}`;
+    if (ref.state !== "pending") {
+      const currentHead = await readGitRef(repoRoot, branchRef, timeoutMs, signal);
+      if (currentHead !== null && (ref.state === "deleted" || ref.state === "missing")) {
+        recordProgress({ step: "branch", branch: ref.branch, state: "retained" });
+      }
+      continue;
+    }
+    if (ref.oid === null) {
+      const currentHead = await readGitRef(repoRoot, branchRef, timeoutMs, signal);
+      recordProgress({
+        step: "branch",
+        branch: ref.branch,
+        state: currentHead === null ? "missing" : "retained",
+      });
+      continue;
+    }
+
+    const currentHead = await readGitRef(repoRoot, branchRef, timeoutMs, signal);
+    if (currentHead === null) {
+      recordProgress({ step: "branch", branch: ref.branch, state: "missing" });
+      continue;
+    }
+    if (currentHead !== ref.oid) {
+      recordProgress({ step: "branch", branch: ref.branch, state: "retained" });
+      continue;
+    }
+    const otherCheckout = await branchCheckedOutElsewhere(
+      repoRoot,
+      branchRef,
+      requestedPath,
+      timeoutMs,
+      signal,
+    );
+    if (otherCheckout !== null) {
+      throw new Error(`分支 ${ref.branch} 仍在其他 worktree 检出，分支保留，拒绝删除：${otherCheckout}`);
+    }
+    if (request.force !== true && !(await branchIsMergedIntoDefault(repoRoot, ref.oid, timeoutMs, signal))) {
+      throw new Error(`分支未并入来源仓库默认分支，拒绝默认删除；请显式使用 --force：${ref.branch}`);
+    }
+    if (resolve(request.repo) !== requestedRepo || (await realpath(requestedRepo)) !== requestedRepo) {
+      throw new Error(`来源仓库路径已更换，拒绝删除分支：${request.repo}`);
+    }
+    if ((await gitDirectory(repoRoot, "--git-common-dir", timeoutMs, signal)) !== sourceCommonDir) {
+      throw new Error(`来源仓库身份已变化，拒绝删除分支：${request.repo}`);
+    }
+    if (await lstatIfPresent(requestedPath)) {
+      throw new Error(`隔离工作区路径重新出现，拒绝删除分支：${request.path}`);
+    }
+    if (request.force === true && request.allowBranchMismatch === true) {
+      await assertBranchesUnprotected([ref.branch], repoRoot, timeoutMs, signal);
+    }
+    const branchLifecycle = request.lifecycle?.("branch");
+    await gitBranchRemove({
+      repoRoot,
+      branchRef,
+      expectedHead: ref.oid,
+      timeoutMs,
+      ...(branchLifecycle === undefined ? {} : { lifecycle: branchLifecycle }),
+      ...(signal === undefined ? {} : { signal }),
+    });
+    const remainingHead = await readGitRef(repoRoot, branchRef, timeoutMs, signal);
+    recordProgress({
+      step: "branch",
+      branch: ref.branch,
+      state: remainingHead === null ? "deleted" : "retained",
+    });
+  }
+
+  for (const ref of plan.refs) {
+    if (ref.state !== "deleted" && ref.state !== "missing") continue;
+    const currentHead = await readGitRef(repoRoot, `refs/heads/${ref.branch}`, timeoutMs, signal);
+    if (currentHead !== null) recordProgress({ step: "branch", branch: ref.branch, state: "retained" });
+  }
+  const branchOutcome = plan.refs.some((ref) => ref.state === "pending" || ref.state === "retained")
+    ? "kept"
+    : plan.refs.some((ref) => ref.state === "deleted")
+      ? "deleted"
+      : "missing";
+  if (via === null) return { kind: "missing", branchOutcome };
+  return { kind: "removed", via, branchOutcome };
 }
+
 
 export function createWorktreePort(options: WorktreePortOptions): WorktreePort {
   const createTimeoutMs = options.createTimeoutMs ?? WORKTRUNK_TIMEOUT_DEFAULTS.createMs;

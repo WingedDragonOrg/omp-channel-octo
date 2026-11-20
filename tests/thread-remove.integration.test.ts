@@ -16,13 +16,30 @@ import {
   submitAndWaitForIngressHandoff,
 } from "./fixtures/core-fakes.ts";
 
+
 class RemovalTransport extends FakeTransport {
   receiptDeliveredBeforeArchive = false;
+  readonly events: Array<
+    | { kind: "send"; channelId: string; text: string }
+    | { kind: "archive"; shortId: string }
+  > = [];
+
+  override async sendText(
+    ...args: Parameters<FakeTransport["sendText"]>
+  ): ReturnType<FakeTransport["sendText"]> {
+    const [target, text] = args;
+    const receipt = await super.sendText(...args);
+    this.events.push({ kind: "send", channelId: target.channelId, text });
+    return receipt;
+  }
 
   override async archiveThread(groupId: string, shortId: string, signal?: AbortSignal): Promise<void> {
-    this.receiptDeliveredBeforeArchive = this.sent.some(({ target, text }) =>
-      target.channelId === `${groupId}____${shortId}` && text.includes("归档"),
+    this.receiptDeliveredBeforeArchive = this.events.some(event =>
+      event.kind === "send"
+      && event.channelId === `${groupId}____${shortId}`
+      && event.text.includes("归档"),
     );
+    this.events.push({ kind: "archive", shortId });
     await super.archiveThread(groupId, shortId, signal);
   }
 }
@@ -242,6 +259,135 @@ test("real host remove protects unmerged work, then force deletes its branch wit
   }
 });
 
+test("real host remove requires force to clean a switched branch and archives only after the itemized receipt is delivered", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oco-remove-switched-branch-integration-")));
+  const transport = new RemovalTransport();
+  const harness = await createCoreHarness({
+    root,
+    transport,
+    worktreePort: createWorktreePort({ command: "/no/omp", worktrunkCandidates: [] }),
+  });
+  const store = await openChannelStore(harness.stateDir);
+  const groupId = "group-allowed";
+  const shortId = "remove-switched-branch";
+  const thread = { channelType: 5 as const, channelId: `${groupId}____${shortId}` };
+  try {
+    const repo = await repository(root, "source");
+    const worktree = join(root, "owned");
+    await git(repo, "worktree", "add", "-qb", "registered-feature", worktree);
+    const mainHead = await git(repo, "rev-parse", "HEAD");
+    await git(worktree, "switch", "-c", "active-feature");
+    await writeFile(join(worktree, "active-feature.txt"), "only on the switched branch\n");
+    await git(worktree, "add", ".");
+    await git(worktree, "commit", "-qm", "switched branch work");
+    const activeHead = await git(worktree, "rev-parse", "HEAD");
+    expect(activeHead).not.toBe(await git(repo, "rev-parse", "refs/heads/registered-feature"));
+
+    transport.setThreads(groupId, [{
+      shortId,
+      groupId,
+      channelId: thread.channelId,
+      name: "Switched branch cleanup",
+      creatorUid: harness.bot.uid,
+      status: 1,
+      memberCount: 1,
+      messageCount: 0,
+      createdAt: "2026-11-20T00:00:00.000Z",
+      updatedAt: "2026-11-20T00:00:00.000Z",
+    }]);
+    store.ensureBinding({
+      botUid: harness.bot.uid,
+      ...thread,
+      cwd: worktree,
+      sessionId: "remove-switched-session",
+      sessionFile: null,
+      cwdPinned: true,
+    });
+    store.saveThreadWorkspace({
+      botUid: harness.bot.uid,
+      ...thread,
+      layout: "single",
+      status: "ready",
+      entryPath: null,
+      error: null,
+      projects: [{
+        name: "feature",
+        repo,
+        path: worktree,
+        branch: "registered-feature",
+        created: true,
+      }],
+    });
+
+    const rejectedReceiptPromise = transport.waitForRemoteText(({ target, text }) =>
+      target.channelId === thread.channelId
+      && target.channelType === thread.channelType
+      && text.includes("registered-feature"),
+    );
+    await harness.service.submitInbound(inbound({
+      ...thread,
+      messageId: "remove-switched-without-force",
+      text: "/thread remove",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    const rejectedReceipt = await rejectedReceiptPromise;
+    expect(rejectedReceipt.text).not.toContain("本地隔离工作区与记录分支清理完成");
+    expect(existsSync(worktree)).toBe(true);
+    expect(await git(worktree, "branch", "--show-current")).toBe("active-feature");
+    expect(await git(repo, "branch", "--list", "registered-feature")).toBe("registered-feature");
+    expect(await git(repo, "branch", "--list", "active-feature")).toBe("+ active-feature");
+    expect(transport.managementCalls.filter(call => call.action === "thread-archive")).toHaveLength(0);
+
+    const forceStartEvent = transport.events.length;
+    const completeReceiptPromise = transport.waitForRemoteText(({ target, text, messageId }) =>
+      target.channelId === thread.channelId
+      && target.channelType === thread.channelType
+      && messageId !== rejectedReceipt.messageId
+      && text.includes("registered-feature"),
+    );
+    await harness.service.submitInbound(inbound({
+      ...thread,
+      messageId: "remove-switched-with-force",
+      text: "/thread remove --force",
+      mentionedUserIds: [harness.bot.uid],
+    }));
+    const completeReceipt = await completeReceiptPromise;
+
+    expect(existsSync(worktree)).toBe(false);
+    expect(await git(repo, "branch", "--list", "registered-feature")).toBe("");
+    expect(await git(repo, "branch", "--list", "active-feature")).toBe("");
+    expect(await git(repo, "rev-parse", "HEAD")).toBe(mainHead);
+    expect(await git(repo, "worktree", "list", "--porcelain")).not.toContain(worktree);
+    const receiptLines = completeReceipt.text.split(/\r?\n/);
+    expect(receiptLines.find(line => line.includes(worktree))).toContain("工作区已清理");
+    for (const branch of ["registered-feature", "active-feature"]) {
+      expect(receiptLines.find(line => line.includes(branch))).toContain("已删除");
+    }
+
+    await transport.waitForManagementCalls(call =>
+      call.action === "thread-archive" && call.shortId === shortId,
+    );
+    const deliveredReceiptIndex = transport.events.findIndex((event, index) =>
+      index >= forceStartEvent
+      && event.kind === "send"
+      && event.channelId === thread.channelId
+      && event.text === completeReceipt.text,
+    );
+    const archiveIndex = transport.events.findIndex((event, index) =>
+      index >= forceStartEvent && event.kind === "archive" && event.shortId === shortId,
+    );
+    expect(deliveredReceiptIndex).toBeGreaterThanOrEqual(forceStartEvent);
+    expect(archiveIndex).toBeGreaterThan(deliveredReceiptIndex);
+    expect(transport.receiptDeliveredBeforeArchive).toBe(true);
+    expect((await transport.listThreads(groupId)).find(entry => entry.shortId === shortId)?.status).toBe(2);
+    expect(transport.managementCalls.filter(call => call.action === "thread-archive")).toHaveLength(1);
+    expect(harness.workers.prompts).toEqual([]);
+  } finally {
+    store.close();
+    await closeCoreHarness(harness);
+  }
+}, 20_000);
+
 // Shared entry content never blocks cleanup once projects and branches are released.
 test.each(["/thread remove", "/thread remove --force"])("real shared %s cleans remaining entry contents and archives", async (command) => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "oco-remove-shared-integration-")));
@@ -264,6 +410,7 @@ test.each(["/thread remove", "/thread remove --force"])("real shared %s cleans r
     const pathB = join(entry, "b");
     await git(repoA, "worktree", "add", "-qb", "thread-a", pathA);
     await git(repoB, "worktree", "add", "-qb", "thread-b", pathB);
+    if (command.endsWith("--force")) await git(pathB, "switch", "-qc", "thread-b-switched");
     await git(repoA, "worktree", "remove", pathA);
     const unknown = join(entry, "nested", "owner-note.txt");
     await mkdir(dirname(unknown));
@@ -292,6 +439,7 @@ test.each(["/thread remove", "/thread remove --force"])("real shared %s cleans r
     expect(existsSync(pathB)).toBe(false);
     expect(await git(repoA, "branch", "--list", "thread-a")).toBe("");
     expect(await git(repoB, "branch", "--list", "thread-b")).toBe("");
+    if (command.endsWith("--force")) expect(await git(repoB, "branch", "--list", "thread-b-switched")).toBe("");
     expect(existsSync(join(detached, "keep.txt"))).toBe(true);
     expect(store.getThreadWorkspace(harness.bot.uid, thread)?.entryPath).toBeNull();
     expect(existsSync(entry)).toBe(false);

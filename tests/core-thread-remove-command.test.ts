@@ -591,51 +591,70 @@ test("a missing outcome without confirmed branch state retains ownership and can
   }
 });
 
-test("a partial branch-removal result retains the original workspace and remaining branch for the next command", async () => {
+test("a branch-only partial cleanup retries only its remaining project before archiving", async () => {
   const target: ThreadTarget = { channelType: 5, channelId: `${REMOVE_GROUP}____remove-branch-only` };
   const worktrees = new RecordingWorktrees();
-  worktrees.removeBehavior = async (request, runProcess) => {
-    if (worktrees.requests.length === 1) {
-      runProcess("worktree");
-      await rm(request.path, { recursive: true, force: true });
-      runProcess("branch");
-      return { kind: "removed", via: "git", branchOutcome: "kept" };
-    }
-    runProcess("branch");
-    return { kind: "removed", via: "git", branchOutcome: "deleted" };
-  };
   const harness = await createCoreHarness({ worktreePort: worktrees });
   try {
-    const workspace = await seedOwnedWorkspace(harness, target);
-    const firstCommand = removalCommand(harness, target, "remove-branch-partial");
+    const workspace = await seedOwnedWorkspace(harness, target, { names: ["api", "web"] });
+    const api = workspace.record.projects[0]!;
+    const apiPath = api.path!;
+    const apiBranch = api.branch!;
+    const webPath = workspace.record.projects[1]!.path!;
+    worktrees.removeBehavior = async (request, runProcess) => {
+      const exists = await pathExists(request.path);
+      if (exists) {
+        runProcess("worktree");
+        await rm(request.path, { recursive: true, force: true });
+      }
+      runProcess("branch");
+      if (request.path === apiPath && exists) {
+        return { kind: "removed", via: "git", branchOutcome: "kept" };
+      }
+      return exists
+        ? { kind: "removed", via: "git", branchOutcome: "deleted" }
+        : { kind: "missing", branchOutcome: "deleted" };
+    };
+    const firstCommand = removalCommand(harness, target, "remove-branch-partial", "--force");
     const firstReply = waitForNextTargetText(harness, target);
     await harness.service.submitInbound(firstCommand);
     await firstReply;
 
-    expect(worktrees.requests).toHaveLength(1);
+    expect(worktrees.requests).toHaveLength(2);
+    expect(worktrees.requests.map(({ path }) => path)).toEqual([apiPath, webPath]);
+    expect(await pathExists(apiPath)).toBe(false);
+    expect(await pathExists(webPath)).toBe(false);
     expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
     await withStore(harness, (store) => {
-      expect(store.getThreadWorkspace(harness.bot.uid, target)?.projects[0]).toMatchObject({
-        created: true,
-        path: workspace.record.projects[0]!.path,
-        branch: workspace.record.projects[0]!.branch,
-      });
+      expect(store.getThreadWorkspace(harness.bot.uid, target)?.projects).toMatchObject([
+        { name: "api", created: true, path: apiPath, branch: apiBranch },
+        { name: "web", created: false, path: null, branch: null },
+      ]);
     });
 
     const retryCommand = removalCommand(harness, target, "remove-branch-retry", "--force");
     await harness.service.submitInbound(retryCommand);
     expect(await waitForAction(harness, "thread-archive")).toBe(true);
-    expect(worktrees.requests[1]!.path).toBe(workspace.record.projects[0]!.path!);
-    expect(worktrees.requests[1]!.repo).toBe(workspace.record.projects[0]!.repo);
-    expect(worktrees.requests[1]!.branch).toBe(workspace.record.projects[0]!.branch!);
-    expect(worktrees.requests[1]!.force).toBe(true);
-    expect((worktrees.requests[1] as RecordedRemovalRequest & { deleteBranch?: boolean }).deleteBranch).toBe(true);
+    expect(worktrees.requests).toHaveLength(3);
+    expect(worktrees.requests[2]).toMatchObject({
+      path: apiPath,
+      repo: api.repo,
+      branch: apiBranch,
+      force: true,
+      deleteBranch: true,
+    });
+    expect(worktrees.processSteps.map(({ step }) => step)).toEqual([
+      "worktree",
+      "branch",
+      "worktree",
+      "branch",
+      "branch",
+    ]);
     await withStore(harness, (store) => {
-      expect(store.getThreadWorkspace(harness.bot.uid, target)?.projects[0]).toMatchObject({
-        created: false,
-        path: null,
-        branch: null,
-      });
+      expect(store.getThreadWorkspace(harness.bot.uid, target)?.projects).toMatchObject([
+        { created: false, path: null, branch: null },
+        { created: false, path: null, branch: null },
+      ]);
       expect(store.listThreadMergeEvents(harness.bot.uid)).toEqual([]);
     });
   } finally {
@@ -643,24 +662,32 @@ test("a partial branch-removal result retains the original workspace and remaini
   }
 });
 
-test("an unknown removal process stops that operation without replaying it, but a new command may retry", async () => {
+test("an unknown branch-removal result after worktree deletion is not archived or replayed", async () => {
   const target: ThreadTarget = { channelType: 5, channelId: `${REMOVE_GROUP}____remove-unknown` };
   const worktrees = new RecordingWorktrees();
   const normalRemove = worktrees.removeBehavior;
-  worktrees.removeBehavior = async (_request, runProcess) => {
-    runProcess("worktree", "unknown");
-    throw new Error("removal process exit is unknown");
+  worktrees.removeBehavior = async (request, runProcess) => {
+    runProcess("worktree");
+    await rm(request.path, { recursive: true, force: true });
+    runProcess("branch", "unknown");
+    throw new Error("branch removal process exit is unknown");
   };
   const harness = await createCoreHarness({ worktreePort: worktrees });
   try {
     const workspace = await seedOwnedWorkspace(harness, target, { names: ["api", "web"] });
-    const command = removalCommand(harness, target, "remove-unknown-command");
+    const command = removalCommand(harness, target, "remove-unknown-command", "--force");
     const refusal = waitForNextTargetText(harness, target);
     await harness.service.submitInbound(command);
     await refusal;
 
     expect(worktrees.requests).toHaveLength(1);
-    expect(await pathExists(workspace.record.projects[0]!.path!)).toBe(true);
+    expect(worktrees.requests[0]).toMatchObject({
+      path: workspace.record.projects[0]!.path,
+      force: true,
+      deleteBranch: true,
+    });
+    expect(worktrees.processSteps.map(({ step }) => step)).toEqual(["worktree", "branch"]);
+    expect(await pathExists(workspace.record.projects[0]!.path!)).toBe(false);
     expect(await pathExists(workspace.record.projects[1]!.path!)).toBe(true);
     expect(harness.transport.managementCalls.filter(({ action }) => action === "thread-archive")).toEqual([]);
     expect(harness.workers.prompts).toEqual([]);
@@ -674,8 +701,8 @@ test("an unknown removal process stops that operation without replaying it, but 
         channelId: target.channelId,
         sourceId: "remove-unknown-command",
         phase: "unknown",
-        step: "worktree",
-        cwd: workspace.record.projects[0]!.path,
+        step: "branch",
+        cwd: workspace.record.projects[0]!.repo,
         resourcePaths: expect.arrayContaining([
           workspace.record.projects[0]!.path!,
           workspace.record.projects[0]!.repo,
@@ -686,10 +713,22 @@ test("an unknown removal process stops that operation without replaying it, but 
       expect(leases[0]?.processIdentity).not.toBeNull();
       expect(store.listHostMergeLeases(harness.bot.uid)).toEqual([]);
     });
-    worktrees.removeBehavior = normalRemove;
-    await harness.service.submitInbound(removalCommand(harness, target, "remove-unknown-retry"));
+
+    worktrees.removeBehavior = async (request, runProcess) => {
+      if (await pathExists(request.path)) return normalRemove(request, runProcess);
+      runProcess("branch");
+      return { kind: "missing", branchOutcome: "deleted" };
+    };
+    await harness.service.submitInbound(removalCommand(harness, target, "remove-unknown-retry", "--force"));
     expect(await waitForAction(harness, "thread-archive")).toBe(true);
     expect(worktrees.requests).toHaveLength(3);
+    expect(worktrees.processSteps.map(({ step }) => step)).toEqual([
+      "worktree",
+      "branch",
+      "branch",
+      "worktree",
+      "branch",
+    ]);
     expect(await pathExists(workspace.record.projects[0]!.path!)).toBe(false);
     expect(await pathExists(workspace.record.projects[1]!.path!)).toBe(false);
     await withStore(harness, store => {
@@ -705,6 +744,7 @@ test("an unknown removal process stops that operation without replaying it, but 
     await closeCoreHarness(harness);
   }
 });
+
 
 test("a pending same-thread ask refuses removal immediately even after the binding moved elsewhere", async () => {
   const target: ThreadTarget = { channelType: 5, channelId: `${REMOVE_GROUP}____remove-busy-ask` };

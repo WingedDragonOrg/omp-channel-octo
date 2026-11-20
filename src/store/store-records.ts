@@ -2,7 +2,7 @@
  * 持久层的记录类型：每张表在 TypeScript 侧的形状，被 store 门面与各领域模块共用。
  */
 
-import type { ChatAppendMode, ChatExecutionState, ChatTarget, FileLinkResolverConfig, HostMergeOutcome, HostMergeProgressPhase, TextMention, ThreadListenLevel, ThreadSummary, WorkerGoal, WorkerGoalRun, WorkerProcess, WorktreeRemovalStep } from "../contracts.ts";
+import type { ChatAppendMode, ChatExecutionState, ChatTarget, FileLinkResolverConfig, HostMergeOutcome, HostMergeProgressPhase, TextMention, ThreadListenLevel, ThreadSummary, WorkerGoal, WorkerGoalRun, WorkerProcess, WorktreeRemovalPlan, WorktreeRemovalStep } from "../contracts.ts";
 
 export interface BindingSessionInitialization {
   taskId: string;
@@ -549,6 +549,8 @@ export interface ThreadWorkspaceProjectRecord {
   accessPath?: string;
   /** Persisted original worktree destination used to verify an accessPath after project.path is cleared. */
   accessTarget?: string;
+  /** Persisted force-cleanup snapshot; preserves actual branch identity after worktree removal. */
+  removal?: WorktreeRemovalPlan;
 }
 
 export interface ThreadWorkspaceRecord extends ChatTarget {

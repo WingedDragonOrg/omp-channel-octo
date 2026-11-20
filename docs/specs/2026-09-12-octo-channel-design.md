@@ -98,6 +98,8 @@ OctoBuddy 增强器打开跨工作区的 Zed SSH 文件时，状态接口提供�
 
 `/thread remove` 与 `thread-delete` 的持久资源清理由 `threads/thread-workspace-cleanup.ts` 独占，调用方显式选择分支策略。remove 的每个 worktree/branch 步骤复用 `workspace/worktrunk.ts` 的受管进程与 watchdog，并在 `host_merge_leases` 以 `operation_kind=thread-remove` 记录原完整资源组、步骤、进程身份及结果；旧行默认为 merge，两个结果命名空间独立。只有已知业务 outcome 可在启动时补发回执并排定归档；`exited` 但无 outcome 仍为 unknown，不重做 Git、不称成功，也不作为独立新命令的资源占用门禁。缺失目录仍保留调度资源键，只对现存 cwd 探测 Git root；持久归属和实际路径验证仍是清理前提。
 
+切换过分支的子区 worktree 仅在 `/thread remove --force` 下可按确认的授权处理登记分支和实际分支；须先持久化实际身份并保留其他 checkout、主及默认分支等保护，逐项报告本地清理与远端归档状态。详细失败、恢复及验收契约见 `2026-09-17-thread-worktrunk-design.md` 的「切换分支后的强制清理 SDD」。
+
 `tasks/task-scheduler.ts` 独占聊天串行链、排定任务、聊天/会话租约、等待回执标记及关停任务快照；不同会话不因 cwd 相同而互相排队。运行中 worker 和 blocked 目录仍由服务管理，调度仅经明确端口查询。`commands/command-routing.ts` 统一内建命令别名及注册校验，从别名表推导的 action 类型约束完整分派表；durable claim 保留用户输入的命令名，重启仍在 claim 完成后请求，未知命令照常走既有 handler 或 OMP 任务路径。
 
 #### 独立聊天并行调度 SDD（2026-11-03）

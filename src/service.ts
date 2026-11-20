@@ -10148,15 +10148,17 @@ class CoreService implements ChannelService {
         worktrees,
         force,
         deleteBranch: true,
+        allowBranchMismatch: force,
         lease: cleanupLease,
         signal: controller.signal,
         lifecycle: removalLifecycle,
         isUnknown: () => operationUnknown,
       });
       if (result.unknown || operationUnknown) {
+        const detail = result.messages.join("；");
         return {
           kind: "refused",
-          message: "本地清理进程结果未确认；不会视为成功，本次不归档且不会自动重放。核对资源状态后可发送新命令重试。",
+          message: `本地清理进程结果未确认；不会视为成功，本次不归档且不会自动重放。核对资源状态后可发送新命令重试。${detail.length === 0 ? "" : `详情：${detail}`}`,
         };
       }
       if (this.stopping || controller.signal.aborted) {

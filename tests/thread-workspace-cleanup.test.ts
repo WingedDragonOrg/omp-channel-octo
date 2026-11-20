@@ -208,6 +208,85 @@ async function createCleanupWorktree(root: string, name: string): Promise<{ repo
   return { repo, path };
 }
 
+test("force cleanup retries the recorded branch after removing a switched worktree", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oco-switched-partial-cleanup-")));
+  const store = await openChannelStore(join(root, "state"));
+  const git = async (cwd: string, ...args: string[]): Promise<string> => {
+    const child = Bun.spawn(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+    const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    if (code !== 0) throw new Error(err);
+    return out.trim();
+  };
+  try {
+    const { repo, path } = await createCleanupWorktree(root, "switched");
+    await git(path, "switch", "-c", "current");
+    const ownership = {
+      botUid: "bot",
+      channelType: 5 as const,
+      channelId: "group____switched-partial",
+      layout: "single" as const,
+      status: "ready" as const,
+      entryPath: null,
+      workspaceRoot: null,
+      error: null,
+      projects: [{ name: "project", repo, path, branch: "feature", created: true }],
+    };
+    store.saveThreadWorkspace(ownership);
+    const branchLock = join(repo, ".git", "refs", "heads", "feature.lock");
+    await writeFile(branchLock, "locked\n");
+    const branchNames = async () =>
+      (await git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/"))
+        .split("\n")
+        .filter(Boolean)
+        .sort();
+    expect(await branchNames()).toEqual(["current", "feature", "main"]);
+
+    const worktrees = createWorktreePort({ command: "/no/omp", worktrunkCandidates: [] });
+    const first = await cleanupOwnedThreadWorkspace({
+      ownership,
+      store,
+      worktrees,
+      deleteBranch: true,
+      force: true,
+      allowBranchMismatch: true,
+      lease: { ready: Promise.resolve(), complete() {} },
+    });
+    expect(first.complete).toBe(false);
+    expect(existsSync(path)).toBe(false);
+    expect(await branchNames()).toEqual(["feature", "main"]);
+    expect(store.getThreadWorkspace("bot", ownership)?.projects[0]).toMatchObject({
+      created: true,
+      path,
+      branch: "feature",
+    });
+
+    await rm(branchLock, { force: true });
+    const retryOwnership = store.getThreadWorkspace("bot", ownership);
+    if (!retryOwnership) throw new Error("partial workspace ownership was not persisted");
+    const retry = await cleanupOwnedThreadWorkspace({
+      ownership: retryOwnership,
+      store,
+      worktrees,
+      deleteBranch: true,
+      force: true,
+      allowBranchMismatch: true,
+      lease: { ready: Promise.resolve(), complete() {} },
+    });
+    expect(retry.complete).toBe(true);
+    expect(existsSync(path)).toBe(false);
+    expect(await branchNames()).toEqual(["main"]);
+    expect(store.getThreadWorkspace("bot", ownership)?.projects[0]).toMatchObject({
+      created: false,
+      path: null,
+      branch: null,
+    });
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+
 test("shared cleanup unlinks a recorded original-worktree entry after releasing its target", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "oco-cleanup-access-link-")));
   const store = await openChannelStore(join(root, "state"));

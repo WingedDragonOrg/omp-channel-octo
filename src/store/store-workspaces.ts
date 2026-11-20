@@ -1,6 +1,6 @@
 import { relative, isAbsolute, sep } from "node:path";
 import { Database } from "bun:sqlite";
-import type { ChatTarget, ThreadListenLevel, ThreadSummary } from "../contracts.ts";
+import type { ChatTarget, ThreadListenLevel, ThreadSummary, WorktreeRemovalPlan } from "../contracts.ts";
 import type {
   BindingRecord,
   ThreadWorkspaceCleanupInput,
@@ -641,6 +641,33 @@ function isWorkspaceProject(value: unknown): value is ThreadWorkspaceProjectReco
     && typeof project.created === "boolean"
     && (project.accessPath === undefined || typeof project.accessPath === "string")
     && (project.accessTarget === undefined || typeof project.accessTarget === "string")
+    && (project.removal === undefined || isWorktreeRemovalPlan(project.removal))
+  );
+}
+
+function isWorktreeRemovalPlan(value: unknown): value is WorktreeRemovalPlan {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const plan = value as Record<string, unknown>;
+  return (
+    typeof plan.path === "string"
+    && typeof plan.repoRoot === "string"
+    && typeof plan.commonDir === "string"
+    && (plan.pathDevice === null || typeof plan.pathDevice === "string")
+    && (plan.pathInode === null || typeof plan.pathInode === "string")
+    && typeof plan.registeredBranch === "string"
+    && (plan.actualBranch === null || typeof plan.actualBranch === "string")
+    && (plan.headOid === null || (typeof plan.headOid === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/iu.test(plan.headOid)))
+    && (plan.worktree === "pending" || plan.worktree === "removed" || plan.worktree === "missing")
+    && Array.isArray(plan.refs)
+    && plan.refs.every((value) => {
+      if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+      const ref = value as Record<string, unknown>;
+      return (
+        typeof ref.branch === "string"
+        && (ref.oid === null || (typeof ref.oid === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/iu.test(ref.oid)))
+        && (ref.state === "pending" || ref.state === "deleted" || ref.state === "missing" || ref.state === "retained")
+      );
+    })
   );
 }
 

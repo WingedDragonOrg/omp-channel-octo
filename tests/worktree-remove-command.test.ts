@@ -47,6 +47,11 @@ async function hasBranch(repo: string, branch: string): Promise<boolean> {
   throw new Error(`git show-ref failed: ${result.stderr}`);
 }
 
+async function hasWorktree(repo: string, path: string): Promise<boolean> {
+  const worktrees = await runGit(repo, ["worktree", "list", "--porcelain"]);
+  return worktrees.split("\n").some((line) => line === `worktree ${path}`);
+}
+
 async function createRepo(root: string): Promise<string> {
   const repo = join(root, "project");
   await mkdir(repo);
@@ -436,6 +441,286 @@ test("force removal deletes both an unmerged branch and a dirty worktree", async
       branchExists: await hasBranch(repo, branch),
       mainHead: await runGit(repo, ["rev-parse", "refs/heads/main"]),
     }).toEqual({ worktreeExists: false, branchExists: false, mainHead });
+  });
+});
+
+test("default removal rejects a clean worktree switched away from its recorded branch", async () => {
+  await withRepository(async (root, repo) => {
+    const recorded = "registered-feature";
+    const current = "checked-out-feature";
+    const worktree = await addWorktree(repo, root, "switched-worktree", recorded);
+    await commitFile(worktree, "registered.txt", "registered change\n", "registered change");
+    await runGit(repo, ["merge", "--quiet", "--ff-only", recorded]);
+    await runGit(worktree, ["switch", "-q", "-c", current, "main"]);
+    const port = gitFallbackPort(root);
+
+    const rejected = await port.remove({ path: worktree, repo, branch: recorded, deleteBranch: true }).then(
+      () => false,
+      () => true,
+    );
+    const forcedWithoutAuthorization = await port.remove({
+      path: worktree, repo, branch: recorded, deleteBranch: true, force: true,
+    }).then(() => false, () => true);
+    expect(forcedWithoutAuthorization).toBe(true);
+
+    expect({
+      rejected,
+      worktreeExists: existsSync(worktree),
+      worktreeRegistered: await hasWorktree(repo, worktree),
+      currentBranch: await runGit(worktree, ["branch", "--show-current"]),
+      recordedBranchExists: await hasBranch(repo, recorded),
+      currentBranchExists: await hasBranch(repo, current),
+    }).toEqual({
+      rejected: true,
+      worktreeExists: true,
+      worktreeRegistered: true,
+      currentBranch: current,
+      recordedBranchExists: true,
+      currentBranchExists: true,
+    });
+  });
+});
+
+test("force removal deletes the recorded and current branches after a worktree switch", async () => {
+  await withRepository(async (root, repo) => {
+    const recorded = "registered-unmerged";
+    const current = "current-unmerged";
+    const worktree = await addWorktree(repo, root, "switched-force-worktree", recorded);
+    await commitFile(worktree, "registered.txt", "registered change\n", "registered change");
+    await runGit(worktree, ["switch", "-q", "-c", current, "main"]);
+    await commitFile(worktree, "current.txt", "current change\n", "current change");
+    const mainHead = await runGit(repo, ["rev-parse", "refs/heads/main"]);
+    const port = gitFallbackPort(root);
+
+    await port.remove({
+      path: worktree,
+      repo,
+      branch: recorded,
+      force: true,
+      deleteBranch: true,
+      allowBranchMismatch: true,
+    });
+
+    expect({
+      worktreeExists: existsSync(worktree),
+      worktreeRegistered: await hasWorktree(repo, worktree),
+      recordedBranchExists: await hasBranch(repo, recorded),
+      currentBranchExists: await hasBranch(repo, current),
+      mainHead: await runGit(repo, ["rev-parse", "refs/heads/main"]),
+    }).toEqual({
+      worktreeExists: false,
+      worktreeRegistered: false,
+      recordedBranchExists: false,
+      currentBranchExists: false,
+      mainHead,
+    });
+  });
+});
+
+test("force removal keeps a switched branch after its ref lock fails following worktree removal", async () => {
+  await withRepository(async (root, repo) => {
+    const recorded = "registered-before-lock";
+    const current = "current-locked";
+    const worktree = await addWorktree(repo, root, "switched-locked-worktree", recorded);
+    await commitFile(worktree, "registered.txt", "registered change\n", "registered change");
+    await runGit(worktree, ["switch", "-q", "-c", current, "main"]);
+    await commitFile(worktree, "current.txt", "current change\n", "current change");
+    const lockPath = join(repo, ".git", "refs", "heads", `${current}.lock`);
+    const lockContents = "held by another process\n";
+    await writeFile(lockPath, lockContents, "utf8");
+    const port = gitFallbackPort(root);
+
+    const rejected = await port.remove({
+      path: worktree,
+      repo,
+      branch: recorded,
+      force: true,
+      deleteBranch: true,
+      allowBranchMismatch: true,
+    }).then(
+      () => false,
+      () => true,
+    );
+
+    expect({
+      rejected,
+      worktreeExists: existsSync(worktree),
+      worktreeRegistered: await hasWorktree(repo, worktree),
+      currentBranchExists: await hasBranch(repo, current),
+      lockContents: await readFile(lockPath, "utf8"),
+    }).toEqual({
+      rejected: true,
+      worktreeExists: false,
+      worktreeRegistered: false,
+      currentBranchExists: true,
+      lockContents,
+    });
+  });
+});
+
+test("force removal refuses when the recorded branch is checked out in another worktree", async () => {
+  await withRepository(async (root, repo) => {
+    const recorded = "registered-elsewhere";
+    const current = "owner-current";
+    const worktree = await addWorktree(repo, root, "switched-owner-worktree", recorded);
+    await runGit(worktree, ["switch", "-q", "-c", current, "main"]);
+    const otherWorktree = join(root, "other-registered-worktree");
+    await runGit(repo, ["worktree", "add", "-q", otherWorktree, recorded]);
+    const port = gitFallbackPort(root);
+
+    const rejected = await port.remove({
+      path: worktree,
+      repo,
+      branch: recorded,
+      force: true,
+      deleteBranch: true,
+      allowBranchMismatch: true,
+    }).then(
+      () => false,
+      () => true,
+    );
+
+    expect({
+      rejected,
+      worktreeExists: existsSync(worktree),
+      worktreeRegistered: await hasWorktree(repo, worktree),
+      currentBranch: existsSync(worktree) ? await runGit(worktree, ["branch", "--show-current"]) : null,
+      otherWorktreeExists: existsSync(otherWorktree),
+      otherWorktreeRegistered: await hasWorktree(repo, otherWorktree),
+      otherWorktreeBranch: await runGit(otherWorktree, ["branch", "--show-current"]),
+      recordedBranchExists: await hasBranch(repo, recorded),
+      currentBranchExists: await hasBranch(repo, current),
+    }).toEqual({
+      rejected: true,
+      worktreeExists: true,
+      worktreeRegistered: true,
+      currentBranch: current,
+      otherWorktreeExists: true,
+      otherWorktreeRegistered: true,
+      otherWorktreeBranch: recorded,
+      recordedBranchExists: true,
+      currentBranchExists: true,
+    });
+  });
+});
+
+test("force removal protects the source default branch when it is checked out in the switched worktree", async () => {
+  await withRepository(async (root, repo) => {
+    const recorded = "registered-before-default-switch";
+    const worktree = await addWorktree(repo, root, "default-current-worktree", recorded);
+    await runGit(repo, ["config", "--local", "worktrunk.default-branch", "main"]);
+    await runGit(repo, ["switch", "-q", "-c", "source-checkout-branch"]);
+    await runGit(worktree, ["switch", "-q", "main"]);
+    const port = gitFallbackPort(root);
+
+    const rejected = await port.remove({
+      path: worktree,
+      repo,
+      branch: recorded,
+      force: true,
+      deleteBranch: true,
+      allowBranchMismatch: true,
+    }).then(
+      () => false,
+      () => true,
+    );
+
+    expect({
+      rejected,
+      worktreeExists: existsSync(worktree),
+      worktreeRegistered: await hasWorktree(repo, worktree),
+      currentBranch: await runGit(worktree, ["branch", "--show-current"]),
+      mainBranchExists: await hasBranch(repo, "main"),
+      recordedBranchExists: await hasBranch(repo, recorded),
+    }).toEqual({
+      rejected: true,
+      worktreeExists: true,
+      worktreeRegistered: true,
+      currentBranch: "main",
+      mainBranchExists: true,
+      recordedBranchExists: true,
+    });
+  });
+});
+
+test("force removal protects the recorded default branch after switching the worktree away from it", async () => {
+  await withRepository(async (root, repo) => {
+    await runGit(repo, ["config", "--local", "worktrunk.default-branch", "main"]);
+    await runGit(repo, ["switch", "-q", "-c", "source-checkout-branch"]);
+    const worktree = join(root, "default-recorded-worktree");
+    await runGit(repo, ["worktree", "add", "-q", worktree, "main"]);
+    const current = "non-default-current";
+    await runGit(worktree, ["switch", "-q", "-c", current, "source-checkout-branch"]);
+    const port = gitFallbackPort(root);
+
+    const rejected = await port.remove({
+      path: worktree,
+      repo,
+      branch: "main",
+      force: true,
+      deleteBranch: true,
+      allowBranchMismatch: true,
+    }).then(
+      () => false,
+      () => true,
+    );
+
+    expect({
+      rejected,
+      worktreeExists: existsSync(worktree),
+      worktreeRegistered: await hasWorktree(repo, worktree),
+      currentBranch: await runGit(worktree, ["branch", "--show-current"]),
+      defaultBranchExists: await hasBranch(repo, "main"),
+      currentBranchExists: await hasBranch(repo, current),
+    }).toEqual({
+      rejected: true,
+      worktreeExists: true,
+      worktreeRegistered: true,
+      currentBranch: current,
+      defaultBranchExists: true,
+      currentBranchExists: true,
+    });
+  });
+});
+
+test("force removal refuses a detached worktree and preserves its unrecorded commit", async () => {
+  await withRepository(async (root, repo) => {
+    const branch = "detached-recorded";
+    const worktree = await addWorktree(repo, root, "detached-worktree", branch);
+    await runGit(worktree, ["checkout", "--detach", "HEAD"]);
+    await commitFile(worktree, "detached.txt", "unrecorded commit\n", "detached commit");
+    const detachedHead = await runGit(worktree, ["rev-parse", "HEAD"]);
+    const recordedHead = await runGit(repo, ["rev-parse", `refs/heads/${branch}`]);
+    const port = gitFallbackPort(root);
+
+    const rejected = await port.remove({
+      path: worktree,
+      repo,
+      branch,
+      force: true,
+      deleteBranch: true,
+      allowBranchMismatch: true,
+    }).then(
+      () => false,
+      () => true,
+    );
+
+    expect({
+      rejected,
+      worktreeExists: existsSync(worktree),
+      worktreeRegistered: await hasWorktree(repo, worktree),
+      currentBranch: await runGit(worktree, ["branch", "--show-current"]),
+      detachedHead: await runGit(worktree, ["rev-parse", "HEAD"]),
+      recordedHead: await runGit(repo, ["rev-parse", `refs/heads/${branch}`]),
+    }).toEqual({
+      rejected: true,
+      worktreeExists: true,
+      worktreeRegistered: true,
+      currentBranch: "",
+      detachedHead,
+      recordedHead,
+    });
+    expect(detachedHead).not.toBe(recordedHead);
   });
 });
 

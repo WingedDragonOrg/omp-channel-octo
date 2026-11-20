@@ -499,6 +499,26 @@ export type WorktreeRemovalLifecycle = Pick<
   WorktreeMergeLifecycle,
   "beforeSpawn" | "onSpawn" | "onConfirmedExit" | "onNotSpawned" | "onUnknown"
 >;
+export type WorktreeRemovalRefState = "pending" | "deleted" | "missing" | "retained";
+
+/** Durable snapshot for retries: never infer a switched branch after its worktree is gone. */
+export interface WorktreeRemovalPlan {
+  path: string;
+  repoRoot: string;
+  commonDir: string;
+  pathDevice: string | null;
+  pathInode: string | null;
+  registeredBranch: string;
+  actualBranch: string | null;
+  headOid: string | null;
+  worktree: "pending" | "removed" | "missing";
+  refs: Array<{ branch: string; oid: string | null; state: WorktreeRemovalRefState }>;
+}
+
+export type WorktreeRemovalProgress =
+  | { step: "worktree"; state: "removed" | "missing" }
+  | { step: "branch"; branch: string; state: Exclude<WorktreeRemovalRefState, "pending"> };
+
 
 
 /** Native OMP CLI `commit` outcome with actual HEADs and optional sanitized Git metadata. */
@@ -1177,6 +1197,14 @@ export interface WorktreeRemovalRequest {
   deleteBranch?: boolean;
   /** Returns fresh process callbacks for each destructive command actually spawned. */
   lifecycle?: (step: WorktreeRemovalStep) => WorktreeRemovalLifecycle;
+  /** Force authorization for deleting a different branch currently checked out by this owned worktree. */
+  allowBranchMismatch?: boolean;
+  /** Prior pre-read identities and confirmed cleanup steps for a new explicit retry. */
+  expectedPlan?: WorktreeRemovalPlan;
+  /** Persist the inspected identity before the first destructive step. */
+  onPlanned?: (plan: WorktreeRemovalPlan) => void;
+  /** Persist each independently confirmed worktree/ref result before continuing. */
+  onProgress?: (progress: WorktreeRemovalProgress) => void;
 }
 
 export type WorktreeRemovalOutcome =

@@ -5,6 +5,8 @@ import type {
   WorktreePort,
   WorktreeRemovalLifecycle,
   WorktreeRemovalOutcome,
+  WorktreeRemovalPlan,
+  WorktreeRemovalProgress,
   WorktreeRemovalStep,
 } from "../contracts.ts";
 import type { ChannelStore } from "../store/index.ts";
@@ -27,6 +29,7 @@ export interface ThreadWorkspaceCleanupOptions {
   readonly force: boolean;
   readonly deleteBranch: boolean;
   readonly lease: ThreadWorkspaceCleanupLease;
+  readonly allowBranchMismatch?: boolean;
   readonly signal?: AbortSignal;
   readonly lifecycle?: (
     project: ThreadWorkspaceRecord["projects"][number],
@@ -48,7 +51,8 @@ export function threadWorkspaceCleanupPaths(
 ): string[] {
   const paths: string[] = [];
   for (const project of ownership.projects) {
-    if (project.created && project.path !== null) paths.push(project.path);
+    const ownedPath = project.removal?.path ?? project.path;
+    if ((project.created || (deleteBranch && project.removal !== undefined)) && ownedPath !== null) paths.push(ownedPath);
     if (project.accessPath != null) paths.push(project.accessPath);
     if (project.accessTarget != null) paths.push(project.accessTarget);
     if (deleteBranch && (project.created || project.branch !== null)) paths.push(project.repo);
@@ -127,51 +131,150 @@ export async function cleanupOwnedThreadWorkspace(
         messages.push(`${project.name} 的原项目链接所有权不完整或目标不一致，资源已保留`);
         continue;
       }
-      if (!project.created) {
-        if (project.path !== null || project.branch !== null) {
+      const resumeRemoval = deleteBranch && project.removal !== undefined && project.branch !== null;
+      if (!project.created && !resumeRemoval) {
+        if (project.path !== null || project.branch !== null || project.removal !== undefined) {
           messages.push(`${project.name} 的创建或资源状态未确认，保留记录`);
         }
         continue;
       }
-      if (project.path === null || project.branch === null) {
+      const path = project.removal?.path ?? project.path;
+      if (path === null || project.branch === null) {
         messages.push(`${project.name} 缺少路径或分支所有权，未自动清理`);
         continue;
       }
+      const registeredBranch = project.branch;
       if (!worktrees) {
         messages.push(`${project.name} 工作区能力不可用，资源已保留`);
         continue;
       }
 
-      const prior = { created: project.created, path: project.path, branch: project.branch };
+      let reportedPlan = project.removal;
+      let checkpointFailed = false;
+      const persist = (
+        update: () => void,
+        failureText: string,
+      ): void => {
+        const previous = {
+          created: project.created,
+          path: project.path,
+          branch: project.branch,
+          removal: project.removal === undefined
+            ? undefined
+            : { ...project.removal, refs: project.removal.refs.map((ref) => ({ ...ref })) },
+        };
+        update();
+        try {
+          store.saveThreadWorkspace(ownership);
+          reportedPlan = project.removal;
+        } catch (error) {
+          project.created = previous.created;
+          project.path = previous.path;
+          project.branch = previous.branch;
+          if (previous.removal === undefined) delete project.removal;
+          else project.removal = previous.removal;
+          checkpointFailed = true;
+          throw new Error(`${failureText}：${boundedError(error)}`);
+        }
+      };
       try {
         const lifecycle = options.lifecycle === undefined || !deleteBranch
           ? undefined
           : (step: WorktreeRemovalStep) => options.lifecycle!(project, step);
+        const onPlanned = deleteBranch
+          ? (plan: WorktreeRemovalPlan): void => {
+              persist(() => {
+                project.removal = { ...plan, refs: plan.refs.map((ref) => ({ ...ref })) };
+              }, "清理前无法持久化实际分支与引用身份");
+            }
+          : undefined;
+        const onProgress = deleteBranch
+          ? (progress: WorktreeRemovalProgress): void => {
+              persist(() => {
+                if (project.removal === undefined) throw new Error("清理进度缺少预读身份记录");
+                if (progress.step === "worktree") {
+                  // 分支确认清理前保留原工作区所有权；removal.worktree 记录实际删除状态。
+                  project.removal.worktree = progress.state;
+                } else {
+                  const ref = project.removal.refs.find((candidate) => candidate.branch === progress.branch);
+                  if (ref === undefined) throw new Error("清理进度不属于预读分支身份");
+                  ref.state = progress.state;
+                }
+              }, "清理步骤结果已知但所有权更新失败");
+            }
+          : undefined;
         const request = {
-          path: project.path,
-          force,
+          path,
           repo: project.repo,
-          ...(project.branch === null ? {} : { branch: project.branch }),
-          ...(deleteBranch ? { deleteBranch: true, ...(lifecycle === undefined ? {} : { lifecycle }) } : {}),
+          force,
+          branch: registeredBranch,
+          ...(deleteBranch
+            ? {
+                deleteBranch: true,
+                allowBranchMismatch: force && options.allowBranchMismatch === true,
+                ...(project.removal === undefined ? {} : { expectedPlan: project.removal }),
+                ...(onPlanned === undefined ? {} : { onPlanned }),
+                ...(onProgress === undefined ? {} : { onProgress }),
+                ...(lifecycle === undefined ? {} : { lifecycle }),
+              }
+            : {}),
         };
         const outcome = await worktrees.remove(request, signal);
+        const planBeforeFinalize = reportedPlan;
+        const previous = {
+          created: project.created,
+          path: project.path,
+          branch: project.branch,
+          removal: project.removal === undefined
+            ? undefined
+            : { ...project.removal, refs: project.removal.refs.map((ref) => ({ ...ref })) },
+        };
         applyRemovalOutcome(project, outcome, deleteBranch);
         try {
           store.saveThreadWorkspace(ownership);
         } catch (error) {
-          Object.assign(project, prior);
+          project.created = previous.created;
+          project.path = previous.path;
+          project.branch = previous.branch;
+          if (previous.removal === undefined) delete project.removal;
+          else project.removal = previous.removal;
           messages.push(`${project.name} 清理结果已知但所有权更新失败：${boundedError(error)}`);
           stop = true;
           break;
         }
-        const label = safeDisplayText(`${project.name}（${prior.path}；分支 ${prior.branch}）`, 700) ?? "项目";
+        const actualPath = planBeforeFinalize?.path ?? path;
+        const label = safeDisplayText(`${project.name}（${actualPath}；登记分支 ${planBeforeFinalize?.registeredBranch ?? registeredBranch}）`, 700) ?? "项目";
         const workspaceState = outcome.kind === "missing" ? "工作区已不存在" : "工作区已清理";
-        const branchState = outcome.branchOutcome === "deleted" ? "分支已删除"
-          : outcome.branchOutcome === "missing" ? "分支已不存在" : "分支保留";
-        messages.push(`${label}：${workspaceState}，${branchState}`);
+        const branchState = outcome.branchOutcome === "deleted" ? "已删除"
+          : outcome.branchOutcome === "missing" ? "已不存在" : "保留";
+        const branchDetails = planBeforeFinalize === undefined
+          ? `登记分支 ${registeredBranch} ${branchState}`
+          : planBeforeFinalize.refs.map((ref) => {
+              const state = ref.state === "deleted" ? "已删除"
+                : ref.state === "missing" ? "已不存在"
+                  : ref.state === "retained" ? "已保留（引用已变化）" : "尚未清理";
+              return `${ref.branch === planBeforeFinalize.registeredBranch ? "登记分支" : "实际分支"} ${ref.branch} ${state}`;
+            }).join("，");
+        messages.push(`${label}：${workspaceState}，${branchDetails}`);
       } catch (error) {
-        messages.push(`${safeDisplayText(`${project.name}（${project.path}；分支 ${project.branch}）`, 700) ?? "项目"} 清理失败：${boundedError(error)}`);
-        if (options.isUnknown?.() === true || isAborted(signal)) {
+        const planForFailure = reportedPlan;
+        const pathForReport = planForFailure?.path ?? path;
+        const worktreeDetail = planForFailure === undefined
+          ? ""
+          : `；工作区${planForFailure.worktree === "removed" ? "已清理"
+              : planForFailure.worktree === "missing" ? "已不存在" : "状态未确认"}`;
+        const branchDetail = planForFailure === undefined
+          ? ""
+          : `；${planForFailure.refs.map((ref) => {
+              const state = ref.state === "deleted" ? "已删除"
+                : ref.state === "missing" ? "已不存在"
+                  : ref.state === "retained" ? "已保留（引用已变化）" : "尚未清理";
+              return `${ref.branch === planForFailure.registeredBranch ? "登记分支" : "实际分支"} ${ref.branch} ${state}`;
+            }).join("，")}`;
+        messages.push(
+          `${safeDisplayText(`${project.name}（${pathForReport}${worktreeDetail}${branchDetail}）`, 700) ?? "项目"} 清理失败：${boundedError(error)}`,
+        );
+        if (checkpointFailed || options.isUnknown?.() === true || isAborted(signal)) {
           stop = true;
           break;
         }
@@ -264,6 +367,7 @@ export async function cleanupOwnedThreadWorkspace(
     !project.created
     && project.path === null
     && project.branch === null
+    && project.removal === undefined
     && project.accessPath == null
     && project.accessTarget == null,
   ) && ownership.entryPath === null && (ownership.workspaceRoot ?? null) === null;
@@ -283,30 +387,19 @@ function applyRemovalOutcome(
     project.created = false;
     project.path = null;
     project.branch = null;
+    delete project.removal;
     return;
   }
-  if (outcome.branchOutcome === "kept") return;
-  if (
-    deleteBranch
-    && outcome.branchOutcome !== "deleted"
-    && outcome.branchOutcome !== "missing"
-  ) {
-    return;
-  }
+  if (outcome.branchOutcome !== "deleted" && outcome.branchOutcome !== "missing") return;
   project.created = false;
   project.path = null;
-  if (
-    outcome.branchOutcome === "deleted"
-    || outcome.branchOutcome === "missing"
-    || (!deleteBranch && outcome.kind === "missing")
-  ) {
-    project.branch = null;
-  }
+  project.branch = null;
+  delete project.removal;
 }
 
 function projectsWorktreesReleased(ownership: ThreadWorkspaceRecord): boolean {
   return ownership.projects.every(project =>
-    !project.created && project.path === null && project.branch === null,
+    !project.created && project.path === null && project.branch === null && project.removal === undefined,
   );
 }
 
