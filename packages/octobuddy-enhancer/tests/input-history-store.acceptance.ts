@@ -17,6 +17,24 @@ async function withStorePath(run: (databasePath: string) => Promise<void>): Prom
   }
 }
 
+test("default history database is stored under the oco data directory", async () => {
+  const home = await mkdtemp(join(tmpdir(), "octobuddy-history-home-"));
+  try {
+    const moduleUrl = new URL("../src/host/input-history.ts", import.meta.url).href;
+    const process = Bun.spawn([Bun.which("bun")!, "-e", `
+      import { InputHistoryStore } from ${JSON.stringify(moduleUrl)};
+      const store = new InputHistoryStore();
+      await store.appendInputHistory(${JSON.stringify(chatKey)}, { text: "saved" });
+      await store.close();
+    `], { env: { ...Bun.env, HOME: home }, stdout: "pipe", stderr: "pipe" });
+    const error = await new Response(process.stderr).text();
+    expect(await process.exited, error).toBe(0);
+    expect(existsSync(join(home, ".oco", "data", "octo-buddy.sqlite"))).toBe(true);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("opens lazily with private permissions and persists structured entries across store recreation", async () => {
   await withStorePath(async (databasePath) => {
     const first = new InputHistoryStore(databasePath);

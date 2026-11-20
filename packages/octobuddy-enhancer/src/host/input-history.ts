@@ -14,7 +14,7 @@ export interface InputHistorySnapshot {
   entries: InputHistoryEntry[];
 }
 
-const defaultDatabasePath = resolve(homedir(), ".config", "octobuddy-enhancer", "input-history.sqlite");
+const defaultDatabasePath = resolve(homedir(), ".oco", "data", "octo-buddy.sqlite");
 const defaultLimit = 100;
 const schema = `
   CREATE TABLE IF NOT EXISTS input_history_config (
@@ -128,7 +128,6 @@ async function openPrivateDatabase(path: string): Promise<Database> {
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const directoryInfo = await lstat(directory);
   if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) throw new Error("input history storage is unavailable");
-  await chmod(directory, 0o700);
 
   try {
     const fileInfo = await lstat(path);
