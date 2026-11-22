@@ -346,3 +346,56 @@ test("a paused recovery snapshot preserves a previously authorized native contin
     expect(recovery.goalStopped).toHaveLength(0);
     expect(store.isGoalTaskResuming("paused-snapshot")).toBe(true);
   }));
+test("hot native goal runs bypass uncertain and revoked-goal cold recovery", () =>
+  withStore((store) => {
+    acceptGoal(store, "hot-unaccepted-goal", "session-hot-unaccepted", {
+      op: "create",
+      objective: "keep the live native goal",
+    });
+    expect(store.markStarted("hot-unaccepted-goal")).toBe(true);
+    store.markGoalTaskDispatched("hot-unaccepted-goal", "session-hot-unaccepted");
+
+    acceptGoal(store, "hot-revoked-goal", "session-hot-revoked", {
+      op: "create",
+      objective: "keep the live goal until the runtime is reattached",
+    });
+    expect(store.markStarted("hot-revoked-goal")).toBe(true);
+    store.markGoalTaskDispatched("hot-revoked-goal", "session-hot-revoked");
+    store.markGoalTaskAccepted("hot-revoked-goal", "goal-hot-revoked");
+    store.stopGoalContinuation(botUid, target, "session-hot-revoked", "pause");
+
+    const hotTaskIds = ["hot-unaccepted-goal", "hot-revoked-goal"];
+    const recovered = store.prepareTasksForRestart(botUid, stopReasons, hotTaskIds);
+
+    expect(recovered.hotTasks.map(({ id, state }) => [id, state])).toEqual([
+      ["hot-unaccepted-goal", "running"],
+      ["hot-revoked-goal", "running"],
+    ]);
+    expect(recovered.hotTasks.map(({ id, stopIntent }) => [id, stopIntent])).toEqual([
+      ["hot-unaccepted-goal", null],
+      ["hot-revoked-goal", null],
+    ]);
+    expect(recovered.queued).toEqual([]);
+    expect(recovered.uncertain).toEqual([]);
+    expect(recovered.stopped).toEqual([]);
+    expect(recovered.goalStopped).toEqual([]);
+    expect(store.getGoalTask("hot-unaccepted-goal")).toMatchObject({
+      dispatched: true,
+      accepted: false,
+    });
+    expect(store.getGoalTask("hot-revoked-goal")).toMatchObject({
+      dispatched: true,
+      accepted: true,
+      acceptedGoalId: "goal-hot-revoked",
+    });
+    expect(store.getGoalSession(botUid, target, "session-hot-revoked")).toMatchObject({
+      continuationAuthorized: false,
+      stopIntent: "pause",
+    });
+
+    const repeated = store.prepareTasksForRestart(botUid, stopReasons, hotTaskIds);
+    expect(repeated.hotTasks.map(({ id }) => id)).toEqual(hotTaskIds);
+    expect(repeated.uncertain).toEqual([]);
+    expect(repeated.goalStopped).toEqual([]);
+  }));
+

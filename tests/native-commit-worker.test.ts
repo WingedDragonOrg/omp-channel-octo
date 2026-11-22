@@ -17,7 +17,7 @@ import { TaskStartupError } from "../src/contracts.ts";
 import { createWorkerFactory } from "../src/omp/index.ts";
 import { groupAlive, terminateProcessGroup } from "../src/omp/process.ts";
 import { openTrackedCommit } from "../src/runtime/worker-lease.ts";
-import type { WorkerLedgerRecord } from "../src/store/store-records.ts";
+import type { WorkerLedgerInput } from "../src/store/store-records.ts";
 
 const fixturePath = resolve(import.meta.dir, "fixtures/native-commit-cli.ts");
 const markerExtensionPath = resolve(import.meta.dir, "fixtures/omp-extension-marker.ts");
@@ -1115,7 +1115,7 @@ test("tracked commit 在 run 前登记真实进程台账，close 后才释放资
     const store = await ChannelStore.open(databasePath);
     const botUid = "commit-fixture-bot";
     const sessionId = "bound-session";
-    const ledger: Omit<WorkerLedgerRecord, keyof WorkerProcess | "state" | "moveTargetCwd"> = {
+    const ledger: Omit<WorkerLedgerInput, keyof WorkerProcess | "state" | "moveTargetCwd"> = {
       id: "commit-worker-fixture",
       botUid,
       sessionId,

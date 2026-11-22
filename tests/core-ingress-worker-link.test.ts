@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { recvIngressSourceId } from "../src/inbound/ingress-types.ts";
 import { openChannelStore } from "../src/store/index.ts";
-import type { WorkerLedgerRecord } from "../src/store/store-records.ts";
+import type { WorkerLedgerInput } from "../src/store/store-records.ts";
 import { inbound } from "./fixtures/core-fakes.ts";
 
 test("session worker ledger is transactionally linked to its exact ingress intent and paths", async () => {
@@ -53,7 +53,7 @@ test("session worker ledger is transactionally linked to its exact ingress inten
     resourceCwds: [cwd],
     workerLedgerId: workerId,
   };
-  const worker: WorkerLedgerRecord = {
+  const worker: WorkerLedgerInput = {
     id: workerId,
     botUid: accepted.job.botUid,
     sessionId: "session-ingress-worker-link",
@@ -72,7 +72,7 @@ test("session worker ledger is transactionally linked to its exact ingress inten
     expect(store.recordIngressWorker(accepted.job.id, { ...worker, cwd: join(root, "unrecorded") })).toBe(false);
     expect(store.getWorkerLedger(worker.botUid, workerId)).toBeNull();
     expect(store.recordIngressWorker(accepted.job.id, worker)).toBe(true);
-    expect(store.getWorkerLedger(worker.botUid, workerId)).toEqual(worker);
+    expect(store.getWorkerLedger(worker.botUid, workerId)).toEqual({ ...worker, runtimeId: null });
 
     const sourceCwd = join(root, "move-source");
     const targetCwd = join(root, "move-target");
@@ -124,7 +124,7 @@ test("session worker ledger is transactionally linked to its exact ingress inten
       resourceCwds: [sourceCwd, targetCwd],
       workerLedgerId: moveWorkerId,
     };
-    const moveWorker: WorkerLedgerRecord = {
+    const moveWorker: WorkerLedgerInput = {
       ...worker,
       id: moveWorkerId,
       sessionId: expectedBinding.sessionId,
@@ -137,7 +137,7 @@ test("session worker ledger is transactionally linked to its exact ingress inten
     expect(store.recordIngressWorker(moveAccepted.job.id, { ...moveWorker, moveTargetCwd: join(root, "wrong-target") })).toBe(false);
     expect(store.getWorkerLedger(worker.botUid, moveWorkerId)).toBeNull();
     expect(store.recordIngressWorker(moveAccepted.job.id, moveWorker)).toBe(true);
-    expect(store.getWorkerLedger(worker.botUid, moveWorkerId)).toEqual(moveWorker);
+    expect(store.getWorkerLedger(worker.botUid, moveWorkerId)).toEqual({ ...moveWorker, runtimeId: null });
   } finally {
     store.close();
     await rm(root, { recursive: true, force: true });

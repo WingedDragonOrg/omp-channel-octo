@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatTarget, ThreadSummary } from "../src/contracts.ts";
-import type { ThreadForkRecord, WorkerLedgerRecord } from "../src/store/store-records.ts";
+import type { ThreadForkRecord, WorkerLedgerInput } from "../src/store/store-records.ts";
 import { openChannelStore, type ChannelStore } from "../src/store/index.ts";
 
 const botUid = "fork-store-bot";
@@ -633,7 +633,7 @@ test("legacy worker ledger rows survive nullable session file migration and stop
     }
 
     let store = await openChannelStore(root);
-    const preparationWorker: WorkerLedgerRecord = {
+    const preparationWorker: WorkerLedgerInput = {
       id: "fork-preparation-worker",
       botUid: "fork-preparation-bot",
       sessionId: "fork-op-1",
@@ -644,6 +644,12 @@ test("legacy worker ledger rows survive nullable session file migration and stop
       cwd: "/work/shared-project",
       moveTargetCwd: null,
       state: "running",
+    };
+    const runtimeWorker: WorkerLedgerInput = {
+      ...preparationWorker,
+      id: "runtime-owned-worker",
+      botUid: "runtime-owned-bot",
+      runtimeId: "runtime-owner-123",
     };
     try {
       expect(store.getWorkerLedger("legacy-worker-bot", "legacy-running")).toEqual({
@@ -657,6 +663,7 @@ test("legacy worker ledger rows survive nullable session file migration and stop
         cwd: "/legacy/cwd",
         moveTargetCwd: "/legacy/move-target",
         state: "running",
+        runtimeId: null,
       });
       expect(store.getWorkerLedger("legacy-worker-bot", "legacy-stopped")).toMatchObject({
         id: "legacy-stopped",
@@ -668,7 +675,80 @@ test("legacy worker ledger rows survive nullable session file migration and stop
       expect(store.listWorkerLedger("legacy-worker-bot").map((worker) => worker.id)).toEqual(["legacy-running"]);
 
       store.recordWorker(preparationWorker);
+      expect(store.getWorkerLedger(preparationWorker.botUid, preparationWorker.id)?.runtimeId).toBeNull();
+      expect(() => store.recordWorker({
+        ...preparationWorker,
+        identity: "pid=62002;start=wrong-owner",
+        runtimeId: "runtime-owner-123",
+      })).toThrow(/owner or identity/u);
+      expect(store.getWorkerLedger(preparationWorker.botUid, preparationWorker.id)?.runtimeId).toBeNull();
+      store.recordWorker({ ...preparationWorker, runtimeId: "runtime-owner-123" });
+      expect(store.getWorkerLedger(preparationWorker.botUid, preparationWorker.id)?.runtimeId)
+        .toBe("runtime-owner-123");
+      expect(() => store.recordWorker({ ...preparationWorker, runtimeId: "different-runtime" }))
+        .toThrow(/owner or identity/u);
+      expect(store.getWorkerLedger(preparationWorker.botUid, preparationWorker.id)?.runtimeId)
+        .toBe("runtime-owner-123");
       store.markWorkerStopped(preparationWorker.id);
+      const replacementWorker: WorkerLedgerInput = {
+        ...preparationWorker,
+        sessionId: "recovered-session",
+        sessionFile: "/work/shared-project/sessions/recovered-session.jsonl",
+        pid: 62002,
+        pgid: 62002,
+        identity: "pid=62002;start=fork-recovered",
+        runtimeId: "runtime-owner-456",
+      };
+      expect(() => store.recordWorker({ ...replacementWorker, cwd: "/work/other-project" }))
+        .toThrow(/owner or identity/u);
+      expect(() => store.recordWorker({ ...replacementWorker, botUid: "wrong-bot" }))
+        .toThrow(/owner or identity/u);
+      expect(store.getWorkerLedger(preparationWorker.botUid, preparationWorker.id)).toMatchObject({
+        runtimeId: "runtime-owner-123",
+        state: "stopped",
+        identity: preparationWorker.identity,
+        sessionId: preparationWorker.sessionId,
+      });
+      store.recordWorker(replacementWorker);
+      expect(store.getWorkerLedger(preparationWorker.botUid, preparationWorker.id)).toMatchObject({
+        runtimeId: "runtime-owner-456",
+        state: "running",
+        sessionId: replacementWorker.sessionId,
+        sessionFile: replacementWorker.sessionFile,
+        identity: "pid=62002;start=fork-recovered",
+      });
+      expect(() => store.recordWorker({
+        ...replacementWorker,
+        sessionId: "unapproved-session-change",
+        sessionFile: "/work/shared-project/sessions/unapproved.jsonl",
+      })).toThrow(/owner or identity/u);
+      expect(store.getWorkerLedger(preparationWorker.botUid, preparationWorker.id)).toMatchObject({
+        runtimeId: "runtime-owner-456",
+        state: "running",
+        sessionId: replacementWorker.sessionId,
+        identity: replacementWorker.identity,
+      });
+      store.markWorkerStopped(preparationWorker.id);
+      store.recordWorker(runtimeWorker);
+      store.markWorkerStopped(runtimeWorker.id);
+      const uncertainWorker: WorkerLedgerInput = {
+        ...preparationWorker,
+        id: "uncertain-owner-worker",
+        botUid: "uncertain-owner-bot",
+        state: "unknown",
+        runtimeId: "runtime-owner-unknown",
+      };
+      store.recordWorker(uncertainWorker);
+      expect(() => store.recordWorker({
+        ...uncertainWorker,
+        pid: 62003,
+        pgid: 62003,
+        identity: "pid=62003;start=unconfirmed-replacement",
+      })).toThrow(/owner or identity/u);
+      expect(store.getWorkerLedger(uncertainWorker.botUid, uncertainWorker.id)).toMatchObject({
+        state: "unknown",
+        identity: uncertainWorker.identity,
+      });
     } finally {
       store.close();
     }
@@ -677,6 +757,17 @@ test("legacy worker ledger rows survive nullable session file migration and stop
     try {
       expect(store.getWorkerLedger("fork-preparation-bot", "fork-preparation-worker")).toEqual({
         ...preparationWorker,
+        sessionId: "recovered-session",
+        sessionFile: "/work/shared-project/sessions/recovered-session.jsonl",
+        pid: 62002,
+        pgid: 62002,
+        identity: "pid=62002;start=fork-recovered",
+        runtimeId: "runtime-owner-456",
+        state: "stopped",
+      });
+      expect(store.getWorkerLedger(runtimeWorker.botUid, runtimeWorker.id)).toEqual({
+        ...runtimeWorker,
+        runtimeId: "runtime-owner-123",
         state: "stopped",
       });
       expect(store.getWorkerLedger("other-worker-bot", "fork-preparation-worker")).toBeNull();
@@ -693,8 +784,15 @@ test("legacy worker ledger rows survive nullable session file migration and stop
     const migrated = new Database(join(root, "channel.sqlite"));
     try {
       expect(migrated.query("PRAGMA table_info(worker_ledger)").all()).toEqual(
-        expect.arrayContaining([expect.objectContaining({ name: "session_file", notnull: 0 })]),
+        expect.arrayContaining([
+          expect.objectContaining({ name: "session_file", notnull: 0 }),
+          expect.objectContaining({ name: "runtime_id", notnull: 0 }),
+        ]),
       );
+      expect(migrated.query("SELECT runtime_id FROM worker_ledger WHERE id = 'legacy-running'").get())
+        .toEqual({ runtime_id: null });
+      expect(migrated.query("SELECT runtime_id FROM worker_ledger WHERE id = 'runtime-owned-worker'").get())
+        .toEqual({ runtime_id: "runtime-owner-123" });
       expect(migrated.query("SELECT updated_at FROM worker_ledger WHERE id = 'legacy-running'").get())
         .toEqual({ updated_at: 101 });
       expect(migrated.query("SELECT updated_at FROM worker_ledger WHERE id = 'legacy-stopped'").get())

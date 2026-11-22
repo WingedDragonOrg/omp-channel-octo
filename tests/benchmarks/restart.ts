@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { Database } from "bun:sqlite";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createOctoProtocolFixture, waitForFixture, type FixtureConnection, type FixtureSentMessage } from "../fixtures/octo-protocol-server.ts";
@@ -14,6 +14,7 @@ const checkout = resolve(import.meta.dir, "../..");
 const observationMs = 3_000;
 type Audit = { kind: string; pid: number; sessionFile: string; name?: string; text?: string; resumed?: boolean };
 type Task = { state: string; result_text: string | null };
+type RuntimeIdentity = { path: string; botUid: string; runtimeId: string; pid: number; processIdentity: string };
 type Result = { seamless: number; resumed: number; queued: number; notices: number; overlaps: number; duplicates: number };
 function auditRows(path: string): Audit[] {
   if (!existsSync(path)) return [];
@@ -46,6 +47,7 @@ async function scenario(mode: "graceful" | "crash", cliExecutable?: string): Pro
   const auditPath = join(root, "audit.jsonl");
   let db: Database | undefined;
   let succeeded = false;
+  let cleanupRuntime: (() => Promise<void>) | undefined;
   try {
     const bin = join(root, "bin");
     await mkdir(bin);
@@ -91,6 +93,77 @@ exit 2
     function task(id: string): Task | null {
       return db!.query("SELECT state, result_text FROM tasks WHERE message_id = ?").get(id) as Task | null;
     }
+    async function runtimeManifest(): Promise<RuntimeIdentity | undefined> {
+      const runtimeRoot = join(root, "state", "agent-runtime");
+      let entries;
+      try {
+        entries = await readdir(runtimeRoot, { withFileTypes: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        throw error;
+      }
+      const paths = entries.filter(entry => entry.isDirectory())
+        .map(entry => join(runtimeRoot, entry.name, "runtime.json"))
+        .filter(existsSync);
+      assert.ok(paths.length <= 1, "The isolated state directory contains multiple agent runtimes");
+      if (paths.length === 0) return undefined;
+      const path = paths[0]!;
+      const value = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+      assert.equal(value.botUid, fixture.botUid, "Runtime manifest belongs to a different fixture Bot");
+      assert.ok(typeof value.runtimeId === "string" && value.runtimeId.length > 0);
+      assert.ok(typeof value.pid === "number" && Number.isSafeInteger(value.pid) && value.pid > 1);
+      assert.ok(typeof value.processIdentity === "string" && value.processIdentity.length > 0);
+      return {
+        path,
+        botUid: value.botUid as string,
+        runtimeId: value.runtimeId as string,
+        pid: value.pid as number,
+        processIdentity: value.processIdentity as string,
+      };
+    }
+    async function processIdentity(pid: number): Promise<string | undefined> {
+      const ps = Bun.spawn(["/bin/ps", "-p", String(pid), "-o", "lstart="], {
+        stdout: "pipe", stderr: "ignore", env: { ...process.env, TZ: "UTC" },
+      });
+      const [output, code] = await Promise.all([new Response(ps.stdout).text(), ps.exited]);
+      const started = output.trim();
+      return code === 0 && started.length > 0 ? `pid=${pid};start=${started}` : undefined;
+    }
+    async function processCommand(pid: number): Promise<string> {
+      const ps = Bun.spawn(["/bin/ps", "-p", String(pid), "-o", "command="], { stdout: "pipe", stderr: "ignore" });
+      const [command] = await Promise.all([new Response(ps.stdout).text(), ps.exited]);
+      return command;
+    }
+    async function waitForProcessExit(pid: number, identity: string, description: string): Promise<void> {
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline && await processIdentity(pid) === identity) await Bun.sleep(20);
+      assert.notEqual(await processIdentity(pid), identity, description);
+    }
+    async function stopRuntimeForColdRecovery(runtime: RuntimeIdentity, worker: Audit, workerIdentity: string): Promise<void> {
+      assert.equal(await processIdentity(runtime.pid), runtime.processIdentity, "Runtime process identity changed before shutdown");
+      assert.equal(await processIdentity(worker.pid), workerIdentity, "OMP worker identity changed before runtime shutdown");
+      const command = await processCommand(runtime.pid);
+      assert.ok(command.includes(join(root, "state", "agent-runtime")), "Refusing to signal a PID outside this fixture's runtime");
+      process.kill(runtime.pid, "SIGKILL");
+      await waitForProcessExit(runtime.pid, runtime.processIdentity, "Agent runtime did not exit after SIGKILL");
+      await waitForProcessExit(worker.pid, workerIdentity, "Runtime exit did not confirm the old OMP worker exit");
+    }
+    cleanupRuntime = async (): Promise<void> => {
+      const runtime = await runtimeManifest().catch(() => undefined);
+      if (!runtime || await processIdentity(runtime.pid) !== runtime.processIdentity) return;
+      const runtimePath = join(root, "state", "agent-runtime");
+      if (!(await processCommand(runtime.pid)).includes(runtimePath)) return;
+      process.kill(runtime.pid, "SIGTERM");
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline && await processIdentity(runtime.pid) === runtime.processIdentity) await Bun.sleep(20);
+      if (await processIdentity(runtime.pid) === runtime.processIdentity
+        && (await processCommand(runtime.pid)).includes(runtimePath)) {
+        process.kill(runtime.pid, "SIGKILL");
+        const killDeadline = Date.now() + 3_000;
+        while (Date.now() < killDeadline && await processIdentity(runtime.pid) === runtime.processIdentity) await Bun.sleep(20);
+      }
+      assert.notEqual(await processIdentity(runtime.pid), runtime.processIdentity, "Benchmark leaked its isolated agent runtime");
+    };
     const first = await launch();
     db = new Database(join(root, "state/channel.sqlite"), { readonly: true });
     // A completed turn proves the fixture and delivery work before interruption.
@@ -105,6 +178,11 @@ exit 2
     const bindingBefore = db.query("SELECT session_id, session_file FROM chats WHERE channel_type = 1").get();
     const oldWorker = auditRows(auditPath).filter(r => r.kind === "startup").at(-1)!;
     assert.ok(alive(oldWorker.pid), "Interruption must occur with a live RPC worker");
+    const oldWorkerIdentity = await processIdentity(oldWorker.pid);
+    assert.ok(oldWorkerIdentity, "Could not verify the old RPC worker identity");
+    const oldRuntime = await runtimeManifest();
+    assert.ok(oldRuntime, "The isolated agent runtime manifest is missing");
+    assert.equal(await processIdentity(oldRuntime.pid), oldRuntime.processIdentity, "Runtime manifest PID identity did not match the operating system");
     if (mode === "graceful") {
       send(first.connection, "/restart now", "1004");
       assert.equal(await exited(first.child), 0);
@@ -112,8 +190,14 @@ exit 2
       first.child.kill("SIGKILL");
       await exited(first.child);
     }
-    // Do not wait for the worker here: the product must enforce the exclusion.
+    assert.equal(await processIdentity(oldRuntime.pid), oldRuntime.processIdentity, "Channel restart exited the independent runtime");
+    assert.equal(await processIdentity(oldWorker.pid), oldWorkerIdentity, "Channel restart exited the runtime-owned OMP worker");
+    await stopRuntimeForColdRecovery(oldRuntime, oldWorker, oldWorkerIdentity);
+    assert.notEqual(await processIdentity(oldWorker.pid), oldWorkerIdentity, "The old OMP worker was not confirmed dead before cold recovery");
     const second = await launch();
+    const recoveredRuntime = await runtimeManifest();
+    assert.ok(recoveredRuntime, "Cold recovery did not launch a replacement runtime");
+    assert.notEqual(recoveredRuntime.runtimeId, oldRuntime.runtimeId, "Cold recovery reused the exited runtime identity");
     await Bun.sleep(observationMs);
     assert.equal(second.child.exitCode, null, "Replacement CLI exited unexpectedly");
     const rows = auditRows(auditPath);
@@ -122,7 +206,8 @@ exit 2
     const duplicates = ["completed", "begin", "finish", "queued"].reduce((sum, name) => sum + Math.max(0, count(name) - 1), 0);
     assert.equal(overlaps, 0, "Same session opened while its previous worker was alive");
     assert.equal(duplicates, 0, "A committed side effect was executed twice");
-    assert.ok(!alive(oldWorker.pid), "Old RPC worker must be gone after recovery");
+    assert.notEqual(await processIdentity(oldWorker.pid), oldWorkerIdentity, "Old RPC worker survived runtime recovery");
+    assert.ok(rows.some(r => r.kind === "startup" && r.resumed === true), "Cold recovery did not reopen the original OMP session file");
     assert.equal(rows.filter(r => r.kind === "session_reset").length, 0, "Recovery reset the persistent session");
     assert.deepEqual(db.query("SELECT session_id, session_file FROM chats WHERE channel_type = 1").get(), bindingBefore, "Restart replaced the chat session");
     const delivered = fixture.sentMessages.slice(beforeRestart).map(text);
@@ -169,6 +254,7 @@ exit 2
         try { await exited(child, 5_000); } catch { child.kill("SIGKILL"); await child.exited; }
       }
     }
+    await cleanupRuntime?.();
     db?.close();
     await fixture.close();
     // Only PIDs recorded by this fixture, and still identifiable by its unique

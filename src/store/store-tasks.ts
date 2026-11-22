@@ -526,7 +526,9 @@ export function hasTaskStopIntent(db: Database, taskId: string): boolean {
 }
 
 /**
- * 启动恢复入口：一次事务内规范化该 Bot 遗留的在途任务，并把结果分成三组。
+ * 启动恢复入口：一次事务内规范化该 Bot 遗留的在途任务。
+ * `hotTasks` 只返回仍处于 started 且由独立 runtime 明确报告存活的任务；它们完全跳过冷恢复结算，
+ * 包括持久停止意图、prompt/goal 接受状态与重新排队，原样交给 service 接回原调度。
  * - `stopped`：先结算持久停止意图（`stop_intent`）——进程被 SIGKILL 时它是「这一回合是被叫停的」唯一
  *   证据。`interrupt` 与 `question_timeout` 都落 `interrupted`，说明文案由调用方传入（必须与在线路径
  *   同源，因为它会被回传通知当「原因」原样使用）；结算清列并把原意图随记录交回。intent 为 `interrupt`
@@ -540,22 +542,40 @@ export function hasTaskStopIntent(db: Database, taskId: string): boolean {
  *   已有 OMP 接受回执的行（`prompt_started = 1 AND prompt_accepted = 1`）必须续接原会话，调用方用
  *   {@link isTaskResuming} 分流。
  *
- * `stopped` 与 `uncertain` 只含本次结算的行，后续启动不会重复上报；三组各自按 accepted_at, rowid
- * 升序。`queued` 行原样保留，终态行不参与，等待中的提问不动，调度也不在这里发生；`session_id` 与
- * relay 等元数据随行保留。
+ * `hotTasks`、`queued`、`uncertain`、`stopped` 与 `goalStopped` 各自按 accepted_at, rowid 升序。`stopped` 与
+ * `uncertain` 只含本次结算的行，后续启动不会重复上报；`queued` 行原样保留，终态行不参与，等待中的
+ * 提问不动，调度也不在这里发生；`session_id` 与 relay 等元数据随行保留。
  */
 export function prepareTasksForRestart(
   db: Database,
   botUid: string,
   reasonTexts: Record<TaskStopIntent, string>,
+  hotTaskIds: readonly string[] = [],
 ): TaskRestartRecovery {
   return transaction(db, () => {
+    const requestedHotTaskIds = new Set(hotTaskIds);
+    const hotTasks = query(db,
+      `SELECT * FROM tasks
+       WHERE bot_uid = ? AND state = 'started'
+       ORDER BY accepted_at ASC, rowid ASC`,
+      [botUid],
+    ).filter((row) => requestedHotTaskIds.has(asString(row.id))).map((row) => ({
+      ...taskFromRow(row),
+      stopIntent: asStopIntent(row.stop_intent),
+    }));
+    const persistedHotTaskIdSet = new Set(hotTasks.map(({ id }) => id));
+    const persistedHotTaskIds = [...persistedHotTaskIdSet];
+    const excludeHotTasks = persistedHotTaskIds.length === 0
+      ? ""
+      : ` AND id NOT IN (${persistedHotTaskIds.map(() => "?").join(", ")})`;
+    const coldTaskParams = [botUid, ...persistedHotTaskIds];
+
     const stopped: StoppedTaskRecovery[] = [];
     for (const row of query(db,
       `SELECT id, stop_intent FROM tasks
-       WHERE bot_uid = ? AND state IN ('queued', 'started') AND stop_intent IS NOT NULL
+       WHERE bot_uid = ? AND state IN ('queued', 'started') AND stop_intent IS NOT NULL${excludeHotTasks}
        ORDER BY accepted_at ASC, rowid ASC`,
-      [botUid],
+      coldTaskParams,
     )) {
       const stopIntent = asStopIntent(row.stop_intent);
       if (stopIntent === null) continue;
@@ -577,10 +597,10 @@ export function prepareTasksForRestart(
     const uncertainIdsSet = new Set([
       ...query(db,
         `SELECT id FROM tasks
-         WHERE bot_uid = ? AND state = 'started' AND prompt_started = 1 AND prompt_accepted = 0`,
-        [botUid],
+         WHERE bot_uid = ? AND state = 'started' AND prompt_started = 1 AND prompt_accepted = 0${excludeHotTasks}`,
+        coldTaskParams,
       ).map((row) => asString(row.id)),
-      ...undispatchedGoalAcceptanceIds(db, botUid),
+      ...undispatchedGoalAcceptanceIds(db, botUid).filter((taskId) => !persistedHotTaskIdSet.has(taskId)),
     ]);
     const uncertainIds = uncertainIdsSet.size === 0
       ? []
@@ -604,6 +624,7 @@ export function prepareTasksForRestart(
 
     const goalStopped: GoalStoppedRecovery[] = [];
     for (const taskId of revokedGoalTaskIds(db, botUid)) {
+      if (persistedHotTaskIdSet.has(taskId)) continue;
       const request = getGoalTask(db, taskId);
       const session = request
         ? getGoalSession(db, request.botUid, request, request.sessionId)
@@ -626,8 +647,12 @@ export function prepareTasksForRestart(
       }
     }
 
-    run(db, "UPDATE tasks SET state = 'queued' WHERE bot_uid = ? AND state = 'started'", [botUid]);
+    run(db,
+      `UPDATE tasks SET state = 'queued' WHERE bot_uid = ? AND state = 'started'${excludeHotTasks}`,
+      coldTaskParams,
+    );
     return {
+      hotTasks,
       queued: query(db,
         "SELECT * FROM tasks WHERE bot_uid = ? AND state = 'queued' ORDER BY accepted_at ASC, rowid ASC",
         [botUid],

@@ -129,6 +129,64 @@ test("重启准备把在途任务按接受顺序重排为 queued，并保留恢�
     // 别的 Bot 的在途任务不属于这次恢复。
     expect(store.getTask("other-task")?.state).toBe("running");
   }));
+test("hot started tasks stay with the runtime while cold tasks keep restart recovery behavior", () =>
+  withStore((store, stateDir) => {
+    const hot = taskFor("m1", "hot-task");
+    accept(store, hot);
+    expect(store.markStarted(hot.id)).toBe(true);
+    store.markTaskPromptStarted(hot.id, "session-hot");
+    expect(store.markTaskStopIntent(hot.id, "interrupt")).toBe(true);
+    store.createQuestion({
+      id: "q-hot",
+      taskId: hot.id,
+      botUid,
+      channelType: target.channelType,
+      channelId: target.channelId,
+      payload: "正在运行的提问",
+    });
+
+    const uncertain = taskFor("m2", "cold-uncertain");
+    accept(store, uncertain);
+    expect(store.markStarted(uncertain.id)).toBe(true);
+    store.markTaskPromptStarted(uncertain.id, "session-cold-uncertain");
+
+    const accepted = taskFor("m3", "cold-accepted");
+    accept(store, accepted);
+    expect(store.markStarted(accepted.id)).toBe(true);
+    store.markTaskPromptStarted(accepted.id, "session-cold-accepted");
+    store.markTaskPromptAccepted(accepted.id);
+
+    accept(store, taskFor("m4", "queued-candidate"));
+
+    const recovered = store.prepareTasksForRestart(botUid, stopReasons, [
+      hot.id,
+      hot.id,
+      "queued-candidate",
+    ]);
+
+    expect(recovered.hotTasks.map(({ id, state }) => [id, state])).toEqual([["hot-task", "running"]]);
+    expect(recovered.hotTasks[0]).toMatchObject({
+      id: hot.id,
+      state: "running",
+      stopIntent: "interrupt",
+    });
+    expect(recovered.queued.map(({ id }) => id)).toEqual(["cold-accepted", "queued-candidate"]);
+    expect(recovered.uncertain.map(({ id }) => id)).toEqual(["cold-uncertain"]);
+    expect(recovered.stopped).toEqual([]);
+    expect(recovered.goalStopped).toEqual([]);
+    expect(store.getTask(hot.id)?.state).toBe("running");
+    expect(readStopIntent(stateDir, hot.id)).toBe("interrupt");
+    expect(store.getQuestion("q-hot")?.state).toBe("pending");
+
+    const repeated = store.prepareTasksForRestart(botUid, stopReasons, [hot.id]);
+    expect(repeated.hotTasks.map(({ id }) => id)).toEqual([hot.id]);
+    expect(repeated.uncertain).toEqual([]);
+    expect(repeated.stopped).toEqual([]);
+    expect(repeated.queued.map(({ id }) => id)).toEqual(["cold-accepted", "queued-candidate"]);
+    expect(store.getTask(hot.id)?.state).toBe("running");
+    expect(readStopIntent(stateDir, hot.id)).toBe("interrupt");
+  }));
+
 
 test("重复启动收敛：同一集合与顺序，恢复会话不被替换", () =>
   withStore((store) => {

@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import type { ChatTarget } from "../contracts.ts";
-import type { BindingRecord, OutboxInsert, WorkerLedgerRecord } from "./store-records.ts";
+import type { BindingRecord, OutboxInsert, WorkerLedgerInput } from "./store-records.ts";
 import {
   type IngressBindingSnapshot,
   type IngressCancellationCandidate,
@@ -723,7 +723,7 @@ export function markIngressCommandDispatchIntent(
 export function recordIngressWorker(
   db: Database,
   id: number,
-  worker: WorkerLedgerRecord,
+  worker: WorkerLedgerInput,
 ): boolean {
   return transaction(db, () => {
     const row = jobRow(db, id);

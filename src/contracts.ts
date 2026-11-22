@@ -1097,6 +1097,13 @@ export interface ChannelServiceOptions {
   config: CoreServiceConfig;
   transport: ChannelTransport;
   workerFactory: WorkerFactory;
+  /** Production OMP workers live in a per-Bot runtime process that survives channel restarts. */
+  agentRuntime?: {
+    ompCommand: string;
+    ompExtraArgs?: readonly string[];
+    startupTimeoutMs?: number;
+    cancelTimeoutMs?: number;
+  };
   loopWebOrigin?: string;
   /** Bot lock held by state migration and transferred to CoreService for this start. */
   migrationLock?: { botUid: string; lock: LockHandle };

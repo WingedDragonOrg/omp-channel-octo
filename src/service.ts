@@ -60,7 +60,9 @@ import {
 import { ChatAuthorization } from "./inbound/chat-authorization.ts";
 import { createChatGrantDesk, type ChatGrantDesk } from "./inbound/chat-grants.ts";
 import { acquireBotLock, assertBotLockFree, type LockHandle } from "./runtime/bot-lock.ts";
-import { openTrackedCommit, openTrackedWorker, type TrackedCommit, type TrackedWorker, type WorkerSession } from "./runtime/worker-lease.ts";
+import { openTrackedCommit, openTrackedWorker, openTrackedAgentWorker, type TrackedAgentWorker, type TrackedCommit, type TrackedWorker, type WorkerSession } from "./runtime/worker-lease.ts";
+import { ensureAgentRuntime, type AgentRuntimeWorker, type EnsureAgentRuntimeResult } from "./runtime/agent-runtime.ts";
+import type { AgentRuntimeWorkerSnapshot } from "./runtime/agent-runtime-protocol.ts";
 import { LoopController, type LoopDeliveryOutcome } from "./loop/controller.ts";
 import type { LoopBinding, LoopInput, LoopTaskKey, LoopTaskRoute, LoopTaskRouteEndingReason } from "./loop/types.ts";
 import { renderLoopInput } from "./loop/render.ts";
@@ -113,6 +115,9 @@ import type {
   OutboxInsert,
   TanOperation,
   TaskRecord,
+  HotTaskRecovery,
+  WorkerLedgerRecord,
+  TaskStopIntent,
   ThreadListenRecord,
   ThreadMergeEventRecord,
   ThreadWorkspaceOperationRecord,
@@ -304,7 +309,8 @@ type RuntimeTask = {
   isGoalTask: boolean;
   target: ChatTarget;
   cwd: string;
-  lease?: TrackedWorker;
+  lease?: TrackedWorker | TrackedAgentWorker;
+  workerOpening?: Promise<void>;
   cancelRequested: boolean;
   cancelController: AbortController;
   cancelReplySent: boolean;
@@ -598,6 +604,13 @@ class CoreService implements ChannelService {
   /** Captured after per-bot credential provisioning; never inferred from CLI installation. */
   private cliIdentityReady = false;
   private readonly activityOperations = new Set<Promise<void>>();
+  /** Authenticated connection to the independent per-Bot worker owner; never shut down by channel. */
+  private agentRuntime: EnsureAgentRuntimeResult | undefined;
+  /** Startup snapshot keyed by task; absence alone never proves a runtime-owned process exited. */
+  private readonly runtimeWorkersByTask = new Map<string, AgentRuntimeWorkerSnapshot[]>();
+  /** Persisted started rows retained for exact runtime reattachment, including fail-closed unknowns. */
+  private readonly hotTaskRecoveries = new Map<string, HotTaskRecovery>();
+  private readonly hotTaskSnapshots = new Map<string, AgentRuntimeWorkerSnapshot>();
   /**
    * 恢复任务先占调度序、后执行所等的启动门：`start()` 接线全部成功才放行，失败即拒绝，
    * 已排定的恢复任务随之放弃（行留在 queued，下一次进程再试）。
@@ -1120,6 +1133,41 @@ class CoreService implements ChannelService {
           );
         }
       }
+      this.runtimeWorkersByTask.clear();
+      this.hotTaskRecoveries.clear();
+      this.hotTaskSnapshots.clear();
+      if (this.options.agentRuntime !== undefined) {
+        const cliEnv = cliCredentials?.env();
+        const runtime = await ensureAgentRuntime({
+          stateDir: this.options.config.stateDir,
+          botUid: identity.uid,
+          ompCommand: this.options.agentRuntime.ompCommand,
+          ...(this.options.agentRuntime.ompExtraArgs === undefined
+            ? {}
+            : { ompExtraArgs: this.options.agentRuntime.ompExtraArgs }),
+          ...(this.options.agentRuntime.startupTimeoutMs === undefined
+            ? {}
+            : { startupTimeoutMs: this.options.agentRuntime.startupTimeoutMs }),
+          ...(this.options.agentRuntime.cancelTimeoutMs === undefined
+            ? {}
+            : { cancelTimeoutMs: this.options.agentRuntime.cancelTimeoutMs }),
+          ...(cliEnv === undefined ? {} : { cliEnv }),
+        });
+        this.agentRuntime = runtime;
+        let runtimeWorkers: readonly AgentRuntimeWorkerSnapshot[];
+        try {
+          runtimeWorkers = await runtime.client.listWorkers();
+        } catch (error) {
+          await runtime.client.disconnect().catch(() => {});
+          this.agentRuntime = undefined;
+          throw error;
+        }
+        for (const snapshot of runtimeWorkers) {
+          const workers = this.runtimeWorkersByTask.get(snapshot.taskId) ?? [];
+          workers.push(snapshot);
+          this.runtimeWorkersByTask.set(snapshot.taskId, workers);
+        }
+      }
       const protectedIngressSpool = new Set([
         ...this.store.listRecoverableIngressJobs(identity.uid),
         ...this.store.listUnknownIngressJobs(identity.uid),
@@ -1279,11 +1327,189 @@ class CoreService implements ChannelService {
           for (const path of lease.resourcePaths) this.blockedDirectories.add(path);
         }
       }
-      // 重启不丢工作：先把每个遗留 worker 的进程组收干净，再动任何任务状态。无法确认死亡的
-      // 目录保持 block——它的任务留在队列继续挡住同目录的新写者（runTask 原样放过）。
+      // Runtime-owned rows are never handed to the channel worker factory: an absent snapshot is
+      // not proof that a detached process exited. Only an exact, live runtime identity is hot and
+      // attachable; every other runtime-owned row remains started and blocks its resources.
+      const hotTaskIds = new Set<string>();
+      const currentRuntimeId = this.agentRuntime?.handle.runtimeId;
+      // A channel SIGKILL can land after runtime createWorker succeeds but before SQLite records
+      // its process. Recover those rows from the runtime's authenticated snapshot, never by probing
+      // an unowned PID with the channel factory.
+      for (const snapshots of this.runtimeWorkersByTask.values()) {
+        for (const snapshot of snapshots) {
+          if (snapshot.stage === "exited-confirmed") continue;
+          let task = this.store.getTask(snapshot.taskId);
+          if (task === null) {
+            if (snapshot.process !== null) this.blockedDirectories.add(snapshot.process.cwd);
+            continue;
+          }
+          const processInfo = snapshot.process;
+          let binding = this.store.getBinding(identity.uid, taskTarget(task));
+          const liveRuntimeWorker = task.state === "running"
+            && snapshot.runtimeId === currentRuntimeId
+            && processInfo !== null
+            && processInfo.cwd === task.cwd
+            && (snapshot.stage === "omp-ready" || snapshot.stage === "active");
+          const noRuntimeDispatch = snapshot.activeDispatchId === null && snapshot.dispatches.length === 0;
+          const ordinaryPromptTask = this.store.getGoalTask(task.id) === null
+            && !task.messageId.startsWith(WATCH_WAKE_PREFIX)
+            && !task.messageId.startsWith("watch:event:")
+            && !task.messageId.startsWith("dispatch:tan:");
+          const uninitializedBinding = binding !== null
+            && binding.sessionId === task.sessionId
+            && binding.cwd === task.cwd
+            && binding.sessionFile === null;
+          const partiallyInitializedBinding = binding !== null
+            && binding.sessionId === snapshot.sessionId
+            && binding.sessionFile === snapshot.sessionFile
+            && binding.cwd === task.cwd
+            && task.sessionId !== snapshot.sessionId;
+          if (
+            liveRuntimeWorker
+            && noRuntimeDispatch
+            && ordinaryPromptTask
+            && !this.store.isTaskResuming(task.id)
+            && (uninitializedBinding || partiallyInitializedBinding)
+          ) {
+            try {
+              const sessionFile = await existingSessionFile(snapshot.sessionFile);
+              if (sessionFile === null) throw new Error("runtime session file is unavailable");
+              let initialized = true;
+              if (initialized && uninitializedBinding) {
+                const nextBinding = {
+                  ...binding!,
+                  sessionId: snapshot.sessionId,
+                  sessionFile,
+                };
+                initialized = task.channelType === 5 && binding!.cwdPinned === true
+                  ? this.store.initializeBindingSessionFromTask(
+                    identity.uid,
+                    taskTarget(task),
+                    task.id,
+                    binding!,
+                    snapshot.sessionId,
+                    sessionFile,
+                  )
+                  : this.store.ensureBindingIfMatches(
+                    nextBinding,
+                    binding!,
+                    { clearSessionInitialization: true },
+                  );
+              }
+              if (initialized) {
+                // The runtime proves the worker exists but has no dispatch; persist its actual
+                // initialized session before admitting the one still-undispatched user prompt.
+                this.store.markTaskPromptStarted(task.id, snapshot.sessionId);
+                task = this.store.getTask(task.id) ?? task;
+                binding = this.store.getBinding(identity.uid, taskTarget(task));
+                initialized = binding?.sessionId === snapshot.sessionId
+                  && binding.sessionFile === snapshot.sessionFile
+                  && task.sessionId === snapshot.sessionId;
+              }
+              if (!initialized) {
+                throw new Error("runtime session could not be adopted without changing its identity");
+              }
+            } catch (error) {
+              console.error(`[worker recovery] runtime session initialization could not be adopted task=${task.id}: ${safeErrorMessage(error, "session adoption failed")}`);
+            }
+          }
+          const exactBinding = task.state === "running"
+            && snapshot.runtimeId === currentRuntimeId
+            && processInfo !== null
+            && snapshot.sessionId === task.sessionId
+            && snapshot.sessionFile === binding?.sessionFile
+            && binding?.sessionId === task.sessionId
+            && binding.cwd === task.cwd
+            && processInfo.cwd === task.cwd
+            && (snapshot.stage === "omp-ready" || snapshot.stage === "active");
+          if (task.state === "running") hotTaskIds.add(task.id);
+          if (exactBinding && processInfo !== null) {
+            try {
+              this.store.recordWorker({
+                id: task.id,
+                botUid: identity.uid,
+                sessionId: snapshot.sessionId,
+                sessionFile: snapshot.sessionFile,
+                ...processInfo,
+                moveTargetCwd: null,
+                runtimeId: snapshot.runtimeId,
+                state: "running",
+              });
+              this.hotTaskSnapshots.set(task.id, snapshot);
+            } catch (error) {
+              console.error(`[worker recovery] runtime worker ledger could not be recovered task=${task.id}: ${safeErrorMessage(error, "runtime ledger recovery failed")}`);
+              this.blockedDirectories.add(task.cwd);
+              this.blockedDirectories.add(processInfo.cwd);
+            }
+          } else {
+            this.blockedDirectories.add(task.cwd);
+            if (processInfo !== null) this.blockedDirectories.add(processInfo.cwd);
+          }
+        }
+      }
       for (const ledger of this.store.listWorkerLedger(identity.uid)) {
         if (recoveredAutoCommitWorkerIds.has(ledger.id)) continue;
-        const stopped = ledger.state === "stopped" || await this.options.workerFactory.recover(ledger);
+        const snapshots = this.runtimeWorkersByTask.get(ledger.id) ?? [];
+        const exactSnapshots = snapshots.filter(snapshot =>
+          snapshot.sessionId === ledger.sessionId
+          && (ledger.sessionFile === null || snapshot.sessionFile === ledger.sessionFile)
+          && snapshot.process !== null
+          && snapshot.process.pid === ledger.pid
+          && snapshot.process.pgid === ledger.pgid
+          && snapshot.process.identity === ledger.identity
+          && snapshot.process.cwd === ledger.cwd);
+        const exactLive = exactSnapshots.filter(snapshot =>
+          snapshot.stage === "omp-ready" || snapshot.stage === "active");
+        const taskHasUnresolvedRuntimeWorker = snapshots.some(snapshot =>
+          snapshot.stage !== "exited-confirmed");
+        let stopped = ledger.state === "stopped";
+        let runtimeOwned = ledger.runtimeId !== null;
+        let attachable: AgentRuntimeWorkerSnapshot | undefined;
+
+        if (ledger.runtimeId !== null) {
+          if (exactSnapshots.some(snapshot => snapshot.stage === "exited-confirmed")) {
+            stopped = true;
+          } else if (
+            exactLive.length === 1
+            && exactLive[0]!.runtimeId === currentRuntimeId
+            && exactLive[0]!.process !== null
+          ) {
+            stopped = false;
+            attachable = exactLive[0];
+          } else {
+            stopped = false;
+          }
+        } else if (exactLive.length === 1 && exactLive[0]!.runtimeId === currentRuntimeId) {
+          runtimeOwned = true;
+          stopped = false;
+          try {
+            this.store.recordWorker({ ...ledger, runtimeId: exactLive[0]!.runtimeId });
+            attachable = exactLive[0];
+          } catch (error) {
+            console.error(`[worker recovery] 无法转交 runtime 所有权 task=${ledger.id}: ${safeErrorMessage(error, "runtime owner upgrade failed")}`);
+          }
+        } else if (exactSnapshots.some(snapshot => snapshot.stage === "exited-confirmed")) {
+          stopped = true;
+        } else if (taskHasUnresolvedRuntimeWorker) {
+          // A runtime has a record for this task, but it does not prove this ledger process exited.
+          runtimeOwned = true;
+          stopped = false;
+        } else if (!stopped) {
+          try {
+            stopped = await this.options.workerFactory.recover(ledger);
+          } catch {
+            stopped = false;
+          }
+        }
+
+        if (runtimeOwned && !stopped) {
+          const task = this.store.getTask(ledger.id);
+          if (task?.state === "running") {
+            hotTaskIds.add(ledger.id);
+            if (attachable !== undefined) this.hotTaskSnapshots.set(ledger.id, attachable);
+          }
+        }
+
         const review = this.store.getReviewJob(ledger.id);
         if (stopped) {
           this.store.markWorkerStopped(ledger.id);
@@ -1298,6 +1524,8 @@ class CoreService implements ChannelService {
               { recursive: true, force: true },
             ).catch(() => {});
           }
+        } else if (runtimeOwned && attachable !== undefined && this.store.getTask(ledger.id)?.state === "running") {
+          // This task's scheduler lease will be rebuilt from its original persisted schedule order.
         } else {
           const sessionJob = [
             ...this.store.listUnknownIngressJobs(identity.uid),
@@ -1360,13 +1588,14 @@ class CoreService implements ChannelService {
       this.ingress.restore(identity.uid, this.store.listUnknownIngressJobs(identity.uid));
       // 旧版重启通报已随续接机制移除：遗留行静默清理，绝不再投递。
       this.serviceRestart.consumeStartupNotices(identity.uid);
-      // started→queued（prompt 标记随行保留）由存储域一次性完成；先补发遗留卡片终态，恢复
-      // 回合随后接上同一条卡片记录，不与卡片恢复竞争。
+      // started→queued is still performed only for cold recovery; hot runtime rows stay running and
+      // retain their durable stop intent while the same task/session is reattached.
       const recovery = this.store.prepareTasksForRestart(identity.uid, {
         cancel: "用户取消当前任务",
         interrupt: INTERRUPT_REASON_TEXT,
         question_timeout: QUESTION_TIMEOUT_REASON_TEXT,
-      });
+      }, [...hotTaskIds]);
+      for (const task of recovery.hotTasks) this.hotTaskRecoveries.set(task.id, task);
       // Reconcile route endings and hand off undispatched child Loop tasks before any recovered
       // task enters scheduler tails, so an ended child can never dispatch an old Loop prompt.
       await this.reconcileLoopRouteEndingsAtStartup(identity.uid);
@@ -1382,24 +1611,45 @@ class CoreService implements ChannelService {
         }
       }
       await this.progressCards.recover();
-      // 续接任务重挂提问的快照必须在开放入站之前一次性建好：此后到达的答复由快照认领、交给
-      // 续跑的原 ask 消费，不会因「此刻没有在跑的回合」被当成新输入再唤醒一个任务。恢复任务
-      // 的实际执行在启动门之后，快照与 `worker.resume` 的先后因此由这里固定；续跑路径不再重复
-      // 初始化——重复快照会把已经认领过的行重新交出去。
+      // Rebuild ask snapshots before opening ingress. Runtime attach replays pending host-tool calls;
+      // these snapshots let a replayed ask reclaim its original question rows and waits.
       for (const task of recovery.queued) {
         if (this.store.isTaskResuming(task.id) || this.store.isGoalTaskResuming(task.id)) this.questions.beginRecovery(task.id);
       }
-      // 恢复任务先占住聊天链与目录序，再让 transport 开始接新入站：任何新消息（含下面的
-      // 恢复失败回执与按持久化监听策略恢复的子区通知排在前面；恢复任务仍等启动门放行。
+      // A durable stop intent must settle on the original hot worker before startup notice or
+      // ingress can expose that task as running. Missing/uncertain snapshots remain fail-closed.
+      for (const task of recovery.hotTasks) {
+        if (task.stopIntent === null) {
+          this.questions.beginRecovery(task.id);
+          continue;
+        }
+        const snapshot = this.hotTaskSnapshots.get(task.id);
+        if (snapshot === undefined) {
+          this.blockedDirectories.add(task.cwd);
+          continue;
+        }
+        await this.stopHotTaskForIntent(task, task.stopIntent, snapshot);
+      }
+      // Rebuild scheduler leases for remaining hot and cold work in their shared durable order.
+      const recoveryTasks = [
+        ...recovery.queued,
+        ...recovery.hotTasks.filter(task => this.store.getTask(task.id)?.state === "running"),
+      ];
       const recoveryOrders = new Map<string, number>();
-      for (const task of recovery.queued) {
+      for (const task of recoveryTasks) {
         const order = this.store.getTaskScheduleOrder(task.id);
         if (order === null) throw new Error(`recovered task ${task.id} has no durable schedule order`);
         recoveryOrders.set(task.id, order);
       }
-      for (const task of [...recovery.queued].sort(
+      for (const task of recoveryTasks.sort(
         (left, right) => recoveryOrders.get(left.id)! - recoveryOrders.get(right.id)!,
-      )) this.scheduler.scheduleTask(task.id);
+      )) {
+        if (task.state === "running") {
+          if (this.hotTaskSnapshots.has(task.id)) this.scheduler.scheduleStartedTask(task.id);
+        } else {
+          this.scheduler.scheduleTask(task.id);
+        }
+      }
       for (const task of recovery.stopped) {
         if (task.stopIntent === "cancel") this.questions.cancelForTask(task.id, "cancelled");
         else if (task.stopIntent !== "question_timeout") this.questions.cancelForTask(task.id, "interrupted");
@@ -1497,6 +1747,11 @@ class CoreService implements ChannelService {
       this.startupGate.reject(error instanceof Error ? error : new Error("channel 启动失败"));
       await this.botEvents.stop();
       await this.options.transport.stop().catch(() => {});
+      if (!this.stopping) {
+        const agentRuntime = this.agentRuntime;
+        this.agentRuntime = undefined;
+        await agentRuntime?.client.disconnect().catch(() => {});
+      }
       this.bot = undefined;
       if (!this.stopping) {
         await lock.release();
@@ -1552,10 +1807,19 @@ class CoreService implements ChannelService {
       runtime.closing = true;
       runtime.stopText?.();
       runtime.stopActivity?.();
-      this.questions.rejectForTask(runtime.taskId, new Error("channel stopping"));
-      if (runtime.btwOperations.size > 0) await Promise.allSettled([...runtime.btwOperations]);
+      if (this.agentRuntime === undefined) {
+        this.questions.rejectForTask(runtime.taskId, new Error("channel stopping"));
+      }
       if (runtime.lease) {
-        await runtime.lease.close().catch(() => false);
+        if (
+          "detach" in runtime.lease
+          && !runtime.cancelRequested
+          && (runtime.stopCause === null || runtime.workAfterStop)
+        ) {
+          await runtime.lease.detach().catch(() => {});
+        } else {
+          await runtime.lease.close().catch(() => false);
+        }
       }
     }
     for (const runtime of this.reviewRuntimes.values()) {
@@ -1566,6 +1830,16 @@ class CoreService implements ChannelService {
       await operation.workerReady;
       await this.stopCommitProcess(operation).catch(() => false);
     }
+    // Disconnect after attached workers detach. This closes channel waiters without terminating
+    // runtime-owned workers or resolving their pending host-tool/ask calls.
+    await this.agentRuntime?.client.disconnect().catch(() => {});
+    for (const runtime of runtimes) {
+      await runtime.workerOpening?.catch(() => {});
+      if (runtime.lease && "detach" in runtime.lease) {
+        await runtime.lease.detach().catch(() => {});
+      }
+    }
+    await Promise.allSettled(runtimes.flatMap(runtime => [...runtime.btwOperations]));
     this.outbox.abortAll();
     await this.scheduler.settle();
     await this.threadForks.settle();
@@ -1585,6 +1859,10 @@ class CoreService implements ChannelService {
     await this.options.transport.stop().catch(() => {});
     // A start still in preparation or awaiting CONNACK must unwind before its store is closed.
     if (this.startPromise) await this.startPromise.catch(() => {});
+    // Startup may have created the runtime after shutdown's first disconnect pass.
+    const lateRuntime = this.agentRuntime;
+    this.agentRuntime = undefined;
+    await lateRuntime?.client.disconnect().catch(() => {});
     const lock = this.lock;
     const migrationLock = this.options.migrationLock?.lock;
     this.ready = false;
@@ -4474,6 +4752,9 @@ class CoreService implements ChannelService {
     binding: BindingRecord | null,
   ): Promise<BindingRecord | null> {
     const task = this.store.getTask(taskId);
+    if (task !== null && this.hotTaskRecoveries.has(taskId)) {
+      return binding?.sessionId === task.sessionId && binding.cwd === task.cwd ? binding : null;
+    }
     if (task?.messageId.startsWith(WATCH_WAKE_PREFIX)) {
       if (binding?.sessionId === task.sessionId) return { ...binding, cwd: task.cwd };
       return {
@@ -12316,10 +12597,86 @@ class CoreService implements ChannelService {
     }
   }
 
+  private async stopHotTaskForIntent(
+    task: TaskRecord,
+    stopIntent: TaskStopIntent,
+    snapshot: AgentRuntimeWorkerSnapshot,
+  ): Promise<void> {
+    const target = taskTarget(task);
+    const processInfo = snapshot.process;
+    const runtime = this.agentRuntime;
+    if (
+      runtime === undefined
+      || snapshot.botUid !== task.botUid
+      || snapshot.taskId !== task.id
+      || snapshot.runtimeId !== runtime.handle.runtimeId
+      || snapshot.sessionId !== task.sessionId
+      || processInfo === null
+      || processInfo.cwd !== task.cwd
+      || (snapshot.stage !== "omp-ready" && snapshot.stage !== "active")
+    ) {
+      this.blockedDirectories.add(task.cwd);
+      if (processInfo !== null) this.blockedDirectories.add(processInfo.cwd);
+      return;
+    }
+    let lease: TrackedAgentWorker;
+    try {
+      lease = await openTrackedAgentWorker({
+        client: runtime.client,
+        runtimeId: runtime.handle.runtimeId,
+        botUid: task.botUid,
+        taskId: task.id,
+        runId: snapshot.runId,
+        worker: { kind: "attach", sessionId: snapshot.sessionId },
+        store: this.store,
+        blockDirectory: cwd => this.blockedDirectories.add(cwd),
+      });
+    } catch (error) {
+      console.error(`[task recovery] 无法 attach 持久停止意图 task=${task.id}: ${safeErrorMessage(error, "runtime attach failed")}`);
+      this.blockedDirectories.add(task.cwd);
+      this.blockedDirectories.add(processInfo.cwd);
+      return;
+    }
+    if (stopIntent !== "cancel") await lease.worker.abortTurn().catch(() => {});
+    const stopped = await lease.close().catch(() => false);
+    if (!stopped) return;
+
+    if (stopIntent === "cancel") {
+      this.store.markCancelled(task.id);
+      this.questions.cancelForTask(task.id, "cancelled");
+    } else {
+      this.store.markInterrupted(
+        task.id,
+        stopIntent === "question_timeout" ? QUESTION_TIMEOUT_REASON_TEXT : INTERRUPT_REASON_TEXT,
+      );
+      if (stopIntent === "interrupt") this.questions.cancelForTask(task.id, "interrupted");
+    }
+    const progress = this.progressCards.startTask(task.id, target);
+    this.trackProgressTail(target, task.id, () => progress.tail);
+    progress.finish("cancelled");
+    progress.stop(false);
+    this.releaseProgressTail(target, task.id, progress.tail);
+    this.typingLeases.release(target, `task:${task.id}`);
+    this.outbox.releaseIfIdle(task.id);
+    this.discovery.releaseTask(task.id);
+    await this.notifyThreadOutcome(task.id);
+    this.serviceRestart.maybeRunDeferred();
+  }
+
   private async runTask(taskId: string, expectedCwd?: string): Promise<void> {
     const persistedTask = this.store.getTask(taskId);
-    if (!persistedTask || persistedTask.state !== "queued") return;
+    const hotRecovery = persistedTask?.state === "running"
+      ? this.hotTaskRecoveries.get(taskId)
+      : undefined;
+    if (!persistedTask || (persistedTask.state !== "queued" && hotRecovery === undefined)) return;
+    const isHotRuntimeTask = hotRecovery !== undefined;
     const target = taskTarget(persistedTask);
+    if (isHotRuntimeTask && hotRecovery.stopIntent !== null) {
+      const snapshot = this.hotTaskSnapshots.get(taskId);
+      if (snapshot === undefined) this.blockedDirectories.add(persistedTask.cwd);
+      else await this.stopHotTaskForIntent(persistedTask, hotRecovery.stopIntent, snapshot);
+      return;
+    }
     if (persistedTask.text === THREAD_MERGE_COMMIT_TASK_TEXT) {
       this.scheduler.takeWaitingReceipt(taskId);
       this.store.markFailed(taskId, "automatic thread-merge commit cannot be replayed after restart");
@@ -12345,6 +12702,10 @@ class CoreService implements ChannelService {
       return;
     }
     if (await this.threadWorkspaceIncomplete(target, true)) {
+      if (isHotRuntimeTask) {
+        this.blockedDirectories.add(persistedTask.cwd);
+        return;
+      }
       if (goalTask) {
         const cancelled = this.store.stopGoalContinuation(this.bot!.uid, target, goalTask.sessionId, "pause");
         await this.cleanupCancelledGoalTasks(target, cancelled);
@@ -12361,6 +12722,24 @@ class CoreService implements ChannelService {
     const bindingAtStart = goalTask
       ? this.store.getBinding(this.bot!.uid, target)
       : await this.reconcileTaskBinding(taskId, target, this.store.getBinding(this.bot!.uid, target));
+    if (isHotRuntimeTask) {
+      const snapshot = this.hotTaskSnapshots.get(taskId);
+      if (
+        snapshot === undefined
+        || !bindingAtStart
+        || bindingAtStart.sessionId !== snapshot.sessionId
+        || bindingAtStart.sessionFile !== snapshot.sessionFile
+        || bindingAtStart.cwd !== persistedTask.cwd
+        || snapshot.sessionId !== persistedTask.sessionId
+        || snapshot.process?.cwd !== persistedTask.cwd
+      ) {
+        this.blockedDirectories.add(persistedTask.cwd);
+        if (snapshot?.process !== null && snapshot?.process !== undefined) {
+          this.blockedDirectories.add(snapshot.process.cwd);
+        }
+        return;
+      }
+    }
     if (isTanDispatch && (
       tanOperation?.phase !== "done"
       || tanFork?.phase !== "ready"
@@ -12403,6 +12782,10 @@ class CoreService implements ChannelService {
       ? { ...persistedTask, cwd: bindingAtStart.cwd, sessionId: bindingAtStart.sessionId }
       : persistedTask;
     if (expectedCwd !== undefined && task.cwd !== expectedCwd) {
+      if (isHotRuntimeTask) {
+        this.blockedDirectories.add(persistedTask.cwd);
+        return;
+      }
       this.scheduler.takeWaitingReceipt(taskId);
       if (goalTask) {
         const cancelled = this.store.stopGoalContinuation(this.bot!.uid, target, goalTask.sessionId, "pause");
@@ -12419,11 +12802,13 @@ class CoreService implements ChannelService {
       console.error(`[task] 目录仍被未确认的 worker 占用，任务保持排队 task=${taskId}`);
       return;
     }
-    if (!this.store.markStarted(taskId)) return;
+    if (!isHotRuntimeTask && !this.store.markStarted(taskId)) return;
     if (await this.cancelEndedLoopTaskBeforeDispatch(taskId, target)) return;
     // Goal recovery requires its own native goal receipt; ordinary prompts retain prompt receipts.
     const goalResuming = this.store.isGoalTaskResuming(taskId);
-    const resuming = this.store.isTaskResuming(taskId) || goalResuming;
+    const hotRuntimeHasDispatch = isHotRuntimeTask
+      && (this.hotTaskSnapshots.get(taskId)?.dispatches.length ?? 0) > 0;
+    const resuming = this.store.isTaskResuming(taskId) || goalResuming || hotRuntimeHasDispatch;
     this.typingLeases.acquire(taskTarget(task), `task:${taskId}`);
     if (this.scheduler.takeWaitingReceipt(taskId)) {
       this.outbox.enqueueText(taskTarget(task), receiptText("开始执行排队消息", task.text), null);
@@ -12490,7 +12875,8 @@ class CoreService implements ChannelService {
     });
     let contextInjection: ContextInjection | undefined;
     let startupPhase: TaskStartupPhase = "context";
-
+    let runtimeOutcomeUnknown = false;
+    let runtimeTerminalFailure = false;
     runtime.stopActivity = (abortProgress) => progress.stop(abortProgress);
     runtime.stopText = () => textDelivery.stop();
     runtime.rollProgressCard = () => progress.roll();
@@ -12548,7 +12934,7 @@ class CoreService implements ChannelService {
         throw new TaskStartupError("session-invalid", "恢复所需的会话绑定缺失或身份不匹配");
       }
       const chatModel = this.store.resolveChatModel(this.bot!.uid, target).model;
-      const workerOptions: Omit<WorkerOptions, "onSpawn"> = {
+      const workerOptions: Omit<WorkerOptions, "onSpawn" | "signal"> = {
         contextScope: turnContext.workerScope,
         cwd: task.cwd,
         sessionDir,
@@ -12563,27 +12949,95 @@ class CoreService implements ChannelService {
         if (!sessionFile) throw new TaskStartupError("session-invalid", "绑定的 OMP 会话文件不存在");
         workerOptions.sessionFile = sessionFile;
       }
-      runtime.lease = await openTrackedWorker({
-        workerFactory: this.options.workerFactory,
-        store: this.store,
-        worker: workerOptions,
-        ledger: {
-          id: task.id,
-          botUid: this.bot!.uid,
-          sessionId: task.sessionId,
-          sessionFile: binding?.sessionFile ?? join(sessionDir, `${task.sessionId}.jsonl`),
-        },
-        blockDirectory: (cwd) => this.blockedDirectories.add(cwd),
-      });
+      if (this.stopping) {
+        runtime.suspended = true;
+        return;
+      }
+      const hostTools = createHostTools(this.hostToolHost(), task);
+      const ready = Promise.withResolvers<void>();
+      runtime.workerOpening = ready.promise;
+      try {
+        if (this.agentRuntime !== undefined) {
+          const snapshot = isHotRuntimeTask ? this.hotTaskSnapshots.get(taskId) : undefined;
+          if (
+            isHotRuntimeTask
+            && (
+              snapshot === undefined
+              || snapshot.runtimeId !== this.agentRuntime.handle.runtimeId
+              || snapshot.taskId !== taskId
+              || snapshot.sessionId !== task.sessionId
+              || snapshot.process?.cwd !== task.cwd
+            )
+          ) {
+            this.blockedDirectories.add(task.cwd);
+            runtime.suspended = true;
+            return;
+          }
+          try {
+            runtime.lease = await openTrackedAgentWorker({
+              client: this.agentRuntime.client,
+              runtimeId: this.agentRuntime.handle.runtimeId,
+              botUid: this.bot!.uid,
+              taskId,
+              runId: snapshot?.runId ?? randomUUID(),
+              worker: snapshot === undefined
+                ? { kind: "create", options: workerOptions }
+                : { kind: "attach", sessionId: snapshot.sessionId },
+              hostTools,
+              store: this.store,
+              blockDirectory: cwd => this.blockedDirectories.add(cwd),
+            });
+          } catch (error) {
+            runtimeOutcomeUnknown = true;
+            this.blockedDirectories.add(task.cwd);
+            if (!isHotRuntimeTask) throw error;
+            console.error(`[task recovery] 无法 attach 原 runtime worker task=${taskId}: ${safeErrorMessage(error, "runtime attach failed")}`);
+            this.blockedDirectories.add(task.cwd);
+            runtime.suspended = true;
+            return;
+          }
+        } else {
+          runtime.lease = await openTrackedWorker({
+            workerFactory: this.options.workerFactory,
+            store: this.store,
+            worker: workerOptions,
+            ledger: {
+              id: task.id,
+              botUid: this.bot!.uid,
+              sessionId: task.sessionId,
+              sessionFile: binding?.sessionFile ?? join(sessionDir, `${task.sessionId}.jsonl`),
+            },
+            blockDirectory: cwd => this.blockedDirectories.add(cwd),
+          });
+        }
+      } finally {
+        ready.resolve();
+        if (runtime.workerOpening === ready.promise) delete runtime.workerOpening;
+      }
       const worker = runtime.lease.worker;
-      if (runtime.cancelRequested || this.stopping) {
+      if (runtime.cancelRequested || this.stopping || runtime.suspended) {
         runtime.closing = true;
         if (runtime.btwOperations.size > 0) await Promise.allSettled([...runtime.btwOperations]);
-        await runtime.lease.close();
+        if (
+          "detach" in runtime.lease
+          && this.stopping
+          && !runtime.cancelRequested
+          && runtime.stopCause === null
+        ) {
+          await runtime.lease.detach().catch(() => {});
+        } else {
+          await runtime.lease.close();
+        }
         if (runtime.cancelRequested) this.store.markCancelled(taskId);
         return;
       }
-      const authoritativeState: ProjectSessionState = await worker.refreshState();
+      let authoritativeState: ProjectSessionState;
+      try {
+        authoritativeState = await worker.refreshState();
+      } catch (error) {
+        if ("dispatch" in worker) runtimeOutcomeUnknown = true;
+        throw error;
+      }
       const previousForWorker: ProjectSessionBinding = binding ?? {
         sessionId: "",
         cwd: task.cwd,
@@ -12645,7 +13099,7 @@ class CoreService implements ChannelService {
         ? null
         : await this.history.prepareTurn(task, target, verified.sessionId);
       const promptContext: PromptContext = {
-        tools: createHostTools(this.hostToolHost(), task),
+        tools: hostTools,
         ...(contextInjection === undefined ? {} : { contextInjection }),
       };
       const freshReadController = new AbortController();
@@ -12655,7 +13109,7 @@ class CoreService implements ChannelService {
         this.shutdownController.signal,
       ]);
       const freshReadBridge = turnContext.serveFreshContextReads(freshReadSignal);
-      const resumeStreamPrefix = resuming ? `resume:${randomUUID()}:` : "";
+      const resumeStreamPrefix = resuming && !isHotRuntimeTask ? `resume:${randomUUID()}:` : "";
       const pendingGoalUpdates: WorkerGoal[] = [];
       const latestGoalProgress: { value: WorkerGoal | null } = { value: null };
       const persistGoalProgress = (goal: WorkerGoal): void => {
@@ -12696,6 +13150,78 @@ class CoreService implements ChannelService {
           ? { ...event, messageId: `${resumeStreamPrefix}${event.messageId}` }
           : event);
       };
+      const runtimeWorker = runtime.lease && "dispatch" in runtime.lease.worker
+        ? runtime.lease.worker as AgentRuntimeWorker
+        : undefined;
+      const dispatchOrWatchRuntime = async (
+        input: Omit<Parameters<AgentRuntimeWorker["dispatch"]>[0], "dispatchId">,
+      ) => {
+        if (runtimeWorker === undefined) throw new Error("runtime worker is unavailable");
+        let existingDispatch: AgentRuntimeWorker["snapshot"]["dispatches"][number] | undefined;
+        if (isHotRuntimeTask) {
+          const snapshot = runtimeWorker.snapshot;
+          if (
+            snapshot.dispatches.length > 1
+            || (snapshot.activeDispatchId !== null
+              && snapshot.dispatches[0]?.dispatchId !== snapshot.activeDispatchId)
+          ) {
+            runtimeOutcomeUnknown = true;
+            throw new Error("runtime task has an ambiguous active dispatch");
+          }
+          existingDispatch = snapshot.dispatches[0];
+          if (
+            (goalTask !== null) !== (existingDispatch?.kind === "goal")
+            && existingDispatch !== undefined
+          ) {
+            runtimeOutcomeUnknown = true;
+            throw new Error("runtime task dispatch kind does not match its task");
+          }
+          if (
+            existingDispatch === undefined
+            && input.kind !== "goal"
+            && this.store.isTaskResuming(taskId)
+          ) {
+            runtimeOutcomeUnknown = true;
+            throw new Error("accepted prompt has no persisted runtime dispatch");
+          }
+        }
+        const dispatchId = existingDispatch?.dispatchId ?? taskId;
+        if (existingDispatch === undefined) {
+          try {
+            await runtimeWorker.dispatch({ ...input, dispatchId });
+          } catch (error) {
+            runtimeOutcomeUnknown = true;
+            throw error;
+          }
+        }
+        let projectionFailed = false;
+        let projectionError: unknown;
+        let state;
+        try {
+          state = await runtimeWorker.watchRun(dispatchId, 0, event => {
+            try {
+              consumeEvent(event);
+            } catch (error) {
+              projectionFailed = true;
+              projectionError = error;
+              throw error;
+            }
+          });
+        } catch (error) {
+          if (projectionFailed) throw projectionError;
+          runtimeOutcomeUnknown = true;
+          throw error;
+        }
+        if (state.state === "unknown") {
+          runtimeOutcomeUnknown = true;
+          throw new Error(state.error ?? "runtime dispatch outcome is unknown");
+        }
+        if (state.state === "failed") {
+          runtimeTerminalFailure = true;
+          throw new Error(state.error ?? "runtime dispatch failed");
+        }
+        return state;
+      };
       let goalResult: WorkerGoalResult | null = null;
       let settledGoal: WorkerGoal | null = null;
       let goalAbsent = false;
@@ -12712,9 +13238,25 @@ class CoreService implements ChannelService {
           } else {
             request = latest.request;
           }
-          this.store.markGoalTaskDispatched(taskId, verified.sessionId, request.op);
+          const hasExistingRuntimeDispatch = isHotRuntimeTask
+            && (runtimeWorker?.snapshot.dispatches.length ?? 0) === 1;
+          if (
+            !hasExistingRuntimeDispatch
+            && (!isHotRuntimeTask || !latest.dispatched || request.op === "recover")
+          ) {
+            this.store.markGoalTaskDispatched(taskId, verified.sessionId, request.op);
+          }
           runtime.promptInFlight = true;
-          goalResult = await worker.runGoal(request, consumeEvent, promptContext);
+          if (runtimeWorker !== undefined) {
+            const state = await dispatchOrWatchRuntime({
+              kind: "goal",
+              goal: request,
+              context: promptContext,
+            });
+            goalResult = state.result as WorkerGoalResult;
+          } else {
+            goalResult = await worker.runGoal(request, consumeEvent, promptContext);
+          }
           const accepted = this.store.getGoalTask(taskId);
           if (!accepted?.accepted || !accepted.acceptedGoalId) {
             throw new WorkerGoalError("invalid-response", "native goal dispatch returned without a durable goal acceptance");
@@ -12747,7 +13289,11 @@ class CoreService implements ChannelService {
           }
         } else if (resuming) {
           runtime.promptInFlight = true;
-          await worker.resume(consumeEvent, promptContext);
+          if (runtimeWorker !== undefined) {
+            await dispatchOrWatchRuntime({ kind: "resume", context: promptContext });
+          } else {
+            await worker.resume(consumeEvent, promptContext);
+          }
         } else {
           if (isSourceWatchWakeTask) {
             if (!this.sourceWatchCoordinator.wakeAllowed(target, persistedTask.messageId)) {
@@ -12803,13 +13349,26 @@ class CoreService implements ChannelService {
               return;
             }
           } else {
+          if (!isSourceWatchWakeTask && !isHotRuntimeTask) {
             this.store.markTaskPromptStarted(taskId, verified.sessionId);
           }
           runtime.promptInFlight = true;
           const prompt = isTanDispatch
             ? (/^\s*\/\S+/u.test(task.text) ? `用户请求：\n${task.text}` : task.text)
             : (historyTurn?.text ?? task.text);
-          await worker.prompt(/^\/ratchet(?:\s|$)/u.test(prompt.trimStart()) ? prompt.trimStart() : prompt, consumeEvent, promptContext);
+          const normalizedPrompt = /^\/ratchet(?:\s|$)/u.test(prompt.trimStart())
+            ? prompt.trimStart()
+            : prompt;
+          if (runtimeWorker !== undefined) {
+            await dispatchOrWatchRuntime({
+              kind: "prompt",
+              text: normalizedPrompt,
+              context: promptContext,
+            });
+          } else {
+            await worker.prompt(normalizedPrompt, consumeEvent, promptContext);
+          }
+        }
         }
       } finally {
         runtime.promptInFlight = false;
@@ -12948,6 +13507,10 @@ class CoreService implements ChannelService {
         // 与成功分支同一判据：显式 /interrupt 的终态不保留恢复快照（提问超时相反）。
         if (!questionTimeout) this.questions.cancelForTask(taskId, "interrupted");
         progress.finish("cancelled");
+      } else if (runtimeOutcomeUnknown || (isHotRuntimeTask && !runtimeTerminalFailure)) {
+        runtime.suspended = true;
+        this.blockedDirectories.add(task.cwd);
+        console.error(`[task] runtime 状态未知，任务保持 started task=${taskId}: ${safeErrorMessage(error, "runtime outcome unknown")}`);
       } else if (runtime.suspended || this.stopping) {
         // Stop aborts startup I/O before its per-runtime suspend loop; `stopping` closes that race.
         console.error(`[task] 停机挂起，任务保持未结算 task=${taskId}`);
@@ -12978,9 +13541,20 @@ class CoreService implements ChannelService {
       progress.stop(!progress.finished);
       this.releaseProgressTail(target, taskId, progress.tail);
       this.typingLeases.release(runtime.target, `task:${taskId}`);
-      this.questions.rejectForTask(taskId, new Error("task finished"));
+      const preservePendingAsk = (this.agentRuntime !== undefined || isHotRuntimeTask)
+        && !runtime.cancelRequested
+        && runtime.stopCause === null
+        && (runtime.suspended || runtimeOutcomeUnknown || this.stopping);
+      if (!preservePendingAsk) this.questions.rejectForTask(taskId, new Error("task finished"));
       if (runtime.btwOperations.size > 0) await Promise.allSettled([...runtime.btwOperations]);
-      if (runtime.lease && !this.stopping && !this.shutdownController.signal.aborted && !runtime.cancelRequested) {
+      if (
+        runtime.lease
+        && !runtimeOutcomeUnknown
+        && !runtime.suspended
+        && !this.stopping
+        && !this.shutdownController.signal.aborted
+        && !runtime.cancelRequested
+      ) {
         const worker = runtime.lease.worker;
         const binding = this.store.getBinding(this.bot!.uid, runtime.target);
         if (
@@ -13002,7 +13576,18 @@ class CoreService implements ChannelService {
           }
         }
       }
-      if (runtime.lease) await runtime.lease.close();
+      if (runtime.lease) {
+        if (
+          "detach" in runtime.lease
+          && !runtime.cancelRequested
+          && (runtime.stopCause === null || runtime.workAfterStop)
+          && (runtime.suspended || runtimeOutcomeUnknown || this.stopping)
+        ) {
+          await runtime.lease.detach().catch(() => {});
+        } else {
+          await runtime.lease.close();
+        }
+      }
       this.outbox.releaseIfIdle(taskId);
       // Deregister before a creator-chat notice so a shared directory does not queue behind this run.
       this.discovery.releaseTask(taskId);

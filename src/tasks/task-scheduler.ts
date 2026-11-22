@@ -216,8 +216,17 @@ export class TaskScheduler {
 
   constructor(private readonly deps: TaskSchedulerDeps) {}
 
-  /** Schedule a task using its durable acceptance-order token. */
+  /** Schedule a queued task using its durable acceptance-order token. */
   scheduleTask(taskId: string): void {
+    this.schedule(taskId, "queued");
+  }
+
+  /** Schedule a runtime-owned started task through the same chat/session order during recovery. */
+  scheduleStartedTask(taskId: string): void {
+    this.schedule(taskId, "running");
+  }
+
+  private schedule(taskId: string, state: "queued" | "running"): void {
     if (this.scheduledTasks.has(taskId)) return;
     const task = this.deps.store.getTask(taskId);
     if (!task) return;
@@ -226,7 +235,7 @@ export class TaskScheduler {
     const target = taskTarget(task);
     const chatKey = targetKey(target);
     const previousChat = this.chatTails.get(chatKey) ?? Promise.resolve();
-    const next = previousChat.catch(() => {}).then(() => this.runScheduledTask(taskId));
+    const next = previousChat.catch(() => {}).then(() => this.runScheduledTask(taskId, state));
     this.chatTails.set(chatKey, next);
     this.scheduledTasks.set(taskId, next);
     this.taskOperations.add(next);
@@ -1534,18 +1543,18 @@ export class TaskScheduler {
     await this.deps.notifyThreadOutcome(taskId);
   }
 
-  private async runScheduledTask(taskId: string): Promise<void> {
+  private async runScheduledTask(taskId: string, expectedState: "queued" | "running"): Promise<void> {
     try {
       await this.deps.awaitStartReady();
     } catch {
-      // 启动失败：这条排定任务不执行，行仍以 queued 留给下一次进程。
+      // 启动失败：排定任务不执行，持久状态留给下一次进程。
       return;
     }
     let lease: SessionLease | undefined;
     try {
       for (let attempt = 0; attempt < 4; attempt += 1) {
         const current = this.deps.store.getTask(taskId);
-        if (this.deps.stopping() || !current || current.state !== "queued") return;
+        if (this.deps.stopping() || !current || current.state !== expectedState) return;
         const target = taskTarget(current);
         const binding = await this.deps.reconcileBinding(
           taskId,
@@ -1553,15 +1562,15 @@ export class TaskScheduler {
           this.bindingFor(target),
         );
         const reconciledCurrent = this.deps.store.getTask(taskId);
-        if (this.deps.stopping() || !reconciledCurrent || reconciledCurrent.state !== "queued") return;
+        if (this.deps.stopping() || !reconciledCurrent || reconciledCurrent.state !== expectedState) return;
         const cwd = binding?.cwd ?? reconciledCurrent.cwd;
         const commitTask = this.isCommitTask(reconciledCurrent);
         if (!commitTask && this.deps.isDirectoryBlocked(cwd)) return;
         const sessionKey = this.sessionKey(target, binding);
         const taskOrder = this.taskOrder(taskId);
-        let skipRepositoryOrdering = false;
+        let skipRepositoryOrdering = expectedState === "running";
         try {
-          if (!commitTask) {
+          if (expectedState !== "running" && !commitTask) {
             skipRepositoryOrdering =
               await this.deps.shouldRunTaskBeforeRepositoryProbe(taskId, target, binding, cwd);
           }
@@ -1593,7 +1602,7 @@ export class TaskScheduler {
         }
 
         const beforeLease = this.deps.store.getTask(taskId);
-        if (this.deps.stopping() || !beforeLease || beforeLease.state !== "queued") return;
+        if (this.deps.stopping() || !beforeLease || beforeLease.state !== expectedState) return;
         const beforeTarget = taskTarget(beforeLease);
         lease = this.createSessionLease(beforeTarget, sessionKey, taskId);
         await lease.ready;
@@ -1604,7 +1613,7 @@ export class TaskScheduler {
           this.bindingFor(beforeTarget),
         );
         const latest = this.deps.store.getTask(taskId);
-        if (this.deps.stopping() || !latest || latest.state !== "queued") return;
+        if (this.deps.stopping() || !latest || latest.state !== expectedState) return;
         const currentCwd = refreshed?.cwd ?? latest.cwd;
         const currentSessionKey = this.sessionKey(beforeTarget, refreshed);
         if (currentCwd !== cwd || currentSessionKey !== sessionKey) {
@@ -1618,7 +1627,7 @@ export class TaskScheduler {
           return;
         }
         try {
-          if (!commitTask) {
+          if (expectedState !== "running" && !commitTask) {
             skipRepositoryOrdering = await this.deps.shouldRunTaskBeforeRepositoryProbe(
               taskId,
               beforeTarget,
@@ -1695,7 +1704,7 @@ export class TaskScheduler {
         return;
       }
       const task = this.deps.store.getTask(taskId);
-      if (!task || task.state !== "queued") return;
+      if (!task || task.state !== expectedState || expectedState === "running") return;
       this.takeWaitingReceipt(taskId);
       this.deps.store.markFailed(taskId, "绑定会话或目录在启动前持续变更，任务未启动。");
       await this.deps.enqueueText(taskTarget(task), GENERIC_TASK_FAILURE_NOTICE, taskId);

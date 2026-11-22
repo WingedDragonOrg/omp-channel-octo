@@ -297,6 +297,12 @@ async function runService(
       loopWebOrigin: new URL(config.apiUrl).origin,
       worktrees: createWorktreePort({ command: ompCommand }),
       cliCredentials,
+      agentRuntime: {
+        ompCommand,
+        ompExtraArgs: config.ompExtraArgs,
+        ...(config.startupTimeoutMs === undefined ? {} : { startupTimeoutMs: config.startupTimeoutMs }),
+        ...(config.cancelTimeoutMs === undefined ? {} : { cancelTimeoutMs: config.cancelTimeoutMs }),
+      },
       // Only a config that came from a file can be written back; a hand-built config has no path.
       ...(config.configPath === undefined
         ? {}

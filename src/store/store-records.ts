@@ -227,15 +227,19 @@ export interface GoalStoppedRecovery extends TaskRecord {
   goalStopIntent: GoalStopIntent;
   goalStatus: WorkerGoal["status"] | null;
 }
+export interface HotTaskRecovery extends TaskRecord {
+  stopIntent: TaskStopIntent | null;
+}
 
 /**
- * 启动恢复的一次规范化结果。`queued` 是按接受顺序待执行的任务：没有派发过的行重放原文，已有
- * OMP 接受回执的行续接原会话。`uncertain` 是本次被 fail-closed 的已派发行——prompt 已落账但收不到
- * 接受回执，无法判定它是否真的进过会话，既不重放也不错续，由服务按实际异常说明结算并关闭其问题。
- * `stopped` 是本次按持久停止意图结算的行。三个数组各自按 accepted_at, rowid 升序；`uncertain` 与
- * `stopped` 只含本次结算的行，后续启动不会重复上报。
+ * 启动恢复结果。`hotTasks` 是 runtime 确认仍存活的 started 任务，附原 `stopIntent`，保持 started 并由
+ * service 接回原调度。`queued` 按接受顺序待执行：没有派发过的行重放原文，已有 OMP 接受回执的行续接原会话。
+ * `uncertain` 是本次被 fail-closed 的已派发行，prompt 已落账却没有接受回执，既不重放也不错续，由服务按实际
+ * 异常说明结算并关闭其问题。`stopped` 是本次按持久停止意图结算的行。五组数组各自按 accepted_at, rowid
+ * 升序；`uncertain` 与 `stopped` 只含本次结算的行，后续启动不会重复上报。
  */
 export interface TaskRestartRecovery {
+  hotTasks: HotTaskRecovery[];
   queued: TaskRecord[];
   uncertain: TaskRecord[];
   stopped: StoppedTaskRecovery[];
@@ -386,11 +390,17 @@ export type QuestionInsert = Omit<
 export interface WorkerLedgerRecord extends WorkerProcess {
   id: string;
   botUid: string;
+  runtimeId: string | null;
   sessionId: string;
   sessionFile: string | null;
   moveTargetCwd: string | null;
   state: "running" | "stopping" | "stopped" | "unknown";
 }
+
+/** Write shape: omitting runtimeId preserves the legacy worker owner; runtime workers set it explicitly. */
+export type WorkerLedgerInput = Omit<WorkerLedgerRecord, "runtimeId"> & {
+  runtimeId?: string | null;
+};
 export interface HostMergeLeaseRecord extends ChatTarget {
   id: string;
   botUid: string;

@@ -8,7 +8,7 @@ import type { OmpWorker, WorkerFactory, WorkerOptions, WorkerProcess } from "../
 import { createWorkerFactory } from "../src/omp/index.ts";
 import { openTrackedWorker, type TrackedWorker } from "../src/runtime/worker-lease.ts";
 import { ChannelStore } from "../src/store/index.ts";
-import type { WorkerLedgerRecord } from "../src/store/store-records.ts";
+import type { WorkerLedgerInput } from "../src/store/store-records.ts";
 
 const fixturePath = resolve(import.meta.dir, "fixtures/omp-rpc-worker.ts");
 const sourceSessionId = "source-session";
@@ -171,7 +171,7 @@ function ledgerOptions(harness: ForkHarness, botUid: string) {
     botUid,
     sessionId: sourceSessionId,
     sessionFile: harness.sourceFile,
-  } satisfies Omit<WorkerLedgerRecord, keyof WorkerProcess | "state" | "moveTargetCwd">;
+  } satisfies Omit<WorkerLedgerInput, keyof WorkerProcess | "state" | "moveTargetCwd">;
 }
 
 test("native fork uses only the requested source and preserves tracked close and ledger boundaries", async () => {

@@ -12,7 +12,7 @@ import type {
 } from "../src/contracts.ts";
 import { openTrackedWorker, withStoppedWorker } from "../src/runtime/worker-lease.ts";
 import { ChannelStore } from "../src/store/index.ts";
-import type { WorkerLedgerRecord } from "../src/store/store-records.ts";
+import type { WorkerLedgerInput, WorkerLedgerRecord } from "../src/store/store-records.ts";
 
 interface WorkerLeaseHarness {
   root: string;
@@ -20,7 +20,7 @@ interface WorkerLeaseHarness {
   store: ChannelStore;
   workerFactory: WorkerFactory;
   workerOptions: Omit<WorkerOptions, "onSpawn">;
-  ledger: Omit<WorkerLedgerRecord, keyof WorkerProcess | "state" | "moveTargetCwd">;
+  ledger: Omit<WorkerLedgerInput, keyof WorkerProcess | "state" | "moveTargetCwd">;
   process: WorkerProcess;
   moveTargetCwd: string;
   worker: OmpWorker;
@@ -73,7 +73,7 @@ async function withHarness<T>(
     sessionDir: join(root, "sessions"),
     sessionFile,
   };
-  const ledger: Omit<WorkerLedgerRecord, keyof WorkerProcess | "state" | "moveTargetCwd"> = {
+  const ledger: Omit<WorkerLedgerInput, keyof WorkerProcess | "state" | "moveTargetCwd"> = {
     id: `worker-${id}`,
     botUid,
     sessionId,

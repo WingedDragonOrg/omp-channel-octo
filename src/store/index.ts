@@ -7,7 +7,7 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ChatAppendMode, ChatTarget, HostMergeProgressPhase, ThreadListenLevel, ThreadSummary, WorkerGoal, WorkerProcess, WorktreeMergeOutcome } from "../contracts.ts";
-import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceCleanupInput, ThreadWorkspaceCleanupRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadWorkspaceOperationInput, ThreadWorkspaceOperationRecord, ThreadForkInput, ThreadForkRecord, ThreadListenRecord, ThreadMergeEventRecord, ThreadTaskEventRecord, HostMergeLeaseRecord, HostMergeLeaseInput, HostMergeProgressCardInput, HostMergeProgressCardRecord, HostRemovalLeaseInput, HostRemovalLeaseRecord, HostThreadRemovalOutcome, ReviewJobRecord } from "./store-records.ts";
+import type { BindingRecord, GoalSessionRecord, GoalStopIntent, GoalTaskRecord, GoalTaskRequest, InboundClaim, TaskRecord, TaskRestartRecovery, TaskStopIntent, ProgressCardRecord, OutboxRecord, OutboxInsert, TextStreamOutboxCommit, QuestionCloseReason, QuestionInsert, QuestionRecord, WorkerLedgerInput, WorkerLedgerRecord, ContextLedgerRecord, HistoryLedgerRecord, AllowedChatRecord, ChatGrantOperationInput, ChatGrantOperationRecord, CommandClaimState, ThreadWorkspaceRecord, ThreadWorkspaceCleanupInput, ThreadWorkspaceCleanupRecord, ThreadWorkspaceIntentRecord, ThreadWorkspaceIntentInput, ThreadWorkspaceOperationInput, ThreadWorkspaceOperationRecord, ThreadForkInput, ThreadForkRecord, ThreadListenRecord, ThreadMergeEventRecord, ThreadTaskEventRecord, HostMergeLeaseRecord, HostMergeLeaseInput, HostMergeProgressCardInput, HostMergeProgressCardRecord, HostRemovalLeaseInput, HostRemovalLeaseRecord, HostThreadRemovalOutcome, ReviewJobRecord } from "./store-records.ts";
 import type { TaskFileLinkContext } from "./store-records.ts";
 import type { LoopBinding, LoopInput, LoopTask, LoopTaskKey, LoopTaskRoute, LoopTaskRouteEnding, LoopTaskRouteEndingReason, LoopTaskRouteEndingState, LoopThreadCreation, LoopThreadCreationAttempt, LoopWorkspace } from "../loop/types.ts";
 import type { SessionContextSnapshotRecord, TanOperation, ReferenceHistoryEntry, ReferenceHistorySnapshot } from "./store-records.ts";
@@ -904,14 +904,18 @@ export class ChannelStore {
   }
 
   /**
-   * 启动恢复：一次事务内把该 Bot 遗留的在途任务规范化，返回 `stopped`（本次按持久停止意图结算的行，
-   * 附带原意图）、`uncertain`（本次 fail-closed 的已派发行）与 `queued`（按接受顺序待执行）三组。
-   * 只动状态，不调度、不取消提问；`session_id` 等元数据随行保留，`queued` 里用
-   * {@link isTaskResuming} 决定重放原文还是续接会话。停止行的说明文案由调用方传入，与在线路径同源。
+   * 启动恢复：一次事务内规范化该 Bot 的遗留任务。`hotTasks` 返回独立 runtime 确认仍存活的 started 任务，
+   * 附原 `stopIntent` 供 service 接回原 worker 后处理；这些任务不被停止、标 uncertain 或重新排队。其余返回
+   * `stopped`（本次按持久停止意图结算）、`uncertain`（本次 fail-closed 的已派发行）、`goalStopped`（已撤销的目标执行）
+   * 与 `queued`（按接受顺序待执行）。冷恢复状态变更与现有逻辑一致，不调度、不取消提问，元数据随行保留。
+   * `queued` 里用 {@link isTaskResuming} 决定重放原文还是续接会话；停止文案由调用方传入。
    */
-
-  prepareTasksForRestart(botUid: string, reasonTexts: Record<TaskStopIntent, string>): TaskRestartRecovery {
-    return prepareTasksForRestart(this.db, botUid, reasonTexts);
+  prepareTasksForRestart(
+    botUid: string,
+    reasonTexts: Record<TaskStopIntent, string>,
+    hotTaskIds?: readonly string[],
+  ): TaskRestartRecovery {
+    return prepareTasksForRestart(this.db, botUid, reasonTexts, hotTaskIds);
   }
 
   /**
@@ -1084,12 +1088,12 @@ export class ChannelStore {
     return LOOP_TRANSFER_ERROR_TEXT;
   }
 
-  recordWorker(worker: WorkerLedgerRecord): void {
+  recordWorker(worker: WorkerLedgerInput): void {
     recordWorker(this.db, worker);
   }
 
   /** Records a spawned session worker only while its exact ingress dispatch-intent still owns it. */
-  recordIngressWorker(jobId: number, worker: WorkerLedgerRecord): boolean {
+  recordIngressWorker(jobId: number, worker: WorkerLedgerInput): boolean {
     return recordIngressWorker(this.db, jobId, worker);
   }
 

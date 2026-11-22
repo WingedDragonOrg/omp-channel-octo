@@ -1,16 +1,47 @@
 import type {
+  AgentRuntimeClient,
+  AgentRuntimeWorker,
+} from "./agent-runtime.ts";
+import type { AgentRuntimeWorkerOptions } from "./agent-runtime-protocol.ts";
+import type {
   CommitWorker,
   CommitWorkerOptions,
+  HostTool,
   OmpWorker,
   WorkerFactory,
   WorkerOptions,
   WorkerProcess,
 } from "../contracts.ts";
 import type { ChannelStore } from "../store/index.ts";
-import type { WorkerLedgerRecord } from "../store/store-records.ts";
+import type { WorkerLedgerInput, WorkerLedgerRecord } from "../store/store-records.ts";
 
 export type WorkerSession = Omit<OmpWorker, "stop">;
+export type AgentRuntimeWorkerSession = Omit<AgentRuntimeWorker, "stop">;
 export type CommitSession = Omit<CommitWorker, "stop">;
+
+export interface TrackedAgentWorker {
+  readonly worker: AgentRuntimeWorkerSession;
+  readonly snapshot: AgentRuntimeWorker["snapshot"];
+  /** Stops and finalizes the runtime-owned worker; never falls back to channel-side recovery. */
+  close(recoverOnFailure?: boolean): Promise<boolean>;
+  /** Releases the channel attachment without stopping or finalizing the runtime-owned process. */
+  detach(): Promise<void>;
+}
+
+export type OpenTrackedAgentWorkerOptions = {
+  readonly client: AgentRuntimeClient;
+  readonly runtimeId: string;
+  readonly botUid: string;
+  readonly taskId: string;
+  readonly runId: string;
+  readonly worker:
+    | { readonly kind: "create"; readonly options: AgentRuntimeWorkerOptions }
+    | { readonly kind: "attach"; readonly sessionId: string };
+  readonly hostTools?: readonly HostTool[];
+  readonly store: Pick<ChannelStore, "recordWorker" | "markWorkerStopped">;
+  readonly blockDirectory: (cwd: string) => void;
+};
+
 
 export interface TrackedWorker {
   readonly worker: WorkerSession;
@@ -31,7 +62,7 @@ export interface OpenTrackedWorkerOptions {
   readonly workerFactory: WorkerFactory;
   readonly store: Pick<ChannelStore, "recordWorker" | "markWorkerStopped">;
   readonly worker: Omit<WorkerOptions, "onSpawn">;
-  readonly ledger: Omit<WorkerLedgerRecord, keyof WorkerProcess | "state" | "moveTargetCwd">;
+  readonly ledger: Omit<WorkerLedgerRecord, keyof WorkerProcess | "state" | "moveTargetCwd" | "runtimeId">;
   readonly moveTargetCwd?: string;
   readonly recordWorker?: (worker: WorkerLedgerRecord) => boolean;
   readonly blockDirectory: (cwd: string) => void;
@@ -41,7 +72,7 @@ export interface OpenTrackedCommitOptions {
   readonly workerFactory: WorkerFactory;
   readonly store: Pick<ChannelStore, "recordWorker" | "markWorkerStopped">;
   readonly worker: Omit<CommitWorkerOptions, "onSpawn">;
-  readonly ledger: Omit<WorkerLedgerRecord, keyof WorkerProcess | "state" | "moveTargetCwd">;
+  readonly ledger: Omit<WorkerLedgerRecord, keyof WorkerProcess | "state" | "moveTargetCwd" | "runtimeId">;
   readonly blockDirectory: (cwd: string) => void;
 }
 
@@ -53,7 +84,7 @@ interface OpenTrackedProcessOptions<TWorker extends StoppableWorker> {
   readonly workerFactory: Pick<WorkerFactory, "recover">;
   readonly store: Pick<ChannelStore, "recordWorker" | "markWorkerStopped">;
   readonly create: (onSpawn: (process: WorkerProcess) => void) => Promise<TWorker>;
-  readonly ledger: Omit<WorkerLedgerRecord, keyof WorkerProcess | "state" | "moveTargetCwd">;
+  readonly ledger: Omit<WorkerLedgerRecord, keyof WorkerProcess | "state" | "moveTargetCwd" | "runtimeId">;
   readonly moveTargetCwd?: string;
   readonly recordWorker?: (worker: WorkerLedgerRecord) => boolean;
   readonly blockDirectory: (cwd: string) => void;
@@ -83,6 +114,7 @@ async function openTrackedProcess<TWorker extends StoppableWorker>(
       const ledger = {
         ...options.ledger,
         ...processInfo,
+        runtimeId: null,
         moveTargetCwd: options.moveTargetCwd ?? null,
         state: "running" as const,
       };
@@ -153,6 +185,121 @@ export async function openTrackedWorker(options: OpenTrackedWorkerOptions): Prom
     ...(options.recordWorker === undefined ? {} : { recordWorker: options.recordWorker }),
     blockDirectory: options.blockDirectory,
   });
+}
+
+/** Tracks a worker owned by the independent runtime; ordinary channel close uses detach, not stop. */
+export async function openTrackedAgentWorker(
+  options: OpenTrackedAgentWorkerOptions,
+): Promise<TrackedAgentWorker> {
+  let worker = options.worker.kind === "create"
+    ? await options.client.createWorker({
+        taskId: options.taskId,
+        runId: options.runId,
+        workerOptions: options.worker.options,
+      }, options.hostTools)
+    : await options.client.attachWorker({
+        taskId: options.taskId,
+        runId: options.runId,
+        sessionId: options.worker.sessionId,
+      }, options.hostTools);
+  const snapshot = worker.snapshot;
+  const processInfo = snapshot.process;
+  const attachSessionId = options.worker.kind === "attach" ? options.worker.sessionId : undefined;
+  const valid = snapshot.botUid === options.botUid
+    && snapshot.taskId === options.taskId
+    && snapshot.runId === options.runId
+    && snapshot.runtimeId === options.runtimeId
+    && processInfo !== null
+    && snapshot.sessionId === worker.sessionId
+    && snapshot.sessionFile === worker.sessionFile
+    && (attachSessionId === undefined || snapshot.sessionId === attachSessionId)
+    && worker.process !== null
+    && worker.process.pid === processInfo.pid
+    && worker.process.pgid === processInfo.pgid
+    && worker.process.identity === processInfo.identity
+    && worker.process.cwd === processInfo.cwd
+    && (snapshot.stage === "omp-ready" || snapshot.stage === "active");
+  if (!valid || processInfo === null) {
+    const cwd = processInfo?.cwd
+      ?? (options.worker.kind === "create" ? options.worker.options.cwd : undefined);
+    if (cwd !== undefined) options.blockDirectory(cwd);
+    if (options.worker.kind === "create") {
+      await worker.stop().catch(() => false);
+    } else {
+      await options.client.detachWorker(options.taskId, options.runId).catch(() => {});
+    }
+    throw new Error("agent runtime returned an unverified worker identity");
+  }
+  const ledger: WorkerLedgerInput = {
+    id: options.taskId,
+    botUid: options.botUid,
+    sessionId: snapshot.sessionId,
+    sessionFile: snapshot.sessionFile,
+    ...processInfo,
+    moveTargetCwd: null,
+    runtimeId: options.runtimeId,
+    state: "running",
+  };
+  try {
+    options.store.recordWorker(ledger);
+  } catch (error) {
+    options.blockDirectory(processInfo.cwd);
+    if (options.worker.kind === "create") {
+      const stopped = await worker.stop().catch(() => false);
+      if (stopped) options.store.markWorkerStopped(options.taskId);
+    } else {
+      await options.client.detachWorker(options.taskId, options.runId).catch(() => {});
+    }
+    throw error;
+  }
+
+  let detachPromise: Promise<void> | undefined;
+  let closePromise: Promise<boolean> | undefined;
+  let detached = false;
+  const detach = (): Promise<void> => {
+    if (closePromise) return closePromise.then(() => {});
+    if (!detachPromise) {
+      detachPromise = options.client.detachWorker(options.taskId, options.runId).then(() => {
+        detached = true;
+      });
+    }
+    return detachPromise;
+  };
+  const close = (_recoverOnFailure = false): Promise<boolean> => {
+    if (!closePromise) {
+      closePromise = (async () => {
+        let stopped = false;
+        try {
+          await detachPromise?.catch(() => {});
+          if (detached) {
+            worker = await options.client.attachWorker({
+              taskId: options.taskId,
+              runId: options.runId,
+              sessionId: snapshot.sessionId,
+            });
+            detached = false;
+          }
+          stopped = await worker.stop();
+        } catch {
+          // A failed runtime stop is not confirmation that its process group exited.
+        }
+        if (stopped) options.store.markWorkerStopped(options.taskId);
+        else options.blockDirectory(processInfo.cwd);
+        return stopped;
+      })();
+    }
+    return closePromise;
+  };
+  return {
+    get worker() {
+      return worker;
+    },
+    get snapshot() {
+      return worker.snapshot;
+    },
+    close,
+    detach,
+  };
 }
 
 export async function openTrackedCommit(options: OpenTrackedCommitOptions): Promise<TrackedCommit> {

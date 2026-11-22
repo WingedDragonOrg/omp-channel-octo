@@ -6,7 +6,7 @@
 
 ## 背景与目标
 
-通过 Octo 私聊和指定群聊操作本机 OMP。使用独立于终端的持久会话，保持用户当前全自动执行习惯。channel 是常驻消息服务，OMP 是通过 stdio RPC 驱动的子进程；不依赖模型 API auth-gateway。
+通过 Octo 私聊和指定群聊操作本机 OMP。使用独立于终端的持久会话，保持用户当前全自动执行习惯。channel 是常驻消息服务；独立运行时持有普通任务的 OMP 子进程及 stdio RPC，channel 重启后重新接管。详细设计见 `2026-11-20-agent-runtime-channel-separation-design.md`；不依赖模型 API auth-gateway。
 
 ## 范围
 
@@ -74,7 +74,7 @@ OctoBuddy 增强器提供当前聊天会话的只读 Agent Hub，展示 agent �
 | 子区回传 | 子区持久策略 `listen=off|merge|task`，默认 merge，仅实际合并成功回传创建方聊天；task 额外回传独立派发与 Loop 任务四种终态，成功附实际结果的脱敏有界摘录，失败附持久化的具体错误，缺失时明确不可用；off 静默。合并失败及修复失败始终在子区处理。通知按接收聊天追加模式交付且不回答 pending ask | 单一子区策略、稳定事件去重；普通任务不打扰父会话 |
 | 迁移 | `/move <目录>` 使用 OMP 原生 `/move`，沿用当前 session ID、历史与附件 | 保持会话连续性，不伪造新会话 |
 | 调度 | 同聊天 `ordered` 输入按受理次序安装任务、会话切换与操作屏障；长命令交给服务拥有的后台 operation 后不再阻塞后续受理。取消、停止与只读查询走独立 control 入口，保留当前聊天与精确 session 顺序及各自取消语义；`/thread remove`、`/thread merge` 不建立跨聊天路径/仓库资源屏障，独立会话不因 cwd 相同、祖先/后代、父群/子区或 shared 资源归属而互斥。独立 `/commit` 与 `thread-delete` 保持既有资源保护 | 保留同聊天业务顺序及各命令原有保护边界；避免完整长命令 lifetime 成为同聊天或全局入站完成条件 |
-| 故障 | 确认旧进程退出后，已进入生成的任务沿原 session 续接，未派发任务按序执行；接受状态不明则停止自动恢复 | 续接不重放原始 prompt，不把未知工具副作用当作尚未发生 |
+| 故障 | channel 重启接回独立运行时中的原任务和 OMP；运行时退出时确认旧进程退出后沿原 session 冷恢复，未派发任务按序执行；接受状态或进程归属不明则停止自动恢复 | 不重放原始 prompt，不并发写同一 session |
 | 共享说明 | 新 session 首次和 compact 边界加载当前聊天最新说明；普通回合沿用已加载快照。实时读取遇瞬时故障时按成员读取策略有界重试，取消或耗尽不使用旧说明冒充新读取 | 持久写入与会话刷新分离，说明进入原生会话消息，不反复改写 system |
 | 成员上下文 | 新任务与 steering 查询当前聊天成员；首次及语义变化时随对应用户输入持久保存 | 相同成员不重复，历史不移动，API 顺序不构成变化 |
 | Mention 投递 | 助手以 `@[uid:显示名]` 表达点名，宿主增量转换并在同一消息流式发送结构化 mention | 保持回复连贯、流式可见及真实 @提醒 |
@@ -92,7 +92,7 @@ OctoBuddy 增强器提供当前聊天会话的只读 Agent Hub，展示 agent �
 
 `cards/progress-cards.ts` 统一拥有进度卡的持久恢复与每任务轮次状态。服务将已归一化的 `ExecutionEvent` 交给每任务的 `TaskProgress`；研究帧自身可以开卡，其最近快照在同一任务滚卡时结转，新任务独立开始。队列 tail 仍登记到服务关停排空集合，子区归档前读取并等待当前 tail。`session/session-lifecycle.ts` 负责会话身份/cwd 校验、目录回退、`/new` 和原生 `/move`；它通过 `TaskScheduler` 取得聊天/会话租约，blocked 集合继续由服务单点拥有，源、目标目录仅检查未确认退出的 worker 阻塞。
 
-`runtime/worker-lease.ts` 独占运行期 worker 的终止、恢复回收和台账收尾；业务侧只取得不含 `stop` 的 `WorkerSession`，服务的停机、取消、问答超时及任务收尾共用同一 lease。首次 `close` 的策略和完整 Promise（包含台账写入失败）由 lease 保存，并发与后续关闭复用同一结果。停止或恢复未确认时，按 spawn 的真实 cwd 与预先声明的迁移目标阻塞目录；迁移目标随 spawn 台账一次写入，初始化失败和重启恢复也使用这份记录。
+`runtime/worker-lease.ts` 管理运行期 worker 及台账收尾；业务侧只取得不含 `stop` 的 `WorkerSession`。普通任务由独立运行时持有 OMP，channel 停机时解除连接而不终止 worker；取消、问答超时与任务收尾仍作用于原 worker。临时 worker 和独立 commit 保持原有生命周期。停止或恢复未确认时按持久归属阻塞相关目录；详细设计见 `2026-11-20-agent-runtime-channel-separation-design.md`。
 服务启动在取得 Bot 独占锁后失败时，先完成启动路径清理并释放该锁，再报告失败；若停机已接管清理，则由停机路径释放。
 
 `/new`、`/move` 的候选 worker 通过 `withStoppedWorker` 运行：scope 验证会话、确认进程停止并完成台账更新后才交付结果，调用方随后持久化绑定并发送回执。停止未确认或台账更新失败不会交付成功结果；操作失败仍执行关闭，关闭中的台账错误优先返回，否则保留原操作错误。聊天/会话租约覆盖整个 scope 和绑定提交。

@@ -532,6 +532,7 @@ export function applySchema(db: Database): void {
       identity TEXT NOT NULL,
       cwd TEXT NOT NULL,
       move_target_cwd TEXT,
+      runtime_id TEXT,
       state TEXT NOT NULL CHECK(state IN ('running', 'stopping', 'stopped', 'unknown')),
       updated_at INTEGER NOT NULL
     );
@@ -875,6 +876,7 @@ export function applySchema(db: Database): void {
     "ALTER TABLE outbox ADD COLUMN stream_final INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE outbox ADD COLUMN create_payload_json TEXT",
     "ALTER TABLE worker_ledger ADD COLUMN move_target_cwd TEXT",
+    "ALTER TABLE worker_ledger ADD COLUMN runtime_id TEXT",
     "ALTER TABLE ingress_jobs ADD COLUMN schedule_order INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN schedule_order INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN message_seq INTEGER NOT NULL DEFAULT 0",
@@ -1173,16 +1175,17 @@ function migrateWorkerLedgerNullableSessionFile(db: Database): void {
         identity TEXT NOT NULL,
         cwd TEXT NOT NULL,
         move_target_cwd TEXT,
+        runtime_id TEXT,
         state TEXT NOT NULL CHECK(state IN ('running', 'stopping', 'stopped', 'unknown')),
         updated_at INTEGER NOT NULL
       );
       INSERT INTO worker_ledger_nullable(
         id, bot_uid, session_id, session_file, pid, pgid, identity, cwd,
-        move_target_cwd, state, updated_at
+        move_target_cwd, runtime_id, state, updated_at
       )
       SELECT
         id, bot_uid, session_id, session_file, pid, pgid, identity, cwd,
-        move_target_cwd, state, updated_at
+        move_target_cwd, runtime_id, state, updated_at
       FROM worker_ledger;
       DROP TABLE worker_ledger;
       ALTER TABLE worker_ledger_nullable RENAME TO worker_ledger;
