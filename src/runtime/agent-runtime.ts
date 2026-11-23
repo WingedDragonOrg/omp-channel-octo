@@ -28,7 +28,7 @@ import type {
   WorkerOptions,
   WorkerProcess,
 } from "../contracts.ts";
-import { WorkerGoalError, WorkerSteerRejectedError } from "../contracts.ts";
+import { TaskStartupError, WorkerGoalError, WorkerSteerRejectedError } from "../contracts.ts";
 import type { ProjectSessionState } from "../session/project-session.ts";
 import { createWorkerFactory } from "../omp/index.ts";
 import { OCTO_CLI_ENV_ALLOWLIST } from "./octo-cli.ts";
@@ -80,6 +80,8 @@ type StoredDispatch = Mutable<AgentRuntimeDispatchSnapshot> & {
 type StoredWorker = Mutable<AgentRuntimeWorkerSnapshot> & {
   sessionKeys: string[];
   dispatchMap: Record<string, StoredDispatch>;
+  /** Private, bounded OMP startup detail retained for local diagnosis, never sent over the runtime protocol. */
+  startupFailure?: { code: string; diagnostic?: string };
 };
 
 type WorkerRecord = {
@@ -341,6 +343,18 @@ function assertStoredWorker(value: unknown, botUid: string): asserts value is St
       || !Array.isArray(entry.events)
     ) {
       throw new Error("Agent runtime ledger dispatch state is invalid");
+    }
+  }
+  if (value.startupFailure !== undefined) {
+    const startupFailure = value.startupFailure;
+    assertObject(startupFailure, "Agent runtime ledger startup failure");
+    if (
+      typeof startupFailure.code !== "string"
+      || startupFailure.code.length > 64
+      || (startupFailure.diagnostic !== undefined
+        && (typeof startupFailure.diagnostic !== "string" || startupFailure.diagnostic.length > 256))
+    ) {
+      throw new Error("Agent runtime ledger startup failure is invalid");
     }
   }
 }
@@ -786,6 +800,12 @@ export class AgentRuntimeServer {
       this.#persistLedger();
       return workerSnapshot(snapshot);
     } catch (error) {
+      if (error instanceof TaskStartupError) {
+        snapshot.startupFailure = {
+          code: error.code,
+          ...(error.diagnostic === undefined ? {} : { diagnostic: error.diagnostic.slice(0, 256) }),
+        };
+      }
       if (record.worker) {
         const stopped = await record.worker.stop().catch(() => false);
         if (stopped) this.#markExited(record);

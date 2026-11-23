@@ -1,6 +1,6 @@
 import { mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
   AgentRuntimeClient,
@@ -68,6 +68,7 @@ async function manifestPath(stateDir: string): Promise<string> {
 async function withRuntime<T>(
   scenario: "normal" | "crash",
   run: (harness: RuntimeHarness) => Promise<T>,
+  launch: { readonly ompCommand?: string; readonly ompExtraArgs?: readonly string[] } = {},
 ): Promise<T> {
   const tempDir = await realpath(await mkdtemp(join(tmpdir(), "agent-runtime-test-")));
   const stateDir = join(tempDir, "state");
@@ -75,8 +76,8 @@ async function withRuntime<T>(
   const started = await ensureAgentRuntime({
     stateDir,
     botUid,
-    ompCommand: process.execPath,
-    ompExtraArgs: [
+    ompCommand: launch.ompCommand ?? process.execPath,
+    ompExtraArgs: launch.ompExtraArgs ?? [
       fixturePath,
       "--mode",
       "interactive",
@@ -137,6 +138,29 @@ describe("agent runtime channel recovery", () => {
       } finally {
         await writeFile(path, JSON.stringify(original));
       }
+    });
+  });
+
+  test("retains a bounded startup diagnostic when OMP exits before ready", async () => {
+    await withRuntime("normal", async harness => {
+      await expect(harness.client.createWorker({
+        taskId: "task-startup-failure",
+        runId: "run-startup-failure",
+        workerOptions: harness.workerOptions(),
+      })).rejects.toThrow("fixture OMP startup failure");
+
+      const runtimeManifestPath = await manifestPath(harness.stateDir);
+      const ledger = JSON.parse(await readFile(join(dirname(runtimeManifestPath), "workers.json"), "utf8")) as Array<Record<string, unknown>>;
+      expect(ledger).toHaveLength(1);
+      const failure = ledger[0]?.startupFailure as Record<string, unknown> | undefined;
+      expect(failure?.code).toBe("exited");
+      expect(failure?.diagnostic).toContain("fixture OMP startup failure");
+      expect(String(failure?.diagnostic).length).toBeLessThanOrEqual(256);
+      expect(ledger[0]?.sessionId).toBe("");
+      expect(ledger[0]?.stage).toBe("exited-confirmed");
+    }, {
+      ompCommand: "/bin/sh",
+      ompExtraArgs: ["-c", "printf 'fixture OMP startup failure' >&2; sleep 1; exit 23"],
     });
   });
 
