@@ -191,7 +191,7 @@ export async function openTrackedWorker(options: OpenTrackedWorkerOptions): Prom
 export async function openTrackedAgentWorker(
   options: OpenTrackedAgentWorkerOptions,
 ): Promise<TrackedAgentWorker> {
-  let worker = options.worker.kind === "create"
+  const worker = options.worker.kind === "create"
     ? await options.client.createWorker({
         taskId: options.taskId,
         runId: options.runId,
@@ -255,13 +255,10 @@ export async function openTrackedAgentWorker(
 
   let detachPromise: Promise<void> | undefined;
   let closePromise: Promise<boolean> | undefined;
-  let detached = false;
   const detach = (): Promise<void> => {
     if (closePromise) return closePromise.then(() => {});
     if (!detachPromise) {
-      detachPromise = options.client.detachWorker(options.taskId, options.runId).then(() => {
-        detached = true;
-      });
+      detachPromise = options.client.detachWorker(options.taskId, options.runId);
     }
     return detachPromise;
   };
@@ -271,14 +268,7 @@ export async function openTrackedAgentWorker(
         let stopped = false;
         try {
           await detachPromise?.catch(() => {});
-          if (detached) {
-            worker = await options.client.attachWorker({
-              taskId: options.taskId,
-              runId: options.runId,
-              sessionId: snapshot.sessionId,
-            });
-            detached = false;
-          }
+          // stop-worker targets the runtime record directly; reattaching can wait forever offline.
           stopped = await worker.stop();
         } catch {
           // A failed runtime stop is not confirmation that its process group exited.

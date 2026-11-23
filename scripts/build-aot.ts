@@ -7,6 +7,7 @@ import { assertAotSupported } from "./aot-support.ts";
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const executablePath = resolve(process.argv[2] ?? join(projectRoot, "dist", "oco"));
 const watchdogPath = join(dirname(executablePath), "oco-watchdog");
+const agentRuntimePath = join(dirname(executablePath), "oco-agent-runtime");
 const runtimeOmpDir = join(dirname(executablePath), "runtime", "omp");
 const runtimeTestDir = join(dirname(executablePath), "tests");
 const previewTestSource = join(projectRoot, "tests", "preview-card.acceptance.ts");
@@ -60,6 +61,17 @@ runBun([
 
 runBun([
   "build",
+  "--compile",
+  "--aot",
+  "--define",
+  "OMP_CHANNEL_OCTO_AOT=true",
+  join(projectRoot, "src", "runtime", "agent-runtime-entry.ts"),
+  "--outfile",
+  agentRuntimePath,
+]);
+
+runBun([
+  "build",
   "--target=bun",
   join(projectRoot, "src", "omp", "context-extension.ts"),
   "--outfile",
@@ -79,7 +91,9 @@ await copyFile(join(projectRoot, "src", "omp", "goal-rpc.yml"), join(runtimeOmpD
 await copyFile(join(projectRoot, "src", "omp", "ratchet-rpc.yml"), join(runtimeOmpDir, "ratchet-rpc.yml"));
 await chmod(executablePath, 0o755);
 await chmod(watchdogPath, 0o755);
+await chmod(agentRuntimePath, 0o755);
 console.log(`Built AOT channel: ${executablePath}`);
 console.log(`Built AOT watchdog: ${watchdogPath}`);
+console.log(`Built AOT agent runtime: ${agentRuntimePath}`);
 console.log(`External OMP assets: ${runtimeOmpDir}`);
 console.log(`External preview acceptance test: ${previewTestAsset}`);

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
@@ -388,6 +388,7 @@ class RpcWorker implements OmpWorker {
 	#streaming = false;
 	#activeTools = new Map<string, HostTool>();
 	#hostCalls = new Map<string, HostCall>();
+	#hostToolResultHashes = new Map<string, string[]>();
 	#nativeAskCall: NativeAskCall | undefined;
 	#nativeAskToolCallCandidate: string | undefined;
 	#assistantToolCallBatch = new Map<string, string>();
@@ -2567,12 +2568,27 @@ class RpcWorker implements OmpWorker {
 		void Promise.resolve()
 			.then(() => tool.execute(args, controller.signal, toolCallId))
 			.then(
-				text => this.#sendHostToolResult(requestId, false, typeof text === "string" ? text : String(text)),
-				error => this.#sendHostToolResult(requestId, true, asError(error, "Host tool failed").message),
+				text => {
+					const result = typeof text === "string" ? text : String(text);
+					this.#rememberHostToolResultHash(toolName, toolCallId, result);
+					this.#sendHostToolResult(requestId, false, result);
+				},
+				error => {
+					const result = asError(error, "Host tool failed").message;
+					this.#rememberHostToolResultHash(toolName, toolCallId, result);
+					this.#sendHostToolResult(requestId, true, result);
+				},
 			)
 			.finally(() => {
 				if (this.#hostCalls.get(requestId) === call) this.#hostCalls.delete(requestId);
 			});
+	}
+	#rememberHostToolResultHash(toolName: string, toolCallId: string | undefined, result: string): void {
+		if (toolCallId === undefined) return;
+		const key = JSON.stringify([toolName, toolCallId]);
+		const hashes = this.#hostToolResultHashes.get(key) ?? [];
+		hashes.push(createHash("sha256").update(result).digest("hex"));
+		this.#hostToolResultHashes.set(key, hashes);
 	}
 
 	#handleHostToolCancel(frame: RpcFrame): void {
@@ -2591,13 +2607,35 @@ class RpcWorker implements OmpWorker {
 		}
 	}
 
+	// Only a single text block identifies the string sent to OMP; other shapes fail closed.
+	#resultHashFromToolExecutionEnd(frame: RpcFrame): string | undefined {
+		if (!isRecord(frame.result) || !Array.isArray(frame.result.content) || frame.result.content.length !== 1) {
+			return undefined;
+		}
+		const [content] = frame.result.content;
+		if (!isRecord(content) || content.type !== "text" || typeof content.text !== "string") return undefined;
+		return createHash("sha256").update(content.text).digest("hex");
+	}
+
 	#emitWorkerEvent(active: PromptRun, frame: RpcFrame): void {
 		try {
 			if (frame.type === "tool_execution_end") {
 				const toolCallId = typeof frame.toolCallId === "string" ? frame.toolCallId : "";
 				const toolName = typeof frame.toolName === "string" ? frame.toolName : "";
 				if (toolCallId.length > 0 && toolName.length > 0) {
-					this.#activeTools.get(toolName)?.onResultAccepted?.(toolCallId);
+					const key = JSON.stringify([toolName, toolCallId]);
+					const hashes = this.#hostToolResultHashes.get(key);
+					const resultHash = this.#resultHashFromToolExecutionEnd(frame);
+					const activeTool = this.#activeTools.get(toolName);
+					if (hashes && resultHash !== undefined && activeTool?.onResultAccepted) {
+						// Identical digests under this tool identity have equivalent acceptance outcomes.
+						const matchIndex = hashes.indexOf(resultHash);
+						if (matchIndex !== -1) {
+							hashes.splice(matchIndex, 1);
+							if (hashes.length === 0) this.#hostToolResultHashes.delete(key);
+							activeTool.onResultAccepted(toolCallId, resultHash);
+						}
+					}
 				}
 			}
 			const message = frame.message;
@@ -2640,6 +2678,7 @@ class RpcWorker implements OmpWorker {
 		if (run.settled) return;
 		run.settled = true;
 		this.#streaming = false;
+		this.#hostToolResultHashes.clear();
 		this.#nativeAskToolCallCandidate = undefined;
 		this.#clearPendingNativeAskUi();
 		this.#clearTransientAskRoutingState();

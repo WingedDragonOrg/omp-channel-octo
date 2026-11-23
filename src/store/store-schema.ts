@@ -558,6 +558,7 @@ export function applySchema(db: Database): void {
       not_started_text TEXT,
       outcome_kind TEXT CHECK(outcome_kind IS NULL OR outcome_kind IN ('succeeded', 'execution-failed')),
       outcome_json TEXT,
+      result_hashes_json TEXT NOT NULL DEFAULT '[]',
       auto_commit_task_id TEXT,
       auto_commit_state TEXT CHECK(auto_commit_state IS NULL OR auto_commit_state IN ('committing', 'result-known', 'merge-ready', 'merging', 'unknown', 'complete')),
       auto_commit_dispatched INTEGER NOT NULL DEFAULT 0 CHECK(auto_commit_dispatched IN (0, 1)),
@@ -906,6 +907,8 @@ export function applySchema(db: Database): void {
     "ALTER TABLE host_merge_leases ADD COLUMN not_started_text TEXT",
     "ALTER TABLE host_merge_leases ADD COLUMN outcome_kind TEXT",
     "ALTER TABLE host_merge_leases ADD COLUMN outcome_json TEXT",
+    // Legacy result_hash digests came from generic execution and cannot prove which terminal outcome they describe.
+    "ALTER TABLE host_merge_leases ADD COLUMN result_hashes_json TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE host_merge_leases ADD COLUMN operation_kind TEXT NOT NULL DEFAULT 'merge' CHECK(operation_kind IN ('merge', 'thread-remove'))",
     "ALTER TABLE host_merge_leases ADD COLUMN removal_step TEXT CHECK(removal_step IS NULL OR removal_step IN ('worktree', 'branch'))",
     "ALTER TABLE host_merge_leases ADD COLUMN removal_resources_json TEXT",

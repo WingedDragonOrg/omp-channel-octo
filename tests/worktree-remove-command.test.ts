@@ -233,7 +233,9 @@ test("default removal deletes a merged branch and worktree while preserving main
         },
         onConfirmedExit: () => lifecycleEvents.push(`onConfirmedExit:${step}`),
         onNotSpawned: () => lifecycleEvents.push(`onNotSpawned:${step}`),
-        onUnknown: () => lifecycleEvents.push(`onUnknown:${step}`),
+        onUnknown: () => {
+          lifecycleEvents.push(`onUnknown:${step}`);
+        },
       };
     };
 

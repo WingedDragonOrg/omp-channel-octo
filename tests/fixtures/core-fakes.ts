@@ -14,6 +14,7 @@ import type {
   BotIdentity,
   CardFrame,
   ChannelCommandHandler,
+  ChannelServiceOptions,
   ChannelService,
   ChannelStatus,
   CommitWorker,
@@ -1999,6 +2000,7 @@ export interface CoreHarnessOptions {
   transport?: FakeTransport;
   workers?: FakeWorkerFactory;
   prompt?: FakePrompt;
+  agentRuntime?: ChannelServiceOptions["agentRuntime"];
   startOnline?: boolean;
   /**
    * `null` omits ownerId from the test config so enrollment starts unconfigured.
@@ -2082,6 +2084,7 @@ export async function createCoreHarness(options: CoreHarnessOptions = {}): Promi
     transport,
     ...(options.loop === undefined ? {} : { loop: options.loop }),
     ...(options.loopWebOrigin === undefined ? {} : { loopWebOrigin: options.loopWebOrigin }),
+    ...(options.agentRuntime === undefined ? {} : { agentRuntime: options.agentRuntime }),
     workerFactory: workers,
     ...(worktreePort === undefined ? {} : { worktrees: worktreePort }),
     ...(options.commandHandlers === undefined ? {} : { commandHandlers: options.commandHandlers }),

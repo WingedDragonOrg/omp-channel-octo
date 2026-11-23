@@ -489,17 +489,23 @@ export interface WorktreeMergeLifecycle {
   /** Clear an intent when no wt command was started and no process can still act. */
   onNotSpawned(): void;
   /** Keep the operation blocked when process exit cannot be confirmed. */
-  onUnknown(): void;
+  onUnknown(): HostMergeOutcome | void;
 }
 
 /** One destructive stage of an owned-worktree removal. */
 export type WorktreeRemovalStep = "worktree" | "branch";
 
 /** Per-command process tracking for worktree removal; it never represents a merge result. */
-export type WorktreeRemovalLifecycle = Pick<
-  WorktreeMergeLifecycle,
-  "beforeSpawn" | "onSpawn" | "onConfirmedExit" | "onNotSpawned" | "onUnknown"
->;
+export type WorktreeRemovalLifecycle = Omit<
+  Pick<
+    WorktreeMergeLifecycle,
+    "beforeSpawn" | "onSpawn" | "onConfirmedExit" | "onNotSpawned" | "onUnknown"
+  >,
+  "onUnknown"
+> & {
+  /** Removal has no merge outcome to return. */
+  onUnknown(): void;
+};
 export type WorktreeRemovalRefState = "pending" | "deleted" | "missing" | "retained";
 
 /** Durable snapshot for retries: never infer a switched branch after its worktree is gone. */
@@ -642,8 +648,8 @@ export interface HostTool {
    * durable state on it instead of the RPC request id.
    */
   execute(args: Record<string, unknown>, signal: AbortSignal, toolCallId?: string): Promise<string>;
-  /** Called when OMP reports `tool_execution_end` for the exact native tool call. */
-  onResultAccepted?(toolCallId: string): void;
+  /** Called when OMP accepts this exact native result; `resultHash` is SHA-256 of its raw UTF-8 text. */
+  onResultAccepted?(toolCallId: string, resultHash: string): void;
 }
 
 export interface ContextInjection {

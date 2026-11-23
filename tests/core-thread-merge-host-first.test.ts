@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { expect, test, vi } from "bun:test";
 import { Database } from "bun:sqlite";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -2419,12 +2420,15 @@ test("only an actual Worktrunk execution failure creates one stable repair task"
       worktrees.mergeFailure = undefined;
       const management = (promptContext?.tools ?? []).find(({ name }) => name === "octo_management");
       if (!management) throw new Error("management tool missing");
-      await management.execute(
+      const mergeResult = await management.execute(
         { action: "thread-merge" },
         new AbortController().signal,
         "host-first-repair-merge",
       );
-      management.onResultAccepted?.("host-first-repair-merge");
+      management.onResultAccepted?.(
+        "host-first-repair-merge",
+        createHash("sha256").update(mergeResult, "utf8").digest("hex"),
+      );
     },
   });
   fixtureWorktrees = harness.worktrees;

@@ -134,7 +134,7 @@ bun run build:aot
 bun tests/benchmarks/aot.ts
 ```
 
-The build first checks whether `bun build --help` advertises experimental `--aot` and writes no artifacts when unsupported. Ship `dist/oco`, `dist/oco-watchdog`, `dist/tests/preview-card.acceptance.test.ts`, and the adjacent `dist/runtime/omp/` assets together; the bundled preview remains an external Bun test resource. The offline benchmark uses a fake Bun to check the AOT `test --card` invocation and environment-file selection without sending a message, plus offline Octo/worker fixtures and an independent Bun process to load the OMP extension and goal config.
+The build first checks whether `bun build --help` advertises experimental `--aot` and writes no artifacts when unsupported. Ship `dist/oco`, `dist/oco-agent-runtime`, `dist/oco-watchdog`, `dist/tests/preview-card.acceptance.test.ts`, and the adjacent `dist/runtime/omp/` assets together; the bundled preview remains an external Bun test resource. The offline benchmark uses a fake Bun to check the AOT `test --card` invocation and environment-file selection without sending a message, plus offline Octo/worker fixtures and an independent Bun process to load the OMP extension and goal config.
 
 Create a local configuration and exercise the service:
 

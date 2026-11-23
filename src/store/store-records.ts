@@ -429,6 +429,8 @@ export interface HostMergeLeaseRecord extends ChatTarget {
     headAfter: string | null;
   } | null;
   stopRequested: boolean;
+  /** SHA-256 digests of exact host-tool results proven to correspond to this direct merge outcome. */
+  resultHashes: readonly string[];
   outcome: HostMergeOutcome | null;
   createdAt: number;
   updatedAt: number;

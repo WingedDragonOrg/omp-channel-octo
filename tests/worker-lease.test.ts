@@ -1,3 +1,4 @@
+import type { AgentRuntimeClient, AgentRuntimeWorker } from "../src/runtime/agent-runtime.ts";
 import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -10,7 +11,7 @@ import type {
   WorkerOptions,
   WorkerProcess,
 } from "../src/contracts.ts";
-import { openTrackedWorker, withStoppedWorker } from "../src/runtime/worker-lease.ts";
+import { openTrackedAgentWorker, openTrackedWorker, withStoppedWorker } from "../src/runtime/worker-lease.ts";
 import { ChannelStore } from "../src/store/index.ts";
 import type { WorkerLedgerInput, WorkerLedgerRecord } from "../src/store/store-records.ts";
 
@@ -244,6 +245,76 @@ test("close 无法确认停止时，block 实际进程 cwd 与计划目标且台
     },
     { stopResult: false },
   ));
+
+test("runtime lease close after detach returns unknown without reattaching", () =>
+  withHarness(async (harness) => {
+    const taskId = harness.ledger.id;
+    const runId = `run-${taskId}`;
+    const runtimeId = "isolated-runtime";
+    const snapshot = {
+      botUid: harness.ledger.botUid,
+      taskId,
+      runId,
+      runtimeId,
+      sessionId: harness.worker.sessionId,
+      sessionFile: harness.worker.sessionFile,
+      process: harness.process,
+      stage: "omp-ready" as const,
+    } as AgentRuntimeWorker["snapshot"];
+    let stopCalls = 0;
+    let attachCalls = 0;
+    const worker = {
+      snapshot,
+      process: harness.process,
+      sessionId: snapshot.sessionId,
+      sessionFile: snapshot.sessionFile,
+      stop: async () => {
+        stopCalls += 1;
+        return false;
+      },
+    } as unknown as AgentRuntimeWorker;
+    const client = {
+      createWorker: async () => worker,
+      attachWorker: async () => {
+        attachCalls += 1;
+        return new Promise<AgentRuntimeWorker>(() => {});
+      },
+      detachWorker: async () => {},
+    } as unknown as AgentRuntimeClient;
+    harness.runningProcesses.add(harness.process.identity);
+    const lease = await openTrackedAgentWorker({
+      client,
+      runtimeId,
+      botUid: harness.ledger.botUid,
+      taskId,
+      runId,
+      worker: {
+        kind: "create",
+        options: {
+          cwd: harness.workerOptions.cwd,
+          sessionDir: harness.workerOptions.sessionDir,
+          sessionFile: harness.worker.sessionFile,
+        },
+      },
+      store: harness.store,
+      blockDirectory: cwd => harness.blockedDirectories.add(cwd),
+    });
+
+    await lease.detach();
+    const closed = await Promise.race([
+      lease.close(),
+      Bun.sleep(100).then(() => undefined),
+    ]);
+
+    expect(closed).toBe(false);
+    expect(attachCalls).toBe(0);
+    expect(stopCalls).toBe(1);
+    expect(harness.runningProcesses.has(harness.process.identity)).toBe(true);
+    expect(harness.blockedDirectories).toEqual(new Set([harness.process.cwd]));
+    expect(await persistedWorkers(harness.databasePath, harness.ledger.botUid)).toMatchObject([
+      { id: taskId, state: "running", runtimeId, cwd: harness.process.cwd },
+    ]);
+  }));
 
 test("并发 close 共用一次进程停止与台账 finalization", () =>
   withHarness(async (harness) => {

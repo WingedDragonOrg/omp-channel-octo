@@ -1,8 +1,11 @@
+import { createHash } from "node:crypto";
 import { expect, test, vi } from "bun:test";
 import { mkdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ThreadSummary } from "../src/contracts";
 import { WorktreeMergeExecutionError } from "../src/threads/thread-merge";
+import { createHostTools, type HostToolHost } from "../src/host-tools.ts";
+import type { TaskRecord } from "../src/store/store-records.ts";
 import { ChannelStore } from "../src/store";
 import {
   assistantText,
@@ -14,11 +17,16 @@ import {
   inbound,
   readText,
   waitForStatus,
+  type CoreHarness,
 } from "./fixtures/core-fakes";
 
 const GROUP_TOOLS = { channelId: "group-tools", channelType: 2 as const };
 const THREAD_CHANNEL_ID = "group-tools____topic-7";
 const THREAD_TOOLS = { channelId: THREAD_CHANNEL_ID, channelType: 5 as const };
+
+function hostToolResultHash(result: string): string {
+  return createHash("sha256").update(result, "utf8").digest("hex");
+}
 
 /** One live thread of the fixture group, as the management listing reports it. */
 function threadRecord(shortId: string): ThreadSummary {
@@ -202,7 +210,7 @@ test("private prompts receive ask, file, and channel tools but no group tools", 
   const harness = await createCoreHarness({
     prompt: async ({ append, promptContext, text }) => {
       const names = (promptContext?.tools ?? []).map(({ name }) => name).sort();
-      if (names.join(",") !== "ask,channel_control,octo_discover,octo_send_file,watch") {
+      if (names.join(",") !== "ask,channel_control,octo_discover,octo_send_file,schedule,watch") {
         throw new Error(`unexpected private host tools: ${names.join(",")}`);
       }
       await append("private-tools.log", text);
@@ -1201,15 +1209,31 @@ test("thread-merge merges the bound workspace through the port and reports wt's 
           signal,
           mergeOperationId,
         );
-        const retried = JSON.parse(
-          await management.execute(
-            { action: "thread-merge", target: "release-1", remove: false },
-            signal,
-            mergeOperationId,
-          ),
-        ) as { merged: boolean; replayed?: boolean; target?: string };
+        const retriedResult = await management.execute(
+          { action: "thread-merge", target: "release-1", remove: false },
+          signal,
+          mergeOperationId,
+        );
+        const retried = JSON.parse(retriedResult) as { merged: boolean; replayed?: boolean; target?: string };
         expect(retried).toMatchObject({ merged: true, replayed: true, target: "release-1" });
-        management.onResultAccepted?.(mergeOperationId);
+        const mergeStore = await ChannelStore.open(join(harness.stateDir, "channel.sqlite"));
+        try {
+          const mergeThread = { channelId: "group-tools____thread-1", channelType: 5 as const };
+          const executingTask = mergeStore.getLatestTask(harness.bot.uid, mergeThread);
+          if (!executingTask) throw new Error("merge task missing");
+          const lease = mergeStore.getHostMergeLeaseBySourceId(
+            harness.bot.uid,
+            mergeThread,
+            JSON.stringify([executingTask.id, mergeOperationId]),
+          );
+          expect(lease?.resultHashes).toEqual([
+            hostToolResultHash(result),
+            hostToolResultHash(retriedResult),
+          ]);
+        } finally {
+          mergeStore.close();
+        }
+        management.onResultAccepted?.(mergeOperationId, hostToolResultHash(result));
         log.push(`merged:${result}\n`);
         if (mergeCallCount === 2) {
           const replay = await management.execute(
@@ -1320,6 +1344,9 @@ test("thread-merge merges the bound workspace through the port and reports wt's 
       expect(events).toHaveLength(2);
       expect(new Set(events.map(({ id }) => id)).size).toBe(2);
       expect(events.map(({ commit }) => commit)).toEqual([null, null]);
+      // The replay response has a different raw result string; accepting the first, already-delivered
+      // result must still settle the lease after the replay digest was also recorded.
+      expect(mergeStore.listHostMergeLeases(harness.bot.uid)).toHaveLength(0);
       expect(mergeStore.getThreadListen(harness.bot.uid, thread)?.mergePending).toBe(false);
     } finally {
       mergeStore.close();
@@ -1403,21 +1430,35 @@ test("thread-merge reports the port's failure and refuses a thread without a wor
       }
       if (text === "merge without a workspace") {
         const callId = "merge-tool-unbound";
+        let resultText = "";
         const outcome = await management
           .execute({ action: "thread-merge" }, signal, callId)
-          .then((value) => `resolved:${value}`)
-          .catch((error: Error) => `rejected:${error.message}`);
-        management.onResultAccepted?.(callId);
+          .then((value) => {
+            resultText = value;
+            return `resolved:${value}`;
+          })
+          .catch((error: unknown) => {
+            resultText = error instanceof Error ? error.message : String(error);
+            return `rejected:${resultText}`;
+          });
+        management.onResultAccepted?.(callId, hostToolResultHash(resultText));
         log.push(`${outcome}\n`);
         return;
       }
       if (text === "merge that conflicts") {
         const callId = "merge-tool-failure";
+        let resultText = "";
         const outcome = await management
           .execute({ action: "thread-merge" }, signal, callId)
-          .then((value) => `resolved:${value}`)
-          .catch((error: Error) => `rejected:${error.message}`);
-        management.onResultAccepted?.(callId);
+          .then((value) => {
+            resultText = value;
+            return `resolved:${value}`;
+          })
+          .catch((error: unknown) => {
+            resultText = error instanceof Error ? error.message : String(error);
+            return `rejected:${resultText}`;
+          });
+        management.onResultAccepted?.(callId, hostToolResultHash(resultText));
         log.push(`${outcome}\n`);
       }
     },
@@ -1914,7 +1955,7 @@ test("a default-pipeline merge schedules the thread's archive beside the merge r
       if (text === "merge and archive") {
         const callId = "merge-archive-tool-call";
         const result = await management.execute({ action: "thread-merge" }, signal, callId);
-        management.onResultAccepted?.(callId);
+        management.onResultAccepted?.(callId, hostToolResultHash(result));
         log.push(`${result}\n`);
         emit(assistantText("merge-archive-reply", "合并完成，本子区随后归档", true));
       }
@@ -2325,5 +2366,236 @@ test("channel_control without a detected supervisor reports it and schedules not
     expect(restartResult).toContain("未检测到守护进程");
   } finally {
     await closeCoreHarness(harness);
+  }
+});
+test("a recreated host tool settles only its task-scoped known merge result without replay", async () => {
+  const original = await createCoreHarness();
+  const taskId = "host-tool-merge-receipt-task";
+  const toolCallId = "host-tool-merge-receipt-call";
+  const thread = { channelId: THREAD_CHANNEL_ID, channelType: 5 as const };
+  const cwd = join(original.root, "host-tool-merge-receipt");
+  const task: TaskRecord = {
+    id: taskId,
+    botUid: original.bot.uid,
+    ...thread,
+    messageId: "host-tool-merge-receipt-message",
+    senderId: "owner-1",
+    text: "merge the thread",
+    sessionId: "host-tool-merge-receipt-session",
+    cwd,
+    state: "running",
+    resultText: null,
+    errorText: null,
+    messageSeq: 0,
+    historyEligible: true,
+    relaySuppressed: false,
+  };
+  let originalStopped = false;
+  let restarted: CoreHarness | undefined;
+  let originalStore: ChannelStore | undefined;
+  const sourceId = JSON.stringify([taskId, toolCallId]);
+  const hostFor = (service: CoreHarness["service"]): HostToolHost => {
+    // Reach the private adapter so this integration test uses the service's real merge lifecycle.
+    const adapter = service as unknown as { hostToolHost(): HostToolHost };
+    return adapter.hostToolHost();
+  };
+  const managementFor = (service: CoreHarness["service"]) => {
+    const management = createHostTools(hostFor(service), task).find(({ name }) => name === "octo_management");
+    if (!management) throw new Error("management tool missing");
+    return management;
+  };
+
+  try {
+    const worktrees = original.worktrees;
+    if (!worktrees) throw new Error("expected a worktree port in the harness");
+    await mkdir(cwd, { recursive: true });
+    originalStore = await ChannelStore.open(join(original.stateDir, "channel.sqlite"));
+    originalStore.ensureBinding({
+      botUid: original.bot.uid,
+      ...thread,
+      cwd,
+      sessionId: task.sessionId,
+      sessionFile: null,
+      cwdPinned: true,
+    });
+    worktrees.mergeFailure = new WorktreeMergeExecutionError(1, "persisted host-tool merge failure");
+
+    const firstPlanEntered = Promise.withResolvers<void>();
+    const releaseFirstPlan = Promise.withResolvers<void>();
+    const secondWorktrunkEntered = Promise.withResolvers<void>();
+    const releaseSecondWorktrunk = Promise.withResolvers<void>();
+    const originalPlanMerge = worktrees.planMerge.bind(worktrees);
+    const originalWorktrunk = worktrees.worktrunk.bind(worktrees);
+    let planMergeCalls = 0;
+    let worktrunkCalls = 0;
+    worktrees.planMerge = async (request) => {
+      if (++planMergeCalls === 1) {
+        firstPlanEntered.resolve();
+        await releaseFirstPlan.promise;
+      }
+      return originalPlanMerge(request);
+    };
+    worktrees.worktrunk = async () => {
+      if (++worktrunkCalls === 2) {
+        secondWorktrunkEntered.resolve();
+        await releaseSecondWorktrunk.promise;
+        throw new Error("different preflight failure");
+      }
+      return originalWorktrunk();
+    };
+
+    const firstManagement = managementFor(original.service);
+    const firstMergePromise = firstManagement
+      .execute({ action: "thread-merge" }, new AbortController().signal, toolCallId)
+      .then(() => null, (error: unknown) => error);
+    let concurrentMergePromise: Promise<unknown> | undefined;
+    let mergeResult: unknown;
+    let unrelatedResult: unknown;
+    try {
+      await waitForSignal(firstPlanEntered.promise, "first merge plan gate");
+      const concurrentManagement = managementFor(original.service);
+      concurrentMergePromise = concurrentManagement
+        .execute({ action: "thread-merge" }, new AbortController().signal, toolCallId)
+        .then(() => null, (error: unknown) => error);
+      await waitForSignal(secondWorktrunkEntered.promise, "concurrent merge preflight gate");
+      releaseFirstPlan.resolve();
+      mergeResult = await firstMergePromise;
+      releaseSecondWorktrunk.resolve();
+      unrelatedResult = await concurrentMergePromise;
+    } finally {
+      releaseFirstPlan.resolve();
+      releaseSecondWorktrunk.resolve();
+    }
+    if (!(mergeResult instanceof WorktreeMergeExecutionError)) throw new Error("expected a persisted merge failure");
+    if (!(unrelatedResult instanceof Error) || unrelatedResult instanceof WorktreeMergeExecutionError) {
+      throw new Error("expected a different concurrent preflight failure");
+    }
+    expect(unrelatedResult.message).toContain("different preflight failure");
+    const acceptedResultHash = hostToolResultHash(mergeResult.message);
+    const unrelatedResultHash = hostToolResultHash(unrelatedResult.message);
+    expect(originalStore.getHostMergeLeaseBySourceId(original.bot.uid, thread, sourceId)).toMatchObject({
+      commandText: null,
+      phase: "exited",
+      outcome: { kind: "execution-failed" },
+      resultHashes: [acceptedResultHash],
+    });
+    firstManagement.onResultAccepted?.(toolCallId, unrelatedResultHash);
+    expect(originalStore.getHostMergeLeaseBySourceId(original.bot.uid, thread, sourceId)).toMatchObject({
+      resultHashes: [acceptedResultHash],
+    });
+    expect(worktrees.merges).toHaveLength(1);
+
+    originalStore.close();
+    originalStore = undefined;
+    await closeCoreHarness(original, { remove: false });
+    originalStopped = true;
+
+    const recoveredHarness = await createCoreHarness({ root: original.root, bot: original.bot });
+    restarted = recoveredHarness;
+    const store = await ChannelStore.open(join(recoveredHarness.stateDir, "channel.sqlite"));
+    try {
+      expect(store.getHostMergeLeaseBySourceId(recoveredHarness.bot.uid, thread, sourceId)).toMatchObject({
+        phase: "exited",
+        outcome: { kind: "execution-failed" },
+        resultHashes: [acceptedResultHash],
+      });
+      const recoveredManagement = managementFor(recoveredHarness.service);
+      const cancellationResultHash = hostToolResultHash("OMP cancelled host tool");
+      recoveredManagement.onResultAccepted?.(toolCallId, cancellationResultHash);
+      expect(store.getHostMergeLeaseBySourceId(recoveredHarness.bot.uid, thread, sourceId)).toMatchObject({
+        phase: "exited",
+        resultHashes: [acceptedResultHash],
+      });
+      expect(recoveredHarness.worktrees?.merges).toHaveLength(0);
+      recoveredManagement.onResultAccepted?.(toolCallId, acceptedResultHash);
+      expect(store.getHostMergeLeaseBySourceId(recoveredHarness.bot.uid, thread, sourceId)).toBeNull();
+      expect(recoveredHarness.worktrees?.merges).toHaveLength(0);
+
+      const addKnownFailure = (id: string, operationId: string, commandText?: string): void => {
+        store.reserveHostMergeLease({
+          id,
+          botUid: recoveredHarness.bot.uid,
+          target: thread,
+          sourceId: operationId,
+          cwd,
+          resourceCwds: [cwd],
+          ...(commandText === undefined ? {} : { commandText }),
+        });
+        store.recordHostMergeProcess(id, {
+          pid: 43020,
+          pgid: 43020,
+          identity: `pid=43020;start=${id}`,
+        });
+        store.markHostMergeProcessExited(id);
+        const expectedOutcome = {
+          kind: "execution-failed",
+          exitCode: 1,
+          diagnostic: "fixture result",
+        } as const;
+        store.persistHostMergeOutcome(id, expectedOutcome);
+        store.persistHostMergeResultHash(id, hostToolResultHash("fixture result"), expectedOutcome);
+      };
+
+      const notStartedCallId = "host-tool-not-started-call";
+      const notStartedSourceId = JSON.stringify([taskId, notStartedCallId]);
+      store.reserveHostMergeLease({
+        id: "host-tool-not-started-lease",
+        botUid: recoveredHarness.bot.uid,
+        target: thread,
+        sourceId: notStartedSourceId,
+        cwd,
+        resourceCwds: [cwd],
+      });
+      store.completeHostMergeLease("host-tool-not-started-lease", {
+        kind: "not-spawned",
+        diagnostic: "confirmed not started",
+      });
+      const notStartedResultHash = hostToolResultHash("confirmed not started");
+      const notStartedOutcome = { kind: "not-started", diagnostic: "confirmed not started" } as const;
+      store.persistHostMergeResultHash("host-tool-not-started-lease", notStartedResultHash, notStartedOutcome);
+      recoveredManagement.onResultAccepted?.(notStartedCallId, notStartedResultHash);
+      expect(store.getHostMergeLeaseBySourceId(recoveredHarness.bot.uid, thread, notStartedSourceId)).toBeNull();
+
+      const unknownCallId = "host-tool-unknown-call";
+      const unknownSourceId = JSON.stringify([taskId, unknownCallId]);
+      store.reserveHostMergeLease({
+        id: "host-tool-unknown-lease",
+        botUid: recoveredHarness.bot.uid,
+        target: thread,
+        sourceId: unknownSourceId,
+        cwd,
+        resourceCwds: [cwd],
+      });
+      store.markHostMergeLeaseUnknown("host-tool-unknown-lease");
+      recoveredManagement.onResultAccepted?.(unknownCallId, hostToolResultHash("unknown result"));
+      expect(store.getHostMergeLeaseBySourceId(recoveredHarness.bot.uid, thread, unknownSourceId)).toMatchObject({
+        id: "host-tool-unknown-lease",
+        phase: "unknown",
+        outcome: null,
+      });
+
+      const foreignCallId = "host-tool-shared-native-call";
+      const foreignSourceId = JSON.stringify(["another-task", foreignCallId]);
+      addKnownFailure("foreign-task-merge-lease", foreignSourceId);
+      recoveredManagement.onResultAccepted?.(foreignCallId, hostToolResultHash("fixture result"));
+      expect(store.getHostMergeLeaseBySourceId(recoveredHarness.bot.uid, thread, foreignSourceId)).not.toBeNull();
+
+      const commandCallId = "host-tool-command-identity-collision";
+      const commandSourceId = JSON.stringify([taskId, commandCallId]);
+      addKnownFailure("command-merge-lease", commandSourceId, "/thread merge");
+      recoveredManagement.onResultAccepted?.(commandCallId, hostToolResultHash("fixture result"));
+      expect(store.getHostMergeLeaseBySourceId(recoveredHarness.bot.uid, thread, commandSourceId)).not.toBeNull();
+    } finally {
+      store.close();
+    }
+  } finally {
+    originalStore?.close();
+    if (restarted) {
+      await closeCoreHarness(restarted);
+    } else if (!originalStopped) {
+      await closeCoreHarness(original);
+    } else {
+      await rm(original.root, { recursive: true, force: true });
+    }
   }
 });

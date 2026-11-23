@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { startAgentRuntimeServer, type AgentRuntimeServerOptions } from "./agent-runtime.ts";
 
-const configPath = Bun.argv[2];
+const configPath = process.argv[2];
 if (!configPath) throw new Error("Agent runtime daemon config path is required");
 
 const config = JSON.parse(await readFile(configPath, "utf8")) as AgentRuntimeServerOptions;

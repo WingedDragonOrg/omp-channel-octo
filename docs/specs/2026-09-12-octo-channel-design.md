@@ -118,6 +118,8 @@ OctoBuddy 增强器提供当前聊天会话的只读 Agent Hub，展示 agent �
 merge 路径由 `WorktreePort.planMerge` 提供 source＋真实 target checkout；默认目标使用 wt 自身的分支解析。执行前复核计划并固定显式 target；目标没有 checkout 时只记录 source，不伪造目录。Git ref CAS 与 index 锁各自保护单次操作，并不使 staging、rebase、hook、checkout 更新及清理成为整体事务。
 
 **生命周期与恢复。** 普通会话命令持有聊天/session 至候选 worker 停止和绑定提交完成；goal 持有至 `session_settled`。未确认退出的 worker 仍不能复用其 session，但旧 worker/host-operation ledger 中的未知进程或结果不阻塞新的 `/thread remove` 或 `/thread merge`，亦不证明进程仍存活。merge/remove 为每个操作持久保留身份、步骤与结果；同一稳定操作的未知结果不得自动重放、续跑后续破坏性阶段或宣称成功，取消和停止必须记录实际操作结果；remove 任一步未知均不排定归档。独立 `/commit` 继续使用原资源租约，退出未确认仍封锁对应工作树；`thread-delete` 恢复和占用语义不变。重启按原身份交付已知结果，不重放原 prompt、不把 queued 批量失败、不改写线上任务。
+直接 host-tool `thread-merge` 的结果仅在有明确执行/重放来源且匹配同一持久终态时，才按交给 OMP 的原始 UTF-8 结果字符串 SHA-256 小写摘要写入 lease；同一 taskId+native toolCallId 的重放可能返回不同文本，因此保留所有已证明交付的摘要。只有完全相同摘要的 OMP 接受回执才能结算；取消错误、通用 preflight 异常、未知 outcome 或其他操作的回执不能释放 lease，也不重放 merge。
+
 
 **验收。** 在隔离夹具验证父→子、子→父、shared 不同项目、入口→项目、相同 cwd、祖先→后代的普通任务并发及聊天 FIFO、同 session 独占、取消、new/move、goal 与恢复。验证 `/thread remove` 和 `/thread merge` 在另一个聊天任务、相关目录/Git 活动及旧未确认 ledger 存在时仍按原命令顺序启动，不等待/拒绝且无替代路径锁；同时验证当前聊天/session 顺序、取消、持久归属/路径/branch 校验、部分副作用和未知历史结果不重放/不称成功。direct host merge、shared/fork 行为不变；独立 `/commit` 与 `thread-delete` 原资源冲突语义不变。真实 RPC 子进程、临时 Git 工作区 smoke 与既有离线 restart benchmark 仅使用隔离资源，不操作常驻服务。
 
@@ -155,7 +157,7 @@ OMP worker 启动失败时，保留启动阶段有限的 stderr；退出后将�
 
 #### AOT 编译发布
 
-常规 `bun run` 与 `bun link` 仍通过 Bun 运行源码；可选 `bun run build:aot` 会先检查 `bun build --help` 明确声明实验性 `--aot`，仅在支持该选项的 Bun 上为当前构建平台生成 `dist/oco` 与独立的 `dist/oco-watchdog`。发布时必须将二者、`dist/tests/preview-card.acceptance.test.ts` 与 `dist/runtime/omp/context-extension.ts`、`dist/runtime/omp/goal-rpc.yml` 一起部署。扩展被打包为独立、包含其本地传递依赖的 TypeScript 文件，供 OMP 子进程读取；goal 配置和 preview acceptance test 也保持为外部文件，不依赖 channel 的 bunfs，test bundle 保留 `bun:test`。AOT watchdog 使用单独编译的轻量入口，保留隔离进程组、ready 握手、父进程退出后终止 worker 进程组及原有回收行为。
+常规 `bun run` 与 `bun link` 仍通过 Bun 运行源码；可选 `bun run build:aot` 会先检查 `bun build --help` 明确声明实验性 `--aot`，仅在支持该选项的 Bun 上为当前构建平台生成 `dist/oco`、独立的 `dist/oco-agent-runtime` 与 `dist/oco-watchdog`。发布时必须将三个可执行文件、`dist/tests/preview-card.acceptance.test.ts` 与 `dist/runtime/omp/` 一起部署。扩展被打包为独立、包含其本地传递依赖的 TypeScript 文件，供 OMP 子进程读取；goal、ratchet 配置和 preview acceptance test 也保持为外部文件，不依赖 channel 的 bunfs，test bundle 保留 `bun:test`。AOT watchdog 使用单独编译的轻量入口，保留隔离进程组、ready 握手、父进程退出后终止 worker 进程组及原有回收行为。
 
 `bun tests/benchmarks/aot.ts` 在临时目录构建，并用离线 Octo/OMP 子进程 fixture 覆盖 compiled CLI 的正常消息、watchdog、外部扩展与 goal 配置加载、`status` / `restart` 的程序识别，并通过假 Bun 验证 `test --card` 调用打包资源、加载 checkout `.envrc` 或显式 `OMP_CHANNEL_OCTO_ENV_FILE` 且不触发真实消息发送；它不注册 Bot、不调用模型服务。AOT 构建实验性且面向构建机器的平台；未构建产物前不应按源码运行方式部署。
 

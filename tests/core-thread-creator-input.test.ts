@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { mkdir } from "node:fs/promises";
@@ -169,7 +170,7 @@ async function invokeCreatorInput(
     );
     // Model the OMP host-tool result acknowledgement, after which replay must recover the same
     // result rather than accepting another parent task.
-    management.onResultAccepted?.(toolCallId);
+    management.onResultAccepted?.(toolCallId, createHash("sha256").update(result, "utf8").digest("hex"));
     return { actions, result };
   } catch (error) {
     return { actions, error: error instanceof Error ? error.message : String(error) };

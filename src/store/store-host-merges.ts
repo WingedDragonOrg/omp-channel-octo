@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { Database } from "bun:sqlite";
 import { isAbsolute } from "node:path";
 import type { ChatTarget, HostMergeOutcome, HostMergeProgressPhase, WorktreeMergeOutcome, WorktreeRemovalStep } from "../contracts.ts";
@@ -126,6 +127,24 @@ function resourceCwds(row: Record<string, unknown>, cwd: string): string[] {
   }
   return parsed as string[];
 }
+
+function resultHashes(row: Record<string, unknown>): string[] {
+  const encoded = asNullableString(row.result_hashes_json);
+  if (encoded === null) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(encoded);
+  } catch {
+    throw new Error("invalid persisted host merge result hashes");
+  }
+  if (
+    !Array.isArray(parsed)
+    || parsed.some((value) => typeof value !== "string" || !/^[0-9a-f]{64}$/u.test(value))
+  ) {
+    throw new Error("invalid persisted host merge result hashes");
+  }
+  return [...new Set(parsed as string[])];
+}
 function decodeHostMergeLease(row: Record<string, unknown>): HostMergeLeaseRecord {
   return {
     id: asString(row.id),
@@ -150,6 +169,7 @@ function decodeHostMergeLease(row: Record<string, unknown>): HostMergeLeaseRecor
     autoCommitDispatched: Number(row.auto_commit_dispatched ?? 1) !== 0,
     autoCommitResult: autoCommitResult(row.auto_commit_result_json),
     stopRequested: Number(row.stop_requested ?? 0) !== 0,
+    resultHashes: resultHashes(row),
     outcome: outcome(row),
     createdAt: Number(row.created_at ?? 0),
     updatedAt: Number(row.updated_at ?? 0),
@@ -481,25 +501,86 @@ export function completeHostMergeLease(db: Database, id: string, completion: Hos
 }
 
 
-export function settleHostMergeLease(db: Database, id: string): void {
+/** Append a result digest only when the caller proves it came from this exact durable outcome. */
+export function persistHostMergeResultHash(
+  db: Database,
+  id: string,
+  resultHash: string,
+  expectedOutcome: HostMergeOutcome,
+): boolean {
+  if (!/^[0-9a-f]{64}$/u.test(resultHash)) throw new Error("invalid host merge result hash");
+  let persisted = false;
+  transaction(db, () => {
+    const row = query(db, "SELECT * FROM host_merge_leases WHERE id = ? AND operation_kind = 'merge'", [id])[0];
+    if (
+      !row
+      || asNullableString(row.source_text) !== null
+      || asNullableString(row.auto_commit_task_id) !== null
+      || phase(row.phase) !== "exited"
+      || !isDeepStrictEqual(outcome(row), expectedOutcome)
+    ) return;
+    const hashes = resultHashes(row);
+    if (hashes.includes(resultHash)) {
+      persisted = true;
+      return;
+    }
+    const encodedHashes = asNullableString(row.result_hashes_json) ?? "[]";
+    const result = run(db,
+      `UPDATE host_merge_leases
+       SET result_hashes_json = ?, updated_at = ?
+       WHERE id = ? AND operation_kind = 'merge' AND source_text IS NULL
+         AND auto_commit_task_id IS NULL AND phase = 'exited'
+         AND not_started_text IS ? AND outcome_kind IS ? AND outcome_json IS ?
+         AND result_hashes_json IS ?`,
+      [
+        JSON.stringify([...hashes, resultHash]),
+        Date.now(),
+        id,
+        asNullableString(row.not_started_text),
+        asNullableString(row.outcome_kind),
+        asNullableString(row.outcome_json),
+        encodedHashes,
+      ],
+    );
+    persisted = result.changes === 1;
+  });
+  return persisted;
+}
+
+export function settleHostMergeLease(db: Database, id: string, acceptedResultHash?: string): void {
   const row = query(db, "SELECT * FROM host_merge_leases WHERE id = ? AND operation_kind = 'merge'", [id])[0];
   if (!row) return;
   if (phase(row.phase) !== "exited" || outcome(row) === null) {
     throw new Error("host merge result is not durably settleable");
   }
+  const persistedHashes = resultHashes(row);
+  if (acceptedResultHash !== undefined && (
+    !/^[0-9a-f]{64}$/u.test(acceptedResultHash)
+    || !persistedHashes.includes(acceptedResultHash)
+    || asNullableString(row.source_text) !== null
+    || asNullableString(row.auto_commit_task_id) !== null
+  )) {
+    throw new Error("accepted host merge result does not match its durable lease");
+  }
   const notStarted = asNullableString(row.not_started_text);
   const outcomeKind = asNullableString(row.outcome_kind);
   const outcomeJson = asNullableString(row.outcome_json);
+  const hashesJson = asNullableString(row.result_hashes_json) ?? "[]";
+  const directGuard = acceptedResultHash === undefined
+    ? ""
+    : "AND source_text IS NULL AND auto_commit_task_id IS NULL";
   const result = run(db,
     `DELETE FROM host_merge_leases
      WHERE id = ? AND operation_kind = 'merge' AND phase = 'exited'
-       AND not_started_text IS ? AND outcome_kind IS ? AND outcome_json IS ?`,
-    [id, notStarted, outcomeKind, outcomeJson],
+       AND not_started_text IS ? AND outcome_kind IS ? AND outcome_json IS ?
+       AND result_hashes_json IS ? ${directGuard}`,
+    [id, notStarted, outcomeKind, outcomeJson, hashesJson],
   );
   if (result.changes !== 1 && query(db, "SELECT 1 FROM host_merge_leases WHERE id = ? AND operation_kind = 'merge'", [id]).length > 0) {
     throw new Error("host merge result changed before settlement");
   }
 }
+
 
 export function getHostMergeLeaseBySourceId(
   db: Database,

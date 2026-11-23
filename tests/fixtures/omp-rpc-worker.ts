@@ -83,6 +83,11 @@ type Scenario =
 	| "interrupt"
 	| "crash"
 	| "host-tool"
+	| "host-tool-retry-both"
+	| "host-tool-retry-first-only"
+	| "host-tool-retry-second-only"
+	| "host-tool-retry-reverse-order"
+	| "host-tool-retry-unmatched"
 	| "host-unknown"
 	| "host-cancel"
 	| "host-stop"
@@ -365,6 +370,14 @@ let nativeAskFlow: NativeAskFlow | undefined;
 let pendingHostToolRequestId: string | undefined;
 let pendingHostToolCallId: string | undefined;
 let pendingHostToolName: string | undefined;
+type PendingHostToolRetryBatch = {
+	requestIds: readonly string[];
+	toolCallId: string;
+	toolName: string;
+	acceptedRequestIds: readonly string[];
+	results: Map<string, Frame>;
+};
+let pendingHostToolRetry: PendingHostToolRetryBatch | undefined;
 let streaming = false;
 /**
  * Id of the last completed local-only run, remembered so a later prompt can replay its
@@ -1099,6 +1112,33 @@ function emitHostToolCall(): void {
 		}, 20);
 	}
 }
+
+function emitHostToolRetryCalls(): void {
+	const requestIds = ["fixture-host-retry-1", "fixture-host-retry-2"] as const;
+	const acceptedRequestIds = scenario === "host-tool-retry-both"
+		? requestIds
+		: scenario === "host-tool-retry-first-only"
+			? [requestIds[0]]
+			: scenario === "host-tool-retry-second-only" || scenario === "host-tool-retry-unmatched"
+				? [requestIds[1]]
+				: [requestIds[1], requestIds[0]];
+	const toolCallId = "fixture-tool-call-retry";
+	const toolName = flag("--host-tool-name") ?? "fixture_echo";
+	pendingHostToolRetry = {
+		requestIds,
+		toolCallId,
+		toolName,
+		acceptedRequestIds,
+		results: new Map(),
+	};
+	emit({ type: "agent_start" });
+	for (const [index, id] of requestIds.entries()) {
+		const args = { attempt: index + 1 };
+		emit({ type: "tool_execution_start", toolCallId, toolName, args });
+		emit({ type: "host_tool_call", id, toolCallId, toolName, arguments: args });
+	}
+}
+
 function emitRatchetUiRequest(
 	mode: RatchetAskMode,
 	stage: "ask" | "input",
@@ -1660,6 +1700,39 @@ function completeHostToolTurn(command: Frame): void {
 		return;
 	}
 	emit({ type: "agent_end", messages: [message], willContinue: false });
+}
+
+function handleHostToolRetryResult(id: string | undefined, command: Frame): void {
+	const batch = pendingHostToolRetry;
+	if (!batch || id === undefined || !batch.requestIds.includes(id) || batch.results.has(id)) {
+		appendLog({ kind: "unexpected_host_tool_retry_result", id });
+		return;
+	}
+	batch.results.set(id, command);
+	appendLog({ kind: "host_tool_retry_result_received", id });
+	if (batch.results.size !== batch.requestIds.length) return;
+
+	// Delay completion events until both results are in flight to exercise payload-based association.
+	for (const requestId of batch.acceptedRequestIds) {
+		const result = batch.results.get(requestId);
+		if (!result) throw new Error(`missing host-tool retry result: ${requestId}`);
+		const resultPayload = scenario === "host-tool-retry-unmatched"
+			? { content: [{ type: "text", text: "unmatched tool result" }] }
+			: result.result && typeof result.result === "object" && !Array.isArray(result.result)
+				? result.result as Frame
+				: {};
+		emit({
+			type: "tool_execution_end",
+			toolCallId: batch.toolCallId,
+			toolName: batch.toolName,
+			result: { ...resultPayload, details: {} },
+			isError: result.isError === true,
+		});
+	}
+	pendingHostToolRetry = undefined;
+	emitAssistantMessage("fixture host tool retries completed", 0);
+	emit({ type: "agent_end", messages: [], willContinue: false });
+	appendLog({ kind: "host_tool_retry_complete", acceptedCount: batch.acceptedRequestIds.length });
 }
 
 /**
@@ -2743,6 +2816,16 @@ async function handlePrompt(id: string | undefined, message: string): Promise<vo
 		setTimeout(() => emitModelErrorScenario(id), 35);
 		return;
 	}
+	if (
+		scenario === "host-tool-retry-both"
+		|| scenario === "host-tool-retry-first-only"
+		|| scenario === "host-tool-retry-second-only"
+		|| scenario === "host-tool-retry-reverse-order"
+		|| scenario === "host-tool-retry-unmatched"
+	) {
+		emitHostToolRetryCalls();
+		return;
+	}
 	if (scenario === "host-tool" || scenario === "host-unknown" || scenario === "host-cancel" || scenario === "host-stop") {
 		emitHostToolCall();
 		return;
@@ -3395,6 +3478,16 @@ function handleCommand(command: Frame): void {
 		return;
 	}
 	if (type === "host_tool_result") {
+		if (
+			scenario === "host-tool-retry-both"
+			|| scenario === "host-tool-retry-first-only"
+			|| scenario === "host-tool-retry-second-only"
+			|| scenario === "host-tool-retry-reverse-order"
+			|| scenario === "host-tool-retry-unmatched"
+		) {
+			handleHostToolRetryResult(id, command);
+			return;
+		}
 		if (!pendingHostToolRequestId || id !== pendingHostToolRequestId) {
 			appendLog({ kind: "unexpected_host_tool_result", id });
 			return;

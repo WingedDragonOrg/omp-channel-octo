@@ -169,18 +169,20 @@ export interface TaskSchedulerDeps {
 }
 
 export class TaskScheduler {
-  /** 每个聊天的任务串行链：该聊天的下一个任务接在上一个（或已排定任务）之后。 */
-  private readonly chatTails = new Map<string, Promise<void>>();
   /** 已排定任务操作：同 session 的较早任务据此等待。 */
   private readonly scheduledTasks = new Map<string, Promise<void>>();
   /** 关停要等的在途任务（已排定任务的操作）。 */
   private readonly taskOperations = new Set<Promise<void>>();
+  /** A retry requested while an existing queued operation is still settling. */
+  private readonly retryAfterSettlement = new Set<string>();
+  /** Later tasks parked behind a queued commit wake only when that commit operation terminates. */
+  private readonly queuedCommitDependents = new Map<string, Set<string>>();
   /** In-memory marker used to add the startup receipt to tasks that waited for their chat/session. */
   private readonly waiting = new Set<string>();
   /** Tasks and session commands share per-session and per-chat lease tails. */
   private readonly sessionTails = new Map<string, Promise<void>>();
   private readonly sessionLeaseOwners = new Map<string, Set<SessionLeaseOwner>>();
-  /** Scheduling order lets command barriers distinguish earlier work from later task tails. */
+  /** Durable order lets barriers distinguish earlier tasks from later scheduled tasks. */
   private readonly scheduledOrder = new Map<string, number>();
   private readonly commandReservations = new Set<CommandReservationRecord>();
   /** Ordinary workers and session-control workers are shared resource users. */
@@ -225,6 +227,58 @@ export class TaskScheduler {
   scheduleStartedTask(taskId: string): void {
     this.schedule(taskId, "running");
   }
+  /** Re-schedule durable queue entries after a temporary directory block is released. */
+  retryQueuedTasks(): void {
+    if (this.deps.stopping()) return;
+    const queued = this.deps.store.listQueuedTasks();
+    queued.sort((left, right) => this.taskOrder(left.id) - this.taskOrder(right.id));
+    for (const task of queued) {
+      if (this.scheduledTasks.has(task.id)) this.retryAfterSettlement.add(task.id);
+      else this.scheduleTask(task.id);
+    }
+  }
+
+  /** Notify parked work when a task reaches a terminal state outside scheduler cleanup. */
+  notifyTaskTerminal(taskId: string): void {
+    const state = this.deps.store.getTask(taskId)?.state;
+    if (state === "queued" || state === "running") return;
+    this.wakeQueuedCommitDependents(taskId);
+  }
+
+  private registerQueuedCommitDependent(commitTaskId: string, taskId: string): void {
+    const dependents = this.queuedCommitDependents.get(commitTaskId) ?? new Set<string>();
+    dependents.add(taskId);
+    this.queuedCommitDependents.set(commitTaskId, dependents);
+  }
+
+  private forgetQueuedCommitDependent(commitTaskId: string, taskId: string): void {
+    const dependents = this.queuedCommitDependents.get(commitTaskId);
+    if (!dependents) return;
+    dependents.delete(taskId);
+    if (dependents.size === 0) this.queuedCommitDependents.delete(commitTaskId);
+  }
+
+  private forgetTaskFromQueuedCommitDependents(taskId: string): void {
+    if (this.deps.store.getTask(taskId)?.state === "queued") return;
+    for (const [commitTaskId, dependents] of this.queuedCommitDependents) {
+      dependents.delete(taskId);
+      if (dependents.size === 0) this.queuedCommitDependents.delete(commitTaskId);
+    }
+  }
+
+  private wakeQueuedCommitDependents(commitTaskId: string): void {
+    const dependents = this.queuedCommitDependents.get(commitTaskId);
+    if (!dependents) return;
+    const commit = this.deps.store.getTask(commitTaskId);
+    if (commit?.state === "queued" || commit?.state === "running") return;
+    this.queuedCommitDependents.delete(commitTaskId);
+    if (this.deps.stopping()) return;
+    for (const taskId of dependents) {
+      if (this.deps.store.getTask(taskId)?.state !== "queued") continue;
+      if (this.scheduledTasks.has(taskId)) this.retryAfterSettlement.add(taskId);
+      else this.scheduleTask(taskId);
+    }
+  }
 
   private schedule(taskId: string, state: "queued" | "running"): void {
     if (this.scheduledTasks.has(taskId)) return;
@@ -232,19 +286,46 @@ export class TaskScheduler {
     if (!task) return;
     const order = this.taskOrder(taskId);
     this.scheduledOrder.set(taskId, order);
-    const target = taskTarget(task);
-    const chatKey = targetKey(target);
-    const previousChat = this.chatTails.get(chatKey) ?? Promise.resolve();
-    const next = previousChat.catch(() => {}).then(() => this.runScheduledTask(taskId, state));
-    this.chatTails.set(chatKey, next);
+    const chatKey = targetKey(taskTarget(task));
+    // Re-tries must not join behind later chat work: its FIFO checks may be waiting on this task.
+    const predecessors = [...this.scheduledTasks.entries()]
+      .filter(([scheduledTaskId]) => {
+        if (scheduledTaskId === taskId) return false;
+        const scheduledOrder = this.scheduledOrder.get(scheduledTaskId);
+        if (scheduledOrder === undefined || scheduledOrder >= order) return false;
+        const scheduledTask = this.deps.store.getTask(scheduledTaskId);
+        return scheduledTask !== null && targetKey(taskTarget(scheduledTask)) === chatKey;
+      })
+      .map(([, operation]) => operation);
+    const next = Promise.allSettled(predecessors).then(async () => {
+      let expectedState = state;
+      for (;;) {
+        await this.runScheduledTask(taskId, expectedState);
+        const retry = this.retryAfterSettlement.delete(taskId);
+        if (
+          !retry
+          || this.deps.stopping()
+          || this.deps.store.getTask(taskId)?.state !== "queued"
+        ) return;
+        expectedState = "queued";
+      }
+    });
     this.scheduledTasks.set(taskId, next);
     this.taskOperations.add(next);
     const cleanup = () => {
-      if (this.chatTails.get(chatKey) === next) this.chatTails.delete(chatKey);
       if (this.scheduledTasks.get(taskId) === next) this.scheduledTasks.delete(taskId);
       if (this.scheduledOrder.get(taskId) === order) this.scheduledOrder.delete(taskId);
       this.taskOperations.delete(next);
+      this.forgetTaskFromQueuedCommitDependents(taskId);
+      this.wakeQueuedCommitDependents(taskId);
+      const retry = this.retryAfterSettlement.delete(taskId);
+      if (
+        retry
+        && !this.deps.stopping()
+        && this.deps.store.getTask(taskId)?.state === "queued"
+      ) this.scheduleTask(taskId);
     };
+
     void next.then(cleanup, cleanup);
   }
 
@@ -493,8 +574,7 @@ export class TaskScheduler {
     }
     const order = lease.order;
     this.scheduledOrder.set(taskId, order);
-    // Do not chain this after chatTails: a later task may already be waiting on this commit's
-    // FIFO intent, so chaining behind it would deadlock. The root/session barriers serialize it.
+    // Durable session/root reservations serialize this commit without chaining behind later tasks.
     const next = Promise.resolve().then(async () => {
       try {
         await this.deps.awaitStartReady();
@@ -517,6 +597,14 @@ export class TaskScheduler {
       if (this.scheduledTasks.get(taskId) === next) this.scheduledTasks.delete(taskId);
       if (this.scheduledOrder.get(taskId) === order) this.scheduledOrder.delete(taskId);
       this.taskOperations.delete(next);
+      this.forgetTaskFromQueuedCommitDependents(taskId);
+      this.wakeQueuedCommitDependents(taskId);
+      const retry = this.retryAfterSettlement.delete(taskId);
+      if (
+        retry
+        && !this.deps.stopping()
+        && this.deps.store.getTask(taskId)?.state === "queued"
+      ) this.scheduleTask(taskId);
     };
     void next.then(cleanup, cleanup);
   }
@@ -677,11 +765,20 @@ export class TaskScheduler {
     };
   }
 
+  private hasScheduledChatWork(target: ChatTarget): boolean {
+    const key = targetKey(target);
+    for (const taskId of this.scheduledTasks.keys()) {
+      const task = this.deps.store.getTask(taskId);
+      if (task !== null && targetKey(taskTarget(task)) === key) return true;
+    }
+    return false;
+  }
+
   hasChatWork(target: ChatTarget): boolean {
     const key = targetKey(target);
     const binding = this.bindingFor(target);
     const sessionKeys = new Set(this.leaseKeys(target, this.sessionKey(target, binding)));
-    return this.chatTails.has(key)
+    return this.hasScheduledChatWork(target)
       || this.deps.store.listQueuedTasks().some(task => targetKey(taskTarget(task)) === key)
       || [...this.commandReservations].some(reservation =>
         reservation.sessionKeys.some(sessionKey => sessionKeys.has(sessionKey)),
@@ -1379,7 +1476,7 @@ export class TaskScheduler {
   }
 
   private hasLeaseFor(target: ChatTarget, sessionKey: string): boolean {
-    if (this.chatTails.has(targetKey(target))) return true;
+    if (this.hasScheduledChatWork(target)) return true;
     return this.leaseKeys(target, sessionKey).some((key) => this.sessionTails.has(key));
   }
 
@@ -1533,6 +1630,33 @@ export class TaskScheduler {
     return operations;
   }
 
+  private async earliestQueuedCommitInRepository(
+    taskId: string,
+    taskOrder: number,
+    repositoryRoot: string,
+  ): Promise<TaskRecord | undefined> {
+    const candidates = this.deps.store.listQueuedTasks()
+      .filter(candidate =>
+        candidate.id !== taskId
+        && this.taskOrder(candidate.id) < taskOrder
+        && this.isCommitTask(candidate))
+      .sort((left, right) => this.taskOrder(left.id) - this.taskOrder(right.id));
+    for (const candidate of candidates) {
+      const target = taskTarget(candidate);
+      const binding = await this.deps.reconcileBinding(
+        candidate.id,
+        target,
+        this.bindingFor(target),
+      );
+      const current = this.deps.store.getTask(candidate.id);
+      if (!current || current.state !== "queued") continue;
+      const root = await this.deps.repositoryRoot(binding?.cwd ?? current.cwd);
+      const latest = this.deps.store.getTask(candidate.id);
+      if (root === repositoryRoot && latest?.state === "queued") return latest;
+    }
+    return undefined;
+  }
+
   private async failRepositoryProbe(taskId: string, target: ChatTarget): Promise<void> {
     const current = this.deps.store.getTask(taskId);
     if (!current || current.state !== "queued") return;
@@ -1601,6 +1725,11 @@ export class TaskScheduler {
           return;
         }
 
+        if (
+          expectedState === "queued"
+          && this.hasQueuedWork(target, sessionKey, taskOrder, taskId)
+        ) return;
+
         const beforeLease = this.deps.store.getTask(taskId);
         if (this.deps.stopping() || !beforeLease || beforeLease.state !== expectedState) return;
         const beforeTarget = taskTarget(beforeLease);
@@ -1650,6 +1779,15 @@ export class TaskScheduler {
           await this.failRepositoryProbe(taskId, beforeTarget);
           return;
         }
+        if (
+          expectedState === "queued"
+          && this.hasQueuedWork(beforeTarget, currentSessionKey, taskOrder, taskId)
+        ) {
+          lease.complete();
+          lease = undefined;
+          return;
+        }
+
 
         let activeRoot: string | undefined;
         if (!commitTask && !skipRepositoryOrdering) {
@@ -1669,7 +1807,54 @@ export class TaskScheduler {
             }
             // Keep accepted work queued while an unconfirmed worker owns this Git worktree.
             if (blocked) return;
+            let earlierCommit: TaskRecord | undefined;
+            try {
+              earlierCommit = await this.earliestQueuedCommitInRepository(taskId, taskOrder, root);
+            } catch {
+              await this.failRepositoryProbe(taskId, beforeTarget);
+              return;
+            }
+            if (earlierCommit) {
+              lease.complete();
+              lease = undefined;
+              const earlierTaskId = earlierCommit.id;
+              let operation = this.scheduledTasks.get(earlierTaskId);
+              if (!operation) {
+                await this.waitForPriorReservations(
+                  beforeTarget,
+                  currentSessionKey,
+                  taskOrder,
+                  currentCwd,
+                );
+                operation = this.scheduledTasks.get(earlierTaskId);
+              }
+              if (operation) await operation.catch(() => {});
+
+              const earlierState = this.deps.store.getTask(earlierTaskId)?.state;
+              if (earlierState === "queued" || earlierState === "running") {
+                this.registerQueuedCommitDependent(earlierTaskId, taskId);
+                const latestState = this.deps.store.getTask(earlierTaskId)?.state;
+                if (latestState === "queued" || latestState === "running") {
+                  // Let commit settlement or a later block-release retry wake this task.
+                  this.retryAfterSettlement.delete(taskId);
+                  return;
+                }
+                this.forgetQueuedCommitDependent(earlierTaskId, taskId);
+              }
+              continue;
+            }
+
+            let blockedAfterProbe: boolean;
+            try {
+              blockedAfterProbe = await this.repositoryIsBlocked(root);
+            } catch {
+              blockedAfterProbe = true;
+            }
+            // Ordering probes yielded; close any same-root directory block before synchronous publication.
+            if (blockedAfterProbe || this.deps.isDirectoryBlocked(root)) return;
             activeRoot = root;
+          } else if (this.deps.isDirectoryBlocked(currentCwd)) {
+            return;
           }
         }
         const blocker = this.exclusiveResourceBlocker(currentCwd, activeRoot ?? null, taskId);
@@ -1689,15 +1874,8 @@ export class TaskScheduler {
         try {
           await this.deps.runTask(taskId, currentCwd);
         } finally {
-          if (activeRoot !== undefined && this.activeResourceUsers.get(taskId) === activeUse) {
-            let blocked = true;
-            try {
-              blocked = await this.repositoryIsBlocked(activeRoot);
-            } catch {
-              // Keep unconfirmed activity until restart, when worker recovery rechecks it.
-            }
-            if (!blocked) this.activeResourceUsers.delete(taskId);
-          } else if (!this.deps.isDirectoryBlocked(currentCwd)) {
+          // Unknown workers remain protected by the service-owned directory block, not this task lease.
+          if (this.activeResourceUsers.get(taskId) === activeUse) {
             this.activeResourceUsers.delete(taskId);
           }
         }

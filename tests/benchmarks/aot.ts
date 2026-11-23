@@ -4,12 +4,108 @@ import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { runRestartBenchmark } from "./restart.ts";
+import { connectAgentRuntime, type EnsureAgentRuntimeResult } from "../../src/runtime/agent-runtime.ts";
 
 const checkout = resolve(import.meta.dir, "../..");
 const root = await realpath(await mkdtemp(join(tmpdir(), "oco-aot-benchmark-")));
 const binary = join(root, "dist", "oco");
 const runtimeAssets = join(dirname(binary), "runtime", "omp");
 
+async function connectToAotRuntime(
+  child: Bun.Subprocess,
+  stateDir: string,
+  botUid: string,
+): Promise<EnsureAgentRuntimeResult> {
+  const deadline = Date.now() + 15_000;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) {
+      throw new Error(`AOT agent runtime exited before becoming available: ${String(lastError)}`);
+    }
+    try {
+      return await connectAgentRuntime({ stateDir, botUid });
+    } catch (error) {
+      lastError = error;
+      await Bun.sleep(25);
+    }
+  }
+  throw new Error(`AOT agent runtime did not become available: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
+}
+
+async function waitForChildExit(child: Bun.Subprocess, timeoutMs = 5_000): Promise<number> {
+  const { promise, reject } = Promise.withResolvers<never>();
+  const timer = setTimeout(() => reject(new Error("AOT agent runtime did not exit")), timeoutMs);
+  try {
+    return await Promise.race([child.exited, promise]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function verifyAotRuntimeRestart(runtimeExecutable: string, root: string): Promise<void> {
+  const stateDir = join(root, "aot-agent-runtime-state");
+  const configPath = join(root, "aot-agent-runtime.json");
+  const botUid = "aot-agent-runtime-benchmark";
+  await writeFile(configPath, JSON.stringify({ stateDir, botUid, ompCommand: "/bin/false" }), { mode: 0o600 });
+  // queryProcess fingerprints `ps lstart`; match the connector's timezone and locale.
+  const env: NodeJS.ProcessEnv = {
+    HOME: root,
+    PATH: "/usr/bin:/bin",
+    ...(process.env.LANG === undefined ? {} : { LANG: process.env.LANG }),
+    ...(process.env.LC_ALL === undefined ? {} : { LC_ALL: process.env.LC_ALL }),
+    ...(process.env.LC_TIME === undefined ? {} : { LC_TIME: process.env.LC_TIME }),
+    ...(process.env.TZ === undefined ? {} : { TZ: process.env.TZ }),
+  };
+  const daemons: Bun.Subprocess[] = [];
+  let connected: EnsureAgentRuntimeResult | undefined;
+  try {
+    const launch = (): Bun.Subprocess => {
+      const child = Bun.spawn([runtimeExecutable, configPath], {
+        cwd: root,
+        env,
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "inherit",
+      });
+      daemons.push(child);
+      return child;
+    };
+    const first = launch();
+    connected = await connectToAotRuntime(first, stateDir, botUid);
+    assert.equal(connected.handle.pid, first.pid, "The standalone AOT daemon owns the runtime process");
+    const firstRuntimeId = connected.handle.runtimeId;
+    await connected.client.disconnect();
+    await connected.handle.shutdown();
+    assert.equal(await waitForChildExit(first), 0, "The standalone AOT daemon shuts down cleanly");
+    connected = undefined;
+
+    const second = launch();
+    connected = await connectToAotRuntime(second, stateDir, botUid);
+    assert.equal(connected.handle.pid, second.pid, "Cold start uses the standalone AOT daemon executable");
+    assert.notEqual(connected.handle.runtimeId, firstRuntimeId, "A cold daemon restart creates a new runtime identity");
+    await connected.client.disconnect();
+    await connected.handle.shutdown();
+    assert.equal(await waitForChildExit(second), 0, "The restarted AOT daemon shuts down cleanly");
+    connected = undefined;
+  } finally {
+    if (connected) {
+      await connected.client.disconnect().catch(() => {});
+      await connected.handle.shutdown().catch(() => {});
+    }
+    for (const child of daemons) {
+      if (child.exitCode !== null) continue;
+      child.kill("SIGTERM");
+      try {
+        await waitForChildExit(child);
+      } catch {
+        child.kill("SIGKILL");
+        await child.exited;
+      }
+    }
+  }
+}
+
+const agentRuntimeExecutable = join(dirname(binary), "oco-agent-runtime");
 try {
   const build = Bun.spawn([process.execPath, join(checkout, "scripts/build-aot.ts"), binary], {
     cwd: checkout,
@@ -21,6 +117,7 @@ try {
   assert.equal(buildCode, 0, "AOT channel build succeeds");
   assert.ok(existsSync(join(dirname(binary), "oco-watchdog")), "AOT watchdog companion is built");
 
+  assert.ok(existsSync(agentRuntimeExecutable), "AOT agent runtime daemon is a separate executable");
   const extensionPath = join(runtimeAssets, "context-extension.ts");
   const goalConfigPath = join(runtimeAssets, "goal-rpc.yml");
   const ratchetConfigPath = join(runtimeAssets, "ratchet-rpc.yml");
@@ -37,6 +134,7 @@ try {
   assert.equal(await loader.exited, 0, "an independent Bun/OMP process loads the external extension and goal config");
   const previewTestPath = join(dirname(binary), "tests", "preview-card.acceptance.test.ts");
   assert.ok(existsSync(previewTestPath), "AOT preview test is a packaged external Bun test asset");
+  await verifyAotRuntimeRestart(agentRuntimeExecutable, root);
   const previewBin = join(root, "preview-bin");
   const previewArgsPath = join(root, "preview-bun-args.txt");
   const previewEnvPath = join(root, "preview-env-status.txt");
@@ -140,7 +238,7 @@ exit 2
 
 
   await runRestartBenchmark(binary);
-  console.log("AOT offline CLI, supervisor detection, watchdog, extension assets, and normal message path passed");
+  console.log("AOT offline CLI, standalone agent-runtime cold start/restart, supervisor detection, watchdog, extension assets, and normal message path passed");
 } finally {
   await rm(root, { recursive: true, force: true });
 }

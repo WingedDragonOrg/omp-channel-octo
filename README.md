@@ -426,7 +426,7 @@ bun tests/benchmarks/restart.ts
 bun run build:aot
 ```
 
-请将 `dist/oco`、`dist/oco-watchdog`、`dist/tests/preview-card.acceptance.test.ts` 和 `dist/runtime/omp/` 一起部署；preview test、OMP 扩展、goal 与 ratchet RPC 配置都是可读的外部资源。常规 `bun run` / `bun link` 仍运行源码。AOT 的 `status` / `restart` 按编译程序路径识别 Super，不依赖二进制目录作为工作目录；`test --card` 使用打包测试资源并调用 Bun test。离线回归会用假 Bun 校验参数，不发送真实消息；另验证 watchdog、扩展加载和正常消息路径，不连接真实 Bot 或模型：
+请将 `dist/oco`、`dist/oco-agent-runtime`、`dist/oco-watchdog`、`dist/tests/preview-card.acceptance.test.ts` 和 `dist/runtime/omp/` 一起部署；preview test、OMP 扩展、goal 与 ratchet RPC 配置都是可读的外部资源。常规 `bun run` / `bun link` 仍运行源码。AOT 的 `status` / `restart` 按编译程序路径识别 Super，不依赖二进制目录作为工作目录；`test --card` 使用打包测试资源并调用 Bun test。离线回归会用假 Bun 校验参数，不发送真实消息；另验证 watchdog、扩展加载和正常消息路径，不连接真实 Bot 或模型：
 
 ```sh
 bun tests/benchmarks/aot.ts

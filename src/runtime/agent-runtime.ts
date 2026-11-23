@@ -4,6 +4,7 @@ import {
   closeSync,
   fsyncSync,
   openSync,
+  realpathSync,
   renameSync,
   writeFileSync,
 } from "node:fs";
@@ -33,6 +34,7 @@ import type { ProjectSessionState } from "../session/project-session.ts";
 import { createWorkerFactory } from "../omp/index.ts";
 import { OCTO_CLI_ENV_ALLOWLIST } from "./octo-cli.ts";
 import { queryProcess } from "../omp/process.ts";
+import { IS_AOT_BINARY } from "./aot-runtime.ts";
 import {
   AGENT_RUNTIME_PROTOCOL_VERSION,
   type AgentRuntimeAttachWorkerInput,
@@ -88,6 +90,9 @@ type WorkerRecord = {
   snapshot: StoredWorker;
   worker?: OmpWorker;
   calls: Map<string, PendingHostCall>;
+  cancelledCalls: Map<string, PendingHostCall>;
+  acceptedToolResults: Map<string, AcceptedHostToolResult>;
+  hostToolResultHashes: Map<string, Map<string, string[]>>;
 };
 
 type PendingHostCall = {
@@ -100,6 +105,13 @@ type PendingHostCall = {
   resolve: (text: string) => void;
   reject: (error: Error) => void;
   settled: boolean;
+};
+type AcceptedHostToolResult = {
+  ackId: string;
+  dispatchId: string;
+  toolName: string;
+  toolCallId: string;
+  resultHash: string;
 };
 
 type RuntimeConnection = {
@@ -117,13 +129,66 @@ type PendingRequest = {
 };
 
 type RuntimeClientConnection = {
-  socket: Socket;
+  socket: Socket | undefined;
+  connectingSocket: Socket | undefined;
   epoch: number;
-  buffer: string;
   pending: Map<string, PendingRequest>;
   eventListeners: Set<(event: RuntimeEvent) => void>;
   closed: boolean;
+  available: boolean;
+  error?: Error;
+  reconnecting: Promise<void> | undefined;
 };
+
+type RuntimeClientIdentity = Pick<
+  RuntimeManifest,
+  "protocolVersion" | "botUid" | "runtimeId" | "pid" | "processIdentity" | "socketPath" | "secret"
+> & { manifestPath: string };
+
+type RuntimeWorkerRegistration = {
+  input: AttachWorkerInput;
+  snapshot?: AgentRuntimeWorkerSnapshot;
+  attachedEpoch?: number;
+};
+
+type RuntimeWatch = {
+  readonly key: string;
+  readonly taskId: string;
+  readonly runId: string;
+  readonly dispatchId: string;
+  cursor: number;
+  readonly onEvent: AgentRuntimeWatchEvent;
+  readonly promise: Promise<AgentRunState>;
+  readonly resolve: (state: AgentRunState) => void;
+  readonly reject: (error: Error) => void;
+  armedEpoch: number | undefined;
+  pendingEvents: RuntimeEvent[];
+  settled: boolean;
+};
+
+type ExecutingHostTool = {
+  readonly taskId: string;
+  readonly runId: string;
+  readonly dispatchId: string;
+  readonly toolCallId?: string;
+  readonly controller: AbortController;
+  result?: { readonly isError: boolean; readonly result: string };
+  delivery?: Promise<void> | undefined;
+};
+
+class RuntimeConnectionLostError extends Error {
+  constructor() {
+    super("Agent runtime channel disconnected");
+    this.name = "RuntimeConnectionLostError";
+  }
+}
+
+class RuntimeIdentityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RuntimeIdentityError";
+  }
+}
 
 type RuntimeEvent = {
   event: string;
@@ -247,6 +312,9 @@ function promptContextForWire(context: PromptContext | undefined): AgentRuntimeP
 
 function fingerprint(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+function hashHostToolResult(result: string): string {
+  return createHash("sha256").update(result).digest("hex");
 }
 
 function dispatchSnapshot(dispatch: StoredDispatch): AgentRuntimeDispatchSnapshot {
@@ -516,6 +584,9 @@ export class AgentRuntimeServer {
       const record: WorkerRecord = {
         snapshot: { ...previous, runtimeId: this.runtimeId, sessionKeys: [...(previous.sessionKeys ?? [])] },
         calls: new Map(),
+        cancelledCalls: new Map(),
+        acceptedToolResults: new Map(),
+        hostToolResultHashes: new Map(),
       };
       if (record.snapshot.sessionKeys.length === 0) {
         if (record.snapshot.sessionFile) record.snapshot.sessionKeys.push(`file:${resolve(record.snapshot.sessionFile)}`);
@@ -669,6 +740,8 @@ export class AgentRuntimeServer {
       const record = this.#getRecord(args as unknown as AttachWorkerInput);
       await this.#assertLiveIdentity(record);
       this.#resendPendingCalls(record);
+      this.#resendCancelledCalls(record);
+      this.#resendAcceptedToolResults(record);
       return workerSnapshot(record.snapshot);
     }
     if (operation === "detach-worker") {
@@ -704,11 +777,40 @@ export class AgentRuntimeServer {
       const record = this.#getRecord(args as unknown as AttachWorkerInput);
       const callId = String(args.callId);
       const call = record.calls.get(callId);
-      if (!call || call.settled) return { accepted: false };
+      if (!call || call.settled) {
+        record.cancelledCalls.delete(callId);
+        return { accepted: false };
+      }
+      const isError = args.isError === true;
+      const result = String(args.result ?? (isError ? "Host tool failed" : ""));
+      this.#rememberHostToolResult(record, call.dispatchId, call.toolName, call.toolCallId, result);
       call.settled = true;
-      if (args.isError === true) call.reject(new Error(String(args.result ?? "Host tool failed")));
-      else call.resolve(String(args.result ?? ""));
+      if (isError) call.reject(new Error(result));
+      else call.resolve(result);
       record.calls.delete(callId);
+      record.cancelledCalls.delete(callId);
+      return { accepted: true };
+    }
+    if (operation === "host-tool-cancel-ack") {
+      const record = this.#getRecord(args as unknown as AttachWorkerInput);
+      const callId = String(args.callId ?? "");
+      const call = record.cancelledCalls.get(callId);
+      if (!call) return { accepted: false };
+      if (call.dispatchId !== String(args.dispatchId ?? "")) throw new Error("Host tool cancellation identity does not match");
+      record.cancelledCalls.delete(callId);
+      return { accepted: true };
+    }
+    if (operation === "host-tool-result-accepted-ack") {
+      const record = this.#getRecord(args as unknown as AttachWorkerInput);
+      const ackId = String(args.ackId ?? "");
+      const accepted = record.acceptedToolResults.get(ackId);
+      if (!accepted) return { accepted: false };
+      if (
+        accepted.dispatchId !== String(args.dispatchId ?? "")
+        || accepted.toolCallId !== String(args.toolCallId ?? "")
+        || accepted.resultHash !== String(args.resultHash ?? "")
+      ) throw new Error("Host tool result acceptance identity does not match");
+      record.acceptedToolResults.delete(ackId);
       return { accepted: true };
     }
     if (operation === "worker-operation") {
@@ -767,7 +869,13 @@ export class AgentRuntimeServer {
       sessionKeys,
       dispatchMap: {},
     };
-    const record: WorkerRecord = { snapshot, calls: new Map() };
+    const record: WorkerRecord = {
+      snapshot,
+      calls: new Map(),
+      cancelledCalls: new Map(),
+      acceptedToolResults: new Map(),
+      hostToolResultHashes: new Map(),
+    };
     this.#workers.set(key, record);
     for (const sessionKey of sessionKeys) this.#sessionOwners.set(sessionKey, key);
     this.#persistLedger();
@@ -975,6 +1083,7 @@ export class AgentRuntimeServer {
       dispatch.error = errorText(error);
     } finally {
       if (record.snapshot.activeDispatchId === dispatch.dispatchId) record.snapshot.activeDispatchId = null;
+      record.hostToolResultHashes.delete(dispatch.dispatchId);
       if (record.snapshot.stage === "active") record.snapshot.stage = "omp-ready";
       record.snapshot.dispatches = Object.values(record.snapshot.dispatchMap).map(dispatchSnapshot);
       this.#persistLedger();
@@ -988,14 +1097,52 @@ export class AgentRuntimeServer {
     const tools: HostTool[] | undefined = context.tools?.map(descriptor => ({
       ...descriptor,
       execute: (args, signal, toolCallId) => this.#callHostTool(record, dispatch, descriptor.name, args, signal, toolCallId),
-      onResultAccepted: toolCallId => {
-        this.#sendEvent({ event: "host-tool-result-accepted", taskId: record.snapshot.taskId, runId: record.snapshot.runId, dispatchId: dispatch.dispatchId, value: { toolCallId, toolName: descriptor.name } });
+      onResultAccepted: (toolCallId, acceptedHash) => {
+        const resultHashes = record.hostToolResultHashes.get(dispatch.dispatchId);
+        if (!resultHashes) return;
+        const resultKey = JSON.stringify([descriptor.name, toolCallId]);
+        const hashes = resultHashes.get(resultKey);
+        if (!hashes) return;
+        // Within this dispatch/tool/call identity, identical result digests are interchangeable.
+        const matchIndex = hashes.indexOf(acceptedHash);
+        if (matchIndex === -1) return;
+        hashes.splice(matchIndex, 1);
+        if (hashes.length === 0) resultHashes.delete(resultKey);
+        if (resultHashes.size === 0) record.hostToolResultHashes.delete(dispatch.dispatchId);
+        const resultHash = acceptedHash;
+        const accepted: AcceptedHostToolResult = {
+          ackId: randomUUID(),
+          dispatchId: dispatch.dispatchId,
+          toolName: descriptor.name,
+          toolCallId,
+          resultHash,
+        };
+        record.acceptedToolResults.set(accepted.ackId, accepted);
+        this.#sendAcceptedToolResult(record, accepted);
       },
     }));
     return {
       ...(context.contextInjection === undefined ? {} : { contextInjection: context.contextInjection }),
       ...(tools === undefined ? {} : { tools }),
     };
+  }
+  #rememberHostToolResult(
+    record: WorkerRecord,
+    dispatchId: string,
+    toolName: string,
+    toolCallId: string | undefined,
+    result: string,
+  ): void {
+    if (toolCallId === undefined) return;
+    let hashesByCall = record.hostToolResultHashes.get(dispatchId);
+    if (!hashesByCall) {
+      hashesByCall = new Map();
+      record.hostToolResultHashes.set(dispatchId, hashesByCall);
+    }
+    const key = JSON.stringify([toolName, toolCallId]);
+    const hashes = hashesByCall.get(key) ?? [];
+    hashes.push(hashHostToolResult(result));
+    hashesByCall.set(key, hashes);
   }
 
   #callHostTool(
@@ -1006,7 +1153,11 @@ export class AgentRuntimeServer {
     signal: AbortSignal,
     toolCallId?: string,
   ): Promise<string> {
-    if (signal.aborted) return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error("Host tool cancelled"));
+    if (signal.aborted) {
+      const error = signal.reason instanceof Error ? signal.reason : new Error("Host tool cancelled");
+      this.#rememberHostToolResult(record, dispatch.dispatchId, toolName, toolCallId, error.message);
+      return Promise.reject(error);
+    }
     const callId = randomUUID();
     const pending = Promise.withResolvers<string>();
     const call: PendingHostCall = {
@@ -1021,14 +1172,15 @@ export class AgentRuntimeServer {
       settled: false,
     };
     const onAbort = (): void => {
+      if (call.settled) return;
       const error = signal.reason instanceof Error ? signal.reason : new Error("Host tool cancelled");
       call.controller.abort(error);
-      this.#sendEvent({ event: "host-tool-cancel", taskId: record.snapshot.taskId, runId: record.snapshot.runId, dispatchId: dispatch.dispatchId, value: { callId } });
-      if (!call.settled) {
-        call.settled = true;
-        call.reject(error);
-        record.calls.delete(callId);
-      }
+      record.cancelledCalls.set(callId, call);
+      this.#sendCancelledHostCall(record, call);
+      call.settled = true;
+      this.#rememberHostToolResult(record, call.dispatchId, call.toolName, call.toolCallId, error.message);
+      call.reject(error);
+      record.calls.delete(callId);
     };
     signal.addEventListener("abort", onAbort, { once: true });
     record.calls.set(callId, call);
@@ -1053,6 +1205,33 @@ export class AgentRuntimeServer {
   #resendPendingCalls(record?: WorkerRecord): void {
     const records = record ? [record] : [...this.#workers.values()];
     for (const item of records) for (const call of item.calls.values()) this.#sendHostCall(item, call);
+  }
+  #resendCancelledCalls(record: WorkerRecord): void {
+    for (const call of record.cancelledCalls.values()) this.#sendCancelledHostCall(record, call);
+  }
+
+  #sendCancelledHostCall(record: WorkerRecord, call: PendingHostCall): void {
+    this.#sendEvent({
+      event: "host-tool-cancel",
+      taskId: record.snapshot.taskId,
+      runId: record.snapshot.runId,
+      dispatchId: call.dispatchId,
+      value: { callId: call.callId },
+    });
+  }
+
+  #resendAcceptedToolResults(record: WorkerRecord): void {
+    for (const accepted of record.acceptedToolResults.values()) this.#sendAcceptedToolResult(record, accepted);
+  }
+
+  #sendAcceptedToolResult(record: WorkerRecord, accepted: AcceptedHostToolResult): void {
+    this.#sendEvent({
+      event: "host-tool-result-accepted",
+      taskId: record.snapshot.taskId,
+      runId: record.snapshot.runId,
+      dispatchId: accepted.dispatchId,
+      value: accepted,
+    });
   }
 
   async #workerOperation(
@@ -1090,7 +1269,7 @@ export async function ensureAgentRuntime(options: AgentRuntimeLaunchOptions): Pr
   await mkdir(paths.socketDir, { recursive: true, mode: 0o700 });
   await chmod(paths.socketDir, 0o700);
   const connect = async (manifest: RuntimeManifest): Promise<EnsureAgentRuntimeResult> => {
-    const client = await connectManifest(manifest, options.botUid, Math.max(1_000, options.startupTimeoutMs ?? DAEMON_START_TIMEOUT_MS));
+    const client = await connectManifest(manifest, options.botUid, Math.max(1_000, options.startupTimeoutMs ?? DAEMON_START_TIMEOUT_MS), paths.manifestPath);
     await client.updateCliEnv(options.cliEnv);
     return { handle: handleFor(manifest), client };
   };
@@ -1111,8 +1290,10 @@ export async function ensureAgentRuntime(options: AgentRuntimeLaunchOptions): Pr
   };
   atomicWriteJson(paths.configPath, config);
   await chmod(paths.configPath, 0o600);
-  const entryPath = fileURLToPath(new URL("./agent-runtime-entry.ts", import.meta.url));
-  const child = Bun.spawn([process.execPath, entryPath, paths.configPath], {
+  const command = IS_AOT_BINARY
+    ? [resolve(dirname(realpathSync(process.execPath)), "oco-agent-runtime"), paths.configPath]
+    : [process.execPath, fileURLToPath(new URL("./agent-runtime-entry.ts", import.meta.url)), paths.configPath];
+  const child = Bun.spawn(command, {
     cwd: process.cwd(),
     env: process.env,
     stdin: "ignore",
@@ -1149,7 +1330,7 @@ export async function connectAgentRuntime(options: { readonly stateDir: string; 
   if (manifest.botUid !== options.botUid || manifest.protocolVersion !== AGENT_RUNTIME_PROTOCOL_VERSION) throw new Error("Agent runtime identity does not match");
   const processSnapshot = await queryProcess(manifest.pid);
   if (!processSnapshot || processSnapshot.identity !== manifest.processIdentity) throw new Error("Agent runtime process identity is unknown");
-  return { handle: handleFor(manifest), client: await connectManifest(manifest, options.botUid, SOCKET_CONNECT_TIMEOUT_MS) };
+  return { handle: handleFor(manifest), client: await connectManifest(manifest, options.botUid, SOCKET_CONNECT_TIMEOUT_MS, paths.manifestPath) };
 }
 
 async function readManifestIfPresent(path: string): Promise<RuntimeManifest | undefined> {
@@ -1179,135 +1360,456 @@ function handleFor(manifest: RuntimeManifest): AgentRuntimeHandle {
   };
 }
 
-async function connectManifest(manifest: RuntimeManifest, botUid: string, timeoutMs: number): Promise<AgentRuntimeClient> {
-  return AgentRuntimeClient.connect({ socketPath: manifest.socketPath, secret: manifest.secret, botUid, runtimeId: manifest.runtimeId, timeoutMs });
+async function connectManifest(manifest: RuntimeManifest, botUid: string, timeoutMs: number, manifestPath: string): Promise<AgentRuntimeClient> {
+  return AgentRuntimeClient.connect({
+    socketPath: manifest.socketPath,
+    secret: manifest.secret,
+    botUid,
+    runtimeId: manifest.runtimeId,
+    pid: manifest.pid,
+    processIdentity: manifest.processIdentity,
+    manifestPath,
+    timeoutMs,
+  });
 }
 
 export class AgentRuntimeClient {
   readonly runtimeId: string;
   readonly pid: number;
-  readonly #connection: RuntimeClientConnection;
+  readonly #connection: RuntimeClientConnection = {
+    socket: undefined,
+    connectingSocket: undefined,
+    epoch: 0,
+    pending: new Map(),
+    eventListeners: new Set(),
+    closed: false,
+    available: false,
+    reconnecting: undefined,
+  };
+  readonly #identity: RuntimeClientIdentity;
   readonly #botUid: string;
   readonly #tools = new Map<string, Map<string, HostTool>>();
-  readonly #executingTools = new Map<string, AbortController>();
+  readonly #registrations = new Map<string, RuntimeWorkerRegistration>();
+  readonly #executingTools = new Map<string, ExecutingHostTool>();
+  readonly #watches = new Map<string, Set<RuntimeWatch>>();
+  readonly #acceptedResultAcks = new Set<string>();
   readonly #clientEventListener: (event: RuntimeEvent) => void;
   #requestCounter = 0;
+  #ready = false;
 
-  private constructor(runtimeId: string, pid: number, botUid: string, connection: RuntimeClientConnection) {
-    this.runtimeId = runtimeId;
-    this.pid = pid;
-    this.#botUid = botUid;
-    this.#connection = connection;
+  private constructor(identity: RuntimeClientIdentity) {
+    this.#identity = identity;
+    this.runtimeId = identity.runtimeId;
+    this.pid = identity.pid;
+    this.#botUid = identity.botUid;
     this.#clientEventListener = event => this.#handleEvent(event);
     this.#connection.eventListeners.add(this.#clientEventListener);
-
   }
-  static async connect(options: { socketPath: string; secret: string; botUid: string; runtimeId: string; timeoutMs: number }): Promise<AgentRuntimeClient> {
-    const socket = createConnection(options.socketPath);
+
+  static async connect(options: {
+    socketPath: string;
+    secret: string;
+    botUid: string;
+    runtimeId: string;
+    pid: number;
+    processIdentity: string;
+    manifestPath: string;
+    timeoutMs: number;
+  }): Promise<AgentRuntimeClient> {
+    const client = new AgentRuntimeClient({
+      protocolVersion: AGENT_RUNTIME_PROTOCOL_VERSION,
+      botUid: options.botUid,
+      runtimeId: options.runtimeId,
+      pid: options.pid,
+      processIdentity: options.processIdentity,
+      socketPath: options.socketPath,
+      secret: options.secret,
+      manifestPath: options.manifestPath,
+    });
+    try {
+      await client.#openSocket(options.timeoutMs);
+      client.#connection.available = true;
+      client.#ready = true;
+      return client;
+    } catch (error) {
+      await client.disconnect();
+      throw error;
+    }
+  }
+
+  async #verifyRuntimeIdentity(): Promise<void> {
+    let manifest: RuntimeManifest | undefined;
+    try {
+      manifest = await readManifestIfPresent(this.#identity.manifestPath);
+    } catch {
+      throw new RuntimeIdentityError("Agent runtime manifest identity is unknown; refusing reconnection");
+    }
+    if (
+      !manifest
+      || manifest.protocolVersion !== this.#identity.protocolVersion
+      || manifest.botUid !== this.#identity.botUid
+      || manifest.runtimeId !== this.#identity.runtimeId
+      || manifest.pid !== this.#identity.pid
+      || manifest.processIdentity !== this.#identity.processIdentity
+      || manifest.socketPath !== this.#identity.socketPath
+      || manifest.secret !== this.#identity.secret
+    ) {
+      throw new RuntimeIdentityError("Agent runtime identity changed; refusing reconnection");
+    }
+    const processSnapshot = await queryProcess(this.#identity.pid).catch(() => undefined);
+    if (!processSnapshot || processSnapshot.identity !== this.#identity.processIdentity) {
+      throw new RuntimeIdentityError("Agent runtime process identity is unknown; refusing reconnection");
+    }
+  }
+
+  async #openSocket(timeoutMs: number): Promise<Socket> {
+    if (this.#connection.closed) throw this.#connection.error ?? new Error("Agent runtime channel disconnected");
+    await this.#verifyRuntimeIdentity();
+    if (this.#connection.closed) throw this.#connection.error ?? new Error("Agent runtime channel disconnected");
+    const socket = createConnection(this.#identity.socketPath);
     socket.setEncoding("utf8");
-    const connection: RuntimeClientConnection = {
-      socket,
-      epoch: 0,
-      buffer: "",
-      pending: new Map(),
-      eventListeners: new Set(),
-      closed: false,
+    this.#connection.connectingSocket = socket;
+    const welcome = Promise.withResolvers<{ readonly epoch: number }>();
+    let receivedWelcome = false;
+    let buffer = "";
+    const failSocket = (error: Error): void => {
+      welcome.reject(error);
+      socket.destroy();
     };
-    const clientReady = Promise.withResolvers<{ runtimeId: string; epoch: number; pid: number }>();
-    const timer = setTimeout(() => clientReady.reject(new Error("Agent runtime connection timed out")), options.timeoutMs);
-    socket.on("connect", () => writeLine(socket, { kind: "hello", version: AGENT_RUNTIME_PROTOCOL_VERSION, secret: options.secret, botUid: options.botUid }));
+
+    socket.on("connect", () => {
+      writeLine(socket, {
+        kind: "hello",
+        version: this.#identity.protocolVersion,
+        secret: this.#identity.secret,
+        botUid: this.#identity.botUid,
+      });
+    });
     socket.on("data", chunk => {
-      connection.buffer += String(chunk);
-      if (Buffer.byteLength(connection.buffer, "utf8") > MAX_FRAME_BYTES) {
-        socket.destroy(new Error("Agent runtime frame exceeds limit"));
+      if (socket !== this.#connection.connectingSocket && socket !== this.#connection.socket) return;
+      buffer += String(chunk);
+      if (Buffer.byteLength(buffer, "utf8") > MAX_FRAME_BYTES) {
+        failSocket(new Error("Agent runtime frame exceeds limit"));
         return;
       }
       for (;;) {
-        const newline = connection.buffer.indexOf("\n");
+        const newline = buffer.indexOf("\n");
         if (newline < 0) break;
-        const line = connection.buffer.slice(0, newline);
-        connection.buffer = connection.buffer.slice(newline + 1);
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
         if (!line) continue;
         try {
           const message = parseJsonLine(line);
-          if (message.kind === "welcome") {
-            if (message.version !== AGENT_RUNTIME_PROTOCOL_VERSION || message.runtimeId !== options.runtimeId || typeof message.epoch !== "number" || typeof message.pid !== "number") throw new Error("Agent runtime welcome identity does not match");
-            connection.epoch = message.epoch;
-            clientReady.resolve({ runtimeId: String(message.runtimeId), epoch: message.epoch, pid: message.pid });
+          if (!receivedWelcome) {
+            if (
+              message.kind !== "welcome"
+              || message.version !== this.#identity.protocolVersion
+              || message.runtimeId !== this.#identity.runtimeId
+              || message.pid !== this.#identity.pid
+              || !Number.isSafeInteger(message.epoch)
+            ) {
+              throw new RuntimeIdentityError("Agent runtime welcome identity does not match");
+            }
+            receivedWelcome = true;
+            this.#connection.epoch = message.epoch as number;
+            welcome.resolve({ epoch: message.epoch as number });
             continue;
           }
           if (message.kind === "response") {
             const id = String(message.id ?? "");
-            const pending = connection.pending.get(id);
+            const pending = this.#connection.pending.get(id);
             if (!pending) continue;
-            connection.pending.delete(id);
+            this.#connection.pending.delete(id);
             pending.abort?.();
             if (message.ok === true) pending.resolve(message.value);
             else pending.reject(errorFromText(String(message.error ?? "Agent runtime operation failed")));
             continue;
           }
-          if (message.kind === "event" && message.epoch === connection.epoch) {
+          if (message.kind === "event" && message.epoch === this.#connection.epoch) {
             const event = message as unknown as RuntimeEvent;
-            for (const listener of connection.eventListeners) listener(event);
+            for (const listener of this.#connection.eventListeners) listener(event);
           }
         } catch (error) {
-          socket.destroy(error instanceof Error ? error : new Error("Invalid runtime response"));
+          failSocket(error instanceof Error ? error : new Error("Invalid runtime response"));
           return;
         }
       }
     });
     socket.on("error", error => {
-      connection.closed = true;
-      clientReady.reject(error);
-      for (const pending of connection.pending.values()) pending.reject(error);
-      connection.pending.clear();
+      welcome.reject(error);
+      this.#handleSocketLoss(socket);
     });
     socket.on("close", () => {
-      connection.closed = true;
-      for (const pending of connection.pending.values()) pending.reject(new Error("Agent runtime channel disconnected"));
-      connection.pending.clear();
+      welcome.reject(new RuntimeConnectionLostError());
+      this.#handleSocketLoss(socket);
     });
+
+    const timer = setTimeout(() => welcome.reject(new Error("Agent runtime connection timed out")), timeoutMs);
     try {
-      const welcome = await clientReady.promise;
-      return new AgentRuntimeClient(welcome.runtimeId, welcome.pid, options.botUid, connection);
+      await welcome.promise;
+      await this.#verifyRuntimeIdentity();
+      if (this.#connection.closed) throw this.#connection.error ?? new Error("Agent runtime channel disconnected");
+      if (this.#connection.connectingSocket !== socket || socket.destroyed) throw new RuntimeConnectionLostError();
+      this.#connection.connectingSocket = undefined;
+      this.#connection.socket = socket;
+      return socket;
+    } catch (error) {
+      if (this.#connection.connectingSocket === socket) this.#connection.connectingSocket = undefined;
+      socket.destroy();
+      throw error;
     } finally {
       clearTimeout(timer);
     }
   }
 
+  #handleSocketLoss(socket: Socket): void {
+    const wasCurrent = this.#connection.socket === socket;
+    const wasConnecting = this.#connection.connectingSocket === socket;
+    if (!wasCurrent && !wasConnecting) return;
+    if (wasCurrent) {
+      this.#connection.socket = undefined;
+      this.#connection.available = false;
+      for (const watches of this.#watches.values()) {
+        for (const watch of watches) {
+          watch.armedEpoch = undefined;
+          watch.pendingEvents = [];
+        }
+      }
+    }
+    if (wasConnecting) this.#connection.connectingSocket = undefined;
+    if (wasCurrent) {
+      const error = new RuntimeConnectionLostError();
+      for (const pending of this.#connection.pending.values()) {
+        pending.abort?.();
+        pending.reject(error);
+      }
+      this.#connection.pending.clear();
+    }
+    if (this.#ready && !this.#connection.closed) void this.#startReconnect().catch(() => {});
+  }
+
+  #startReconnect(): Promise<void> {
+    if (this.#connection.closed) return Promise.reject(this.#connection.error ?? new Error("Agent runtime channel disconnected"));
+    if (this.#connection.reconnecting) return this.#connection.reconnecting;
+    const reconnecting = this.#reconnectUntilConnected().catch(error => {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      this.#terminate(failure);
+      throw failure;
+    });
+    this.#connection.reconnecting = reconnecting;
+    void reconnecting.then(
+      () => this.#finishReconnect(reconnecting),
+      () => this.#finishReconnect(reconnecting),
+    );
+    return reconnecting;
+  }
+
+  #finishReconnect(reconnecting: Promise<void>): void {
+    if (this.#connection.reconnecting !== reconnecting) return;
+    this.#connection.reconnecting = undefined;
+    if (!this.#connection.closed && (!this.#connection.socket || !this.#connection.available)) {
+      void this.#startReconnect().catch(() => {});
+    }
+  }
+
+  async #reconnectUntilConnected(): Promise<void> {
+    let delayMs = 50;
+    while (!this.#connection.closed) {
+      await Bun.sleep(delayMs);
+      if (this.#connection.closed) throw this.#connection.error ?? new Error("Agent runtime channel disconnected");
+      let socket: Socket;
+      try {
+        socket = await this.#openSocket(SOCKET_CONNECT_TIMEOUT_MS);
+      } catch (error) {
+        if (error instanceof RuntimeIdentityError) throw error;
+        if (this.#connection.closed) throw this.#connection.error ?? error;
+        delayMs = Math.min(delayMs * 2, 1_000);
+        continue;
+      }
+      try {
+        await this.#restoreAttachments(socket);
+        await this.#restoreWatches(socket);
+      } catch (error) {
+        if (this.#connection.socket !== socket || error instanceof RuntimeConnectionLostError) {
+          delayMs = Math.min(delayMs * 2, 1_000);
+          continue;
+        }
+        throw error;
+      }
+      if (this.#connection.socket === socket && !socket.destroyed) {
+        this.#connection.available = true;
+        return;
+      }
+      delayMs = Math.min(delayMs * 2, 1_000);
+    }
+    throw this.#connection.error ?? new Error("Agent runtime channel disconnected");
+  }
+
+  async #restoreAttachments(socket: Socket): Promise<void> {
+    for (const registration of [...this.#registrations.values()]) {
+      try {
+        const snapshot = await this.#requestOnSocket(socket, "attach-worker", registration.input) as AgentRuntimeWorkerSnapshot;
+        const key = this.#runKey(registration.input.taskId, registration.input.runId);
+        if (this.#registrations.get(key) !== registration) continue;
+        registration.snapshot = snapshot;
+        registration.attachedEpoch = this.#connection.epoch;
+      } catch (error) {
+        if (this.#connection.socket !== socket || error instanceof RuntimeConnectionLostError) throw error;
+        this.#discardRegistration(registration, error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+  }
+
+  async #restoreWatches(socket: Socket): Promise<void> {
+    for (const watches of [...this.#watches.values()]) {
+      const active = [...watches].filter(watch => !watch.settled);
+      const first = active[0];
+      if (!first) continue;
+      for (const watch of active) {
+        watch.armedEpoch = undefined;
+        watch.pendingEvents = [];
+      }
+      const fromSeq = Math.min(...active.map(watch => watch.cursor));
+      const state = await this.#requestOnSocket(socket, "watch-run", {
+        taskId: first.taskId,
+        runId: first.runId,
+        dispatchId: first.dispatchId,
+        fromSeq,
+      }) as AgentRunState;
+      for (const watch of active) this.#armWatch(watch, this.#connection.epoch);
+      if (isTerminal(state.state)) {
+        for (const watch of active) this.#resolveWatch(watch, state);
+      }
+    }
+  }
+
+  async #waitForConnection(): Promise<Socket> {
+    if (this.#connection.closed) throw this.#connection.error ?? new Error("Agent runtime channel disconnected");
+    const current = this.#connection.socket;
+    if (this.#connection.available && current && !current.destroyed && current.writable) return current;
+    await this.#startReconnect();
+    if (this.#connection.closed) throw this.#connection.error ?? new Error("Agent runtime channel disconnected");
+    const connected = this.#connection.socket;
+    if (!this.#connection.available || !connected || connected.destroyed || !connected.writable) {
+      throw new RuntimeConnectionLostError();
+    }
+    return connected;
+  }
+
+  async #request(operation: string, args: unknown, signal?: AbortSignal): Promise<unknown> {
+    const socket = await this.#waitForConnection();
+    return this.#requestOnSocket(socket, operation, args, signal);
+  }
+
+  async #requestRetryable(operation: string, args: unknown, signal?: AbortSignal): Promise<unknown> {
+    for (;;) {
+      try {
+        return await this.#request(operation, args, signal);
+      } catch (error) {
+        if (!(error instanceof RuntimeConnectionLostError)) throw error;
+        await this.#waitForConnection();
+      }
+    }
+  }
+
+  async #requestOnSocket(socket: Socket, operation: string, args: unknown, signal?: AbortSignal): Promise<unknown> {
+    if (this.#connection.closed) throw this.#connection.error ?? new Error("Agent runtime channel disconnected");
+    if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Operation cancelled");
+    if (this.#connection.socket !== socket || socket.destroyed || !socket.writable) throw new RuntimeConnectionLostError();
+    const id = `${process.pid}:${++this.#requestCounter}:${randomUUID()}`;
+    const pending = Promise.withResolvers<unknown>();
+    let abort: (() => void) | undefined;
+    if (signal) {
+      abort = () => {
+        if (!this.#connection.pending.delete(id)) return;
+        void this.#requestOnSocket(socket, "cancel-request", { targetRequestId: id }).catch(() => {});
+        pending.reject(signal.reason instanceof Error ? signal.reason : new Error("Operation cancelled"));
+      };
+      signal.addEventListener("abort", abort, { once: true });
+    }
+    this.#connection.pending.set(id, {
+      resolve: pending.resolve,
+      reject: pending.reject,
+      abort: () => signal?.removeEventListener("abort", abort!),
+    });
+    writeLine(socket, { kind: "request", id, epoch: this.#connection.epoch, operation, args });
+    return pending.promise;
+  }
+
   async listWorkers(): Promise<readonly AgentRuntimeWorkerSnapshot[]> {
-    return await this.#request("list-workers", {}) as AgentRuntimeWorkerSnapshot[];
+    return await this.#requestRetryable("list-workers", {}) as AgentRuntimeWorkerSnapshot[];
   }
 
   async createWorker(input: CreateWorkerInput, hostTools: readonly HostTool[] = [], signal?: AbortSignal): Promise<AgentRuntimeWorker> {
     safeId(input.taskId, "taskId");
     safeId(input.runId, "runId");
     this.#setTools(input.taskId, input.runId, hostTools);
-    const processSnapshot = await this.#request("create-worker", input, signal) as AgentRuntimeWorkerSnapshot;
+    let processSnapshot: AgentRuntimeWorkerSnapshot;
+    try {
+      processSnapshot = await this.#request("create-worker", input, signal) as AgentRuntimeWorkerSnapshot;
+    } catch (error) {
+      if (error instanceof RuntimeConnectionLostError) {
+        throw new Error("Agent runtime worker creation outcome is unknown; refusing to retry", { cause: error });
+      }
+      throw error;
+    }
+    this.#registerWorker(processSnapshot);
     return new AgentRuntimeWorker(this, processSnapshot);
   }
 
   async attachWorker(input: AttachWorkerInput, hostTools: readonly HostTool[] = []): Promise<AgentRuntimeWorker> {
     safeId(input.taskId, "taskId");
     safeId(input.runId, "runId");
+    const key = this.#runKey(input.taskId, input.runId);
     this.#setTools(input.taskId, input.runId, hostTools);
-    const snapshot = await this.#request("attach-worker", input) as AgentRuntimeWorkerSnapshot;
-    return new AgentRuntimeWorker(this, snapshot);
+    const registration = this.#registrations.get(key) ?? { input };
+    registration.input = input;
+    this.#registrations.set(key, registration);
+    try {
+      const snapshot = await this.#requestRetryable("attach-worker", input) as AgentRuntimeWorkerSnapshot;
+      registration.snapshot = snapshot;
+      registration.attachedEpoch = this.#connection.epoch;
+      return new AgentRuntimeWorker(this, snapshot);
+    } catch (error) {
+      if (this.#registrations.get(key) === registration) {
+        this.#discardRegistration(registration, error instanceof Error ? error : new Error(String(error)));
+      }
+      throw error;
+    }
   }
 
   /** Drops local tool registration only; runtime-owned host calls are not cancelled or settled. */
   async detachWorker(taskId: string, runId: string): Promise<void> {
-    await this.#request("detach-worker", { taskId, runId });
-    this.#tools.delete(this.#runKey(taskId, runId));
+    const key = this.#runKey(taskId, runId);
+    this.#tools.delete(key);
+    this.#registrations.delete(key);
   }
 
   async disconnect(): Promise<void> {
+    this.#terminate(new Error("Agent runtime channel disconnected"));
+  }
+
+  #terminate(error: Error): void {
     if (this.#connection.closed) return;
     this.#connection.closed = true;
+    this.#connection.available = false;
+    this.#connection.error = error;
     this.#connection.eventListeners.delete(this.#clientEventListener);
-    this.#connection.socket.end();
-    this.#connection.socket.destroy();
-    this.#executingTools.clear();
+    const socket = this.#connection.socket;
+    const connectingSocket = this.#connection.connectingSocket;
+    this.#connection.socket = undefined;
+    this.#connection.connectingSocket = undefined;
+    for (const pending of this.#connection.pending.values()) {
+      pending.abort?.();
+      pending.reject(error);
+    }
+    this.#connection.pending.clear();
+    for (const watches of this.#watches.values()) {
+      for (const watch of watches) this.#rejectWatch(watch, error);
+    }
+    socket?.end();
+    socket?.destroy();
+    connectingSocket?.destroy();
   }
 
   async dispatch(
@@ -1319,7 +1821,21 @@ export class AgentRuntimeClient {
       ...input,
       ...(input.context === undefined ? {} : { context: promptContextForWire(input.context) }),
     };
-    return await this.#request("dispatch", { taskId: snapshot.taskId, runId: snapshot.runId, dispatch: wireInput }) as AgentRunState;
+    try {
+      return await this.#request("dispatch", { taskId: snapshot.taskId, runId: snapshot.runId, dispatch: wireInput }) as AgentRunState;
+    } catch (error) {
+      if (!(error instanceof RuntimeConnectionLostError)) throw error;
+      try {
+        await this.#waitForConnection();
+        return await this.#requestRetryable("run-state", {
+          taskId: snapshot.taskId,
+          runId: snapshot.runId,
+          dispatchId: input.dispatchId,
+        }) as AgentRunState;
+      } catch (queryError) {
+        throw new Error(`Agent runtime dispatch outcome is unknown; refusing to resend ${input.dispatchId}`, { cause: queryError });
+      }
+    }
   }
 
   async watchRun(
@@ -1330,35 +1846,55 @@ export class AgentRuntimeClient {
   ): Promise<AgentRunState> {
     if (!Number.isSafeInteger(fromSeq) || fromSeq < 0) throw new Error("fromSeq must be a non-negative safe integer");
     const terminal = Promise.withResolvers<AgentRunState>();
-    let cursor = fromSeq;
-    const eventListener = (event: RuntimeEvent): void => {
-      if (event.taskId !== snapshot.taskId || event.runId !== snapshot.runId || event.dispatchId !== dispatchId) return;
-      if (event.event === "run-event" && typeof event.seq === "number" && event.seq > cursor) {
-        cursor = event.seq;
-        try {
-          onEvent(event.value as WorkerEvent, event.seq);
-        } catch (error) {
-          terminal.reject(error instanceof Error ? error : new Error(String(error)));
-        }
-      } else if (event.event === "run-terminal") {
-        terminal.resolve(event.value as AgentRunState);
-      }
+    const key = `${snapshot.taskId}\0${snapshot.runId}\0${dispatchId}`;
+    const watch: RuntimeWatch = {
+      key,
+      taskId: snapshot.taskId,
+      runId: snapshot.runId,
+      dispatchId,
+      cursor: fromSeq,
+      onEvent,
+      promise: terminal.promise,
+      resolve: terminal.resolve,
+      reject: terminal.reject,
+      armedEpoch: undefined,
+      pendingEvents: [],
+      settled: false,
     };
-    const onClose = (): void => terminal.reject(new Error("Agent runtime channel disconnected"));
-    this.#connection.socket.once("close", onClose);
-    this.#connection.eventListeners.add(eventListener);
+    void watch.promise.catch(() => {});
+    const watches = this.#watches.get(key) ?? new Set<RuntimeWatch>();
+    watches.add(watch);
+    this.#watches.set(key, watches);
+    let socket: Socket;
     try {
-      const state = await this.#request("watch-run", { taskId: snapshot.taskId, runId: snapshot.runId, dispatchId, fromSeq }) as AgentRunState;
-      if (isTerminal(state.state)) terminal.resolve(state);
-      return await terminal.promise;
+      socket = await this.#waitForConnection();
+      if (!watch.settled && watch.armedEpoch !== this.#connection.epoch) {
+        await this.#subscribeWatch(watch, socket);
+      }
+      return await watch.promise;
+    } catch (error) {
+      if (error instanceof RuntimeConnectionLostError && !watch.settled) {
+        try {
+          socket = await this.#waitForConnection();
+          if (!watch.settled && watch.armedEpoch !== this.#connection.epoch) {
+            await this.#subscribeWatch(watch, socket);
+          }
+          return await watch.promise;
+        } catch (reconnectError) {
+          this.#rejectWatch(watch, reconnectError instanceof Error ? reconnectError : new Error(String(reconnectError)));
+          throw reconnectError;
+        }
+      }
+      this.#rejectWatch(watch, error instanceof Error ? error : new Error(String(error)));
+      throw error;
     } finally {
-      this.#connection.socket.off("close", onClose);
-      this.#connection.eventListeners.delete(eventListener);
+      watches.delete(watch);
+      if (watches.size === 0) this.#watches.delete(key);
     }
   }
 
   async runState(snapshot: AgentRuntimeWorkerSnapshot, dispatchId: string): Promise<AgentRunState> {
-    return await this.#request("run-state", { taskId: snapshot.taskId, runId: snapshot.runId, dispatchId }) as AgentRunState;
+    return await this.#requestRetryable("run-state", { taskId: snapshot.taskId, runId: snapshot.runId, dispatchId }) as AgentRunState;
   }
 
   async workerOperation(snapshot: AgentRuntimeWorkerSnapshot, method: string, args: unknown[] = [], signal?: AbortSignal): Promise<unknown> {
@@ -1366,7 +1902,24 @@ export class AgentRuntimeClient {
   }
 
   async stopWorker(snapshot: AgentRuntimeWorkerSnapshot): Promise<boolean> {
-    return await this.#request("stop-worker", { taskId: snapshot.taskId, runId: snapshot.runId }) as boolean;
+    const socket = this.#connection.socket;
+    if (
+      this.#connection.closed
+      || !this.#connection.available
+      || !socket
+      || socket.destroyed
+      || !socket.writable
+    ) return false;
+    try {
+      return await this.#requestOnSocket(socket, "stop-worker", { taskId: snapshot.taskId, runId: snapshot.runId }) as boolean;
+    } catch (error) {
+      if (
+        error instanceof RuntimeConnectionLostError
+        || this.#connection.closed
+        || !this.#connection.available
+      ) return false;
+      throw error;
+    }
   }
 
   async cancelRun(snapshot: AgentRuntimeWorkerSnapshot, dispatchId: string): Promise<boolean> {
@@ -1374,30 +1927,21 @@ export class AgentRuntimeClient {
     return result.cancelled;
   }
 
-  async #request(operation: string, args: unknown, signal?: AbortSignal): Promise<unknown> {
-    if (this.#connection.closed || this.#connection.socket.destroyed) throw new Error("Agent runtime channel is disconnected");
-    if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Operation cancelled");
-    const id = `${process.pid}:${++this.#requestCounter}:${randomUUID()}`;
-    const pending = Promise.withResolvers<unknown>();
-    let abort: (() => void) | undefined;
-    if (signal) {
-      abort = () => {
-        void this.#request("cancel-request", { targetRequestId: id }).catch(() => {});
-        pending.reject(signal.reason instanceof Error ? signal.reason : new Error("Operation cancelled"));
-        this.#connection.pending.delete(id);
-      };
-      signal.addEventListener("abort", abort, { once: true });
-    }
-    this.#connection.pending.set(id, {
-      resolve: pending.resolve,
-      reject: pending.reject,
-      abort: () => signal?.removeEventListener("abort", abort!),
-    });
-    writeLine(this.#connection.socket, { kind: "request", id, epoch: this.#connection.epoch, operation, args });
-    return pending.promise;
-  }
   async updateCliEnv(cliEnv: Readonly<Record<string, string>> | undefined): Promise<void> {
-    await this.#request("update-cli-env", { cliEnv: safeCliEnv(cliEnv, this.#botUid) });
+    await this.#requestRetryable("update-cli-env", { cliEnv: safeCliEnv(cliEnv, this.#botUid) });
+  }
+
+  #registerWorker(snapshot: AgentRuntimeWorkerSnapshot): void {
+    const input: AttachWorkerInput = {
+      taskId: snapshot.taskId,
+      runId: snapshot.runId,
+      sessionId: snapshot.sessionId,
+    };
+    this.#registrations.set(this.#runKey(snapshot.taskId, snapshot.runId), {
+      input,
+      snapshot,
+      attachedEpoch: this.#connection.epoch,
+    });
   }
 
   #setTools(taskId: string, runId: string, tools: readonly HostTool[]): void {
@@ -1408,34 +1952,192 @@ export class AgentRuntimeClient {
     return `${taskId}\0${runId}`;
   }
 
+  #resolveWatch(watch: RuntimeWatch, state: AgentRunState): void {
+    if (watch.settled) return;
+    watch.settled = true;
+    watch.resolve(state);
+  }
 
-  async #resolveHostTool(event: RuntimeEvent): Promise<void> {
-    const value = event.value as { callId: string; toolName: string; args: Record<string, unknown>; toolCallId?: string; cancelled?: boolean };
-    const tool = this.#tools.get(this.#runKey(event.taskId, event.runId))?.get(value.toolName);
-    if (!tool) return;
-    const previous = this.#executingTools.get(value.callId);
-    if (previous) return;
-    const controller = new AbortController();
-    this.#executingTools.set(value.callId, controller);
-    if (value.cancelled) controller.abort(new Error("OMP cancelled host tool"));
-    try {
-      const result = await tool.execute(value.args, controller.signal, value.toolCallId);
-      await this.#request("host-tool-result", { taskId: event.taskId, runId: event.runId, callId: value.callId, isError: false, result: String(result) });
-    } catch (error) {
-      await this.#request("host-tool-result", { taskId: event.taskId, runId: event.runId, callId: value.callId, isError: true, result: errorText(error) }).catch(() => {});
-    } finally {
-      this.#executingTools.delete(value.callId);
+  #rejectWatch(watch: RuntimeWatch, error: Error): void {
+    if (watch.settled) return;
+    watch.settled = true;
+    watch.reject(error);
+  }
+  #discardRegistration(registration: RuntimeWorkerRegistration, error: Error): void {
+    const key = this.#runKey(registration.input.taskId, registration.input.runId);
+    if (this.#registrations.get(key) === registration) {
+      this.#registrations.delete(key);
+      this.#tools.delete(key);
+    }
+    for (const watches of this.#watches.values()) {
+      for (const watch of watches) {
+        if (watch.taskId === registration.input.taskId && watch.runId === registration.input.runId) {
+          this.#rejectWatch(watch, error);
+        }
+      }
     }
   }
 
+  async #subscribeWatch(watch: RuntimeWatch, socket: Socket): Promise<void> {
+    watch.armedEpoch = undefined;
+    watch.pendingEvents = [];
+    const state = await this.#requestOnSocket(socket, "watch-run", {
+      taskId: watch.taskId,
+      runId: watch.runId,
+      dispatchId: watch.dispatchId,
+      fromSeq: watch.cursor,
+    }) as AgentRunState;
+    this.#armWatch(watch, this.#connection.epoch);
+    if (isTerminal(state.state)) this.#resolveWatch(watch, state);
+  }
+
+  #armWatch(watch: RuntimeWatch, epoch: number): void {
+    watch.armedEpoch = epoch;
+    const pending = watch.pendingEvents;
+    watch.pendingEvents = [];
+    pending.sort((left, right) => {
+      if (left.event === "run-event" && right.event === "run-event") return (left.seq ?? 0) - (right.seq ?? 0);
+      if (left.event === "run-event") return -1;
+      if (right.event === "run-event") return 1;
+      return 0;
+    });
+    for (const event of pending) this.#consumeWatchEvent(watch, event);
+  }
+
+  #consumeWatchEvent(watch: RuntimeWatch, event: RuntimeEvent): void {
+    if (watch.settled) return;
+    if (event.event === "run-event" && typeof event.seq === "number" && event.seq > watch.cursor) {
+      try {
+        watch.onEvent(event.value as WorkerEvent, event.seq);
+        watch.cursor = event.seq;
+      } catch (error) {
+        this.#rejectWatch(watch, error instanceof Error ? error : new Error(String(error)));
+      }
+    } else if (event.event === "run-terminal") {
+      this.#resolveWatch(watch, event.value as AgentRunState);
+    }
+  }
+
+  async #resolveHostTool(event: RuntimeEvent): Promise<void> {
+    const value = event.value as { callId: string; toolName: string; args: Record<string, unknown>; toolCallId?: string; cancelled?: boolean };
+    const existing = this.#executingTools.get(value.callId);
+    if (existing) {
+      if (existing.result) await this.#deliverHostToolResult(value.callId, existing).catch(() => {});
+      return;
+    }
+    const tool = this.#tools.get(this.#runKey(event.taskId, event.runId))?.get(value.toolName);
+    if (!tool) return;
+    const controller = new AbortController();
+    const execution: ExecutingHostTool = {
+      taskId: event.taskId,
+      runId: event.runId,
+      dispatchId: event.dispatchId ?? "",
+      ...(value.toolCallId === undefined ? {} : { toolCallId: value.toolCallId }),
+      controller,
+    };
+    this.#executingTools.set(value.callId, execution);
+    if (value.cancelled) controller.abort(new Error("OMP cancelled host tool"));
+    try {
+      execution.result = { isError: false, result: String(await tool.execute(value.args, controller.signal, value.toolCallId)) };
+    } catch (error) {
+      execution.result = { isError: true, result: errorText(error) };
+    }
+    await this.#deliverHostToolResult(value.callId, execution).catch(() => {});
+  }
+
+  #deliverHostToolResult(callId: string, execution: ExecutingHostTool): Promise<void> {
+    if (!execution.result) return Promise.resolve();
+    if (execution.delivery) return execution.delivery;
+    const result = execution.result;
+    const delivery = this.#requestRetryable("host-tool-result", {
+      taskId: execution.taskId,
+      runId: execution.runId,
+      callId,
+      isError: result.isError,
+      result: result.result,
+    }).then(() => {
+      if (this.#executingTools.get(callId) === execution) this.#executingTools.delete(callId);
+    }).finally(() => {
+      if (execution.delivery === delivery) execution.delivery = undefined;
+    });
+    execution.delivery = delivery;
+    return delivery;
+  }
+
   #handleEvent(event: RuntimeEvent): void {
-    if (event.event === "host-tool-call") void this.#resolveHostTool(event);
+    if (event.event === "run-event" && typeof event.seq === "number" && event.dispatchId) {
+      const key = `${event.taskId}\0${event.runId}\0${event.dispatchId}`;
+      for (const watch of this.#watches.get(key) ?? []) {
+        if (watch.settled) continue;
+        if (watch.armedEpoch !== this.#connection.epoch) watch.pendingEvents.push(event);
+        else this.#consumeWatchEvent(watch, event);
+      }
+    } else if (event.event === "run-terminal" && event.dispatchId) {
+      const key = `${event.taskId}\0${event.runId}\0${event.dispatchId}`;
+      for (const watch of this.#watches.get(key) ?? []) {
+        if (watch.settled) continue;
+        if (watch.armedEpoch !== this.#connection.epoch) watch.pendingEvents.push(event);
+        else this.#consumeWatchEvent(watch, event);
+      }
+      for (const [callId, execution] of this.#executingTools) {
+        if (execution.taskId === event.taskId && execution.runId === event.runId && execution.dispatchId === event.dispatchId && execution.result) {
+          this.#executingTools.delete(callId);
+        }
+      }
+    } else if (event.event === "host-tool-call") void this.#resolveHostTool(event);
     else if (event.event === "host-tool-cancel") {
       const value = event.value as { callId: string };
-      this.#executingTools.get(value.callId)?.abort(new Error("OMP cancelled host tool"));
+      const execution = this.#executingTools.get(value.callId);
+      if (
+        execution
+        && execution.taskId === event.taskId
+        && execution.runId === event.runId
+        && execution.dispatchId === event.dispatchId
+      ) {
+        execution.controller.abort(new Error("OMP cancelled host tool"));
+        void this.#requestRetryable("host-tool-cancel-ack", {
+          taskId: event.taskId,
+          runId: event.runId,
+          dispatchId: event.dispatchId,
+          callId: value.callId,
+        }).catch(() => {});
+      }
     } else if (event.event === "host-tool-result-accepted") {
-      const value = event.value as { toolName: string; toolCallId: string };
-      this.#tools.get(this.#runKey(event.taskId, event.runId))?.get(value.toolName)?.onResultAccepted?.(value.toolCallId);
+      const value = event.value as { ackId: string; toolName: string; toolCallId?: string; resultHash?: string };
+      if (
+        typeof value.ackId !== "string"
+        || typeof value.toolCallId !== "string"
+        || typeof value.resultHash !== "string"
+        || !/^[0-9a-f]{64}$/u.test(value.resultHash)
+        || this.#acceptedResultAcks.has(value.ackId)
+      ) return;
+      const tool = this.#tools.get(this.#runKey(event.taskId, event.runId))?.get(value.toolName);
+      if (!tool) return;
+      this.#acceptedResultAcks.add(value.ackId);
+      if (tool.onResultAccepted) {
+        try {
+          tool.onResultAccepted(value.toolCallId, value.resultHash);
+        } catch (error) {
+          this.#acceptedResultAcks.delete(value.ackId);
+          throw error;
+        }
+      }
+      for (const [callId, execution] of this.#executingTools) {
+        if (
+          execution.taskId === event.taskId
+          && execution.runId === event.runId
+          && execution.dispatchId === event.dispatchId
+          && execution.toolCallId === value.toolCallId
+        ) this.#executingTools.delete(callId);
+      }
+      void this.#requestRetryable("host-tool-result-accepted-ack", {
+        taskId: event.taskId,
+        runId: event.runId,
+        dispatchId: event.dispatchId,
+        ackId: value.ackId,
+        toolCallId: value.toolCallId,
+        resultHash: value.resultHash,
+      }).catch(() => {}).finally(() => this.#acceptedResultAcks.delete(value.ackId));
     }
   }
 }

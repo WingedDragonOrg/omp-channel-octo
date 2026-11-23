@@ -9,6 +9,7 @@ import type {
   ChatTarget,
   GroupMember,
   GroupContext,
+  HostMergeOutcome,
   HostTool,
   InboundMessage,
   ThreadListenLevel,
@@ -52,6 +53,8 @@ import { threadChannelId, threadParentGroupId, threadShortId } from "./threads/t
 import { worktreeSlug } from "./workspace/worktree.ts";
 import {
   mergeThreadWorkspace,
+  HostMergeExecutionFailureError,
+  HostMergeNotStartedError,
   WorktreeMergeExecutionError,
 } from "./threads/thread-merge.ts";
 import {
@@ -104,6 +107,10 @@ export interface HostToolHost {
     resourceCwds: readonly string[],
     archiveGeneration: number,
   ) => WorktreeMergeLifecycle;
+  /** Persists a result digest only when its exact terminal outcome matches the durable lease. */
+  recordHostMergeResultHash(target: ChatTarget, sourceId: string, resultHash: string, expectedOutcome: HostMergeOutcome): void;
+  /** Settles only when OMP accepts a digest persisted for this direct host-tool merge lease. */
+  settleAcceptedHostMerge(target: ChatTarget, sourceId: string, resultHash: string): void;
   readonly store: Pick<
     ChannelStore,
     | "enqueueOutbox"
@@ -113,6 +120,7 @@ export interface HostToolHost {
     | "getOwnerId"
     | "getThreadWorkspace"
     | "getThreadForkByTarget"
+    | "getHostMergeLeaseBySourceId"
     | "saveThreadWorkspace"
     | "saveThreadWorkspaceWithOutbox"
     | "commitThreadWorkspaceBatch"
@@ -1207,7 +1215,6 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
   const actions = dispatchable
     ? [...MANAGEMENT_BASE_ACTIONS, MANAGEMENT_DISPATCH_ACTION]
     : [...MANAGEMENT_BASE_ACTIONS];
-  const pendingMergeLifecycles = new Map<string, WorktreeMergeLifecycle>();
   const descriptionState: { snapshot: GroupContext | undefined } = { snapshot: undefined };
   let descriptionTail: Promise<void> = Promise.resolve();
   const managementTool: HostTool = {
@@ -1305,20 +1312,15 @@ export function createHostTools(host: HostToolHost, task: TaskRecord): HostTool[
         descriptionState,
         signal,
         toolCallId,
-        toolCallId === undefined
-          ? undefined
-          : (lifecycle) => pendingMergeLifecycles.set(toolCallId, lifecycle),
       );
-      if (args.action !== "description-read" && args.action !== "description-write") return invoke();
-      const operation = descriptionTail.then(invoke);
+      const execute = () => invoke();
+      if (args.action !== "description-read" && args.action !== "description-write") return execute();
+      const operation = descriptionTail.then(execute);
       descriptionTail = operation.then(() => {}, () => {});
       return operation;
     },
-    onResultAccepted: (toolCallId) => {
-      const lifecycle = pendingMergeLifecycles.get(toolCallId);
-      if (!lifecycle) return;
-      lifecycle.settle();
-      pendingMergeLifecycles.delete(toolCallId);
+    onResultAccepted: (toolCallId, resultHash) => {
+      host.settleAcceptedHostMerge(target, hostMergeToolSourceId(task.id, toolCallId), resultHash);
     },
   };
   return [channelTool, managementTool, fileTool, askTool, forkTool, watchTool, discoveryTool, ...scheduleTools];
@@ -1355,6 +1357,25 @@ async function runChannelTool(
   throw new Error(`unknown action: ${typeof action === "string" ? action : String(action)}`);
 }
 
+/** Stable task/tool identity used by merge execution and result acceptance. */
+function hostMergeToolSourceId(taskId: string, toolCallId: string | undefined): string {
+  return toolCallId === undefined ? taskId : JSON.stringify([taskId, toolCallId]);
+}
+
+function recordThreadMergeResultHash(
+  host: HostToolHost,
+  target: ChatTarget,
+  taskId: string,
+  toolCallId: string | undefined,
+  signal: AbortSignal,
+  resultText: string,
+  expectedOutcome: HostMergeOutcome,
+): void {
+  if (toolCallId === undefined || signal.aborted) return;
+  const resultHash = createHash("sha256").update(resultText, "utf8").digest("hex");
+  host.recordHostMergeResultHash(target, hostMergeToolSourceId(taskId, toolCallId), resultHash, expectedOutcome);
+}
+
 async function runManagementTool(
   host: HostToolHost,
   task: TaskRecord,
@@ -1365,7 +1386,6 @@ async function runManagementTool(
   descriptionState: { snapshot: GroupContext | undefined },
   signal: AbortSignal,
   toolCallId?: string,
-  onWorktreeMergeLifecycle?: (lifecycle: WorktreeMergeLifecycle) => void,
 ): Promise<string> {
   const action = args.action;
   const automaticLoopInput = task.messageId.startsWith(LOOP_INPUT_MESSAGE_PREFIX);
@@ -1724,9 +1744,15 @@ async function runManagementTool(
           short_id: fork.thread.shortId,
         });
       }
-      const operationId = toolCallId === undefined ? task.id : JSON.stringify([task.id, toolCallId]);
+      const operationId = hostMergeToolSourceId(task.id, toolCallId);
       const replay = await host.replayThreadMergeSuccess(workspaceTarget, operationId);
-      if (replay !== null) return replay;
+      if (replay !== null) {
+        const lease = host.store.getHostMergeLeaseBySourceId(host.botUid, workspaceTarget, operationId);
+        if (lease?.outcome?.kind === "succeeded") {
+          recordThreadMergeResultHash(host, workspaceTarget, task.id, toolCallId, signal, replay, lease.outcome);
+        }
+        return replay;
+      }
       host.store.suppressTaskRelay(task.id);
 
       try {
@@ -1740,19 +1766,7 @@ async function runManagementTool(
             beginEnding: () => host.beginThreadRoutesEnding(workspaceTarget),
             ...(host.worktreeMergeLifecycle === undefined
               ? {}
-              : {
-                  worktreeMergeLifecycle: (mergeTarget, cwd, sourceId, resourceCwds, archiveGeneration) => {
-                    const lifecycle = host.worktreeMergeLifecycle!(
-                      mergeTarget,
-                      cwd,
-                      sourceId,
-                      resourceCwds,
-                      archiveGeneration,
-                    );
-                    onWorktreeMergeLifecycle?.(lifecycle);
-                    return lifecycle;
-                  },
-                }),
+              : { worktreeMergeLifecycle: host.worktreeMergeLifecycle }),
             beforeMerge: () => {
               ensureThreadListenForTarget(host, workspaceTarget);
             },
@@ -1770,8 +1784,55 @@ async function runManagementTool(
           result.archive === "scheduled" ? "scheduled" : "not-scheduled",
           operationId,
         );
-        return JSON.stringify({ merged: true, ...result });
+        const toolResult = JSON.stringify({ merged: true, ...result });
+        const expectedOutcome: HostMergeOutcome = {
+          kind: "succeeded",
+          summary: {
+            branch: result.branch,
+            target: result.target,
+            squashed: result.squashed,
+            rebased: result.rebased,
+            committed: result.committed,
+            removed: result.removed,
+            ...(result.commit === undefined ? {} : { commit: result.commit }),
+          },
+        };
+        recordThreadMergeResultHash(
+          host,
+          workspaceTarget,
+          task.id,
+          toolCallId,
+          signal,
+          toolResult,
+          expectedOutcome,
+        );
+        return toolResult;
       } catch (error) {
+        if (error instanceof HostMergeExecutionFailureError) {
+          recordThreadMergeResultHash(
+            host,
+            workspaceTarget,
+            task.id,
+            toolCallId,
+            signal,
+            error.message,
+            error.outcome,
+          );
+          throw error;
+        }
+        if (error instanceof HostMergeNotStartedError) {
+          const resultText = boundedManagementError(error, "合并隔离工作区失败");
+          recordThreadMergeResultHash(
+            host,
+            workspaceTarget,
+            task.id,
+            toolCallId,
+            signal,
+            resultText,
+            error.outcome,
+          );
+          throw new HostMergeNotStartedError(resultText, error.outcome);
+        }
         if (error instanceof WorktreeMergeExecutionError) throw error;
         throw new Error(boundedManagementError(error, "合并隔离工作区失败"));
       }

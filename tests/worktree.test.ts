@@ -1123,7 +1123,9 @@ printf '{"branch":"%s","target":"main","squashed":false,"rebased":false,"committ
       complete: () => {},
       settle: () => {},
       onNotSpawned: () => lifecycleEvents.push("not-spawned"),
-      onUnknown: () => lifecycleEvents.push("unknown"),
+      onUnknown: () => {
+        lifecycleEvents.push("unknown");
+      },
     };
     const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [wt] });
 
@@ -1171,7 +1173,9 @@ printf '{"branch":"linked-branch","target":"main","squashed":true,"rebased":true
       complete: () => {},
       settle: () => {},
       onNotSpawned: () => lifecycleEvents.push("not-spawned"),
-      onUnknown: () => lifecycleEvents.push("unknown"),
+      onUnknown: () => {
+        lifecycleEvents.push("unknown");
+      },
     };
     const port = createWorktreePort({
       command: "/nonexistent/omp",
@@ -1220,7 +1224,9 @@ exit 17`,
       },
       settle: () => lifecycleEvents.push("settle"),
       onNotSpawned: () => lifecycleEvents.push("not-spawned"),
-      onUnknown: () => lifecycleEvents.push("unknown"),
+      onUnknown: () => {
+        lifecycleEvents.push("unknown");
+      },
     };
     const failure = await failedPort
       .merge({ cwd: linked, lifecycle })
@@ -1282,7 +1288,9 @@ exit 18`,
       complete: () => {},
       settle: () => {},
       onNotSpawned: () => lifecycleEvents.push("not-spawned"),
-      onUnknown: () => lifecycleEvents.push("unknown"),
+      onUnknown: () => {
+        lifecycleEvents.push("unknown");
+      },
     };
     const port = createWorktreePort({ command: "/nonexistent/omp", worktrunkCandidates: [wt] });
 
@@ -1394,7 +1402,9 @@ while :; do sleep 10; done`,
       complete: () => {},
       settle: () => {},
       onNotSpawned: () => lifecycleEvents.push("not-spawned"),
-      onUnknown: () => lifecycleEvents.push("unknown"),
+      onUnknown: () => {
+        lifecycleEvents.push("unknown");
+      },
     };
     const port = createWorktreePort({
       command: "/nonexistent/omp",

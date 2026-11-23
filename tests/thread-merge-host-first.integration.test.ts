@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -442,12 +442,11 @@ async function runRepairScenario(scenario: "conflict" | "hook"): Promise<void> {
       const callId = "merge-repair-tool-call";
       const signal = new AbortController().signal;
       const result = await management.execute({ action: "thread-merge" }, signal, callId);
-      const retried = JSON.parse(
-        await management.execute({ action: "thread-merge" }, signal, callId),
-      ) as { merged: boolean; replayed?: boolean; removed?: boolean };
+      const retriedResult = await management.execute({ action: "thread-merge" }, signal, callId);
+      const retried = JSON.parse(retriedResult) as { merged: boolean; replayed?: boolean; removed?: boolean };
       expect(retried).toMatchObject({ merged: true, replayed: true, removed: true });
       expect(JSON.parse(result)).toMatchObject({ merged: true, removed: true });
-      management.onResultAccepted?.(callId);
+      management.onResultAccepted?.(callId, createHash("sha256").update(retriedResult, "utf8").digest("hex"));
       emit(assistantText("repaired-merge-result", "合并修复完成，工作区与分支已清理。", true));
     });
     await sendMerge(harness, world);

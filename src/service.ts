@@ -577,6 +577,7 @@ class CoreService implements ChannelService {
   private readonly reviewRuntimes = new Map<string, ReviewRuntime>();
   private readonly ingressCommitReservations = new Map<number, DestructiveCommandReservation>();
   private readonly blockedDirectories = new Set<string>();
+  private readonly runtimeStartupDirectoryBlocks = new Map<string, number>();
   private readonly ingressSessionDirectoryBlocks = new Map<number, Set<string>>();
   /** 问题与问答卡：等待者、卡片代次与问题行的所有者。 */
   /** 出站投递：文字、流式编辑与文件共用的队列。 */
@@ -4868,8 +4869,25 @@ class CoreService implements ChannelService {
     for (const jobId of jobIds) this.ingressSessionDirectoryBlocks.delete(jobId);
   }
 
+  private acquireRuntimeStartupDirectoryBlock(cwd: string): void {
+    this.runtimeStartupDirectoryBlocks.set(
+      cwd,
+      (this.runtimeStartupDirectoryBlocks.get(cwd) ?? 0) + 1,
+    );
+  }
+
+  private releaseRuntimeStartupDirectoryBlock(cwd: string): void {
+    const count = this.runtimeStartupDirectoryBlocks.get(cwd);
+    if (count === undefined) return;
+    if (count === 1) this.runtimeStartupDirectoryBlocks.delete(cwd);
+    else this.runtimeStartupDirectoryBlocks.set(cwd, count - 1);
+  }
+
   private isWorkspaceDirectoryBlocked(cwd: string): boolean {
     for (const blockedCwd of this.blockedDirectories) {
+      if (resourcePathsRelated(cwd, blockedCwd)) return true;
+    }
+    for (const blockedCwd of this.runtimeStartupDirectoryBlocks.keys()) {
       if (resourcePathsRelated(cwd, blockedCwd)) return true;
     }
     for (const paths of this.ingressSessionDirectoryBlocks.values()) {
@@ -8083,6 +8101,7 @@ class CoreService implements ChannelService {
         this.questions.cancelForTask(taskId, "cancelled");
         const queuedOperation = this.commitOperationsByTask.get(taskId);
         if (queuedOperation !== undefined) this.abandonCommitOperation(queuedOperation);
+        this.scheduler.notifyTaskTerminal(taskId);
       }
     }
     const pendingCommit = stopCheckpoint === null
@@ -8130,6 +8149,7 @@ class CoreService implements ChannelService {
       this.store.markCancelled(activeTask.id, "commit cancelled before start");
       this.questions.cancelForTask(activeTask.id, "cancelled");
       if (operation) this.abandonCommitOperation(operation);
+      this.scheduler.notifyTaskTerminal(activeTask.id);
       markStopDispatchIntent();
       await this.outbox.enqueueText(target, "已停止尚未开始的提交；没有 Git 副作用。", null);
       return;
@@ -8353,7 +8373,10 @@ class CoreService implements ChannelService {
     if (queuedCommit && queued.includes(queuedCommit.taskId)) {
       this.abandonCommitOperation(queuedCommit);
     }
-    for (const taskId of queued) this.scheduler.takeWaitingReceipt(taskId);
+    for (const taskId of queued) {
+      this.scheduler.takeWaitingReceipt(taskId);
+      this.scheduler.notifyTaskTerminal(taskId);
+    }
     const commitOperationCandidate = this.commitOperationsByTarget.get(key);
     const commitOperation = commitOperationCandidate !== undefined
       && (stopIntentTaskIds === null || stopIntentTaskIds.has(commitOperationCandidate.taskId))
@@ -9654,14 +9677,18 @@ class CoreService implements ChannelService {
     let outcomePersisted = false;
     let processStarted = false;
     let acceptedNotified = false;
-    const finishNotSpawned = (): void => {
-      if (!reserved || outcomePersisted) return;
+    let notStartedOutcome: { kind: "not-started"; diagnostic: string } | undefined;
+    const finishNotSpawned = (): { kind: "not-started"; diagnostic: string } | undefined => {
+      if (!reserved) return undefined;
+      if (outcomePersisted) return notStartedOutcome;
       this.clearPendingThreadRoutesEnding(target);
       const diagnostic = autoCommitDiagnostic?.()
         ?? "Worktrunk merge was confirmed not to have started; it will not be replayed automatically.";
+      notStartedOutcome = { kind: "not-started", diagnostic };
       this.store.completeHostMergeLease(id, { kind: "not-spawned", diagnostic });
       outcomePersisted = true;
-      progress?.finishFromOutcome({ kind: "not-started", diagnostic });
+      progress?.finishFromOutcome(notStartedOutcome);
+      return notStartedOutcome;
     };
     return {
       archiveGeneration: capturedArchiveGeneration,
@@ -9745,11 +9772,9 @@ class CoreService implements ChannelService {
       },
       onNotSpawned: finishNotSpawned,
       onUnknown: () => {
-        if (!reserved || outcomePersisted) return;
-        if (!processStarted) {
-          finishNotSpawned();
-          return;
-        }
+        if (!reserved) return;
+        if (outcomePersisted) return notStartedOutcome;
+        if (!processStarted) return finishNotSpawned();
         this.store.markHostMergeLeaseUnknown(id);
         if (!confirmedExit) {
           this.blockedDirectories.add(cwd);
@@ -12139,6 +12164,31 @@ class CoreService implements ChannelService {
           undefined,
           archiveGeneration,
         ),
+      recordHostMergeResultHash: (target, sourceId, resultHash, expectedOutcome) => {
+        if (target.channelType !== 5) return;
+        const lease = this.store.getHostMergeLeaseBySourceId(botUid, target, sourceId);
+        if (
+          lease === null
+          || lease.commandText !== null
+          || lease.autoCommitTaskId !== null
+          || lease.phase !== "exited"
+          || lease.outcome === null
+        ) return;
+        this.store.persistHostMergeResultHash(lease.id, resultHash, expectedOutcome);
+      },
+      settleAcceptedHostMerge: (target, sourceId, resultHash) => {
+        if (target.channelType !== 5) return;
+        const lease = this.store.getHostMergeLeaseBySourceId(botUid, target, sourceId);
+        if (
+          lease === null
+          || lease.commandText !== null
+          || lease.autoCommitTaskId !== null
+          || lease.phase !== "exited"
+          || lease.outcome === null
+          || !lease.resultHashes.includes(resultHash)
+        ) return;
+        this.store.settleHostMergeLease(lease.id, resultHash);
+      },
       tryAcquireDestructiveResources: (cwds, task) =>
         this.scheduler.tryAcquireDestructiveResources(cwds, task),
       threadReferences: (target) => this.store.getThreadReferences(botUid, target),
@@ -12592,6 +12642,7 @@ class CoreService implements ChannelService {
       } else {
         acquiredReservation?.complete();
       }
+      this.scheduler.notifyTaskTerminal(taskId);
       this.serviceRestart.maybeRunDeferred();
       await this.notifyThreadOutcome(taskId);
     }
@@ -12661,6 +12712,44 @@ class CoreService implements ChannelService {
     this.discovery.releaseTask(task.id);
     await this.notifyThreadOutcome(task.id);
     this.serviceRestart.maybeRunDeferred();
+  }
+
+  /** True only when this exact runtime run is confirmed stopped before task prompt dispatch. */
+  private async hasConfirmedUndispatchedRuntimeWorker(
+    taskId: string,
+    cwd: string,
+    runId: string | undefined,
+    isHotRuntimeTask: boolean,
+    resuming: boolean,
+    isGoalTask: boolean,
+    promptDispatchStarted: boolean,
+  ): Promise<boolean> {
+    if (
+      isHotRuntimeTask
+      || resuming
+      || isGoalTask
+      || promptDispatchStarted
+      || runId === undefined
+    ) return false;
+    const agentRuntime = this.agentRuntime;
+    const botUid = this.bot?.uid;
+    if (agentRuntime === undefined || botUid === undefined) return false;
+    try {
+      const matches = (await agentRuntime.client.listWorkers()).filter(snapshot =>
+        snapshot.botUid === botUid
+        && snapshot.runtimeId === agentRuntime.handle.runtimeId
+        && snapshot.taskId === taskId
+        && snapshot.runId === runId);
+      if (matches.length !== 1) return false;
+      const [snapshot] = matches;
+      return snapshot?.stage === "exited-confirmed"
+        && snapshot.process !== null
+        && snapshot.process.cwd === cwd
+        && snapshot.activeDispatchId === null
+        && snapshot.dispatches.length === 0;
+    } catch {
+      return false;
+    }
   }
 
   private async runTask(taskId: string, expectedCwd?: string): Promise<void> {
@@ -12877,6 +12966,8 @@ class CoreService implements ChannelService {
     let startupPhase: TaskStartupPhase = "context";
     let runtimeOutcomeUnknown = false;
     let runtimeTerminalFailure = false;
+    let runtimeWorkerRunId: string | undefined;
+    let promptDispatchStarted = false;
     runtime.stopActivity = (abortProgress) => progress.stop(abortProgress);
     runtime.stopText = () => textDelivery.stop();
     runtime.rollProgressCard = () => progress.roll();
@@ -12973,13 +13064,15 @@ class CoreService implements ChannelService {
             runtime.suspended = true;
             return;
           }
+          const runId = snapshot?.runId ?? randomUUID();
+          runtimeWorkerRunId = runId;
           try {
             runtime.lease = await openTrackedAgentWorker({
               client: this.agentRuntime.client,
               runtimeId: this.agentRuntime.handle.runtimeId,
               botUid: this.bot!.uid,
               taskId,
-              runId: snapshot?.runId ?? randomUUID(),
+              runId,
               worker: snapshot === undefined
                 ? { kind: "create", options: workerOptions }
                 : { kind: "attach", sessionId: snapshot.sessionId },
@@ -12989,10 +13082,9 @@ class CoreService implements ChannelService {
             });
           } catch (error) {
             runtimeOutcomeUnknown = true;
-            this.blockedDirectories.add(task.cwd);
             if (!isHotRuntimeTask) throw error;
-            console.error(`[task recovery] 无法 attach 原 runtime worker task=${taskId}: ${safeErrorMessage(error, "runtime attach failed")}`);
             this.blockedDirectories.add(task.cwd);
+            console.error(`[task recovery] 无法 attach 原 runtime worker task=${taskId}: ${safeErrorMessage(error, "runtime attach failed")}`);
             runtime.suspended = true;
             return;
           }
@@ -13352,6 +13444,7 @@ class CoreService implements ChannelService {
           if (!isSourceWatchWakeTask && !isHotRuntimeTask) {
             this.store.markTaskPromptStarted(taskId, verified.sessionId);
           }
+          promptDispatchStarted = true;
           runtime.promptInFlight = true;
           const prompt = isTanDispatch
             ? (/^\s*\/\S+/u.test(task.text) ? `用户请求：\n${task.text}` : task.text)
@@ -13486,6 +13579,41 @@ class CoreService implements ChannelService {
         }
       }
     } catch (error) {
+      const mayConfirmUndispatchedRuntimeWorker = runtimeOutcomeUnknown
+        && !this.stopping
+        && !isHotRuntimeTask
+        && !resuming
+        && goalTask === null
+        && !promptDispatchStarted
+        && runtimeWorkerRunId !== undefined;
+      let confirmedUndispatchedRuntimeExit = false;
+      if (runtimeOutcomeUnknown && !this.stopping) {
+        if (mayConfirmUndispatchedRuntimeWorker) this.acquireRuntimeStartupDirectoryBlock(task.cwd);
+        else this.blockedDirectories.add(task.cwd);
+      }
+      if (
+        mayConfirmUndispatchedRuntimeWorker
+        && await this.hasConfirmedUndispatchedRuntimeWorker(
+          taskId,
+          task.cwd,
+          runtimeWorkerRunId,
+          isHotRuntimeTask,
+          resuming,
+          goalTask !== null,
+          promptDispatchStarted,
+        )
+      ) {
+        // This exact runtime ledger proves the failed worker exited before task dispatch intent.
+        runtimeOutcomeUnknown = false;
+        confirmedUndispatchedRuntimeExit = true;
+      }
+      if (mayConfirmUndispatchedRuntimeWorker) {
+        if (runtimeOutcomeUnknown && !this.stopping) this.blockedDirectories.add(task.cwd);
+        this.releaseRuntimeStartupDirectoryBlock(task.cwd);
+        if (confirmedUndispatchedRuntimeExit && !this.stopping) {
+          this.scheduler.retryQueuedTasks();
+        }
+      }
       try {
         await this.outbox.settleStreamText(taskId);
       } catch (settlementError) {

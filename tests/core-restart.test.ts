@@ -1,12 +1,16 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import type { ChatTarget, RestartPort } from "../src/contracts";
 import type { ChannelStore } from "../src/store";
 import { openChannelStore } from "../src/store";
 import type { TaskRecord } from "../src/store/store-records";
+import { ensureAgentRuntime, type EnsureAgentRuntimeResult } from "../src/runtime/agent-runtime.ts";
+import type { AgentRuntimeWorkerSnapshot } from "../src/runtime/agent-runtime-protocol.ts";
+
 import {
   FakeTransport,
   FakeWorkerFactory,
@@ -89,6 +93,29 @@ async function withStore<T>(root: string, work: (store: ChannelStore) => T): Pro
   } finally {
     store.close();
   }
+}
+
+/** This integration test observes a real runtime subprocess; fake timers cannot advance its exit. */
+async function waitForTaskUntil(
+  readTask: () => TaskRecord | null,
+  predicate: (task: TaskRecord) => boolean,
+  label: string,
+  timeoutMs = 10_000,
+): Promise<TaskRecord> {
+  const deadline = performance.now() + timeoutMs;
+  let task: TaskRecord | null = null;
+  while (performance.now() < deadline) {
+    task = readTask();
+    if (task && predicate(task)) return task;
+    const remainingMs = deadline - performance.now();
+    if (remainingMs <= 0) break;
+    await new Promise<void>((resolve) => setTimeout(resolve, Math.min(25, remainingMs)));
+  }
+  task = readTask();
+  if (task && predicate(task)) return task;
+  throw new Error(
+    `${label} was not reached within ${timeoutMs}ms (last task state: ${task?.state ?? "missing"})`,
+  );
 }
 
 function seedQueuedTask(store: ChannelStore, task: TaskRecord): void {
@@ -519,6 +546,409 @@ test("a failed startup never runs recovered tasks", async () => {
   expect(workers.prompts).toHaveLength(0);
   expect(await withStore(first.root, (store) => store.getTask("startup-failed-task")?.state)).toBe("queued");
   await rm(first.root, { recursive: true, force: true });
+});
+
+test("a confirmed empty runtime exit settles an undispatched recovered task", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-runtime-recovery-")));
+  const cwd = join(root, "tmp");
+  const sessionDir = join(root, "sessions");
+  const ompCommand = join(root, "failing-omp");
+  const bot = { uid: "bot-runtime-recovery", name: "Fixture Bot" };
+  const target: ChatTarget = { channelId: "dm-runtime-recovery", channelType: 1 };
+  const taskId = "runtime-startup-recovery-task";
+  let runtime: EnsureAgentRuntimeResult | undefined;
+  let harness: CoreHarness | undefined;
+  let stateObserver: ChannelStore | undefined;
+  try {
+    await mkdir(cwd, { recursive: true });
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(ompCommand, "#!/bin/sh\nsleep 0.5\nexit 23\n");
+    await chmod(ompCommand, 0o755);
+    const runtimeOptions = {
+      stateDir: join(root, "state"),
+      botUid: bot.uid,
+      ompCommand,
+      startupTimeoutMs: 3_000,
+    };
+    runtime = await ensureAgentRuntime(runtimeOptions);
+    let startupError: unknown;
+    try {
+      await runtime.client.createWorker({
+        taskId,
+        runId: "confirmed-old-run",
+        workerOptions: { cwd, sessionDir },
+      });
+    } catch (error) {
+      startupError = error;
+    }
+    expect(startupError).toBeInstanceOf(Error);
+    const oldSnapshot = (await runtime.client.listWorkers()).find(
+      (snapshot) => snapshot.taskId === taskId && snapshot.runId === "confirmed-old-run",
+    );
+    expect(oldSnapshot).toMatchObject({
+      stage: "exited-confirmed",
+      process: { cwd },
+      activeDispatchId: null,
+      dispatches: [],
+    });
+    await runtime.client.disconnect();
+
+    await withStore(root, (store) => {
+      seedQueuedTask(store, taskRow({ id: taskId, botUid: bot.uid, ...target, cwd }));
+      expect(store.markStarted(taskId)).toBe(true);
+    });
+    harness = await createCoreHarness({
+      root,
+      bot,
+      agentRuntime: { ompCommand, startupTimeoutMs: 3_000 },
+    });
+    stateObserver = await openChannelStore(join(root, "state"));
+    const taskStore = stateObserver;
+    const recovered = await waitForTaskUntil(
+      () => taskStore.getTask(taskId),
+      (task) => task.state === "failed",
+      "recovered task failure",
+    );
+    expect(recovered.state).toBe("failed");
+
+    const task = await withStore(root, (store) => store.getTask(taskId));
+    expect(task?.state).toBe("failed");
+    await submitAndWaitForIngressHandoff(
+      harness,
+      inbound({ messageId: "runtime-recovery-followup", ...target, text: "follow-up" }),
+    );
+    const followup = await waitForTaskUntil(
+      () => taskStore.getLatestTask(bot.uid, target),
+      (task) => task.id !== taskId && task.state === "failed",
+      "follow-up task failure",
+    );
+    expect(followup.id).not.toBe(taskId);
+    expect(followup.state).toBe("failed");
+    const database = new Database(join(root, "state", "channel.sqlite"), { readonly: true });
+    let markers: { prompt_started: number; prompt_accepted: number };
+    try {
+      markers = database.query(
+        "SELECT prompt_started, prompt_accepted FROM tasks WHERE id = ?",
+      ).get(taskId) as { prompt_started: number; prompt_accepted: number };
+    } finally {
+      database.close();
+    }
+    expect(markers).toEqual({ prompt_started: 0, prompt_accepted: 0 });
+
+    if (harness) await closeCoreHarness(harness, { remove: false });
+    harness = undefined;
+    runtime = await ensureAgentRuntime(runtimeOptions);
+    const taskSnapshots = (await runtime.client.listWorkers()).filter(
+      (snapshot) => snapshot.taskId === taskId,
+    );
+    expect(taskSnapshots).toHaveLength(2);
+    expect(taskSnapshots.every((snapshot) =>
+      snapshot.stage === "exited-confirmed"
+      && snapshot.process?.cwd === cwd
+      && snapshot.activeDispatchId === null
+      && snapshot.dispatches.length === 0)).toBe(true);
+  } finally {
+    stateObserver?.close();
+    if (harness) await closeCoreHarness(harness, { remove: false });
+    if (runtime) {
+      await runtime.client.disconnect();
+      await runtime.handle.shutdown().catch(() => {});
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("confirmed startup exit reschedules related queued work without reversing FIFO", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-runtime-release-")));
+  const cwd = join(root, "tmp");
+  const ompCommand = join(root, "unused-omp");
+  const bot = { uid: "bot-runtime-release", name: "Fixture Bot" };
+  const target: ChatTarget = { channelId: "dm-runtime-release", channelType: 1 };
+  const laterTarget: ChatTarget = { channelId: "dm-runtime-release-later", channelType: 1 };
+  const creationStarted = Promise.withResolvers<void>();
+  const releaseCreation = Promise.withResolvers<void>();
+  const probeStarted = Promise.withResolvers<void>();
+  const releaseProbe = Promise.withResolvers<readonly AgentRuntimeWorkerSnapshot[]>();
+  let runtime: EnsureAgentRuntimeResult | undefined;
+  let harness: CoreHarness | undefined;
+  let firstRun: { taskId: string; runId: string; cwd: string } | undefined;
+  let lastRun: { taskId: string; runId: string; cwd: string } | undefined;
+  const createOrder: string[] = [];
+  try {
+    await mkdir(cwd, { recursive: true });
+    await writeFile(ompCommand, "#!/bin/sh\nexit 0\n");
+    await chmod(ompCommand, 0o755);
+    const runtimeOptions = {
+      stateDir: join(root, "state"),
+      botUid: bot.uid,
+      ompCommand,
+      startupTimeoutMs: 3_000,
+    };
+    harness = await createCoreHarness({
+      root,
+      bot,
+      agentRuntime: { ompCommand, startupTimeoutMs: 3_000 },
+    });
+    runtime = await ensureAgentRuntime(runtimeOptions);
+
+    type RuntimeClientForTest = {
+      createWorker(input: {
+        taskId: string;
+        runId: string;
+        workerOptions: { cwd: string };
+      }, hostTools?: readonly unknown[]): Promise<unknown>;
+      listWorkers(): Promise<readonly AgentRuntimeWorkerSnapshot[]>;
+    };
+    const internal = harness.service as unknown as {
+      agentRuntime: { handle: { runtimeId: string }; client: RuntimeClientForTest };
+      scheduler: {
+        settle(): Promise<unknown>;
+        waitForTaskSettlement(taskId: string): Promise<void>;
+      };
+    };
+    const client = internal.agentRuntime.client;
+    client.createWorker = async input => {
+      const run = { taskId: input.taskId, runId: input.runId, cwd: input.workerOptions.cwd };
+      createOrder.push(run.taskId);
+      lastRun = run;
+      if (firstRun === undefined) {
+        firstRun = run;
+        creationStarted.resolve();
+        await releaseCreation.promise;
+      }
+      throw new Error("fixture runtime worker creation failed");
+    };
+    let firstProbe = true;
+    client.listWorkers = async () => {
+      if (firstProbe) {
+        firstProbe = false;
+        probeStarted.resolve();
+        return await releaseProbe.promise;
+      }
+      if (!lastRun) return [];
+      return [{
+        botUid: bot.uid,
+        taskId: lastRun.taskId,
+        runId: lastRun.runId,
+        runtimeId: internal.agentRuntime.handle.runtimeId,
+        sessionId: "fixture-session",
+        sessionFile: join(lastRun.cwd, "fixture-session.jsonl"),
+        process: {
+          pid: 4242,
+          pgid: 4242,
+          identity: `fixture-exited-${lastRun.taskId}`,
+          cwd: lastRun.cwd,
+        },
+        stage: "exited-confirmed",
+        activeDispatchId: null,
+        dispatches: [],
+      }];
+    };
+
+    await submitAndWaitForIngressHandoff(
+      harness,
+      inbound({ messageId: "runtime-release-first", ...target, text: "start worker" }),
+    );
+    await creationStarted.promise;
+    const task = await withStore(root, store => store.getLatestTask(bot.uid, target));
+    if (!task) throw new Error("runtime startup task was not durably accepted");
+    releaseCreation.resolve();
+    await probeStarted.promise;
+
+    await submitAndWaitForIngressHandoff(
+      harness,
+      inbound({ messageId: "runtime-release-mode", ...laterTarget, text: "/mode queue" }),
+    );
+    await submitAndWaitForIngressHandoff(
+      harness,
+      inbound({ messageId: "runtime-release-later-1", ...laterTarget, text: "first queued task" }),
+    );
+    const firstQueued = await withStore(root, store => store.getLatestTask(bot.uid, laterTarget));
+    if (!firstQueued) throw new Error("first queued task was not durably accepted");
+    await waitForStatus(harness.service, laterTarget, status => status.queued === 1);
+    await submitAndWaitForIngressHandoff(
+      harness,
+      inbound({ messageId: "runtime-release-later-2", ...laterTarget, text: "second queued task" }),
+    );
+    const secondQueued = await withStore(root, store => store.getLatestTask(bot.uid, laterTarget));
+    if (!secondQueued || secondQueued.id === firstQueued.id) {
+      throw new Error("second queued task was not durably accepted");
+    }
+    if (!firstRun) throw new Error("runtime create request was not captured");
+    expect(firstQueued.cwd).toBe(firstRun.cwd);
+    expect(secondQueued.cwd).toBe(firstRun.cwd);
+    await waitForStatus(harness.service, laterTarget, status => status.queued === 2);
+    await Promise.all([
+      internal.scheduler.waitForTaskSettlement(firstQueued.id),
+      internal.scheduler.waitForTaskSettlement(secondQueued.id),
+    ]);
+    expect(createOrder).toHaveLength(1);
+
+    releaseProbe.resolve([{
+      botUid: bot.uid,
+      taskId: firstRun.taskId,
+      runId: firstRun.runId,
+      runtimeId: internal.agentRuntime.handle.runtimeId,
+      sessionId: "fixture-session",
+      sessionFile: join(firstRun.cwd, "fixture-session.jsonl"),
+      process: {
+        pid: 4242,
+        pgid: 4242,
+        identity: "fixture-confirmed-exit",
+        cwd: firstRun.cwd,
+      },
+      stage: "exited-confirmed",
+      activeDispatchId: null,
+      dispatches: [],
+    }]);
+    await internal.scheduler.waitForTaskSettlement(task.id);
+    await internal.scheduler.settle();
+
+    const rows = await withStore(root, store => ({
+      failed: store.getTask(task.id)?.state,
+      first: store.getTask(firstQueued.id)?.state,
+      second: store.getTask(secondQueued.id)?.state,
+    }));
+    expect(rows).toEqual({ failed: "failed", first: "failed", second: "failed" });
+    expect(createOrder).toEqual([task.id, firstQueued.id, secondQueued.id]);
+  } finally {
+    releaseCreation.resolve();
+    releaseProbe.resolve([]);
+    if (harness) await closeCoreHarness(harness, { remove: false });
+    if (runtime) {
+      await runtime.client.disconnect();
+      await runtime.handle.shutdown().catch(() => {});
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cancel racing an unconfirmed runtime worker creation keeps related queued work blocked", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-channel-octo-runtime-cancel-race-")));
+  const cwd = join(root, "tmp");
+  const ompCommand = join(root, "unused-omp");
+  const bot = { uid: "bot-runtime-cancel-race", name: "Fixture Bot" };
+  const target: ChatTarget = { channelId: "dm-runtime-cancel-race", channelType: 1 };
+  const laterTarget: ChatTarget = { channelId: "dm-runtime-cancel-race-later", channelType: 1 };
+  const creationStarted = Promise.withResolvers<void>();
+  const releaseCreation = Promise.withResolvers<void>();
+  const probeStarted = Promise.withResolvers<void>();
+  const releaseProbe = Promise.withResolvers<readonly AgentRuntimeWorkerSnapshot[]>();
+  let runtime: EnsureAgentRuntimeResult | undefined;
+  let harness: CoreHarness | undefined;
+  let run: { taskId: string; runId: string; cwd: string } | undefined;
+  let createCalls = 0;
+  try {
+    await mkdir(cwd, { recursive: true });
+    await writeFile(ompCommand, "#!/bin/sh\nexit 0\n");
+    await chmod(ompCommand, 0o755);
+    const runtimeOptions = {
+      stateDir: join(root, "state"),
+      botUid: bot.uid,
+      ompCommand,
+      startupTimeoutMs: 3_000,
+    };
+    harness = await createCoreHarness({
+      root,
+      bot,
+      agentRuntime: { ompCommand, startupTimeoutMs: 3_000 },
+    });
+    runtime = await ensureAgentRuntime(runtimeOptions);
+
+    type RuntimeClientForTest = {
+      createWorker(input: {
+        taskId: string;
+        runId: string;
+        workerOptions: { cwd: string };
+      }, hostTools?: readonly unknown[]): Promise<unknown>;
+      listWorkers(): Promise<readonly AgentRuntimeWorkerSnapshot[]>;
+    };
+    const internal = harness.service as unknown as {
+      agentRuntime: { handle: { runtimeId: string }; client: RuntimeClientForTest };
+      scheduler: {
+        settle(): Promise<unknown>;
+        waitForTaskSettlement(taskId: string): Promise<void>;
+      };
+    };
+    const client = internal.agentRuntime.client;
+    client.createWorker = async input => {
+      createCalls += 1;
+      if (createCalls !== 1) throw new Error("unexpected worker create while exit is unconfirmed");
+      run = { taskId: input.taskId, runId: input.runId, cwd: input.workerOptions.cwd };
+      creationStarted.resolve();
+      await releaseCreation.promise;
+      throw new Error("fixture runtime worker creation failed");
+    };
+    client.listWorkers = async () => {
+      probeStarted.resolve();
+      return await releaseProbe.promise;
+    };
+
+    await submitAndWaitForIngressHandoff(
+      harness,
+      inbound({ messageId: "runtime-cancel-race-task", ...target, text: "start worker" }),
+    );
+    await creationStarted.promise;
+    const task = await withStore(root, store => store.getLatestTask(bot.uid, target));
+    if (!task) throw new Error("runtime startup task was not durably accepted");
+    await submitAndWaitForIngressHandoff(
+      harness,
+      inbound({ messageId: "runtime-cancel-race-cancel", ...target, text: "/cancel" }),
+    );
+    await waitForStatus(harness.service, target, status => status.state === "cancelled");
+
+    releaseCreation.resolve();
+    await Promise.race([
+      probeStarted.promise,
+      internal.scheduler.waitForTaskSettlement(task.id).then(() => {
+        throw new Error("cancelled startup failure settled without checking runtime exit");
+      }),
+    ]);
+    if (!run) throw new Error("runtime create request was not captured");
+    const unknownWorker: AgentRuntimeWorkerSnapshot = {
+      botUid: bot.uid,
+      taskId: run.taskId,
+      runId: run.runId,
+      runtimeId: internal.agentRuntime.handle.runtimeId,
+      sessionId: task.sessionId,
+      sessionFile: join(run.cwd, "unknown.jsonl"),
+      process: {
+        pid: 4242,
+        pgid: 4242,
+        identity: "fixture-unknown-runtime-worker",
+        cwd: run.cwd,
+      },
+      stage: "unknown",
+      activeDispatchId: null,
+      dispatches: [],
+    };
+
+    await submitAndWaitForIngressHandoff(
+      harness,
+      inbound({ messageId: "runtime-cancel-race-later", ...laterTarget, text: "must stay queued" }),
+    );
+    const laterTask = await withStore(root, store => store.getLatestTask(bot.uid, laterTarget));
+    expect(laterTask?.cwd).toBe(run.cwd);
+    await waitForStatus(harness.service, laterTarget, status => status.queued === 1);
+
+    releaseProbe.resolve([unknownWorker]);
+    await internal.scheduler.settle();
+    const rows = await withStore(root, store => ({
+      cancelled: store.getTask(task.id)?.state,
+      later: store.getTask(laterTask?.id ?? "")?.state,
+    }));
+    expect(rows).toEqual({ cancelled: "cancelled", later: "queued" });
+    expect(createCalls).toBe(1);
+  } finally {
+    releaseCreation.resolve();
+    releaseProbe.resolve([]);
+    if (harness) await closeCoreHarness(harness, { remove: false });
+    if (runtime) {
+      await runtime.client.disconnect();
+      await runtime.handle.shutdown().catch(() => {});
+    }
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("an explicit interrupt stays terminal when the process stops before the turn unwinds", async () => {

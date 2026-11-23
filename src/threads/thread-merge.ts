@@ -17,6 +17,26 @@ import { WorktreeMergeExecutionError, worktrunkUnavailableText } from "../worksp
 
 export { WorktreeMergeExecutionError };
 
+export class HostMergeNotStartedError extends Error {
+  constructor(
+    message: string,
+    readonly outcome: Extract<HostMergeOutcome, { kind: "not-started" }>,
+  ) {
+    super(message);
+    this.name = "HostMergeNotStartedError";
+  }
+}
+
+export class HostMergeExecutionFailureError extends WorktreeMergeExecutionError {
+  readonly outcome: Extract<HostMergeOutcome, { kind: "execution-failed" }>;
+
+  constructor(outcome: Extract<HostMergeOutcome, { kind: "execution-failed" }>) {
+    super(outcome.exitCode, outcome.diagnostic);
+    this.name = "HostMergeExecutionFailureError";
+    this.outcome = outcome;
+  }
+}
+
 export interface ThreadMergeHost {
   readonly botUid: string;
   readonly store: Pick<
@@ -87,10 +107,10 @@ export async function mergeThreadWorkspace(
     : undefined;
   const replayOutcome = (outcome: HostMergeOutcome): WorktreeMergeSummary & { archive?: "scheduled" } => {
     if (outcome.kind === "not-started") {
-      throw new Error(outcome.diagnostic);
+      throw new HostMergeNotStartedError(outcome.diagnostic, outcome);
     }
     if (outcome.kind === "execution-failed") {
-      throw new WorktreeMergeExecutionError(outcome.exitCode, outcome.diagnostic);
+      throw new HostMergeExecutionFailureError(outcome);
     }
     const replayOwnership = host.store.getThreadWorkspace(host.botUid, target);
     if (outcome.summary.removed && binding && replayOwnership !== null) {
@@ -221,12 +241,14 @@ export async function mergeThreadWorkspace(
   } catch (error) {
     if (error instanceof WorktreeMergeExecutionError && confirmedExit) {
       if (lifecycle) {
+        const outcome: Extract<HostMergeOutcome, { kind: "execution-failed" }> = {
+          kind: "execution-failed",
+          exitCode: error.exitCode,
+          diagnostic: error.diagnostic,
+        };
         try {
-          lifecycle.complete({
-            kind: "execution-failed",
-            exitCode: error.exitCode,
-            diagnostic: error.diagnostic,
-          });
+          lifecycle.complete(outcome);
+          outcomePersisted = true;
         } catch (persistError) {
           try {
             lifecycle.onUnknown();
@@ -235,9 +257,16 @@ export async function mergeThreadWorkspace(
           }
           throw persistError;
         }
+        throw new HostMergeExecutionFailureError(outcome);
       }
     } else if (!outcomePersisted) {
-      lifecycle?.onUnknown();
+      const terminalOutcome = lifecycle?.onUnknown();
+      if (terminalOutcome !== undefined && terminalOutcome.kind === "not-started") {
+        throw new HostMergeNotStartedError(
+          error instanceof Error ? error.message : String(error),
+          terminalOutcome,
+        );
+      }
     }
     throw error;
   }
