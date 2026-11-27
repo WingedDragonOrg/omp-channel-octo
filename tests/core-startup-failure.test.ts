@@ -99,7 +99,7 @@ test("a bound workspace that is gone reports the binding class with its code", a
     const row = taskRow(harness, "startup-binding-failure");
     expect(row.error_text).toStartWith("绑定不可用（cwd-missing）：");
     expect(row.error_text).toContain("cwd-missing");
-    expect(row.error_text).toContain("/gone/workspace");
+    expect(row.error_text).toContain("绑定的工作目录或会话不可用");
 
     const lines = taskLogLines(logged.mock.calls);
     expect(lines).toHaveLength(1);
@@ -222,11 +222,11 @@ test("the worker factory reports not-ready when the child never becomes ready", 
   }
 });
 
-test("an early OMP exit reports bounded, redacted stderr and the exit status", async () => {
+test("an early OMP exit reports its status without exposing stderr", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "oco-startup-stderr-"));
   const script = join(workspace, "fail.sh");
   try {
-    await writeFile(script, "#!/bin/sh\nsleep 0.2\nprintf 'Configuration broken: authorization: Bearer secret-value\\n' >&2\nexit 23\n", "utf8");
+    await writeFile(script, "#!/bin/sh\nsleep 0.2\nprintf 'Configuration broken: unrecognized-private-value-42\\n' >&2\nexit 23\n", "utf8");
     await chmod(script, 0o755);
     const factory = createWorkerFactory({ ompCommand: script });
     const error = await factory.create({ cwd: workspace, sessionDir: workspace, onSpawn: () => {} })
@@ -234,10 +234,9 @@ test("an early OMP exit reports bounded, redacted stderr and the exit status", a
     expect(error).toBeInstanceOf(TaskStartupError);
     expect((error as TaskStartupError).code).toBe("exited");
     const report = classifyStartupFailure(error, "startup");
-    expect(report.notice).toContain("Configuration broken");
-    expect(report.notice).toContain("23");
-    expect(report.notice).not.toContain("secret-value");
-    expect(report.detail).not.toContain("secret-value");
+    expect(report.notice).toContain("退出码 23");
+    expect(report.notice).not.toContain("unrecognized-private-value-42");
+    expect(report.detail).not.toContain("unrecognized-private-value-42");
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
@@ -253,7 +252,7 @@ test("a worker whose stdout closes while it is alive does not report the host's 
     const error = await factory.create({ cwd: workspace, sessionDir: workspace, onSpawn: () => {} })
       .then(() => undefined, (failure: unknown) => failure);
     const report = classifyStartupFailure(error, "startup");
-    expect(report.notice).toContain("stdout closed");
+    expect(report.notice).not.toContain("stdout closed");
     expect(report.notice).not.toContain("退出码");
   } finally {
     await rm(workspace, { recursive: true, force: true });

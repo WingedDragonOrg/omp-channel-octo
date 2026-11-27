@@ -1337,11 +1337,28 @@ class CoreService implements ChannelService {
       // its process. Recover those rows from the runtime's authenticated snapshot, never by probing
       // an unowned PID with the channel factory.
       for (const snapshots of this.runtimeWorkersByTask.values()) {
+        if (this.agentRuntime?.client.protocolVersion === 1 && snapshots.some(snapshot =>
+          snapshot.stage === "exited-confirmed" && snapshot.activeDispatchId === null && snapshot.dispatches.length === 0)) {
+          const task = this.store.getTask(snapshots[0]!.taskId);
+          if (task?.state === "running") {
+            hotTaskIds.add(task.id);
+            this.blockedDirectories.add(task.cwd);
+            continue;
+          }
+        }
         for (const snapshot of snapshots) {
-          if (snapshot.stage === "exited-confirmed") continue;
           let task = this.store.getTask(snapshot.taskId);
+          if (snapshot.stage === "exited-confirmed" && !snapshot.startupFenced) continue;
+          if ((snapshot.stage === "not-spawned" || snapshot.stage === "exited-confirmed")
+            && snapshot.startupFenced && snapshot.botUid === identity.uid
+            && snapshot.runtimeId === currentRuntimeId && task !== null
+            && (task.state === "failed" || task.state === "completed" || task.state === "cancelled" || task.state === "interrupted")
+            && snapshot.startupCwd === task.cwd && snapshot.activeDispatchId === null
+            && snapshot.dispatches.length === 0 && !this.store.hasWorkerLedger(task.id)
+            && snapshots.length === 1) continue;
           if (task === null) {
             if (snapshot.process !== null) this.blockedDirectories.add(snapshot.process.cwd);
+            else if (snapshot.startupCwd !== undefined) this.blockedDirectories.add(snapshot.startupCwd);
             continue;
           }
           const processInfo = snapshot.process;
@@ -12723,32 +12740,31 @@ class CoreService implements ChannelService {
     resuming: boolean,
     isGoalTask: boolean,
     promptDispatchStarted: boolean,
-  ): Promise<boolean> {
+  ): Promise<AgentRuntimeWorkerSnapshot | undefined> {
     if (
       isHotRuntimeTask
       || resuming
       || isGoalTask
       || promptDispatchStarted
       || runId === undefined
-    ) return false;
+    ) return undefined;
     const agentRuntime = this.agentRuntime;
     const botUid = this.bot?.uid;
-    if (agentRuntime === undefined || botUid === undefined) return false;
+    if (agentRuntime === undefined || botUid === undefined) return undefined;
+    if (agentRuntime.client.protocolVersion === 1) return undefined;
     try {
-      const matches = (await agentRuntime.client.listWorkers()).filter(snapshot =>
-        snapshot.botUid === botUid
-        && snapshot.runtimeId === agentRuntime.handle.runtimeId
-        && snapshot.taskId === taskId
-        && snapshot.runId === runId);
-      if (matches.length !== 1) return false;
-      const [snapshot] = matches;
-      return snapshot?.stage === "exited-confirmed"
-        && snapshot.process !== null
-        && snapshot.process.cwd === cwd
-        && snapshot.activeDispatchId === null
-        && snapshot.dispatches.length === 0;
+      const workers = await agentRuntime.client.listWorkers();
+      const matches = workers.filter(snapshot => snapshot.taskId === taskId);
+      const snapshot = matches.length === 1 ? matches[0] : undefined;
+      if (!snapshot || snapshot.botUid !== botUid || snapshot.runtimeId !== agentRuntime.handle.runtimeId
+        || snapshot.runId !== runId || snapshot.startupCwd !== cwd || snapshot.startupFenced !== true
+        || snapshot.startupFailure === undefined || snapshot.activeDispatchId !== null
+        || snapshot.dispatches.length !== 0 || this.store.hasWorkerLedger(taskId)) return undefined;
+      if (snapshot.stage === "not-spawned" && snapshot.process === null) return snapshot;
+      if (snapshot.stage === "exited-confirmed" && snapshot.process?.cwd === cwd) return snapshot;
+      return undefined;
     } catch {
-      return false;
+      return undefined;
     }
   }
 
@@ -13073,6 +13089,7 @@ class CoreService implements ChannelService {
               botUid: this.bot!.uid,
               taskId,
               runId,
+              fenceStartupFailure: !isHotRuntimeTask && !resuming && goalTask === null,
               worker: snapshot === undefined
                 ? { kind: "create", options: workerOptions }
                 : { kind: "attach", sessionId: snapshot.sessionId },
@@ -13591,21 +13608,18 @@ class CoreService implements ChannelService {
         if (mayConfirmUndispatchedRuntimeWorker) this.acquireRuntimeStartupDirectoryBlock(task.cwd);
         else this.blockedDirectories.add(task.cwd);
       }
-      if (
-        mayConfirmUndispatchedRuntimeWorker
-        && await this.hasConfirmedUndispatchedRuntimeWorker(
-          taskId,
-          task.cwd,
-          runtimeWorkerRunId,
-          isHotRuntimeTask,
-          resuming,
-          goalTask !== null,
-          promptDispatchStarted,
+      const confirmedStartup = mayConfirmUndispatchedRuntimeWorker
+        ? await this.hasConfirmedUndispatchedRuntimeWorker(
+          taskId, task.cwd, runtimeWorkerRunId, isHotRuntimeTask, resuming,
+          goalTask !== null, promptDispatchStarted,
         )
-      ) {
-        // This exact runtime ledger proves the failed worker exited before task dispatch intent.
+        : undefined;
+      if (confirmedStartup) {
         runtimeOutcomeUnknown = false;
         confirmedUndispatchedRuntimeExit = true;
+        error = confirmedStartup.startupFailure
+          ? new TaskStartupError(confirmedStartup.startupFailure.code, "OMP worker startup failed", confirmedStartup.startupFailure.diagnostic)
+          : new Error("OMP worker startup failed");
       }
       if (mayConfirmUndispatchedRuntimeWorker) {
         if (runtimeOutcomeUnknown && !this.stopping) this.blockedDirectories.add(task.cwd);
@@ -13638,6 +13652,9 @@ class CoreService implements ChannelService {
       } else if (runtimeOutcomeUnknown || (isHotRuntimeTask && !runtimeTerminalFailure)) {
         runtime.suspended = true;
         this.blockedDirectories.add(task.cwd);
+        if (mayConfirmUndispatchedRuntimeWorker && this.agentRuntime?.client.protocolVersion === 1) {
+          await this.outbox.enqueueText(runtime.target, "任务启动异常（worker-start），结果未确认；后续任务保持等待。", taskId);
+        }
         console.error(`[task] runtime 状态未知，任务保持 started task=${taskId}: ${safeErrorMessage(error, "runtime outcome unknown")}`);
       } else if (runtime.suspended || this.stopping) {
         // Stop aborts startup I/O before its per-runtime suspend loop; `stopping` closes that race.

@@ -1,5 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { contextSidecarPath, writePreparedReceipt } from "../../src/session/context-sidecar.ts";
 
 /**
  * Deterministic RPC-mode child used by omp-worker tests.
@@ -2295,6 +2296,9 @@ function emitResearchHigherScenario(id: string | undefined): void {
 }
 
 async function handlePrompt(id: string | undefined, message: string): Promise<void> {
+	if (argv.includes("--fixture-context-receipt")) {
+		await writePreparedReceipt(contextSidecarPath(process.env.OMP_CHANNEL_OCTO_CONTEXT_ROOT!, sessionId));
+	}
 	appendLog({ kind: "prompt", id, message });
 	if (scenario.startsWith("native-ask") && (message === "/native ask" || message === "/retry")) {
 		beginNativeAskPrompt(id);
