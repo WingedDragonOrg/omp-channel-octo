@@ -28,6 +28,7 @@ import type {
   WorkerModelSwitch,
   WorkerOptions,
   WorkerProcess,
+  TaskStartupCode,
 } from "../contracts.ts";
 import { TaskStartupError, WorkerGoalError, WorkerSteerRejectedError } from "../contracts.ts";
 import type { ProjectSessionState } from "../session/project-session.ts";
@@ -82,8 +83,6 @@ type StoredDispatch = Mutable<AgentRuntimeDispatchSnapshot> & {
 type StoredWorker = Mutable<AgentRuntimeWorkerSnapshot> & {
   sessionKeys: string[];
   dispatchMap: Record<string, StoredDispatch>;
-  /** Private, bounded OMP startup detail retained for local diagnosis, never sent over the runtime protocol. */
-  startupFailure?: { code: string; diagnostic?: string };
 };
 
 type WorkerRecord = {
@@ -340,6 +339,9 @@ function workerSnapshot(record: StoredWorker): AgentRuntimeWorkerSnapshot {
     stage: record.stage,
     activeDispatchId: record.activeDispatchId,
     dispatches: Object.values(record.dispatchMap).map(dispatchSnapshot),
+    ...(record.startupFailure === undefined ? {} : { startupFailure: record.startupFailure }),
+    ...(record.startupCwd === undefined ? {} : { startupCwd: record.startupCwd }),
+    ...(record.startupFenced === undefined ? {} : { startupFenced: record.startupFenced }),
   };
 }
 
@@ -368,7 +370,7 @@ function assertStoredWorker(value: unknown, botUid: string): asserts value is St
     || typeof value.runtimeId !== "string"
     || typeof value.sessionId !== "string"
     || typeof value.sessionFile !== "string"
-    || !["spawn-intent", "identity-verified", "omp-ready", "active", "stopping", "exited-confirmed", "unknown"].includes(String(value.stage))
+    || !["spawn-intent", "not-spawned", "identity-verified", "omp-ready", "active", "stopping", "exited-confirmed", "unknown"].includes(String(value.stage))
     || (value.activeDispatchId !== null && typeof value.activeDispatchId !== "string")
   ) {
     throw new Error("Agent runtime ledger worker identity or state is invalid");
@@ -425,6 +427,21 @@ function assertStoredWorker(value: unknown, botUid: string): asserts value is St
       throw new Error("Agent runtime ledger startup failure is invalid");
     }
   }
+  if (value.stage === "not-spawned") {
+    assertObject(value.startupFailure, "Agent runtime pre-spawn failure");
+    if (value.process !== null || typeof value.startupCwd !== "string" || !isAbsolute(value.startupCwd)
+      || value.activeDispatchId !== null || Object.keys(value.dispatchMap).length !== 0
+      || !["spawn-failed", "cwd-missing", "session-dir-missing"].includes(String(value.startupFailure.code))) {
+      throw new Error("Agent runtime pre-spawn proof is invalid");
+    }
+  }
+  if (value.startupFenced === true && (
+    (value.stage !== "not-spawned" && value.stage !== "exited-confirmed")
+    || typeof value.startupCwd !== "string" || !isAbsolute(value.startupCwd)
+    || value.startupFailure === undefined || value.activeDispatchId !== null
+    || Object.keys(value.dispatchMap).length !== 0
+    || (value.stage === "not-spawned" && value.process !== null)
+  )) throw new Error("Agent runtime startup fence is invalid");
 }
 
 
@@ -592,9 +609,9 @@ export class AgentRuntimeServer {
         if (record.snapshot.sessionFile) record.snapshot.sessionKeys.push(`file:${resolve(record.snapshot.sessionFile)}`);
         if (record.snapshot.sessionId) record.snapshot.sessionKeys.push(`session:${record.snapshot.sessionId}`);
       }
-      if (!record.snapshot.process) {
+      if (!record.snapshot.process && record.snapshot.stage !== "not-spawned") {
         record.snapshot.stage = "unknown";
-      } else if (record.snapshot.stage !== "exited-confirmed") {
+      } else if (record.snapshot.process && record.snapshot.stage !== "exited-confirmed") {
         const stopped = await this.#factory.recover(record.snapshot.process).catch(() => false);
         record.snapshot.stage = stopped ? "exited-confirmed" : "unknown";
       }
@@ -723,7 +740,11 @@ export class AgentRuntimeServer {
       const value = await this.#operate(connection, operation, args, controller.signal);
       this.#send(connection, { kind: "response", id, ok: true, value });
     } catch (error) {
-      this.#send(connection, { kind: "response", id, ok: false, error: errorText(error) });
+      this.#send(connection, {
+        kind: "response", id, ok: false, error: errorText(error),
+        ...(error instanceof TaskStartupError
+          ? { startupFailure: { code: error.code, diagnostic: error.diagnostic } } : {}),
+      });
     } finally {
       connection.requests.delete(id);
     }
@@ -850,6 +871,9 @@ export class AgentRuntimeServer {
     const runId = safeId(input.runId, "runId");
     const key = this.#workerKey(taskId, runId);
     if (this.#workers.has(key)) throw new Error("Agent runtime run already exists");
+    if ([...this.#workers.values()].some(record => record.snapshot.taskId === taskId && record.snapshot.startupFenced)) {
+      throw new Error("Agent runtime task startup is already settled");
+    }
     const options = input.workerOptions;
     if (!options || !options.cwd || !options.sessionDir) throw new Error("Agent runtime worker options are invalid");
     if (options.contextScope && options.contextScope.botUid !== this.botUid) throw new Error("Worker bot identity does not match runtime identity");
@@ -866,6 +890,7 @@ export class AgentRuntimeServer {
       stage: "spawn-intent",
       activeDispatchId: null,
       dispatches: [],
+      startupCwd: options.cwd,
       sessionKeys,
       dispatchMap: {},
     };
@@ -922,8 +947,17 @@ export class AgentRuntimeServer {
         const stopped = await this.#factory.recover(snapshot.process).catch(() => false);
         if (stopped) this.#markExited(record);
         else snapshot.stage = "unknown";
+      } else if (input.fenceStartupFailure && error instanceof TaskStartupError
+        && (error.code === "spawn-failed" || error.code === "cwd-missing" || error.code === "session-dir-missing")) {
+        snapshot.stage = "not-spawned";
+        this.#releaseSession(record);
       } else {
         snapshot.stage = "unknown";
+      }
+      if (input.fenceStartupFailure && snapshot.startupFailure !== undefined
+        && (snapshot.stage === "not-spawned" || snapshot.stage === "exited-confirmed")
+        && ![...this.#workers.values()].some(other => other !== record && other.snapshot.taskId === taskId)) {
+        snapshot.startupFenced = true;
       }
       this.#persistLedger();
       throw error;
@@ -1309,7 +1343,7 @@ export async function ensureAgentRuntime(options: AgentRuntimeLaunchOptions): Pr
     try {
       const manifest = await readManifestIfPresent(paths.manifestPath);
       if (manifest) {
-        if (manifest.botUid !== options.botUid || manifest.protocolVersion !== AGENT_RUNTIME_PROTOCOL_VERSION) throw new Error("Agent runtime identity does not match");
+        if (manifest.botUid !== options.botUid) throw new Error("Agent runtime identity does not match");
         const processSnapshot = await queryProcess(manifest.pid);
         if (processSnapshot && processSnapshot.identity === manifest.processIdentity) {
           return await connect(manifest);
@@ -1327,7 +1361,7 @@ export async function connectAgentRuntime(options: { readonly stateDir: string; 
   const paths = pathsFor(options.stateDir, safeId(options.botUid, "botUid"));
   const manifest = await readManifestIfPresent(paths.manifestPath);
   if (!manifest) throw new Error("Agent runtime is not running");
-  if (manifest.botUid !== options.botUid || manifest.protocolVersion !== AGENT_RUNTIME_PROTOCOL_VERSION) throw new Error("Agent runtime identity does not match");
+  if (manifest.botUid !== options.botUid) throw new Error("Agent runtime identity does not match");
   const processSnapshot = await queryProcess(manifest.pid);
   if (!processSnapshot || processSnapshot.identity !== manifest.processIdentity) throw new Error("Agent runtime process identity is unknown");
   return { handle: handleFor(manifest), client: await connectManifest(manifest, options.botUid, SOCKET_CONNECT_TIMEOUT_MS, paths.manifestPath) };
@@ -1337,7 +1371,7 @@ async function readManifestIfPresent(path: string): Promise<RuntimeManifest | un
   try {
     const value: unknown = JSON.parse(await readFile(path, "utf8"));
     assertObject(value, "Agent runtime manifest");
-    if (value.protocolVersion !== AGENT_RUNTIME_PROTOCOL_VERSION || typeof value.botUid !== "string" || typeof value.runtimeId !== "string" || typeof value.pid !== "number" || typeof value.processIdentity !== "string" || typeof value.socketPath !== "string" || typeof value.secret !== "string") {
+    if ((value.protocolVersion !== 1 && value.protocolVersion !== AGENT_RUNTIME_PROTOCOL_VERSION) || typeof value.botUid !== "string" || typeof value.runtimeId !== "string" || typeof value.pid !== "number" || typeof value.processIdentity !== "string" || typeof value.socketPath !== "string" || typeof value.secret !== "string") {
       throw new Error("Agent runtime manifest is invalid");
     }
     return value as RuntimeManifest;
@@ -1362,6 +1396,7 @@ function handleFor(manifest: RuntimeManifest): AgentRuntimeHandle {
 
 async function connectManifest(manifest: RuntimeManifest, botUid: string, timeoutMs: number, manifestPath: string): Promise<AgentRuntimeClient> {
   return AgentRuntimeClient.connect({
+    protocolVersion: manifest.protocolVersion,
     socketPath: manifest.socketPath,
     secret: manifest.secret,
     botUid,
@@ -1405,6 +1440,10 @@ export class AgentRuntimeClient {
     this.#clientEventListener = event => this.#handleEvent(event);
     this.#connection.eventListeners.add(this.#clientEventListener);
   }
+  get protocolVersion(): number {
+    return this.#identity.protocolVersion;
+  }
+
 
   static async connect(options: {
     socketPath: string;
@@ -1415,9 +1454,10 @@ export class AgentRuntimeClient {
     processIdentity: string;
     manifestPath: string;
     timeoutMs: number;
+    protocolVersion?: number;
   }): Promise<AgentRuntimeClient> {
     const client = new AgentRuntimeClient({
-      protocolVersion: AGENT_RUNTIME_PROTOCOL_VERSION,
+      protocolVersion: options.protocolVersion ?? AGENT_RUNTIME_PROTOCOL_VERSION,
       botUid: options.botUid,
       runtimeId: options.runtimeId,
       pid: options.pid,
@@ -1522,7 +1562,10 @@ export class AgentRuntimeClient {
             this.#connection.pending.delete(id);
             pending.abort?.();
             if (message.ok === true) pending.resolve(message.value);
-            else pending.reject(errorFromText(String(message.error ?? "Agent runtime operation failed")));
+            else if (message.startupFailure && typeof message.startupFailure === "object") {
+              const failure = message.startupFailure as { code: TaskStartupCode; diagnostic?: string };
+              pending.reject(new TaskStartupError(failure.code, String(message.error), failure.diagnostic));
+            } else pending.reject(errorFromText(String(message.error ?? "Agent runtime operation failed")));
             continue;
           }
           if (message.kind === "event" && message.epoch === this.#connection.epoch) {

@@ -38,6 +38,7 @@ export type OpenTrackedAgentWorkerOptions = {
     | { readonly kind: "create"; readonly options: AgentRuntimeWorkerOptions }
     | { readonly kind: "attach"; readonly sessionId: string };
   readonly hostTools?: readonly HostTool[];
+  readonly fenceStartupFailure?: boolean;
   readonly store: Pick<ChannelStore, "recordWorker" | "markWorkerStopped">;
   readonly blockDirectory: (cwd: string) => void;
 };
@@ -196,6 +197,7 @@ export async function openTrackedAgentWorker(
         taskId: options.taskId,
         runId: options.runId,
         workerOptions: options.worker.options,
+        ...(options.fenceStartupFailure ? { fenceStartupFailure: true } : {}),
       }, options.hostTools)
     : await options.client.attachWorker({
         taskId: options.taskId,

@@ -4,6 +4,7 @@ import type {
   WorkerModelCatalog,
   WorkerModelSwitch,
   WorkerOptions,
+  TaskStartupCode,
   WorkerProcess,
   WorkerContextUsage,
   OmpAvailableCommand,
@@ -13,10 +14,11 @@ import type {
 } from "../contracts.ts";
 import type { ProjectSessionState } from "../session/project-session.ts";
 
-export const AGENT_RUNTIME_PROTOCOL_VERSION = 1;
+export const AGENT_RUNTIME_PROTOCOL_VERSION = 2;
 
 export type AgentRuntimeStage =
   | "spawn-intent"
+  | "not-spawned"
   | "identity-verified"
   | "omp-ready"
   | "active"
@@ -48,6 +50,9 @@ export interface AgentRuntimeWorkerSnapshot {
   readonly stage: AgentRuntimeStage;
   readonly activeDispatchId: string | null;
   readonly dispatches: readonly AgentRuntimeDispatchSnapshot[];
+  readonly startupFailure?: { readonly code: TaskStartupCode; readonly diagnostic?: string };
+  readonly startupCwd?: string;
+  readonly startupFenced?: boolean;
 }
 
 export type AgentRuntimeWorkerOptions = Omit<WorkerOptions, "onSpawn" | "signal">;
@@ -55,6 +60,7 @@ export interface AgentRuntimeCreateWorkerInput {
   readonly taskId: string;
   readonly runId: string;
   readonly workerOptions: AgentRuntimeWorkerOptions;
+  readonly fenceStartupFailure?: boolean;
 }
 
 export interface AgentRuntimeAttachWorkerInput {
@@ -89,7 +95,8 @@ export type AgentRuntimeWireRequest = {
 
 export type AgentRuntimeWireResponse =
   | { readonly kind: "response"; readonly id: string; readonly ok: true; readonly value: unknown }
-  | { readonly kind: "response"; readonly id: string; readonly ok: false; readonly error: string };
+  | { readonly kind: "response"; readonly id: string; readonly ok: false; readonly error: string;
+      readonly startupFailure?: { readonly code: TaskStartupCode; readonly diagnostic?: string } };
 
 export type AgentRuntimeWireEvent = {
   readonly kind: "event";

@@ -153,7 +153,7 @@ OMP 扩展可在 `session_start` 恢复观察并发起自主回合；RPC `ready`
 
 本机入口为 `oco`（`omp-channel-octo` 的别名，`bun link` 安装）：`start` 是守护进程托管的服务进程入口，`run` 是不探测守护进程的调试入口；`restart`/`status`/`logs` 通过自动识别出的守护进程程序操作常驻实例，源码 CLI 按 checkout 识别，AOT CLI 按运行中的编译程序路径识别。`test --card` 在源码和 AOT 中均通过 Bun test 发送真实预览卡；AOT 使用单独打包的外部测试资源。源码读取 checkout 根目录 `.envrc`；AOT 默认读取二进制目录上级的 `.envrc`，独立部署可用 `OMP_CHANNEL_OCTO_ENV_FILE` 指定位置，不输出凭据。配置在 `~/.oco/config/config.json`，服务日志由服务自持在 `~/.oco/logs/`，状态目录默认 `~/.oco/state/`，OMP 会话默认落在 `~/.oco/sessions/`（每个项目一个子目录，见下）；守护进程与程序名不写进配置。省略 `stateDir` 的已有实例启动时自动迁移旧标准状态目录的 SQLite；工作区、会话和已有文件保持原位置。迁移契约见 `2026-11-12-oco-state-directory-design.md`。
 
-OMP worker 启动失败时，保留启动阶段有限的 stderr；退出后将退出码和脱敏、单行、限长的 stderr 摘要随分类提示发到当前聊天，并写入有界任务错误与服务日志。仅启动失败使用该诊断；已就绪后仍排空并丢弃 stderr。群成员可见摘要，脱敏无法保证识别所有自定义凭据。
+OMP worker 启动失败时，当前聊天收到分类与原因码；进程退出已确认时附退出码。新 runtime 始终排空并丢弃 stderr，不将其写入聊天、任务行或服务日志；旧版 runtime 保留其已有的本地启动诊断行为，channel 不转发其原始错误。新 runtime 仅在同任务创建已被持久封锁、身份及未派发状态均确认且无冲突台账时结算启动失败；未确认结果保持阻塞。旧版 runtime 可继续承载已有和新任务；其启动异常无法原子排除并发创建时，提示 `worker-start` 与结果未确认并保持阻塞。
 
 #### AOT 编译发布
 

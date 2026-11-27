@@ -36,7 +36,7 @@ import { acceptCommitTask, acceptTask, acceptTaskIf, cancelQueued, claimCommand,
 import { hasRatchetSession } from "./store-tasks.ts";
 import { bindGoalTaskSession, clearGoalSession, finishGoalTaskProgress, getGoalSession, getGoalTask, isGoalTaskResuming, markGoalTaskAccepted, markGoalTaskAgentAccepted, markGoalTaskDispatched, saveGoalSessionProgress, stopGoalContinuation, updateGoalTaskProgress } from "./store-goals.ts";
 import { clearProgressCard, listProgressCards, recordProgressCardAttempt, saveProgressCard } from "./store-cards.ts";
-import { getWorkerLedger, listWorkerLedger, markWorkerStopped, recordWorker } from "./store-workers.ts";
+import { getWorkerLedger, hasWorkerLedger, listWorkerLedger, markWorkerStopped, recordWorker } from "./store-workers.ts";
 import { beginHostMergeAutoCommitMerge, beginHostRemovalStep, bindHostMergeProgressCardMessage, clearHostMergeProgressCard, completeHostMergeLease, getHostMergeLeaseBySourceId, getHostMergeProgressCard, getHostRemovalLeaseBySourceId, listHostMergeLeases, listHostMergeProgressCards, listHostRemovalLeases, markHostMergeAutoCommitDispatched, markHostMergeAutoCommitMergeReady, markHostMergeLeaseUnknown, markHostMergeProcessExited, markHostMergeProgressCardAttempted, markHostMergeProgressCardUnavailable, markHostMergeProgressCardUnknown, markHostRemovalLeaseUnknown, markHostRemovalProcessExited, persistHostMergeOutcome, persistHostMergeResultHash as storeHostMergeResultHash, persistHostRemovalOutcome, recordHostMergeAutoCommitResult, recordHostMergeProcess, recordHostMergeProgressCardAttempt, recordHostRemovalProcess, releaseHostRemovalLease, requestHostMergeStop, reserveHostMergeLease, reserveHostMergeProgressCard, reserveHostRemovalLease, settleHostMergeLease, settleHostRemovalLease, updateHostMergeProgressCard, type HostMergeLeaseCompletion } from "./store-host-merges.ts";
 import { advanceHistoryLedger, clearContextLedger, commitContextInjection, commitHistoryInjection, getContextLedger, getHistoryLedger, prepareContextInjection, prepareHistoryInjection, pruneHistoryLedger } from "./store-ledgers.ts";
 import { acknowledgeTextOutbox, beginTextCreate, bindTextOutbox, commitTextStream, countPendingOutbox, countUnknownOutbox, enqueueOutbox, failTextOutbox, getBotEventCursor, getLatestFinalAssistantText, getOutbox, listPendingOutbox, listPendingOutboxTargets, listTextStream, markOutboxDead, markOutboxFailure, markOutboxSent, setBotEventCursor, updateTextOutbox } from "./store-outbox.ts";
@@ -1102,6 +1102,9 @@ export class ChannelStore {
   }
   getWorkerLedger(botUid: string, id: string): WorkerLedgerRecord | null {
     return getWorkerLedger(this.db, botUid, id);
+  }
+  hasWorkerLedger(id: string): boolean {
+    return hasWorkerLedger(this.db, id);
   }
   reserveHostMergeLease(input: HostMergeLeaseInput): void {
     reserveHostMergeLease(this.db, input);

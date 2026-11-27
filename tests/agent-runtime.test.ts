@@ -579,14 +579,14 @@ describe("agent runtime channel recovery", () => {
         taskId: "task-startup-failure",
         runId: "run-startup-failure",
         workerOptions: harness.workerOptions(),
-      })).rejects.toThrow("fixture OMP startup failure");
+      })).rejects.toThrow("OMP output ended before ready");
 
       const runtimeManifestPath = await manifestPath(harness.stateDir);
       const ledger = JSON.parse(await readFile(join(dirname(runtimeManifestPath), "workers.json"), "utf8")) as Array<Record<string, unknown>>;
       expect(ledger).toHaveLength(1);
       const failure = ledger[0]?.startupFailure as Record<string, unknown> | undefined;
       expect(failure?.code).toBe("exited");
-      expect(failure?.diagnostic).toContain("fixture OMP startup failure");
+      expect(failure?.diagnostic).toBe("退出码 23");
       expect(String(failure?.diagnostic).length).toBeLessThanOrEqual(256);
       expect(ledger[0]?.sessionId).toBe("");
       expect(ledger[0]?.stage).toBe("exited-confirmed");

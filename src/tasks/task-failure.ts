@@ -1,6 +1,6 @@
 /**
  * 任务失败分类:把 worker 创建成功之前的启动失败,以及启动之后的执行失败,收敛成分类的
- * 聊天文案、任务行前缀与日志细节。worker 启动诊断经脱敏和限长后显示在当前聊天。
+ * 聊天只显示已确认的进程退出码。
  */
 
 import { TaskStartupError, type TaskStartupCode } from "../contracts.ts";
@@ -90,14 +90,16 @@ function describeTaskFailure(kind: TaskFailureKind, code: string | undefined, er
   // enter logs or durable task rows.
   const detail = kind === "members"
     ? safeMemberFailureDetail(error)
-    : failureText(error, words.fallback);
+    : error instanceof TaskStartupError ? words.fallback : failureText(error, words.fallback);
+  const diagnostic = error instanceof TaskStartupError && /^退出码 [0-9]+$/u.test(error.diagnostic ?? "")
+    ? error.diagnostic : undefined;
   return {
     kind,
     code: resolved,
     detail,
     notice: kind === "context" || kind === "members" || kind === "generic"
       ? words.notice
-      : `${words.notice}（${resolved}）。${error instanceof TaskStartupError && error.diagnostic ? `\n${error.diagnostic}` : ""}`,
+      : `${words.notice}（${resolved}）。${diagnostic ? `\n${diagnostic}` : ""}`,
     row: `${words.row}（${resolved}）：${detail}`,
   };
 }

@@ -73,6 +73,10 @@ export function getWorkerLedger(db: Database, botUid: string, id: string): Worke
   )[0];
   return row ? workerLedgerFromRow(row) : null;
 }
+export function hasWorkerLedger(db: Database, id: string): boolean {
+  return query(db, "SELECT 1 FROM worker_ledger WHERE id = ?", [id]).length !== 0;
+}
+
 
 export function listWorkerLedger(db: Database, botUid: string): WorkerLedgerRecord[] {
   return query(db, "SELECT * FROM worker_ledger WHERE bot_uid = ? AND state != 'stopped'", [botUid])
